@@ -5,4 +5,4 @@ valk: $(SRC)
 	valkmain build . src/*.valk -o ./valk
 
 run: valk
-	./valk build ./debug/example.valk debug -v
+	./valk build ./debug/example.valk debug -vvv
