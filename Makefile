@@ -6,3 +6,6 @@ valk: $(SRC)
 
 run: valk
 	./valk build ./debug/example.valk debug -vvv
+
+time: valk
+	/usr/bin/time -v ./valk build ./debug/example.valk debug -vvv
