@@ -1,5 +1,5 @@
 
-cstruct pthread_t {
+struct pthread_t {
 	data: uint
 }
 

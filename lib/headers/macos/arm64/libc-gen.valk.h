@@ -9,12 +9,12 @@ type libc_dirent (libc_gen_dirent)
 type libc_timezone (libc_gen_timezone)
 type libc_addrinfo (libc_gen_addrinfo)
 
-cstruct libc_gen_timespec {
+struct libc_gen_timespec {
     tv_sec: int
     tv_nsec: int
 }
 
-cstruct libc_gen_stat {
+struct libc_gen_stat {
     st_dev: i32
     st_mode: u16
     st_nlink: u16
@@ -35,7 +35,7 @@ cstruct libc_gen_stat {
     st_qspare: inline [int, 2]
 }
 
-cstruct libc_gen_dirent {
+struct libc_gen_dirent {
     d_ino: uint
     d_seekoff: uint
     d_reclen: u16
@@ -44,24 +44,24 @@ cstruct libc_gen_dirent {
     d_name: inline [i8, 1024]
 }
 
-cstruct libc_gen_timeval {
+struct libc_gen_timeval {
     tv_sec: int
     tv_usec: i32
 }
 
-cstruct libc_gen_pollfd {
+struct libc_gen_pollfd {
     fd: i32
     events: i16
     revents: i16
 }
 
-cstruct libc_gen_sockaddr {
+struct libc_gen_sockaddr {
     sa_len: u8
     sa_family: u8
     sa_data: inline [i8, 14]
 }
 
-cstruct libc_gen_addrinfo {
+struct libc_gen_addrinfo {
     ai_flags: i32
     ai_family: i32
     ai_socktype: i32
@@ -72,7 +72,7 @@ cstruct libc_gen_addrinfo {
     ai_next: libc_gen_addrinfo
 }
 
-cstruct libc_gen_timezone {
+struct libc_gen_timezone {
     tz_minuteswest: i32
     tz_dsttime: i32
 }
