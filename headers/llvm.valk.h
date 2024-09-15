@@ -135,5 +135,41 @@ link_static "LLVMVEDesc"
 link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
 
+// link_dynamic "c"
+link_static "stdc++"
+// link_static "rt"
+// link_static "dl"
+link_dynamic "pthread"
 link_dynamic "m"
-link_dynamic "stdc++"
+// link_static "z"
+link_static "tinfo"
+// link_static "xml2"
+link_static "gcc_eh"
+
+pointer LLVMModuleRef {}
+pointer LLVMPassManagerRef {}
+pointer LLVMContextRef {}
+pointer LLVMMemoryBufferRef {}
+pointer LLVMTargetMachineRef {}
+
+alias LLVMBool as bool
+// Output types
+value LLVMAssemblyFile (0)
+value LLVMObjectFile (1)
+
+fn LLVMContextCreate() LLVMContextRef;
+fn LLVMContextSetOpaquePointers(context: LLVMContextRef, enable: bool) void;
+fn LLVMModuleCreateWithNameInContext(name: cstring, context: LLVMContextRef) LLVMModuleRef;
+fn LLVMCreateMemoryBufferWithContentsOfFile(path: cstring, buffer_ref: ptr, msg_ref: ptr) LLVMBool;
+
+fn LLVMLinkModules2(mod1: LLVMModuleRef, mod2: LLVMModuleRef) LLVMBool;
+fn LLVMPrintModuleToString(mod: LLVMModuleRef) cstring;
+
+fn LLVMSetTarget(mod: LLVMModuleRef, triple: cstring) void;
+fn LLVMSetDataLayout(mod: LLVMModuleRef, layout: cstring) void;
+
+fn LLVMTargetMachineEmitToFile(target_machine: LLVMTargetMachineRef, mod: LLVMModuleRef, path_out: cstring, output_type: i32, error_msg_ref: ptr) LLVMBool;
+
+fn LLVMDisposeMessage(cstr: cstring) void;
+fn LLVMDisposeModule(module: LLVMModuleRef) void;
+fn LLVMContextDispose(context: LLVMContextRef) void;

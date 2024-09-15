@@ -1,9 +1,10 @@
 
+HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
 
-valk: $(SRC)
-	valkmain build . src/*.valk -o ./valk
-valkd: $(SRC)
+valk: $(SRC) $(HDRS)
+	valkmain build . src/*.valk -o ./valk -vv
+valkd: $(SRC) $(HDRS)
 	gdb --args valkmain build . src/*.valk -o ./valk
 
 run: valk
