@@ -11,3 +11,9 @@ run: valk
 
 time: valk
 	/usr/bin/time -v ./valk build ./debug/example.valk debug -vvv
+
+toolchains:
+	chmod +x ./toolchains/setup.sh
+	./toolchains/setup.sh
+
+.PHONY: toolchains

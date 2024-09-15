@@ -135,5 +135,5 @@ link_static "LLVMVEDesc"
 link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
 
-// link_dynamic "m"
-// link_dynamic "stdc++"
+link_dynamic "m"
+link_dynamic "stdc++"
