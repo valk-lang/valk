@@ -164,6 +164,7 @@ fn LLVMCreateMemoryBufferWithContentsOfFile(path: cstring, buffer_ref: ptr, msg_
 
 fn LLVMLinkModules2(mod1: LLVMModuleRef, mod2: LLVMModuleRef) LLVMBool;
 fn LLVMPrintModuleToString(mod: LLVMModuleRef) cstring;
+fn LLVMParseIRInContext(context: LLVMContextRef, buffer: LLVMMemoryBufferRef, mod_ref: ptr, msg_ref: ptr) LLVMBool;
 
 fn LLVMSetTarget(mod: LLVMModuleRef, triple: cstring) void;
 fn LLVMSetDataLayout(mod: LLVMModuleRef, layout: cstring) void;
