@@ -11,7 +11,7 @@ run: valk
 	./valk build ./debug/example.valk debug -vvv -o ./debug/test
 
 time: valk
-	/usr/bin/time -v ./valk build ./debug/example.valk debug -vvv -o ./debug/test
+	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/test
 
 toolchains:
 	chmod +x ./toolchains/setup.sh
