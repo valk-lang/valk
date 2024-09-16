@@ -1,5 +1,5 @@
 
-// #if STATIC
+#if STATIC
 link_static "LLVMOption"
 link_static "LLVMObjCARCOpts"
 link_static "LLVMMCJIT"
@@ -136,20 +136,40 @@ link_static "LLVMVEDesc"
 link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
 
-// #else
-// link_dynamic "LLVM-15"
-// #end
-
-// $(LLVM_LIBS) -lc -lstdc++ -lrt -ldl -lpthread -lm -lz -ltinfo -lxml2
+#if OS == linux
 link_static "stdc++"
-// link_static "rt"
-// link_static "dl"
 link_dynamic "pthread"
 link_dynamic "m"
 link_static "z"
 link_static "tinfo"
-// link_static "xml2"
 link_static "gcc_eh"
+
+#elif OS == macos
+link_static "curses"
+link_static "c++"
+link_static "z"
+
+#elif OS == win
+link_static "libcurl"
+link_static "crypt32"
+link_static "ws2_32"
+link_static "zlib"
+#end
+
+#else
+link_dynamic "LLVM-15"
+#end
+
+// $(LLVM_LIBS) -lc -lstdc++ -lrt -ldl -lpthread -lm -lz -ltinfo -lxml2
+// link_static "stdc++"
+// // link_static "rt"
+// // link_static "dl"
+// link_dynamic "pthread"
+// link_dynamic "m"
+// link_static "z"
+// link_static "tinfo"
+// // link_static "xml2"
+// link_static "gcc_eh"
 
 alias LLVMBool as bool
 
