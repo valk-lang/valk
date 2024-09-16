@@ -157,28 +157,105 @@ value LLVMAbortProcessAction (0) // verifier will print to stderr and abort()
 value LLVMPrintMessageAction (1) // verifier will print to stderr and return 1
 value LLVMReturnStatusAction (2) // verifier will just return 1
 
+// LLVMCodeGenOptLevel
+value LLVMCodeGenLevelNone (0)
+value LLVMCodeGenLevelLess (1)
+value LLVMCodeGenLevelDefault (2)
+value LLVMCodeGenLevelAggressive (3)
+
+// LLVMRelocMode
+value LLVMRelocDefault (0)
+value LLVMRelocStatic (1)
+value LLVMRelocPIC (2)
+value LLVMRelocDynamicNoPic (3)
+value LLVMRelocROPI (4)
+value LLVMRelocRWPI (5)
+value LLVMRelocROPI_RWPI (6)
+
+// LLVMCodeModel
+value LLVMCodeModelDefault (0)
+value LLVMCodeModelJITDefault (1)
+value LLVMCodeModelTiny (2)
+value LLVMCodeModelSmall (3)
+value LLVMCodeModelKernel (4)
+value LLVMCodeModelMedium (5)
+value LLVMCodeModelLarge (6)
+
+// Types
 pointer LLVMModuleRef {}
 pointer LLVMPassManagerRef {}
 pointer LLVMContextRef {}
 pointer LLVMMemoryBufferRef {}
 pointer LLVMTargetMachineRef {}
 pointer LLVMTargetDataRef {}
+pointer LLVMTargetRef {}
 
+// Init
 fn LLVMContextCreate() LLVMContextRef;
 fn LLVMContextSetOpaquePointers(context: LLVMContextRef, enable: bool) void;
 fn LLVMModuleCreateWithNameInContext(name: cstring, context: LLVMContextRef) LLVMModuleRef;
 fn LLVMCreateMemoryBufferWithContentsOfFile(path: cstring, buffer_ref: ptr, msg_ref: ptr) LLVMBool;
 
+// Moodule / verify
 fn LLVMLinkModules2(mod1: LLVMModuleRef, mod2: LLVMModuleRef) LLVMBool;
 fn LLVMPrintModuleToString(mod: LLVMModuleRef) cstring;
 fn LLVMParseIRInContext(context: LLVMContextRef, buffer: LLVMMemoryBufferRef, mod_ref: ptr, msg_ref: ptr) LLVMBool;
 fn LLVMVerifyModule(mod: LLVMModuleRef, return_status_action: i32, error_msg_ref: ptr) LLVMBool;
 
+// Target
+fn LLVMGetTargetFromTriple(triple: cstring, target_ref: ptr, msg_ref: ptr) LLVMBool;
+fn LLVMCreateTargetMachine(target: LLVMTargetRef, triple: cstring, cpu: cstring, features: ?cstring, code_gen_level: i32, reloc_mode: i32, code_model: i32) ?LLVMTargetMachineRef;
+fn LLVMCreateTargetDataLayout(machine: LLVMTargetMachineRef) LLVMTargetDataRef;
+fn LLVMCopyStringRepOfTargetData(target: LLVMTargetDataRef) cstring;
+fn LLVMGetHostCPUFeatures() cstring;
+fn LLVMGetDefaultTargetTriple() cstring;
+fn LLVMGetTargetName(target: LLVMTargetDataRef) cstring;
+fn LLVMGetTargetDescription(target: LLVMTargetDataRef) cstring;
+fn LLVMGetTargetHasJIT(target: LLVMTargetDataRef) LLVMBool;
+fn LLVMGetTargetHasTargetMachine(target: LLVMTargetDataRef) LLVMBool;
+
+// Build
 fn LLVMSetTarget(mod: LLVMModuleRef, triple: cstring) void;
 fn LLVMSetDataLayout(mod: LLVMModuleRef, layout: cstring) void;
-
 fn LLVMTargetMachineEmitToFile(target_machine: LLVMTargetMachineRef, mod: LLVMModuleRef, path_out: cstring, output_type: i32, error_msg_ref: ptr) LLVMBool;
 
-fn LLVMDisposeMessage(cstr: cstring) void;
+// Dispose
+fn LLVMDisposeMessage(cstr: ?cstring) void;
 fn LLVMDisposeModule(module: LLVMModuleRef) void;
 fn LLVMContextDispose(context: LLVMContextRef) void;
+
+// Target c magic
+// x86
+fn LLVMInitializeX86TargetInfo() void;
+fn LLVMInitializeX86Target() void;
+fn LLVMInitializeX86TargetMC() void;
+fn LLVMInitializeX86AsmPrinter() void;
+fn LLVMInitializeX86AsmParser() void;
+fn LLVMInitializeX86Disassembler() void;
+// Aarch64
+fn LLVMInitializeAArch64TargetInfo() void;
+fn LLVMInitializeAArch64Target() void;
+fn LLVMInitializeAArch64TargetMC() void;
+fn LLVMInitializeAArch64AsmPrinter() void;
+fn LLVMInitializeAArch64AsmParser() void;
+fn LLVMInitializeAArch64Disassembler() void;
+// #define LLVM_TARGET(TargetName) LLVMInitialize##TargetName##TargetInfo()
+// LLVM_TARGET(AArch64)
+// LLVM_TARGET(AMDGPU)
+// LLVM_TARGET(ARM)
+// LLVM_TARGET(AVR)
+// LLVM_TARGET(BPF)
+// LLVM_TARGET(Hexagon)
+// LLVM_TARGET(Lanai)
+// LLVM_TARGET(Mips)
+// LLVM_TARGET(MSP430)
+// LLVM_TARGET(NVPTX)
+// LLVM_TARGET(PowerPC)
+// LLVM_TARGET(RISCV)
+// LLVM_TARGET(Sparc)
+// LLVM_TARGET(SystemZ)
+// LLVM_TARGET(VE)
+// LLVM_TARGET(WebAssembly)
+// LLVM_TARGET(X86)
+// LLVM_TARGET(XCore)
+// LLVM_TARGET(M68k)
