@@ -1,4 +1,5 @@
 
+// #if STATIC
 link_static "LLVMOption"
 link_static "LLVMObjCARCOpts"
 link_static "LLVMMCJIT"
@@ -134,6 +135,10 @@ link_static "LLVMVEAsmParser"
 link_static "LLVMVEDesc"
 link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
+
+// #else
+// link_dynamic "LLVM-15"
+// #end
 
 // $(LLVM_LIBS) -lc -lstdc++ -lrt -ldl -lpthread -lm -lz -ltinfo -lxml2
 link_static "stdc++"
