@@ -100,7 +100,6 @@ link_static "LLVMCFGuard"
 link_static "LLVMGlobalISel"
 link_static "LLVMSelectionDAG"
 link_static "LLVMAsmPrinter"
-link_static "LLVMDebugInfoDWARF"
 link_static "LLVMCodeGen"
 link_static "LLVMTarget"
 link_static "LLVMScalarOpts"
@@ -110,6 +109,7 @@ link_static "LLVMTransformUtils"
 link_static "LLVMBitWriter"
 link_static "LLVMAnalysis"
 link_static "LLVMProfileData"
+link_static "LLVMDebugInfoDWARF"
 link_static "LLVMObject"
 link_static "LLVMTextAPI"
 link_static "LLVMBitReader"
@@ -135,27 +135,34 @@ link_static "LLVMVEDesc"
 link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
 
-// link_dynamic "c"
+// $(LLVM_LIBS) -lc -lstdc++ -lrt -ldl -lpthread -lm -lz -ltinfo -lxml2
 link_static "stdc++"
 // link_static "rt"
 // link_static "dl"
 link_dynamic "pthread"
 link_dynamic "m"
-// link_static "z"
+link_static "z"
 link_static "tinfo"
 // link_static "xml2"
 link_static "gcc_eh"
+
+alias LLVMBool as bool
+
+// Output types
+value LLVMAssemblyFile (0)
+value LLVMObjectFile (1)
+
+// Return status action
+value LLVMAbortProcessAction (0) // verifier will print to stderr and abort()
+value LLVMPrintMessageAction (1) // verifier will print to stderr and return 1
+value LLVMReturnStatusAction (2) // verifier will just return 1
 
 pointer LLVMModuleRef {}
 pointer LLVMPassManagerRef {}
 pointer LLVMContextRef {}
 pointer LLVMMemoryBufferRef {}
 pointer LLVMTargetMachineRef {}
-
-alias LLVMBool as bool
-// Output types
-value LLVMAssemblyFile (0)
-value LLVMObjectFile (1)
+pointer LLVMTargetDataRef {}
 
 fn LLVMContextCreate() LLVMContextRef;
 fn LLVMContextSetOpaquePointers(context: LLVMContextRef, enable: bool) void;
@@ -165,6 +172,7 @@ fn LLVMCreateMemoryBufferWithContentsOfFile(path: cstring, buffer_ref: ptr, msg_
 fn LLVMLinkModules2(mod1: LLVMModuleRef, mod2: LLVMModuleRef) LLVMBool;
 fn LLVMPrintModuleToString(mod: LLVMModuleRef) cstring;
 fn LLVMParseIRInContext(context: LLVMContextRef, buffer: LLVMMemoryBufferRef, mod_ref: ptr, msg_ref: ptr) LLVMBool;
+fn LLVMVerifyModule(mod: LLVMModuleRef, return_status_action: i32, error_msg_ref: ptr) LLVMBool;
 
 fn LLVMSetTarget(mod: LLVMModuleRef, triple: cstring) void;
 fn LLVMSetDataLayout(mod: LLVMModuleRef, layout: cstring) void;
