@@ -3,6 +3,7 @@ HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
 
+# Development
 valk: $(SRC) $(HDRS)
 	valkmain build . src/*.valk -o ./valk -vv
 valkd: $(SRC) $(HDRS)
@@ -10,7 +11,7 @@ valkd: $(SRC) $(HDRS)
 static: $(SRC) $(HDRS)
 	valkmain build . src/*.valk -o ./valk -vv --static
 
-# ///
+# Distributions
 linux-x64: $(SRC) $(HDRS)
 	mkdir -p dist/linux-x64
 	valkmain build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64
@@ -23,8 +24,8 @@ macos-arm64: $(SRC) $(HDRS)
 win-x64: $(SRC) $(HDRS)
 	mkdir -p dist/win-x64
 	valkmain build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64
-# ///
 
+# Testing
 run: valk
 	./valk build ./debug/example.valk debug -v -o ./debug/test
 
@@ -37,6 +38,7 @@ debug/example: $(SRC_EXAMPLE)
 ex: valk debug/example
 	./debug/example
 
+# Setup
 toolchains:
 	chmod +x ./toolchains/setup.sh
 	./toolchains/setup.sh
