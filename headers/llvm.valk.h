@@ -150,10 +150,9 @@ link_static "c++"
 link_static "z"
 
 #elif OS == win
-link_static "libcurl"
-link_static "crypt32"
-link_static "ws2_32"
-link_static "zlib"
+link_dynamic "advapi32"
+link_dynamic "shell32"
+link_dynamic "ole32"
 #end
 
 #else
