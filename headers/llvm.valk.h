@@ -150,6 +150,9 @@ link_static "c++"
 link_static "z"
 
 #elif OS == win
+link_dynamic "msvcprt"
+link_dynamic "oldnames"
+
 link_dynamic "advapi32"
 link_dynamic "shell32"
 link_dynamic "ole32"
