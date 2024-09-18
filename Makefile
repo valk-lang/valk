@@ -27,7 +27,7 @@ win-x64: $(SRC) $(HDRS)
 
 # Testing
 run: valk
-	./valk build ./debug/example.valk debug -v -o ./debug/test
+	./valk build ./debug/example.valk debug -vvv -o ./debug/test
 
 time: valk
 	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/test
