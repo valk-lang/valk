@@ -1,6 +1,7 @@
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
+SRC_LIB=$(wildcard lib/src/*/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
 
 # Development
@@ -32,11 +33,13 @@ run: valk
 time: valk
 	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/test
 
-debug/example: $(SRC_EXAMPLE)
+debug/example: $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -v -o ./debug/example
 
 ex: valk debug/example
 	./debug/example
+exd: valk debug/example
+	gdb ./debug/example
 
 # Setup
 toolchains:
