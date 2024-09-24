@@ -8,3 +8,4 @@
 - when you create a new object and you dont pass in a property value and there's no default value
 -- if nullable, use `null` as value, if it has a `construct` without arguments, use that
 - enums
+- array sort & custom sort
