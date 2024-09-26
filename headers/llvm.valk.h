@@ -216,6 +216,8 @@ pointer LLVMMemoryBufferRef {}
 pointer LLVMTargetMachineRef {}
 pointer LLVMTargetDataRef {}
 pointer LLVMTargetRef {}
+pointer LLVMPassManagerBuilderRef {}
+pointer LLVMValueRef {}
 
 // Init
 fn LLVMContextCreate() LLVMContextRef;
@@ -241,6 +243,21 @@ fn LLVMGetTargetDescription(target: LLVMTargetDataRef) cstring;
 fn LLVMGetTargetHasJIT(target: LLVMTargetDataRef) LLVMBool;
 fn LLVMGetTargetHasTargetMachine(target: LLVMTargetDataRef) LLVMBool;
 
+// Optimize
+fn LLVMPassManagerBuilderCreate() LLVMPassManagerBuilderRef;
+fn LLVMPassManagerBuilderSetOptLevel(pm_builder: LLVMPassManagerBuilderRef, opt_level: u32) void;
+fn LLVMPassManagerBuilderSetSizeLevel(pm_builder: LLVMPassManagerBuilderRef, opt_level: u32) void;
+fn LLVMCreateFunctionPassManagerForModule(mod: LLVMModuleRef) LLVMPassManagerRef;
+fn LLVMCreatePassManager() LLVMPassManagerRef;
+fn LLVMPassManagerBuilderPopulateFunctionPassManager(pm_builder: LLVMPassManagerBuilderRef, func_pm: LLVMPassManagerRef) void;
+fn LLVMPassManagerBuilderPopulateModulePassManager(pm_builder: LLVMPassManagerBuilderRef, func_pm: LLVMPassManagerRef) void;
+fn LLVMInitializeFunctionPassManager(func_pm: LLVMPassManagerRef) void;
+fn LLVMGetFirstFunction(mod: LLVMModuleRef) ?LLVMValueRef;
+fn LLVMGetNextFunction(val: LLVMValueRef) ?LLVMValueRef;
+fn LLVMRunFunctionPassManager(func_pm: LLVMPassManagerRef, func: LLVMValueRef) void;
+fn LLVMFinalizeFunctionPassManager(func_pm: LLVMPassManagerRef) void;
+fn LLVMRunPassManager(pm: LLVMPassManagerRef, mod: LLVMModuleRef) void;
+
 // Build
 fn LLVMSetTarget(mod: LLVMModuleRef, triple: cstring) void;
 fn LLVMSetDataLayout(mod: LLVMModuleRef, layout: cstring) void;
@@ -250,6 +267,8 @@ fn LLVMTargetMachineEmitToFile(target_machine: LLVMTargetMachineRef, mod: LLVMMo
 fn LLVMDisposeMessage(cstr: ?cstring) void;
 fn LLVMDisposeModule(module: LLVMModuleRef) void;
 fn LLVMContextDispose(context: LLVMContextRef) void;
+fn LLVMDisposePassManager(pm: LLVMPassManagerRef) void;
+fn LLVMPassManagerBuilderDispose(pm_builder: LLVMPassManagerBuilderRef) void;
 
 // Target c magic
 // x86
