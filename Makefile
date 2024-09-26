@@ -37,7 +37,7 @@ debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -v -o ./debug/example
 
 ex: valk debug/example
-	./debug/example
+	time -v ./debug/example
 exd: valk debug/example
 	gdb ./debug/example
 
