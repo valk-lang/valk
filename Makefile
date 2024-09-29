@@ -28,10 +28,12 @@ win-x64: $(SRC) $(HDRS)
 
 # Testing
 run: valk
-	./valk build ./debug/example.valk debug -vvv -o ./debug/test
+	./valk build ./debug/example.valk debug -v -o ./debug/example
+rund: valk
+	gdb --args ./valk build ./debug/example.valk debug -v -o ./debug/example
 
 time: valk
-	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/test
+	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/example
 
 debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -v -o ./debug/example
