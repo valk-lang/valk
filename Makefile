@@ -36,7 +36,7 @@ time: valk
 	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/example
 
 debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
-	./valk build ./debug/example.valk debug -v -o ./debug/example
+	./valk build ./debug/example.valk debug -vv -o ./debug/example
 
 ex: valk debug/example
 	time -v ./debug/example
