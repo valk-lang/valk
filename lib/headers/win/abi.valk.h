@@ -116,12 +116,6 @@ fn lchown(pathname: cstring, owner: u32, group: u32) i32;
 
 fn umask(mask: u32) u32;
 
-fn gettimeofday(tv: libc_timeval, tz: libc_timezone) i32;
-fn settimeofday(tv: libc_timeval, tz: libc_timezone) i32;
-//time_t time(time_t tloc);
-
-//int sysinfo(struct sysinfo info);
-
 fn _flushall() void;
 
 fn gettid() i32;
@@ -138,3 +132,6 @@ fn CloseHandle(handle: ptr) bool;
 
 fn CreateMutexA(lpMutexAttributes: ?ptr, bInitialOwner: bool, lpName: ?cstring) HANDLE;
 fn ReleaseMutex(mutex: ptr) void;
+
+// Time
+fn GetSystemTimeAsFileTime(ft: libc_FILETIME) void;
