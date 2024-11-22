@@ -37,9 +37,13 @@ time: valk
 
 debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -vv -o ./debug/example
+debug/example.exe: valk $(SRC_EXAMPLE) $(SRC_LIB)
+	./valk build ./debug/example.valk debug -vv -o ./debug/example.exe --target win-x64
 
 ex: valk debug/example
 	time -v ./debug/example
+exw: valk debug/example.exe
+	./debug/example.exe
 exd: valk debug/example
 	gdb ./debug/example
 
