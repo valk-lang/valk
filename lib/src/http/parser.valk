@@ -1,0 +1,259 @@
+
+// @ignore_access_types
+
+use utils
+use mem
+use io
+use fs
+
+struct Parser {
+    ~ stage: uint (0)
+    ~ input_pos: uint (0)
+    ~ status: uint (0)
+    ~ headers_start: uint (0)
+    ~ content_start: uint (0)
+    ~ headers_length: uint (0)
+    ~ content_length: uint (0)
+
+    ~ method: String ("")
+    ~ path: String ("")
+    ~ query_string: String ("")
+    ~ header_data: String ("")
+
+    - chunks: utils:ByteBuffer (utils:ByteBuffer.new(8192))
+    ~ input: utils:ByteBuffer (utils:ByteBuffer.new(8192))
+
+    ~ chunked: bool (false)
+    ~ done: bool (false)
+
+    fn reset() {
+        this.stage = 0
+        this.status = 0
+        this.headers_start = 0
+        this.content_start = 0
+        this.headers_length = 0
+        this.content_length = 0
+
+        this.path = ""
+        this.method = ""
+        this.query_string = ""
+        this.header_data = ""
+
+        this.chunks.clear()
+
+        this.chunked = false
+        this.done = false
+
+        let input = this.input
+        if this.input_pos >= input.length {
+            input.clear()
+            this.input_pos = 0
+            input.reduce_size(8192)
+        } else {
+            let pos = this.input_pos
+            if pos > 64 * 1024 {
+                input.clear_until(pos)
+            }
+        }
+    }
+    fn reset_input() {
+        this.input.clear()
+        this.input_pos = 0
+    }
+
+    fn body() String {
+        if !this.done : return ""
+        if this.chunked : return this.chunks.to_string()
+        return this.input.sub_str(this.content_start, this.content_length)
+    }
+
+    fn parse(is_response: bool) !invalid !http413 !incomplete !data_removed_from_input {
+
+        if this.done {
+            return
+        }
+
+        let input = this.input
+        let pos = this.input_pos
+        if pos > input.length {
+            throw data_removed_from_input
+        }
+
+        let stage = this.stage
+        let data = input.data
+        let length = input.length
+
+        // Header
+        if stage == 0 {
+            let index = input.index_of_byte('\r', pos) ! {
+                if length - pos > 4096 {
+                    throw http413
+                }
+                throw incomplete
+            }
+
+            let version = ""
+
+            if is_response {
+                let line = input.sub_str(pos, index - pos)
+                let split = line.split(" ")
+                if split.length < 2 : throw invalid
+                version = split.get(0) ? ""
+                let status = split.get(1) ? ""
+                this.status = status.to_uint() ! throw invalid
+
+            } else {
+                if index + 1 == length : throw incomplete
+                if @ptrv(data, u8, index + 1) != '\n' { throw invalid }
+
+                let space1 = input.index_of_byte(' ', pos) ! { throw invalid }
+                let space2 = input.index_of_byte(' ', space1 + 1) ! { throw invalid }
+
+                if space1 > index { throw invalid }
+                if space2 > index { throw invalid }
+
+                // Request "GET / HTTP/1.1"
+
+                let method = input.sub_str(pos, space1 - pos)
+                let path = input.sub_str(space1 + 1, space2 - space1 - 1)
+
+                let qmark = path.byte_index_of_byte('?') ? 0
+                if qmark > 0 {
+                    let len = path.bytes
+                    this.query_string = path.byte_sub_str(qmark + 1, len - qmark - 1)
+                    path = path.byte_sub_str(0, qmark)
+                }
+                version = input.sub_str(space2 + 1, index - space2 - 1)
+
+                this.method = method
+                this.path = path
+            }
+
+            pos = index + 2
+            this.input_pos = pos
+            this.headers_start = pos
+
+            stage = 1
+            this.stage = stage
+        }
+
+        // Headers
+        while stage == 1 {
+            let index = input.index_of_byte('\r', pos) ! {
+                if input.length - pos > 4096 {
+                    throw http413
+                }
+                throw incomplete
+            }
+            if index + 1 == length : throw incomplete
+            if @ptrv(data, u8, index + 1) != '\n' { throw invalid }
+
+            if index == pos {
+                // End of headers
+                pos = index + 2
+                this.input_pos = pos
+
+                stage = 2
+                this.stage = stage
+
+                this.content_start = pos
+                this.header_data = this.input.sub_str(this.headers_start, this.headers_length + 2)
+                break
+            }
+
+            let key_adr = input.data + pos
+            let header_len = index - pos
+            if header_len > 4095 : throw http413
+
+            let headers_length = this.headers_length + header_len + 2
+            if headers_length > 8192 : throw http413
+            this.headers_length = headers_length
+
+            // Check certain headers
+            let h1 = "content-length"
+            let h2 = "transfer-encoding"
+            if header_len > h1.bytes && @ptrv(key_adr, u8, h1.bytes) == ':' {
+                mem:ascii_bytes_to_lower(key_adr, h1.bytes)
+                if mem:equal(key_adr, h1.data_ptr(), h1.bytes) {
+                    let value_adr = key_adr + h1.bytes + 1;
+                    while @ptrv(value_adr, u8).is_html_spacing() : value_adr += 1
+                    let value_len = ((input.data + index) - value_adr) @as uint
+                    let content_len = mem:bytes_to_uint(value_adr, value_len) ! { throw invalid }
+                    this.content_length = content_len
+                }
+            } else if header_len > h2.bytes && @ptrv(key_adr, u8, h2.bytes) == ':' {
+                mem:ascii_bytes_to_lower(key_adr, h2.bytes)
+                if mem:equal(key_adr, h2.data_ptr(), h2.bytes) {
+                    let value_adr = key_adr + h1.bytes + 1;
+                    while @ptrv(value_adr, u8).is_html_spacing() : value_adr += 1
+                    let v = "chunked"
+                    if mem:equal(value_adr, v.data_ptr(), v.bytes) {
+                        this.chunked = true
+                        this.content_length = 0
+                    }
+                }
+            }
+
+            pos = index + 2
+            this.input_pos = pos
+        }
+
+        if stage == 2 {
+            let content_len = this.content_length
+            let chunked = this.chunked
+            let bytes_left = length - pos
+
+            if chunked {
+                let chunks = this.chunks
+
+                while true {
+                    // Read length line
+                    let chlen = this.content_length
+                    if chlen == 0 {
+                        let index = input.index_of_byte('\r', pos) ! {
+                            if bytes_left > 16 { 
+                                throw invalid
+                            }
+                            throw incomplete
+                        }
+                        let line = input.sub_str(pos, index - pos)
+                        let len = (line.hex_to_uint() ! throw invalid) + 2
+
+                        pos = index + 2
+                        this.input_pos = pos
+                        bytes_left = length - pos
+
+                        if len == 2 { 
+                            pos += 2
+                            this.input_pos += 2
+                            break
+                        }
+
+                        chlen = len
+                        this.content_length = len
+                    }
+                    // Read chunk content
+                    if bytes_left < chlen : throw incomplete
+
+                    chunks.append_from_ptr(input.data + pos, chlen - 2)
+                    input.clear_until(pos + chlen)
+
+                    this.content_length = 0
+                    pos = 0
+                    this.input_pos = 0
+                    bytes_left = length - (pos + chlen)
+                }
+
+            } else {
+                // Non chunked
+                if bytes_left < content_len : throw incomplete
+
+                pos += content_len
+                this.input_pos = pos
+            }
+
+            this.stage = 3
+            this.done = true
+        }
+    }
+}
