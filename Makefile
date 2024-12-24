@@ -46,6 +46,8 @@ exw: valk debug/example.exe
 	./debug/example.exe
 exd: valk debug/example
 	gdb ./debug/example
+exv: valk debug/example
+	valgrind ./debug/example
 
 # Setup
 toolchains:
