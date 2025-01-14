@@ -49,6 +49,9 @@ exd: valk debug/example
 exv: valk debug/example
 	valgrind --track-origins=no ./debug/example
 
+clean:
+	rm ./valk
+
 # Setup
 toolchains:
 	chmod +x ./toolchains/setup.sh
