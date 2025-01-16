@@ -36,7 +36,7 @@ time: valk
 	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/example
 
 debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
-	./valk build ./debug/example.valk debug -vvv -o ./debug/example -c
+	./valk build ./debug/example.valk debug -vv -o ./debug/example -c
 debug/example.exe: valk $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -vv -o ./debug/example.exe --target win-x64
 
@@ -51,6 +51,7 @@ exv: valk debug/example
 
 clean:
 	rm ./valk
+	rm ./debug/example
 
 # Setup
 toolchains:
