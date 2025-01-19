@@ -46,6 +46,12 @@ exw: valk debug/example.exe
 	./debug/example.exe
 exd: valk debug/example
 	gdb ./debug/example
+exv: valk debug/example
+	valgrind --track-origins=no ./debug/example
+
+clean:
+	rm ./valk
+	rm ./debug/example
 
 # Setup
 toolchains:
