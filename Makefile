@@ -14,17 +14,25 @@ static: $(SRC) $(HDRS)
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
+	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
-	valkmain build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64
+	valkmain build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean
+	cp -r ./lib ./dist/win-x64/
 macos-x64: $(SRC) $(HDRS)
+	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
-	valkmain build . src/*.valk -o ./dist/macos-x64/valk -vv --static --target macos-x64
+	valkmain build . src/*.valk -o ./dist/macos-x64/valk -vv --static --target macos-x64 --clean
+	cp -r ./lib ./dist/win-x64/
 macos-arm64: $(SRC) $(HDRS)
+	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
-	valkmain build . src/*.valk -o ./dist/macos-arm64/valk -vv --static --target macos-arm64
-win-x64: $(SRC) $(HDRS)
+	valkmain build . src/*.valk -o ./dist/macos-arm64/valk -vv --static --target macos-arm64 --clean
+	cp -r ./lib ./dist/win-x64/
+win-x64:
+	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
-	valkmain build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64
+	valkmain build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean
+	cp -r ./lib ./dist/win-x64/
 
 # Testing
 run: valk
