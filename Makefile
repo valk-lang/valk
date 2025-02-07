@@ -34,6 +34,10 @@ win-x64:
 	valkmain build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean
 	cp -r ./lib ./dist/win-x64/
 
+test: valk
+	./valk build ./tests/*.valk . --test -o ./debug/test-all
+	./debug/test-all
+
 # Testing
 run: valk
 	./valk build ./debug/example.valk debug -v -o ./debug/example
