@@ -35,7 +35,7 @@ win-x64:
 	cp -r ./lib ./dist/win-x64/
 
 test: valk
-	./valk build ./tests/*.valk . --test -o ./debug/test-all
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
 	./debug/test-all
 
 # Testing
