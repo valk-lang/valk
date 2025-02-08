@@ -34,6 +34,10 @@ win-x64:
 	valkmain build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean
 	cp -r ./lib ./dist/win-x64/
 
+test: valk
+	./valk build ./tests/*.valk . --test -o ./debug/test-all
+	./debug/test-all
+
 # Testing
 run: valk
 	./valk build ./debug/example.valk debug -v -o ./debug/example
@@ -47,9 +51,13 @@ debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -vv -o ./debug/example
 debug/example.exe: valk $(SRC_EXAMPLE) $(SRC_LIB)
 	./valk build ./debug/example.valk debug -vv -o ./debug/example.exe --target win-x64
+debug/test: valk $(SRC_EXAMPLE) $(SRC_LIB)
+	./valk build ./debug/example.valk debug -vv -o ./debug/test --test
 
 ex: valk debug/example
 	time -v ./debug/example
+ext: valk debug/test
+	time -v ./debug/test
 exw: valk debug/example.exe
 	./debug/example.exe
 exd: valk debug/example
