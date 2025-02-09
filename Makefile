@@ -10,7 +10,7 @@ FLAGS=--def "VERSION=$(VERSION)"
 
 # Development
 valk: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
+	valk-legacy build . src/*.valk -o ./valk -vvv $(FLAGS)
 valkd: $(SRC) $(HDRS)
 	gdb --args valk-legacy build . src/*.valk -o ./valk $(FLAGS)
 static: $(SRC) $(HDRS)
