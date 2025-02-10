@@ -10,11 +10,11 @@ FLAGS=--def "VERSION=$(VERSION)"
 
 # Development
 valk: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv $(FLAGS) --clean
+	valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
 valkd: $(SRC) $(HDRS)
 	gdb --args valk-legacy build . src/*.valk -o ./valk $(FLAGS)
 static: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) --clean
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
@@ -82,7 +82,7 @@ clean:
 	rm ./valk
 	rm ./debug/example
 
-dist_setup:
+toolchains:
 	chmod +x ./toolchains/setup.sh
 	./toolchains/setup.sh
 
