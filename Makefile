@@ -10,11 +10,22 @@ FLAGS=--def "VERSION=$(VERSION)"
 
 # Development
 valk: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv $(FLAGS) --clean
+	valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
 valkd: $(SRC) $(HDRS)
-	gdb --args valk-legacy build . src/*.valk -o ./valk $(FLAGS)
+	gdb --args valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
 static: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
+
+# CI tests
+ci_linux: $(SRC) $(HDRS)
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
+	-L /usr/lib/x86_64-linux-gnu \
+	-L /usr/lib/llvm-15/lib/
+
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
@@ -48,6 +59,7 @@ win-x64:
 	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
 test: valk
+	mkdir -p ./debug
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
 	./debug/test-all
 
@@ -82,7 +94,7 @@ clean:
 	rm ./valk
 	rm ./debug/example
 
-dist_setup:
+toolchains:
 	chmod +x ./toolchains/setup.sh
 	./toolchains/setup.sh
 
