@@ -19,10 +19,12 @@ static: $(SRC) $(HDRS)
 # CI tests
 ci_linux: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
-	-L /usr/lib/llvm-15/lib/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
-	-L /usr/lib/x86_64-linux-gnu
+	-L /usr/lib/x86_64-linux-gnu \
+	-L /usr/lib/llvm-15/lib/
 
 
 # Distributions
