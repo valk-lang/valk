@@ -12,16 +12,19 @@ FLAGS=--def "VERSION=$(VERSION)"
 valk: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
 valkd: $(SRC) $(HDRS)
-	gdb --args valk-legacy build . src/*.valk -o ./valk $(FLAGS)
+	gdb --args valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
 static: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS)
+	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
+# CI tests
 ci_linux: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) --clean \
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L /usr/lib/llvm-15/lib/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/x86_64-linux-gnu
+	./valk build ./tests/*.valk . --test -o ./test-all -vvv
+	./test-all
 
 
 # Distributions
