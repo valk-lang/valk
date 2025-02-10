@@ -23,7 +23,9 @@ ci_linux: $(SRC) $(HDRS)
 	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/x86_64-linux-gnu
+	chmod +x ./valk
 	./valk build ./tests/*.valk . --test -o ./test-all -vvv
+	chmod +x ./test-all
 	./test-all
 
 
