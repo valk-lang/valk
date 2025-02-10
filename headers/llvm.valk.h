@@ -137,9 +137,9 @@ link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
 
 #if OS == linux
-link_static "stdc++"
 link_dynamic "pthread"
 link_dynamic "m"
+link_static "stdc++"
 link_static "z"
 link_static "tinfo"
 link_static "gcc_eh"

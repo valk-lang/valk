@@ -14,7 +14,15 @@ valk: $(SRC) $(HDRS)
 valkd: $(SRC) $(HDRS)
 	gdb --args valk-legacy build . src/*.valk -o ./valk $(FLAGS)
 static: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) --clean
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS)
+
+ci_linux: $(SRC) $(HDRS)
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) --clean \
+	-L /usr/lib/llvm-15/lib/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
+	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
+	-L /usr/lib/x86_64-linux-gnu
+
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
