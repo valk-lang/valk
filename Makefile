@@ -23,10 +23,6 @@ ci_linux: $(SRC) $(HDRS)
 	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/x86_64-linux-gnu
-	chmod +x ./valk
-	./valk build ./tests/*.valk . --test -o ./test-all -vvv
-	chmod +x ./test-all
-	./test-all
 
 
 # Distributions
@@ -61,6 +57,7 @@ win-x64:
 	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
 test: valk
+	mkdir -p ./debug
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
 	./debug/test-all
 
