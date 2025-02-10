@@ -8,7 +8,7 @@ SRC_EXAMPLE=$(wildcard debug/*.valk)
 
 FLAGS=--def "VERSION=$(VERSION)"
 
-# Development
+# Build
 valk: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
 valkd: $(SRC) $(HDRS)
@@ -16,8 +16,14 @@ valkd: $(SRC) $(HDRS)
 static: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
-# CI tests
-ci_linux: $(SRC) $(HDRS)
+# Testing
+test: valk
+	mkdir -p ./debug
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
+	./debug/test-all
+
+# CI commands
+ci-linux: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
@@ -25,7 +31,6 @@ ci_linux: $(SRC) $(HDRS)
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/x86_64-linux-gnu \
 	-L /usr/lib/llvm-15/lib/
-
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
@@ -58,46 +63,15 @@ win-x64:
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
 	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
-test: valk
-	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
-	./debug/test-all
+dist-all: win-x64 linux-x64 macos-x64 macos-arm64
 
-# Testing
-run: valk
-	./valk build ./debug/example.valk debug -v -o ./debug/example
-rund: valk
-	gdb --args ./valk build ./debug/example.valk debug -v -o ./debug/example
-
-time: valk
-	/usr/bin/time -v ./valk build ./debug/example.valk debug -v -o ./debug/example
-
-debug/example: valk $(SRC_EXAMPLE) $(SRC_LIB)
-	./valk build ./debug/example.valk debug -vv -o ./debug/example
-debug/example.exe: valk $(SRC_EXAMPLE) $(SRC_LIB)
-	./valk build ./debug/example.valk debug -vv -o ./debug/example.exe --target win-x64
-debug/test: valk $(SRC_EXAMPLE) $(SRC_LIB)
-	./valk build ./debug/example.valk debug -vv -o ./debug/test --test
-
-ex: valk debug/example
-	time -v ./debug/example
-ext: valk debug/test
-	time -v ./debug/test
-exw: valk debug/example.exe
-	./debug/example.exe
-exd: valk debug/example
-	gdb ./debug/example
-exv: valk debug/example
-	valgrind --track-origins=no ./debug/example
-
-clean:
-	rm ./valk
-	rm ./debug/example
-
+# Toolchains for building distributions
 toolchains:
 	chmod +x ./toolchains/setup.sh
 	./toolchains/setup.sh
 
-dist_all: win-x64 linux-x64 macos-x64 macos-arm64
+# Misc
+clean:
+	rm ./valk
 
-.PHONY: dist_setup valkd run time ex
+.PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux
