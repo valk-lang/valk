@@ -52,7 +52,7 @@ make
 ## Benchmarks
 
 <div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/master/misc/valk-bintree.png">
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-bintree.png">
 </p>
 The binary object tree test revolves around creating large amount of objects in a tree structure, iterating over them and doing some calculations.
 </div>
@@ -60,7 +60,7 @@ The binary object tree test revolves around creating large amount of objects in 
 ---
 
 <div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/master/misc/valk-http.png">
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-http.png">
 </p></div>
 
 ## Why Valk over Rust, Go, Zig?
