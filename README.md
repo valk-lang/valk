@@ -5,7 +5,7 @@
 
 Valk is a programming language aimed to be fast & simple at the same time. It offers the best of all worlds. The simplicity of python with the performance of Rust. It has a new way of doing garbage collection which allows it to be much faster than what is currently available in the gc space. We also allow you to access memory directly so developers can invent their own types/structures. We try to bring back the joy in programming.
 
-**Features**: Fastest GC ⚡, Coroutines, No undefined behaviour, Package management, Generics, Fast compile times, Cross compiling, Optional manual memory mangement, Importing c libraries, and more...
+**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Fast compile times, Cross compiling, Optional manual memory mangement, Importing c libraries, and more...
 
 **Coroutines** are purely for concurrency. Threads can be used for parallelism.
 
@@ -71,7 +71,7 @@ As for performance, Valk and these 3 other languages will all relatively run at 
 
 Why is Valk so fast memory wise? We use memory pools and have an innovative gc algorithm. This algorithm has multiple benefits. E.g. We free short-lived objects using 0 cpu instructions. If you have a million short-lived objects, Rust would call `free()` a million times (we guess). Valk just resets a single pointer in the pool and all objects are freed at once.
 
-## Language design facts
+## Language design
 
 - Each thread handles it's own memory, but you can still share your variables with other threads. Even when your thread has ended, the memory will still be valid and automatically freed once other threads no longer use it.
 
