@@ -248,6 +248,7 @@ fn LLVMGetTargetHasTargetMachine(target: LLVMTargetDataRef) LLVMBool;
 fn LLVMPassManagerBuilderCreate() LLVMPassManagerBuilderRef;
 fn LLVMPassManagerBuilderSetOptLevel(pm_builder: LLVMPassManagerBuilderRef, opt_level: u32) void;
 fn LLVMPassManagerBuilderSetSizeLevel(pm_builder: LLVMPassManagerBuilderRef, opt_level: u32) void;
+fn LLVMPassManagerBuilderUseInlinerWithThreshold(pm_builder: LLVMPassManagerBuilderRef, threshold: u32) void;
 fn LLVMCreateFunctionPassManagerForModule(mod: LLVMModuleRef) LLVMPassManagerRef;
 fn LLVMCreatePassManager() LLVMPassManagerRef;
 fn LLVMPassManagerBuilderPopulateFunctionPassManager(pm_builder: LLVMPassManagerBuilderRef, func_pm: LLVMPassManagerRef) void;
