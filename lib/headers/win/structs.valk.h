@@ -2,7 +2,7 @@
 // alias libc_stat as libc_stat_fix
 
 struct libc_jmp_buf {
-    data: inline [ptr, 5]
+    data: <[5 x ptr]>
 }
 
 struct libc_timezone {

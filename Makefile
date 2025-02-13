@@ -22,6 +22,14 @@ test: valk
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
 	./debug/test-all
 
+# Testing
+test-cross: valk
+	mkdir -p ./debug
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target linux-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target macos-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target macos-arm64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target win-x64
+
 # CI commands
 ci-linux: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \

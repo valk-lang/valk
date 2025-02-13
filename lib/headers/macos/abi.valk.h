@@ -4,9 +4,9 @@ shared stderr : ?ptr;
 shared stdin : ?ptr;
 shared stdout : ?ptr;
 
-alias FILE as ptr;
-alias DIR as ptr
-alias libc_addrinfo_fix as libc_addrinfo
+alias FILE for ptr;
+alias DIR for ptr
+alias libc_addrinfo_fix for libc_addrinfo
 
 // pid_t = i32
 // socklen_t = u32

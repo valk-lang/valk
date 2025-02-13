@@ -3,29 +3,29 @@ shared stderr : ?ptr;
 shared stdin : ?ptr;
 shared stdout : ?ptr;
 
-alias FILE as ptr
-alias SOCKET as uint
-alias HANDLE as ptr
+alias FILE for ptr
+alias SOCKET for uint
+alias HANDLE for ptr
 
 // HANDLE : ptr
 // DWORD : u32
 // ULONG : u32
 
-alias read as _read;
-alias write as _write;
-alias open as _open;
-alias close as _close;
-alias sync as _flushall;
+alias read for _read;
+alias write for _write;
+alias open for _open;
+alias close for _close;
+alias sync for _flushall;
 
-alias stat as _stat;
-alias mkdir as _mkdir;
-alias rmdir as _rmdir;
-alias unlink as _unlink;
+alias stat for _stat;
+alias mkdir for _mkdir;
+alias rmdir for _rmdir;
+alias unlink for _unlink;
 
-alias popen as _popen;
-alias pclose as _pclose;
+alias popen for _popen;
+alias pclose for _pclose;
 
-alias poll as WSAPoll;
+alias poll for WSAPoll;
 
 fn malloc(size: uint) ptr;
 fn free(adr: ptr) void;

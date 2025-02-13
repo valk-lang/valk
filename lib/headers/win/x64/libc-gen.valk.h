@@ -29,20 +29,20 @@ struct libc_gen__FILETIME {
 
 struct libc_gen__WIN32_FIND_DATAA {
     dwFileAttributes: u32
-    ftCreationTime: inline libc_gen__FILETIME
-    ftLastAccessTime: inline libc_gen__FILETIME
-    ftLastWriteTime: inline libc_gen__FILETIME
+    ftCreationTime: <libc_gen__FILETIME>
+    ftLastAccessTime: <libc_gen__FILETIME>
+    ftLastWriteTime: <libc_gen__FILETIME>
     nFileSizeHigh: u32
     nFileSizeLow: u32
     dwReserved0: u32
     dwReserved1: u32
-    cFileName: inline [i8, 260]
-    cAlternateFileName: inline [i8, 14]
+    cFileName: <[260 x i8]>
+    cAlternateFileName: <[14 x i8]>
 }
 
 struct libc_gen_sockaddr {
     sa_family: u16
-    sa_data: inline [i8, 14]
+    sa_data: <[14 x i8]>
 }
 
 struct libc_gen_addrinfo {
