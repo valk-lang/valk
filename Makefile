@@ -43,7 +43,8 @@ ci-linux: $(SRC) $(HDRS)
 ci-macos: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L /usr/lib/ \
-	-L /usr/local/lib/
+	-L /usr/local/lib/ \
+	-L /usr/local/opt/ncurses/lib
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
