@@ -40,6 +40,11 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/x86_64-linux-gnu \
 	-L /usr/lib/llvm-15/lib/
 
+ci-macos: $(SRC) $(HDRS)
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	-L /usr/lib/ \
+	-L /usr/lib/llvm-15/lib/
+
 # Distributions
 linux-x64: $(SRC) $(HDRS)
 	rm -rf dist/linux-x64/*
