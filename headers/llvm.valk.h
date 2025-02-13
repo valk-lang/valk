@@ -149,6 +149,7 @@ link_static "gcc_eh"
 link_static "curses"
 link_static "c++"
 link_static "z"
+link_static "zstd"
 
 #elif OS == win
 link_dynamic "msvcprt"
