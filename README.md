@@ -9,7 +9,6 @@ Valk is a programming language aimed to be fast & simple at the same time. It of
 
 **Coroutines** are purely for concurrency. Threads can be used for parallelism.
 
-
 ## Install
 
 TODO
