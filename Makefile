@@ -47,6 +47,12 @@ ci-macos: $(SRC) $(HDRS)
 	-L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/ \
 	-L /opt/homebrew/lib/
 
+ci-win: $(SRC) $(HDRS)
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	-L /usr/lib/ \
+	-L /usr/local/lib/ \
+	-L /mingw64/opt/llvm-15/lib/
+
 # Distributions
 linux-x64: $(SRC) $(HDRS)
 	rm -rf dist/linux-x64/*
