@@ -49,9 +49,7 @@ ci-macos: $(SRC) $(HDRS)
 
 ci-win: $(SRC) $(HDRS)
 	~/valk-legacy/valk.exe build . src/*.valk -o ./valk -vvv --static --mingw $(FLAGS) \
-	-L /usr/lib/ \
-	-L /usr/local/lib/ \
-	-L /mingw64/opt/llvm-15/lib/
+	-L ~/llvm/lib/
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
