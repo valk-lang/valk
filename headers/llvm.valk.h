@@ -1,5 +1,8 @@
 
 #if STATIC
+#if OS == win
+link_static "LLVM-C"
+#else
 link_static "LLVMOption"
 link_static "LLVMObjCARCOpts"
 link_static "LLVMMCJIT"
@@ -135,6 +138,7 @@ link_static "LLVMVEAsmParser"
 link_static "LLVMVEDesc"
 link_static "LLVMVEDisassembler"
 link_static "LLVMVEInfo"
+#end
 
 #if OS == linux
 link_dynamic "pthread"
