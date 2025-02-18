@@ -30,6 +30,15 @@ test-cross: valk
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target macos-arm64
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target win-x64
 
+test-win-in-wsl:
+	rm -rf /mnt/c/valk-win-test/*
+	mkdir -p /mnt/c/valk-win-test
+	valk-legacy build . src/*.valk -o /mnt/c/valk-win-test/valk -vv --static --target win-x64 --clean $(FLAGS)
+	cp -r ./lib /mnt/c/valk-win-test/
+	cp -r ./toolchains/libraries/win-llvm-15-x64/lld.exe /mnt/c/valk-win-test/lld-link.exe
+	/mnt/c/valk-win-test/valk.exe build . ./tests/*.valk -o "C:/valk-win-test/tests" --test -vv
+	/mnt/c/valk-win-test/tests.exe
+
 # CI commands
 ci-linux: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
