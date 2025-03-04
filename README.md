@@ -1,4 +1,8 @@
 
+<div align="center"><p>
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk.svg">
+</p></div>
+
 # Valk (WIP)
 
 [Website](https://valk-lang.dev) | [Documentation](https://github.com/valk-lang/valk/blob/main/docs/docs.md) | [Roadmap](https://github.com/valk-lang/valk/blob/main/ROADMAP.md) | [Discord](https://discord.gg/RwEGqdSERA)
