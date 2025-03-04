@@ -5,10 +5,11 @@ global local_gc : GcLocal (@undefined)
 
 global stack_main : Stack (@undefined)
 global stack_active : Stack (@undefined)
+
 global stack_items : Bump (@undefined)
-global disable_colors : Bump (@undefined)
-global return_colors : Bump (@undefined)
-global still_used : Bump (@undefined)
+global reconnect_list : Bump (@undefined)
+global reconnect_list_prev : Bump (@undefined)
+global disconnect_list : Bump (@undefined)
 global blanks : Bump (@undefined)
 
 global mem_new : uint
@@ -53,15 +54,13 @@ struct GcLocal {
 
     + static fn init() GcLocal {
 
-        mark_list = PtrRing.new()
+        mark_list = Lifo.new()
 
         stack_items = Bump.new()
-        disable_colors = Bump.new()
-        return_colors = Bump.new()
-        still_used = Bump.new()
-        if blanks == null @as Bump : blanks = Bump.new()
-
-        Color.init()
+        reconnect_list = Bump.new()
+        reconnect_list_prev = Bump.new()
+        disconnect_list = Bump.new()
+        blanks = Bump.new()
 
         mem_new = 0
         mem_trigger = mem_minimum_trigger
@@ -97,26 +96,37 @@ struct GcLocal {
         let mem_marked_before = mem_marked
         let bytes_new = mem_new - mem_marked_before
 
-        // Make sure share color is valid
-        @ptrv(color_state, u8, color_shared) = color_state_used
+        // 
+        this.loop_stack_items(GcLocal.mark_on_stack)
 
         // Check if items have dissapeared from the stack
-        this.check_previous_stack_items()
+        this.loop_previous_stack_items()
 
-        // Mark objects that are still used
-        this.mark_stacks()
+        // Mark stack items
+        this.loop_stack_items(GcLocal.mark_stack_item)
 
-        // Check if objects are still used
-        this.check_still_used()
-        still_used.reset()
+        // Loop disconnects and disconnect sub pipes
+        this.loop_disconnects()
+
+        // Swap reconnect lists
+        let list = reconnect_list_prev
+        reconnect_list_prev = reconnect_list
+        reconnect_list = list
+
+        // Reconnect to disconnected items
+        this.loop_reconnects()
+
+        // Free items that are disconnected
+        this.loop_disconnects_free()
+
         this.check_blanks()
-        blanks.reset()
 
-        // Disable colors that had conflicts
-        this.check_disable_colors()
-        disable_colors.reset()
-        this.check_return_colors()
-        return_colors.reset()
+        this.loop_stack_items(GcLocal.mark_off_stack)
+
+        // Clear lists
+        blanks.reset()
+        reconnect_list_prev.reset()
+        disconnect_list.reset()
 
         //
         let multiplier : uint = 0
@@ -144,182 +154,94 @@ struct GcLocal {
         // print(".")
     }
 
-    fn check_previous_stack_items() {
+    static fn mark_on_stack(item: ptr) {
+        let data = (@ptr_offset(item, -8)) @as GcData
+        data.on_stack = 1
+    }
+    static fn mark_off_stack(item: ptr) {
+        let data = (@ptr_offset(item, -8)) @as GcData
+        data.on_stack = 0
+    }
 
-        this.mark_on_stack(1)
+    static fn mark_stack_item(item: ptr) {
+        let data = (@ptr_offset(item, -8)) @as GcData
+        if data.state < state_used {
+            mark_used(item)
 
-        let stu = still_used
-        let state = color_state
+            let li = stack_items.get(sizeof(ptr))
+            @ptrv(li, ptr) = item
+        }
+    }
+
+    fn loop_previous_stack_items() {
+
+        let discs = disconnect_list
 
         let list = stack_items
         let data = list.data
         let adr = data
         let end = adr + list.index
-        list.index = 0 // Clear list
+        list.reset()
+
         while adr < end {
             let item = @ptrv(adr, ptr)
-            let color = @ptrv(adr, uint, 1) @as color_type
-            adr += sizeof(ptr) * 2
+            let data = (@ptr_offset(item, -8)) @as GcData
+            adr += sizeof(ptr)
 
-            let mark = @ptrv(item, u8, byte_mark_rel)
+            if data.on_stack == 0 {
+                let adr = discs.get(sizeof(ptr))
+                @ptrv(adr, ptr) = item
 
-            if mark & mark_bit_on_stack == 0 {
-                // Disable color
-                if color >= color_custom {
-                    @ptrv(state, u8, color) = color_state_unused
-                    let adr = return_colors.get(sizeof(color_type))
-                    @ptrv(adr, color_type) = color
-
-                    // if @ptrv(item, u8, byte_still_used_rel) == 0 {
-                    if mark & mark_bit_still_used == 0 {
-                        // @ptrv(item, u8, byte_still_used_rel) = 1
-                        @ptrv(item, u8, byte_mark_rel) = mark | mark_bit_still_used
-                        let adr = stu.get(sizeof(ptr))
-                        @ptrv(adr, ptr) = item
-                    }
-                }
-                
+                data.state = state_unused
             } else {
-                // Re-add to list
-                if @ptrv(state, u8, color) == color_state_used {
-                    @ptrv(data, ptr) = item
-                    @ptrv(data, uint, 1) = color
-                    data += sizeof(ptr) * 2
-                } else {
-                    let adr = return_colors.get(sizeof(color_type))
-                    @ptrv(adr, color_type) = color
-                }
+                let adr = list.get(sizeof(ptr))
+                @ptrv(adr, ptr) = item
             }
         }
-        list.index = data - list.data
-
-        this.mark_on_stack(0)
     }
 
-    fn mark_on_stack(val: u8) {
+    fn loop_disconnects() {
 
-        // Globals
-        let g_adr = this.globals.data
-        let g_end_adr = g_adr + this.globals.index
-        while g_adr < g_end_adr {
-            let ref = @ptrv(g_adr, ptr)
-            let item = @ptrv(ref, ?ptr)
-            if isset(item) {
-                if val == 1 {
-                    @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) | mark_bit_on_stack
-                } else {
-                    @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) & (255 - mark_bit_on_stack)
-                }
-            }
-            g_adr += sizeof(ptr)
-        }
+        let list = disconnect_list
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
 
-        // Stack
-        let stack = stack_main
-        let adr = stack.base
-        let top = stack.adr
-        while adr < top {
-            let item = @ptrv(adr, ?ptr)
-            if isset(item) {
-                if val == 1 {
-                    @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) | mark_bit_on_stack
-                } else {
-                    @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) & (255 - mark_bit_on_stack)
-                }
-            }
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            let data = (@ptr_offset(item, -8)) @as GcData
             adr += sizeof(ptr)
-        }
 
-        let coro_data = coro:g_coros.data
-        let coro_count = coro:g_coros.length
-        while coro_count-- > 0 {
-            let coro = @ptrv(coro_data, ?ptr, coro_count)
-            if isset(coro) {
-                let adr = (coro @as coro:Coro).stack.base
-                let top = (coro @as coro:Coro).stack.adr
-                while adr < top {
-                    let item = @ptrv(adr, ?ptr)
-                    if isset(item) {
-                        if val == 1 {
-                            @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) | mark_bit_on_stack
-                        } else {
-                            @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) & (255 - mark_bit_on_stack)
-                        }
-                    }
-                    adr += sizeof(ptr)
-                }
+            if data.state == state_unused {
+                disconnect_rec(item)
             }
         }
     }
 
-    fn mark_stacks() {
+    fn loop_reconnects() {
 
-        // Globals
-        let g_adr = this.globals.data
-        let g_end_adr = g_adr + this.globals.index
-        while g_adr < g_end_adr {
-            let ref = @ptrv(g_adr, ptr)
-            let item = @ptrv(ref, ptr)
-            if item != null {
-                this.mark_item(item)
-            }
-            g_adr += sizeof(ptr)
-        }
+        let list = reconnect_list_prev
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
 
-        // Stack
-        let stack = stack_main
-        let adr = stack.base
-        let top = stack.adr
-        while adr < top {
-            let item = @ptrv(adr, ptr, 0)
-            if item != null {
-                this.mark_item(item)
-            }
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            let data = (@ptr_offset(item, -8)) @as GcData
             adr += sizeof(ptr)
-        }
 
-        let coro_data = coro:g_coros.data
-        let coro_count = coro:g_coros.length
-        while coro_count-- > 0 {
-            let coro = @ptrv(coro_data, ?ptr, coro_count)
-            if isset(coro) {
-                let adr = (coro @as coro:Coro).stack.base
-                let top = (coro @as coro:Coro).stack.adr
-                while adr < top {
-                    let item = @ptrv(adr, ptr)
-                    if item != null {
-                        this.mark_item(item)
-                    }
-                    adr += sizeof(ptr)
-                }
+            data.in_list = data.in_list & (255 - in_list_reconnect)
+
+            if data.state == state_used {
+                data.state = state_unused
+                mark_used(item)
             }
         }
     }
 
-    fn mark_item(item: ptr) {
-        let color = @ptrv(item, color_type, byte_color_rel)
-        if @ptrv(color_state, u8, color) == color_state_unused {
+    fn loop_disconnects_free() {
 
-            let c = Color.get()
-            color_disable_after = false
-
-            mark(item, c)
-
-            if color_disable_after {
-                let adr = disable_colors.get(sizeof(color_type))
-                @ptrv(adr, color_type) = c
-            }
-
-            let li = stack_items.get(sizeof(ptr) * 2)
-            @ptrv(li, ptr) = item
-            @ptrv(li, uint, 1) = c
-        }
-    }
-
-    fn check_still_used() {
-
-        let state = color_state
-        let list = still_used
+        let list = disconnect_list
         let data = list.data
         let adr = data
         let end = adr + list.index
@@ -327,14 +249,7 @@ struct GcLocal {
         while adr < end {
             let item = @ptrv(adr, ptr)
             adr += sizeof(ptr)
-
-            // Check mark
-            let color = @ptrv(item, color_type, byte_color_rel)
-            if @ptrv(state, u8, color) == color_state_unused {
-                free(item)
-            } else {
-                @ptrv(item, u8, byte_mark_rel) = @ptrv(item, u8, byte_mark_rel) & (255 - mark_bit_still_used)
-            }
+            free_disconnect_rec(item)
         }
     }
 
@@ -352,33 +267,57 @@ struct GcLocal {
         }
     }
 
-    fn check_disable_colors() {
-        let list = disable_colors
-        let state = color_state
+    //////////////////////////
+    // Loop stack
+    //////////////////////////
 
-        let data = list.data
-        let adr = data
-        let end = adr + list.index
-        while adr < end {
-            let color = @ptrv(adr, color_type)
-            adr += sizeof(color_type)
-            @ptrv(state, u8, color) = color_state_unused
+    fn loop_stack_items(func: fn(ptr)()) {
+
+        // Globals
+        let g_adr = this.globals.data
+        let g_end_adr = g_adr + this.globals.index
+        while g_adr < g_end_adr {
+            let ref = @ptrv(g_adr, ptr)
+            let item = @ptrv(ref, ?ptr)
+            if isset(item) {
+                func(item)
+            }
+            g_adr += sizeof(ptr)
+        }
+
+        // Stack
+        let stack = stack_main
+        let adr = stack.base
+        let top = stack.adr
+        while adr < top {
+            let item = @ptrv(adr, ?ptr)
+            if isset(item) {
+                func(item)
+            }
+            adr += sizeof(ptr)
+        }
+
+        let coro_data = coro:g_coros.data
+        let coro_count = coro:g_coros.length
+        while coro_count-- > 0 {
+            let coro = @ptrv(coro_data, ?ptr, coro_count)
+            if isset(coro) {
+                let adr = (coro @as coro:Coro).stack.base
+                let top = (coro @as coro:Coro).stack.adr
+                while adr < top {
+                    let item = @ptrv(adr, ?ptr)
+                    if isset(item) {
+                        func(item)
+                    }
+                    adr += sizeof(ptr)
+                }
+            }
         }
     }
 
-    fn check_return_colors() {
-        let list = return_colors
-        let state = color_state
-
-        let data = list.data
-        let adr = data
-        let end = adr + list.index
-        while adr < end {
-            let color = @ptrv(adr, color_type)
-            adr += sizeof(color_type)
-            Color.give(color)
-        }
-    }
+    //////////////////////////
+    // Shutdown
+    //////////////////////////
 
     + fn shutdown() {
         this.run()
