@@ -22,6 +22,11 @@ test: valk
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
 	./debug/test-all
 
+test-win: valk
+	mkdir -p ./debug
+	./valk build ./tests/*.valk . --test -o ./debug/test-1.exe -vv --target win-x64 -c
+	./debug/test-1.exe
+
 # Testing
 test-cross: valk
 	mkdir -p ./debug
