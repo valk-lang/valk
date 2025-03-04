@@ -1,6 +1,6 @@
 
 <div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk.svg">
+    <img height="150" src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk.svg">
 </p></div>
 
 # Valk (WIP)
