@@ -3,9 +3,9 @@
 
 [Website](https://valk-lang.dev) | [Documentation](https://github.com/valk-lang/valk/blob/main/docs/docs.md) | [Roadmap](https://github.com/valk-lang/valk/blob/main/ROADMAP.md) | [Discord](https://discord.gg/RwEGqdSERA)
 
-Valk is a programming language aimed to be fast & simple at the same time. It offers the best of all worlds. The simplicity of python with the performance of Rust. It has a new way of doing garbage collection which allows it to be much faster than what is currently available in the gc space. We also allow you to access memory directly so developers can invent their own types/structures. We try to bring back the joy in programming.
+Valk is a programming language aimed to be fast & simple at the same time. It offers the best of all worlds. The simplicity of Go with the performance of Rust. Valk revolutionizes how garbage collection is done. It's completely stateful. Basically it does not suffer from the GC downsides that other languages have. But in the end, we are trying to make an amazing language that's fun to code in. The performance is just extra.
 
-**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Fast compile times, Cross compiling, Optional manual memory mangement, Importing c libraries, and more...
+**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Fast compile times, Cross compiling, Optional manual memory mangement, Using c libraries, and more...
 
 **Coroutines** are purely for concurrency. Threads can be used for parallelism.
 
@@ -70,13 +70,17 @@ As for performance, Valk and these 3 other languages will all relatively run at 
 
 Why is Valk so fast memory wise? We use memory pools and have an innovative gc algorithm. This algorithm has multiple benefits. E.g. We free short-lived objects using 0 cpu instructions. If you have a million short-lived objects, Rust would call `free()` a million times (we guess). Valk just resets a single pointer in the pool and all objects are freed at once.
 
+As for long-lived objects, this is where Valk also shines because our GC is completely stateful. We dont need to mark/sweep everything to see which objects are no longer used. We track the changes instead. This is also why we get such performance win over Go. When long-lived objects exist, Go has to mark/sweep them, we dont.
+
 ## Language design
 
 - Each thread handles it's own memory, but you can still share your variables with other threads. Even when your thread has ended, the memory will still be valid and automatically freed once other threads no longer use it.
 
-- Valk does not force the user to use mutexes/locks for shared memory. Therefore the program can crash when you use multiple threads to modify the same data at the same time. Reading the same data with multiple threads is fine.
-
 - Unlike other languages, our GC has no randomness. Every run is exactly the same as the run before to the last byte. So there are no fluctuations in cpu usage and memory usage. (Except when using shared memory over multiple threads)
+
+- Reading shared data from multiple threads is safe. Mutating shared data is not. The developer is responsible for using mutexes/atomics.
+
+- Coroutines are single threaded. So mutating data over multiple coroutines is safe.
 
 ## Contributions
 
