@@ -57,7 +57,7 @@ fn system(cmd: cstring) i32;
 fn Sleep(ms: u32) void;
 
 // Poll
-fn WSAPoll(fds: ptr, nfds: u32, timeout: i32) i32;
+fn WSAPoll(fds: ptr, nfds: uint, timeout: i32) i32;
 fn WSAGetLastError() i32;
 fn WSAStartup(wVersionRequired: u16, lpWSAData: ptr) i32;
 fn closesocket(fd: uint) i32;
