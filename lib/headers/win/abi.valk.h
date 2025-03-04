@@ -1,7 +1,7 @@
 
-shared stderr : ?ptr;
-shared stdin : ?ptr;
-shared stdout : ?ptr;
+@shared stderr : ?ptr;
+@shared stdin : ?ptr;
+@shared stdout : ?ptr;
 
 alias FILE for ptr
 alias SOCKET for uint

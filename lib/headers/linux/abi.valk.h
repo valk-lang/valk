@@ -1,8 +1,8 @@
 
 global errno: i32;
-shared stderr: ?FILE;
-shared stdin: ?FILE;
-shared stdout: ?FILE;
+@shared stderr: ?FILE;
+@shared stdin: ?FILE;
+@shared stdout: ?FILE;
 
 alias FILE for ptr;
 alias DIR for ptr
