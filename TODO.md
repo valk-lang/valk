@@ -2,8 +2,6 @@
 # TODO
 
 ```
-- Clean up shared memory
-- convert AST to IR per function. Only generate complete IR & .o after all files have gone through this process. This allows us to re-parse any function on the fly (e.g. $parse_last) and allows namespace A to generate generics in namespace B.
 - Rename `sizeof` to `byte_size` & `bit_size`
 - Use underscores for all tokens .e.g `byte_size` instead of `bytesize`
 - replace `exit fn` with `$exit` flag
@@ -11,6 +9,7 @@
 - enums
 - array sort & custom sort
 - Fix `<{}` vscope and function multi return bugs
+- Coro sleep function
 ```
 
 # Maybe
