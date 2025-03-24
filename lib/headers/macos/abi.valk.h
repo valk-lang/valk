@@ -92,7 +92,7 @@ fn rmdir(pathname: cstring) i32;
 fn link(oldpath: cstring, newpath: cstring) i32;
 fn unlink(pathname: cstring) i32;
 fn symlink(target: cstring, linkpath: cstring) i32;
-fn readlink(pathname: cstring, buf: cstring, bufsiz: uint) int;
+fn readlink(pathname: cstring, buf: ptr, bufsiz: uint) int;
 
 fn chmod(pathname: cstring, mode: u32) i32;
 fn fchmod(fd: i32, mode: u32) i32;
