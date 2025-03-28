@@ -9,7 +9,7 @@
 
 Valk is a programming language aimed to be fast & simple at the same time. The simplicity of Go with the performance of Rust. Valk is also the first programming language with a persistent garbage collector. Meaning no more mark/sweep mechanisms that cause performance problems. We aim to be a feature rich language with a large standard library.
 
-**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Fast compile times, Cross compiling, Optional manual memory mangement, Using c libraries, and more...
+**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory mangement, Using c libraries, and more...
 
 **Coroutines** are purely for concurrency. Threads can be used for parallelism.
 
