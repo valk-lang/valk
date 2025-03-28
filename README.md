@@ -11,7 +11,7 @@ Valk is a programming language aimed to be fast & simple at the same time. The s
 
 **Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory mangement, Using c libraries, and more...
 
-**Coroutines** are purely for concurrency. Threads can be used for parallelism.
+**Coroutines** are used for concurrency. Threads can be used for parallelism. You can also combine them.
 
 ## Install
 
