@@ -21,6 +21,7 @@ test: valk
 	mkdir -p ./debug
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
 	./debug/test-all
+	@./tests/compile-errors/run.sh
 
 test-win: valk
 	mkdir -p ./debug
