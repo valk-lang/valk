@@ -4,6 +4,7 @@ struct pthread_t {
 }
 
 fn pthread_create(thread: pthread_t, attr: ?ptr, entry: ptr, data: ?ptr) i32;
+fn pthread_join(thread: uint, exit_value: ?ptr) i32;
 
 fn pthread_mutex_init(mutex: ptr, attr: ?ptr) i32;
 fn pthread_mutex_destroy(mutex: ptr) i32;
