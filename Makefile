@@ -38,20 +38,10 @@ test-cross: valk
 
 # CI commands
 ci-linux: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
-	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
-	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
-	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
-	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
-	-L /usr/lib/x86_64-linux-gnu \
-	-L /usr/lib/llvm-15/lib/
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS)
 
 ci-macos: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
-	-L /usr/lib/ \
-	-L /usr/local/lib/ \
-	-L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/ \
-	-L /opt/homebrew/lib/
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS)
 
 ci-win: $(SRC) $(HDRS)
 	~/valk-legacy/valk-legacy.exe build . src/*.valk -o ./valk -vvv --static --mingw $(FLAGS) \
