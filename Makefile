@@ -46,7 +46,8 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/llvm-15/lib/
 
 ci-macos: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS)
+	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
 	~/valk-legacy/valk-legacy.exe build . src/*.valk -o ./valk -vvv --static --mingw $(FLAGS) \
