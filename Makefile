@@ -47,6 +47,7 @@ ci-linux: $(SRC) $(HDRS)
 
 ci-macos: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	-L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/ \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
