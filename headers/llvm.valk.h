@@ -150,7 +150,6 @@ link_static "tinfo"
 link_static "gcc_eh"
 
 #elif OS == macos
-link_static "ncurses"
 link_static "c++"
 link_static "z"
 link_static "zstd"
