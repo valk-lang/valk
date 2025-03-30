@@ -2,11 +2,13 @@
 # TODO
 
 ```
-- Use underscores for all tokens .e.g `size_of` instead of `sizeof`
+- Fix `<{}` vscope and function multi return bugs
 - enums
 - array sort & custom sort
-- Fix `<{}` vscope and function multi return bugs
 - Coro sleep function
+- rework public/private/readonly syntax + check public/private/readonly
+- quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `fn get_offset()` hook, on assign `fn set_offset()`
+- make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
 ```
 
 # Maybe
