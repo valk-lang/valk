@@ -37,6 +37,7 @@ test-cross: valk
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target win-x64
 
 # CI commands
+# For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
 ci-linux: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
@@ -47,7 +48,6 @@ ci-linux: $(SRC) $(HDRS)
 
 ci-macos: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
-	-L /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/ \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
