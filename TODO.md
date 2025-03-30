@@ -2,13 +2,7 @@
 # TODO
 
 ```
-- `clone` token + `after_clone` hook
-- immutable type - clone value to convert to/from immutable `imut`
-- force immutable on shared globals
-- Rename `sizeof` to `byte_size` & `bit_size`
-- Use underscores for all tokens .e.g `byte_size` instead of `bytesize`
-- replace `exit fn` with `$exit` flag
-- make `exit`, `panic` built-in functions instead of using e.g. valk:os:exit()
+- Use underscores for all tokens .e.g `size_of` instead of `sizeof`
 - enums
 - array sort & custom sort
 - Fix `<{}` vscope and function multi return bugs

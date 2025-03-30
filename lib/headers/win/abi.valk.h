@@ -60,6 +60,7 @@ fn Sleep(ms: u32) void;
 fn WSAPoll(fds: ptr, nfds: uint, timeout: i32) i32;
 fn WSAGetLastError() i32;
 fn WSAStartup(wVersionRequired: u16, lpWSAData: ptr) i32;
+fn WSACleanup() i32;
 fn closesocket(fd: uint) i32;
 fn ioctlsocket(fd: uint, cmd: int, arg: ptr) i32;
 
