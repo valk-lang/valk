@@ -6,9 +6,13 @@
 - enums
 - array sort & custom sort
 - Coro sleep function
-- rework public/private/readonly syntax + check public/private/readonly
-- quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `fn get_offset()` hook, on assign `fn set_offset()`
+- rework access-types + check access-types : pub/read, default private: pub pub_ns pub_pkg read read_ns read_pkg
+- quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `fn get_offset()` hook, on assign `mut fn set_offset()`
 - make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
+- [value .. value] -> calls range()
+- only parse functions from imut classes when they are used so we no longer need `mut fn`
+- `--ignore-access-types` build option to ignore pub/read access types
+- clean up `scopes` code/logic in the compiler code
 ```
 
 # Maybe
