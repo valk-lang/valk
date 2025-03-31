@@ -16,6 +16,13 @@ valkd: $(SRC) $(HDRS)
 static: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
+install: valk
+	sudo mkdir -p /opt/valk/git/
+	sudo cp ./valk /opt/valk/git/valk
+	sudo cp -r ./lib /opt/valk/git/
+	sudo rm -f /usr/local/bin/valk
+	sudo ln -s /opt/valk/git/valk /usr/local/bin/valk || true
+
 # Testing
 test: valk
 	mkdir -p ./debug

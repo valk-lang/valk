@@ -13,6 +13,7 @@
 - only parse functions from imut classes when they are used so we no longer need `mut fn`
 - `--ignore-access-types` build option to ignore pub/read access types
 - clean up `scopes` code/logic in the compiler code
+- Use Pool allocator for array and string objects/data, malloc/free is way too slow
 ```
 
 # Maybe
