@@ -11,7 +11,7 @@ Valk is a programming language aimed to be fast & simple at the same time. The s
 
 **Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory mangement, Using c libraries, and more...
 
-**Coroutines** are used for concurrency. Threads can be used for parallelism. You can also combine them.
+To see what a persistent GC can do, see the [benchmarks](#benchmarks)
 
 ## Install
 
@@ -55,9 +55,16 @@ make
 ## Benchmarks
 
 <div align="center"><p>
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-fps.png">
+</p>
+</div>
+
+---
+
+<div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-bintree.png">
 </p>
-The binary object tree test revolves around creating large amount of objects in a tree structure, iterating over them and doing some calculations.
+The binary object tree test revolves around creating large amount of short-/long-lived objects, iterating over them and doing some calculations.
 </div>
 
 ---
