@@ -57,6 +57,7 @@ make
 <div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-fps.png">
 </p>
+Game developers often complain that garbage collection hampers their FPS in their game when allocating alot of objects. Valk does not suffer from this issue because it doesnt have a mark/sweep phase.
 </div>
 
 ---
