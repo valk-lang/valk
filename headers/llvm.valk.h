@@ -265,7 +265,7 @@ fn LLVMRunFunctionPassManager(func_pm: LLVMPassManagerRef, func: LLVMValueRef) v
 fn LLVMFinalizeFunctionPassManager(func_pm: LLVMPassManagerRef) void;
 fn LLVMRunPassManager(pm: LLVMPassManagerRef, mod: LLVMModuleRef) void;
 
-// Passes
+// Scalar passes
 fn LLVMAddAggressiveDCEPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddDCEPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddBitTrackingDCEPass(pm: LLVMPassManagerRef) void;
@@ -277,7 +277,7 @@ fn LLVMAddMergedLoadStoreMotionPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddGVNPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddNewGVNPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddIndVarSimplifyPass(pm: LLVMPassManagerRef) void;
-fn LLVMAddInstructionCombiningPass(pm: LLVMPassManagerRef) void;
+// fn LLVMAddInstructionCombiningPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddInstructionSimplifyPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddJumpThreadingPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddLICMPass(pm: LLVMPassManagerRef) void;
@@ -308,6 +308,34 @@ fn LLVMAddTypeBasedAliasAnalysisPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddScopedNoAliasAAPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddBasicAliasAnalysisPass(pm: LLVMPassManagerRef) void;
 fn LLVMAddUnifyFunctionExitNodesPass(pm: LLVMPassManagerRef) void;
+
+// Vector passes
+fn LLVMAddLoopVectorizePass(pm: LLVMPassManagerRef) void;
+fn LLVMAddSLPVectorizePass(pm: LLVMPassManagerRef) void;
+// Utils passes
+fn LLVMAddLowerSwitchPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddPromoteMemoryToRegisterPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddAddDiscriminatorsPass(pm: LLVMPassManagerRef) void;
+// Combine passes
+fn LLVMAddInstructionCombiningPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddAggressiveInstCombinerPass(pm: LLVMPassManagerRef) void;
+// IPO passes
+fn LLVMAddConstantMergePass(pm: LLVMPassManagerRef) void;
+fn LLVMAddMergeFunctionsPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddCalledValuePropagationPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddDeadArgEliminationPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddFunctionAttrsPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddFunctionInliningPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddAlwaysInlinerPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddGlobalDCEPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddGlobalOptimizerPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddPruneEHPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddIPSCCPPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddInternalizePass(pm: LLVMPassManagerRef) void;
+fn LLVMAddInternalizePassWithMustPreservePredicate(pm: LLVMPassManagerRef, context: ptr, must_preserve: fn(LLVMValueRef, ptr)(bool)) void;
+fn LLVMAddStripDeadPrototypesPass(pm: LLVMPassManagerRef) void;
+fn LLVMAddStripSymbolsPass(pm: LLVMPassManagerRef) void;
+
 
 // Build
 fn LLVMSetTarget(mod: LLVMModuleRef, triple: cstring) void;
