@@ -2,7 +2,6 @@
 # TODO
 
 ```
-- Enums
 - Array sort & custom sort
 - Coro sleep function
 - Rework access-types + check access-types : pub/read, default private: pub pub_ns pub_pkg read read_ns read_pkg
