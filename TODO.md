@@ -16,6 +16,8 @@
 - Use Pool allocator for array and string objects/data, malloc/free is way too slow
 - Coroutine/thread exit
 - Coroutine globals
+- Interfaces
+- Extend classes/structs
 ```
 
 # Maybe
