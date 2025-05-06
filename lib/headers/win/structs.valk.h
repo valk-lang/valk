@@ -36,3 +36,8 @@ struct libc_stat_fix {
     st_mtime: i64
     st_ctime: i64
 }
+
+struct libc_timeval_fix {
+    tv_sec: int
+    tv_usec: int
+}
