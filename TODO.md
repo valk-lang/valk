@@ -2,9 +2,8 @@
 # TODO
 
 ```
-- Array sort & custom sort
 - Coro sleep function
-- Rework access-types + check access-types : pub/read, default private: pub pub_ns pub_pkg read read_ns read_pkg
+- Rework access-types : public in package (private otherwise) by default. - + ~ -[+ns~pkg]
 - Quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `fn get_offset()` hook, on assign `mut fn set_offset()`
 - Make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
 - [value .. value] -> calls range()
