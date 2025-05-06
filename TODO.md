@@ -2,12 +2,11 @@
 # TODO
 
 ```
-- Coro sleep function
-- Rework access-types : public in package (private otherwise) by default. - + ~ -[+ns~pkg]
+- Rework access-types : public in package (private otherwise) by default. - + ~ -[ns+pkg~]
 - Quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `fn get_offset()` hook, on assign `mut fn set_offset()`
 - Make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
 - [value .. value] -> calls range()
-- Use flags instead of specifiek function name: $converter, $range
+- Use flags instead of specific function names: $converter, $range
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 - `--ignore-access-types` build option to ignore pub/read access types
 - Clean up `scopes` code/logic in the compiler code
