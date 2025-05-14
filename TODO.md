@@ -2,8 +2,11 @@
 # TODO
 
 ```
-- Rework access-types : public in package (private otherwise) by default. - + ~ -[ns+pkg~]
-- Quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `fn get_offset()` hook, on assign `mut fn set_offset()`
+- Access type checks
+- Quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `$offset` hook, on assign `$offset_set`
+- Short way to create arrays and objects
+-- let x = []#i32, let x : Array[i32] = [], let x = [5#i32]
+- $to $autoconvert : let x = 5 to String
 - Make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
 - [value .. value] -> calls range()
 - Use flags instead of specific function names: $converter, $range
