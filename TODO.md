@@ -3,7 +3,7 @@
 
 ```
 - Access type checks
-- Quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `$offset` hook, on assign `$offset_set`
+- Quick access using square brackets e.g `array[0]` or `"test"[1]` and calls `$offset` hook, on assign `$offset_assign`
 - Short way to create arrays and objects
 -- let x = []#i32, let x : Array[i32] = [], let x = [5#i32]
 - $to $autoconvert : let x = 5 to String
