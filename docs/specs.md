@@ -19,7 +19,7 @@ test() ! match E {
     E.fail, E.fail2 => "f1"
     E.fail3 => <{
         println(EMSG)
-        returnv "f2"
+        return "f2"
     }
     default => {
         println("default")
