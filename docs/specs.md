@@ -32,3 +32,22 @@ test() ! {
     return "z"
 }
 ```
+
+## Match operator
+
+The `match` operator runs a piece of code depending on what the value matches with. If `:` is typed after the match value, it means the match operator needs to return a value instead of just running some code.
+
+```
+// Code
+match E {
+	1 => print("a")
+	2 => { 
+        print("b")
+    }
+}
+// Value
+let x = match E : String {
+	1 => "a"
+	2 => "b"
+}
+```
