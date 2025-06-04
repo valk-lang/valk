@@ -2,7 +2,6 @@
 # TODO
 
 ```
-- match operator
 - Short way to create arrays and objects
 -- let x = []#i32, let x : Array[i32] = [], let x = [5#i32]
 - $to $autoconvert : let x = 5 to String
