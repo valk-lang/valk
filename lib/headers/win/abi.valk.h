@@ -82,7 +82,7 @@ fn setsockopt(sockfd: uint, level: i32, optname: i32, optval: ptr, optlen: u32) 
 fn getaddrinfo(host: cstring, port: cstring, hints: libc_addrinfo_fix, res: ptr) i32;
 fn freeaddrinfo(info: libc_addrinfo_fix) i32;
 
-//int clone(int (fn)(void *), void stack, int flags, void arg, .../* pid_t parent_tid, void tls, pid_t child_tid */ );
+//int clone(int = fn(void *), void stack, int flags, void arg, .../* pid_t parent_tid, void tls, pid_t child_tid */ );
 fn fork() i32;
 fn vfork() i32;
 

@@ -1,12 +1,12 @@
 
-type libc_timespec (libc_gen_timespec)
-type libc_timeval (libc_gen_timeval)
-type libc_sockaddr (libc_gen_sockaddr)
-type libc_pollfd (libc_gen_pollfd)
-type libc_stat (libc_gen_stat)
-type libc_addrinfo (libc_gen_addrinfo)
-type libc_WIN32_FIND_DATAA (libc_gen__WIN32_FIND_DATAA)
-type libc_FILETIME (libc_gen__FILETIME)
+type libc_timespec = libc_gen_timespec
+type libc_timeval = libc_gen_timeval
+type libc_sockaddr = libc_gen_sockaddr
+type libc_pollfd = libc_gen_pollfd
+type libc_stat = libc_gen_stat
+type libc_addrinfo = libc_gen_addrinfo
+type libc_WIN32_FIND_DATAA = libc_gen__WIN32_FIND_DATAA
+type libc_FILETIME = libc_gen__FILETIME
 
 struct libc_gen_stat {
     st_dev: u32

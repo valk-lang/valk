@@ -1,14 +1,14 @@
 
-type libc_timespec (libc_gen_timespec)
-type libc_timeval (libc_gen_timeval)
-type libc_sockaddr (libc_gen_sockaddr)
-type libc_pollfd (libc_gen_pollfd)
-type libc_jmp_buf ([1 x <libc_gen___jmp_buf_tag>])
-type libc_stat (libc_gen_stat)
-type libc_dirent (libc_gen_dirent)
-type libc_timezone (libc_gen_timezone)
-type libc_addrinfo (libc_gen_addrinfo)
-type libc_epoll_event (libc_gen_epoll_event)
+type libc_timespec = libc_gen_timespec
+type libc_timeval = libc_gen_timeval
+type libc_sockaddr = libc_gen_sockaddr
+type libc_pollfd = libc_gen_pollfd
+type libc_jmp_buf = [1 x <libc_gen___jmp_buf_tag>]
+type libc_stat = libc_gen_stat
+type libc_dirent = libc_gen_dirent
+type libc_timezone = libc_gen_timezone
+type libc_addrinfo = libc_gen_addrinfo
+type libc_epoll_event = libc_gen_epoll_event
 
 struct libc_gen_timespec {
     tv_sec: int
