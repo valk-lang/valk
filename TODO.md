@@ -2,8 +2,7 @@
 # TODO
 
 ```
-- Short way to create arrays and objects
--- let x = []#i32, let x : Array[i32] = [], let x = [5#i32]
+- Check if original type is nullable for a while isset condition
 - $to $autoconvert : let x = 5 to String
 - Make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
 - [value .. value] -> calls range()
