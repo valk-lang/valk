@@ -9,7 +9,7 @@
 
 Valk is a programming language aimed to be fast & simple at the same time. The simplicity of Go with the performance of Rust. Valk is also the first programming language with a persistent garbage collector. Meaning no more mark/sweep mechanisms that cause performance problems. We aim to be a feature rich language with a large standard library.
 
-**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory mangement, Using c libraries, and more...
+**Features**: Fastest GC, Coroutines, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory mangement, Integrate c libraries, and more...
 
 To see what a persistent GC can do, see the [benchmarks](#benchmarks)
 
@@ -55,9 +55,8 @@ make
 ## Benchmarks
 
 <div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-fps.png">
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-gc.png">
 </p>
-Game developers often complain that garbage collection hampers their FPS in their game when allocating alot of objects. Valk does not suffer from this issue because it doesnt have a mark/sweep phase.
 </div>
 
 ---
