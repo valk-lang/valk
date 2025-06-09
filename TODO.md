@@ -3,18 +3,15 @@
 
 ```
 - Check if original type is nullable for a while isset condition
-- $to $autoconvert : let x = 5 to String
-- Make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
+- Use flags instead of specific function names: $eq $lt etc...
+- Use Pool allocator for array and string objects/data, malloc/free is too slow
 - [value .. value] -> calls range()
-- Use flags instead of specific function names: $converter, $range
-- Only parse functions from imut classes when they are used so we no longer need `mut fn`
-- `--ignore-access-types` build option to ignore pub/read access types
-- Clean up `scopes` code/logic in the compiler code
-- Use Pool allocator for array and string objects/data, malloc/free is way too slow
 - Coroutine/thread exit
 - Coroutine globals
 - Interfaces
 - Extend classes/structs
+- Clean up `scopes` code/logic in the compiler code
+- Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```
 
 # Maybe
@@ -26,4 +23,5 @@
 -- if property is nullable, use `null` as value, if it has a `construct` without arguments, use that
 - Dont use shadow stack, use real stack
 - Use Bump allocator instead of Pool allocator
+- Make type.class non nullable, all types must have class, pointer void, pointer fnRef, class Closure, class Promise/Coro
 ```
