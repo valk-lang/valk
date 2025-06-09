@@ -34,7 +34,7 @@ fn getenv(key: cstring) ?cstring;
 
 fn _read(fd: i32, buf: cstring, size: uint) int;
 fn _write(fd: i32, buf: cstring, size: u32) int;
-fn _open(path: cstring, flags: i32, mode: u32) i32;
+fn _open(path: cstring, flags: i32, mode: i32) i32;
 fn _close(fd: i32) i32;
 
 fn recv(fd: uint, buf: ptr, len: i32, flags: i32) i32;

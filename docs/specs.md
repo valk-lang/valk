@@ -51,3 +51,13 @@ let x = match E : String {
 	2 => "b"
 }
 ```
+
+## Auto converting / Casting
+
+```
+let x = 5.to(String) // lookup class function flagged with $to that returns String 
+let x = 5.$to(String) // alternatively you can use `.$to` in case a `.to` function is already defined on the class
+let x = 5_u32 // For numbers we can specify a number type directly
+let x = 5.to(u32) // If both types are numbers and there are no matching $to functions, we cast directly
+let x = x.@cast(String) // Direct casting (unsafe)
+```
