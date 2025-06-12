@@ -61,3 +61,13 @@ let x = 5_u32 // For numbers we can specify a number type directly
 let x = 5.to(u32) // If both types are numbers and there are no matching $to functions, we cast directly
 let x = x.@cast(String) // Direct casting (unsafe)
 ```
+
+## Null check algo
+
+```
+1. use isset() to overwrite null types (type.nullable = false, type.null_overwrite = true)
+2. if type checking .null_overwrite = true type against .nullable = false :
+2.1 Loop over all sc_loop scopes between current scope and scope.not_null(decl) scope
+2.1.1 Add decl & clone_chunk to loop_scope.must_not_be_null
+3. When at the end of a sc_loop or a 'continue' statement, check 'loop_scope.must_not_be_null' and check if those decls are null in the current scope or not. if so, show compile error
+```

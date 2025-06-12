@@ -17,6 +17,7 @@
 # Maybe
 
 ```
+- error pass operator `!>`
 - remove shadow stack, use real stack
 - `construct new() {}` instead of `static fn new() {}`
 -- This forces the use of the use of `new()` to create an object of that class (multiple constructors allowed)
