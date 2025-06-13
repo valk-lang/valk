@@ -2,8 +2,6 @@
 # TODO
 
 ```
-- Check if original type is nullable for a while isset condition
-- Use flags instead of specific function names: $eq $lt etc...
 - Use Pool allocator for array and string objects/data, malloc/free is too slow
 - [value .. value] -> calls range()
 - Coroutine/thread exit
