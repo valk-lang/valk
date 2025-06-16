@@ -2,7 +2,6 @@
 # TODO
 
 ```
-- Use Pool allocator for array and string objects/data, malloc/free is too slow
 - [value .. value] -> calls range()
 - Coroutine/thread exit
 - Coroutine globals
