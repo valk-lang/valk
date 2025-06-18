@@ -2,12 +2,13 @@
 # TODO
 
 ```
+- getter e.g. "".utf8  ->  + get utf8 : StringUtf8 { return this @as StringUtf8 }
 - [value .. value] -> calls range()
 - Coroutine/thread exit
 - Coroutine globals
 - Interfaces
+- Union types
 - Extend classes/structs
-- Clean up `scopes` code/logic in the compiler code
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```
 
