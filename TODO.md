@@ -2,7 +2,6 @@
 # TODO
 
 ```
-- getter e.g. "".utf8  ->  + get utf8 : StringUtf8 { return this @as StringUtf8 }
 - [value .. value] -> calls range()
 - Coroutine/thread exit
 - Coroutine globals
