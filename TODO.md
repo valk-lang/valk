@@ -2,18 +2,25 @@
 # TODO
 
 ```
-- [value .. value] -> calls range()
 - Coroutine/thread exit
 - Coroutine globals
 - Interfaces
 - Union types
 - Extend classes/structs
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
+- $lazy properties
+```
+
+# Later
+
+```
+/
 ```
 
 # Maybe
 
 ```
+- [value .. value] -> calls the $range function (from: uint, until: uint, inclusive: bool)
 - error pass operator `!>`
 - remove shadow stack, use real stack
 - `construct new() {}` instead of `static fn new() {}`
