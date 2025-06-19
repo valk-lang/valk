@@ -2,13 +2,12 @@
 # TODO
 
 ```
-- Coroutine globals
 - Interfaces
 - Union types
 - Extend classes/structs
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 - $lazy properties
-- change pointer array types from: [u8 x 10] -> to: ptr, ptr[u8], ptr[u8 x 10]
+- Change pointer array types from: [u8 x 10] -> to: ptr, ptr[u8], ptr[u8 x 10]
 ```
 
 # Later
