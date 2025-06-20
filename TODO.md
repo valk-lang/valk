@@ -2,18 +2,19 @@
 # TODO
 
 ```
-- Interfaces
-- Union types
-- Extend classes/structs
-- Only parse functions from imut classes when they are used so we no longer need `mut fn`
-- $lazy properties
 - Change pointer array types from: [u8 x 10] -> to: ptr, ptr[u8], ptr[u8 x 10]
+- Release 0.0.1
+- Switch valk-legacy to valk-0.0.1
+- Release 0.0.2
 ```
 
 # Later
 
 ```
-/
+- Interfaces
+- Union types
+- $lazy properties
+- Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```
 
 # Maybe
