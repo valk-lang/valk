@@ -2,7 +2,6 @@
 # TODO
 
 ```
-- Extend classes/structs
 - Change pointer array types from: [u8 x 10] -> to: ptr, ptr[u8], ptr[u8 x 10]
 - Release 0.0.1
 - Switch valk-legacy to valk-0.0.1
