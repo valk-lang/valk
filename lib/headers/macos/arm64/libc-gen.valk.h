@@ -32,7 +32,7 @@ struct libc_gen_stat {
     st_flags: u32
     st_gen: u32
     st_lspare: i32
-    st_qspare: <[2 x int]>
+    st_qspare: [2 x int]
 }
 
 struct libc_gen_dirent {
@@ -41,7 +41,7 @@ struct libc_gen_dirent {
     d_reclen: u16
     d_namlen: u16
     d_type: u8
-    d_name: <[1024 x i8]>
+    d_name: [1024 x i8]
 }
 
 struct libc_gen_timeval {
@@ -58,7 +58,7 @@ struct libc_gen_pollfd {
 struct libc_gen_sockaddr {
     sa_len: u8
     sa_family: u8
-    sa_data: <[14 x i8]>
+    sa_data: [14 x i8]
 }
 
 struct libc_gen_addrinfo {
