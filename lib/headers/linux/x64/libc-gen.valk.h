@@ -3,7 +3,7 @@ type libc_timespec (libc_gen_timespec)
 type libc_timeval (libc_gen_timeval)
 type libc_sockaddr (libc_gen_sockaddr)
 type libc_pollfd (libc_gen_pollfd)
-type libc_jmp_buf ([1 x <libc_gen___jmp_buf_tag>])
+type libc_jmp_buf (libc_gen___jmp_buf_tag)
 type libc_stat (libc_gen_stat)
 type libc_dirent (libc_gen_dirent)
 type libc_timezone (libc_gen_timezone)
@@ -30,15 +30,15 @@ struct libc_gen_stat {
     st_atim: <libc_gen_timespec>
     st_mtim: <libc_gen_timespec>
     st_ctim: <libc_gen_timespec>
-    __glibc_reserved: <[3 x int]>
+    __glibc_reserved: [3 x int]
 }
 
 struct libc_gen_anon_struct_2 {
-    __val: <[16 x uint]>
+    __val: [16 x uint]
 }
 
 struct libc_gen___jmp_buf_tag {
-    __jmpbuf: <[8 x int]>
+    __jmpbuf: [8 x int]
     __mask_was_saved: i32
     __saved_mask: <libc_gen_anon_struct_2>
 }
@@ -48,7 +48,7 @@ struct libc_gen_dirent {
     d_off: int
     d_reclen: u16
     d_type: u8
-    d_name: <[256 x i8]>
+    d_name: [256 x i8]
 }
 
 struct libc_gen_pollfd {
@@ -64,7 +64,7 @@ struct libc_gen_timeval {
 
 struct libc_gen_sockaddr {
     sa_family: u16
-    sa_data: <[14 x i8]>
+    sa_data: [14 x i8]
 }
 
 struct libc_gen_addrinfo {
