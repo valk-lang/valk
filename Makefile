@@ -17,11 +17,11 @@ static: $(SRC) $(HDRS)
 	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
 install: valk
-	sudo mkdir -p /opt/valk/git/
-	sudo cp ./valk /opt/valk/git/valk
-	sudo cp -r ./lib /opt/valk/git/
+	sudo mkdir -p /opt/valk/${VERSION}/
+	sudo cp ./valk /opt/valk/${VERSION}/valk
+	sudo cp -r ./lib /opt/valk/${VERSION}/
 	sudo rm -f /usr/local/bin/valk
-	sudo ln -s /opt/valk/git/valk /usr/local/bin/valk || true
+	sudo ln -s /opt/valk/${VERSION}/valk /usr/local/bin/valk || true
 
 # Testing
 test: valk
