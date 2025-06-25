@@ -23,6 +23,9 @@ fn write(fd: i32, data: ptr, length: uint) i32;
 fn open(path: ptr, flags: i32, @infinite) i32;
 fn close(fd: i32) i32;
 
+fn getcwd(buf: cstring, size: i32) ?cstring;
+fn chdir(path: cstring) i32;
+
 fn recv(fd: i32, buf: ptr, len: uint, flags: i32) int;
 fn send(fd: i32, buf: ptr, len: uint, flags: i32) int;
 
