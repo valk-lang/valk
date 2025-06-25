@@ -1,5 +1,5 @@
 
-VERSION=0.0.1
+VERSION=0.0.2
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
@@ -10,11 +10,11 @@ FLAGS=--def "VERSION=$(VERSION)"
 
 # Build
 valk: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
+	valk build . src/*.valk -o ./valk -vv $(FLAGS)
 valkd: $(SRC) $(HDRS)
-	gdb --args valk-legacy build . src/*.valk -o ./valk -vv $(FLAGS)
+	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
 static: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vv --static $(FLAGS)
+	valk build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
 install: valk
 	sudo mkdir -p /opt/valk/${VERSION}/
