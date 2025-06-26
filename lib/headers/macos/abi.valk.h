@@ -26,6 +26,9 @@ fn write(fd: i32, buf: cstring, size: uint) int;
 fn open(path: cstring, flags: i32, @infinite) i32;
 fn close(fd: i32) i32;
 
+fn getcwd(buf: cstring, size: uint) ?cstring;
+fn chdir(path: cstring) i32;
+
 fn recv(fd: i32, buf: ptr, len: uint, flags: i32) int;
 fn send(fd: i32, buf: ptr, len: uint, flags: i32) int;
 
@@ -79,12 +82,6 @@ fn execve(pathname: cstring, argv: ptr, envp: ptr) i32;
 
 fn kill(pid: i32, sig: i32) i32;
 //fn uname(struct utsname buf) i32;
-
-fn getcwd(buf: cstring, size: uint) cstring;
-//char getwd(char buf);
-//char get_current_dir_name();
-//int chdir(path: cstring);
-//int fchdir(int fd);
 
 fn rename(oldpath: cstring, newpath: cstring) i32;
 fn mkdir(pathname: cstring, mode: u32) i32;

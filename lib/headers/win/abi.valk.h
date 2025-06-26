@@ -24,6 +24,8 @@ alias unlink for _unlink;
 
 alias popen for _popen;
 alias pclose for _pclose;
+alias getcwd for _getcwd;
+alias chdir for _chdir;
 
 alias poll for WSAPoll;
 
@@ -94,11 +96,8 @@ fn execve(pathname: cstring, argv: ptr, envp: ptr) i32;
 fn kill(pid: i32, sig: i32) i32;
 //fn uname(struct utsname buf) i32;
 
-fn getcwd(buf: cstring, size: uint) cstring;
-//char getwd(char buf);
-//char get_current_dir_name();
-//int chdir(path: cstring);
-//int fchdir(int fd);
+fn _getcwd(buf: cstring, size: i32) ?cstring;
+fn _chdir(path: cstring) i32;
 
 fn rename(oldpath: cstring, newpath: cstring) i32;
 fn _mkdir(pathname: cstring, mode: u32) i32;
@@ -108,6 +107,7 @@ fn _unlink(pathname: cstring) i32;
 fn symlink(target: cstring, linkpath: cstring) i32;
 fn GetModuleFileNameA(hmodule: ?ptr, buf: ptr, len: u32) u32;
 fn GetFileAttributesA(path: cstring) u32;
+fn GetCurrentDirectory(buffer_size: u32, buffer: ptr) u32;
 
 fn chmod(pathname: cstring, mode: u32) i32;
 fn fchmod(fd: i32, mode: u32) i32;
