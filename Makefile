@@ -6,7 +6,7 @@ SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.
 SRC_LIB=$(wildcard lib/src/*/*.valk) $(wildcard lib/*/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
 
-FLAGS=--def "VERSION=$(VERSION)"
+FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 
 # Build
 valk: $(SRC) $(HDRS)
@@ -26,22 +26,22 @@ install: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS)
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -o ./debug/test-1.exe -vv --target win-x64 -c
+	./valk build ./tests/*.valk . --test -o ./debug/test-win.exe -vv --target win-x64 $(FLAGS)
 	./debug/test-1.exe
 
 # Testing
 test-cross: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target linux-x64
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target macos-x64
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target macos-arm64
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv --target win-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target linux-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target macos-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target macos-arm64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target win-x64
 
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
