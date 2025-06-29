@@ -153,7 +153,7 @@ link static "gcc_eh"
 link static "ncurses"
 link static "c++"
 link static "z"
-link static "zstd"
+// link static "zstd"
 
 #elif OS == win
 link dynamic "msvcprt"
