@@ -46,7 +46,7 @@ test-cross: valk
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
 ci-linux: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	valk build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
@@ -54,39 +54,39 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/llvm-15/lib/
 
 ci-macos: $(SRC) $(HDRS)
-	valk-legacy build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	valk build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
-	~/valk-legacy/valk-legacy.exe build . src/*.valk -o ./valk -vvv --static --mingw $(FLAGS) \
+	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vvv --static --mingw $(FLAGS) \
 	-L ./llvm/lib/
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
-	valk-legacy build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean $(FLAGS)
+	valk build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean $(FLAGS)
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
 macos-x64: $(SRC) $(HDRS)
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
-	valk-legacy build . src/*.valk -o ./dist/macos-x64/valk -vv --static --target macos-x64 --clean $(FLAGS)
+	valk build . src/*.valk -o ./dist/macos-x64/valk -vv --static --target macos-x64 --clean $(FLAGS)
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
 macos-arm64: $(SRC) $(HDRS)
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
-	valk-legacy build . src/*.valk -o ./dist/macos-arm64/valk -vv --static --target macos-arm64 --clean $(FLAGS)
+	valk build . src/*.valk -o ./dist/macos-arm64/valk -vv --static --target macos-arm64 --clean $(FLAGS)
 	cp -r ./lib ./dist/macos-arm64/
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
 win-x64:
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
-	valk-legacy build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean $(FLAGS)
+	valk build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean $(FLAGS)
 	cp -r ./lib ./dist/win-x64/
 	cp -r ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
