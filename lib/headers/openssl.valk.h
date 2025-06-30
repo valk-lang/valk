@@ -9,7 +9,6 @@ link static "crypt32";
 #elif OS == macos
 link static "ssl";
 link static "crypto";
-link dynamic "System";
 #else
 link static "ssl";
 link static "crypto";
