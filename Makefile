@@ -54,7 +54,7 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/llvm-15/lib/
 
 ci-macos: $(SRC) $(HDRS)
-	valk build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
+	valk build . src/*.valk -o ./valk -vvv --static -l zstd $(FLAGS) \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
