@@ -106,6 +106,7 @@ fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
 
 fn _NSGetExecutablePath(buf: ptr, len_u32_ptr: ptr) i32;
+fn realpath(dir: ptr, buf: ptr) cstring;
 
 // Time
 fn gettimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
