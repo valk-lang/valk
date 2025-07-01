@@ -58,7 +58,7 @@ ci-macos: $(SRC) $(HDRS)
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
-	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vvv --static --mingw $(FLAGS) \
+	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vvv --static $(FLAGS) \
 	-L ./llvm/lib/
 
 # Distributions
