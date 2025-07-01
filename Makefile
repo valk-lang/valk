@@ -33,7 +33,7 @@ test: valk
 test-win: valk
 	mkdir -p ./debug
 	./valk build ./tests/*.valk . --test -o ./debug/test-win.exe -vv --target win-x64 $(FLAGS)
-	./debug/test-1.exe
+	./debug/test-win.exe
 
 # Testing
 test-cross: valk
