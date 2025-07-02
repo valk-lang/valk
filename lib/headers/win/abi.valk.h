@@ -108,6 +108,7 @@ fn symlink(target: cstring, linkpath: cstring) i32;
 fn GetModuleFileNameA(hmodule: ?ptr, buf: ptr, len: u32) u32;
 fn GetFileAttributesA(path: cstring) u32;
 fn GetCurrentDirectory(buffer_size: u32, buffer: ptr) u32;
+fn _fullpath(buf: ptr, path: cstring, maxlen: uint) cstring;
 
 fn chmod(pathname: cstring, mode: u32) i32;
 fn fchmod(fd: i32, mode: u32) i32;

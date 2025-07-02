@@ -62,6 +62,7 @@ fn readdir(dirp: DIR) ?libc_dirent;
 fn closedir(dirp: DIR) i32;
 fn mkdir(pathname: cstring, mode: u32) i32;
 fn rmdir(pathname: cstring) i32;
+fn realpath(dir: ptr, buf: ptr) cstring;
 
 fn rename(oldpath: cstring, newpath: cstring) i32;
 fn link(oldpath: cstring, newpath: cstring) i32;
