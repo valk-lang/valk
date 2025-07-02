@@ -16,7 +16,7 @@ link static "crypto";
 
 #if OS == linux
 link dynamic "dl";
-link dynamic ":libc_nonshared.a";
+link ":libc_nonshared.a";
 #end
 
 pointer SSL {}
