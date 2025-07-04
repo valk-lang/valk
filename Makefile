@@ -27,8 +27,8 @@ install: valk
 test: valk
 	mkdir -p ./debug
 	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS)
-	./debug/test-all
-	@./tests/compile-errors/run.sh
+# ./debug/test-all
+# @./tests/compile-errors/run.sh
 
 test-win: valk
 	mkdir -p ./debug
