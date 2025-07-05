@@ -11,6 +11,9 @@ FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 # Build
 valk: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv $(FLAGS)
+valk2: valk $(SRC) $(HDRS)
+	./valk build . src/*.valk -o ./valk2 -vv --def "VERSION=0.0.3"
+
 valkd: $(SRC) $(HDRS)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
 static: $(SRC) $(HDRS)
