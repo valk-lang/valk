@@ -1,22 +1,22 @@
 
 #if OS == win
-link static "libssl";
-link static "libcrypto";
-link static "advapi32";
-link static "user32";
-link static "bcrypt";
-link static "crypt32";
+link "libssl";
+link "libcrypto";
+link "advapi32";
+link "user32";
+link "bcrypt";
+link "crypt32";
 #elif OS == macos
-link static "ssl";
-link static "crypto";
+link "ssl";
+link "crypto";
 #else
-link static "ssl";
-link static "crypto";
+link "ssl";
+link "crypto";
 #end
 
 #if OS == linux
 link dynamic "dl";
-link dynamic ":libc_nonshared.a";
+link ":libc_nonshared.a";
 #end
 
 pointer SSL {}

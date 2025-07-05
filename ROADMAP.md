@@ -1,22 +1,28 @@
 
-# TODO
+# Roadmap
+
+## TODO list
 
 ```
-- Release 0.0.1
-- Switch valk-legacy to valk-0.0.1
++ Release 0.0.1
+- Switch main to 0.0.2
+- Write docs
+- $lazy properties
+- Implement all standard library functions
+- Update docs
 - Release 0.0.2
-```
-
-# Later
-
-```
+- Switch main to 0.0.3
 - Interfaces
 - Union types
-- $lazy properties
+```
+
+## TODO later list
+
+```
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```
 
-# Maybe
+## Maybe
 
 ```
 - [value .. value] -> calls the $range function (from: uint, until: uint, inclusive: bool)

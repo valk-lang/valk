@@ -3,8 +3,8 @@
 
 link dynamic "pthread"
 link dynamic "c"
-link dynamic ":libc_nonshared.a"
-link dynamic ":ld-linux-x86-64.so.2"
+link ":libc_nonshared.a"
+link ":ld-linux-x86-64.so.2"
 
 header "linux/abi"
 #if ARCH == arm64
@@ -34,17 +34,11 @@ header "pthread"
 
 #elif OS == win
 
-// link dynamic "kernel32"
-// link dynamic "libucrt"
-// link dynamic "WS2_32"
-// link dynamic "msvcrt"
-// link dynamic "libvcruntime"
-
-link dynamic "kernel32"
-link dynamic "ws2_32"
-link dynamic "libucrt" // static c-runtime
-link dynamic "libvcruntime" // static c-runtime
-link dynamic "libcmt" // static c-runtime startup
+link "kernel32"
+link "ws2_32"
+link "libucrt" // static c-runtime
+link "libvcruntime" // static c-runtime
+link "libcmt" // static c-runtime startup
 
 header "win/structs"
 header "win/abi"
