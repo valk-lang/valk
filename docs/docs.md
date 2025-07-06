@@ -270,9 +270,7 @@ shared my_shared_global : uint   // Global shared over all threads
 When having a value with a nullable type e.g. `?String`, we often need to prove to the compiler it's not `null` before being able to use it.
 
 ```rust
-fn main() {
-    let msg : ?String = null
-    if true : msg = "Hello"
+fn print(msg: ?String) {
     println(msg) // Compile error
     // Instead we do:
     // Option 1
