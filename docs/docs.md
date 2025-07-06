@@ -21,6 +21,8 @@
 
 <br></td><td width=200px><br>
 
+* [Null checking](#null-checking)
+* [Coroutines](#coroutines)
 
 - [Tokens](#tokens)
     * [Let](#variables)
@@ -233,21 +235,26 @@ fn main() {
 ## Classes
 
 ```rust
-class MyType {
-    a: String
-    b: String ("default value")
-    c: uint (100)
+class User {
+    first_name: String
+    last_name: String ("Doe")
+
+    fn print_name() {
+        println(this.first_name + " " + this.last_name)
+    }
+
+    static fn my_static_function() {
+        println("Hello from my static function")
+    }
 }
 
 fn main() {
-    let obj = MyType {
-        a: "TEST"
+    let u = User {
+        first_name: "John"
     }
-    println(obj.a)   // output: TEST
-    obj.a = "UPDATE" // Set property
-    println(obj.a)   // output: UPDATE
-    println(obj.b)   // output: default value
-    println(obj.c)   // output: 100
+    u.last_name += " The Geat"
+    u.print_name() // output: John Doe The Great
+    User.my_static_function() // output: Hello from my static function
 }
 ```
 
@@ -256,6 +263,43 @@ fn main() {
 ```
 global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
+```
+
+## Null-checking
+
+When having a value with a nullable type e.g. `?String`, we often need to prove to the compiler it's not `null` before being able to use it.
+
+```rust
+fn main() {
+    let msg : ?String = null
+    if true : msg = "Hello"
+    println(msg) // Compile error
+    // Instead we do:
+    // Option 1
+    if isset(msg) : println(msg)
+    // Option 2
+    println(msg ?? "alternative-msg")
+    // Option 3
+    println(msg ?! return)
+    // Option 4
+    if !isset(msg) : return
+    println(msg)
+}
+```
+
+## Coroutines
+
+With coroutines we can run multiple functions at the same time on a single thread. Note that this is only useful to use on functions that contain IO. E.g. read/write files, http requests, database queries, read/write to socket, etc... But that being said, it can be used on any function.
+
+```rust
+// By using `co` we are able to send both requests at the same time
+// Instead of waiting for request_1 to finish before starting request_2
+let request_1 = co http:request("GET", "http://some-website/api/endpoint1")
+let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
+// Now we `await` the results
+// Because `http:request` can fail we must also do some error handling
+let response_1 = await request_1 !? http:Response.empty(400)
+let response_2 = await request_2 !? http:Response.empty(400)
 ```
 
 
@@ -380,14 +424,14 @@ fn main() {
 
 ### Atomics
 
-We can do atomic operations on integers by placing our operation inside an `atomic()` token.
+We can do atomic operations on integers by placing our operation inside an `atomic_op()` token.
 
 ```rust
-// {value-before-updating} = atomic( {variable} {op} {value} )
+// {value-before-updating} = atomic_op( {variable} {op} {value} )
 let v = 5
-let a = atomic(v + 2)
-println(v) // 7
+let a = atomic_op(v + 2)
 println(a) // 5
+println(v) // 7
 ```
 
 ### Testing
