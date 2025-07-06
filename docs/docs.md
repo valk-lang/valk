@@ -14,6 +14,7 @@
 * [Variables](#variables)
 * [Functions](#functions)
    * [Error Handling](#error-handling)
+   * [Closures](#closures)
 * [Classes](#classes)
 * [Globals](#globals)
 
@@ -115,7 +116,7 @@ fn thumbs_up() {
 
 Work in progress.
 
-## Built-in types
+## Types
 
 Types: `String` `Array` `Map`
 
@@ -217,7 +218,21 @@ fn main() {
 }
 ```
 
-### Classes
+### Closures
+
+Closures are anonymous functions
+
+```rust
+fn main() {
+    let prefix = "Hello"
+    let greet = fn(name: String) {
+        println(prefix + ", " + name)
+    }
+    greet("Sam")
+}
+```
+
+## Classes
 
 ```rust
 class MyType {
@@ -238,7 +253,7 @@ fn main() {
 }
 ```
 
-### Globals
+## Globals
 
 ```
 global my_global : uint          // Global (recommended)
