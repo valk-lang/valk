@@ -147,9 +147,7 @@ let v : u8 = "100"    // Compile error because the types are not compatible
 let v : u8 = "100".to(u8) // This works
 ```
 
-## Definitions
-
-### Functions
+## Functions
 
 ```rust
 // Arg2 has a default value of 5
