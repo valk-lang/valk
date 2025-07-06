@@ -26,6 +26,9 @@ install: valk
 	sudo rm -f /usr/local/bin/valk
 	sudo ln -s /opt/valk/${VERSION}/valk /usr/local/bin/valk || true
 
+install-source-compiler:
+	curl -s https://valk-lang.dev/install.sh | bash -s 0.0.1
+
 # Testing
 test: valk
 	mkdir -p ./debug

@@ -3,7 +3,7 @@
     <img height="150" src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk.svg">
 </p></div>
 
-# Valk (WIP)
+# Valk (beta)
 
 [Website](https://valk-lang.dev) | [Documentation](https://github.com/valk-lang/valk/blob/main/docs/docs.md) | [Roadmap](https://github.com/valk-lang/valk/blob/main/ROADMAP.md) | [Discord](https://discord.gg/RwEGqdSERA)
 
@@ -15,12 +15,19 @@ To see what a persistent GC can do, see the [benchmarks](#benchmarks)
 
 ## Install
 
-TODO
+Linux / MacOS
+
+```
+curl -s https://valk-lang.dev/install.sh | bash -s latest
+```
+
+Windows: Download from our website and unzip it into a directory. Optionally: Add the directory to your PATH.
+
 
 ## Basic example
 
 ```rust
-// main.va
+// main.valk
 fn main() {
     println("Hello Valk! 🎉")
 }
@@ -40,6 +47,7 @@ Ubuntu / Debian: `sudo apt-get install llvm-15 lld`
 ```bash
 git clone https://github.com/valk-lang/valk.git
 cd valk
+make install-source-compiler
 make
 ```
 
