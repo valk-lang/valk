@@ -49,6 +49,7 @@ git clone https://github.com/valk-lang/valk.git
 cd valk
 make install-source-compiler
 make
+# optional: make test
 ```
 
 ## Supported platforms
