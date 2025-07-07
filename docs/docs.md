@@ -21,9 +21,6 @@
 
 <br></td><td width=200px><br>
 
-* [Null checking](#null-checking)
-* [Coroutines](#coroutines)
-
 - [Tokens](#tokens)
     * [Let](#variables)
     * [If/Else](#if-else)
@@ -33,12 +30,13 @@
 
 <br></td><td width=200px><br>
 
-* [Advanced](#advanced)
-    * [Access Types](#access-types)
-    * [Value Scopes](#value-scopes)
-    * [Compile Conditions](#compile-conditions)
-    * [Atomics](#atomics)
-    * [Testing](#testing)
+* [Null checking](#null-checking)
+* [Coroutines](#coroutines)
+* [Access Types](#access-types)
+* [Value Scopes](#value-scopes)
+* [Compile Conditions](#compile-conditions)
+* [Atomics](#atomics)
+* [Testing](#testing)
 
 <br></td><td width=200px><br>
 
@@ -265,42 +263,6 @@ global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
 ```
 
-## Null-checking
-
-When having a value with a nullable type e.g. `?String`, we often need to prove to the compiler it's not `null` before being able to use it.
-
-```rust
-fn print(msg: ?String) {
-    println(msg) // Compile error
-    // Instead we do:
-    // Option 1
-    if isset(msg) : println(msg)
-    // Option 2
-    println(msg ?? "alternative-msg")
-    // Option 3
-    println(msg ?! return)
-    // Option 4
-    if !isset(msg) : return
-    println(msg)
-}
-```
-
-## Coroutines
-
-With coroutines we can run multiple functions at the same time on a single thread. Note that this is only useful to use on functions that contain IO. E.g. read/write files, http requests, database queries, read/write to socket, etc... But that being said, it can be used on any function call.
-
-```rust
-// By using `co` we are able to send both requests at the same time
-// Instead of waiting for request_1 to finish before starting request_2
-let request_1 = co http:request("GET", "http://some-website/api/endpoint1")
-let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
-// Now we `await` the results
-// Because `http:request` can fail we must also do some error handling
-let response_1 = await request_1 !? http:Response.empty(400)
-let response_2 = await request_2 !? http:Response.empty(400)
-```
-
-
 ## Tokens
 
 ### If Else
@@ -343,9 +305,43 @@ each m as v {
 // 10 20 30
 ```
 
-## Advanced
+## Null-checking
 
-### Access types
+When having a value with a nullable type e.g. `?String`, we often need to prove to the compiler it's not `null` before being able to use it.
+
+```rust
+fn print(msg: ?String) {
+    println(msg) // Compile error
+    // Instead we do:
+    // Option 1
+    if isset(msg) : println(msg)
+    // Option 2
+    println(msg ?? "alternative-msg")
+    // Option 3
+    println(msg ?! return)
+    // Option 4
+    if !isset(msg) : return
+    println(msg)
+}
+```
+
+## Coroutines
+
+With coroutines we can run multiple functions at the same time on a single thread. Note that this is only useful to use on functions that contain IO. E.g. read/write files, http requests, database queries, read/write to socket, etc... But that being said, it can be used on any function call.
+
+```rust
+// By using `co` we are able to send both requests at the same time
+// Instead of waiting for request_1 to finish before starting request_2
+let request_1 = co http:request("GET", "http://some-website/api/endpoint1")
+let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
+// Now we `await` the results
+// Because `http:request` can fail we must also do some error handling
+let response_1 = await request_1 !? http:Response.empty(400)
+let response_2 = await request_2 !? http:Response.empty(400)
+```
+
+
+## Access types
 
 With access types we control who can access what. By default your declared types, functions, properties, etc. are public, but we can use `-` (private) and `~` (readonly) to limit the access to them.
 
@@ -368,36 +364,29 @@ class MyClass {
 
 For rare cases when you want to ignore access types, you can type `@ignore_access_types` at the top of file.
 
-### Value scopes
+## Value scopes
 
 With `value scopes` we can execute code that eventually returns a value.
 
 ```rust
 let a = 5
 let b = <{
-    if a > 100 {
-        println("Multiply by 2")
-        return a * 2
-    }
     println("Add 10")
     return a + 10
 }
-println(b)
-// output:
-// Add 10
-// 15
+println(b) // 15
 ```
 
 This feature is very useful in error handling for when we want to provide an alternative value but also want to execute some code when it happens. e.g. for logging.
 
 ```rust
-let a = might_error() ? <{
+let a = might_error() !? <{
     Mylogger.log("might_error() returned an error, this should not happen!")
     return 0
 }
 ```
 
-### Compile conditions
+## Compile conditions
 
 With `compile conditions` we can modify our code based on parameters we gave the compiler. We can also do checks on types. This can be useful when working with generic types.
 
@@ -420,7 +409,7 @@ fn main() {
 }
 ```
 
-### Atomics
+## Atomics
 
 We can do atomic operations on integers by placing our operation inside an `atomic_op()` token.
 
@@ -432,7 +421,7 @@ println(a) // 5
 println(v) // 7
 ```
 
-### Testing
+## Testing
 
 To test our project, we pass in the `--test` cli argument with our build command. Instead of calling our `main` function, the program will now run all your defined tests. In these tests we can use `assert` to check if something is an expected result.
 
@@ -458,7 +447,7 @@ valk build src/*.v ./my-tests/*.valk --test --run
 
 Work in progress 🔨
 
-### Structs
+## Structs
 
 A `struct` is a `c` compatible struct type that is not garbage collected. It mostly used for integrating with c libraries, but also if you just want objects that are manually memory managed.
 
@@ -485,6 +474,6 @@ When using the `MyStruct { ...property-values... }` syntax, valk allocates the o
 let ob : MyStruct = my_custom_alloc(sizeof(<MyStruct>))
 ```
 
-### Headers
+## Headers
 
 (WIP)
