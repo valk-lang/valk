@@ -16,6 +16,7 @@
 - Find a way to limit shared memory
 - Interfaces
 - Union types
+- WASM support
 ```
 
 ## For later
