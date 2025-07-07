@@ -1,22 +1,24 @@
 
 # Roadmap
 
-## TODO list
+## Things to do
 
 ```
 + Release 0.0.1
-- Switch main to 0.0.2
-- Write docs
++ Switch main to 0.0.2
+~ Write docs
+
 - $lazy properties
 - Implement all standard library functions
 - Update docs
 - Release 0.0.2
 - Switch main to 0.0.3
+- Find a way to limit shared memory
 - Interfaces
 - Union types
 ```
 
-## TODO later list
+## For later
 
 ```
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`

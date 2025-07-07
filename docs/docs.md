@@ -287,7 +287,7 @@ fn print(msg: ?String) {
 
 ## Coroutines
 
-With coroutines we can run multiple functions at the same time on a single thread. Note that this is only useful to use on functions that contain IO. E.g. read/write files, http requests, database queries, read/write to socket, etc... But that being said, it can be used on any function.
+With coroutines we can run multiple functions at the same time on a single thread. Note that this is only useful to use on functions that contain IO. E.g. read/write files, http requests, database queries, read/write to socket, etc... But that being said, it can be used on any function call.
 
 ```rust
 // By using `co` we are able to send both requests at the same time
