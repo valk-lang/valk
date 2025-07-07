@@ -449,7 +449,7 @@ Work in progress 🔨
 
 ## Structs
 
-A `struct` is a `c` compatible struct type that is not garbage collected. It mostly used for integrating with c libraries, but also if you just want objects that are manually memory managed.
+A `struct` is basically a `class` without the garbage collection. You manage the allocation/free-ing yourself. Structs are compatible with the structs from `c`. This makes them useful for integrating with c libraries.
 
 ```rust
 struct MyStruct {
@@ -468,10 +468,23 @@ fn main() {
 }
 ```
 
-When using the `MyStruct { ...property-values... }` syntax, valk allocates the object using `valk:mem:alloc` (binds to malloc from libc). Which is why you should always free them with `valk:mem:free`. But you can always create your own allocator functions ofcourse.
+Behind the scenes Valk allocates struct objects using `valk:mem:alloc`. So you can free them using `valk:mem:free`. These 2 functions basically map to `malloc` & `free` from libc. So memory that comes from a c library can be freed using the `valk:mem:free` function, and the other way around.
+
+But feel free to implement your own allocator.
 
 ```rust
-let ob : MyStruct = my_custom_alloc(sizeof(<MyStruct>))
+fn alloc(size: uint) ptr {
+    // ... code ...
+}
+fn make[T]() T {
+    #if type_is_struct(T)
+    #error "You can only allocate struct types"
+    #end
+    return alloc(sizeof(<T>)).@cast(T)
+}
+fn main() {
+    let obj : MyStruct = make[MyStruct]()
+}
 ```
 
 ## Headers
