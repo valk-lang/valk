@@ -5,6 +5,17 @@ use net
 use url
 use utils
 
+// Examples
+// ---
+// http:request("GET", "URL").add_header("X", "Y").exec()
+// ---
+// let req = http:request("GET", "URL")
+// let resp : http:Response = null
+// while !isset(resp) { 
+//    resp = req.progress() ! throw connection
+// }
+// ---
+
 class ClientResponse {
     + status: uint (0)
     + headers: Map[String] (Map[String].new())
@@ -12,19 +23,54 @@ class ClientResponse {
 }
 
 class ClientRequest {
-    + method: String
-    + url: String
+    ~ method: String
+    ~ url: url:Url (null)
+    ~ url_str: String
     + body: String ("")
-    + headers: Map[String] (Map[String].new())
+    ~ headers: ?Map[String] (null)
+    // Init
+    - con: ?net:Connection (null)
+    - payload: ?utils:ByteBuffer (null)
+    - response_ctx: ?Context (null)
+    - response_buf: ?utils:ByteBuffer (null)
+    // Files
+    - save_to_path: ?String (null)
+    // Progress
+    - stage: uint (0)
+    - bytes_to_send: uint (0)
+    - bytes_sent: uint (0)
+    - bytes_to_recv: uint (0)
+    - bytes_received: uint (0)
+    ~ send_percent: uint (0)
+    ~ recv_percent: uint (0)
+    ~ done: bool (false)
+    // Final
+    ~ response: ?ClientResponse (null)
 
-    + fn exec() ClientResponse !invalid_url !connection_failed !invalid_response {
+    + static fn new(
+        method: String,
+        url: String,
+        headers: ?Map[String] (null)
+    ) ClientRequest {
 
-        let parts = url:parse(this.url)
+        return ClientRequest {
+            method: method
+            url: url:parse(url)
+            url_str: url
+            headers: headers
+        }
+    }
 
-        let is_https = parts.scheme == "https"
+    - fn connect() net:Connection !invalid_url !connection_failed !invalid_response {
 
-        let split = parts.host.split(":")
-        let host = parts.host
+        let con = this.con
+        if isset(con) : return con
+
+        let url = this.url
+        let is_https = url.scheme == "https"
+
+        let split = url.host.split(":")
+        let host = url.host
         let port : u16 = is_https ? 443 : 80
         if split.length > 2 : throw invalid_url
         if split.length == 2 {
@@ -34,10 +80,10 @@ class ClientRequest {
         }
 
         let sock = net:Socket.new_tcp(host, port) ! {
-            throw invalid_url, "Invalid request url"
+            throw connection_failed, "Connection failed"
         }
 
-        let con = sock.connect() ! {
+        con = sock.connect() ! {
             throw connection_failed, "Connection failed"
         }
 
@@ -48,35 +94,75 @@ class ClientRequest {
             }
         }
 
-        // Send request
-        let buf = this.get_send_data(parts)
-        con.send_byte_buffer(buf) ! {
-            con.close()
-            throw connection_failed, "Unexpected non-blocking connection"
+        this.con = con
+
+        return con
+    }
+
+    - fn response_context() (Context, utils:ByteBuffer) {
+        let ctx = this.response_ctx
+        let buf = this.response_buf
+        if isset(ctx) && isset(buf) : return ctx, buf
+        buf = utils:ByteBuffer.new(2048)
+        ctx = Context.new(buf)
+        this.response_ctx = ctx
+        this.response_buf = buf
+        return ctx, buf
+    }
+
+    + fn progress() ?ClientResponse !invalid_url !connection_failed !connection_closed !invalid_response {
+
+        let resp = this.response
+        if isset(resp) : return resp
+
+        let con = this.connect() ! {
+            if error_is(E, invalid_url) : throw invalid_url
+            throw connection_failed
         }
 
-        //
-        // let parser = Parser.new()
-        let input = utils:ByteBuffer.new(2048)
-        let context = Context.new(input)
-        while true {
-            parse_http(input, context, true) ! {
-                // Check if we need more data
-                if error_is(E, incomplete) {
-                    let bytes = con.recv(input, 8192) ! {
-                        con.close()
-                        throw invalid_response
-                    }
-                    if bytes > 0 : continue
-                }
+        if this.stage == 0 {
+            // Send request
+            let payload = this.get_payload()
+
+            let sent_count = con.send_buffer(payload, this.bytes_sent, false) ! {
+                con.close()
+                throw connection_closed, "Unexpected non-blocking connection"
+            }
+            this.bytes_sent += sent_count
+            this.send_percent = this.bytes_sent * 100 / this.bytes_to_send
+            if this.bytes_sent < this.bytes_to_send : return null
+            // Done
+            this.stage = 1
+            this.send_percent = 100
+        }
+
+        // Receive response
+        let context, recv_buf = this.response_context()
+        if !context.done {
+            let bytes = con.recv(recv_buf, 1024 * 32) ! {
                 con.close()
                 throw invalid_response
             }
-            if context.done : break
-            throw invalid_response
+            this.bytes_received += bytes
+            if context.content_length > 0 {
+                this.recv_percent = this.bytes_received * 100 / context.content_length
+            }
+
+            if bytes == 0 {
+                con.close()
+                throw invalid_response
+            }
+            // Parse bytes
+            parse_http(recv_buf, context, true) ! {
+                if error_is(E, incomplete) : return null
+                throw invalid_response
+            }
+
+            this.recv_percent = 100
         }
 
-        let resp = ClientResponse {
+        // Create response
+        resp = ClientResponse {
             status: context.status
             // headers: request.headers()
             body: context.body()
@@ -84,12 +170,37 @@ class ClientRequest {
 
         con.close()
         context.reset()
-        input.clear()
+        recv_buf.clear()
+
+        this.response = resp
+        this.done = true
 
         return resp
     }
 
-    - fn get_send_data(parts: url:Url) utils:ByteBuffer {
+    + fn exec() ClientResponse !invalid_url !connection_failed !connection_closed !invalid_response {
+
+        let resp : ?ClientResponse = null
+        while !isset(resp) {
+            resp = this.progress() ! {
+                match E {
+                    E.invalid_url => throw invalid_url
+                    E.connection_failed => throw connection_failed
+                    E.connection_closed => throw connection_closed
+                    default => throw invalid_response
+                }
+            }
+        }
+
+        return resp
+    }
+
+    - fn get_payload() utils:ByteBuffer {
+
+        let payload = this.payload
+        if isset(payload) : return payload
+
+        let url = this.url
 
         let len = this.body.bytes
         let buf = utils:ByteBuffer.new(len + 256)
@@ -98,15 +209,15 @@ class ClientRequest {
 
         buf.append_str(method)
         buf.append_str(" ")
-        buf.append_str(parts.path)
-        if parts.query != "" {
+        buf.append_str(url.path)
+        if url.query != "" {
             buf.append_str("?")
-            buf.append_str(parts.query)
+            buf.append_str(url.query)
         }
         buf.append_str(" HTTP/1.1\r\n")
 
         buf.append_str("Host: ")
-        buf.append_str(parts.host)
+        buf.append_str(url.host)
         buf.append_str("\r\n")
 
         buf.append_str("Content-Length: ")
@@ -114,16 +225,22 @@ class ClientRequest {
         buf.append_str("\r\n")
 
         let headers = this.headers
-        each headers._keys as k, i {
-            let v = headers._values.get(i) ! break
-            buf.append_str(k)
-            buf.append_str(": ")
-            buf.append_str(v)
-            buf.append_str("\r\n")
+        if isset(headers) {
+            each headers._keys as k, i {
+                let v = headers._values.get(i) ! break
+                buf.append_str(k)
+                buf.append_str(": ")
+                buf.append_str(v)
+                buf.append_str("\r\n")
+            }
         }
 
         buf.append_str("\r\n")
         buf.append_str(this.body)
+
+        // Calculate request size
+        this.bytes_to_send = buf.length
+        this.payload = buf
 
         return buf
     }
