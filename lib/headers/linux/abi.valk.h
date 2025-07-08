@@ -11,7 +11,7 @@ alias libc_addrinfo_fix for libc_gen_addrinfo
 fn malloc(size: uint) ptr;
 fn free(adr: ptr) i32;
 
-fn exit(code: i32) void;
+fn exit(code: i32) void $exit;
 fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
 fn __errno_location() ptr;

@@ -101,7 +101,7 @@ fn umask(mask: u32) u32;
 
 fn gettid() i32;
 
-fn exit(status: i32) void;
+fn exit(status: i32) void $exit;
 fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
 

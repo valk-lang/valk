@@ -122,7 +122,7 @@ fn _flushall() void;
 
 fn gettid() i32;
 
-fn exit(status: i32) void;
+fn exit(status: i32) void $exit;
 fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
 fn _get_errno(int_ref: ptr) ptr;
