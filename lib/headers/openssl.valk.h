@@ -22,18 +22,57 @@ link ":libc_nonshared.a";
 pointer SSL {}
 pointer SSL_CTX {}
 
+value SSL_VERIFY_PEER (0x1)
+
+value SSL3_VERSION (0x0300)
+value TLS1_VERSION (0x0301)
+value TLS1_1_VERSION (0x0302)
+value TLS1_2_VERSION (0x0303)
+value TLS1_3_VERSION (0x0304)
+value DTLS1_VERSION (0xFEFF)
+value DTLS1_2_VERSION (0xFEFD)
+value DTLS1_BAD_VER (0x0100)
+
+value SSL_OP_NO_ANTI_REPLAY (1 << 24)
+value SSL_OP_NO_SSLv3 (1 << 25)
+value SSL_OP_NO_TLSv1 (1 << 26)
+value SSL_OP_NO_TLSv1_2 (1 << 27)
+value SSL_OP_NO_TLSv1_1 (1 << 28)
+value SSL_OP_NO_TLSv1_3 (1 << 29)
+value SSL_OP_NO_DTLSv1 (1 << 26)
+value SSL_OP_NO_DTLSv1_2 (1 << 27)
+
+value SSL_CTRL_SET_MIN_PROTO_VERSION (123)
+value SSL_CTRL_SET_MAX_PROTO_VERSION (124)
+
+value SSL_CTRL_SET_TLSEXT_HOSTNAME (55)
+value TLSEXT_NAMETYPE_host_name (0)
+
 fn SSL_CTX_new(method: ptr) SSL_CTX;
 fn SSL_new(ctx: SSL_CTX) SSL;
 fn SSL_set_fd(ssl: SSL, fd: i32) void;
 fn SSL_free(ctx: SSL_CTX) void;
 fn SSL_connect(ctx: SSL_CTX) i32;
 
+fn SSL_get_version(ssl: SSL) cstring;
 fn SSL_write(ssl: SSL, data: ptr, bytes: uint) i32;
 fn SSL_read(ssl: SSL, data: ptr, bytes: uint) i32;
 fn SSL_write_ex(ssl: SSL, data: ptr, bytes: uint, bytes_written_uint_ptr: ptr) i32;
 fn SSL_read_ex(ssl: SSL, data: ptr, bytes: uint, bytes_read_uint_ptr: ptr) i32;
+fn SSL_set1_host(ssl: SSL, host: cstring) i32;
+fn SSL_set_verify(ssl: SSL, mode: i32, cb: ?fn(i32, ptr)(i32)) i32;
+fn SSL_set_cipher_list(ssl: SSL, ciphers: cstring) i32;
+fn SSL_ctrl(ssl: SSL, cmd: i32, larg: int, parg: ?ptr) int;
 
 fn SSL_get_error(ssl: SSL, ret: i32) i32;
+fn ERR_clear_error();
+fn ERR_get_error() uint;
+fn ERR_error_string(error: uint, buffer: ?ptr) cstring;
 
 fn TLS_client_method() ptr;
 fn SSLv23_client_method() ptr;
+
+fn SSL_CTX_set_verify(ssl: SSL, mode: i32, cb: ?fn(i32, ptr)(i32)) i32;
+fn SSL_CTX_set_options(ctx: SSL_CTX, flags: int);
+fn SSL_CTX_ctrl(ctx: SSL_CTX, cmd: i32, larg: int, parg: ?ptr) int;
+fn SSL_CTX_load_verify_locations(ctx: SSL_CTX, ca_file: cstring, ca_path: ?cstring) i32;
