@@ -76,3 +76,4 @@ fn SSL_CTX_set_verify(ssl: SSL, mode: i32, cb: ?fn(i32, ptr)(i32)) i32;
 fn SSL_CTX_set_options(ctx: SSL_CTX, flags: int);
 fn SSL_CTX_ctrl(ctx: SSL_CTX, cmd: i32, larg: int, parg: ?ptr) int;
 fn SSL_CTX_load_verify_locations(ctx: SSL_CTX, ca_file: cstring, ca_path: ?cstring) i32;
+fn SSL_CTX_set_default_verify_paths(ctx: SSL_CTX) i32;
