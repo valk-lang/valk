@@ -49,6 +49,8 @@ value SSL_CTRL_SET_TLSEXT_HOSTNAME (55)
 value TLSEXT_NAMETYPE_host_name (0)
 
 fn SSL_CTX_new(method: ptr) SSL_CTX;
+fn SSL_CTX_free(ctx: SSL_CTX) void;
+
 fn SSL_new(ctx: SSL_CTX) SSL;
 fn SSL_set_fd(ssl: SSL, fd: i32) void;
 fn SSL_free(ctx: SSL_CTX) void;

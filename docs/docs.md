@@ -332,8 +332,8 @@ With coroutines we can run multiple functions at the same time on a single threa
 ```rust
 // By using `co` we are able to send both requests at the same time
 // Instead of waiting for request_1 to finish before starting request_2
-let request_1 = co http:request("GET", "http://some-website/api/endpoint1")
-let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
+let request_1 = co http:client()->exec("GET", "http://some-website/api/endpoint1")
+let request_2 = co http:client()->exec("GET", "http://some-website/api/endpoint2")
 // Now we `await` the results
 // Because `http:request` can fail we must also do some error handling
 let response_1 = await request_1 !? http:Response.empty(400)
