@@ -332,8 +332,8 @@ With coroutines we can run multiple functions at the same time on a single threa
 ```rust
 // By using `co` we are able to send both requests at the same time
 // Instead of waiting for request_1 to finish before starting request_2
-let request_1 = co http:client()->exec("GET", "http://some-website/api/endpoint1")
-let request_2 = co http:client()->exec("GET", "http://some-website/api/endpoint2")
+let request_1 = co http:client().exec("GET", "http://some-website/api/endpoint1")
+let request_2 = co http:client().exec("GET", "http://some-website/api/endpoint2")
 // Now we `await` the results
 // Because `http:request` can fail we must also do some error handling
 let response_1 = await request_1 !? http:Response.empty(400)
@@ -346,23 +346,24 @@ let response_2 = await request_2 !? http:Response.empty(400)
 With access types we control who can access what. By default your declared types, functions, properties, etc. are public, but we can use `-` (private) and `~` (readonly) to limit the access to them.
 
 ```rust
-fn ... // public
-- fn ...   // private, function can only be accessed from this file
--ns fn ...  // private, function can only be accessed from this namespace
--pkg fn ... // private, function can only be accessed from this package
+fn ... // default (public within your own package, private outside the package)
++ fn ... // public everywhere
+- fn ... // private everywhere
 
 class MyClass {
-    {prop-name}: ... // public
-    - {prop-name}: ...    // private, property can only be accessed from this file
-    -ns {prop-name}:  ...  // private, property can only be accessed from this namespace
-    -pkg {prop-name}: ...  // private, property can only be accessed from this package
-    ~ {prop-name}: ...    // readonly, property can only be changed from this file
-    ~ns {prop-name}: ...   // readonly, property can only be changed from this file
-    ~pkg {prop-name}: ...  // readonly, property can only be changed from this file
+    {prop-name}: ... // default
+    + {prop-name}: ... // public
+    - {prop-name}: ...    // private
+    ~ {prop-name}: ...    // readonly
 }
+
+// Advanced
+-[ns+] // Private, but public in it's own namespace
+-[pkg+] // Private, but public in it's own package (The default access type)
+-[pkg~ns+] // Private, readonly in own package, public in own namespace
 ```
 
-For rare cases when you want to ignore access types, you can type `@ignore_access_types` at the top of file.
+For rare cases when you want to ignore access types, you can type `@ignore_access` at the top of file.
 
 ## Value scopes
 
