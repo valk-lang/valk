@@ -38,6 +38,7 @@ fn fcntl(fd: i32, action: i32, @infinite) i32;
 fn stat(path: cstring, stat_buf: libc_stat) i32;
 fn fstat(fd: i32, stat_buf: libc_stat) i32;
 fn lstat(path: cstring, stat_buf: libc_stat) i32;
+fn access(path: cstring, mode: i32) i32;
 
 fn opendir(name: cstring) ?ptr;
 fn readdir(dirp: ptr) ?libc_dirent;

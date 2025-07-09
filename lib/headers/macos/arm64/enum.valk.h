@@ -1,6 +1,11 @@
 
 value POLLRDHUP (8192)
 
+value F_OK (0)
+value X_OK (1)
+value W_OK (2)
+value R_OK (4)
+
 // value EINTR (4)
 // value EINVAL (22)
 // value EAGAIN (35)
