@@ -27,6 +27,7 @@ install: valk
 	sudo ln -s /opt/valk/${VERSION}/valk /usr/local/bin/valk || true
 
 update: valk
+	sudo rm -rf /opt/valk/${VERSION}/
 	sudo mkdir -p /opt/valk/${VERSION}/
 	sudo cp ./valk /opt/valk/${VERSION}/valk
 	sudo cp -r ./lib /opt/valk/${VERSION}/
