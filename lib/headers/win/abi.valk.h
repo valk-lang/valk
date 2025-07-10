@@ -6,6 +6,7 @@
 alias FILE for ptr
 alias SOCKET for uint
 alias HANDLE for ptr
+alias BOOLEAN for u8
 
 // HANDLE : ptr
 // DWORD : u32
@@ -33,6 +34,7 @@ fn malloc(size: uint) ptr;
 fn free(adr: ptr) void;
 
 fn getenv(key: cstring) ?cstring;
+fn GetLastError() u32;
 
 fn _read(fd: i32, buf: cstring, size: uint) int;
 fn _write(fd: i32, buf: cstring, size: u32) int;
@@ -108,6 +110,7 @@ fn symlink(target: cstring, linkpath: cstring) i32;
 fn GetModuleFileNameA(hmodule: ?ptr, buf: ptr, len: u32) u32;
 fn GetFileAttributesA(path: cstring) u32;
 fn GetCurrentDirectory(buffer_size: u32, buffer: ptr) u32;
+fn CreateSymbolicLinkA(link: cstring, target: cstring, flags: u32) BOOLEAN;
 fn _fullpath(buf: ptr, path: cstring, maxlen: uint) cstring;
 
 fn chmod(pathname: cstring, mode: u32) i32;
