@@ -7,8 +7,6 @@
 + Release 0.0.1
 + Switch main to 0.0.2
 ~ Write docs
-
-- $lazy properties
 - Implement all standard library functions
 - Update docs
 - Release 0.0.2
