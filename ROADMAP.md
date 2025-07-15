@@ -7,6 +7,8 @@
 + Release 0.0.1
 + Switch main to 0.0.2
 ~ Write docs
+- check if `main` exists with informative error message
+- Short string concat syntax "hello %{name}"
 - Implement all standard library functions
 - Update docs
 - Release 0.0.2
