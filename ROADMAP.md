@@ -13,6 +13,7 @@
 - Update docs
 - Release 0.0.2
 - Switch main to 0.0.3
+- use $lazy properties in compiler
 - Interfaces
 - Union types
 - WASM support
