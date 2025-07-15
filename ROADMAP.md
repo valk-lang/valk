@@ -8,9 +8,6 @@
 + Switch main to 0.0.2
 ~ Write docs
 
-- Shared memory limit
-- trait generics
-
 - $lazy properties
 - Implement all standard library functions
 - Update docs
