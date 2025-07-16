@@ -47,7 +47,7 @@ Ubuntu / Debian: `sudo apt-get install llvm-15 lld`
 ```bash
 git clone https://github.com/valk-lang/valk.git
 cd valk
-make install-source-compiler
+vpkg use 0.0.1
 make
 # optional: make test
 ```

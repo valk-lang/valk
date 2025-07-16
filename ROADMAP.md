@@ -6,11 +6,14 @@
 ```
 + Release 0.0.1
 + Switch main to 0.0.2
-~ Write docs
++ Finish all GC related todos
++ Add more basic features
+- Release 0.0.2
+- Create branch 0.0.3
 - Implement all standard library functions
 - Update docs
-- Release 0.0.2
-- Switch main to 0.0.3
+- Merge 0.0.3 into main + Release
+- Create branch 0.0.4
 - Use $lazy properties in compiler
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
@@ -18,6 +21,7 @@
 - Interfaces
 - Union types
 - WASM support
+- Merge 0.0.4 into main + Release
 ```
 
 ## For later

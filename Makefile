@@ -32,9 +32,6 @@ update: valk
 	sudo cp ./valk /opt/valk/${VERSION}/valk
 	sudo cp -r ./lib /opt/valk/${VERSION}/
 
-install-source-compiler:
-	curl -s https://valk-lang.dev/install.sh | bash -s 0.0.1
-
 # Testing
 test: valk
 	mkdir -p ./debug
