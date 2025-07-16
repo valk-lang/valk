@@ -57,9 +57,9 @@ make
 | OS | Linux | Macos | Windows |
 |--|--|--|--|
 | x64 | ✅ | ✅ | ✅ |
-| arm64 | ✔️ | ✅ | ❌ |
+| arm64 | ❌ | ✅ | ❌ |
 
-✅️ = Available & passes tests | ✔️ = Available, untested | ❌️ = Not available right now
+✅️ = Available & passes tests | ❌️ = Not available right now
 
 ## Benchmarks
 
