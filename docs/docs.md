@@ -358,7 +358,7 @@ fn main() {
     co hi() // Run function call in a coroutine
     let task = co hi() // Same
     await task // Wait until it's finished
-    await co fn()() { hi() }() // Makes no sense, but it works
+    await co fn()() { hi() }() // Makes no sense, but you can and it works
 }
 ```
 
