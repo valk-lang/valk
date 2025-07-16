@@ -153,7 +153,7 @@ let v : u8 = "100".to(u8) // This works
 ```rust
 let name = "Peter"
 let msg1 = "Hello " + name + "!" // Concat strings
-let msg2 = "Hello #{name}!" // Short way (you can even call functions in it)
+let msg2 = "Hello #{name}!" // Short way (you can use any code inside #{} as long as we can convert it to a string)
 ```
 
 ## Functions
