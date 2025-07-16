@@ -7,7 +7,6 @@
 + Release 0.0.1
 + Switch main to 0.0.2
 ~ Write docs
-- Short string concat syntax "hello %{name}"
 - Implement all standard library functions
 - Update docs
 - Release 0.0.2
@@ -15,6 +14,7 @@
 - Use $lazy properties in compiler
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
+- Allow identifiers for numbers in types, e.g. ptr[fs:PATH_MAX_LEN x u8] or global list : [MAX_ITEMS x uint]
 - Interfaces
 - Union types
 - WASM support
