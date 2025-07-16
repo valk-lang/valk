@@ -336,7 +336,7 @@ fn print(msg: ?String) {
 
 ## Coroutines
 
-With coroutines we can run multiple functions at the same time on a single thread. Note that this is only useful to use on functions that contain IO. E.g. read/write files, http requests, database queries, read/write to socket, etc... But that being said, it can be used on any function call.
+With coroutines we can run multiple functions at the same time on a single thread.
 
 ```rust
 // By using `co` we are able to send both requests at the same time
@@ -347,6 +347,19 @@ let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
 // Because `http:request` can fail we must also do some error handling
 let response_1 = await request_1 !? http:Response.empty(400)
 let response_2 = await request_2 !? http:Response.empty(400)
+```
+
+It can be used on any function.
+
+```rust
+fn hi() { println("Hello") } 
+fn main() {
+    hi() // Normal function call
+    co hi() // Run function call in a coroutine
+    let task = co hi() // Same
+    await task // Wait until it's finished
+    await co fn()() { hi() }() // Makes no sense, but it works
+}
 ```
 
 
