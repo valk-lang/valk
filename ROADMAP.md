@@ -7,13 +7,14 @@
 + Release 0.0.1
 + Switch main to 0.0.2
 ~ Write docs
-- check if `main` exists with informative error message
 - Short string concat syntax "hello %{name}"
 - Implement all standard library functions
 - Update docs
 - Release 0.0.2
 - Switch main to 0.0.3
-- use $lazy properties in compiler
+- Use $lazy properties in compiler
+- Use correct windows api and waitForMultipleObjects
+- Make wait-for-thread non-blocking
 - Interfaces
 - Union types
 - WASM support
