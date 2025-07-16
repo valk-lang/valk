@@ -54,7 +54,7 @@ test-cross: valk
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
 ci-linux: $(SRC) $(HDRS)
-	valk -h
+	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
 	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
@@ -63,12 +63,12 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/llvm-15/lib/
 
 ci-macos: $(SRC) $(HDRS)
-	valk -h
+	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static -l zstd $(FLAGS) \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
-	./valk-dev/valk.exe -h
+	./valk-dev/valk.exe -h || echo ""
 	./valk-dev/valk.exe build . src/*.valk -o ./valk -vv --static $(FLAGS) \
 	-L ./llvm/lib/
 
