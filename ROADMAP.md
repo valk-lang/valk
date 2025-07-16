@@ -5,28 +5,28 @@
 
 ```
 + Release 0.0.1
-+ Switch main to 0.0.2
+
 + Finish all GC related todos
 + Add more basic features
 + Release 0.0.2
-- Create branch 0.0.3
+
 - Implement all standard library functions
-- Update docs
-- Merge 0.0.3 into main + Release
-- Create branch 0.0.4
 - Use $lazy properties in compiler
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 - Allow identifiers for numbers in types, e.g. ptr[fs:PATH_MAX_LEN x u8] or global list : [MAX_ITEMS x uint]
+- Update docs
+- Release 0.0.3
+
 - Interfaces
 - Union types
-- WASM support
-- Merge 0.0.4 into main + Release
+- Release 0.0.4
 ```
 
 ## For later
 
 ```
+- WASM support
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```
 
