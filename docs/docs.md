@@ -12,6 +12,7 @@
 * [Packages](#packages)
 * [Types](#types)
 * [Variables](#variables)
+* [Strings](#strings)
 * [Functions](#functions)
    * [Error Handling](#error-handling)
    * [Closures](#closures)
@@ -145,6 +146,14 @@ let v = 5.to(String)  // String is not a number type, but the compiler will try 
 let v : String = 5    // The compiler will always automatically convert a value to String if needed/possible
 let v : u8 = "100"    // Compile error because the types are not compatible
 let v : u8 = "100".to(u8) // This works
+```
+
+## Strings
+
+```rust
+let name = "Peter"
+let msg1 = "Hello " + name + "!" // Concat strings
+let msg2 = "Hello #{name}!" // Short way (you can even call functions in it)
 ```
 
 ## Functions
