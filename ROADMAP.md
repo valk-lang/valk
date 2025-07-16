@@ -8,7 +8,7 @@
 + Switch main to 0.0.2
 + Finish all GC related todos
 + Add more basic features
-- Release 0.0.2
++ Release 0.0.2
 - Create branch 0.0.3
 - Implement all standard library functions
 - Update docs
