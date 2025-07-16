@@ -68,11 +68,8 @@ ci-macos: $(SRC) $(HDRS)
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
-	echo "$PWD"
-	ls -l
-	ls -l ./valk-dev/
-	./valk-dev/valk.exe -h || echo ""
-	./valk-dev/valk.exe build . src/*.valk -o ./valk -vv --static $(FLAGS) \
+	~/valk-dev/valk.exe -h || echo ""
+	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vv --static $(FLAGS) \
 	-L ./llvm/lib/
 
 # Distributions
