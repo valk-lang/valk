@@ -13,7 +13,7 @@ CURL_LIN_X64="$LIB_DIR/linux-curl-x64"
 if [ ! -d "$LIN_X64" ]; then
 	echo "Download linux-x64 toolchain"
 	cd $TC_DIR
-	wget "https://cdn.valk-lang.dev/toolchains/linux-amd64.tar.gz"
+	wget "https://files.valk-cdn.dev/toolchains/linux-amd64.tar.gz"
 	tar -xf "linux-amd64.tar.gz" --checkpoint=.100
 	rm "linux-amd64.tar.gz"
 fi
@@ -21,7 +21,7 @@ fi
 if [ ! -d "$LLVM_LIN_X64" ]; then
 	echo "Download LLVM linux x64"
 	cd $LIB_DIR
-	wget "https://cdn.valk-lang.dev/toolchains/linux-llvm-15-x64.tar.gz"
+	wget "https://files.valk-cdn.dev/toolchains/linux-llvm-15-x64.tar.gz"
 	tar -xf "linux-llvm-15-x64.tar.gz" --checkpoint=.100
 	rm "linux-llvm-15-x64.tar.gz"
 fi
@@ -29,7 +29,7 @@ fi
 if [ ! -d "$CURL_LIN_X64" ]; then
 	echo "Download Curl linux x64"
 	cd $LIB_DIR
-	wget "https://cdn.valk-lang.dev/toolchains/linux-curl-x64.tar.gz"
+	wget "https://files.valk-cdn.dev/toolchains/linux-curl-x64.tar.gz"
 	tar -xf "linux-curl-x64.tar.gz" --checkpoint=.100
 	rm "linux-curl-x64.tar.gz"
 fi
