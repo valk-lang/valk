@@ -9,18 +9,21 @@
 + Finish all GC related todos
 + Add more basic features
 + Release 0.0.2
-
-- Implement all standard library functions
 - Use $lazy properties in compiler
+- Path class for creating correct win/macos/linux paths
+- Release 0.0.3
+
+- Use Path class for all paths in the compiler
+- Implement all standard library functions
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 - Allow identifiers for numbers in types, e.g. ptr[fs:PATH_MAX_LEN x u8] or global list : [MAX_ITEMS x uint]
 - Update docs
-- Release 0.0.3
+- Release 0.0.4
 
 - Interfaces
 - Union types
-- Release 0.0.4
+- Release 0.0.5
 ```
 
 ## For later
