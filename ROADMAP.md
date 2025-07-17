@@ -11,7 +11,7 @@
 + Release 0.0.2
 + Use $lazy properties in compiler
 + Path class for creating correct win/macos/linux paths
-- Release 0.0.3
++ Release 0.0.3
 
 - Use Path class for all paths in the compiler
 - Implement all standard library functions
