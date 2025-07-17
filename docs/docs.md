@@ -506,6 +506,8 @@ fn main() {
 }
 ```
 
+Note: `Path` is immutable. Each time you use `.add` or `.pop` it returns a new object.
+
 Although unclean paths usually work, for certain domains it's recommended to use `Path`. Like adding a path to your `exec` commands in case you want it to work cross-platform. Certain terminals cant handle using the wrong slashes.
 
 ```rust
