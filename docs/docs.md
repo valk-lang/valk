@@ -38,6 +38,8 @@
 * [Compile Conditions](#compile-conditions)
 * [Atomics](#atomics)
 * [Testing](#testing)
+* [Files](#files)
+    - [Paths](#paths)
 
 <br></td><td width=200px><br>
 
@@ -464,6 +466,52 @@ Or we can put our tests in a different directory.
 
 ```sh
 valk build src/*.v ./my-tests/*.valk --test --run
+```
+
+## Files
+
+use `valk:fs` to access all file system related functions
+
+```rust
+use valk:fs
+
+fn main() {
+    let content = fs:read("./myfile.txt") // Read file
+    fs:write("./myfile.txt", content) // Write to file
+    fs:remove("./myfile.txt") // Delete file
+    fs:mkdir("~/mydir") // Create directory
+    fs:rmdir("~/mydir") // Delete directory
+    fs:exists("~/mydir") // Check if file exists
+    fs:move("~/mydir", "~/newdir") // Rename file
+    fs:is_file("~/mydir") // Check if path is a file
+    fs:is_dir("~/mydir") // Check if path is a directory
+    fs:files_in("~/mydir") // Get all files in a directory
+    fs:symlink("/usr/bin/some", "~/project/bin/some") // Create symlinks
+}
+```
+
+## Paths
+
+The `Path` class helps you create clean paths. If your path starts with `./`, Path will auto resolve it to the full path. It cleans out double slashes `//` and it converts slashes to back-slashes and visa-versa based on if you are running on windows or another OS.
+
+```rust
+fn main() {
+    let path = fs:path("./dir1/dir2/file.txt")
+    let str = path.str() // Convert to string : e.g. /var/www/dir1/dir2/file.txt
+    println(path) // Path auto converts to string, so no need to use .str() everywhere
+    let file = path.basename() // file.txt
+    let dir = path.pop() // /var/www/dir1/dir2
+    let parent = dir.pop() // /var/www/dir1
+    let dir2 = parent.add("test\\hello.txt") // /var/www/dir1/test/hello.txt
+}
+```
+
+Although unclean paths usually work, for certain domains it's recommended to use `Path`. Like adding a path to your `exec` commands in case you want it to work cross-platform. Certain terminals cant handle using the wrong slashes.
+
+```rust
+fn main() {
+    core:exec("ls -l " + fs:path(mydir))
+}
 ```
 
 ## Unsafe
