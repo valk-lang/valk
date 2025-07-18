@@ -112,6 +112,7 @@ toolchains:
 
 # Misc
 clean:
-	rm ./valk
+	rm -f ./valk
+	rm -f ./valk2
 
 .PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux
