@@ -20,6 +20,7 @@ static: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
 install: valk
+	sudo rm -rf /opt/valk/${VERSION}/
 	sudo mkdir -p /opt/valk/${VERSION}/
 	sudo cp ./valk /opt/valk/${VERSION}/valk
 	sudo cp -r ./lib /opt/valk/${VERSION}/
