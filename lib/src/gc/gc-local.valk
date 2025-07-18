@@ -1,60 +1,45 @@
 
 use coro
-use core
-use mem
 
 value mem_minimum_trigger (256 * 1024)
 
-// Lists
-@shared stack_items: Bump (Bump.new())
-@shared dis_owned_list: Bump (Bump.new())
-@shared re_own_list: Bump (Bump.new())
-@shared mark_list: Lifo (Lifo.new())
-// Counters
-shared mem_marked: uint (0)
-shared mem_trigger: uint (mem_minimum_trigger)
-shared mem_new: uint (0)
+// Core
+global gc : Gc (@undefined)
+global check_shared : bool
+// Local - Counters
+global mem_marked: uint (0)
+global mem_trigger: uint (mem_minimum_trigger)
+global mem_new: uint (0)
+// Local - lists
+global globals: Bump (@undefined)
+global updated_list: Bump (@undefined)
+global blanks: Bump (@undefined)
+global dis_owned_list: Bump (@undefined)
+global re_own_list: Bump (@undefined)
+global mark_list: Lifo (@undefined)
 
-fn wait_for_gc() {
-    if runner_thread != thread {
-        thread.unlock()
-        lock.lock()
-        lock.unlock()
-        thread.lock()
-    }
-}
-
-struct Gc {
+class Gc {
+    check_shared_ptr: ptr[bool] (@ref(check_shared))
     //
     disable: bool (true)
     did_shutdown: bool (false)
 
     + static fn init() Gc {
+        globals = Bump.new()
+        updated_list = Bump.new()
+        blanks = Bump.new()
+        dis_owned_list = Bump.new()
+        re_own_list = Bump.new()
+        mark_list = Lifo.new()
         return Gc {}
     }
 
     fn collect() {
 
-        if running : wait_for_gc()
         if this.disable : return
-
-        let before = mem_minimum_trigger
-        thread.unlock()
-        lock.lock()
-        if mem_minimum_trigger != before {
-            lock.unlock()
-            thread.lock()
-            return
-        }
-        running = true
-        runner_thread = thread
         this.disable = true
 
-        // Lock all threads
-        each threads as t {
-            // print("WANT: #{ t.mutex.@cast(ptr) }\n")
-            t.lock()
-        }
+        let must_check_shared = check_shared
 
         // 
         this.loop_stack_items(Gc.mark_on_stack)
@@ -65,7 +50,7 @@ struct Gc {
         // Mark stack items
         this.loop_stack_items(Gc.mark_stack_item)
 
-        // 3 phases to dis-own
+        //
         this.loop_dis_own()
         this.loop_re_own()
 
@@ -75,30 +60,29 @@ struct Gc {
         this.check_blanks()
 
         // Reset pools
-        each threads as t {
-            reset_pools(t.pools, t.poolc_ptr[0])
-        }
+        reset_pools(pools, poolc)
 
         // Reset mem_new
         mem_new = mem_marked
 
         // Update trigger point
         let high = mem_marked / 100 * 120 + mem_minimum_trigger
-        let high2 = mem_trigger / 100 * 90
-        if high2 > high : high = high2
+        let low = mem_trigger / 100 * 90
+        if low > high : high = low
         mem_trigger = high
 
-        // Release all locks
-        each threads as t {
-            t.unlock()
+        //
+        if must_check_shared {
+            check_shared = false
+            let count = atomic_op(shared_run_count + 1)
+            if (count + 1) == shared_run_total {
+                // Im last - I need to clean the shared list
+                clean_shared()
+            }
         }
 
         //
         this.disable = false
-        running = false
-        runner_thread = null
-        thread.lock()
-        lock.unlock()
     }
 
     static fn mark_on_stack(item: GcItem) {
@@ -181,25 +165,23 @@ struct Gc {
 
     fn loop_updates() {
 
-        each threads as t {
-            let list = t.updated_list
-            let data = list.data
-            let adr = data
-            let end = adr + list.index
-            list.reset()
+        let list = updated_list
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.reset()
 
-            let ml = mark_list
+        let ml = mark_list
 
-            while adr < end {
-                let item = @ptrv(adr, GcItem)
-                adr += size_of(ptr)
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr += size_of(ptr)
 
-                let data = item.data()
-                data.remove_in_updates()
+            let data = item.data()
+            data.remove_in_updates()
 
-                if data.state == state_owned {
-                    ml.add(item)
-                }
+            if data.state == state_owned {
+                ml.add(item)
             }
         }
 
@@ -208,23 +190,21 @@ struct Gc {
 
     fn check_blanks() {
 
-        each threads as t {
-            let list = t.blanks
-            let data = list.data
-            let adr = data
-            let end = adr + list.index
-            list.reset()
+        let list = blanks
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.reset()
 
-            while adr < end {
-                let item = @ptrv(adr, GcItem)
-                adr += size_of(ptr)
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr += size_of(ptr)
 
-                let data = item.data()
-                data.remove_in_blanks()
-                if data.state != state_new : continue
+            let data = item.data()
+            data.remove_in_blanks()
+            if data.state != state_new : continue
 
-                free_blank(item)
-            }
+            free_blank(item)
         }
     }
 
@@ -234,55 +214,53 @@ struct Gc {
 
     fn loop_stack_items(func: fnRef(ptr)()) {
 
-        each threads as t {
-            // Globals
-            let g_adr = t.globals.data
-            let g_end_adr = g_adr + t.globals.index
-            while g_adr < g_end_adr {
-                let ref = @ptrv(g_adr, ptr)
-                let item = @ptrv(ref, ?ptr)
-                if isset(item) {
-                    func(item)
-                }
-                g_adr += size_of(ptr)
+        // Globals
+        let g_adr = globals.data
+        let g_end_adr = g_adr + globals.index
+        while g_adr < g_end_adr {
+            let ref = @ptrv(g_adr, ptr)
+            let item = @ptrv(ref, ?ptr)
+            if isset(item) {
+                func(item)
             }
+            g_adr += size_of(ptr)
+        }
 
-            // Stack
-            let adr = t.stack_root
-            let top = t.stack_top_ptr[0]
-            while adr < top {
-                let item = @ptrv(adr, ?ptr)
-                if isset(item) {
-                    func(item)
-                }
-                adr += size_of(ptr)
+        // Stack
+        let adr = stack_root
+        let top = stack_top
+        while adr < top {
+            let item = @ptrv(adr, ?ptr)
+            if isset(item) {
+                func(item)
             }
+            adr += size_of(ptr)
+        }
 
-            // Backup
-            adr = t.stack_backup
-            let size = t.stack_backup_size_ptr[0]
-            top = adr + size
-            while adr < top {
-                let item = @ptrv(adr, ?ptr)
-                if isset(item) {
-                    func(item)
-                }
-                adr += size_of(ptr)
+        // Backup
+        adr = stack_backup
+        let size = stack_backup_size
+        top = adr + size
+        while adr < top {
+            let item = @ptrv(adr, ?ptr)
+            if isset(item) {
+                func(item)
             }
+            adr += size_of(ptr)
+        }
 
-            let coros = @ptrv(t.coros_ptr, Array[?coro:Coro])
-            each coros as coro {
-                if isset(coro) {
-                    let adr = coro.stack
-                    if isset(adr) {
-                        let top = adr + coro.stack_size
-                        while adr < top {
-                            let item = @ptrv(adr, ?ptr)
-                            if isset(item) {
-                                func(item)
-                            }
-                            adr += size_of(ptr)
+        let coros = coro:g_coros
+        each coros as coro {
+            if isset(coro) {
+                let adr = coro.stack
+                if isset(adr) {
+                    let top = adr + coro.stack_size
+                    while adr < top {
+                        let item = @ptrv(adr, ?ptr)
+                        if isset(item) {
+                            func(item)
                         }
+                        adr += size_of(ptr)
                     }
                 }
             }
