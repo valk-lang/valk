@@ -12,6 +12,7 @@
 + Use $lazy properties in compiler
 + Path class for creating correct win/macos/linux paths
 + Release 0.0.3
++ Rework GC to remove reconnect list
 - Http option follow redirects (default: true)
 - Use Path class for all paths in the compiler
 - Implement all standard library functions
