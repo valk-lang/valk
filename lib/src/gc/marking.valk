@@ -1,38 +1,39 @@
 
 use core
 
-fn adjust_block(block: ptr, used: bool, gc: Gc) {
+fn adjust_block(block: ptr, used: bool) {
     if used {
         @ptrv(block, uint, 2)++
-        gc.mem_marked += @ptrv(block, uint, 4)
+        mem_marked += @ptrv(block, uint, 4)
     } else {
         @ptrv(block, uint, 2)--
-        gc.mem_marked -= @ptrv(block, uint, 4)
+        mem_marked -= @ptrv(block, uint, 4)
     }
 }
 
-fn increase_block(item: ptr, gc: Gc) $hot {
+fn increase_block(item: ptr) $hot {
     let data = (@offset(item, u8, -8)).@cast(GcData)
     let offset = data.block_offset
     if offset > 0 {
         let block = item - offset
-        adjust_block(block, true, gc)
+        adjust_block(block, true)
     }
 }
 
-fn mark_used(item: ?ptr) $hot {
+fn mark_used(item: ?GcItem) $hot {
 
-    let _gc = gc
-    let ml = _gc.mark_list
+    let ml = gc.mark_list
     if isset(item) : ml.add(item)
 
     while true {
         let item = ml.pop() ! break
 
         let data = (@offset(item, u8, -8)).@cast(GcData)
+        // if data.is_still_co_owned() : panic("STILL COO (2)")
+        // if data.is_shared() : panic("Setting shared item to owned state")
 
         let state = data.state
-        data.state = state_used
+        data.state = state_owned
 
         // Increase block counter
         if state == state_new {
@@ -40,41 +41,32 @@ fn mark_used(item: ?ptr) $hot {
             let offset = data.block_offset
             if offset > 0 {
                 let block = item - offset
-                adjust_block(block, true, _gc)
+                adjust_block(block, true)
             }
         }
 
         // Props
-        let has_vtable = data.has_vtable == 1
+        let has_vtable = data.has_vtable()
         let propc = data.propc
         if propc > 0 {
             // Mark properties
-            let reconnect = false
             let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
             while propc-- > 0 {
-                let sub = @ptrv(prop_base, ?ptr, propc)
-                if isset(sub) && (sub & 1 == 0) {
-                    let sub_data = (@offset(sub, u8, -8)).@cast(GcData)
-                    if sub_data.state < state_used {
-                        // Connect
+                let sub = @ptrv(prop_base, ?GcItem, propc)
+                if isset(sub) && (sub & 3 == 0) {
+                    let sub_data = gcdata(sub)
+                    if sub_data.state < state_owned && !sub_data.is_shared() {
+                        // Own
                         @ptrv(prop_base, ?ptr, propc) = sub | 1
-                        if sub_data.state == state_new : increase_block(sub, _gc)
-                        sub_data.state = state_used
+                        if sub_data.state == state_new : increase_block(sub)
+                        sub_data.state = state_owned
                         // Mark sub properties
                         ml.add(sub)
                     } else {
-                        // If already connected or is shared
-                        // Add to reconnect_list
-                        reconnect = true
+                        // Co-own
+                        @ptrv(prop_base, ?ptr, propc) = sub | 2
+                        sub_data.co_own()
                     }
-                }
-            }
-            if reconnect {
-                let in_list = data.in_list
-                if in_list & in_list_reconnect == 0 {
-                    data.in_list = in_list | in_list_reconnect
-                    let adr = _gc.reconnect_list.get(size_of(ptr))
-                    @ptrv(adr, ptr) = item
                 }
             }
         }
@@ -90,42 +82,63 @@ fn mark_used(item: ?ptr) $hot {
     }
 }
 
-fn disconnect_rec(item: ptr) $hot {
+fn free_blank(item: ptr) $hot {
+    let data = (@offset(item, u8, -8)).@cast(GcData)
+    if data.state != state_new : return
+    data.remove_has_vtable()
+    let vt = data.vtable
+    let func = @ptrv(vt, ?fnRef(ptr)(), 1)
+    if isset(func) {
+        func(item)
+    }
+}
 
-    let _gc = gc
-    let ml = _gc.mark_list
+fn dis_own_rec(item: ptr) {
+
+    let ml = gc.mark_list
     ml.add(item)
 
     while true {
-        let item = ml.pop() ! break
-        let data = (@offset(item, u8, -8)).@cast(GcData)
+        let item = (ml.pop() ! break).@cast(GcItem)
+        let data = gcdata(item)
+        // if data.is_shared() : panic("Dis owning a shared item")
+        // if data.mark != 0 : panic("Dis owning an item with a mark")
 
-        let has_vtable = data.has_vtable == 1
-        let propc = data.propc
         let offset = data.block_offset
 
         if offset > 0 {
             let block = item - offset
-            adjust_block(block, false, _gc)
+            adjust_block(block, false)
         }
 
         data.state = state_new
+        if data.co_count > 0 {
+            gc.re_own_list.add_ptr(item)
+        }
 
         // Props
+        let has_vtable = data.has_vtable()
+        let propc = data.propc
         if propc > 0 {
             // Mark properties
             let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
             while propc-- > 0 {
-                let sub = @ptrv(prop_base, ptr, propc)
-                if sub & 1 == 1 {
-                    let sub_item : ptr = sub & -2.to(uint)
-                    @ptrv(prop_base, ?ptr, propc) = sub_item
-
-                    let sub_data = (@offset(sub_item, u8, -8)).@cast(GcData)
-                    if sub_data.state < state_shared_unused {
-                        ml.add(sub_item)
-                    } else {
-                        sub_data.state--
+                let sub = @ptrv(prop_base, ?GcItem, propc)
+                if isset(sub) {
+                    // if sub & 3 == 3 : panic("IS3")
+                    if sub & 1 == 1 {
+                        sub = sub - 1
+                        @ptrv(prop_base, ptr, propc) = sub
+                        let data = gcdata(sub)
+                        if data.is_shared() {
+                            data.state = state_no_owner
+                            continue
+                        }
+                        ml.add(sub)
+                    } else if sub & 2 == 2 {
+                        sub = sub - 2
+                        @ptrv(prop_base, ptr, propc) = sub
+                        gcdata(sub).dis_co_own()
                     }
                 }
             }
@@ -136,92 +149,93 @@ fn disconnect_rec(item: ptr) $hot {
             let vt = data.vtable
             let func = @ptrv(vt, ?fnRef(ptr, fnRef(ptr, ptr)())(), 0)
             if isset(func) {
-                func(item, property_disconnect)
+                func(item, property_dis_own)
             }
-
-            let in_list = data.in_list
-            if in_list & in_list_blanks == 0 {
-                data.in_list = in_list | in_list_blanks
-
-                let adr = _gc.blanks.get(size_of(ptr))
-                @ptrv(adr, ptr) = item
+            if !data.is_in_blanks() {
+                data.set_in_blanks()
+                gc.blanks.add_ptr(item)
             }
         }
     }
-
-    return
 }
 
-fn free_blank(item: ptr) $hot {
-    let data = (@offset(item, u8, -8)).@cast(GcData)
-    if data.state != state_new : return
-    data.has_vtable = 0
-    let vt = data.vtable
-    let func = @ptrv(vt, ?fnRef(ptr)(), 1)
-    if isset(func) {
-        func(item)
+
+fn share_null_check(item: ?ptr) {
+    if isset(item) {
+        share(item)
     }
 }
 
-fn share_null_check(item: ?ptr) {
-    if !isset(item) : return
-    share(item)
-}
+fn share(item: GcItem) {
+    // let data = gcdata(item)
+    let ds = gc.dont_stop
+    gc.dont_stop = true
 
-fn share(item: ptr) {
-
-    let _gc = gc
-    let ml = _gc.mark_list
-    let i = ml.index
+    let ml = gc.mark_list
+    let start = ml.index
     ml.add(item)
 
     while true {
-        if ml.index == i : break
-        let item = ml.pop() ! break
+        if ml.index == start : break
+        let item = (ml.pop() ! break).@cast(GcItem)
+        // if item < 0x1000000 : panic("Corrupt share item\n")
+        let data = gcdata(item)
+        if data.mark == mark {
+            // if !data.is_shared() : panic("Has the correct mark, but isnt shared")
+            continue
+        }
 
-        let data = (@offset(item, u8, -8)).@cast(GcData)
-        if data.age == shared_mark : continue
+        let is_shared = data.is_shared()
+        data.mark = mark
 
-        let state = data.state
+        if !is_shared {
+            // if running : panic("Late stage sharing")
+            data.set_shared()
+            data.remove_still_co_owned()
+            let is_new = data.state == state_new
+            data.state = state_no_owner
 
-        data.age = shared_mark
-
-        if state < state_shared_unused {
-            let is_new = state == state_new
-            data.state = state + 2 + (is_new.@cast(u8))
+            gc.shared_items.add_ptr(item)
 
             let offset = data.block_offset
-            let block = item - offset
-
-            _gc.shared_items.add_ptr(item)
-
-            // Increase block counter
             if offset > 0 {
-                atomic_op(mem_shared + @ptrv(block, uint, 4))
+                let block = item - offset
+                let isize = @ptrv(block, uint, 4)
                 if is_new {
                     @ptrv(block, uint, 2)++
                 } else {
-                    _gc.mem_marked -= @ptrv(block, uint, 4)
+                    // let b = mem_marked
+                    mem_marked -= isize
+                    // if mem_marked > b : panic("Broken")
                 }
+                // Increase mem shared
+                atomic_op(mem_shared + isize)
             }
         }
 
         // Props
-        let has_vtable = data.has_vtable == 1
+        let has_vtable = data.has_vtable()
         let propc = data.propc
         if propc > 0 {
             // Mark properties
             let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
             while propc-- > 0 {
-                let sub = @ptrv(prop_base, ?ptr, propc)
+                let sub = @ptrv(prop_base, ?GcItem, propc)
                 if isset(sub) {
+                    let sub_item : GcItem = sub & -4.to(uint)
+
+                    let sub_data = gcdata(sub_item)
                     if sub & 1 == 1 {
-                        sub = sub - 1
-                        @ptrv(prop_base, ptr, propc) = sub
-                        let data = (@offset(sub, u8, -8)).@cast(GcData)
-                        data.state--
+                        // Remove ownership
+                        @ptrv(prop_base, ?GcItem, propc) = sub_item
+                        sub_data.state = state_no_owner
+                    } else if sub & 2 == 2 {
+                        // Remove co ownership
+                        @ptrv(prop_base, ?GcItem, propc) = sub_item
+                        sub_data.dis_co_own()
                     }
-                    ml.add(sub)
+
+                    ml.add(sub_item)
                 }
             }
         }
@@ -236,7 +250,48 @@ fn share(item: ptr) {
         }
     }
 
-    if mem_shared > mem_shared_trigger && !mem_shared_running && mem_shared_trigger > 0 {
-        collect_shared()
+    gc.dont_stop = ds
+
+    // if !ds : collect_shared_if_threshold_reached()
+    // if start == 0 : collect_shared_if_threshold_reached()
+}
+
+fn update_mark(item: GcItem) {
+    let data = gcdata(item)
+
+    let ml = gc.mark_list
+    ml.add(item)
+
+    while true {
+        let item = (ml.pop() ! break).@cast(GcItem)
+        let data = gcdata(item)
+                    // if !data.is_shared() : panic("Marking a non shared item")
+        if data.mark == mark : continue 
+        data.mark = mark
+
+        // Props
+        let has_vtable = data.has_vtable()
+        let propc = data.propc
+        if propc > 0 {
+            // Mark properties
+            let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
+            while propc-- > 0 {
+                let sub = @ptrv(prop_base, ?GcItem, propc)
+                if isset(sub) {
+                    let item : GcItem = sub & -4.to(uint)
+                    // if !gcdata(item).is_shared() : panic("Shared item has non shared properties")
+                    ml.add(item)
+                }
+            }
+        }
+
+        // Call hook gc_action
+        if has_vtable {
+            let vt = data.vtable
+            let func = @ptrv(vt, ?fnRef(ptr, fnRef(ptr, ptr)())(), 0)
+            if isset(func) {
+                func(item, property_update_mark)
+            }
+        }
     }
 }

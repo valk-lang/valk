@@ -3,72 +3,50 @@ use coro
 use core
 use mem
 
-~ global gc : Gc (@undefined)
+value mem_minimum_trigger (10 * 1024)
 
-global stack_root : [20_000 x ptr]
-global stack_top : ptr (@undefined)
-global stack_backup : [10_000 x ptr]
-global stack_backup_size : uint
-
-value mem_minimum_trigger (256 * 1024)
-
-fn thread_init() {
-    // mem:clear(stack_root, 20_000)
-    stack_top = stack_root
-    pools_init()
-    Gc.init()
-}
+// Core
+global gc : Gc (@undefined)
+// Local - Counters
+global mem_marked: uint
+global mem_trigger: uint
+global mem_new: uint
 
 struct Gc {
-    globals: Bump (Bump.new())
-    //
-    shared_state: u8 (shared_state_idle)
-    shared_update: bool (false)
-    mutex: core:MutexStruct[void]
+    mutex: core:MutexStruct[void] (core:MutexStruct[void].new())
     // Lists
+    globals: Bump (Bump.new())
     stack_items: Bump (Bump.new())
-    reconnect_list: Bump (Bump.new())
-    reconnect_list_prev: Bump (Bump.new())
-    disconnect_list: Bump (Bump.new())
+    updated_list: Bump (Bump.new())
     blanks: Bump (Bump.new())
+    dis_owned_list: Bump (Bump.new())
+    re_own_list: Bump (Bump.new())
     shared_items: Bump (Bump.new())
-    //
     mark_list: Lifo (Lifo.new())
-    // Counters
-    mem_marked: uint (0)
-    mem_trigger: uint (mem_minimum_trigger)
-    mem_suggestion: uint (mem_minimum_trigger)
-    mem_new: uint (0)
-    // Stacks
+    // Refs
     stack_root: ptr (stack_root)
-    stack_top_ptr: ptr[1 x ptr] (@ref(stack_top))
+    stack_top_ptr: ptr[ptr] (@ref(stack_top))
     stack_backup: ptr (stack_backup)
-    stack_backup_size_ptr: ptr[1 x ptr] (@ref(stack_backup_size))
+    stack_backup_size_ptr: ptr[uint] (@ref(stack_backup_size))
     coros_ptr: ptr[Array[?coro:Coro]] (@ref(coro:g_coros))
+    pools: ptr (pools)
+    poolc_ptr: ptr[uint] (@ref(poolc))
     //
+    mark_shared: bool (false)
+    dont_stop: bool (false)
     disable: bool (true)
     did_shutdown: bool (false)
 
     + static fn init() Gc {
-
-        let gcl = Gc {
-            mutex: core:MutexStruct[void].new()
-        }
-        gc = gcl
-
-        return gcl
+        mem_marked = mem_minimum_trigger
+        return Gc {}
     }
 
-    fn add_global(ref: ptr) {
-        let adr = this.globals.get(size_of(ptr))
-        @ptrv(adr, ptr) = ref
-    }
-
-    fn push_to_shared() {
-        add_gc(this)
-    }
+    fn lock() { this.mutex.lock() }
+    fn unlock() { this.mutex.unlock() }
 
     fn collect() {
+        if this.dont_stop : panic("Started GC while adding shared memory (bug)")
 
         if this.disable : return
         this.disable = true
@@ -82,76 +60,48 @@ struct Gc {
         // Mark stack items
         if !this.did_shutdown : this.loop_stack_items(Gc.mark_stack_item)
 
-        // Loop disconnects and disconnect sub pipes
-        this.loop_disconnects()
-
-        // Swap reconnect lists
-        let list = this.reconnect_list_prev
-        this.reconnect_list_prev = this.reconnect_list
-        this.reconnect_list = list
+        //
+        this.loop_dis_own()
+        if !this.did_shutdown : this.loop_re_own()
 
         // Reconnect to disconnected items
-        if !this.did_shutdown : this.loop_reconnects()
+        if !this.did_shutdown : this.loop_updates()
 
         this.check_blanks()
 
-        if !this.did_shutdown : this.loop_stack_items(Gc.mark_off_stack)
-
-        // Handle shared items
-        if this.shared_update {
-            if this.shared_state == shared_state_mark {
-                if !this.did_shutdown : this.mark_shared()
-            } else {
-                this.clear_shared()
-            }
-            this.shared_update = false
-        }
-
-        // Clear lists
-        this.blanks.reset()
-        this.reconnect_list_prev.reset()
-        this.disconnect_list.reset()
-
         // Reset pools
-        if !mem_shared_running : reset_pools()
+        if this.mark_shared : this.mark_shared_items()
+        else : reset_pools(this.pools, this.poolc_ptr[0])
+
         // Reset mem_new
-        this.mem_new = this.mem_marked
+        mem_new = mem_marked
 
         // Update trigger point
-        let high = this.mem_marked / 100 * 120 + mem_minimum_trigger
-        let high_sug = this.mem_marked / 100 * 110 + mem_minimum_trigger
-        let high2 = this.mem_trigger / 100 * 90
-        if high2 > high : high = high2
-        if high2 > high_sug : high_sug = high2
-        this.mem_trigger = high
-        this.mem_suggestion = high_sug
+        let high = mem_marked / 100 * 120 + mem_minimum_trigger
+        let low = mem_trigger / 100 * 90
+        if low > high : high = low
+        mem_trigger = high
 
         //
         this.disable = false
     }
 
-    static fn mark_on_stack(item: ptr) {
-        let data = (@offset(item, u8, -8)).@cast(GcData)
-        data.on_stack = 1
-    }
-    static fn mark_off_stack(item: ptr) {
-        let data = (@offset(item, u8, -8)).@cast(GcData)
-        data.on_stack = 0
+    static fn mark_on_stack(item: GcItem) {
+        gcdata(item).set_on_stack()
     }
 
     static fn mark_stack_item(item: ptr) {
         let data = (@offset(item, u8, -8)).@cast(GcData)
-        if data.state < state_used {
+        if data.state < state_owned && !data.is_shared() {
             mark_used(item)
-
-            let li = gc.stack_items.get(size_of(ptr))
-            @ptrv(li, ptr) = item
+            gc.stack_items.add_ptr(item)
         }
+        data.remove_on_stack()
     }
 
     fn loop_previous_stack_items() {
 
-        let discs = this.disconnect_list
+        let discs = this.dis_owned_list
         let list = this.stack_items
         let data = list.data
         let adr = data
@@ -163,56 +113,84 @@ struct Gc {
             let data = (@offset(item, u8, -8)).@cast(GcData)
             adr += size_of(ptr)
 
-            if data.on_stack == 0 {
-                let adr = discs.get(size_of(ptr))
-                @ptrv(adr, ptr) = item
+            // A stack item can become shared
+            if data.is_shared() : continue
 
-                data.state--
-            } else {
+            if data.is_on_stack() {
                 let adr = list.get(size_of(ptr))
                 @ptrv(adr, ptr) = item
+            } else {
+                let adr = discs.get(size_of(ptr))
+                @ptrv(adr, ptr) = item
+                data.state = state_no_owner
             }
         }
     }
 
-    fn loop_disconnects() {
+    fn loop_dis_own() {
 
-        let list = this.disconnect_list
+        let list = this.dis_owned_list
+        let data = list.data
+        let adr = data
+
+        while adr < data + list.index {
+            let item = @ptrv(adr, ptr)
+            let data = (@offset(item, u8, -8)).@cast(GcData)
+            adr += size_of(ptr)
+
+            // A dis-owned item can become shared, so we need to make sure it's ignored
+            if data.state == state_no_owner && !data.is_shared() {
+                dis_own_rec(item)
+            }
+        }
+
+        list.reset()
+    }
+
+    fn loop_re_own() {
+
+        let list = this.re_own_list
         let data = list.data
         let adr = data
         let end = adr + list.index
+        list.reset()
 
         while adr < end {
             let item = @ptrv(adr, ptr)
             let data = (@offset(item, u8, -8)).@cast(GcData)
             adr += size_of(ptr)
 
-            if data.state == state_unused {
-                disconnect_rec(item)
+            // if data.is_shared() : panic("Shared re-own item")
+
+            if data.state == state_new && data.co_count > 0 {
+                mark_used(item)
+                data.set_still_co_owned()
             }
         }
     }
 
-    fn loop_reconnects() {
+    fn loop_updates() {
 
-        let list = this.reconnect_list_prev
+        let list = this.updated_list
         let data = list.data
         let adr = data
         let end = adr + list.index
+        list.reset()
+
         let ml = this.mark_list
 
         while adr < end {
-            let item = @ptrv(adr, ptr)
-            let data = (@offset(item, u8, -8)).@cast(GcData)
+            let item = @ptrv(adr, GcItem)
             adr += size_of(ptr)
 
-            data.in_list = data.in_list & (255 - in_list_reconnect)
+            let data = gcdata(item)
+            data.remove_in_updates()
 
-            if data.state == state_used {
-                // mark_used(item)
+            if data.state == state_owned {
                 ml.add(item)
             }
         }
+
         mark_used(null)
     }
 
@@ -222,13 +200,14 @@ struct Gc {
         let data = list.data
         let adr = data
         let end = adr + list.index
+        list.reset()
 
         while adr < end {
-            let item = @ptrv(adr, ptr)
+            let item = @ptrv(adr, GcItem)
             adr += size_of(ptr)
 
-            let data = (@offset(item, u8, -8)).@cast(GcData)
-            data.in_list = data.in_list & (255 - in_list_blanks)
+            let data = gcdata(item)
+            data.remove_in_blanks()
             if data.state != state_new : continue
 
             free_blank(item)
@@ -276,7 +255,7 @@ struct Gc {
             adr += size_of(ptr)
         }
 
-        let coros = @ptrv(this.coros_ptr, Array[?coro:Coro])
+        let coros = this.coros_ptr[0]
         each coros as coro {
             if isset(coro) {
                 let adr = coro.stack
@@ -298,111 +277,82 @@ struct Gc {
     // Shared
     //////////////////////////
 
-    fn mark_shared() {
-        let list = this.reconnect_list
+    fn mark_shared_items() {
+        this.mark_shared = false
+        // Loop over stack items
+        this.loop_stack_items(fn(item: GcItem) {
+            let data = gcdata(item)
+            // if data.is_shared() : update_mark(item)
+            if data.is_shared() : share(item)
+        })
+    }
+
+    fn update_marks() {
+        let list = this.shared_items
         let data = list.data
         let adr = data
         let end = adr + list.index
 
         while adr < end {
-            let item = @ptrv(adr, ptr)
-            let data = (@offset(item, u8, -8)).@cast(GcData)
+            let item = @ptrv(adr, GcItem)
             adr += size_of(ptr)
-
-            // Props
-            let has_vtable = data.has_vtable == 1
-            let propc = data.propc
-            if propc > 0 {
-                // Mark properties
-                let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
-                while propc-- > 0 {
-                    let sub = @ptrv(prop_base, ?ptr, propc)
-                    if isset(sub) {
-                        let base = sub & -2.to(uint)
-                        let data = (@offset(base, u8, -8)).@cast(GcData)
-                        if data.state == state_shared_unused {
-                            share(base)
-                        }
-                    }
-                }
-            }
-
-            // Call hook _gc_share
-            if has_vtable {
-                let vt = data.vtable
-                let func = @ptrv(vt, ?fnRef(ptr, fnRef(ptr, ptr)())(), 0)
-                if isset(func) {
-                    func(item, property_share_update_age)
-                }
-            }
-        }
-
-        // Mark stack items
-        this.loop_stack_items(fn(item: ptr) {
-            let data = (@offset(item, u8, -8)).@cast(GcData)
-            if data.state == state_shared_unused {
-                share(item)
-            }
-        })
-
-        // Update age for shared items
-        let list2 = this.shared_items
-        let data2 = list2.data
-        let adr2 = data2
-        let end2 = adr2 + list2.index
-
-        while adr2 < end2 {
-            let item = @ptrv(adr2, ptr)
-            let data = (@offset(item, u8, -8)).@cast(GcData)
-            adr2 += size_of(ptr)
-
-            if data.state == state_shared {
+            let data = gcdata(item)
+            if data.state == state_owned || data.co_count > 0 {
                 share(item)
             }
         }
     }
-    fn clear_shared() {
 
+    // fn validate_shared() {
+    //     let list = this.shared_items
+    //     let data = list.data
+    //     let adr = data
+    //     let end = adr + list.index
+
+    //     while adr < end {
+    //         let item = @ptrv(adr, GcItem)
+    //         adr += size_of(ptr)
+    //         let data = gcdata(item)
+
+    //         if !data.is_shared() : panic("Shared items contains non-shared")
+    //         if data.state == state_new : panic("Shared items contains new_state")
+    //     }
+    // }
+
+    fn clear_shared() {
         let list = this.shared_items
         let data = list.data
         let adr = data
         let end = adr + list.index
         list.reset()
 
-        let mark = shared_mark
-
         while adr < end {
-            let item = @ptrv(adr, ptr)
-            let data = (@offset(item, u8, -8)).@cast(GcData)
+            let item = @ptrv(adr, GcItem)
             adr += size_of(ptr)
+            let data = gcdata(item)
 
-            if data.age == mark {
+            if data.mark == mark {
                 list.add_ptr(item)
                 continue
             }
 
-            // Clear shared item
-            // Load data before clear
-            let has_vtable = data.has_vtable == 1
+            free_shared_item(item)
+            // let has_vtable = data.has_vtable()
+            // let vt = data.vtable
+            // let offset = data.block_offset
+            // @ptrv(data, u32) = 0
+            // data.mark = 0
 
-            // Clear data
-            @ptrv(data, u32) = 0
+            // if offset > 0 {
+            //     let block = item - offset
+            //     @ptrv(block, uint, 2)--
+            //     atomic_op(mem_shared - @ptrv(block, uint, 4))
+            // }
 
-            let offset = data.block_offset
-            if offset > 0 {
-                let block = item - offset
-                @ptrv(block, uint, 2)-- // Reduce block items-used
-                atomic_op(mem_shared - @ptrv(block, uint, 4))
-
-                if has_vtable {
-                    let vt = data.vtable
-                    // gc_free
-                    let ff = @ptrv(vt, ?fnRef(ptr)(), 1)
-                    if isset(ff) {
-                        ff(item)
-                    }
-                }
-            }
+            // if has_vtable {
+            //     let func = @ptrv(vt, ?fnRef(ptr)(), 1)
+            //     if isset(func) : func(item)
+            // }
         }
     }
 
@@ -413,11 +363,9 @@ struct Gc {
     + fn shutdown() {
         this.did_shutdown = true
         this.collect()
-        this.mutex.unlock()
-        remove_gc(this)
 
         // Free blocks or store them in unused-block-list if they still contain items
-        shutdown_lock.lock()
+        pool_lock.lock()
         loop_all_blocks(fn(block: Block)() {
             if block.used == 0 {
                 mem:free(block)
@@ -425,22 +373,24 @@ struct Gc {
                 add_unused_block(block)
             }
         })
-        shutdown_lock.unlock()
+        pool_lock.unlock()
 
+        lock.lock()
         dump_shared(this.shared_items)
+        lock.unlock()
 
         //
         this.mutex.free()
+        //
+        this.globals.free()
         this.stack_items.free()
-        this.reconnect_list.free()
-        this.reconnect_list_prev.free()
-        this.disconnect_list.free()
+        this.updated_list.free()
         this.blanks.free()
+        this.dis_owned_list.free()
+        this.re_own_list.free()
         this.shared_items.free()
         this.mark_list.free()
+        //
         mem:free(this)
-
-        // Free pools
-        pools_free()
     }
 }

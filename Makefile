@@ -20,6 +20,7 @@ static: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
 install: valk
+	sudo rm -rf /opt/valk/${VERSION}/
 	sudo mkdir -p /opt/valk/${VERSION}/
 	sudo cp ./valk /opt/valk/${VERSION}/valk
 	sudo cp -r ./lib /opt/valk/${VERSION}/
@@ -112,6 +113,7 @@ toolchains:
 
 # Misc
 clean:
-	rm ./valk
+	rm -f ./valk
+	rm -f ./valk2
 
 .PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux
