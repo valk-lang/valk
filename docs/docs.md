@@ -496,7 +496,7 @@ fn main() {
 {
     fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
     fs:realpath(path) // Resolve a symlink path
-    fs:merge(dir, fn) // Returns dir + {slash} + fn, but prevents double slashes
+    fs:add(dir, fn) // Returns dir + {slash} + fn, but prevents double slashes
 }
 ```
 
