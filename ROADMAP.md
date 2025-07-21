@@ -14,7 +14,7 @@
 + Release 0.0.3
 + Rework GC to remove reconnect list
 + Http option follow redirects (default: true)
-- Use fs:resolve on all paths in the compiler
++ Use fs:resolve on all paths in the compiler
 - Warn unused variables / namespaces. And --no-warn/-nw option
 - Type modes (mode Path for String) (extends type but no new properties allowed)
 + Release 0.0.4
