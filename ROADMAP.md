@@ -13,18 +13,19 @@
 + Path class for creating correct win/macos/linux paths
 + Release 0.0.3
 + Rework GC to remove reconnect list
-- Http option follow redirects (default: true)
++ Http option follow redirects (default: true)
 - Use Path class for all paths in the compiler
++ Release 0.0.4
 - Implement all standard library functions
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 - Allow identifiers for numbers in types, e.g. ptr[fs:PATH_MAX_LEN x u8] or global list : [MAX_ITEMS x uint]
 - Update docs
-- Release 0.0.4
+- Release 0.0.5
 
 - Interfaces
 - Union types
-- Release 0.0.5
+- Release 0.0.6
 ```
 
 ## For later
