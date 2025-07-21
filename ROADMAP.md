@@ -16,7 +16,9 @@
 + Http option follow redirects (default: true)
 - Use fs:resolve on all paths in the compiler
 - Warn unused variables / namespaces. And --no-warn/-nw option
+- Type modes (mode Path for String) (extends type but no new properties allowed)
 + Release 0.0.4
+- Use Path mode in compiler
 - Implement all standard library functions
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
