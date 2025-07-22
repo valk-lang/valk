@@ -21,11 +21,12 @@
 - Release 0.0.4
 - Use Path mode in compiler
 - Implement all standard library functions
-- Use correct windows api and waitForMultipleObjects
-- Make wait-for-thread non-blocking
 - Allow identifiers for numbers in types, e.g. ptr[fs:PATH_MAX_LEN x u8] or global list : [MAX_ITEMS x uint]
 - Update docs
 - Release 0.0.5
+- Share project with others?
+- Use correct windows api and waitForMultipleObjects
+- Make wait-for-thread non-blocking
 
 - Interfaces
 - Union types
