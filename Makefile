@@ -1,4 +1,5 @@
 
+VALKV=0.0.3
 VERSION=0.0.4
 
 HDRS=$(wildcard headers/*.valk.h)
@@ -11,8 +12,11 @@ FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 # Build
 valk: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv $(FLAGS)
-valk2: valk $(SRC) $(HDRS)
-	./valk build . src/*.valk -o ./valk2 -vv --def "VERSION=0.0.4"
+valk2: 
+	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
+valk3: 
+	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
+
 valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
 	./valk2 build . src/*.valk -o ./valk3 -vv --def "VERSION=0.0.4"
@@ -78,6 +82,7 @@ ci-win: $(SRC) $(HDRS)
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
+	vpkg use $(VALKV)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	valk build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean $(FLAGS)
@@ -85,6 +90,7 @@ linux-x64: $(SRC) $(HDRS)
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
 macos-x64: $(SRC) $(HDRS)
+	vpkg use $(VALKV)
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
 	valk build . src/*.valk -o ./dist/macos-x64/valk -vv --static --target macos-x64 --clean $(FLAGS)
@@ -92,6 +98,7 @@ macos-x64: $(SRC) $(HDRS)
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
 macos-arm64: $(SRC) $(HDRS)
+	vpkg use $(VALKV)
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
 	valk build . src/*.valk -o ./dist/macos-arm64/valk -vv --static --target macos-arm64 --clean $(FLAGS)
@@ -99,6 +106,7 @@ macos-arm64: $(SRC) $(HDRS)
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
 win-x64:
+	vpkg use $(VALKV)
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
 	valk build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean $(FLAGS)
@@ -119,4 +127,4 @@ clean:
 	rm -f ./valk
 	rm -f ./valk2
 
-.PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2
+.PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
