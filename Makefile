@@ -12,9 +12,9 @@ FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 # Build
 valk: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv $(FLAGS)
-valk2: 
+valk2: valk
 	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
-valk3: 
+valk3: valk2
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
 
 valk-profile: valk2
@@ -42,7 +42,7 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS)
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
