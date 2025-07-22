@@ -13,6 +13,9 @@ valk: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv $(FLAGS)
 valk2: valk $(SRC) $(HDRS)
 	./valk build . src/*.valk -o ./valk2 -vv --def "VERSION=0.0.4"
+valk-profile: valk2
+	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
+	./valk2 build . src/*.valk -o ./valk3 -vv --def "VERSION=0.0.4"
 
 valkd: $(SRC) $(HDRS)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
