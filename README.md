@@ -114,6 +114,11 @@ When not to use Valk:
 
 Once we hit version 0.1.0, we want to look for people who can help with the standard library & 3rd party packages. If you want to contribute, just hop into the discord and post in general chat or send a private message to the discord owner.
 
+<div align="center"><p>
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valko-circle.png">
+</p>
+</div>
+
 ## References
 
 Binary tree benchmark code: [https://programming-language-benchmarks.vercel.app/problem/binarytrees](https://programming-language-benchmarks.vercel.app/problem/binarytrees)
