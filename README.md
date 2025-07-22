@@ -86,7 +86,7 @@ The binary object tree test revolves around creating large amount of short-/long
 
 ## Why Valk over Rust, Go, Zig?
 
-Rust: Too much complexity in our opinion. It's not fun if you are already trying to fix complex problems.
+Rust: Too much complexity in our opinion. It's not fun if you are already trying to solve complex problems.
 
 Zig: Manual memory management. Which we can respect, but it's not something you want to do always for every project. And even if you manage it manually, we think Valk will still out perform your custom memory management in large projects.
 
