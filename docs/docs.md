@@ -155,7 +155,10 @@ let v : u8 = "100".to(u8) // This works
 ```rust
 let name = "Peter"
 let msg1 = "Hello " + name + "!" // Concat strings
-let msg2 = "Hello #{name}!" // Short way (you can use any code inside #{} as long as we can convert it to a string)
+let msg2 = "Hello %name!" // Short way
+let msg3 = "Name length x 2: %{ name.length * 2 }!" // Inline value (You can use any code inside %{} as long as it can be converter to String)
+let msg4 = "Hello \%name!" // Prevent inlining using '\' before '%'
+let msg5 = r"Hello %name!" // Prevent inlining using 'r' (raw) at the start 
 ```
 
 ## Functions
