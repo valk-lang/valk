@@ -86,23 +86,29 @@ The binary object tree test revolves around creating large amount of short-/long
 
 ## Why Valk over Rust, Go, Zig?
 
-Valk offers a performance & simplicity mixture that these other languages cannot offer. Both Rust & Zig require you to think about alot of extra concepts. If you are trying to solve complex problems, you dont want more complexity on top of it.
+Rust: Too much complexity in our opinion. It's not fun if you are already trying to fix complex problems.
 
-As for performance, Valk and these 3 other languages will all relatively run at the same speed because they will mostly resolve to the same CPU instructions. But there's one big difference between them and that's how they manage memory. Currently we have a test where we compare the handling of millions of short/long-lived objects in Valk/Rust/Go. Valk seems to be ~30% faster than Rust and ~65% faster than Go. So not only do you get a simple language, you get very great performance as well. We cant compare it to Zig because how they manage memory is up to the developer.
+Zig: Manual memory management. Which we can respect, but it's not something you want to do always for every project. And even if you manage it manually, we think Valk will still out perform your custom memory management in large projects.
 
-Why is Valk so fast memory wise? We use memory pools and have an innovative gc algorithm. This algorithm has multiple benefits. E.g. We free short-lived objects using 0 cpu instructions. If you have a million short-lived objects, Rust would call `free()` a million times (we guess). Valk just resets a single pointer in the pool and all objects are freed at once.
+Go: It's nice, but it also has alot wrong with it. No thread local globals, nil crashes, dead locks, it's package management, etc. etc. Valk tries to fix these pain-points. We also aim to be faster than Go.
 
-As for long-lived objects, this is where Valk also shines because our GC is completely stateful. We dont need to mark/sweep everything to see which objects are no longer used. We track the changes instead. This is also why we get such performance win over Go. When long-lived objects exist, Go has to mark/sweep them, we dont.
+When not to use Valk:
+
+- Creating .dll/.so files. We currently dont even support it (but we will).
+
+- When you need 100% control. Like if your program needs to change specific CPU register values.
+
+- When your program needs to run on niche infrastructure. We currently only do: win/linux/mac with x64/arm64.
 
 ## Language design
 
-- Each thread handles it's own memory, but you can still share your variables with other threads. Even when your thread has ended, the memory will still be valid and automatically freed once other threads no longer use it.
+- Co routines are semi-stackful. We run the co-routines on the main stack and if it blocks, we copy it to a temporary buffer. This way we can keep memory usage low. And yes, it's fast.
 
-- Unlike other languages, our GC has no randomness. Every run is exactly the same as the run before to the last byte. So there are no fluctuations in cpu usage and memory usage. (Except when using shared memory over multiple threads)
+- Each thread manages it's own memory. So we dont need to block other threads. You can share objects with other threads. Each time you do, the shared memory counter increases. At a certain point it will block other threads to free un-used shared objects. But we never block every X seconds like other languages do.
 
-- Reading shared data from multiple threads is safe. Mutating shared data is not. The developer is responsible for using mutexes/atomics.
+- The local GC has no randomness. Every time you run a program it will use the exact same amount of memory and run the exact same speed.
 
-- Coroutines are single threaded. So mutating data over multiple coroutines is safe.
+- Co routines are single threaded. We dont do task-stealing.
 
 ## Contributions
 
