@@ -106,7 +106,7 @@ When not to use Valk:
 
 - Each thread manages it's own memory. So we dont need to block other threads. You can share objects with other threads. Each time you do, the shared memory counter increases. At a certain point it will block other threads to free un-used shared objects. But we never block every X seconds like other languages do.
 
-- The local GC has no randomness. Every time you run a program it will use the exact same amount of memory and run the exact same speed.
+- The local GC has no randomness. Every time you run a program it will use the exact same amount of memory and run at the exact same speed.
 
 - Co routines are single threaded. We dont do task-stealing.
 
