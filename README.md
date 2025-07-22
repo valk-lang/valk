@@ -36,6 +36,8 @@ fn main() {
 ```sh
 valk build main.valk -o ./main
 ./main
+# Or to quickly build & run a script:
+# valk main.valk
 ```
 
 ## Build from source (Linux / macOS / WSL)
