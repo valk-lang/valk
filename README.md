@@ -18,7 +18,7 @@ To see what a persistent GC can do, see the [benchmarks](#benchmarks)
 Linux / MacOS
 
 ```
-curl -s https://valk-lang.dev/install.sh | bash -s latest
+curl -s https://valk-lang.dev/install.sh | bash
 ```
 
 Windows: Download from our website and unzip it into a directory. Optionally: Add the directory to your PATH.
