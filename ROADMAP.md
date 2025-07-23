@@ -18,7 +18,7 @@
 + Warn unused variables / namespaces. And --no-warn/-nw option
 + Type modes (mode Path for String) (extends type but no new properties allowed)
 + Dont use hashes to compare IR. Just compare file content (= faster & more correct)
-- Release 0.0.4
++ Release 0.0.4
 - Use Path mode in compiler
 - Implement all standard library functions
 - Allow identifiers for numbers in types, e.g. ptr[fs:PATH_MAX_LEN x u8] or global list : [MAX_ITEMS x uint]

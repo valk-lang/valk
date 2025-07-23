@@ -1,6 +1,6 @@
 
-VALKV=0.0.3
-VERSION=0.0.4
+VALKV=0.0.4
+VERSION=0.0.5
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
@@ -19,7 +19,7 @@ valk3: valk2
 
 valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
-	./valk2 build . src/*.valk -o ./valk3 -vv --def "VERSION=0.0.4"
+	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
 
 valkd: $(SRC) $(HDRS)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
