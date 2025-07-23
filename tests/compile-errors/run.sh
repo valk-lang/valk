@@ -22,7 +22,7 @@ while IFS=';' read -r file msg; do
     fi
 
     count=$((count+1))
-    cmd="./valk build ./tests/compile-errors/$file.valk"
+    cmd="./valk build ./tests/compile-errors/$file.valk -vvv"
     output=$($cmd)
     status=$?
 
