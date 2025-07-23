@@ -16,6 +16,8 @@ valk2: valk
 	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
 valk3: valk2
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
+valkvg: valk
+	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
 
 valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
