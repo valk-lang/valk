@@ -24,12 +24,14 @@ while IFS=';' read -r file msg; do
     count=$((count+1))
     cmd="./valk build ./tests/compile-errors/$file.valk"
     output=$($cmd)
+    status=$?
 
     # Check if build command failed
-    if [[ $? -ne 1 ]]; then
+    if [[ $status -eq 0 ]]; then
         echo "# Build command should have failed, but didnt."
         echo "- File: $file"
         echo "- Cmd: $cmd"
+        echo "- Exit code: $status"
         echo "- Output: $output"
         exit 1
     fi
@@ -39,6 +41,7 @@ while IFS=';' read -r file msg; do
         echo "# Build command did return the correct error message."
         echo "- File: $file"
         echo "- Cmd: $cmd"
+        echo "- Exit code: $status"
         echo "- Output: $output"
         echo "- Missing mesage: $msg"
         exit 1
