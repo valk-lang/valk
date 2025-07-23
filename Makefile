@@ -44,9 +44,9 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
+	@./tests/compile-errors/run.sh
 	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all
 	./debug/test-all
-	@./tests/compile-errors/run.sh
 
 test-win: valk
 	mkdir -p ./debug
