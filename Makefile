@@ -74,7 +74,7 @@ ci-linux: $(SRC) $(HDRS)
 
 ci-macos: $(SRC) $(HDRS)
 	valk -h || true
-	valk build . src/*.valk -o ./valk -vv --no-opt -l zstd $(FLAGS) \
+	valk build . src/*.valk -o ./valk -vv --static -l zstd $(FLAGS) \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
