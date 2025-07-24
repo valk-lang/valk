@@ -1,6 +1,6 @@
 
-VALKV=0.0.4
-VERSION=0.0.5
+VALKV=0.0.3
+VERSION=0.0.4
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
