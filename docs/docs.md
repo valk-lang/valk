@@ -172,9 +172,9 @@ let b = array[String]{ "1", "2", "3" } // Init using macro
 // Api
 a.length // Returns amount of items in the array
 a.append(b) // Append value
-a.prepend(b) // Prepend value
+a.prepend(b) // Prepend value (append is faster than prepend)
 a.append_many(b) // Append multiple
-a.prepend_many(b) // Append multiple
+a.prepend_many(b) // Prepend multiple
 a.get(index) ! // Get value by index
 a.set(index, value) ! // Set value by index
 a.remove(index) // Remove by index
