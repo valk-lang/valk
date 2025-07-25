@@ -13,6 +13,8 @@
 * [Types](#types)
 * [Variables](#variables)
 * [Strings](#strings)
+* [Arrays](#arrays)
+* [Maps](#maps)
 * [Functions](#functions)
    * [Error Handling](#error-handling)
    * [Closures](#closures)
@@ -159,6 +161,21 @@ let msg2 = "Hello %name!" // Short way
 let msg3 = "Name length x 2: %{ name.length * 2 }!" // Inline value (You can use any code inside %{} as long as it can be converter to String)
 let msg4 = "Hello \%name!" // Prevent inlining using '\' before '%'
 let msg5 = r"Hello %name!" // Prevent inlining using 'r' (raw) at the start 
+```
+
+## Arrays
+
+```rust
+let a = Array[String].new()
+a.append("X")
+a.append("Y")
+// Short
+let b = array[String]{ "X", "Y" }
+let c = a + b // X, Y, X, Y (calls .merge which returns a copy)
+c.unique() // X, Y (Make list unique)
+c.prepend("A") // A, X, Y
+c.append_many(array[String]{ "Z", "O" }) // A, X, Y, Z, O
+c.part(1, 3) // X, Y, Z
 ```
 
 ## Functions
