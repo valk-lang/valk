@@ -321,9 +321,29 @@ fn main() {
 }
 ```
 
+## Modes
+
+With `mode` you can write a wrapper around an existing class. Allowing you to overwrite functions for custom behaviour. You cannot add new properties. Mode types are always compatible with its base type.
+
+```rust
+mode LowerCaseString for String {
+    fn equals(cmp: LowerCaseString) bool $eq {
+        return this.lower() == cmp.lower()
+    }
+}
+
+fn main() {
+    let a : String = "HELLO"
+    let b : LowerCaseString = "HELLO"
+    println(a == "hello") // False
+    println(b == "hello") // True
+}
+```
+
+
 ## Globals
 
-```
+```rust
 global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
 ```
