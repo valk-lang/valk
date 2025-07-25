@@ -574,38 +574,41 @@ use `valk:fs` to access all file system related functions
 
 ```rust
 use valk:fs
-
-fn main() {
-    let content = fs:read("./myfile.txt") // Read file
-    fs:write("./myfile.txt", content) // Write to file
-    fs:remove("./myfile.txt") // Delete file
-    fs:mkdir("~/mydir") // Create directory
-    fs:rmdir("~/mydir") // Delete directory
-    fs:exists("~/mydir") // Check if file exists
-    fs:move("~/mydir", "~/newdir") // Rename file
-    fs:is_file("~/mydir") // Check if path is a file
-    fs:is_dir("~/mydir") // Check if path is a directory
-    fs:files_in("~/mydir") // Get all files in a directory
-    fs:symlink("/usr/bin/some", "~/project/bin/some") // Create symlinks
-}
+// File & Directories
+let content = fs:read(path) // Read file to String
+fs:write(path, content)
+fs:remove(path)
+fs:move(from_path, to_path)
+fs:exists(path)
+fs:mkdir(path)
+fs:rmdir(path)
+fs:is_file(path)
+fs:is_dir(path)
+fs:files_in(path) // Returns all files in a directory -> Array[String]
+fs:symlink(link_path, target_path) // Create a symlink
+// Paths
+fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
+fs:realpath(path) // Returns the target path from a symlink
+fs:dir_of(path) // ./part1/part2 -> ./part1
+fs:basename(path) // ./part1/part2 -> part2
+fs:ext(path, with_dot) // Returns the extension from a path, e.g. "jpg",".jpg" otherwise ""
+fs:add(part1, part2) // Returns part1 + {slash} + part2, prevents double slashes
+fs:cwd() // Returns current working directory
+fs:chdir(path) // Change current working directory
+fs:exe_path() // Returns the path of the running executable
+fs:exe_dir() // Returns the directory of the running executable
+fs:home_dir() // Returns the home directory from the user running the executable
+fs:path(path) // Converts String to Path class (more info below)
 ```
 
 ## Paths
-
-```rust
-{
-    fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
-    fs:realpath(path) // Resolve a symlink path
-    fs:add(dir, fn) // Returns dir + {slash} + fn, but prevents double slashes
-}
-```
 
 Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs:path("path")`
 
 ```rust
 fn main() {
     let path : Path = "."
-    path = path.add("folder1").add("folder2/").add("/file")
+    path = path.add("folder1").add("folder2/").add("/file") // Adding parts to a path without worrying about double slashes
     println(path) // ./folder1/folder2/file
     path = path.resolve()
     println(path) // /var/www/folder1/folder2/file
