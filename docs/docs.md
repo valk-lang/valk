@@ -177,9 +177,9 @@ a.append_many(b) // Append multiple
 a.prepend_many(b) // Prepend multiple
 a.get(index) ! // Get value by index
 a.set(index, value) ! // Set value by index
+a.set_expand(index, value, gap_value) // Set value by index, fill the gaps with the gap-value
 a.remove(index) // Remove by index
 a.remove_value(value) // Remove by value
-a.set_expand(index, value, gap_value) // Set value by index, fill the gaps with the gap-value
 a.part(1, 3) // Copy a part from the array, args: (start-index, amount)
 a.range(2, 2) // Copy a part from the array, args: (start-index, end-index, inclusive = true)
 a.contains(value) // Checks if array contains a certain value
