@@ -166,16 +166,50 @@ let msg5 = r"Hello %name!" // Prevent inlining using 'r' (raw) at the start
 ## Arrays
 
 ```rust
-let a = Array[String].new()
-a.append("X")
-a.append("Y")
-// Short
-let b = array[String]{ "X", "Y" }
-let c = a + b // X, Y, X, Y (calls .merge which returns a copy)
-c.unique() // X, Y (Make list unique)
-c.prepend("A") // A, X, Y
-c.append_many(array[String]{ "Z", "O" }) // A, X, Y, Z, O
-c.part(1, 3) // X, Y, Z
+// Init
+let a = Array[String].new() // Init new array
+let b = array[String]{ "1", "2", "3" } // Init using macro
+// Api
+a.length // Returns amount of items in the array
+a.append(b) // Append value
+a.prepend(b) // Prepend value
+a.append_many(b) // Append multiple
+a.prepend_many(b) // Append multiple
+a.get(index) ! // Get value by index
+a.set(index, value) ! // Set value by index
+a.remove(index) // Remove by index
+a.remove_value(value) // Remove by value
+a.set_expand(index, value, gap_value) // Set value by index, fill the gaps with the gap-value
+a.part(1, 3) // Copy a part from the array, args: (start-index, amount)
+a.range(2, 2) // Copy a part from the array, args: (start-index, end-index, inclusive = true)
+a.contains(value) // Checks if array contains a certain value
+a.unique() // Make the values unique
+a.unique_copy() // Returns a copy with only unique values
+a.filter() // Filter out empty values
+a.filter(fn() bool { ... }) // Custom filter function (return true to remove the value)
+a.filter_copy(fn() bool { ... }) // Returns a copy with the filtered values
+a.copy() // Copy the array
+a.merge(b) // Adds values from b to a
+a.clear() // Empties the array
+```
+
+## Maps
+
+```rust
+let a = Map[uint].new() // Init map
+let b = map[uint]{ "a" => 1, "b" => 2 } // Init using macro
+let c = hashmap[uint]{ "a" => 1, "b" => 2 } // Hashmap (uses more memory, but much faster look ups)
+// API
+m.length // Returns amount of items in the map
+m.set(key, value) // Set a value
+m.has(key) // Check if map has a key
+m.get(key) ! // Get a value by key
+m.remove(key) // Removes a value
+m.keys() // Get array of all keys
+m.values() // Get array of all values
+m.merge(m2) // Adds values from m2 to m
+m.copy() // Copy the map
+m.clear()
 ```
 
 ## Functions
