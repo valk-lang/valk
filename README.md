@@ -110,6 +110,8 @@ When not to use Valk:
 
 - Co routines are single threaded. We dont do task-stealing.
 
+- We are a self hosted language with a LLVM backend. We depend on libc for system calls. We use the OS default linker for linking (ld/ld64/link.exe).
+
 ## Contributions
 
 Once we hit version 0.1.0, we want to look for people who can help with the standard library & 3rd party packages. If you want to contribute, just hop into the discord and post in general chat or send a private message to the discord owner.
