@@ -189,7 +189,7 @@ a.filter() // Filter out empty values
 a.filter(fn() bool { ... }) // Custom filter function (return true to remove the value)
 a.filter_copy(fn() bool { ... }) // Returns a copy with the filtered values
 a.copy() // Copy the array
-a.merge(b) // Adds values from b to a
+a.merge(b) // Adds values from b to a (returns a copy, use append_many if you want to modify the existing array)
 a.clear() // Empties the array
 ```
 
