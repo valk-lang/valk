@@ -29,7 +29,7 @@ fn chdir(path: cstring) i32;
 fn recv(fd: i32, buf: ptr, len: uint, flags: i32) int;
 fn send(fd: i32, buf: ptr, len: uint, flags: i32) int;
 
-fn pipe(fds: ptr[2 x i32]) i32;
+fn pipe(fds: ptr[i32 x 2]) i32;
 fn fcntl(fd: i32, action: i32, @infinite) i32;
 
 fn socket(domain: i32, type: i32, protocol: i32) i32;

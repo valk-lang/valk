@@ -36,13 +36,13 @@ struct libc_gen__WIN32_FIND_DATAA {
     nFileSizeLow: u32
     dwReserved0: u32
     dwReserved1: u32
-    cFileName: [260 x i8]
-    cAlternateFileName: [14 x i8]
+    cFileName: [i8 x 260]
+    cAlternateFileName: [i8 x 14]
 }
 
 struct libc_gen_sockaddr {
     sa_family: u16
-    sa_data: [14 x i8]
+    sa_data: [i8 x 14]
 }
 
 struct libc_gen_addrinfo {
