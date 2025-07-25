@@ -600,6 +600,22 @@ fn main() {
 }
 ```
 
+Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs:path("path")`
+
+```rust
+fn main() {
+    let path : Path = "."
+    path = path.add("folder1").add("folder2/").add("/file")
+    println(path) // ./folder1/folder2/file
+    path = path.resolve()
+    println(path) // /var/www/folder1/folder2/file
+    path = path + ".txt"
+    println(path) // /var/www/folder1/folder2/file.txt
+    path = path.pop()
+    println(path) // /var/www/folder1/folder2
+}
+```
+
 ## Unsafe
 
 Work in progress 🔨
