@@ -18,11 +18,13 @@
 * [Functions](#functions)
    * [Error Handling](#error-handling)
    * [Closures](#closures)
-* [Classes](#classes)
-* [Globals](#globals)
 
 
 <br></td><td width=200px><br>
+
+* [Classes](#classes)
+* [Modes](#modes)
+* [Globals](#globals)
 
 - [Tokens](#tokens)
     * [Let](#variables)
@@ -161,6 +163,30 @@ let msg2 = "Hello %name!" // Short way
 let msg3 = "Name length x 2: %{ name.length * 2 }!" // Inline value (You can use any code inside %{} as long as it can be converter to String)
 let msg4 = "Hello \%name!" // Prevent inlining using '\' before '%'
 let msg5 = r"Hello %name!" // Prevent inlining using 'r' (raw) at the start 
+// Api
+s.length // Length of string
+s.starts_with(x) // Checks if string starts with ...
+s.ends_with(x) // Checks if string ends with ...
+s.is_empty() // Check if length == 0
+s.lower() // Convert to lowercase
+s.upper() // Convert to uppercase
+s.is_alpha() // Check if only contains a-zA-Z
+s.is_alpha_numeric() // Check if only contains a-zA-Z0-9
+s.is_integer() // Check if characters are only 0-9
+s.is_number() // Check if characters are only 0-9 but can contain 1 dot e.g. 123.45
+s.index_of(b) ! // Returns index from a sub-string
+s.index_of_byte(b) ! // Returns index from a u8/byte
+s.contains(b) // Returns true if string contains sub-string
+s.contains_byte(b) // Returns true if string contains a certain u8/byte
+s.get(index) ! // Returns the u8/byte at index
+s.part(index, amount) // Returns a sub-string
+s.range(start, end) // Returns a sub-string
+s.split(on) Array[String] // Split string into parts
+s.trim(part) / s.rtrim(part) / s.ltrim(part)
+s.replace(part, with)
+s.escape() // Adds slashes in front of all special characters
+s.unescape() // Removes all slashes
+s.ansi.{color}() // E.g. println("hello".ansi.green()) | colors: black, red, green, yellow, blue, purple, cyan, white
 ```
 
 ## Arrays
