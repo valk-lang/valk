@@ -575,13 +575,13 @@ use `valk:fs` to access all file system related functions
 ```rust
 use valk:fs
 // File & Directories
-let content = fs:read(path) // Read file to String
-fs:write(path, content)
-fs:remove(path)
+fs:read(path) // Read file, returns content as a String
+fs:write(path, content, append: bool) // Write to file
+fs:delete(path) // Delete file
 fs:move(from_path, to_path)
 fs:exists(path)
-fs:mkdir(path)
-fs:rmdir(path)
+fs:mkdir(path) // Create directory
+fs:rmdir(path) // Delete directory
 fs:is_file(path)
 fs:is_dir(path)
 fs:files_in(path) // Returns all files in a directory -> Array[String]
@@ -591,7 +591,7 @@ fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./
 fs:realpath(path) // Returns the target path from a symlink
 fs:dir_of(path) // ./part1/part2 -> ./part1
 fs:basename(path) // ./part1/part2 -> part2
-fs:ext(path, with_dot) // Returns the extension from a path, e.g. "jpg",".jpg" otherwise ""
+fs:ext(path, with_dot: bool) // Returns the extension from a path, e.g. "jpg",".jpg" otherwise ""
 fs:add(part1, part2) // Returns part1 + {slash} + part2, prevents double slashes
 fs:cwd() // Returns current working directory
 fs:chdir(path) // Change current working directory
