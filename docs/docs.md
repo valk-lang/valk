@@ -630,10 +630,10 @@ use valk:net
 net:Socket.new_tcp(host: String, port: u16) !
 // net:SocketTCP
 net:SocketTCP.new(host: String, port: u16) !
-// Function for a client
+// Functions for client sockets
 sock.connect() net:Connection !
 con.ssl_connect(host: String) ! // For SSL communication, call this once on the connection from sock.connect()
-// Function for a server
+// Functions for server sockets
 sock.bind() !
 sock.accept() net:Connection !
 // net:Connection
