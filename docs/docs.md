@@ -622,6 +622,8 @@ valk build src/*.v ./my-tests/*.valk --test --run
 
 ## Sockets
 
+Currently we only support `TCP` sockets. We are still working on expanding our `net` functionality.
+
 ```rust
 use valk:net
 // net:Socket
@@ -642,7 +644,7 @@ con.recv(buffer: utils:ByteBuffer, max_bytes: uint) uint ! // Receive data from 
 con.close() // Close connection
 ```
 
-Examples
+Example
 
 ```rust
 use valk:net
