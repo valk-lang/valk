@@ -36,14 +36,15 @@
 <br></td><td width=200px><br>
 
 * [Null checking](#null-checking)
+* [Files](#files)
+    - [Paths](#paths)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
 * [Compile Conditions](#compile-conditions)
 * [Atomics](#atomics)
 * [Testing](#testing)
-* [Files](#files)
-    - [Paths](#paths)
+* [Sockets](#sockets)
 
 <br></td><td width=200px><br>
 
@@ -436,6 +437,57 @@ fn print(msg: ?String) {
 }
 ```
 
+## Files
+
+use `valk:fs` to access all file system related functions
+
+```rust
+use valk:fs
+// File & Directories
+fs:read(path) // Read file, returns content as a String
+fs:write(path, content, append: bool) // Write to file
+fs:delete(path) // Delete file
+fs:move(from_path, to_path)
+fs:exists(path)
+fs:mkdir(path) // Create directory
+fs:rmdir(path) // Delete directory
+fs:is_file(path)
+fs:is_dir(path)
+fs:files_in(path) // Returns all files in a directory -> Array[String]
+fs:symlink(link_path, target_path) // Create a symlink
+// Paths
+fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
+fs:realpath(path) // Returns the target path from a symlink
+fs:dir_of(path) // ./part1/part2 -> ./part1
+fs:basename(path) // ./part1/part2 -> part2
+fs:ext(path, with_dot: bool) // Returns the extension from a path, e.g. "jpg",".jpg" otherwise ""
+fs:add(part1, part2) // Returns part1 + {slash} + part2, prevents double slashes
+fs:cwd() // Returns current working directory
+fs:chdir(path) // Change current working directory
+fs:exe_path() // Returns the path of the running executable
+fs:exe_dir() // Returns the directory of the running executable
+fs:home_dir() // Returns the home directory from the user running the executable
+fs:path(path) // Converts String to Path class (more info below)
+```
+
+## Paths
+
+Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs:path("path")`
+
+```rust
+fn main() {
+    let path : Path = "."
+    path = path.add("folder1").add("folder2/").add("/file") // Adding parts to a path without worrying about double slashes
+    println(path) // ./folder1/folder2/file
+    path = path.resolve()
+    println(path) // /var/www/folder1/folder2/file
+    path = path + ".txt"
+    println(path) // /var/www/folder1/folder2/file.txt
+    path = path.pop()
+    println(path) // /var/www/folder1/folder2
+}
+```
+
 ## Coroutines
 
 With coroutines we can run multiple functions at the same time on a single thread.
@@ -568,56 +620,78 @@ Or we can put our tests in a different directory.
 valk build src/*.v ./my-tests/*.valk --test --run
 ```
 
-## Files
-
-use `valk:fs` to access all file system related functions
+## Sockets
 
 ```rust
-use valk:fs
-// File & Directories
-fs:read(path) // Read file, returns content as a String
-fs:write(path, content, append: bool) // Write to file
-fs:delete(path) // Delete file
-fs:move(from_path, to_path)
-fs:exists(path)
-fs:mkdir(path) // Create directory
-fs:rmdir(path) // Delete directory
-fs:is_file(path)
-fs:is_dir(path)
-fs:files_in(path) // Returns all files in a directory -> Array[String]
-fs:symlink(link_path, target_path) // Create a symlink
-// Paths
-fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
-fs:realpath(path) // Returns the target path from a symlink
-fs:dir_of(path) // ./part1/part2 -> ./part1
-fs:basename(path) // ./part1/part2 -> part2
-fs:ext(path, with_dot: bool) // Returns the extension from a path, e.g. "jpg",".jpg" otherwise ""
-fs:add(part1, part2) // Returns part1 + {slash} + part2, prevents double slashes
-fs:cwd() // Returns current working directory
-fs:chdir(path) // Change current working directory
-fs:exe_path() // Returns the path of the running executable
-fs:exe_dir() // Returns the directory of the running executable
-fs:home_dir() // Returns the home directory from the user running the executable
-fs:path(path) // Converts String to Path class (more info below)
+use valk:net
+// net:Socket
+net:Socket.new_tcp(host: String, port: u16) !
+// net:SocketTCP
+net:SocketTCP.new(host: String, port: u16) !
+// Function for a client
+sock.connect() net:Connection !
+con.ssl_connect(host: String) ! // For SSL communication, call this once on the connection from sock.connect()
+// Function for a server
+sock.bind() !
+sock.accept() net:Connection !
+// net:Connection
+con.send(data: String) ! // Send bytes of a string
+con.send_buffer(data: utils:ByteBuffer, skip_bytes: uint, send_all: bool) ! // Send bytes from a buffer
+con.send_bytes(data: ptr, bytes: uint, send_all: bool) ! // Send bytes from a raw pointer
+con.recv(buffer: utils:ByteBuffer, max_bytes: uint) uint ! // Receive data from a socket, returns amount of bytes received
+con.close() // Close connection
 ```
 
-## Paths
-
-Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs:path("path")`
+Examples
 
 ```rust
+use valk:net
+use valk:utils
+
+// Server
+fn server() {
+    let sock = net:SocketTCP.new("127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
+    sock.bind() ! panic("Failed binding to port: " + EMSG)
+    let buffer = utils:ByteBuffer.new()
+    while true {
+        let con = sock.accept() ! {
+            println("# Failed to accept connection")
+            continue;
+        }
+        // Handle connection (normally you do this on a separate coroutine)
+        while true {
+            buffer.clear()
+            let bytes = con.recv(buffer, 1000) ! {
+                if E == E.closed : break // Connection closed
+                println("# Server failed to read from connection")
+                break
+            }
+            println("# Server received: " + buffer)
+            con.send("PONG") ! {
+                println("# Server failed to send data")
+                break
+            }
+        }
+    }
+}
+
+// Client
 fn main() {
-    let path : Path = "."
-    path = path.add("folder1").add("folder2/").add("/file") // Adding parts to a path without worrying about double slashes
-    println(path) // ./folder1/folder2/file
-    path = path.resolve()
-    println(path) // /var/www/folder1/folder2/file
-    path = path + ".txt"
-    println(path) // /var/www/folder1/folder2/file.txt
-    path = path.pop()
-    println(path) // /var/www/folder1/folder2
+    // Start our server in the background
+    let s = co server()
+    // Open client
+    let sock = net:SocketTCP.new("127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
+    let con = sock.connect() ! panic("Failed to connect")
+    // Send
+    con.send("PING") ! panic("Client failed to send data")
+    // Recv
+    let buffer = utils:ByteBuffer.new()
+    con.recv(buffer, 1000) ! panic("Client failed to read from connection")
+    println("# Client received: " + buffer)
+    con.close()
 }
 ```
+
 
 ## Unsafe
 
