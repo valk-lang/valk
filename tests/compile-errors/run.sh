@@ -1,5 +1,6 @@
 #!/bin/bash
 
+echo ""
 echo "# Test compile errors"
 
 # Set the filepath here
@@ -52,3 +53,10 @@ done < "$FILEPATH"
 
 echo "# All build commands have failed succesfully"
 echo "# Test count: $count"
+
+echo ""
+echo "# Test type compatibility"
+./valk ./tests/compile-errors/type-checks.valk
+
+echo ""
+echo "# Done"
