@@ -20,8 +20,8 @@
 + Dont use hashes to compare IR. Just compare file content (= faster & more correct)
 + Release 0.0.4
 + Allow identifiers for numbers in types, e.g. ptr[u8 x fs:PATH_MAX_LEN] or global list : [uint x MAX_ITEMS]
-- Add more standard library functions
-- Update docs
++ Add more standard library functions
++ Update docs
 - Release 0.0.5
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
