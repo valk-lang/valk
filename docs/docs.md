@@ -44,6 +44,8 @@
 * [Compile Conditions](#compile-conditions)
 * [Atomics](#atomics)
 * [Testing](#testing)
+* [HTTP Client](#http-client)
+* [HTTP Server](#http-server)
 * [Sockets](#sockets)
 
 <br></td><td width=200px><br>
@@ -620,6 +622,47 @@ Or we can put our tests in a different directory.
 
 ```sh
 valk build src/*.v ./my-tests/*.valk --test --run
+```
+
+## HTTP Client
+
+With `valk:http` you can send HTTP requests to APIs or download files from a url.
+
+```rust
+// Send basic request
+let res = http:request("GET", "http://some-website/api/endpoint") ! panic("Request failed")
+
+// Send GET request with data
+let data = map[String]{ "key1" => "val1" }
+let res = http:request("GET", "http://some-website/api/endpoint", http:Options{ query_data: data }) ! panic("Request failed")
+
+// Send POST request with data
+let json_data = map[String]{ "key1" => "val1" }.to(json:Value)
+let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json_data.encode() }) ! panic("Request failed")
+
+// Download file
+http:download(url, to_path) ! panic("Failed to download file")
+```
+
+## HTTP Server
+
+```js
+use valk:http
+
+fn handler(req: http:Request) http:Response {
+    return http:Response.html("Hello world!")
+}
+
+fn main() {
+    let host = "127.0.0.1"
+    let port : u16 = 9000
+    let s = http:Server.new(host, port, handler) ! {
+        println("Failed to initialize http server")
+        return
+    }
+    println("HTTP server - http://%host:%prot")
+    s.start()
+}
 ```
 
 ## Sockets
