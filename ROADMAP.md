@@ -22,7 +22,9 @@
 + Allow identifiers for numbers in types, e.g. ptr[u8 x fs:PATH_MAX_LEN] or global list : [uint x MAX_ITEMS]
 + Add more standard library functions
 + Update docs
-- Release 0.0.5
++ Release 0.0.5
+- Update HTTP client options
+- LSP + vscode extension
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
