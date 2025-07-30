@@ -447,13 +447,15 @@ use valk:fs
 fs:read(path) // Read file, returns content as a String
 fs:write(path, content, append: bool) // Write to file
 fs:delete(path) // Delete file
+fs:delete_recursive(path) // Delete file or directory recursive
 fs:move(from_path, to_path)
+fs:copy(from_path, to_path, recursive) // Copy file or directory
 fs:exists(path)
 fs:mkdir(path) // Create directory
 fs:rmdir(path) // Delete directory
 fs:is_file(path)
 fs:is_dir(path)
-fs:files_in(path) // Returns all files in a directory -> Array[String]
+fs:files_in(path, recursive) // Returns all files in a directory
 fs:symlink(link_path, target_path) // Create a symlink
 // Paths
 fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
