@@ -660,7 +660,7 @@ fn main() {
         println("Failed to initialize http server")
         return
     }
-    println("HTTP server - http://%host:%prot")
+    println("HTTP server - http://%host:%port")
     s.start()
 }
 ```
