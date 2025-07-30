@@ -15,7 +15,7 @@ struct libc_addrinfo_fix {
     ai_family: i32
     ai_socktype: i32
     ai_protocol: i32
-    ai_addrlen: i64
+    ai_addrlen: uint
     ai_canonname: ptr
     ai_addr: ptr
     ai_next: ptr

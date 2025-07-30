@@ -74,11 +74,11 @@ fn dup(old_fd: i32) i32;
 fn dup2(old_fd: i32, new_fd: i32) i32;
 
 fn socket(domain: i32, type: i32, protocol: i32) uint;
-fn connect(sockfd: uint, addr: libc_sockaddr, addrlen: i32) i32;
+fn connect(sockfd: uint, addr: libc_sockaddr, addrlen: u32) i32;
 fn accept(sockfd: uint, addr: ?libc_sockaddr, addrlen: ?ptr) uint;
 //fn accept4(sockfd: i32, addr: ?libc_sockaddr, addrlen: ?ptr, flags: i32) i32;
 fn shutdown(sockfd: uint, how: i32) i32;
-fn bind(sockfd: uint, addr: libc_sockaddr, addrlen: i32) i32;
+fn bind(sockfd: uint, addr: libc_sockaddr, addrlen: u32) i32;
 fn listen(sockfd: uint, backlog: i32) i32;
 
 fn getsockopt(sockfd: uint, level: i32, optname: i32, optval: ptr, optlen: u32) i32;
