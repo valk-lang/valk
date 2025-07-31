@@ -24,6 +24,7 @@
 + Update docs
 + Release 0.0.5
 - Update HTTP client options
+- fn encode[T](value: T) -> fn encode(value: $T)
 - LSP + vscode extension
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
