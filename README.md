@@ -69,28 +69,29 @@ make
 
 <div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-gc.png">
+</p><p>
+Code: <a href="https://github.com/valk-lang/valk/tree/main/examples/bench/gc-overhead">https://github.com/valk-lang/valk/tree/main/examples/bench/gc-overhead</a>
 </p>
 </div>
-
-Code: [https://github.com/valk-lang/valk/tree/main/examples/bench/gc-overhead](https://github.com/valk-lang/valk/tree/main/examples/bench/gc-overhead)
 
 ---
 
 <div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-bintree.png">
-</p>
+</p><p>
 The binary object tree test revolves around creating large amount of short-/long-lived objects, iterating over them and doing some calculations.
+</p><p>
+Code: <a href="https://github.com/valk-lang/valk/tree/main/examples/bench/binary-tree">https://github.com/valk-lang/valk/tree/main/examples/bench/binary-tree</a>
+</p>
 </div>
-
-Code: [https://github.com/valk-lang/valk/tree/main/examples/bench/binary-tree](https://github.com/valk-lang/valk/tree/main/examples/bench/binary-tree)
 
 ---
 
 <div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-http.png">
+</p><p>
+Code: <a href="https://github.com/valk-lang/valk/tree/main/examples/bench/http">https://github.com/valk-lang/valk/tree/main/examples/bench/http</a>
 </p></div>
-
-Code: [https://github.com/valk-lang/valk/tree/main/examples/bench/http](https://github.com/valk-lang/valk/tree/main/examples/bench/http)
 
 ## Why Valk over Rust, Go, Zig?
 
