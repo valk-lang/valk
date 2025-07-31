@@ -38,6 +38,7 @@
 ## For later
 
 ```
+- $only_if_used
 - WASM support
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```
