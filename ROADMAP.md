@@ -23,8 +23,9 @@
 + Add more standard library functions
 + Update docs
 + Release 0.0.5
-- Update HTTP client options
-- fn encode[T](value: T) -> fn encode(value: $T)
++ Update HTTP client options
++ fn encode[T](value: T) -> fn encode(value: $T)
++ Release 0.0.6
 - LSP + vscode extension
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
@@ -32,7 +33,7 @@
 
 - Interfaces
 - Union types
-- Release 0.0.6
+- Release 0.0.7
 ```
 
 ## For later
