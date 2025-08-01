@@ -1,17 +1,18 @@
 
-VALKV=0.0.4
-VERSION=0.0.5
+VALKV=0.0.5
+VERSION=0.0.6
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
 SRC_LIB=$(wildcard lib/src/*/*.valk) $(wildcard lib/*/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
+vc=/opt/valk/0.0.5/valk
 
 FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 
 # Build
 valk: $(SRC) $(HDRS)
-	valk build . src/*.valk -o ./valk -vv $(FLAGS)
+	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS)
 valk2: valk
 	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
 valk3: valk2

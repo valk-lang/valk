@@ -38,6 +38,7 @@
 * [Null checking](#null-checking)
 * [Files](#files)
     - [Paths](#paths)
+* [JSON](#json)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
@@ -98,9 +99,7 @@ To organize your code we group files into different directories. Each namespace 
 ```json
 {
     "namespaces": {
-        "my_namespace": "src/my-namespace",
-        "models": "src/database/models",
-        "controllers": "src/controllers"
+        "my_namespace": "src/my-namespace"
     }
 }
 ```
@@ -492,6 +491,99 @@ fn main() {
 }
 ```
 
+## JSON
+
+API : `valk:json`
+
+```rust
+json:decode(text) ! // Convert json string to json:Value
+{json:Value}.encode(pretty) // Convert json:Value to json string
+// Create values
+json:null_value()
+json:bool(v: bool)
+json:int(v: int)
+json:uint(v: uint)
+json:float(v: float)
+json:string(v: String)
+json:array(v: Array[json:Value])
+json:object(v: Map[json:Value])
+// Set object keys
+{json:Value}.set(key, v)
+{json:Value}.remove(key)
+```
+
+With `valk:json` you can convert any type to json or json to any type out-of-the-box.
+
+```rust
+use valk:json
+
+class A {
+    msg: String ("Hello")
+    b: B (B{})
+}
+class B {
+    msg: String ("World")
+}
+
+fn main() {
+    let a = A{}
+    // Converting our object to json string
+    let pretty = true
+    let str = json:encode[A](a, pretty)
+    println(str)
+    // {
+    //     "msg": "Hello",
+    //     "b": {
+    //         "msg": "World"
+    //     }
+    // }
+
+    // Convert json string back to your type
+    // First convert it to a json:Value
+    let json_value = json:decode(str) ! panic("Invalid json syntax")
+    // And now convert your json:Value to A
+    let a2 = json:to_type[A](json_value)
+    // Check result
+    println(a2.msg + " " + a2.b.msg) // Prints: Hello world
+}
+```
+
+If you need to customize how your class is converted to json or from json, then you can define the following functions to override the logic.
+
+```rust
+use valk:json
+
+class A {
+    value: int (123)
+    // Object -> json:Value
+    + fn to_json_value() json:Value {
+        return json:int(this.value)
+    }
+    // json:Value -> Object
+    + static fn from_json_value(jv: json:Value) SELF {
+        return SELF { value: jv.int() }
+    }
+}
+```
+
+You can also work directly with a `json:Value` instead of converting to/from a type
+
+```rust
+use valk:json
+
+fn main() {
+    let str = "{ \"Hello\": \"world\" }"
+    let v = json:decode(str) ! panic("Invalid json syntax")
+    // Change some data
+    v.set("Hello", json:string("Valk"))
+    v.set("v1", json:bool(true))
+    v.set("v2", json:null_value())
+    // Encode back to json string
+    let str2 = v.encode()
+    print(str2) // Prints: { "Hello": "Valk", "v1": true, "v2": null }
+}
+```
+
 ## Coroutines
 
 With coroutines we can run multiple functions at the same time on a single thread.
@@ -592,12 +684,12 @@ fn main() {
 
 ## Atomics
 
-We can do atomic operations on integers by placing our operation inside an `atomic_op()` token.
+We can do atomic operations on integers by placing our operation inside an `atomic()` token.
 
 ```rust
-// {value-before-updating} = atomic_op( {variable} {op} {value} )
+// {value-before-updating} = atomic( {variable} {op} {value} )
 let v = 5
-let a = atomic_op(v + 2)
+let a = atomic(v + 2)
 println(a) // 5
 println(v) // 7
 ```

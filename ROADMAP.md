@@ -24,6 +24,7 @@
 + Update docs
 + Release 0.0.5
 - Update HTTP client options
+- fn encode[T](value: T) -> fn encode(value: $T)
 - LSP + vscode extension
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
@@ -37,6 +38,7 @@
 ## For later
 
 ```
+- $only_if_used
 - WASM support
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
 ```

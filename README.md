@@ -42,6 +42,8 @@ valk build main.valk -o ./main
 
 ## Build from source (Linux / macOS / WSL)
 
+valk/vp: `curl -s https://valk-lang.dev/install.sh | bash`
+
 macOS: `brew install llvm@15 && brew link llvm@15`
 
 Ubuntu / Debian: `sudo apt-get install llvm-15 lld`
@@ -70,19 +72,26 @@ make
 </p>
 </div>
 
+Code: [Link](examples/bench/gc-overhead)
+
 ---
 
 <div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-bintree.png">
 </p>
-The binary object tree test revolves around creating large amount of short-/long-lived objects, iterating over them and doing some calculations.
 </div>
+
+The binary object tree test revolves around creating large amount of short-/long-lived objects, iterating over them and doing some calculations.
+
+Code: [Link](examples/bench/binary-tree)
 
 ---
 
 <div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-http.png">
 </p></div>
+
+Code: [Link](examples/bench/http)
 
 ## Why Valk over Rust, Go, Zig?
 
@@ -115,10 +124,6 @@ When not to use Valk:
 ## Contributions
 
 Once we hit version 0.1.0, we want to look for people who can help with the standard library & 3rd party packages. If you want to contribute, just hop into the discord and post in general chat or send a private message to the discord owner.
-
-## References
-
-Binary tree benchmark code: [https://programming-language-benchmarks.vercel.app/problem/binarytrees](https://programming-language-benchmarks.vercel.app/problem/binarytrees)
 
 ---
 
