@@ -495,6 +495,8 @@ fn main() {
 
 ## JSON
 
+API : `valk:json`
+
 ```rust
 json:decode(text) ! // Convert json string to json:Value
 {json:Value}.encode(pretty) // Convert json:Value to json string
