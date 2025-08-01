@@ -686,12 +686,12 @@ fn main() {
 
 ## Atomics
 
-We can do atomic operations on integers by placing our operation inside an `atomic_op()` token.
+We can do atomic operations on integers by placing our operation inside an `atomic()` token.
 
 ```rust
-// {value-before-updating} = atomic_op( {variable} {op} {value} )
+// {value-before-updating} = atomic( {variable} {op} {value} )
 let v = 5
-let a = atomic_op(v + 2)
+let a = atomic(v + 2)
 println(a) // 5
 println(v) // 7
 ```
