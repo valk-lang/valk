@@ -495,6 +495,23 @@ fn main() {
 
 ## JSON
 
+```rust
+json:decode(text) ! // Convert json string to json:Value
+{json:Value}.encode(pretty) // Convert json:Value to json string
+// Create values
+json:null_value()
+json:bool(v: bool)
+json:int(v: int)
+json:uint(v: uint)
+json:float(v: float)
+json:string(v: String)
+json:array(v: Array[json:Value])
+json:object(v: Map[json:Value])
+// Set object keys
+{json:Value}.set(key, v)
+{json:Value}.remove(key)
+```
+
 With `valk:json` you can convert any type to json or json to any type out-of-the-box.
 
 ```rust
@@ -565,25 +582,6 @@ fn main() {
     let str2 = v.encode()
     print(str2) // Prints: { "Hello": "Valk", "v1": true, "v2": null }
 }
-```
-
-API
-
-```rust
-json:decode(text) ! // Convert json string to json:Value
-{json:Value}.encode(pretty) // Convert json:Value to json string
-// Create values
-json:null_value()
-json:bool(v: bool)
-json:int(v: int)
-json:uint(v: uint)
-json:float(v: float)
-json:string(v: String)
-json:array(v: Array[json:Value])
-json:object(v: Map[json:Value])
-// Set object keys
-{json:Value}.set(key, v)
-{json:Value}.remove(key, v)
 ```
 
 ## Coroutines
