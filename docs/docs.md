@@ -99,9 +99,7 @@ To organize your code we group files into different directories. Each namespace 
 ```json
 {
     "namespaces": {
-        "my_namespace": "src/my-namespace",
-        "models": "src/database/models",
-        "controllers": "src/controllers"
+        "my_namespace": "src/my-namespace"
     }
 }
 ```
