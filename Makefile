@@ -6,7 +6,7 @@ HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
 SRC_LIB=$(wildcard lib/src/*/*.valk) $(wildcard lib/*/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
-vc=/opt/valk/0.0.5/valk
+vc=valk
 
 FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 
