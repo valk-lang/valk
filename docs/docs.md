@@ -549,6 +549,21 @@ class A {
 }
 ```
 
+You can also work directly with a `json:Value` instead of converting to/from a type
+
+```rust
+use valk:json
+
+fn main() {
+    let str = "{ \"Hello\": \"world\" }"
+    let v = json:decode(str) ! panic("Invalid json syntax")
+    v.set("Hello", json:new_string("Valk"))
+    v.set("Something", json:new_bool(true))
+    let str2 = v.encode()
+    print(str2) // Prints: { "Hello": "Valk", "Something": true }
+}
+```
+
 ## Coroutines
 
 With coroutines we can run multiple functions at the same time on a single thread.
