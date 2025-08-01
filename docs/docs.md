@@ -38,6 +38,7 @@
 * [Null checking](#null-checking)
 * [Files](#files)
     - [Paths](#paths)
+* [JSON](#json)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
@@ -489,6 +490,62 @@ fn main() {
     println(path) // /var/www/folder1/folder2/file.txt
     path = path.pop()
     println(path) // /var/www/folder1/folder2
+}
+```
+
+## JSON
+
+With `valk:json` you can convert any type to json or json to any type out-of-the-box.
+
+```rust
+use valk:json
+
+class A {
+    msg: String ("Hello")
+    b: B (B{})
+}
+class B {
+    msg: String ("World")
+}
+
+fn main() {
+    let a = A{}
+    // Converting our object to json string
+    let pretty = true
+    let str = json:encode[A](a, pretty)
+    println(str)
+    // {
+    //     "msg": "Hello",
+    //     "b": {
+    //         "msg": "World"
+    //     }
+    // }
+
+    // Convert json string back to your type
+    // First convert it to a json:Value
+    let json_value = json:decode(str) ! panic("Invalid json syntax")
+    // And now convert your json:Value to A
+    let a2 = json:to_type[A](json_value)
+    // Check result
+    println(a2.msg + " " + a2.b.msg) // Prints: Hello world
+}
+```
+
+If you need to customize how your class is converter to json or from json, then you can define the following functions to override the logic.
+
+```rust
+use valk:json
+
+class A {
+    value: int (123)
+    // Object -> json:Value
+    + fn to_json_value() json:Value {
+        return json:new_int(this.value)
+    }
+    // json:Value -> Object
+    + static fn from_json_value(jv: json:Value) SELF {
+        return SELF { value: jv.int() }
+    }
 }
 ```
 
