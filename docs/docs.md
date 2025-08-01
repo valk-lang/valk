@@ -550,7 +550,7 @@ fn main() {
 }
 ```
 
-If you need to customize how your class is converter to json or from json, then you can define the following functions to override the logic.
+If you need to customize how your class is converted to json or from json, then you can define the following functions to override the logic.
 
 ```rust
 use valk:json
