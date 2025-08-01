@@ -540,7 +540,7 @@ class A {
     value: int (123)
     // Object -> json:Value
     + fn to_json_value() json:Value {
-        return json:new_int(this.value)
+        return json:int(this.value)
     }
     // json:Value -> Object
     + static fn from_json_value(jv: json:Value) SELF {
@@ -557,11 +557,33 @@ use valk:json
 fn main() {
     let str = "{ \"Hello\": \"world\" }"
     let v = json:decode(str) ! panic("Invalid json syntax")
-    v.set("Hello", json:new_string("Valk"))
-    v.set("Something", json:new_bool(true))
+    // Change some data
+    v.set("Hello", json:string("Valk"))
+    v.set("v1", json:bool(true))
+    v.set("v2", json:null_value())
+    // Encode back to json string
     let str2 = v.encode()
-    print(str2) // Prints: { "Hello": "Valk", "Something": true }
+    print(str2) // Prints: { "Hello": "Valk", "v1": true, "v2": null }
 }
+```
+
+API
+
+```rust
+json:decode(text) ! // Convert json string to json:Value
+{json:Value}.encode(pretty) // Convert json:Value to json string
+// Create values
+json:null_value()
+json:bool(v: bool)
+json:int(v: int)
+json:uint(v: uint)
+json:float(v: float)
+json:string(v: String)
+json:array(v: Array[json:Value])
+json:object(v: Map[json:Value])
+// Set object keys
+{json:Value}.set(key, v)
+{json:Value}.remove(key, v)
 ```
 
 ## Coroutines
