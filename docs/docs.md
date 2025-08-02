@@ -54,6 +54,7 @@
 * [Unsafe](#unsafe)
     * WIP 🔨
     * [Structs](#structs)
+    * [Headers](#headers)
 
 <br></td></tr>
 </table>
@@ -834,7 +835,11 @@ fn main() {
 
 ## Unsafe
 
-Work in progress 🔨
+Although Valk aims to be a safe language, we also dont want to prevent people from doing unsafe things if they want. So what is unsafe? All tokens that start with `@` are assumed unsafe. So that and using the `ptr` type (ptr = void* in c).
+
+We also have `struct`, which isnt unsafe, but can cause memory leaks if you forget to free the objects.
+
+Then we have `header` files. Header files are used to make the compiler aware of functions/globals/... in 3rd party static libaries. But if you define something differently than how it exists in the library, your program will probably crash when you use it. So make sure your header definitions match the library.
 
 ## Structs
 
@@ -878,4 +883,39 @@ fn main() {
 
 ## Headers
 
-(WIP)
+Header files are used to make the compiler aware of functions/globals/... in 3rd party static libraries. A header file should have the extension `.valk.h` and should be located in a directory that's defined in your `valk.json` under `{ "headers": { "directories": ["my-headers"] } }` -> which point to `{project-dir}/my-headers`.
+
+A header file can also tell the compiler which library to link with, and if it should link dynamic, static or based on compiler arguments.
+
+```rust
+// {project}/my-headers/openssl.valk.h
+
+#if OS == win
+link "libssl"
+link "libcrypto"
+#else
+link "ssl"
+link "crypto"
+#end
+
+// Because we dont know the struct layout for this type we will just use `ptr` instead of defining a `struct`
+// We can later swap this out with a `struct` if we want
+alias SSL_CTX ptr 
+
+fn SSL_new(ctx: SSL_CTX) SSL;
+fn SSL_free(ctx: SSL_CTX) void;
+fn SSL_set_fd(ssl: SSL, fd: i32) void;
+fn SSL_connect(ctx: SSL_CTX) i32;
+```
+
+How to use it
+
+```rust
+// main.valk
+header "example" as ex
+
+fn main() {
+    let ssl = ex:SSL_new()
+    ex:SSL_free(ssl)
+}
+```

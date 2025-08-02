@@ -1,23 +1,23 @@
 
 #if OS == win
-link "libssl";
-link "libcrypto";
-link "advapi32";
-link "user32";
-link "bcrypt";
-link "crypt32";
+link "libssl"
+link "libcrypto"
+link "advapi32"
+link "user32"
+link "bcrypt"
+link "crypt32"
 #elif OS == macos
-link "ssl";
-link "crypto";
+link "ssl"
+link "crypto"
 #else
-link "ssl";
-link "crypto";
+link "ssl"
+link "crypto"
 #end
 
-#if OS == linux
-link dynamic "dl";
-link ":libc_nonshared.a";
-#end
+// #if OS == linux
+// link dynamic "dl"
+// link ":libc_nonshared.a"
+// #end
 
 pointer SSL {}
 pointer SSL_CTX {}
