@@ -15,7 +15,7 @@ To see what a persistent GC can do, see the [benchmarks](#benchmarks)
 
 ## Install
 
-Linux / MacOS
+Linux / MacOS / WSL
 
 ```
 curl -s https://valk-lang.dev/install.sh | bash
