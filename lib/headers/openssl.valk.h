@@ -14,10 +14,10 @@ link "ssl"
 link "crypto"
 #end
 
-// #if OS == linux
-// link dynamic "dl"
-// link ":libc_nonshared.a"
-// #end
+#if OS == linux
+link dynamic "dl"
+link ":libc_nonshared.a"
+#end
 
 pointer SSL {}
 pointer SSL_CTX {}

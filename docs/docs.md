@@ -52,7 +52,6 @@
 <br></td><td width=200px><br>
 
 * [Unsafe](#unsafe)
-    * WIP 🔨
     * [Structs](#structs)
     * [Headers](#headers)
 
@@ -883,7 +882,7 @@ fn main() {
 
 ## Headers
 
-Header files are used to make the compiler aware of functions/globals/... in 3rd party static libraries. A header file should have the extension `.valk.h` and should be located in a directory that's defined in your `valk.json` under `{ "headers": { "directories": ["my-headers"] } }` -> which point to `{project-dir}/my-headers`.
+Header files are used to make the compiler aware of functions/globals/... in 3rd party static libraries. A header file should have the extension `.valk.h` and should be located in a directory that's defined in your `valk.json` under `{ "headers": { "directories": ["my-headers"] } }` -> which points to `{project-dir}/my-headers`.
 
 A header file can also tell the compiler which library to link with, and if it should link dynamic, static or based on compiler arguments.
 
@@ -919,3 +918,28 @@ fn main() {
     ex:SSL_free(ssl)
 }
 ```
+
+## Linking
+
+As mentioned above, you can tell the compiler to link with certain libraries inside a header file. But instead of that, you can also just use compiler arguments. Lets go over both methods.
+
+In a header file:
+
+```rust
+// If add dynamic or static, it will cause the compiler to always link dynamic or static. 
+// In other case it will just base itself on the compiler arguments
+link [dynamic|static] "{library-name}"
+// On linux/macos the linker will always look for `lib{lib-name}[.so/.a]`
+// You can override this logic by defining the exact filename using `:` at the start
+link ":mylib.a"
+```
+
+Using command line arguments
+
+```bash
+# This will look for libssl.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
+valk build src/*.valk -l ssl -L "/usr/my-libs"
+# This will look for libssl.a
+valk build src/*.valk -l ssl -L "/usr/my-libs" --static
+```
+
