@@ -42,7 +42,7 @@ valk build main.valk -o ./main
 
 ## Build from source (Linux / macOS / WSL)
 
-valk/vp: `curl -s https://valk-lang.dev/install.sh | bash`
+valk/vman: `curl -s https://valk-lang.dev/install.sh | bash`
 
 macOS: `brew install llvm@15 && brew link llvm@15`
 
@@ -51,7 +51,7 @@ Ubuntu / Debian: `sudo apt-get install llvm-15 lld`
 ```bash
 git clone https://github.com/valk-lang/valk.git
 cd valk
-vp use
+vman use
 make
 # optional: make test
 ```

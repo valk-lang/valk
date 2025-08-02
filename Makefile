@@ -85,7 +85,7 @@ ci-win: $(SRC) $(HDRS)
 
 # Distributions
 linux-x64: $(SRC) $(HDRS)
-	vp use $(VALKV)
+	vman use $(VALKV)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	valk build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean $(FLAGS)
@@ -93,7 +93,7 @@ linux-x64: $(SRC) $(HDRS)
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
 macos-x64: $(SRC) $(HDRS)
-	vp use $(VALKV)
+	vman use $(VALKV)
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
 	valk build . src/*.valk -o ./dist/macos-x64/valk -vv --static --target macos-x64 --clean $(FLAGS)
@@ -101,7 +101,7 @@ macos-x64: $(SRC) $(HDRS)
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
 macos-arm64: $(SRC) $(HDRS)
-	vp use $(VALKV)
+	vman use $(VALKV)
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
 	valk build . src/*.valk -o ./dist/macos-arm64/valk -vv --static --target macos-arm64 --clean $(FLAGS)
@@ -109,7 +109,7 @@ macos-arm64: $(SRC) $(HDRS)
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
 win-x64:
-	vp use $(VALKV)
+	vman use $(VALKV)
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
 	valk build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean $(FLAGS)
