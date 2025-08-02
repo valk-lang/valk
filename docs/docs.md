@@ -887,7 +887,7 @@ Header files are used to make the compiler aware of functions/globals/... in 3rd
 A header file can also tell the compiler which library to link with, and if it should link dynamic, static or based on compiler arguments.
 
 ```rust
-// {project}/my-headers/openssl.valk.h
+// {project}/my-headers/example.valk.h
 
 #if OS == win
 link "libssl"
