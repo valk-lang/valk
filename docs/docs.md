@@ -500,16 +500,19 @@ json:decode(text) ! // Convert json string to json:Value
 {json:Value}.encode(pretty) // Convert json:Value to json string
 // Create values
 json:null_value()
-json:bool(v: bool)
-json:int(v: int)
-json:uint(v: uint)
-json:float(v: float)
-json:string(v: String)
-json:array(v: Array[json:Value])
-json:object(v: Map[json:Value])
+json:bool_value(v: bool)
+json:int_value(v: int)
+json:uint_value(v: uint)
+json:float_value(v: float)
+json:string_value(v: String)
+json:array_value(v: ?Array[json:Value])
+json:object_value(v: ?Map[json:Value])
 // Set object keys
 {json:Value}.set(key, v)
 {json:Value}.remove(key)
+// Modify array
+{json:Value}.add(v) // Add item to array
+{json:Value}.remove_index(index)
 ```
 
 With `valk:json` you can convert any type to json or json to any type out-of-the-box.
@@ -575,8 +578,8 @@ fn main() {
     let str = "{ \"Hello\": \"world\" }"
     let v = json:decode(str) ! panic("Invalid json syntax")
     // Change some data
-    v.set("Hello", json:string("Valk"))
-    v.set("v1", json:bool(true))
+    v.set("Hello", json:string_value("Valk"))
+    v.set("v1", json:bool_value(true))
     v.set("v2", json:null_value())
     // Encode back to json string
     let str2 = v.encode()
