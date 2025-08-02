@@ -899,7 +899,7 @@ link "crypto"
 
 // Because we dont know the struct layout for this type we will just use `ptr` instead of defining a `struct`
 // We can later swap this out with a `struct` if we want
-alias SSL_CTX ptr 
+alias SSL_CTX for ptr 
 
 fn SSL_new(ctx: SSL_CTX) SSL;
 fn SSL_free(ctx: SSL_CTX) void;
