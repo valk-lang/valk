@@ -26,14 +26,18 @@
 + Update HTTP client options
 + fn encode[T](value: T) -> fn encode(value: $T)
 + Release 0.0.6
-- LSP + vscode extension
+- valk lsp
+- valk fmt
+- vscode extension
+- template engine
+- Release 0.0.7
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 
 - Interfaces
 - Union types
-- Release 0.0.7
+- Release 0.0.8
 ```
 
 ## For later
