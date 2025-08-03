@@ -7,8 +7,6 @@ import (
 	"strconv"
 )
 
-var mnode *Node = &Node{}
-
 type Node struct {
 	left  *Node
 	right *Node
