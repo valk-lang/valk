@@ -22,23 +22,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + core:getenv(var: type:String) type:String
 ```
 
-## Classes for 'core'
-
-```js
-+ core:TestResults {
-}
-```
-
-```js
-+ core:TestEntry {
-}
-```
-
-```js
-+ core:Closure {
-}
-```
-
 ## Globals for 'core'
 
 ```js
@@ -60,18 +43,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + gc:collect_shared() void
 + gc:init() gc:Gc
 + gc:shutdown() void
-```
-
-## Classes for 'gc'
-
-```js
-+ gc:PtrRing {
-}
-```
-
-```js
-+ gc:GcPtr {
-}
 ```
 
 ## Globals for 'gc'
@@ -174,51 +145,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + type:offset_int(offset: type:int) type:ptr
 ```
 
-## Classes for 'type'
-
-```js
-+ type:String {
-    ~ bytes: type:uint
-    + length() type:uint
-    + data() type:ptr[type:u8]
-    + data_cstring() type:cstring
-    + starts_with(part: type:String) type:bool
-    + ends_with(part: type:String) type:bool
-    + is_empty() type:bool
-    + to_uint() type:uint
-    + to_int() type:int
-    + hex_to_uint() type:uint
-    + hex_to_int() type:int
-    + octal_to_uint() type:uint
-    + octal_to_int() type:int
-    + to_float() type:f64
-    + lower() type:String
-    + upper() type:String
-    + is_alpha(allow_extra_bytes: type:String ("")) type:bool
-    + is_alpha_numeric(allow_extra_bytes: type:String ("")) type:bool
-    + is_integer() type:bool
-    + is_number() type:bool
-    + make_empty(length: type:uint) type:String
-    + make_from_ptr(data: type:ptr, length: type:uint) type:String
-    + index_of(part: type:String, start_index: type:uint (0)) type:uint
-    + index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint
-    + contains(part: type:String) type:bool
-    + contains_byte(byte: type:u8) type:bool
-    + get(index: type:uint) type:u8
-    + range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:String
-    + part(start_index: type:uint, length: type:uint) type:String
-    + split(on: type:String) type:Array[type:String]
-    + trim(part: type:String, limit: type:uint (0)) type:String
-    + rtrim(part: type:String, limit: type:uint (0)) type:String
-    + ltrim(part: type:String, limit: type:uint (0)) type:String
-    + replace(part: type:String, with: type:String) type:String
-    + escape() type:String
-    + unescape() type:String
-    + to_json_value() json:Value
-    + from_json_value(val: json:Value) type:String
-}
-```
-
 # mem
 
 ## Functions for 'mem'
@@ -253,18 +179,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + coro:yield() void
 + coro:await_coro(coro: coro:Coro) void
 + coro:throw(code: type:u32, msg: type:String) void
-```
-
-## Classes for 'coro'
-
-```js
-+ coro:CoroPoll {
-}
-```
-
-```js
-+ coro:Coro {
-}
 ```
 
 # fs
@@ -413,129 +327,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + http:respond(code: type:uint, content_type: type:String, body: type:String, headers: ?type:Map[type:String] (null)) void
 ```
 
-## Classes for 'http'
-
-```js
-+ http:Request {
-    + method: type:String
-    + path: type:String
-    + query_string: type:String
-    + headers() type:Map[type:String]
-    + params() type:Map[type:String]
-    + params_grouped() type:Map[type:Array[type:String]]
-    + data() type:Map[type:String]
-    + files() type:Map[fs:InMemoryFile]
-    + body() type:String
-}
-```
-
-```js
-+ http:Response {
-    + html(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
-    + json(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
-    + text(body: type:String, code: type:u32 (200), content_type: type:String ("text/plain"), headers: ?type:Map[type:String] (null)) http:Response
-    + redirect(location: type:String, code: type:u32 (301), headers: ?type:Map[type:String] (null)) http:Response
-    + empty(code: type:u32, headers: ?type:Map[type:String] (null)) http:Response
-    + file(path: type:String, filename: ?type:String (null)) http:Response
-}
-```
-
-```js
-+ http:ClientRequest {
-    ~ recv_buffer: utils:ByteBuffer
-    ~ bytes_to_send: type:uint
-    ~ bytes_sent: type:uint
-    ~ bytes_to_recv: type:uint
-    ~ bytes_received: type:uint
-    ~ sent_percent: type:uint
-    ~ recv_percent: type:uint
-    ~ done: type:bool
-    + create(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientRequest
-    + progress() type:bool
-    + response() http:ClientResponse
-}
-```
-
-```js
-+ http:Server {
-    ~ host: type:String
-    + fast_handler: ?fn(http:Context, http:ResponseWriter)()
-    ~ port: type:u16
-    + show_info: type:bool
-    + new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server
-    + start(worker_count: type:i32 (8)) void
-    + add_static_dir(path: type:String) void
-}
-```
-
-```js
-+ http:Context {
-    ~ method: utils:ByteBufferStrRef
-    ~ path: utils:ByteBufferStrRef
-    ~ query_string: utils:ByteBufferStrRef
-    ~ header_data: utils:ByteBufferStrRef
-    ~ save_to_file: ?fs:FileStream
-    ~ status: type:uint
-    ~ stage: type:uint
-    ~ parsed_index: type:uint
-    ~ content_length: type:uint
-    ~ body_received: type:uint
-    ~ has_host: type:bool
-    ~ chunked: type:bool
-    ~ done: type:bool
-    + headers() type:Map[type:String]
-    + params() type:Map[type:String]
-    + params_grouped() type:Map[type:Array[type:String]]
-    + data() type:Map[type:String]
-    + files() type:Map[fs:InMemoryFile]
-    + body() type:String
-}
-```
-
-```js
-+ http:Worker {
-}
-```
-
-```js
-+ http:Connection {
-}
-```
-
-```js
-+ http:Options {
-    + body: type:String
-    + query_data: ?type:Map[type:String]
-    + headers: ?type:Map[type:String]
-    + output_to_file: ?type:String
-    + follow_redirects: type:bool
-    + get_headers() type:Map[type:String]
-    + set_header(key: type:String, value: type:String) http:Options
-    + set_headers(headers: type:Map[type:String]) http:Options
-    + clear_headers(key: type:String, value: type:String) http:Options
-}
-```
-
-```js
-+ http:RouteArg {
-}
-```
-
-```js
-+ http:ClientResponse {
-    + headers: type:Map[type:String]
-    + body: type:String
-    + status: type:uint
-}
-```
-
-```js
-+ http:ResponseWriter {
-    ~ responded: type:bool
-    + respond(code: type:uint, content_type: type:String, body: type:String, headers: ?type:Map[type:String] (null)) void
-}
-```
-
 # json
 
 ## Functions for 'json'
@@ -588,60 +379,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + json:encode(pretty: type:bool (false)) type:String
 ```
 
-## Classes for 'json'
-
-```js
-+ json:Parser {
-}
-```
-
-```js
-+ json:Value {
-    + object_values: ?type:Map[json:Value]
-    + array_values: ?type:Array[json:Value]
-    + string_value: type:String
-    + type: type:int
-    + int_value: type:int
-    + float_value: type:float
-    + bool_value: type:bool
-    + get(key: type:String) json:Value
-    + set(key: type:String, val: json:Value) void
-    + has(key: type:String) type:bool
-    + remove(key: type:String) void
-    + add(value: json:Value) void
-    + remove_index(index: type:uint) void
-    + string() type:String
-    + int() type:int
-    + float() type:float
-    + bool() type:bool
-    + array() type:Array[json:Value]
-    + map() type:Map[json:Value]
-    + is_null() type:bool
-    + is_string() type:bool
-    + is_bool() type:bool
-    + is_number() type:bool
-    + is_array() type:bool
-    + is_object() type:bool
-    + set_null(key: type:String) json:Value
-    + set_string(key: type:String, value: type:String) json:Value
-    + set_number_int(key: type:String, value: type:int) json:Value
-    + set_number_uint(key: type:String, value: type:uint) json:Value
-    + set_number_float(key: type:String, value: type:float) json:Value
-    + set_bool(key: type:String, value: type:bool) json:Value
-    + set_array(key: type:String, values: type:Array[json:Value]) json:Value
-    + set_object(key: type:String, values: type:Map[json:Value]) json:Value
-    + add_null() json:Value
-    + add_string(value: type:String) json:Value
-    + add_number_int(value: type:int) json:Value
-    + add_number_uint(value: type:uint) json:Value
-    + add_number_float(value: type:float) json:Value
-    + add_bool(value: type:bool) json:Value
-    + add_array(value: type:Array[json:Value]) json:Value
-    + add_object(value: type:Map[json:Value]) json:Value
-    + encode(pretty: type:bool (false)) type:String
-}
-```
-
 # net
 
 ## Functions for 'net'
@@ -665,51 +402,11 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 ## Classes for 'net'
 
 ```js
-+ net:Socket {
-}
-```
-
-```js
-+ net:SSL {
-    ~ ctx: SSL
-    ~ ssl: SSL
-}
-```
-
-```js
-+ net:SocketTCP {
-    ~ host: type:String
-    ~ fd: type:int
-    ~ port: type:u16
-    + new(host: type:String, port: type:u16) net:SocketTCP
-    + close() void
-    + connect() net:Connection
-    + bind() void
-    + accept() net:Connection
-}
-```
-
-```js
 + net:AddrInfo {
     ~ data: libc_gen_addrinfo
     + new(host: type:String, port: type:u16) net:AddrInfo
     + sock_addr() libc_gen_sockaddr
     + addr_len() type:u32
-}
-```
-
-```js
-+ net:Connection {
-    ~ ssl: ?net:SSL
-    ~ fd: type:int
-    ~ ssl_enabled: type:bool
-    + new(fd: type:int) net:Connection
-    + close() void
-    + ssl_connect(host: type:String, ca_cert_path: ?type:String (null)) void
-    + send(data: type:String) void
-    + send_buffer(data: utils:ByteBuffer, skip_bytes: type:uint, send_all: type:bool) type:uint
-    + send_bytes(data: type:ptr, bytes: type:uint, send_all: type:bool) type:uint
-    + recv(buffer: utils:ByteBuffer, bytes: type:uint) type:uint
 }
 ```
 
@@ -723,17 +420,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + thread:start(func: fn()()) thread:Thread
 + thread:start_unsafe(func: fn()()) thread:Thread
 + thread:wait() void
-```
-
-## Classes for 'thread'
-
-```js
-+ thread:Thread {
-    ~ finished: type:bool
-    + start(func: fn()()) thread:Thread
-    + start_unsafe(func: fn()()) thread:Thread
-    + wait() void
-}
 ```
 
 # time
@@ -811,16 +497,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 }
 ```
 
-```js
-+ utils:ByteBufferStrRef {
-    + new(buffer: utils:ByteBuffer, offset: type:uint, length: type:uint) utils:ByteBufferStrRef
-    + data() type:ptr
-    + clear() void
-    + to_str() type:String
-    + equals(cmp: type:String) type:bool
-}
-```
-
 # url
 
 ## Functions for 'url'
@@ -829,16 +505,5 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + url:parse(str: type:String) url:Url
 + url:encode(str: type:String) type:String
 + url:decode(str: type:String) type:String
-```
-
-## Classes for 'url'
-
-```js
-+ url:Url {
-    + scheme: type:String
-    + host: type:String
-    + path: type:String
-    + query: type:String
-}
 ```
 
