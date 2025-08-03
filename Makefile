@@ -20,6 +20,9 @@ valk3: valk2
 valkvg: valk
 	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
 
+doc: valk
+	./valk doc lib/ -o docs/api.md --markdown
+
 valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
