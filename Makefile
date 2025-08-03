@@ -21,7 +21,7 @@ valkvg: valk
 	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
 
 doc: valk
-	./valk doc lib/ -o docs/api.md --markdown
+	./valk doc lib/ -o docs/api.md --markdown --no-private
 
 valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
