@@ -1,11 +1,9 @@
 
 # Documentation
 
-Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type) | [mem](#mem) | [ansi](#ansi) | [coro](#coro) | [fs](#fs) | [http](#http) | [json](#json) | [net](#net) | [thread](#thread) | [time](#time) | [utils](#utils) | [url](#url)
+Namespaces: [core](#core) | [gc](#gc) | [io](#io) |  | [mem](#mem) | [ansi](#ansi) | [coro](#coro) | [fs](#fs) | [http](#http) | [json](#json) | [net](#net) | [thread](#thread) | [time](#time) | [utils](#utils) | [url](#url)
 
 ---
-
-# main
 
 # core
 
@@ -67,8 +65,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + io:print(msg: type:String) void
 + io:print_from_ptr(adr: type:ptr, len: type:uint) void
 ```
-
-# type
 
 # mem
 
