@@ -41,8 +41,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + gc:collect_shared_if_threshold_reached() void
 + gc:alloc(size: type:uint) gc:GcPtr
 + gc:collect_shared() void
-+ gc:init() gc:Gc
-+ gc:shutdown() void
 ```
 
 ## Globals for 'gc'
@@ -71,79 +69,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 ```
 
 # type
-
-## Functions for 'type'
-
-```js
-+ type:to_str() type:String
-+ type:to_hex() type:String
-+ type:round_up(modulo: type:i8) type:i8
-+ type:round_down(modulo: type:i8) type:i8
-+ type:to_base(base: type:i8) type:String
-+ type:character_length(base: type:i8) type:uint
-+ type:print(base: type:i8) void
-+ type:equals_str(str: type:String) type:bool
-+ type:length() type:uint
-+ type:data() type:ptr[type:u8]
-+ type:data_cstring() type:cstring
-+ type:starts_with(part: type:String) type:bool
-+ type:ends_with(part: type:String) type:bool
-+ type:is_empty() type:bool
-+ type:to_uint() type:uint
-+ type:to_int() type:int
-+ type:hex_to_uint() type:uint
-+ type:hex_to_int() type:int
-+ type:octal_to_uint() type:uint
-+ type:octal_to_int() type:int
-+ type:to_float() type:f64
-+ type:lower() type:String
-+ type:upper() type:String
-+ type:is_alpha() type:bool
-+ type:is_alpha_numeric() type:bool
-+ type:is_integer() type:bool
-+ type:is_number() type:bool
-+ type:make_empty(length: type:uint) type:String
-+ type:make_from_ptr(data: type:ptr, length: type:uint) type:String
-+ type:index_of(part: type:String, start_index: type:uint (0)) type:uint
-+ type:index_of_byte(byte: type:u8, memory_size: type:uint) type:uint
-+ type:contains(part: type:String) type:bool
-+ type:contains_byte(byte: type:u8) type:bool
-+ type:get(index: type:uint) type:String
-+ type:range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:String
-+ type:part(start_index: type:uint, length: type:uint) type:String
-+ type:split(on: type:String) type:Array[type:String]
-+ type:trim(part: type:String, limit: type:uint (0)) type:String
-+ type:rtrim(part: type:String, limit: type:uint (0)) type:String
-+ type:ltrim(part: type:String, limit: type:uint (0)) type:String
-+ type:replace(part: type:String, with: type:String) type:String
-+ type:escape() type:String
-+ type:unescape() type:u8
-+ type:black(bold: type:bool (false)) type:String
-+ type:red(bold: type:bool (false)) type:String
-+ type:green(bold: type:bool (false)) type:String
-+ type:yellow(bold: type:bool (false)) type:String
-+ type:blue(bold: type:bool (false)) type:String
-+ type:purple(bold: type:bool (false)) type:String
-+ type:cyan(bold: type:bool (false)) type:String
-+ type:white(bold: type:bool (false)) type:String
-+ type:to_json_value() json:Value
-+ type:from_json_value(val: json:Value) type:String
-+ type:is_ascii() type:bool
-+ type:is_hex() type:bool
-+ type:is_octal() type:bool
-+ type:is_lower() type:bool
-+ type:is_upper() type:bool
-+ type:is_space_or_tab() type:bool
-+ type:is_html_spacing() type:bool
-+ type:is_html_whitespace() type:bool
-+ type:is_whitespace() type:bool
-+ type:is_newline() type:bool
-+ type:hex_byte_to_hex_value() type:u8
-+ type:to_ascii_string() type:String
-+ type:print_bytes(length: type:uint, end_with_newline: type:bool (true)) void
-+ type:offset(offset: type:uint) type:ptr
-+ type:offset_int(offset: type:int) type:ptr
-```
 
 # mem
 
@@ -191,9 +116,9 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + fs:size(path: type:String) type:uint
 + fs:sync() void
 + fs:read_bytes(path: type:String, buffer: utils:ByteBuffer (/)) utils:ByteBuffer
-+ fs:read(bytes: type:uint (10240)) type:String
++ fs:read(path: type:String) type:String
 + fs:write(path: type:String, content: type:String, append: type:bool (false)) void
-+ fs:write_bytes(from: type:ptr, len: type:uint) void
++ fs:write_bytes(path: type:String, data: type:ptr, size: type:uint, append: type:bool (false)) void
 + fs:exists(path: type:String) type:bool
 + fs:delete(path: type:String) void
 + fs:delete_recursive(path: type:String) void
@@ -207,8 +132,8 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + fs:symlink(link: type:String, target: type:String, is_directory: type:bool) void
 + fs:mime(ext_without_dot: type:String) type:String
 + fs:path(path: type:String) fs:Path
-+ fs:resolve() fs:Path
-+ fs:add(part: type:String) fs:Path
++ fs:resolve(path: type:String) type:String
++ fs:add(dir: type:String, fn: type:String) type:String
 + fs:cwd() type:String
 + fs:chdir(path: type:String) void
 + fs:exe_dir() type:String
@@ -219,11 +144,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + fs:basename(path: type:String) type:String
 + fs:home_dir() type:String
 + fs:stream(path: type:String, read: type:bool, write: type:bool, append: type:bool (false), auto_create: type:bool (false)) fs:FileStream
-+ fs:new(path: type:String) fs:Path
-+ fs:pop() fs:Path
-+ fs:close() void
-+ fs:create_from_ptr(data: type:ptr, size: type:uint) fs:InMemoryFile
-+ fs:save(path: type:String) void
 ```
 
 ## Classes for 'fs'
@@ -302,29 +222,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + http:create_request(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientRequest
 + http:request(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientResponse
 + http:download(url: type:String, to_path: type:String, method: type:String ("GET"), options: ?http:Options (null)) void
-+ http:headers() type:Map[type:String]
-+ http:params() type:Map[type:String]
-+ http:params_grouped() type:Map[type:Array[type:String]]
-+ http:data() type:Map[type:String]
-+ http:files() type:Map[fs:InMemoryFile]
-+ http:body() type:String
-+ http:html(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
-+ http:json(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
-+ http:text(body: type:String, code: type:u32 (200), content_type: type:String ("text/plain"), headers: ?type:Map[type:String] (null)) http:Response
-+ http:redirect(location: type:String, code: type:u32 (301), headers: ?type:Map[type:String] (null)) http:Response
-+ http:empty(code: type:u32, headers: ?type:Map[type:String] (null)) http:Response
-+ http:file(path: type:String, filename: ?type:String (null)) http:Response
-+ http:create(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientRequest
-+ http:progress() type:bool
-+ http:response() http:ClientResponse
-+ http:new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server
-+ http:start(worker_count: type:i32 (8)) void
-+ http:add_static_dir(path: type:String) void
-+ http:get_headers() type:Map[type:String]
-+ http:set_header(key: type:String, value: type:String) http:Options
-+ http:set_headers(headers: type:Map[type:String]) http:Options
-+ http:clear_headers(key: type:String, value: type:String) http:Options
-+ http:respond(code: type:uint, content_type: type:String, body: type:String, headers: ?type:Map[type:String] (null)) void
 ```
 
 # json
@@ -342,41 +239,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + json:array_value(values: ?type:Array[json:Value] (null)) json:Value
 + json:object_value(values: ?type:Map[json:Value] (null)) json:Value
 + json:encode_value(json: json:Value, pretty: type:bool (false)) type:String
-+ json:get(key: type:String) json:Value
-+ json:set(key: type:String, val: json:Value) void
-+ json:has(key: type:String) type:bool
-+ json:remove(key: type:String) void
-+ json:add(value: json:Value) void
-+ json:remove_index(index: type:uint) void
-+ json:string() type:String
-+ json:int() type:int
-+ json:float() type:float
-+ json:bool() type:bool
-+ json:array() type:Array[json:Value]
-+ json:map() type:Map[json:Value]
-+ json:is_null() type:bool
-+ json:is_string() type:bool
-+ json:is_bool() type:bool
-+ json:is_number() type:bool
-+ json:is_array() type:bool
-+ json:is_object() type:bool
-+ json:set_null(key: type:String) json:Value
-+ json:set_string(key: type:String, value: type:String) json:Value
-+ json:set_number_int(key: type:String, value: type:int) json:Value
-+ json:set_number_uint(key: type:String, value: type:uint) json:Value
-+ json:set_number_float(key: type:String, value: type:float) json:Value
-+ json:set_bool(key: type:String, value: type:bool) json:Value
-+ json:set_array(key: type:String, values: type:Array[json:Value]) json:Value
-+ json:set_object(key: type:String, values: type:Map[json:Value]) json:Value
-+ json:add_null() json:Value
-+ json:add_string(value: type:String) json:Value
-+ json:add_number_int(value: type:int) json:Value
-+ json:add_number_uint(value: type:uint) json:Value
-+ json:add_number_float(value: type:float) json:Value
-+ json:add_bool(value: type:bool) json:Value
-+ json:add_array(value: type:Array[json:Value]) json:Value
-+ json:add_object(value: type:Map[json:Value]) json:Value
-+ json:encode(pretty: type:bool (false)) type:String
 ```
 
 # net
@@ -385,18 +247,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 
 ```js
 + net:set_ca_cert_path(path: ?type:String) void
-+ net:new(fd: type:int) net:Connection
-+ net:close() void
-+ net:connect() net:Connection
-+ net:bind() void
-+ net:accept() net:Connection
-+ net:sock_addr() libc_gen_sockaddr
-+ net:addr_len() type:u32
-+ net:ssl_connect(host: type:String, ca_cert_path: ?type:String (null)) void
-+ net:send(data: type:String) void
-+ net:send_buffer(data: utils:ByteBuffer, skip_bytes: type:uint, send_all: type:bool) type:uint
-+ net:send_bytes(data: type:ptr, bytes: type:uint, send_all: type:bool) type:uint
-+ net:recv(buffer: utils:ByteBuffer, bytes: type:uint) type:uint
 ```
 
 ## Classes for 'net'
@@ -418,8 +268,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 + thread:sleep_ns(ns: type:uint) void
 + thread:sleep_ms(ms: type:uint) void
 + thread:start(func: fn()()) thread:Thread
-+ thread:start_unsafe(func: fn()()) thread:Thread
-+ thread:wait() void
 ```
 
 # time
@@ -434,36 +282,6 @@ Namespaces: [main](#main) | [core](#core) | [gc](#gc) | [io](#io) | [type](#type
 ```
 
 # utils
-
-## Functions for 'utils'
-
-```js
-+ utils:new(buffer: utils:ByteBuffer, offset: type:uint, length: type:uint) utils:ByteBufferStrRef
-+ utils:clone() utils:ByteBuffer
-+ utils:clear() void
-+ utils:clear_until(index: type:uint) void
-+ utils:clear_part(index: type:uint, len: type:uint) void
-+ utils:get(index: type:uint) type:u8
-+ utils:append(buffer: utils:ByteBuffer, start_index: type:uint (0)) void
-+ utils:append_from_ptr(data: type:ptr, length: type:uint) void
-+ utils:append_byte(byte: type:u8) void
-+ utils:append_str(str: type:String) void
-+ utils:append_uint(value: type:uint) void
-+ utils:append_int(value: type:int) void
-+ utils:equals_str(str: type:String) type:bool
-+ utils:starts_with(str: type:String, offset: type:uint) type:bool
-+ utils:index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint
-+ utils:index_where_byte_is_not(byte: type:u8, start_index: type:uint (0)) type:uint
-+ utils:to_string() type:String
-+ utils:part(start_index: type:uint, length: type:uint) type:String
-+ utils:str_ref(offset: type:uint, length: type:uint) utils:ByteBufferStrRef
-+ utils:minimum_free_space(length: type:uint) void
-+ utils:minimum_size(minimum_size: type:uint) void
-+ utils:reduce_size(size: type:uint) void
-+ utils:data() type:ptr
-+ utils:to_str() type:String
-+ utils:equals(cmp: type:String) type:bool
-```
 
 ## Classes for 'utils'
 
