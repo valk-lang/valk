@@ -58,6 +58,10 @@
 <br></td></tr>
 </table>
 
+## Standard library API
+
+See: [API docs](api.md)
+
 ## Getting started
 
 Install on linux, macos or WSL
