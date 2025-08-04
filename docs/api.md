@@ -436,7 +436,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn filter_copy(func: ?fn(T)(bool) (null)) Array[T]
     + fn fit_index(index: uint) void
-     fn from_json_value_auto() 
     + fn get(index: uint) T !not_found
     + fn increase_size(new_size: uint) GcPtr
     + fn index_of(item: T) uint !not_found
