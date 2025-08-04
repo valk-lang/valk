@@ -440,38 +440,9 @@ fn print(msg: ?String) {
 
 ## Files
 
-use `valk:fs` to access all file system related functions
+API for [valk:fs](api.md#fs)
 
-```rust
-use valk:fs
-// File & Directories
-fs:read(path) // Read file, returns content as a String
-fs:write(path, content, append: bool) // Write to file
-fs:delete(path) // Delete file
-fs:delete_recursive(path) // Delete file or directory recursive
-fs:move(from_path, to_path)
-fs:copy(from_path, to_path, recursive) // Copy file or directory
-fs:exists(path)
-fs:mkdir(path) // Create directory
-fs:rmdir(path) // Delete directory
-fs:is_file(path)
-fs:is_dir(path)
-fs:files_in(path, recursive) // Returns all files in a directory
-fs:symlink(link_path, target_path) // Create a symlink
-// Paths
-fs:resolve(path) // Uses correct slashes + Removes double slashes + resolves `./` and `/../`
-fs:realpath(path) // Returns the target path from a symlink
-fs:dir_of(path) // ./part1/part2 -> ./part1
-fs:basename(path) // ./part1/part2 -> part2
-fs:ext(path, with_dot: bool) // Returns the extension from a path, e.g. "jpg",".jpg" otherwise ""
-fs:add(part1, part2) // Returns part1 + {slash} + part2, prevents double slashes
-fs:cwd() // Returns current working directory
-fs:chdir(path) // Change current working directory
-fs:exe_path() // Returns the path of the running executable
-fs:exe_dir() // Returns the directory of the running executable
-fs:home_dir() // Returns the home directory from the user running the executable
-fs:path(path) // Converts String to Path class (more info below)
-```
+use `valk:fs` to access all file system related functions
 
 ## Paths
 
@@ -493,27 +464,7 @@ fn main() {
 
 ## JSON
 
-API : `valk:json`
-
-```rust
-json:decode(text) ! // Convert json string to json:Value
-{json:Value}.encode(pretty) // Convert json:Value to json string
-// Create values
-json:null_value()
-json:bool_value(v: bool)
-json:int_value(v: int)
-json:uint_value(v: uint)
-json:float_value(v: float)
-json:string_value(v: String)
-json:array_value(v: ?Array[json:Value])
-json:object_value(v: ?Map[json:Value])
-// Set object keys
-{json:Value}.set(key, v)
-{json:Value}.remove(key)
-// Modify array
-{json:Value}.add(v) // Add item to array
-{json:Value}.remove_index(index)
-```
+API for [valk:json](api.md#json)
 
 With `valk:json` you can convert any type to json or json to any type out-of-the-box.
 
@@ -719,7 +670,11 @@ Or we can put our tests in a different directory.
 valk build src/*.v ./my-tests/*.valk --test --run
 ```
 
-## HTTP Client
+## HTTP
+
+API for [valk:http](api.md#http)
+
+### HTTP Client
 
 With `valk:http` you can send HTTP requests to APIs or download files from a url.
 
@@ -739,7 +694,7 @@ let res = http:request("POST", "http://some-website/api/endpoint", http:Options{
 http:download(url, to_path) ! panic("Failed to download file")
 ```
 
-## HTTP Server
+### HTTP Server
 
 ```js
 use valk:http
@@ -761,6 +716,8 @@ fn main() {
 ```
 
 ## Sockets
+
+API for [valk:net](api.md#net)
 
 Currently we only support `TCP` sockets. We are still working on expanding our `net` functionality.
 
