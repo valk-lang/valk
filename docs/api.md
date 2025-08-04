@@ -20,7 +20,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn exec(cmd: type:String, stream_output: type:bool (false)) (type:i32, type:String)
 + fn exit(code: type:i32) void
-+ fn getenv(var: type:String) type:String
++ fn getenv(var: type:String) type:String !not_found
 + fn libc_errno() type:i32
 + fn panic(msg: type:String) void
 + fn raise(code: type:i32) void
@@ -33,7 +33,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + class Mutex[T] {
     + fn lock() T
-    + static fn new(value: T) core:Mutex
+    + static fn new(value: T) core:Mutex[T]
     + fn unlock(value: T) void
 }
 ```
@@ -64,9 +64,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn add(dir: type:String, fn: type:String) type:String
 + fn basename(path: type:String) type:String
 + fn chdir(path: type:String) void
-+ fn copy(from_path: type:String, to_path: type:String, recursive: type:bool (false)) void
++ fn copy(from_path: type:String, to_path: type:String, recursive: type:bool (false)) void !fail
 + fn cwd() type:String
-+ fn delete(path: type:String) void
++ fn delete(path: type:String) void !delete
 + fn delete_recursive(path: type:String) void
 + fn dir_of(path: type:String) type:String
 + fn exe_dir() type:String
@@ -74,26 +74,26 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn exists(path: type:String) type:bool
 + fn ext(path: type:String, with_dot: type:bool (false)) type:String
 + fn files_in(dir: type:String, recursive: type:bool (false), files: type:bool (true), dirs: type:bool (true), prefix: ?type:String (null), result: type:Array[type:String] (...)) type:Array[type:String]
-+ fn home_dir() type:String
++ fn home_dir() type:String !not_found
 + fn is_dir(path: type:String) type:bool
 + fn is_file(path: type:String) type:bool
 + fn mime(ext_without_dot: type:String) type:String
-+ fn mkdir(path: type:String, permissions: type:u32 (493)) void
-+ fn move(from_path: type:String, to_path: type:String) void
-+ fn open(path: type:String, writable: type:bool, append_on_write: type:bool) type:int
-+ fn open_extend(path: type:String, writable: type:bool, append_on_write: type:bool, create_file_if_doesnt_exist: type:bool (false), create_file_permissions: type:u32 (420)) type:int
++ fn mkdir(path: type:String, permissions: type:u32 (493)) void !fail
++ fn move(from_path: type:String, to_path: type:String) void !fail
++ fn open(path: type:String, writable: type:bool, append_on_write: type:bool) type:int !open
++ fn open_extend(path: type:String, writable: type:bool, append_on_write: type:bool, create_file_if_doesnt_exist: type:bool (false), create_file_permissions: type:u32 (420)) type:int !open !access
 + fn path(path: type:String) fs:Path
-+ fn read(path: type:String) type:String
-+ fn read_bytes(path: type:String, buffer: utils:ByteBuffer (...)) utils:ByteBuffer
++ fn read(path: type:String) type:String !open !read !close
++ fn read_bytes(path: type:String, buffer: utils:ByteBuffer (...)) utils:ByteBuffer !open !read !close
 + fn realpath(path: type:String) type:String
 + fn resolve(path: type:String) type:String
-+ fn rmdir(path: type:String) void
++ fn rmdir(path: type:String) void !fail
 + fn size(path: type:String) type:uint
-+ fn stream(path: type:String, read: type:bool, write: type:bool, append: type:bool (false), auto_create: type:bool (false)) fs:FileStream
-+ fn symlink(link: type:String, target: type:String, is_directory: type:bool) void
++ fn stream(path: type:String, read: type:bool, write: type:bool, append: type:bool (false), auto_create: type:bool (false)) fs:FileStream !err_open
++ fn symlink(link: type:String, target: type:String, is_directory: type:bool) void !permissions !exists !other
 + fn sync() void
-+ fn write(path: type:String, content: type:String, append: type:bool (false)) void
-+ fn write_bytes(path: type:String, data: type:ptr, size: type:uint, append: type:bool (false)) void
++ fn write(path: type:String, content: type:String, append: type:bool (false)) void !open !write
++ fn write_bytes(path: type:String, data: type:ptr, size: type:uint, append: type:bool (false)) void !open !write
 ```
 
 ## Classes for 'fs'
@@ -104,8 +104,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ reading: type:bool
 
     + fn close() void
-    + fn read(bytes: type:uint (10240)) type:String
-    + fn write_bytes(from: type:ptr, len: type:uint) void
+    + fn read(bytes: type:uint (10240)) type:String !read_err
+    + fn write_bytes(from: type:ptr, len: type:uint) void !write_err
 }
 ```
 
@@ -157,9 +157,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'http'
 
 ```js
-+ fn create_request(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientRequest
-+ fn download(url: type:String, to_path: type:String, method: type:String ("GET"), options: ?http:Options (null)) void
-+ fn request(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientResponse
++ fn create_request(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientRequest !invalid_url !ssl !connect
++ fn download(url: type:String, to_path: type:String, method: type:String ("GET"), options: ?http:Options (null)) void !invalid_path !invalid_url !ssl !connect !disconnect !invalid_response
++ fn request(method: type:String, url: type:String, options: ?http:Options (null)) http:ClientResponse !invalid_url !invalid_output_path !ssl !connect !disconnect !invalid_response
 ```
 
 ## Classes for 'http'
@@ -197,9 +197,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + class Router[T] {
-    + fn add(method: type:String, url: type:String, handler: T) void
-    + fn find(method: type:String, url: type:String) http:Route
-    + static fn new() http:Router
+    + fn add(method: type:String, url: type:String, handler: T) void !invalid_route
+    + fn find(method: type:String, url: type:String) http:Route[T] !not_found
+    + static fn new() http:Router[T]
 }
 ```
 
@@ -210,8 +210,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ port: type:u16
     + show_info: type:bool
 
-    + fn add_static_dir(path: type:String) void
-    + static fn new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server
+    + fn add_static_dir(path: type:String) void !notfound
+    + static fn new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server !socket_init_error !socket_bind_error
     + fn start(worker_count: type:i32 (8)) void
 }
 ```
@@ -226,11 +226,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn print(msg: type:String) void
 + fn print_from_ptr(adr: type:ptr, len: type:uint) void
 + fn println(msg: type:String) void
-+ fn read(fd: type:int, buffer: type:ptr, buffer_size: type:uint) type:uint
++ fn read(fd: type:int, buffer: type:ptr, buffer_size: type:uint) type:uint !failed !again
 + fn set_non_block(fd: type:int, value: type:bool) void
 + fn valk_fd(fd: type:int) type:int
-+ fn write(fd: type:int, str: type:String) void
-+ fn write_bytes(fd: type:int, data: type:ptr, length: type:uint) type:uint
++ fn write(fd: type:int, str: type:String) void !failed !again
++ fn write_bytes(fd: type:int, data: type:ptr, length: type:uint) type:uint !failed !again
 ```
 
 # json
@@ -240,7 +240,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn array_value(values: ?type:Array[json:Value] (null)) json:Value
 + fn bool_value(value: type:bool) json:Value
-+ fn decode(json: type:String) json:Value
++ fn decode(json: type:String) json:Value !invalid
 + fn encode_value(json: json:Value, pretty: type:bool (false)) type:String
 + fn float_value(value: type:float) json:Value
 + fn int_value(value: type:int) json:Value
@@ -257,12 +257,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn alloc(size: type:uint) type:ptr
 + fn ascii_bytes_to_lower(adr: type:ptr, len: type:uint) void
-+ fn bytes_to_uint(adr: type:ptr, len: type:uint) type:uint
++ fn bytes_to_uint(adr: type:ptr, len: type:uint) type:uint !not_a_number
 + fn calloc(size: type:uint) type:ptr
 + fn clear(adr: type:ptr, length: type:uint) void
 + fn copy(from: type:ptr, to: type:ptr, length: type:uint) void
 + fn equal(a: type:ptr, b: type:ptr, length: type:uint) type:bool
-+ fn find_char(adr: type:ptr, ch: type:u8, length: type:uint) type:uint
++ fn find_char(adr: type:ptr, ch: type:u8, length: type:uint) type:uint !not_found
 + fn free(adr: type:ptr) void
 ```
 
@@ -281,7 +281,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ data: libc_gen_addrinfo
 
     + fn addr_len() type:u32
-    + static fn new(host: type:String, port: type:u16) net:AddrInfo
+    + static fn new(host: type:String, port: type:u16) net:AddrInfo !fail
     + fn sock_addr() libc_gen_sockaddr
 }
 ```
@@ -329,93 +329,93 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ length: type:uint
     ~ size: type:uint
 
-    + fn append(item: T, unique: type:bool (false)) type:Array
-    + fn append_copy(item: T, unique: type:bool (false)) type:Array
-    + fn append_many(items: type:Array) type:Array
-    + fn append_many_copy(items: type:Array) type:Array
-    + fn clear() type:Array
+    + fn append(item: T, unique: type:bool (false)) type:Array[T]
+    + fn append_copy(item: T, unique: type:bool (false)) type:Array[T]
+    + fn append_many(items: type:Array[T]) type:Array[T]
+    + fn append_many_copy(items: type:Array[T]) type:Array[T]
+    + fn clear() type:Array[T]
     + fn contains(value: T) type:bool
-    + fn copy() type:Array
-    + fn equal(array: type:Array) type:bool
-    + fn equal_ignore_order(array: type:Array) type:bool
-    + fn filter(func: ?fn(T)(type:bool) (null)) type:Array
-    + fn filter_copy(func: ?fn(T)(type:bool) (null)) type:Array
+    + fn copy() type:Array[T]
+    + fn equal(array: type:Array[T]) type:bool
+    + fn equal_ignore_order(array: type:Array[T]) type:bool
+    + fn filter(func: ?fn(T)(type:bool) (null)) type:Array[T]
+    + fn filter_copy(func: ?fn(T)(type:bool) (null)) type:Array[T]
     + fn fit_index(index: type:uint) void
     + static fn from_json_value_auto() void
-    + fn get(index: type:uint) T
+    + fn get(index: type:uint) T !not_found
     + fn increase_size(new_size: type:uint) gc:GcPtr
-    + fn index_of(item: T) type:uint
-    + fn intersect(with: type:Array) type:Array
-    + fn merge(items: type:Array) type:Array
-    + static fn new(start_size: type:uint (2)) type:Array
-    + fn part(start: type:uint, amount: type:uint) type:Array
-    + fn pop_first() T
-    + fn pop_last() T
-    + fn prepend(item: T, unique: type:bool (false)) type:Array
-    + fn prepend_copy(item: T, unique: type:bool (false)) type:Array
-    + fn prepend_many(items: type:Array) type:Array
-    + fn prepend_many_copy(items: type:Array) type:Array
-    + fn push(item: T, unique: type:bool (false)) type:Array
-    + fn range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:Array
-    + fn remove(index: type:uint) type:Array
-    + fn remove_copy(index: type:uint) type:Array
-    + fn remove_value(value: T) type:Array
-    + fn remove_value_copy(value: T) type:Array
-    + fn reverse() type:Array
-    + fn reverse_copy() type:Array
-    + fn set(index: type:uint, value: T) void
+    + fn index_of(item: T) type:uint !not_found
+    + fn intersect(with: type:Array[T]) type:Array[T]
+    + fn merge(items: type:Array[T]) type:Array[T]
+    + static fn new(start_size: type:uint (2)) type:Array[T]
+    + fn part(start: type:uint, amount: type:uint) type:Array[T]
+    + fn pop_first() T !empty
+    + fn pop_last() T !empty
+    + fn prepend(item: T, unique: type:bool (false)) type:Array[T]
+    + fn prepend_copy(item: T, unique: type:bool (false)) type:Array[T]
+    + fn prepend_many(items: type:Array[T]) type:Array[T]
+    + fn prepend_many_copy(items: type:Array[T]) type:Array[T]
+    + fn push(item: T, unique: type:bool (false)) type:Array[T]
+    + fn range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:Array[T]
+    + fn remove(index: type:uint) type:Array[T]
+    + fn remove_copy(index: type:uint) type:Array[T]
+    + fn remove_value(value: T) type:Array[T]
+    + fn remove_value_copy(value: T) type:Array[T]
+    + fn reverse() type:Array[T]
+    + fn reverse_copy() type:Array[T]
+    + fn set(index: type:uint, value: T) void !out_of_range
     + fn set_expand(index: type:uint, value: T, filler_value: T) void
-    + fn sort(func: ?fn(T, T)(type:bool) (null)) type:Array
-    + fn sort_copy(func: ?fn(T, T)(type:bool) (null)) type:Array
+    + fn sort(func: ?fn(T, T)(type:bool) (null)) type:Array[T]
+    + fn sort_copy(func: ?fn(T, T)(type:bool) (null)) type:Array[T]
     + fn swap(index_a: type:uint, index_b: type:uint) void
     + fn to_json_value() json:Value
-    + fn unique() type:Array
-    + fn unique_copy() type:Array
+    + fn unique() type:Array[T]
+    + fn unique_copy() type:Array[T]
 }
 ```
 
 ```js
 + class FlatMap[K, T] {
-    + fn clear() type:FlatMap
-    + fn copy() type:FlatMap
-    + fn get(key: K) T
+    + fn clear() type:FlatMap[K, T]
+    + fn copy() type:FlatMap[K, T]
+    + fn get(key: K) T !not_found
     + fn has(key: K) type:bool
     + fn has_value(value: T) type:bool
     + fn keys() type:Array[K]
     + fn length() type:uint
-    + fn merge(map: type:FlatMap) type:FlatMap
-    + static fn new() type:FlatMap
-    + fn remove(key: K) type:FlatMap
-    + fn set(key: K, value: T) type:FlatMap
-    + fn set_many(map: type:FlatMap) type:FlatMap
-    + fn set_unique(key: K, value: T) void
-    + fn sort_keys() type:FlatMap
-    + fn values() type:Array
+    + fn merge(map: type:FlatMap[K, T]) type:FlatMap[K, T]
+    + static fn new() type:FlatMap[K, T]
+    + fn remove(key: K) type:FlatMap[K, T]
+    + fn set(key: K, value: T) type:FlatMap[K, T]
+    + fn set_many(map: type:FlatMap[K, T]) type:FlatMap[K, T]
+    + fn set_unique(key: K, value: T) void !not_unique
+    + fn sort_keys() type:FlatMap[K, T]
+    + fn values() type:Array[T]
 }
 ```
 
 ```js
 + class HashMap[K, T] {
-    + fn clear() type:HashMap
-    + fn copy() type:HashMap
-    + fn get(key: K) T
+    + fn clear() type:HashMap[K, T]
+    + fn copy() type:HashMap[K, T]
+    + fn get(key: K) T !not_found
     + fn has(key: K) type:bool
     + fn has_value(value: T) type:bool
     + fn keys() type:Array[K]
     + fn length() type:uint
-    + fn merge(map: type:HashMap) type:HashMap
-    + static fn new() type:HashMap
-    + fn remove(key: K) type:HashMap
-    + fn set(key: K, value: T) type:HashMap
-    + fn set_unique(key: K, value: T) type:HashMap
-    + fn sort_keys() type:HashMap
-    + fn values() type:Array
+    + fn merge(map: type:HashMap[K, T]) type:HashMap[K, T]
+    + static fn new() type:HashMap[K, T]
+    + fn remove(key: K) type:HashMap[K, T]
+    + fn set(key: K, value: T) type:HashMap[K, T]
+    + fn set_unique(key: K, value: T) type:HashMap[K, T]
+    + fn sort_keys() type:HashMap[K, T]
+    + fn values() type:Array[T]
 }
 ```
 
 ```js
 + mode Map[T] for type:HashMap[type:String, T] {
-    + static fn new() type:Map
+    + static fn new() type:Map[T]
 }
 ```
 
@@ -424,8 +424,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ count: type:uint
 
     + fn add(item: T) void
-    + fn get() T
-    + static fn new(start_size: type:uint (2)) type:Pool
+    + fn get() T !empty
+    + static fn new(start_size: type:uint (2)) type:Pool[T]
 }
 ```
 
@@ -441,10 +441,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn escape() type:String
     + static fn from_json_value(val: json:Value) type:String
     + fn get(index: type:uint) type:u8
-    + fn hex_to_int() type:int
-    + fn hex_to_uint() type:uint
-    + fn index_of(part: type:String, start_index: type:uint (0)) type:uint
-    + fn index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint
+    + fn hex_to_int() type:int !invalid
+    + fn hex_to_uint() type:uint !invalid
+    + fn index_of(part: type:String, start_index: type:uint (0)) type:uint !not_found
+    + fn index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint !not_found
     + fn is_alpha(allow_extra_bytes: type:String ("")) type:bool
     + fn is_alpha_numeric(allow_extra_bytes: type:String ("")) type:bool
     + fn is_empty() type:bool
@@ -455,18 +455,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn ltrim(part: type:String, limit: type:uint (0)) type:String
     + static fn make_empty(length: type:uint) type:String
     + static fn make_from_ptr(data: type:ptr, length: type:uint) type:String
-    + fn octal_to_int() type:int
-    + fn octal_to_uint() type:uint
+    + fn octal_to_int() type:int !invalid
+    + fn octal_to_uint() type:uint !invalid
     + fn part(start_index: type:uint, length: type:uint) type:String
     + fn range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:String
     + fn replace(part: type:String, with: type:String) type:String
     + fn rtrim(part: type:String, limit: type:uint (0)) type:String
     + fn split(on: type:String) type:Array[type:String]
     + fn starts_with(part: type:String) type:bool
-    + fn to_float() type:f64
-    + fn to_int() type:int
+    + fn to_float() type:f64 !invalid
+    + fn to_int() type:int !invalid
     + fn to_json_value() json:Value
-    + fn to_uint() type:uint
+    + fn to_uint() type:uint !invalid
     + fn trim(part: type:String, limit: type:uint (0)) type:String
     + fn unescape() type:String
     + fn upper() type:String
@@ -568,7 +568,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + class ptr {
-    + fn index_of_byte(byte: type:u8, memory_size: type:uint) type:uint
+    + fn index_of_byte(byte: type:u8, memory_size: type:uint) type:uint !not_found
     + fn offset(offset: type:uint) type:ptr
     + fn offset_int(offset: type:int) type:ptr
     + fn print_bytes(length: type:uint, end_with_newline: type:bool (true)) void
@@ -688,9 +688,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn clear_until(index: type:uint) void
     + fn clone() utils:ByteBuffer
     + fn equals_str(str: type:String) type:bool
-    + fn get(index: type:uint) type:u8
-    + fn index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint
-    + fn index_where_byte_is_not(byte: type:u8, start_index: type:uint (0)) type:uint
+    + fn get(index: type:uint) type:u8 !range
+    + fn index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint !not_found
+    + fn index_where_byte_is_not(byte: type:u8, start_index: type:uint (0)) type:uint !not_found
     + fn minimum_free_space(length: type:uint) void
     + fn minimum_size(minimum_size: type:uint) void
     + static fn new(start_size: type:uint (128)) utils:ByteBuffer
