@@ -667,6 +667,17 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn parse(str: String) Url
 ```
 
+## Classes for 'url'
+
+```js
++ class Url {
+    + host: String
+    + path: String
+    + query: String
+    + scheme: String
+}
+```
+
 # utils
 
 ## Classes for 'utils'
