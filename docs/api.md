@@ -52,7 +52,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn await_coro(coro: Coro) void
 + fn await_fd(fd: int, read: bool, write: bool) PollEvent
-+ fn throw(code: u32, msg: String) void
 + fn yield() void
 ```
 
