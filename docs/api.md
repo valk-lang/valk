@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [http](#http) | [io](#io) | [json](#json) |  | [mem](#mem) | [net](#net) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
 
 ---
 
