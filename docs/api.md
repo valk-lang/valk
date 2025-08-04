@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [core](#core) | [gc](#gc) | [io](#io) |  | [mem](#mem) | [ansi](#ansi) | [coro](#coro) | [fs](#fs) | [http](#http) | [json](#json) | [net](#net) | [thread](#thread) | [time](#time) | [utils](#utils) | [url](#url)
+Namespaces: [core](#core) | [gc](#gc) | [io](#io) | [type](#type) | [mem](#mem) | [ansi](#ansi) | [coro](#coro) | [fs](#fs) | [http](#http) | [json](#json) | [net](#net) | [thread](#thread) | [time](#time) | [utils](#utils) | [url](#url)
 
 ---
 
@@ -64,6 +64,238 @@ Namespaces: [core](#core) | [gc](#gc) | [io](#io) |  | [mem](#mem) | [ansi](#ans
 + fn println(msg: type:String) void
 + fn print(msg: type:String) void
 + fn print_from_ptr(adr: type:ptr, len: type:uint) void
+```
+
+# type
+
+## Classes for 'type'
+
+```js
++ class uint {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:uint) type:uint
+    + fn round_down(modulo: type:uint) type:uint
+    + fn to_base(base: type:uint) type:String
+    + fn character_length(base: type:uint) type:uint
+    + fn print(base: type:uint) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class cstring {
+}
+```
+
+```js
++ class u64 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:u64) type:u64
+    + fn round_down(modulo: type:u64) type:u64
+    + fn to_base(base: type:u64) type:String
+    + fn character_length(base: type:u64) type:uint
+    + fn print(base: type:u64) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class String {
+    ~ bytes: type:uint
+
+    + fn length() type:uint
+    + fn data() type:ptr[type:u8]
+    + fn data_cstring() type:cstring
+    + fn starts_with(part: type:String) type:bool
+    + fn ends_with(part: type:String) type:bool
+    + fn is_empty() type:bool
+    + fn to_uint() type:uint
+    + fn to_int() type:int
+    + fn hex_to_uint() type:uint
+    + fn hex_to_int() type:int
+    + fn octal_to_uint() type:uint
+    + fn octal_to_int() type:int
+    + fn to_float() type:f64
+    + fn lower() type:String
+    + fn upper() type:String
+    + fn is_alpha(allow_extra_bytes: type:String ("")) type:bool
+    + fn is_alpha_numeric(allow_extra_bytes: type:String ("")) type:bool
+    + fn is_integer() type:bool
+    + fn is_number() type:bool
+    + fn make_empty(length: type:uint) type:String
+    + fn make_from_ptr(data: type:ptr, length: type:uint) type:String
+    + fn index_of(part: type:String, start_index: type:uint (0)) type:uint
+    + fn index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint
+    + fn contains(part: type:String) type:bool
+    + fn contains_byte(byte: type:u8) type:bool
+    + fn get(index: type:uint) type:u8
+    + fn range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:String
+    + fn part(start_index: type:uint, length: type:uint) type:String
+    + fn split(on: type:String) type:Array[type:String]
+    + fn trim(part: type:String, limit: type:uint (0)) type:String
+    + fn rtrim(part: type:String, limit: type:uint (0)) type:String
+    + fn ltrim(part: type:String, limit: type:uint (0)) type:String
+    + fn replace(part: type:String, with: type:String) type:String
+    + fn escape() type:String
+    + fn unescape() type:String
+    + fn to_json_value() json:Value
+    + fn from_json_value(val: json:Value) type:String
+}
+```
+
+```js
++ class u32 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:u32) type:u32
+    + fn round_down(modulo: type:u32) type:u32
+    + fn to_base(base: type:u32) type:String
+    + fn character_length(base: type:u32) type:uint
+    + fn print(base: type:u32) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class i32 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:i32) type:i32
+    + fn round_down(modulo: type:i32) type:i32
+    + fn to_base(base: type:i32) type:String
+    + fn character_length(base: type:i32) type:uint
+    + fn print(base: type:i32) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class float {
+    + fn to_str(decimals: type:uint (2)) type:String
+}
+```
+
+```js
++ class bool {
+}
+```
+
+```js
++ class f64 {
+    + fn to_str(decimals: type:uint (2)) type:String
+}
+```
+
+```js
++ class u16 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:u16) type:u16
+    + fn round_down(modulo: type:u16) type:u16
+    + fn to_base(base: type:u16) type:String
+    + fn character_length(base: type:u16) type:uint
+    + fn print(base: type:u16) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class int {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:int) type:int
+    + fn round_down(modulo: type:int) type:int
+    + fn to_base(base: type:int) type:String
+    + fn character_length(base: type:int) type:uint
+    + fn print(base: type:int) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class u8 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:u8) type:u8
+    + fn round_down(modulo: type:u8) type:u8
+    + fn to_base(base: type:u8) type:String
+    + fn character_length(base: type:u8) type:uint
+    + fn print(base: type:u8) void
+    + fn equals_str(str: type:String) type:bool
+    + fn is_ascii() type:bool
+    + fn is_hex() type:bool
+    + fn is_octal() type:bool
+    + fn is_number() type:bool
+    + fn is_lower() type:bool
+    + fn is_upper() type:bool
+    + fn is_alpha() type:bool
+    + fn is_alpha_numeric() type:bool
+    + fn is_space_or_tab() type:bool
+    + fn is_html_spacing() type:bool
+    + fn is_html_whitespace() type:bool
+    + fn is_whitespace() type:bool
+    + fn is_newline() type:bool
+    + fn hex_byte_to_hex_value() type:u8
+    + fn to_ascii_string() type:String
+    + fn unescape() type:u8
+}
+```
+
+```js
++ class i64 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:i64) type:i64
+    + fn round_down(modulo: type:i64) type:i64
+    + fn to_base(base: type:i64) type:String
+    + fn character_length(base: type:i64) type:uint
+    + fn print(base: type:i64) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class f32 {
+    + fn to_str(decimals: type:uint (2)) type:String
+}
+```
+
+```js
++ class ptr {
+    + fn to_hex() type:String
+    + fn index_of_byte(byte: type:u8, memory_size: type:uint) type:uint
+    + fn print_bytes(length: type:uint, end_with_newline: type:bool (true)) void
+    + fn offset(offset: type:uint) type:ptr
+    + fn offset_int(offset: type:int) type:ptr
+}
+```
+
+```js
++ class i16 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:i16) type:i16
+    + fn round_down(modulo: type:i16) type:i16
+    + fn to_base(base: type:i16) type:String
+    + fn character_length(base: type:i16) type:uint
+    + fn print(base: type:i16) void
+    + fn equals_str(str: type:String) type:bool
+}
+```
+
+```js
++ class i8 {
+    + fn to_str() type:String
+    + fn to_hex() type:String
+    + fn round_up(modulo: type:i8) type:i8
+    + fn round_down(modulo: type:i8) type:i8
+    + fn to_base(base: type:i8) type:String
+    + fn character_length(base: type:i8) type:uint
+    + fn print(base: type:i8) void
+    + fn equals_str(str: type:String) type:bool
+}
 ```
 
 # mem
