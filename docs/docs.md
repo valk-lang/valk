@@ -260,6 +260,8 @@ class A {
     list: Array[int]
 }
 let ob = A { list: .{1,2,3} }
+// Operators also typehint for the value on the right side
+let is_equal = (ob.list == .{3,2,1})
 ```
 
 ## Functions
