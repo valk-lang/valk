@@ -33,7 +33,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + class Mutex[T] {
     + fn lock() T
-    + fn new(value: T) core:Mutex
+    + static fn new(value: T) core:Mutex
     + fn unlock(value: T) void
 }
 ```
@@ -114,7 +114,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ data: type:ptr
     ~ size: type:uint
 
-    + fn create_from_ptr(data: type:ptr, size: type:uint) fs:InMemoryFile
+    + static fn create_from_ptr(data: type:ptr, size: type:uint) fs:InMemoryFile
     + fn save(path: type:String) void
 }
 ```
@@ -124,7 +124,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ bytes: type:uint
 
     + fn add(part: type:String) fs:Path
-    + fn new(path: type:String) fs:Path
+    + static fn new(path: type:String) fs:Path
     + fn pop() fs:Path
     + fn resolve() fs:Path
 }
@@ -186,12 +186,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + headers: ?type:Map[type:String]
     + status: type:u32
 
-    + fn empty(code: type:u32, headers: ?type:Map[type:String] (null)) http:Response
-    + fn file(path: type:String, filename: ?type:String (null)) http:Response
-    + fn html(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
-    + fn json(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
-    + fn redirect(location: type:String, code: type:u32 (301), headers: ?type:Map[type:String] (null)) http:Response
-    + fn text(body: type:String, code: type:u32 (200), content_type: type:String ("text/plain"), headers: ?type:Map[type:String] (null)) http:Response
+    + static fn empty(code: type:u32, headers: ?type:Map[type:String] (null)) http:Response
+    + static fn file(path: type:String, filename: ?type:String (null)) http:Response
+    + static fn html(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
+    + static fn json(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
+    + static fn redirect(location: type:String, code: type:u32 (301), headers: ?type:Map[type:String] (null)) http:Response
+    + static fn text(body: type:String, code: type:u32 (200), content_type: type:String ("text/plain"), headers: ?type:Map[type:String] (null)) http:Response
 }
 ```
 
@@ -199,7 +199,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + class Router[T] {
     + fn add(method: type:String, url: type:String, handler: T) void
     + fn find(method: type:String, url: type:String) http:Route
-    + fn new() http:Router
+    + static fn new() http:Router
 }
 ```
 
@@ -211,7 +211,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + show_info: type:bool
 
     + fn add_static_dir(path: type:String) void
-    + fn new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server
+    + static fn new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server
     + fn start(worker_count: type:i32 (8)) void
 }
 ```
@@ -281,7 +281,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ data: libc_gen_addrinfo
 
     + fn addr_len() type:u32
-    + fn new(host: type:String, port: type:u16) net:AddrInfo
+    + static fn new(host: type:String, port: type:u16) net:AddrInfo
     + fn sock_addr() libc_gen_sockaddr
 }
 ```
@@ -302,8 +302,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + class Thread {
     ~ finished: type:bool
 
-    + fn start(func: fn()()) thread:Thread
-    + fn start_unsafe(func: fn()()) thread:Thread
+    + static fn start(func: fn()()) thread:Thread
+    + static fn start_unsafe(func: fn()()) thread:Thread
     + fn wait() void
 }
 ```
@@ -341,13 +341,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn filter(func: ?fn(T)(type:bool) (null)) type:Array
     + fn filter_copy(func: ?fn(T)(type:bool) (null)) type:Array
     + fn fit_index(index: type:uint) void
-    + fn from_json_value_auto() void
+    + static fn from_json_value_auto() void
     + fn get(index: type:uint) T
     + fn increase_size(new_size: type:uint) gc:GcPtr
     + fn index_of(item: T) type:uint
     + fn intersect(with: type:Array) type:Array
     + fn merge(items: type:Array) type:Array
-    + fn new(start_size: type:uint (2)) type:Array
+    + static fn new(start_size: type:uint (2)) type:Array
     + fn part(start: type:uint, amount: type:uint) type:Array
     + fn pop_first() T
     + fn pop_last() T
@@ -384,7 +384,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn keys() type:Array[K]
     + fn length() type:uint
     + fn merge(map: type:FlatMap) type:FlatMap
-    + fn new() type:FlatMap
+    + static fn new() type:FlatMap
     + fn remove(key: K) type:FlatMap
     + fn set(key: K, value: T) type:FlatMap
     + fn set_many(map: type:FlatMap) type:FlatMap
@@ -404,7 +404,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn keys() type:Array[K]
     + fn length() type:uint
     + fn merge(map: type:HashMap) type:HashMap
-    + fn new() type:HashMap
+    + static fn new() type:HashMap
     + fn remove(key: K) type:HashMap
     + fn set(key: K, value: T) type:HashMap
     + fn set_unique(key: K, value: T) type:HashMap
@@ -415,7 +415,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + mode Map[T] for type:HashMap[type:String, T] {
-    + fn new() type:Map
+    + static fn new() type:Map
 }
 ```
 
@@ -425,7 +425,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
     + fn add(item: T) void
     + fn get() T
-    + fn new(start_size: type:uint (2)) type:Pool
+    + static fn new(start_size: type:uint (2)) type:Pool
 }
 ```
 
@@ -439,7 +439,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn data_cstring() type:cstring
     + fn ends_with(part: type:String) type:bool
     + fn escape() type:String
-    + fn from_json_value(val: json:Value) type:String
+    + static fn from_json_value(val: json:Value) type:String
     + fn get(index: type:uint) type:u8
     + fn hex_to_int() type:int
     + fn hex_to_uint() type:uint
@@ -453,8 +453,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn length() type:uint
     + fn lower() type:String
     + fn ltrim(part: type:String, limit: type:uint (0)) type:String
-    + fn make_empty(length: type:uint) type:String
-    + fn make_from_ptr(data: type:ptr, length: type:uint) type:String
+    + static fn make_empty(length: type:uint) type:String
+    + static fn make_from_ptr(data: type:ptr, length: type:uint) type:String
     + fn octal_to_int() type:int
     + fn octal_to_uint() type:uint
     + fn part(start_index: type:uint, length: type:uint) type:String
@@ -693,7 +693,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn index_where_byte_is_not(byte: type:u8, start_index: type:uint (0)) type:uint
     + fn minimum_free_space(length: type:uint) void
     + fn minimum_size(minimum_size: type:uint) void
-    + fn new(start_size: type:uint (128)) utils:ByteBuffer
+    + static fn new(start_size: type:uint (128)) utils:ByteBuffer
     + fn part(start_index: type:uint, length: type:uint) type:String
     + fn reduce_size(size: type:uint) void
     + fn starts_with(str: type:String, offset: type:uint) type:bool
