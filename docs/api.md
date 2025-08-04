@@ -28,11 +28,21 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn socket_errno() type:i32
 ```
 
+## Classes for 'core'
+
+```js
++ class Mutex[T] {
+    + fn lock() T
+    + fn new(value: T) core:Mutex
+    + fn unlock(value: T) void
+}
+```
+
 ## Globals for 'core'
 
 ```js
-~ global core:error_code : type:u32
-~ global core:error_msg : type:String
+~ global error_code : type:u32
+~ global error_msg : type:String
 ```
 
 # coro
@@ -110,50 +120,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```
 
 ```js
-+ class Path {
++ mode Path for type:String {
     ~ bytes: type:uint
 
     + fn add(part: type:String) fs:Path
-    + fn contains(part: type:String) type:bool
-    + fn contains_byte(byte: type:u8) type:bool
-    + fn data() type:ptr[type:u8]
-    + fn data_cstring() type:cstring
-    + fn ends_with(part: type:String) type:bool
-    + fn escape() type:String
-    + fn from_json_value(val: json:Value) type:String
-    + fn get(index: type:uint) type:u8
-    + fn hex_to_int() type:int
-    + fn hex_to_uint() type:uint
-    + fn index_of(part: type:String, start_index: type:uint (0)) type:uint
-    + fn index_of_byte(byte: type:u8, start_index: type:uint (0)) type:uint
-    + fn is_alpha(allow_extra_bytes: type:String ("")) type:bool
-    + fn is_alpha_numeric(allow_extra_bytes: type:String ("")) type:bool
-    + fn is_empty() type:bool
-    + fn is_integer() type:bool
-    + fn is_number() type:bool
-    + fn length() type:uint
-    + fn lower() type:String
-    + fn ltrim(part: type:String, limit: type:uint (0)) type:String
-    + fn make_empty(length: type:uint) type:String
-    + fn make_from_ptr(data: type:ptr, length: type:uint) type:String
     + fn new(path: type:String) fs:Path
-    + fn octal_to_int() type:int
-    + fn octal_to_uint() type:uint
-    + fn part(start_index: type:uint, length: type:uint) type:String
     + fn pop() fs:Path
-    + fn range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:String
-    + fn replace(part: type:String, with: type:String) type:String
     + fn resolve() fs:Path
-    + fn rtrim(part: type:String, limit: type:uint (0)) type:String
-    + fn split(on: type:String) type:Array[type:String]
-    + fn starts_with(part: type:String) type:bool
-    + fn to_float() type:f64
-    + fn to_int() type:int
-    + fn to_json_value() json:Value
-    + fn to_uint() type:uint
-    + fn trim(part: type:String, limit: type:uint (0)) type:String
-    + fn unescape() type:String
-    + fn upper() type:String
 }
 ```
 
@@ -174,9 +147,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Globals for 'gc'
 
 ```js
-~ shared gc:mem_usage_peak : type:uint
-~ shared gc:mem_usage_shared : type:uint
-~ global gc:mem_usage_thread : type:uint
+~ shared mem_usage_peak : type:uint
+~ shared mem_usage_shared : type:uint
+~ global mem_usage_thread : type:uint
 ```
 
 # http
@@ -219,6 +192,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn json(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
     + fn redirect(location: type:String, code: type:u32 (301), headers: ?type:Map[type:String] (null)) http:Response
     + fn text(body: type:String, code: type:u32 (200), content_type: type:String ("text/plain"), headers: ?type:Map[type:String] (null)) http:Response
+}
+```
+
+```js
++ class Router[T] {
+    + fn add(method: type:String, url: type:String, handler: T) void
+    + fn find(method: type:String, url: type:String) http:Route
+    + fn new() http:Router
 }
 ```
 
@@ -341,6 +322,112 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 # type
 
 ## Classes for 'type'
+
+```js
++ class Array[T] {
+    ~ data: gc:GcPtr
+    ~ length: type:uint
+    ~ size: type:uint
+
+    + fn append(item: T, unique: type:bool (false)) type:Array
+    + fn append_copy(item: T, unique: type:bool (false)) type:Array
+    + fn append_many(items: type:Array) type:Array
+    + fn append_many_copy(items: type:Array) type:Array
+    + fn clear() type:Array
+    + fn contains(value: T) type:bool
+    + fn copy() type:Array
+    + fn equal(array: type:Array) type:bool
+    + fn equal_ignore_order(array: type:Array) type:bool
+    + fn filter(func: ?fn(T)(type:bool) (null)) type:Array
+    + fn filter_copy(func: ?fn(T)(type:bool) (null)) type:Array
+    + fn fit_index(index: type:uint) void
+    + fn from_json_value_auto() void
+    + fn get(index: type:uint) T
+    + fn increase_size(new_size: type:uint) gc:GcPtr
+    + fn index_of(item: T) type:uint
+    + fn intersect(with: type:Array) type:Array
+    + fn merge(items: type:Array) type:Array
+    + fn new(start_size: type:uint (2)) type:Array
+    + fn part(start: type:uint, amount: type:uint) type:Array
+    + fn pop_first() T
+    + fn pop_last() T
+    + fn prepend(item: T, unique: type:bool (false)) type:Array
+    + fn prepend_copy(item: T, unique: type:bool (false)) type:Array
+    + fn prepend_many(items: type:Array) type:Array
+    + fn prepend_many_copy(items: type:Array) type:Array
+    + fn push(item: T, unique: type:bool (false)) type:Array
+    + fn range(start: type:uint, end: type:uint, inclusive: type:bool (true)) type:Array
+    + fn remove(index: type:uint) type:Array
+    + fn remove_copy(index: type:uint) type:Array
+    + fn remove_value(value: T) type:Array
+    + fn remove_value_copy(value: T) type:Array
+    + fn reverse() type:Array
+    + fn reverse_copy() type:Array
+    + fn set(index: type:uint, value: T) void
+    + fn set_expand(index: type:uint, value: T, filler_value: T) void
+    + fn sort(func: ?fn(T, T)(type:bool) (null)) type:Array
+    + fn sort_copy(func: ?fn(T, T)(type:bool) (null)) type:Array
+    + fn swap(index_a: type:uint, index_b: type:uint) void
+    + fn to_json_value() json:Value
+    + fn unique() type:Array
+    + fn unique_copy() type:Array
+}
+```
+
+```js
++ class FlatMap[K, T] {
+    + fn clear() type:FlatMap
+    + fn copy() type:FlatMap
+    + fn get(key: K) T
+    + fn has(key: K) type:bool
+    + fn has_value(value: T) type:bool
+    + fn keys() type:Array[K]
+    + fn length() type:uint
+    + fn merge(map: type:FlatMap) type:FlatMap
+    + fn new() type:FlatMap
+    + fn remove(key: K) type:FlatMap
+    + fn set(key: K, value: T) type:FlatMap
+    + fn set_many(map: type:FlatMap) type:FlatMap
+    + fn set_unique(key: K, value: T) void
+    + fn sort_keys() type:FlatMap
+    + fn values() type:Array
+}
+```
+
+```js
++ class HashMap[K, T] {
+    + fn clear() type:HashMap
+    + fn copy() type:HashMap
+    + fn get(key: K) T
+    + fn has(key: K) type:bool
+    + fn has_value(value: T) type:bool
+    + fn keys() type:Array[K]
+    + fn length() type:uint
+    + fn merge(map: type:HashMap) type:HashMap
+    + fn new() type:HashMap
+    + fn remove(key: K) type:HashMap
+    + fn set(key: K, value: T) type:HashMap
+    + fn set_unique(key: K, value: T) type:HashMap
+    + fn sort_keys() type:HashMap
+    + fn values() type:Array
+}
+```
+
+```js
++ mode Map[T] for type:HashMap[type:String, T] {
+    + fn new() type:Map
+}
+```
+
+```js
++ class Pool[T] {
+    ~ count: type:uint
+
+    + fn add(item: T) void
+    + fn get() T
+    + fn new(start_size: type:uint (2)) type:Pool
+}
+```
 
 ```js
 + class String {
