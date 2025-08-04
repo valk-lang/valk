@@ -3,7 +3,7 @@ VALKV=0.0.6
 VERSION=0.0.7
 
 HDRS=$(wildcard headers/*.valk.h)
-SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk)
+SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk) $(wildcard src/doc/*.valk)
 SRC_LIB=$(wildcard lib/src/*/*.valk) $(wildcard lib/*/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
 vc=valk
@@ -19,6 +19,9 @@ valk3: valk2
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
 valkvg: valk
 	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
+
+doc: valk
+	./valk doc lib/ -o docs/api.md --markdown --no-private
 
 valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
