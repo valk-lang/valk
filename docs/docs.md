@@ -15,6 +15,7 @@
 * [Strings](#strings)
 * [Arrays](#arrays)
 * [Maps](#maps)
+* [Typehints](#typehints)
 * [Functions](#functions)
    * [Error Handling](#error-handling)
    * [Closures](#closures)
@@ -200,7 +201,7 @@ s.ansi.{color}() // E.g. println("hello".ansi.green()) | colors: black, red, gre
 ```rust
 // Init
 let a = Array[String].new() // Init new array
-let b = array[String]{ "1", "2", "3" } // Init using macro
+let b = Array[String]{ "1", "2", "3" } // Init using macro
 // Api
 a.length // Returns amount of items in the array
 a.append(b) // Append value
@@ -229,8 +230,8 @@ a.clear() // Empties the array
 
 ```rust
 let a = Map[uint].new() // Init map
-let b = map[uint]{ "a" => 1, "b" => 2 } // Init using macro
-let c = hashmap[uint]{ "a" => 1, "b" => 2 } // Hashmap (uses more memory, but much faster look ups)
+let b = Map[uint]{ "a" => 1, "b" => 2 } // Init using macro
+let c : Map[uint] = .{ "a" => 1, "b" => 2 } // Use '.' to refer to the typehinted type
 // API
 m.length // Returns amount of items in the map
 m.set(key, value) // Set a value
@@ -242,6 +243,23 @@ m.values() // Get array of all values
 m.merge(m2) // Adds values from m2 to m
 m.copy() // Copy the map
 m.clear()
+```
+
+## Typehints
+
+When declaring variables, properties, globals, function arguments, ... you can or sometimes must provide a `type`. With `.` you can refer to this type when passing a value to that variable, property, ...
+
+```rust
+// Variables
+let x : Array[int] = .{ 1, 2, 3 }
+// Function arguments
+fn test(list: Array[int]) { ... }
+test(.{ 1, 2, 3})
+// Properties
+class A {
+    list: Array[int]
+}
+let ob = A { list: .{1,2,3} }
 ```
 
 ## Functions
