@@ -222,6 +222,52 @@ Namespaces: [core](#core) | [gc](#gc) | [io](#io) |  | [mem](#mem) | [ansi](#ans
 + fn download(url: type:String, to_path: type:String, method: type:String ("GET"), options: ?http:Options (null)) void
 ```
 
+## Classes for 'http'
+
+```js
++ class Response {
+    + body: type:String
+    + content_type: type:String
+    + headers: ?type:Map[type:String]
+    + status: type:u32
+
+    + fn html(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
+    + fn json(body: type:String, code: type:u32 (200), headers: ?type:Map[type:String] (null)) http:Response
+    + fn text(body: type:String, code: type:u32 (200), content_type: type:String ("text/plain"), headers: ?type:Map[type:String] (null)) http:Response
+    + fn redirect(location: type:String, code: type:u32 (301), headers: ?type:Map[type:String] (null)) http:Response
+    + fn empty(code: type:u32, headers: ?type:Map[type:String] (null)) http:Response
+    + fn file(path: type:String, filename: ?type:String (null)) http:Response
+}
+```
+
+```js
++ class Server {
+    ~ host: type:String
+    + fast_handler: ?fn(http:Context, http:ResponseWriter)()
+    ~ port: type:u16
+    + show_info: type:bool
+
+    + fn new(host: type:String, port: type:u16, handler: fn(http:Request)(http:Response)) http:Server
+    + fn start(worker_count: type:i32 (8)) void
+    + fn add_static_dir(path: type:String) void
+}
+```
+
+```js
++ class Options {
+    + body: type:String
+    + query_data: ?type:Map[type:String]
+    + headers: ?type:Map[type:String]
+    + output_to_file: ?type:String
+    + follow_redirects: type:bool
+
+    + fn get_headers() type:Map[type:String]
+    + fn set_header(key: type:String, value: type:String) http:Options
+    + fn set_headers(headers: type:Map[type:String]) http:Options
+    + fn clear_headers(key: type:String, value: type:String) http:Options
+}
+```
+
 # json
 
 ## Functions for 'json'
@@ -267,6 +313,18 @@ Namespaces: [core](#core) | [gc](#gc) | [io](#io) |  | [mem](#mem) | [ansi](#ans
 + fn sleep_ns(ns: type:uint) void
 + fn sleep_ms(ms: type:uint) void
 + fn start(func: fn()()) thread:Thread
+```
+
+## Classes for 'thread'
+
+```js
++ class Thread {
+    ~ finished: type:bool
+
+    + fn start(func: fn()()) thread:Thread
+    + fn start_unsafe(func: fn()()) thread:Thread
+    + fn wait() void
+}
 ```
 
 # time
