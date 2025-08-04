@@ -340,7 +340,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn null_value() Value
 + fn object_value(values: ?Map[Value] (null)) Value
 + fn string_value(text: String) Value
-+ fn to_type[T](data: Value, pretty: bool (false)) T
++ fn to_type[T](data: Value) T
 + fn uint_value(value: uint) Value
 + fn value[T](val: T) Value
 ```
