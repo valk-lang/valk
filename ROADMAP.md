@@ -26,6 +26,7 @@
 + Update HTTP client options
 + fn encode[T](value: T) -> fn encode(value: $T)
 + Release 0.0.6
+- valk doc
 - valk lsp
 - valk fmt
 - vscode extension
