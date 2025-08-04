@@ -34,6 +34,7 @@
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
+- Full HTTP 1.1 protocol + Cookies
 
 - Interfaces
 - Union types
