@@ -159,10 +159,68 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !invalid_url !ssl !connect
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !invalid_path !invalid_url !ssl !connect !disconnect !invalid_response
++ fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !invalid !http413 !incomplete !missing_host_header !file_error
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !invalid_url !invalid_output_path !ssl !connect !disconnect !invalid_response
 ```
 
 ## Classes for 'http'
+
+```js
++ class ClientRequest {
+    ~ bytes_received: uint
+    ~ bytes_sent: uint
+    ~ bytes_to_recv: uint
+    ~ bytes_to_send: uint
+    ~ recv_buffer: ByteBuffer
+    ~ recv_percent: uint
+    ~ request_sent: bool
+    ~ response_received: bool
+    ~ sent_percent: uint
+
+    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !invalid_url !connection_failed !ssl !invalid_output_path
+    + fn progress() bool !disconnect !invalid_response
+    + fn response() ClientResponse !in_progress !invalid_response
+}
+```
+
+```js
++ class ClientResponse {
+    + body: String
+    + headers: Map[String]
+    + status: uint
+}
+```
+
+```js
++ class Connection {
+    ~ fd: int
+    ~ netcon: Connection
+    ~ worker: Worker
+
+    + fn close() void
+}
+```
+
+```js
++ class Context {
+    ~ body_received: uint
+    ~ chunked: bool
+    ~ content_length: uint
+    ~ has_host: bool
+    ~ method: ByteBufferStrRef
+    ~ parsed_index: uint
+    ~ path: ByteBufferStrRef
+    ~ query_string: ByteBufferStrRef
+    ~ status: uint
+
+    + fn body() String
+    + fn data() Map[String]
+    + fn files() Map[InMemoryFile]
+    + fn headers() Map[String]
+    + fn params() Map[String]
+    + fn params_grouped() Map[Array[String]]
+}
+```
 
 ```js
 + class Options {
@@ -180,6 +238,21 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```
 
 ```js
++ class Request {
+    + method: String
+    + path: String
+    + query_string: String
+
+    + fn body() String
+    + fn data() Map[String]
+    + fn files() Map[InMemoryFile]
+    + fn headers() Map[String]
+    + fn params() Map[String]
+    + fn params_grouped() Map[Array[String]]
+}
+```
+
+```js
 + class Response {
     + body: String
     + content_type: String
@@ -192,6 +265,25 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
     + static fn redirect(location: String, code: u32 (301), headers: ?Map[String] (null)) Response
     + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Map[String] (null)) Response
+}
+```
+
+```js
++ class ResponseWriter {
+    ~ responded: bool
+
+    + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null)) void
+    + fn send_file(path: String, custom_filename: ?String (null)) void
+    + fn send_file_stream(stream: FileStream, filename: ?String (null)) void
+    + fn send_status(status_code: uint) void
+}
+```
+
+```js
++ class Route[T] {
+    + handler: T
+
+    + fn params(path: String) Map[String]
 }
 ```
 
