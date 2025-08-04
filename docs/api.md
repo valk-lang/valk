@@ -73,7 +73,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn exe_path() type:String
 + fn exists(path: type:String) type:bool
 + fn ext(path: type:String, with_dot: type:bool (false)) type:String
-+ fn files_in(dir: type:String, recursive: type:bool (false), files: type:bool (true), dirs: type:bool (true), prefix: ?type:String (null), result: type:Array[type:String] (/)) type:Array[type:String]
++ fn files_in(dir: type:String, recursive: type:bool (false), files: type:bool (true), dirs: type:bool (true), prefix: ?type:String (null), result: type:Array[type:String] (...)) type:Array[type:String]
 + fn home_dir() type:String
 + fn is_dir(path: type:String) type:bool
 + fn is_file(path: type:String) type:bool
@@ -84,7 +84,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn open_extend(path: type:String, writable: type:bool, append_on_write: type:bool, create_file_if_doesnt_exist: type:bool (false), create_file_permissions: type:u32 (420)) type:int
 + fn path(path: type:String) fs:Path
 + fn read(path: type:String) type:String
-+ fn read_bytes(path: type:String, buffer: utils:ByteBuffer (/)) utils:ByteBuffer
++ fn read_bytes(path: type:String, buffer: utils:ByteBuffer (...)) utils:ByteBuffer
 + fn realpath(path: type:String) type:String
 + fn resolve(path: type:String) type:String
 + fn rmdir(path: type:String) void
