@@ -333,13 +333,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn array_value(values: ?Array[Value] (null)) Value
 + fn bool_value(value: bool) Value
 + fn decode(json: String) Value !invalid
++ fn encode[T](val: T, pretty: bool (false)) String
 + fn encode_value(json: Value, pretty: bool (false)) String
 + fn float_value(value: float) Value
 + fn int_value(value: int) Value
 + fn null_value() Value
 + fn object_value(values: ?Map[Value] (null)) Value
 + fn string_value(text: String) Value
++ fn to_type[T](data: Value, pretty: bool (false)) T
 + fn uint_value(value: uint) Value
++ fn value[T](val: T) Value
 ```
 
 # mem
@@ -433,7 +436,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn filter_copy(func: ?fn(T)(bool) (null)) Array[T]
     + fn fit_index(index: uint) void
-    + static fn from_json_value_auto() void
+     fn from_json_value_auto() 
     + fn get(index: uint) T !not_found
     + fn increase_size(new_size: uint) GcPtr
     + fn index_of(item: T) uint !not_found
