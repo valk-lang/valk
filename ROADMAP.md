@@ -26,7 +26,7 @@
 + Update HTTP client options
 + fn encode[T](value: T) -> fn encode(value: $T)
 + Release 0.0.6
-- valk doc
++ valk doc
 - valk lsp
 - valk fmt
 - vscode extension
@@ -36,6 +36,7 @@
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 - Full HTTP 1.1 protocol + Cookies
+- Better errors
 
 - Interfaces
 - Union types
