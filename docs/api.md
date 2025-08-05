@@ -332,7 +332,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn array_value(values: ?Array[Value] (null)) Value
 + fn bool_value(value: bool) Value
 + fn decode(json: String) Value !invalid
-+ fn encode[T](val: T, pretty: bool (false)) String
++ fn encode(val: T, pretty: bool (false)) String
 + fn encode_value(json: Value, pretty: bool (false)) String
 + fn float_value(value: float) Value
 + fn int_value(value: int) Value
@@ -341,7 +341,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn string_value(text: String) Value
 + fn to_type[T](data: Value) T
 + fn uint_value(value: uint) Value
-+ fn value[T](val: T) Value
++ fn value(val: T) Value
 ```
 
 # mem

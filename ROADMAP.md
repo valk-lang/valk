@@ -24,8 +24,8 @@
 + Update docs
 + Release 0.0.5
 + Update HTTP client options
-+ fn encode[T](value: T) -> fn encode(value: $T)
 + Release 0.0.6
++ fn encode[T](value: T) -> fn encode(value: $T)
 + valk doc
 - valk lsp
 - valk fmt
