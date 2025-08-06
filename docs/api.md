@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
 
 ---
 
@@ -332,7 +332,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn array_value(values: ?Array[Value] (null)) Value
 + fn bool_value(value: bool) Value
 + fn decode(json: String) Value !invalid
-+ fn encode(val: T, pretty: bool (false)) String
++ fn encode(data: $T, pretty: bool (false)) String
 + fn encode_value(json: Value, pretty: bool (false)) String
 + fn float_value(value: float) Value
 + fn int_value(value: int) Value
@@ -341,7 +341,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn string_value(text: String) Value
 + fn to_type[T](data: Value) T
 + fn uint_value(value: uint) Value
-+ fn value(val: T) Value
++ fn value(data: $T) Value
 ```
 
 # mem
@@ -358,6 +358,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn equal(a: ptr, b: ptr, length: uint) bool
 + fn find_char(adr: ptr, ch: u8, length: uint) uint !not_found
 + fn free(adr: ptr) void
++ fn resize(adr: ptr, size: uint, new_size: uint) ptr
 ```
 
 # net
@@ -378,6 +379,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + static fn new(host: String, port: u16) AddrInfo !fail
     + fn sock_addr() libc_gen_sockaddr
 }
+```
+
+# template
+
+## Functions for 'template'
+
+```js
++ fn render(path: String, data: $T, template_directory: ?String (null)) String !FileNotFound
++ fn render_content(content: String, data: ?Value (null), template_directory: ?String (null), template_path: ?String (null)) String
 ```
 
 # thread
