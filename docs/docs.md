@@ -15,6 +15,7 @@
 * [Strings](#strings)
 * [Arrays](#arrays)
 * [Maps](#maps)
+* [Objects](#objects)
 * [Typehints](#typehints)
 * [Functions](#functions)
    * [Error Handling](#error-handling)
@@ -40,7 +41,6 @@
 * [Files](#files)
     - [Paths](#paths)
 * [JSON](#json)
-* [Objects](#objects)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
@@ -200,50 +200,59 @@ s.ansi.{color}() // E.g. println("hello".ansi.green()) | colors: black, red, gre
 ## Arrays
 
 ```rust
-// Init
-let a = Array[String].new() // Init new array
-let b = Array[String]{ "1", "2", "3" } // Init using macro
-// Api
-a.length // Returns amount of items in the array
-a.append(b) // Append value
-a.prepend(b) // Prepend value (append is faster than prepend)
-a.append_many(b) // Append multiple
-a.prepend_many(b) // Prepend multiple
-a.get(index) ! // Get value by index
-a.set(index, value) ! // Set value by index
-a.set_expand(index, value, gap_value) // Set value by index, fill the gaps with the gap-value
-a.remove(index) // Remove by index
-a.remove_value(value) // Remove by value
-a.part(1, 3) // Copy a part from the array, args: (start-index, amount)
-a.range(2, 2) // Copy a part from the array, args: (start-index, end-index, inclusive = true)
-a.contains(value) // Checks if array contains a certain value
-a.unique() // Make the values unique
-a.unique_copy() // Returns a copy with only unique values
-a.filter() // Filter out empty values
-a.filter(fn() bool { ... }) // Custom filter function (return true to remove the value)
-a.filter_copy(fn() bool { ... }) // Returns a copy with the filtered values
-a.copy() // Copy the array
-a.merge(b) // Adds values from b to a (returns a copy, use append_many if you want to modify the existing array)
-a.clear() // Empties the array
+let arr = Array[int]{ 1, 2, 3 } // Create array
+let arr : Array[int] = .{ 1, 2, 3 } // Using typehint
+// Basics
+arr.push(4)
+arr.prepend(5)
+let v = arr.get(0) ! panic("Empty array")
+arr.clear()
+//
+each arr as value {}
+each arr as value, index {}
 ```
+
+Full `Array` API: [valk:core](api.md#core)
 
 ## Maps
 
+A `Map` is a key/value store. The keys are always strings and the value type you can choose. If you need non-string keys, use `HashMap`
+
 ```rust
-let a = Map[uint].new() // Init map
-let b = Map[uint]{ "a" => 1, "b" => 2 } // Init using macro
-let c : Map[uint] = .{ "a" => 1, "b" => 2 } // Use '.' to refer to the typehinted type
-// API
-m.length // Returns amount of items in the map
-m.set(key, value) // Set a value
-m.has(key) // Check if map has a key
-m.get(key) ! // Get a value by key
-m.remove(key) // Removes a value
-m.keys() // Get array of all keys
-m.values() // Get array of all values
-m.merge(m2) // Adds values from m2 to m
-m.copy() // Copy the map
+let m = Map[uint]{ "a" => 1, "b" => 2 } // Create map
+let m : Map[uint] = .{ "a" => 1, "b" => 2 } // Using typehint
+// Basics
+m.set(key, value)
+m.remove(key)
+m.has(key)
 m.clear()
+//
+each arr as value {}
+each arr as value, key {}
+each arr as value, key, index {}
+```
+
+Full `Map` API: [valk:core](api.md#core)
+
+If you need non-string keys, use `HashMap`. `HashMap` and `Map` are compatible types.
+
+```rust
+let h = HashMap[uint, String]{ 5 => "x", 10 => "y" }
+// Map and HashMap are compatible types as long as the key/value types match
+let a : Map[uint] = .{ "v1" => 10 }
+let b : HashMap[String, uint] = a
+let c : Map[uint] = b
+```
+
+Full `HashMap` API: [valk:core](api.md#core)
+
+## Objects
+
+With `object` you can generate object data on the fly without defining a class.
+
+```rust
+let data = object { message: "hello", message2: "world" }
+println(data.message + " " + data.message2) // hello world
 ```
 
 ## Typehints
@@ -525,15 +534,6 @@ let data = json:value(object { hello: "world" })
 let json = data.encode()
 println(json) // { "hello": "world" }
 let data2 = json:decode(json) ! panic("Invalid json syntax")
-```
-
-## Objects
-
-With `object` you can generate object data on the fly without defining a class.
-
-```rust
-let data = object { message: "hello", message2: "world" }
-println(data.message + " " + data.message2) // hello world
 ```
 
 ## Coroutines
