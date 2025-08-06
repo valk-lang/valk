@@ -30,7 +30,7 @@
 - valk lsp
 - valk fmt
 - vscode extension
-- template engine
+~ template engine
 - Release 0.0.7
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
