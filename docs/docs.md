@@ -176,6 +176,7 @@ s.length // Length of string
 s.starts_with(x) bool
 s.ends_with(x) bool
 s.is_empty() bool
+s.contains(x) bool
 s.lower() String // Convert to lowercase
 s.upper() String // Convert to lowercase
 s.part(start_index, length) String // Sub string
@@ -250,7 +251,7 @@ When declaring variables, properties, globals, function arguments, ... you can o
 // Variables
 let x : Array[int] = .{ 1, 2, 3 }
 // Function arguments
-fn test(list: Array[int]) { ... }
+fn test(list: Array[int]) {}
 test(.{ 1, 2, 3})
 // Properties
 class A {
