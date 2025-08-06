@@ -9,9 +9,11 @@
 + Finish all GC related todos
 + Add more basic features
 + Release 0.0.2
+
 + Use $lazy properties in compiler
 + Path class for creating correct win/macos/linux paths
 + Release 0.0.3
+
 + Rework GC to remove reconnect list
 + Http option follow redirects (default: true)
 + Use fs:resolve on all paths in the compiler
@@ -19,28 +21,38 @@
 + Type modes (mode Path for String) (extends type but no new properties allowed)
 + Dont use hashes to compare IR. Just compare file content (= faster & more correct)
 + Release 0.0.4
+
 + Allow identifiers for numbers in types, e.g. ptr[u8 x fs:PATH_MAX_LEN] or global list : [uint x MAX_ITEMS]
 + Add more standard library functions
 + Update docs
 + Release 0.0.5
+
 + Update HTTP client options
 + Release 0.0.6
+
 + fn encode[T](value: T) -> fn encode(value: $T)
 + valk doc
 - valk lsp
-- valk fmt
 - vscode extension
+- use "x" as X { a, b as B, c }
+- ptr[u8 x 3]{ 'a', 'b', 'c' } or ptr[u8]{ 'a', 'b' }
+- Only allow pointer or number return types for functions
+- Copy on assign if not pointer or number
+- 
 ~ template engine
 - Release 0.0.7
+
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 - Full HTTP 1.1 protocol + Cookies
 - Better errors
+- valk fmt
+- Release 0.0.x
 
 - Interfaces
 - Union types
-- Release 0.0.8
+- Release 0.0.x
 ```
 
 ## For later
