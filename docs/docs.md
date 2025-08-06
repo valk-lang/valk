@@ -40,6 +40,7 @@
 * [Files](#files)
     - [Paths](#paths)
 * [JSON](#json)
+* [Objects](#objects)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
@@ -490,76 +491,49 @@ fn main() {
 
 API for [valk:json](api.md#json)
 
-With `valk:json` you can convert any type to json or json to any type out-of-the-box.
+The `valk:json` namespaces provides multiple ways to convert data from and to json. You can either work with:
+
+- use json values directly
+- use classes
+- use objects
+
+Example: using json values directly
 
 ```rust
-use valk:json
-
-class A {
-    msg: String ("Hello")
-    b: B (B{})
-}
-class B {
-    msg: String ("World")
-}
-
-fn main() {
-    let a = A{}
-    // Converting our object to json string
-    let pretty = true
-    let str = json:encode(a, pretty)
-    println(str)
-    // {
-    //     "msg": "Hello",
-    //     "b": {
-    //         "msg": "World"
-    //     }
-    // }
-
-    // Convert json string back to your type
-    // First convert it to a json:Value
-    let json_value = json:decode(str) ! panic("Invalid json syntax")
-    // And now convert your json:Value to A
-    let a2 = json:to_type[A](json_value)
-    // Check result
-    println(a2.msg + " " + a2.b.msg) // Prints: Hello world
-}
+let data = json:object_values(Map[json:Value]{ "hello": json:string_value("world") })
+let json = data.encode()
+println(json) // { "hello": "world" }
+let data2 = json:decode(json) ! panic("Invalid json syntax")
 ```
 
-If you need to customize how your class is converted to json or from json, then you can define the following functions to override the logic.
+Example: using classes
 
 ```rust
-use valk:json
-
-class A {
-    value: int (123)
-    // Object -> json:Value
-    + fn to_json_value() json:Value {
-        return json:int(this.value)
-    }
-    // json:Value -> Object
-    + static fn from_json_value(jv: json:Value) SELF {
-        return SELF { value: jv.int() }
-    }
+class Data {
+    hello: String ("world")
 }
+let data = json:value(Data{})
+let json = data.encode()
+println(json) // { "hello": "world" }
+let data2 = json:to_type[Data](json)
 ```
 
-You can also work directly with a `json:Value` instead of converting to/from a type
+Example: using objects
 
 ```rust
-use valk:json
+let data = json:value(object { hello: "world" })
+let json = data.encode()
+println(json) // { "hello": "world" }
+let data2 = json:decode(json) ! panic("Invalid json syntax")
+```
 
-fn main() {
-    let str = "{ \"Hello\": \"world\" }"
-    let v = json:decode(str) ! panic("Invalid json syntax")
-    // Change some data
-    v.set("Hello", json:string_value("Valk"))
-    v.set("v1", json:bool_value(true))
-    v.set("v2", json:null_value())
-    // Encode back to json string
-    let str2 = v.encode()
-    print(str2) // Prints: { "Hello": "Valk", "v1": true, "v2": null }
-}
+## Objects
+
+With `object` you can generate object data on the fly without defining a class.
+
+```rust
+let data = object { message: "hello", message2: "world" }
+println(data.message + " " + data.message2) // hello world
 ```
 
 ## Coroutines
