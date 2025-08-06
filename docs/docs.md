@@ -212,7 +212,7 @@ each arr as value {}
 each arr as value, index {}
 ```
 
-Full `Array` API: [valk:core](api.md#core)
+Full `Array` API: [valk:type](api.md#type)
 
 ## Maps
 
@@ -232,7 +232,7 @@ each arr as value, key {}
 each arr as value, key, index {}
 ```
 
-Full `Map` API: [valk:core](api.md#core)
+Full `Map` API: [valk:type](api.md#type)
 
 If you need non-string keys, use `HashMap`. `HashMap` and `Map` are compatible types.
 
@@ -244,7 +244,7 @@ let b : HashMap[String, uint] = a
 let c : Map[uint] = b
 ```
 
-Full `HashMap` API: [valk:core](api.md#core)
+Full `HashMap` API: [valk:type](api.md#type)
 
 ## Objects
 
