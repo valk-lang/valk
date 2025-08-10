@@ -113,10 +113,16 @@ To organize your code we group files into different directories. Each namespace 
 ```rust
 // main.valk
 use my_namespace
+// Alternatives
+use my_namespace as mn // Alias for namespace
+use my_namespace { thumbs_up } // extract single identifier
+use my_namespace as mn { thumbs_up } // Both
 
 fn main() {
     // Calling a function from another namespace
     my_namespace:thumbs_up()
+    mn:thumbs_up() // Using the alias
+    thumbs_up() // Direct import from `use my_namespace { thumbs_up }`
 }
 ```
 

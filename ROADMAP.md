@@ -34,7 +34,7 @@
 + valk doc
 - valk lsp
 - vscode extension
-- use "x" as X { a, b as B, c }
++ use "x" as X { a, b as B, c }
 + Allocate stack/heap arrays : @array[u8 x 3]{ 'a', 'b', 'c' }
 + Copy on assign if not pointer or number
 ~ template engine
