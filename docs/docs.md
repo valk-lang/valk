@@ -675,11 +675,11 @@ With `valk:http` you can send HTTP requests to APIs or download files from a url
 let res = http:request("GET", "http://some-website/api/endpoint") ! panic("Request failed")
 
 // Send GET request with data
-let data = map[String]{ "key1" => "val1" }
+let data = Map[String]{ "key1" => "val1" }
 let res = http:request("GET", "http://some-website/api/endpoint", http:Options{ query_data: data }) ! panic("Request failed")
 
 // Send POST request with data
-let json_data = map[String]{ "key1" => "val1" }.to(json:Value)
+let json_data = Map[String]{ "key1" => "val1" }.to(json:Value)
 let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json_data.encode() }) ! panic("Request failed")
 
 // Download file
