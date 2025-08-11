@@ -149,6 +149,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ~ shared mem_usage_peak : uint
 ~ shared mem_usage_shared : uint
 ~ global mem_usage_thread : uint
++ shared verify : bool
 ```
 
 # http
@@ -329,18 +330,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'json'
 
 ```js
-+ fn array_value(values: ?Array[Value] (null)) Value
-+ fn bool_value(value: bool) Value
 + fn decode(json: String) Value !invalid
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_value(json: Value, pretty: bool (false)) String
-+ fn float_value(value: float) Value
-+ fn int_value(value: int) Value
-+ fn null_value() Value
-+ fn object_value(values: ?Map[Value] (null)) Value
-+ fn string_value(text: String) Value
++ fn new_array(values: ?Array[Value] (null)) Value
++ fn new_bool(value: bool) Value
++ fn new_float(value: float) Value
++ fn new_int(value: int) Value
++ fn new_null() Value
++ fn new_object(values: ?Map[Value] (null)) Value
++ fn new_string(text: String) Value
++ fn new_uint(value: uint) Value
 + fn to_type[T](data: Value) T
-+ fn uint_value(value: uint) Value
 + fn value(data: $T) Value
 ```
 

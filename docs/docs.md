@@ -503,7 +503,7 @@ The `valk:json` namespaces provides multiple ways to convert data from and to js
 Example: using json values directly
 
 ```rust
-let data = json:object_values(Map[json:Value]{ "hello": json:string_value("world") })
+let data = json:new_object(Map[json:Value]{ "hello": json:new_string("world") })
 let json = data.encode()
 println(json) // { "hello": "world" }
 let data2 = json:decode(json) ! panic("Invalid json syntax")
