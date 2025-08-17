@@ -93,6 +93,20 @@ Code: [Link](examples/bench/binary-tree)
 
 Code: [Link](examples/bench/http)
 
+---
+
+### Object creation statistics
+
+Creating 10 million objects of size 8:
+
+|  | Create short lived | Create long lived | Process memory usage |
+|--|--|--|--|
+| Valk | 31ms | 128ms | 160 MB |
+| Go | 115ms | 216ms | 591 MB |
+
+Code: [Link](examples/bench/objects)
+
+
 ## Why Valk over Rust, Go, Zig?
 
 Rust: Too much complexity in our opinion. It's not fun if you are already trying to solve complex problems.
