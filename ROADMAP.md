@@ -32,13 +32,15 @@
 
 + fn encode[T](value: T) -> fn encode(value: $T)
 + valk doc
-- valk lsp
-- vscode extension
 + use "x" as X { a, b as B, c }
 + Allocate stack/heap arrays : @array[u8 x 3]{ 'a', 'b', 'c' }
 + Copy on assign if not pointer or number
 ~ template engine
-- Release 0.0.7
++ Release 0.0.7
+
+- valk lsp
+- vscode extension
+- Release 0.0.8
 
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
