@@ -123,6 +123,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ bytes: uint
 
     + fn add(part: String) Path
+    + fn dir_of() Path
     + static fn new(path: String) Path
     + fn pop() Path
     + fn resolve() Path
@@ -318,7 +319,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn print(msg: String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
 + fn println(msg: String) void
-+ fn read(fd: int, buffer: ptr, buffer_size: uint) uint !failed !again
++ fn read(fd: int, buffer: ptr, buffer_size: uint) uint !failed
 + fn set_non_block(fd: int, value: bool) void
 + fn valk_fd(fd: int) int
 + fn write(fd: int, str: String) void !failed !again
@@ -803,8 +804,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn clear_until(index: uint) void
     + fn clone() ByteBuffer
     + fn equals_str(str: String) bool
-    + fn get(index: uint) u8 !range
-    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !not_found
+    + fn get(index: uint) u8
+    + fn index_of(byte: u8, start_index: uint (0)) uint !not_found
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !not_found
     + fn minimum_free_space(length: uint) void
     + fn minimum_size(minimum_size: uint) void
