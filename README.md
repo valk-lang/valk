@@ -13,7 +13,7 @@ Valk is a programming language aimed to be fast & simple at the same time. The s
 
 To see what a persistent GC can do, see the [benchmarks](#benchmarks)
 
-Extensions: [vscode](https://marketplace.visualstudio.com/items?itemName=valk-lang.valk)
+Extensions: [vscode](https://marketplace.visualstudio.com/items?itemName=valk-lang.valk) | [vim](https://github.com/valk-lang/valk-vim)
 
 ## Install
 
