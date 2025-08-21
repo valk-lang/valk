@@ -45,7 +45,7 @@ while IFS=';' read -r file msg; do
         echo "- Cmd: $cmd"
         echo "- Exit code: $status"
         echo "- Output: $output"
-        echo "- Missing mesage: $msg"
+        echo "- Missing message: $msg"
         exit 1
     fi
 
