@@ -43,6 +43,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 ~ global error_code : u32
 ~ global error_msg : String
+~ global error_msg_index : uint
+~ global error_msgs : [String x 100]
 ```
 
 # coro
