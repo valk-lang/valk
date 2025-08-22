@@ -40,7 +40,7 @@
 
 + valk lsp
 + vscode extension
-- Release 0.0.8
++ Release 0.0.8
 
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
