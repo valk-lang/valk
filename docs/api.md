@@ -20,9 +20,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn exec(cmd: String, stream_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
++ fn get_error_trace() Array[String]
 + fn getenv(var: String) String !not_found
 + fn libc_errno() i32
 + fn panic(msg: String) void
++ fn print_error_trace() void
 + fn raise(code: i32) void
 + fn signal_ignore(sig: int) void
 + fn socket_errno() i32
@@ -43,8 +45,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 ~ global error_code : u32
 ~ global error_msg : String
-~ global error_msg_index : uint
-~ global error_msgs : [String x 100]
 ```
 
 # coro
