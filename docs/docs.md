@@ -307,7 +307,7 @@ my_func() ! { print("error") }
 let v = my_func() ! { print("error"); return }
 // ! You can also use a single line
 let v = my_func() ! return
-// !> pass the error along the caller
+// !> pass the error to the parent caller
 let v = my_func() !>
 // _ Ignore the error, but the return type/value is always `void`
 my_func() _
@@ -320,9 +320,8 @@ Custom error message & checking which error was thrown:
 Note: Inside the error handler you can access the error message via `EMSG` and the error code via `E`
 
 ```rust
-fn my_func(must_fail: bool (true)) String !fail !nope {
-    if must_fail : throw fail, "We failed"
-    return "hi"
+fn my_func() String !fail !nope {
+    throw fail, "We failed"
 }
 
 fn main() {
