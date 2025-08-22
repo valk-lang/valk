@@ -56,6 +56,7 @@
 * [Unsafe](#unsafe)
     * [Structs](#structs)
     * [Headers](#headers)
+    * [Linking](#linking)
 
 <br></td></tr>
 </table>
@@ -286,6 +287,17 @@ fn main() {
 
 ### Error handling
 
+Functions can return errors using `throw`. Errors must be defined in your function declaration first.
+
+```rust
+fn my_func(must_fail: bool) String !fail {
+    if must_fail : throw fail
+    return "hi"
+}
+```
+
+When calling this function the error must always be handled. There are many ways to do this:
+
 ```rust
 // !? Provide a alternative value when an error occurs
 let v = my_func() !? "hello"
@@ -295,44 +307,62 @@ my_func() ! { print("error") }
 let v = my_func() ! { print("error"); return }
 // ! You can also use a single line
 let v = my_func() ! return
-// _ Ignore the error, but the return type is always `void`
+// !> pass the error along the caller
+let v = my_func() !>
+// _ Ignore the error, but the return type/value is always `void`
 my_func() _
+// !! panic on error
+let v = my_func() !!
 ```
 
-A code example
+Custom error message & checking which error was thrown:
+
+Note: Inside the error handler you can access the error message via `EMSG` and the error code via `E`
 
 ```rust
-fn add(value: int) int !too_big {
-    if value > 100 : throw too_big
-    return value + 10
+fn my_func(must_fail: bool (true)) String !fail !nope {
+    if must_fail : throw fail, "We failed"
+    return "hi"
 }
 
 fn main() {
-    // Alternative value in case of an error
-    let x = add(10) !? 0 // result: 20
-    x = add(200) !? 5 // result: 5
-
-    // Alternative value using scope
-    x = add(200) !? <{
-        println("We had an error 😢")
-        return 210
-    }
-    // result: 210
-
-    // Exit the function on error
-    x = add(200) ! {
-        println("We had an error 😢")
-        return // main has a void return type, so we use an empty return
-    }
-    // Single line
-    x = add(200) ! return
-    // Break / continue loops on error
-    while true {
-        x = add(200) ! break // or continue
-        x = add(200) ! {
-            println("error, stop the loop")
-            break
+    my_func() ! {
+        println(EMSG) // Prints: We failed
+        // Checking the error code using `match`
+        match E {
+            E.fail => println("Error code `fail` was thrown")
+            E.nope => println("Error code `nope` was thrown")
+            default => println("Another error was thrown")
         }
+        // Checking the error code using `if`
+        if E == E.fail : println("Error code `fail` was thrown")
+    }
+}
+```
+
+Error traces: When you using `!>` to pass errors to the parent, you can ask for a trace of these passes. This trace resets every time `throw` is called.
+
+```rust
+use valk:core
+
+fn f1() !fail {
+    f2() !>
+}
+fn f2() !fail {
+    throw fail
+}
+fn main() {
+    f1() ! {
+        let trace = core:get_error_trace()
+        each trace as str {
+            println(str)
+        }
+        // OR
+        core:print_error_trace()
+        // ------------- ERROR TRACE -------------
+        // .../src/example.valk:4
+        // .../src/example.valk:7
+        // -------------- END TRACE --------------
     }
 }
 ```
