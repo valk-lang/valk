@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
 
 ---
 
@@ -153,6 +153,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ~ shared mem_usage_shared : uint
 ~ global mem_usage_thread : uint
 + shared verify : bool
+```
+
+# html
+
+## Functions for 'html'
+
+```js
++ fn sanitize(code: String) String
++ fn sanitize_with_options(code: String, options: ?SanitizeOptions (null)) String
 ```
 
 # http
@@ -392,7 +401,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn render(content: String, data: $T, options: ?RenderOptions (null)) String
 + fn render_path(path: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
-+ fn sanitize_html(str: String) String
 ```
 
 ## Classes for 'template'

@@ -817,7 +817,7 @@ fn main() {
 
 ## Templates
 
-`valk:template` is a small template engine. Over time we will expand it's functionality.
+`valk:template` is a small template engine. Currently it's funtionality is limited, but we will expand on it in the coming versions.
 
 Example template:
 
@@ -841,6 +841,7 @@ How to render:
 
 ```rust
 use valk:template
+use valk:html
 //
 class Article {
     title: String
@@ -851,7 +852,7 @@ fn main() {
     let template_dir = __DIR__
     let options = template:RenderOptions {
         // Adding html sanitizer to prevent XSS attacks
-        sanitize: template:sanitize_html
+        sanitize: html:sanitize
         // Setting a template directory allows you to use @include("...")
         template_directory: template_dir
     }
@@ -881,7 +882,7 @@ Template engine tokens:
 @each(... as val, key) // With key
 @each(... as val, key, index) // With key & index
 
-{{ }} // Print sanitized (if isset)
+{{ }} // Print sanitized (if sanitizer isset in the options)
 @{{ }} // Print without sanitization
 
 @include("...") // include other template (template_directory must be set in options)
