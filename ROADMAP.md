@@ -42,6 +42,9 @@
 + vscode extension
 + Release 0.0.8
 
++ template engine improvements
+- Release 0.0.9
+
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
