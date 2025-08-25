@@ -471,7 +471,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn prepend_copy(item: T, unique: bool (false)) Array[T]
     + fn prepend_many(items: Array[T]) Array[T]
     + fn prepend_many_copy(items: Array[T]) Array[T]
-    + fn push(item: T, unique: bool (false)) Array[T]
     + fn range(start: uint, end: uint, inclusive: bool (true)) Array[T]
     + fn remove(index: uint) Array[T]
     + fn remove_copy(index: uint) Array[T]
@@ -800,7 +799,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + class ByteBuffer {
-    ~ data: ptr
+    ~ data: GcPtr
     ~ length: uint
     ~ size: uint
 
