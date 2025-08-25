@@ -390,8 +390,17 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'template'
 
 ```js
-+ fn render(path: String, data: $T, template_directory: ?String (null)) String !FileNotFound
-+ fn render_content(content: String, data: ?Value (null), template_directory: ?String (null), template_path: ?String (null)) String
++ fn render(content: String, data: $T, options: ?RenderOptions (null)) String
++ fn render_path(path: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
+```
+
+## Classes for 'template'
+
+```js
++ class RenderOptions {
+    + sanitize: ?fn(String)(String)
+    + template_directory: ?String
+}
 ```
 
 # thread
