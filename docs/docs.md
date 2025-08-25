@@ -888,6 +888,8 @@ Template engine tokens:
 @include("...") // include other template (template_directory must be set in options)
 ```
 
+Note: `valk:template` works at runtime and can therefor not detect bad template syntax at compile time.
+
 ## Unsafe
 
 Although Valk aims to be a safe language, we also dont want to prevent people from doing unsafe things if they want. So what is unsafe? All tokens that start with `@` are assumed unsafe. So that and using the `ptr` type (ptr = void* in c).
