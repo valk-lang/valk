@@ -194,11 +194,13 @@ Full `String` API: [valk:type](api.md#type)
 
 ## Arrays
 
+Important: always use `append` instead of `prepend` when possible. Appending is ALOT faster.
+
 ```rust
 let arr = Array[int]{ 1, 2, 3 } // Create array
 let arr : Array[int] = .{ 1, 2, 3 } // Using typehint
 // Basics
-arr.push(4)
+arr.append(4)
 arr.prepend(5)
 let v = arr.get(0) ! panic("Empty array")
 arr.clear()
