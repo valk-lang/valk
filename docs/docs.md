@@ -50,6 +50,7 @@
 * [HTTP Client](#http-client)
 * [HTTP Server](#http-server)
 * [Sockets](#sockets)
+* [Templates](#templates)
 
 <br></td><td width=200px><br>
 
@@ -814,6 +815,77 @@ fn main() {
 }
 ```
 
+## Templates
+
+`valk:template` is a small template engine. Over time we will expand it's functionality.
+
+Example template:
+
+```html
+<html>
+    <head></head>
+    <body>
+        @include("header.html")
+
+        <h1>{{ title }}</h1>
+
+        @each(articles as art)
+        <h2>{{ art.title }}</h2>
+        <p>@{{ art.content }}</p>
+        @end
+    </body>
+</html>
+```
+
+How to render:
+
+```rust
+use valk:template
+//
+class Article {
+    title: String
+    content: String
+}
+//
+fn main() {
+    let template_dir = __DIR__
+    let options = template:RenderOptions {
+        // Adding html sanitizer to prevent XSS attacks
+        sanitize: template:sanitize_html
+        // Setting a template directory allows you to use @include("...")
+        template_directory: template_dir
+    }
+    // Template data
+    let data = object { 
+        title: "Hello world"
+        articles: Array[Article]{
+            Article {
+                title: "Article 1"
+                content: "Some content"
+            }
+        }
+    }
+    // Render the template
+    let result = template:render_path(template_dir + "/example.html", data, options) ! panic("Error: %EMSG")
+
+    println(result)
+}
+```
+
+Template engine tokens:
+
+```
+@if(...) @elif(...) @else @end
+
+@each(... as val) @end // Loop over array or map
+@each(... as val, key) // With key
+@each(... as val, key, index) // With key & index
+
+{{ }} // Print sanitized (if isset)
+@{{ }} // Print without sanitization
+
+@include("...") // include other template (template_directory must be set in options)
+```
 
 ## Unsafe
 
