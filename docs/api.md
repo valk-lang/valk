@@ -392,6 +392,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn render(content: String, data: $T, options: ?RenderOptions (null)) String
 + fn render_path(path: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
++ fn sanitize_html(str: String) String
 ```
 
 ## Classes for 'template'
@@ -684,8 +685,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + class ptr {
     + fn index_of_byte(byte: u8, memory_size: uint) uint !not_found
-    + fn offset(offset: uint) ptr
-    + fn offset_int(offset: int) ptr
+    + fn offset(offset: int) ptr
     + fn print_bytes(length: uint, end_with_newline: bool (true)) void
     + fn to_hex() String
 }
