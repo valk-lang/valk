@@ -888,7 +888,7 @@ Template engine tokens:
 @include("...") // include other template (template_directory must be set in options)
 ```
 
-Note: `valk:template` works at runtime and can therefor not detect bad template syntax at compile time.
+Note: `valk:template` works at runtime and can therefor not detect incorrect template syntax at compile time.
 
 ## Unsafe
 
