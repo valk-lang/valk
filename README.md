@@ -139,7 +139,11 @@ When not to use Valk:
 
 ## Contributions
 
-Once we hit version 0.1.0, we want to look for people who can help with the standard library & 3rd party packages. If you want to contribute, just hop into the discord and post in general chat or send a private message to the discord owner.
+We are mainly looking for people who want to add more functionality either via packages or pull requests to the standard library.
+
+If you have an idea of what you want to add but dont know how to start, hop on our discord channel and ask for help.
+
+Highly requested: Hashing/encryption methods, Popular tool/service integrations (e.g. mysql, postgres, S3 api, GUI libraries, ...)
 
 ---
 

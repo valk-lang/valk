@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
 
 ---
 
@@ -20,9 +20,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn exec(cmd: String, stream_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
++ fn get_error_trace() Array[String]
 + fn getenv(var: String) String !not_found
 + fn libc_errno() i32
 + fn panic(msg: String) void
++ fn print_error_trace() void
 + fn raise(code: i32) void
 + fn signal_ignore(sig: int) void
 + fn socket_errno() i32
@@ -43,8 +45,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 ~ global error_code : u32
 ~ global error_msg : String
-~ global error_msg_index : uint
-~ global error_msgs : [String x 100]
 ```
 
 # coro
@@ -153,6 +153,27 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ~ shared mem_usage_shared : uint
 ~ global mem_usage_thread : uint
 + shared verify : bool
+```
+
+# html
+
+## Functions for 'html'
+
+```js
++ fn sanitize(code: String) String
++ fn sanitize_with_options(code: String, options: ?SanitizeOptions (null)) String
+```
+
+## Classes for 'html'
+
+```js
++ class SanitizeOptions {
+    + escape_ampersand: bool
+    + escape_double_quote: bool
+    + escape_gt: bool
+    + escape_lt: bool
+    + escape_single_quote: bool
+}
 ```
 
 # http
@@ -390,8 +411,17 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'template'
 
 ```js
-+ fn render(path: String, data: $T, template_directory: ?String (null)) String !FileNotFound
-+ fn render_content(content: String, data: ?Value (null), template_directory: ?String (null), template_path: ?String (null)) String
++ fn render(content: String, data: $T, options: ?RenderOptions (null)) String
++ fn render_path(path: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
+```
+
+## Classes for 'template'
+
+```js
++ class RenderOptions {
+    + sanitize: ?fn(String)(String)
+    + template_directory: ?String
+}
 ```
 
 # thread
@@ -462,7 +492,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn prepend_copy(item: T, unique: bool (false)) Array[T]
     + fn prepend_many(items: Array[T]) Array[T]
     + fn prepend_many_copy(items: Array[T]) Array[T]
-    + fn push(item: T, unique: bool (false)) Array[T]
     + fn range(start: uint, end: uint, inclusive: bool (true)) Array[T]
     + fn remove(index: uint) Array[T]
     + fn remove_copy(index: uint) Array[T]
@@ -676,8 +705,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + class ptr {
     + fn index_of_byte(byte: u8, memory_size: uint) uint !not_found
-    + fn offset(offset: uint) ptr
-    + fn offset_int(offset: int) ptr
+    + fn offset(offset: int) ptr
     + fn print_bytes(length: uint, end_with_newline: bool (true)) void
     + fn to_hex() String
 }
@@ -791,7 +819,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + class ByteBuffer {
-    ~ data: ptr
+    ~ data: GcPtr
     ~ length: uint
     ~ size: uint
 
