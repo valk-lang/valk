@@ -164,6 +164,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn sanitize_with_options(code: String, options: ?SanitizeOptions (null)) String
 ```
 
+## Classes for 'html'
+
+```js
++ class SanitizeOptions {
+    + escape_ampersand: bool
+    + escape_double_quote: bool
+    + escape_gt: bool
+    + escape_lt: bool
+    + escape_single_quote: bool
+}
+```
+
 # http
 
 ## Functions for 'http'
