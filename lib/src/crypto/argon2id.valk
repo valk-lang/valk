@@ -16,6 +16,17 @@ value ARGON2_PREHASH_SEED_LENGTH (72)
 value ARGON2_SYNCPOINTS (4)
 
 value ARGON2_QWORDS_IN_BLOCK (ARGON2_BLOCK_SIZE / 8)
+value ARGON2_OWORDS_IN_BLOCK (ARGON2_BLOCK_SIZE / 16)
+value ARGON2_HWORDS_IN_BLOCK (ARGON2_BLOCK_SIZE / 32)
+
+class Argon2Pos {
+    pass: u32
+    lane: u32
+    slice: u8
+    index: u32
+}
+
+type Argon2Block ([u64 x ARGON2_ADDRESSES_IN_BLOCK])
 
 class Argon2 {
     type: u32
@@ -30,6 +41,7 @@ class Argon2 {
     threads: u32
     block_count: u32
     blocks_per_thread: u32
+    blocks_per_segment: u32
 
     data: ptr[[u64 x ARGON2_ADDRESSES_IN_BLOCK]]
 
@@ -37,14 +49,16 @@ class Argon2 {
         if threads < 1 : threads = 1
         if passes < 1 : passes = 1
 
-        let st = ARGON2_SYNCPOINTS * threads
-        // Rounding
-        block_count = block_count / st * st
-        // Fitting
-        if block_count < 2 * st : block_count = 2 * st
+        let segment_count = ARGON2_SYNCPOINTS * threads
+        // Minimum amount of blocks
+        if block_count < 2 * segment_count : block_count = 2 * segment_count
+        // Segment
+        let blocks_per_segment = block_count / segment_count
+        // Rounding - Making sure the amount of blocks is even accross segments
+        block_count = blocks_per_segment * segment_count
 
-        let blocks_per_thread = block_count / threads
         let data = mem:alloc(ARGON2_BLOCK_SIZE * block_count)
+        let blocks_per_thread = blocks_per_segment * ARGON2_SYNCPOINTS
 
         return SELF {
             type: type
@@ -59,6 +73,7 @@ class Argon2 {
             passes: passes
             threads: threads
             block_count: block_count
+            blocks_per_segment: blocks_per_segment
             blocks_per_thread: blocks_per_thread
             data: data
         }
@@ -66,6 +81,12 @@ class Argon2 {
 
     fn gc_free() {
         mem:free(this.data)
+    }
+
+    + fn run() {
+        this.init()
+        this.fill_memory_blocks()
+        this.finalize()
     }
 
     fn init() {
@@ -168,42 +189,150 @@ class Argon2 {
             thr++
         }
     }
-}
 
-fn key(password: String, salt: String, rounds: u32, memory: u32, threads: u8, keyLen: u32) String {
-    return deriveKey(Argon2Type.i, password, salt, null, null, 0, rounds, memory, threads, keyLen)
-}
-
-fn deriveKey(mode: Argon2Type, password: String, salt: String, secret: ?String, data: ?ptr, data_len: u32, rounds: u32, memory: u32, threads: u32, keyLen: u32) String {
-    if rounds < 1 : panic("argon2: number of rounds too small")
-    if threads < 1 : panic("argon2: parallelism degree too low")
-    let h0 = initHash(password, salt, secret, data, rounds, memory, threads, keyLen, mode)
-
-    memory = memory / (syncPoints * threads) * (syncPoints * threads)
-    if memory < 2 * syncPoints * threads {
-        memory = 2 * syncPoints * threads
+    // Single threaded
+    fn fill_memory_blocks() {
+        let r : u32 = 0
+        let s : u32 = 0
+        let l : u32 = 0
+        while r < this.passes {
+            while s < ARGON2_SYNCPOINTS {
+                while l < this.blocks_per_thread {
+                    let pos = Argon2Pos {
+                        pass: r
+                        lane: l
+                        slice: s.to(u8)
+                        index: 0
+                    }
+                    this.fill_segment(pos);
+                    l++
+                }
+                s++
+            }
+            r++
+        }
     }
-    let B = initBlocks(&h0, memory, threads)
-    processBlocks(B, time, memory, threads, mode)
-    return extractKey(B, memory, threads, keyLen)
+
+    fn fill_segment(pos: Argon2Pos) {
+        let ref_block : ?ptr[u64 x ARGON2_ADDRESSES_IN_BLOCK] = null
+        let curr_block : ?ptr[u64 x ARGON2_ADDRESSES_IN_BLOCK] = null
+        let address_block : Argon2Block = [0...]
+        let input_block : Argon2Block = [0...]
+        let zero_block : Argon2Block = [0...]
+        let pseudo_rand : u64 = 0
+        let ref_index : u64 = 0
+        let ref_lane : u64 = 0
+        let prev_offset : u32 = 0
+        let curr_offset : u32 = 0
+        let start_index : u32 = 0
+        let i : u32 = 0
+
+        let data_independent_addressing = (this.type == Argon2Type.i) || (this.type == Argon2Type.id && (pos.pass == 0) && (pos.slice < ARGON2_SYNCPOINTS / 2))
+
+        if data_independent_addressing {
+            input_block[0] = pos.pass
+            input_block[1] = pos.lane
+            input_block[2] = pos.slice
+            input_block[3] = this.block_count
+            input_block[4] = this.passes
+            input_block[5] = this.type
+        }
+
+        if (0 == pos.pass) && (0 == pos.slice) {
+            start_index = 2 // The first 2 blocks are already generated
+            if (data_independent_addressing) {
+                input_block[6]++
+                argon2_fill_block(zero_block, input_block, address_block, false)
+                argon2_fill_block(zero_block, address_block, address_block, false)
+            }
+        }
+
+        // Offset of the current block
+        curr_offset = pos.lane * this.blocks_per_thread + pos.slice * this.blocks_per_segment + start_index
+
+        if (0 == curr_offset % this.blocks_per_thread) {
+            // Last block in this lane
+            prev_offset = curr_offset + this.blocks_per_thread - 1
+        } else {
+            // Previous block
+            prev_offset = curr_offset - 1
+        }
+
+        i = start_index
+        while i < this.blocks_per_segment {
+            // Rotating prev_offset if needed
+            if curr_offset % this.blocks_per_thread == 1 {
+                prev_offset = curr_offset - 1
+            }
+
+            // Computing the index of the reference block
+            // Taking pseudo-random value from the previous block
+            if (data_independent_addressing) {
+                if (i % ARGON2_ADDRESSES_IN_BLOCK == 0) {
+                    input_block[6]++
+                    argon2_fill_block(zero_block, input_block, address_block, false)
+                    argon2_fill_block(zero_block, address_block, address_block, false)
+                }
+                pseudo_rand = address_block[i % ARGON2_ADDRESSES_IN_BLOCK]
+            } else {
+                pseudo_rand = this.data[prev_offset][0]
+            }
+
+            // Computing the lane of the reference block
+            ref_lane = (pseudo_rand >> 32) % this.threads
+
+            if ((pos.pass == 0) && (pos.slice == 0)) {
+                // Can not reference other lanes yet
+                ref_lane = pos.lane
+            }
+
+            // Computing the number of possible reference block within the lane
+            pos.index = i;
+            ref_index = argon2_index_alpha(pseudo_rand, this.blocks_per_thread, this.blocks_per_segment, this.threads, pos.pass, pos.slice, pos.lane, i)
+
+            // 2 Creating a new block
+            ref_block = this.data + this.blocks_per_thread * ref_lane + ref_index;
+            curr_block = this.data + curr_offset;
+            if(0 == pos.pass) {
+                argon2_fill_block(this.data + prev_offset, ref_block, curr_block, false);
+            } else {
+                argon2_fill_block(this.data + prev_offset, ref_block, curr_block, true);
+            }
+
+            i++
+            curr_offset++
+            prev_offset++
+        }
+    }
+
 }
 
+// fn key(password: String, salt: String, rounds: u32, memory: u32, threads: u8, keyLen: u32) String {
+//     return deriveKey(Argon2Type.i, password, salt, null, null, 0, rounds, memory, threads, keyLen)
+// }
 
-value syncPoints (4)
-// const (
-// 	blockLength = 128
-// 	syncPoints  = 4
-// )
+// fn deriveKey(mode: Argon2Type, password: String, salt: String, secret: ?String, data: ?ptr, data_len: u32, rounds: u32, memory: u32, threads: u32, keyLen: u32) String {
+//     if rounds < 1 : panic("argon2: number of rounds too small")
+//     if threads < 1 : panic("argon2: parallelism degree too low")
+//     let h0 = initHash(password, salt, secret, data, rounds, memory, threads, keyLen, mode)
 
-// type block [blockLength]uint64
+//     memory = memory / (syncPoints * threads) * (syncPoints * threads)
+//     if memory < 2 * syncPoints * threads {
+//         memory = 2 * syncPoints * threads
+//     }
+//     let B = initBlocks(&h0, memory, threads)
+//     processBlocks(B, time, memory, threads, mode)
+//     return extractKey(B, memory, threads, keyLen)
+// }
 
-fn initHash(password: String, salt: String, key: ?String, data: ?ptr, rounds: u32, memory: u32, threads: u32, keyLen: u32, mode: int) [u8 x 72] {
-  let h0 : [u8 x 72] = [0...]
-  let params : [u8 x 24] = [0...]
-  let tmp : [u8 x 4] = [0...]
 
-  return h0
-}
+// fn initHash(password: String, salt: String, key: ?String, data: ?ptr, rounds: u32, memory: u32, threads: u32, keyLen: u32, mode: int) [u8 x 72] {
+//   let h0 : [u8 x 72] = [0...]
+//   let params : [u8 x 24] = [0...]
+//   let tmp : [u8 x 4] = [0...]
+
+//   return h0
+// }
 
 fn argon2_load_block(dst: ptr[u64], input: ptr) {
     let i = 0
@@ -211,68 +340,6 @@ fn argon2_load_block(dst: ptr[u64], input: ptr) {
         dst[i] = u64.read_little_endian(input + i * size_of(u64))
         i++
     }
-}
-
-fn processBlocks(B: []block, time, memory, threads uint32, mode int) {
-    lanes := memory / threads
-    segments := lanes / syncPoints
-
-    processSegment := func(n, slice, lane uint32, wg *sync.WaitGroup) {
-        var addresses, in, zero block
-        if mode == argon2i || (mode == argon2id && n == 0 && slice < syncPoints/2) {
-            in[0] = uint64(n)
-            in[1] = uint64(lane)
-            in[2] = uint64(slice)
-            in[3] = uint64(memory)
-            in[4] = uint64(time)
-            in[5] = uint64(mode)
-        }
-
-        index := uint32(0)
-        if n == 0 && slice == 0 {
-            index = 2 // we have already generated the first two blocks
-            if mode == argon2i || mode == argon2id {
-                in[6]++
-                processBlock(&addresses, &in, &zero)
-                processBlock(&addresses, &addresses, &zero)
-            }
-        }
-
-        offset := lane*lanes + slice*segments + index
-        var random uint64
-        for index < segments {
-            prev := offset - 1
-            if index == 0 && slice == 0 {
-                prev += lanes // last block in lane
-            }
-            if mode == argon2i || (mode == argon2id && n == 0 && slice < syncPoints/2) {
-                if index%blockLength == 0 {
-                    in[6]++
-                    processBlock(&addresses, &in, &zero)
-                    processBlock(&addresses, &addresses, &zero)
-                }
-                random = addresses[index%blockLength]
-            } else {
-                random = B[prev][0]
-            }
-            newOffset := indexAlpha(random, lanes, segments, threads, n, slice, lane, index)
-            processBlockXOR(&B[offset], &B[prev], &B[newOffset])
-            index, offset = index+1, offset+1
-        }
-        wg.Done()
-    }
-
-    for n := uint32(0); n < time; n++ {
-        for slice := uint32(0); slice < syncPoints; slice++ {
-            var wg sync.WaitGroup
-            for lane := uint32(0); lane < threads; lane++ {
-                wg.Add(1)
-                go processSegment(n, slice, lane, &wg)
-            }
-            wg.Wait()
-        }
-    }
-
 }
 
 fn argon2_blake2b(out: ptr[u8], outlen: u32, in: ptr, inlen: uint) {
@@ -321,4 +388,226 @@ fn argon2_blake2b(out: ptr[u8], outlen: u32, in: ptr, inlen: uint) {
 
         mem:copy(out_buffer, out, toproduce)
     }
+}
+
+fn argon2_fill_block(state: ptr[u64], ref_block: ptr[u64], next_block: ptr[u64], use_xor: bool) {
+    let t: [u64 x ARGON2_QWORDS_IN_BLOCK] = [0...]
+    let i = 0
+    while i < ARGON2_QWORDS_IN_BLOCK {
+        t[i] = ref_block[i] ^ next_block[i]
+        i++
+    }
+
+    i = 0
+    while i < ARGON2_BLOCK_SIZE {
+        blamkaGeneric(
+			&t[i+0], &t[i+1], &t[i+2], &t[i+3],
+			&t[i+4], &t[i+5], &t[i+6], &t[i+7],
+			&t[i+8], &t[i+9], &t[i+10], &t[i+11],
+			&t[i+12], &t[i+13], &t[i+14], &t[i+15]
+		)
+        i += 16
+    }
+
+    i = 0
+    while i < ARGON2_BLOCK_SIZE / 8 {
+		blamkaGeneric(
+			&t[i], &t[i+1], &t[16+i], &t[16+i+1],
+			&t[32+i], &t[32+i+1], &t[48+i], &t[48+i+1],
+			&t[64+i], &t[64+i+1], &t[80+i], &t[80+i+1],
+			&t[96+i], &t[96+i+1], &t[112+i], &t[112+i+1]
+		)
+        i += 2
+    }
+
+    i = 0
+    if use_xor {
+        while i < ARGON2_QWORDS_IN_BLOCK {
+            state[i] = state[i] ^ (ref_block[i] ^ next_block[i] ^ t[i])
+            i++
+        }
+    } else {
+        while i < ARGON2_QWORDS_IN_BLOCK {
+            state[i] = ref_block[i] ^ next_block[i] ^ t[i]
+            i++
+        }
+    }
+}
+
+fn blamkaGeneric(t00: ptr[u64], t01: ptr[u64], t02: ptr[u64], t03: ptr[u64], t04: ptr[u64], t05: ptr[u64], t06: ptr[u64], t07: ptr[u64], t08: ptr[u64], t09: ptr[u64], t10: ptr[u64], t11: ptr[u64], t12: ptr[u64], t13: ptr[u64], t14: ptr[u64], t15: ptr[u64]) {
+    let v00 = t00[0]
+    let v01 = t01[0]
+    let v02 = t02[0]
+    let v03 = t03[0]
+    let v04 = t04[0]
+    let v05 = t05[0]
+    let v06 = t06[0]
+    let v07 = t07[0]
+    let v08 = t08[0]
+    let v09 = t09[0]
+    let v10 = t10[0]
+    let v11 = t11[0]
+    let v12 = t12[0]
+    let v13 = t13[0]
+    let v14 = t14[0]
+    let v15 = t15[0]
+
+	v00 += v04 + 2* v00.to(u32).to(u64) * v04.to(u32).to(u64)
+	v12 ^= v00
+	v12 = v12>>32 | v12<<32
+	v08 += v12 + 2 * v08.to(u32).to(u64) * v12.to(u32).to(u64)
+	v04 ^= v08
+	v04 = v04>>24 | v04<<40
+
+	v00 += v04 + 2 * v00.to(u32).to(u64) * v04.to(u32).to(u64)
+	v12 ^= v00
+	v12 = v12>>16 | v12<<48
+	v08 += v12 + 2 * v08.to(u32).to(u64) * v12.to(u32).to(u64)
+	v04 ^= v08
+	v04 = v04>>63 | v04<<1
+
+	v01 += v05 + 2 * v01.to(u32).to(u64) * v05.to(u32).to(u64)
+	v13 ^= v01
+	v13 = v13>>32 | v13<<32
+	v09 += v13 + 2 * v09.to(u32).to(u64) * v13.to(u32).to(u64)
+	v05 ^= v09
+	v05 = v05>>24 | v05<<40
+
+	v01 += v05 + 2 * v01.to(u32).to(u64) * v05.to(u32).to(u64)
+	v13 ^= v01
+	v13 = v13>>16 | v13<<48
+	v09 += v13 + 2 * v09.to(u32).to(u64) * v13.to(u32).to(u64)
+	v05 ^= v09
+	v05 = v05>>63 | v05<<1
+
+	v02 += v06 + 2 * v02.to(u32).to(u64) * v06.to(u32).to(u64)
+	v14 ^= v02
+	v14 = v14>>32 | v14<<32
+	v10 += v14 + 2 * v10.to(u32).to(u64) * v14.to(u32).to(u64)
+	v06 ^= v10
+	v06 = v06>>24 | v06<<40
+
+	v02 += v06 + 2 * v02.to(u32).to(u64) * v06.to(u32).to(u64)
+	v14 ^= v02
+	v14 = v14>>16 | v14<<48
+	v10 += v14 + 2 * v10.to(u32).to(u64) * v14.to(u32).to(u64)
+	v06 ^= v10
+	v06 = v06>>63 | v06<<1
+
+	v03 += v07 + 2 * v03.to(u32).to(u64) * v07.to(u32).to(u64)
+	v15 ^= v03
+	v15 = v15>>32 | v15<<32
+	v11 += v15 + 2 * v11.to(u32).to(u64) * v15.to(u32).to(u64)
+	v07 ^= v11
+	v07 = v07>>24 | v07<<40
+
+	v03 += v07 + 2 * v03.to(u32).to(u64) * v07.to(u32).to(u64)
+	v15 ^= v03
+	v15 = v15>>16 | v15<<48
+	v11 += v15 + 2 * v11.to(u32).to(u64) * v15.to(u32).to(u64)
+	v07 ^= v11
+	v07 = v07>>63 | v07<<1
+
+	v00 += v05 + 2 * v00.to(u32).to(u64) * v05.to(u32).to(u64)
+	v15 ^= v00
+	v15 = v15>>32 | v15<<32
+	v10 += v15 + 2 * v10.to(u32).to(u64) * v15.to(u32).to(u64)
+	v05 ^= v10
+	v05 = v05>>24 | v05<<40
+
+	v00 += v05 + 2 * v00.to(u32).to(u64) * v05.to(u32).to(u64)
+	v15 ^= v00
+	v15 = v15>>16 | v15<<48
+	v10 += v15 + 2 * v10.to(u32).to(u64) * v15.to(u32).to(u64)
+	v05 ^= v10
+	v05 = v05>>63 | v05<<1
+
+	v01 += v06 + 2 * v01.to(u32).to(u64) * v06.to(u32).to(u64)
+	v12 ^= v01
+	v12 = v12>>32 | v12<<32
+	v11 += v12 + 2 * v11.to(u32).to(u64) * v12.to(u32).to(u64)
+	v06 ^= v11
+	v06 = v06>>24 | v06<<40
+
+	v01 += v06 + 2 * v01.to(u32).to(u64) * v06.to(u32).to(u64)
+	v12 ^= v01
+	v12 = v12>>16 | v12<<48
+	v11 += v12 + 2 * v11.to(u32).to(u64) * v12.to(u32).to(u64)
+	v06 ^= v11
+	v06 = v06>>63 | v06<<1
+
+	v02 += v07 + 2 * v02.to(u32).to(u64) * v07.to(u32).to(u64)
+	v13 ^= v02
+	v13 = v13>>32 | v13<<32
+	v08 += v13 + 2 * v08.to(u32).to(u64) * v13.to(u32).to(u64)
+	v07 ^= v08
+	v07 = v07>>24 | v07<<40
+
+	v02 += v07 + 2 * v02.to(u32).to(u64) * v07.to(u32).to(u64)
+	v13 ^= v02
+	v13 = v13>>16 | v13<<48
+	v08 += v13 + 2 * v08.to(u32).to(u64) * v13.to(u32).to(u64)
+	v07 ^= v08
+	v07 = v07>>63 | v07<<1
+
+	v03 += v04 + 2 * v03.to(u32).to(u64) * v04.to(u32).to(u64)
+	v14 ^= v03
+	v14 = v14>>32 | v14<<32
+	v09 += v14 + 2 * v09.to(u32).to(u64) * v14.to(u32).to(u64)
+	v04 ^= v09
+	v04 = v04>>24 | v04<<40
+
+	v03 += v04 + 2 * v03.to(u32).to(u64) * v04.to(u32).to(u64)
+	v14 ^= v03
+	v14 = v14>>16 | v14<<48
+	v09 += v14 + 2 * v09.to(u32).to(u64) * v14.to(u32).to(u64)
+	v04 ^= v09
+	v04 = v04>>63 | v04<<1
+
+    t00[0] = v00
+    t01[0] = v01
+    t02[0] = v02
+    t03[0] = v03
+    t04[0] = v04
+    t05[0] = v05
+    t06[0] = v06
+    t07[0] = v07
+    t08[0] = v08
+    t09[0] = v09
+    t10[0] = v10
+    t11[0] = v11
+    t12[0] = v12
+    t13[0] = v13
+    t14[0] = v14
+    t15[0] = v15
+}
+
+fn argon2_index_alpha(rand: u64, lanes: u32, segments: u32, threads: u32, n: u32, slice: u32, lane: u32, index: u32) u32 {
+	let refLane = (rand >> 32).to(u32) % threads
+	if n == 0 && slice == 0 {
+		refLane = lane
+	}
+	let m = 3*segments
+    let s = ((slice+1) % ARGON2_SYNCPOINTS) * segments
+	if lane == refLane {
+		m += index
+	}
+	if n == 0 {
+		m = slice*segments
+        s = 0
+		if slice == 0 || lane == refLane {
+			m += index
+		}
+	}
+	if index == 0 || lane == refLane {
+		m--
+	}
+	return phi(rand, m, s, refLane, lanes)
+}
+
+fn phi(rand: u64, m: u64, s: u64, lane: u32, lanes: u32) u32 {
+	let p = rand & 0xFFFFFFFF
+	p = (p * p) >> 32
+	p = (p * m) >> 32
+	return lane*lanes + ((s+m-(p+1)) % lanes.to(u64)).to(u32)
 }
