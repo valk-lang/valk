@@ -60,6 +60,9 @@ fn _pclose(stream: FILE) i32;
 fn system(cmd: cstring) i32;
 fn Sleep(ms: u32) void;
 
+fn srand(seed: u32);
+fn rand() i32;
+
 // Poll
 fn WSAPoll(fds: ptr, nfds: uint, timeout: i32) i32;
 fn WSAGetLastError() i32;

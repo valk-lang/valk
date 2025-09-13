@@ -52,6 +52,8 @@ fn epoll_wait(epfd: i32, events: ptr, maxevents: i32, timeout: i32) i32;
 fn epoll_ctl(epfd: i32, op: i32, fd: i32, event: libc_epoll_event) i32;
 
 fn nanosleep(req: libc_timespec, rem: libc_timespec) i32;
+fn srand(seed: u32);
+fn rand() i32;
 
 // Files
 fn stat(path: cstring, stat_buf: libc_stat) i32;
