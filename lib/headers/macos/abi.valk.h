@@ -49,7 +49,10 @@ fn popen(command: cstring, type: cstring) ?ptr;
 fn fgets(s: cstring, n: i32, stream: ptr) ?cstring;
 fn pclose(stream: ptr) i32;
 fn system(cmd: cstring) i32;
+
 fn nanosleep(req: libc_timespec, rem: libc_timespec) i32;
+fn srand(seed: u32);
+fn rand() i32;
 
 // Poll
 fn poll(fds: ptr, nfds: u32, timeout: i32) i32;
