@@ -2,7 +2,7 @@
 // alias libc_stat as libc_stat_fix
 
 struct libc_jmp_buf {
-    data: [ptr x 5]
+    data: [@ptr x 5]
 }
 
 struct libc_timezone {
@@ -16,9 +16,9 @@ struct libc_addrinfo_fix {
     ai_socktype: i32
     ai_protocol: i32
     ai_addrlen: uint
-    ai_canonname: ptr
-    ai_addr: ptr
-    ai_next: ptr
+    ai_canonname: @ptr
+    ai_addr: @ptr
+    ai_next: @ptr
 }
 
 struct libc_stat_fix {

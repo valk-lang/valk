@@ -1,14 +1,14 @@
 
-@shared stderr : ?ptr;
-@shared stdin : ?ptr;
-@shared stdout : ?ptr;
+@shared stderr : ?@ptr;
+@shared stdin : ?@ptr;
+@shared stdout : ?@ptr;
 
-alias FILE for ptr
+alias FILE for @ptr
 alias SOCKET for uint
-alias HANDLE for ptr
+alias HANDLE for @ptr
 alias BOOLEAN for u8
 
-// HANDLE : ptr
+// HANDLE : @ptr
 // DWORD : u32
 // ULONG : u32
 
@@ -30,8 +30,8 @@ alias chdir for _chdir;
 
 alias poll for WSAPoll;
 
-fn malloc(size: uint) ptr;
-fn free(adr: ptr) void;
+fn malloc(size: uint) @ptr;
+fn free(adr: @ptr) void;
 
 fn getenv(key: cstring) ?cstring;
 fn GetLastError() u32;
@@ -41,17 +41,17 @@ fn _write(fd: i32, buf: cstring, size: u32) int;
 fn _open(path: cstring, flags: i32, mode: i32) i32;
 fn _close(fd: i32) i32;
 
-fn recv(fd: uint, buf: ptr, len: i32, flags: i32) i32;
-fn send(fd: uint, buf: ptr, len: i32, flags: i32) i32;
+fn recv(fd: uint, buf: @ptr, len: i32, flags: i32) i32;
+fn send(fd: uint, buf: @ptr, len: i32, flags: i32) i32;
 
 // Files
 fn _stat(path: cstring, stat_buf: libc_stat) i32;
 fn fstat(fd: i32, stat_buf: libc_stat) i32;
 fn lstat(path: cstring, stat_buf: libc_stat) i32;
 
-fn FindFirstFileA(lpFileName: cstring, lpFindFileData: ptr) ptr;
-fn FindNextFileA(hFindFile: ptr, lpFindFileData: ptr) bool;
-fn FindClose(hFindFile: ptr) bool;
+fn FindFirstFileA(lpFileName: cstring, lpFindFileData: @ptr) @ptr;
+fn FindNextFileA(hFindFile: @ptr, lpFindFileData: @ptr) bool;
+fn FindClose(hFindFile: @ptr) bool;
 
 // OS
 fn _popen(command: cstring, type: cstring) ?FILE;
@@ -64,12 +64,12 @@ fn srand(seed: u32);
 fn rand() i32;
 
 // Poll
-fn WSAPoll(fds: ptr, nfds: uint, timeout: i32) i32;
+fn WSAPoll(fds: @ptr, nfds: uint, timeout: i32) i32;
 fn WSAGetLastError() i32;
-fn WSAStartup(wVersionRequired: u16, lpWSAData: ptr) i32;
+fn WSAStartup(wVersionRequired: u16, lpWSAData: @ptr) i32;
 fn WSACleanup() i32;
 fn closesocket(fd: uint) i32;
-fn ioctlsocket(fd: uint, cmd: int, arg: ptr) i32;
+fn ioctlsocket(fd: uint, cmd: int, arg: @ptr) i32;
 
 //fn pipe(pipefd: i32[2]) i32;
 //int select(int nfds, fd_set restrict readfds, fd_set restrict writefds, fd_set restrict exceptfds, struct timeval restrict timeout);
@@ -78,22 +78,22 @@ fn dup2(old_fd: i32, new_fd: i32) i32;
 
 fn socket(domain: i32, type: i32, protocol: i32) uint;
 fn connect(sockfd: uint, addr: libc_sockaddr, addrlen: u32) i32;
-fn accept(sockfd: uint, addr: ?libc_sockaddr, addrlen: ?ptr) uint;
-//fn accept4(sockfd: i32, addr: ?libc_sockaddr, addrlen: ?ptr, flags: i32) i32;
+fn accept(sockfd: uint, addr: ?libc_sockaddr, addrlen: ?@ptr) uint;
+//fn accept4(sockfd: i32, addr: ?libc_sockaddr, addrlen: ?@ptr, flags: i32) i32;
 fn shutdown(sockfd: uint, how: i32) i32;
 fn bind(sockfd: uint, addr: libc_sockaddr, addrlen: u32) i32;
 fn listen(sockfd: uint, backlog: i32) i32;
 
-fn getsockopt(sockfd: uint, level: i32, optname: i32, optval: ptr, optlen: u32) i32;
-fn setsockopt(sockfd: uint, level: i32, optname: i32, optval: ptr, optlen: u32) i32;
-fn getaddrinfo(host: cstring, port: cstring, hints: libc_addrinfo_fix, res: ptr) i32;
+fn getsockopt(sockfd: uint, level: i32, optname: i32, optval: @ptr, optlen: u32) i32;
+fn setsockopt(sockfd: uint, level: i32, optname: i32, optval: @ptr, optlen: u32) i32;
+fn getaddrinfo(host: cstring, port: cstring, hints: libc_addrinfo_fix, res: @ptr) i32;
 fn freeaddrinfo(info: libc_addrinfo_fix) i32;
 
 //int clone(int (fn)(void *), void stack, int flags, void arg, .../* pid_t parent_tid, void tls, pid_t child_tid */ );
 fn fork() i32;
 fn vfork() i32;
 
-fn execve(pathname: cstring, argv: ptr, envp: ptr) i32;
+fn execve(pathname: cstring, argv: @ptr, envp: @ptr) i32;
 
 //fn wait3(wstatus: i32[1], options: i32, struct rusage rusage) i32;
 //fn wait4(pid: i32, wstatus: i32[1], options: i32, struct rusage rusage) i32;
@@ -110,11 +110,11 @@ fn _rmdir(pathname: cstring) i32;
 fn link(oldpath: cstring, newpath: cstring) i32;
 fn _unlink(pathname: cstring) i32;
 fn symlink(target: cstring, linkpath: cstring) i32;
-fn GetModuleFileNameA(hmodule: ?ptr, buf: ptr, len: u32) u32;
+fn GetModuleFileNameA(hmodule: ?@ptr, buf: @ptr, len: u32) u32;
 fn GetFileAttributesA(path: cstring) u32;
-fn GetCurrentDirectory(buffer_size: u32, buffer: ptr) u32;
+fn GetCurrentDirectory(buffer_size: u32, buffer: @ptr) u32;
 fn CreateSymbolicLinkA(link: cstring, target: cstring, flags: u32) BOOLEAN;
-fn _fullpath(buf: ptr, path: cstring, maxlen: uint) cstring;
+fn _fullpath(buf: @ptr, path: cstring, maxlen: uint) cstring;
 
 fn chmod(pathname: cstring, mode: u32) i32;
 fn fchmod(fd: i32, mode: u32) i32;
@@ -131,15 +131,15 @@ fn gettid() i32;
 fn exit(status: i32) void $exit;
 fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
-fn _get_errno(int_ref: ptr) ptr;
+fn _get_errno(int_ref: @ptr) @ptr;
 
-fn CreateThread(lpThreadAttributes: ?ptr, dwStackSize: uint, lpStartAddress: ptr, lpParameter: ?ptr, dwCreationFlags: u32, lpThreadId: ?ptr) ?ptr;
-fn TerminateThread(handle: ptr, exit_code: i32) bool;
-fn WaitForSingleObject(handle: ptr, timeout_ms: u32) u32;
-fn CloseHandle(handle: ptr) bool;
+fn CreateThread(lpThreadAttributes: ?@ptr, dwStackSize: uint, lpStartAddress: @ptr, lpParameter: ?@ptr, dwCreationFlags: u32, lpThreadId: ?@ptr) ?@ptr;
+fn TerminateThread(handle: @ptr, exit_code: i32) bool;
+fn WaitForSingleObject(handle: @ptr, timeout_ms: u32) u32;
+fn CloseHandle(handle: @ptr) bool;
 
-fn CreateMutexA(lpMutexAttributes: ?ptr, bInitialOwner: bool, lpName: ?cstring) HANDLE;
-fn ReleaseMutex(mutex: ptr) void;
+fn CreateMutexA(lpMutexAttributes: ?@ptr, bInitialOwner: bool, lpName: ?cstring) HANDLE;
+fn ReleaseMutex(mutex: @ptr) void;
 
 // Time
 fn GetSystemTimeAsFileTime(ft: libc_FILETIME) void;

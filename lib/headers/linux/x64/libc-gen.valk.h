@@ -84,7 +84,7 @@ struct libc_gen_timezone {
 }
 
 struct libc_gen_epoll_data {
-    ptr: ptr
+    ptr: @ptr
     fd: i32
     u32: u32
     u64: uint
