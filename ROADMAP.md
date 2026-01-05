@@ -43,8 +43,8 @@
 + Release 0.0.8
 
 + template engine improvements
-+ Rework arrays from `@array[...]{...}` to `[1, 2, 3]`
-- Basic crypto functions
++ Rework arrays from `@array[...]{...}` to `{1, 2, 3}`
++ Basic crypto functions
 - Release 0.0.9
 
 - Share project with others?
