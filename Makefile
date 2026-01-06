@@ -117,9 +117,10 @@ win-x64:
 	mkdir -p dist/win-x64
 	valk build . src/*.valk -o ./dist/win-x64/valk -vv --static --target win-x64 --clean $(FLAGS)
 	cp -r ./lib ./dist/win-x64/
-	cp -r ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
+	cp ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
+	cp ./dist/LLVM-C.dll ./dist/win-x64/
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
-	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
+	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe LLVM-C.dll
 
 dist-all: win-x64 linux-x64 macos-x64 macos-arm64
 
