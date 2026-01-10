@@ -45,7 +45,8 @@
 + template engine improvements
 + Rework arrays from `@array[...]{...}` to `{1, 2, 3}`
 + Basic crypto functions
-- Release 0.0.9
++ Improve enums
++ Release 0.0.9
 
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
