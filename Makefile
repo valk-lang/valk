@@ -48,13 +48,13 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv -c $(FLAGS) -o ./debug/test-all
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv -c -o ./debug/test-win.exe --target win-x64 $(FLAGS)
+	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS)
 	./debug/test-win.exe
 
 # Testing
