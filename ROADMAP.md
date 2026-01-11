@@ -51,6 +51,9 @@
 + Fix shared gc bug
 + Release 0.0.10
 
++ Re-enable multi threaded compiling
+- Release 0.0.11
+
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
