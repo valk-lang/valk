@@ -48,6 +48,9 @@
 + Improve enums
 + Release 0.0.9
 
++ Fix shared gc bug
++ Release 0.0.10
+
 - Share project with others?
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
