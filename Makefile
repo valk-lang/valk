@@ -48,13 +48,13 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vvv -c $(FLAGS) -o ./debug/test-all
+	./valk build ./tests/*.valk . --test -vv -c $(FLAGS) -o ./debug/test-all
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vvv -c -o ./debug/test-win.exe --target win-x64 $(FLAGS)
+	./valk build ./tests/*.valk . --test -vv -c -o ./debug/test-win.exe --target win-x64 $(FLAGS)
 	./debug/test-win.exe
 
 # Testing
@@ -83,7 +83,7 @@ ci-macos: $(SRC) $(HDRS)
 
 ci-win: $(SRC) $(HDRS)
 	~/valk-dev/valk.exe -h || echo ""
-	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vvv -c --static $(FLAGS) \
+	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
 	-L ./llvm/lib/
 
 # Distributions
@@ -133,5 +133,6 @@ toolchains:
 clean:
 	rm -f ./valk
 	rm -f ./valk2
+	rm -rf ~/.valk/cache
 
 .PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
