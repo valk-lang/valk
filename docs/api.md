@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
 
 ---
 
@@ -18,12 +18,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'core'
 
 ```js
-+ fn exec(cmd: String, stream_output: bool (false)) (i32, String)
++ fn exec(cmd: imut String, stream_output: bool (false)) (i32, imut String)
 + fn exit(code: i32) void
-+ fn get_error_trace() Array[String]
-+ fn getenv(var: String) String !not_found
++ fn get_error_trace() Array[imut String]
++ fn getenv(var: imut String) imut String !not_found
 + fn libc_errno() i32
-+ fn panic(msg: String) void
++ fn panic(msg: imut String) void
 + fn print_error_trace() void
 + fn raise(code: i32) void
 + fn signal_ignore(sig: int) void
@@ -35,7 +35,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + class Mutex[T] {
     + fn lock() T
-    + static fn new(value: T) Mutex[T]
+    + static fn new(value: T) imut Mutex[T]
     + fn unlock(value: T) void
 }
 ```
@@ -44,7 +44,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 ~ global error_code : u32
-~ global error_msg : String
+~ global error_msg : imut String
 ```
 
 # coro
@@ -57,55 +57,97 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + fn yield() void
 ```
 
+# crypto
+
+## Functions for 'crypto'
+
+```js
++ fn bcrypt(cost: uint, salt: imut String, password: imut String, output: ByteBuffer) void
++ fn bcrypt_hash(password: imut String, cost: uint (12)) imut String
++ fn bcrypt_verify(password: imut String, hash: imut String) bool
++ fn blowfish_encrypt_block(context: BlowfishContext, input: ptr[u8], output: ptr[u8]) void
++ fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !invalid_salt !invalid_key
++ fn blowfish_init_state(context: BlowfishContext) void
++ fn blowfish_xor_block(data: &[u8], salt: ByteBuffer, saltIndex: &[uint]) void
+```
+
+## Classes for 'crypto'
+
+```js
++ class Blake2b {
+    + fn finalize(out: ptr[u8]) void
+    + static fn hash_str(input: imut String, key: ?imut String (null), lowercase: bool (true)) imut String !invalid_key
+    + static fn new(hash_size: uint, key: ?imut String (null)) Blake2b !invalid_hash_size !invalid_key
+    + fn update(data: ptr[u8], length: uint) void
+}
+```
+
+```js
++ class BlowfishContext {
+}
+```
+
+## Globals for 'crypto'
+
+```js
++ global IV : [u64 x 8]
++ global SIGMA : [[u8 x 16] x 12]
++ global parray : [u32 x 18]
++ global sbox1 : [u32 x 256]
++ global sbox2 : [u32 x 256]
++ global sbox3 : [u32 x 256]
++ global sbox4 : [u32 x 256]
+```
+
 # fs
 
 ## Functions for 'fs'
 
 ```js
-+ fn add(dir: String, fn: String) String
-+ fn basename(path: String) String
-+ fn chdir(path: String) void
-+ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !fail
-+ fn cwd() String
-+ fn delete(path: String) void !delete
-+ fn delete_recursive(path: String) void
-+ fn dir_of(path: String) String
-+ fn exe_dir() String
-+ fn exe_path() String
-+ fn exists(path: String) bool
-+ fn ext(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (...)) Array[String]
-+ fn home_dir() String !not_found
-+ fn is_dir(path: String) bool
-+ fn is_file(path: String) bool
-+ fn mime(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (493)) void !fail
-+ fn move(from_path: String, to_path: String) void !fail
-+ fn open(path: String, writable: bool, append_on_write: bool) int !open
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) int !open !access
-+ fn path(path: String) Path
-+ fn read(path: String) String !open !read !close
-+ fn read_bytes(path: String, buffer: ByteBuffer (...)) ByteBuffer !open !read !close
-+ fn realpath(path: String) String
-+ fn resolve(path: String) String
-+ fn rmdir(path: String) void !fail
-+ fn size(path: String) uint
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !err_open
-+ fn symlink(link: String, target: String, is_directory: bool) void !permissions !exists !other
++ fn add(dir: imut String, fn: imut String) imut String
++ fn basename(path: imut String) imut String
++ fn chdir(path: imut String) void
++ fn copy(from_path: imut String, to_path: imut String, recursive: bool (false)) void !fail
++ fn cwd() imut String
++ fn delete(path: imut String) void !delete
++ fn delete_recursive(path: imut String) void
++ fn dir_of(path: imut String) imut String
++ fn exe_dir() imut String
++ fn exe_path() imut String
++ fn exists(path: imut String) bool
++ fn ext(path: imut String, with_dot: bool (false)) imut String
++ fn files_in(dir: imut String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?imut String (null), result: Array[imut String] (...)) Array[imut String]
++ fn home_dir() imut String !not_found
++ fn is_dir(path: imut String) bool
++ fn is_file(path: imut String) bool
++ fn mime(ext_without_dot: imut String) imut String
++ fn mkdir(path: imut String, permissions: u32 (493)) void !fail
++ fn move(from_path: imut String, to_path: imut String) void !fail
++ fn open(path: imut String, writable: bool, append_on_write: bool) int !open
++ fn open_extend(path: imut String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) int !open !access
++ fn path(path: imut String) imut Path
++ fn read(path: imut String) imut String !open !read !close
++ fn read_bytes(path: imut String, buffer: ByteBuffer (...)) ByteBuffer !open !read !close
++ fn realpath(path: imut String) imut String
++ fn resolve(path: imut String) imut String
++ fn rmdir(path: imut String) void !fail
++ fn size(path: imut String) uint
++ fn stream(path: imut String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !err_open
++ fn symlink(link: imut String, target: imut String, is_directory: bool) void !permissions !exists !other
 + fn sync() void
-+ fn write(path: String, content: String, append: bool (false)) void !open !write
-+ fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !open !write
++ fn write(path: imut String, content: imut String, append: bool (false)) void !open !write
++ fn write_bytes(path: imut String, data: ptr, size: uint, append: bool (false)) void !open !write
 ```
 
 ## Classes for 'fs'
 
 ```js
 + class FileStream {
-    ~ path: String
+    ~ path: imut String
     ~ reading: bool
 
     + fn close() void
-    + fn read(bytes: uint (10240)) String !read_err
+    + fn read(bytes: uint (10240), output: ByteBuffer) bool !read_err
     + fn write_bytes(from: ptr, len: uint) void !write_err
 }
 ```
@@ -116,19 +158,19 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ size: uint
 
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
-    + fn save(path: String) void
+    + fn save(path: imut String) void
 }
 ```
 
 ```js
-+ mode Path for String {
++ mode Path for imut String {
     ~ bytes: uint
 
-    + fn add(part: String) Path
-    + fn dir_of() Path
-    + static fn new(path: String) Path
-    + fn pop() Path
-    + fn resolve() Path
+    + fn add(part: imut String) imut Path
+    + fn dir_of() imut Path
+    + static fn new(path: imut String) imut Path
+    + fn pop() imut Path
+    + fn resolve() imut Path
 }
 ```
 
@@ -151,7 +193,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 ~ shared mem_usage_peak : uint
 ~ shared mem_usage_shared : uint
-~ global mem_usage_thread : uint
 + shared verify : bool
 ```
 
@@ -160,8 +201,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'html'
 
 ```js
-+ fn sanitize(code: String) String
-+ fn sanitize_with_options(code: String, options: ?SanitizeOptions (null)) String
++ fn sanitize(code: imut String) imut String
++ fn sanitize_with_options(code: imut String, options: ?SanitizeOptions (null)) imut String
 ```
 
 ## Classes for 'html'
@@ -181,10 +222,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'http'
 
 ```js
-+ fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !invalid_url !ssl !connect
-+ fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !invalid_path !invalid_url !ssl !connect !disconnect !invalid_response
++ fn create_request(method: imut String, url: imut String, options: ?Options (null)) ClientRequest !invalid_url !ssl !connect
++ fn download(url: imut String, to_path: imut String, method: imut String ("GET"), options: ?Options (null)) void !invalid_path !invalid_url !ssl !connect !disconnect !invalid_response
 + fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !invalid !http413 !incomplete !missing_host_header !file_error
-+ fn request(method: String, url: String, options: ?Options (null)) ClientResponse !invalid_url !invalid_output_path !ssl !connect !disconnect !invalid_response
++ fn request(method: imut String, url: imut String, options: ?Options (null)) ClientResponse !invalid_url !invalid_output_path !ssl !connect !disconnect !invalid_response
 ```
 
 ## Classes for 'http'
@@ -201,7 +242,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ response_received: bool
     ~ sent_percent: uint
 
-    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !invalid_url !connection_failed !ssl !invalid_output_path
+    + static fn create(method: imut String, url: imut String, options: ?Options (null)) ClientRequest !invalid_url !connection_failed !ssl !invalid_output_path
     + fn progress() bool !disconnect !invalid_response
     + fn response() ClientResponse !in_progress !invalid_response
 }
@@ -209,8 +250,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + class ClientResponse {
-    + body: String
-    + headers: Map[String]
+    + body: imut String
+    + headers: Map[imut String]
     + status: uint
 }
 ```
@@ -237,58 +278,58 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ query_string: ByteBufferStrRef
     ~ status: uint
 
-    + fn body() String
-    + fn data() Map[String]
+    + fn body() imut String
+    + fn data() Map[imut String]
     + fn files() Map[InMemoryFile]
-    + fn headers() Map[String]
-    + fn params() Map[String]
-    + fn params_grouped() Map[Array[String]]
+    + fn headers() Map[imut String]
+    + fn params() Map[imut String]
+    + fn params_grouped() Map[Array[imut String]]
 }
 ```
 
 ```js
 + class Options {
-    + body: String
+    + body: imut String
     + follow_redirects: bool
-    + headers: ?Map[String]
-    + output_to_file: ?String
-    + query_data: ?Map[String]
+    + headers: ?Map[imut String]
+    + output_to_file: ?imut String
+    + query_data: ?Map[imut String]
 
-    + fn clear_headers(key: String, value: String) Options
-    + fn get_headers() Map[String]
-    + fn set_header(key: String, value: String) Options
-    + fn set_headers(headers: Map[String]) Options
+    + fn clear_headers(key: imut String, value: imut String) Options
+    + fn get_headers() Map[imut String]
+    + fn set_header(key: imut String, value: imut String) Options
+    + fn set_headers(headers: Map[imut String]) Options
 }
 ```
 
 ```js
 + class Request {
-    + method: String
-    + path: String
-    + query_string: String
+    + method: imut String
+    + path: imut String
+    + query_string: imut String
 
-    + fn body() String
-    + fn data() Map[String]
+    + fn body() imut String
+    + fn data() Map[imut String]
     + fn files() Map[InMemoryFile]
-    + fn headers() Map[String]
-    + fn params() Map[String]
-    + fn params_grouped() Map[Array[String]]
+    + fn headers() Map[imut String]
+    + fn params() Map[imut String]
+    + fn params_grouped() Map[Array[imut String]]
 }
 ```
 
 ```js
 + class Response {
-    + body: String
-    + content_type: String
-    + headers: ?Map[String]
+    + body: imut String
+    + content_type: imut String
+    + headers: ?Map[imut String]
     + status: u32
 
-    + static fn empty(code: u32, headers: ?Map[String] (null)) Response
-    + static fn file(path: String, filename: ?String (null)) Response
-    + static fn html(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
-    + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
-    + static fn redirect(location: String, code: u32 (301), headers: ?Map[String] (null)) Response
-    + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Map[String] (null)) Response
+    + static fn empty(code: u32, headers: ?Map[imut String] (null)) Response
+    + static fn file(path: imut String, filename: ?imut String (null)) Response
+    + static fn html(body: imut String, code: u32 (200), headers: ?Map[imut String] (null)) Response
+    + static fn json(body: imut String, code: u32 (200), headers: ?Map[imut String] (null)) Response
+    + static fn redirect(location: imut String, code: u32 (301), headers: ?Map[imut String] (null)) Response
+    + static fn text(body: imut String, code: u32 (200), content_type: imut String ("text/plain"), headers: ?Map[imut String] (null)) Response
 }
 ```
 
@@ -296,9 +337,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + class ResponseWriter {
     ~ responded: bool
 
-    + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null)) void
-    + fn send_file(path: String, custom_filename: ?String (null)) void
-    + fn send_file_stream(stream: FileStream, filename: ?String (null)) void
+    + fn respond(code: uint, content_type: imut String, body: imut String, headers: ?Map[imut String] (null)) void
+    + fn send_file(path: imut String, custom_filename: ?imut String (null)) void
+    + fn send_file_stream(stream: FileStream, filename: ?imut String (null)) void
     + fn send_status(status_code: uint) void
 }
 ```
@@ -307,14 +348,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + class Route[T] {
     + handler: T
 
-    + fn params(path: String) Map[String]
+    + fn params(path: imut String) Map[imut String]
 }
 ```
 
 ```js
 + class Router[T] {
-    + fn add(method: String, url: String, handler: T) void !invalid_route
-    + fn find(method: String, url: String) Route[T] !not_found
+    + fn add(method: imut String, url: imut String, handler: T) void !invalid_route
+    + fn find(method: imut String, url: imut String) Route[T] !not_found
     + static fn new() Router[T]
 }
 ```
@@ -322,12 +363,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + class Server {
     + fast_handler: ?fn(Context, ResponseWriter)()
-    ~ host: String
+    ~ host: imut String
     ~ port: u16
     + show_info: bool
 
-    + fn add_static_dir(path: String) void !notfound
-    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !socket_init_error !socket_bind_error
+    + fn add_static_dir(path: imut String) void !notfound
+    + static fn new(host: imut String, port: u16, handler: fn(Request)(Response)) Server !socket_init_error !socket_bind_error
     + fn start(worker_count: i32 (8)) void
 }
 ```
@@ -339,13 +380,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn close(fd: int) void
 + fn os_fd(fd: int) i32
-+ fn print(msg: String) void
++ fn print(msg: imut String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
-+ fn println(msg: String) void
++ fn println(msg: imut String) void
 + fn read(fd: int, buffer: ptr, buffer_size: uint) uint !failed
 + fn set_non_block(fd: int, value: bool) void
 + fn valk_fd(fd: int) int
-+ fn write(fd: int, str: String) void !failed !again
++ fn write(fd: int, str: imut String) void !failed !again
 + fn write_bytes(fd: int, data: ptr, length: uint) uint !failed !again
 ```
 
@@ -354,16 +395,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: String) Value !invalid
-+ fn encode(data: $T, pretty: bool (false)) String
-+ fn encode_value(json: Value, pretty: bool (false)) String
++ fn decode(json: imut String) Value !invalid
++ fn encode(data: $T, pretty: bool (false)) imut String
++ fn encode_value(json: Value, pretty: bool (false)) imut String
 + fn new_array(values: ?Array[Value] (null)) Value
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
 + fn new_int(value: int) Value
 + fn new_null() Value
 + fn new_object(values: ?Map[Value] (null)) Value
-+ fn new_string(text: String) Value
++ fn new_string(text: imut String) Value
 + fn new_uint(value: uint) Value
 + fn to_type[T](data: Value) T
 + fn value(data: $T) Value
@@ -391,7 +432,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'net'
 
 ```js
-+ fn set_ca_cert_path(path: ?String) void
++ fn set_ca_cert_path(path: ?imut String) void
 ```
 
 ## Classes for 'net'
@@ -401,7 +442,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     ~ data: libc_gen_addrinfo
 
     + fn addr_len() u32
-    + static fn new(host: String, port: u16) AddrInfo !fail
+    + static fn new(host: imut String, port: u16) AddrInfo !fail
     + fn sock_addr() libc_gen_sockaddr
 }
 ```
@@ -411,16 +452,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'template'
 
 ```js
-+ fn render(content: String, data: $T, options: ?RenderOptions (null)) String
-+ fn render_path(path: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
++ fn render(content: imut String, data: $T, options: ?RenderOptions (null)) imut String
++ fn render_path(path: imut String, data: $T, options: ?RenderOptions (null)) imut String !FileNotFound
 ```
 
 ## Classes for 'template'
 
 ```js
 + class RenderOptions {
-    + sanitize: ?fn(String)(String)
-    + template_directory: ?String
+    + sanitize: ?fn(imut String)(imut String)
+    + template_directory: ?imut String
 }
 ```
 
@@ -431,7 +472,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```js
 + fn sleep_ms(ms: uint) void
 + fn sleep_ns(ns: uint) void
-+ fn start(func: fn()()) Thread
++ fn start(func: fn()()) Thread !start
 ```
 
 ## Classes for 'thread'
@@ -440,8 +481,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + class Thread {
     ~ finished: bool
 
-    + static fn start(func: fn()()) Thread
-    + static fn start_unsafe(func: fn()()) Thread
+    + static fn start(func: fn()()) Thread !start
+    + static fn start_unsafe(func: fn()()) Thread !start
     + fn wait() void
 }
 ```
@@ -550,7 +591,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ```
 
 ```js
-+ mode Map[T] for HashMap[String, T] {
++ mode Map[T] for HashMap[imut String, T] {
     + static fn new() Map[T]
 }
 ```
@@ -569,43 +610,45 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 + class String {
     ~ bytes: uint
 
-    + fn contains(part: String) bool
+    + fn contains(part: imut String) bool
     + fn contains_byte(byte: u8) bool
     + fn data() ptr[u8]
     + fn data_cstring() cstring
-    + fn ends_with(part: String) bool
-    + fn escape() String
-    + static fn from_json_value(val: Value) String
+    + fn ends_with(part: imut String) bool
+    + fn escape() imut String
+    + static fn from_json_value(val: Value) imut String
     + fn get(index: uint) u8
     + fn hex_to_int() int !invalid
     + fn hex_to_uint() uint !invalid
-    + fn index_of(part: String, start_index: uint (0)) uint !not_found
+    + fn index_of(part: imut String, start_index: uint (0)) uint !not_found
     + fn index_of_byte(byte: u8, start_index: uint (0)) uint !not_found
-    + fn is_alpha(allow_extra_bytes: String ("")) bool
-    + fn is_alpha_numeric(allow_extra_bytes: String ("")) bool
+    + fn is_alpha(allow_extra_bytes: imut String ("")) bool
+    + fn is_alpha_numeric(allow_extra_bytes: imut String ("")) bool
     + fn is_empty() bool
     + fn is_integer() bool
     + fn is_number() bool
     + fn length() uint
-    + fn lower() String
-    + fn ltrim(part: String, limit: uint (0)) String
-    + static fn make_empty(length: uint) String
-    + static fn make_from_ptr(data: ptr, length: uint) String
+    + fn lower() imut String
+    + fn ltrim(part: imut String, limit: uint (0)) imut String
+    + static fn make_empty(length: uint) imut String
+    + static fn make_from_ptr(data: ptr, length: uint) imut String
     + fn octal_to_int() int !invalid
     + fn octal_to_uint() uint !invalid
-    + fn part(start_index: uint, length: uint) String
-    + fn range(start: uint, end: uint, inclusive: bool (true)) String
-    + fn replace(part: String, with: String) String
-    + fn rtrim(part: String, limit: uint (0)) String
-    + fn split(on: String) Array[String]
-    + fn starts_with(part: String) bool
+    + fn pad_left(char: u8, length: uint) imut String
+    + fn pad_right(char: u8, length: uint) imut String
+    + fn part(start_index: uint, length: uint) imut String
+    + fn range(start: uint, end: uint, inclusive: bool (true)) imut String
+    + fn replace(part: imut String, with: imut String) imut String
+    + fn rtrim(part: imut String, limit: uint (0)) imut String
+    + fn split(on: imut String) Array[imut String]
+    + fn starts_with(part: imut String) bool
     + fn to_float() f64 !invalid
     + fn to_int() int !invalid
     + fn to_json_value() Value
     + fn to_uint() uint !invalid
-    + fn trim(part: String, limit: uint (0)) String
-    + fn unescape() String
-    + fn upper() String
+    + fn trim(part: imut String, limit: uint (0)) imut String
+    + fn unescape() imut String
+    + fn upper() imut String
 }
 ```
 
@@ -621,84 +664,109 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 
 ```js
 + class f32 {
-    + fn to_str(decimals: uint (2)) String
+    + fn to_str(decimals: uint (2)) imut String
 }
 ```
 
 ```js
 + class f64 {
-    + fn to_str(decimals: uint (2)) String
+    + fn to_str(decimals: uint (2)) imut String
 }
 ```
 
 ```js
 + class float {
-    + fn to_str(decimals: uint (2)) String
+    + fn to_str(decimals: uint (2)) imut String
 }
 ```
 
 ```js
 + class i16 {
     + fn character_length(base: i16) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: i16) void
+    + static fn random() i16
+    + static fn read_big_endian(from: ptr[u8 x 2]) i16
+    + static fn read_little_endian(from: ptr[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
-    + fn to_base(base: i16) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: i16) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: i16, to: ptr[u8 x 2]) void
+    + static fn write_little_endian(v: i16, to: ptr[u8 x 2]) void
 }
 ```
 
 ```js
 + class i32 {
     + fn character_length(base: i32) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: i32) void
+    + static fn random() i32
+    + static fn read_big_endian(from: ptr[u8 x 4]) i32
+    + static fn read_little_endian(from: ptr[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
-    + fn to_base(base: i32) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: i32) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: i32, to: ptr[u8 x 4]) void
+    + static fn write_little_endian(v: i32, to: ptr[u8 x 4]) void
 }
 ```
 
 ```js
 + class i64 {
     + fn character_length(base: i64) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: i64) void
+    + static fn random() i64
+    + static fn read_big_endian(from: ptr[u8 x 8]) i64
+    + static fn read_little_endian(from: ptr[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
-    + fn to_base(base: i64) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: i64) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: i64, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: i64, to: ptr[u8 x 8]) void
 }
 ```
 
 ```js
 + class i8 {
     + fn character_length(base: i8) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: i8) void
+    + static fn random() i8
+    + static fn read_big_endian(from: ptru8) i8
+    + static fn read_little_endian(from: ptru8) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
-    + fn to_base(base: i8) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: i8) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: i8, to: ptru8) void
+    + static fn write_little_endian(v: i8, to: ptru8) void
 }
 ```
 
 ```js
 + class int {
     + fn character_length(base: int) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: int) void
+    + static fn random() int
+    + static fn read_big_endian(from: ptr[u8 x 8]) int
+    + static fn read_little_endian(from: ptr[u8 x 8]) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
-    + fn to_base(base: int) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: int) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: int, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: int, to: ptr[u8 x 8]) void
 }
 ```
 
@@ -707,53 +775,73 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn index_of_byte(byte: u8, memory_size: uint) uint !not_found
     + fn offset(offset: int) ptr
     + fn print_bytes(length: uint, end_with_newline: bool (true)) void
-    + fn to_hex() String
+    + fn to_hex() imut String
+}
+```
+
+```js
++ class ref {
 }
 ```
 
 ```js
 + class u16 {
     + fn character_length(base: u16) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: u16) void
+    + static fn random() u16
+    + static fn read_big_endian(from: ptr[u8 x 2]) u16
+    + static fn read_little_endian(from: ptr[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
-    + fn to_base(base: u16) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: u16) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: u16, to: ptr[u8 x 2]) void
+    + static fn write_little_endian(v: u16, to: ptr[u8 x 2]) void
 }
 ```
 
 ```js
 + class u32 {
     + fn character_length(base: u32) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: u32) void
+    + static fn random() u32
+    + static fn read_big_endian(from: ptr[u8 x 4]) u32
+    + static fn read_little_endian(from: ptr[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
-    + fn to_base(base: u32) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: u32) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: u32, to: ptr[u8 x 4]) void
+    + static fn write_little_endian(v: u32, to: ptr[u8 x 4]) void
 }
 ```
 
 ```js
 + class u64 {
     + fn character_length(base: u64) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: u64) void
+    + static fn random() u64
+    + static fn read_big_endian(from: ptr[u8 x 8]) u64
+    + static fn read_little_endian(from: ptr[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
-    + fn to_base(base: u64) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: u64) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: u64, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: u64, to: ptr[u8 x 8]) void
 }
 ```
 
 ```js
 + class u8 {
     + fn character_length(base: u8) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn hex_byte_to_hex_value() u8
     + fn is_alpha() bool
     + fn is_alpha_numeric() bool
@@ -769,26 +857,36 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn is_upper() bool
     + fn is_whitespace() bool
     + fn print(base: u8) void
+    + static fn random() u8
+    + static fn read_big_endian(from: ptru8) u8
+    + static fn read_little_endian(from: ptru8) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
-    + fn to_ascii_string() String
-    + fn to_base(base: u8) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_ascii_string() imut String
+    + fn to_base(base: u8) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
     + fn unescape() u8
+    + static fn write_big_endian(v: u8, to: ptru8) void
+    + static fn write_little_endian(v: u8, to: ptru8) void
 }
 ```
 
 ```js
 + class uint {
     + fn character_length(base: uint) uint
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn print(base: uint) void
+    + static fn random() uint
+    + static fn read_big_endian(from: ptr[u8 x 8]) uint
+    + static fn read_little_endian(from: ptr[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
-    + fn to_base(base: uint) String
-    + fn to_hex() String
-    + fn to_str() String
+    + fn to_base(base: uint) imut String
+    + fn to_hex() imut String
+    + fn to_str() imut String
+    + static fn write_big_endian(v: uint, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: uint, to: ptr[u8 x 8]) void
 }
 ```
 
@@ -797,19 +895,19 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
 ## Functions for 'url'
 
 ```js
-+ fn decode(str: String) String
-+ fn encode(str: String) String
-+ fn parse(str: String) Url
++ fn decode(str: imut String) imut String
++ fn encode(str: imut String) imut String
++ fn parse(str: imut String) Url
 ```
 
 ## Classes for 'url'
 
 ```js
 + class Url {
-    + host: String
-    + path: String
-    + query: String
-    + scheme: String
+    + host: imut String
+    + path: imut String
+    + query: imut String
+    + scheme: imut String
 }
 ```
 
@@ -827,24 +925,25 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [fs](#fs) | [gc](#gc
     + fn append_byte(byte: u8) void
     + fn append_from_ptr(data: ptr, length: uint) void
     + fn append_int(value: int) void
-    + fn append_str(str: String) void
+    + fn append_str(str: imut String) void
     + fn append_uint(value: uint) void
     + fn clear() void
     + fn clear_part(index: uint, len: uint) void
     + fn clear_until(index: uint) void
     + fn clone() ByteBuffer
-    + fn equals_str(str: String) bool
+    + fn equals_str(str: imut String) bool
     + fn get(index: uint) u8
     + fn index_of(byte: u8, start_index: uint (0)) uint !not_found
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !not_found
     + fn minimum_free_space(length: uint) void
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
-    + fn part(start_index: uint, length: uint) String
+    + fn part(start_index: uint, length: uint) imut String
     + fn reduce_size(size: uint) void
-    + fn starts_with(str: String, offset: uint) bool
+    + fn set(index: uint, v: u8) void
+    + fn starts_with(str: imut String, offset: uint) bool
     + fn str_ref(offset: uint, length: uint) ByteBufferStrRef
-    + fn to_string() String
+    + fn to_string() imut String
 }
 ```
 
