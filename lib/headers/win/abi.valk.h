@@ -36,7 +36,7 @@ fn free(adr: ptr) void;
 fn getenv(key: cstring) ?cstring;
 fn GetLastError() u32;
 
-fn _read(fd: i32, buf: cstring, size: uint) int;
+fn _read(fd: i32, buf: cstring, size: u32) int;
 fn _write(fd: i32, buf: cstring, size: u32) int;
 fn _open(path: cstring, flags: i32, mode: i32) i32;
 fn _close(fd: i32) i32;
