@@ -52,7 +52,7 @@
 + Release 0.0.10
 
 + Re-enable multi threaded compiling
-- Improve closure data binding
++ Fix closure data binding order
 - Release 0.0.11
 
 - Share project with others?
