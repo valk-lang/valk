@@ -53,6 +53,7 @@
 
 + Re-enable multi threaded compiling
 + Fix closure data binding order
++ Fix cast ptr -> u32/u16/u8
 - Release 0.0.11
 
 - Share project with others?
