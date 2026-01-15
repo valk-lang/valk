@@ -3,6 +3,8 @@
 
 link dynamic "pthread"
 link dynamic "c"
+link static "uring"
+// link ":liburing.a"
 link ":libc_nonshared.a"
 link ":ld-linux-x86-64.so.2"
 
@@ -15,6 +17,7 @@ header "linux/x64/libc-enums"
 header "linux/x64/libc-gen"
 #end
 header "pthread"
+header "linux/uring"
 
 #elif OS == macos
 
