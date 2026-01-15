@@ -59,7 +59,7 @@
 - Use correct windows api and waitForMultipleObjects
 - Make wait-for-thread non-blocking
 - Full HTTP 1.1 protocol + Cookies
-- async file reads
+- async file read/write
 - Better errors
 - valk fmt
 - Release 0.0.x
