@@ -1,0 +1,13 @@
+
+struct OVERLAPPED {
+    Internal: ptr
+    InternalHigh: ptr
+    Offset: u32
+    OffsetHigh: u32
+    // Pointer: ptr
+    hEvent: ptr
+}
+
+fn CreateIoCompletionPort(FileHandle: ptr, ExistingCompletionPort: ?ptr, CompletionKey: uint, NumberOfConcurrentThreads: u32) ptr;
+fn GetQueuedCompletionStatus(CompletionPort: ptr, lpNumberOfBytesTransferred: ptr, lpCompletionKey: ptr, lpOverlapped: ptr, dwMilliseconds: u32) bool;
+

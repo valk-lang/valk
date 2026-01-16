@@ -53,6 +53,9 @@ fn FindFirstFileA(lpFileName: cstring, lpFindFileData: ptr) ptr;
 fn FindNextFileA(hFindFile: ptr, lpFindFileData: ptr) bool;
 fn FindClose(hFindFile: ptr) bool;
 
+fn ReadFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: ptr, lpOverlapped: ?ptr) bool;
+fn WriteFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ptr, lpOverlapped: ?ptr) bool;
+
 // OS
 fn _popen(command: cstring, type: cstring) ?FILE;
 fn fgets(s: cstring, n: i32, stream: FILE) ?cstring;
@@ -68,6 +71,8 @@ fn WSAPoll(fds: ptr, nfds: uint, timeout: i32) i32;
 fn WSAGetLastError() i32;
 fn WSAStartup(wVersionRequired: u16, lpWSAData: ptr) i32;
 fn WSACleanup() i32;
+fn WSARecv(fd: uint, lpBuffers: ptr, dwBufferCount: u32, lpNumberOfBytesRecvd: &u32, lpFlags: &u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
+fn WSASend(fd: uint, lpBuffers: ptr, dwBufferCount: u32, lpNumberOfBytesSent: &u32, lpFlags: &u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
 fn closesocket(fd: uint) i32;
 fn ioctlsocket(fd: uint, cmd: int, arg: ptr) i32;
 
