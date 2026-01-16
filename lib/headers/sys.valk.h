@@ -34,6 +34,7 @@ header "macos/x64/libc-enums"
 header "macos/x64/libc-gen"
 #end
 header "pthread"
+header "macos/kqueue"
 
 #elif OS == win
 

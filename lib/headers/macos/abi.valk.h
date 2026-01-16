@@ -57,7 +57,7 @@ fn rand() i32;
 // Poll
 fn poll(fds: ptr, nfds: u32, timeout: i32) i32;
 
-//fn pipe(pipefd: i32[2]) i32;
+fn pipe(pipefd: *[i32 x 2]) i32;
 //int select(int nfds, fd_set restrict readfds, fd_set restrict writefds, fd_set restrict exceptfds, struct timeval restrict timeout);
 fn dup(old_fd: i32) i32;
 fn dup2(old_fd: i32, new_fd: i32) i32;
@@ -115,3 +115,4 @@ fn realpath(dir: ptr, buf: ptr) cstring;
 // Time
 fn gettimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
 fn settimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
+
