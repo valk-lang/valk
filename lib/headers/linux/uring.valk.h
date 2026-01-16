@@ -51,12 +51,12 @@ struct io_uring_cq {
 }
 
 struct io_uring {
-    sq: <io_uring_sq>
-    cq: <io_uring_cq>
-    flags: u32
-    ring_fd: i32
-    features: u32
-    pad: [u32 x 3]
+    sq: <io_uring_sq> (@undefined)
+    cq: <io_uring_cq> (@undefined)
+    flags: u32 (@undefined)
+    ring_fd: i32 (@undefined)
+    features: u32 (@undefined)
+    pad: [u32 x 3] (@undefined)
 }
 
 // struct io_uring_params {
@@ -81,4 +81,60 @@ enum IOSQE {
     BUFFER_SELECT_BIT
 }
 
-fn io_uring_queue_init(entries: u32, ring: ptr, flags: u32) i32;
+enum IORING_OP {
+    NOP
+    READV
+    WRITEV
+    FSYNC
+    READ_FIXED
+    WRITE_FIXED
+    POLL_ADD
+    POLL_REMOVE
+    SYNC_FILE_RANGE
+    SENDMSG
+    RECVMSG
+    TIMEOUT
+    TIMEOUT_REMOVE
+    ACCEPT
+    ASYNC_CANCEL
+    LINK_TIMEOUT
+    CONNECT
+    FALLOCATE
+    OPENAT
+    CLOSE
+    FILES_UPDATE
+    STATX
+    READ
+    WRITE
+    FADVISE
+    MADVISE
+    SEND
+    RECV
+    OPENAT2
+    EPOLL_CTL
+    SPLICE
+    PROVIDE_BUFFERS
+    REMOVE_BUFFERS
+    TEE
+    SHUTDOWN
+    RENAMEAT
+    UNLINKAT
+    MKDIRAT
+    SYMLINKAT
+    LINKAT
+    LAST
+}
+
+// Init
+fn io_uring_queue_init(entries: u32, ring: io_uring, flags: u32) i32;
+// Register file descriptors
+fn io_uring_register_files(ring: io_uring, files: *[i32], nr_files: u32) i32;
+// Submit
+fn io_uring_submit_and_wait(ring: io_uring, wait_nr: u32) i32;
+fn io_uring_submit(ring: io_uring) i32;
+// Submission queue events (sqe)
+fn io_uring_get_sqe(ring: io_uring) ?io_uring_sqe;
+fn io_uring_sqe_set_flags(ring: io_uring, flags: u32);
+// Completion queue events (cqe)
+fn __io_uring_get_cqe(ring: io_uring, cqe_ptr: *?io_uring_cqe, submit: u32, wait_nr: u32, sigmask: ?ptr) i32;
+fn io_uring_peek_cqe(ring: io_uring, cqe_ptr: *?io_uring_cqe); // check if an io_uring completion event is available
