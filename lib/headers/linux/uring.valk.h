@@ -137,4 +137,3 @@ fn io_uring_get_sqe(ring: io_uring) ?io_uring_sqe;
 fn io_uring_sqe_set_flags(ring: io_uring, flags: u32);
 // Completion queue events (cqe)
 fn __io_uring_get_cqe(ring: io_uring, cqe_ptr: *?io_uring_cqe, submit: u32, wait_nr: u32, sigmask: ?ptr) i32;
-fn io_uring_peek_cqe(ring: io_uring, cqe_ptr: *?io_uring_cqe); // check if an io_uring completion event is available
