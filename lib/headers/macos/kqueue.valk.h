@@ -8,4 +8,5 @@ struct kEvent {
     udata: ptr // opaque user data identifier
 }
 
+fn kqueue() i32;
 fn kevent(kq: i32, changelist: ?*[<kEvent>], nchanges: i32, eventlist: ?*[<kEvent>], nevents: i32, timeout: libc_timespec) i32;
