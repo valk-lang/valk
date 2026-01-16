@@ -82,3 +82,5 @@ fn fgets(buffer: cstring, size: i32, stream: FILE) ?cstring;
 // Time
 fn gettimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
 fn settimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
+
+fn eventfd(initval: u32, flags: i32) i32;
