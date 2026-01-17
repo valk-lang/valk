@@ -61,3 +61,15 @@ struct GUID {
     Data3: u16
     Data4: [u8 x 8]
 }
+
+value _SS_MAXSIZE   (128)          // Maximum size
+value _SS_ALIGNSIZE (size_of(i64)) // Desired alignment
+value _SS_PAD1SIZE  (_SS_ALIGNSIZE - size_of(u16))
+value _SS_PAD2SIZE  (_SS_MAXSIZE - (size_of(u16) + _SS_PAD1SIZE + _SS_ALIGNSIZE))
+
+struct sockaddr_storage {
+    ss_family: u16
+    __ss_pad1: [u8 x _SS_PAD1SIZE]
+    __ss_align: i64
+    __ss_pad2: [u8 x _SS_PAD2SIZE]
+}
