@@ -54,8 +54,8 @@ fn FindFirstFileA(lpFileName: cstring, lpFindFileData: ptr) ptr;
 fn FindNextFileA(hFindFile: ptr, lpFindFileData: ptr) bool;
 fn FindClose(hFindFile: ptr) bool;
 
-fn ReadFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: ptr, lpOverlapped: ?ptr) bool;
-fn WriteFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ptr, lpOverlapped: ?ptr) bool;
+fn ReadFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: ?ptr, lpOverlapped: ?ptr) bool;
+fn WriteFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ?ptr, lpOverlapped: ?ptr) bool;
 
 // OS
 fn _popen(command: cstring, type: cstring) ?FILE;
@@ -82,6 +82,9 @@ fn WSAIoctl(s: SOCKET, dwIoControlCode: u32, lpvInBuffer: ptr, cbInBuffer: u32, 
 fn closesocket(fd: uint) i32;
 fn ioctlsocket(fd: uint, cmd: int, arg: ptr) i32;
 
+fn CreatePipe(hReadPipe: &HANDLE, hWritePipe: &HANDLE, lpPipeAttributes: ?ptr, nSize: u32) bool;
+fn CreateNamedPipeA(name: cstring, dwOpenMode: u32, dwPipeMode: u32, nMaxInstances: u32, nOutBufferSize: u32, nInBufferSize: u32, nDefaultTimeOut: u32, lpSecurityAttributes: ?ptr) HANDLE;
+fn ConnectNamedPipe(pipe: HANDLE, lpOverlapped: ?ptr) bool;
 //fn pipe(pipefd: i32[2]) i32;
 //int select(int nfds, fd_set restrict readfds, fd_set restrict writefds, fd_set restrict exceptfds, struct timeval restrict timeout);
 fn dup(old_fd: i32) i32;
