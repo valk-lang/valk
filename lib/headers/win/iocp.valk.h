@@ -1,7 +1,7 @@
 
 struct OVERLAPPED {
-    Internal: ?ptr
-    InternalHigh: ?ptr
+    Internal: uint
+    InternalHigh: uint
     Offset: u32
     OffsetHigh: u32
     hEvent: HANDLE
