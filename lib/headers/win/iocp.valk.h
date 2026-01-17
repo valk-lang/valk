@@ -1,11 +1,10 @@
 
 struct OVERLAPPED {
-    Internal: ptr
-    InternalHigh: ptr
+    Internal: ?ptr
+    InternalHigh: ?ptr
     Offset: u32
     OffsetHigh: u32
-    // Pointer: ptr
-    hEvent: ptr
+    hEvent: HANDLE
 }
 
 fn CreateIoCompletionPort(FileHandle: ptr, ExistingCompletionPort: ?ptr, CompletionKey: uint, NumberOfConcurrentThreads: u32) ptr;

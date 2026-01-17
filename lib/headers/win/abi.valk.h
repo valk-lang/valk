@@ -5,7 +5,7 @@
 
 alias FILE for ptr
 alias SOCKET for uint
-alias HANDLE for ptr
+alias HANDLE for uint
 alias BOOLEAN for u8
 
 // HANDLE : ptr
@@ -29,6 +29,7 @@ alias getcwd for _getcwd;
 alias chdir for _chdir;
 
 alias poll for WSAPoll;
+// alias AcceptEx for lpfnAcceptEx;
 
 fn malloc(size: uint) ptr;
 fn free(adr: ptr) void;
@@ -71,8 +72,12 @@ fn WSAPoll(fds: ptr, nfds: uint, timeout: i32) i32;
 fn WSAGetLastError() i32;
 fn WSAStartup(wVersionRequired: u16, lpWSAData: ptr) i32;
 fn WSACleanup() i32;
-fn WSARecv(fd: uint, lpBuffers: ptr, dwBufferCount: u32, lpNumberOfBytesRecvd: &u32, lpFlags: &u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
-fn WSASend(fd: uint, lpBuffers: ptr, dwBufferCount: u32, lpNumberOfBytesSent: &u32, lpFlags: &u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
+fn WSARecv(fd: uint, lpBuffers: ?ptr, dwBufferCount: u32, lpNumberOfBytesRecvd: ?&u32, lpFlags: ?&u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
+fn WSASend(fd: uint, lpBuffers: ?ptr, dwBufferCount: u32, lpNumberOfBytesSent: ?&u32, lpFlags: ?&u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
+fn WSASocketA(af: i32, type: i32, protocol: i32, lpProtocolInfo: ?ptr, g: uint, dwFlags: u32) SOCKET;
+fn WSAAccept(s: SOCKET, name: ?libc_sockaddr, namelen: i32, lpfnCondition: ?ptr, dwCallbackData: ?&u32) i32;
+fn WSAConnect(s: SOCKET, name: libc_sockaddr, namelen: i32, lpCallerData: ?ptr, lpCalleeData: ?ptr, lpSQOS: ?ptr, lpGQOS: ?ptr) i32;
+fn WSAIoctl(s: SOCKET, dwIoControlCode: u32, lpvInBuffer: ptr, cbInBuffer: u32, lpvOutBuffer: ptr, cbOutBuffer: u32, lpcbBytesReturned: &u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
 fn closesocket(fd: uint) i32;
 fn ioctlsocket(fd: uint, cmd: int, arg: ptr) i32;
 
@@ -84,6 +89,7 @@ fn dup2(old_fd: i32, new_fd: i32) i32;
 fn socket(domain: i32, type: i32, protocol: i32) uint;
 fn connect(sockfd: uint, addr: libc_sockaddr, addrlen: u32) i32;
 fn accept(sockfd: uint, addr: ?libc_sockaddr, addrlen: ?ptr) uint;
+fn AcceptEx(sListenSocket: SOCKET, sAcceptSocket: SOCKET, lpOutputBuffer: ptr, dwReceiveDataLength: u32, dwLocalAddressLength: u32, dwRemoteAddressLength: u32, lpdwBytesReceived: &u32, lpOverlapped: ?ptr) bool;
 //fn accept4(sockfd: i32, addr: ?libc_sockaddr, addrlen: ?ptr, flags: i32) i32;
 fn shutdown(sockfd: uint, how: i32) i32;
 fn bind(sockfd: uint, addr: libc_sockaddr, addrlen: u32) i32;

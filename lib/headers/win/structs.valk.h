@@ -43,3 +43,21 @@ struct libc_timeval_fix {
     tv_sec: int
     tv_usec: int
 }
+
+struct in_addr {
+    addr: u32
+}
+
+struct sockaddr_in {
+    sa_family: u16
+    sin_port: u16
+    sin_addr: u32
+    sin_zero: [u8 x 8]
+}
+
+struct GUID {
+    Data1: u32
+    Data2: u16
+    Data3: u16
+    Data4: [u8 x 8]
+}

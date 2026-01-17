@@ -39,6 +39,7 @@ header "macos/kqueue"
 #elif OS == win
 
 link "kernel32"
+link "wsock32"
 link "ws2_32"
 link "libucrt" // static c-runtime
 link "libvcruntime" // static c-runtime

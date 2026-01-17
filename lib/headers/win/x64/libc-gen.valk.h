@@ -42,7 +42,9 @@ struct libc_gen__WIN32_FIND_DATAA {
 
 struct libc_gen_sockaddr {
     sa_family: u16
-    sa_data: [i8 x 14]
+    sin_port: u16
+    sin_addr: u32
+    sin_zero: [u8 x 8]
 }
 
 struct libc_gen_addrinfo {
