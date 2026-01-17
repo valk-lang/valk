@@ -44,6 +44,7 @@ link "ws2_32"
 link "libucrt" // static c-runtime
 link "libvcruntime" // static c-runtime
 link "libcmt" // static c-runtime startup
+link "ntdll"
 
 header "win/structs"
 header "win/abi"

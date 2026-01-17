@@ -145,13 +145,16 @@ fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
 fn _get_errno(int_ref: ptr) ptr;
 
-fn CreateThread(lpThreadAttributes: ?ptr, dwStackSize: uint, lpStartAddress: ptr, lpParameter: ?ptr, dwCreationFlags: u32, lpThreadId: ?ptr) ?ptr;
+fn CreateThread(lpThreadAttributes: ?ptr, dwStackSize: uint, lpStartAddress: ptr, lpParameter: ?ptr, dwCreationFlags: u32, lpThreadId: ?ptr) HANDLE;
 fn TerminateThread(handle: ptr, exit_code: i32) bool;
 fn WaitForSingleObject(handle: ptr, timeout_ms: u32) u32;
-fn CloseHandle(handle: ptr) bool;
+fn CloseHandle(handle: HANDLE) bool;
 
 fn CreateMutexA(lpMutexAttributes: ?ptr, bInitialOwner: bool, lpName: ?cstring) HANDLE;
-fn ReleaseMutex(mutex: ptr) void;
+fn ReleaseMutex(mutex: HANDLE) void;
 
 // Time
 fn GetSystemTimeAsFileTime(ft: libc_FILETIME) void;
+fn CreateWaitableTimerExW(lpTimerAttributes: ?ptr, name: ?ptr, flags: u32, dwDesiredAccess: u32) ?HANDLE;
+fn SetWaitableTimer(hTimer: HANDLE, due: &i64, lPeriod: i64, pfnCompletionRoutine: ?ptr, lpArgToCompletionRoutine: ?ptr, fResume: bool) bool;
+

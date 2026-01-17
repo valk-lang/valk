@@ -54,7 +54,7 @@ test: valk
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --filter "server/client"
+	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --filter "sleep"
 	./debug/test-win.exe
 
 # Testing
