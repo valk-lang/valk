@@ -29,7 +29,6 @@ alias getcwd for _getcwd;
 alias chdir for _chdir;
 
 alias poll for WSAPoll;
-// alias AcceptEx for lpfnAcceptEx;
 
 fn malloc(size: uint) ptr;
 fn free(adr: ptr) void;

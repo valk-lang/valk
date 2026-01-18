@@ -4,7 +4,6 @@
 link dynamic "pthread"
 link dynamic "c"
 link static "uring"
-// link ":liburing.a"
 link ":libc_nonshared.a"
 link ":ld-linux-x86-64.so.2"
 
