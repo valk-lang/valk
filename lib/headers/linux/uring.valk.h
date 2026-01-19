@@ -7,12 +7,13 @@ struct io_uring_sqe {
     off: u64 // offset, aka. addr2
     addr: u64 // aka. splice_off_in
     len: u32 // buffer size or number of iovecs
-    event_flags: u32
+    rw_flags: u32
     user_data: u64 // data to be passed back at completion time
     buf_index: u16 // aka. buf_group
     personality: u16
     file_index: u32 // aka. splice_fd_in: i32
-    pad2: [u64 x 8]
+    pad2: [u64 x 2]
+    // pad: [u8 x 8]
 }
 
 struct io_uring_cqe {
