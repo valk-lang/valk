@@ -76,7 +76,6 @@ fn WSASend(fd: uint, lpBuffers: ?ptr, dwBufferCount: u32, lpNumberOfBytesSent: ?
 fn WSASocketA(af: i32, type: i32, protocol: i32, lpProtocolInfo: ?ptr, g: uint, dwFlags: u32) SOCKET;
 fn WSAAccept(s: SOCKET, name: ?libc_sockaddr, namelen: i32, lpfnCondition: ?ptr, dwCallbackData: ?&u32) i32;
 fn WSAConnect(s: SOCKET, name: libc_sockaddr, namelen: i32, lpCallerData: ?ptr, lpCalleeData: ?ptr, lpSQOS: ?ptr, lpGQOS: ?ptr) i32;
-fn WSAGetOverlappedResult(s: SOCKET, lpOverlapped: ptr, lpcbTransfer: &u32, fWait: bool, flags: &u32) bool;
 fn WSAIoctl(s: SOCKET, dwIoControlCode: u32, lpvInBuffer: ptr, cbInBuffer: u32, lpvOutBuffer: ptr, cbOutBuffer: u32, lpcbBytesReturned: &u32, lpOverlapped: ?ptr, lpCompletionRoutine: ?ptr) i32;
 fn closesocket(fd: uint) i32;
 fn ioctlsocket(fd: uint, cmd: int, arg: ptr) i32;
