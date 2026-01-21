@@ -9,8 +9,6 @@ alias DIR for ptr
 alias libc_addrinfo_fix for libc_addrinfo
 
 value SEEK_SET (0) // set file offset to offset
-value SEEK_CUR (1) // set file offset to current plus offset
-value SEEK_END (2) // set file offset to EOF plus offset
 
 // pid_t = i32
 // socklen_t = u32
