@@ -55,6 +55,7 @@ fn FindClose(hFindFile: ptr) bool;
 
 fn ReadFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: ?ptr, lpOverlapped: ?ptr) bool;
 fn WriteFile(hFile: uint, lpBuffer: ptr, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ?ptr, lpOverlapped: ?ptr) bool;
+fn CreateFileA(path: cstring, access: u32, share_mode: u32, lpSecurityAttributes: ?ptr, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: HANDLE) HANDLE;
 
 // OS
 fn _popen(command: cstring, type: cstring) ?FILE;
