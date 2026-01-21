@@ -8,6 +8,10 @@ alias FILE for ptr;
 alias DIR for ptr
 alias libc_addrinfo_fix for libc_addrinfo
 
+value SEEK_SET (0) // set file offset to offset
+value SEEK_CUR (1) // set file offset to current plus offset
+value SEEK_END (2) // set file offset to EOF plus offset
+
 // pid_t = i32
 // socklen_t = u32
 // mode_t = u32
@@ -25,6 +29,7 @@ fn read(fd: i32, buf: cstring, size: uint) int;
 fn write(fd: i32, buf: cstring, size: uint) int;
 fn open(path: cstring, flags: i32, @infinite) i32;
 fn close(fd: i32) i32;
+fn lseek(fd: i32, offset: int, flags: u32) int;
 
 fn getcwd(buf: cstring, size: uint) ?cstring;
 fn chdir(path: cstring) i32;
