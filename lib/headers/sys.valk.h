@@ -3,6 +3,7 @@
 
 link dynamic "pthread"
 link dynamic "c"
+link static "uring"
 link ":libc_nonshared.a"
 link ":ld-linux-x86-64.so.2"
 
@@ -15,6 +16,7 @@ header "linux/x64/libc-enums"
 header "linux/x64/libc-gen"
 #end
 header "pthread"
+header "linux/uring"
 
 #elif OS == macos
 
@@ -31,19 +33,23 @@ header "macos/x64/libc-enums"
 header "macos/x64/libc-gen"
 #end
 header "pthread"
+header "macos/kqueue"
 
 #elif OS == win
 
 link "kernel32"
+link "wsock32"
 link "ws2_32"
 link "libucrt" // static c-runtime
 link "libvcruntime" // static c-runtime
 link "libcmt" // static c-runtime startup
+link "ntdll"
 
 header "win/structs"
 header "win/abi"
 header "win/x64/enum"
 header "win/x64/libc-enums"
 header "win/x64/libc-gen"
+header "win/iocp"
 
 #end

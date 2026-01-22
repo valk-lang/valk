@@ -8,6 +8,8 @@ alias FILE for ptr;
 alias DIR for ptr
 alias libc_addrinfo_fix for libc_addrinfo
 
+value SEEK_SET (0) // set file offset to offset
+
 // pid_t = i32
 // socklen_t = u32
 // mode_t = u32
@@ -25,6 +27,7 @@ fn read(fd: i32, buf: cstring, size: uint) int;
 fn write(fd: i32, buf: cstring, size: uint) int;
 fn open(path: cstring, flags: i32, @infinite) i32;
 fn close(fd: i32) i32;
+fn lseek(fd: i32, offset: int, flags: u32) int;
 
 fn getcwd(buf: cstring, size: uint) ?cstring;
 fn chdir(path: cstring) i32;
@@ -57,7 +60,7 @@ fn rand() i32;
 // Poll
 fn poll(fds: ptr, nfds: u32, timeout: i32) i32;
 
-//fn pipe(pipefd: i32[2]) i32;
+fn pipe(pipefd: *[i32 x 2]) i32;
 //int select(int nfds, fd_set restrict readfds, fd_set restrict writefds, fd_set restrict exceptfds, struct timeval restrict timeout);
 fn dup(old_fd: i32) i32;
 fn dup2(old_fd: i32, new_fd: i32) i32;
@@ -115,3 +118,4 @@ fn realpath(dir: ptr, buf: ptr) cstring;
 // Time
 fn gettimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
 fn settimeofday(tv: libc_timeval, tz: ?libc_timezone) i32;
+

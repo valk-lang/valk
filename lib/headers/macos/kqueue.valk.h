@@ -1,0 +1,37 @@
+
+struct kEvent {
+    ident: uint	// identifier for this event
+    filter: i16 // filter for event
+    flags: u16 // action flags for kqueue
+    fflags: u32 // filter flag value
+    data: i64 // filter data value
+    udata: ptr // opaque user data identifier
+}
+
+struct aiocb {
+    fd: i32
+    offset: i64
+    buf: ptr
+    len: i64
+    prio: i32
+    sig: <sigevent>
+    op: i32
+}
+
+struct sigevent {
+    notify: i32
+    signo: i32
+    kq: i32
+    kevent_flags: u16
+    thread_id: i32
+    value: ?ptr
+    func: ?ptr
+    attr: ?ptr
+}
+
+fn kqueue() i32;
+fn kevent(kq: i32, changelist: ?*[<kEvent>], nchanges: i32, eventlist: ?*[<kEvent>], nevents: i32, timeout: ?libc_timespec) i32;
+
+fn aio_read(cb: aiocb) i32;
+fn aio_return(cb: aiocb) int;
+

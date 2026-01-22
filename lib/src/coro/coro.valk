@@ -4,20 +4,23 @@ header "sys" as sys
 use mem
 use gc
 use type
-use time
-use thread
+use io
 
 global coro_run_first : ?Coro
 global coro_run_last : ?Coro
 global current_coro : ?Coro
-
-global coro_poll : ?CoroPoll
 global g_coros : Array[?Coro] (.new(16))
-global g_coro_sleepers: Array[Coro] (.new(16))
-global g_coro_sleepers_next: Array[Coro] (.new(16))
 global g_coro_indexes : type:Pool[uint] (.new(16))
-global g_coro_poll_count : uint
 global g_coro_count : uint
+
+#if OS == macos
+global kqfd : i32
+global timer_id : uint
+#end
+
+#if OS == win
+global cport : ?ptr
+#end
 
 class Coro {
     args: ptr
@@ -42,9 +45,10 @@ class Coro {
 
     error_code: u32 (0)
     error_msg: String ("")
+    // async results
+    poll_event: io:PollEvent (0)
+    completion_res: i64 (0)
 
-    poll_event: PollEvent (0)
-    sleep_until: uint (0)
     test: uint (10)
     error: u32 (0)
     started: bool (false)
@@ -84,15 +88,17 @@ class Coro {
         return coro
     }
 
-    static fn get_poll() CoroPoll {
-        let poll = coro_poll
-        if poll == null {
-            let p = CoroPoll.new()
-            coro_poll = p
-            return p
+    #if OS == macos
+    static fn get_kq() i32 {
+        let fd = kqfd
+        if fd == 0 {
+            kqfd = sys:kqueue()
+            if kqfd == -1 : panic("Failed init kqueue")
         }
-        return poll.@cast(CoroPoll)
+        return kqfd
     }
+    #end
+
 
     //////////////
     // AWAIT
@@ -110,16 +116,56 @@ class Coro {
         this.block()
     }
 
-    fn await_fd(fd: FD, read: bool, write: bool) PollEvent {
-        this.poll_fd(fd, read, write)
-        this.block()
-        return this.poll_event
-    }
+    fn sleep(ns: uint) {
+        #if OS == linux
+        let sqe = io:sqe(this) ! return
+        let nsec = ns.@cast(int)
+        let ts = io:kernel_timespec {
+            tv_sec: nsec / 1000000000
+            tv_nsec: (nsec % 1000000000)
+        }
+        io:io_uring_prep_timeout(sqe, ts, 0, 0)
 
-    fn poll_fd(fd: FD, read: bool, write: bool) {
-        let poll = Coro.get_poll()
-        poll.set(fd, this, read, write)
-        g_coro_poll_count++
+        #elif OS == macos
+        let ms = ns.to(i64) / 1000000
+        let ev : <sys:kEvent> = @undefined
+        io:EV_SET(@ref(ev), timer_id++, io:EVFILT_TIMER, io:EV_ADD | io:EV_ENABLE | io:EV_ONESHOT, 0, ms, this)
+        let kq = this.get_kq()
+        sys:kevent(kq, @ref(ev), 1, null, 0, null)
+
+        #else
+        let timer = sys:CreateWaitableTimerExW(null, null, 0, sys:TIMER_ALL_ACCESS)
+        if timer == 0 : return
+
+        let due : i64 = (ns.to(int) / 100) * -1
+        let ok = sys:SetWaitableTimer(timer, &due, 0, null, null, false)
+        if !ok {
+            sys:CloseHandle(timer)
+            return
+        }
+
+        let wcp : sys:HANDLE = 0
+        let status = sys:NtCreateWaitCompletionPacket(&wcp, sys:MAXIMUM_ALLOWED, null)
+        if status != 0 {
+            sys:CloseHandle(timer)
+            return
+        }
+
+        let ov = io:overlap[io:OverlapData]()
+        let sig : bool = false
+        status = sys:NtAssociateWaitCompletionPacket(wcp, io:iocp(), timer, null, ov, sys:STATUS_SUCCESS, 0, &sig)
+        if status != 0 {
+            sys:CloseHandle(timer)
+            io:free_ov(ov)
+            return
+        }
+
+        #end
+        this.block()
+
+        #if OS == win
+        io:free_ov(ov)
+        #end
     }
 
     fn await_last() {
@@ -267,12 +313,18 @@ class Coro {
     //////////////
 
     static fn loop(until: ?Coro (null)) {
+        #if OS == linux
+        let ring = io:uring()
+        #elif OS == macos
+        let kq = Coro.get_kq()
+        #elif OS == win
+        let cport = io:iocp()
+        #end
 
-        let poll = Coro.get_poll()
         let coros = Array[Coro].new(16)
         let has_run = true
 
-        while g_coro_count > 0 {
+        while true {
             if isset(until) && until.done : break
 
             // Run coro chain
@@ -291,58 +343,81 @@ class Coro {
                 if until.done : break
             }
 
-            // Sleep info
-            let timeout : uint = 1000
-            let sleepers = g_coro_sleepers
-            let sleepers_next = g_coro_sleepers_next
-            let utime : uint = 0
-
-            // Sleep coros
-            if sleepers.length > 0 {
-                utime = time:microtime()
-                each sleepers as coro {
-                    if utime >= coro.sleep_until {
-                        coro.resume()
-                    } else {
-                        sleepers_next.append(coro)
-                        let tm = (coro.sleep_until - utime) / 1000 + 1
-                        if tm < timeout : timeout = tm
-                    }
-                }
-                g_coro_sleepers = sleepers_next
-                g_coro_sleepers_next = sleepers
-                sleepers.clear()
-            }
-
-            // Done check
-            if isset(until) {
-                if until.done : break
-            }
-
             // Wait for poll coros
-            if g_coro_poll_count > 0 {
-                poll.wait(timeout.@cast(i32), coros) ! {
-                    panic("Too many file descriptors")
+            #if OS == linux
+            if io:uring_unsubmitted > 0 : io:uring_submit(ring)
+            #end
+
+            coros.clear()
+            #if OS == linux
+            while true {
+                let cqe : ?sys:io_uring_cqe = null
+                if coros.length == 0 {
+                    gc:unlock()
+                    io:io_uring_wait_cqe(ring, @ref(cqe))
+                    gc:lock()
+                } else {
+                    io:io_uring_peek_cqe(ring, @ref(cqe))
+                }
+                if !isset(cqe) {
+                    break
                 }
                 //
-                if coros.length == 0 {
-                    if has_run {
-                        // has_run = false
-                        gc:collect()
-                    }
-                } else {
-                    has_run = true
+                let coro = cqe.user_data.@cast(Coro)
+                coros.append(coro)
+                coro.poll_event = cqe.res.@cast(io:PollEvent)
+                coro.completion_res = cqe.res
+                io:io_uring_cqe_seen(ring, cqe)
+            }
+            #elif OS == macos
+            let events : [<sys:kEvent> x 64] = @undefined
+            gc:unlock()
+            let nevents = sys:kevent(kq, null, 0, @ref(events), 64, null)
+            gc:lock()
+            while nevents-- > 0 {
+                let ev = events[nevents]
+                let coro = ev.udata.@cast(Coro)
+                if ev.filter == io:EVFILT_READ {
+                    coro.poll_event = sys:POLLIN
+                    coro.completion_res = ev.data
+                } else if ev.filter == io:EVFILT_WRITE {
+                    coro.poll_event = sys:POLLOUT
+                    coro.completion_res = ev.data
                 }
-                // Resume coroutines
-                g_coro_poll_count -= coros.length
-                each coros as coro {
-                    coro.resume()
-                }
+                coros.append(coro)
+            }
 
-            } else if utime > 0 && timeout > 0 && g_coro_sleepers.length > 0 {
-                gc:unlock()
-                thread:sleep_ms(timeout)
-                gc:lock()
+            #elif OS == win
+            gc:unlock()
+            let first = true
+
+            while true {
+                let bytes: u32 = 0
+                let key: uint = 0
+                let ov: ?io:OverlapData = null
+                let result = sys:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, first ? sys:INFINITE : 0)
+                if !result || !isset(ov) : break
+                first = false
+                let coro = ov.base.coro.@cast(Coro)
+                coros.append(coro)
+            }
+            gc:lock()
+
+            #else
+            panic("Unsupported OS for: coroutine loop")
+            #end
+            //
+            if coros.length == 0 {
+                if has_run {
+                    // has_run = false
+                    gc:collect()
+                }
+            } else {
+                has_run = true
+            }
+            // Resume coroutines
+            each coros as coro {
+                coro.resume()
             }
         }
     }

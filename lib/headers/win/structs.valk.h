@@ -37,7 +37,39 @@ struct libc_stat_fix {
     st_ctime: i64
 }
 
+type libc_timeval (libc_timeval_fix)
+
 struct libc_timeval_fix {
     tv_sec: int
     tv_usec: int
+}
+
+struct in_addr {
+    addr: u32
+}
+
+struct sockaddr_in {
+    sa_family: u16
+    sin_port: u16
+    sin_addr: u32
+    sin_zero: [u8 x 8]
+}
+
+struct GUID {
+    Data1: u32
+    Data2: u16
+    Data3: u16
+    Data4: [u8 x 8]
+}
+
+value _SS_MAXSIZE   (128)          // Maximum size
+value _SS_ALIGNSIZE (size_of(i64)) // Desired alignment
+value _SS_PAD1SIZE  (_SS_ALIGNSIZE - size_of(u16))
+value _SS_PAD2SIZE  (_SS_MAXSIZE - (size_of(u16) + _SS_PAD1SIZE + _SS_ALIGNSIZE))
+
+struct sockaddr_storage {
+    ss_family: u16
+    __ss_pad1: [u8 x _SS_PAD1SIZE]
+    __ss_align: i64
+    __ss_pad2: [u8 x _SS_PAD2SIZE]
 }
