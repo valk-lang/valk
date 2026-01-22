@@ -58,10 +58,7 @@
 - Release 0.0.11
 
 - Share project with others?
-- Use correct windows api and waitForMultipleObjects
-- Make wait-for-thread non-blocking
 - Full HTTP 1.1 protocol + Cookies
-- async file read/write
 - Better errors
 - valk fmt
 - Release 0.0.x
