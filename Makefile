@@ -54,7 +54,7 @@ test: valk
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS)
+	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --no-opt -c
 	./debug/test-win.exe
 
 test-macos-build: valk
