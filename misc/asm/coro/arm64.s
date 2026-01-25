@@ -1,4 +1,6 @@
 
+.global _valk_stack_swap
+_valk_stack_swap:
 .global valk_stack_swap
 valk_stack_swap:
 
