@@ -1,6 +1,8 @@
 
 header "sys" as sys
 
+use core
+use coro
 use mem
 use gc
 use type
@@ -13,8 +15,9 @@ global g_coros : Array[?Coro] (.new(16))
 global g_coro_indexes : type:Pool[uint] (.new(16))
 global g_coro_count : uint
 
+global main_state : <CoroState> (@undefined)
+
 #if OS == macos
-global kqfd : i32
 global timer_id : uint
 #end
 
@@ -22,26 +25,23 @@ global timer_id : uint
 global cport : ?ptr
 #end
 
+struct CoroState {
+    rsp: ptr
+}
 class Coro {
     args: ptr
     gc_args: Array[gc:GcPtr] (.{})
 
-    stack: ?ptr
-    stack_mem_size: uint (0)
-    stack_size: uint (0)
+    s: core:Stack (core:Stack.new())
 
-    start_func: fnRef(Coro)()
+    state: <CoroState> (@undefined)
+    stack: ptr (@undefined)
+
+    start_func: fnRef()()
     handler: fnRef()()
     follow_up: ?Coro
     next_resume: ?Coro
     g_list_index: uint (0)
-
-    s_stack: ?ptr
-    s_top: ptr (0.@cast(ptr))
-    s_bottom: ptr (0.@cast(ptr))
-    s_cont: ptr (0.@cast(ptr))
-    s_size: uint (0)
-    s_back_buf: ptr (0.@cast(ptr))
 
     error_code: u32 (0)
     error_msg: String ("")
@@ -59,7 +59,7 @@ class Coro {
         let coro = Coro {
             args: mem:alloc(128)
             //
-            start_func: start_func.@cast(fnRef(Coro)())
+            start_func: start_func.@cast(fnRef()())
             handler: handler.@cast(fnRef()())
         }
 
@@ -83,21 +83,36 @@ class Coro {
             coro_run_last = coro
         }
 
+        #if ARCH == x64
+        let return_addr_space = 2 * size_of(ptr)
+        #if OS == win
+        let regs = 30
+        #else
+        let regs = 6
+        #end
+        #elif ARCH == arm64
+        let return_addr_space = size_of(ptr)
+        let regs = 19
+        #else
+        #error "Unsupported OS: coroutines"
+        #end
+
+        let stack = mem:alloc(core:STACK_SIZE)
+        let stack_top = stack + core:STACK_SIZE
+        let stack_start = stack_top - (regs * size_of(ptr)) - return_addr_space
+        // Make sure stack is 8 byte aligned (ptr size)
+        stack_start = stack_start - (stack_start.to(uint) & (size_of(ptr) - 1))
+
+        mem:clear(stack_start, regs * size_of(ptr)) // Required for windows
+
+        @ptrv(stack_start, ptr, regs) = start_func
+        coro.state.rsp = stack_start
+        coro.stack = stack
+
         g_coro_count++
 
         return coro
     }
-
-    #if OS == macos
-    static fn get_kq() i32 {
-        let fd = kqfd
-        if fd == 0 {
-            kqfd = sys:kqueue()
-            if kqfd == -1 : panic("Failed init kqueue")
-        }
-        return kqfd
-    }
-    #end
 
 
     //////////////
@@ -113,7 +128,7 @@ class Coro {
             ref = ref.follow_up
         }
         ob.follow_up = this
-        this.block()
+        this.yield()
     }
 
     fn sleep(ns: uint) {
@@ -130,7 +145,7 @@ class Coro {
         let ms = ns.to(i64) / 1000000
         let ev : <sys:kEvent> = @undefined
         io:EV_SET(@ref(ev), timer_id++, io:EVFILT_TIMER, io:EV_ADD | io:EV_ENABLE | io:EV_ONESHOT, 0, ms, this)
-        let kq = this.get_kq()
+        let kq = io:kqueue()
         sys:kevent(kq, @ref(ev), 1, null, 0, null)
 
         #else
@@ -151,21 +166,19 @@ class Coro {
             return
         }
 
-        let ov = io:overlap[io:OverlapData]()
+        let ov = @stack(<io:OverlapData>)
+        mem:clear(ov, size_of(<io:OverlapData>))
+        ov.base.coro = coro:current_coro
+
         let sig : bool = false
         status = sys:NtAssociateWaitCompletionPacket(wcp, io:iocp(), timer, null, ov, sys:STATUS_SUCCESS, 0, &sig)
         if status != 0 {
             sys:CloseHandle(timer)
-            io:free_ov(ov)
             return
         }
 
         #end
-        this.block()
-
-        #if OS == win
-        io:free_ov(ov)
-        #end
+        this.yield()
     }
 
     fn await_last() {
@@ -177,109 +190,39 @@ class Coro {
             coro_run_first = this
             coro_run_last = this
         }
-        this.block()
+        this.yield()
     }
 
     //////////////
     // FLOW
     //////////////
 
-    fn block() {
-        // let here = @stack(inline [ptr, 5])
-        current_coro = null
-        let here = @stack(<sys:libc_jmp_buf>)
-        if @setjmp(here) == 0 {
-            this.s_cont = here.@cast(ptr)
-            this.s_top = this.s_cont - 32
-
-            #if OS == win
-            @ptrv(here, ptr, 0) += 0x80
-            #end
-
-            // Save stack
-            let size = (this.s_bottom - this.s_top).@cast(uint)
-            let stack = this.s_stack
-            let has_stack = isset(stack)
-            let create_stack = !has_stack || size > this.s_size
-            if create_stack {
-                if has_stack : mem:free(stack.@cast(ptr))
-                stack = mem:alloc(size)
-                this.s_size = size
-                this.s_stack = stack
-            }
-
-            mem:copy(this.s_top, stack.@cast(ptr), size)
-
-            // Save GC stack
-            let gc_stack = this.stack
-            let gc_size : uint = gc:stack_top - (&gc:stack_root).@cast(ptr)
-            if !isset(gc_stack) || gc_size > this.stack_mem_size {
-                if isset(gc_stack) : mem:free(gc_stack)
-                gc_stack = mem:alloc(gc_size)
-                this.stack_mem_size = gc_size
-                this.stack = gc_stack
-            }
-            this.stack_size = gc_size
-
-            mem:copy(gc:stack_root, gc_stack, gc_size)
-
-            // Jump out
-            @longjmp(this.s_back_buf)
-        }
+    fn yield() $undefined {
+        sys:valk_stack_swap(@ref(this.state), @ref(main_state))
     }
 
-    fn start() {
-        let pad = @stack([u8 x 2048]).@cast(ptr)
-        this.started = true
-        this.s_bottom = pad
-        let start = this.start_func
-        start(this)
-    }
-    fn continue() {
-        // Restore stack
-        let size = (this.s_bottom - this.s_top).@cast(uint)
-        let stack = this.s_stack.@cast(ptr)
-        mem:copy(stack, this.s_top, size)
-        // Restore GC stack
-        let gc_stack = this.stack
-        let gc_size = this.stack_size
-        if isset(gc_stack) : mem:copy(gc_stack, gc:stack_root, gc_size)
-        gc:stack_top = (&gc:stack_root).@cast(ptr) + gc_size
-        // Jump
-        @longjmp(this.s_cont)
-    }
-
-    static fn setjmp(buf: ptr) i32 {
-        if @setjmp(buf) == 0 {
-            return 0
-        }
-        return 1
-    }
-    fn resume() {
+    fn resume() $undefined {
         if this.done : return
+
+        let current = current_coro
         current_coro = this
 
-        gc:backup_gc_stack()
+        core:main_stack.now = core:stack_now
+        core:stack_now = this.s.now
 
-        // Start/continue coro
-        let jmpbuf = @stack(<sys:libc_jmp_buf>)
-        if @setjmp(jmpbuf) == 0 {
+        if isset(current) : sys:valk_stack_swap(@ref(current.state), @ref(this.state))
+        else : sys:valk_stack_swap(@ref(main_state), @ref(this.state))
 
-            #if OS == win
-            @ptrv(jmpbuf, ptr, 0) += 0x80
-            #end
-
-            this.s_back_buf = jmpbuf
-            if this.started == false {
-                this.start()
-            } else {
-                this.continue()
-            }
-        }
-
-        gc:restore_gc_stack()
+        this.s.now = core:stack_now
+        core:stack_now = core:main_stack.now
+        current_coro = null
 
         if this.done {
+            // Clean up
+            this.s.free()
+            mem:free(this.stack)
+            mem:free(this.args)
+            // Next
             let next = this.follow_up
             if isset(next) {
                 this.follow_up = null
@@ -294,18 +237,10 @@ class Coro {
         g_coro_count--
         let index = this.g_list_index
 
-        let gc_stack = this.stack
-        if isset(gc_stack) {
-            mem:free(gc_stack)
-            this.stack = null
-            this.stack_size = 0
-        }
-        let s = this.s_stack
-        if isset(s) : mem:free(s)
-
         g_coros.set(index, null) _
         g_coro_indexes.add(index)
-        @longjmp(this.s_back_buf)
+
+        this.yield()
     }
 
     //////////////
@@ -316,13 +251,12 @@ class Coro {
         #if OS == linux
         let ring = io:uring()
         #elif OS == macos
-        let kq = Coro.get_kq()
+        let kq = io:kqueue()
         #elif OS == win
         let cport = io:iocp()
         #end
 
         let coros = Array[Coro].new(16)
-        let has_run = true
 
         while true {
             if isset(until) && until.done : break
@@ -348,7 +282,7 @@ class Coro {
             if io:uring_unsubmitted > 0 : io:uring_submit(ring)
             #end
 
-            coros.clear()
+            gc:collect_if_threshold_almost_reached()
             #if OS == linux
             while true {
                 let cqe : ?sys:io_uring_cqe = null
@@ -380,9 +314,11 @@ class Coro {
                 if ev.filter == io:EVFILT_READ {
                     coro.poll_event = sys:POLLIN
                     coro.completion_res = ev.data
+                    if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = sys:POLLHUP
                 } else if ev.filter == io:EVFILT_WRITE {
                     coro.poll_event = sys:POLLOUT
                     coro.completion_res = ev.data
+                    if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = sys:POLLHUP
                 }
                 coros.append(coro)
             }
@@ -406,27 +342,12 @@ class Coro {
             #else
             panic("Unsupported OS for: coroutine loop")
             #end
-            //
-            if coros.length == 0 {
-                if has_run {
-                    // has_run = false
-                    gc:collect()
-                }
-            } else {
-                has_run = true
-            }
+
             // Resume coroutines
             each coros as coro {
                 coro.resume()
             }
+            coros.clear()
         }
-    }
-
-    ///////////////////
-    // GC
-    ///////////////////
-
-    fn gc_free() {
-        mem:free(this.args)
     }
 }

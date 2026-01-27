@@ -59,8 +59,8 @@ test-win: valk
 
 test-macos-build: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --target macos-x64
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --target macos-arm64
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
 
 # Testing
 test-cross: valk
@@ -133,6 +133,12 @@ dist-all: win-x64 linux-x64 macos-x64 macos-arm64
 toolchains:
 	chmod +x ./toolchains/setup.sh
 	./toolchains/setup.sh
+
+asm:
+	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
+	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
+	clang-15 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
+	clang-15 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
 
 # Misc
 clean:

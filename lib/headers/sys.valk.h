@@ -1,4 +1,7 @@
 
+link ":valk-stack-swap.o"
+fn valk_stack_swap(from: ptr, to: ptr);
+
 #if OS == linux
 
 link dynamic "pthread"
