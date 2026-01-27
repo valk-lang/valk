@@ -460,6 +460,44 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 }
 ```
 
+```js
++ class Connection {
+    ~ fd: i32
+    ~ ssl: ?SSL
+    ~ ssl_enabled: bool
+
+    + fn close() void
+    + static fn new(fd: i32) Connection
+    + fn recv(buffer: ByteBuffer, bytes: uint) uint !connection !closed
+    + fn send(data: imut String) void !connection
+    + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !connection
+    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !connection !closed
+    + fn ssl_connect(host: imut String, ca_cert_path: ?imut String (null)) void !ssl_error
+}
+```
+
+```js
++ class Socket {
+    ~ fd: i32
+    ~ host: imut String
+    ~ port: u16
+
+    + static fn client(type: net:SOCKET_TYPE(int), host: imut String, port: u16) Connection !invalid_host !create !connect !closed
+    + fn close() void
+    + static fn close_fd(fd: i32) void
+    + static fn server(type: net:SOCKET_TYPE(int), host: imut String, port: u16) SocketServer !invalid_host !create !bind !listen !closed
+}
+```
+
+```js
++ class SocketServer {
+    ~ socket: Socket
+
+    + fn accept() Connection !too_many_connections !error !closed
+    + fn close() void
+}
+```
+
 # template
 
 ## Functions for 'template'
