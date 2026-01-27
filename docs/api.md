@@ -18,16 +18,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'core'
 
 ```js
-+ fn exec(cmd: imut String, stream_output: bool (false)) (i32, imut String)
++ fn exec(cmd: imut String, print_output: bool (false)) (i32, imut String)
 + fn exit(code: i32) void
 + fn get_error_trace() Array[imut String]
 + fn getenv(var: imut String) imut String !not_found
-+ fn libc_errno() i32
 + fn panic(msg: imut String) void
 + fn print_error_trace() void
 + fn raise(code: i32) void
 + fn signal_ignore(sig: int) void
-+ fn socket_errno() i32
 ```
 
 ## Classes for 'core'
@@ -53,7 +51,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn await_coro(coro: Coro) void
-+ fn await_fd(fd: int, read: bool, write: bool) PollEvent
++ fn await_last() void
 + fn yield() void
 ```
 
@@ -127,7 +125,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn open_extend(path: imut String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) int !open !access
 + fn path(path: imut String) imut Path
 + fn read(path: imut String) imut String !open !read !close
-+ fn read_bytes(path: imut String, buffer: ByteBuffer (...)) ByteBuffer !open !read !close
 + fn realpath(path: imut String) imut String
 + fn resolve(path: imut String) imut String
 + fn rmdir(path: imut String) void !fail
@@ -136,7 +133,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn symlink(link: imut String, target: imut String, is_directory: bool) void !permissions !exists !other
 + fn sync() void
 + fn write(path: imut String, content: imut String, append: bool (false)) void !open !write
-+ fn write_bytes(path: imut String, data: ptr, size: uint, append: bool (false)) void !open !write
++ fn write_from_ptr(path: imut String, data: ptr, size: uint, append: bool (false)) void !open !write
 ```
 
 ## Classes for 'fs'
@@ -144,11 +141,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class FileStream {
     ~ path: imut String
+    + read_offset: uint
     ~ reading: bool
 
     + fn close() void
-    + fn read(bytes: uint (10240), output: ByteBuffer) bool !read_err
-    + fn write_bytes(from: ptr, len: uint) void !write_err
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !read_err
+    + fn write(str: imut String) void !write_err
+    + fn write_buffer(buffer: ByteBuffer) void !write_err
+    + fn write_from_ptr(from: ptr, len: uint) void !write_err
 }
 ```
 
@@ -157,6 +157,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ data: ptr
     ~ size: uint
 
+    + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
+    + static fn create_from_file(path: imut String) InMemoryFile !load
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn save(path: imut String) void
 }
@@ -181,6 +183,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn alloc(size: uint) GcPtr
 + fn collect() void
++ fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
 + fn collect_shared() void
 + fn collect_shared_if_threshold_reached() void
@@ -378,16 +381,22 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'io'
 
 ```js
++ fn await_fd(fd: int, read: bool, write: bool) PollEvent
++ fn await_socket_fd(fd: uint, read: bool, write: bool) PollEvent
 + fn close(fd: int) void
 + fn os_fd(fd: int) i32
 + fn print(msg: imut String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
 + fn println(msg: imut String) void
-+ fn read(fd: int, buffer: ptr, buffer_size: uint) uint !failed
++ fn read(fd: int, buf: ByteBuffer, amount: uint, offset: uint) uint !fail
++ fn read_to_ptr(fd: int, buf: ptr, amount: uint, offset: uint) uint !fail
++ fn read_to_ptr_sync(fd: int, buf: ptr, amount: uint, offset: uint) uint !fail
 + fn set_non_block(fd: int, value: bool) void
 + fn valk_fd(fd: int) int
-+ fn write(fd: int, str: imut String) void !failed !again
-+ fn write_bytes(fd: int, data: ptr, length: uint) uint !failed !again
++ fn write(fd: int, buf: ByteBuffer, amount: uint) uint !fail
++ fn write_from_ptr(fd: int, buf: ptr, amount: uint) uint !fail
++ fn write_from_ptr_sync(fd: int, buf: ptr, amount: uint) uint !fail
++ fn write_string(fd: int, str: imut String) uint !fail
 ```
 
 # json
@@ -416,6 +425,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn alloc(size: uint) ptr
++ fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
 + fn bytes_to_uint(adr: ptr, len: uint) uint !not_a_number
 + fn calloc(size: uint) ptr
@@ -432,6 +442,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'net'
 
 ```js
++ fn recv(fd: int, buf: ByteBuffer, amount: uint) uint !fail !again
++ fn recv_to_ptr(fd: int, buf: ptr, amount: uint) uint !fail !again
++ fn send(fd: int, buf: ByteBuffer, amount: uint) uint !fail !again
++ fn send_from_ptr(fd: int, buf: ptr, amount: uint) uint !fail !again
++ fn send_string(fd: int, str: imut String) uint !fail !again
 + fn set_ca_cert_path(path: ?imut String) void
 ```
 
@@ -470,9 +485,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'thread'
 
 ```js
-+ fn sleep_ms(ms: uint) void
-+ fn sleep_ns(ns: uint) void
 + fn start(func: fn()()) Thread !start
++ fn suspend_ms(ms: uint) void
++ fn suspend_ns(ns: uint) void
 ```
 
 ## Classes for 'thread'
@@ -482,7 +497,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ finished: bool
 
     + static fn start(func: fn()()) Thread !start
-    + static fn start_unsafe(func: fn()()) Thread !start
     + fn wait() void
 }
 ```
@@ -691,6 +705,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
     + fn to_base(base: i16) imut String
+    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: i16, to: ptr[u8 x 2]) void
@@ -709,6 +724,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
     + fn to_base(base: i32) imut String
+    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: i32, to: ptr[u8 x 4]) void
@@ -727,6 +743,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
     + fn to_base(base: i64) imut String
+    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: i64, to: ptr[u8 x 8]) void
@@ -745,6 +762,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
     + fn to_base(base: i8) imut String
+    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: i8, to: ptru8) void
@@ -763,6 +781,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
     + fn to_base(base: int) imut String
+    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: int, to: ptr[u8 x 8]) void
@@ -795,6 +814,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
     + fn to_base(base: u16) imut String
+    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: u16, to: ptr[u8 x 2]) void
@@ -813,6 +833,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
     + fn to_base(base: u32) imut String
+    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: u32, to: ptr[u8 x 4]) void
@@ -831,6 +852,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
     + fn to_base(base: u64) imut String
+    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: u64, to: ptr[u8 x 8]) void
@@ -864,6 +886,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: u8) u8
     + fn to_ascii_string() imut String
     + fn to_base(base: u8) imut String
+    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + fn unescape() u8
@@ -883,6 +906,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
     + fn to_base(base: uint) imut String
+    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() imut String
     + fn to_str() imut String
     + static fn write_big_endian(v: uint, to: ptr[u8 x 8]) void
