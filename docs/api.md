@@ -121,8 +121,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn mime(ext_without_dot: imut String) imut String
 + fn mkdir(path: imut String, permissions: u32 (493)) void !fail
 + fn move(from_path: imut String, to_path: imut String) void !fail
-+ fn open(path: imut String, writable: bool, append_on_write: bool) int !open
-+ fn open_extend(path: imut String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) int !open !access
++ fn open(path: imut String, writable: bool, append_on_write: bool) i32 !open
++ fn open_extend(path: imut String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) i32 !open !access
 + fn path(path: imut String) imut Path
 + fn read(path: imut String) imut String !open !read !close
 + fn realpath(path: imut String) imut String
@@ -261,7 +261,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Connection {
-    ~ fd: int
+    ~ fd: i32
     ~ netcon: Connection
     ~ worker: Worker
 
@@ -381,22 +381,20 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'io'
 
 ```js
-+ fn await_fd(fd: int, read: bool, write: bool) PollEvent
-+ fn await_socket_fd(fd: uint, read: bool, write: bool) PollEvent
-+ fn close(fd: int) void
-+ fn os_fd(fd: int) i32
++ fn await_fd(fd: i32, read: bool, write: bool) PollEvent
++ fn await_socket_fd(fd: i32, read: bool, write: bool) PollEvent
++ fn close(fd: i32) void
 + fn print(msg: imut String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
 + fn println(msg: imut String) void
-+ fn read(fd: int, buf: ByteBuffer, amount: uint, offset: uint) uint !fail
-+ fn read_to_ptr(fd: int, buf: ptr, amount: uint, offset: uint) uint !fail
-+ fn read_to_ptr_sync(fd: int, buf: ptr, amount: uint, offset: uint) uint !fail
-+ fn set_non_block(fd: int, value: bool) void
-+ fn valk_fd(fd: int) int
-+ fn write(fd: int, buf: ByteBuffer, amount: uint) uint !fail
-+ fn write_from_ptr(fd: int, buf: ptr, amount: uint) uint !fail
-+ fn write_from_ptr_sync(fd: int, buf: ptr, amount: uint) uint !fail
-+ fn write_string(fd: int, str: imut String) uint !fail
++ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !fail
++ fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !fail
++ fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !fail
++ fn set_non_block(fd: i32, value: bool) void
++ fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !fail
++ fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !fail
++ fn write_from_ptr_sync(fd: i32, buf: ptr, amount: uint) uint !fail
++ fn write_string(fd: i32, str: imut String) uint !fail
 ```
 
 # json
@@ -442,11 +440,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: int, buf: ByteBuffer, amount: uint) uint !fail !again
-+ fn recv_to_ptr(fd: int, buf: ptr, amount: uint) uint !fail !again
-+ fn send(fd: int, buf: ByteBuffer, amount: uint) uint !fail !again
-+ fn send_from_ptr(fd: int, buf: ptr, amount: uint) uint !fail !again
-+ fn send_string(fd: int, str: imut String) uint !fail !again
++ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !fail !again
++ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !fail !again
++ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !fail !again
++ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !fail !again
++ fn send_string(fd: i32, str: imut String) uint !fail !again
 + fn set_ca_cert_path(path: ?imut String) void
 ```
 
@@ -795,11 +793,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn offset(offset: int) ptr
     + fn print_bytes(length: uint, end_with_newline: bool (true)) void
     + fn to_hex() imut String
-}
-```
-
-```js
-+ class ref {
 }
 ```
 

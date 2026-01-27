@@ -59,8 +59,8 @@ test-win: valk
 
 test-macos-build: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --target macos-x64
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --target macos-arm64
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
 
 # Testing
 test-cross: valk
