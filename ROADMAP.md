@@ -56,6 +56,7 @@
 + Fix cast ptr -> u32/u16/u8
 + Rework async IO
 + Rework stack & coroutines
++ Socket API change
 - Release 0.0.11
 
 - Share project with others?

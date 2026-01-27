@@ -743,27 +743,7 @@ fn main() {
 
 API for [valk:net](api.md#net)
 
-Currently we only support `TCP` sockets. We are still working on expanding our `net` functionality.
-
-```rust
-use valk:net
-// net:Socket
-net:Socket.new_tcp(host: String, port: u16) !
-// net:SocketTCP
-net:SocketTCP.new(host: String, port: u16) !
-// Functions for client sockets
-sock.connect() net:Connection !
-con.ssl_connect(host: String) ! // For SSL communication, call this once on the connection from sock.connect()
-// Functions for server sockets
-sock.bind() !
-sock.accept() net:Connection !
-// net:Connection
-con.send(data: String) ! // Send bytes of a string
-con.send_buffer(data: utils:ByteBuffer, skip_bytes: uint, send_all: bool) ! // Send bytes from a buffer
-con.send_bytes(data: ptr, bytes: uint, send_all: bool) ! // Send bytes from a raw pointer
-con.recv(buffer: utils:ByteBuffer, max_bytes: uint) uint ! // Receive data from a socket, returns amount of bytes received
-con.close() // Close connection
-```
+Create a socket server/client. Currently only supports TCP.
 
 Example
 
@@ -773,15 +753,14 @@ use valk:utils
 
 // Server
 fn server() {
-    let sock = net:SocketTCP.new("127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
-    sock.bind() ! panic("Failed binding to port: " + EMSG)
+    let sock = net:Socket.server(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
     let buffer = utils:ByteBuffer.new()
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
             continue;
         }
-        // Handle connection (normally you do this on a separate coroutine)
+        // Handle connection (normally you do this on a separate coroutine so you can keep accepting new connections)
         while true {
             buffer.clear()
             let bytes = con.recv(buffer, 1000) ! {
@@ -803,8 +782,7 @@ fn main() {
     // Start our server in the background
     let s = co server()
     // Open client
-    let sock = net:SocketTCP.new("127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
-    let con = sock.connect() ! panic("Failed to connect")
+    let con = net:Socket.client(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
     // Send
     con.send("PING") ! panic("Client failed to send data")
     // Recv
