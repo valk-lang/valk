@@ -55,6 +55,7 @@
 + Fix closure data binding order
 + Fix cast ptr -> u32/u16/u8
 + Rework async IO
++ Rework stack & coroutines
 - Release 0.0.11
 
 - Share project with others?
