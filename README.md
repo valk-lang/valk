@@ -23,7 +23,11 @@ Linux / MacOS / WSL
 curl -s https://valk-lang.dev/install.sh | bash
 ```
 
-Windows: Download from our website and unzip it into a directory. Optionally: Add the directory to your PATH.
+Windows (powershell)
+
+```
+irm https://valk-lang.dev/install.ps1 | iex
+```
 
 
 ## Basic example
