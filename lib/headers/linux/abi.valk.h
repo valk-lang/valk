@@ -16,6 +16,7 @@ fn signal(signum: i32, handler: ?fnRef(i32)()) void;
 fn raise(sig: i32) i32;
 fn __errno_location() ptr;
 fn getenv(key: cstring) ?cstring;
+fn sysconf(name: i32) int;
 
 fn sync() void;
 fn read(fd: i32, buf: ptr, size: uint) int;
