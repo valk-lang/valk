@@ -749,12 +749,11 @@ Example
 
 ```rust
 use valk:net
-use valk:utils
 
 // Server
 fn server() {
     let sock = net:Socket.server(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
-    let buffer = utils:ByteBuffer.new()
+    let buffer = ByteBuffer.new()
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
@@ -786,7 +785,7 @@ fn main() {
     // Send
     con.send("PING") ! panic("Client failed to send data")
     // Recv
-    let buffer = utils:ByteBuffer.new()
+    let buffer = ByteBuffer.new()
     con.recv(buffer, 1000) ! panic("Client failed to read from connection")
     println("# Client received: " + buffer)
     con.close()

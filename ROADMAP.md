@@ -57,6 +57,7 @@
 + Rework async IO
 + Rework stack & coroutines
 + Socket API change
++ Remove `utils` namespace / move ByteBuffer to `type` namespace
 - Release 0.0.11
 
 - Share project with others?
