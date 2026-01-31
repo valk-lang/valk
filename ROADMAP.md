@@ -1,7 +1,7 @@
 
 # Roadmap
 
-`+` = Done | `~` = Done, but needs more work | `-` = Todo
+`+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
 # Upcoming version
