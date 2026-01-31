@@ -1,7 +1,7 @@
 
 # Roadmap
 
-`+` = Done | `~` = Half-done | `-` = Todo
+`+` = Done | `~` = Done, but needs more work | `-` = Todo
 
 ```
 # Upcoming version
@@ -14,6 +14,7 @@
 + Socket API change
 + Remove `utils` namespace / move ByteBuffer to `type` namespace
 + Rework AST parse flow
++ Async mutexes
 - Release 0.0.11
 
 # Next steps
