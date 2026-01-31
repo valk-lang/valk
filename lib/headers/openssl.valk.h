@@ -22,6 +22,22 @@ link ":libc_nonshared.a"
 pointer SSL {}
 pointer SSL_CTX {}
 
+enum ERROR {
+    NONE                 (0)
+    SSL                  (1)
+    WANT_READ            (2)
+    WANT_WRITE           (3)
+    WANT_X509_LOOKUP     (4)
+    SYSCALL              (5) // look at error stack/return value/errno
+    ZERO_RETURN          (6)
+    WANT_CONNECT         (7)
+    WANT_ACCEPT          (8)
+    WANT_ASYNC           (9)
+    WANT_ASYNC_JOB       (10)
+    WANT_CLIENT_HELLO_CB (11)
+    WANT_RETRY_VERIFY    (12)
+}
+
 value SSL_VERIFY_PEER (0x1)
 
 value SSL3_VERSION (0x0300)
@@ -56,6 +72,7 @@ fn SSL_set_fd(ssl: SSL, fd: i32) void;
 fn SSL_free(ctx: SSL_CTX) void;
 fn SSL_connect(ctx: SSL_CTX) i32;
 
+fn SSL_get_fd(ctx: SSL) i32;
 fn SSL_get_version(ssl: SSL) cstring;
 fn SSL_write(ssl: SSL, data: ptr, bytes: uint) i32;
 fn SSL_read(ssl: SSL, data: ptr, bytes: uint) i32;
