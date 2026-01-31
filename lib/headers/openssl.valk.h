@@ -72,6 +72,7 @@ fn SSL_set_fd(ssl: SSL, fd: i32) void;
 fn SSL_free(ctx: SSL_CTX) void;
 fn SSL_connect(ctx: SSL_CTX) i32;
 
+fn SSL_get_fd(ctx: SSL) i32;
 fn SSL_get_version(ssl: SSL) cstring;
 fn SSL_write(ssl: SSL, data: ptr, bytes: uint) i32;
 fn SSL_read(ssl: SSL, data: ptr, bytes: uint) i32;
