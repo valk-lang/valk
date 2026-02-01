@@ -49,7 +49,7 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --def "DEBUG=1"
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1"
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
