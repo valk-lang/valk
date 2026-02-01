@@ -14,6 +14,7 @@ global current_coro : ?Coro
 global g_coros : Array[?Coro] (.new(16))
 global g_coro_indexes : type:Pool[uint] (.new(16))
 global g_coro_count : uint
+global run_coros : Array[Coro] (.new(16))
 
 global main_state : <CoroState> (@undefined)
 
@@ -32,10 +33,16 @@ class Coro {
     args: ptr
     gc_args: Array[gc:GcPtr] (.{})
 
-    s: core:Stack (core:Stack.new())
-
     state: <CoroState> (@undefined)
-    stack: ptr (@undefined)
+
+    backup_main_stack: ptr (@undefined)
+    backup_main_stack_size: uint (0)
+    backup_gc_stack: ptr (@undefined)
+    backup_gc_stack_size: uint (0)
+    backup_sp: ptr (@undefined)
+    backup_gc_sp: ptr (@undefined)
+    stack_base: ptr (@undefined)
+    gc_stack_base: ptr (@undefined)
 
     start_func: fnRef()()
     handler: fnRef()()
@@ -52,6 +59,7 @@ class Coro {
     test: uint (10)
     error: u32 (0)
     started: bool (false)
+    active: bool (false)
     done: bool (false)
 
     static fn new(handler: ptr, start_func: ptr) SELF {
@@ -74,14 +82,22 @@ class Coro {
             coro.g_list_index = index
         }
 
-        let last = coro_run_last
-        if isset(last) {
-            last.next_resume = coro
-            coro_run_last = coro
-        } else {
-            coro_run_first = coro
-            coro_run_last = coro
-        }
+        run_coros.append(coro)
+        // let last = coro_run_last
+        // if isset(last) {
+        //     last.next_resume = coro
+        //     coro_run_last = coro
+        // } else {
+        //     coro_run_first = coro
+        //     coro_run_last = coro
+        // }
+
+        g_coro_count++
+
+        return coro
+    }
+
+    fn init_stack(base: ptr) {
 
         #if ARCH == x64
         let return_addr_space = 2 * size_of(ptr)
@@ -97,23 +113,15 @@ class Coro {
         #error "Unsupported OS: coroutines"
         #end
 
-        let stack = mem:alloc(core:STACK_SIZE)
-        let stack_top = stack + core:STACK_SIZE
-        let stack_start = stack_top - (regs * size_of(ptr)) - return_addr_space
+        let stack_start = base - (regs * size_of(ptr)) - return_addr_space
         // Make sure stack is 8 byte aligned (ptr size)
         stack_start = stack_start - (stack_start.to(uint) & (size_of(ptr) - 1))
 
         mem:clear(stack_start, regs * size_of(ptr)) // Required for windows
 
-        @ptrv(stack_start, ptr, regs) = start_func
-        coro.state.rsp = stack_start
-        coro.stack = stack
-
-        g_coro_count++
-
-        return coro
+        @ptrv(stack_start, ptr, regs) = this.start_func
+        this.state.rsp = stack_start
     }
-
 
     //////////////
     // AWAIT
@@ -182,14 +190,15 @@ class Coro {
     }
 
     fn await_last() {
-        let last = coro_run_last
-        if isset(last) {
-            last.next_resume = this
-            coro_run_last = this
-        } else {
-            coro_run_first = this
-            coro_run_last = this
-        }
+        run_coros.append(this)
+        // let last = coro_run_last
+        // if isset(last) {
+        //     last.next_resume = this
+        //     coro_run_last = this
+        // } else {
+        //     coro_run_first = this
+        //     coro_run_last = this
+        // }
         this.yield()
     }
 
@@ -198,35 +207,90 @@ class Coro {
     //////////////
 
     fn yield() $undefined {
-        sys:valk_stack_swap(@ref(this.state), @ref(main_state))
+        let v = 0
+        let sp = @ref(v).@cast(ptr) - 128
+        this.backup_sp = sp
+        this.backup_gc_sp = gc_stack_sp
+
+        // Backup stack
+        // Backup Main stack
+        let size : uint = this.stack_base - sp
+        let size_prev = this.backup_main_stack_size
+        if size > size_prev {
+            if size_prev > 0 : mem:free(this.backup_main_stack)
+            this.backup_main_stack = mem:alloc(size)
+        }
+        this.backup_main_stack_size = size
+        if size > 0 {
+            mem:copy(sp, this.backup_main_stack, size)
+        }
+
+        // Backup GC stack
+        let gc_size : uint = gc_stack_sp - this.gc_stack_base
+        let gc_size_prev = this.backup_gc_stack_size
+        if gc_size > gc_size_prev {
+            if gc_size_prev > 0 : mem:free(this.backup_gc_stack)
+            this.backup_gc_stack = mem:alloc(gc_size)
+        }
+        this.backup_gc_stack_size = gc_size
+        if gc_size > 0 {
+            mem:copy(this.gc_stack_base, this.backup_gc_stack, gc_size)
+        }
+
+        // Swap
+        SELF.swap(@ref(this.state), @ref(main_state))
+    }
+
+    static fn swap(from: ptr, to: ptr) $undefined {
+        sys:valk_stack_swap(from, to)
     }
 
     fn resume() $undefined {
         if this.done : return
 
-        let current = current_coro
+        let v = 0
         current_coro = this
 
-        core:main_stack.now = core:stack_now
-        core:stack_now = this.s.now
+        // Set stack base
+        gc_stack_sp_backup = gc_stack_sp
+        this.active = true
 
-        if isset(current) : sys:valk_stack_swap(@ref(current.state), @ref(this.state))
-        else : sys:valk_stack_swap(@ref(main_state), @ref(this.state))
+        if this.started {
+            // Restore stack
+            if this.backup_main_stack_size > 0 {
+                mem:copy(this.backup_main_stack, this.backup_sp, this.backup_main_stack_size)
+            }
+            if this.backup_gc_stack_size > 0 {
+                mem:copy(this.backup_gc_stack, this.gc_stack_base, this.backup_gc_stack_size)
+            }
+            gc_stack_sp = this.backup_gc_sp
+        } else {
+            // Init stack
+            this.stack_base = @ref(v).@cast(ptr) - 256
+            this.gc_stack_base = gc_stack_sp
+            this.init_stack(this.stack_base)
+            this.started = true
+        }
 
-        this.s.now = core:stack_now
-        core:stack_now = core:main_stack.now
+        // Swap
+        SELF.swap(@ref(main_state), @ref(this.state))
+
+        // Restore stack base
+        this.active = false
+        gc_stack_sp = gc_stack_sp_backup
         current_coro = null
 
         if this.done {
             // Clean up
-            this.s.free()
-            mem:free(this.stack)
+            if this.backup_main_stack_size > 0 : mem:free(this.backup_main_stack)
+            if this.backup_gc_stack_size > 0 : mem:free(this.backup_gc_stack)
             mem:free(this.args)
+
             // Next
             let next = this.follow_up
             if isset(next) {
                 this.follow_up = null
-                next.resume()
+                run_coros.append(next)
             }
         }
     }
@@ -256,8 +320,6 @@ class Coro {
         let cport = io:iocp()
         #end
 
-        let coros = Array[Coro].new(16)
-
         while true {
             if isset(until) && until.done : break
 
@@ -286,7 +348,7 @@ class Coro {
             #if OS == linux
             while true {
                 let cqe : ?sys:io_uring_cqe = null
-                if coros.length == 0 {
+                if run_coros.length == 0 {
                     gc:unlock()
                     io:io_uring_wait_cqe(ring, @ref(cqe))
                     gc:lock()
@@ -298,7 +360,7 @@ class Coro {
                 }
                 //
                 let coro = cqe.user_data.@cast(Coro)
-                coros.append(coro)
+                run_coros.append(coro)
                 coro.poll_event = cqe.res.@cast(io:PollEvent)
                 coro.completion_res = cqe.res
                 io:io_uring_cqe_seen(ring, cqe)
@@ -320,7 +382,7 @@ class Coro {
                     coro.completion_res = ev.data
                     if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = sys:POLLHUP
                 }
-                coros.append(coro)
+                run_coros.append(coro)
             }
 
             #elif OS == win
@@ -335,7 +397,7 @@ class Coro {
                 if !result || !isset(ov) : break
                 first = false
                 let coro = ov.base.coro.@cast(Coro)
-                coros.append(coro)
+                run_coros.append(coro)
             }
             gc:lock()
 
@@ -344,10 +406,10 @@ class Coro {
             #end
 
             // Resume coroutines
-            each coros as coro {
+            each run_coros as coro {
                 coro.resume()
             }
-            coros.clear()
+            run_coros.clear()
         }
     }
 }
