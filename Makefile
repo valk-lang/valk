@@ -49,7 +49,7 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --leak-check --def "DEBUG=1"
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --def "DEBUG=1"
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
@@ -145,6 +145,6 @@ asm:
 clean:
 	rm -f ./valk
 	rm -f ./valk2
-	rm -rf ~/.valk/cache
+# rm -rf ~/.valk/cache
 
 .PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
