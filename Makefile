@@ -33,11 +33,12 @@ static: $(SRC) $(HDRS)
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
 install: valk
-	sudo rm -rf /opt/valk/${VERSION}/
-	sudo mkdir -p /opt/valk/${VERSION}/
-	sudo cp ./valk /opt/valk/${VERSION}/valk
-	sudo cp -r ./lib /opt/valk/${VERSION}/
-	sudo rm -f /usr/local/bin/valk
+	rm -rf ~/.vman/versions/${VERSION}/
+	mkdir -p ~/.vman/versions/${VERSION}/
+	cp ./valk ~/.vman/versions/${VERSION}/valk
+	cp -r ./lib ~/.vman/versions/${VERSION}/
+	rm -f ~/.vman/bin/valk
+	ln -s ~/.vman/versions/${VERSION}/valk ~/.vman/bin/valk
 
 update: valk
 	sudo rm -rf /opt/valk/${VERSION}/
