@@ -136,10 +136,14 @@ toolchains:
 	./toolchains/setup.sh
 
 asm:
-	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
+	zig build-obj -target x86_64-linux-gnu ./misc/asm/coro/x64.s --name valk-stack-swap && mv valk-stack-swap.o ./lib/libs/linux-x64/valk-stack-swap.o
+	zig build-obj -target x86_64-macos ./misc/asm/coro/x64.s --name valk-stack-swap && mv valk-stack-swap.o ./lib/libs/macos-x64/valk-stack-swap.o
+	zig build-obj -target aarch64-macos ./misc/asm/coro/arm64.s --name valk-stack-swap && mv valk-stack-swap.o ./lib/libs/macos-arm64/valk-stack-swap.o
+	zig build-obj -target x86_64-windows ./misc/asm/coro/x64-win.s --name valk-stack-swap && mv valk-stack-swap.obj ./lib/libs/win-x64/valk-stack-swap.o
+#	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
+#	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
+#	clang-15 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
+#	clang-15 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
 
 # Misc
 clean:

@@ -3,6 +3,7 @@ link ":valk-stack-swap.o"
 fn valk_stack_swap(from: ptr, to: ptr);
 fn valk_save_registers(to: ptr);
 fn valk_restore_registers(from: ptr);
+fn valk_stack_needs_space() bool;
 
 #if OS == linux
 

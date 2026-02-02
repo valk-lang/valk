@@ -52,3 +52,8 @@ movq 24(%rdi), %r13
 movq 32(%rdi), %r14
 movq 40(%rdi), %r15
 retq
+
+.global _valk_get_rsp
+_valk_get_rsp:
+movq  %rsp, %rax
+retq
