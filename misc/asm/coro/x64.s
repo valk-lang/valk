@@ -31,6 +31,8 @@ retq
 
 .global _valk_save_registers
 _valk_save_registers:
+.global valk_save_registers
+valk_save_registers:
 movq %rbp, (%rdi)
 movq %rbx, 8(%rdi)
 movq %r12, 16(%rdi)
@@ -41,6 +43,8 @@ retq
 
 .global _valk_restore_registers
 _valk_restore_registers:
+.global valk_restore_registers
+valk_restore_registers:
 movq (%rdi), %rbp
 movq 8(%rdi), %rbx
 movq 16(%rdi), %r12
