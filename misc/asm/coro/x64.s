@@ -28,3 +28,23 @@ popq %rbp
 
 # jump
 retq
+
+.global _valk_save_registers
+_valk_save_registers:
+movq %rbp, (%rdi)
+movq %rbx, 8(%rdi)
+movq %r12, 16(%rdi)
+movq %r13, 24(%rdi)
+movq %r14, 32(%rdi)
+movq %r15, 40(%rdi)
+retq
+
+.global _valk_restore_registers
+_valk_restore_registers:
+movq (%rdi), %rbp
+movq 8(%rdi), %rbx
+movq 16(%rdi), %r12
+movq 24(%rdi), %r13
+movq 32(%rdi), %r14
+movq 40(%rdi), %r15
+retq
