@@ -19,6 +19,8 @@ valk3: valk2
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
 valkvg: valk
 	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
+valkexe: $(SRC) $(HDRS)
+	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static
 
 doc: valk
 	./valk doc lib/ -o docs/api.md --markdown --no-private
@@ -49,7 +51,7 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1"
+	./valk build ./tests/*.valk . --test $(FLAGS) -o ./debug/test-all --leak-check --def "DEBUG=1"
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
