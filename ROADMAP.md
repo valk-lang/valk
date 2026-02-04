@@ -6,7 +6,9 @@
 ```
 # Upcoming version
 
-- Make all syntax consistent
+- Work out bad features: cothrow, imut
+- Rework stack allocation arrays & structs + init values
+- Shared array/map locks & .$is_shared builtin
 - Update docs
 - Release 0.0.13
 - Share project with others
@@ -23,6 +25,7 @@
 ## Maybe
 
 ```
+- Change function syntax to `exampleFunc` instead of `example_func`
 - WASM support
 - Dont use shadow stack, use real stack
 - Only parse functions from imut classes when they are used so we no longer need `mut fn`
