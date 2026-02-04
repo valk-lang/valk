@@ -6,9 +6,9 @@
 ```
 # Upcoming version
 
+- Shared array/map locks & .$is_shared builtin
 - Work out bad features: cothrow, imut
 - Rework stack allocation arrays & structs + init values
-- Shared array/map locks & .$is_shared builtin
 - Update docs
 - Release 0.0.13
 - Share project with others
