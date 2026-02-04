@@ -6,20 +6,13 @@
 ```
 # Upcoming version
 
-+ Re-enable multi threaded compiling
-+ Fix closure data binding order
-+ Fix cast ptr -> u32/u16/u8
-+ Rework async IO
-+ Rework stack & coroutines
-+ Socket API change
-+ Remove `utils` namespace / move ByteBuffer to `type` namespace
-+ Rework AST parse flow
-+ Async mutexes
-- Release 0.0.11
+- Make all syntax consistent
+- Update docs
+- Release 0.0.13
+- Share project with others
 
 # Next steps
 
-- Share project with others?
 - Full HTTP 1.1 protocol + Cookies
 - valk fmt
 - Interfaces
@@ -42,6 +35,19 @@
 ## Done
 
 ```
++ Syntax clean up
++ Release 0.0.12
+
++ Re-enable multi threaded compiling
++ Fix closure data binding order
++ Fix cast ptr -> u32/u16/u8
++ Rework async IO
++ Rework stack & coroutines
++ Socket API change
++ Remove `utils` namespace / move ByteBuffer to `type` namespace
++ Rework AST parse flow
++ Async mutexes
++ Release 0.0.11
 
 + Fix shared gc bug
 + Release 0.0.10
