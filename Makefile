@@ -1,6 +1,6 @@
 
-VALKV=0.0.10
-VERSION=0.0.11
+VALKV=0.0.11
+VERSION=0.0.12
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk) $(wildcard src/doc/*.valk) $(wildcard src/lsp/*.valk)
@@ -51,7 +51,7 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test $(FLAGS) -o ./debug/test-all --leak-check --def "DEBUG=1"
+	./valk build ./tests/*.valk . --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
@@ -147,6 +147,6 @@ asm:
 clean:
 	rm -f ./valk
 	rm -f ./valk2
-	rm -rf ~/.valk/cache
+# rm -rf ~/.valk/cache
 
 .PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3

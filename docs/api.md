@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url) | [utils](#utils)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url)
 
 ---
 
@@ -32,8 +32,17 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Mutex[T] {
+    + fn await_unlock() void
     + fn lock() T
-    + static fn new(value: T) imut Mutex[T]
+    + static fn new(value: T) Mutex[T] !create
+    + fn unlock(value: T) void
+}
+```
+
+```js
++ class SyncMutex[T] {
+    + fn lock() T
+    + static fn new(value: T) imut SyncMutex[T]
     + fn unlock(value: T) void
 }
 ```
@@ -226,7 +235,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn create_request(method: imut String, url: imut String, options: ?Options (null)) ClientRequest !invalid_url !ssl !connect
-+ fn download(url: imut String, to_path: imut String, method: imut String ("GET"), options: ?Options (null)) void !invalid_path !invalid_url !ssl !connect !disconnect !invalid_response
++ fn download(url: imut String, to_path: imut String, method: imut String (""), options: ?Options (null)) void !invalid_path !invalid_url !ssl !connect !disconnect !invalid_response
 + fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !invalid !http413 !incomplete !missing_host_header !file_error
 + fn request(method: imut String, url: imut String, options: ?Options (null)) ClientResponse !invalid_url !invalid_output_path !ssl !connect !disconnect !invalid_response
 ```
@@ -332,7 +341,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn html(body: imut String, code: u32 (200), headers: ?Map[imut String] (null)) Response
     + static fn json(body: imut String, code: u32 (200), headers: ?Map[imut String] (null)) Response
     + static fn redirect(location: imut String, code: u32 (301), headers: ?Map[imut String] (null)) Response
-    + static fn text(body: imut String, code: u32 (200), content_type: imut String ("text/plain"), headers: ?Map[imut String] (null)) Response
+    + static fn text(body: imut String, code: u32 (200), content_type: imut String (""), headers: ?Map[imut String] (null)) Response
 }
 ```
 
@@ -372,7 +381,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn add_static_dir(path: imut String) void !notfound
     + static fn new(host: imut String, port: u16, handler: fn(Request)(Response)) Server !socket_init_error !socket_bind_error
-    + fn start(worker_count: i32 (8)) void
+    + fn start(worker_count: i32 (-1)) void
 }
 ```
 
@@ -413,7 +422,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn new_object(values: ?Map[Value] (null)) Value
 + fn new_string(text: imut String) Value
 + fn new_uint(value: uint) Value
-+ fn to_type[T](data: Value) T
 + fn value(data: $T) Value
 ```
 
@@ -440,11 +448,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !fail !again
-+ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !fail !again
-+ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !fail !again
-+ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !fail !again
-+ fn send_string(fd: i32, str: imut String) uint !fail !again
++ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !fail
++ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !fail
++ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !fail
++ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !fail
++ fn send_string(fd: i32, str: imut String) uint !fail
 + fn set_ca_cert_path(path: ?imut String) void
 ```
 
@@ -473,6 +481,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !connection
     + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !connection !closed
     + fn ssl_connect(host: imut String, ca_cert_path: ?imut String (null)) void !ssl_error
+}
+```
+
+```js
++ class SSL {
+    ~ ctx: SSL
+    ~ ssl: SSL
+
+    + static fn ca_paths() Array[imut String]
+    + static fn last_error_msg() imut String
 }
 ```
 
@@ -598,6 +616,38 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn to_json_value() Value
     + fn unique() Array[T]
     + fn unique_copy() Array[T]
+}
+```
+
+```js
++ class ByteBuffer {
+    ~ data: GcPtr
+    ~ length: uint
+    ~ size: uint
+
+    + fn append(buffer: ByteBuffer, start_index: uint (0)) void
+    + fn append_byte(byte: u8) void
+    + fn append_from_ptr(data: ptr, length: uint) void
+    + fn append_int(value: int) void
+    + fn append_str(str: imut String) void
+    + fn append_uint(value: uint) void
+    + fn clear() void
+    + fn clear_part(index: uint, len: uint) void
+    + fn clear_until(index: uint) void
+    + fn clone() ByteBuffer
+    + fn equals_str(str: imut String) bool
+    + fn get(index: uint) u8
+    + fn index_of(byte: u8, start_index: uint (0)) uint !not_found
+    + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !not_found
+    + fn minimum_free_space(length: uint) void
+    + fn minimum_size(minimum_size: uint) void
+    + static fn new(start_size: uint (128)) ByteBuffer
+    + fn part(start_index: uint, length: uint) imut String
+    + fn reduce_size(size: uint) void
+    + fn set(index: uint, v: u8) void
+    + fn starts_with(str: imut String, offset: uint) bool
+    + fn str_ref(offset: uint, length: uint) ByteBufferStrRef
+    + fn to_string() imut String
 }
 ```
 
@@ -963,42 +1013,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + path: imut String
     + query: imut String
     + scheme: imut String
-}
-```
-
-# utils
-
-## Classes for 'utils'
-
-```js
-+ class ByteBuffer {
-    ~ data: GcPtr
-    ~ length: uint
-    ~ size: uint
-
-    + fn append(buffer: ByteBuffer, start_index: uint (0)) void
-    + fn append_byte(byte: u8) void
-    + fn append_from_ptr(data: ptr, length: uint) void
-    + fn append_int(value: int) void
-    + fn append_str(str: imut String) void
-    + fn append_uint(value: uint) void
-    + fn clear() void
-    + fn clear_part(index: uint, len: uint) void
-    + fn clear_until(index: uint) void
-    + fn clone() ByteBuffer
-    + fn equals_str(str: imut String) bool
-    + fn get(index: uint) u8
-    + fn index_of(byte: u8, start_index: uint (0)) uint !not_found
-    + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !not_found
-    + fn minimum_free_space(length: uint) void
-    + fn minimum_size(minimum_size: uint) void
-    + static fn new(start_size: uint (128)) ByteBuffer
-    + fn part(start_index: uint, length: uint) imut String
-    + fn reduce_size(size: uint) void
-    + fn set(index: uint, v: u8) void
-    + fn starts_with(str: imut String, offset: uint) bool
-    + fn str_ref(offset: uint, length: uint) ByteBufferStrRef
-    + fn to_string() imut String
 }
 ```
 
