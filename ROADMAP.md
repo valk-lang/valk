@@ -9,6 +9,7 @@
 + Shared array/map locks & .$is_shared builtin
 ~ Work out bad features: cothrow, imut
 - Rework stack allocation arrays & structs + init values
+- convert grouped values to inline struct types
 - Update docs
 - Release 0.0.13
 - Share project with others
@@ -19,12 +20,12 @@
 - valk fmt
 - Interfaces
 - Union types
-- Data race solution
 ```
 
 ## Maybe
 
 ```
+- Data race solution
 - Change function syntax to `exampleFunc` instead of `example_func`
 - WASM support
 - Dont use shadow stack, use real stack
