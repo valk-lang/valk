@@ -60,6 +60,8 @@
     * [Headers](#headers)
     * [Linking](#linking)
 
+* [Valk manager](#valk-manager)
+
 * [Misc](#misc)
     * [Data races](#data-races)
 
@@ -141,7 +143,18 @@ fn thumbs_up() {
 
 ## Packages
 
-Work in progress.
+Packages are still in an early stage. You can install/manage packages for your project using the `vman` command.
+
+```sh
+vman install # Install pacakages defined in the valk.json config
+vman install {pkg} # Install pacakage globally
+vman remove {pkg} # Remove pacakage
+# Example:
+vman install github.com/valk-lang/pkg-example
+vman remove example
+```
+
+Example package: [link](https://github.com/valk-lang/pkg-example)
 
 ## Types
 
@@ -982,6 +995,20 @@ valk build src/*.valk -l ssl -L "/usr/my-libs"
 valk build src/*.valk -l ssl -L "/usr/my-libs" --static
 ```
 
+## Valk manager
+
+The valk manager aka `vman` can be used to install/update new versions of `valk`. It is also used to install packages for your project.
+
+```sh
+vman use latest # Will install/use the latest version of valk
+vman use # Will install/use the valk version defined in your {cwd}/valk.json config -> { "use": "x.x.x" }
+vman use {version} # Install/use a specific version
+vman install # Install pacakages defined in the valk.json config
+vman install {pkg} # Install pacakage globally
+vman remove {pkg} # Remove pacakage
+```
+
+Project: [Link](https://github.com/valk-lang/vman)
 
 ## Misc
 
