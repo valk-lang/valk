@@ -154,6 +154,17 @@ vman install github.com/valk-lang/pkg-example
 vman remove example
 ```
 
+After you installed a package, it will added to your `valk.json` config. In this config you can also change the name you want to use in your code.
+
+```rust
+// Example: valk.json -> { "dependencies": "example": {...} }
+use example:funcs
+
+fn main() {
+    funcs:print_hello()
+}
+```
+
 Example package: [link](https://github.com/valk-lang/pkg-example)
 
 ## Types
