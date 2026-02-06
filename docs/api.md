@@ -215,8 +215,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'html'
 
 ```js
-+ fn sanitize(code: String) String
-+ fn sanitize_with_options(code: String, options: ?SanitizeOptions (null)) String
++ fn sanitize(code: String, options: ?SanitizeOptions (null)) String
++ fn sanitize_filter(code: String) String
 ```
 
 ## Classes for 'html'
@@ -742,6 +742,20 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
+}
+```
+
+```js
++ class StringComposer {
+    + fn append(buffer: StringComposer) void
+    + fn append_byte(byte: u8) void
+    + fn append_from_ptr(data: ptr, length: uint) void
+    + fn append_int(value: int) void
+    + fn append_str(str: String) void
+    + fn append_uint(value: uint) void
+    + fn clear() void
+    + static fn new(start_size: uint (256)) StringComposer
+    + fn to_string() String
 }
 ```
 
