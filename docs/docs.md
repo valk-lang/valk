@@ -59,6 +59,9 @@
     * [Headers](#headers)
     * [Linking](#linking)
 
+* [Misc](#misc)
+    * [Data races](#data-races)
+
 <br></td></tr>
 </table>
 
@@ -978,3 +981,11 @@ valk build src/*.valk -l ssl -L "/usr/my-libs"
 valk build src/*.valk -l ssl -L "/usr/my-libs" --static
 ```
 
+
+## Misc
+
+## Data races
+
+Currently we dont have a automatic solution/detection for data races. However `Array` & `Map` are protected against data races. For integers you can use `atomic()`.
+
+You can use `core:race_lock()` and `core:race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).
