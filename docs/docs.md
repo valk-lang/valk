@@ -124,7 +124,7 @@ To organize your code we group files into different directories. Each namespace 
 ```
 
 ```rust
-// main.valk
+// src/main.valk
 use my_namespace
 // Alternatives
 use my_namespace as mn // Alias for namespace
@@ -144,6 +144,10 @@ fn main() {
 fn thumbs_up() {
     println("👍")
 }
+```
+
+```sh
+valk build src/main.valk -o ./myprogram
 ```
 
 ## Packages
