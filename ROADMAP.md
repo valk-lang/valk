@@ -6,6 +6,7 @@
 ```
 # Upcoming version
 
++ Fix function type type-checking
 - Improve docs
 - Make sure the LSP works on windows
 - Check `TODO` in the code base
