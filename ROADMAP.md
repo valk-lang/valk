@@ -9,7 +9,7 @@
 + Shared array/map locks & .$is_shared builtin
 + Rework stack allocation arrays & structs + init values
 + Update docs
-- Release 0.0.13
++ Release 0.0.13
 - Share project with others
 
 # Next steps
