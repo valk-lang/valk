@@ -7,15 +7,14 @@
 # Upcoming version
 
 + Shared array/map locks & .$is_shared builtin
-~ Work out bad features: cothrow, imut
-- Rework stack allocation arrays & structs + init values
-- convert grouped values to inline struct types
++ Rework stack allocation arrays & structs + init values
 - Update docs
 - Release 0.0.13
 - Share project with others
 
 # Next steps
 
+~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
 - valk fmt
 - Interfaces
@@ -25,6 +24,7 @@
 ## Maybe
 
 ```
+- Convert grouped values to inline struct types
 - Data race solution
 - Change function syntax to `exampleFunc` instead of `example_func`
 - WASM support
