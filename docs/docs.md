@@ -27,6 +27,7 @@
 * [Classes](#classes)
 * [Modes](#modes)
 * [Globals](#globals)
+* [Interface / Union types](#interface-union-types)
 
 - [Tokens](#tokens)
     * [Let](#variables)
@@ -438,6 +439,10 @@ fn main() {
 global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
 ```
+
+## Interface / Union types
+
+`interface` & `union` types are still under development and will be release in upcoming versions. 
 
 ## Tokens
 
@@ -959,20 +964,16 @@ fn main() {
 
 ## Linking
 
-As mentioned above, you can tell the compiler to link with certain libraries inside a header file. But instead of that, you can also just use compiler arguments. Lets go over both methods.
+If your program needs to link with 3rd party libraries (.so/.a/.dll/.lib/.dylib/.tbd/.o), you have 2 options.
 
-In a header file:
+Option 1: Define the libraries in your `.valk.h` header file
 
 ```rust
-// If add dynamic or static, it will cause the compiler to always link dynamic or static. 
-// In other case it will just base itself on the compiler arguments
-link [dynamic|static] "{library-name}"
-// On linux/macos the linker will always look for `lib{lib-name}[.so/.a]`
-// You can override this logic by defining the exact filename using `:` at the start
-link ":mylib.a"
+link [dynamic|static] "mylib" // Will link with libmylib.so/.a/.dll/.lib/.dylib/.tbd
+link ":mylib.a" // use ':' the specify the exact name. This will link with `mylib.a`
 ```
 
-Using command line arguments
+Option 2: Use CLI arguments
 
 ```bash
 # This will look for libssl.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
@@ -986,6 +987,6 @@ valk build src/*.valk -l ssl -L "/usr/my-libs" --static
 
 ## Data races
 
-Currently we dont have a automatic solution/detection for data races. However `Array` & `Map` are protected against data races. For integers you can use `atomic()`.
+Currently we dont have a builtin solution/detection for data races. However `Array` & `Map` are protected against data races. For integers you can use `atomic()`. `String` is also safe because they are immutable. In other cases you will have to create a Mutex and lock/unlock when needed.
 
 You can use `core:race_lock()` and `core:race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).

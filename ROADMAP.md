@@ -9,6 +9,7 @@
 - Improve docs
 - Make sure the LSP works on windows
 - Check `TODO` in the code base
+- Add `link_dir` token for header files
 - Release 0.0.14
 - Share project with others
 
