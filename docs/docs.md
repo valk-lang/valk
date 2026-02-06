@@ -45,13 +45,14 @@
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
-* [Compile Conditions](#compile-conditions)
+* [Compile macros](#compile-macros)
 * [Atomics](#atomics)
 * [Testing](#testing)
 * [HTTP Client](#http-client)
 * [HTTP Server](#http-server)
 * [Sockets](#sockets)
 * [Templates](#templates)
+* [Crypto](#crypto)
 
 <br></td><td width=200px><br>
 
@@ -678,9 +679,9 @@ let a = might_error() !? <{
 }
 ```
 
-## Compile conditions
+## Compile macros
 
-With `compile conditions` we can modify our code based on parameters we gave the compiler. We can also do checks on types. This can be useful when working with generic types.
+With `compile macros` we can modify our code based on parameters we gave the compiler. We can also do checks on types. This can be useful when working with generic types.
 
 ```rust
 fn main() {
@@ -907,6 +908,26 @@ Template engine tokens:
 ```
 
 Note: `valk:template` works at runtime and can therefor not detect incorrect template syntax at compile time.
+
+## Crypto
+
+Currently we only support a few algorithms (bcrypt / blake2b)
+
+Password hashing/verify example:
+
+```rust
+use valk:crypto
+
+fn main() {
+    let password = "test"
+    let hash = crypto:bcrypt_hash(password)
+    if crypto:bcrypt_verify("test", hash) {
+        println("👍")
+    } else {
+        println("❌")
+    }
+}
+```
 
 ## Unsafe
 
