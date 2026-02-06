@@ -6,10 +6,10 @@
 ```
 # Upcoming version
 
-+ Shared array/map locks & .$is_shared builtin
-+ Rework stack allocation arrays & structs + init values
-+ Update docs
-+ Release 0.0.13
+- Improve docs
+- Make sure the LSP works on windows
+- Check `TODO` in the code base
+- Release 0.0.14
 - Share project with others
 
 # Next steps
@@ -39,6 +39,11 @@
 ## Done
 
 ```
++ Shared array/map locks & .$is_shared builtin
++ Rework stack allocation arrays & structs + init values
++ Update docs
++ Release 0.0.13
+
 + Syntax clean up
 + Release 0.0.12
 
