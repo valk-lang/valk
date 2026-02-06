@@ -80,8 +80,13 @@ Install on linux, macos or WSL
 curl -s https://valk-lang.dev/install.sh | bash -s latest
 ```
 
-Windows: see our [Download page](https://valk-lang.dev/download). Just unzip the files into a folder and use `valk.exe` in your terminal.
+Windows (via powershell)
 
+```sh
+irm https://valk-lang.dev/install.ps1 | iex
+```
+
+Manual download: [Download page](https://valk-lang.dev/download)
 
 ## Basic example
 
