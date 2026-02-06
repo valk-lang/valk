@@ -104,7 +104,7 @@ valk build main.valk -o ./main
 
 ## Multiple files
 
-To build multiple files into a program, you simply add them to the build command. However, we recommend to use only 1 file (e.g. main.valk) and put all other files into a namespace. (See next chapter)
+To build multiple files into a program, you simply add them to the build command. However, for big projects we use namespaces to organize our code (See next chapter).
 
 ```sh
 valk build file-1.valk file-2.valk -o ./main
