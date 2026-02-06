@@ -57,7 +57,7 @@ test: valk
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --leak-check --def "DEBUG=1" --no-opt
+	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1" --debug
 	./debug/test-win.exe
 
 test-macos-build: valk
