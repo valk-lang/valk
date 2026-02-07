@@ -7,10 +7,9 @@
 # Upcoming version
 
 + Fix function type type-checking
-- Improve docs
-- Make sure the LSP works on windows
++ Improve docs
++ Make sure the LSP works on windows
 - Check `TODO` in the code base
-- Add `link_dir` token for header files
 - Release 0.0.14
 - Share project with others
 
@@ -26,6 +25,7 @@
 ## Maybe
 
 ```
+- Add `link_dir` token for header files
 - Convert grouped values to inline struct types
 - Data race solution
 - Change function syntax to `exampleFunc` instead of `example_func`
