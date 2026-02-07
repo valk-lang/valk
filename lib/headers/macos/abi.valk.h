@@ -109,7 +109,7 @@ fn umask(mask: u32) u32;
 fn gettid() i32;
 
 fn exit(status: i32) void $exit;
-fn signal(signum: i32, handler: ?fnRef(i32)()) void;
+fn signal(signum: i32, handler: ?fn(i32)()) void;
 fn raise(sig: i32) i32;
 
 fn _NSGetExecutablePath(buf: ptr, len_u32_ptr: ptr) i32;

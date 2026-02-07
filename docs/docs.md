@@ -179,11 +179,17 @@ Example package: [link](https://github.com/valk-lang/pkg-example)
 
 ## Types
 
-Types: `String` `Array` `Map`
-
 Integer types: `int`, `uint`, `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64`
 
 Float types: `float`, `f32`, `f64`
+
+Built-in classes: `String` `Array` `Map` `HashMap`
+
+Function pointer: `fn({arg-types})({return-types})` e.g. `fn(i32)()`
+
+Closure function pointer: `Fn({arg-types})({return-types})` e.g. `Fn(i32)()`
+
+Coroutine type: `co({return-types})` e.g. `co(i32)` (returns an i32 when using `await`)
 
 Other: `ptr` <- raw pointer (unsafe)
 
@@ -409,7 +415,11 @@ fn main() {
 
 ### Closures
 
-Closures are anonymous functions
+Closures are anonymous functions that can have variables bound to them from outside their scope.
+
+You can create anonymous functions by using the `fn` keyword. Based on whether you used a variable from outside the scope or not, the return type will either be a raw function pointer `fn()()` or a closure type `Fn()()`
+
+A `fn()()` type is always compatible with `Fn()()`. But not the other way around. So when you need to specify a type and you want to support both raw function pointers and closures, use `Fn` instead of `fn`.
 
 ```rust
 fn main() {

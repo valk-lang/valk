@@ -5,12 +5,9 @@
 
 ```
 # Upcoming version
-
-+ Fix function type type-checking
-+ Improve docs
-+ Make sure the LSP works on windows
-+ Check `TODO` in the code base
-+ Release 0.0.14
++ LSP improvements
+- rename `fn` -> `Fn` and `fnRef` -> `fn`
+- Release 0.0.15
 - Share project with others
 
 # Next steps
@@ -47,6 +44,12 @@
 ## Done
 
 ```
++ Fix function type type-checking
++ Improve docs
++ Make sure the LSP works on windows
++ Check `TODO` in the code base
++ Release 0.0.14
+
 + Shared array/map locks & .$is_shared builtin
 + Rework stack allocation arrays & structs + init values
 + Update docs
