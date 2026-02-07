@@ -9,8 +9,8 @@
 + Fix function type type-checking
 + Improve docs
 + Make sure the LSP works on windows
-- Check `TODO` in the code base
-- Release 0.0.14
++ Check `TODO` in the code base
++ Release 0.0.14
 - Share project with others
 
 # Next steps
