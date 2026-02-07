@@ -17,9 +17,10 @@
 
 ~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
-- valk fmt
 - Interfaces
 - Union types
+- More atomic features
+- valk fmt
 ```
 
 ## Maybe
