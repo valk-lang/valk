@@ -6,8 +6,8 @@
 ```
 # Upcoming version
 + LSP improvements
-- rename `fn` -> `Fn` and `fnRef` -> `fn`
-- Release 0.0.15
++ rename `fn` -> `Fn` and `fnRef` -> `fn`
++ Release 0.0.15
 - Share project with others
 
 # Next steps
