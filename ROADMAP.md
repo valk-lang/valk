@@ -15,6 +15,11 @@
 
 # Next steps
 
+- Allow all types of 128 bit and lower as function arguments
+- @stack(StructName) -> stackAlloc StructName { ... }
+-- This is the same as `let x : <StructName> = { ... }`
+-- but stackAlloc can as a value, e.g. in function arguments
+- Allow @undefined for entire struct. E.g. let user = User { @undefined }
 ~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
 - Interfaces
