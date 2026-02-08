@@ -79,7 +79,7 @@ fn SSL_read(ssl: SSL, data: ptr, bytes: uint) i32;
 fn SSL_write_ex(ssl: SSL, data: ptr, bytes: uint, bytes_written_uint_ptr: ptr) i32;
 fn SSL_read_ex(ssl: SSL, data: ptr, bytes: uint, bytes_read_uint_ptr: ptr) i32;
 fn SSL_set1_host(ssl: SSL, host: cstring) i32;
-fn SSL_set_verify(ssl: SSL, mode: i32, cb: ?fn(i32, ptr)(i32)) i32;
+fn SSL_set_verify(ssl: SSL, mode: i32, cb: ?fnptr(i32, ptr)(i32)) i32;
 fn SSL_set_cipher_list(ssl: SSL, ciphers: cstring) i32;
 fn SSL_ctrl(ssl: SSL, cmd: i32, larg: int, parg: ?ptr) int;
 
@@ -91,7 +91,7 @@ fn ERR_error_string(error: uint, buffer: ?ptr) cstring;
 fn TLS_client_method() ptr;
 fn SSLv23_client_method() ptr;
 
-fn SSL_CTX_set_verify(ssl: SSL, mode: i32, cb: ?fn(i32, ptr)(i32)) i32;
+fn SSL_CTX_set_verify(ssl: SSL, mode: i32, cb: ?fnptr(i32, ptr)(i32)) i32;
 fn SSL_CTX_set_options(ctx: SSL_CTX, flags: int);
 fn SSL_CTX_ctrl(ctx: SSL_CTX, cmd: i32, larg: int, parg: ?ptr) int;
 fn SSL_CTX_load_verify_locations(ctx: SSL_CTX, ca_file: cstring, ca_path: ?cstring) i32;
