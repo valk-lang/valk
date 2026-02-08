@@ -187,7 +187,7 @@ Built-in classes: `String` `Array` `Map` `HashMap`
 
 Function pointer: `fn({arg-types})({return-types})` e.g. `fn(i32)()`
 
-Closure function pointer: `Fn({arg-types})({return-types})` e.g. `Fn(i32)()`
+Raw function pointer: `fnptr({arg-types})({return-types})` e.g. `fnptr(i32)()`
 
 Coroutine type: `co({return-types})` e.g. `co(i32)` (returns an i32 when using `await`)
 
@@ -417,9 +417,9 @@ fn main() {
 
 Closures are anonymous functions that can have variables bound to them from outside their scope.
 
-You can create anonymous functions by using the `fn` keyword. Based on whether you used a variable from outside the scope or not, the return type will either be a raw function pointer `fn()()` or a closure type `Fn()()`
+You can create anonymous functions by using the `fn` keyword. Based on whether you used a variable from outside the scope or not, the return type will either be a raw function pointer `fnptr()()` or a closure type `fn()()`
 
-A `fn()()` type is always compatible with `Fn()()`. But not the other way around. So when you need to specify a type and you want to support both raw function pointers and closures, use `Fn` instead of `fn`.
+A `fnptr()()` type is always compatible with `fn()()`. But not the other way around. So when you need to specify a type and you want to support both raw function pointers and closures, use `fn` instead of `fnptr`.
 
 ```rust
 fn main() {
@@ -638,7 +638,7 @@ fn main() {
     co hi() // Run function call in a coroutine
     let task = co hi() // Same
     await task // Wait until it's finished
-    await co fn()() { hi() }() // Makes no sense, but you can and it works
+    await co fn(){ hi() }() // Makes no sense, but you can and it works
 }
 ```
 
