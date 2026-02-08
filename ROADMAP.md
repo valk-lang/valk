@@ -5,9 +5,9 @@
 
 ```
 # Upcoming version
-+ LSP improvements
-+ rename `fnRef` -> `fnptr`
-+ Release 0.0.15
+
++ Markdown parser
+- Release 0.0.16
 - Share project with others
 
 # Next steps
@@ -44,6 +44,10 @@
 ## Done
 
 ```
++ LSP improvements
++ rename `fnRef` -> `fnptr`
++ Release 0.0.15
+
 + Fix function type type-checking
 + Improve docs
 + Make sure the LSP works on windows
