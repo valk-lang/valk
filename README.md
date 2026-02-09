@@ -109,6 +109,7 @@ Creating 10 million objects of size 8:
 |--|--|--|--|
 | Valk | 31ms | 128ms | 160 MB |
 | Go | 115ms | 216ms | 591 MB |
+| C# | 28ms | 480ms | 253 MB |
 
 Code: [Link](examples/bench/objects)
 

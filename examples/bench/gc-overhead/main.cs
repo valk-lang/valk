@@ -44,7 +44,6 @@ class GcOverhead
         internal void Hold() { }
     }
 
-    const int MinDepth = 4;
     public static void Main(string[] args)
     {
         int repeat = 50;
