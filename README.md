@@ -139,17 +139,17 @@ When not to use Valk:
 
 - The local GC has no randomness. Every time you run a program it will use the exact same amount of memory and run at the exact same speed.
 
-- Co routines are single threaded. We dont do task-stealing.
+- Co routines are single threaded. A co-routine will always run on the same thread it started on.
 
-- We are a self hosted language with a LLVM backend. We depend on libc for system calls. We use the OS default linker for linking (ld/ld64/link.exe).
+- We are a self hosted language with a LLVM backend. We depend on libc for system calls. We use the native linux & macos linker. For windows we use lld-link.
 
 ## Contributions
 
-We are mainly looking for people who want to add more functionality either via packages or pull requests to the standard library.
+The most helpful thing you can do is to create 3rd party packages.
 
-If you have an idea of what you want to add but dont know how to start, hop on our discord channel and ask for help.
+If you want to work on the language itself, just hop on our discord and discuss with us what you want to change.
 
-Highly requested: Hashing/encryption methods, Popular tool/service integrations (e.g. mysql, postgres, S3 api, GUI libraries, ...)
+Either way, you should join our discord 😊 Everyone is welcome. The more people, the better.
 
 ---
 
