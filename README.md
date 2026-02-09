@@ -115,9 +115,9 @@ Code: [Link](examples/bench/objects)
 
 ## Why Valk over Rust, Go, Zig?
 
-`Rust`: Too much complexity. Having to deal with complex coding concepts is not great if we are already trying to solve complex problems.
+`Rust`: Too much complexity. Having to deal with complex coding concepts is not great if we are already trying to solve complex problems. Also: Slow compile times and their way of doing async.
 
-`Zig`: Manual memory management. It's not something you want to do in every project. The less things you have to manage/think about, the easier it is to manage your code.
+`Zig`: Manual memory management. It's not something you want to do in every project. The less things you have to manage/think about, the easier it is to manage your code. There are also philosophical differences between zig and valk. E.g. No hidden allocations. Which is great, but it does come with down sides that you will need to deal with every time.
 
 `Go`: Great language, but there are alot of things we dont like. Nil checking/crashes, dead locks, it's package management, no thread local storage and more.
 
