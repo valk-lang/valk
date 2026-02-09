@@ -9,6 +9,8 @@
 + Markdown parser
 - Load file as string value into code `#load({path})`
 - A `--watch` build argument
+- A `--config` build argument
+- Rename `#STR` to `#string`
 - Release 0.0.16
 - Share project with others
 
