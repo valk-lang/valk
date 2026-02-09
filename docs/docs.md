@@ -703,9 +703,9 @@ fn main() {
     println("...")
     #end
 
-    #if @type_is_pointer(T)
+    #if is_pointer_type(T)
     println("Type is a pointer")
-    #if @type_is_gc(T)
+    #if is_gc_type(T)
     println("Type is a garbage collected type")
     #end
     #end
