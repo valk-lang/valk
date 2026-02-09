@@ -126,9 +126,9 @@ Code: [Link](examples/bench/objects)
 
 Other languages:
 
-`C#`: Too much ram usage. Slower than the languages mentioned above (except in certain cases). Bad language design, different features doing the same thing. Managed by microsoft and their products get worse every year.
+`C#`: Too much ram usage. Long GC pauses which can lower performance. No forced null checking = unexpected crashes. Async deadlocks. Microsoft eco-system. No clear language design (too many features doing the same thing = bloat). etc.
 
-`Java`: Same thing. Bad GC. Slower than other languages. Bad language design. The list of 'why not java' is too long.
+`Java`: Uses way too much ram. Slow GC. Non-native performance. Licensing. The list of 'why not java' is too long.
 
 When not to use Valk:
 
