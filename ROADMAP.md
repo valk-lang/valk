@@ -20,6 +20,7 @@
 - Mysql or Postgres package
 - Interfaces
 - Union types
+- vman templates -> vman template http-server-router ./src
 - Allow all types of 128 bit and lower as function arguments
 - @stack(StructName) -> stackalloc StructName { ... }
 -- This is the same as `let x : <StructName> = { ... }`
