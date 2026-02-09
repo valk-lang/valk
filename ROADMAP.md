@@ -7,6 +7,8 @@
 # Upcoming version
 
 + Markdown parser
+- Load file as string value into code `#load({path})`
+- A `--watch` build argument
 - Release 0.0.16
 - Share project with others
 
