@@ -5,22 +5,24 @@
 
 ```
 # Upcoming version
-+ LSP improvements
-+ rename `fnRef` -> `fnptr`
-+ Release 0.0.15
+
++ Markdown parser
+- Release 0.0.16
 - Share project with others
 
 # Next steps
 
+- Package platform
+- Mysql or Postgres package
+- Interfaces
+- Union types
 - Allow all types of 128 bit and lower as function arguments
-- @stack(StructName) -> stackAlloc StructName { ... }
+- @stack(StructName) -> stackalloc StructName { ... }
 -- This is the same as `let x : <StructName> = { ... }`
--- but stackAlloc can as a value, e.g. in function arguments
+-- but stackalloc can be used as a value, e.g. in function arguments
 - Allow @undefined for entire struct. E.g. let user = User { @undefined }
 ~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
-- Interfaces
-- Union types
 - More atomic features
 - valk fmt
 ```
@@ -44,6 +46,10 @@
 ## Done
 
 ```
++ LSP improvements
++ rename `fnRef` -> `fnptr`
++ Release 0.0.15
+
 + Fix function type type-checking
 + Improve docs
 + Make sure the LSP works on windows
