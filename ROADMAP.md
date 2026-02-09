@@ -12,15 +12,17 @@
 
 # Next steps
 
+- Package platform
+- Mysql or Postgres package
+- Interfaces
+- Union types
 - Allow all types of 128 bit and lower as function arguments
-- @stack(StructName) -> stackAlloc StructName { ... }
+- @stack(StructName) -> stackalloc StructName { ... }
 -- This is the same as `let x : <StructName> = { ... }`
--- but stackAlloc can as a value, e.g. in function arguments
+-- but stackalloc can be used as a value, e.g. in function arguments
 - Allow @undefined for entire struct. E.g. let user = User { @undefined }
 ~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
-- Interfaces
-- Union types
 - More atomic features
 - valk fmt
 ```
