@@ -115,19 +115,21 @@ Code: [Link](examples/bench/objects)
 
 ## Why Valk over Rust, Go, Zig?
 
-Rust: Too much complexity in our opinion. It's not fun if you are already trying to solve complex problems.
+`Rust`: Too much complexity. Having to deal with complex coding concepts is not great if we are already trying to solve complex problems.
 
-Zig: Manual memory management. Which we can respect, but it's not something you want to do always for every project. And even if you manage it manually, we think Valk will still out perform your custom memory management in large projects.
+`Zig`: Manual memory management. It's not something you want to do in every project. The less things you have to manage/think about, the easier it is to manage your code.
 
-Go: It's nice, but it also has alot wrong with it. No thread local globals, nil crashes, dead locks, it's package management, etc. etc. Valk tries to fix these pain-points. We also aim to be faster than Go.
+`Go`: Great language, but there are alot of things we dont like. Nil checking/crashes, dead locks, it's package management, no thread local storage and more.
+
+`Note`: All of these are great languages we respect. But none of them are what we want. So we created valk to do things our way.
 
 When not to use Valk:
 
-- Creating .dll/.so files. We currently dont even support it (but we will).
+- When you need very low-level control. E.g. custom assembly code / register access.
 
-- When you need 100% control. Like if your program needs to change specific CPU register values.
+- When your program needs to run on niche infrastructure. We currently only support: win/linux/mac for x86_64/arm64.
 
-- When your program needs to run on niche infrastructure. We currently only do: win/linux/mac with x64/arm64.
+- Creating .dll/.so/.a/.lib files. (We will support this in the future)
 
 ## Language design
 
