@@ -121,11 +121,13 @@ Code: [Link](examples/bench/objects)
 
 `Go`: Great language, but there are alot of things we dont like. Nil checking/crashes, dead locks, it's package management, no thread local storage and more.
 
+`Note`: All of these are great languages we respect. But none of them are what we want. So we created valk to do things our way.
+
+Other languages:
+
 `C#`: Slower than other languages mentioned here. Bad GC, too much ram usage. Bad language design, different features doing the same thing. Managed by microsoft, and their products get worse every year.
 
 `Java`: Same thing. Bad GC. Slower than other languages. Bad language design. The list of 'why not java' is too long.
-
-`Note`: All of these are great languages we respect. But none of them are what we want. So we created valk to do things our way.
 
 When not to use Valk:
 
