@@ -11,6 +11,7 @@
 - A `--watch` build argument
 - A `--config` build argument
 - Rename `#STR` to `#string`
+- A `define` keyword to define things in .valk files instead .valk.h
 - Release 0.0.16
 - Share project with others
 
