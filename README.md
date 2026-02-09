@@ -125,7 +125,7 @@ Code: [Link](examples/bench/objects)
 
 Other languages:
 
-`C#`: Slower than other languages mentioned here. Bad GC, too much ram usage. Bad language design, different features doing the same thing. Managed by microsoft, and their products get worse every year.
+`C#`: Too much ram usage. Slower than the languages mentioned above (except in certain cases). Bad language design, different features doing the same thing. Managed by microsoft and their products get worse every year.
 
 `Java`: Same thing. Bad GC. Slower than other languages. Bad language design. The list of 'why not java' is too long.
 
