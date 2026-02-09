@@ -149,7 +149,7 @@ The most helpful thing you can do is to create 3rd party packages.
 
 If you want to work on the language itself, just hop on our discord and discuss with us what you want to change.
 
-Either way, you should join our discord 😊 Everyone is welcome. The more people, the better.
+Either way, you should join our [discord](https://discord.gg/RwEGqdSERA) 😊 Everyone is welcome. The more people, the better.
 
 ---
 
