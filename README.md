@@ -74,17 +74,6 @@ make
 ## Benchmarks
 
 <div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-gc.png">
-</p>
-</div>
-
-Because valk only operates on objects that modified their reference path towards the stack, the GC has very little work todo, no matter how many objects you have. This can be crucial in applications where latency is important.
-
-Code: [Link](examples/bench/gc-overhead)
-
----
-
-<div align="center"><p>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-bintree.png">
 </p>
 </div>
@@ -92,6 +81,17 @@ Code: [Link](examples/bench/gc-overhead)
 The binary object tree test revolves around creating large amount of short-/long-lived objects, iterating over them and doing some calculations.
 
 Code: [Link](examples/bench/binary-tree)
+
+---
+
+<div align="center"><p>
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-gc.png">
+</p>
+</div>
+
+Because valk only operates on objects that modified their reference path towards the stack, the GC has very little work todo, no matter how many objects you have. This can be crucial in applications where latency is important.
+
+Code: [Link](examples/bench/gc-overhead)
 
 ---
 
