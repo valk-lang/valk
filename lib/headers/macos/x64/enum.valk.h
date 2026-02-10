@@ -1,5 +1,4 @@
 
-value POLLRDHUP (8192)
 
 // value EINTR (4)
 // value EINVAL (22)

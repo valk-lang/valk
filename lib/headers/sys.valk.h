@@ -1,58 +1,58 @@
 
-link ":valk-stack-swap.o"
-fn valk_stack_swap(from: ptr, to: ptr);
+// link ":valk-stack-swap.o"
+// fn valk_stack_swap(from: ptr, to: ptr);
 
-#if OS == linux
+// #if OS == linux
 
-link dynamic "pthread"
-link dynamic "c"
-link static "uring"
-link ":libc_nonshared.a"
-link ":ld-linux-x86-64.so.2"
+// link dynamic "pthread"
+// link dynamic "c"
+// link static "uring"
+// link ":libc_nonshared.a"
+// link ":ld-linux-x86-64.so.2"
 
-header "linux/abi"
-#if ARCH == arm64
-header "linux/arm64/libc-enums"
-header "linux/arm64/libc-gen"
-#else
-header "linux/x64/libc-enums"
-header "linux/x64/libc-gen"
-#end
-header "pthread"
-header "linux/uring"
+// header "linux/abi"
+// #if ARCH == arm64
+// header "linux/arm64/libc-enums"
+// header "linux/arm64/libc-gen"
+// #else
+// header "linux/x64/libc-enums"
+// header "linux/x64/libc-gen"
+// #end
+// header "pthread"
+// header "linux/uring"
 
-#elif OS == macos
+// #elif OS == macos
 
-link dynamic "System"
+// link dynamic "System"
 
-header "macos/abi"
-#if ARCH == arm64
-header "macos/arm64/enum"
-header "macos/arm64/libc-enums"
-header "macos/arm64/libc-gen"
-#elif ARCH == x64
-header "macos/x64/enum"
-header "macos/x64/libc-enums"
-header "macos/x64/libc-gen"
-#end
-header "pthread"
-header "macos/kqueue"
+// header "macos/abi"
+// #if ARCH == arm64
+// header "macos/arm64/enum"
+// header "macos/arm64/libc-enums"
+// header "macos/arm64/libc-gen"
+// #elif ARCH == x64
+// header "macos/x64/enum"
+// header "macos/x64/libc-enums"
+// header "macos/x64/libc-gen"
+// #end
+// header "pthread"
+// header "macos/kqueue"
 
-#elif OS == win
+// #elif OS == win
 
-link "kernel32"
-link "wsock32"
-link "ws2_32"
-link "libucrt" // static c-runtime
-link "libvcruntime" // static c-runtime
-link "libcmt" // static c-runtime startup
-link "ntdll"
+// link "kernel32"
+// link "wsock32"
+// link "ws2_32"
+// link "libucrt" // static c-runtime
+// link "libvcruntime" // static c-runtime
+// link "libcmt" // static c-runtime startup
+// link "ntdll"
 
-header "win/structs"
-header "win/abi"
-header "win/x64/enum"
-header "win/x64/libc-enums"
-header "win/x64/libc-gen"
-header "win/iocp"
+// header "win/structs"
+// header "win/abi"
+// header "win/x64/enum"
+// header "win/x64/libc-enums"
+// header "win/x64/libc-gen"
+// header "win/iocp"
 
-#end
+// #end
