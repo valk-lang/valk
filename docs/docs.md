@@ -56,6 +56,8 @@
 
 <br></td><td width=200px><br>
 
+* [Embed](#embed)
+
 * [Unsafe](#unsafe)
     * [Structs](#structs)
     * [External libraries](#external-libraries)
@@ -938,6 +940,27 @@ fn main() {
     }
 }
 ```
+
+## Embed
+
+With `#embed` & `#embed_dir` you can embed files/assets into your code as strings at compile time. All paths are relative to your `valk.json` config.
+
+```rust
+fn main() {
+    let content = #embed("views/page1.html")
+    println(content)
+    let files = #embed_dir("views")
+    each files as content, filename {
+        println(filename)
+    }
+    // Example output:
+    // page1.html
+    // sub-dir/page2.html
+    // sub-dir/page3.html
+}
+```
+
+Note: `#embed_dir` is recursive. Also try to put an embed in a separate function if you need it in multiple places. Embedding the same file in multiple places is a waste of spaces and results in a larger binary size.
 
 ## Unsafe
 
