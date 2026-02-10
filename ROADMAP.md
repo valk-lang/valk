@@ -10,6 +10,7 @@
 - Load file as string value into code `#load({path})`
 - A `--watch` build argument
 - A `--config` build argument
+- A `--ir` build argument (output is a single IR file)
 - Rename `#STR` to `#string`
 - A `define` keyword to define things in .valk files instead .valk.h
 - Release 0.0.16
@@ -21,6 +22,8 @@
 - Mysql or Postgres package
 - Interfaces
 - Union types
+- Provide a `IR` build so people can build valk with `clang` instead of `valk`
+-- This way people can be sure there is no hidden code inside the compiler
 - vman templates -> vman template http-server-router ./src
 - Allow all types of 128 bit and lower as function arguments
 - @stack(StructName) -> stackalloc StructName { ... }
