@@ -58,7 +58,7 @@
 
 * [Unsafe](#unsafe)
     * [Structs](#structs)
-    * [Headers](#headers)
+    * [External libraries](#external-libraries)
     * [Linking](#linking)
 
 * [Valk manager](#valk-manager)
@@ -941,11 +941,11 @@ fn main() {
 
 ## Unsafe
 
-Although Valk aims to be a safe language, we also dont want to prevent people from doing unsafe things if they want. So what is unsafe? All tokens that start with `@` are assumed unsafe. So that and using the `ptr` type (ptr = void* in c).
+Although Valk aims to be a safe language, we also dont want to prevent people from doing unsafe things if they want. So which features are unsafe? 
 
-We also have `struct`, which isnt unsafe, but can cause memory leaks if you forget to free the objects.
-
-Then we have `header` files. Header files are used to make the compiler aware of functions/globals/... in 3rd party static libaries. But if you define something differently than how it exists in the library, your program will probably crash when you use it. So make sure your header definitions match the library.
+- All tokens that start with `@`
+- Uses of `pointer` types e.g. `ptr` (pointer type = void pointer)
+- The `struct` types are unsafe in the sense of memory-leaks if you dont free them
 
 ## Structs
 
@@ -987,63 +987,39 @@ fn main() {
 }
 ```
 
-## Headers
+## External libraries
 
-Header files are used to make the compiler aware of functions/globals/... in 3rd party static libraries. A header file should have the extension `.valk.h` and should be located in a directory that's defined in your `valk.json` under `{ "headers": { "directories": ["my-headers"] } }` -> which points to `{project-dir}/my-headers`.
+To bind with external libraries we have to do 2 things:
 
-A header file can also tell the compiler which library to link with, and if it should link dynamic, static or based on compiler arguments.
+- Define the external functions/globals we want to import
+- Link with the library
+
+Defining extern symbols is done by using the `extern` keyword
 
 ```rust
-// {project}/my-headers/example.valk.h
-
-#if OS == win
-link "libssl"
-link "libcrypto"
-#else
-link "ssl"
-link "crypto"
-#end
-
-// Because we dont know the struct layout for this type we will just use `ptr` instead of defining a `struct`
-// We can later swap this out with a `struct` if we want
-alias SSL_CTX for ptr 
-
-fn SSL_new(ctx: SSL_CTX) SSL;
-fn SSL_free(ctx: SSL_CTX) void;
-fn SSL_set_fd(ssl: SSL, fd: i32) void;
-fn SSL_connect(ctx: SSL_CTX) i32;
+extern fn malloc(size: uint) ptr;
+extern fn free(adr: ptr);
 ```
 
-How to use it
+To link with your library you have 2 options:
+
+- Define the link information inside your code
+- Use command line arguments `-L` and `-l`
+
+Option 1: Inside the code
 
 ```rust
-// main.valk
-header "example" as ex
-
-fn main() {
-    let ssl = ex:SSL_new()
-    ex:SSL_free(ssl)
-}
-```
-
-## Linking
-
-If your program needs to link with 3rd party libraries (.so/.a/.dll/.lib/.dylib/.tbd/.o), you have 2 options.
-
-Option 1: Define the libraries in your `.valk.h` header file
-
-```rust
-link [dynamic|static] "mylib" // Will link with libmylib.so/.a/.dll/.lib/.dylib/.tbd
+link "mylib" // Will link with libmylib.so/.a/.dll/.lib/.dylib/.tbd
+link [dynamic|static] "mylib" // Optional: you can force it to link static or dynamic
 link ":mylib.a" // use ':' the specify the exact name. This will link with `mylib.a`
 ```
 
 Option 2: Use CLI arguments
 
 ```bash
-# This will look for libssl.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
-valk build src/*.valk -l ssl -L "/usr/my-libs"
-# This will look for libssl.a
-valk build src/*.valk -l ssl -L "/usr/my-libs" --static
+# This will look for libmylib.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
+valk build src/*.valk -l mylib -L "/usr/my-libs"
+valk build src/*.valk -l mylib -L "/usr/my-libs" --static
 ```
 
 ## Valk manager
