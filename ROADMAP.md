@@ -6,7 +6,7 @@
 ```
 # Upcoming version
 
-- A `--watch` build argument
++ A `--watch` build argument
 - A `--ir` build argument (output is a single IR file)
 - Release 0.0.17
 
