@@ -78,6 +78,8 @@ make
 </p>
 </div>
 
+Because valk only operates on objects that modified their reference path towards the stack, the GC has very little work todo, no matter how many objects you have. This can be crucial in applications where latency is important.
+
 Code: [Link](examples/bench/gc-overhead)
 
 ---
