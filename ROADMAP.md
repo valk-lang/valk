@@ -8,14 +8,14 @@
 
 + Markdown parser
 + Embed file into code `#embed({path})`
-- A `--watch` build argument
 + Rename `#STR` to `#string`
 + A `extern` keyword to define things in .valk files instead .valk.h
-- Release 0.0.16
-- Share project with others
++ Remove all header logic - no more `.valk.h` files
++ Release 0.0.16
 
 # Next steps
 
+- A `--watch` build argument
 - A `--ir` build argument (output is a single IR file)
 - Package platform
 - Mysql or Postgres package
