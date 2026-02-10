@@ -7,11 +7,11 @@
 # Upcoming version
 
 + Markdown parser
-- Embed file into code `#embed({path})`
++ Embed file into code `#embed({path})`
 - A `--watch` build argument
 - A `--config` build argument
 - A `--ir` build argument (output is a single IR file)
-- Rename `#STR` to `#string`
++ Rename `#STR` to `#string`
 - A `define` keyword to define things in .valk files instead .valk.h
 - Release 0.0.16
 - Share project with others
