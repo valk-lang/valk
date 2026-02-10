@@ -51,9 +51,12 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv -c
+	./valk build ./tests/*.valk ./tests --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv
 	./debug/test-all
 	@./tests/compile-errors/run.sh
+
+watchtest: valk
+	./valk build ./tests/*.valk ./tests --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w
 
 test-win: valk
 	mkdir -p ./debug
