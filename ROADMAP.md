@@ -6,12 +6,7 @@
 ```
 # Upcoming version
 
-+ Markdown parser
-+ Embed file into code `#embed({path})`
-+ Rename `#STR` to `#string`
-+ A `extern` keyword to define things in .valk files instead .valk.h
-+ Remove all header logic - no more `.valk.h` files
-+ Release 0.0.16
+- Release 0.0.17
 
 # Next steps
 
@@ -54,6 +49,13 @@
 ## Done
 
 ```
++ Markdown parser
++ Embed file into code `#embed({path})`
++ Rename `#STR` to `#string`
++ A `extern` keyword to define things in .valk files instead .valk.h
++ Remove all header logic - no more `.valk.h` files
++ Release 0.0.16
+
 + LSP improvements
 + rename `fnRef` -> `fnptr`
 + Release 0.0.15
