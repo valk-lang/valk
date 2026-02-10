@@ -7,7 +7,7 @@
 # Upcoming version
 
 + Markdown parser
-- Load file as string value into code `#load({path})`
+- Embed file into code `#embed({path})`
 - A `--watch` build argument
 - A `--config` build argument
 - A `--ir` build argument (output is a single IR file)
