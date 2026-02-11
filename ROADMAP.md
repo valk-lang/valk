@@ -8,6 +8,7 @@
 
 + A `--watch` build argument
 + A `--ir` build argument (output is a single IR file)
+- Improve link command
 - Release 0.0.17
 
 # Next steps
