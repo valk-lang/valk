@@ -10,9 +10,57 @@ vc=valk
 
 FLAGS=--def "VERSION=$(VERSION),DEF_TEST=TestValue"
 
+# Toolchain configuration
+TOOLCHAIN_DIR := ./toolchains
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Determine architecture
+ifeq ($(UNAME_M),x86_64)
+    ARCH := x64
+endif
+ifeq ($(UNAME_M),arm64)
+    ARCH := arm64
+endif
+
+# Homebrew LLVM path detection
+HOMEBREW_LLVM := $(shell brew --prefix llvm@15 2>/dev/null)
+ifeq ($(HOMEBREW_LLVM),)
+    HOMEBREW_LLVM := $(shell brew --prefix llvm 2>/dev/null)
+endif
+
+# Set toolchain paths based on OS and architecture
+ifeq ($(UNAME_S),Linux)
+    TOOLCHAIN_LIB := $(TOOLCHAIN_DIR)/libraries/linux-llvm-15-$(ARCH)/lib
+endif
+ifeq ($(UNAME_S),Darwin)
+    # Use Homebrew LLVM if available, otherwise fall back to toolchain
+    ifneq ($(HOMEBREW_LLVM),)
+        TOOLCHAIN_LIB := $(HOMEBREW_LLVM)/lib
+    else
+        TOOLCHAIN_LIB := $(TOOLCHAIN_DIR)/libraries/macos-llvm-15-$(ARCH)/lib
+    endif
+endif
+
+# Setup toolchains first (optional - use Homebrew LLVM if available)
+setup-toolchains:
+	@echo "Setting up toolchains..."
+	@if [ -n "$(HOMEBREW_LLVM)" ]; then \
+		echo "Using Homebrew LLVM at: $(HOMEBREW_LLVM)"; \
+	else \
+		echo "No Homebrew LLVM found, trying to download toolchains..."; \
+		chmod +x ./toolchains/setup.sh; \
+		./toolchains/setup.sh; \
+	fi
+
 # Build
-valk: $(SRC) $(HDRS)
-	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS)
+valk: setup-toolchains $(SRC) $(HDRS)
+	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) \
+	-L $(TOOLCHAIN_LIB) \
+	-L /opt/homebrew/lib \
+	-L /usr/local/lib \
+	-L /opt/homebrew/opt/zstd/lib \
+	-L /usr/local/opt/zstd/lib
 valk2: valk
 	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
 valk3: valk2
@@ -32,7 +80,12 @@ valk-profile: valk2
 valkd: $(SRC) $(HDRS)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
 static: $(SRC) $(HDRS)
-	valk build . src/*.valk -o ./valk -vv --static $(FLAGS)
+	valk build . src/*.valk -o ./valk -vv --static -l zstd -l z $(FLAGS) \
+	-L $(TOOLCHAIN_LIB) \
+	-L /opt/homebrew/lib \
+	-L /usr/local/lib \
+	-L /opt/homebrew/opt/zstd/lib \
+	-L /usr/local/opt/zstd/lib
 
 install: valk
 	rm -rf ~/.vman/versions/${VERSION}/
@@ -51,34 +104,31 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv
+	./valk build ./tests/*.valk . --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv -c
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
-watchtest: valk
-	./valk build ./tests/*.valk ./tests --test $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w
-
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1" --debug
+	./valk build ./tests/*.valk . --test -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1" --debug
 	./debug/test-win.exe
 
 test-macos-build: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests --test -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
-	./valk build ./tests/*.valk ./tests --test -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
+	./valk build ./tests/*.valk . --test -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
 
 # Testing
 test-cross: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests --test -o ./debug/test-all -vv $(FLAGS) --target linux-x64
-	./valk build ./tests/*.valk ./tests --test -o ./debug/test-all -vv $(FLAGS) --target macos-x64
-	./valk build ./tests/*.valk ./tests --test -o ./debug/test-all -vv $(FLAGS) --target macos-arm64
-	./valk build ./tests/*.valk ./tests --test -o ./debug/test-all -vv $(FLAGS) --target win-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target linux-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target macos-x64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target macos-arm64
+	./valk build ./tests/*.valk . --test -o ./debug/test-all -vv $(FLAGS) --target win-x64
 
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
-ci-linux: $(SRC) $(HDRS)
+ci-linux: setup-toolchains $(SRC) $(HDRS)
 	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
@@ -87,10 +137,15 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/llvm-15/lib/
 
-ci-macos: $(SRC) $(HDRS)
+ci-macos: setup-toolchains $(SRC) $(HDRS)
 	valk -h || true
-	valk build . src/*.valk -o ./valk -vv --static -l zstd $(FLAGS) \
-	-L /usr/local/Cellar/ncurses/6.5/lib
+	valk build . src/*.valk -o ./valk -vv --static -l zstd -l z $(FLAGS) \
+	-L $(TOOLCHAIN_LIB) \
+	-L $(HOME)/.vman/versions/$(VALKV)/lib \
+	-L /opt/homebrew/lib \
+	-L /usr/local/lib \
+	-L /opt/homebrew/opt/zstd/lib \
+	-L /usr/local/opt/zstd/lib
 
 ci-win: $(SRC) $(HDRS)
 	~/valk-dev/valk.exe -h || echo ""
