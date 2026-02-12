@@ -14,6 +14,7 @@
 
 # Next steps
 
+- on exit thread/process { ... }
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
 -- This way people can be sure there is no hidden code inside the compiler
 - vman templates -> vman template http-server-router ./src
