@@ -5,14 +5,15 @@
 
 ```
 # Upcoming version
-- Release 0.1.0
-
-# Next steps
 
 - Package platform
 - Mysql or Postgres package
 - Interfaces
 - Union types
+- Release 0.1.1
+
+# Next steps
+
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
 -- This way people can be sure there is no hidden code inside the compiler
 - vman templates -> vman template http-server-router ./src
@@ -46,6 +47,8 @@
 ## Done
 
 ```
++ Release 0.1.0
+
 + A `--watch` build argument
 + A `--ir` build argument (output is a single IR file)
 + Improve link command
