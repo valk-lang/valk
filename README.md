@@ -152,6 +152,8 @@ When not to use Valk:
 
 - We are a self hosted language with a LLVM backend. We depend on libc for system calls. We use the native linux & macos linker. For windows we use lld-link.
 
+- How to trust a self hosted compiler? You can compile the valk source with --ir to a single IR file. Then you can compile that IR file with clang to create your new valk compiler and at that point you know there is no hidden code inside the compiler.
+
 ## Contributions
 
 The most helpful thing you can do is to create 3rd party packages.
