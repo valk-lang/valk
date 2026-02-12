@@ -5,11 +5,7 @@
 
 ```
 # Upcoming version
-
-+ A `--watch` build argument
-+ A `--ir` build argument (output is a single IR file)
-- Improve link command
-- Release 0.0.17
+- Release 0.1.0
 
 # Next steps
 
@@ -50,6 +46,11 @@
 ## Done
 
 ```
++ A `--watch` build argument
++ A `--ir` build argument (output is a single IR file)
++ Improve link command
++ Release 0.0.17
+
 + Markdown parser
 + Embed file into code `#embed({path})`
 + Rename `#STR` to `#string`
