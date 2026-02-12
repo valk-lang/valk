@@ -32,7 +32,7 @@ valk-profile: valk2
 valkd: $(SRC) $(HDRS)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
 static: $(SRC) $(HDRS)
-	valk build . src/*.valk -o ./valk -vv --static $(FLAGS)
+	valk build . src/*.valk -o ./valk -vv --static -l zstd -L /opt/homebrew/opt/ncurses/lib -L /usr/local/opt/ncurses/lib -L /opt/homebrew/opt/llvm@15/lib -L /usr/local/opt/llvm@15/lib $(FLAGS)
 
 install: valk
 	rm -rf ~/.vman/versions/${VERSION}/
