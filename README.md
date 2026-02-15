@@ -118,19 +118,11 @@ Code: [Link](examples/bench/objects)
 
 ## Why Valk over Rust, Go, Zig?
 
-`Rust`: Too much complexity. Having to deal with complex coding concepts is not great if we are already trying to solve complex problems. Also: Slow compile times and their way of doing async.
+The main goal of Valk is that it's simple to write but it runs lightning fast. We dont want to manage memory or lifetimes. Developers already have to solve complex problems, we dont need to add more complexity on top of it.
 
-`Zig`: Manual memory management. It's not something you want to do in every project. The less things you have to manage/think about, the easier it is to manage your code. There are also philosophical differences between zig and valk. E.g. No hidden allocations. Which is great, but it does come with down sides that you will need to deal with every time.
+So why not Go? It is a great language, Valk is just an alternative. Which one you find better is up to you. However, Valk is different than Go. Different, error handling, package management, coroutines, c-compatible, etc. If you don't like Go, you might like Valk.
 
-`Go`: Great language, but there are alot of things we dont like. Nil checking/crashes, dead locks, it's package management, no thread local storage and more.
-
-`Note`: All of these are great languages we respect. But none of them are what we want. So we created valk to do things our way.
-
-Other languages:
-
-`C#`: Too much ram usage. Long GC pauses which can lower performance. No forced null checking = unexpected crashes. Async deadlocks. Microsoft eco-system. No clear language design (too many features doing the same thing = bloat). etc.
-
-`Java`: Uses way too much ram. Slow GC. Non-native performance. Licensing. The list of 'why not java' is too long.
+Valk is also somewhat the only language without a mark/sweep GC. If you have experienced latency problems in other GC languages, you might want to try out Valk.
 
 When not to use Valk:
 

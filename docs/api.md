@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [type](#type) | [url](#url)
 
 ---
 
@@ -33,19 +33,19 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Classes for 'core'
 
 ```js
-+ class Mutex[T] {
++ class Mutex {
     + fn await_unlock() void
-    + fn lock() T
-    + static fn new(value: T) Mutex[T] !create
-    + fn unlock(value: T) void
+    + fn lock() void
+    + static fn new() Mutex !create
+    + fn unlock() void
 }
 ```
 
 ```js
-+ class SyncMutex[T] {
-    + fn lock() T
-    + static fn new(value: T) SyncMutex[T]
-    + fn unlock(value: T) void
++ class SyncMutex {
+    + fn lock() void
+    + static fn new() SyncMutex
+    + fn unlock() void
 }
 ```
 
@@ -63,7 +63,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn await_coro(coro: Coro) void
 + fn await_last() void
-+ fn yield() void
++ fn await_short_delay() void
 ```
 
 # crypto
@@ -131,6 +131,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn is_file(path: String) bool
 + fn mime(ext_without_dot: String) String
 + fn mkdir(path: String, permissions: u32 (493)) void !fail
++ fn modified_time(path: String) uint !file_not_found
 + fn move(from_path: String, to_path: String) void !fail
 + fn open(path: String, writable: bool, append_on_write: bool) i32 !open
 + fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) i32 !open !access
@@ -205,6 +206,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Globals for 'gc'
 
 ```js
+~ global gc : Gc
 ~ shared mem_usage_peak : uint
 ~ shared mem_usage_shared : uint
 + shared verify : bool
@@ -401,6 +403,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !fail
 + fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !fail
 + fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !fail
++ fn set_mode(fd: i32, mode: io:MODE(int)) void
 + fn set_non_block(fd: i32, value: bool) void
 + fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !fail
 + fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !fail
@@ -425,6 +428,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn new_string(text: String) Value
 + fn new_uint(value: uint) Value
 + fn value(data: $T) Value
+```
+
+# markdown
+
+## Functions for 'markdown'
+
+```js
++ fn to_html(md: String, options: ?ToHtmlOptions (null)) String
 ```
 
 # mem
@@ -488,8 +499,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class SSL {
-    ~ ctx: SSL
-    ~ ssl: SSL
+    ~ ctx: OSSL
+    ~ ssl: OSSL
 
     + static fn ca_paths() Array[String]
     + static fn last_error_msg() String
@@ -544,16 +555,34 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn start(func: fn()()) Thread !start
 + fn suspend_ms(ms: uint) void
 + fn suspend_ns(ns: uint) void
++ fn task(handler: fn()()) Task !error
 ```
 
 ## Classes for 'thread'
 
 ```js
++ class Task {
+    ~ done: bool
+
+    + fn await() void
+}
+```
+
+```js
 + class Thread {
     ~ finished: bool
+    ~ started: bool
 
     + static fn start(func: fn()()) Thread !start
     + fn wait() void
+}
+```
+
+```js
++ class ThreadSuspendGate {
+    + static fn new() ThreadSuspendGate !error
+    + fn signal() void
+    + fn wait(should_wait: fn()(bool), timeout_ms: uint (0)) bool
 }
 ```
 
