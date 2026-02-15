@@ -20,10 +20,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
-+ fn get_error_trace() Array[String]
 + fn getenv(var: String) String !not_found
 + fn panic(msg: String) void
-+ fn print_error_trace() void
 + fn race_lock() void
 + fn race_unlock() void
 + fn raise(code: i32) void
@@ -49,13 +47,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 }
 ```
 
-## Globals for 'core'
-
-```js
-~ global error_code : u32
-~ global error_msg : String
-```
-
 # coro
 
 ## Functions for 'coro'
@@ -63,7 +54,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn await_coro(coro: Coro) void
 + fn await_last() void
-+ fn await_short_delay() void
 ```
 
 # crypto
@@ -563,6 +553,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Task {
     ~ done: bool
+    ~ started: bool
 
     + fn await() void
 }
@@ -609,7 +600,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
-    + fn clear() Array[T]
+    + fn clear(reduce_size: bool (false)) Array[T]
     + fn contains(value: T) bool
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
@@ -620,9 +611,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn increase_size(new_size: uint) GcPtr
     + fn index_of(item: T) uint !not_found
     + fn intersect(with: Array[T]) Array[T]
+    + fn lock() void
     + fn merge(items: Array[T]) Array[T]
     + static fn new(start_size: uint (2)) Array[T]
-    + fn nolock_index_of(item: T) uint !not_found
     + fn part(start: uint, amount: uint) Array[T]
     + fn pop_first() T !empty
     + fn pop_last() T !empty
@@ -638,6 +629,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn swap(index_a: uint, index_b: uint) void
     + fn to_json_value() Value
     + fn unique() Array[T]
+    + fn unlock() void
 }
 ```
 
@@ -702,12 +694,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn has_value(value: T) bool
     + fn keys() Array[K]
     + fn length() uint
+    + fn lock() void
     + fn merge(map: HashMap[K, T]) HashMap[K, T]
     + static fn new() HashMap[K, T]
     + fn remove(key: K) HashMap[K, T]
     + fn set(key: K, value: T) HashMap[K, T]
     + fn set_unique(key: K, value: T) HashMap[K, T]
     + fn sort_keys() HashMap[K, T]
+    + fn unlock() void
     + fn values() Array[T]
 }
 ```
