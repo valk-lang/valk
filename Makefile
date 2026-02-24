@@ -56,8 +56,8 @@ test: valk
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
-watchtest: valk
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w
+watchtest: valk2
+	./valk2 build ./tests/*.valk ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w -v
 
 test-win: valk
 	mkdir -p ./debug

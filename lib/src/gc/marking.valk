@@ -1,95 +1,61 @@
 
-fn increase_block(block: ptr) $inline {
-    @ptrv(block, uint, 2)++
-    gc.mem_marked += @ptrv(block, uint, 4)
-}
-fn decrease_block(block: ptr) $inline {
-    @ptrv(block, uint, 2)--
-    gc.mem_marked -= @ptrv(block, uint, 4)
-}
-
-fn increase_block_of_item(item: ptr) {
-    let data = (item.$offset(-8)).@cast(GcData)
-    let offset = data.block_offset & offmask
-    if offset > 0 {
-        let block = item - offset
-        increase_block(block)
-    }
-}
-
-fn decrease_block_of_item(item: ptr) {
-    let data = (item.$offset(-8)).@cast(GcData)
-    let offset = data.block_offset & offmask
-    if offset > 0 {
-        let block = item - offset
-        decrease_block(block)
-    }
-}
-
 fn mark_used(item: ?GcItem) $hot {
 
     let ml = gc.mark_list
+    let pl = gc.prop_list
     if isset(item) : ml.add(item)
 
     while true {
         let item = ml.pop() ! break
         let data = gcdata(item)
-        // if data.is_shared() : panic("Setting shared item to owned state")
+        let block = data.block()
 
-        if data.is_new() : increase_block_of_item(item)
+        if data.is_new() {
+            block.slots_used++
+            gc.mem_marked += block.isize
+        }
         #if GC_DEBUG
         if data.is_still_co_owned() : panic("double ownership")
         #end
         data.set_owned()
 
-        // Props
-        let has_vtable = data.has_vtable()
-        let propc = data.propc
-        if propc > 0 {
-            let prop_base : ptr[?GcItem] = item + size_of(ptr) * has_vtable.@cast(uint)
-            // Mark properties
-            while propc-- > 0 {
-                let sub = prop_base[propc]
-                if isset(sub) && (sub & prop_mask == 0) {
-                    let sub_data = gcdata(sub)
-                    if sub_data.is_not_owned_not_shared() {
-                        // Own
-                        @ptrv(prop_base, ?ptr, propc) = sub | prop_owned
-                        if sub_data.is_new() : increase_block_of_item(sub)
-                        sub_data.set_owned()
-                        // Mark sub properties
-                        ml.add(sub)
-                    } else {
-                        // Co-own
-                        @ptrv(prop_base, ?ptr, propc) = sub | prop_co_owned
-                        sub_data.co_own()
+        let pf = block.props
+        if isset(pf) : pf(item, pl.@cast(.))
+        
+        while true {
+            let ref = pl.pop() ! break
+            let sub = @ptrv(ref, ?ptr)
+            if !isset(sub) : continue
+            if sub & prop_mask == 0 {
+                let sub_data = gcdata(sub)
+                if sub_data.is_not_owned_not_shared() {
+                    @ptrv(ref, ptr) = sub | prop_owned
+                    if sub_data.is_new() {
+                        let sub_block = sub_data.block()
+                        sub_block.slots_used++
+                        gc.mem_marked += sub_block.isize
                     }
+                    sub_data.set_owned()
+                    ml.add(sub)
+                } else {
+                    @ptrv(ref, ptr) = sub | prop_co_owned
+                    sub_data.co_own()
                 }
             }
-        }
-
-        // Call hook gc_action
-        if has_vtable {
-            let func = @ptrv(data.vtable, ?fnptr(ptr, fnptr(ptr, ptr)())(), 0)
-            if isset(func) : func(item, property_mark)
         }
     }
 }
 
 fn free_blank(item: ptr) $hot {
-    let data = (item.$offset(-8)).@cast(GcData)
+    let data = gcdata(item)
     if data.is_not_new() : return
 
     // Call gc_free
-    let func = @ptrv(data.vtable, ?fnptr(ptr)(), 1)
-    if isset(func) : func(item)
-    data.remove_has_vtable()
+    let block = data.block()
+    let onfree = block.onfree
+    if isset(onfree) : onfree(item)
 
     #if GC_DEBUG
-    let leakmark = data.block_offset & mark_leak
-    if leakmark != 0 : panic("Leak mark not 0 at alloc")
-    // let mark = data.block_offset & offsetbits
-    // if mark != 0 : panic("Mark not 0 before free")
     if data.co_count != 0 : panic("co_count not 0 before free")
     if data.flags != 0 {
         print("Flags: ")
@@ -103,6 +69,7 @@ fn free_blank(item: ptr) $hot {
 fn dis_own_rec(item: ptr) {
 
     let ml = gc.mark_list
+    let pl = gc.prop_list
     ml.add(item)
 
     while true {
@@ -116,57 +83,51 @@ fn dis_own_rec(item: ptr) {
         #end
 
         if data.is_on_stack() {
+            data.set_owned()
             gc.prev_stack_items.add_ptr(item)
             continue
         }
 
-        decrease_block_of_item(item)
+        let block = data.block()
+        // if data.block_index != 0xFF {
+            block.slots_used--
+            gc.mem_marked -= block.isize
+        // }
 
         gc.dis_own_count++
         data.set_new()
         if data.co_count > 0 : gc.re_own_list.add_ptr(item)
 
         // Props
-        let has_vtable = data.has_vtable()
-        let propc = data.propc
-        if propc > 0 {
-            // Mark properties
-            let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
-            while propc-- > 0 {
-                let sub = @ptrv(prop_base, ?GcItem, propc)
-                if isset(sub) {
-                    if sub & prop_owned == prop_owned {
-                        sub = sub - prop_owned
-                        @ptrv(prop_base, ptr, propc) = sub
-                        let data = gcdata(sub)
-                        data.set_no_owner()
-                        if data.is_shared() : continue
-                        ml.add(sub)
-                    } else if sub & prop_co_owned == prop_co_owned {
-                        sub = sub - prop_co_owned
-                        @ptrv(prop_base, ptr, propc) = sub
-                        let data = gcdata(sub)
-                        // data.dis_co_own()
-                        atomic(data.co_count - 1)
-                        if data.is_still_co_owned() {
-                            data.remove_still_co_owned()
-                            // Lets pretend we were the owner
-                            ml.add(sub)
-                        }
-                    }
+        let pf = block.props
+        if isset(pf) : pf(item, pl.@cast(.))
+        
+        while true {
+            let ref = pl.pop() ! break
+            let sub = @ptrv(ref, ?ptr)
+            if !isset(sub) : continue
+            if sub & prop_owned == prop_owned {
+                let sub_item = sub - prop_owned
+                @ptrv(ref, ptr) = sub_item
+                let sub_data = gcdata(sub_item)
+                sub_data.set_no_owner()
+                if sub_data.is_shared() : continue
+                ml.add(sub_item)
+            } else if sub & prop_co_owned == prop_co_owned {
+                let sub_item = sub - prop_co_owned
+                @ptrv(ref, ptr) = sub_item
+                let sub_data = gcdata(sub_item)
+                atomic(sub_data.co_count - 1)
+                if sub_data.is_still_co_owned() {
+                    sub_data.remove_still_co_owned()
+                    // Lets pretend we were the owner
+                    ml.add(sub_item)
                 }
             }
         }
 
-        // Call hook gc_action
-        if has_vtable {
-            let func = @ptrv(data.vtable, ?fnptr(ptr, fnptr(ptr, ptr)())(), 0)
-            if isset(func) : func(item, property_dis_own)
-            if !data.is_in_blanks() {
-                data.set_in_blanks()
-                gc.blanks.add_ptr(item)
-            }
-        }
+        let onfree = block.onfree
+        if isset(onfree) : gc.blanks.add_ptr(item)
     }
 }
 
@@ -182,6 +143,7 @@ fn share(item: GcItem) {
     gc.dont_stop = true
 
     let ml = gc.mark_list
+    let pl = gc.prop_list
     let start = ml.index
     ml.add(item)
 
@@ -192,7 +154,7 @@ fn share(item: GcItem) {
 
         if data.is_shared() : continue
         data.set_shared()
-        data.set_mark()
+        // data.set_mark()
 
         let is_new = data.is_new()
         if is_new : data.set_no_owner()
@@ -203,52 +165,39 @@ fn share(item: GcItem) {
 
         gc.shared_items.add_ptr(item)
 
-        let offset = data.block_offset & offmask
-        if offset > 0 {
-            let block = item - offset
-            let isize = @ptrv(block, uint, 4)
+        let block = data.block()
+        // if data.block_index != 0xFF {
+            let size = block.isize
             if is_new {
-                @ptrv(block, uint, 2)++
+                block.slots_used++
             } else {
-                gc.mem_marked -= isize
+                gc.mem_marked -= size
             }
             // Increase mem shared
-            atomic(mem_shared + isize)
-        }
+            atomic(mem_shared + size)
+        // }
 
         // Props
-        let has_vtable = data.has_vtable()
-        let propc = data.propc
-        if propc > 0 {
-            // Mark properties
-            let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
-            while propc-- > 0 {
-                let sub = @ptrv(prop_base, ?GcItem, propc)
-                if isset(sub) {
-                    let sub_item : GcItem = sub & -4.to(uint)
-
-                    let sub_data = gcdata(sub_item)
-                    if sub & prop_owned == prop_owned {
-                        // Remove ownership
-                        @ptrv(prop_base, ?GcItem, propc) = sub_item
-                        sub_data.set_no_owner()
-                    } else if sub & prop_co_owned == prop_co_owned {
-                        // Remove co ownership
-                        @ptrv(prop_base, ?GcItem, propc) = sub_item
-                        // sub_data.dis_co_own()
-                        atomic(sub_data.co_count - 1)
-                    }
-
-                    ml.add(sub_item)
-                }
+        let pf = block.props
+        if isset(pf) : pf(item, pl.@cast(.))
+        
+        while true {
+            let ref = pl.pop() ! break
+            let sub = @ptrv(ref, ?ptr)
+            if !isset(sub) : continue
+            let sub_item : GcItem = sub & -4.to(uint)
+            let sub_data = gcdata(sub_item)
+            if sub & prop_owned == prop_owned {
+                // Remove ownership
+                @ptrv(ref, ?GcItem) = sub_item
+                sub_data.set_no_owner()
+            } else if sub & prop_co_owned == prop_co_owned {
+                // Remove co ownership
+                @ptrv(ref, ?GcItem) = sub_item
+                atomic(sub_data.co_count - 1)
             }
-        }
 
-        // Call hook gc_action
-        if has_vtable {
-            let vt = data.vtable
-            let func = @ptrv(vt, ?fnptr(ptr, fnptr(ptr, ptr)())(), 0)
-            if isset(func) : func(item, property_share)
+            ml.add(sub_item)
         }
     }
 
@@ -258,6 +207,7 @@ fn share(item: GcItem) {
 fn update_mark(item: GcItem) {
 
     let ml = gc.mark_list
+    let pl = gc.prop_list
     ml.add(item)
 
     while true {
@@ -268,29 +218,18 @@ fn update_mark(item: GcItem) {
         data.set_mark()
 
         // Props
-        let has_vtable = data.has_vtable()
-        let propc = data.propc
-        if propc > 0 {
-            // Mark properties
-            let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
-            while propc-- > 0 {
-                let sub = @ptrv(prop_base, ?GcItem, propc)
-                if isset(sub) {
-                    let item : GcItem = sub & -4.to(uint)
-                    let data = gcdata(item)
-                    if data.is_marked() : continue 
-                    ml.add(item)
-                }
-            }
-        }
-
-        // Call hook gc_action
-        if has_vtable {
-            let vt = data.vtable
-            let func = @ptrv(vt, ?fnptr(ptr, fnptr(ptr, ptr)())(), 0)
-            if isset(func) {
-                func(item, property_update_mark)
-            }
+        let block = data.block()
+        let pf = block.props
+        if isset(pf) : pf(item, pl.@cast(.))
+        
+        while true {
+            let ref = pl.pop() ! break
+            let sub = @ptrv(ref, ?ptr)
+            if !isset(sub) : continue
+            let sub_item : GcItem = sub & -4.to(uint)
+            let sub_data = gcdata(sub_item)
+            if sub_data.is_marked() : continue 
+            ml.add(sub_item)
         }
     }
 }
@@ -298,6 +237,7 @@ fn update_mark(item: GcItem) {
 fn mark_leak_rec(item: GcItem, on: bool) {
 
     let ml = gc.mark_list
+    let pl = gc.prop_list
     ml.add(item)
 
     while true {
@@ -313,24 +253,16 @@ fn mark_leak_rec(item: GcItem, on: bool) {
         }
 
         // Props
-        let has_vtable = data.has_vtable()
-        let propc = data.propc
-        if propc > 0 {
-            // Mark properties
-            let prop_base = item + size_of(ptr) * has_vtable.@cast(uint)
-            while propc-- > 0 {
-                let sub = @ptrv(prop_base, ?GcItem, propc)
-                if isset(sub) {
-                    let item : GcItem = sub & -4.to(uint)
-                    ml.add(item)
-                }
-            }
-        }
-
-        // Call hook gc_action
-        if has_vtable {
-            let func = @ptrv(data.vtable, ?fnptr(ptr, fnptr(ptr, ptr)())(), 0)
-            if isset(func) : func(item, property_add_mark_list)
+        let block = data.block()
+        let pf = block.props
+        if isset(pf) : pf(item, pl.@cast(.))
+        
+        while true {
+            let ref = pl.pop() ! break
+            let sub = @ptrv(ref, ?ptr)
+            if !isset(sub) : continue
+            let sub_item : ptr = sub & -4.to(uint)
+            ml.add(sub_item)
         }
     }
 }
