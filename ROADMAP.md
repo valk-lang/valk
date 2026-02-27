@@ -48,6 +48,9 @@
 ## Done
 
 ```
++ Release 0.1.1 - 0.1.6
++ Optimizations & rewrites
+
 + Release 0.1.0
 
 + A `--watch` build argument
