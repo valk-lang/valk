@@ -437,19 +437,119 @@ fn ast_while(p: Parser, scope: Scope) {
 
 fn ast_each(p: Parser, scope: Scope) {
 
+    let b = p.build
     let on = read_value(p, scope)
+    let class = on.rett.get_class() !? null
+    if !isset(class) || on.rett.nullable : p.error("Cannot use 'each' on type: " + on.rett)
+
+    ast_gen_ir_comment(scope, "Each statement")
+    let is_slice = class.is_slice
+
+    // if !is_slice {
+    //     let func_each = class.get_func("_each") !? null
+    //     if isset(func_each) {
+    //         let call = vgen_func_call(b, scope, vgen_func_ptr(func_each), .{ on })
+    //         let retts = call.rett.unroll()
+    //         if retts.length == 0 : p.error("The _each function has no return type")
+    //         each retts as rett {
+    //             let class = rett.get_class() ! p.error("Invalid return type for _each. It's only allowed to return Slice[T] types")
+    //             if !class.is_slice || rett.nullable : p.error("Invalid return type for _each. It's only allowed to return Slice[T] types")
+    //         }
+    //         on = call
+    //         is_slice = true
+    //     }
+    // }
+
+    // Init on value
+    ast_gen_ir_comment(scope, "Init each on-values")
+    let on_values = on.unroll()
+    each on_values as on {
+        if on.needs_buffer() : on = vgen_buffer(scope, on)
+        scope.ast.append(tgen_statement(on))
+    }
+
+    // Get types
+    let types = Array[Type]{}
+    if is_slice {
+        each on_values as on {
+            let sclass = on.rett.get_class() ! p.bug("Missing slice class")
+            let gtypes = sclass.generic_types
+            if isset(gtypes) {
+                gtypes.get(0) -> type : types.append(type)
+            }
+        }
+    } else {
+        let func = class.get_func("_next") ! p.error("Cannot use 'each' on type: '" + on.rett + "'. This type does not have an '_next' function")
+        let retts = func.rett.unroll()
+        each retts as rett {
+            types.append(rett)
+        }
+    }
+    // Add index type
+    types.append(b.valk_type("type", "uint"))
+
+    // Read variable names
+    p.expect("as", true, true)
+    let names = Array[String]{}
+    let single = false
+    while true {
+        let name = p.read_word(true, true) 
+        if names.contains(name) : p.error("Duplicate variable name: " + name)
+        names.append(name)
+        if names.length > types.length : p.error("Too many variables for this each statement")
+        p.expect3(",", "{", ":", true, true)
+        if p.word_is(",") : continue
+        single = p.word_is(":")
+        break
+    }
+
+    // Index
+    let index_name : ?String = null 
+    if names.length == types.length {
+        index_name = names.pop_last() ! p.error("Missing index name")
+    }
+    let index_decl = Decl.new(b.valk_type("type", "uint"), false, index_name)
+    index_decl.is_mut = true
+    scope.add_decl(index_decl)
+
+    // Set index to 0
+    ast_gen_ir_comment(scope, "Set index to 0")
+    scope.ast.append(Token {
+        type: AST.assign
+        value1: vgen_decl(index_decl)
+        value2: vgen_int(0, index_decl.type)
+    })
+
+    let maxv : ?Value = null
+    if is_slice {
+        // Read slice max length
+        ast_gen_ir_comment(scope, "Get slice max index")
+        each on_values as onv {
+            let len = vgen_ptrv(onv, b.valk_type("type", "uint"), vgen_int(0, b.valk_type("type", "uint")))
+            scope.ast.append(tgen_statement(len))
+            maxv = len
+            break
+        }
+        // Read slice.data
+        ast_gen_ir_comment(scope, "Get slice data properties")
+        each on_values as onv, i {
+            let data = vgen_ptrv(onv, b.valk_type("gc", "GcPtr"), vgen_int(1, b.valk_type("type", "uint")))
+            on_values.set(i, data) _
+            scope.ast.append(tgen_statement(data))
+        }
+    }
 
     // Stage 1
     let fp = p.loop_first_parse
     p.loop_first_parse = true
 
     let start = p.clone_chunk()
-    let loop = ast_each_stage(p, scope, on, null)
+    let loop = ast_each_stage(p, scope, names, types, on_values, is_slice, single, index_decl, maxv, null)
 
     // Stage 2
     p.loop_first_parse = fp
     p.set_chunk(start)
-    loop = ast_each_stage(p, scope, on, loop.null_at_start)
+    loop = ast_each_stage(p, scope, names, types, on_values, is_slice, single, index_decl, maxv, loop.null_at_start)
 
     each loop.null_at_end as decl {
         scope.not_null_remove(decl)
@@ -462,37 +562,22 @@ fn ast_each(p: Parser, scope: Scope) {
     })
 }
 
-fn ast_each_stage(p: Parser, scope: Scope, on: Value, null_at_start: ?Array[Decl]) Scope {
+fn ast_each_stage(
+    p: Parser, scope: Scope,
+    names: Array[String], types: Array[Type], on_values: Array[Value],
+    is_slice: bool, single: bool,
+    index_decl: Decl,
+    maxv: ?Value,
+    null_at_start: ?Array[Decl]
+    ) Scope {
+
+    let b = p.build
     let pfunc = p.func()
     let pfast = pfunc.fast()
 
-    let class = on.rett.get_class() !? null
-    if !isset(class) || on.rett.nullable : p.error("Cannot use 'each' on type: " + on.rett)
-    let func = class.get_func("each_get") ! p.error("Cannot use 'each' on type: '" + on.rett + "'. This type does not have an 'each_get' function")
-
-    p.expect("as", true, true)
-
-    // Read variable names
-    let names = Array[String]{}
-    let single = false
-    while true {
-        let name = p.read_word(true, true) 
-        if names.contains(name) : p.error("Duplicate variable name: " + name)
-        names.append(name)
-        p.expect3(",", "{", ":", true, true)
-        if p.word_is(",") : continue
-        single = p.word_is(":")
-        break
-    }
-
-    // Check if too many variables
-    let rettcount = func.rett.count_types()
-    if names.length > rettcount + 1 : p.error("Too many variable names")
-    let index_name : ?String = null
-    if names.length == rettcount + 1 : index_name = names.pop_last() ! p.error("Missing index variable name (bug)")
-
     // Create scope
     let sub = scope.sub_scope(SCOPE.loop)
+    ast_gen_ir_comment(sub, "Each loop scope")
 
     if isset(null_at_start) {
         each null_at_start as decl {
@@ -500,68 +585,80 @@ fn ast_each_stage(p: Parser, scope: Scope, on: Value, null_at_start: ?Array[Decl
         }
     }
 
-    // Set decls
-    let idecl = Decl.new(type_uint(p.build), false)
-    idecl.is_mut = true
-    sub.add_decl(idecl)
-    sub.loop_idecl = idecl
+    ast_gen_ir_comment(sub, "Load index")
+    let vindex = vgen_decl(index_decl)
+    sub.ast.append(tgen_statement(vindex))
 
-    if isset(index_name) {
-        sub.set_idf(p.ctx, index_name, Idf.for_decl(idecl))
-    }
-
-    if !p.loop_first_parse {
-        scope.ast.append(Token {
-            type: AST.assign
-            value1: vgen_decl(idecl)
-            value2: vgen_int(0, idecl.type)
-        })
-    }
-
-    // Fcall
-    let values = Array[Value]{ on, vgen_decl(idecl) }
-    let fcall = vgen_func_call(p.build, sub, vgen_func_ptr(func), values)
-
-    let retvs = fcall.unroll()
-    if retvs.length < 1 : p.error("each_get function must return atleast 1 value")
-
-    // Check error
-    let b = p.build
-    let break_scope = sub.sub_scope(SCOPE.default)
-
-    break_scope.ast.append(Token {
-        type: AST.break
-    })
-    break_scope.did_return = true
-
-    let breakv = vgen_inline_scope(break_scope, type_none(b))
-    fcall = vgen_error_handler(p.ctx, scope, fcall, fcall.trim_errors(), breakv, false)
-
-    if !p.loop_first_parse {
+    // Check max index
+    if isset(maxv) {
+        ast_gen_ir_comment(sub, "Compare index to slice length")
+        let if_scope = sub.sub_scope(SCOPE.if)
+        let cond = vgen_compare(vindex, maxv, OP.gte, b.valk_type("type", "bool"))
+        ast_gen_break(p.ctx, if_scope)
         sub.ast.append(Token {
-            type: AST.statement
-            value1: fcall
+            type: AST.if
+            value1: cond
+            scope1: if_scope
+            scope2: null
         })
     }
 
-    // Declare values
+    // Set decls
+    sub.loop_idecl = index_decl
+    let index_name = index_decl.name
+    if isset(index_name) : sub.set_idf(p.ctx, index_name, Idf.for_decl(index_decl))
+    //
+    let decls = Array[Decl]{}
     each names as name, i {
-        let vv = retvs.get(i) ! p.error("Missing 'each_get' return value")
-        let vdecl = Decl.new(vv.rett, false)
-        vdecl.name = name
-        sub.set_idf(p.ctx, name, Idf.for_decl(vdecl))
-        sub.add_decl(vdecl)
+        let type = types.get(i) ! p.bug("Missing each value type")
+        let decl = Decl.new(type, false, name)
+        sub.add_decl(decl)
+        decls.append(decl)
+        sub.set_idf(p.ctx, name, Idf.for_decl(decl))
+    }
 
-        if !p.loop_first_parse {
-            sub.ast.append(Token {
-                type: AST.declare
-                decl: vdecl
-                value1: vv
-            })
+    // Get values
+    if is_slice {
+        // Slice
+        ast_gen_ir_comment(sub, "Get slice values")
+        each decls as decl, i {
+            let onv = on_values.get(i) ! p.bug("Missing slice value for each statement")
+            let v = vgen_ptrv(onv, decl.type, vindex)
+            if v.rett.is_gc() {
+                let op = vgen_op(vgen_cast(v, b.valk_type("type", "uint")), vgen_int(-4, b.valk_type("type", "uint")), OP.bit_and, b.valk_type("type", "uint"))
+                v = vgen_cast(op, v.rett)
+            }
+            ast_gen_ir_comment(sub, "Set each variable value for: " + (decl.name ?? "/"))
+            ast_gen_assign(p.ctx, sub, vgen_decl(decl), v, true, p.chunk)
+        }
+    } else {
+        // Call _next
+        ast_gen_ir_comment(sub, "Call each-get")
+        let on = on_values.get(0) ! p.bug("Missing on value")
+        let class = on.rett.get_class() !? null
+        if !isset(class) || on.rett.nullable : p.error("Cannot use 'each' on type: " + on.rett)
+        let func = class.get_func("_next") ! p.bug("Missing _next function")
+
+        let values = Array[Value]{ on, vindex }
+        let fcall = vgen_func_call(b, sub, vgen_func_ptr(func), values)
+        // Check error
+        let break_scope = sub.sub_scope(SCOPE.default)
+        break_scope.ast.append(Token { type: AST.break })
+        break_scope.did_return = true
+        let breakv = vgen_inline_scope(break_scope, type_none(b))
+        fcall = vgen_error_handler(p.ctx, sub, fcall, fcall.trim_errors(), breakv, false)
+
+        if !p.loop_first_parse : sub.ast.append(tgen_statement(fcall))
+        let retvs = fcall.unroll()
+        each decls as decl, i {
+            let v = retvs.get(i) ! p.bug("Missing return value from _next")
+            ast_gen_ir_comment(sub, "Set each variable value for: " + (decl.name ?? "/"))
+            ast_gen_assign(p.ctx, sub, vgen_decl(decl), v, true, p.chunk)
         }
     }
 
     // AST
+    ast_gen_ir_comment(sub, "Each loop code")
     read_ast(p, sub, single)
 
     if p.loop_first_parse {
@@ -672,35 +769,7 @@ fn ast_cothrow(p: Parser, scope: Scope) {
 }
 
 fn ast_break(p: Parser, scope: Scope) {
-
-    let loop = scope.find_type(SCOPE.loop) ! p.error("Using 'break' without being inside a loop")
-    each loop.decls as decl {
-        if !decl.type.is_gc() : continue
-        scope.ast.append(Token {
-            type: AST.assign
-            value1: vgen_decl(decl)
-            value2: vgen_null(decl.type)
-        })
-    }
-
-    // Detect when variables can become null at the end of the loop
-    let s : ?Scope = scope
-    let u = Array[Decl].new()
-    while isset(s) {
-        let decls = s.not_null_removed
-        each decls as decl {
-            if u.contains(decl) : continue
-            loop.null_at_end.append(decl)
-            u.append(decl)
-        }
-        if s == loop : break
-        s = s.parent
-    }
-
-    scope.ast.append(Token {
-        type: AST.break
-    })
-    scope.did_return = true
+    ast_gen_break(p.ctx, scope)
 }
 fn ast_continue(p: Parser, scope: Scope) {
 
