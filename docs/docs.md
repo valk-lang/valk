@@ -462,7 +462,7 @@ fn main() {
 
 ## Generics
 
-With generics you can pass types to classes or function that customize that class or function.
+With generics you can generate customized versions of a class or function.
 
 ```rust
 // Generic class
@@ -472,7 +472,6 @@ class Data[T] {
         return this.my_data
     }
 }
-
 fn main() {
     let Data[uint]{ my_data: 10 }
 }
