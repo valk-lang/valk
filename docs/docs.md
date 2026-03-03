@@ -188,6 +188,8 @@ Float types: `float`, `f32`, `f64`
 
 Built-in classes: `String` `Array` `Map` `HashMap`
 
+Null-able types: `?String` (allows you to assign `null`. Only on pointer types, not numeric types)
+
 Function pointer: `fn({arg-types})({return-types})` e.g. `fn(i32)()`
 
 Raw function pointer: `fnptr({arg-types})({return-types})` e.g. `fnptr(i32)()`
@@ -492,7 +494,7 @@ fn main() {
 ```
 
 - Generic type names use the same naming conventions as variable names
-- You can also modify generic type: e.g. If `T` is `String`, then `?T` will become `?String`
+- Generic types can be modified: e.g. If `T` is `String`, then `?T` will become `?String`
 
 You can also generate a generic function based on the value of an argument
 
