@@ -407,8 +407,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn decode(json: String) Value !invalid
-+ fn encode(data: $T, pretty: bool (false)) String
-+ fn encode_value(json: Value, pretty: bool (false)) String
++ fn encode(data: $T, pretty: bool (false), output: ?StringComposer (null), depth: uint (0)) StringComposer
++ fn encode_to_string(data: $T, pretty: bool (false)) String
 + fn new_array(values: ?Array[Value] (null)) Value
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
@@ -595,12 +595,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Array[T] {
     ~ data: GcPtr
+    ~ each_slice: ?Slice[T]
     ~ length: uint
     ~ size: uint
 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
     + fn clear(reduce_size: bool (false)) Array[T]
+    + fn compose_json(str: StringComposer, pretty: bool, depth: uint) void
     + fn contains(value: T) bool
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
@@ -611,6 +613,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn increase_size(new_size: uint) GcPtr
     + fn index_of(item: T) uint !not_found
     + fn intersect(with: Array[T]) Array[T]
+    + fn iter() Slice[T]
     + fn lock() void
     + fn merge(items: Array[T]) Array[T]
     + static fn new(start_size: uint (2)) Array[T]
@@ -624,7 +627,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn remove_value(value: T) Array[T]
     + fn reverse() Array[T]
     + fn set(index: uint, value: T) void !out_of_range
+    + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
+    + fn slice(start: uint, amount: uint) Slice[T]
     + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn to_json_value() Value
@@ -770,12 +775,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class StringComposer {
-    + fn append(buffer: StringComposer) void
-    + fn append_byte(byte: u8) void
-    + fn append_from_ptr(data: ptr, length: uint) void
-    + fn append_int(value: int) void
-    + fn append_str(str: String) void
-    + fn append_uint(value: uint) void
+    + fn append(buffer: StringComposer) StringComposer
+    + fn append_byte(byte: u8) StringComposer
+    + fn append_f64(value: f64, decimals: uint (2), trim_zeros: bool (false)) StringComposer
+    + fn append_from_ptr(data: ptr, length: uint) StringComposer
+    + fn append_int(value: int) StringComposer
+    + fn append_str(str: String) StringComposer
+    + fn append_str_json_escaped(add: String) StringComposer
+    + fn append_uint(value: uint) StringComposer
     + fn clear() void
     + static fn new(start_size: uint (256)) StringComposer
     + fn to_string() String
@@ -794,19 +801,22 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class f32 {
-    + fn to_str(decimals: uint (2)) String
+    + fn to_str(decimals: uint (2), trim_zeros: bool (false)) String
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class f64 {
-    + fn to_str(decimals: uint (2)) String
+    + fn to_str(decimals: uint (2), trim_zeros: bool (false)) String
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class float {
-    + fn to_str(decimals: uint (2)) String
+    + fn to_str(decimals: uint (2), trim_zeros: bool (false)) String
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 

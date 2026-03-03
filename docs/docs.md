@@ -25,6 +25,7 @@
 <br></td><td width=200px><br>
 
 * [Classes](#classes)
+* [Generics](#generics)
 * [Modes](#modes)
 * [Globals](#globals)
 * [Interface / Union types](#interface-union-types)
@@ -458,6 +459,37 @@ fn main() {
     User.my_static_function() // output: Hello from my static function
 }
 ```
+
+## Generics
+
+With generics you can pass types to classes or function that customize that class or function.
+
+```rust
+// Generic class
+class Data[T] {
+    my_data: T
+    fn getData() T {
+        return this.my_data
+    }
+}
+
+fn main() {
+    let Data[uint]{ my_data: 10 }
+}
+```
+
+```rust
+// Generic function
+fn add[X, Y](v1: X, v2: Y) String {
+    return v1 + v2
+}
+fn main() {
+    let str = add[String, uint]("10/", 10)
+}
+```
+
+- Generic type names use the same naming conventions as variable names
+- You can also modify generic type: e.g. If `T` is `String`, then `?T` will become `?String`
 
 ## Modes
 
