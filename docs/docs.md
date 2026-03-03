@@ -473,22 +473,42 @@ class Data[T] {
     }
 }
 fn main() {
-    let Data[uint]{ my_data: 10 }
+    let v1 = Data[uint]{ my_data: 10 }
+    let v2 = Data[String]{ my_data: "hello" }
 }
 ```
 
 ```rust
 // Generic function
 fn add[X, Y](v1: X, v2: Y) String {
-    return v1 + v2
+    return v1 + "-" + v2
 }
 fn main() {
-    let str = add[String, uint]("10/", 10)
+    let v1 = add[String, uint]("5", 10)
+    // v1 = "5-10"
+    let v2 = add[uint, uint](5, 10)
+    // v2 = 15
 }
 ```
 
 - Generic type names use the same naming conventions as variable names
 - You can also modify generic type: e.g. If `T` is `String`, then `?T` will become `?String`
+
+You can also generate a generic function based on the value of an argument
+
+```rust
+fn multiply(value: $T) T {
+    #if type_has_method(T, multi)
+    return value.multi()
+    #elif is_type_of_class(T, String)
+    return value + "x" + value
+    #else
+    return value * 2
+    #end
+}
+```
+
+Basically `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)`
 
 ## Modes
 
