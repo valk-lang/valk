@@ -481,11 +481,11 @@ fn main() {
 ```rust
 // Generic function
 fn add[X, Y](v1: X, v2: Y) String {
-    return v1 + "-" + v2
+    return v1 + v2
 }
 fn main() {
     let v1 = add[String, uint]("5", 10)
-    // v1 = "5-10"
+    // v1 = "510"
     let v2 = add[uint, uint](5, 10)
     // v2 = 15
 }
