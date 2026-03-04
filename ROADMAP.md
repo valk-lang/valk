@@ -48,6 +48,12 @@
 ## Done
 
 ```
++ Release 0.1.7
++ --release option
++ json optimizations
++ slice type + array optimizations
++ rework value scope parsing
+
 + Release 0.1.1 - 0.1.6
 + Optimizations & rewrites
 
