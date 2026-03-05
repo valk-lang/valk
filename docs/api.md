@@ -61,6 +61,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'crypto'
 
 ```js
++ fn base64_decode(str: String) String
++ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void
++ fn base64_encode(str: String) String
++ fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void
 + fn bcrypt_hash(password: String, cost: uint (12)) String
 + fn bcrypt_verify(password: String, hash: String) bool
@@ -68,6 +72,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !invalid_salt !invalid_key
 + fn blowfish_init_state(context: BlowfishContext) void
 + fn blowfish_xor_block(data: &[u8], salt: ByteBuffer, saltIndex: &[uint]) void
++ fn sha256_encode(str: String) String
 ```
 
 ## Classes for 'crypto'
@@ -83,6 +88,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class BlowfishContext {
+}
+```
+
+```js
++ class Sha256 {
+    + fn final(hash: ptr[u8 x 32]) void
+    + fn update(data: ptr[u8], len: uint) void
 }
 ```
 
@@ -524,8 +536,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'template'
 
 ```js
-+ fn render(content: String, data: $T, options: ?RenderOptions (null)) String
-+ fn render_path(path: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !FileNotFound
++ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String
++ fn set_content(name: String, content: String) void
++ fn set_content_many(content: Map[String]) void
 ```
 
 ## Classes for 'template'
@@ -533,7 +547,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class RenderOptions {
     + sanitize: ?fn(String)(String)
-    + template_directory: ?String
 }
 ```
 
@@ -658,15 +671,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn get(index: uint) u8
     + fn index_of(byte: u8, start_index: uint (0)) uint !not_found
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !not_found
+    + fn ltrim(filter: fnptr(u8)(bool)) void
     + fn minimum_free_space(length: uint) void
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
     + fn reduce_size(size: uint) void
+    + fn rtrim(filter: fnptr(u8)(bool)) void
     + fn set(index: uint, v: u8) void
     + fn starts_with(str: String, offset: uint) bool
     + fn str_ref(offset: uint, length: uint) ByteBufferStrRef
     + fn to_string() String
+    + fn trim(filter: fnptr(u8)(bool)) void
 }
 ```
 
@@ -796,6 +812,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class cstring {
+    + fn get(index: uint) u8
+    + fn index_of(find: u8) uint !notfound
+    + fn length() uint
+    + fn to_string() String
 }
 ```
 
