@@ -48,6 +48,11 @@
 ## Done
 
 ```
++ Release 0.1.8
++ Multi assign
++ Directory as package src
++ Crypto: base64/sha1/sha256
+
 + Release 0.1.7
 + --release option
 + json optimizations
