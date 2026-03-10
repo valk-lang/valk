@@ -4,6 +4,10 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.1.9
+- Rework errors
+- Rework namespaces
+
 # Upcoming version
 
 - Package platform
