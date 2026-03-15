@@ -394,13 +394,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Server {
-    + fast_handler: ?fn(Context, ResponseWriter)()!
+    + fast_handler: ?fn(Context, ResponseWriter)()
     ~ host: String
     ~ port: u16
     + show_info: bool
 
     + fn add_static_dir(path: String) void !core:LookupError
-    + static fn new(host: String, port: u16, handler: fn(Request)(Response)!) Server !http:HttpError
+    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !http:HttpError
     + fn start(worker_count: i32 (-1)) void
 }
 ```
@@ -562,7 +562,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class RenderOptions {
-    + sanitize: ?fn(String)(String)!
+    + sanitize: ?fn(String)(String)
 }
 ```
 
@@ -571,10 +571,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'thread'
 
 ```js
-+ fn start(func: fn()()!) Thread !core:InitError
++ fn start(func: fn()()) Thread !core:InitError
 + fn suspend_ms(ms: uint) void
 + fn suspend_ns(ns: uint) void
-+ fn task(handler: fn()()!) Task !core:InitError
++ fn task(handler: fn()()) Task !core:InitError
 ```
 
 ## Classes for 'thread'
@@ -593,7 +593,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ finished: bool
     ~ started: bool
 
-    + static fn start(func: fn()()!) Thread !core:InitError
+    + static fn start(func: fn()()) Thread !core:InitError
     + fn wait() void
 }
 ```
@@ -602,7 +602,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class ThreadSuspendGate {
     + static fn new() ThreadSuspendGate
     + fn signal() void
-    + fn wait(should_wait: fn()(bool)!, timeout_ms: uint (0)) bool
+    + fn wait(should_wait: fn()(bool), timeout_ms: uint (0)) bool
 }
 ```
 
@@ -636,7 +636,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
     + fn equal_ignore_order(array: Array[T]) bool
-    + fn filter(func: ?fn(T)(bool)! (null)) Array[T]
+    + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn fit_index(index: uint) void
     + fn get(index: uint) T !core:LookupError
     + fn increase_size(new_size: uint) GcPtr
@@ -659,7 +659,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
     + fn slice(start: uint, amount: uint) Slice[T]
-    + fn sort(func: ?fn(T, T)(bool)! (null)) Array[T]
+    + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn to_json_value() Value
     + fn unique() Array[T]
@@ -688,18 +688,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn get(index: uint) u8
     + fn index_of(byte: u8, start_index: uint (0)) uint !core:LookupError
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !core:LookupError
-    + fn ltrim(filter: fnptr(u8)(bool)!) void
+    + fn ltrim(filter: fnptr(u8)(bool)) void
     + fn minimum_free_space(length: uint) void
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
     + fn reduce_size(size: uint) void
-    + fn rtrim(filter: fnptr(u8)(bool)!) void
+    + fn rtrim(filter: fnptr(u8)(bool)) void
     + fn set(index: uint, v: u8) void
     + fn starts_with(str: String, offset: uint) bool
     + fn str_ref(offset: uint, length: uint) ByteBufferStrRef
     + fn to_string() String
-    + fn trim(filter: fnptr(u8)(bool)!) void
+    + fn trim(filter: fnptr(u8)(bool)) void
 }
 ```
 
