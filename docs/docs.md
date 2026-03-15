@@ -392,53 +392,21 @@ my_func() _
 let v = my_func() !!
 ```
 
-Custom error message & checking which error was thrown:
-
-Note: Inside the error handler you can access the error message via `EMSG` and the error code via `E`
+You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown.
 
 ```rust
-fn my_func() String !fail !nope {
-    throw fail, "We failed"
-}
-
 fn main() {
     my_func() ! {
-        println(EMSG) // Prints: We failed
-        // Checking the error code using `match`
-        match E {
+        // Checking the error code using `if`
+        if E.code == E.fail : println("Error code `fail` was thrown")
+        // Using 'match'
+        match E.code {
             E.fail => println("Error code `fail` was thrown")
             E.nope => println("Error code `nope` was thrown")
-            default => println("Another error was thrown")
+            default => println("Another error was thrown") // Only required if not all codes were checked (compiler will tell)
         }
-        // Checking the error code using `if`
-        if E == E.fail : println("Error code `fail` was thrown")
-    }
-}
-```
-
-Error traces: When you using `!>` to pass errors to the parent, you can ask for a trace of these passes. This trace resets every time `throw` is called.
-
-```rust
-use valk:core
-
-fn f1() !fail {
-    f2() !>
-}
-fn f2() !fail {
-    throw fail
-}
-fn main() {
-    f1() ! {
-        let trace = core:get_error_trace()
-        each trace as str {
-            println(str)
-        }
-        // OR
-        core:print_error_trace()
-        // ------------- ERROR TRACE -------------
-        // .../src/example.valk:4
-        // .../src/example.valk:7
-        // -------------- END TRACE --------------
+        // Payload data
+        println(E.message)
     }
 }
 ```
