@@ -9,6 +9,7 @@
 - Rework namespaces
 - Nullable int
 - fnptr -> fn without allocation
+- match without a value
 
 # Upcoming version
 
