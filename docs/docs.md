@@ -19,7 +19,9 @@
 * [Typehints](#typehints)
 * [Functions](#functions)
    * [Errors](#errors)
-   * [Error Handling](#error-handling)
+   * [Error handling](#error-handling)
+   * [Throw functions](#throw-functions)
+   * [Exit functions](#exit-functions)
    * [Closures](#closures)
 
 
@@ -408,6 +410,54 @@ fn main() {
         // Payload data
         println(E.message)
     }
+}
+```
+
+### Throw functions
+
+Throw-functions are used to generate throw statements in order to reduce repetitive code. A throw function is just a normal function that's flagged with `$throw`
+
+Example
+
+```rust
+fn parse_error(parser: MyParser, message: String) !ParseError $throw {
+    // Log message
+    parser.build.log("Parse error: " + message + " | at: " + parser.location.to_string())
+    // Return error
+    throw ParseError {
+        message: message
+        line: parser.location.line
+        col: parser.location.col
+        file: parser.filepath ?? "<generated-code>"
+        content: parser.content
+        at_index: parser.location.index
+    }
+}
+
+fn parse() !ParseError {
+    // ...
+    if something: parse_error(p, "This should not happen")
+    // ...
+}
+```
+
+### Exit functions
+
+Calling a function that's flagged with `$exit` tells the compiler that the function will exit the program. E.g. the `panic` function. This mechanic is used for certain null-checking or error-handling features.
+
+```rust
+fn myexit() $exit {
+    println("I QUIT")
+    exit(0)
+}
+fn main() {
+    let str : ?String = null
+    // ... some code ...
+    if !isset(str) {
+        println("This should not happen")
+        myexit()
+    }
+    // Now the compiler knows that `str` cannot be `null` at this point
 }
 ```
 
