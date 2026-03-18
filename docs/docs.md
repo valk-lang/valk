@@ -18,7 +18,10 @@
 * [Objects](#objects)
 * [Typehints](#typehints)
 * [Functions](#functions)
-   * [Error Handling](#error-handling)
+   * [Errors](#errors)
+   * [Error handling](#error-handling)
+   * [Throw functions](#throw-functions)
+   * [Exit functions](#exit-functions)
    * [Closures](#closures)
 
 
@@ -35,7 +38,7 @@
     * [If/Else](#if-else)
     * [While](#while)
     * [Each](#each)
-    * [Throw](#error-handling)
+    * [Throw](#errors)
 
 <br></td><td width=200px><br>
 
@@ -337,16 +340,40 @@ fn main() {
 }
 ```
 
-### Error handling
+### Errors
 
-Functions can return errors using `throw`. Errors must be defined in your function declaration first.
+Functions can return errors using `throw`. But first you need to define an error type or you can use one of the built-in ones.
+
+To define an error type you must provide atleast 1 error code or atleast extend 1 existing error type. Optionally you can define payload fields in case you want to pass error related data.
 
 ```rust
-fn my_func(must_fail: bool) String !fail {
-    if must_fail : throw fail
-    return "hi"
+error {Error type name} ({codes}) [extends ({error types})] [payload { {field-name}: {type} }]
+// Example
+error MyError (invalid_input, missing_key) extends (LookupError) payload { message: String, key: Key }
+```
+
+Usage:
+
+```rust
+fn find_value(key: Key) Value !MyError {
+    //...
+    throw .missing_key { message: "Key not found", key: Key }
+    //...
 }
 ```
+
+Built-in error types:
+
+```rust
+AnError (error) // Generic error
+ExternError (extern) // For when an extern function returns an error
+IterError (end) // You can end an 'each' loop with any error or you can use this one
+InitError (init) // Common error
+LookupError (missing, exists, range, empty) // For when a function needs to find or store something
+SyntaxError (syntax) // Common error
+```
+
+### Error handling
 
 When calling this function the error must always be handled. There are many ways to do this:
 
@@ -367,54 +394,70 @@ my_func() _
 let v = my_func() !!
 ```
 
-Custom error message & checking which error was thrown:
-
-Note: Inside the error handler you can access the error message via `EMSG` and the error code via `E`
+You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown.
 
 ```rust
-fn my_func() String !fail !nope {
-    throw fail, "We failed"
-}
-
 fn main() {
     my_func() ! {
-        println(EMSG) // Prints: We failed
-        // Checking the error code using `match`
-        match E {
+        // Checking the error code using `if`
+        if E.code == E.fail : println("Error code `fail` was thrown")
+        // Using 'match'
+        match E.code {
             E.fail => println("Error code `fail` was thrown")
             E.nope => println("Error code `nope` was thrown")
-            default => println("Another error was thrown")
+            default => println("Another error was thrown") // Only required if not all codes were checked (compiler will tell)
         }
-        // Checking the error code using `if`
-        if E == E.fail : println("Error code `fail` was thrown")
+        // Payload data
+        println(E.message)
     }
 }
 ```
 
-Error traces: When you using `!>` to pass errors to the parent, you can ask for a trace of these passes. This trace resets every time `throw` is called.
+### Throw functions
+
+Throw-functions are used to generate throw statements in order to reduce repetitive code. A throw function is just a normal function that's flagged with `$throw`
+
+Example
 
 ```rust
-use valk:core
-
-fn f1() !fail {
-    f2() !>
+fn parse_error(parser: MyParser, message: String) !ParseError $throw {
+    // Log message
+    parser.build.log("Parse error: " + message + " | at: " + parser.location.to_string())
+    // Return error
+    throw ParseError {
+        message: message
+        line: parser.location.line
+        col: parser.location.col
+        file: parser.filepath ?? "<generated-code>"
+        content: parser.content
+        at_index: parser.location.index
+    }
 }
-fn f2() !fail {
-    throw fail
+
+fn parse() !ParseError {
+    // ...
+    if something: parse_error(p, "This should not happen")
+    // ...
+}
+```
+
+### Exit functions
+
+Calling a function that's flagged with `$exit` tells the compiler that the function will exit the program. E.g. the `panic` function. This mechanic is used for certain null-checking or error-handling features.
+
+```rust
+fn myexit() $exit {
+    println("I QUIT")
+    exit(0)
 }
 fn main() {
-    f1() ! {
-        let trace = core:get_error_trace()
-        each trace as str {
-            println(str)
-        }
-        // OR
-        core:print_error_trace()
-        // ------------- ERROR TRACE -------------
-        // .../src/example.valk:4
-        // .../src/example.valk:7
-        // -------------- END TRACE --------------
+    let str : ?String = null
+    // ... some code ...
+    if !isset(str) {
+        println("This should not happen")
+        myexit()
     }
+    // Now the compiler knows that `str` cannot be `null` at this point
 }
 ```
 

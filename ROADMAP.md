@@ -7,6 +7,9 @@
 - Release 0.1.9
 - Rework errors
 - Rework namespaces
+- Nullable int
+- fnptr -> fn without allocation
+- match without a value
 
 # Upcoming version
 
