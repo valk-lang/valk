@@ -5,7 +5,7 @@
 
 ```
 - Release 0.1.9
-- Rework errors
++ Rework errors
 - Rework namespaces
 - Nullable int
 - fnptr -> fn without allocation
