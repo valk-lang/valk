@@ -4,8 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.1.9
-+ Rework errors
+- Release 0.1.10
 - Rework namespaces
 - Nullable int
 - fnptr -> fn without allocation
@@ -55,6 +54,9 @@
 ## Done
 
 ```
++ Release 0.1.9
++ Rework errors
+
 + Release 0.1.8
 + Multi assign
 + Directory as package src
