@@ -10,7 +10,7 @@ DIST_DEPS=
 DIST_COMP=valk
 vc=valk
 
-FLAGS=--def "VERSION=$(VERSION)"
+FLAGS=--def "VERSION=$(VERSION)" -L "/opt/llvm15/lib"
 TEST_FLAGS=--test --def "DEF_TEST=TestValue"
 
 # Build
