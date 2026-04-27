@@ -5,6 +5,9 @@
 
 ```
 - Release 0.1.10
+- options: --no-default-includes --link-args {args} --sysroot {path}
+
+- Release 0.1.11
 - Rework namespaces
 - Nullable int
 - fnptr -> fn without allocation
