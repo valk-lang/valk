@@ -5,7 +5,7 @@
 
 ```
 - Release 0.1.10
-- options: --no-default-includes --link-args {args} --sysroot {path}
+- options: --no-default-includes --link-arg {arg} --sysroot {path}
 
 - Release 0.1.11
 - Rework namespaces
