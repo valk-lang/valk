@@ -1,6 +1,6 @@
 
-VALKV=0.1.9
-VERSION=0.1.10
+VALKV=0.1.10
+VERSION=0.1.11
 
 HDRS=$(wildcard headers/*.valk.h)
 SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk) $(wildcard src/doc/*.valk) $(wildcard src/lsp/*.valk)
@@ -11,19 +11,20 @@ DIST_COMP=valk
 vc=valk
 
 FLAGS=--def "VERSION=$(VERSION)"
+DEV_FLAGS=-L /opt/llvm15/lib
 TEST_FLAGS=--test --def "DEF_TEST=TestValue"
 
 # Build
 valk: $(SRC) $(HDRS)
-	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS)
+	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
 valk2: valk
-	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
+	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
 valk3: valk2
-	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
+	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
 valkvg: valk
-	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS)
+	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
 valkexe: $(SRC) $(HDRS)
-	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static
+	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS) --target win-x64 --static
 
 doc: valk
 	./valk doc lib/ -o docs/api.md --markdown --no-private
@@ -105,7 +106,9 @@ linux-x64: $(SRC) $(HDRS) $(DIST_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
-	$(DIST_COMP) build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean $(FLAGS)
+	$(DIST_COMP) build . src/*.valk -o ./dist/linux-x64/valk -vv --static --target linux-x64 --clean $(FLAGS) \
+	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" -L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" -L "toolchains/toolchains/linux-amd64/lib64" -L "toolchains/libraries/linux-llvm-15-x64/lib" \
+	--sysroot toolchains/toolchains/linux-amd64 -l pthread -l dl
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
