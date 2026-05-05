@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.1.10
+- Release 0.1.11
 - Rework namespaces
 - Nullable int
 - fnptr -> fn without allocation
@@ -54,6 +54,9 @@
 ## Done
 
 ```
++ Release 0.1.10
++ options: --no-default-libs --link-arg {arg} --sysroot {path}
+
 + Release 0.1.9
 + Rework errors
 
