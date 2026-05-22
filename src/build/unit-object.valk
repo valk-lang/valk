@@ -2,6 +2,37 @@
 use valk:fs
 use helper
 use valk:thread
+use llvm
+
+fn build_objects(b: Build) !Error {
+
+    // Init LLVM
+    let t = b.target
+    if (t.arch == "x64") {
+        // llvm:LLVMInitializeX86Disassembler()
+        llvm:LLVMInitializeX86TargetInfo()
+        llvm:LLVMInitializeX86Target()
+        llvm:LLVMInitializeX86TargetMC()
+        llvm:LLVMInitializeX86AsmPrinter()
+        // llvm:LLVMInitializeX86AsmParser()
+    } else if (t.arch == "arm64") {
+        llvm:LLVMInitializeAArch64TargetInfo()
+        llvm:LLVMInitializeAArch64Target()
+        llvm:LLVMInitializeAArch64TargetMC()
+        llvm:LLVMInitializeAArch64AsmPrinter()
+    }
+
+    // Build object files
+    let thrs = Array[thread:Thread]{}
+    each b.units as u {
+        let thr = unit_object(u) !>
+        if isset(thr) : thrs.append(thr)
+    }
+    // Wait for threads
+    each thrs as thr {
+        thr.wait()
+    }
+}
 
 fn unit_object(u: Unit) ?thread:Thread !Error {
     // IR
@@ -16,15 +47,158 @@ fn unit_object(u: Unit) ?thread:Thread !Error {
     b.log3("Create object file: " + path_o)
 
     if !helper:file_has_same_content(path_ir_prev, ir) {
-        // IR changed
-        // Create new object file
+        // Write IR file
         b.log3("Write IR: " + path_ir)
         fs:write(path_ir, ir) ! b.error("Failed to write IR file: " + path_ir)
-        //
-        build_ir(path_ir, path_o, b.target)
+
+        // Convert to object file
+        b.log3("Generate: " + path_o)
+        let err = llvm_build(path_ir, path_o, b.target, b.is_optimize)
+        if isset(err) : b.error(err)
+
+        // Update IR cache file
+        fs:copy(path_ir, path_ir_prev) ! b.error("Failed to write IR file: " + path_ir_prev)
     }
     return null
 }
 
-fn build_ir(path_ir: String, path_o: String, target: Target) {
+fn llvm_build(path_ir: String, path_o: String, target: Target, optimize: bool) ?String {
+
+    let ctx = llvm:LLVMContextCreate()
+    llvm:LLVMContextSetOpaquePointers(ctx, true)
+
+    let error: ?cstring = null
+    let buf: ?llvm:LLVMMemoryBufferRef = null
+    llvm:LLVMCreateMemoryBufferWithContentsOfFile(path_ir.data, @ref(buf), @ref(error))
+    if isset(error) : return "LLVM create buffer error: " + error
+    if !isset(buf) : return "LLVM failed to load IR content"
+
+    let mod : ?llvm:LLVMModuleRef = null
+    if llvm:LLVMParseIRInContext(ctx, buf, @ref(mod), @ref(error)) {
+        if isset(error) : return "LLVM parse error: " + error
+        return "LLVM parse error: <no-error-message>"
+    }
+    if !isset(mod) : return "LLVM error: Module was not created"
+
+    if llvm:LLVMVerifyModule(mod, llvm:LLVMReturnStatusAction, @ref(error)) {
+        if isset(error) : return "LLVM error in: " + path_ir + "\nLLVM verify error: " + error
+        return "LLVM verify error: <no-error-message>"
+    }
+
+    // let code = llvm:LLVMPrintModuleToString(mod);
+    // println(code)
+
+    // Optimize
+    if optimize {
+        let passBuilder = llvm:LLVMPassManagerBuilderCreate();
+
+        // Note: O3 can produce slower code than O2 sometimes
+        llvm:LLVMPassManagerBuilderSetOptLevel(passBuilder, 3);
+        llvm:LLVMPassManagerBuilderSetSizeLevel(passBuilder, 0);
+        llvm:LLVMPassManagerBuilderUseInlinerWithThreshold(passBuilder, 1000);
+
+        let func_passes = llvm:LLVMCreateFunctionPassManagerForModule(mod);
+        let mod_passes = llvm:LLVMCreatePassManager();
+
+        llvm:LLVMPassManagerBuilderPopulateFunctionPassManager(passBuilder, func_passes);
+        llvm:LLVMPassManagerBuilderPopulateModulePassManager(passBuilder, mod_passes);
+
+        llvm:LLVMPassManagerBuilderDispose(passBuilder);
+        llvm:LLVMInitializeFunctionPassManager(func_passes);
+
+        let func = llvm:LLVMGetFirstFunction(mod)
+        while isset(func) {
+            llvm:LLVMRunFunctionPassManager(func_passes, func)
+            func = llvm:LLVMGetNextFunction(func)
+        }
+
+        llvm:LLVMFinalizeFunctionPassManager(func_passes);
+        llvm:LLVMRunPassManager(mod_passes, mod);
+
+        llvm:LLVMDisposePassManager(func_passes);
+        llvm:LLVMDisposePassManager(mod_passes);
+    }
+    //
+
+    // Generate .o file
+    let target_machine = llvm_set_target(mod, target) ! {
+        return E.msg
+    }
+
+    // Emit assembly
+    // if llvm:LLVMTargetMachineEmitToFile(target_machine, mod, path_o.replace(".o", ".s").data, llvm:LLVMAssemblyFile, @ref(error)) {
+    //     if isset(error) {
+    //         let str : String = error
+    //         llvm:LLVMDisposeMessage(error)
+    //         llvm_error("LLVM failed to create .s file: " + str)
+    //     } else: llvm_error("LLVM failed to create .s file")
+    // }
+
+    if llvm:LLVMTargetMachineEmitToFile(target_machine, mod, path_o.data, llvm:LLVMObjectFile, @ref(error)) {
+        if isset(error) {
+            let str : String = error
+            llvm:LLVMDisposeMessage(error)
+            return "LLVM failed to create .o file: " + str
+        } else: return "LLVM failed to create .o file"
+    }
+
+    llvm:LLVMDisposeMessage(error);
+    llvm:LLVMDisposeModule(mod);
+    llvm:LLVMContextDispose(ctx);
+
+    return null
+}
+
+
+
+fn llvm_set_target(mod: llvm:LLVMModuleRef, t: Target) llvm:LLVMTargetMachineRef !InitError {
+
+    let error : ?cstring = null;
+    let triple : ?String = null;
+    let cpu = "generic";
+    //
+    if (t.arch == "x64") {
+        if (t.os == "linux") {
+            triple = "x86_64-pc-linux-gnu";
+        } else if (t.os == "macos") {
+            triple = "x86_64-apple-darwin";
+        } else if (t.os == "win") {
+            triple = "x86_64-pc-windows-msvc";
+        }
+    } else if (t.arch == "arm64") {
+        if (t.os == "linux") {
+            triple = "aarch64-pc-linux-gnu";
+        } else if (t.os == "macos") {
+            triple = "arm64-apple-darwin";
+        } else if (t.os == "win") {
+            triple = "aarch64-pc-windows-msvc";
+        }
+    }
+
+    if !isset(triple) : throw .error { msg: "Unknown llvm target architecture" }
+
+    let target : ?llvm:LLVMTargetRef = null;
+    if llvm:LLVMGetTargetFromTriple(triple.data, @ref(target), @ref(error)) {
+        if isset(error) {
+            let err : String = error
+            llvm:LLVMDisposeMessage(error);
+            throw .error { msg: "LLVM - Unknow target: " + err }
+        }
+        throw .error { msg: "LLVM - Unknow target" }
+    }
+
+    if !isset(target) : throw .error { msg: "LLVM failed to create target object" }
+
+    // let features = "+sse,+sse2"
+    let machine = llvm:LLVMCreateTargetMachine(target, triple.data, cpu.data, null, llvm:LLVMCodeGenLevelDefault, llvm:LLVMRelocPIC, llvm:LLVMCodeModelDefault);
+
+    if !isset(machine) : throw .error { msg: "LLVM failed to create target machine object" }
+
+    let data_layout = llvm:LLVMCreateTargetDataLayout(machine)
+    let data_layout_str = llvm:LLVMCopyStringRepOfTargetData(data_layout)
+
+    llvm:LLVMSetTarget(mod, triple.data)
+    llvm:LLVMSetDataLayout(mod, data_layout_str)
+
+    return machine
 }
