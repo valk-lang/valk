@@ -12,7 +12,7 @@ vc=valk
 
 FLAGS=--def "VERSION=$(VERSION)"
 DEV_FLAGS=-L /opt/llvm15/lib
-TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vvv
+TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
 
 # Build
 valk: $(SRC) $(HDRS)
