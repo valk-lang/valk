@@ -6,7 +6,7 @@
 ```
 - Release 0.1.11
 - Rework namespaces
-- Nullable int
++ Nullable int
 - fnptr -> fn without allocation
 - match without a value
 
