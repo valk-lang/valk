@@ -7,7 +7,7 @@
 - Release 0.1.11
 - Rework namespaces
 + Nullable int
-- fnptr -> fn without allocation
++ fnptr -> fn without allocation
 - match without a value
 
 # Upcoming version
