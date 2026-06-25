@@ -8,6 +8,7 @@
 - Rework namespaces
 + Nullable int
 + fnptr -> fn without allocation
+- use error pass handler by default
 
 # Upcoming version
 
