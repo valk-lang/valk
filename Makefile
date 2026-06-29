@@ -18,7 +18,7 @@ TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
 valk: $(SRC) $(HDRS)
 	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
 valk2: valk
-	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
+	./valk build . src/*.valk -o ./valk2 -vvv $(FLAGS) $(DEV_FLAGS)
 valk3: valk2
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
 valkvg: valk
