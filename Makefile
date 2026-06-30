@@ -98,7 +98,7 @@ ci-macos: $(SRC) $(HDRS)
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC) $(HDRS)
-	ls -l ".\llvm\lib\"
+	dir ".\llvm\lib\"
 	~/valk-dev/valk.exe -h || echo ""
 	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
 	-L ".\llvm\lib\"
