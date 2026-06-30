@@ -9,7 +9,7 @@
 + Nullable int
 + fnptr -> fn without allocation
 + use error pass handler by default
-- 1 object per file instead of namespace
++ 1 object per file instead of namespace
 
 # Upcoming version
 
@@ -17,7 +17,7 @@
 - Mysql or Postgres package
 - Interfaces
 - Union types
-- Release 0.1.1
+- Release 0.1.12
 
 # Next steps
 
