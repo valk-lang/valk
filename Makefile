@@ -100,7 +100,7 @@ ci-macos: $(SRC) $(HDRS)
 ci-win: $(SRC) $(HDRS)
 	~/valk-dev/valk.exe -h || echo ""
 	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
-	-L ./llvm/lib/
+	-L ~/valk-dev/llvm/lib/
 
 # Distributions
 linux-x64: $(SRC) $(HDRS) $(DIST_DEPS)
