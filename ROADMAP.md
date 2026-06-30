@@ -5,10 +5,11 @@
 
 ```
 - Release 0.1.11
-- Rework namespaces
++ Rework namespaces
 + Nullable int
 + fnptr -> fn without allocation
 + use error pass handler by default
+- 1 object per file instead of namespace
 
 # Upcoming version
 
