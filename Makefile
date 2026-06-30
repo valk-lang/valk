@@ -18,11 +18,11 @@ TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
 valk: $(SRC) $(HDRS)
 	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
 valk2: valk
-	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
+	./valk build -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
 valk3: valk2
-	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
+	./valk2 build -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
 valkvg: valk
-	valgrind ./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
+	valgrind ./valk build -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
 valkexe: $(SRC) $(HDRS)
 	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS) --target win-x64 --static
 
@@ -55,30 +55,30 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 
 watchtest: valk2
-	./valk2 build ./tests/*.valk ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w -v
+	./valk2 build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w -v
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1" --debug
+	./valk build ./tests $(TEST_FLAGS) -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1" --debug
 	./debug/test-win.exe
 
 test-macos-build: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
+	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
+	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
 
 # Testing
 test-cross: valk
 	mkdir -p ./debug
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target linux-x64
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target macos-x64
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target macos-arm64
-	./valk build ./tests/*.valk ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target win-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target linux-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target macos-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target macos-arm64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target win-x64
 
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
