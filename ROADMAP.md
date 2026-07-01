@@ -4,20 +4,16 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.1.11
-+ Rework namespaces
-+ Nullable int
-+ fnptr -> fn without allocation
-+ use error pass handler by default
-+ 1 object per file instead of namespace
-
-# Upcoming version
-
+- Release 0.1.12
+- Fix errors missing payload, e.g. println(E.message) -> crash, because no message was set in the throw code
 - Package platform
 - Mysql or Postgres package
 - Interfaces
 - Union types
-- Release 0.1.12
+
+# Upcoming version
+
+/
 
 # Next steps
 
@@ -55,6 +51,13 @@
 ## Done
 
 ```
++ Release 0.1.11
++ Rework namespaces
++ Nullable int
++ fnptr -> fn without allocation
++ use error pass handler by default
++ 1 object per file instead of namespace
+
 + Release 0.1.10
 + options: --no-default-libs --link-arg {arg} --sysroot {path}
 
