@@ -1,5 +1,6 @@
 
 use fs
+use io
 
 shared ca_cert : ?String
 global ca_dirs : ?Array[String]
@@ -10,12 +11,16 @@ global ca_paths : ?Array[String]
 }
 
 + class SSL {
-    ~ ctx: OSSL
+    ~ ctx: SSL_CTX
     ~ ssl: OSSL
-    - host: String
-    - ca_cert_path: ?String
+    ~ cert_dir: ?String
+    ~ cert_file: ?String
+    ~ error_code: uint (0)
+    - error_message: String ("")
+    - error_changed: bool (false)
+    ~ connected: bool (false)
 
-    + static fn ca_paths() Array[String] {
+    + static fn default_ca_cert_paths() Array[String] {
         let paths = ca_paths
         if isset(paths) : return paths
         // List
@@ -44,62 +49,155 @@ global ca_paths : ?Array[String]
         return paths
     }
 
-    static fn try_ca_path(ctx: SSL_CTX, path: ?String) bool {
-        if !isset(path) : return false
-        #if OS == win
-        if path.starts_with("\\\\") : return false
-        #end
-        return SSL_CTX_load_verify_locations(ctx, path.data, null) == 1
-    }
-
-    static fn new(fd: FD, host: String, ca_path: ?String (null)) SSL {
+    + static fn new() SSL {
         let method = TLS_client_method()
         let ctx = SSL_CTX_new(method)
-
-        // CA cert path
-        // User defined cert
-        if SELF.try_ca_path(ctx, ca_path) {
-        } else {
-
-            let found = false
-            let ca_paths = SELF.ca_paths()
-            each ca_paths as path {
-                if SELF.try_ca_path(ctx, path.data_cstring) {
-                    ca_path = path
-                    found = true
-                    break
-                }
-            }
-
-            if !found {
-                SSL_CTX_set_default_verify_paths(ctx)
-            }
-        }
-
-        // Verify settings
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
-
-        // Ciphers
-        // SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, null)
-        // SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
-
-        // Init SSL
         let ssl = SSL_new(ctx)
-        SSL_set_fd(ssl, fd.@cast(i32))
-        SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host.data)
 
-        return SSL {
+        let res = SSL {
             ctx: ctx
             ssl: ssl
-            host: host
-            ca_cert_path: ca_path
         }
+
+        let found = false
+        let ca_paths = SELF.default_ca_cert_paths()
+        each ca_paths as path {
+            res.set_ca_cert(path) ! continue
+            found = true
+            break
+        }
+
+        if !found {
+            SSL_CTX_set_default_verify_paths(ctx)
+        }
+
+        return res
     }
 
-    + static fn last_error_msg() String {
-        let e : uint = ERR_get_error()
-        let msg = ERR_error_string(e, null)
-        return msg
+    + fn set_ca_cert(path: ?String) !NetError {
+        let dir = this.cert_dir
+        let dir_arg = isset(dir) ? dir.data : null
+        if !isset(path) {
+            SSL_CTX_load_verify_locations(this.ctx, null, dir_arg)
+            return
+        }
+        #if OS == win
+        if path.starts_with("\\\\") : throw .ssl
+        #end
+        if SSL_CTX_load_verify_locations(this.ctx, path.data, dir_arg) != 1 : throw .ssl
+    }
+    + fn set_ca_cert_dir(dir: ?String) !NetError {
+        let file = this.cert_file
+        let file_arg = isset(file) ? file.data : null
+        if !isset(dir) {
+            SSL_CTX_load_verify_locations(this.ctx, file_arg, null)
+            return
+        }
+        #if OS == win
+        if path.starts_with("\\\\") : throw .ssl
+        #end
+        if SSL_CTX_load_verify_locations(this.ctx, file_arg, dir.data) != 1 : throw .ssl
+    }
+    + fn set_fd(fd: FD) {
+        SSL_set_fd(this.ssl, fd.@cast(i32))
+    }
+    + fn set_host(host: String) {
+        SSL_ctrl(this.ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, host.data)
+    }
+    + fn set_verify(enable: bool) {
+        SSL_CTX_set_verify(this.ctx, enable ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, null);
+    }
+
+    + fn connect() !NetError {
+        while true {
+            let res = SSL_connect(this.ssl)
+            if res != 1 {
+                let err = SSL_get_error(this.ssl, res)
+                if err == ERROR.WANT_READ {
+                    let fd = SSL_get_fd(this.ssl)
+                    if fd == -1 : throw .ssl
+                    io:await_fd(fd, true, false)
+                    continue
+                }
+                if err == ERROR.WANT_WRITE {
+                    let fd = SSL_get_fd(this.ssl)
+                    if fd == -1 : throw .ssl
+                    io:await_fd(fd, false, true)
+                    continue
+                }
+                this.update_error()
+                throw .ssl
+            }
+            break
+        }
+        this.connected = true
+    }
+
+    + fn write(from: ptr, len: uint) uint !NetError {
+        let wbytes : i32 = 0 
+        while true {
+            wbytes = SSL_write(this.ssl, from, len);
+            if wbytes < 0 {
+                // SSL_ERROR_WANT_WRITE: 3
+                let err = SSL_get_error(this.ssl, wbytes);
+                if err == 3 {
+                    // EAGAIN
+                    #if OS != macos
+                    continue
+                    #else
+                    let ev = io:await_fd(this.fd, false, true)
+                    if ev.is_closed() || !ev.is_writable() : throw .closed
+                    continue
+                    #end
+                }
+                throw .write
+            }
+            break
+        }
+        return wbytes
+    }
+
+    + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !NetError {
+        let rcvd : i32 = 0
+        while true {
+            buffer.minimum_free_space(max_bytes)
+            rcvd = SSL_read(this.ssl, buffer.data.@offset(buffer.length), max_bytes);
+            if rcvd <= 0 {
+                // SSL_ERROR_NONE: 0
+                // SSL_ERROR_WANT_READ: 2
+                // SSL_ERROR_ZERO_RETURN: 6
+                let err = SSL_get_error(this.ssl, rcvd);
+                if err == 2 {
+                    #if OS != macos
+                    continue
+                    #else
+                    let ev = io:await_fd(this.fd, true, false)
+                    if ev.is_closed() || !ev.is_readable() : throw .closed
+                    continue
+                    #end
+                }
+                throw .ssl
+            }
+            buffer.length += rcvd
+            break
+        }
+        return rcvd
+    }
+
+    + fn get_error() uint {
+        return this.error_code
+    }
+    + fn get_error_message() String {
+        if !this.error_changed : return this.error_message
+        let msg = ERR_error_string(this.error_code, null)
+        this.error_message = msg
+        this.error_changed = false
+        return this.error_message
+    }
+
+    fn update_error() {
+        this.error_code = ERR_get_error()
+        this.error_changed = true
     }
 
     fn gc_free() {
