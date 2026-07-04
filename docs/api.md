@@ -689,7 +689,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn index_of(byte: u8, start_index: uint (0)) uint !core:LookupError
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !core:LookupError
     + fn ltrim(filter: fnptr(u8)(bool)) void
-    + fn minimum_free_space(length: uint) void
+    + fn reserve_space(length: uint) void
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
