@@ -243,7 +243,7 @@ s.part(start_index, length) String // Sub string
 s.range(start_index, end_index) String // Sub string using end-index
 ```
 
-Full `String` API: [valk:type](api.md#type)
+Full `String` API: [valk:type](api.md#core)
 
 ## Arrays
 
@@ -262,7 +262,7 @@ each arr as value {}
 each arr as value, index {}
 ```
 
-Full `Array` API: [valk:type](api.md#type)
+Full `Array` API: [valk:type](api.md#core)
 
 ## Maps
 
@@ -282,7 +282,7 @@ each arr as value, key {}
 each arr as value, key, index {}
 ```
 
-Full `Map` API: [valk:type](api.md#type)
+Full `Map` API: [valk:type](api.md#core)
 
 If you need non-string keys, use `HashMap`. `HashMap` and `Map` are compatible types.
 
@@ -294,7 +294,7 @@ let b : HashMap[String, uint] = a
 let c : Map[uint] = b
 ```
 
-Full `HashMap` API: [valk:type](api.md#type)
+Full `HashMap` API: [valk:type](api.md#core)
 
 ## Objects
 
