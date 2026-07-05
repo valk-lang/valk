@@ -91,7 +91,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn clear_part(index: uint, len: uint) void
     + fn clear_until(index: uint) void
     + fn clone() ByteBuffer
-    + fn create_reader() ByteReader
     + fn equals_str(str: String) bool
     + fn fill(with: u8, amount: uint) void
     + fn get(index: uint) u8
@@ -101,6 +100,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
+    + fn reader() ByteReader
     + fn reduce_size(size: uint) void
     + fn ref(offset: uint, length: uint) ByteBufferRef
     + fn reserve_space(length: uint) void
