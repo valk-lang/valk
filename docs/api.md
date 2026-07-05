@@ -20,7 +20,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
-+ fn getenv(var: String) String !pkg_1:core:LookupError
++ fn getenv(var: String) String !LookupError
 + fn panic(msg: String) void
 + fn race_lock() void
 + fn race_unlock() void
@@ -51,24 +51,24 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equal_ignore_order(array: Array[T]) bool
     + fn filter(func: ?fn(T)(bool) (...)) Array[T]
     + fn fit_index(index: uint) void
-    + fn get(index: uint) T !pkg_1:core:LookupError
+    + fn get(index: uint) T !LookupError
     + fn increase_size(new_size: uint) GcPtr
-    + fn index_of(item: T) uint !pkg_1:core:LookupError
+    + fn index_of(item: T) uint !LookupError
     + fn intersect(with: Array[T]) Array[T]
     + fn iter() Slice[T]
     + fn lock() void
     + fn merge(items: Array[T]) Array[T]
     + static fn new(start_size: uint (2)) Array[T]
     + fn part(start: uint, amount: uint) Array[T]
-    + fn pop_first() T !pkg_1:core:LookupError
-    + fn pop_last() T !pkg_1:core:LookupError
+    + fn pop_first() T !LookupError
+    + fn pop_last() T !LookupError
     + fn prepend(item: T, unique: bool (false)) Array[T]
     + fn prepend_many(items: Array[T]) Array[T]
     + fn range(start: uint, end: uint, inclusive: bool (true)) Array[T]
     + fn remove(index: uint) Array[T]
     + fn remove_value(value: T) Array[T]
     + fn reverse() Array[T]
-    + fn set(index: uint, value: T) void !pkg_1:core:LookupError
+    + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
     + fn slice(start: uint, amount: uint) Slice[T]
@@ -95,19 +95,19 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn fill(with: u8, amount: uint) void
     + fn get(index: uint) u8
-    + fn index_of(byte: u8, start_index: uint (0)) uint !pkg_1:core:LookupError
-    + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !pkg_1:core:LookupError
+    + fn index_of(byte: u8, start_index: uint (0)) uint !LookupError
+    + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !LookupError
     + fn ltrim(filter: fnptr(u8)(bool)) void
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
     + fn reduce_size(size: uint) void
+    + fn ref(offset: uint, length: uint) ByteBufferRef
     + fn reserve_space(length: uint) void
     + fn rtrim(filter: fnptr(u8)(bool)) void
     + fn set(index: uint, v: u8) void
     + fn skip(amount: uint) void
     + fn starts_with(str: String, offset: uint) bool
-    + fn str_ref(offset: uint, length: uint) ByteBufferStrRef
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn write_big_endian(value: uint, bytes: uint) void
@@ -170,7 +170,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class FlatMap[K, T] {
     + fn clear() FlatMap[K, T]
     + fn copy() FlatMap[K, T]
-    + fn get(key: K) T !pkg_1:core:LookupError
+    + fn get(key: K) T !LookupError
     + fn has(key: K) bool
     + fn has_value(value: T) bool
     + fn keys() Array[K]
@@ -180,7 +180,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn remove(key: K) FlatMap[K, T]
     + fn set(key: K, value: T) FlatMap[K, T]
     + fn set_many(map: FlatMap[K, T]) FlatMap[K, T]
-    + fn set_unique(key: K, value: T) void !pkg_1:core:LookupError
+    + fn set_unique(key: K, value: T) void !LookupError
     + fn sort_keys() FlatMap[K, T]
     + fn values() Array[T]
 }
@@ -190,7 +190,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class HashMap[K, T] {
     + fn clear() HashMap[K, T]
     + fn copy() HashMap[K, T]
-    + fn get(key: K) T !pkg_1:core:LookupError
+    + fn get(key: K) T !LookupError
     + fn has(key: K) bool
     + fn has_value(value: T) bool
     + fn keys() Array[K]
@@ -217,7 +217,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class Mutex {
     + fn await_unlock() void
     + fn lock() void
-    + static fn new() Mutex !pkg_1:core:InitError
+    + static fn new() Mutex !InitError
     + fn unlock() void
 }
 ```
@@ -227,7 +227,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ count: uint
 
     + fn add(item: T) void
-    + fn get() T !pkg_1:core:LookupError
+    + fn get() T !LookupError
     + static fn new(start_size: uint (2)) Pool[T]
 }
 ```
@@ -244,10 +244,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn escape() String
     + static fn from_json_value(val: Value) String
     + fn get(index: uint) u8
-    + fn hex_to_int() int !pkg_1:core:SyntaxError
-    + fn hex_to_uint() uint !pkg_1:core:SyntaxError
-    + fn index_of(part: String, start_index: uint (0)) uint !pkg_1:core:LookupError
-    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !pkg_1:core:LookupError
+    + fn hex_to_int() int !SyntaxError
+    + fn hex_to_uint() uint !SyntaxError
+    + fn index_of(part: String, start_index: uint (0)) uint !LookupError
+    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
     + fn is_alpha(allow_extra_bytes: String ("")) bool
     + fn is_alpha_numeric(allow_extra_bytes: String ("")) bool
     + fn is_empty() bool
@@ -258,8 +258,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn ltrim(part: String, limit: uint (0)) String
     + static fn make_empty(length: uint) String
     + static fn make_from_ptr(data: ptr, length: uint) String
-    + fn octal_to_int() int !pkg_1:core:SyntaxError
-    + fn octal_to_uint() uint !pkg_1:core:SyntaxError
+    + fn octal_to_int() int !SyntaxError
+    + fn octal_to_uint() uint !SyntaxError
     + fn pad_left(char: u8, length: uint) String
     + fn pad_right(char: u8, length: uint) String
     + fn part(start_index: uint, length: uint) String
@@ -268,10 +268,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn rtrim(part: String, limit: uint (0)) String
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
-    + fn to_float() f64 !pkg_1:core:SyntaxError
-    + fn to_int() int !pkg_1:core:SyntaxError
+    + fn to_float() f64 !SyntaxError
+    + fn to_int() int !SyntaxError
     + fn to_json_value() Value
-    + fn to_uint() uint !pkg_1:core:SyntaxError
+    + fn to_uint() uint !SyntaxError
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
@@ -310,7 +310,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class cstring {
     + fn get(index: uint) u8
-    + fn index_of(find: u8) uint !pkg_1:core:LookupError
+    + fn index_of(find: u8) uint !LookupError
     + fn length() uint
     + fn to_string() String
 }
@@ -445,23 +445,23 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals(data: ptr, len: uint) bool
     + fn equals_string(str: String) bool
     + fn fill_bytes(byte: u8, amount: uint) void
-    + fn index_of_byte(byte: u8, memory_size: uint) uint !pkg_1:core:LookupError
+    + fn index_of_byte(byte: u8, memory_size: uint) uint !LookupError
     + fn index_of_byte_inf(byte: u8) uint
     + fn print_bytes(length: uint, end_with_newline: bool (true)) void
     + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8
     + fn read_cstring(memory_size: uint) String
     + fn read_cstring_inf() String
-    + fn read_hex_int(len: uint) int !pkg_1:core:SyntaxError
+    + fn read_hex_int(len: uint) int !SyntaxError
     + fn read_hex_int_dynamic(max_bytes: uint) (int, uint)
-    + fn read_hex_uint(len: uint) uint !pkg_1:core:SyntaxError
+    + fn read_hex_uint(len: uint) uint !SyntaxError
     + fn read_hex_uint_dynamic(max_bytes: uint) (uint, uint)
-    + fn read_int(len: uint) int !pkg_1:core:SyntaxError
+    + fn read_int(len: uint) int !SyntaxError
     + fn read_int_dynamic(max_bytes: uint) (int, uint)
     + fn read_little_endian(bytes: uint) uint
-    + fn read_octal_int(len: uint) int !pkg_1:core:SyntaxError
+    + fn read_octal_int(len: uint) int !SyntaxError
     + fn read_octal_int_dynamic(max_bytes: uint) (int, uint)
-    + fn read_octal_uint(len: uint) uint !pkg_1:core:SyntaxError
+    + fn read_octal_uint(len: uint) uint !SyntaxError
     + fn read_octal_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_string(len: uint) String
     + fn read_u16_be() u16
@@ -470,7 +470,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_u32_le() u32
     + fn read_u64_be() u64
     + fn read_u64_le() u64
-    + fn read_uint(len: uint) uint !pkg_1:core:SyntaxError
+    + fn read_uint(len: uint) uint !SyntaxError
     + fn read_uint_be() uint
     + fn read_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_uint_le() uint
@@ -629,7 +629,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt_hash(password: String, cost: uint (12)) String
 + fn bcrypt_verify(password: String, hash: String) bool
 + fn blowfish_encrypt_block(context: BlowfishContext, input: ptr[u8], output: ptr[u8]) void
-+ fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !pkg_1:crypto:CryptoError
++ fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !valk:crypto:CryptoError
 + fn blowfish_init_state(context: BlowfishContext) void
 + fn blowfish_xor_block(data: &[u8], salt: ByteBuffer, saltIndex: &[uint]) void
 + fn sha1_encode(str: String) String
@@ -641,8 +641,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Blake2b {
     + fn finalize(out: ptr[u8]) void
-    + static fn hash_str(input: String, key: ?String (null), lowercase: bool (true)) String !pkg_1:crypto:CryptoError
-    + static fn new(hash_size: uint, key: ?String (null)) Blake2b !pkg_1:crypto:CryptoError
+    + static fn hash_str(input: String, key: ?String (null), lowercase: bool (true)) String !valk:crypto:CryptoError
+    + static fn new(hash_size: uint, key: ?String (null)) Blake2b !valk:crypto:CryptoError
     + fn update(data: ptr[u8], length: uint) void
 }
 ```
@@ -692,9 +692,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
 + fn chdir(path: String) void
-+ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !pkg_1:io:IoError
++ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !valk:io:IoError
 + fn cwd() String
-+ fn delete(path: String) void !pkg_1:io:IoError
++ fn delete(path: String) void !valk:io:IoError
 + fn delete_recursive(path: String) void
 + fn dir_of(path: String) String
 + fn exe_dir() String
@@ -702,26 +702,26 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn exists(path: String) bool
 + fn ext(path: String, with_dot: bool (false)) String
 + fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (...)) Array[String]
-+ fn home_dir() String !pkg_1:core:ExternError
++ fn home_dir() String !ExternError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
 + fn mime(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (493)) void !pkg_1:io:IoError
-+ fn modified_time(path: String) uint !pkg_1:io:IoError
-+ fn move(from_path: String, to_path: String) void !pkg_1:io:IoError
-+ fn open(path: String, writable: bool, append_on_write: bool) i32 !pkg_1:io:IoError
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) i32 !pkg_1:io:IoError
++ fn mkdir(path: String, permissions: u32 (493)) void !valk:io:IoError
++ fn modified_time(path: String) uint !valk:io:IoError
++ fn move(from_path: String, to_path: String) void !valk:io:IoError
++ fn open(path: String, writable: bool, append_on_write: bool) i32 !valk:io:IoError
++ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) i32 !valk:io:IoError
 + fn path(path: String) Path
-+ fn read(path: String) String !pkg_1:io:IoError
++ fn read(path: String) String !valk:io:IoError
 + fn realpath(path: String) String
 + fn resolve(path: String) String
-+ fn rmdir(path: String) void !pkg_1:io:IoError
++ fn rmdir(path: String) void !valk:io:IoError
 + fn size(path: String) uint
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !pkg_1:io:IoError
-+ fn symlink(link: String, target: String, is_directory: bool) void !pkg_1:io:IoError
++ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !valk:io:IoError
++ fn symlink(link: String, target: String, is_directory: bool) void !valk:io:IoError
 + fn sync() void
-+ fn write(path: String, content: String, append: bool (false)) void !pkg_1:io:IoError
-+ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !pkg_1:io:IoError
++ fn write(path: String, content: String, append: bool (false)) void !valk:io:IoError
++ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !valk:io:IoError
 ```
 
 ## Classes for 'fs'
@@ -733,10 +733,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ reading: bool
 
     + fn close() void
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !pkg_1:io:IoError
-    + fn write(str: String) void !pkg_1:io:IoError
-    + fn write_buffer(buffer: ByteBuffer) void !pkg_1:io:IoError
-    + fn write_from_ptr(from: ptr, len: uint) void !pkg_1:io:IoError
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !valk:io:IoError
+    + fn write(str: String) void !valk:io:IoError
+    + fn write_buffer(buffer: ByteBuffer) void !valk:io:IoError
+    + fn write_from_ptr(from: ptr, len: uint) void !valk:io:IoError
 }
 ```
 
@@ -746,7 +746,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ size: uint
 
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !pkg_1:io:IoError
+    + static fn create_from_file(path: String) InMemoryFile !valk:io:IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn save(path: String) void
 }
@@ -814,10 +814,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'http'
 
 ```js
-+ fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !pkg_1:http:HttpError
-+ fn download(url: String, to_path: String, method: String (""), options: ?Options (null)) void !pkg_1:http:HttpError
-+ fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !pkg_1:http:HttpParseError
-+ fn request(method: String, url: String, options: ?Options (null)) ClientResponse !pkg_1:http:HttpError
++ fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !valk:http:HttpError
++ fn download(url: String, to_path: String, method: String (""), options: ?Options (null)) void !valk:http:HttpError
++ fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !valk:http:HttpParseError
++ fn request(method: String, url: String, options: ?Options (null)) ClientResponse !valk:http:HttpError
 ```
 
 ## Classes for 'http'
@@ -835,9 +835,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ response_received: bool
     ~ sent_percent: uint
 
-    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !pkg_1:http:HttpError
-    + fn progress() bool !pkg_1:http:HttpError
-    + fn response() ClientResponse !pkg_1:http:HttpError
+    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !valk:http:HttpError
+    + fn progress() bool !valk:http:HttpError
+    + fn response() ClientResponse !valk:http:HttpError
 }
 ```
 
@@ -865,10 +865,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ chunked: bool
     ~ content_length: uint
     ~ has_host: bool
-    ~ method: ByteBufferStrRef
+    ~ method: ByteBufferRef
     ~ parsed_index: uint
-    ~ path: ByteBufferStrRef
-    ~ query_string: ByteBufferStrRef
+    ~ path: ByteBufferRef
+    ~ query_string: ByteBufferRef
     ~ status: uint
 
     + fn body() String
@@ -950,7 +950,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Router[T] {
     + fn add(method: String, url: String, handler: T) void
-    + fn find(method: String, url: String) Route[T] !pkg_1:core:LookupError
+    + fn find(method: String, url: String) Route[T] !LookupError
     + static fn new() Router[T]
 }
 ```
@@ -962,8 +962,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ port: u16
     + show_info: bool
 
-    + fn add_static_dir(path: String) void !pkg_1:core:LookupError
-    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !pkg_1:http:HttpError
+    + fn add_static_dir(path: String) void !LookupError
+    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !valk:http:HttpError
     + fn start(worker_count: i32 (-1)) void
 }
 ```
@@ -979,15 +979,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn print(msg: String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !pkg_1:io:IoError
-+ fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !pkg_1:io:IoError
-+ fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !pkg_1:io:IoError
-+ fn set_mode(fd: i32, mode: pkg_1:io:MODE(int)) void
++ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !valk:io:IoError
++ fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !valk:io:IoError
++ fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !valk:io:IoError
++ fn set_mode(fd: i32, mode: valk:io:MODE(int)) void
 + fn set_non_block(fd: i32, value: bool) void
-+ fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !pkg_1:io:IoError
-+ fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !pkg_1:io:IoError
-+ fn write_from_ptr_sync(fd: i32, buf: ptr, amount: uint) uint !pkg_1:io:IoError
-+ fn write_string(fd: i32, str: String) uint !pkg_1:io:IoError
++ fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !valk:io:IoError
++ fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !valk:io:IoError
++ fn write_from_ptr_sync(fd: i32, buf: ptr, amount: uint) uint !valk:io:IoError
++ fn write_string(fd: i32, str: String) uint !valk:io:IoError
 ```
 
 # json
@@ -995,7 +995,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: String) Value !pkg_1:json:ParseError
++ fn decode(json: String) Value !valk:json:ParseError
 + fn encode(data: $T, pretty: bool (false), output: ?StringComposer (null), depth: uint (0)) StringComposer
 + fn encode_to_string(data: $T, pretty: bool (false)) String
 + fn new_array(values: ?Array[Value] (null)) Value
@@ -1025,12 +1025,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn alloc(size: uint) ptr
 + fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
-+ fn bytes_to_uint(adr: ptr, len: uint) uint !pkg_1:core:SyntaxError
++ fn bytes_to_uint(adr: ptr, len: uint) uint !SyntaxError
 + fn calloc(size: uint) ptr
 + fn clear(adr: ptr, length: uint) void
 + fn copy(from: ptr, to: ptr, length: uint) void
 + fn equal(a: ptr, b: ptr, length: uint) bool
-+ fn find_char(adr: ptr, ch: u8, length: uint) uint !pkg_1:core:LookupError
++ fn find_char(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(adr: ptr) void
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
 ```
@@ -1040,11 +1040,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !pkg_1:net:NetError
-+ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !pkg_1:net:NetError
-+ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !pkg_1:net:NetError
-+ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !pkg_1:net:NetError
-+ fn send_string(fd: i32, str: String) uint !pkg_1:net:NetError
++ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !valk:net:NetError
++ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !valk:net:NetError
++ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !valk:net:NetError
++ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !valk:net:NetError
++ fn send_string(fd: i32, str: String) uint !valk:net:NetError
 ```
 
 ## Classes for 'net'
@@ -1054,7 +1054,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ data: libc_gen_addrinfo
 
     + fn addr_len() u32
-    + static fn new(host: String, port: u16) AddrInfo !pkg_1:net:NetError
+    + static fn new(host: String, port: u16) AddrInfo !valk:net:NetError
     + fn sock_addr() libc_gen_sockaddr
 }
 ```
@@ -1068,11 +1068,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn close() void
     + static fn new(fd: i32) Connection
-    + fn recv(buffer: ByteBuffer, bytes: uint) uint !pkg_1:net:NetError
-    + fn send(data: String) void !pkg_1:net:NetError
-    + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !pkg_1:net:NetError
-    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !pkg_1:net:NetError
-    + fn ssl_connect(ssl: SSL) void !pkg_1:net:NetError
+    + fn recv(buffer: ByteBuffer, bytes: uint) uint !valk:net:NetError
+    + fn send(data: String) void !valk:net:NetError
+    + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !valk:net:NetError
+    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !valk:net:NetError
+    + fn ssl_connect(ssl: SSL) void !valk:net:NetError
 }
 ```
 
@@ -1086,18 +1086,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ fd: i32
     ~ ssl: OSSL
 
-    + fn connect(fd: i32) void !pkg_1:net:NetError
-    + fn custom_error(msg: String) void !pkg_1:net:NetError
+    + fn connect(fd: i32) void !valk:net:NetError
+    + fn custom_error(msg: String) void !valk:net:NetError
     + static fn default_ca_cert_paths() Array[String]
     + fn get_error() uint
     + fn get_error_message() String
     + static fn new() SSL
-    + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !pkg_1:net:NetError
-    + fn set_ca_cert(path: ?String) void !pkg_1:net:NetError
-    + fn set_ca_cert_dir(dir: ?String) void !pkg_1:net:NetError
+    + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !valk:net:NetError
+    + fn set_ca_cert(path: ?String) void !valk:net:NetError
+    + fn set_ca_cert_dir(dir: ?String) void !valk:net:NetError
     + fn set_host(host: String) void
     + fn set_verify(enable: bool) void
-    + fn write(from: ptr, len: uint) uint !pkg_1:net:NetError
+    + fn write(from: ptr, len: uint) uint !valk:net:NetError
 }
 ```
 
@@ -1107,10 +1107,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ host: String
     ~ port: u16
 
-    + static fn client(type: pkg_1:net:SOCKET_TYPE(int), host: String, port: u16) Connection !pkg_1:net:NetError
+    + static fn client(type: valk:net:SOCKET_TYPE(int), host: String, port: u16) Connection !valk:net:NetError
     + fn close() void
     + static fn close_fd(fd: i32) void
-    + static fn server(type: pkg_1:net:SOCKET_TYPE(int), host: String, port: u16) SocketServer !pkg_1:net:NetError
+    + static fn server(type: valk:net:SOCKET_TYPE(int), host: String, port: u16) SocketServer !valk:net:NetError
 }
 ```
 
@@ -1118,7 +1118,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class SocketServer {
     ~ socket: Socket
 
-    + fn accept() Connection !pkg_1:net:NetError
+    + fn accept() Connection !valk:net:NetError
     + fn close() void
 }
 ```
@@ -1128,7 +1128,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'template'
 
 ```js
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !pkg_1:template:Error
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !valk:template:Error
 + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String
 + fn set_content(name: String, content: String) void
 + fn set_content_many(content: Map[String]) void
@@ -1147,10 +1147,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'thread'
 
 ```js
-+ fn start(func: fn()()) Thread !pkg_1:core:InitError
++ fn start(func: fn()()) Thread !InitError
 + fn suspend_ms(ms: uint) void
 + fn suspend_ns(ns: uint) void
-+ fn task(handler: fn()()) Task !pkg_1:core:InitError
++ fn task(handler: fn()()) Task !InitError
 ```
 
 ## Classes for 'thread'
@@ -1169,7 +1169,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ finished: bool
     ~ started: bool
 
-    + static fn start(func: fn()()) Thread !pkg_1:core:InitError
+    + static fn start(func: fn()()) Thread !InitError
     + fn wait() void
 }
 ```
