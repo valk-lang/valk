@@ -10,7 +10,7 @@
 + ByteReader + Rewrite ByteBuffer functions
 + Move 'type' namespace to 'core'
 + Only allow references on local variable
-- each ... skip ... as ... {}
++ each ... skip ... as ... {}
 - Package platform
 - Mysql or Postgres package
 - Interfaces
