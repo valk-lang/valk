@@ -11,7 +11,7 @@ DIST_COMP=valk
 vc=valk
 
 FLAGS=--def "VERSION=$(VERSION)"
-DIST_FLAGS=. src/*.valk --static --clean --release -vv
+DIST_FLAGS=. src/*.valk --static --release -vv
 DEV_FLAGS=-L /opt/llvm15/lib
 TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
 
@@ -109,7 +109,10 @@ linux-x64: $(SRC) $(HDRS) $(DIST_DEPS)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(FLAGS) $(DIST_FLAGS) \
-	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" -L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" -L "toolchains/toolchains/linux-amd64/lib64" -L "toolchains/libraries/linux-llvm-15-x64/lib" \
+	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" \
+	-L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" \
+	-L "toolchains/toolchains/linux-amd64/lib64" \
+	-L "toolchains/libraries/linux-llvm-15-x64/lib" \
 	--sysroot toolchains/toolchains/linux-amd64 -l pthread -l dl
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
@@ -119,7 +122,8 @@ macos-x64: $(SRC) $(HDRS) $(DIST_DEPS)
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
 	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(FLAGS) $(DIST_FLAGS) \
-	--sysroot toolchains/toolchains/macos-x64
+	--sysroot toolchains/toolchains/macos-11-3 \
+	-L toolchains/libraries/macos-llvm-15-x64/lib
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
@@ -128,7 +132,8 @@ macos-arm64: $(SRC) $(HDRS) $(DIST_DEPS)
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
 	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(FLAGS) $(DIST_FLAGS) \
-	--sysroot toolchains/toolchains/macos-arm64
+	--sysroot toolchains/toolchains/macos-11-3 \
+	-L toolchains/libraries/macos-llvm-15-arm64/lib
 	cp -r ./lib ./dist/macos-arm64/
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
@@ -137,7 +142,10 @@ win-x64: $(DIST_DEPS)
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
 	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) \
-	--sysroot toolchains/toolchains/win-x64
+	--sysroot toolchains/toolchains/win-sdk-x64 \
+	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
+	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
+	-L toolchains/libraries/win-llvm-15-x64/lib
 	cp -r ./lib ./dist/win-x64/
 	cp ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
 	cp ./toolchains/libraries/win-llvm-15-x64/LLVM-C.dll ./dist/win-x64/
