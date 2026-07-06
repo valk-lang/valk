@@ -4,13 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.1.12
-+ Fix errors missing payload, e.g. println(E.message) -> crash, because no message was set in the throw code
-+ SSL allow to disable ca-cert host verification
-+ ByteReader + Rewrite ByteBuffer functions
-+ Move 'type' namespace to 'core'
-+ Only allow references on local variable
-+ each ... skip ... as ... {}
+- Release 0.1.13
 - Package platform
 - Mysql or Postgres package
 - Interfaces
@@ -56,6 +50,14 @@
 ## Done
 
 ```
++ Release 0.1.12
++ Fix errors missing payload, e.g. println(E.message) -> crash, because no message was set in the throw code
++ SSL allow to disable ca-cert host verification
++ ByteReader + Rewrite ByteBuffer functions
++ Move 'type' namespace to 'core'
++ Only allow references on local variable
++ each ... skip ... as ... {}
+
 + Release 0.1.11
 + Rework namespaces
 + Nullable int
