@@ -4,16 +4,14 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.1.13
-+ Process class to start a process async
-
-# Upcoming version
++ Release 0.1.14
 - Complete libc integration
 - Package platform
 - Mysql or Postgres package
 - Interfaces
 - Union types
 
+# Upcoming version
 /
 
 # Next steps
@@ -52,6 +50,9 @@
 ## Done
 
 ```
++ Release 0.1.13
++ Process class to start a process async
+
 + Release 0.1.12
 + Fix errors missing payload, e.g. println(E.message) -> crash, because no message was set in the throw code
 + SSL allow to disable ca-cert host verification
