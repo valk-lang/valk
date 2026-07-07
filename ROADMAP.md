@@ -5,6 +5,7 @@
 
 ```
 + Release 0.1.14
++ Improve watch command
 - Complete libc integration
 - Package platform
 - Mysql or Postgres package
