@@ -70,8 +70,10 @@ test-win: valk
 
 test-macos-build: valk
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
-	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
+	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64 \
+	--sysroot toolchains/toolchains/macos-11-3
+	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64 \
+	--sysroot toolchains/toolchains/macos-11-3
 
 # Testing
 test-cross: valk
