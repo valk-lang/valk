@@ -5,13 +5,14 @@
 
 ```
 - Release 0.1.13
-- Process class to start a process async
++ Process class to start a process async
+
+# Upcoming version
+- Complete libc integration
 - Package platform
 - Mysql or Postgres package
 - Interfaces
 - Union types
-
-# Upcoming version
 
 /
 
