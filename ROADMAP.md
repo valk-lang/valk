@@ -6,6 +6,8 @@
 ```
 + Release 0.1.14
 + Improve watch command
++ Validator functions
++ Template improvements
 - Complete libc integration
 - Package platform
 - Mysql or Postgres package
