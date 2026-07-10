@@ -57,6 +57,9 @@ echo "# Test count: $count"
 echo ""
 echo "# Test type compatibility"
 ./valk ./tests/compile-errors/type-checks.valk
+if [[ $? != 0 ]]; then
+    exit 1
+fi
 
 echo ""
 echo "# Done"
