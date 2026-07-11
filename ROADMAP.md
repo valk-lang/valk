@@ -11,6 +11,7 @@
 - Auto cast to json:Value
 - each on nullable value (shouldnt work) / auto wrap with if isset()
 - "default" token in class scope = default value for this type
+- defer statements
 
 
 # Upcoming version
