@@ -8,14 +8,17 @@
 + Improve watch command
 + Validator functions
 + Template improvements
+- Auto cast to json:Value
+- each on nullable value (shouldnt work) / auto wrap with if isset()
+- "default" token in class scope = default value for this type
+
+
+# Upcoming version
 - Complete libc integration
 - Package platform
 - Mysql or Postgres package
 - Interfaces
 - Union types
-
-# Upcoming version
-/
 
 # Next steps
 
