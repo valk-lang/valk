@@ -12,6 +12,7 @@
 - each on nullable value (shouldnt work) / auto wrap with if isset()
 - "default" token in class scope = default value for this type
 - defer statements
+- Remove Token and use Value with 'void' return type instead
 
 
 # Upcoming version
