@@ -979,7 +979,7 @@ fn main() {
     let template_dir = __DIR__
     let options = template:RenderOptions {
         // Adding html sanitizer to prevent XSS attacks
-        sanitize: html:sanitize
+        sanitize: html:sanitize_filter
         // Setting a template directory allows you to use @include("...")
         template_directory: template_dir
     }
