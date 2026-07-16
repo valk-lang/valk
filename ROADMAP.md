@@ -8,21 +8,27 @@
 + Improve watch command
 + Validator functions
 + Template improvements
-- Auto cast to json:Value
-- each on nullable value (shouldnt work) / auto wrap with if isset()
-- "default" token in class scope = default value for this type
-- defer statements
-- Remove Token and use Value with 'void' return type instead
-
++ Package platform (vpkg.dev)
++ Http fixes
++ Rename `--no-default-libs` to `--no-system-libs`
++ Json changes `.get` -> `.get_or`
++ Allow using `main` namespace from another package
 
 # Upcoming version
+- Each on nullable value (shouldnt work) / auto wrap with if isset()
+- "default" token in class scope = default value for this type
+- Defer statements
+- Remove 'Token' class in compiler and use Value with 'void' return type instead
+- Rewrite valk parser
+
+
+# Next steps
+
+- Valk fmt
 - Complete libc integration
-- Package platform
 - Mysql or Postgres package
 - Interfaces
 - Union types
-
-# Next steps
 
 - on exit thread/process { ... }
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
@@ -36,7 +42,6 @@
 ~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
 - More atomic features
-- valk fmt
 ```
 
 ## Maybe
