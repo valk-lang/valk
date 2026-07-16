@@ -4,23 +4,15 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-+ Release 0.1.14
-+ Improve watch command
-+ Validator functions
-+ Template improvements
-+ Package platform (vpkg.dev)
-+ Http fixes
-+ Rename `--no-default-libs` to `--no-system-libs`
-+ Json changes `.get` -> `.get_or`
-+ Allow using `main` namespace from another package
-
-# Upcoming version
+- Release 0.2.0
+- Rewrite valk parser
 - Each on nullable value (shouldnt work) / auto wrap with if isset()
 - "default" token in class scope = default value for this type
 - Defer statements
 - Remove 'Token' class in compiler and use Value with 'void' return type instead
-- Rewrite valk parser
 
+# Upcoming version
+/
 
 # Next steps
 
@@ -63,6 +55,16 @@
 ## Done
 
 ```
++ Release 0.1.14
++ Improve watch command
++ Validator functions
++ Template improvements
++ Package platform (vpkg.dev)
++ Http fixes
++ Rename `--no-default-libs` to `--no-system-libs`
++ Json changes `.get` -> `.get_or`
++ Allow using `main` namespace from another package
+
 + Release 0.1.13
 + Process class to start a process async
 
