@@ -171,4 +171,4 @@ clean:
 	rm -f ./valk2
 # rm -rf ~/.valk/cache
 
-.PHONY: clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
+.PHONY: valk clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
