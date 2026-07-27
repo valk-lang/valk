@@ -2,9 +2,7 @@
 VALKV=0.1.14
 VERSION=0.1.15
 
-HDRS=$(wildcard headers/*.valk.h)
-SRC=$(wildcard src/*.valk) $(wildcard src/build/*.valk) $(wildcard src/helper/*.valk) $(wildcard src/doc/*.valk) $(wildcard src/lsp/*.valk)
-SRC_LIB=$(wildcard lib/src/*/*.valk) $(wildcard lib/*/*.valk)
+SRC=$(wildcard src/*.valk)
 SRC_EXAMPLE=$(wildcard debug/*.valk)
 DIST_DEPS=
 DIST_COMP=valk
@@ -16,7 +14,7 @@ DEV_FLAGS=-L /opt/llvm15/lib
 TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
 
 # Build
-valk: $(SRC) $(HDRS)
+valk: $(SRC)
 	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
 valk2: valk
 	./valk build -o ./valk2 -vvv $(FLAGS) $(DEV_FLAGS)
@@ -24,7 +22,7 @@ valk3: valk2
 	./valk2 build -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
 valkvg: valk
 	valgrind ./valk build -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
-valkexe: $(SRC) $(HDRS)
+valkexe: $(SRC)
 	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS) --target win-x64 --static
 
 doc: valk
@@ -34,9 +32,9 @@ valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
 
-valkd: $(SRC) $(HDRS)
+valkd: $(SRC)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
-static: $(SRC) $(HDRS)
+static: $(SRC)
 	valk build . src/*.valk -o ./valk -vv --static -l zstd -L /opt/homebrew/opt/ncurses/lib -L /usr/local/opt/ncurses/lib -L /opt/homebrew/opt/llvm@15/lib -L /usr/local/opt/llvm@15/lib $(FLAGS)
 
 install: valk
@@ -85,7 +83,7 @@ test-cross: valk
 
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
-ci-linux: $(SRC) $(HDRS)
+ci-linux: $(SRC)
 	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
@@ -94,19 +92,19 @@ ci-linux: $(SRC) $(HDRS)
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/llvm-15/lib/
 
-ci-macos: $(SRC) $(HDRS)
+ci-macos: $(SRC)
 	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static -l zstd $(FLAGS) \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
-ci-win: $(SRC) $(HDRS)
+ci-win: $(SRC)
 	ls -l "./llvm/lib/"
 	~/valk-dev/valk.exe -h || echo ""
 	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
 	-L "./llvm/lib/"
 
 # Distributions
-linux-x64: $(SRC) $(HDRS) $(DIST_DEPS)
+linux-x64: $(SRC) $(DIST_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
@@ -119,7 +117,7 @@ linux-x64: $(SRC) $(HDRS) $(DIST_DEPS)
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
-macos-x64: $(SRC) $(HDRS) $(DIST_DEPS)
+macos-x64: $(SRC) $(DIST_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
@@ -129,7 +127,7 @@ macos-x64: $(SRC) $(HDRS) $(DIST_DEPS)
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
-macos-arm64: $(SRC) $(HDRS) $(DIST_DEPS)
+macos-arm64: $(SRC) $(DIST_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
