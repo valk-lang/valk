@@ -1,0 +1,320 @@
+// Compiler-facing value produced from an EXP.value expression tree.
+// Mirrors the old Value idea, but is filled from the structured Exp AST
+// (value_from_exp) rather than while tokenizing.
+
+enum VAL : u8 {
+    undefined
+    int
+    float
+    bool
+    string
+    char
+    null
+    id       // name lookup (may carry resolved Idf)
+    op       // binary op (VALUE_OP in .op); left/right in value1/value2
+    unary    // unary op (VALUE_OP in .op); operand in value1
+    call     // callee in value1; args in values
+    cast     // value.@cast(Type); value1 = on, cast_type = Type
+    paren    // grouping; value1 = inner (usually folded away)
+    multi    // argument list only (values array); not a runtime value alone
+}
+
+class Value {
+    type: VAL
+    // Result type when known (literals, casts, resolved ids, …)
+    rett: ?Type (null)
+    // Source expression (for errors / spans)
+    exp: ?Exp (null)
+    // Children
+    value1: ?Value (null)
+    value2: ?Value (null)
+    values: ?Array[Value] (null)
+    // Operators (VALUE_OP for op / unary)
+    op: u8 (0)
+    // Literal payloads
+    int_val: int (0)
+    float_val: f64 (0)
+    bool_val: bool (false)
+    string_val: String ("")
+    // Identifier
+    name: String ("")
+    ns_name: ?String (null)
+    idf: ?Idf (null)
+    // Cast target
+    cast_type: ?Type (null)
+
+    // Report an error at this value's source span when available.
+    fn error(msg: String) !Error $throw {
+        let e = this.exp
+        if isset(e) : e.error(msg)
+        // Fallback without span
+        throw .error
+    }
+
+    fn bug(msg: String) !Error $throw {
+        this.error("(Compiler bug) " + msg)
+    }
+}
+
+// Convert a structured EXP.value into a Value using `scope` for name lookup.
+fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
+    if exp.type != EXP.value : exp.bug("Expected EXP.value")
+    let kind = exp.kind
+    let b = exp.src.build
+
+    if kind == VALUE_KIND.paren {
+        let inner = exp.get(VALUE_EXP.left)
+        if !isset(inner) : exp.bug("Missing paren inner value")
+        return value_from_exp(inner, scope) !>
+    }
+
+    if kind == VALUE_KIND.number || kind == VALUE_KIND.hex || kind == VALUE_KIND.octal {
+        let v = value_from_int_literal(exp, b) !>
+        v.exp = exp
+        return v
+    }
+    if kind == VALUE_KIND.float {
+        let v = value_from_float_literal(exp, b) !>
+        v.exp = exp
+        return v
+    }
+    if kind == VALUE_KIND.bool {
+        let v = vgen_bool(exp.bool1, type_bool_basic(b))
+        v.exp = exp
+        return v
+    }
+    if kind == VALUE_KIND.null {
+        let v = vgen_null(type_any(b))
+        v.exp = exp
+        return v
+    }
+    if kind == VALUE_KIND.string {
+        let v = vgen_string(strip_quotes(exp.str1), type_string_basic(b))
+        v.exp = exp
+        return v
+    }
+    if kind == VALUE_KIND.char {
+        let text = strip_quotes(exp.str1)
+        let v = vgen_char(char_literal_byte(exp.str1), text, type_int_basic(b))
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.id {
+        let v = value_from_id_exp(exp, scope) !>
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.unary {
+        let operand_exp = exp.get(VALUE_EXP.left)
+        if !isset(operand_exp) : exp.bug("Missing unary operand")
+        let operand = value_from_exp(operand_exp, scope) !>
+        let op = exp.number.@cast(VALUE_OP)
+        // Fold unary minus into integer/float literals when possible
+        if op == VALUE_OP.neg {
+            if operand.type == VAL.int {
+                operand.int_val = 0 - operand.int_val
+                operand.exp = exp
+                return operand
+            }
+            if operand.type == VAL.float {
+                operand.float_val = 0.0 - operand.float_val
+                operand.exp = exp
+                return operand
+            }
+        }
+        let v = vgen_unary(operand, op)
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.op {
+        let left_exp = exp.get(VALUE_EXP.left)
+        let right_exp = exp.get(VALUE_EXP.right)
+        if !isset(left_exp) || !isset(right_exp) : exp.bug("Missing binary op operands")
+        let left = value_from_exp(left_exp, scope) !>
+        let right = value_from_exp(right_exp, scope) !>
+        let op = exp.number.@cast(VALUE_OP)
+        // Prefer left's type; compares / logic later refine to bool
+        let rett = left.rett
+        if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte || op == VALUE_OP.and || op == VALUE_OP.or {
+            rett = type_bool_basic(b)
+        }
+        let v = vgen_op(left, right, op, rett)
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.call {
+        let callee_exp = exp.get(VALUE_EXP.left)
+        if !isset(callee_exp) : exp.bug("Missing call callee")
+        let callee = value_from_exp(callee_exp, scope) !>
+        let args_exp = exp.get(VALUE_EXP.right)
+        let args = Array[Value]{}
+        if isset(args_exp) {
+            // args_exp is VALUE_KIND.multi with sequential subs
+            let i: uint = 0
+            while true {
+                let a = args_exp.get(i)
+                if !isset(a) : break
+                args.append(value_from_exp(a, scope) !>)
+                i++
+            }
+        }
+        let v = vgen_call(callee, args)
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.cast {
+        let on_exp = exp.get(VALUE_EXP.left)
+        let type_exp = exp.get(VALUE_EXP.right)
+        if !isset(on_exp) : exp.bug("Missing cast value")
+        if !isset(type_exp) : exp.bug("Missing cast type")
+        let on = value_from_exp(on_exp, scope) !>
+        let cast_t = type_from_exp(type_exp, scope) !>
+        let v = vgen_cast(on, cast_t)
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.dot {
+        // Property / method access: left.name (call may wrap this later)
+        let on_exp = exp.get(VALUE_EXP.left)
+        if !isset(on_exp) : exp.bug("Missing dot left value")
+        let on = value_from_exp(on_exp, scope) !>
+        let v = vgen_dot(on, exp.str1)
+        v.exp = exp
+        return v
+    }
+
+    if kind == VALUE_KIND.multi {
+        // Bare multi list (usually only appears as call args, already handled)
+        let args = Array[Value]{}
+        let i: uint = 0
+        while true {
+            let a = exp.get(i)
+            if !isset(a) : break
+            args.append(value_from_exp(a, scope) !>)
+            i++
+        }
+        let v = vgen_multi(args)
+        v.exp = exp
+        return v
+    }
+
+    exp.bug("Unknown value kind: " + kind)
+}
+
+// ---- helpers ----
+
+fn value_from_int_literal(exp: Exp, b: Build) Value !Error {
+    let text = exp.str1.replace("_", "")
+    let n: int = 0
+    if exp.kind == VALUE_KIND.hex {
+        n = (text.hex_to_int() ! exp.error("Invalid hex integer: " + exp.str1)).@cast(int)
+    } else if exp.kind == VALUE_KIND.octal {
+        // Source form is 0c… — strip leading 0c/0C if present for octal_to_int
+        let body = text
+        if body.starts_with("0c") || body.starts_with("0C") {
+            body = body.part(2, body.length - 2)
+        }
+        n = (body.octal_to_int() ! exp.error("Invalid octal integer: " + exp.str1)).@cast(int)
+    } else {
+        n = text.to_int() ! exp.error("Invalid integer: " + exp.str1)
+    }
+    return vgen_int(n, type_int_basic(b))
+}
+
+fn value_from_float_literal(exp: Exp, b: Build) Value !Error {
+    let text = exp.str1.replace("_", "")
+    let n = text.to_float() ! exp.error("Invalid float: " + exp.str1)
+    return vgen_float(n, type_float_basic(b))
+}
+
+fn value_from_id_exp(exp: Exp, scope: Scope) Value !Error {
+    let id = exp.get(VALUE_EXP.left)
+    if !isset(id) : exp.bug("Missing id sub-expression")
+    let name = id.str1
+    let ns_name = id.str2
+
+    let idf: ?Idf = null
+    if isset(ns_name) {
+        let ns_idf = scope.get_idf(ns_name)
+        if !isset(ns_idf) : exp.error("Unknown namespace: " + ns_name)
+        if ns_idf.type != IDF.scope {
+            exp.error("Expected a namespace before ':', found: " + ns_name)
+        }
+        let ns_scope = ns_idf.scope
+        if !isset(ns_scope) : exp.bug("Scope idf is missing scope")
+        idf = ns_scope.get_idf(name)
+        if !isset(idf) : exp.error("Unknown identifier: " + ns_name + ":" + name)
+    } else {
+        idf = scope.get_idf(name)
+        // Unresolved ids are allowed here (e.g. other value aliases); later stages resolve
+    }
+
+    return vgen_id(name, ns_name, idf)
+}
+
+// Provisional primitive Types until core class-backed types are wired through.
+fn type_int_basic(b: Build) Type {
+    return Type {
+        type: TYPE.int
+        build: b
+        custom_name: "int"
+    }
+}
+fn type_float_basic(b: Build) Type {
+    return Type {
+        type: TYPE.float
+        build: b
+        custom_name: "float"
+    }
+}
+fn type_bool_basic(b: Build) Type {
+    return Type {
+        type: TYPE.bool
+        build: b
+        custom_name: "bool"
+    }
+}
+fn type_string_basic(b: Build) Type {
+    // String is a class in core; until looked up, mark as class-named placeholder
+    return Type {
+        type: TYPE.class
+        build: b
+        custom_name: "String"
+    }
+}
+
+// Strip surrounding quotes from a string/char token (keeps escapes as written).
+fn strip_quotes(s: String) String {
+    if s.length >= 2 {
+        let first = s.get(0)
+        let last = s.get(s.length - 1)
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return s.part(1, s.length - 2)
+        }
+    }
+    return s
+}
+
+// Best-effort single-byte value from a char token like 'a' or '\n'.
+fn char_literal_byte(s: String) int {
+    let inner = strip_quotes(s)
+    if inner.length == 0 : return 0
+    if inner.get(0) == '\\' && inner.length >= 2 {
+        let e = inner.get(1)
+        if e == 'n' : return '\n'
+        if e == 't' : return '\t'
+        if e == 'r' : return '\r'
+        if e == '0' : return 0
+        if e == '\\' : return '\\'
+        if e == '\'' : return '\''
+        if e == '"' : return '"'
+        return e
+    }
+    return inner.get(0)
+}
