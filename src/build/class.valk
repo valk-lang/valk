@@ -1,3 +1,5 @@
+use helper
+
 // Compiler-facing class/type object created from an EXP.class expression.
 // Holds the same information the parser stored on Exp, but as named fields.
 // `kind` is the keyword: class / struct / slice / pointer / integer / float / boolean / mode
@@ -12,7 +14,7 @@ class Class {
     // Original parse expression (source span / raw AST)
     exp: Exp
     // Sub-expressions from EXP.class (still raw for later stages)
-    generics: ?Exp (null) // EXP.body `[...]`
+    generics: ?Exp (null) // EXP.body `[...]` of the declaration
     body: ?Exp (null)     // EXP.body `{...}`
     flags: ?Array[String] (null)
     // Kind-specific header fields
@@ -23,7 +25,19 @@ class Class {
     // Members (declaration order; includes nameless props)
     props: Array[Prop] (.{})
     // Cached Type for this class (immutable once created; shared by all bare refs)
+    // Never created for generic base classes — only for concrete / specialized classes.
     type: ?Type (null)
+    // ---- Generics ----
+    // True for `class Foo[T, U] { ... }` before specialization
+    is_generic_base: bool (false)
+    // Ordered generic parameter names from the declaration (`T`, `U`, ...)
+    generic_names: ?Array[String] (null)
+    // Concrete type args for a specialized instance (`Array[String]` → [String])
+    generic_types: ?Array[Type] (null)
+    // Base class when this is a specialization
+    generic_from: ?Class (null)
+    // Cache of specializations: hash(type args) → Class (only on the base)
+    generic_cache: ?Map[Class] (null)
     // Size
     size: u32 (0)
     size_known: bool (false) // Wether we determined the size of class (in bytes)
@@ -38,7 +52,12 @@ class Class {
     }
 
     // Type representing this class. Created once and cached.
-    fn get_type() Type {
+    // Must not be used on generic base classes — specialize first.
+    fn get_type() Type !Error {
+        if this.is_generic_base {
+            // Never form a Type for an un-specialized generic base
+            this.ns.build.error("(Compiler bug) get_type() on generic base class: " + this.name)
+        }
         let cached = this.type
         if isset(cached) : return cached
 
@@ -57,5 +76,169 @@ class Class {
         }
         this.type = res
         return res
+    }
+
+    // Specialize a generic base with concrete type arguments.
+    // Returns a cached instance if this combination was already generated.
+    // Sets generic param identifiers on the new class scope.
+    fn specialize(gtypes: Array[Type], at: Exp) Class !Error {
+        if !this.is_generic_base {
+            at.error("Type is not generic: " + this.name)
+        }
+        let names = this.generic_names
+        if !isset(names) : at.bug("Generic base is missing generic_names")
+        if gtypes.length != names.length {
+            at.error("Generic type '" + this.name + "' expects " + names.length + " type argument(s), got " + gtypes.length)
+        }
+
+        let cache = this.generic_cache
+        if !isset(cache) {
+            let m = Map[Class]{}
+            this.generic_cache = m
+            cache = m
+        }
+
+        let key = generic_types_key(gtypes)
+        let existing = cache.get(key) !? null
+        if isset(existing) : return existing
+
+        // Parent of the specialized scope: same as the base's parent (source-file scope)
+        let parent = this.scope.parent
+        let gscope = Scope.new(parent)
+
+        let gclass = Class {
+            unit: this.unit
+            ns: this.ns
+            name: this.name + "__" + key
+            act: this.act
+            kind: this.kind
+            scope: gscope
+            exp: this.exp
+            generics: this.generics
+            body: this.body
+            flags: this.flags
+            number_size: this.number_size
+            signed: this.signed
+            packed: this.packed
+            is_async: this.is_async
+            is_generic_base: false
+            generic_names: names
+            generic_types: gtypes
+            generic_from: this
+        }
+
+        // Bind generic parameters as type identifiers in the new class scope
+        let i: uint = 0
+        each names as gname {
+            let gt = gtypes.get(i) ! at.bug("Missing generic type argument")
+            gscope.set_idf(gname, Idf.for_type(gt))
+            i++
+        }
+        // SELF points at the specialized class
+        gscope.set_idf("SELF", Idf.for_class(gclass))
+
+        cache.set(key, gclass)
+        this.unit.classes.append(gclass)
+
+        // Parse properties on the specialized class (base is skipped)
+        this.ns.build.pipeline.parse_properties.append(gclass)
+
+        return gclass
+    }
+}
+
+// Stable cache key for a list of concrete generic type arguments.
+fn generic_types_key(types: Array[Type]) String {
+    let buf = ByteBuffer.new()
+    buf.write_string("[")
+    each types as t, i {
+        if i > 0 : buf.write_string(",")
+        type_append_key(t, buf)
+    }
+    buf.write_string("]")
+    return helper:ctxhash(buf.to_string())
+}
+
+fn type_append_key(t: Type, buf: ByteBuffer) {
+    // Prefer identity of interned types: class name (+ specialization name), wrappers, etc.
+    if t.type == TYPE.void {
+        buf.write_string("void")
+        return
+    }
+    if t.type == TYPE.any {
+        buf.write_string("any")
+        return
+    }
+    if t.type == TYPE.nullable {
+        buf.write_string("?")
+        let sub = t.sub_type
+        if isset(sub) : type_append_key(sub, buf)
+        return
+    }
+    if t.type == TYPE.ptr {
+        buf.write_string("*")
+        if t.is_slice_ptr : buf.write_string("[]")
+        let sub = t.sub_type
+        if isset(sub) : type_append_key(sub, buf)
+        if t.array_size > 0 {
+            buf.write_string("x")
+            buf.write_uint_ascii(t.array_size.to(uint))
+        }
+        return
+    }
+    if t.type == TYPE.ref {
+        buf.write_string("&")
+        if t.is_slice_ptr : buf.write_string("[]")
+        let sub = t.sub_type
+        if isset(sub) : type_append_key(sub, buf)
+        return
+    }
+    if t.type == TYPE.inline {
+        buf.write_string("<>")
+        let sub = t.sub_type
+        if isset(sub) : type_append_key(sub, buf)
+        return
+    }
+    if t.type == TYPE.array {
+        buf.write_string("[")
+        let sub = t.sub_type
+        if isset(sub) : type_append_key(sub, buf)
+        buf.write_string("x")
+        buf.write_uint_ascii(t.array_size.to(uint))
+        buf.write_string("]")
+        return
+    }
+    if t.type == TYPE.multi {
+        buf.write_string("(")
+        let subs = t.sub_types
+        if isset(subs) {
+            each subs as st, i {
+                if i > 0 : buf.write_string(",")
+                type_append_key(st, buf)
+            }
+        }
+        buf.write_string(")")
+        return
+    }
+    let c = t.class
+    if isset(c) {
+        buf.write_string(c.name)
+        // Include resolved generic args if this class is itself a specialization
+        let gts = c.generic_types
+        if isset(gts) {
+            buf.write_string("<")
+            each gts as gt, i {
+                if i > 0 : buf.write_string(",")
+                type_append_key(gt, buf)
+            }
+            buf.write_string(">")
+        }
+        return
+    }
+    buf.write_string("#")
+    buf.write_uint_ascii(t.type.@cast(u32).to(uint))
+    if t.custom_name.length > 0 {
+        buf.write_string(":")
+        buf.write_string(t.custom_name)
     }
 }
