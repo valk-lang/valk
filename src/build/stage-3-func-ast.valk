@@ -60,6 +60,7 @@ fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     if exp.type == EXP.stmt : return value_from_stmt_exp(ctx, scope, exp) !>
     if exp.type == EXP.if : return value_from_if_exp(ctx, scope, state, exp) !>
     if exp.type == EXP.while : return value_from_while_exp(ctx, scope, state, exp) !>
+    if exp.type == EXP.each : return value_from_each_exp(ctx, scope, state, exp) !>
     if exp.type == EXP.block : return value_from_block_exp(ctx, scope, state, exp) !>
     if exp.type == EXP.break : return vgen_break(ctx.build, exp)
     if exp.type == EXP.continue : return vgen_continue(ctx.build, exp)
@@ -297,6 +298,138 @@ fn value_from_while_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp)
         body_vals = body_values_from_nested(ctx, body_scope, state, body_exp) !>
     }
     return vgen_while(cond, body_vals, b, exp)
+}
+
+// `each on [skip n] as name[, name...] { ... }` / `each ... : stmt`
+//
+// Desugars to:
+//   let __on = on
+//   let __i: index_type = skip ?? 0
+//   while true {
+//     let name1[, name2, ...][, index_name] = __on._next(__i) ! { break }
+//     __i += 1
+//     <body>
+//   }
+// The index-advance runs before <body> so an early `continue` in the body still
+// advances the loop (there is no loop-aware lowering for `continue` to rely on).
+fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = ctx.build
+    let on_exp = exp.get(EACH_EXP.on)
+    if !isset(on_exp) : exp.bug("each is missing the iterated value")
+
+    let on = value_from_exp(on_exp, scope, ctx.without_type()) !>
+    let on_nn = value_try_remove_nullable(on, scope, ctx)
+    if on_nn.rett.is_nullable_type() {
+        on_exp.error("Cannot use 'each' on a nullable type: " + on_nn.rett.compat_display_name())
+    }
+    let class = on_nn.rett.get_class_or_null()
+    if !isset(class) {
+        on_exp.error("Cannot use 'each' on type: " + on_nn.rett.compat_display_name())
+    }
+    let next_func = class.get_func("_next")
+    if !isset(next_func) {
+        on_exp.error("Cannot use 'each' on type '" + on_nn.rett.compat_display_name() + "'. This type does not have a '_next' function")
+    }
+    // `_next`'s args include an implicit `this` first for instance methods.
+    let next_arg_skip: uint = 0
+    if isset(next_func.class) && !next_func.is_static : next_arg_skip = 1
+    let index_arg = next_func.args.get(next_arg_skip) ! exp.bug("'_next' is missing its index parameter")
+    let index_type = index_arg.type
+
+    let names = exp.list
+    if !isset(names) : exp.bug("each is missing variable names")
+    if names.length == 0 : exp.bug("each is missing variable names")
+
+    let item_rett = next_func.get_rett()
+    let item_types = Array[Type]{}
+    if item_rett.type == TYPE.multi {
+        let subs = item_rett.sub_types
+        if isset(subs) : item_types = subs
+    }
+    if item_types.length == 0 : item_types.append(item_rett)
+
+    if names.length > item_types.length + 1 {
+        exp.error("Too many variables for this each statement")
+    }
+    let has_index_name = names.length == item_types.length + 1
+    let item_names_count = has_index_name ? names.length - 1 : names.length
+
+    // Scope holding the `on` / index temporaries around the while loop.
+    let each_scope = scope.sub_scope()
+
+    let on_decl = Decl.new(on_nn.rett, false, null)
+    each_scope.add_decl(on_decl)
+    let on_declare = vgen_declare(Array[Decl]{ on_decl }, Array[Value]{ on_nn }, b, exp)
+
+    let index_decl = Decl.new(index_type, false, null)
+    index_decl.is_mut = true
+    each_scope.add_decl(index_decl)
+
+    let start_value = vgen_int(0, index_type)
+    let skip_exp = exp.get(EACH_EXP.skip)
+    if isset(skip_exp) {
+        let skip_v = value_from_exp(skip_exp, scope, ctx.with_type(index_type)) !>
+        if !skip_v.rett.is_integer_type() {
+            skip_exp.error("Expected an integer value for 'skip', not: " + skip_v.rett.compat_display_name())
+        }
+        skip_v = value_try_convert(skip_v, scope, ctx, index_type)
+        index_type.compat_check(skip_v.rett, skip_exp) !>
+        start_value = skip_v
+    }
+    let index_declare = vgen_declare(Array[Decl]{ index_decl }, Array[Value]{ start_value }, b, exp)
+
+    // Loop body scope: item/index names declared here are visible to the user body.
+    let body_scope = each_scope.sub_scope()
+
+    let callee = vgen_dot(vgen_decl(on_decl), "_next", item_rett)
+    callee.idf = Idf.for_func(next_func)
+    let next_call = vgen_call(callee, Array[Value]{ vgen_decl(index_decl) }, item_rett)
+    next_call.exp = exp
+    next_call.can_error = true
+    next_call.error_type = next_func.error_type
+
+    let success = next_call.trim_errors()
+    let handled = value_error_result(next_call, vgen_break(b, exp), success.rett, ERRH_KIND.block, exp)
+    let item_parts = handled.unroll()
+
+    let bind_decls = Array[Decl]{}
+    let bind_inits = Array[Value]{}
+    let i: uint = 0
+    while i < item_names_count {
+        let name = names.get(i) ! exp.bug("Missing each variable name")
+        let part = item_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
+        let item_type = item_types.get(i) ! exp.bug("Missing each item type")
+        let decl = Decl.new(item_type, false, name)
+        bind_decls.append(decl)
+        bind_inits.append(part)
+        body_scope.add_decl(decl)
+        body_scope.set_idf(name, Idf.for_decl(decl))
+        i++
+    }
+    if has_index_name {
+        let index_name = names.get(names.length - 1) ! exp.bug("Missing each index name")
+        let index_user_decl = Decl.new(index_type, false, index_name)
+        bind_decls.append(index_user_decl)
+        bind_inits.append(vgen_decl(index_decl))
+        body_scope.add_decl(index_user_decl)
+        body_scope.set_idf(index_name, Idf.for_decl(index_user_decl))
+    }
+    let bind_declare = vgen_declare(bind_decls, bind_inits, b, exp)
+
+    let advance = vgen_assign(vgen_decl(index_decl), vgen_int(1, index_type), ASSIGN_OP.add, b, exp)
+
+    let body_exp = exp.get(EACH_EXP.body)
+    let user_vals = Array[Value]{}
+    if isset(body_exp) {
+        user_vals = body_values_from_nested(ctx, body_scope, state, body_exp) !>
+    }
+
+    let body_vals = Array[Value]{ bind_declare, advance }
+    body_vals.append_many(user_vals)
+
+    let loop = vgen_while(vgen_bool(true, type_bool(b)), body_vals, b, exp)
+
+    return vgen_block(Array[Value]{ on_declare, index_declare, loop }, b, exp)
 }
 
 fn value_from_block_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
