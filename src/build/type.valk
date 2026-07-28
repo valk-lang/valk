@@ -304,18 +304,247 @@ class Type {
 
     // Same class identity after stripping nullability (old `is_type_of_class`).
     fn is_type_of_class(other: Type) bool {
-        let ca = this.get_class_or_null()
-        let cb = other.get_class_or_null()
+        let ca = this.compat_class()
+        let cb = other.compat_class()
         return isset(ca) && isset(cb) && ca == cb
     }
 
-    // Best-effort type compatibility until full `compat` exists.
-    fn is_compatible_with(other: Type) bool {
+    // Class used for identity checks — unwraps `mode X for Y` to Y.
+    fn compat_class() ?Class {
+        let c = this.get_class_or_null()
+        if !isset(c) : return null
+        let mode_for = c.mode_for_class
+        if isset(mode_for) : return mode_for
+        return c
+    }
+
+    // True for integer / float / bool (including class-backed number types).
+    fn is_number_type() bool {
+        return this.is_integer_type() || this.is_float_type() || this.is_bool_type()
+    }
+
+    // Byte size used for number compatibility (no full layout walk).
+    // `*` integer/float sizes use pointer size.
+    fn number_byte_size() u32 {
+        let t = this.get_non_nullable()
+        let c = t.class
+        if isset(c) {
+            let kind = c.kind
+            if kind == CLASS_KIND.integer || kind == CLASS_KIND.float {
+                let s = c.number_size
+                if s == 0 : return t.ptr_size()
+                return s
+            }
+            if kind == CLASS_KIND.boolean : return 1
+        }
+        if t.type == TYPE.bool : return 1
+        // Bare TYPE.int / float without class — treat as pointer-sized host int
+        if t.type == TYPE.int || t.type == TYPE.float : return t.ptr_size()
+        // Fallback: cached/compute size when available
+        let s = t.size() ! return 0
+        return s
+    }
+
+    // Can a value of type `other` be passed where `this` is expected?
+    // (Mirrors old `Type.compat` — assignability / parameter matching.)
+    //
+    // Numbers: same kind (int/float/bool) and same byte size; integers also need
+    // matching signedness (old rule). Classes compare by identity (modes unwrap).
+    fn compat(other: Type, ignore_imut: bool (false)) bool {
         if this == other : return true
+
+        // `any` is permissive (docs / incomplete generics)
+        if this.type == TYPE.any || other.type == TYPE.any : return true
+
+        let base = this
+        let typ = other
+
+        // Expected `?X` accepts non-null `X`
+        if base.is_nullable_type() && !typ.is_nullable_type() {
+            base = base.get_non_nullable()
+        }
+
+        // Both nullable: compare inners
+        if base.is_nullable_type() {
+            if !typ.is_nullable_type() : return false
+            let bs = base.sub_type
+            let ts = typ.sub_type
+            if !isset(bs) || !isset(ts) : return false
+            return bs.compat(ts, ignore_imut)
+        }
+
+        // Numbers: same numeric kind + same byte size (not class identity)
+        if base.is_number_type() && typ.is_number_type() {
+            return base.compat_numbers(typ)
+        }
+
+        // Kind mismatch — allow &T ↔ *T (same as old)
+        if base.type != typ.type {
+            if base.type == TYPE.ref && typ.type == TYPE.ptr {
+                // fall through to pointer-style sub compare
+            } else if base.type == TYPE.ptr && typ.type == TYPE.ref {
+                // fall through
+            } else if base.type == TYPE.class || typ.type == TYPE.class {
+                // class vs non-class already failed number path
+                let bc = base.compat_class()
+                let tc = typ.compat_class()
+                if isset(bc) && isset(tc) && bc == tc : return true
+                return false
+            } else {
+                return false
+            }
+        }
+
+        // Enums must match
+        let be = base.enum
+        let te = typ.enum
+        if isset(be) || isset(te) {
+            if be != te : return false
+        }
+
+        // *T / &T — compare pointed-to types
+        if base.type == TYPE.ptr || base.type == TYPE.ref {
+            let bs = base.sub_type
+            let ts = typ.sub_type
+            if !isset(bs) || !isset(ts) : return false
+            // slice-ptr flag: require both or neither when either is set
+            if base.is_slice_ptr != typ.is_slice_ptr : return false
+            return bs.compat(ts, ignore_imut)
+        }
+
+        // Inline <T>
+        if base.type == TYPE.inline {
+            let bs = base.sub_type
+            let ts = typ.sub_type
+            if !isset(bs) || !isset(ts) : return false
+            return bs.compat(ts, ignore_imut)
+        }
+
+        // Fixed arrays [T x N]
+        if base.type == TYPE.array {
+            let bs = base.sub_type
+            let ts = typ.sub_type
+            if !isset(bs) || !isset(ts) : return false
+            // If both sizes known and non-zero, base must not require a larger array
+            if base.array_size > 0 && typ.array_size > 0 && base.array_size > typ.array_size {
+                return false
+            }
+            return bs.compat(ts, ignore_imut)
+        }
+
+        // Multi (T, U, …)
+        if base.type == TYPE.multi {
+            let bs = base.sub_types
+            let ts = typ.sub_types
+            if !isset(bs) || !isset(ts) : return false
+            if bs.length != ts.length : return false
+            each bs as bt, i {
+                let ot = ts.get(i) ! return false
+                if !bt.compat(ot, ignore_imut) : return false
+            }
+            return true
+        }
+
+        // Function types — arity and arg/rett compatibility (simplified)
+        if base.type == TYPE.fn || base.type == TYPE.fnptr {
+            if typ.type != base.type : return false
+            let bs = base.sub_types
+            let ts = typ.sub_types
+            if isset(bs) || isset(ts) {
+                if !isset(bs) || !isset(ts) : return false
+                if bs.length != ts.length : return false
+                // First N-1 are args (contravariant: expected arg accepts actual), last is rett
+                // Without a fixed split, require pairwise compat both ways for now
+                each bs as bt, i {
+                    let ot = ts.get(i) ! return false
+                    if !bt.compat(ot, ignore_imut) && !ot.compat(bt, ignore_imut) : return false
+                }
+            }
+            return true
+        }
+
+        // co(…) — compare return-type list when present
+        if base.type == TYPE.co {
+            if typ.type != TYPE.co : return false
+            let bs = base.sub_types
+            let ts = typ.sub_types
+            if isset(ts) && ts.length > 0 {
+                if !isset(bs) : return false
+                if bs.length != ts.length : return false
+                each bs as bt, i {
+                    let ot = ts.get(i) ! return false
+                    if !bt.compat(ot, ignore_imut) : return false
+                }
+            }
+            return true
+        }
+
+        // Class / struct / slice / mode / pointer-kind: same class identity
+        let base_class = base.compat_class()
+        let type_class = typ.compat_class()
+        if isset(base_class) || isset(type_class) {
+            if base_class != type_class : return false
+            return true
+        }
+
+        // void / other primitives with no class
+        if base.type == TYPE.void : return typ.type == TYPE.void
+
+        return true
+    }
+
+    // Number-only branch of compat: same kind family + same byte size.
+    // e.g. int/i32/u32 of equal width are compatible; float widths must match.
+    // (Signedness is not required — only storage size.)
+    fn compat_numbers(other: Type) bool {
         let a = this.get_non_nullable()
         let b = other.get_non_nullable()
-        if a == b : return true
-        return a.is_type_of_class(b)
+
+        if a.is_bool_type() || b.is_bool_type() {
+            return a.is_bool_type() && b.is_bool_type()
+        }
+        if a.is_float_type() || b.is_float_type() {
+            if !a.is_float_type() || !b.is_float_type() : return false
+            return a.number_byte_size() == b.number_byte_size()
+        }
+        // integers — size only
+        if !a.is_integer_type() || !b.is_integer_type() : return false
+        return a.number_byte_size() == b.number_byte_size()
+    }
+
+    // Alias used by meta `$is_compatible_with` and payload checks.
+    fn is_compatible_with(other: Type) bool {
+        return this.compat(other)
+    }
+
+    // Report incompatible types at `at` (expected = this, got = other).
+    fn compat_check(other: Type, at: Exp) !Error {
+        if this.compat(other) : return
+        at.error("Incompatible types. Passing a value of incompatible type where '" + this.compat_display_name() + "' is expected")
+    }
+
+    fn compat_display_name() String {
+        if this.custom_name.length > 0 : return this.custom_name
+        let c = this.class
+        if isset(c) : return c.name
+        if this.type == TYPE.void : return "void"
+        if this.type == TYPE.any : return "any"
+        if this.type == TYPE.nullable {
+            let sub = this.sub_type
+            if isset(sub) : return "?" + sub.compat_display_name()
+            return "?"
+        }
+        if this.type == TYPE.ptr {
+            let sub = this.sub_type
+            if isset(sub) : return "*" + sub.compat_display_name()
+            return "*"
+        }
+        if this.type == TYPE.ref {
+            let sub = this.sub_type
+            if isset(sub) : return "&" + sub.compat_display_name()
+            return "&"
+        }
+        return "type"
     }
 
     // Method lookup not wired on Class yet — always false for now.
@@ -325,6 +554,8 @@ class Type {
 
     // Conversion hooks not implemented yet — always false for now.
     fn can_convert_to(other: Type) bool {
+        // Same type or already assignable counts as a free conversion
+        if this.compat(other) : return true
         return false
     }
 
