@@ -633,7 +633,46 @@ fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 }
 
 // `base[…]` — body is EXP.body; re-parse as type list (specialize) or value (index).
+// Bare/unwrapped entry point: raw offset access, then apply the implicit default-value
+// fallback when the resolved access is fallible and not already wrapped by an explicit
+// error handler (`!?`, `! {}`, …) — see value_from_call_raw for the wrapped case.
 fn value_from_offset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let v = value_from_offset_raw_exp(exp, scope, ctx) !>
+    if v.can_error : return value_apply_offset_default(v, scope, ctx, exp) !>
+    return v
+}
+
+// No explicit handler after `[]` — fall back to a default/zero value instead of
+// rethrowing (matches Array/Map `[]` semantics: an out-of-bounds read yields the
+// zero value / null, it does not propagate an error to the caller).
+fn value_apply_offset_default(call: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let left = call.trim_errors()
+    let default_v = vgen_default_value(left.rett)
+    return value_error_result(call, default_v, default_v.rett, ERRH_KIND.value, at)
+}
+
+// Mode-fallthrough lookup for the `$offset` get hook.
+fn resolve_offset_get_func(class: Class) ?Func {
+    let f = class.offset
+    if isset(f) : return f
+    let for_class = class.mode_for_class
+    if isset(for_class) : return resolve_offset_get_func(for_class)
+    return null
+}
+
+// Mode-fallthrough lookup for the `$offset_assign` set hook.
+fn resolve_offset_assign_func(class: Class) ?Func {
+    let f = class.offset_assign
+    if isset(f) : return f
+    let for_class = class.mode_for_class
+    if isset(for_class) : return resolve_offset_assign_func(for_class)
+    return null
+}
+
+// Same as value_from_offset_exp but without the implicit default-value fallback —
+// used both as the main entry point (wrapped there) and directly by value_from_call_raw
+// when an explicit error handler already wraps the access.
+fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let left_exp = exp.get(VALUE_EXP.left)
     if !isset(left_exp) : exp.bug("offset is missing base")
     let body = exp.get(VALUE_EXP.right)
@@ -711,7 +750,85 @@ fn value_from_offset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
     }
 
+    // Class `$offset` hook, e.g. `Array[T].get(index: uint) T !LookupError`.
+    let on_class = on_t.get_class_or_null()
+    if isset(on_class) {
+        let get_func = resolve_offset_get_func(on_class)
+        if isset(get_func) {
+            if on.rett.is_nullable_type() {
+                exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+            }
+            let arg_skip: uint = 0
+            if isset(get_func.class) && !get_func.is_static : arg_skip = 1
+            let index_arg = get_func.args.get(arg_skip) ! exp.bug("'$offset' function is missing its index parameter")
+            index = value_try_convert(index, scope, ctx, index_arg.type)
+            index_arg.type.compat_check(index.rett, index_exp) !>
+
+            let callee = vgen_dot(on, get_func.name, get_func.get_rett())
+            callee.idf = Idf.for_func(get_func)
+            let call = vgen_call(callee, Array[Value]{ index }, get_func.get_rett())
+            call.exp = exp
+            if get_func.can_error {
+                call.can_error = true
+                call.error_type = get_func.error_type
+            }
+            return call
+        }
+    }
+
     exp.error("Type: '" + on.rett.compat_display_name() + "' has no '[]' get offset function")
+}
+
+// `on[index] = value` — only handled here when `on` resolves to a class with a
+// `$offset_assign` hook; fixed arrays / pointers return null so the caller falls
+// through to the normal assignable (VAL.ptrv) path.
+fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right_exp: Exp, at: Exp) ?Value !Error {
+    let base_exp = left_exp.get(VALUE_EXP.left)
+    if !isset(base_exp) : left_exp.bug("offset is missing base")
+    let body = left_exp.get(VALUE_EXP.right)
+    if !isset(body) : left_exp.bug("offset is missing body")
+    if body.type != EXP.body : left_exp.bug("offset body must be EXP.body")
+
+    let on = value_from_exp(base_exp, scope, ctx.without_type()) !>
+    let on_t = on.rett.get_non_nullable()
+    // Fixed array / pointer targets use the existing assignable (VAL.ptrv) path.
+    if on_t.type == TYPE.array || on_t.type == TYPE.ptr || on_t.type == TYPE.ref : return null
+
+    let on_class = on_t.get_class_or_null()
+    if !isset(on_class) : return null
+    let set_func = resolve_offset_assign_func(on_class)
+    if !isset(set_func) : return null
+
+    if on.rett.is_nullable_type() {
+        left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    }
+
+    let index_exp = parse_body_as_value_exp(body) !>
+    let index = value_from_exp(index_exp, scope, ctx.without_type()) !>
+
+    let arg_skip: uint = 0
+    if isset(set_func.class) && !set_func.is_static : arg_skip = 1
+    let index_arg = set_func.args.get(arg_skip) ! at.bug("'$offset_assign' function is missing its index parameter")
+    index = value_try_convert(index, scope, ctx, index_arg.type)
+    index_arg.type.compat_check(index.rett, index_exp) !>
+
+    let value_arg = set_func.args.get(arg_skip + 1) ! at.bug("'$offset_assign' function is missing its value parameter")
+    let right = value_from_exp(right_exp, scope, ctx.with_type(value_arg.type)) !>
+    right = value_try_convert(right, scope, ctx, value_arg.type)
+    value_arg.type.compat_check(right.rett, right_exp) !>
+
+    let callee = vgen_dot(on, set_func.name, set_func.get_rett())
+    callee.idf = Idf.for_func(set_func)
+    let call = vgen_call(callee, Array[Value]{ index, right }, set_func.get_rett())
+    call.exp = at
+    if set_func.can_error {
+        call.can_error = true
+        call.error_type = set_func.error_type
+        // Unhandled `[]=` errors are silently ignored (out-of-range writes are a no-op),
+        // matching the implicit default-value fallback for reads.
+        return value_apply_error_ignore(call, at, ctx)
+    }
+    return call
 }
 
 // Generic class base from a value left of `[T, …]`.
