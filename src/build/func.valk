@@ -4,8 +4,11 @@
 class Arg {
     name: String
     type: Type
+    // Storage for the argument; bound as IDF.decl on Func.arg_scope
+    decl: Decl
     // Default value still raw: EXP.body `(...)` when present
     default: ?Exp (null)
+    // `$G` style generic arg type (inferred from call-site values)
     is_generic: bool (false)
     generic_name: String ("")
 }
@@ -18,7 +21,7 @@ class Func {
     // Original parse expression (source span / raw AST)
     exp: Exp
     // Scope for argument names + signature type resolution
-    // (parent = file scope for free funcs, class/trait scope for methods)
+    // (parent = file scope for free funcs, class/trait/extend scope for methods)
     arg_scope: Scope
     // Sub-expressions from EXP.func (still raw until type stage)
     generics: ?Exp (null) // EXP.body `[...]`
@@ -30,11 +33,41 @@ class Func {
     // Resolved signature (filled by parse_func_types)
     args: Array[Arg] (.{})
     rett: ?Type (null) // null → void
+    error_type: ?ErrorType (null)
+    can_error: bool (false)
     infinite_args: bool (false) // `@infinite` in arg list
     parsed_types: bool (false)
-    // Generic declaration: `fn foo[T, U](...)`
+    // ---- Generics: `fn foo[T, U](...)` ----
     is_generic_base: bool (false)
     generic_names: ?Array[String] (null)
+    // Concrete type args for a specialization (`foo[String]` → [String type])
+    generic_types: ?Array[Type] (null)
+    // Base when this is a specialization
+    generic_from: ?Func (null)
+    // Cache of specializations (only on the base): key → Func
+    generic_cache: ?Map[Func] (null)
+    // `$G` arg-type generics (inferred at call site)
+    has_generic_args: bool (false)
+    generic_arg_names: Array[String] (.{})
+    // When true, `$G` names already have concrete types in generic_types map-by-name
+    // (kept as ordered list parallel to extra types after [T] types)
+    generic_args_defined: bool (false)
+    // Map name → Type for both [T] and $G bindings (specializations)
+    generic_type_map: ?Map[Type] (null)
+    // ---- Flags / linkage ----
+    is_extern: bool (false)
+    is_entrance: bool (false)
+    must_exit: bool (false)   // $exit
+    will_exit: bool (false)   // @willexit
+    must_throw: bool (false)  // $throw
+    is_hot: bool (false)      // $hot
+    is_inline: bool (false)   // $inline
+    is_global: bool (false)   // $global (free funcs only)
+    // Calls unknown/native code — used for GC / purity tracking later
+    info_calls_unknown_code: bool (false)
+    auto_to: bool (false)     // $auto (also registers as $to)
+    no_buffers: bool (false)  // @nobuffers
+    skip_ast: bool (false)    // generic-arg bases (and similar) skip body parse until specialized
     // `test "name" { ... }` — no args; only built when options.is_test
     is_test: bool (false)
     test_name: String ("")
@@ -43,30 +76,72 @@ class Func {
     group: ?Group (null)
     is_static: bool (false)
     is_getter: bool (false) // `get name: Type { ... }`
+    is_mut: bool (false)    // `mut fn` (filled when mut keyword is parsed)
 
     fn get_rett() Type {
         let r = this.rett
         if isset(r) : return r
         return type_void(this.ns.build)
     }
+
+    // Specialize `fn foo[T, U]` with concrete type arguments.
+    // Returns a cached instance when this combination was already generated.
+    fn specialize(gtypes: Array[Type], at: Exp) Func !Error {
+        if !this.is_generic_base {
+            at.error("Function is not generic: " + this.name)
+        }
+        let names = this.generic_names
+        if !isset(names) : at.bug("Generic base is missing generic_names")
+        if gtypes.length != names.length {
+            at.error("Generic function '" + this.name + "' expects " + names.length + " type argument(s), got " + gtypes.length)
+        }
+        return get_func_generic(this, gtypes, null) !>
+    }
+
+    // Specialize a `$G` generic-arg function (optionally after [T] types).
+    // `extra_names` / `extra_types` are the `$G` names and inferred types from the call.
+    fn specialize_generic_args(extra_names: Array[String], extra_types: Array[Type], at: Exp) Func !Error {
+        if !this.has_generic_args && !this.is_generic_base {
+            at.error("Function has no generic parameters: " + this.name)
+        }
+        if extra_names.length != extra_types.length {
+            at.bug("generic arg name/type length mismatch")
+        }
+        // Combine fixed [T] types (if already a specialization) with $G types
+        let all_types = Array[Type]{}
+        let fixed = this.generic_types
+        if isset(fixed) {
+            each fixed as t : all_types.append(t)
+        } else if this.is_generic_base {
+            at.error("Generic function '" + this.name + "' requires type arguments before call")
+        }
+        each extra_types as t : all_types.append(t)
+
+        // Base for the cache is always the generic root
+        let base = this.generic_from ?? this
+        return get_func_generic(base, all_types, extra_names) !>
+    }
 }
 
-// Resolve argument list + return type from raw EXP fields on Func.
+// Resolve argument list + return type + error type + flags from raw EXP fields.
 fn parse_func_types(func: Func) !Error {
     if func.parsed_types : return
     func.parsed_types = true
 
-    // Bind generic type parameters on arg_scope before reading types
+    // Generic bases only bind type-param names; full signature needs specialization
+    if func.is_generic_base {
+        bind_func_generics(func) !>
+        return
+    }
+
+    // Bind [T] params (specialization already placed concrete types on arg_scope)
     bind_func_generics(func) !>
 
     // Instance methods / getters: implicit `this` first
     let owner = func.class
     if isset(owner) && !func.is_static {
         let this_type = owner.get_type() !>
-        func.args.append(Arg {
-            name: "this"
-            type: this_type
-        })
+        append_func_arg(func, "this", this_type)
     }
 
     // Arguments from EXP.body `(...)` — getters have none
@@ -85,19 +160,199 @@ fn parse_func_types(func: Func) !Error {
         func.rett = type_void(func.ns.build)
     }
 
-    // Error type after `!` — left as EXP.id until error types are resolved on Func
+    // Error type after `!ErrorName`
+    resolve_func_error_type(func) !>
+
+    // Flags: $exit, $throw, $global, $offset, …
+    apply_func_flags(func) !>
+
+    // Bind each arg (including `this`) as IDF.decl on arg_scope for body lookup
+    bind_func_arg_decls(func) !>
 }
 
-// Parse `fn name[T, U]` generic names and bind each as IDF.type on arg_scope.
+// Look up EXP.id error type and store on Func.
+fn resolve_func_error_type(func: Func) !Error {
+    let err_exp = func.error
+    if !isset(err_exp) : return
+
+    let idf = resolve_idf_from_id(err_exp, func.arg_scope) !>
+    if idf.type != IDF.error_type {
+        err_exp.error("Identifier must be an error type")
+    }
+    let etype = idf.error_type
+    if !isset(etype) : err_exp.bug("Error-type idf is missing error_type")
+    func.error_type = etype
+    func.can_error = true
+}
+
+// Apply signature flags collected on EXP.func.list / Func.flags.
+fn apply_func_flags(func: Func) !Error {
+    let flags = func.flags
+    if !isset(flags) : return
+
+    let owner = func.class
+    let b = func.ns.build
+    let at = func.exp
+
+    each flags as flag {
+        if flag == "$entrance" {
+            func.is_entrance = true
+        } else if flag == "$exit" {
+            func.must_exit = true
+        } else if flag == "@willexit" {
+            func.will_exit = true
+        } else if flag == "$throw" {
+            func.must_throw = true
+        } else if flag == "$hot" {
+            func.is_hot = true
+        } else if flag == "$inline" {
+            func.is_inline = true
+        } else if flag == "$global" {
+            if isset(owner) {
+                at.error("'$global' is only valid on free functions, not methods")
+            }
+            func.is_global = true
+            // Visible everywhere (like $global classes)
+            b.scope.set_idf(func.name, Idf.for_func(func))
+        } else if flag == "$undefined" {
+            func.info_calls_unknown_code = true
+        } else if flag == "$offset" {
+            if !isset(owner) : at.error("'$offset' is only valid on class methods")
+            if isset(owner.offset) {
+                at.error("Multiple functions marked with $offset for the same type")
+            }
+            owner.offset = func
+        } else if flag == "$offset_assign" {
+            if !isset(owner) : at.error("'$offset_assign' is only valid on class methods")
+            if isset(owner.offset_assign) {
+                at.error("Multiple functions marked with $offset_assign for the same type")
+            }
+            owner.offset_assign = func
+        } else if flag == "$to" || flag == "$auto" {
+            if flag == "$auto" : func.auto_to = true
+            validate_hook_func(func, "$to", 0) !>
+            if isset(owner) : owner.to_hooks.append(func)
+            else : b.to_hooks.append(func)
+        } else if flag == "$eq" {
+            if !isset(owner) : at.error("'$eq' is only valid on class methods")
+            validate_hook_func(func, "$eq", 1) !>
+            owner.eq_hooks.append(func)
+        } else if flag == "$lt" {
+            if !isset(owner) : at.error("'$lt' is only valid on class methods")
+            validate_hook_func(func, "$lt", 1) !>
+            owner.lt_hooks.append(func)
+        } else if flag == "$gt" {
+            if !isset(owner) : at.error("'$gt' is only valid on class methods")
+            validate_hook_func(func, "$gt", 1) !>
+            owner.gt_hooks.append(func)
+        } else if flag == "$lte" {
+            if !isset(owner) : at.error("'$lte' is only valid on class methods")
+            validate_hook_func(func, "$lte", 1) !>
+            owner.lte_hooks.append(func)
+        } else if flag == "$gte" {
+            if !isset(owner) : at.error("'$gte' is only valid on class methods")
+            validate_hook_func(func, "$gte", 1) !>
+            owner.gte_hooks.append(func)
+        } else if flag == "$add" {
+            if !isset(owner) : at.error("'$add' is only valid on class methods")
+            validate_hook_func(func, "$add", 1) !>
+            owner.add_hooks.append(func)
+        } else if flag == "@nobuffers" {
+            func.no_buffers = true
+        } else {
+            at.error("Unknown function flag: " + flag)
+        }
+    }
+}
+
+// Hook functions: instance methods with a fixed extra-arg count and a single return value.
+// `argc` is the number of explicit args (excluding implicit `this`).
+fn validate_hook_func(func: Func, flag_name: String, argc: uint) !Error {
+    let at = func.exp
+    if func.is_static : at.error("Functions marked with " + flag_name + " cannot be static")
+    // args include implicit `this`
+    if func.args.length != (argc + 1) {
+        at.error("Functions marked with " + flag_name + " must have " + argc + " argument(s)")
+    }
+    let rett = func.get_rett()
+    if rett.is_void_type() {
+        at.error("Functions marked with " + flag_name + " must return a value")
+    }
+    if rett.type == TYPE.multi {
+        let subs = rett.sub_types
+        if isset(subs) && subs.length > 1 {
+            at.error("Functions marked with " + flag_name + " must return only 1 value")
+        }
+    }
+    if argc == 1 && func.can_error {
+        at.error("Functions marked with " + flag_name + " should never throw an error")
+    }
+}
+
+// Create Decl for each arg and bind name → IDF.decl on arg_scope.
+fn bind_func_arg_decls(func: Func) !Error {
+    each func.args as arg {
+        let decl = arg.decl
+        let name = arg.name
+        if func.arg_scope.has_local(name) {
+            // `this` / args should not collide with generic type names (different IDF kinds),
+            // but duplicate arg names are already rejected while parsing.
+            func.exp.error("Duplicate argument name: " + name)
+        }
+        func.arg_scope.set_idf(name, Idf.for_decl(decl))
+    }
+}
+
+// Append a typed argument (creates Decl). Does not bind into scope yet.
+fn append_func_arg(func: Func, name: String, type: Type, default: ?Exp (null), is_generic: bool (false), generic_name: String ("")) Arg {
+    let decl = Decl.new(type, true, name)
+    let arg = Arg {
+        name: name
+        type: type
+        decl: decl
+        default: default
+        is_generic: is_generic
+        generic_name: generic_name
+    }
+    func.args.append(arg)
+    return arg
+}
+
+// Parse `fn name[T, U]` generic names.
+// - Base: bind each name as TYPE.any placeholder on arg_scope
+// - Specialization: concrete types are already on arg_scope / generic_type_map
 fn bind_func_generics(func: Func) !Error {
     let body = func.generics
     if !isset(body) : return
-    let names = parse_class_generic_names(body) !>
-    func.generic_names = names
-    func.is_generic_base = true
+
+    // Names may already be set when created as a specialization
+    let names = func.generic_names
+    if !isset(names) {
+        names = parse_class_generic_names(body) !>
+        func.generic_names = names
+    }
+
+    // Specialization: types already bound by get_func_generic
+    if isset(func.generic_from) || func.generic_args_defined : return
+
+    // Generic base: only placeholders
+    if func.is_generic_base {
+        let b = func.ns.build
+        each names as gname {
+            let t = Type {
+                type: TYPE.any
+                build: b
+                custom_name: gname
+            }
+            func.arg_scope.set_idf(gname, Idf.for_type(t))
+        }
+        return
+    }
+
+    // Non-base with generics body but no specialization data — treat like base placeholders
+    // (should not happen for normal paths)
     let b = func.ns.build
     each names as gname {
-        // Fresh type param (not the shared type_any cache)
         let t = Type {
             type: TYPE.any
             build: b
@@ -130,13 +385,19 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
             p.error("Invalid argument name: '" + p.word() + "'")
         }
         let name = p.word()
+        // Avoid colliding with already-bound names (generic type params, earlier args)
         if scope.has_local(name) {
             p.error("Duplicate argument name: " + name)
+        }
+        // Also reject duplicate among args not yet bound (this already bound via has_local
+        // once decls are set — during parse only check prior args)
+        each func.args as existing {
+            if existing.name == name : p.error("Duplicate argument name: " + name)
         }
 
         p.expect(":", true, true) !>
 
-        // Type: normal type, or `$G` for generic arg type (method-style)
+        // Type: normal type, or `$G` for generic arg type (call-site inference)
         let is_generic = false
         let generic_name = ""
         let arg_type = type_any(func.ns.build)
@@ -146,13 +407,34 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
             let full_name = p.word()
             let gname = full_name.ltrim("$")
             if gname.length == 0 : p.error("Empty generic argument name")
-            is_generic = true
-            generic_name = gname
-            // Placeholder until generic-arg specialization exists (not the shared type_any cache)
-            arg_type = Type {
-                type: TYPE.any
-                build: func.ns.build
-                custom_name: full_name
+
+            if func.generic_args_defined {
+                // Specialization: look up concrete type for this $G name
+                let gmap = func.generic_type_map
+                if !isset(gmap) : p.error("(Compiler bug) Missing generic_type_map for specialized generic-arg func")
+                let gt = gmap.get(gname) ! p.error("(Compiler bug) Missing argument generic type: " + gname)
+                arg_type = gt
+            } else {
+                // Base: placeholder + track name for later specialization
+                let gnames = func.generic_names
+                if func.generic_arg_names.contains(gname) {
+                    p.error("Duplicate generic name: " + gname)
+                }
+                if isset(gnames) {
+                    each gnames as existing {
+                        if existing == gname : p.error("Duplicate generic name: " + gname)
+                    }
+                }
+                func.generic_arg_names.append(gname)
+                is_generic = true
+                generic_name = gname
+                arg_type = Type {
+                    type: TYPE.any
+                    build: func.ns.build
+                    custom_name: full_name
+                }
+                func.has_generic_args = true
+                func.skip_ast = true
             }
         } else {
             let type_exp = read_type_exp(p, true, true) !>
@@ -169,14 +451,7 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
 
         // Skip void-typed args (old compiler does the same)
         if arg_type.type != TYPE.void {
-            let arg = Arg {
-                name: name
-                type: arg_type
-                default: default
-                is_generic: is_generic
-                generic_name: generic_name
-            }
-            func.args.append(arg)
+            append_func_arg(func, name, arg_type, default, is_generic, generic_name)
         }
 
         t = p.tok(true, true) !>
@@ -184,4 +459,110 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
         if t == TOK.sign && p.word_is(")") : break
         p.error("Expected ',' or ')' in function arguments, found: '" + p.word() + "'")
     }
+}
+
+// Create (or reuse) a specialized Func for a generic base.
+// `types` is the full list: first the [T, U] types, then any `$G` inferred types.
+// `generic_arg_names` is non-null when `$G` names are included at the end of `types`.
+fn get_func_generic(base: Func, types: Array[Type], generic_arg_names: ?Array[String]) Func !Error {
+    if !base.is_generic_base && !base.has_generic_args {
+        base.exp.bug("get_func_generic on non-generic function: " + base.name)
+    }
+
+    let cache = base.generic_cache
+    if !isset(cache) {
+        let m = Map[Func]{}
+        base.generic_cache = m
+        cache = m
+    }
+
+    let key = generic_types_key(types)
+    let existing = cache.get(key) !? null
+    if isset(existing) : return existing
+
+    // Parent of specialized arg_scope: same as the base's parent
+    let parent = base.arg_scope.parent
+    let gscope = Scope.new(parent)
+
+    let gfunc = Func {
+        unit: base.unit
+        ns: base.ns
+        name: base.name + "__" + key
+        act: base.act
+        exp: base.exp
+        arg_scope: gscope
+        generics: base.generics
+        args_exp: base.args_exp
+        rett_exp: base.rett_exp
+        error: base.error
+        body: base.body
+        flags: base.flags
+        is_generic_base: false
+        generic_names: base.generic_names
+        generic_types: types
+        generic_from: base
+        generic_args_defined: isset(generic_arg_names)
+        has_generic_args: false // specialized — concrete types
+        skip_ast: false
+        is_extern: base.is_extern
+        is_entrance: base.is_entrance
+        must_exit: base.must_exit
+        will_exit: base.will_exit
+        must_throw: base.must_throw
+        is_hot: base.is_hot
+        is_inline: base.is_inline
+        is_global: base.is_global
+        info_calls_unknown_code: base.info_calls_unknown_code
+        auto_to: base.auto_to
+        no_buffers: base.no_buffers
+        is_test: base.is_test
+        test_name: base.test_name
+        class: base.class
+        group: base.group
+        is_static: base.is_static
+        is_getter: base.is_getter
+        is_mut: base.is_mut
+    }
+
+    // Bind type params: [T, U] names then `$G` names
+    let gmap = Map[Type]{}
+    gfunc.generic_type_map = gmap
+    let k: uint = 0
+    let names = base.generic_names
+    if isset(names) {
+        each names as gname {
+            let type = types.get(k) ! base.exp.bug("Missing generic type argument for: " + gname)
+            gmap.set(gname, type)
+            gscope.set_idf(gname, Idf.for_type(type))
+            k++
+        }
+    }
+    if isset(generic_arg_names) {
+        each generic_arg_names as gname {
+            let type = types.get(k) ! base.exp.bug("Missing generic-arg type for: " + gname)
+            gmap.set(gname, type)
+            gscope.set_idf(gname, Idf.for_type(type))
+            k++
+        }
+        gfunc.generic_arg_names = generic_arg_names
+    }
+
+    // SELF for methods (class scope may already have it; rebind for clarity)
+    let owner = gfunc.class
+    if isset(owner) && !owner.is_generic_base {
+        gscope.set_idf("SELF", Idf.for_class(owner))
+    }
+
+    cache.set(key, gfunc)
+
+    // Parse full signature with concrete bindings
+    parse_func_types(gfunc) !>
+
+    // Track on unit + AST pipeline (like a normal function)
+    gfunc.unit.functions.append(gfunc)
+    if !gfunc.skip_ast {
+        gfunc.ns.build.pipeline.parse_func_asts.append(gfunc)
+    }
+
+    return gfunc
 }
