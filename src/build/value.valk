@@ -38,9 +38,9 @@ enum VAL : u8 {
 
 class Value {
     type: VAL
-    // Result type when known (literals, casts, resolved ids, …)
-    // Control-flow values (if/while/let/…) use void.
-    rett: ?Type (null)
+    // Result type of this value — never null; use void when there is no value
+    // (control-flow, incomplete/unresolved expressions, statement forms).
+    rett: Type
     // Source expression (for errors / spans)
     exp: ?Exp (null)
     // Children
@@ -170,7 +170,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
             operand.exp = exp
             return operand
         }
-        let v = vgen_unary(operand, op)
+        let v = vgen_unary(operand, op, operand.rett)
         v.exp = exp
         return v
     }
@@ -188,6 +188,8 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
             folded.exp = exp
             return folded
         }
+        // Operand type compatibility (skip when either side is still void/unknown)
+        value_check_op_compat(left, right, op, exp) !>
         // Prefer left's type; compare / logic yield bool
         let rett = left.rett
         if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte || op == VALUE_OP.and || op == VALUE_OP.or {
@@ -222,20 +224,16 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
                 folded.exp = exp
                 return folded
             }
-            // Static method call: Node.tree(…) — rett from func if known
-            if isset(on) && on.type == VAL.type {
-                let cidf = callee.idf
-                if isset(cidf) && cidf.type == IDF.func {
-                    let f = cidf.func
-                    if isset(f) {
-                        let v = vgen_call(callee, args, f.get_rett())
-                        v.exp = exp
-                        return v
-                    }
-                }
-            }
         }
-        let v = vgen_call(callee, args)
+        // Resolve Func when possible and check args against parameter types
+        let call_func = value_resolve_call_func(callee)
+        if isset(call_func) {
+            value_check_call_args(call_func, callee, args, exp) !>
+            let v = vgen_call(callee, args, call_func.get_rett())
+            v.exp = exp
+            return v
+        }
+        let v = vgen_call(callee, args, type_void(b))
         v.exp = exp
         return v
     }
@@ -287,7 +285,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
                 }
             }
         }
-        let v = vgen_dot(on, exp.str1)
+        let v = vgen_dot(on, exp.str1, type_void(b))
         v.exp = exp
         return v
     }
@@ -312,7 +310,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
             args.append(value_from_exp(a, scope) !>)
             i++
         }
-        let v = vgen_multi(args)
+        let v = vgen_multi(args, type_void(b))
         v.exp = exp
         return v
     }
@@ -530,16 +528,12 @@ fn value_from_id_exp(exp: Exp, scope: Scope) Value !Error {
         }
     }
 
-    return vgen_id(name, ns_name, idf)
+    return vgen_id(name, ns_name, idf, type_void(b))
 }
 
-// VAL.type for a value's result type (`typeof(v)` / `v.$type`). Errors if rett is unknown.
+// VAL.type for a value's result type (`typeof(v)` / `v.$type`).
 fn value_as_rett_type(on: Value, at: Exp, b: Build) Value !Error {
-    let rett = on.rett
-    if !isset(rett) {
-        at.error("Cannot determine type of expression")
-    }
-    return vgen_type(rett, b)
+    return vgen_type(on.rett, b)
 }
 
 // Pure meta-properties on VAL.type (`T.$is_inline` → bool, `T.$notnull` → VAL.type).
@@ -709,6 +703,128 @@ fn value_fold_string(v: Value) ?String {
     }
     if v.type == VAL.id : return v.name
     return null
+}
+
+// ---- Operator / call type checks ----
+
+// Ensure left/right operand types are compatible for `op`.
+// Skips when either side is still void (incomplete / unresolved).
+// - && / || : both bool
+// - compare / arithmetic / bitwise : right must be assignable to left's type
+fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Error {
+    let lt = left.rett
+    let rt = right.rett
+    if lt.is_void_type() || rt.is_void_type() : return
+
+    if op == VALUE_OP.and || op == VALUE_OP.or {
+        if !lt.is_bool_type() {
+            at.error("Left operand of logical operator must be bool")
+        }
+        if !rt.is_bool_type() {
+            at.error("Right operand of logical operator must be bool")
+        }
+        return
+    }
+
+    // Compare and arithmetic/bitwise: operands must be compatible
+    // (old: l.rett.compat_check(r.rett) — expected left, got right)
+    if !lt.compat(rt) {
+        if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte {
+            if rt.compat(lt) : return
+        }
+        lt.compat_check(rt, at) !>
+    }
+}
+
+// Resolve the Func being called from a callee Value, if known.
+// - free fn: VAL.id with IDF.func
+// - static method: VAL.id with value1=VAL.type and IDF.func
+// - instance method: VAL.id with value1=receiver and name matching class.funcs
+fn value_resolve_call_func(callee: Value) ?Func {
+    if callee.type != VAL.id : return null
+    let idf = callee.idf
+    if isset(idf) && idf.type == IDF.func {
+        return idf.func
+    }
+    // Instance method: receiver.method — look up by name on receiver type
+    let on = callee.value1
+    if !isset(on) : return null
+    let name = callee.name
+    if name.length == 0 : return null
+
+    if on.type == VAL.type {
+        let t = on.of_type
+        if !isset(t) : return null
+        let c = t.class
+        if !isset(c) : return null
+        return c.funcs.get(name) !? null
+    }
+
+    // Value receiver — class from rett (void means incomplete)
+    let rett = on.rett
+    if rett.is_void_type() : return null
+    let c = rett.get_class_or_null()
+    if !isset(c) : return null
+    return c.funcs.get(name) !? null
+}
+
+// Check call arity and each argument against Func.args.
+// Skips implicit `this` for instance methods (receiver is not in `args`).
+// Soft: void rett on an arg means incomplete typing — that slot is not checked.
+fn value_check_call_args(func: Func, callee: Value, args: Array[Value], at: Exp) !Error {
+    // Ensure signature types are resolved
+    if !func.parsed_types {
+        parse_func_types(func) !>
+    }
+
+    let params = func.args
+    // Instance methods have `this` as first arg; call args are the remaining ones
+    let skip: uint = 0
+    if isset(func.class) && !func.is_static {
+        let on = callee.value1
+        if isset(on) && on.type != VAL.type {
+            skip = 1
+        }
+    }
+
+    let max_params = params.length > skip ? params.length - skip : 0
+
+    // Required = leading params without defaults (after skip)
+    let required: uint = 0
+    let pi: uint = skip
+    while pi < params.length {
+        let p = params.get(pi) ! break
+        if isset(p.default) : break
+        required++
+        pi++
+    }
+
+    if args.length < required {
+        at.error("Not enough arguments for '" + func.name + "' (expected at least " + required + ", got " + args.length + ")")
+    }
+    if !func.infinite_args && args.length > max_params {
+        at.error("Too many arguments for '" + func.name + "' (expected at most " + max_params + ", got " + args.length + ")")
+    }
+
+    let i: uint = 0
+    while i < args.length {
+        let param_i = skip + i
+        let param: ?Arg = null
+        if param_i < params.length {
+            param = params.get(param_i) !? null
+        } else if func.infinite_args && params.length > 0 {
+            param = params.get(params.length - 1) !? null
+        }
+        if !isset(param) : break
+
+        let av = args.get(i) ! break
+        let avt = av.rett
+        if !avt.is_void_type() && !param.is_generic {
+            // Expected param type accepts actual arg type
+            param.type.compat_check(avt, at) !>
+        }
+        i++
+    }
 }
 
 // Strip surrounding quotes from a string/char token (keeps escapes as written).
