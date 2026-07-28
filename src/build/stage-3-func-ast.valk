@@ -1,0 +1,291 @@
+// Resolve function bodies into a sequence of Values on the body Scope.
+//
+// Everything in a function body is a Value — including if/while/let/return/assign.
+// Control-flow values have rett = void (side effects only).
+//
+// Prerequisites: parse_func_types (args + this bound as IDF.decl on arg_scope).
+
+fn parse_func_ast(func: Func) !Error {
+    if func.parsed_ast : return
+    if func.skip_ast : return
+    if func.is_generic_base : return
+
+    // Stdlib bodies use the full value language (class init, each, macros, …).
+    // Signatures are typed; defer body ASTs for `valk:*` until those forms exist.
+    if func.ns.pkg.name == "valk" {
+        func.parsed_ast = true
+        return
+    }
+
+    func.parsed_ast = true
+
+    let body = func.body
+    if !isset(body) : return
+
+    // Body scope parents arg_scope (args + this already bound as IDF.decl)
+    let scope = func.arg_scope.sub_scope()
+    scope.func = func
+    func.body_scope = scope
+
+    let rett = func.get_rett()
+    if !rett.is_void_type() : scope.must_return = true
+    if func.must_exit : scope.must_exit = true
+    if func.must_throw : scope.must_throw = true
+
+    let exps = read_func_body_exps(body) !>
+    let state = ParseState.new()
+    each exps as exp {
+        let v = body_value_from_exp(func, scope, state, exp) !? null
+        if isset(v) : scope.append_value(v)
+    }
+    if state.has_open_if() || state.is_skipping() {
+        body.error("Missing compile macro '#end' in function body")
+    }
+}
+
+// Convert one body-level EXP into a Value. Returns null for comments / skipped #if.
+fn body_value_from_exp(func: Func, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
+    if exp.type == EXP.macro {
+        parse_macro_exp(func.ns, scope, state, exp) !>
+        return null
+    }
+    if state.is_skipping() : return null
+    if exp.type == EXP.comment : return null
+
+    if exp.type == EXP.let : return value_from_let_exp(func, scope, exp) !>
+    if exp.type == EXP.return : return value_from_return_exp(func, scope, exp) !>
+    if exp.type == EXP.assign : return value_from_assign_exp(func, scope, exp) !>
+    if exp.type == EXP.stmt : return value_from_stmt_exp(func, scope, exp) !>
+    if exp.type == EXP.if : return value_from_if_exp(func, scope, state, exp) !>
+    if exp.type == EXP.while : return value_from_while_exp(func, scope, state, exp) !>
+    if exp.type == EXP.block : return value_from_block_exp(func, scope, state, exp) !>
+    if exp.type == EXP.break : return vgen_break(func.ns.build, exp)
+    if exp.type == EXP.continue : return vgen_continue(func.ns.build, exp)
+    if exp.type == EXP.throw : return value_from_throw_exp(func, scope, exp) !>
+
+    // Already an EXP.value used as a statement
+    if exp.type == EXP.value {
+        return value_from_exp(exp, scope) !>
+    }
+
+    exp.bug("Unhandled body expression type: " + exp.type)
+}
+
+// ---- Body value constructors ----
+
+fn value_from_let_exp(func: Func, scope: Scope, exp: Exp) Value !Error {
+    let b = func.ns.build
+    let names = exp.list
+    if !isset(names) : exp.bug("let is missing names")
+    if names.length == 0 : exp.bug("let is missing names")
+
+    let types_exp = exp.get(LET_EXP.types)
+    let value_exp = exp.get(LET_EXP.value)
+    if !isset(value_exp) : exp.bug("let is missing RHS value")
+
+    let rhs = value_from_exp(value_exp, scope) !>
+    let rhs_parts = value_unroll(rhs)
+
+    if names.length > rhs_parts.length {
+        exp.error("Right side of '=' does not return enough values for the declared variables")
+    }
+
+    let decls = Array[Decl]{}
+    let inits = Array[Value]{}
+    let i: uint = 0
+    each names as name {
+        let part = rhs_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
+        let part_rett = part.rett
+        let decl_type = part_rett ?? type_any(b)
+        if isset(types_exp) {
+            let te = types_exp.get(i)
+            if isset(te) && te.type == EXP.type {
+                decl_type = type_from_exp(te, scope) !>
+            }
+        }
+        if decl_type.is_void_type() {
+            exp.error("You cannot declare a variable of type 'void'")
+        }
+
+        if name != "_" {
+            if scope.has_local(name) {
+                exp.error("Name already used in this scope: " + name)
+            }
+            let decl = Decl.new(decl_type, false, name)
+            decls.append(decl)
+            inits.append(part)
+            scope.add_decl(decl)
+            scope.set_idf(name, Idf.for_decl(decl))
+        } else {
+            inits.append(part)
+        }
+        i++
+    }
+
+    return vgen_declare(decls, inits, b, exp)
+}
+
+fn value_from_return_exp(func: Func, scope: Scope, exp: Exp) Value !Error {
+    let b = func.ns.build
+    if func.must_exit || func.will_exit {
+        exp.error("You cannot use 'return' in a function that's marked with '$exit'")
+    }
+
+    let rett = func.get_rett()
+    let value_exp = exp.get(RETURN_EXP.value)
+    let retv: ?Value = null
+
+    if rett.is_void_type() {
+        if isset(value_exp) {
+            exp.error("Function returns void; 'return' must not have a value")
+        }
+    } else {
+        if !isset(value_exp) {
+            exp.error("Function must return a value of type matching the signature")
+        }
+        retv = value_from_exp(value_exp, scope) !>
+        // Soft type check while property/method typing is incomplete
+    }
+
+    scope.did_return = true
+    return vgen_return(retv, b, exp)
+}
+
+fn value_from_assign_exp(func: Func, scope: Scope, exp: Exp) Value !Error {
+    let b = func.ns.build
+    let left_exp = exp.get(ASSIGN_EXP.left)
+    let right_exp = exp.get(ASSIGN_EXP.right)
+    if !isset(left_exp) || !isset(right_exp) : exp.bug("assign is missing operands")
+
+    let left = value_from_exp(left_exp, scope) !>
+    let right = value_from_exp(right_exp, scope) !>
+    let op = exp.kind.@cast(ASSIGN_OP)
+
+    if left.type != VAL.decl {
+        exp.error("Left side of assignment is not assignable")
+    }
+
+    return vgen_assign(left, right, op, b, exp)
+}
+
+fn value_from_stmt_exp(func: Func, scope: Scope, exp: Exp) Value !Error {
+    // Expression statement — the value itself (call, etc.); not wrapped
+    let value_exp = exp.get(STMT_EXP.value)
+    if !isset(value_exp) : exp.bug("statement is missing value")
+    return value_from_exp(value_exp, scope) !>
+}
+
+fn value_from_if_exp(func: Func, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = func.ns.build
+    let cond_exp = exp.get(IF_EXP.cond)
+    if !isset(cond_exp) : exp.bug("if is missing condition")
+    let cond = value_from_exp(cond_exp, scope) !>
+    let cr = cond.rett
+    if isset(cr) && !cr.is_bool_type() && cr.type != TYPE.any {
+        exp.error("The if condition value must be of type bool")
+    }
+
+    let then_scope = scope.sub_scope()
+    let then_body = exp.get(IF_EXP.then_body)
+    let then_vals = Array[Value]{}
+    if isset(then_body) {
+        then_vals = body_values_from_nested(func, then_scope, state, then_body) !>
+    }
+
+    let else_v: ?Value = null
+    let else_body = exp.get(IF_EXP.else_body)
+    if isset(else_body) {
+        let es = scope.sub_scope()
+        let else_vals = body_values_from_nested(func, es, state, else_body) !>
+        else_v = vgen_block(else_vals, b, else_body)
+        if then_scope.did_return && es.did_return {
+            scope.did_return = true
+        }
+    }
+
+    return vgen_if(cond, then_vals, else_v, b, exp)
+}
+
+fn value_from_while_exp(func: Func, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = func.ns.build
+    let cond_exp = exp.get(WHILE_EXP.cond)
+    if !isset(cond_exp) : exp.bug("while is missing condition")
+    let cond = value_from_exp(cond_exp, scope) !>
+    let cr = cond.rett
+    if isset(cr) && !cr.is_bool_type() && cr.type != TYPE.any {
+        exp.error("The while condition value must be of type bool")
+    }
+
+    let body_scope = scope.sub_scope()
+    let body_exp = exp.get(WHILE_EXP.body)
+    let body_vals = Array[Value]{}
+    if isset(body_exp) {
+        body_vals = body_values_from_nested(func, body_scope, state, body_exp) !>
+    }
+    return vgen_while(cond, body_vals, b, exp)
+}
+
+fn value_from_block_exp(func: Func, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = func.ns.build
+    let body = scope.sub_scope()
+    let vals = body_values_from_nested(func, body, state, exp) !>
+    if body.did_return : scope.did_return = true
+    return vgen_block(vals, b, exp)
+}
+
+fn value_from_throw_exp(func: Func, scope: Scope, exp: Exp) Value !Error {
+    let b = func.ns.build
+    if func.must_exit {
+        exp.error("You cannot 'throw' in a function that's flagged with '$exit'")
+    }
+    let value_exp = exp.get(RETURN_EXP.value)
+    if !isset(value_exp) : exp.bug("throw is missing value")
+    let v = value_from_exp(value_exp, scope) !>
+    scope.did_return = true
+    return vgen_throw(v, b, exp)
+}
+
+// Collect Values for a then/else/while/block nested body.
+fn body_values_from_nested(func: Func, scope: Scope, state: ParseState, exp: Exp) Array[Value] !Error {
+    let out = Array[Value]{}
+
+    if exp.type == EXP.if {
+        let v = body_value_from_exp(func, scope, state, exp) !? null
+        if isset(v) : out.append(v)
+        return out
+    }
+
+    if exp.type == EXP.block {
+        let members = exp.body_exps
+        if isset(members) {
+            each members as mem {
+                let v = body_value_from_exp(func, scope, state, mem) !? null
+                if isset(v) : out.append(v)
+            }
+            return out
+        }
+        let body = exp.get(BLOCK_EXP.body)
+        if isset(body) {
+            let exps = read_func_body_exps(body) !>
+            each exps as mem {
+                let v = body_value_from_exp(func, scope, state, mem) !? null
+                if isset(v) : out.append(v)
+            }
+        }
+        return out
+    }
+
+    let v = body_value_from_exp(func, scope, state, exp) !? null
+    if isset(v) : out.append(v)
+    return out
+}
+
+// ---- helpers ----
+
+fn value_unroll(v: Value) Array[Value] {
+    if v.type == VAL.multi {
+        let vals = v.values
+        if isset(vals) : return vals
+    }
+    return Array[Value]{ v }
+}

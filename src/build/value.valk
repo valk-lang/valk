@@ -2,6 +2,8 @@
 // Mirrors the old Value idea, but is filled from the structured Exp AST
 // (value_from_exp) rather than while tokenizing.
 
+// Everything in a function body is a Value — including control flow.
+// if / while / let / return / assign / block have rett = void (side-effecting).
 enum VAL : u8 {
     undefined
     int
@@ -11,6 +13,7 @@ enum VAL : u8 {
     char
     null
     id       // name lookup (may carry resolved Idf)
+    decl     // local / argument variable (Decl)
     type     // compile-time type value (of_type); rett is String; props like .$is_inline
     op       // binary op (VALUE_OP in .op); left/right in value1/value2
     unary    // unary op (VALUE_OP in .op); operand in value1
@@ -18,11 +21,25 @@ enum VAL : u8 {
     cast     // value.@cast(Type); value1 = on, cast_type = Type
     paren    // grouping; value1 = inner (usually folded away)
     multi    // argument list only (values array); not a runtime value alone
+    // Class / struct construction: Type { prop: value, ... }
+    // value1 = type side; values = field inits (each Value.name = prop name)
+    class_init
+    // ---- Function-body / control-flow values (typically rett = void) ----
+    declare  // let: decls + init values; binds names as side effect
+    assign   // lvalue op= rvalue; op = ASSIGN_OP
+    if       // value1=cond; values=then body; value2=else block (optional VAL.block)
+    while    // value1=cond; values=body
+    block    // sequential values (nested `{ ... }` or then/else body)
+    return   // value1=optional return value
+    throw    // value1=thrown value
+    break
+    continue
 }
 
 class Value {
     type: VAL
     // Result type when known (literals, casts, resolved ids, …)
+    // Control-flow values (if/while/let/…) use void.
     rett: ?Type (null)
     // Source expression (for errors / spans)
     exp: ?Exp (null)
@@ -30,7 +47,7 @@ class Value {
     value1: ?Value (null)
     value2: ?Value (null)
     values: ?Array[Value] (null)
-    // Operators (VALUE_OP for op / unary)
+    // Operators: VALUE_OP for op/unary; ASSIGN_OP for VAL.assign
     op: u8 (0)
     // Literal payloads
     int_val: int (0)
@@ -41,6 +58,10 @@ class Value {
     name: String ("")
     ns_name: ?String (null)
     idf: ?Idf (null)
+    // VAL.decl — single decl reference
+    decl: ?Decl (null)
+    // VAL.declare — one or more new locals
+    decls: ?Array[Decl] (null)
     // Cast target
     cast_type: ?Type (null)
     // VAL.type: the actual Type this compile-time value represents
@@ -167,10 +188,10 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
             folded.exp = exp
             return folded
         }
-        // Prefer left's type; compare / logic rett filled later when needed
+        // Prefer left's type; compare / logic yield bool
         let rett = left.rett
         if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte || op == VALUE_OP.and || op == VALUE_OP.or {
-            rett = null
+            rett = type_bool(b)
         }
         let v = vgen_op(left, right, op, rett)
         v.exp = exp
@@ -193,13 +214,25 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
                 i++
             }
         }
-        // Type meta-methods: T.$can_convert_to(U) — callee is VAL.id from a folded-or-pending dot
+        // Type meta-methods: T.$can_convert_to(U) — only `$…` names, not static methods
         if callee.type == VAL.id {
             let on = callee.value1
-            if isset(on) && on.type == VAL.type {
+            if isset(on) && on.type == VAL.type && callee.name.starts_with("$") {
                 let folded = value_type_method(on, callee.name, args, exp, b) !>
                 folded.exp = exp
                 return folded
+            }
+            // Static method call: Node.tree(…) — rett from func if known
+            if isset(on) && on.type == VAL.type {
+                let cidf = callee.idf
+                if isset(cidf) && cidf.type == IDF.func {
+                    let f = cidf.func
+                    if isset(f) {
+                        let v = vgen_call(callee, args, f.get_rett())
+                        v.exp = exp
+                        return v
+                    }
+                }
             }
         }
         let v = vgen_call(callee, args)
@@ -232,11 +265,26 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         }
         // Compile-time type meta-properties: T.$is_inline → VAL.bool
         // Method-style meta (`$can_convert_to`) stays as a dot so the call site can fold it.
+        // Non-meta names on VAL.type are static members (e.g. Node.tree) → VAL.id dot.
         if on.type == VAL.type {
             let folded = value_type_prop(on, exp.str1, exp, b) !>
             if isset(folded) {
                 folded.exp = exp
                 return folded
+            }
+            // Static method / member access — attach class func idf when known
+            let t = on.of_type
+            if isset(t) {
+                let c = t.class
+                if isset(c) {
+                    let f = c.funcs.get(exp.str1) !? null
+                    if isset(f) {
+                        let v = vgen_dot(on, exp.str1, f.get_rett())
+                        v.exp = exp
+                        v.idf = Idf.for_func(f)
+                        return v
+                    }
+                }
             }
         }
         let v = vgen_dot(on, exp.str1)
@@ -269,7 +317,105 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         return v
     }
 
+    if kind == VALUE_KIND.incr || kind == VALUE_KIND.decr {
+        let operand_exp = exp.get(VALUE_EXP.left)
+        if !isset(operand_exp) : exp.bug("Missing ++/-- operand")
+        let operand = value_from_exp(operand_exp, scope) !>
+        // Result type matches operand (int-like); full assignability checks later
+        let v = Value {
+            type: VAL.op
+            op: kind == VALUE_KIND.incr ? VALUE_OP.add : VALUE_OP.sub
+            value1: operand
+            rett: operand.rett
+            exp: exp
+            bool_val: exp.bool1 // prefix flag stashed for IR later
+        }
+        return v
+    }
+
+    if kind == VALUE_KIND.error_code {
+        // Placeholder until error-value typing is wired; name in string_val
+        let v = Value {
+            type: VAL.id
+            name: exp.str1
+            string_val: exp.str1
+            rett: type_int(b) // error codes are u32-ish at runtime
+            exp: exp
+        }
+        return v
+    }
+
+    if kind == VALUE_KIND.class_init {
+        return value_from_class_init_exp(exp, scope) !>
+    }
+
     exp.bug("Unknown value kind: " + kind)
+}
+
+// Type { prop: value, ... }
+fn value_from_class_init_exp(exp: Exp, scope: Scope) Value !Error {
+    let left_exp = exp.get(VALUE_EXP.left)
+    if !isset(left_exp) : exp.bug("class_init is missing type")
+    let left = value_from_exp(left_exp, scope) !>
+
+    let class = value_as_class_for_init(left)
+    if !isset(class) {
+        exp.error("Class init requires a class or struct type before '{'")
+    }
+
+    let fields_exp = exp.get(VALUE_EXP.right)
+    let field_vals = Array[Value]{}
+    if isset(fields_exp) {
+        let i: uint = 0
+        while true {
+            let fexp = fields_exp.get(i)
+            if !isset(fexp) : break
+            let fname = fexp.str1
+            if fname.length == 0 : fexp.bug("class_init field is missing name")
+            let vexp = fexp.get(VALUE_EXP.left)
+            if !isset(vexp) : fexp.bug("class_init field is missing value")
+            let fv = value_from_exp(vexp, scope) !>
+            fv.name = fname
+            // Soft prop check when props are known
+            let prop = class.get_prop_by_name(fname) !? null
+            if !isset(prop) && class.props.length > 0 {
+                // Only error when the class has finished prop parse and props exist
+                // (empty props may mean not parsed yet)
+                let has_named = false
+                each class.props as p {
+                    if isset(p.name) : has_named = true
+                }
+                if has_named {
+                    fexp.error("There's no property named: '" + fname + "'")
+                }
+            }
+            field_vals.append(fv)
+            i++
+        }
+    }
+
+    let rett = class.get_type() !>
+    let v = vgen_class_init(class, field_vals, rett, exp)
+    return v
+}
+
+// Resolve Type / class id for class init left-hand side.
+fn value_as_class_for_init(v: Value) ?Class {
+    if v.type == VAL.type {
+        let t = v.of_type
+        if !isset(t) : return null
+        return t.class
+    }
+    if v.type == VAL.id {
+        let idf = v.idf
+        if !isset(idf) : return null
+        if idf.type == IDF.class : return idf.class
+        if idf.type == IDF.type {
+            let t = idf.of_type
+            if isset(t) : return t.class
+        }
+    }
+    return null
 }
 
 // ---- helpers ----
@@ -321,6 +467,15 @@ fn value_from_id_exp(exp: Exp, scope: Scope) Value !Error {
         // Unresolved ids are allowed here (e.g. other value aliases); later stages resolve
     }
 
+    // Locals / arguments → VAL.decl with known type
+    if isset(idf) && idf.type == IDF.decl {
+        let d = idf.decl
+        if !isset(d) : exp.bug("Decl idf is missing decl")
+        let v = vgen_decl(d)
+        v.exp = exp
+        return v
+    }
+
     // Compile-time constants (macro defs on Build.scope) fold to their Value
     if isset(idf) && idf.type == IDF.value {
         let bound = idf.value
@@ -339,6 +494,7 @@ fn value_from_id_exp(exp: Exp, scope: Scope) Value !Error {
             idf: idf
             cast_type: bound.cast_type
             of_type: bound.of_type
+            decl: bound.decl
         }
         return v
     }
@@ -417,13 +573,18 @@ fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
     if name == "$is_raw_pointer" : return vgen_bool(t.is_raw_pointer_type(), type_bool(b))
     if name == "$has_vtable" : return vgen_bool(t.has_vtable(), type_bool(b))
 
-    // Method-style: keep as `.name` so `.(args)` folds via value_type_method
+    // Method-style meta: keep as `.name` so `.(args)` folds via value_type_method
     if name == "$can_convert_to" : return null
     if name == "$is_type_of" : return null
     if name == "$has_method" : return null
     if name == "$is_compatible_with" : return null
 
-    at.error("Unknown type property: '" + name + "'")
+    // Unknown `$…` meta on a type
+    if name.starts_with("$") {
+        at.error("Unknown type property: '" + name + "'")
+    }
+    // Normal name (e.g. static method `Node.tree`) — not a type meta-prop
+    return null
 }
 
 // Type meta-method calls: T.$can_convert_to(U) / T.$is_type_of(U) / T.$has_method(name) / …
