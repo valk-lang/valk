@@ -296,15 +296,6 @@ let c : Map[uint] = b
 
 Full `HashMap` API: [valk:type](api.md#core)
 
-## Objects
-
-With `object` you can generate object data on the fly without defining a class.
-
-```rust
-let data = object { message: "hello", message2: "world" }
-println(data.message + " " + data.message2) // hello world
-```
-
 ## Typehints
 
 When declaring variables, properties, globals, function arguments, ... you can or sometimes must provide a `type`. With `.` you can refer to this type when passing a value to that variable, property, ...
@@ -703,15 +694,6 @@ println(json) // { "hello": "world" }
 let data2 = json:to_type[Data](json)
 ```
 
-Example: using objects
-
-```rust
-let data = json:value(object { hello: "world" })
-let json = data.encode()
-println(json) // { "hello": "world" }
-let data2 = json:decode(json) ! panic("Invalid json syntax")
-```
-
 ## Coroutines
 
 With coroutines we can run multiple functions at the same time on a single thread.
@@ -974,6 +956,10 @@ class Article {
     title: String
     content: String
 }
+class PageData {
+    title: String
+    articles: Array[Article]
+}
 //
 fn main() {
     let template_dir = __DIR__
@@ -984,7 +970,7 @@ fn main() {
         template_directory: template_dir
     }
     // Template data
-    let data = object { 
+    let data = PageData {
         title: "Hello world"
         articles: Array[Article]{
             Article {
