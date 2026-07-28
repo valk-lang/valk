@@ -277,18 +277,22 @@ fn read_value_postfix(p: Parser, allow_newline: bool, allow_class_init: bool) Ex
     return apply_value_postfix(p, v, allow_class_init) !>
 }
 
-// Attach `.member` / `.@cast(Type)` / `(args)` / error-handlers / `++` / `--` / `{ fields }` to a value.
+// Attach `.member` / `.@cast(Type)` / `(args)` / `[index]` / error-handlers / `++` / `--` / `{ fields }` to a value.
 // Class init only when `allow_class_init` (off for if/while conditions).
 // Error handlers allow a space before the token (`f() !`, `f() !? alt`) but not a newline.
 fn apply_value_postfix(p: Parser, v: Exp, allow_class_init: bool) Exp !Error {
     while true {
-        // Tight postfix: no space before `(`, `.`, `++`, `--`
+        // Tight postfix: no space before `(`, `.`, `[`, `++`, `--`
         let t = p.tok(false, false, false) !>
         if t == TOK.sign && p.word_is("(") {
             v = read_value_call(p, v) !>
             // Optional error handler immediately after the call (space ok, newline not)
             let handled = try_read_error_handler(p, v) !>
             if isset(handled) : v = handled
+            continue
+        }
+        if t == TOK.sign && p.word_is("[") {
+            v = read_value_offset(p, v) !>
             continue
         }
         if t == TOK.sign && (p.word_is("++") || p.word_is("--")) {
@@ -346,18 +350,53 @@ fn apply_value_postfix(p: Parser, v: Exp, allow_class_init: bool) Exp !Error {
     return v
 }
 
-// `Type { prop: value, … }` — left is the type/id expression already parsed.
-// Field values always allow nested class init.
+// Current token is tight `[` after a value.
+// Captures `[...]` as EXP.body; lower re-parses as type list or value index.
+fn read_value_offset(p: Parser, left: Exp) Exp !Error {
+    p.expect("[", false, false) !>
+    let exp = p.create_exp(EXP.value)
+    exp.i = left.i
+    exp.kind = VALUE_KIND.offset
+    exp.set(VALUE_EXP.left, left)
+    exp.set(VALUE_EXP.right, read_body_exp(p, "[", "]") !>)
+    exp.set_end(p.pos.i)
+    return exp
+}
+
+// `Type { … }` — left is the type/id expression already parsed.
+// Body is captured raw; fields are parsed at lower once the class is known.
 fn read_value_class_init(p: Parser, left: Exp) Exp !Error {
     p.expect("{", true, true) !>
     let exp = p.create_exp(EXP.value)
     exp.i = left.i
     exp.kind = VALUE_KIND.class_init
     exp.set(VALUE_EXP.left, left)
+    exp.set(VALUE_EXP.right, read_body_exp(p, "{", "}") !>)
+    exp.set_end(p.pos.i)
+    return exp
+}
 
+// Bare `{ … }` value — body captured raw; ambient type at lower chooses
+// class-init fields vs fixed-array elements (no content peeking).
+// `{` already consumed.
+fn read_value_inline_init(p: Parser) Exp !Error {
+    let exp = p.create_exp(EXP.value)
+    if p.word_len > 0 {
+        exp.i = p.word_i
+    }
+    exp.kind = VALUE_KIND.class_init
+    // No left — type from ambient at lower
+    exp.set(VALUE_EXP.right, read_body_exp(p, "{", "}") !>)
+    exp.set_end(p.pos.i)
+    return exp
+}
+
+// After `{` already consumed (or body re-parse at interior): `prop: value` until `}`.
+fn read_class_init_fields(p: Parser) Exp !Error {
     let fields = p.create_exp(EXP.value)
     fields.kind = VALUE_KIND.multi
     let fi: uint = 0
+    let keep_comments = p.pos.src.format
 
     while true {
         let t = p.tok(true, true, false) !>
@@ -367,8 +406,7 @@ fn read_value_class_init(p: Parser, left: Exp) Exp !Error {
             break
         }
         if t == TOK.comment {
-            // Keep comments when formatting so they are not dropped from the AST
-            if left.src.format {
+            if keep_comments {
                 p.tok(true, true) !>
                 fields.set(fi, read_comment_exp(p))
                 fi++
@@ -398,10 +436,49 @@ fn read_value_class_init(p: Parser, left: Exp) Exp !Error {
         }
         // Newline-separated fields: next prop name or `}`
     }
+    return fields
+}
 
-    exp.set(VALUE_EXP.right, fields)
-    exp.set_end(p.pos.i)
-    return exp
+// After `{` already consumed: parse positional values until `}`.
+fn read_array_init_elements(p: Parser) Exp !Error {
+    let elems = p.create_exp(EXP.value)
+    elems.kind = VALUE_KIND.multi
+    let ei: uint = 0
+    let keep_comments = p.pos.src.format
+
+    while true {
+        let t = p.tok(true, true, false) !>
+        if t == TOK.end : p.error("Unexpected end of file in array init, missing '}'")
+        if t == TOK.sign && p.word_is("}") {
+            p.tok(true, true) !>
+            break
+        }
+        if t == TOK.comment {
+            if keep_comments {
+                p.tok(true, true) !>
+                elems.set(ei, read_comment_exp(p))
+                ei++
+            } else {
+                p.tok(true, true) !>
+            }
+            continue
+        }
+        if t == TOK.sign && p.word_is(",") {
+            p.tok(true, true) !>
+            continue
+        }
+
+        elems.set(ei, read_value_exp(p, true, true) !>)
+        ei++
+
+        t = p.tok(true, true, false) !>
+        if t == TOK.sign && p.word_is(",") {
+            p.tok(true, true) !>
+            continue
+        }
+        // Newline-separated elements
+    }
+    return elems
 }
 
 fn read_value_primary(p: Parser, allow_newline: bool) Exp !Error {
@@ -434,6 +511,11 @@ fn read_value_primary(p: Parser, allow_newline: bool) Exp !Error {
         p.expect(")", true, allow_newline) !>
         exp.set_end(p.pos.i)
         return exp
+    }
+
+    // Bare `{ fields }` / `{ elems }` — type from ambient at lower (inline struct / fixed array)
+    if t == TOK.sign && p.word_is("{") {
+        return read_value_inline_init(p) !>
     }
 
     if t == TOK.int || t == TOK.float || t == TOK.hex || t == TOK.octal {
@@ -538,8 +620,8 @@ fn read_value_primary(p: Parser, allow_newline: bool) Exp !Error {
         }
 
         // Identifier (optional ns:name) — VALUE_EXP.left → EXP.id
-        // Optional tight `[T, U]` type args (VALUE_EXP.right multi) for generic
-        // class/func specialization: `X[String].new()`, `HashMap[K, V]{}`, `foo[T](...)`.
+        // Generic type args and index are postfix `[…]` (see apply_value_postfix /
+        // VALUE_KIND.offset) so `x[0]` is not mistaken for type arguments.
         let exp = p.create_exp(EXP.value)
         if p.word_len > 0 {
             exp.i = p.word_i
@@ -556,12 +638,6 @@ fn read_value_primary(p: Parser, allow_newline: bool) Exp !Error {
         }
         id.set_end(p.pos.i)
         exp.set(VALUE_EXP.left, id)
-        // Generics must be tight (no space): same rule as named types
-        t2 = p.tok(false, false, false) !>
-        if t2 == TOK.sign && p.word_is("[") {
-            p.tok(false, false) !>
-            exp.set(VALUE_EXP.right, read_value_type_args(p) !>)
-        }
         exp.set_end(p.pos.i)
         return exp
     }

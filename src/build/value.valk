@@ -26,6 +26,10 @@ enum VAL : u8 {
     // Class / struct construction: Type { prop: value, ... }
     // value1 = type side; values = field inits (each Value.name = prop name)
     class_init
+    // Fixed-array construction: { v0, v1, ... } — values = elements; rett = array type
+    array_init
+    // Element access: base[index] — value1 = base, value2 = index; rett = element type
+    ptrv
     // cond ? a : b  /  a ?? b  — value1=cond (or isset), value2=then, values=[else]
     this_or_that
     // isset(v) — value1=operand; rett=bool; may set .issets
@@ -103,10 +107,10 @@ class Value {
     }
 
     // True when this value can appear on the left of `=` / `+=` / …
-    // Locals, object properties, globals (ptr index later).
+    // Locals, object properties, globals, and fixed-array / pointer index (ptrv).
     fn assignable() bool {
         let t = this.type
-        return t == VAL.decl || t == VAL.prop || t == VAL.global
+        return t == VAL.decl || t == VAL.prop || t == VAL.global || t == VAL.ptrv
     }
 
     // Multi-return / multi-value unpack: VAL.multi → values array; else single-element list.
@@ -447,62 +451,262 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if kind == VALUE_KIND.class_init {
         return value_from_class_init_exp(exp, scope, ctx) !>
     }
+    if kind == VALUE_KIND.offset {
+        return value_from_offset_exp(exp, scope, ctx) !>
+    }
 
     exp.bug("Unknown value kind: " + kind)
 }
 
-// Type { prop: value, ... }
-fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+// `base[…]` — body is EXP.body; re-parse as type list (specialize) or value (index).
+fn value_from_offset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let left_exp = exp.get(VALUE_EXP.left)
-    if !isset(left_exp) : exp.bug("class_init is missing type")
-    let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+    if !isset(left_exp) : exp.bug("offset is missing base")
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("offset is missing body")
+    if body.type != EXP.body : exp.bug("offset body must be EXP.body")
 
-    let class = left.as_class_for_init()
-    if !isset(class) {
-        exp.error("Class init requires a class or struct type before '{'")
+    let on = value_from_exp(left_exp, scope, ctx.without_type()) !>
+    let b = ctx.build
+
+    // Generic class specialize: `HashMap[String, uint]` / `X[String]`
+    let gen_class = offset_generic_class(on)
+    if isset(gen_class) {
+        let type_exps = parse_body_as_type_list(body) !>
+        if type_exps.length == 0 {
+            exp.error("Generic type '" + gen_class.name + "' requires type arguments")
+        }
+        let gtypes = Array[Type]{}
+        each type_exps as te {
+            gtypes.append(type_from_exp(te, scope) !>)
+        }
+        let c = gen_class.specialize(gtypes, exp) !>
+        let v = vgen_type(c.get_type() !>, b)
+        v.exp = exp
+        v.idf = Idf.for_class(c)
+        return v
     }
 
-    let fields_exp = exp.get(VALUE_EXP.right)
-    let field_vals = Array[Value]{}
-    if isset(fields_exp) {
-        let i: uint = 0
-        while true {
-            let fexp = fields_exp.get(i)
-            if !isset(fexp) : break
-            // Comments kept only for --fmt; skip during value conversion
-            if fexp.type == EXP.comment {
-                i++
-                continue
+    // Generic free function: `foo[T]`
+    let gen_func = offset_generic_func(on)
+    if isset(gen_func) {
+        let type_exps = parse_body_as_type_list(body) !>
+        if type_exps.length == 0 {
+            exp.error("Generic function '" + gen_func.name + "' requires type arguments")
+        }
+        let gtypes = Array[Type]{}
+        each type_exps as te {
+            gtypes.append(type_from_exp(te, scope) !>)
+        }
+        let f = gen_func.specialize(gtypes, exp) !>
+        let v = vgen_id(f.name, null, Idf.for_func(f), type_void(b))
+        v.exp = exp
+        return v
+    }
+
+    // Index / offset — body is a single value expression
+    let index_exp = parse_body_as_value_exp(body) !>
+    let index = value_from_exp(index_exp, scope, ctx.without_type()) !>
+
+    let on_t = on.rett.get_non_nullable()
+
+    // Fixed array `[T x N]`
+    if on_t.type == TYPE.array {
+        let sub = on_t.sub_type
+        if !isset(sub) : exp.bug("Array type is missing sub_type")
+        if !index.rett.is_integer_type() {
+            index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
+        }
+        let size = on_t.array_size
+        if size > 0 && index.type == VAL.int {
+            if index.int_val < 0 || index.int_val.@cast(uint) >= size.@cast(uint) {
+                exp.error("Out of bounds. You are asking for index '" + index.int_val + "' on type: " + on_t.compat_display_name() + ". The last index is: " + (size - 1))
             }
-            let fname = fexp.str1
-            if fname.length == 0 : fexp.bug("class_init field is missing name")
-            let vexp = fexp.get(VALUE_EXP.left)
-            if !isset(vexp) : fexp.bug("class_init field is missing value")
-            // Soft prop check when props are known; use prop type as suggestion
-            let prop = class.get_prop_by_name(fname) !? null
-            if !isset(prop) && class.props.length > 0 {
-                // Only error when the class has finished prop parse and props exist
-                // (empty props may mean not parsed yet)
-                let has_named = false
-                each class.props as p {
-                    if isset(p.name) : has_named = true
-                }
-                if has_named {
-                    fexp.error("There's no property named: '" + fname + "'")
-                }
+        }
+        return vgen_ptrv(on, index, sub, exp)
+    }
+
+    // *T / &T with known element type
+    if on_t.type == TYPE.ptr || on_t.type == TYPE.ref {
+        let sub = on_t.sub_type
+        if isset(sub) {
+            if !index.rett.is_integer_type() {
+                index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
             }
-            let field_ctx = ctx.without_type()
-            if isset(prop) : field_ctx = ctx.with_type(prop.type)
-            let fv = value_from_exp(vexp, scope, field_ctx) !>
-            fv.name = fname
-            field_vals.append(fv)
-            i++
+            return vgen_ptrv(on, index, sub, exp)
         }
     }
 
-    let rett = class.get_type() !>
-    let v = vgen_class_init(class, field_vals, rett, exp)
-    return v
+    exp.error("Type: '" + on.rett.compat_display_name() + "' has no '[]' get offset function")
+}
+
+// Generic class base from a value left of `[T, …]`.
+fn offset_generic_class(on: Value) ?Class {
+    if on.type == VAL.type {
+        let t = on.of_type
+        if !isset(t) : return null
+        let c = t.class
+        if isset(c) && c.is_generic_base : return c
+        return null
+    }
+    if on.type == VAL.id {
+        let idf = on.idf
+        if !isset(idf) : return null
+        if idf.type == IDF.class {
+            let c = idf.class
+            if isset(c) && c.is_generic_base : return c
+        }
+        if idf.type == IDF.type {
+            let t = idf.of_type
+            if isset(t) {
+                let c = t.class
+                if isset(c) && c.is_generic_base : return c
+            }
+        }
+    }
+    return null
+}
+
+// Generic free-function base from a value left of `[T, …]`.
+fn offset_generic_func(on: Value) ?Func {
+    if on.type != VAL.id : return null
+    let idf = on.idf
+    if !isset(idf) : return null
+    if idf.type != IDF.func : return null
+    let f = idf.func
+    if isset(f) && f.is_generic_base : return f
+    return null
+}
+
+// Type { … } or bare { … } — right is EXP.body; re-parse as fields or array elems.
+fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("class_init is missing body")
+    if body.type != EXP.body : exp.bug("class_init body must be EXP.body")
+
+    let left_exp = exp.get(VALUE_EXP.left)
+
+    // Bare `{ … }` with ambient fixed array → element list
+    if !isset(left_exp) {
+        let ambient = ctx.type
+        if isset(ambient) {
+            let atype = ambient.get_non_nullable()
+            if atype.type == TYPE.array {
+                return value_from_array_init_body(exp, body, ambient, scope, ctx) !>
+            }
+        }
+    }
+
+    let class: ?Class = null
+    let rett: ?Type = null
+
+    if isset(left_exp) {
+        let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+        class = left.as_class_for_init()
+        if !isset(class) {
+            exp.error("Class init requires a class or struct type before '{'")
+        }
+        rett = class.get_type() !>
+    } else {
+        // Bare `{ fields }` — need ambient type (assign / prop field / arg / return)
+        let ambient = ctx.type
+        if !isset(ambient) {
+            exp.error("You cannot use '{' here. It can only be used for defining the starting value for inline types. E.g. let myvar: [u8 x 2] = { 6, 7 }")
+        }
+        class = class_from_inline_init_type(ambient)
+        if !isset(class) {
+            exp.error("The '{' token can only be used to define initialization values for inline struct or fixed arrays. Not for: " + ambient.compat_display_name())
+        }
+        // Keep ambient (e.g. `<IIS1>`) so assign/compat match without extra convert
+        rett = ambient
+    }
+
+    let fields_exp = parse_body_as_class_init_fields(body) !>
+    let field_vals = Array[Value]{}
+    let i: uint = 0
+    while true {
+        let fexp = fields_exp.get(i)
+        if !isset(fexp) : break
+        // Comments kept only for --fmt; skip during value conversion
+        if fexp.type == EXP.comment {
+            i++
+            continue
+        }
+        let fname = fexp.str1
+        if fname.length == 0 : fexp.bug("class_init field is missing name")
+        let vexp = fexp.get(VALUE_EXP.left)
+        if !isset(vexp) : fexp.bug("class_init field is missing value")
+        // Soft prop check when props are known; use prop type as suggestion
+        let prop = class.get_prop_by_name(fname) !? null
+        if !isset(prop) && class.props.length > 0 {
+            let has_named = false
+            each class.props as p {
+                if isset(p.name) : has_named = true
+            }
+            if has_named {
+                fexp.error("There's no property named: '" + fname + "'")
+            }
+        }
+        let field_ctx = ctx.without_type()
+        if isset(prop) : field_ctx = ctx.with_type(prop.type)
+        let fv = value_from_exp(vexp, scope, field_ctx) !>
+        fv.name = fname
+        field_vals.append(fv)
+        i++
+    }
+
+    return vgen_class_init(class, field_vals, rett, exp)
+}
+
+// Bare `{ v0, v1, ... }` for fixed arrays — body re-parsed as element values.
+fn value_from_array_init_body(exp: Exp, body: Exp, ambient: Type, scope: Scope, ctx: Context) Value !Error {
+    let atype = ambient.get_non_nullable()
+    let sub = atype.sub_type
+    if !isset(sub) : exp.bug("Array type is missing sub_type")
+    let size = atype.array_size
+    if size < 1 : exp.error("Array size is 0 (bug)")
+
+    let elems_exp = parse_body_as_array_init_elements(body) !>
+    let values = Array[Value]{}
+    let i: uint = 0
+    while true {
+        let eexp = elems_exp.get(i)
+        if !isset(eexp) : break
+        if eexp.type == EXP.comment {
+            i++
+            continue
+        }
+        if values.length >= size {
+            eexp.error("Too many values")
+        }
+        let ev = value_from_exp(eexp, scope, ctx.with_type(sub)) !>
+        ev = value_try_convert(ev, scope, ctx, sub)
+        let at = ev.exp
+        if isset(at) : sub.compat_check(ev.rett, at) !>
+        else : sub.compat_check(ev.rett, eexp) !>
+        values.append(ev)
+        i++
+    }
+    if values.length < size {
+        exp.error("Missing array values. Expected amount '" + size + "', but found '" + values.length + "'")
+    }
+
+    return vgen_array_init(values, ambient, exp)
+}
+
+// Class/struct usable for bare `{ fields }` from ambient type (`<Struct>`, struct, class).
+fn class_from_inline_init_type(t: Type) ?Class {
+    let nn = t.get_non_nullable()
+    if nn.type == TYPE.inline {
+        let sub = nn.sub_type
+        if !isset(sub) : return null
+        return sub.get_class_or_null()
+    }
+    // Direct structural type (less common for bare init; named form usually used)
+    let c = nn.get_class_or_null()
+    if !isset(c) : return null
+    if c.kind == CLASS_KIND.struct || c.kind == CLASS_KIND.class : return c
+    return null
 }
 
 // ---- helpers ----
@@ -637,11 +841,17 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let c = idf.class
         if isset(c) {
             if c.is_generic_base {
-                if !isset(gens) {
-                    exp.error("Generic type '" + c.name + "' requires type arguments")
+                if isset(gens) {
+                    // Legacy: type args still attached on id (if any)
+                    let gtypes = value_resolve_type_args(gens, scope) !>
+                    c = c.specialize(gtypes, exp) !>
+                } else {
+                    // Bare generic base — postfix `Type[T]` specializes via VALUE_KIND.offset.
+                    // Cannot call get_type() on an un-specialized base.
+                    let v = vgen_id(name, ns_name, Idf.for_class(c), type_void(b))
+                    v.exp = exp
+                    return v
                 }
-                let gtypes = value_resolve_type_args(gens, scope) !>
-                c = c.specialize(gtypes, exp) !>
             } else if isset(gens) {
                 exp.error("Type is not generic: " + c.name)
             }
