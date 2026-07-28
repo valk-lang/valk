@@ -58,6 +58,9 @@ test: valk
 #./debug/test-all
 #@./tests/compile-errors/run.sh
 
+test-fmt: valk
+	./tests/fmt/run.sh
+
 watchtest: valk2
 	./valk2 build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w -v
 
