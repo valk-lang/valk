@@ -80,16 +80,19 @@ class Value {
     }
 }
 
-// Convert a structured EXP.value into a Value using `scope` for name lookup.
-fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
+// Convert a structured EXP.value into a Value.
+// `scope` for name lookup; `ctx` for ambient info (function, suggested type, …).
+// Sub-expressions that do not inherit the outer expectation use `ctx.without_type()`.
+fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if exp.type != EXP.value : exp.bug("Expected EXP.value")
     let kind = exp.kind
-    let b = exp.src.build
+    let b = ctx.build
 
     if kind == VALUE_KIND.paren {
         let inner = exp.get(VALUE_EXP.left)
         if !isset(inner) : exp.bug("Missing paren inner value")
-        return value_from_exp(inner, scope) !>
+        // Parentheses preserve the suggested type
+        return value_from_exp(inner, scope, ctx) !>
     }
 
     if kind == VALUE_KIND.number || kind == VALUE_KIND.hex || kind == VALUE_KIND.octal {
@@ -108,7 +111,10 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         return v
     }
     if kind == VALUE_KIND.null {
-        let v = vgen_null(type_any(b))
+        // Prefer the suggested type when the caller expects a concrete nullability/type
+        let nt = ctx.type
+        let null_t = isset(nt) ? nt : type_any(b)
+        let v = vgen_null(null_t)
         v.exp = exp
         return v
     }
@@ -125,7 +131,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
     }
 
     if kind == VALUE_KIND.id {
-        let v = value_from_id_exp(exp, scope) !>
+        let v = value_from_id_exp(exp, scope, ctx) !>
         v.exp = exp
         return v
     }
@@ -144,7 +150,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
     if kind == VALUE_KIND.unary {
         let operand_exp = exp.get(VALUE_EXP.left)
         if !isset(operand_exp) : exp.bug("Missing unary operand")
-        let operand = value_from_exp(operand_exp, scope) !>
+        let operand = value_from_exp(operand_exp, scope, ctx.without_type()) !>
         let op = exp.number.@cast(VALUE_OP)
         // Fold constants when possible
         if op == VALUE_OP.neg {
@@ -179,8 +185,8 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         let left_exp = exp.get(VALUE_EXP.left)
         let right_exp = exp.get(VALUE_EXP.right)
         if !isset(left_exp) || !isset(right_exp) : exp.bug("Missing binary op operands")
-        let left = value_from_exp(left_exp, scope) !>
-        let right = value_from_exp(right_exp, scope) !>
+        let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+        let right = value_from_exp(right_exp, scope, ctx.without_type()) !>
         let op = exp.number.@cast(VALUE_OP)
         // Fold compile-time constants (macro defs, literals, bare compare words)
         let folded = value_try_fold_op(left, right, op, b)
@@ -203,16 +209,38 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
     if kind == VALUE_KIND.call {
         let callee_exp = exp.get(VALUE_EXP.left)
         if !isset(callee_exp) : exp.bug("Missing call callee")
-        let callee = value_from_exp(callee_exp, scope) !>
+        let callee = value_from_exp(callee_exp, scope, ctx.without_type()) !>
+        // Resolve Func early so arg parsing can use parameter types as suggestions
+        let call_func = value_resolve_call_func(callee)
         let args_exp = exp.get(VALUE_EXP.right)
         let args = Array[Value]{}
         if isset(args_exp) {
             // args_exp is VALUE_KIND.multi with sequential subs
             let i: uint = 0
+            // Instance methods skip implicit `this` when mapping arg index → param
+            let skip: uint = 0
+            if isset(call_func) && isset(call_func.class) && !call_func.is_static {
+                let on = callee.value1
+                if isset(on) && on.type != VAL.type : skip = 1
+            }
             while true {
                 let a = args_exp.get(i)
                 if !isset(a) : break
-                args.append(value_from_exp(a, scope) !>)
+                let arg_ctx = ctx.without_type()
+                if isset(call_func) {
+                    let params = call_func.args
+                    let param_i = skip + i
+                    let param: ?Arg = null
+                    if param_i < params.length {
+                        param = params.get(param_i) !? null
+                    } else if call_func.infinite_args && params.length > 0 {
+                        param = params.get(params.length - 1) !? null
+                    }
+                    if isset(param) && !param.is_generic {
+                        arg_ctx = ctx.with_type(param.type)
+                    }
+                }
+                args.append(value_from_exp(a, scope, arg_ctx) !>)
                 i++
             }
         }
@@ -225,8 +253,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
                 return folded
             }
         }
-        // Resolve Func when possible and check args against parameter types
-        let call_func = value_resolve_call_func(callee)
+        // Check args against parameter types when Func is known
         if isset(call_func) {
             value_check_call_args(call_func, callee, args, exp) !>
             let v = vgen_call(callee, args, call_func.get_rett())
@@ -243,7 +270,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         let type_exp = exp.get(VALUE_EXP.right)
         if !isset(on_exp) : exp.bug("Missing cast value")
         if !isset(type_exp) : exp.bug("Missing cast type")
-        let on = value_from_exp(on_exp, scope) !>
+        let on = value_from_exp(on_exp, scope, ctx.without_type()) !>
         let cast_t = type_from_exp(type_exp, scope) !>
         let v = vgen_cast(on, cast_t)
         v.exp = exp
@@ -254,7 +281,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         // Property / method access: left.name / left.$meta (call may wrap this later)
         let on_exp = exp.get(VALUE_EXP.left)
         if !isset(on_exp) : exp.bug("Missing dot left value")
-        let on = value_from_exp(on_exp, scope) !>
+        let on = value_from_exp(on_exp, scope, ctx.without_type()) !>
         // Any value: .$type → VAL.type of its result type (same as typeof)
         if exp.str1 == "$type" {
             let v = value_as_rett_type(on, exp, b) !>
@@ -294,7 +321,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         // typeof(value) → VAL.type of the value's result type (rett)
         let inner_exp = exp.get(VALUE_EXP.left)
         if !isset(inner_exp) : exp.bug("Missing typeof operand")
-        let inner = value_from_exp(inner_exp, scope) !>
+        let inner = value_from_exp(inner_exp, scope, ctx.without_type()) !>
         let v = value_as_rett_type(inner, exp, b) !>
         v.exp = exp
         return v
@@ -307,7 +334,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
         while true {
             let a = exp.get(i)
             if !isset(a) : break
-            args.append(value_from_exp(a, scope) !>)
+            args.append(value_from_exp(a, scope, ctx.without_type()) !>)
             i++
         }
         let v = vgen_multi(args, type_void(b))
@@ -318,7 +345,7 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
     if kind == VALUE_KIND.incr || kind == VALUE_KIND.decr {
         let operand_exp = exp.get(VALUE_EXP.left)
         if !isset(operand_exp) : exp.bug("Missing ++/-- operand")
-        let operand = value_from_exp(operand_exp, scope) !>
+        let operand = value_from_exp(operand_exp, scope, ctx.without_type()) !>
         // Result type matches operand (int-like); full assignability checks later
         let v = Value {
             type: VAL.op
@@ -344,17 +371,17 @@ fn value_from_exp(exp: Exp, scope: Scope) Value !Error {
     }
 
     if kind == VALUE_KIND.class_init {
-        return value_from_class_init_exp(exp, scope) !>
+        return value_from_class_init_exp(exp, scope, ctx) !>
     }
 
     exp.bug("Unknown value kind: " + kind)
 }
 
 // Type { prop: value, ... }
-fn value_from_class_init_exp(exp: Exp, scope: Scope) Value !Error {
+fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let left_exp = exp.get(VALUE_EXP.left)
     if !isset(left_exp) : exp.bug("class_init is missing type")
-    let left = value_from_exp(left_exp, scope) !>
+    let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
 
     let class = value_as_class_for_init(left)
     if !isset(class) {
@@ -377,9 +404,7 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope) Value !Error {
             if fname.length == 0 : fexp.bug("class_init field is missing name")
             let vexp = fexp.get(VALUE_EXP.left)
             if !isset(vexp) : fexp.bug("class_init field is missing value")
-            let fv = value_from_exp(vexp, scope) !>
-            fv.name = fname
-            // Soft prop check when props are known
+            // Soft prop check when props are known; use prop type as suggestion
             let prop = class.get_prop_by_name(fname) !? null
             if !isset(prop) && class.props.length > 0 {
                 // Only error when the class has finished prop parse and props exist
@@ -392,6 +417,10 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope) Value !Error {
                     fexp.error("There's no property named: '" + fname + "'")
                 }
             }
+            let field_ctx = ctx.without_type()
+            if isset(prop) : field_ctx = ctx.with_type(prop.type)
+            let fv = value_from_exp(vexp, scope, field_ctx) !>
+            fv.name = fname
             field_vals.append(fv)
             i++
         }
@@ -447,12 +476,12 @@ fn value_from_float_literal(exp: Exp, b: Build) Value !Error {
     return vgen_float(n, type_float(b) !>)
 }
 
-fn value_from_id_exp(exp: Exp, scope: Scope) Value !Error {
+fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let id = exp.get(VALUE_EXP.left)
     if !isset(id) : exp.bug("Missing id sub-expression")
     let name = id.str1
     let ns_name = id.str2
-    let b = exp.src.build
+    let b = ctx.build
 
     let idf: ?Idf = null
     if isset(ns_name) {
@@ -506,7 +535,8 @@ fn value_from_id_exp(exp: Exp, scope: Scope) Value !Error {
     if isset(idf) && idf.type == IDF.value_expr {
         let value_exp = idf.value_exp
         if !isset(value_exp) : exp.bug("Value-expr idf is missing value_exp")
-        let v = value_from_exp(value_exp, scope) !>
+        // Keep suggested type so e.g. a null alias can inherit the use-site expectation
+        let v = value_from_exp(value_exp, scope, ctx) !>
         v.exp = exp
         v.idf = idf
         return v
