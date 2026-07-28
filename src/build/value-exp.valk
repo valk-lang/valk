@@ -7,11 +7,69 @@
 //   Use parentheses to opt in: `if (Node { a: 1 }).ok { … }`.
 
 fn read_value_exp(p: Parser, allow_newline: bool (false), allow_class_init: bool (true)) Exp !Error {
-    return read_value_or(p, allow_newline, allow_class_init) !>
+    // Lowest: ?? / ?! then ternary ? : then || …
+    return read_value_null_ops(p, allow_newline, allow_class_init) !>
 }
 
-// Precedence (low → high): ||  &&  cmp  |  ^  &  <<>>  +-  */%  unary  postfix
+// Precedence (low → high): ??/?!  ternary  ||  &&  cmp  |  ^  &  <<>>  +-  */%  unary  postfix
 //
+// left ?? right  |  left ?! body
+fn read_value_null_ops(p: Parser, allow_newline: bool, allow_class_init: bool) Exp !Error {
+    let left = read_value_ternary(p, allow_newline, allow_class_init) !>
+    while true {
+        let t = p.tok(true, allow_newline, false) !>
+        if t != TOK.sign : break
+        if p.word_is("??") {
+            p.tok(true, allow_newline) !>
+            let right = read_value_null_ops(p, allow_newline, allow_class_init) !>
+            let exp = p.create_exp(EXP.value)
+            exp.i = left.i
+            exp.kind = VALUE_KIND.null_coalesce
+            exp.set(VALUE_EXP.left, left)
+            exp.set(VALUE_EXP.right, right)
+            exp.set_end(p.pos.i)
+            left = exp
+            continue
+        }
+        if p.word_is("?!") {
+            p.tok(true, allow_newline) !>
+            let body = read_null_exit_body(p) !>
+            let exp = p.create_exp(EXP.value)
+            exp.i = left.i
+            exp.kind = VALUE_KIND.null_exit
+            exp.set(VALUE_EXP.left, left)
+            exp.set(VALUE_EXP.right, body)
+            exp.set_end(p.pos.i)
+            left = exp
+            continue
+        }
+        break
+    }
+    return left
+}
+
+// cond ? then : else  (right-associative via full recursive then/else)
+fn read_value_ternary(p: Parser, allow_newline: bool, allow_class_init: bool) Exp !Error {
+    let left = read_value_or(p, allow_newline, allow_class_init) !>
+    let t = p.tok(true, allow_newline, false) !>
+    // Bare `?` only (not `??` / `?!` — those are multi-char tokens)
+    if t == TOK.sign && p.word_is("?") {
+        p.tok(true, allow_newline) !>
+        let then_exp = read_value_exp(p, allow_newline, allow_class_init) !>
+        p.expect(":", true, allow_newline) !>
+        let else_exp = read_value_exp(p, allow_newline, allow_class_init) !>
+        let exp = p.create_exp(EXP.value)
+        exp.i = left.i
+        exp.kind = VALUE_KIND.ternary
+        exp.set(VALUE_EXP.left, left)
+        exp.set(VALUE_EXP.right, then_exp)
+        exp.set(VALUE_EXP.third, else_exp)
+        exp.set_end(p.pos.i)
+        return exp
+    }
+    return left
+}
+
 // ||
 fn read_value_or(p: Parser, allow_newline: bool, allow_class_init: bool) Exp !Error {
     let left = read_value_and(p, allow_newline, allow_class_init) !>
@@ -219,14 +277,18 @@ fn read_value_postfix(p: Parser, allow_newline: bool, allow_class_init: bool) Ex
     return apply_value_postfix(p, v, allow_class_init) !>
 }
 
-// Attach `.member` / `.@cast(Type)` / `(args)` / `++` / `--` / `{ fields }` to a value.
+// Attach `.member` / `.@cast(Type)` / `(args)` / error-handlers / `++` / `--` / `{ fields }` to a value.
 // Class init only when `allow_class_init` (off for if/while conditions).
+// Error handlers allow a space before the token (`f() !`, `f() !? alt`) but not a newline.
 fn apply_value_postfix(p: Parser, v: Exp, allow_class_init: bool) Exp !Error {
     while true {
         // Tight postfix: no space before `(`, `.`, `++`, `--`
         let t = p.tok(false, false, false) !>
         if t == TOK.sign && p.word_is("(") {
             v = read_value_call(p, v) !>
+            // Optional error handler immediately after the call (space ok, newline not)
+            let handled = try_read_error_handler(p, v) !>
+            if isset(handled) : v = handled
             continue
         }
         if t == TOK.sign && (p.word_is("++") || p.word_is("--")) {
@@ -462,6 +524,19 @@ fn read_value_primary(p: Parser, allow_newline: bool) Exp !Error {
             return exp
         }
 
+        if p.word_is("isset") {
+            let exp = p.create_exp(EXP.value)
+            if p.word_len > 0 && p.pos.i >= p.word_len {
+                exp.i = p.pos.i - p.word_len
+            }
+            exp.kind = VALUE_KIND.isset
+            p.expect("(", false, false) !>
+            exp.set(VALUE_EXP.left, read_value_exp(p, true, true) !>)
+            p.expect(")", true, allow_newline) !>
+            exp.set_end(p.pos.i)
+            return exp
+        }
+
         // Identifier (optional ns:name) — VALUE_EXP.left → EXP.id
         let exp = p.create_exp(EXP.value)
         if p.word_len > 0 && p.pos.i >= p.word_len {
@@ -529,5 +604,125 @@ fn make_value_op(p: Parser, left: Exp, op: VALUE_OP, right: Exp) Exp {
     exp.set(VALUE_EXP.left, left)
     exp.set(VALUE_EXP.right, right)
     exp.set_end(right.i + right.len)
+    return exp
+}
+
+// Body after `?!` or `!` error handler: `{ ... }` or a single statement.
+fn read_null_exit_body(p: Parser) Exp !Error {
+    let t = p.tok(true, true, false) !>
+    if t == TOK.sign && p.word_is("{") {
+        return read_block_exp(p) !>
+    }
+    // Single statement (must exit: return / throw / break / continue / exit)
+    let exp = p.create_exp(EXP.block)
+    exp.bool1 = true // single-statement form
+    let stmt = read_func_stmt_exp(p) !>
+    exp.body_exps = Array[Exp]{ stmt }
+    exp.i = stmt.i
+    exp.set_end(p.pos.i)
+    return exp
+}
+
+// If the next token is an error-handler marker after a call, parse and wrap `on`.
+// Returns null when no handler is present (caller may apply default pass later).
+// Space allowed before marker; newline is not (matches old `next_is_one_of(..., true, false)`).
+fn try_read_error_handler(p: Parser, on: Exp) ?Exp !Error {
+    let t = p.tok(true, false, false) !>
+    if t == TOK.sign {
+        if p.word_is("!?") {
+            p.tok(true, false) !>
+            let exp = p.create_exp(EXP.value)
+            exp.i = on.i
+            exp.kind = VALUE_KIND.error_handler
+            exp.number = ERRH_KIND.value
+            exp.set(VALUE_EXP.left, on)
+            exp.set(VALUE_EXP.right, read_value_exp(p, true, true) !>)
+            exp.set_end(p.pos.i)
+            return exp
+        }
+        if p.word_is("!>") {
+            p.tok(true, false) !>
+            let exp = p.create_exp(EXP.value)
+            exp.i = on.i
+            exp.kind = VALUE_KIND.error_handler
+            exp.number = ERRH_KIND.pass
+            exp.set(VALUE_EXP.left, on)
+            exp.set_end(p.pos.i)
+            return exp
+        }
+        if p.word_is("!!") {
+            p.tok(true, false) !>
+            let exp = p.create_exp(EXP.value)
+            exp.i = on.i
+            exp.kind = VALUE_KIND.error_handler
+            exp.number = ERRH_KIND.panic
+            exp.set(VALUE_EXP.left, on)
+            exp.set_end(p.pos.i)
+            return exp
+        }
+        if p.word_is("!") {
+            p.tok(true, false) !>
+            let exp = p.create_exp(EXP.value)
+            exp.i = on.i
+            exp.kind = VALUE_KIND.error_handler
+            exp.number = ERRH_KIND.block
+            exp.set(VALUE_EXP.left, on)
+            exp.set(VALUE_EXP.right, read_null_exit_body(p) !>)
+            exp.set_end(p.pos.i)
+            return exp
+        }
+        if p.word_is("->") {
+            p.tok(true, false) !>
+            return read_success_handler_exp(p, on) !>
+        }
+    }
+    if t == TOK.word && p.word_is("_") {
+        p.tok(true, false) !>
+        let exp = p.create_exp(EXP.value)
+        exp.i = on.i
+        exp.kind = VALUE_KIND.error_handler
+        exp.number = ERRH_KIND.ignore
+        exp.set(VALUE_EXP.left, on)
+        exp.set_end(p.pos.i)
+        return exp
+    }
+    return null
+}
+
+// `call -> name { body }` / `call -> (a, b) { body }` / `call -> name : stmt`
+fn read_success_handler_exp(p: Parser, on: Exp) Exp !Error {
+    let exp = p.create_exp(EXP.value)
+    exp.i = on.i
+    exp.kind = VALUE_KIND.error_handler
+    exp.number = ERRH_KIND.success
+    exp.set(VALUE_EXP.left, on)
+
+    let names = Array[String]{}
+    let t = p.tok(true, true, false) !>
+    if t == TOK.sign && p.word_is("(") {
+        p.tok(true, true) !>
+        while true {
+            names.append(p.read_word(true, true) !>)
+            t = p.tok(true, true, false) !>
+            if t == TOK.sign && p.word_is(")") {
+                p.tok(true, true) !>
+                break
+            }
+            if t == TOK.sign && p.word_is(",") {
+                p.tok(true, true) !>
+                continue
+            }
+            p.error("Expected ',' or ')' in success-handler names, found: '" + p.word() + "'")
+        }
+    } else {
+        // Optional single name; body may start with `{` or `:` without a name for void… but
+        // old requires at least one return value + name. Keep name optional for parse then check later.
+        if t == TOK.word {
+            names.append(p.read_word(true, true) !>)
+        }
+    }
+    exp.list = names
+    exp.set(VALUE_EXP.right, read_then_body_exp(p) !>)
+    exp.set_end(p.pos.i)
     return exp
 }

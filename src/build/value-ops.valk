@@ -1,0 +1,559 @@
+// Operator / conversion / isset / ternary / ?? / ?! value semantics.
+
+// ---- isset tracking helpers ----
+
+fn value_add_isset(v: Value, on: Value) {
+    if on.type != VAL.decl : return
+    let d = on.decl
+    if !isset(d) : return
+    let list = v.issets
+    if !isset(list) {
+        list = Array[Decl]{}
+        v.issets = list
+    }
+    list.append(d, true)
+}
+
+fn value_merge_issets(into: Value, from: ?Array[Decl]) {
+    if !isset(from) : return
+    let list = into.issets
+    if !isset(list) {
+        list = Array[Decl]{}
+        into.issets = list
+    }
+    each from as d {
+        list.append(d, true)
+    }
+}
+
+fn value_merge_not_issets(into: Value, from: ?Array[Decl]) {
+    if !isset(from) : return
+    let list = into.not_issets
+    if !isset(list) {
+        list = Array[Decl]{}
+        into.not_issets = list
+    }
+    each from as d {
+        list.append(d, true)
+    }
+}
+
+// ---- try_convert / nullable helpers ----
+
+// Reinterpret type without changing representation (pointer-sized / ref types).
+fn vgen_wrap(on: Value, rett: Type) Value {
+    return Value {
+        type: VAL.wrap
+        value1: on
+        rett: rett
+        exp: on.exp
+        issets: on.issets
+        not_issets: on.not_issets
+        can_error: on.can_error
+        error_type: on.error_type
+        pre_value: on.pre_value
+    }
+}
+
+// Strip `?T` → `T` when scope proves non-null, or when the value is already non-null.
+fn value_try_remove_nullable(v: Value, scope: Scope, ctx: Context) Value {
+    if !v.rett.is_nullable_type() : return v
+    return value_try_convert(v, scope, ctx, v.rett.get_non_nullable())
+}
+
+// Force-strip nullable for pointer-like types (IR wrap). Used after isset / ?? success path.
+fn value_force_remove_nullable(v: Value, ctx: Context) Value {
+    if !v.rett.is_nullable_type() : return v
+    let nn = v.rett.get_non_nullable()
+    // Pointer / class refs: wrap with non-null type
+    if nn.is_pointer_type() || !nn.is_inline_type() {
+        return vgen_wrap(v, nn)
+    }
+    // Inline nullable not fully modeled yet — keep as wrap for IR
+    return vgen_wrap(v, nn)
+}
+
+// Make a non-null value nullable (for unifying ternary / ?? branches).
+fn value_make_nullable(v: Value, at: Exp) Value !Error {
+    if v.rett.is_nullable_type() : return v
+    if v.rett.is_pointer_type() || !v.rett.is_inline_type() {
+        return vgen_wrap(v, v.rett.nullable())
+    }
+    // Inline: allow wrap for now
+    return vgen_wrap(v, v.rett.nullable())
+}
+
+// Convert `v` toward `target` when possible: not_null strip, $to hooks, nullable wrap.
+// Soft: returns best-effort conversion; caller still runs compat_check when needed.
+fn value_try_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto: bool (true)) Value {
+    if target.is_void_type() : return v
+    if target.compat(v.rett) && target.is_nullable_type() == v.rett.is_nullable_type() {
+        return v
+    }
+
+    let result = v
+
+    // ?T → T when decl is known non-null in scope
+    if result.rett.is_nullable_type() && !target.is_nullable_type() {
+        if result.type == VAL.decl {
+            let d = result.decl
+            if isset(d) && scope.not_null_check(d) {
+                result = value_force_remove_nullable(result, ctx)
+            }
+        }
+    }
+
+    // $to hooks (instance methods on class)
+    if !result.rett.is_nullable_type() && !target.compat(result.rett) {
+        let class = result.rett.get_class_or_null()
+        if isset(class) {
+            let hook = class_get_to_hook(class, target, is_auto)
+            if isset(hook) {
+                let callee = vgen_dot(result, hook.name, hook.get_rett())
+                callee.idf = Idf.for_func(hook)
+                let call = vgen_call(callee, Array[Value]{}, hook.get_rett())
+                call.exp = result.exp
+                result = call
+            }
+        }
+    }
+
+    // Target is nullable: convert inner then wrap
+    if target.is_nullable_type() {
+        let nnt = target.get_non_nullable()
+        result = value_try_convert(result, scope, ctx, nnt, is_auto)
+        if result.rett.is_nullable_type() : return result
+        if result.rett.is_pointer_type() || !result.rett.is_inline_type() {
+            return vgen_wrap(result, result.rett.nullable())
+        }
+        return vgen_wrap(result, result.rett.nullable())
+    }
+
+    return result
+}
+
+// Select a $to hook from class.to_hooks (and later global to_hooks).
+fn class_get_to_hook(class: Class, target: Type, is_auto: bool) ?Func {
+    each class.to_hooks as func {
+        if is_auto && !func.auto_to : continue
+        let fr = func.get_rett()
+        if target.compat(fr) {
+            let tc = target.get_class_or_null()
+            let fc = fr.get_class_or_null()
+            if tc == fc : return func
+            if !isset(tc) && !isset(fc) : return func
+        }
+    }
+    return null
+}
+
+// Compare-hook selection: first hook whose (this, other) args accept the types.
+fn hook_select_compare(hooks: Array[Func], left_type: Type, right_type: Type) ?Func {
+    each hooks as func {
+        let args = func.args
+        // args[0] is this, args[1] is the other operand
+        let arg1 = args.get(0) ! continue
+        let arg2 = args.get(1) ! continue
+        if !arg1.type.compat(left_type) : continue
+        if !arg2.type.compat(right_type) : continue
+        return func
+    }
+    return null
+}
+
+// ---- Binary ops (&& isset prop, compare hooks, arith) ----
+
+fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let left_exp = exp.get(VALUE_EXP.left)
+    let right_exp = exp.get(VALUE_EXP.right)
+    if !isset(left_exp) || !isset(right_exp) : exp.bug("Missing binary op operands")
+    let op = exp.number.@cast(VALUE_OP)
+    let b = ctx.build
+
+    // && : evaluate right in a sub-scope with left's issets applied
+    if op == VALUE_OP.and {
+        let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+        if !left.rett.is_void_type() && !left.rett.is_bool_type() {
+            exp.error("Expected a value of type 'bool', not: " + left.rett.compat_display_name())
+        }
+        let sub = scope.sub_scope()
+        sub.apply_issets(left.issets)
+        let right = value_from_exp(right_exp, sub, ctx.without_type()) !>
+        if !right.rett.is_void_type() && !right.rett.is_bool_type() {
+            exp.error("Expected a value of type 'bool', not: " + right.rett.compat_display_name())
+        }
+        let folded = value_try_fold_op(left, right, op, b)
+        if isset(folded) {
+            folded.exp = exp
+            value_merge_issets(folded, left.issets)
+            value_merge_issets(folded, right.issets)
+            return folded
+        }
+        let v = vgen_op(left, right, op, type_bool(b))
+        v.exp = exp
+        value_merge_issets(v, left.issets)
+        value_merge_issets(v, right.issets)
+        return v
+    }
+
+    // || : merge not_issets
+    if op == VALUE_OP.or {
+        let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+        if !left.rett.is_void_type() && !left.rett.is_bool_type() {
+            exp.error("Expected a value of type 'bool', not: " + left.rett.compat_display_name())
+        }
+        let right = value_from_exp(right_exp, scope, ctx.without_type()) !>
+        if !right.rett.is_void_type() && !right.rett.is_bool_type() {
+            exp.error("Expected a value of type 'bool', not: " + right.rett.compat_display_name())
+        }
+        let folded = value_try_fold_op(left, right, op, b)
+        if isset(folded) {
+            folded.exp = exp
+            value_merge_not_issets(folded, left.not_issets)
+            value_merge_not_issets(folded, right.not_issets)
+            return folded
+        }
+        let v = vgen_op(left, right, op, type_bool(b))
+        v.exp = exp
+        value_merge_not_issets(v, left.not_issets)
+        value_merge_not_issets(v, right.not_issets)
+        return v
+    }
+
+    // Compare ops with hooks + nullable handling
+    if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte {
+        return value_from_compare_exp(exp, left_exp, right_exp, op, scope, ctx) !>
+    }
+
+    // Arithmetic / bitwise
+    let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+    let right = value_from_exp(right_exp, scope, ctx.without_type()) !>
+    let folded = value_try_fold_op(left, right, op, b)
+    if isset(folded) {
+        folded.exp = exp
+        return folded
+    }
+    // try_convert right toward left when possible
+    right = value_try_convert(right, scope, ctx, left.rett)
+    value_check_op_compat(left, right, op, exp) !>
+    let v = vgen_op(left, right, op, left.rett)
+    v.exp = exp
+    return v
+}
+
+fn value_from_compare_exp(exp: Exp, left_exp: Exp, right_exp: Exp, op: VALUE_OP, scope: Scope, ctx: Context) Value !Error {
+    let b = ctx.build
+    let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
+    let right = value_from_exp(right_exp, scope, ctx.without_type()) !>
+
+    // Constant fold first
+    let folded = value_try_fold_op(left, right, op, b)
+    if isset(folded) {
+        folded.exp = exp
+        return folded
+    }
+
+    // Soft skip when either side is still unresolved
+    if left.rett.is_void_type() || right.rett.is_void_type() {
+        let v = vgen_op(left, right, op, type_bool(b))
+        v.exp = exp
+        return v
+    }
+
+    let l = value_try_remove_nullable(left, scope, ctx)
+    let r = value_try_remove_nullable(right, scope, ctx)
+
+    let noteq = false
+    let cmp_op = op
+    if cmp_op == VALUE_OP.ne {
+        cmp_op = VALUE_OP.eq
+        noteq = true
+    }
+
+    if cmp_op != VALUE_OP.eq {
+        if l.rett.is_nullable_type() {
+            exp.error("The left value type does not support compare operators: '" + l.rett.compat_display_name() + "'")
+        }
+        if r.rett.is_nullable_type() {
+            exp.error("The right value type does not support compare operators: '" + r.rett.compat_display_name() + "'")
+        }
+    }
+
+    let nnl = l.rett.is_nullable_type() ? value_force_remove_nullable(l, ctx) : l
+    let nnr = r.rett.is_nullable_type() ? value_force_remove_nullable(r, ctx) : r
+
+    // Compare hooks
+    let hook: ?Func = null
+    let lc = nnl.rett.get_class_or_null()
+    if isset(lc) {
+        let hooks: ?Array[Func] = null
+        if cmp_op == VALUE_OP.eq : hooks = lc.eq_hooks
+        else if cmp_op == VALUE_OP.lt : hooks = lc.lt_hooks
+        else if cmp_op == VALUE_OP.lte : hooks = lc.lte_hooks
+        else if cmp_op == VALUE_OP.gt : hooks = lc.gt_hooks
+        else if cmp_op == VALUE_OP.gte : hooks = lc.gte_hooks
+        if isset(hooks) : hook = hook_select_compare(hooks, nnl.rett, nnr.rett)
+    }
+
+    // Try flipped hooks
+    if !isset(hook) {
+        let rc = nnr.rett.get_class_or_null()
+        if isset(rc) {
+            let hooks: ?Array[Func] = null
+            if cmp_op == VALUE_OP.eq : hooks = rc.eq_hooks
+            else if cmp_op == VALUE_OP.lt : hooks = rc.gte_hooks
+            else if cmp_op == VALUE_OP.lte : hooks = rc.gt_hooks
+            else if cmp_op == VALUE_OP.gt : hooks = rc.lte_hooks
+            else if cmp_op == VALUE_OP.gte : hooks = rc.lt_hooks
+            if isset(hooks) {
+                let h = hook_select_compare(hooks, nnr.rett, nnl.rett)
+                if isset(h) {
+                    hook = h
+                    let tmp = nnl
+                    nnl = nnr
+                    nnr = tmp
+                    let tmp2 = l
+                    l = r
+                    r = tmp2
+                }
+            }
+        }
+    }
+
+    let cmp: Value = vgen_op(nnl, nnr, cmp_op, type_bool(b))
+    if isset(hook) {
+        let callee = vgen_dot(nnl, hook.name, hook.get_rett())
+        callee.idf = Idf.for_func(hook)
+        // Instance method: first arg is receiver (already nnl); pass nnr as explicit arg
+        let args = Array[Value]{ nnr }
+        cmp = vgen_call(callee, args, type_bool(b))
+    } else {
+        // Native: convert right toward left when possible
+        nnr = value_try_convert(nnr, scope, ctx, nnl.rett)
+        if !nnl.rett.is_void_type() && !nnr.rett.is_void_type() {
+            if !nnl.rett.compat(nnr.rett) && !nnr.rett.compat(nnl.rett) {
+                nnl.rett.compat_check(nnr.rett, exp) !>
+            }
+        }
+        cmp = vgen_op(nnl, nnr, cmp_op, type_bool(b))
+    }
+
+    // Nullable equality: both null OR both set and equal
+    if cmp_op == VALUE_OP.eq {
+        let bool_t = type_bool(b)
+        if l.rett.is_nullable_type() && r.rett.is_nullable_type() {
+            let issetl = vgen_isset_val(l, bool_t)
+            let issetr = vgen_isset_val(r, bool_t)
+            let notissetl = vgen_unary(issetl, VALUE_OP.not, bool_t)
+            let notissetr = vgen_unary(issetr, VALUE_OP.not, bool_t)
+            let both_null = vgen_op(notissetl, notissetr, VALUE_OP.and, bool_t)
+            let both_set = vgen_op(issetl, issetr, VALUE_OP.and, bool_t)
+            let set_and_eq = vgen_op(both_set, cmp, VALUE_OP.and, bool_t)
+            cmp = vgen_op(both_null, set_and_eq, VALUE_OP.or, bool_t)
+        } else if l.rett.is_nullable_type() {
+            cmp = vgen_op(vgen_isset_val(l, bool_t), cmp, VALUE_OP.and, bool_t)
+        } else if r.rett.is_nullable_type() {
+            cmp = vgen_op(vgen_isset_val(r, bool_t), cmp, VALUE_OP.and, bool_t)
+        }
+    }
+
+    if noteq {
+        cmp = vgen_unary(cmp, VALUE_OP.not, type_bool(b))
+    }
+    cmp.exp = exp
+    return cmp
+}
+
+fn vgen_isset_val(on: Value, bool_t: Type) Value {
+    return Value {
+        type: VAL.isset
+        value1: on
+        rett: bool_t
+        exp: on.exp
+    }
+}
+
+// ---- isset(v) ----
+
+fn value_from_isset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let inner_exp = exp.get(VALUE_EXP.left)
+    if !isset(inner_exp) : exp.bug("Missing isset operand")
+    let on = value_from_exp(inner_exp, scope, ctx.without_type()) !>
+    let b = ctx.build
+    let bool_t = type_bool(b)
+
+    if on.rett.is_nullable_type() {
+        let v = vgen_isset_val(on, bool_t)
+        v.exp = exp
+        value_add_isset(v, on)
+        return v
+    }
+
+    // Non-nullable: still evaluate operand for side effects; result is always true
+    // (old: this_but_that(on, true) so the value is evaluated)
+    let v = vgen_bool(true, bool_t)
+    v.exp = exp
+    v.pre_value = on
+    value_add_isset(v, on)
+    return v
+}
+
+// ---- ternary / ?? / ?! ----
+
+fn value_from_ternary_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let cond_exp = exp.get(VALUE_EXP.left)
+    let then_exp = exp.get(VALUE_EXP.right)
+    let else_exp = exp.get(VALUE_EXP.third)
+    if !isset(cond_exp) || !isset(then_exp) || !isset(else_exp) : exp.bug("Incomplete ternary")
+
+    let cond = value_from_exp(cond_exp, scope, ctx.with_type(type_bool(ctx.build))) !>
+    if !cond.rett.is_void_type() && !cond.rett.is_bool_type() {
+        exp.error("You can only use '?' after values that return a bool. This value has type: " + cond.rett.compat_display_name())
+    }
+
+    let then_scope = scope.sub_scope()
+    then_scope.apply_issets(cond.issets)
+    let v1 = value_from_exp(then_exp, then_scope, ctx) !>
+
+    let else_scope = scope.sub_scope()
+    else_scope.apply_issets(cond.not_issets)
+    // Suggest then's type for else (helps null typing)
+    let else_ctx = ctx
+    if !v1.rett.is_void_type() : else_ctx = ctx.with_type(v1.rett)
+    let v2 = value_from_exp(else_exp, else_scope, else_ctx) !>
+
+    // Unify nullability
+    let l = value_try_remove_nullable(v1, then_scope, ctx)
+    let r = v2
+    if !l.rett.is_nullable_type() {
+        r = value_try_remove_nullable(v2, else_scope, ctx)
+    }
+    if r.rett.is_nullable_type() {
+        l = value_make_nullable(l, exp) !>
+    } else if l.rett.is_nullable_type() {
+        r = value_make_nullable(r, exp) !>
+    }
+    r = value_try_convert(r, else_scope, ctx, l.rett)
+    if !l.rett.is_void_type() && !r.rett.is_void_type() {
+        l.rett.compat_check(r.rett, exp) !>
+    }
+
+    let v = vgen_this_or_that(cond, l, r, l.rett)
+    v.exp = exp
+    return v
+}
+
+fn value_from_null_coalesce_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let left_exp = exp.get(VALUE_EXP.left)
+    let right_exp = exp.get(VALUE_EXP.right)
+    if !isset(left_exp) || !isset(right_exp) : exp.bug("Incomplete ??")
+
+    let on = value_from_exp(left_exp, scope, ctx) !>
+    if !on.rett.is_void_type() && !on.rett.is_nullable_type() {
+        exp.error("You can only use '??' and '?!' on nullable values. Value type is: '" + on.rett.compat_display_name() + "'")
+    }
+
+    let alt = value_from_exp(right_exp, scope, ctx.with_type(on.rett.is_nullable_type() ? on.rett.get_non_nullable() : on.rett)) !>
+    let iss = vgen_isset_val(on, type_bool(ctx.build))
+    let left = on
+    if !alt.rett.is_nullable_type() {
+        left = value_force_remove_nullable(on, ctx)
+    }
+    alt = value_try_convert(alt, scope, ctx, left.rett)
+    if !left.rett.is_void_type() && !alt.rett.is_void_type() {
+        left.rett.compat_check(alt.rett, exp) !>
+    }
+    let v = vgen_this_or_that(iss, left, alt, alt.rett)
+    v.exp = exp
+    return v
+}
+
+fn value_from_null_exit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let left_exp = exp.get(VALUE_EXP.left)
+    let body_exp = exp.get(VALUE_EXP.right)
+    if !isset(left_exp) || !isset(body_exp) : exp.bug("Incomplete ?!")
+
+    let on = value_from_exp(left_exp, scope, ctx) !>
+    if !on.rett.is_void_type() && !on.rett.is_nullable_type() {
+        exp.error("You can only use '??' and '?!' on nullable values. Value type is: '" + on.rett.compat_display_name() + "'")
+    }
+
+    let sub = scope.sub_scope()
+    let body = value_body_from_block_exp(ctx, sub, body_exp) !>
+    if !sub.did_return {
+        exp.error("Expected the code after '?!' to end with: return, exit, continue, break or throw")
+    }
+
+    // Result type is non-null of left; IR: if !isset(on) { body }; then on as non-null
+    let iss = vgen_isset_val(on, type_bool(ctx.build))
+    // Represent as: if !isset → body (exit); value is force-non-null on
+    // Store as this_or_that with then=non-null on, else=block (unreachable for value)
+    let nn = value_force_remove_nullable(on, ctx)
+    let not_iss = vgen_unary(iss, VALUE_OP.not, type_bool(ctx.build))
+    // value1=cond(!isset), value2=body side-effect (void), then result nn via wrap
+    // Cleaner: VAL.error_handler-like — use this_or_that(isset, nn, body) but body is void.
+    // Keep: pre_value = if(!isset) body; rett = nn
+    let ifv = vgen_if(not_iss, Array[Value]{ body }, null, ctx.build, exp)
+    let v = vgen_wrap(nn, nn.rett)
+    v.pre_value = ifv
+    v.exp = exp
+    return v
+}
+
+// Convert EXP.block (or body with body_exps) into a VAL.block; updates sub.did_return.
+fn value_body_from_block_exp(ctx: Context, scope: Scope, body_exp: Exp) Value !Error {
+    let state = ParseState.new()
+    let values = Array[Value]{}
+    let members = body_exp.body_exps
+    if isset(members) {
+        each members as mem {
+            let v = body_value_from_exp(ctx, scope, state, mem) !? null
+            if isset(v) {
+                values.append(v)
+                if v.type == VAL.return || v.type == VAL.throw || v.type == VAL.break || v.type == VAL.continue {
+                    scope.did_return = true
+                }
+            }
+        }
+    } else if body_exp.type == EXP.block {
+        // Nested via BLOCK_EXP.body raw — re-read if needed
+        let raw = body_exp.get(BLOCK_EXP.body)
+        if isset(raw) {
+            let pos = raw.pos
+            if isset(pos) {
+                let p = pos.copy().init_parser()
+                let stmts = read_func_stmts(p) !>
+                each stmts as mem {
+                    let v = body_value_from_exp(ctx, scope, state, mem) !? null
+                    if isset(v) {
+                        values.append(v)
+                        if v.type == VAL.return || v.type == VAL.throw || v.type == VAL.break || v.type == VAL.continue {
+                            scope.did_return = true
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Single statement exp used as body
+        let v = body_value_from_exp(ctx, scope, state, body_exp) !? null
+        if isset(v) {
+            values.append(v)
+            if v.type == VAL.return || v.type == VAL.throw || v.type == VAL.break || v.type == VAL.continue {
+                scope.did_return = true
+            }
+        }
+    }
+    return vgen_block(values, ctx.build, body_exp)
+}
+
+fn vgen_this_or_that(cond: Value, then_v: Value, else_v: Value, rett: Type) Value {
+    return Value {
+        type: VAL.this_or_that
+        value1: cond
+        value2: then_v
+        values: Array[Value]{ else_v }
+        rett: rett
+        exp: cond.exp
+    }
+}

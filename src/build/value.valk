@@ -24,6 +24,15 @@ enum VAL : u8 {
     // Class / struct construction: Type { prop: value, ... }
     // value1 = type side; values = field inits (each Value.name = prop name)
     class_init
+    // cond ? a : b  /  a ?? b  — value1=cond (or isset), value2=then, values=[else]
+    this_or_that
+    // isset(v) — value1=operand; rett=bool; may set .issets
+    isset
+    // Type-only wrap (nullable strip/add); value1=inner
+    wrap
+    // Fallible call with handler applied — value1=success value, value2=handler side-effect tree
+    // (IR lowers to error-check + branch). op = ERRH_KIND.
+    error_handler
     // ---- Function-body / control-flow values (typically rett = void) ----
     declare  // let: decls + init values; binds names as side effect
     assign   // lvalue op= rvalue; op = ASSIGN_OP
@@ -47,7 +56,7 @@ class Value {
     value1: ?Value (null)
     value2: ?Value (null)
     values: ?Array[Value] (null)
-    // Operators: VALUE_OP for op/unary; ASSIGN_OP for VAL.assign
+    // Operators: VALUE_OP for op/unary; ASSIGN_OP for VAL.assign; ERRH_KIND for error_handler
     op: u8 (0)
     // Literal payloads
     int_val: int (0)
@@ -66,6 +75,14 @@ class Value {
     cast_type: ?Type (null)
     // VAL.type: the actual Type this compile-time value represents
     of_type: ?Type (null)
+    // Flow-sensitive nullability (from isset / && / !)
+    issets: ?Array[Decl] (null)
+    not_issets: ?Array[Decl] (null)
+    // Fallible call metadata (before error handler trims it)
+    can_error: bool (false)
+    error_type: ?ErrorType (null)
+    // Side-effect / pre-value chain (old this_but_that / error-check scaffolding)
+    pre_value: ?Value (null)
 
     // Report an error at this value's source span when available.
     fn error(msg: String) !Error $throw {
@@ -77,6 +94,119 @@ class Value {
 
     fn bug(msg: String) !Error $throw {
         this.error("(Compiler bug) " + msg)
+    }
+
+    // Multi-return / multi-value unpack: VAL.multi → values array; else single-element list.
+    fn unroll() Array[Value] {
+        if this.type == VAL.multi {
+            let vals = this.values
+            if isset(vals) : return vals
+        }
+        return Array[Value]{ this }
+    }
+
+    // Success value of a fallible call (errors trimmed conceptually).
+    fn trim_errors() Value {
+        if !this.can_error : return this
+        return Value {
+            type: this.type
+            rett: this.rett
+            exp: this.exp
+            value1: this.value1
+            value2: this.value2
+            values: this.values
+            op: this.op
+            int_val: this.int_val
+            float_val: this.float_val
+            bool_val: this.bool_val
+            string_val: this.string_val
+            name: this.name
+            ns_name: this.ns_name
+            idf: this.idf
+            decl: this.decl
+            cast_type: this.cast_type
+            of_type: this.of_type
+            can_error: false
+            error_type: null
+            pre_value: this
+        }
+    }
+
+    // Class / type id on the left of `Type { fields }` init.
+    fn as_class_for_init() ?Class {
+        if this.type == VAL.type {
+            let t = this.of_type
+            if !isset(t) : return null
+            return t.class
+        }
+        if this.type == VAL.id {
+            let idf = this.idf
+            if !isset(idf) : return null
+            if idf.type == IDF.class : return idf.class
+            if idf.type == IDF.type {
+                let t = idf.of_type
+                if isset(t) : return t.class
+            }
+        }
+        return null
+    }
+
+    // Extract Type from a compile-time VAL.type value.
+    fn as_type() ?Type {
+        if this.type == VAL.type : return this.of_type
+        return null
+    }
+
+    // Extract a name from a compile-time value (bare id or string).
+    fn as_name() ?String {
+        if this.type == VAL.id : return this.name
+        if this.type == VAL.string : return this.string_val
+        return null
+    }
+
+    // Constant string form for folding == / != (null if not foldable as string).
+    // Bare unresolved ids use their name (`OS == win` → right side "win").
+    fn fold_string() ?String {
+        if this.type == VAL.string : return this.string_val
+        if this.type == VAL.char : return this.string_val
+        if this.type == VAL.bool : return this.bool_val ? "1" : "0"
+        if this.type == VAL.int {
+            let buf = ByteBuffer.new()
+            buf.write_int_ascii(this.int_val)
+            return buf.to_string()
+        }
+        if this.type == VAL.id : return this.name
+        return null
+    }
+
+    // Resolve the Func being called from this callee Value, if known.
+    // - free fn: VAL.id with IDF.func
+    // - static method: VAL.id with value1=VAL.type and IDF.func
+    // - instance method: VAL.id with value1=receiver and name matching class.funcs
+    fn resolve_call_func() ?Func {
+        if this.type != VAL.id : return null
+        let idf = this.idf
+        if isset(idf) && idf.type == IDF.func {
+            return idf.func
+        }
+        let on = this.value1
+        if !isset(on) : return null
+        let name = this.name
+        if name.length == 0 : return null
+
+        if on.type == VAL.type {
+            let t = on.of_type
+            if !isset(t) : return null
+            let c = t.class
+            if !isset(c) : return null
+            return c.funcs.get(name) !? null
+        }
+
+        let rett = on.rett
+        if rett.is_void_type() : return null
+        let c = rett.get_class_or_null()
+        if !isset(c) : return null
+        return c.funcs.get(name) !? null
     }
 }
 
@@ -186,93 +316,49 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             operand.exp = exp
             return operand
         }
+        if op == VALUE_OP.not {
+            if !operand.rett.is_bool_type() {
+                exp.error("Expected a value of type 'bool' after '!', the value type we found was: " + operand.rett.compat_display_name())
+            }
+            let v = vgen_unary(operand, op, type_bool(b))
+            v.exp = exp
+            // Flip issets when only one side is tracked (matches old !isset behavior)
+            let is_list = operand.issets
+            let not_list = operand.not_issets
+            let is_count = (isset(is_list) ? is_list.length : 0) + (isset(not_list) ? not_list.length : 0)
+            if is_count == 1 {
+                v.issets = not_list
+                v.not_issets = is_list
+            }
+            return v
+        }
         let v = vgen_unary(operand, op, operand.rett)
         v.exp = exp
         return v
     }
 
     if kind == VALUE_KIND.op {
-        let left_exp = exp.get(VALUE_EXP.left)
-        let right_exp = exp.get(VALUE_EXP.right)
-        if !isset(left_exp) || !isset(right_exp) : exp.bug("Missing binary op operands")
-        let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
-        let right = value_from_exp(right_exp, scope, ctx.without_type()) !>
-        let op = exp.number.@cast(VALUE_OP)
-        // Fold compile-time constants (macro defs, literals, bare compare words)
-        let folded = value_try_fold_op(left, right, op, b)
-        if isset(folded) {
-            folded.exp = exp
-            return folded
-        }
-        // Operand type compatibility (skip when either side is still void/unknown)
-        value_check_op_compat(left, right, op, exp) !>
-        // Prefer left's type; compare / logic yield bool
-        let rett = left.rett
-        if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte || op == VALUE_OP.and || op == VALUE_OP.or {
-            rett = type_bool(b)
-        }
-        let v = vgen_op(left, right, op, rett)
-        v.exp = exp
-        return v
+        return value_from_op_exp(exp, scope, ctx) !>
     }
 
     if kind == VALUE_KIND.call {
-        let callee_exp = exp.get(VALUE_EXP.left)
-        if !isset(callee_exp) : exp.bug("Missing call callee")
-        let callee = value_from_exp(callee_exp, scope, ctx.without_type()) !>
-        // Resolve Func early so arg parsing can use parameter types as suggestions
-        let call_func = value_resolve_call_func(callee)
-        let args_exp = exp.get(VALUE_EXP.right)
-        let args = Array[Value]{}
-        if isset(args_exp) {
-            // args_exp is VALUE_KIND.multi with sequential subs
-            let i: uint = 0
-            // Instance methods skip implicit `this` when mapping arg index → param
-            let skip: uint = 0
-            if isset(call_func) && isset(call_func.class) && !call_func.is_static {
-                let on = callee.value1
-                if isset(on) && on.type != VAL.type : skip = 1
-            }
-            while true {
-                let a = args_exp.get(i)
-                if !isset(a) : break
-                let arg_ctx = ctx.without_type()
-                if isset(call_func) {
-                    let params = call_func.args
-                    let param_i = skip + i
-                    let param: ?Arg = null
-                    if param_i < params.length {
-                        param = params.get(param_i) !? null
-                    } else if call_func.infinite_args && params.length > 0 {
-                        param = params.get(params.length - 1) !? null
-                    }
-                    if isset(param) && !param.is_generic {
-                        arg_ctx = ctx.with_type(param.type)
-                    }
-                }
-                args.append(value_from_exp(a, scope, arg_ctx) !>)
-                i++
-            }
-        }
-        // Type meta-methods: T.$can_convert_to(U) — only `$…` names, not static methods
-        if callee.type == VAL.id {
-            let on = callee.value1
-            if isset(on) && on.type == VAL.type && callee.name.starts_with("$") {
-                let folded = value_type_method(on, callee.name, args, exp, b) !>
-                folded.exp = exp
-                return folded
-            }
-        }
-        // Check args against parameter types when Func is known
-        if isset(call_func) {
-            value_check_call_args(call_func, callee, args, exp) !>
-            let v = vgen_call(callee, args, call_func.get_rett())
-            v.exp = exp
-            return v
-        }
-        let v = vgen_call(callee, args, type_void(b))
-        v.exp = exp
-        return v
+        return value_from_call_exp(exp, scope, ctx) !>
+    }
+
+    if kind == VALUE_KIND.ternary {
+        return value_from_ternary_exp(exp, scope, ctx) !>
+    }
+    if kind == VALUE_KIND.null_coalesce {
+        return value_from_null_coalesce_exp(exp, scope, ctx) !>
+    }
+    if kind == VALUE_KIND.null_exit {
+        return value_from_null_exit_exp(exp, scope, ctx) !>
+    }
+    if kind == VALUE_KIND.isset {
+        return value_from_isset_exp(exp, scope, ctx) !>
+    }
+    if kind == VALUE_KIND.error_handler {
+        return value_from_error_handler_exp(exp, scope, ctx) !>
     }
 
     if kind == VALUE_KIND.cast {
@@ -393,7 +479,7 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     if !isset(left_exp) : exp.bug("class_init is missing type")
     let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
 
-    let class = value_as_class_for_init(left)
+    let class = left.as_class_for_init()
     if !isset(class) {
         exp.error("Class init requires a class or struct type before '{'")
     }
@@ -439,25 +525,6 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     let rett = class.get_type() !>
     let v = vgen_class_init(class, field_vals, rett, exp)
     return v
-}
-
-// Resolve Type / class id for class init left-hand side.
-fn value_as_class_for_init(v: Value) ?Class {
-    if v.type == VAL.type {
-        let t = v.of_type
-        if !isset(t) : return null
-        return t.class
-    }
-    if v.type == VAL.id {
-        let idf = v.idf
-        if !isset(idf) : return null
-        if idf.type == IDF.class : return idf.class
-        if idf.type == IDF.type {
-            let t = idf.of_type
-            if isset(t) : return t.class
-        }
-    }
-    return null
 }
 
 // ---- helpers ----
@@ -636,7 +703,7 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
             at.error("'.$can_convert_to' expects 1 type argument, got " + args.length)
         }
         // Other type optional: unresolved → false (conversion hooks not ready)
-        let other = value_as_type(args.get(0) ! at.bug("Missing $can_convert_to arg"))
+        let other = (args.get(0) ! at.bug("Missing $can_convert_to arg")).as_type()
         if !isset(other) : return vgen_bool(false, type_bool(b))
         return vgen_bool(t.can_convert_to(other), type_bool(b))
     }
@@ -645,7 +712,7 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
         if args.length != 1 {
             at.error("'.$is_type_of' expects 1 type argument, got " + args.length)
         }
-        let other = value_as_type(args.get(0) ! at.bug("Missing $is_type_of arg"))
+        let other = (args.get(0) ! at.bug("Missing $is_type_of arg")).as_type()
         if !isset(other) : return vgen_bool(false, type_bool(b))
         return vgen_bool(t.is_type_of_class(other), type_bool(b))
     }
@@ -654,7 +721,7 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
         if args.length != 1 {
             at.error("'.$is_compatible_with' expects 1 type argument, got " + args.length)
         }
-        let other = value_as_type(args.get(0) ! at.bug("Missing $is_compatible_with arg"))
+        let other = (args.get(0) ! at.bug("Missing $is_compatible_with arg")).as_type()
         if !isset(other) : return vgen_bool(false, type_bool(b))
         return vgen_bool(t.is_compatible_with(other), type_bool(b))
     }
@@ -663,25 +730,12 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
         if args.length != 1 {
             at.error("'.$has_method' expects 1 name argument, got " + args.length)
         }
-        let mname = value_as_name(args.get(0) ! at.bug("Missing $has_method arg"))
+        let mname = (args.get(0) ! at.bug("Missing $has_method arg")).as_name()
         if !isset(mname) : return vgen_bool(false, type_bool(b))
         return vgen_bool(t.has_method(mname), type_bool(b))
     }
 
     at.error("Unknown type method: '" + name + "'")
-}
-
-// Extract a Type from a compile-time value (VAL.type). Null if not a type value.
-fn value_as_type(v: Value) ?Type {
-    if v.type == VAL.type : return v.of_type
-    return null
-}
-
-// Extract a name from a compile-time value (bare id or string).
-fn value_as_name(v: Value) ?String {
-    if v.type == VAL.id : return v.name
-    if v.type == VAL.string : return v.string_val
-    return null
 }
 
 // Fold a binary op when both sides are compile-time constants. Returns null if not foldable.
@@ -701,8 +755,8 @@ fn value_try_fold_op(left: Value, right: Value, op: VALUE_OP, b: Build) ?Value {
 
     if op == VALUE_OP.eq || op == VALUE_OP.ne {
         // String-ish compare (macro defs, bare words like `win` in `OS == win`)
-        let ls = value_fold_string(left)
-        let rs = value_fold_string(right)
+        let ls = left.fold_string()
+        let rs = right.fold_string()
         if isset(ls) && isset(rs) {
             let eq = ls == rs
             return vgen_bool(op == VALUE_OP.eq ? eq : !eq, type_bool(b))
@@ -735,21 +789,6 @@ fn value_try_fold_op(left: Value, right: Value, op: VALUE_OP, b: Build) ?Value {
     return null
 }
 
-// Constant string form for folding == / != (null if not a compile-time string-like value).
-// Bare unresolved ids use their name (`OS == win` → right side "win").
-fn value_fold_string(v: Value) ?String {
-    if v.type == VAL.string : return v.string_val
-    if v.type == VAL.char : return v.string_val
-    if v.type == VAL.bool : return v.bool_val ? "1" : "0"
-    if v.type == VAL.int {
-        let buf = ByteBuffer.new()
-        buf.write_int_ascii(v.int_val)
-        return buf.to_string()
-    }
-    if v.type == VAL.id : return v.name
-    return null
-}
-
 // ---- Operator / call type checks ----
 
 // Ensure left/right operand types are compatible for `op`.
@@ -779,38 +818,6 @@ fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Erro
         }
         lt.compat_check(rt, at) !>
     }
-}
-
-// Resolve the Func being called from a callee Value, if known.
-// - free fn: VAL.id with IDF.func
-// - static method: VAL.id with value1=VAL.type and IDF.func
-// - instance method: VAL.id with value1=receiver and name matching class.funcs
-fn value_resolve_call_func(callee: Value) ?Func {
-    if callee.type != VAL.id : return null
-    let idf = callee.idf
-    if isset(idf) && idf.type == IDF.func {
-        return idf.func
-    }
-    // Instance method: receiver.method — look up by name on receiver type
-    let on = callee.value1
-    if !isset(on) : return null
-    let name = callee.name
-    if name.length == 0 : return null
-
-    if on.type == VAL.type {
-        let t = on.of_type
-        if !isset(t) : return null
-        let c = t.class
-        if !isset(c) : return null
-        return c.funcs.get(name) !? null
-    }
-
-    // Value receiver — class from rett (void means incomplete)
-    let rett = on.rett
-    if rett.is_void_type() : return null
-    let c = rett.get_class_or_null()
-    if !isset(c) : return null
-    return c.funcs.get(name) !? null
 }
 
 // Check call arity and each argument against Func.args.
