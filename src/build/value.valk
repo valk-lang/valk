@@ -752,7 +752,8 @@ fn offset_generic_func(on: Value) ?Func {
     return null
 }
 
-// Type { … } or bare { … } — right is EXP.body; re-parse as fields or array elems.
+// Type { … } or bare { … } — right is EXP.body.
+// Body items: `prop: v` (fields), `v` ($append), `k => v` ($set_key).
 fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let body = exp.get(VALUE_EXP.right)
     if !isset(body) : exp.bug("class_init is missing body")
@@ -760,7 +761,7 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
 
     let left_exp = exp.get(VALUE_EXP.left)
 
-    // Bare `{ … }` with ambient fixed array → element list
+    // Bare `{ … }` with ambient fixed array → element list (positional only)
     if !isset(left_exp) {
         let ambient = ctx.type
         if isset(ambient) {
@@ -773,63 +774,265 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
 
     let class: ?Class = null
     let rett: ?Type = null
+    let left_val: ?Value = null
 
     if isset(left_exp) {
-        let left = value_from_exp(left_exp, scope, ctx.without_type()) !>
-        class = left.as_class_for_init()
+        left_val = value_from_exp(left_exp, scope, ctx.without_type()) !>
+        class = left_val.as_class_for_init()
         if !isset(class) {
             exp.error("Class init requires a class or struct type before '{'")
         }
-        rett = class.get_type() !>
     } else {
         // Bare `{ fields }` — need ambient type (assign / prop field / arg / return)
         let ambient = ctx.type
         if !isset(ambient) {
             exp.error("You cannot use '{' here. It can only be used for defining the starting value for inline types. E.g. let myvar: [u8 x 2] = { 6, 7 }")
         }
-        class = class_from_inline_init_type(ambient)
-        if !isset(class) {
-            exp.error("The '{' token can only be used to define initialization values for inline struct or fixed arrays. Not for: " + ambient.compat_display_name())
+        // Ambient class type (e.g. Array[String] default `.{}`) — hook/field init
+        let ambient_class = ambient.get_non_nullable().get_class_or_null()
+        if isset(ambient_class) {
+            class = ambient_class
+            rett = ambient
+        } else {
+            class = class_from_inline_init_type(ambient)
+            if !isset(class) {
+                exp.error("The '{' token can only be used to define initialization values for inline struct, fixed arrays, or class types. Not for: " + ambient.compat_display_name())
+            }
+            // Keep ambient (e.g. `<IIS1>`) so assign/compat match without extra convert
+            rett = ambient
         }
-        // Keep ambient (e.g. `<IIS1>`) so assign/compat match without extra convert
-        rett = ambient
     }
 
-    let fields_exp = parse_body_as_class_init_fields(body) !>
-    let field_vals = Array[Value]{}
+    let items_exp = parse_body_as_class_init_fields(body) !>
+    let elem_exps = Array[Exp]{}
+    let pair_exps = Array[Exp]{}
+    let field_exps = Array[Exp]{}
     let i: uint = 0
     while true {
-        let fexp = fields_exp.get(i)
-        if !isset(fexp) : break
-        // Comments kept only for --fmt; skip during value conversion
-        if fexp.type == EXP.comment {
+        let item = items_exp.get(i)
+        if !isset(item) : break
+        if item.type == EXP.comment {
             i++
             continue
         }
-        let fname = fexp.str1
-        if fname.length == 0 : fexp.bug("class_init field is missing name")
-        let vexp = fexp.get(VALUE_EXP.left)
-        if !isset(vexp) : fexp.bug("class_init field is missing value")
-        // Soft prop check when props are known; use prop type as suggestion
-        let prop = class.get_prop_by_name(fname) !? null
-        if !isset(prop) && class.props.length > 0 {
-            let has_named = false
-            each class.props as p {
-                if isset(p.name) : has_named = true
-            }
-            if has_named {
-                fexp.error("There's no property named: '" + fname + "'")
-            }
+        let ik = item.number.@cast(CLASS_INIT_ITEM)
+        if ik == CLASS_INIT_ITEM.field {
+            field_exps.append(item)
+        } else if ik == CLASS_INIT_ITEM.pair {
+            pair_exps.append(item)
+        } else if ik == CLASS_INIT_ITEM.elem {
+            elem_exps.append(item)
+        } else if item.str1.length > 0 {
+            // Legacy field without number set
+            field_exps.append(item)
+        } else {
+            item.error("Invalid class init item")
         }
-        let field_ctx = ctx.without_type()
-        if isset(prop) : field_ctx = ctx.with_type(prop.type)
-        let fv = value_from_exp(vexp, scope, field_ctx) !>
-        fv.name = fname
-        field_vals.append(fv)
         i++
     }
 
-    return vgen_class_init(class, field_vals, rett, exp)
+    let has_fields = field_exps.length > 0
+    let has_elems = elem_exps.length > 0
+    let has_pairs = pair_exps.length > 0
+    if has_fields && (has_elems || has_pairs) {
+        exp.error("Cannot mix property fields with list/map entries in the same class init")
+    }
+    if has_elems && has_pairs {
+        exp.error("Cannot mix list entries and map entries (`=>`) in the same class init")
+    }
+
+    // Generic base: infer from first elem/pair then specialize
+    if class.is_generic_base {
+        if has_fields {
+            exp.error("Generic type '" + class.name + "' requires type arguments")
+        }
+        class = infer_generic_class_from_init_items(class, elem_exps, pair_exps, scope, ctx, exp) !>
+    }
+    if !isset(rett) {
+        rett = class.get_type() !>
+    }
+
+    // Field-only (or empty) structural / default construct
+    if !has_elems && !has_pairs {
+        let fvals = Array[Value]{}
+        each field_exps as fexp {
+            let fname = fexp.str1
+            let vexp = fexp.get(VALUE_EXP.left)
+            if !isset(vexp) : fexp.bug("class_init field is missing value")
+            let prop = class.get_prop_by_name(fname) !? null
+            if !isset(prop) && class.props.length > 0 {
+                let has_named = false
+                each class.props as p {
+                    if isset(p.name) : has_named = true
+                }
+                if has_named {
+                    fexp.error("There's no property named: '" + fname + "'")
+                }
+            }
+            let field_ctx = ctx.without_type()
+            if isset(prop) : field_ctx = ctx.with_type(prop.type)
+            let fv = value_from_exp(vexp, scope, field_ctx) !>
+            fv.name = fname
+            fvals.append(fv)
+        }
+        return vgen_class_init(class, fvals, rett, exp)
+    }
+
+    // List / map init: construct empty, then $append / $set_key
+    return value_from_class_init_hooks(class, rett, elem_exps, pair_exps, scope, ctx, exp) !>
+}
+
+// `Array{ a, b }` / `Map{ k => v }` — empty construct + hook calls.
+fn value_from_class_init_hooks(class: Class, rett: Type, elem_exps: Array[Exp], pair_exps: Array[Exp], scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let construct = class_empty_construct(class, rett, scope, ctx, at) !>
+
+    let hooks = Array[Value]{}
+    if elem_exps.length > 0 {
+        let append_f = class.get_append_hook()
+        if !isset(append_f) {
+            at.error("Type '" + class.pretty_name() + "' has no '$append' hook (needed for list-style class init)")
+        }
+        if !append_f.parsed_types : parse_func_types(append_f) !>
+        each elem_exps as eexp {
+            let vexp = eexp.get(VALUE_EXP.left)
+            if !isset(vexp) : eexp.bug("element missing value")
+            let ect = ctx.without_type()
+            let atype = class_hook_param_type(append_f, 0)
+            if isset(atype) : ect = ctx.with_type(atype)
+            let ev = value_from_exp(vexp, scope, ect) !>
+            if isset(atype) && !ev.rett.is_void_type() {
+                ev = value_try_convert(ev, scope, ctx, atype)
+            }
+            let callee = vgen_dot(construct, append_f.name, append_f.get_rett())
+            callee.idf = Idf.for_func(append_f)
+            let args = Array[Value]{ ev }
+            value_check_call_args(append_f, callee, args, scope, ctx, eexp) !>
+            let call = vgen_call(callee, args, append_f.get_rett())
+            call.exp = eexp
+            hooks.append(call)
+            // Chain when append returns SELF
+            if !call.rett.is_void_type() && call.rett.compat(rett) {
+                construct = call
+            }
+        }
+    } else {
+        let set_f = class.get_set_key_hook()
+        if !isset(set_f) {
+            at.error("Type '" + class.pretty_name() + "' has no '$set_key' hook (needed for map-style class init)")
+        }
+        if !set_f.parsed_types : parse_func_types(set_f) !>
+        each pair_exps as pexp {
+            let kexp = pexp.get(VALUE_EXP.left)
+            if !isset(kexp) : pexp.bug("pair missing key")
+            let vexp = pexp.get(VALUE_EXP.right)
+            if !isset(vexp) : pexp.bug("pair missing value")
+            let kt = class_hook_param_type(set_f, 0)
+            let vt = class_hook_param_type(set_f, 1)
+            let kctx = ctx.without_type()
+            let vctx = ctx.without_type()
+            if isset(kt) : kctx = ctx.with_type(kt)
+            if isset(vt) : vctx = ctx.with_type(vt)
+            let kv = value_from_exp(kexp, scope, kctx) !>
+            let vv = value_from_exp(vexp, scope, vctx) !>
+            if isset(kt) && !kv.rett.is_void_type() : kv = value_try_convert(kv, scope, ctx, kt)
+            if isset(vt) && !vv.rett.is_void_type() : vv = value_try_convert(vv, scope, ctx, vt)
+            let callee = vgen_dot(construct, set_f.name, set_f.get_rett())
+            callee.idf = Idf.for_func(set_f)
+            let args = Array[Value]{ kv, vv }
+            value_check_call_args(set_f, callee, args, scope, ctx, pexp) !>
+            let call = vgen_call(callee, args, set_f.get_rett())
+            call.exp = pexp
+            hooks.append(call)
+            if !call.rett.is_void_type() && call.rett.compat(rett) {
+                construct = call
+            }
+        }
+    }
+
+    // Represent as class_init-like value: value1 = final object, values = hook side-effects
+    // (IR can emit construct then calls; typecheck only needs rett).
+    let v = Value {
+        type: VAL.class_init
+        value1: construct
+        values: hooks
+        rett: rett
+        exp: at
+    }
+    return v
+}
+
+// Empty instance: prefer static `new()` (defaults allowed), else empty field class_init.
+fn class_empty_construct(class: Class, rett: Type, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let f = class.get_func("new")
+    if isset(f) && f.is_static {
+        if !f.parsed_types : parse_func_types(f) !>
+        let tv = vgen_type(rett, ctx.build)
+        let callee = vgen_dot(tv, "new", f.get_rett())
+        callee.idf = Idf.for_func(f)
+        let args = Array[Value]{}
+        value_check_call_args(f, callee, args, scope, ctx, at) !>
+        let call = vgen_call(callee, args, f.get_rett())
+        call.exp = at
+        if call.rett.is_void_type() : call.rett = rett
+        return call
+    }
+    return vgen_class_init(class, Array[Value]{}, rett, at)
+}
+
+// Param type of a method after implicit `this` (instance) or without (static).
+fn class_hook_param_type(f: Func, i: uint) ?Type {
+    let params = f.args
+    let skip: uint = 0
+    if isset(f.class) && !f.is_static : skip = 1 // this
+    let pi = skip + i
+    if pi >= params.length : return null
+    let p = params.get(pi) !? null
+    if !isset(p) : return null
+    if p.is_generic : return null
+    return p.type
+}
+
+// Infer Array{ "x" } / HashMap{ k => v } type args from first item.
+fn infer_generic_class_from_init_items(class: Class, elem_exps: Array[Exp], pair_exps: Array[Exp], scope: Scope, ctx: Context, at: Exp) Class !Error {
+    let names = class.generic_names
+    if !isset(names) {
+        at.error("Generic type '" + class.name + "' requires type arguments")
+    }
+    if names.length == 0 {
+        at.error("Generic type '" + class.name + "' requires type arguments")
+    }
+    if elem_exps.length > 0 {
+        let e0 = elem_exps.get(0) !? null
+        if !isset(e0) : at.error("Cannot infer generic type arguments for '" + class.name + "'")
+        let vexp = e0.get(VALUE_EXP.left)
+        if !isset(vexp) : at.error("Cannot infer generic type arguments for '" + class.name + "'")
+        let v = value_from_exp(vexp, scope, ctx.without_type()) !>
+        if v.rett.is_void_type() {
+            at.error("Cannot infer generic type arguments for '" + class.name + "'")
+        }
+        if names.length == 1 {
+            return class.specialize(Array[Type]{ v.rett }, at) !>
+        }
+        at.error("Generic type '" + class.name + "' expects " + names.length + " type argument(s)")
+    }
+    if pair_exps.length > 0 {
+        let p0 = pair_exps.get(0) !? null
+        if !isset(p0) : at.error("Cannot infer generic type arguments for '" + class.name + "'")
+        let kexp = p0.get(VALUE_EXP.left)
+        if !isset(kexp) : at.error("Cannot infer generic type arguments for '" + class.name + "'")
+        let vexp = p0.get(VALUE_EXP.right)
+        if !isset(vexp) : at.error("Cannot infer generic type arguments for '" + class.name + "'")
+        let k = value_from_exp(kexp, scope, ctx.without_type()) !>
+        let v = value_from_exp(vexp, scope, ctx.without_type()) !>
+        if names.length == 1 {
+            // Map[T] mode: only value type is generic; key is fixed String
+            return class.specialize(Array[Type]{ v.rett }, at) !>
+        }
+        if names.length >= 2 {
+            return class.specialize(Array[Type]{ k.rett, v.rett }, at) !>
+        }
+    }
+    at.error("Generic type '" + class.name + "' requires type arguments (cannot infer from empty init)")
 }
 
 // Bare `{ v0, v1, ... }` for fixed arrays — body re-parsed as element values.
