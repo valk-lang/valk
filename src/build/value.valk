@@ -51,6 +51,10 @@ enum VAL : u8 {
     throw    // value1=thrown value
     break
     continue
+    // Value scope `<{...}`: values = body statements; value1 = phi of return values
+    vscope
+    // Phi of multiple control-flow values (vscope returns, …); values = arms
+    phi
 }
 
 class Value {
@@ -115,11 +119,61 @@ class Value {
         return t == VAL.decl || t == VAL.prop || t == VAL.global || t == VAL.ptrv
     }
 
-    // Multi-return / multi-value unpack: VAL.multi → values array; else single-element list.
+    // Multi-return / multi-value unpack: VAL.multi → values array; vscope/phi via value1.
     fn unroll() Array[Value] {
         if this.type == VAL.multi {
             let vals = this.values
             if isset(vals) : return vals
+        }
+        // Value scope result is the phi of its returns
+        if this.type == VAL.vscope {
+            let phi = this.value1
+            if isset(phi) : return phi.unroll()
+        }
+        if this.type == VAL.phi {
+            // Phi of multi values still multi; single-value phi is one arm
+            let vals = this.values
+            if isset(vals) && vals.length > 0 {
+                let first = vals.get(0) !? null
+                if isset(first) && first.type == VAL.multi : return first.unroll()
+                // Multi rett without stored multi value: one extract per subtype
+                if this.rett.type == TYPE.multi {
+                    let subs = this.rett.sub_types
+                    if isset(subs) {
+                        let out = Array[Value]{}
+                        each subs as st, i {
+                            // Placeholder extracts for let-unpack; IR fills later
+                            out.append(Value {
+                                type: VAL.multi
+                                name: "phi_part"
+                                int_val: i.@cast(int)
+                                value1: this
+                                rett: st
+                                exp: this.exp
+                            })
+                        }
+                        return out
+                    }
+                }
+            }
+        }
+        // Multi-typed value without VAL.multi (e.g. call returning (T,U))
+        if this.rett.type == TYPE.multi {
+            let subs = this.rett.sub_types
+            if isset(subs) {
+                let out = Array[Value]{}
+                each subs as st, i {
+                    out.append(Value {
+                        type: VAL.multi
+                        name: "part"
+                        int_val: i.@cast(int)
+                        value1: this
+                        rett: st
+                        exp: this.exp
+                    })
+                }
+                return out
+            }
         }
         return Array[Value]{ this }
     }
@@ -408,16 +462,33 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
 
     if kind == VALUE_KIND.multi {
-        // Bare multi list (usually only appears as call args, already handled)
+        // Multi-value `(a, b, …)` or bare multi list (call args)
         let args = Array[Value]{}
         let i: uint = 0
+        // Ambient multi type suggests each part (return / let / assign)
+        let ambient = ctx.type
+        let part_types: ?Array[Type] = null
+        if isset(ambient) && ambient.type == TYPE.multi {
+            part_types = ambient.sub_types
+        }
         while true {
             let a = exp.get(i)
             if !isset(a) : break
-            args.append(value_from_exp(a, scope, ctx.without_type()) !>)
+            let part_ctx = ctx.without_type()
+            let pt: ?Type = null
+            if isset(part_types) {
+                pt = part_types.get(i) !? null
+                if isset(pt) : part_ctx = ctx.with_type(pt)
+            }
+            let av = value_from_exp(a, scope, part_ctx) !>
+            // Convert each part toward ambient multi slot (e.g. int → String via $to)
+            if isset(pt) && !av.rett.is_void_type() && !pt.is_void_type() {
+                av = value_try_convert(av, scope, ctx, pt)
+            }
+            args.append(av)
             i++
         }
-        let v = vgen_multi(args, type_void(b))
+        let v = vgen_grouped_values(b, args)
         v.exp = exp
         return v
     }
@@ -462,8 +533,45 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if kind == VALUE_KIND.ref_of {
         return value_from_ref_of_exp(exp, scope, ctx) !>
     }
+    if kind == VALUE_KIND.vscope {
+        return value_from_vscope_exp(exp, scope, ctx) !>
+    }
 
     exp.bug("Unknown value kind: " + kind)
+}
+
+// `<{ ... }` — body re-parsed as statements; returns form the value (phi).
+fn value_from_vscope_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.left)
+    if !isset(body) : exp.bug("vscope is missing body")
+    if body.type != EXP.body : exp.bug("vscope body must be EXP.body")
+
+    let retvs = Array[Value]{}
+    let sub = scope.sub_scope()
+    sub.vscope_retvs = retvs
+    // Seed result type from ambient (assign / !? alt / let type / …)
+    let ambient = ctx.type
+    if isset(ambient) : sub.vscope_rett = ambient
+
+    let state = ParseState.new()
+    let stmts = Array[Value]{}
+    let p = body_parser(body) !>
+    let members = read_func_stmts(p) !>
+    if body.src.format : body.body_exps = members
+    each members as mem {
+        let v = body_value_from_exp(ctx, sub, state, mem) !? null
+        if isset(v) : stmts.append(v)
+    }
+    if state.has_open_if() || state.is_skipping() {
+        exp.error("Missing compile macro '#end' in value scope")
+    }
+
+    let rett = sub.vscope_rett
+    if !isset(rett) || retvs.length == 0 || !sub.did_return {
+        exp.error("Value scope did not return a value")
+    }
+    let phi = vgen_phi(retvs, rett, exp)
+    return vgen_vscope(stmts, phi, exp)
 }
 
 // @ptrv(on, Type, offset?) — body re-parsed as value, type, optional value.
