@@ -45,9 +45,10 @@ fn type_display_name(t: Type) String {
     return "unknown"
 }
 
-// Handle one class-body (or trait-expanded) expression.
+// Handle one class-body (or trait-expanded / group-body) expression.
 // `scope` is used for type resolution (class.scope, or a trait-use scope with T bound).
-fn parse_class_body_member(class: Class, state: ParseState, exp: Exp, scope: Scope) !Error {
+// `group` is set when expanding members inside `group name { ... }`.
+fn parse_class_body_member(class: Class, state: ParseState, exp: Exp, scope: Scope, group: ?Group (null)) !Error {
     // Compile macros always run (own skip/nest bookkeeping)
     if exp.type == EXP.macro {
         parse_macro_exp(class.ns, scope, state, exp) !>
@@ -56,15 +57,167 @@ fn parse_class_body_member(class: Class, state: ParseState, exp: Exp, scope: Sco
     // Suppressed inside a false #if / unused #elif / #else body
     if state.is_skipping() : return
 
+    // Comments are formatting-only
+    if exp.type == EXP.comment : return
+
     if exp.type == EXP.prop {
+        if isset(group) : exp.error("You cannot define properties inside a 'group'")
         parse_class_prop(class, exp, scope) !>
         return
     }
     if exp.type == EXP.trait_use {
+        if isset(group) : exp.error("You cannot use traits inside a 'group'")
         parse_class_trait_use(class, exp) !>
         return
     }
-    // EXP.func / EXP.group / EXP.comment / EXP.macro_def — later
+    if exp.type == EXP.func {
+        parse_class_method(class, exp, scope, group) !>
+        return
+    }
+    if exp.type == EXP.group {
+        if isset(group) : exp.error("Nested groups are not allowed")
+        parse_class_group(class, exp, scope) !>
+        return
+    }
+    if exp.type == EXP.macro_def {
+        parse_class_macro_def(class, exp, scope) !>
+        return
+    }
+
+    exp.bug("Unhandled class-body expression type in parse_class_body_member: " + exp.type)
+}
+
+// `fn` / `get` / `static fn` / `static get` inside a class (or group).
+fn parse_class_method(class: Class, exp: Exp, scope: Scope, group: ?Group) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Method is missing a name")
+
+    let is_static = exp.bool1
+    let is_getter = exp.kind == FUNC_KIND.get
+
+    // Name uniqueness within class or group
+    if isset(group) {
+        if group.funcs.has(name) {
+            exp.error("Function name is already used in group '" + group.name + "': " + name)
+        }
+    } else {
+        if class_member_name_used(class, name) {
+            exp.error("Function name is already used for something else in this class: " + name)
+        }
+    }
+
+    let f = Func {
+        unit: class.unit
+        ns: class.ns
+        name: name
+        act: exp.act
+        exp: exp
+        // Parent is class/trait scope so SELF and generic params resolve
+        arg_scope: scope.sub_scope()
+        generics: exp.get(FUNC_EXP.generics)
+        args_exp: exp.get(FUNC_EXP.args)
+        rett_exp: exp.get(FUNC_EXP.type)
+        error: exp.get(FUNC_EXP.error)
+        body: exp.get(FUNC_EXP.body)
+        flags: exp.list
+        class: class
+        group: group
+        is_static: is_static
+        is_getter: is_getter
+    }
+
+    if isset(group) {
+        group.funcs.set(name, f)
+    } else {
+        class.funcs.set(name, f)
+    }
+
+    class.unit.functions.append(f)
+    class.ns.build.pipeline.parse_func_asts.append(f)
+    class.ns.build.pipeline.parse_func_types.append(f)
+}
+
+// `group name { ... }` — parse nested members into the group.
+fn parse_class_group(class: Class, exp: Exp, scope: Scope) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Group is missing a name")
+
+    if class_member_name_used(class, name) {
+        exp.error("Group name is already used for something else in this class: " + name)
+    }
+
+    let g = Group {
+        class: class
+        name: name
+        act: exp.act
+        exp: exp
+    }
+    class.groups.set(name, g)
+
+    let body = exp.get(GROUP_EXP.body)
+    if !isset(body) : return
+
+    let pos = body.pos
+    if !isset(pos) : body.bug("Group body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let members = read_class_body_exps(p) !>
+    if body.src.format : body.body_exps = members
+
+    let state = ParseState.new()
+    each members as mem {
+        parse_class_body_member(class, state, mem, scope, g) !>
+    }
+    if state.has_open_if() || state.is_skipping() {
+        body.error("Missing compile macro '#end' in group '" + name + "'")
+    }
+}
+
+// Class-body `macro name scope(...) ...` — store on Class.macros by dispatch key.
+fn parse_class_macro_def(class: Class, exp: Exp, scope: Scope) !Error {
+    let name = exp.str1
+    let pattern = exp.get(MACRO_DEF_EXP.pattern)
+    if !isset(pattern) : exp.bug("Macro is missing a pattern")
+
+    let key = macro_class_dispatch_key(pattern) !>
+    if class.macros.has(key) {
+        exp.error("You have 2 class macros that start with the same token: \"" + key + "\"")
+    }
+
+    let m = Macro {
+        name: name
+        act: exp.act
+        exp: exp
+        pattern: pattern
+        output: exp.get(MACRO_DEF_EXP.output)
+        is_value: exp.bool2
+        is_class_macro: true
+        class: class
+        scope: scope.sub_scope()
+    }
+    class.macros.set(key, m)
+}
+
+// Dispatch key for a class macro: first fixed token part, else scope() open tag
+// (e.g. Array's `macro scope("{", V:v1, ...)` is keyed by `{`).
+fn macro_class_dispatch_key(pattern: Exp) String !Error {
+    let parts_exp = pattern.get(MACRO_SCOPE_EXP.parts)
+    if isset(parts_exp) {
+        let first = parts_exp.get(0)
+        if isset(first) && first.kind == MACRO_PART_KIND.token {
+            return first.str1
+        }
+    }
+    if pattern.str1.length > 0 : return pattern.str1
+    pattern.error("Class macro must start with a token or scope open tag")
+}
+
+// True if `name` is already a prop, method, or group on the class.
+fn class_member_name_used(class: Class, name: String) bool {
+    let prop = class.get_prop_by_name(name) !? null
+    if isset(prop) : return true
+    if class.funcs.has(name) : return true
+    if class.groups.has(name) : return true
+    return false
 }
 
 // Mix a trait's member expressions into this class (as if written in the class body).
@@ -124,7 +277,7 @@ fn parse_class_trait_use(class: Class, exp: Exp) !Error {
     // Expand trait members with the same handling as native class body expressions
     let dummy_state = ParseState.new()
     each trait.get_exps() as te {
-        parse_class_body_member(class, dummy_state, te, use_scope) !>
+        parse_class_body_member(class, dummy_state, te, use_scope, null) !>
     }
 }
 
