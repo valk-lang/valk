@@ -28,6 +28,11 @@ enum VAL : u8 {
     class_init
     // Fixed-array construction: { v0, v1, ... } — values = elements; rett = array type
     array_init
+    // Error code value: `.code` / `TypeName.code` / `E.code` / `E.name` (no payload), or
+    // `throw .code { field: value, ... }` (payload). string_val = code name ("" for the
+    // dynamic `E.code`); values = payload field inits when present (each Value.name = field
+    // name); rett = TYPE.error_code Type identifying the ErrorType.
+    error_value
     // Element access / @ptrv: value1 = base, value2 = index; rett = element type
     ptrv
     // @ref(lvalue): value1 = address-of target; rett = ptr
@@ -528,15 +533,12 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
 
     if kind == VALUE_KIND.error_code {
-        // Placeholder until error-value typing is wired; name in string_val
-        let v = Value {
-            type: VAL.id
-            name: exp.str1
-            string_val: exp.str1
-            rett: type_int(b) // error codes are u32-ish at runtime
-            exp: exp
-        }
-        return v
+        // Bare `.code` — implied ErrorType comes from the enclosing function's `!ErrorName`.
+        let func = ctx.func
+        if !isset(func) : exp.error("An error code ('." + exp.str1 + "') can only be used inside a function")
+        let et = func.error_type
+        if !isset(et) : exp.error("Throwing an error but your function has no error type")
+        return value_from_error_code_item(et, exp.str1, exp) !>
     }
 
     if kind == VALUE_KIND.class_init {
@@ -950,6 +952,11 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     if body.type != EXP.body : exp.bug("class_init body must be EXP.body")
 
     let left_exp = exp.get(VALUE_EXP.left)
+
+    // `.code { field: value, ... }` — error payload construction, not a class/struct init.
+    if isset(left_exp) && left_exp.type == EXP.value && left_exp.kind == VALUE_KIND.error_code {
+        return value_from_error_payload_init_exp(exp, scope, ctx, left_exp) !>
+    }
 
     // Bare `{ … }` with ambient fixed array → element list (positional only)
     if !isset(left_exp) {
@@ -1442,6 +1449,18 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         return v
     }
 
+    // Error type as value: `TestError` — `.code` resolves via of_type.error_type
+    if isset(idf) && idf.type == IDF.error_type {
+        if isset(gens) : exp.error("Unexpected type arguments on error type: " + name)
+        let et = idf.error_type
+        if !isset(et) : exp.bug("Error-type idf is missing error_type")
+        parse_error_type(et) !>
+        let v = vgen_type(type_error_code(et), b)
+        v.exp = exp
+        v.idf = idf
+        return v
+    }
+
     // Generic free function: `foo[T]` → specialized Func id
     if isset(idf) && idf.type == IDF.func {
         let f = idf.func
@@ -1518,6 +1537,11 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             if isset(enu) {
                 return value_from_enum_item(enu, name, exp, scope, ctx) !>
             }
+            // Error code constant: `TestError.err2`
+            let et = t.error_type
+            if isset(et) {
+                return value_from_error_code_item(et, name, exp) !>
+            }
             // Static method / member on a class type (modes fall through to wrapped type)
             let c = t.class
             if isset(c) {
@@ -1546,6 +1570,32 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let on_nn = value_try_remove_nullable(on, scope, ctx)
     if on_nn.rett.is_nullable_type() {
         exp.error("You cannot access properties/functions on a nullable type: " + on_nn.rett.compat_display_name())
+    }
+
+    // Caught-error binding (`E`): `.code` (the actual thrown code), a named code
+    // constant (`E.err2`, matching `TypeName.code`), or a payload field (`E.message`).
+    let on_et_t = on_nn.rett
+    if on_et_t.type == TYPE.error_code && on_et_t.error_is_instance {
+        let et = on_et_t.error_type
+        if !isset(et) : exp.bug("Error-instance type is missing error_type")
+        if name == "code" {
+            let v = Value {
+                type: VAL.error_value
+                rett: type_error_code(et)
+                exp: exp
+            }
+            return v
+        }
+        let ptype = et.payload.get(name) !? null
+        if isset(ptype) {
+            let v = vgen_dot(on_nn, name, ptype)
+            v.exp = exp
+            return v
+        }
+        if et.codes.contains(name) {
+            return value_from_error_code_item(et, name, exp) !>
+        }
+        exp.error("Error type '" + et.name + "' has no payload field or code named: '" + name + "'")
     }
 
     let on_class = on_nn.rett.get_class_or_null()
@@ -1602,6 +1652,74 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         exp.error("Cannot access properties/functions on this type: " + on_nn.rett.compat_display_name())
     }
     exp.error("Type '" + on_class.pretty_name() + "' has no property or method named: '" + name + "'")
+}
+
+// `.code` / `TypeName.code` / `E.name` — a named, payload-less error code constant.
+fn value_from_error_code_item(et: ErrorType, name: String, at: Exp) Value !Error {
+    if !et.codes.contains(name) {
+        at.error("Error type '" + et.name + "' does not have an error code named: '" + name + "'")
+    }
+    return Value {
+        type: VAL.error_value
+        string_val: name
+        rett: type_error_code(et)
+        exp: at
+    }
+}
+
+// `throw .code { field: value, ... }` — payload construction. `left_exp` is the
+// VALUE_KIND.error_code operand of the class-init (`{ ... }` is the field body).
+// Only the bare `.code` form is supported here (qualified `TypeName.code { ... }` isn't
+// used anywhere in practice — qualified codes are only ever thrown without a payload).
+fn value_from_error_payload_init_exp(exp: Exp, scope: Scope, ctx: Context, left_exp: Exp) Value !Error {
+    let func = ctx.get_func() !>
+    let et = func.error_type
+    if !isset(et) : left_exp.error("Throwing an error but your function has no error type")
+    let name = left_exp.str1
+    if !et.codes.contains(name) {
+        left_exp.error("Error type '" + et.name + "' does not have an error code named: '" + name + "'")
+    }
+
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("Error payload init is missing body")
+    if body.type != EXP.body : exp.bug("Error payload init body must be EXP.body")
+
+    let items_exp = parse_body_as_class_init_fields(body) !>
+    let values = Array[Value]{}
+    let i: uint = 0
+    while true {
+        let item = items_exp.get(i)
+        if !isset(item) : break
+        if item.type == EXP.comment {
+            i++
+            continue
+        }
+        let ik = item.number.@cast(CLASS_INIT_ITEM)
+        if ik != CLASS_INIT_ITEM.field {
+            item.error("Error payload fields must be named (e.g. 'field: value')")
+        }
+        let fname = item.str1
+        let ftype = et.payload.get(fname) !? null
+        if !isset(ftype) {
+            item.error("Error type '" + et.name + "' has no payload field named: '" + fname + "'")
+        }
+        let vexp = item.get(VALUE_EXP.left)
+        if !isset(vexp) : item.bug("Payload field is missing a value")
+        let fv = value_from_exp(vexp, scope, ctx.with_type(ftype)) !>
+        fv = value_try_convert(fv, scope, ctx, ftype)
+        ftype.compat_check(fv.rett, item) !>
+        fv.name = fname
+        values.append(fv)
+        i++
+    }
+
+    return Value {
+        type: VAL.error_value
+        string_val: name
+        values: values
+        rett: type_error_code(et)
+        exp: exp
+    }
 }
 
 // `EnumName.item` — resolve the variant to a typed constant value.
