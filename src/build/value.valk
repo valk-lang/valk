@@ -559,6 +559,8 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let name = id.str1
     let ns_name = id.str2
     let b = ctx.build
+    // Optional `Id[T, U]` type arguments (VALUE_EXP.right multi TYPE)
+    let gens = exp.get(VALUE_EXP.right)
 
     let idf: ?Idf = null
     if isset(ns_name) {
@@ -578,6 +580,7 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     // Locals / arguments → VAL.decl with known type
     if isset(idf) && idf.type == IDF.decl {
+        if isset(gens) : exp.error("Unexpected type arguments on variable: " + name)
         let d = idf.decl
         if !isset(d) : exp.bug("Decl idf is missing decl")
         let v = vgen_decl(d)
@@ -587,6 +590,7 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     // Compile-time constants (macro defs on Build.scope) fold to their Value
     if isset(idf) && idf.type == IDF.value {
+        if isset(gens) : exp.error("Unexpected type arguments on value: " + name)
         let bound = idf.value
         if !isset(bound) : exp.bug("Value idf is missing value")
         // Return a shallow copy so we can attach this use's source span
@@ -610,6 +614,7 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     // `value Name (expr)` — evaluate the stored expression in this scope
     if isset(idf) && idf.type == IDF.value_expr {
+        if isset(gens) : exp.error("Unexpected type arguments on value: " + name)
         let value_exp = idf.value_exp
         if !isset(value_exp) : exp.bug("Value-expr idf is missing value_exp")
         // Keep suggested type so e.g. a null alias can inherit the use-site expectation
@@ -624,6 +629,17 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if isset(idf) && idf.type == IDF.type {
         let of_type = idf.of_type
         if !isset(of_type) : exp.bug("Type idf is missing of_type")
+        // If the bound type is a generic class, allow `T[U]` only when of_type is a class base
+        let c = of_type.class
+        if isset(gens) {
+            if isset(c) && c.is_generic_base {
+                let gtypes = value_resolve_type_args(gens, scope) !>
+                c = c.specialize(gtypes, exp) !>
+                of_type = c.get_type() !>
+            } else {
+                exp.error("Type is not generic: " + name)
+            }
+        }
         let v = vgen_type(of_type, b)
         v.exp = exp
         v.idf = idf
@@ -631,16 +647,56 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     if isset(idf) && idf.type == IDF.class {
         let c = idf.class
-        if isset(c) && !c.is_generic_base {
+        if isset(c) {
+            if c.is_generic_base {
+                if !isset(gens) {
+                    exp.error("Generic type '" + c.name + "' requires type arguments")
+                }
+                let gtypes = value_resolve_type_args(gens, scope) !>
+                c = c.specialize(gtypes, exp) !>
+            } else if isset(gens) {
+                exp.error("Type is not generic: " + c.name)
+            }
             let of_type = c.get_type() !>
             let v = vgen_type(of_type, b)
             v.exp = exp
-            v.idf = idf
+            v.idf = Idf.for_class(c)
             return v
         }
     }
 
+    // Generic free function: `foo[T]` → specialized Func id
+    if isset(idf) && idf.type == IDF.func {
+        let f = idf.func
+        if isset(f) && f.is_generic_base {
+            if !isset(gens) {
+                // Leave base for call-site specialization when possible
+            } else {
+                let gtypes = value_resolve_type_args(gens, scope) !>
+                f = f.specialize(gtypes, exp) !>
+                idf = Idf.for_func(f)
+            }
+        } else if isset(gens) {
+            exp.error("Function is not generic: " + name)
+        }
+    } else if isset(gens) {
+        exp.error("Unexpected type arguments on: " + name)
+    }
+
     return vgen_id(name, ns_name, idf, type_void(b))
+}
+
+// Resolve multi TYPE_KIND type-argument list from a value id's `[T, U]`.
+fn value_resolve_type_args(gens: Exp, scope: Scope) Array[Type] !Error {
+    let gtypes = Array[Type]{}
+    let i: uint = 0
+    while true {
+        let g = gens.get(i)
+        if !isset(g) : break
+        gtypes.append(type_from_exp(g, scope) !>)
+        i++
+    }
+    return gtypes
 }
 
 // VAL.type for a value's result type (`typeof(v)` / `v.$type`).
@@ -822,8 +878,9 @@ fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Erro
 
 // Check call arity and each argument against Func.args.
 // Skips implicit `this` for instance methods (receiver is not in `args`).
+// Applies `value_try_convert` in place (int literals → i32, etc.) then compat_check.
 // Soft: void rett on an arg means incomplete typing — that slot is not checked.
-fn value_check_call_args(func: Func, callee: Value, args: Array[Value], at: Exp) !Error {
+fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp) !Error {
     // Ensure signature types are resolved
     if !func.parsed_types {
         parse_func_types(func) !>
@@ -870,10 +927,14 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], at: Exp)
         if !isset(param) : break
 
         let av = args.get(i) ! break
-        let avt = av.rett
-        if !avt.is_void_type() && !param.is_generic {
-            // Expected param type accepts actual arg type
-            param.type.compat_check(avt, at) !>
+        if !param.is_generic {
+            // Convert first (literal int → i32, nullable strip, $to hooks, …)
+            av = value_try_convert(av, scope, ctx, param.type)
+            args.set(i, av) ! at.bug("value_check_call_args: args.set out of range")
+            let avt = av.rett
+            if !avt.is_void_type() {
+                param.type.compat_check(avt, at) !>
+            }
         }
         i++
     }
