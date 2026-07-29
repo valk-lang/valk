@@ -105,7 +105,9 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     each unit.extern_globals as global {
         out.write_string("@\"")
         out.write_string(global_ir_name(global))
-        out.write_string("\" = external global ")
+        out.write_string("\" = external ")
+        if !global.shared : out.write_string("thread_local(initialexec) ")
+        out.write_string("global ")
         out.write_string(ir_type(global.get_type() !>) !>)
         out.write_string("\n")
     }
@@ -717,12 +719,6 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         return result
     }
 
-    let lowered = ir_type(value.rett) !>
-    if lowered == "ptr" {
-        ir.comment("TODO heap class allocation")
-        return "null"
-    }
-
     let type = value.rett.get_non_nullable()
     let storage_type = type
     if type.type == TYPE.inline {
@@ -733,27 +729,91 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     let class = storage_type.get_class_or_null()
     if !isset(class) : value.bug("Aggregate class initializer has no class")
 
-    let slot = ir.var()
-    let size = value.rett.size() !>
-    ir.line(slot + " = alloca " + lowered)
-    ir.line("call void @llvm.memset.inline.p0.i64(ptr " + slot + ", i8 0, i64 " + size + ", i1 false)")
-
+    // Evaluate fields first. In particular, a nested GC allocation must happen
+    // before the new object exists but has not yet been rooted.
     let fields = value.values
+    let rendered = Array[String]{}
+    if isset(fields) {
+        each fields as field {
+            rendered.append(ir_emit_value(ir, field) !>)
+        }
+    }
+
+    let lowered = ir_type(value.rett) !>
+    let size = class.compute_body_size() !>
+    if size == 0 && lowered == "ptr" : return "null"
+
+    let slot = ""
+    if lowered == "ptr" {
+        slot = ir_emit_class_alloc(ir, value, class, size) !>
+    } else {
+        slot = ir.var()
+        ir.line(slot + " = alloca " + lowered)
+    }
+    if size > 0 {
+        ir.line("call void @llvm.memset.inline.p0.i64(ptr " + slot + ", i8 0, i64 " + size + ", i1 false)")
+    }
+
     if isset(fields) {
         each fields as field, i {
             let prop: ?Prop = null
             if field.name != "" : prop = class.get_prop_by_name(field.name) !? null
             if !isset(prop) : prop = class.props.get(i) !? null
             if !isset(prop) : value.bug("Cannot match aggregate initializer field to a property")
-            let field_value = ir_emit_value(ir, field) !>
+            let field_value = rendered.get(i) !? "undef"
             let address = ir.var()
             ir.line(address + " = getelementptr i8, ptr " + slot + ", i64 " + prop.offset)
             ir.line("store " + (ir_type(prop.type) !>) + " " + field_value + ", ptr " + address)
         }
     }
+    if lowered == "ptr" : return slot
+
     let out = ir.var()
     ir.line(out + " = load " + lowered + ", ptr " + slot)
     return out
+}
+
+fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String !Error {
+    let allocator = value.allocator
+    if isset(allocator) {
+        let global = allocator.global
+        if global.unit != ir.func.unit {
+            ir.func.unit.extern_globals.append(global, true)
+        }
+        let pool_type = global.get_type() !>
+        let pool_class = pool_type.get_class_or_null()
+        if !isset(pool_class) : value.bug("Generated allocator global is not a Pool")
+        let method_name = isset(allocator.onfree) ? "get_vtable" : "get"
+        let pool_get = pool_class.get_func(method_name)
+        if !isset(pool_get) : value.bug("gc:Pool has no '" + method_name + "' method")
+        if !pool_get.parsed_types : parse_func_types(pool_get) !>
+        if pool_get.unit != ir.func.unit || pool_get.is_extern {
+            ir.func.unit.extern_functions.append(pool_get, true)
+        }
+
+        let pool = ir.var()
+        ir.line(pool + " = load " + (ir_type(pool_type) !>) + ", ptr @\"" + global_ir_name(global) + "\"")
+        let result = ir.var()
+        ir.line(result + " = call " + (ir_type(pool_get.get_rett()) !>) + " @\"" + func_ir_name(pool_get) + "\"(ptr " + pool + ")")
+        return result
+    }
+
+    // Structs, slices, and other pointer-backed value wrappers are reference
+    // values too, but are not GC-managed and therefore have no Pool allocator.
+    if class.kind != CLASS_KIND.class {
+        let idf = valk_idf(ir.func.ns.build, "mem", "alloc_ob") !>
+        let alloc = idf.func
+        if !isset(alloc) : value.bug("mem:alloc_ob is not a function")
+        if !alloc.parsed_types : parse_func_types(alloc) !>
+        if alloc.unit != ir.func.unit || alloc.is_extern {
+            ir.func.unit.extern_functions.append(alloc, true)
+        }
+        let result = ir.var()
+        ir.line(result + " = call " + (ir_type(alloc.get_rett()) !>) + " @\"" + func_ir_name(alloc) + "\"(i64 " + size + ")")
+        return result
+    }
+
+    value.bug("GC class initializer has no allocator: " + class.pretty_name())
 }
 
 fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
