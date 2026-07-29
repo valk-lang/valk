@@ -252,8 +252,9 @@ fn ir_write_func_signature(out: ByteBuffer, func: Func, declare: bool) !Error {
     out.write_string(" @\"")
     out.write_string(func_ir_name(func))
     out.write_string("\"(")
+    if func.is_literal : out.write_string("ptr")
     each func.args as arg, i {
-        if i > 0 : out.write_string(", ")
+        if i > 0 || func.is_literal : out.write_string(", ")
         out.write_string(ir_type(arg.type) !>)
     }
     if func.infinite_args {
@@ -278,8 +279,6 @@ class IRFunc {
     func: Func
     code: ByteBuffer (.new(4096))
     coro_helpers: ByteBuffer (.new(2048))
-    captured_decls: Array[Decl] (.{})
-    captured_addresses: Array[String] (.{})
     varc: uint (0)
     blockc: uint (0)
     terminated: bool (false)
@@ -336,15 +335,21 @@ class IRFunc {
     }
 
     fn captured_address(decl: Decl) String !Error {
-        each this.captured_decls as existing, i {
-            if existing == decl : return this.captured_addresses.get(i) !? ""
+        each this.func.capture_decls as captured, i {
+            if captured != decl : continue
+            let class = this.func.capture_class
+            if !isset(class) : this.func.exp.bug("Literal capture environment is missing")
+            let prop = class.props.get(i) !? null
+            if !isset(prop) : this.func.exp.bug("Literal capture property is missing")
+            let address = this.var()
+            this.line_start()
+            this.write(address)
+            this.write(" = getelementptr i8, ptr \%closure.data, i64 ")
+            this.write_uint(prop.offset)
+            this.line_end()
+            return address
         }
-        let address = "\%capture." + this.captured_decls.length
-        this.captured_decls.append(decl)
-        this.captured_addresses.append(address)
-        this.line(address + " = alloca " + (ir_type(decl.type) !>))
-        this.comment("TODO captured declaration environment")
-        return address
+        this.func.exp.bug("Literal references an unregistered capture")
     }
 
     fn label(name: String) {
@@ -392,8 +397,9 @@ fn generate_func_ir(func: Func) !Error {
     ir.code.write_string(" @\"")
     ir.code.write_string(func.ir_name)
     ir.code.write_string("\"(")
+    if func.is_literal : ir.code.write_string("ptr \%closure.data")
     each func.args as arg, i {
-        if i > 0 : ir.code.write_string(", ")
+        if i > 0 || func.is_literal : ir.code.write_string(", ")
         ir.code.write_string(ir_type(arg.type) !>)
         ir.code.write_string(" \%arg.")
         ir.code.write_uint_ascii(i)
@@ -423,6 +429,7 @@ fn generate_func_ir(func: Func) !Error {
     }
     each func.args as arg, i {
         ir.line("store " + (ir_type(arg.type) !>) + " \%arg." + i + ", ptr " + arg.decl.ir_name)
+        ir_sync_closure_root(ir, arg.decl, "\%arg." + i) !>
     }
 
     each scope.values as value {
@@ -449,6 +456,32 @@ fn ir_decl_uses_gc_stack(func: Func, decl: Decl) bool {
     let stable = func.stable_stack_decl
     if isset(stable) && stable == decl : return true
     return decl.is_gc && (!decl.is_arg || decl.is_mut)
+}
+
+fn ir_sync_closure_root(ir: IRFunc, decl: Decl, closure: String) !Error {
+    let offset = decl.closure_root_offset
+    if !isset(offset) : return
+    let data = ir.var()
+    ir.line_start()
+    ir.write(data)
+    ir.write(" = extractvalue ")
+    ir.write(ir_type(decl.type) !>)
+    ir.write(" ")
+    ir.write(closure)
+    ir.write(", 1")
+    ir.line_end()
+    let address = ir.var()
+    ir.line_start()
+    ir.write(address)
+    ir.write(" = getelementptr i8, ptr \%valk.gc.stack.values, i64 ")
+    ir.write_uint(offset)
+    ir.line_end()
+    ir.line_start()
+    ir.write("store ptr ")
+    ir.write(data)
+    ir.write(", ptr ")
+    ir.write(address)
+    ir.line_end()
 }
 
 fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
@@ -626,6 +659,7 @@ fn global_ir_name(global: Global) String {
 
 fn ir_type(type: Type) String !Error {
     let t = type.get_non_nullable()
+    if t.type == TYPE.fn : return "{ ptr, ptr }"
     if type.is_nullable_type() && !t.is_pointer_sized() {
         return ir_type(t) !>
     }
@@ -860,6 +894,10 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
         result = ir_emit_binary(ir, old, result, assign_value_op(op), left.rett) !>
     }
     ir.line("store " + (ir_type(left.rett) !>) + " " + result + ", ptr " + address)
+    if left.type == VAL.decl {
+        let decl = left.decl
+        if isset(decl) : ir_sync_closure_root(ir, decl, result) !>
+    }
 }
 
 fn ir_emit_gc_property_update(ir: IRFunc, value: Value, owner: String, address: String, result: String) !Error {
@@ -955,6 +993,21 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.wrap || t == VAL.paren {
         let inner = value.value1
         if !isset(inner) : value.bug("IR wrapped value is missing its child")
+        if t == VAL.wrap && value.rett.type == TYPE.fnptr && inner.type == VAL.func {
+            let func = inner.func
+            if isset(func) && !func_has_captures(func) {
+                if func.is_literal {
+                    return "@\"" + (ir_emit_fnptr_adapter(ir, value, func) !>) + "\""
+                }
+                if func.unit != ir.func.unit || func.is_extern {
+                    ir.func.unit.extern_functions.append(func, true)
+                }
+                return "@\"" + func_ir_name(func) + "\""
+            }
+        }
+        if t == VAL.wrap && value.rett.type == TYPE.fn && inner.rett.type == TYPE.fnptr {
+            return ir_emit_fnptr_closure(ir, value, inner) !>
+        }
         return ir_emit_value(ir, inner) !>
     }
     if t == VAL.decl || t == VAL.global || t == VAL.prop || t == VAL.ptrv {
@@ -1100,6 +1153,9 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if isset(func) {
             if func.unit != ir.func.unit || func.is_extern {
                 ir.func.unit.extern_functions.append(func, true)
+            }
+            if value.rett.type == TYPE.fn {
+                return ir_emit_closure(ir, value, func) !>
             }
             return "@\"" + func_ir_name(func) + "\""
         }
@@ -1484,12 +1540,269 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
     value.bug("GC class initializer has no allocator: " + class.pretty_name())
 }
 
+fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
+    let name = "valk.closure.adapter." + func_ir_name(func)
+    if parent.func.unit.closure_adapters.contains(name) : return name
+    parent.func.unit.closure_adapters.append(name)
+    if func.unit != parent.func.unit || func.is_extern {
+        parent.func.unit.extern_functions.append(func, true)
+    }
+
+    let ir = IRFunc {
+        func: parent.func
+        code: parent.coro_helpers
+    }
+    let bound = isset(func.class) && !func.is_static
+    ir.code.write_string("define internal ")
+    ir.code.write_string(ir_func_rett_type(func) !>)
+    ir.code.write_string(" @\"")
+    ir.code.write_string(name)
+    ir.code.write_string("\"(ptr \%closure.data")
+    each func.args as arg, i {
+        if bound && i == 0 : continue
+        ir.code.write_string(", ")
+        ir.code.write_string(ir_type(arg.type) !>)
+        ir.code.write_string(" \%arg.")
+        ir.code.write_uint_ascii(i)
+    }
+    ir.code.write_string(") {\n")
+    ir.label("entry")
+
+    let receiver = ""
+    if bound {
+        let class = func.capture_class
+        if !isset(class) : value.bug("Bound closure data class is missing")
+        let prop = class.props.get(0) !? null
+        if !isset(prop) : value.bug("Bound closure receiver property is missing")
+        receiver = ir_coro_load_prop(ir, "\%closure.data", prop) !>
+    }
+
+    let raw = ""
+    let has_result = !func.get_rett().is_void_type() || func.can_error
+    ir.line_start()
+    if has_result {
+        raw = ir.var()
+        ir.write(raw)
+        ir.write(" = ")
+    }
+    ir.write("call ")
+    ir.write(ir_func_rett_type(func) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(func))
+    ir.write("\"(")
+    let wrote = false
+    each func.args as arg, i {
+        if bound && i == 0 {
+            ir.write(ir_type(arg.type) !>)
+            ir.write(" ")
+            ir.write(receiver)
+            wrote = true
+            continue
+        }
+        if wrote : ir.write(", ")
+        ir.write(ir_type(arg.type) !>)
+        ir.write(" \%arg.")
+        ir.write_uint(i)
+        wrote = true
+    }
+    ir.write(")")
+    ir.line_end()
+    if has_result {
+        ir.line_start()
+        ir.write("ret ")
+        ir.write(ir_func_rett_type(func) !>)
+        ir.write(" ")
+        ir.write(raw)
+        ir.line_end()
+    } else {
+        ir.line("ret void")
+    }
+    ir.code.write_string("}\n\n")
+    return name
+}
+
+fn ir_emit_fnptr_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
+    let name = "valk.fnptr.adapter." + func_ir_name(func)
+    if parent.func.unit.closure_adapters.contains(name) : return name
+    parent.func.unit.closure_adapters.append(name)
+
+    let ir = IRFunc {
+        func: parent.func
+        code: parent.coro_helpers
+    }
+    ir.code.write_string("define internal ")
+    ir.code.write_string(ir_func_rett_type(func) !>)
+    ir.code.write_string(" @\"")
+    ir.code.write_string(name)
+    ir.code.write_string("\"(")
+    each func.args as arg, i {
+        if i > 0 : ir.code.write_string(", ")
+        ir.code.write_string(ir_type(arg.type) !>)
+        ir.code.write_string(" \%arg.")
+        ir.code.write_uint_ascii(i)
+    }
+    ir.code.write_string(") {\n")
+    ir.label("entry")
+    let raw = ""
+    let has_result = !func.get_rett().is_void_type() || func.can_error
+    ir.line_start()
+    if has_result {
+        raw = ir.var()
+        ir.write(raw)
+        ir.write(" = ")
+    }
+    ir.write("call ")
+    ir.write(ir_func_rett_type(func) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(func))
+    ir.write("\"(ptr null")
+    each func.args as arg, i {
+        ir.write(", ")
+        ir.write(ir_type(arg.type) !>)
+        ir.write(" \%arg.")
+        ir.write_uint(i)
+    }
+    ir.write(")")
+    ir.line_end()
+    if has_result {
+        ir.line_start()
+        ir.write("ret ")
+        ir.write(ir_func_rett_type(func) !>)
+        ir.write(" ")
+        ir.write(raw)
+        ir.line_end()
+    } else {
+        ir.line("ret void")
+    }
+    ir.code.write_string("}\n\n")
+    return name
+}
+
+fn ir_emit_fnptr_closure(parent: IRFunc, value: Value, inner: Value) String !Error {
+    return ir_build_closure_value(parent, value.rett, ir_emit_value(parent, inner) !>, "null") !>
+}
+
+fn ir_build_closure_value(ir: IRFunc, type: Type, target: String, data: String) String !Error {
+    let first = ir.var()
+    ir.line_start()
+    ir.write(first)
+    ir.write(" = insertvalue ")
+    ir.write(ir_type(type) !>)
+    ir.write(" undef, ptr ")
+    ir.write(target)
+    ir.write(", 0")
+    ir.line_end()
+    let result = ir.var()
+    ir.line_start()
+    ir.write(result)
+    ir.write(" = insertvalue ")
+    ir.write(ir_type(type) !>)
+    ir.write(" ")
+    ir.write(first)
+    ir.write(", ptr ")
+    ir.write(data)
+    ir.write(", 1")
+    ir.line_end()
+    return result
+}
+
+fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
+    func_prepare_closure(func) !>
+    let class = func.capture_class
+    let allocator = func.capture_allocator
+    if !isset(class) : value.bug("Closure data class was not prepared")
+    let environment = "null"
+    if isset(allocator) {
+        let alloc_value = Value {
+            type: VAL.class_init
+            rett: class.get_type() !>
+            allocator: allocator
+            exp: value.exp
+        }
+        let size = class.compute_body_size() !>
+        environment = ir_emit_class_alloc(ir, alloc_value, class, size) !>
+        ir.line_start()
+        ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
+        ir.write(environment)
+        ir.write(", i8 0, i64 ")
+        ir.write_uint(size)
+        ir.write(", i1 false)")
+        ir.line_end()
+    }
+
+    let target_name = func_ir_name(func)
+    if !func.is_literal : target_name = ir_emit_closure_adapter(ir, value, func) !>
+
+    let capture_base: uint = 0
+    let receiver = value.value1
+    if isset(receiver) && isset(func.class) && !func.is_static {
+        let prop = class.props.get(0) !? null
+        if !isset(prop) : value.bug("Bound closure receiver property is missing")
+        let rendered = ir_emit_value(ir, receiver) !>
+        let address = ir_prop_address(ir, environment, prop)
+        ir.line_start()
+        ir.write("store ")
+        ir.write(ir_type(receiver.rett) !>)
+        ir.write(" ")
+        ir.write(rendered)
+        ir.write(", ptr ")
+        ir.write(address)
+        ir.line_end()
+        capture_base++
+    }
+    each func.capture_decls as decl, i {
+        let prop = class.props.get(i + capture_base) !? null
+        if !isset(prop) : value.bug("Closure capture property is missing")
+        let rendered = ir_emit_value(ir, vgen_decl(decl)) !>
+        let address = ir_prop_address(ir, environment, prop)
+        ir.line_start()
+        ir.write("store ")
+        ir.write(ir_type(decl.type) !>)
+        ir.write(" ")
+        ir.write(rendered)
+        ir.write(", ptr ")
+        ir.write(address)
+        ir.line_end()
+    }
+    return ir_build_closure_value(ir, value.rett, "@\"" + target_name + "\"", environment) !>
+}
+
 fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let callee = value.value1
     if !isset(callee) : value.bug("IR call is missing its callee")
     let args = value.values
     let rendered_types = Array[String]{}
     let rendered_values = Array[String]{}
+    let closure_call = callee.rett.get_non_nullable().type == TYPE.fn && callee.type != VAL.func
+    if callee.type == VAL.func {
+        let direct_func = callee.func
+        if isset(direct_func) && direct_func.is_literal : closure_call = true
+    }
+
+    let target = ""
+    if closure_call {
+        let closure = ir_emit_value(ir, callee) !>
+        target = ir.var()
+        ir.line_start()
+        ir.write(target)
+        ir.write(" = extractvalue ")
+        ir.write(ir_type(callee.rett) !>)
+        ir.write(" ")
+        ir.write(closure)
+        ir.write(", 0")
+        ir.line_end()
+        let environment = ir.var()
+        ir.line_start()
+        ir.write(environment)
+        ir.write(" = extractvalue ")
+        ir.write(ir_type(callee.rett) !>)
+        ir.write(" ")
+        ir.write(closure)
+        ir.write(", 1")
+        ir.line_end()
+        rendered_types.append("ptr")
+        rendered_values.append(environment)
+    }
 
     // Bound method receiver is the implicit first argument.
     if callee.type == VAL.func {
@@ -1506,7 +1819,21 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         }
     }
 
-    let target = ir_emit_value(ir, callee) !>
+    if !closure_call {
+        if callee.type == VAL.func {
+            let direct_func = callee.func
+            if isset(direct_func) {
+                if direct_func.unit != ir.func.unit || direct_func.is_extern {
+                    ir.func.unit.extern_functions.append(direct_func, true)
+                }
+                target = "@\"" + func_ir_name(direct_func) + "\""
+            } else {
+                target = ir_emit_value(ir, callee) !>
+            }
+        } else {
+            target = ir_emit_value(ir, callee) !>
+        }
+    }
     let exits = false
     let call_type = ir_type(value.rett) !>
     if callee.type == VAL.func {
@@ -1570,12 +1897,12 @@ fn ir_coro_prop(value: Value, class: Class, name: String) Prop !Error {
     return class.get_prop_by_name(name) ! value.bug("coro:Coro has no property named '" + name + "'")
 }
 
-fn ir_coro_prop_address(ir: IRFunc, coro: String, prop: Prop) String {
+fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
     let address = ir.var()
     ir.line_start()
     ir.write(address)
     ir.write(" = getelementptr i8, ptr ")
-    ir.write(coro)
+    ir.write(on)
     ir.write(", i64 ")
     ir.write_uint(prop.offset)
     ir.line_end()
@@ -1583,7 +1910,7 @@ fn ir_coro_prop_address(ir: IRFunc, coro: String, prop: Prop) String {
 }
 
 fn ir_coro_load_prop(ir: IRFunc, coro: String, prop: Prop) String !Error {
-    let address = ir_coro_prop_address(ir, coro, prop)
+    let address = ir_prop_address(ir, coro, prop)
     let result = ir.var()
     ir.line_start()
     ir.write(result)
@@ -1628,7 +1955,7 @@ fn ir_coro_get_gc(ir: IRFunc, value: Value, gc_args: String, index: uint) String
     let array_class = gc_args_prop.type.get_class_or_null()
     if !isset(array_class) : value.bug("Coro.gc_args is not an Array")
     let data_prop = array_class.get_prop_by_name("data") ! value.bug("Array has no data property")
-    let data_address = ir_coro_prop_address(ir, gc_args, data_prop)
+    let data_address = ir_prop_address(ir, gc_args, data_prop)
     let data = ir.var()
     ir.line_start()
     ir.write(data)
@@ -1690,6 +2017,13 @@ fn ir_coro_result_types(type: Type) Array[Type] {
     return result
 }
 
+fn ir_is_closure_callable(value: Value) bool {
+    if value.rett.get_non_nullable().type != TYPE.fn : return false
+    if value.type != VAL.func : return true
+    let func = value.func
+    return isset(func) && func.is_literal
+}
+
 fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
     let call = value.value1
     if !isset(call) : value.bug("IR co value has no call")
@@ -1721,7 +2055,8 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
             arg_values.append(ir_emit_value(ir, arg) !>)
         }
     }
-    let handler = ir_emit_value(ir, callee) !>
+    ir_emit_value(ir, callee) !>
+    let handler = ir_emit_address(ir, callee) !>
 
     ir_emit_coro_helper(ir, value, call, arg_types) !>
 
@@ -1819,6 +2154,9 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     ir.code.write_string("\"() {\n")
     ir.label("entry")
 
+    let callee = call.value1
+    if !isset(callee) : value.bug("Coroutine helper call has no callable")
+    let closure_handler = ir_is_closure_callable(callee)
     let result_types = ir_coro_result_types(call.rett)
     let root_count: uint = 0
     each arg_types as type {
@@ -1906,7 +2244,33 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     let error_prop = ir_coro_prop(value, class, "error_code") !>
     let raw_args = ir_coro_load_prop(ir, coro, args_prop) !>
     let gc_args = ir_coro_load_prop(ir, coro, gc_args_prop) !>
-    let handler = ir_coro_load_prop(ir, coro, handler_prop) !>
+    let handler_address = ir_coro_load_prop(ir, coro, handler_prop) !>
+    let closure = ir.var()
+    ir.line_start()
+    ir.write(closure)
+    ir.write(" = load ")
+    ir.write(ir_type(callee.rett) !>)
+    ir.write(", ptr ")
+    ir.write(handler_address)
+    ir.line_end()
+    let handler = ir.var()
+    ir.line_start()
+    ir.write(handler)
+    ir.write(" = extractvalue ")
+    ir.write(ir_type(callee.rett) !>)
+    ir.write(" ")
+    ir.write(closure)
+    ir.write(", 0")
+    ir.line_end()
+    let handler_environment = ir.var()
+    ir.line_start()
+    ir.write(handler_environment)
+    ir.write(" = extractvalue ")
+    ir.write(ir_type(callee.rett) !>)
+    ir.write(" ")
+    ir.write(closure)
+    ir.write(", 1")
+    ir.line_end()
 
     let rendered_args = Array[String]{}
     let offset: uint = 0
@@ -1952,7 +2316,6 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         }
         rendered_args.append(rendered)
     }
-
     let raw_result = ""
     let call_type = call.can_error ? (ir_error_abi_type(call.rett) !>) : (ir_type(call.rett) !>)
     let has_call_result = !call.rett.is_void_type() || call.can_error
@@ -1967,6 +2330,11 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     ir.write(" ")
     ir.write(handler)
     ir.write("(")
+    if closure_handler {
+        ir.write("ptr ")
+        ir.write(handler_environment)
+        if rendered_args.length > 0 : ir.write(", ")
+    }
     each rendered_args as rendered, i {
         if i > 0 : ir.write(", ")
         ir.write(ir_type(arg_types.get(i) !? type_void(value.rett.build)) !>)
@@ -1979,7 +2347,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     let success = raw_result
     if call.can_error {
         let code = ir_extract_error_code(ir, raw_result, call.rett) !>
-        let error_address = ir_coro_prop_address(ir, coro, error_prop)
+        let error_address = ir_prop_address(ir, coro, error_prop)
         ir.line_start()
         ir.write("store i32 ")
         ir.write(code)
@@ -2162,7 +2530,7 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
     }
 
     if !value.can_error : return aggregate
-    let error_address = ir_coro_prop_address(ir, task, error_prop)
+    let error_address = ir_prop_address(ir, task, error_prop)
     let code = ir.var()
     ir.line_start()
     ir.write(code)
@@ -2190,6 +2558,26 @@ fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
 }
 
 fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type) String !Error {
+    if type.get_non_nullable().type == TYPE.fn && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
+        let lt = ir.var()
+        let ld = ir.var()
+        let rt = ir.var()
+        let rd = ir.var()
+        let closure_type = ir_type(type) !>
+        ir.line(lt + " = extractvalue " + closure_type + " " + left + ", 0")
+        ir.line(ld + " = extractvalue " + closure_type + " " + left + ", 1")
+        ir.line(rt + " = extractvalue " + closure_type + " " + right + ", 0")
+        ir.line(rd + " = extractvalue " + closure_type + " " + right + ", 1")
+        let tc = ir.var()
+        let dc = ir.var()
+        let result = ir.var()
+        let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
+        let combine = op == VALUE_OP.eq ? "and" : "or"
+        ir.line(tc + " = " + compare + " ptr " + lt + ", " + rt)
+        ir.line(dc + " = " + compare + " ptr " + ld + ", " + rd)
+        ir.line(result + " = " + combine + " i1 " + tc + ", " + dc)
+        return result
+    }
     let out = ir.var()
     let irt = ir_type(type) !>
     let inst = ""
