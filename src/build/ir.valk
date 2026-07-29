@@ -1,9 +1,576 @@
-// Function IR generation boundary.
-//
-// The LLVM implementation will live here. Keeping this call in the pipeline
-// now gives function ASTs a clear lifetime: semantic lowering finishes, IR is
-// emitted, and the body graph can then be released.
-fn generate_func_ir(func: Func) !Error {
-    // Placeholder until the new LLVM backend is implemented.
+// Textual LLVM function generation. This follows the classic compiler's
+// per-function lifecycle: resolve AST -> emit textual IR -> release AST.
+
+class IRFunc {
+    func: Func
+    code: ByteBuffer (.new(4096))
+    varc: uint (0)
+    blockc: uint (0)
+    terminated: bool (false)
+    loop_cond: ?String (null)
+    loop_after: ?String (null)
+
+    fn line(text: String) {
+        this.code.write_string("  ")
+        this.code.write_string(text)
+        this.code.write_string("\n")
+    }
+
+    fn comment(text: String) {
+        this.line("; " + text)
+    }
+
+    fn var() String {
+        return "\%." + this.varc++
+    }
+
+    fn block(prefix: String) String {
+        return prefix + "." + this.blockc++
+    }
+
+    fn label(name: String) {
+        this.code.write_string(name)
+        this.code.write_string(":\n")
+        this.terminated = false
+    }
+
+    fn jump(name: String) {
+        if this.terminated : return
+        this.line("br label \%" + name)
+        this.terminated = true
+    }
+
+    fn cond_jump(cond: String, yes: String, no: String) {
+        if this.terminated : return
+        this.line("br i1 " + cond + ", label \%" + yes + ", label \%" + no)
+        this.terminated = true
+    }
 }
 
+fn generate_func_ir(func: Func) !Error {
+    let scope = func.body_scope
+    if !isset(scope) : return
+
+    let ir = IRFunc { func: func }
+    func.ir_name = func_ir_name(func)
+
+    ir.code.write_string("define dso_local ")
+    ir.code.write_string(ir_type(func.get_rett()) !>)
+    ir.code.write_string(" @\"")
+    ir.code.write_string(func.ir_name)
+    ir.code.write_string("\"(")
+    each func.args as arg, i {
+        if i > 0 : ir.code.write_string(", ")
+        ir.code.write_string(ir_type(arg.type) !>)
+        ir.code.write_string(" \%arg.")
+        ir.code.write_uint_ascii(i)
+    }
+    if func.infinite_args {
+        if func.args.length > 0 : ir.code.write_string(", ")
+        ir.code.write_string("...")
+    }
+    ir.code.write_string(")")
+    if func.is_inline : ir.code.write_string(" alwaysinline")
+    if func.is_hot : ir.code.write_string(" hot")
+    ir.code.write_string(" {\n")
+    ir.label("entry")
+
+    // Allocate every local once in the entry block. The old backend used the
+    // generated decl_offset nodes; emitting them here has the same LLVM shape
+    // and keeps later value lowering independent of declaration order.
+    each func.all_decls as decl, i {
+        decl.ir_name = "\%decl." + i
+        ir.line(decl.ir_name + " = alloca " + (ir_type(decl.type) !>))
+    }
+    each func.args as arg, i {
+        ir.line("store " + (ir_type(arg.type) !>) + " \%arg." + i + ", ptr " + arg.decl.ir_name)
+    }
+
+    each scope.values as value {
+        ir_emit_stmt(ir, value) !>
+    }
+
+    if !ir.terminated {
+        let rett = func.get_rett()
+        if rett.is_void_type() : ir.line("ret void")
+        else : ir.line("ret " + (ir_type(rett) !>) + " undef")
+    }
+    ir.code.write_string("}\n\n")
+    func.ir_code = ir.code.to_string()
+}
+
+fn func_ir_name(func: Func) String {
+    let out = func.unit.name
+    let class = func.class
+    if isset(class) : out += "__" + class.name
+    out += "__" + func.name + "__" + func.exp.i
+    return out
+}
+
+fn global_ir_name(global: Global) String {
+    return global.unit.name + "__" + global.name
+}
+
+fn ir_type(type: Type) String !Error {
+    let t = type.get_non_nullable()
+    if type.is_nullable_type() && !t.is_pointer_sized() {
+        return ir_type(t) !>
+    }
+    if t.is_pointer_sized() : return "ptr"
+    if t.type == TYPE.void : return "void"
+    if t.type == TYPE.bool : return "i1"
+    if t.type == TYPE.error_code : return "i32"
+    if t.type == TYPE.int {
+        return "i" + ((t.size() !>).to(uint) * 8)
+    }
+    if t.type == TYPE.float {
+        let size = t.size() !>
+        if size == 4 : return "float"
+        if size == 8 : return "double"
+        type.build.error("Unsupported LLVM float size: " + size)
+    }
+    if t.type == TYPE.array {
+        let sub = t.sub_type
+        if !isset(sub) : type.build.bug("Array type is missing its element type during IR generation")
+        return "[" + t.array_size + " x " + (ir_type(sub) !>) + "]"
+    }
+    if t.type == TYPE.inline {
+        let sub = t.sub_type
+        if !isset(sub) : type.build.bug("Inline type is missing its subtype during IR generation")
+        return "[" + (sub.size() !>) + " x i8]"
+    }
+    if t.type == TYPE.multi {
+        let subs = t.sub_types
+        if !isset(subs) : type.build.bug("Multi type is missing subtypes during IR generation")
+        if subs.length == 0 : return "void"
+        if subs.length == 1 {
+            let first = subs.get(0) !? null
+            if isset(first) : return ir_type(first) !>
+        }
+        let out = "{ "
+        each subs as sub, i {
+            if i > 0 : out += ", "
+            out += ir_type(sub) !>
+        }
+        return out + " }"
+    }
+    // Inline class/struct storage.
+    if t.type == TYPE.class {
+        return "[" + (t.size() !>) + " x i8]"
+    }
+    type.build.error("Cannot convert type to LLVM IR type: " + type.compat_display_name())
+}
+
+fn ir_emit_values(ir: IRFunc, values: ?Array[Value]) !Error {
+    if !isset(values) : return
+    each values as value {
+        ir_emit_stmt(ir, value) !>
+    }
+}
+
+fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
+    if ir.terminated : return
+    let t = value.type
+
+    if t == VAL.block || t == VAL.allocas {
+        ir_emit_values(ir, value.values) !>
+        return
+    }
+    if t == VAL.init_allocators {
+        // Allocator discovery currently completes after all function ASTs.
+        // Module-level IR finalization will replace this marker once globals
+        // and allocator definitions are emitted.
+        ir.comment("TODO @INIT_ALLOCATORS (deferred to module IR)")
+        return
+    }
+    if t == VAL.return {
+        let retv = value.value1
+        if !isset(retv) {
+            ir.line("ret void")
+        } else {
+            ir.line("ret " + (ir_type(retv.rett) !>) + " " + (ir_emit_value(ir, retv) !>))
+        }
+        ir.terminated = true
+        return
+    }
+    if t == VAL.assign {
+        ir_emit_assign(ir, value) !>
+        return
+    }
+    if t == VAL.if {
+        ir_emit_if(ir, value) !>
+        return
+    }
+    if t == VAL.while {
+        ir_emit_while(ir, value) !>
+        return
+    }
+    if t == VAL.break {
+        let after = ir.loop_after
+        if isset(after) : ir.jump(after)
+        else : ir.comment("TODO invalid break without active loop")
+        return
+    }
+    if t == VAL.continue {
+        let cond = ir.loop_cond
+        if isset(cond) : ir.jump(cond)
+        else : ir.comment("TODO invalid continue without active loop")
+        return
+    }
+    if t == VAL.ir_comment {
+        ir.comment(value.string_val)
+        return
+    }
+    if t == VAL.decl_offset || t == VAL.gc_stack_init || t == VAL.gc_stack_defer || t == VAL.stable_stack_init {
+        // Entry allocas are emitted above. GC stack lowering follows next.
+        ir.comment("TODO " + t)
+        return
+    }
+
+    // Expression statement: evaluate for side effects.
+    ir_emit_value(ir, value) !>
+}
+
+fn ir_emit_if(ir: IRFunc, value: Value) !Error {
+    let condv = value.value1
+    if !isset(condv) : value.bug("IR if is missing its condition")
+    let cond = ir_emit_value(ir, condv) !>
+    let yes = ir.block("if.then")
+    let no = ir.block("if.else")
+    let after = ir.block("if.after")
+    ir.cond_jump(cond, yes, no)
+
+    ir.label(yes)
+    ir_emit_values(ir, value.values) !>
+    ir.jump(after)
+
+    ir.label(no)
+    let elsev = value.value2
+    if isset(elsev) : ir_emit_stmt(ir, elsev) !>
+    ir.jump(after)
+
+    ir.label(after)
+}
+
+fn ir_emit_while(ir: IRFunc, value: Value) !Error {
+    let cond_block = ir.block("while.cond")
+    let body_block = ir.block("while.body")
+    let after_block = ir.block("while.after")
+    ir.jump(cond_block)
+
+    ir.label(cond_block)
+    let condv = value.value1
+    if !isset(condv) : value.bug("IR while is missing its condition")
+    let cond = ir_emit_value(ir, condv) !>
+    ir.cond_jump(cond, body_block, after_block)
+
+    ir.label(body_block)
+    let old_cond = ir.loop_cond
+    let old_after = ir.loop_after
+    ir.loop_cond = cond_block
+    ir.loop_after = after_block
+    ir_emit_values(ir, value.values) !>
+    ir.loop_cond = old_cond
+    ir.loop_after = old_after
+    ir.jump(cond_block)
+
+    ir.label(after_block)
+}
+
+fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
+    let left = value.value1
+    let right = value.value2
+    if !isset(left) || !isset(right) : value.bug("IR assignment is missing an operand")
+    let address = ir_emit_address(ir, left) !>
+    let result = ir_emit_value(ir, right) !>
+    let op = value.op.@cast(ASSIGN_OP)
+    if op != ASSIGN_OP.set {
+        let old = ir.var()
+        let type = ir_type(left.rett) !>
+        ir.line(old + " = load " + type + ", ptr " + address)
+        result = ir_emit_binary(ir, old, result, assign_value_op(op), left.rett) !>
+    }
+    ir.line("store " + (ir_type(left.rett) !>) + " " + result + ", ptr " + address)
+}
+
+fn assign_value_op(op: ASSIGN_OP) VALUE_OP {
+    if op == ASSIGN_OP.add : return VALUE_OP.add
+    if op == ASSIGN_OP.sub : return VALUE_OP.sub
+    if op == ASSIGN_OP.mul : return VALUE_OP.mul
+    if op == ASSIGN_OP.div : return VALUE_OP.div
+    if op == ASSIGN_OP.mod : return VALUE_OP.mod
+    if op == ASSIGN_OP.bit_and : return VALUE_OP.bit_and
+    if op == ASSIGN_OP.bit_or : return VALUE_OP.bit_or
+    return VALUE_OP.bit_xor
+}
+
+fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
+    if value.type == VAL.decl {
+        let decl = value.decl
+        if !isset(decl) : value.bug("IR declaration value is missing its Decl")
+        return decl.ir_name
+    }
+    if value.type == VAL.global {
+        let global = value.global
+        if !isset(global) : value.bug("IR global value is missing its Global")
+        return "@\"" + global_ir_name(global) + "\""
+    }
+    if value.type == VAL.prop {
+        let on = value.value1
+        let prop = value.prop
+        if !isset(on) || !isset(prop) : value.bug("IR property value is incomplete")
+        let base = ir_emit_value(ir, on) !>
+        let out = ir.var()
+        ir.line(out + " = getelementptr i8, ptr " + base + ", i64 " + prop.offset)
+        return out
+    }
+    if value.type == VAL.ptrv {
+        let on = value.value1
+        let index = value.value2
+        if !isset(on) || !isset(index) : value.bug("IR pointer access is incomplete")
+        let base = ir_emit_value(ir, on) !>
+        let off = ir_emit_value(ir, index) !>
+        let out = ir.var()
+        ir.line(out + " = getelementptr " + (ir_type(value.rett) !>) + ", ptr " + base + ", i64 " + off)
+        return out
+    }
+    // Address-taking of a temporary aggregate (for example a fixed-array
+    // literal passed to a reference argument) materializes a stack slot.
+    let temporary = ir.var()
+    let type = ir_type(value.rett) !>
+    ir.line(temporary + " = alloca " + type)
+    ir.line("store " + type + " " + (ir_emit_value(ir, value) !>) + ", ptr " + temporary)
+    return temporary
+}
+
+fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
+    let pre = value.pre_value
+    if isset(pre) : ir_emit_stmt(ir, pre) !>
+
+    let t = value.type
+    if t == VAL.int : return value.int_val
+    if t == VAL.float : return value.float_val
+    if t == VAL.bool : return value.bool_val ? "1" : "0"
+    if t == VAL.null : return "null"
+    if t == VAL.undefined : return "undef"
+    if t == VAL.wrap || t == VAL.paren {
+        let inner = value.value1
+        if !isset(inner) : value.bug("IR wrapped value is missing its child")
+        return ir_emit_value(ir, inner) !>
+    }
+    if t == VAL.decl || t == VAL.global || t == VAL.prop || t == VAL.ptrv {
+        let address = ir_emit_address(ir, value) !>
+        let out = ir.var()
+        ir.line(out + " = load " + (ir_type(value.rett) !>) + ", ptr " + address)
+        return out
+    }
+    if t == VAL.ptr_of {
+        let inner = value.value1
+        if !isset(inner) : value.bug("IR @ref is missing its value")
+        return ir_emit_address(ir, inner) !>
+    }
+    if t == VAL.ptr_offset {
+        let on = value.value1
+        let offset = value.value2
+        if !isset(on) || !isset(offset) : value.bug("IR pointer offset is incomplete")
+        let out = ir.var()
+        ir.line(out + " = getelementptr i8, ptr " + (ir_emit_value(ir, on) !>) + ", i64 " + (ir_emit_value(ir, offset) !>))
+        return out
+    }
+    if t == VAL.load {
+        let on = value.value1
+        if !isset(on) : value.bug("IR load is missing its pointer")
+        let out = ir.var()
+        ir.line(out + " = load " + (ir_type(value.rett) !>) + ", ptr " + (ir_emit_value(ir, on) !>))
+        return out
+    }
+    if t == VAL.op {
+        let left = value.value1
+        let right = value.value2
+        if !isset(left) : value.bug("IR operator is missing its left operand")
+        // ++/-- are represented as an op with no right child.
+        if !isset(right) {
+            let address = ir_emit_address(ir, left) !>
+            let old = ir.var()
+            let type = ir_type(left.rett) !>
+            ir.line(old + " = load " + type + ", ptr " + address)
+            let next = ir_emit_binary(ir, old, "1", value.op.@cast(VALUE_OP), left.rett) !>
+            ir.line("store " + type + " " + next + ", ptr " + address)
+            return value.bool_val ? next : old
+        }
+        return ir_emit_binary(ir, ir_emit_value(ir, left) !>, ir_emit_value(ir, right) !>, value.op.@cast(VALUE_OP), left.rett) !>
+    }
+    if t == VAL.unary {
+        let inner = value.value1
+        if !isset(inner) : value.bug("IR unary operator is missing its operand")
+        let val = ir_emit_value(ir, inner) !>
+        let op = value.op.@cast(VALUE_OP)
+        if op == VALUE_OP.not {
+            let out = ir.var()
+            ir.line(out + " = xor i1 " + val + ", true")
+            return out
+        }
+        if op == VALUE_OP.neg {
+            let out = ir.var()
+            let type = ir_type(inner.rett) !>
+            let inst = inner.rett.is_float_type() ? "fsub" : "sub"
+            ir.line(out + " = " + inst + " " + type + " 0, " + val)
+            return out
+        }
+        let out = ir.var()
+        ir.line(out + " = xor " + (ir_type(inner.rett) !>) + " " + val + ", -1")
+        return out
+    }
+    if t == VAL.cast {
+        let inner = value.value1
+        if !isset(inner) : value.bug("IR cast is missing its operand")
+        return ir_emit_cast(ir, ir_emit_value(ir, inner) !>, inner.rett, value.rett) !>
+    }
+    if t == VAL.call {
+        return ir_emit_call(ir, value) !>
+    }
+    if t == VAL.assign {
+        ir_emit_assign(ir, value) !>
+        return "undef"
+    }
+    if t == VAL.multi {
+        return ir_emit_multi(ir, value) !>
+    }
+    if t == VAL.memcpy {
+        let values = value.values
+        if isset(values) && values.length == 3 {
+            let from = values.get(0) !? null
+            let to = values.get(1) !? null
+            let len = values.get(2) !? null
+            if isset(from) && isset(to) && isset(len) {
+                ir.line("call void @llvm.memcpy.p0.p0.i64(ptr " + (ir_emit_value(ir, to) !>) + ", ptr " + (ir_emit_value(ir, from) !>) + ", i64 " + (ir_emit_value(ir, len) !>) + ", i1 false)")
+            }
+        }
+        return "undef"
+    }
+    if t == VAL.block || t == VAL.vscope {
+        ir_emit_values(ir, value.values) !>
+        let result = value.value1
+        if isset(result) : return ir_emit_value(ir, result) !>
+        return "undef"
+    }
+    if t == VAL.string {
+        ir.comment("TODO string constant: " + value.string_val)
+        return "null"
+    }
+    if t == VAL.func {
+        let func = value.func
+        if isset(func) : return "@\"" + func_ir_name(func) + "\""
+    }
+
+    ir.comment("TODO lower " + t)
+    return value.rett.is_pointer_sized() ? "null" : "undef"
+}
+
+fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
+    let callee = value.value1
+    if !isset(callee) : value.bug("IR call is missing its callee")
+    let args = value.values
+    let rendered = Array[String]{}
+
+    // Bound method receiver is the implicit first argument.
+    if callee.type == VAL.func {
+        let receiver = callee.value1
+        if isset(receiver) : rendered.append((ir_type(receiver.rett) !>) + " " + (ir_emit_value(ir, receiver) !>))
+    }
+    if isset(args) {
+        each args as arg {
+            rendered.append((ir_type(arg.rett) !>) + " " + (ir_emit_value(ir, arg) !>))
+        }
+    }
+
+    let target = ir_emit_value(ir, callee) !>
+    let call = "call " + (ir_type(value.rett) !>) + " " + target + "(" + rendered.join(", ") + ")"
+    if value.rett.is_void_type() {
+        ir.line(call)
+        return ""
+    }
+    let out = ir.var()
+    ir.line(out + " = " + call)
+    return out
+}
+
+fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
+    let values = value.values
+    if !isset(values) : return "undef"
+    if values.length == 0 : return "undef"
+    let current = "undef"
+    let whole = ir_type(value.rett) !>
+    each values as item, i {
+        let out = ir.var()
+        ir.line(out + " = insertvalue " + whole + " " + current + ", " + (ir_type(item.rett) !>) + " " + (ir_emit_value(ir, item) !>) + ", " + i)
+        current = out
+    }
+    return current
+}
+
+fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type) String !Error {
+    let out = ir.var()
+    let irt = ir_type(type) !>
+    let inst = ""
+    let compare = false
+
+    if op == VALUE_OP.eq {
+        inst = type.is_float_type() ? "fcmp oeq" : "icmp eq"
+        compare = true
+    } else if op == VALUE_OP.ne {
+        inst = type.is_float_type() ? "fcmp one" : "icmp ne"
+        compare = true
+    } else if op == VALUE_OP.lt {
+        inst = type.is_float_type() ? "fcmp olt" : (type.is_signed_type() ? "icmp slt" : "icmp ult")
+        compare = true
+    } else if op == VALUE_OP.gt {
+        inst = type.is_float_type() ? "fcmp ogt" : (type.is_signed_type() ? "icmp sgt" : "icmp ugt")
+        compare = true
+    } else if op == VALUE_OP.lte {
+        inst = type.is_float_type() ? "fcmp ole" : (type.is_signed_type() ? "icmp sle" : "icmp ule")
+        compare = true
+    } else if op == VALUE_OP.gte {
+        inst = type.is_float_type() ? "fcmp oge" : (type.is_signed_type() ? "icmp sge" : "icmp uge")
+        compare = true
+    } else if op == VALUE_OP.add : inst = type.is_float_type() ? "fadd" : "add"
+    else if op == VALUE_OP.sub : inst = type.is_float_type() ? "fsub" : "sub"
+    else if op == VALUE_OP.mul : inst = type.is_float_type() ? "fmul" : "mul"
+    else if op == VALUE_OP.div : inst = type.is_float_type() ? "fdiv" : (type.is_signed_type() ? "sdiv" : "udiv")
+    else if op == VALUE_OP.mod : inst = type.is_float_type() ? "frem" : (type.is_signed_type() ? "srem" : "urem")
+    else if op == VALUE_OP.bit_and || op == VALUE_OP.and : inst = "and"
+    else if op == VALUE_OP.bit_or || op == VALUE_OP.or : inst = "or"
+    else if op == VALUE_OP.bit_xor : inst = "xor"
+    else if op == VALUE_OP.shl : inst = "shl"
+    else if op == VALUE_OP.shr : inst = type.is_signed_type() ? "ashr" : "lshr"
+    else : inst = "add"
+
+    ir.line(out + " = " + inst + " " + irt + " " + left + ", " + right)
+    return out
+}
+
+fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
+    let ft = ir_type(from) !>
+    let tt = ir_type(to) !>
+    if ft == tt : return value
+
+    let inst = "bitcast"
+    if from.is_pointer_sized() && to.is_integer_type() : inst = "ptrtoint"
+    else if from.is_integer_type() && to.is_pointer_sized() : inst = "inttoptr"
+    else if from.is_integer_type() && to.is_integer_type() {
+        let fs = from.size() !>
+        let ts = to.size() !>
+        if fs > ts : inst = "trunc"
+        else : inst = from.is_signed_type() ? "sext" : "zext"
+    } else if from.is_float_type() && to.is_float_type() {
+        inst = (from.size() !>) > (to.size() !>) ? "fptrunc" : "fpext"
+    } else if from.is_integer_type() && to.is_float_type() {
+        inst = from.is_signed_type() ? "sitofp" : "uitofp"
+    } else if from.is_float_type() && to.is_integer_type() {
+        inst = to.is_signed_type() ? "fptosi" : "fptoui"
+    }
+
+    let out = ir.var()
+    ir.line(out + " = " + inst + " " + ft + " " + value + " to " + tt)
+    return out
+}
