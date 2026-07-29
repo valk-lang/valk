@@ -19,6 +19,10 @@ fn parse_func_ast(func: Func) !Error {
     let scope = func.arg_scope.sub_scope()
     scope.func = func
     func.body_scope = scope
+    let alloca_scope = scope.sub_scope()
+    let defer_scope = scope.sub_scope()
+    func.alloca_scope = alloca_scope
+    func.defer_scope = defer_scope
 
     let rett = func.get_rett()
     if !rett.is_void_type() : scope.must_return = true
@@ -31,6 +35,77 @@ fn parse_func_ast(func: Func) !Error {
     append_body_exp_range(ctx, scope, state, exps, 0, exps.length) !>
     if state.has_open_if() || state.is_skipping() {
         body.error("Missing compile macro '#end' in function body")
+    }
+    func_finish_ast(func) !>
+}
+
+// Finalize function-local storage after the complete AST has marked declarations
+// used/mutable/stable. Mirrors the legacy FuncAST alloca/defer scope generation.
+fn func_finish_ast(func: Func) !Error {
+    let b = func.ns.build
+    let psz = b.options.target.ptr_size.to(uint)
+    let alloca_size: uint = 0
+    let stable_size: uint = 0
+    let gc_count: uint = 0
+
+    each func.all_decls as decl {
+        if !decl.is_gc {
+            if decl.must_be_stable {
+                decl.offset = stable_size
+                let size = decl.type.size() !>.to(uint)
+                stable_size += size.round_up(psz)
+            }
+            if decl.is_mut : func.define_decls.append(decl, true)
+            continue
+        }
+        if !decl.is_arg || decl.is_mut {
+            decl.offset = alloca_size
+            alloca_size += psz
+            gc_count++
+            func.define_decls.append(decl, true)
+        }
+    }
+
+    if stable_size > 0 {
+        let decl = Decl.new(type_ptr(b), false, "valk_stable_stack")
+        decl.ir_name = "\%valk_stable_stack"
+        decl.offset = alloca_size
+        alloca_size += psz
+        func.define_decls.append(decl)
+        func.stable_stack_decl = decl
+        gc_count++
+    }
+
+    func.alloca_size = alloca_size
+    func.stable_alloca_size = stable_size
+    func.gc_decl_count = gc_count
+
+    let alloca_scope = func.alloca_scope
+    let defer_scope = func.defer_scope
+    let body_scope = func.body_scope
+    if !isset(alloca_scope) || !isset(defer_scope) || !isset(body_scope) {
+        func.exp.bug("Function setup scopes are missing: " + func.name)
+    }
+
+    if stable_size > 0 {
+        let decl = func.stable_stack_decl
+        if !isset(decl) : func.exp.bug("Stable stack declaration is missing")
+        alloca_scope.append_value(vgen_stable_stack_init(decl, stable_size, b))
+    }
+    if gc_count > 0 {
+        alloca_scope.append_value(vgen_gc_stack_init(alloca_size, gc_count, b))
+        if !func.is_entrance {
+            defer_scope.append_value(vgen_gc_stack_defer(b))
+        }
+    }
+    each func.define_decls as decl {
+        alloca_scope.append_value(vgen_decl_offset(decl, b))
+    }
+
+    // Entrance functions explicitly choose the splice point with @allocas.
+    // Every other function executes the generated scope before its parsed body.
+    if !func.is_entrance {
+        body_scope.values.prepend(vgen_allocas(alloca_scope.values, b))
     }
 }
 
@@ -132,6 +207,15 @@ fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         // Same path-termination semantics as break for flow analysis.
         scope.did_return = true
         return vgen_continue(ctx.build, exp)
+    }
+    if exp.type == EXP.allocas {
+        let func = ctx.get_func() !>
+        if !func.is_entrance {
+            exp.error("@allocas can only be used inside a function that's flagged with $entrance")
+        }
+        let alloca_scope = func.alloca_scope
+        if !isset(alloca_scope) : exp.bug("Function is missing its generated alloca scope")
+        return vgen_allocas(alloca_scope.values, ctx.build, exp)
     }
     if exp.type == EXP.throw : return value_from_throw_exp(ctx, scope, exp) !>
 
@@ -308,6 +392,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if !left.assignable() {
         exp.error("Left side of assignment is not assignable")
     }
+    value_mark_mutable(left)
     if !left.rett.is_void_type() && !right.rett.is_void_type() {
         right = value_try_convert(right, scope, ctx, left.rett)
         let at = right.exp ?? exp
