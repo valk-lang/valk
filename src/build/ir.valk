@@ -256,6 +256,13 @@ fn ir_write_func_signature(out: ByteBuffer, func: Func, declare: bool) !Error {
         if i > 0 : out.write_string(", ")
         out.write_string(ir_type(arg.type) !>)
     }
+    if func.is_literal {
+        func_has_captures(func)
+        each func.capture_decls as decl, i {
+            if func.args.length > 0 || i > 0 : out.write_string(", ")
+            out.write_string("ptr")
+        }
+    }
     if func.infinite_args {
         if func.args.length > 0 : out.write_string(", ")
         out.write_string("...")
@@ -277,10 +284,9 @@ fn ir_target_triple(target: Target) String {
 class IRFunc {
     func: Func
     code: ByteBuffer (.new(4096))
+    coro_helpers: ByteBuffer (.new(2048))
     varc: uint (0)
     blockc: uint (0)
-    captured_decls: Array[Decl] (.{})
-    captured_addresses: Array[String] (.{})
     terminated: bool (false)
     loop_cond: ?String (null)
     loop_after: ?String (null)
@@ -335,17 +341,17 @@ class IRFunc {
     }
 
     fn captured_address(decl: Decl) String !Error {
-        each this.captured_decls as existing, i {
-            if existing == decl : return this.captured_addresses.get(i) !? ""
+        let capture_index: ?uint = null
+        each this.func.capture_decls as captured, i {
+            if captured == decl {
+                capture_index = i
+                break
+            }
         }
-        // Use a named value so a stale numeric SSA name from another
-        // function can never collide with this function's numbering.
-        let address = "\%capture." + this.captured_decls.length
-        this.captured_decls.append(decl)
-        this.captured_addresses.append(address)
-        this.line(address + " = alloca " + (ir_type(decl.type) !>))
-        this.comment("TODO captured declaration environment")
-        return address
+        if !isset(capture_index) {
+            this.func.exp.bug("Literal references unregistered capture: " + (decl.name ?? "<unnamed>"))
+        }
+        return "\%capture." + capture_index
     }
 
     fn label(name: String) {
@@ -399,6 +405,15 @@ fn generate_func_ir(func: Func) !Error {
         ir.code.write_string(" \%arg.")
         ir.code.write_uint_ascii(i)
     }
+    if func.is_literal {
+        func_has_captures(func)
+        each func.capture_decls as decl, i {
+            if func.args.length > 0 || i > 0 : ir.code.write_string(", ")
+            ir.code.write_string("ptr")
+            ir.code.write_string(" \%capture.")
+            ir.code.write_uint_ascii(i)
+        }
+    }
     if func.infinite_args {
         if func.args.length > 0 : ir.code.write_string(", ")
         ir.code.write_string("...")
@@ -442,6 +457,7 @@ fn generate_func_ir(func: Func) !Error {
         }
     }
     ir.code.write_string("}\n\n")
+    ir.code.write_buffer(ir.coro_helpers)
     func.ir_code = ir.code.to_string()
 }
 
@@ -1034,6 +1050,12 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.call {
         return ir_emit_call(ir, value) !>
     }
+    if t == VAL.co {
+        return ir_emit_co(ir, value) !>
+    }
+    if t == VAL.await {
+        return ir_emit_await(ir, value) !>
+    }
     if t == VAL.assign {
         ir_emit_assign(ir, value) !>
         return "undef"
@@ -1499,6 +1521,16 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
             rendered_values.append(ir_emit_value(ir, arg) !>)
         }
     }
+    if callee.type == VAL.func {
+        let target_func = callee.func
+        if isset(target_func) && target_func.is_literal {
+            func_has_captures(target_func)
+            each target_func.capture_decls as decl {
+                rendered_types.append("ptr")
+                rendered_values.append(ir_emit_address(ir, vgen_decl(decl)) !>)
+            }
+        }
+    }
 
     let target = ir_emit_value(ir, callee) !>
     let exits = false
@@ -1541,6 +1573,669 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     }
     if !has_result : return ""
     return out
+}
+
+fn ir_coro_class(value: Value) Class !Error {
+    let idf = valk_idf(value.rett.build, "coro", "Coro") !>
+    let class = idf.class
+    if !isset(class) : value.bug("coro:Coro is not a class")
+    return class
+}
+
+fn ir_coro_func(ir: IRFunc, value: Value, class: Class, name: String) Func !Error {
+    let func = class.get_func(name)
+    if !isset(func) : value.bug("coro:Coro has no function named '" + name + "'")
+    if !func.parsed_types : parse_func_types(func) !>
+    if func.unit != ir.func.unit || func.is_extern {
+        ir.func.unit.extern_functions.append(func, true)
+    }
+    return func
+}
+
+fn ir_coro_prop(value: Value, class: Class, name: String) Prop !Error {
+    return class.get_prop_by_name(name) ! value.bug("coro:Coro has no property named '" + name + "'")
+}
+
+fn ir_coro_prop_address(ir: IRFunc, coro: String, prop: Prop) String {
+    let address = ir.var()
+    ir.line_start()
+    ir.write(address)
+    ir.write(" = getelementptr i8, ptr ")
+    ir.write(coro)
+    ir.write(", i64 ")
+    ir.write_uint(prop.offset)
+    ir.line_end()
+    return address
+}
+
+fn ir_coro_load_prop(ir: IRFunc, coro: String, prop: Prop) String !Error {
+    let address = ir_coro_prop_address(ir, coro, prop)
+    let result = ir.var()
+    ir.line_start()
+    ir.write(result)
+    ir.write(" = load ")
+    ir.write(ir_type(prop.type) !>)
+    ir.write(", ptr ")
+    ir.write(address)
+    ir.line_end()
+    return result
+}
+
+fn ir_coro_append_gc(ir: IRFunc, value: Value, gc_args: String, item: String) !Error {
+    let gc_args_prop = ir_coro_prop(value, ir_coro_class(value) !>, "gc_args") !>
+    let array_class = gc_args_prop.type.get_class_or_null()
+    if !isset(array_class) : value.bug("Coro.gc_args is not an Array")
+    let append = array_class.get_append_hook()
+    if !isset(append) : value.bug("Coro.gc_args Array has no append hook")
+    if !append.parsed_types : parse_func_types(append) !>
+    if append.unit != ir.func.unit || append.is_extern {
+        ir.func.unit.extern_functions.append(append, true)
+    }
+    ir.line_start()
+    if !append.get_rett().is_void_type() {
+        let ignored = ir.var()
+        ir.write(ignored)
+        ir.write(" = ")
+    }
+    ir.write("call ")
+    ir.write(ir_func_rett_type(append) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(append))
+    ir.write("\"(ptr ")
+    ir.write(gc_args)
+    ir.write(", ptr ")
+    ir.write(item)
+    ir.write(", i1 0)")
+    ir.line_end()
+}
+
+fn ir_coro_get_gc(ir: IRFunc, value: Value, gc_args: String, index: uint) String !Error {
+    let gc_args_prop = ir_coro_prop(value, ir_coro_class(value) !>, "gc_args") !>
+    let array_class = gc_args_prop.type.get_class_or_null()
+    if !isset(array_class) : value.bug("Coro.gc_args is not an Array")
+    let data_prop = array_class.get_prop_by_name("data") ! value.bug("Array has no data property")
+    let data_address = ir_coro_prop_address(ir, gc_args, data_prop)
+    let data = ir.var()
+    ir.line_start()
+    ir.write(data)
+    ir.write(" = load ptr, ptr ")
+    ir.write(data_address)
+    ir.line_end()
+    let item_address = ir.var()
+    ir.line_start()
+    ir.write(item_address)
+    ir.write(" = getelementptr ptr, ptr ")
+    ir.write(data)
+    ir.write(", i64 ")
+    ir.write_uint(index)
+    ir.line_end()
+    let item = ir.var()
+    ir.line_start()
+    ir.write(item)
+    ir.write(" = load ptr, ptr ")
+    ir.write(item_address)
+    ir.line_end()
+    return item
+}
+
+fn ir_coro_pop_gc(ir: IRFunc, value: Value, gc_args: String) String !Error {
+    let gc_args_prop = ir_coro_prop(value, ir_coro_class(value) !>, "gc_args") !>
+    let array_class = gc_args_prop.type.get_class_or_null()
+    if !isset(array_class) : value.bug("Coro.gc_args is not an Array")
+    let pop = array_class.get_func("pop_first")
+    if !isset(pop) : value.bug("Coro.gc_args Array has no pop_first function")
+    if !pop.parsed_types : parse_func_types(pop) !>
+    if pop.unit != ir.func.unit || pop.is_extern {
+        ir.func.unit.extern_functions.append(pop, true)
+    }
+    let raw = ir.var()
+    ir.line_start()
+    ir.write(raw)
+    ir.write(" = call ")
+    ir.write(ir_func_rett_type(pop) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(pop))
+    ir.write("\"(ptr ")
+    ir.write(gc_args)
+    ir.write(")")
+    ir.line_end()
+    return ir_extract_error_success(ir, raw, pop.get_rett()) !>
+}
+
+fn ir_coro_result_types(type: Type) Array[Type] {
+    let result = Array[Type]{}
+    if type.is_void_type() : return result
+    if type.type == TYPE.multi {
+        let subs = type.sub_types
+        if isset(subs) {
+            each subs as sub : result.append(sub)
+        }
+    } else {
+        result.append(type)
+    }
+    return result
+}
+
+fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
+    let call = value.value1
+    if !isset(call) : value.bug("IR co value has no call")
+    let callee = call.value1
+    if !isset(callee) : value.bug("IR co call has no callee")
+    let class = ir_coro_class(value) !>
+    let new_func = ir_coro_func(ir, value, class, "new") !>
+    let await_last = ir_coro_func(ir, value, class, "await_last") !>
+    let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
+    let current_global = current_idf.global
+    if !isset(current_global) : value.bug("coro:current_coro is not a global")
+    if current_global.unit != ir.func.unit {
+        ir.func.unit.extern_globals.append(current_global, true)
+    }
+
+    let arg_types = Array[Type]{}
+    let arg_values = Array[String]{}
+    if callee.type == VAL.func {
+        let receiver = callee.value1
+        if isset(receiver) {
+            arg_types.append(receiver.rett)
+            arg_values.append(ir_emit_value(ir, receiver) !>)
+        }
+    }
+    let args = call.values
+    if isset(args) {
+        each args as arg {
+            arg_types.append(arg.rett)
+            arg_values.append(ir_emit_value(ir, arg) !>)
+        }
+    }
+    if callee.type == VAL.func {
+        let target_func = callee.func
+        if isset(target_func) && target_func.is_literal {
+            func_has_captures(target_func)
+            each target_func.capture_decls as decl {
+                arg_types.append(decl.type)
+                arg_values.append(ir_emit_value(ir, vgen_decl(decl)) !>)
+            }
+        }
+    }
+    let handler = ir_emit_value(ir, callee) !>
+
+    ir_emit_coro_helper(ir, value, call, arg_types) !>
+
+    let coro = ir.var()
+    ir.line_start()
+    ir.write(coro)
+    ir.write(" = call ")
+    ir.write(ir_func_rett_type(new_func) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(new_func))
+    ir.write("\"(ptr ")
+    ir.write(handler)
+    ir.write(", ptr @\"")
+    ir.write(value.name)
+    ir.write("\")")
+    ir.line_end()
+
+    let args_prop = ir_coro_prop(value, class, "args") !>
+    let gc_args_prop = ir_coro_prop(value, class, "gc_args") !>
+    let raw_args = ir_coro_load_prop(ir, coro, args_prop) !>
+    let gc_args = ir_coro_load_prop(ir, coro, gc_args_prop) !>
+    let offset: uint = 0
+    each arg_types as type, i {
+        let rendered = arg_values.get(i) !? "undef"
+        if type.is_gc_type() {
+            ir_coro_append_gc(ir, value, gc_args, rendered) !>
+        } else {
+            let address = ir.var()
+            ir.line_start()
+            ir.write(address)
+            ir.write(" = getelementptr i8, ptr ")
+            ir.write(raw_args)
+            ir.write(", i64 ")
+            ir.write_uint(offset)
+            ir.line_end()
+            ir.line_start()
+            ir.write("store ")
+            ir.write(ir_type(type) !>)
+            ir.write(" ")
+            ir.write(rendered)
+            ir.write(", ptr ")
+            ir.write(address)
+            ir.line_end()
+            offset += type.size() !>
+        }
+    }
+
+    let current = ir.var()
+    ir.line_start()
+    ir.write(current)
+    ir.write(" = load ptr, ptr @\"")
+    ir.write(global_ir_name(current_global))
+    ir.write("\"")
+    ir.line_end()
+    ir.line_start()
+    ir.write("call ")
+    ir.write(ir_func_rett_type(await_last) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(await_last))
+    ir.write("\"(ptr ")
+    ir.write(current)
+    ir.write(")")
+    ir.line_end()
+    return coro
+}
+
+fn ir_emit_coro_complete(ir: IRFunc, value: Value, class: Class, coro: String) !Error {
+    let complete = ir_coro_func(ir, value, class, "complete") !>
+    ir.line_start()
+    ir.write("call ")
+    ir.write(ir_func_rett_type(complete) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(complete))
+    ir.write("\"(ptr ")
+    ir.write(coro)
+    ir.write(")")
+    ir.line_end()
+}
+
+fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Array[Type]) !Error {
+    let class = ir_coro_class(value) !>
+    let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
+    let current_global = current_idf.global
+    if !isset(current_global) : value.bug("coro:current_coro is not a global")
+    if current_global.unit != parent.func.unit {
+        parent.func.unit.extern_globals.append(current_global, true)
+    }
+
+    let ir = IRFunc {
+        func: parent.func
+        code: parent.coro_helpers
+    }
+    ir.code.write_string("define internal void @\"")
+    ir.code.write_string(value.name)
+    ir.code.write_string("\"() {\n")
+    ir.label("entry")
+
+    let result_types = ir_coro_result_types(call.rett)
+    let root_count: uint = 0
+    each arg_types as type {
+        if type.is_gc_type() : root_count++
+    }
+    each result_types as type {
+        if type.is_gc_type() : root_count++
+    }
+    let root_global = ""
+    let root_previous = ""
+    let root_values = ""
+    if root_count > 0 {
+        let stack_idf = valk_idf(value.rett.build, "coro", "gc_stack_sp") !>
+        let stack_global = stack_idf.global
+        if !isset(stack_global) : value.bug("coro:gc_stack_sp is not a global")
+        if stack_global.unit != parent.func.unit {
+            parent.func.unit.extern_globals.append(stack_global, true)
+        }
+        root_global = "@\"" + global_ir_name(stack_global) + "\""
+        root_previous = ir.var()
+        root_values = ir.var()
+        let frame = ir.var()
+        let count_address = ir.var()
+        ir.line_start()
+        ir.write(frame)
+        ir.write(" = alloca [")
+        ir.write_uint(16 + root_count * 8)
+        ir.write(" x i8]")
+        ir.line_end()
+        ir.line_start()
+        ir.write(root_previous)
+        ir.write(" = load ptr, ptr ")
+        ir.write(root_global)
+        ir.line_end()
+        ir.line_start()
+        ir.write("store ptr ")
+        ir.write(root_previous)
+        ir.write(", ptr ")
+        ir.write(frame)
+        ir.line_end()
+        ir.line_start()
+        ir.write(count_address)
+        ir.write(" = getelementptr i8, ptr ")
+        ir.write(frame)
+        ir.write(", i64 8")
+        ir.line_end()
+        ir.line_start()
+        ir.write("store i64 ")
+        ir.write_uint(root_count)
+        ir.write(", ptr ")
+        ir.write(count_address)
+        ir.line_end()
+        ir.line_start()
+        ir.write(root_values)
+        ir.write(" = getelementptr i8, ptr ")
+        ir.write(frame)
+        ir.write(", i64 16")
+        ir.line_end()
+        ir.line_start()
+        ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
+        ir.write(root_values)
+        ir.write(", i8 0, i64 ")
+        ir.write_uint(root_count * 8)
+        ir.write(", i1 false)")
+        ir.line_end()
+        ir.line_start()
+        ir.write("store ptr ")
+        ir.write(frame)
+        ir.write(", ptr ")
+        ir.write(root_global)
+        ir.line_end()
+    }
+
+    let coro = ir.var()
+    ir.line_start()
+    ir.write(coro)
+    ir.write(" = load ptr, ptr @\"")
+    ir.write(global_ir_name(current_global))
+    ir.write("\"")
+    ir.line_end()
+
+    let args_prop = ir_coro_prop(value, class, "args") !>
+    let gc_args_prop = ir_coro_prop(value, class, "gc_args") !>
+    let handler_prop = ir_coro_prop(value, class, "handler") !>
+    let error_prop = ir_coro_prop(value, class, "error_code") !>
+    let raw_args = ir_coro_load_prop(ir, coro, args_prop) !>
+    let gc_args = ir_coro_load_prop(ir, coro, gc_args_prop) !>
+    let handler = ir_coro_load_prop(ir, coro, handler_prop) !>
+
+    let capture_count: uint = 0
+    let target = call.value1
+    if isset(target) && target.type == VAL.func {
+        let target_func = target.func
+        if isset(target_func) && target_func.is_literal {
+            func_has_captures(target_func)
+            capture_count = target_func.capture_decls.length
+        }
+    }
+    let capture_start = arg_types.length - capture_count
+    let rendered_args = Array[String]{}
+    let offset: uint = 0
+    let root_index: uint = 0
+    each arg_types as type, i {
+        let rendered = ""
+        if type.is_gc_type() {
+            // Removing the argument also clears the Array's GC ownership.
+            // Consequently result roots start at index zero, matching await.
+            rendered = ir_coro_pop_gc(ir, value, gc_args) !>
+            let root_address = ir.var()
+            ir.line_start()
+            ir.write(root_address)
+            ir.write(" = getelementptr ptr, ptr ")
+            ir.write(root_values)
+            ir.write(", i64 ")
+            ir.write_uint(root_index++)
+            ir.line_end()
+            ir.line_start()
+            ir.write("store ptr ")
+            ir.write(rendered)
+            ir.write(", ptr ")
+            ir.write(root_address)
+            ir.line_end()
+        } else {
+            let address = ir.var()
+            ir.line_start()
+            ir.write(address)
+            ir.write(" = getelementptr i8, ptr ")
+            ir.write(raw_args)
+            ir.write(", i64 ")
+            ir.write_uint(offset)
+            ir.line_end()
+            rendered = ir.var()
+            ir.line_start()
+            ir.write(rendered)
+            ir.write(" = load ")
+            ir.write(ir_type(type) !>)
+            ir.write(", ptr ")
+            ir.write(address)
+            ir.line_end()
+            offset += type.size() !>
+        }
+        if i >= capture_start {
+            let capture_address = ir.var()
+            ir.line_start()
+            ir.write(capture_address)
+            ir.write(" = alloca ")
+            ir.write(ir_type(type) !>)
+            ir.line_end()
+            ir.line_start()
+            ir.write("store ")
+            ir.write(ir_type(type) !>)
+            ir.write(" ")
+            ir.write(rendered)
+            ir.write(", ptr ")
+            ir.write(capture_address)
+            ir.line_end()
+            rendered = capture_address
+        }
+        rendered_args.append(rendered)
+    }
+
+    let raw_result = ""
+    let call_type = call.can_error ? (ir_error_abi_type(call.rett) !>) : (ir_type(call.rett) !>)
+    let has_call_result = !call.rett.is_void_type() || call.can_error
+    ir.line_start()
+    if has_call_result {
+        raw_result = ir.var()
+        ir.write(raw_result)
+        ir.write(" = ")
+    }
+    ir.write("call ")
+    ir.write(call_type)
+    ir.write(" ")
+    ir.write(handler)
+    ir.write("(")
+    each rendered_args as rendered, i {
+        if i > 0 : ir.write(", ")
+        if i >= capture_start : ir.write("ptr")
+        else : ir.write(ir_type(arg_types.get(i) !? type_void(value.rett.build)) !>)
+        ir.write(" ")
+        ir.write(rendered)
+    }
+    ir.write(")")
+    ir.line_end()
+
+    let success = raw_result
+    if call.can_error {
+        let code = ir_extract_error_code(ir, raw_result, call.rett) !>
+        let error_address = ir_coro_prop_address(ir, coro, error_prop)
+        ir.line_start()
+        ir.write("store i32 ")
+        ir.write(code)
+        ir.write(", ptr ")
+        ir.write(error_address)
+        ir.line_end()
+        let failed = ir.var()
+        ir.line_start()
+        ir.write(failed)
+        ir.write(" = icmp ne i32 ")
+        ir.write(code)
+        ir.write(", 0")
+        ir.line_end()
+        let error_block = ir.block("coro.error")
+        let success_block = ir.block("coro.success")
+        ir.cond_jump(failed, error_block, success_block)
+        ir.label(error_block)
+        if root_count > 0 {
+            ir.line_start()
+            ir.write("store ptr ")
+            ir.write(root_previous)
+            ir.write(", ptr ")
+            ir.write(root_global)
+            ir.line_end()
+        }
+        ir_emit_coro_complete(ir, value, class, coro) !>
+        ir.line("ret void")
+        ir.terminated = true
+        ir.label(success_block)
+        success = ir_extract_error_success(ir, raw_result, call.rett) !>
+    }
+
+    let result_offset: uint = 0
+    each result_types as type, i {
+        let rendered = success
+        if call.rett.type == TYPE.multi {
+            rendered = ir.var()
+            ir.line_start()
+            ir.write(rendered)
+            ir.write(" = extractvalue ")
+            ir.write(ir_type(call.rett) !>)
+            ir.write(" ")
+            ir.write(success)
+            ir.write(", ")
+            ir.write_uint(i)
+            ir.line_end()
+        }
+        if type.is_gc_type() {
+            let root_address = ir.var()
+            ir.line_start()
+            ir.write(root_address)
+            ir.write(" = getelementptr ptr, ptr ")
+            ir.write(root_values)
+            ir.write(", i64 ")
+            ir.write_uint(root_index++)
+            ir.line_end()
+            ir.line_start()
+            ir.write("store ptr ")
+            ir.write(rendered)
+            ir.write(", ptr ")
+            ir.write(root_address)
+            ir.line_end()
+            ir_coro_append_gc(ir, value, gc_args, rendered) !>
+        } else {
+            let address = ir.var()
+            ir.line_start()
+            ir.write(address)
+            ir.write(" = getelementptr i8, ptr ")
+            ir.write(raw_args)
+            ir.write(", i64 ")
+            ir.write_uint(result_offset)
+            ir.line_end()
+            ir.line_start()
+            ir.write("store ")
+            ir.write(ir_type(type) !>)
+            ir.write(" ")
+            ir.write(rendered)
+            ir.write(", ptr ")
+            ir.write(address)
+            ir.line_end()
+            result_offset += type.size() !>
+        }
+    }
+    if root_count > 0 {
+        ir.line_start()
+        ir.write("store ptr ")
+        ir.write(root_previous)
+        ir.write(", ptr ")
+        ir.write(root_global)
+        ir.line_end()
+    }
+    ir_emit_coro_complete(ir, value, class, coro) !>
+    ir.line("ret void")
+    ir.code.write_string("}\n\n")
+}
+
+fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
+    let task_value = value.value1
+    if !isset(task_value) : value.bug("IR await has no coroutine value")
+    let task = ir_emit_value(ir, task_value) !>
+    let class = ir_coro_class(value) !>
+    let await_coro = ir_coro_func(ir, value, class, "await_coro") !>
+    let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
+    let current_global = current_idf.global
+    if !isset(current_global) : value.bug("coro:current_coro is not a global")
+    if current_global.unit != ir.func.unit {
+        ir.func.unit.extern_globals.append(current_global, true)
+    }
+    let current = ir.var()
+    ir.line_start()
+    ir.write(current)
+    ir.write(" = load ptr, ptr @\"")
+    ir.write(global_ir_name(current_global))
+    ir.write("\"")
+    ir.line_end()
+    ir.line_start()
+    ir.write("call ")
+    ir.write(ir_func_rett_type(await_coro) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(await_coro))
+    ir.write("\"(ptr ")
+    ir.write(current)
+    ir.write(", ptr ")
+    ir.write(task)
+    ir.write(")")
+    ir.line_end()
+
+    let args_prop = ir_coro_prop(value, class, "args") !>
+    let gc_args_prop = ir_coro_prop(value, class, "gc_args") !>
+    let error_prop = ir_coro_prop(value, class, "error_code") !>
+    let raw_args = ir_coro_load_prop(ir, task, args_prop) !>
+    let gc_args = ir_coro_load_prop(ir, task, gc_args_prop) !>
+    let result_types = ir_coro_result_types(value.rett)
+    let aggregate = "undef"
+    let offset: uint = 0
+    let gc_index: uint = 0
+    each result_types as type, i {
+        let rendered = ""
+        if type.is_gc_type() {
+            rendered = ir_coro_get_gc(ir, value, gc_args, gc_index) !>
+            gc_index++
+        } else {
+            let address = ir.var()
+            ir.line_start()
+            ir.write(address)
+            ir.write(" = getelementptr i8, ptr ")
+            ir.write(raw_args)
+            ir.write(", i64 ")
+            ir.write_uint(offset)
+            ir.line_end()
+            rendered = ir.var()
+            ir.line_start()
+            ir.write(rendered)
+            ir.write(" = load ")
+            ir.write(ir_type(type) !>)
+            ir.write(", ptr ")
+            ir.write(address)
+            ir.line_end()
+            offset += type.size() !>
+        }
+        if value.rett.type == TYPE.multi {
+            let next = ir.var()
+            ir.line_start()
+            ir.write(next)
+            ir.write(" = insertvalue ")
+            ir.write(ir_type(value.rett) !>)
+            ir.write(" ")
+            ir.write(aggregate)
+            ir.write(", ")
+            ir.write(ir_type(type) !>)
+            ir.write(" ")
+            ir.write(rendered)
+            ir.write(", ")
+            ir.write_uint(i)
+            ir.line_end()
+            aggregate = next
+        } else {
+            aggregate = rendered
+        }
+    }
+
+    if !value.can_error : return aggregate
+    let error_address = ir_coro_prop_address(ir, task, error_prop)
+    let code = ir.var()
+    ir.line_start()
+    ir.write(code)
+    ir.write(" = load i32, ptr ")
+    ir.write(error_address)
+    ir.line_end()
+    let raw = ir_build_error_result(ir, aggregate, value.rett, code) !>
+    ir.cache_error_result(value, raw)
+    return raw
 }
 
 fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
