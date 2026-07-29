@@ -981,6 +981,23 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
         let owner = left.value1
         let prop = left.prop
         if !isset(owner) || !isset(prop) : value.bug("IR property assignment is incomplete")
+        if owner.rett.is_gc_type() && left.rett.get_non_nullable().type == TYPE.fn {
+            let owner_value = ir_emit_value(ir, owner) !>
+            let address = ir.var()
+            ir.line(address + " = getelementptr i8, ptr " + owner_value + ", i64 " + prop.offset)
+            let result = ir_emit_value(ir, right) !>
+            let op = value.op.@cast(ASSIGN_OP)
+            if op != ASSIGN_OP.set : value.bug("Compound assignment is not valid for a closure property")
+            let function = ir.var()
+            ir.line(function + " = extractvalue { ptr, ptr } " + result + ", 0")
+            let environment = ir.var()
+            ir.line(environment + " = extractvalue { ptr, ptr } " + result + ", 1")
+            let environment_address = ir.var()
+            ir.line(environment_address + " = getelementptr i8, ptr " + address + ", i64 " + owner.rett.ptr_size())
+            ir_emit_gc_property_update(ir, value, owner_value, environment_address, environment) !>
+            ir.line("store ptr " + function + ", ptr " + address)
+            return
+        }
         if owner.rett.is_gc_type() && left.rett.is_gc_type() {
             let owner_value = ir_emit_value(ir, owner) !>
             let address = ir.var()
@@ -1130,10 +1147,13 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         return value.int_val
     }
     if t == VAL.float {
+        // FloatNumber.to_string() defaults to two decimal places. LLVM constants
+        // need enough precision to round-trip the parsed f64 value.
+        let rendered = value.float_val.to_str(17, false)
         if ir_is_tagged_nullable(value.rett) {
-            return ir_build_tagged_nullable(ir, value.rett, value.float_val) !>
+            return ir_build_tagged_nullable(ir, value.rett, rendered) !>
         }
-        return value.float_val
+        return rendered
     }
     if t == VAL.bool {
         let rendered = value.bool_val ? "1" : "0"
@@ -1177,6 +1197,21 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         let address = ir_emit_address(ir, value) !>
         let out = ir.var()
         ir.line(out + " = load " + (ir_type(value.rett) !>) + ", ptr " + address)
+        // A captured declaration is physically a property of the closure
+        // environment. Unlike an ordinary local/global slot, the collector
+        // may tag that property in place.
+        if t == VAL.decl && value.rett.is_gc_type() {
+            let decl = value.decl
+            if isset(decl) && ir.func.capture_decls.contains(decl) {
+                let as_int = ir.var()
+                ir.line(as_int + " = ptrtoint ptr " + out + " to i64")
+                let masked = ir.var()
+                ir.line(masked + " = and i64 " + as_int + ", -4")
+                let clean = ir.var()
+                ir.line(clean + " = inttoptr i64 " + masked + " to ptr")
+                return clean
+            }
+        }
         return out
     }
     if t == VAL.prop {
@@ -2573,6 +2608,37 @@ fn ir_coro_load_prop(ir: IRFunc, coro: String, prop: Prop) String !Error {
     ir.write(", ptr ")
     ir.write(address)
     ir.line_end()
+    // Coro lowering accesses properties directly instead of going through
+    // VAL.prop/ir_emit_value. The collector stores ownership tags in managed
+    // property pointers, so apply the same cleanup ordinary property reads do.
+    if prop.type.is_gc_type() {
+        let as_int = ir.var()
+        ir.line(as_int + " = ptrtoint ptr " + result + " to i64")
+        let masked = ir.var()
+        ir.line(masked + " = and i64 " + as_int + ", -4")
+        let clean = ir.var()
+        ir.line(clean + " = inttoptr i64 " + masked + " to ptr")
+        return clean
+    }
+    // Inline closures are `{ function, environment }`. Their environment is
+    // the managed property and may be tagged independently of the function.
+    if prop.type.get_non_nullable().type == TYPE.fn {
+        let func = ir.var()
+        ir.line(func + " = extractvalue { ptr, ptr } " + result + ", 0")
+        let environment = ir.var()
+        ir.line(environment + " = extractvalue { ptr, ptr } " + result + ", 1")
+        let as_int = ir.var()
+        ir.line(as_int + " = ptrtoint ptr " + environment + " to i64")
+        let masked = ir.var()
+        ir.line(masked + " = and i64 " + as_int + ", -4")
+        let clean_environment = ir.var()
+        ir.line(clean_environment + " = inttoptr i64 " + masked + " to ptr")
+        let clean = ir.var()
+        ir.line(clean + " = insertvalue { ptr, ptr } undef, ptr " + func + ", 0")
+        let complete = ir.var()
+        ir.line(complete + " = insertvalue { ptr, ptr } " + clean + ", ptr " + clean_environment + ", 1")
+        return complete
+    }
     return result
 }
 
@@ -2609,13 +2675,7 @@ fn ir_coro_get_gc(ir: IRFunc, value: Value, gc_args: String, index: uint) String
     let array_class = gc_args_prop.type.get_class_or_null()
     if !isset(array_class) : value.bug("Coro.gc_args is not an Array")
     let data_prop = array_class.get_prop_by_name("data") ! value.bug("Array has no data property")
-    let data_address = ir_prop_address(ir, gc_args, data_prop)
-    let data = ir.var()
-    ir.line_start()
-    ir.write(data)
-    ir.write(" = load ptr, ptr ")
-    ir.write(data_address)
-    ir.line_end()
+    let data = ir_coro_load_prop(ir, gc_args, data_prop) !>
     let item_address = ir.var()
     ir.line_start()
     ir.write(item_address)
@@ -2630,7 +2690,15 @@ fn ir_coro_get_gc(ir: IRFunc, value: Value, gc_args: String, index: uint) String
     ir.write(" = load ptr, ptr ")
     ir.write(item_address)
     ir.line_end()
-    return item
+    // Array[GcPtr] entries are managed properties too and may carry ownership
+    // tags after a collection.
+    let as_int = ir.var()
+    ir.line(as_int + " = ptrtoint ptr " + item + " to i64")
+    let masked = ir.var()
+    ir.line(masked + " = and i64 " + as_int + ", -4")
+    let clean = ir.var()
+    ir.line(clean + " = inttoptr i64 " + masked + " to ptr")
+    return clean
 }
 
 fn ir_coro_pop_gc(ir: IRFunc, value: Value, gc_args: String) String !Error {
