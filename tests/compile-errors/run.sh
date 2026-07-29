@@ -25,7 +25,10 @@ while IFS=';' read -r file msg; do
     count=$((count+1))
     cmd="./valk build ./tests/compile-errors/$file.valk --no-warn"
     echo "> Run: $cmd"
-    output=$($cmd)
+    # The rewrite compiler may write diagnostics to stderr (and its runtime
+    # can terminate with a non-zero status after reporting them). Capture both
+    # streams so the expected diagnostic is still checked reliably.
+    output=$($cmd 2>&1)
     status=$?
 
     # Check if build command failed
