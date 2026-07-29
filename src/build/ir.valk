@@ -1,4 +1,5 @@
 use llvm
+use helper
 
 // Textual LLVM function generation. This follows the classic compiler's
 // per-function lifecycle: resolve AST -> emit textual IR -> release AST.
@@ -247,7 +248,7 @@ fn ir_write_string_constant(out: ByteBuffer, index: uint, value: String) {
 
 fn ir_write_func_signature(out: ByteBuffer, func: Func, declare: bool) !Error {
     out.write_string(declare ? "declare " : "define ")
-    out.write_string(ir_type(func.get_rett()) !>)
+    out.write_string(ir_func_rett_type(func) !>)
     out.write_string(" @\"")
     out.write_string(func_ir_name(func))
     out.write_string("\"(")
@@ -286,10 +287,36 @@ class IRFunc {
     gc_stack_global: String ("")
     gc_stack_previous: String ("")
     cleanup_active: bool (false)
+    current_block: String ("")
+    vscope_after: ?String (null)
+    vscope_results: ?Array[String] (null)
+    vscope_blocks: ?Array[String] (null)
+    error_values: Array[Value] (.{})
+    error_results: Array[String] (.{})
 
     fn line(text: String) {
         this.code.write_string("  ")
         this.code.write_string(text)
+        this.code.write_string("\n")
+    }
+
+    fn line_start() {
+        this.code.write_string("  ")
+    }
+
+    fn write(text: String) {
+        this.code.write_string(text)
+    }
+
+    fn write_uint(value: uint) {
+        this.code.write_uint_ascii(value)
+    }
+
+    fn write_int(value: int) {
+        this.code.write_int_ascii(value)
+    }
+
+    fn line_end() {
         this.code.write_string("\n")
     }
 
@@ -324,6 +351,7 @@ class IRFunc {
     fn label(name: String) {
         this.code.write_string(name)
         this.code.write_string(":\n")
+        this.current_block = name
         this.terminated = false
     }
 
@@ -338,6 +366,19 @@ class IRFunc {
         this.line("br i1 " + cond + ", label \%" + yes + ", label \%" + no)
         this.terminated = true
     }
+
+    fn cached_error_result(value: Value) ?String {
+        each this.error_values as existing, i {
+            if existing == value : return this.error_results.get(i) !? null
+        }
+        return null
+    }
+
+    fn cache_error_result(value: Value, result: String) {
+        if isset(this.cached_error_result(value)) : return
+        this.error_values.append(value)
+        this.error_results.append(result)
+    }
 }
 
 fn generate_func_ir(func: Func) !Error {
@@ -348,7 +389,7 @@ fn generate_func_ir(func: Func) !Error {
     func.ir_name = func_ir_name(func)
 
     ir.code.write_string("define dso_local ")
-    ir.code.write_string(ir_type(func.get_rett()) !>)
+    ir.code.write_string(ir_func_rett_type(func) !>)
     ir.code.write_string(" @\"")
     ir.code.write_string(func.ir_name)
     ir.code.write_string("\"(")
@@ -392,8 +433,13 @@ fn generate_func_ir(func: Func) !Error {
     if !ir.terminated {
         let rett = func.get_rett()
         ir_emit_func_cleanup(ir) !>
-        if rett.is_void_type() : ir.line("ret void")
-        else : ir.line("ret " + (ir_type(rett) !>) + " undef")
+        if func.can_error {
+            ir_emit_error_return(ir, rett.is_void_type() ? "" : "undef", rett, "0") !>
+        } else if rett.is_void_type() {
+            ir.line("ret void")
+        } else {
+            ir.line("ret " + (ir_type(rett) !>) + " undef")
+        }
     }
     ir.code.write_string("}\n\n")
     func.ir_code = ir.code.to_string()
@@ -434,7 +480,12 @@ fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
 
 fn ir_emit_gc_stack_defer(ir: IRFunc) {
     if ir.gc_stack_global == "" || ir.func.is_entrance : return
-    ir.line("store ptr " + ir.gc_stack_previous + ", ptr " + ir.gc_stack_global)
+    ir.line_start()
+    ir.write("store ptr ")
+    ir.write(ir.gc_stack_previous)
+    ir.write(", ptr ")
+    ir.write(ir.gc_stack_global)
+    ir.line_end()
 }
 
 // Run the generated function defer scope on every real function exit. It may
@@ -456,12 +507,117 @@ fn ir_emit_func_cleanup(ir: IRFunc) !Error {
     ir.cleanup_active = false
 }
 
+fn ir_build_error_result(ir: IRFunc, rendered: String, rett: Type, code: String) String !Error {
+    if rett.is_void_type() : return code
+    let abi = ir_error_abi_type(rett) !>
+    let current = "undef"
+    if rett.type == TYPE.multi {
+        let subs = rett.sub_types
+        if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
+        each subs as sub, i {
+            let part = ir.var()
+            ir.line_start()
+            ir.write(part)
+            ir.write(" = extractvalue ")
+            ir.write(ir_type(rett) !>)
+            ir.write(" ")
+            ir.write(rendered)
+            ir.write(", ")
+            ir.write_uint(i)
+            ir.line_end()
+            let next = ir.var()
+            ir.line_start()
+            ir.write(next)
+            ir.write(" = insertvalue ")
+            ir.write(abi)
+            ir.write(" ")
+            ir.write(current)
+            ir.write(", ")
+            ir.write(ir_type(sub) !>)
+            ir.write(" ")
+            ir.write(part)
+            ir.write(", ")
+            ir.write_uint(i)
+            ir.line_end()
+            current = next
+        }
+    } else {
+        let next = ir.var()
+        ir.line_start()
+        ir.write(next)
+        ir.write(" = insertvalue ")
+        ir.write(abi)
+        ir.write(" ")
+        ir.write(current)
+        ir.write(", ")
+        ir.write(ir_type(rett) !>)
+        ir.write(" ")
+        ir.write(rendered)
+        ir.write(", 0")
+        ir.line_end()
+        current = next
+    }
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = insertvalue ")
+    ir.write(abi)
+    ir.write(" ")
+    ir.write(current)
+    ir.write(", i32 ")
+    ir.write(code)
+    ir.write(", ")
+    ir.write_uint(ir_normal_rett_count(rett))
+    ir.line_end()
+    return out
+}
+
+fn ir_emit_error_return(ir: IRFunc, rendered: String, rett: Type, code: String) !Error {
+    let result = ir_build_error_result(ir, rendered, rett, code) !>
+    ir.line_start()
+    ir.write("ret ")
+    ir.write(ir_error_abi_type(rett) !>)
+    ir.write(" ")
+    ir.write(result)
+    ir.line_end()
+}
+
 fn func_ir_name(func: Func) String {
     let out = func.unit.name
     let class = func.class
     if isset(class) : out += "__" + class.name
     out += "__" + func.name + "__" + func.exp.i
     return out
+}
+
+fn ir_func_rett_type(func: Func) String !Error {
+    if !func.can_error : return ir_type(func.get_rett()) !>
+    return ir_error_abi_type(func.get_rett()) !>
+}
+
+fn ir_error_abi_type(rett: Type) String !Error {
+    if rett.is_void_type() : return "i32"
+    if rett.type == TYPE.multi {
+        let subs = rett.sub_types
+        if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
+        let out = "{ "
+        each subs as sub, i {
+            if i > 0 : out += ", "
+            out += ir_type(sub) !>
+        }
+        if subs.length > 0 : out += ", "
+        return out + "i32 }"
+    }
+    return "{ " + (ir_type(rett) !>) + ", i32 }"
+}
+
+fn ir_normal_rett_count(rett: Type) uint {
+    if rett.is_void_type() : return 0
+    if rett.type == TYPE.multi {
+        let subs = rett.sub_types
+        return isset(subs) ? subs.length : 0
+    }
+    return 1
 }
 
 fn global_ir_name(global: Global) String {
@@ -541,23 +697,36 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
     }
     if t == VAL.return {
         let retv = value.value1
+        let vscope_after = ir.vscope_after
+        if isset(vscope_after) {
+            if !isset(retv) : value.bug("IR value-scope return has no value")
+            let results = ir.vscope_results
+            let blocks = ir.vscope_blocks
+            if !isset(results) || !isset(blocks) : value.bug("IR value-scope merge state is missing")
+            results.append(ir_emit_value(ir, retv) !>)
+            blocks.append(ir.current_block)
+            ir.jump(vscope_after)
+            return
+        }
         if !isset(retv) {
             ir_emit_func_cleanup(ir) !>
-            ir.line("ret void")
+            if ir.func.can_error : ir_emit_error_return(ir, "", ir.func.get_rett(), "0") !>
+            else : ir.line("ret void")
         } else {
             let rendered = ir_emit_value(ir, retv) !>
             ir_emit_func_cleanup(ir) !>
-            ir.line("ret " + (ir_type(retv.rett) !>) + " " + rendered)
+            if ir.func.can_error : ir_emit_error_return(ir, rendered, ir.func.get_rett(), "0") !>
+            else : ir.line("ret " + (ir_type(retv.rett) !>) + " " + rendered)
         }
         ir.terminated = true
         return
     }
     if t == VAL.throw {
         let thrown = value.value1
-        if isset(thrown) : ir_emit_value(ir, thrown) !>
+        if !isset(thrown) : value.bug("IR throw is missing its error value")
+        let code = ir_emit_value(ir, thrown) !>
         ir_emit_func_cleanup(ir) !>
-        ir.comment("TODO lower thrown error value")
-        ir.line("unreachable")
+        ir_emit_error_return(ir, "undef", ir.func.get_rett(), code) !>
         ir.terminated = true
         return
     }
@@ -763,10 +932,21 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
 }
 
 fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
+    let t = value.type
+    if t == VAL.error_handler {
+        return ir_emit_error_handler(ir, value) !>
+    }
+
     let pre = value.pre_value
+    // trim_errors() represents the success projection as a non-fallible clone
+    // whose pre_value is the original call. Reuse that call's ABI result rather
+    // than issuing the call a second time.
+    if t == VAL.call && !value.can_error && isset(pre) && pre.type == VAL.call && pre.can_error {
+        let raw = ir.cached_error_result(pre) ?? (ir_emit_value(ir, pre) !>)
+        return ir_extract_error_success(ir, raw, pre.rett) !>
+    }
     if isset(pre) : ir_emit_stmt(ir, pre) !>
 
-    let t = value.type
     if t == VAL.int : return value.int_val
     if t == VAL.float : return value.float_val
     if t == VAL.bool : return value.bool_val ? "1" : "0"
@@ -867,6 +1047,21 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.class_init {
         return ir_emit_class_init(ir, value) !>
     }
+    if t == VAL.error_value {
+        let et = value.rett.get_non_nullable().error_type
+        if !isset(et) : value.bug("IR error value has no ErrorType")
+        let payload = value.values
+        if isset(payload) {
+            each payload as field {
+                let global = et.payload_globals.get(field.name) !? null
+                if !isset(global) : value.bug("Error payload global is missing: " + et.name + "." + field.name)
+                if global.unit != ir.func.unit : ir.func.unit.extern_globals.append(global, true)
+                let rendered = ir_emit_value(ir, field) !>
+                ir.line("store " + (ir_type(field.rett) !>) + " " + rendered + ", ptr @\"" + global_ir_name(global) + "\"")
+            }
+        }
+        return helper:ctxhash_u32(value.string_val).to(int)
+    }
     if t == VAL.memcpy {
         let values = value.values
         if isset(values) && values.length == 3 {
@@ -879,7 +1074,10 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         }
         return "undef"
     }
-    if t == VAL.block || t == VAL.vscope {
+    if t == VAL.vscope {
+        return ir_emit_vscope(ir, value) !>
+    }
+    if t == VAL.block {
         ir_emit_values(ir, value.values) !>
         let result = value.value1
         if isset(result) : return ir_emit_value(ir, result) !>
@@ -902,7 +1100,253 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     }
 
     ir.comment("TODO lower " + t)
+    if value.can_error || isset(value.error_type) : return "zeroinitializer"
     return (ir_type(value.rett) !>) == "ptr" ? "null" : "undef"
+}
+
+fn ir_emit_vscope(ir: IRFunc, value: Value) String !Error {
+    let after = ir.block("vscope.after")
+    let old_after = ir.vscope_after
+    let old_results = ir.vscope_results
+    let old_blocks = ir.vscope_blocks
+    let results = Array[String]{}
+    let blocks = Array[String]{}
+    ir.vscope_after = after
+    ir.vscope_results = results
+    ir.vscope_blocks = blocks
+
+    ir_emit_values(ir, value.values) !>
+    if !ir.terminated : ir.jump(after)
+    ir.label(after)
+
+    ir.vscope_after = old_after
+    ir.vscope_results = old_results
+    ir.vscope_blocks = old_blocks
+
+    if results.length == 0 : return "undef"
+    if results.length == 1 : return results.get(0) !? "undef"
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = phi ")
+    ir.write(ir_type(value.rett) !>)
+    ir.write(" ")
+    each results as result, i {
+        if i > 0 : ir.write(", ")
+        ir.write("[ ")
+        ir.write(result)
+        ir.write(", \%")
+        ir.write(blocks.get(i) !? "")
+        ir.write(" ]")
+    }
+    ir.line_end()
+    return out
+}
+
+fn ir_extract_error_code(ir: IRFunc, raw: String, rett: Type) String !Error {
+    let count = ir_normal_rett_count(rett)
+    if count == 0 : return raw
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = extractvalue ")
+    ir.write(ir_error_abi_type(rett) !>)
+    ir.write(" ")
+    ir.write(raw)
+    ir.write(", ")
+    ir.write_uint(count)
+    ir.line_end()
+    return out
+}
+
+fn ir_extract_error_success(ir: IRFunc, raw: String, rett: Type) String !Error {
+    if rett.is_void_type() : return ""
+    let abi = ir_error_abi_type(rett) !>
+    if rett.type != TYPE.multi {
+        let out = ir.var()
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = extractvalue ")
+        ir.write(abi)
+        ir.write(" ")
+        ir.write(raw)
+        ir.write(", 0")
+        ir.line_end()
+        return out
+    }
+    let subs = rett.sub_types
+    if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
+    let current = "undef"
+    each subs as sub, i {
+        let part = ir.var()
+        ir.line(part + " = extractvalue " + abi + " " + raw + ", " + i)
+        let next = ir.var()
+        ir.line(next + " = insertvalue " + (ir_type(rett) !>) + " " + current + ", " + (ir_type(sub) !>) + " " + part + ", " + i)
+        current = next
+    }
+    return current
+}
+
+fn ir_store_caught_error(ir: IRFunc, value: Value, code: String) {
+    let decl = value.decl
+    if !isset(decl) : return
+    ir.line_start()
+    ir.write("store i32 ")
+    ir.write(code)
+    ir.write(", ptr ")
+    ir.write(decl.ir_name)
+    ir.line_end()
+}
+
+fn ir_error_default(ir: IRFunc, type: Type) String !Error {
+    let string_class = type_string(ir.func.ns.build).get_class_or_null()
+    let class = type.get_class_or_null()
+    if isset(string_class) && class == string_class {
+        let index = ir.func.unit.add_string("")
+        let out = ir.var()
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = getelementptr i8, ptr @\"valk.str.")
+        ir.write_uint(index)
+        ir.write("\", i64 8")
+        ir.line_end()
+        return out
+    }
+    if type.is_pointer_sized() : return "null"
+    return "zeroinitializer"
+}
+
+fn ir_default_pass_payloads(ir: IRFunc, value: Value, from: ?ErrorType, to: ?ErrorType) !Error {
+    if !isset(to) : return
+    each to.payload as ptype, name {
+        if isset(from) && from.payload.has(name) : continue
+        let global = to.payload_globals.get(name) !? null
+        if !isset(global) : value.bug("Error payload global is missing: " + to.name + "." + name)
+        if global.unit != ir.func.unit : ir.func.unit.extern_globals.append(global, true)
+        let fallback = ir_error_default(ir, ptype) !>
+        ir.line_start()
+        ir.write("store ")
+        ir.write(ir_type(ptype) !>)
+        ir.write(" ")
+        ir.write(fallback)
+        ir.write(", ptr @\"")
+        ir.write(global_ir_name(global))
+        ir.write("\"")
+        ir.line_end()
+    }
+}
+
+fn ir_emit_error_panic(ir: IRFunc, value: Value) !Error {
+    let idf = valk_idf(ir.func.ns.build, "core", "panic") !>
+    let panic_func = idf.func
+    if !isset(panic_func) : value.bug("core:panic is not a function")
+    if !panic_func.parsed_types : parse_func_types(panic_func) !>
+    if panic_func.unit != ir.func.unit || panic_func.is_extern {
+        ir.func.unit.extern_functions.append(panic_func, true)
+    }
+    let index = ir.func.unit.add_string("Unhandled error")
+    let msg = ir.var()
+    ir.line_start()
+    ir.write(msg)
+    ir.write(" = getelementptr i8, ptr @\"valk.str.")
+    ir.write_uint(index)
+    ir.write("\", i64 8")
+    ir.line_end()
+    ir_emit_func_cleanup(ir) !>
+    ir.line_start()
+    ir.write("call void @\"")
+    ir.write(func_ir_name(panic_func))
+    ir.write("\"(ptr ")
+    ir.write(msg)
+    ir.write(")")
+    ir.line_end()
+    ir.line("unreachable")
+    ir.terminated = true
+}
+
+fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
+    let call = value.pre_value
+    if !isset(call) : value.bug("IR error handler is missing its fallible value")
+    let raw = ir.cached_error_result(call) ?? (ir_emit_value(ir, call) !>)
+    ir.cache_error_result(call, raw)
+    let call_rett = call.rett
+    let code = ir_extract_error_code(ir, raw, call_rett) !>
+    let success_value = ir_extract_error_success(ir, raw, call_rett) !>
+    let has_error = ir.var()
+    ir.line_start()
+    ir.write(has_error)
+    ir.write(" = icmp ne i32 ")
+    ir.write(code)
+    ir.write(", 0")
+    ir.line_end()
+
+    let error_block = ir.block("error")
+    let success_block = ir.block("success")
+    let after_block = ir.block("error.after")
+    ir.cond_jump(has_error, error_block, success_block)
+
+    let kind = value.op.@cast(ERRH_KIND)
+    let error_result = ""
+    let error_reaches_after = false
+    let error_predecessor = error_block
+    ir.label(error_block)
+    ir_store_caught_error(ir, value, code)
+    if kind == ERRH_KIND.pass {
+        ir_default_pass_payloads(ir, value, call.error_type, ir.func.error_type) !>
+        ir_emit_func_cleanup(ir) !>
+        ir_emit_error_return(ir, "undef", ir.func.get_rett(), code) !>
+        ir.terminated = true
+    } else if kind == ERRH_KIND.panic {
+        ir_emit_error_panic(ir, value) !>
+    } else if kind == ERRH_KIND.value {
+        let handler = value.value2
+        if !isset(handler) : value.bug("Error value handler is missing its fallback")
+        error_result = ir_emit_value(ir, handler) !>
+        error_reaches_after = !ir.terminated
+        error_predecessor = ir.current_block
+        ir.jump(after_block)
+    } else if kind == ERRH_KIND.block {
+        let handler = value.value2
+        if isset(handler) : ir_emit_stmt(ir, handler) !>
+        error_reaches_after = !ir.terminated
+        ir.jump(after_block)
+    } else {
+        // Ignore and success-handler forms both continue on error.
+        error_reaches_after = true
+        ir.jump(after_block)
+    }
+
+    ir.label(success_block)
+    let success_result = success_value
+    if kind == ERRH_KIND.success {
+        let handler = value.value2
+        if isset(handler) : ir_emit_stmt(ir, handler) !>
+    }
+    let success_reaches_after = !ir.terminated
+    let success_predecessor = ir.current_block
+    ir.jump(after_block)
+
+    ir.label(after_block)
+    if value.rett.is_void_type() : return ""
+    if kind == ERRH_KIND.value && error_reaches_after && success_reaches_after {
+        let out = ir.var()
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = phi ")
+        ir.write(ir_type(value.rett) !>)
+        ir.write(" [ ")
+        ir.write(error_result)
+        ir.write(", \%")
+        ir.write(error_predecessor)
+        ir.write(" ], [ ")
+        ir.write(success_result)
+        ir.write(", \%")
+        ir.write(success_predecessor)
+        ir.write(" ]")
+        ir.line_end()
+        return out
+    }
+    return success_result
 }
 
 fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
@@ -1038,41 +1482,64 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let callee = value.value1
     if !isset(callee) : value.bug("IR call is missing its callee")
     let args = value.values
-    let rendered = Array[String]{}
+    let rendered_types = Array[String]{}
+    let rendered_values = Array[String]{}
 
     // Bound method receiver is the implicit first argument.
     if callee.type == VAL.func {
         let receiver = callee.value1
-        if isset(receiver) : rendered.append((ir_type(receiver.rett) !>) + " " + (ir_emit_value(ir, receiver) !>))
+        if isset(receiver) {
+            rendered_types.append(ir_type(receiver.rett) !>)
+            rendered_values.append(ir_emit_value(ir, receiver) !>)
+        }
     }
     if isset(args) {
         each args as arg {
-            rendered.append((ir_type(arg.rett) !>) + " " + (ir_emit_value(ir, arg) !>))
+            rendered_types.append(ir_type(arg.rett) !>)
+            rendered_values.append(ir_emit_value(ir, arg) !>)
         }
     }
 
     let target = ir_emit_value(ir, callee) !>
     let exits = false
+    let call_type = ir_type(value.rett) !>
     if callee.type == VAL.func {
         let func = callee.func
-        if isset(func) : exits = func.must_exit || func.will_exit
+        if isset(func) {
+            exits = func.must_exit || func.will_exit
+            call_type = ir_func_rett_type(func) !>
+        }
+    } else if value.can_error || isset(value.error_type) {
+        call_type = ir_error_abi_type(value.rett) !>
     }
     if exits : ir_emit_func_cleanup(ir) !>
-    let call = "call " + (ir_type(value.rett) !>) + " " + target + "(" + rendered.join(", ") + ")"
-    if value.rett.is_void_type() {
-        ir.line(call)
-        if exits {
-            ir.line("unreachable")
-            ir.terminated = true
-        }
-        return ""
+    let returns_abi_value = value.can_error || isset(value.error_type)
+    let has_result = !value.rett.is_void_type() || returns_abi_value
+    let out = ""
+    ir.line_start()
+    if has_result {
+        out = ir.var()
+        ir.write(out)
+        ir.write(" = ")
     }
-    let out = ir.var()
-    ir.line(out + " = " + call)
+    ir.write("call ")
+    ir.write(call_type)
+    ir.write(" ")
+    ir.write(target)
+    ir.write("(")
+    each rendered_values as rendered, i {
+        if i > 0 : ir.write(", ")
+        ir.write(rendered_types.get(i) !? "")
+        ir.write(" ")
+        ir.write(rendered)
+    }
+    ir.write(")")
+    ir.line_end()
     if exits {
         ir.line("unreachable")
         ir.terminated = true
     }
+    if !has_result : return ""
     return out
 }
 
