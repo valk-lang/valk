@@ -54,10 +54,23 @@ update: valk
 # Testing
 test: valk
 	mkdir -p ./debug
-#./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -vv
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all
 	./debug/test-all
 	@./tests/compile-errors/run.sh
+
+test-gc-debug: valk
+	mkdir -p ./debug
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-debug --def "GC_DEBUG=1"
+	./debug/test-gc-debug
+
+test-gc-shared-stress: valk
+	mkdir -p ./debug
+	./valk build ./tests/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress --def "GC_DEBUG=1"
+	@run=0; while [ $$run -lt 10 ]; do \
+		run=$$((run + 1)); \
+		echo "Shared GC stress run $$run/10"; \
+		./debug/test-gc-shared-stress || exit $$?; \
+	done
 
 test-fmt: valk
 	./tests/fmt/run.sh
@@ -76,6 +89,12 @@ test-macos-build: valk
 	--sysroot toolchains/toolchains/macos-11-3
 	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64 \
 	--sysroot toolchains/toolchains/macos-11-3
+
+test-cross-ir: valk
+	mkdir -p ./debug
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-x64-ir --target macos-x64 --ir --clean
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-arm64-ir --target macos-arm64 --ir --clean
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-win-x64-ir --target win-x64 --ir --clean
 
 # Testing
 test-cross: valk
