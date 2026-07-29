@@ -1,0 +1,191 @@
+use llvm
+use helper
+use valk:fs
+
+// Emit one native object for every Unit/LLVM module. Linking deliberately
+// remains a separate stage.
+fn emit_unit_objects(build: Build) !Error {
+    llvm_init_object_target(build.options.target)
+    let machine = llvm_create_object_target(build) !>
+
+    each build.lists.units as unit {
+        if unit.ir_code.length == 0 : continue
+        let dir = object_output_dir(build) !>
+        unit.path_o = helper:add(dir, unit.name + ".o")
+        unit.path_ir = helper:add(dir, unit.name + ".ir")
+
+        let unchanged = !build.options.is_clean_build
+            && fs:exists(unit.path_o)
+            && helper:file_has_same_content(unit.path_ir, unit.ir_code)
+        if unchanged {
+            unit.ir_code = ""
+            continue
+        }
+
+        if build.options.verbose > 1 {
+            println("> Generating object file: " + unit.path_o)
+        }
+        emit_unit_object(build, unit, machine) !>
+        // Only publish the IR cache entry after LLVM successfully created the
+        // matching object. A failed emission therefore cannot mark a stale or
+        // missing object as current on the next build.
+        fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write cached LLVM IR: " + unit.path_ir)
+        // The parsed AST was already released after per-function IR emission,
+        // and executable builds no longer need the textual module after its
+        // object has been produced.
+        unit.ir_code = ""
+    }
+
+    llvm:LLVMDisposeTargetMachine(machine)
+}
+
+fn object_output_dir(build: Build) String !Error {
+    if build.cache.object_dir.length > 0 : return build.cache.object_dir
+
+    let home = fs:home_dir() ! build.error("Cannot find the home directory for the object cache")
+    let root = helper:add(home, ".valk")
+    if !fs:is_dir(root) : fs:mkdir(root) ! build.error("Failed to create object cache directory: " + root)
+    root = helper:add(root, "cache")
+    if !fs:is_dir(root) : fs:mkdir(root) ! build.error("Failed to create object cache directory: " + root)
+
+    let identity = build.options.path_out ?? fs:cwd()
+    identity += "|"
+    identity += build.options.target.target
+    identity += build.options.optimize ? "|opt" : "|no-opt"
+    identity += build.options.debug ? "|debug" : "|no-debug"
+    identity += build.options.is_test ? "|test" : "|no-test"
+    let dir = helper:add(root, "rewrite-" + helper:ctxhash(identity))
+    if !fs:is_dir(dir) : fs:mkdir(dir) ! build.error("Failed to create object cache directory: " + dir)
+    build.cache.object_dir = dir
+    return dir
+}
+
+fn emit_unit_object(build: Build, unit: Unit, machine: llvm:LLVMTargetMachineRef) !Error {
+    let context = llvm:LLVMContextCreate()
+    llvm:LLVMContextSetOpaquePointers(context, true)
+    let name = unit.name + ".ll"
+    let buffer = llvm:LLVMCreateMemoryBufferWithMemoryRangeCopy(
+        unit.ir_code.data,
+        unit.ir_code.bytes,
+        name.data
+    )
+    let module: ?llvm:LLVMModuleRef = null
+    let message: ?cstring = null
+
+    if llvm:LLVMParseIRInContext(context, buffer, @ref(module), @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMContextDispose(context)
+        build.error("LLVM IR parse failed while emitting unit '" + unit.name + "':\n" + detail)
+    }
+    if !isset(module) {
+        llvm:LLVMContextDispose(context)
+        build.error("LLVM IR parser did not create a module while emitting unit: " + unit.name)
+    }
+
+    message = null
+    if llvm:LLVMVerifyModule(module, llvm:LLVMReturnStatusAction, @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMDisposeModule(module)
+        llvm:LLVMContextDispose(context)
+        build.error("LLVM IR verification failed while emitting unit '" + unit.name + "':\n" + detail)
+    }
+    if isset(message) {
+        llvm:LLVMDisposeMessage(message)
+        message = null
+    }
+
+    if build.options.optimize : optimize_object_module(module)
+    llvm_configure_object_module(build, module, machine)
+
+    if llvm:LLVMTargetMachineEmitToFile(machine, module, unit.path_o.data, llvm:LLVMObjectFile, @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMDisposeModule(module)
+        llvm:LLVMContextDispose(context)
+        build.error("LLVM failed to emit object for unit '" + unit.name + "':\n" + detail)
+    }
+
+    if isset(message) : llvm:LLVMDisposeMessage(message)
+    llvm:LLVMDisposeModule(module)
+    llvm:LLVMContextDispose(context)
+}
+
+fn llvm_message_text(message: ?cstring) String {
+    if !isset(message) : return "<no LLVM diagnostic>"
+    return message
+}
+
+fn optimize_object_module(module: llvm:LLVMModuleRef) {
+    let builder = llvm:LLVMPassManagerBuilderCreate()
+    llvm:LLVMPassManagerBuilderSetOptLevel(builder, 3)
+    llvm:LLVMPassManagerBuilderSetSizeLevel(builder, 0)
+    llvm:LLVMPassManagerBuilderUseInlinerWithThreshold(builder, 1000)
+
+    let func_passes = llvm:LLVMCreateFunctionPassManagerForModule(module)
+    let module_passes = llvm:LLVMCreatePassManager()
+    llvm:LLVMPassManagerBuilderPopulateFunctionPassManager(builder, func_passes)
+    llvm:LLVMPassManagerBuilderPopulateModulePassManager(builder, module_passes)
+    llvm:LLVMPassManagerBuilderDispose(builder)
+
+    llvm:LLVMInitializeFunctionPassManager(func_passes)
+    let func = llvm:LLVMGetFirstFunction(module)
+    while isset(func) {
+        llvm:LLVMRunFunctionPassManager(func_passes, func)
+        func = llvm:LLVMGetNextFunction(func)
+    }
+    llvm:LLVMFinalizeFunctionPassManager(func_passes)
+    llvm:LLVMRunPassManager(module_passes, module)
+    llvm:LLVMDisposePassManager(func_passes)
+    llvm:LLVMDisposePassManager(module_passes)
+}
+
+fn llvm_init_object_target(target: Target) {
+    if target.arch == "x64" {
+        llvm:LLVMInitializeX86TargetInfo()
+        llvm:LLVMInitializeX86Target()
+        llvm:LLVMInitializeX86TargetMC()
+        llvm:LLVMInitializeX86AsmPrinter()
+    } else {
+        llvm:LLVMInitializeAArch64TargetInfo()
+        llvm:LLVMInitializeAArch64Target()
+        llvm:LLVMInitializeAArch64TargetMC()
+        llvm:LLVMInitializeAArch64AsmPrinter()
+    }
+}
+
+fn llvm_create_object_target(build: Build) llvm:LLVMTargetMachineRef !Error {
+    let triple = ir_target_triple(build.options.target)
+    let target: ?llvm:LLVMTargetRef = null
+    let message: ?cstring = null
+    if llvm:LLVMGetTargetFromTriple(triple.data, @ref(target), @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        build.error("LLVM could not select target '" + triple + "': " + detail)
+    }
+    if !isset(target) : build.error("LLVM did not create a target for: " + triple)
+
+    let cpu = "generic"
+    let machine = llvm:LLVMCreateTargetMachine(
+        target,
+        triple.data,
+        cpu.data,
+        null,
+        llvm:LLVMCodeGenLevelDefault,
+        llvm:LLVMRelocPIC,
+        llvm:LLVMCodeModelDefault
+    )
+    if !isset(machine) : build.error("LLVM failed to create a target machine for: " + triple)
+    return machine
+}
+
+fn llvm_configure_object_module(build: Build, module: llvm:LLVMModuleRef, machine: llvm:LLVMTargetMachineRef) {
+    let triple = ir_target_triple(build.options.target)
+    llvm:LLVMSetTarget(module, triple.data)
+    let layout = llvm:LLVMCreateTargetDataLayout(machine)
+    let layout_text = llvm:LLVMCopyStringRepOfTargetData(layout)
+    llvm:LLVMSetDataLayout(module, layout_text)
+    llvm:LLVMDisposeMessage(layout_text)
+    llvm:LLVMDisposeTargetData(layout)
+}
