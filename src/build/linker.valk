@@ -3,25 +3,25 @@ use valk:core
 use valk:fs
 use valk:time
 
-// Link the per-Unit objects into a native Linux executable. Other target
-// families retain an explicit error until their legacy command shapes are
-// ported.
 fn link_unit_objects(build: Build) !Error {
     let start = time:microtime()
     let target = build.options.target
-    if target.os != "linux" || !target.host_is_target() {
-        build.error("The rewritten linker currently supports native Linux builds only")
-    }
 
     let output = build.options.path_out
     if isset(output) : output = helper:resolve(output)
     else : output = helper:add(object_output_dir(build) !>, "out")
     build.options.path_out = output
 
-    let dirs = linux_link_dirs(build)
+    let dirs = target_link_dirs(build)
     let missing = Array[String]{}
     let args = ByteBuffer.new(16384)
-    args.write_string("-pie -o \"")
+    if target.os == "win" {
+        args.write_string("/stack:8388608,65536 ")
+        if build.options.debug : args.write_string("/DEBUG ")
+        args.write_string("/out:\"")
+    } else {
+        args.write_string("-pie -o \"")
+    }
     args.write_string(output)
     args.write_string("\" ")
 
@@ -30,21 +30,48 @@ fn link_unit_objects(build: Build) !Error {
         args.write_string(" ")
     }
     each dirs as dir {
-        args.write_string("-L\"")
+        if target.os == "win" {
+            args.write_string("/libpath:\"")
+        } else if target.os == "macos" && dir.ends_with("Frameworks") {
+            args.write_string("-F\"")
+        } else {
+            args.write_string("-L\"")
+        }
         args.write_string(dir)
         args.write_string("\" ")
     }
 
-    let root = build.options.sysroot ?? "/"
-    args.write_string("--sysroot=\"")
-    args.write_string(root)
-    args.write_string("\" ")
-    if target.arch == "x64" {
-        args.write_string("-m elf_x86_64 --dynamic-linker /lib64/ld-linux-x86-64.so.2 ")
+    let bundled_target_dir = helper:add(
+        helper:add(helper:valk_lib_dir(), "libs"),
+        target.target
+    )
+    let root = build.options.sysroot ?? (!target.host_is_target() ? bundled_target_dir : "/")
+    if target.os == "linux" {
+        args.write_string("--sysroot=\"")
+        args.write_string(root)
+        args.write_string("\" ")
+        if target.arch == "x64" {
+            args.write_string("-m elf_x86_64 --dynamic-linker /lib64/ld-linux-x86-64.so.2 ")
+        } else {
+            args.write_string("-m aarch64linux --dynamic-linker /lib/ld-linux-aarch64.so.1 ")
+        }
+        args.write_string("-l:Scrt1.o -l:crti.o -l:crtbeginS.o ")
+    } else if target.os == "macos" {
+        args.write_string("-syslibroot \"")
+        args.write_string(root)
+        args.write_string("\" -arch ")
+        args.write_string(target.arch == "x64" ? "x86_64 " : "arm64 ")
+        args.write_string("-platform_version macos 11.0 15.0 ")
+    } else if target.os == "win" {
+        if isset(build.options.sysroot) {
+            args.write_string("/winsysroot:\"")
+            args.write_string(root)
+            args.write_string("\" ")
+        }
+        args.write_string("/nodefaultlib /guard:ehcont /machine:x64 ")
     } else {
-        args.write_string("-m aarch64linux --dynamic-linker /lib/ld-linux-aarch64.so.1 ")
+        build.error("Unsupported linker target: " + target.target)
     }
-    args.write_string("-l:Scrt1.o -l:crti.o -l:crtbeginS.o ")
 
     each build.lists.units as unit {
         if unit.path_o.length == 0 : continue
@@ -55,15 +82,21 @@ fn link_unit_objects(build: Build) !Error {
 
     each build.lists.links as link {
         if link.type == LINK_KIND.framework {
-            link.exp.error("Framework links are not supported for Linux targets")
+            if target.os != "macos" {
+                link.exp.error("Framework links are only supported for macOS targets")
+            }
+            args.write_string("-framework \"")
+            args.write_string(link.lib)
+            args.write_string("\" ")
+            continue
         }
-        linker_write_lib(args, link.lib, link.type == LINK_KIND.static, dirs, missing)
+        linker_write_lib(args, link.lib, link.type == LINK_KIND.static, dirs, missing, target)
     }
     each build.options.link_libs as lib {
-        linker_write_lib(args, lib, false, dirs, missing)
+        linker_write_lib(args, lib, false, dirs, missing, target)
     }
 
-    args.write_string("-l:crtendS.o -l:crtn.o ")
+    if target.os == "linux" : args.write_string("-l:crtendS.o -l:crtn.o ")
     each build.options.link_args_append as arg {
         args.write_string(arg)
         args.write_string(" ")
@@ -73,7 +106,11 @@ fn link_unit_objects(build: Build) !Error {
     let text = args.to_string()
     fs:write(argfile, text) ! build.error("Failed to write linker response file: " + argfile)
 
-    let command = "ld \"@" + argfile + "\""
+    let linker = "ld"
+    if target.os == "linux" && !target.host_is_target() : linker = "ld.lld"
+    else if target.os == "macos" : linker = "ld64.lld"
+    else if target.os == "win" : linker = "lld-link"
+    let command = linker + " \"@" + argfile + "\""
     if build.options.verbose > 1 {
         helper:msg("🔗", "Link cmd: " + command)
         each missing as name : println("> Warn: Library not found: " + name)
@@ -88,20 +125,31 @@ fn link_unit_objects(build: Build) !Error {
     build.stats.link_us = time:microtime() - start
 }
 
-fn linux_link_dirs(build: Build) Array[String] {
+fn target_link_dirs(build: Build) Array[String] {
     let dirs = Array[String]{}
     each build.options.link_dirs as dir : dirs.append(helper:resolve(dir), true)
 
-    if !build.options.no_system_libs {
-        dirs.append("/lib64", true)
-        dirs.append("/usr/lib64", true)
-        dirs.append("/usr/local/lib64", true)
-        dirs.append("/usr/lib", true)
-        dirs.append("/usr/local/lib", true)
-        if build.options.target.arch == "x64" {
-            dirs.append("/lib/x86_64-linux-gnu", true)
-        } else {
-            dirs.append("/lib/aarch64-linux-gnu", true)
+    let target = build.options.target
+    if !build.options.no_system_libs && target.host_is_target() {
+        if target.os == "linux" {
+            dirs.append("/lib64", true)
+            dirs.append("/usr/lib64", true)
+            dirs.append("/usr/local/lib64", true)
+            dirs.append("/usr/lib", true)
+            dirs.append("/usr/local/lib", true)
+            if target.arch == "x64" {
+                dirs.append("/lib/x86_64-linux-gnu", true)
+            } else {
+                dirs.append("/lib/aarch64-linux-gnu", true)
+            }
+        } else if target.os == "macos" {
+            dirs.append("/usr/local/lib", true)
+            dirs.append("/opt/homebrew/lib", true)
+            dirs.append("/System/Library/Frameworks", true)
+            dirs.append("/Library/Frameworks", true)
+            dirs.append("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib", true)
+            dirs.append("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks", true)
+            dirs.append("/usr/lib", true)
         }
     }
 
@@ -115,14 +163,27 @@ fn linux_link_dirs(build: Build) Array[String] {
             if dir.length > 0 : dirs.append(helper:resolve(helper:add(pkgdir, dir)), true)
         }
     }
+
+    // Keep Valk's bundled target libraries last so explicit CLI, system, and
+    // package directories always take precedence.
+    dirs.append(helper:add(helper:add(helper:valk_lib_dir(), "libs"), target.target), true)
     return dirs
 }
 
-fn linker_write_lib(out: ByteBuffer, raw_name: String, static: bool, dirs: Array[String], missing: Array[String]) {
+fn linker_write_lib(out: ByteBuffer, raw_name: String, static: bool, dirs: Array[String], missing: Array[String], target: Target) {
     let name = raw_name
     if name.starts_with(":") : name = name.part(1, name.length)
     let strict = name.contains(".")
     let is_path = name.contains("/") || name.contains("\\")
+
+    if target.os == "win" {
+        if is_path {
+            linker_write_quoted(out, name)
+        } else {
+            linker_write_quoted(out, strict ? name : (name + ".lib"))
+        }
+        return
+    }
 
     if static && !strict && !is_path {
         let filename = "lib" + name + ".a"
@@ -144,9 +205,11 @@ fn linker_write_lib(out: ByteBuffer, raw_name: String, static: bool, dirs: Array
             linker_write_quoted(out, path)
         } else {
             missing.append(name, true)
-            out.write_string("-l:")
-            out.write_string(name)
-            out.write_string(" ")
+            if target.os == "linux" {
+                out.write_string("-l:")
+                out.write_string(name)
+                out.write_string(" ")
+            }
         }
         return
     }

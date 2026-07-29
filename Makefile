@@ -85,10 +85,12 @@ test-win: valk
 
 test-macos-build: valk
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64 \
-	--sysroot toolchains/toolchains/macos-11-3
-	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64 \
-	--sysroot toolchains/toolchains/macos-11-3
+	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-x64 --target macos-x64
+	./valk build ./tests $(TEST_FLAGS) -vv $(FLAGS) -o ./debug/test-macos-arm64 --target macos-arm64
+
+test-win-build: valk
+	mkdir -p ./debug
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-win-x64.exe --target win-x64
 
 test-cross-ir: valk
 	mkdir -p ./debug
@@ -99,10 +101,10 @@ test-cross-ir: valk
 # Testing
 test-cross: valk
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target linux-x64
-	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target macos-x64
-	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target macos-arm64
-	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-all -vv $(FLAGS) --target win-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-linux-x64 -vv $(FLAGS) --target linux-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-x64 -vv $(FLAGS) --target macos-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-arm64 -vv $(FLAGS) --target macos-arm64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-win-x64.exe -vv $(FLAGS) --target win-x64
 
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
@@ -194,4 +196,4 @@ clean:
 	rm -f ./valk2
 # rm -rf ~/.valk/cache
 
-.PHONY: valk clean toolchains dist-all valkd static test linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
+.PHONY: valk clean toolchains dist-all valkd static test test-gc-debug test-gc-shared-stress test-macos-build test-win-build test-cross-ir test-cross linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
