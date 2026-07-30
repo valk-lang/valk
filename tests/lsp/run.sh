@@ -14,6 +14,17 @@
 set -u
 
 VALK="${VALK:-./valk}"
+
+# `timeout` is GNU coreutils; macOS ships neither it nor gtimeout by default.
+# The guard below only exists to stop a hung server from wedging CI, so running
+# without one is an acceptable fallback — the CI job has its own time limit.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT="timeout 60"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT="gtimeout 60"
+else
+    TIMEOUT=""
+fi
 DIR="$(cd "$(dirname "$0")" && pwd)"
 failed=0
 count=0
@@ -366,7 +377,7 @@ echo "> a message split across reads survives an answer in between"
 stream="$(frame "$init")$(frame "$(notify_save diag.valk)")$(frame "$(notify_open warn-flow.valk)")"
 # Timed: the same desync leaves bytes that can never parse, and the read loop
 # used to spin on them forever rather than stop at end of input.
-out=$(printf '%s' "$stream" | timeout 60 "$VALK" lsp run 2>&1)
+out=$(printf '%s' "$stream" | $TIMEOUT "$VALK" lsp run 2>&1)
 case "$out" in
     *"Variable 'dead' is assigned but never read"*) ;;
     *)
