@@ -181,6 +181,14 @@ check "warns about an unused variable" "\"severity\":2,\"message\":\"Variable 'l
 check "warns about an unused import" "\"severity\":2,\"message\":\"Namespace 'valk:mem' is imported but never used\"" \
     "$(notify_save warn.valk)"
 
+# The range has to be the declaration and nothing else. Looking for a continuation
+# of a value expression consumes the comments that follow it, so the parser ends
+# up lines past the statement; a span taken from there covered all of it, and the
+# editor underlined the comments too. warn.valk:22 is `    let leftover = 40`,
+# which is 21 characters.
+check "a warning's range ends on its own statement" '"range":{"start":{"line":21,"character":4},"end":{"line":21,"character":21}}' \
+    "$(notify_save warn.valk)"
+
 # The CLI half of the same split, here for the same reason as the one-error case
 # above: the two outputs come from one list of Messages and have to stay apart.
 #
