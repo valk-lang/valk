@@ -4,7 +4,11 @@ use helper
 // per-function lifecycle: resolve AST -> emit textual IR -> release AST.
 
 fn generate_unit_modules(build: Build) !Error {
+    mark_reachable(build) !>
     each build.lists.units as unit {
+        // A unit nothing reaches produces no module, and therefore no object
+        // file for the linker to be handed (see linker.valk).
+        if !unit.is_used : continue
         unit.ir_code = generate_unit_module(build, unit) !>
     }
 }
@@ -21,7 +25,10 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     out.write_string("declare void @llvm.memset.inline.p0.i64(ptr, i8, i64, i1)\n")
     out.write_string("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n")
 
+    // Constants keep their index in the name, so skipping one leaves the rest
+    // addressable as before.
     each unit.string_values as value, i {
+        if !(unit.string_used.get(i) !? false) : continue
         ir_write_string_constant(out, i, value)
     }
     if unit.string_values.length > 0 : out.write_string("\n")
@@ -32,6 +39,8 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     // a single module (--release / --ir) is rejected as a redefinition.
     let declared_externs = Map[bool]{}
     each unit.extern_functions as func {
+        // Recorded while lowering any function of this unit, reachable or not.
+        if !func.info_used : continue
         if func.is_extern {
             if declared_externs.has(func.name) : continue
             declared_externs.set(func.name, true)
@@ -42,7 +51,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     // their body is materialized. Keep the module valid with a declaration;
     // once generated, their non-empty ir_code below replaces this path.
     each unit.functions as func {
-        if func.is_extern || func.is_generic_base : continue
+        if func.is_extern || func.is_generic_base || !func.info_used : continue
         if func.ir_code.length > 0 : continue
         ir_write_func_signature(out, func, true) !>
     }
@@ -52,6 +61,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     // storage. Explicit global defaults will be lowered in the next pass.
     let declared_global_externs = Map[bool]{}
     each unit.globals as global {
+        if !global.is_used : continue
         let type = global.get_type() !>
         let external = global.is_extern
         // Same as extern functions: one declaration per raw C symbol
@@ -74,6 +84,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
         out.write_string("\n")
     }
     each unit.extern_globals as global {
+        if !global.is_used : continue
         out.write_string("@\"")
         out.write_string(global_ir_name(global))
         out.write_string("\" = external ")
@@ -87,7 +98,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     ir_write_allocator_helpers(out, build, unit) !>
 
     each unit.functions as func {
-        if func.is_extern || func.is_generic_base : continue
+        if func.is_extern || func.is_generic_base || !func.info_used : continue
         if func.ir_code.length == 0 : continue
         out.write_string(func.ir_code)
     }
@@ -98,7 +109,7 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
     each build.lists.allocator_init_sites as site {
         let func = site.ctx.func
         if !isset(func) : continue
-        if func.unit != unit : continue
+        if func.unit != unit || !func.info_used : continue
         each build.lists.allocators as allocator {
             let global = allocator.global
             if global.unit != unit : unit.extern_globals.append(global, true)
@@ -127,7 +138,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
     each build.lists.allocator_init_sites as site {
         let owner = site.ctx.func
         if !isset(owner) : continue
-        if owner.unit != unit : continue
+        if owner.unit != unit || !owner.info_used : continue
 
         each build.lists.allocators as allocator, i {
             let props_func = allocator.props_func
@@ -540,7 +551,7 @@ fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
     let idf = valk_idf(func.ns.build, "coro", "gc_stack_sp") !>
     let global = idf.global
     if !isset(global) : func.exp.bug("coro:gc_stack_sp is not a global")
-    if global.unit != func.unit : func.unit.extern_globals.append(global, true)
+    ir_use_global(ir, global)
 
     let global_name = "@\"" + global_ir_name(global) + "\""
     let frame_size = func.alloca_size + 16
@@ -662,6 +673,45 @@ fn ir_emit_error_return(ir: IRFunc, rendered: String, rett: Type, code: String) 
     ir.write(" ")
     ir.write(result)
     ir.line_end()
+}
+
+// Record that the function currently being written refers to `func`, and
+// declare it when the definition lives in another module. Every reference to a
+// function symbol goes through here, so the recorded edges are exactly the
+// call graph of the generated code — which is what reachable.valk walks.
+fn ir_use_func(ir: IRFunc, func: Func) {
+    ir.func.functions_used.append(func, true)
+    if func.unit != ir.func.unit || func.is_extern {
+        ir.func.unit.extern_functions.append(func, true)
+    }
+}
+
+// Same for a global. `declare`s go to extern_globals when it is defined elsewhere.
+fn ir_use_global(ir: IRFunc, global: Global) {
+    ir.func.globals_used.append(global, true)
+    if global.unit != ir.func.unit {
+        ir.func.unit.extern_globals.append(global, true)
+    }
+}
+
+// True when this module already holds `name`, in which case the caller reuses
+// it rather than writing a second definition under the same symbol. Its owner
+// becomes reachable along with the referrer, because the adapter's text sits in
+// that owner's ir_code and would otherwise be dropped from the module.
+fn ir_reuse_adapter(ir: IRFunc, name: String) bool {
+    ir.func.unit.closure_adapters.get(name) -> owner {
+        ir.func.functions_used.append(owner, true)
+        return true
+    }
+    return false
+}
+
+// Intern a string literal in the current module and record the use, so an
+// unreachable function's literals are not emitted as constants.
+fn ir_use_string(ir: IRFunc, value: String) uint {
+    let index = ir.func.unit.add_string(value)
+    ir.func.strings_used.append(index, true)
+    return index
 }
 
 fn func_ir_name(func: Func) String {
@@ -924,9 +974,7 @@ fn ir_emit_stable_stack_init(ir: IRFunc, stack_decl: Decl, size: uint) !Error {
     let pools_idf = valk_idf(build, "gc", "pools") !>
     let pools = pools_idf.global
     if !isset(pools) : at.bug("gc:pools is not a global")
-    if pools.unit != ir.func.unit {
-        ir.func.unit.extern_globals.append(pools, true)
-    }
+    ir_use_global(ir, pools)
 
     let pools_type = pools.get_type() !>
     let pool_type = pools_type.sub_type
@@ -936,9 +984,7 @@ fn ir_emit_stable_stack_init(ir: IRFunc, stack_decl: Decl, size: uint) !Error {
     let pool_get = pool_class.get_func("get")
     if !isset(pool_get) : at.bug("gc:Pool.get is missing")
     if !pool_get.parsed_types : parse_func_types(pool_get) !>
-    if pool_get.unit != ir.func.unit || pool_get.is_extern {
-        ir.func.unit.extern_functions.append(pool_get, true)
-    }
+    ir_use_func(ir, pool_get)
 
     let index = ir_pool_index(size, build.options.target.ptr_size.to(uint))
     let pool_address = ir.var()
@@ -1130,9 +1176,7 @@ fn ir_emit_gc_property_update(ir: IRFunc, value: Value, owner: String, address: 
     let update = idf.func
     if !isset(update) : value.bug("gc:property_update is not a function")
     if !update.parsed_types : parse_func_types(update) !>
-    if update.unit != ir.func.unit || update.is_extern {
-        ir.func.unit.extern_functions.append(update, true)
-    }
+    ir_use_func(ir, update)
     ir.line("call void @\"" + func_ir_name(update) + "\"(ptr " + owner + ", ptr " + address + ", ptr " + result + ")")
 }
 
@@ -1141,9 +1185,7 @@ fn ir_emit_gc_share_null_check(ir: IRFunc, value: Value, result: String) !Error 
     let func = idf.func
     if !isset(func) : value.bug("gc:share_null_check is not a function")
     if !func.parsed_types : parse_func_types(func) !>
-    if func.unit != ir.func.unit || func.is_extern {
-        ir.func.unit.extern_functions.append(func, true)
-    }
+    ir_use_func(ir, func)
     ir.line("call void @\"" + func_ir_name(func) + "\"(ptr " + result + ")")
 }
 
@@ -1172,9 +1214,7 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
     if value.type == VAL.global {
         let global = value.global
         if !isset(global) : value.bug("IR global value is missing its Global")
-        if global.unit != ir.func.unit {
-            ir.func.unit.extern_globals.append(global, true)
-        }
+        ir_use_global(ir, global)
         return "@\"" + global_ir_name(global) + "\""
     }
     if value.type == VAL.prop {
@@ -1279,9 +1319,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
                 if func.is_literal {
                     return "@\"" + (ir_emit_fnptr_adapter(ir, value, func) !>) + "\""
                 }
-                if func.unit != ir.func.unit || func.is_extern {
-                    ir.func.unit.extern_functions.append(func, true)
-                }
+                ir_use_func(ir, func)
                 return "@\"" + func_ir_name(func) + "\""
             }
         }
@@ -1483,7 +1521,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             each payload as field {
                 let global = et.payload_globals.get(field.name) !? null
                 if !isset(global) : value.bug("Error payload global is missing: " + et.name + "." + field.name)
-                if global.unit != ir.func.unit : ir.func.unit.extern_globals.append(global, true)
+                ir_use_global(ir, global)
                 let rendered = ir_emit_value(ir, field) !>
                 ir.line("store " + (ir_type(field.rett) !>) + " " + rendered + ", ptr @\"" + global_ir_name(global) + "\"")
             }
@@ -1527,7 +1565,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if isset(runtime_value) : return ir_emit_value(ir, runtime_value) !>
     }
     if t == VAL.string || t == VAL.property_meta {
-        let index = ir.func.unit.add_string(value.string_val)
+        let index = ir_use_string(ir, value.string_val)
         let out = ir.var()
         ir.line(out + " = getelementptr i8, ptr @\"valk.str." + index + "\", i64 8")
         return out
@@ -1535,9 +1573,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.func {
         let func = value.func
         if !isset(func) : value.bug("IR function value has no resolved function")
-        if func.unit != ir.func.unit || func.is_extern {
-            ir.func.unit.extern_functions.append(func, true)
-        }
+        ir_use_func(ir, func)
         if value.rett.type == TYPE.fn {
             return ir_emit_closure(ir, value, func) !>
         }
@@ -2012,7 +2048,7 @@ fn ir_store_caught_error(ir: IRFunc, value: Value, code: String) !Error {
     each payloads as payload_decl, name {
         let global = error_type.payload_globals.get(name) !? null
         if !isset(global) : continue
-        if global.unit != ir.func.unit : ir.func.unit.extern_globals.append(global, true)
+        ir_use_global(ir, global)
         let type = ir_type(payload_decl.type) !>
         let loaded = ir.var()
         ir.line(loaded + " = load " + type + ", ptr @\"" + global_ir_name(global) + "\"")
@@ -2024,7 +2060,7 @@ fn ir_error_default(ir: IRFunc, type: Type) String !Error {
     let string_class = type_string(ir.func.ns.build).get_class_or_null()
     let class = type.get_class_or_null()
     if isset(string_class) && class == string_class {
-        let index = ir.func.unit.add_string("")
+        let index = ir_use_string(ir, "")
         let out = ir.var()
         ir.line_start()
         ir.write(out)
@@ -2044,7 +2080,7 @@ fn ir_default_pass_payloads(ir: IRFunc, value: Value, from: ?ErrorType, to: ?Err
         if isset(from) && from.payload.has(name) : continue
         let global = to.payload_globals.get(name) !? null
         if !isset(global) : value.bug("Error payload global is missing: " + to.name + "." + name)
-        if global.unit != ir.func.unit : ir.func.unit.extern_globals.append(global, true)
+        ir_use_global(ir, global)
         let fallback = ir_error_default(ir, ptype) !>
         ir.line_start()
         ir.write("store ")
@@ -2063,10 +2099,8 @@ fn ir_emit_error_panic(ir: IRFunc, value: Value) !Error {
     let panic_func = idf.func
     if !isset(panic_func) : value.bug("core:panic is not a function")
     if !panic_func.parsed_types : parse_func_types(panic_func) !>
-    if panic_func.unit != ir.func.unit || panic_func.is_extern {
-        ir.func.unit.extern_functions.append(panic_func, true)
-    }
-    let index = ir.func.unit.add_string("Unhandled error")
+    ir_use_func(ir, panic_func)
+    let index = ir_use_string(ir, "Unhandled error")
     let msg = ir.var()
     ir.line_start()
     ir.write(msg)
@@ -2273,9 +2307,7 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
     let allocator = value.allocator
     if isset(allocator) {
         let global = allocator.global
-        if global.unit != ir.func.unit {
-            ir.func.unit.extern_globals.append(global, true)
-        }
+        ir_use_global(ir, global)
         let pool_type = global.get_type() !>
         let pool_class = pool_type.get_class_or_null()
         if !isset(pool_class) : value.bug("Generated allocator global is not a Pool")
@@ -2283,9 +2315,7 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
         let pool_get = pool_class.get_func(method_name)
         if !isset(pool_get) : value.bug("gc:Pool has no '" + method_name + "' method")
         if !pool_get.parsed_types : parse_func_types(pool_get) !>
-        if pool_get.unit != ir.func.unit || pool_get.is_extern {
-            ir.func.unit.extern_functions.append(pool_get, true)
-        }
+        ir_use_func(ir, pool_get)
 
         let pool = ir.var()
         ir.line(pool + " = load " + (ir_type(pool_type) !>) + ", ptr @\"" + global_ir_name(global) + "\"")
@@ -2301,9 +2331,7 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
         let alloc = idf.func
         if !isset(alloc) : value.bug("mem:alloc_ob is not a function")
         if !alloc.parsed_types : parse_func_types(alloc) !>
-        if alloc.unit != ir.func.unit || alloc.is_extern {
-            ir.func.unit.extern_functions.append(alloc, true)
-        }
+        ir_use_func(ir, alloc)
         let result = ir.var()
         ir.line(result + " = call " + (ir_type(alloc.get_rett()) !>) + " @\"" + func_ir_name(alloc) + "\"(i64 " + size + ")")
         return result
@@ -2314,11 +2342,9 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
 
 fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
     let name = "valk.closure.adapter." + func_ir_name(func)
-    if parent.func.unit.closure_adapters.contains(name) : return name
-    parent.func.unit.closure_adapters.append(name)
-    if func.unit != parent.func.unit || func.is_extern {
-        parent.func.unit.extern_functions.append(func, true)
-    }
+    ir_use_func(parent, func)
+    if ir_reuse_adapter(parent, name) : return name
+    parent.func.unit.closure_adapters.set(name, parent.func)
 
     let ir = IRFunc {
         func: parent.func
@@ -2395,8 +2421,9 @@ fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Err
 
 fn ir_emit_fnptr_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
     let name = "valk.fnptr.adapter." + func_ir_name(func)
-    if parent.func.unit.closure_adapters.contains(name) : return name
-    parent.func.unit.closure_adapters.append(name)
+    ir_use_func(parent, func)
+    if ir_reuse_adapter(parent, name) : return name
+    parent.func.unit.closure_adapters.set(name, parent.func)
 
     let ir = IRFunc {
         func: parent.func
@@ -2503,7 +2530,8 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     }
 
     let target_name = func_ir_name(func)
-    if !func.is_literal : target_name = ir_emit_closure_adapter(ir, value, func) !>
+    if func.is_literal : ir_use_func(ir, func)
+    else : target_name = ir_emit_closure_adapter(ir, value, func) !>
 
     let capture_base: uint = 0
     let receiver = value.value1
@@ -2619,9 +2647,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         if callee.type == VAL.func {
             let direct_func = callee.func
             if isset(direct_func) {
-                if direct_func.unit != ir.func.unit || direct_func.is_extern {
-                    ir.func.unit.extern_functions.append(direct_func, true)
-                }
+                ir_use_func(ir, direct_func)
                 target = "@\"" + func_ir_name(direct_func) + "\""
             } else {
                 target = ir_emit_value(ir, callee) !>
@@ -2719,9 +2745,7 @@ fn ir_coro_func(ir: IRFunc, value: Value, class: Class, name: String) Func !Erro
     let func = class.get_func(name)
     if !isset(func) : value.bug("coro:Coro has no function named '" + name + "'")
     if !func.parsed_types : parse_func_types(func) !>
-    if func.unit != ir.func.unit || func.is_extern {
-        ir.func.unit.extern_functions.append(func, true)
-    }
+    ir_use_func(ir, func)
     return func
 }
 
@@ -2792,9 +2816,7 @@ fn ir_coro_append_gc(ir: IRFunc, value: Value, gc_args: String, item: String) !E
     let append = array_class.get_append_hook()
     if !isset(append) : value.bug("Coro.gc_args Array has no append hook")
     if !append.parsed_types : parse_func_types(append) !>
-    if append.unit != ir.func.unit || append.is_extern {
-        ir.func.unit.extern_functions.append(append, true)
-    }
+    ir_use_func(ir, append)
     ir.line_start()
     if !append.get_rett().is_void_type() {
         let ignored = ir.var()
@@ -2851,9 +2873,7 @@ fn ir_coro_pop_gc(ir: IRFunc, value: Value, gc_args: String) String !Error {
     let pop = array_class.get_func("pop_first")
     if !isset(pop) : value.bug("Coro.gc_args Array has no pop_first function")
     if !pop.parsed_types : parse_func_types(pop) !>
-    if pop.unit != ir.func.unit || pop.is_extern {
-        ir.func.unit.extern_functions.append(pop, true)
-    }
+    ir_use_func(ir, pop)
     let raw = ir.var()
     ir.line_start()
     ir.write(raw)
@@ -2900,9 +2920,7 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
     let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
     let current_global = current_idf.global
     if !isset(current_global) : value.bug("coro:current_coro is not a global")
-    if current_global.unit != ir.func.unit {
-        ir.func.unit.extern_globals.append(current_global, true)
-    }
+    ir_use_global(ir, current_global)
 
     let arg_types = Array[Type]{}
     let arg_values = Array[String]{}
@@ -3018,9 +3036,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
     let current_global = current_idf.global
     if !isset(current_global) : value.bug("coro:current_coro is not a global")
-    if current_global.unit != parent.func.unit {
-        parent.func.unit.extern_globals.append(current_global, true)
-    }
+    ir_use_global(parent, current_global)
 
     let ir = IRFunc {
         func: parent.func
@@ -3049,9 +3065,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         let stack_idf = valk_idf(value.rett.build, "coro", "gc_stack_sp") !>
         let stack_global = stack_idf.global
         if !isset(stack_global) : value.bug("coro:gc_stack_sp is not a global")
-        if stack_global.unit != parent.func.unit {
-            parent.func.unit.extern_globals.append(stack_global, true)
-        }
+        ir_use_global(parent, stack_global)
         root_global = "@\"" + global_ir_name(stack_global) + "\""
         root_previous = ir.var()
         root_values = ir.var()
@@ -3325,9 +3339,7 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
     let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
     let current_global = current_idf.global
     if !isset(current_global) : value.bug("coro:current_coro is not a global")
-    if current_global.unit != ir.func.unit {
-        ir.func.unit.extern_globals.append(current_global, true)
-    }
+    ir_use_global(ir, current_global)
     if ir.func.is_entrance {
         let loop = ir_coro_func(ir, value, class, "loop") !>
         ir.line_start()
