@@ -407,6 +407,25 @@ fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
 // ---- Body value constructors ----
 
+// Drop the non-null facts a loop body invalidates, keeping the rest.
+//
+// A loop runs zero or more times and can leave through `break`, so a fact established
+// before it only survives when the body never assigns the declaration a possibly-null
+// value. The body's sticky record (loop_invalidated) is what matters, not its final
+// state: `if c { x = null; break }` followed by `x = "b"` ends the body with the fact
+// re-established, yet the break edge leaves the loop with x null.
+//
+// Note the body is parsed with these facts still in place, so code inside the loop
+// trusts them; a body that invalidates a fact only after using it can still defeat
+// that. Closing it needs a loop fixed-point (or a pre-pass over the body's assignment
+// targets) and is unchanged here — this decides only what holds after the loop.
+fn scope_clear_facts_invalidated_by(scope: Scope, body_scope: Scope) {
+    let loop_facts = scope.not_null.copy()
+    each loop_facts as decl {
+        if body_scope.loop_invalidated.contains(decl) : scope.clear_not_null(decl)
+    }
+}
+
 fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let b = ctx.build
     let names = exp.list
@@ -520,13 +539,13 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     return vgen_return(retv, b, exp)
 }
 
-// Return from a value scope: collect into vscope_retvs / unify vscope_rett.
+// Return from a value scope: collect into vscope_returns / unify vscope_rett.
 fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: Exp, value_exp: ?Exp) Value !Error {
     let b = ctx.build
     if !isset(value_exp) {
         exp.error("Value scope return must have a value")
     }
-    let retvs = vscope.vscope_retvs ?! exp.bug("Missing value scope return values")
+    let returns = vscope.vscope_returns ?! exp.bug("Missing value scope return values")
     let known = vscope.vscope_rett
     let ret_ctx = ctx.without_suggested_type()
     if isset(known) : ret_ctx = ctx.with_suggested_type(known)
@@ -534,6 +553,22 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
     let retv = value_from_exp(value_exp, scope, ret_ctx) !>
     if isset(known) {
         if !retv.rett.is_void_type() && !known.is_void_type() {
+            // A branch returning a nullable value widens the result to `?T`, even when
+            // the expectation came from a declaration or an argument. The mismatch is
+            // then reported where the scope is used — `let x: String = <{ … }` points at
+            // the assignment — instead of being buried on an inner return.
+            // Returns collected before the widening are re-wrapped so every incoming
+            // edge of the phi carries the widened representation: `?T` and `T` differ
+            // for inline types, so this cannot be a rett-only change.
+            if retv.rett.is_nullable_type() && !known.is_nullable_type() {
+                known = known.nullable()
+                vscope.vscope_rett = known
+                each returns as prev {
+                    let pv = prev.value1
+                    if !isset(pv) : exp.bug("Value scope return has no value")
+                    prev.value1 = value_make_nullable(pv, prev.exp ?? exp) !>
+                }
+            }
             retv = value_try_convert(retv, scope, ctx, known)
             let at = retv.exp ?? exp
             known.compat_check(retv.rett, at) !>
@@ -542,10 +577,11 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
         retv = value_try_remove_nullable(retv, scope, ctx)
         vscope.vscope_rett = retv.rett
     }
-    retvs.append(retv)
     scope.did_return = true
     // Represent as a return of the value (IR later jumps to vscope after-block)
-    return vgen_return(retv, b, exp)
+    let ret = vgen_return(retv, b, exp)
+    returns.append(ret)
+    return ret
 }
 
 fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
@@ -674,6 +710,22 @@ fn value_from_if_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Va
         }
     }
 
+    // A fact invalidated on a reachable path cannot survive the if: after
+    // `if c { x = null }` the declaration is only maybe-set again. Each branch
+    // scope records its final state, so a branch that assigns null and later
+    // re-assigns non-null reports the fact, not the invalidation. Clearing runs
+    // before the merge below so a fact both branches re-establish still wins.
+    if !then_scope.did_return {
+        each then_scope.not_null_removed as decl {
+            scope.clear_not_null(decl)
+        }
+    }
+    if !es.did_return {
+        each es.not_null_removed as decl {
+            scope.clear_not_null(decl)
+        }
+    }
+
     // Facts after the if are those guaranteed by every reachable branch.
     if then_scope.did_return {
         scope.apply_issets(es.not_null)
@@ -712,14 +764,7 @@ fn value_from_while_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp)
     if isset(body_exp) {
         body_vals = body_values_from_nested(ctx, body_scope, state, body_exp) !>
     }
-    // A loop may execute zero or more times and may leave through `break`.
-    // Unless we have a full loop fixed-point analysis, facts established before
-    // it cannot safely be used afterwards: the body may assign the declaration
-    // to null on an exit path.
-    let loop_facts = scope.not_null.copy()
-    each loop_facts as decl {
-        scope.clear_not_null(decl)
-    }
+    scope_clear_facts_invalidated_by(scope, body_scope)
     return vgen_while(cond, body_vals, b, exp)
 }
 
@@ -847,10 +892,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         user_vals = body_values_from_nested(ctx, body_scope, state, body_exp) !>
     }
 
-    let loop_facts = scope.not_null.copy()
-    each loop_facts as decl {
-        scope.clear_not_null(decl)
-    }
+    scope_clear_facts_invalidated_by(scope, body_scope)
 
     let body_vals = Array[Value]{ bind_init, advance }
     body_vals.append_many(user_vals)
