@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -25,11 +25,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn race_lock() void
 + fn race_unlock() void
 + fn raise(code: i32) void
-+ fn read_big_endian(from: ptr[u8], bytes: uint) uint
-+ fn read_little_endian(from: ptr[u8], bytes: uint) uint
++ fn read_big_endian(from: ptr, bytes: uint) uint
++ fn read_little_endian(from: ptr, bytes: uint) uint
 + fn signal_ignore(sig: int) void
-+ fn write_big_endian(to: ptr[u8], v: uint, bytes: uint) void
-+ fn write_little_endian(to: ptr[u8], v: uint, bytes: uint) void
++ fn write_big_endian(to: ptr, v: uint, bytes: uint) void
++ fn write_little_endian(to: ptr, v: uint, bytes: uint) void
 ```
 
 ## Classes for 'core'
@@ -49,13 +49,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
     + fn equal_ignore_order(array: Array[T]) bool
-    + fn filter(func: ?fn(T)(bool) (...)) Array[T]
+    + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn fit_index(index: uint) void
+    + static fn from_json_value_auto[X](val: X) Array[T]
     + fn get(index: uint) T !LookupError
     + fn increase_size(new_size: uint) GcPtr
     + fn index_of(item: T) uint !LookupError
     + fn intersect(with: Array[T]) Array[T]
     + fn iter() Slice[T]
+    + fn join(divider: String) String
     + fn lock() void
     + fn merge(items: Array[T]) Array[T]
     + static fn new(start_size: uint (2)) Array[T]
@@ -72,7 +74,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
     + fn slice(start: uint, amount: uint) Slice[T]
-    + fn sort(func: ?fn(T, T)(bool) (...)) Array[T]
+    + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn to_json_value() Value
     + fn unique() Array[T]
@@ -143,9 +145,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8
     + fn read_cstring() String
+    + fn read_float() float
     + fn read_hex_int() uint
     + fn read_hex_uint() uint
-    + fn read_int() uint
+    + fn read_int() int
     + fn read_little_endian(bytes: uint) uint
     + fn read_octal_int() uint
     + fn read_octal_uint() uint
@@ -233,12 +236,20 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
++ class Process {
+    + fn did_exit() bool
+    + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !ExternError
+    + fn stop() void
+}
+```
+
+```js
 + class String {
     ~ bytes: uint
 
-    + fn contains(part: String) bool
-    + fn contains_byte(byte: u8) bool
-    + fn data() ptr[u8]
+    + fn contains(part: String, start_index: uint (0)) bool
+    + fn contains_byte(byte: u8, start_index: uint (0)) bool
+    + fn data() ptr
     + fn data_cstring() cstring
     + fn ends_with(part: String) bool
     + fn escape() String
@@ -252,7 +263,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_alpha_numeric(allow_extra_bytes: String ("")) bool
     + fn is_empty() bool
     + fn is_integer() bool
+    + fn is_lower() bool
     + fn is_number() bool
+    + fn is_syntax(mask: String, mask_is_exclude: bool (false)) bool
+    + fn is_upper() bool
     + fn length() uint
     + fn lower() String
     + fn ltrim(part: String, limit: uint (0)) String
@@ -263,6 +277,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn pad_left(char: u8, length: uint) String
     + fn pad_right(char: u8, length: uint) String
     + fn part(start_index: uint, length: uint) String
+    + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
     + fn range(start: uint, end: uint, inclusive: bool (true)) String
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String
@@ -343,16 +358,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i16) void
     + static fn random() i16
-    + static fn read_big_endian(from: ptr[u8 x 2]) i16
-    + static fn read_little_endian(from: ptr[u8 x 2]) i16
+    + static fn read_big_endian(from: ptr) i16
+    + static fn read_little_endian(from: ptr) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
     + fn to_base(base: i16) String
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i16, to: ptr[u8 x 2]) void
-    + static fn write_little_endian(v: i16, to: ptr[u8 x 2]) void
+    + static fn write_big_endian(v: i16, to: ptr) void
+    + static fn write_little_endian(v: i16, to: ptr) void
 }
 ```
 
@@ -362,16 +377,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i32) void
     + static fn random() i32
-    + static fn read_big_endian(from: ptr[u8 x 4]) i32
-    + static fn read_little_endian(from: ptr[u8 x 4]) i32
+    + static fn read_big_endian(from: ptr) i32
+    + static fn read_little_endian(from: ptr) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
     + fn to_base(base: i32) String
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i32, to: ptr[u8 x 4]) void
-    + static fn write_little_endian(v: i32, to: ptr[u8 x 4]) void
+    + static fn write_big_endian(v: i32, to: ptr) void
+    + static fn write_little_endian(v: i32, to: ptr) void
 }
 ```
 
@@ -381,16 +396,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i64) void
     + static fn random() i64
-    + static fn read_big_endian(from: ptr[u8 x 8]) i64
-    + static fn read_little_endian(from: ptr[u8 x 8]) i64
+    + static fn read_big_endian(from: ptr) i64
+    + static fn read_little_endian(from: ptr) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
     + fn to_base(base: i64) String
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i64, to: ptr[u8 x 8]) void
-    + static fn write_little_endian(v: i64, to: ptr[u8 x 8]) void
+    + static fn write_big_endian(v: i64, to: ptr) void
+    + static fn write_little_endian(v: i64, to: ptr) void
 }
 ```
 
@@ -400,16 +415,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i8) void
     + static fn random() i8
-    + static fn read_big_endian(from: ptru8) i8
-    + static fn read_little_endian(from: ptru8) i8
+    + static fn read_big_endian(from: ptr) i8
+    + static fn read_little_endian(from: ptr) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
     + fn to_base(base: i8) String
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i8, to: ptru8) void
-    + static fn write_little_endian(v: i8, to: ptru8) void
+    + static fn write_big_endian(v: i8, to: ptr) void
+    + static fn write_little_endian(v: i8, to: ptr) void
 }
 ```
 
@@ -419,16 +434,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: int) void
     + static fn random() int
-    + static fn read_big_endian(from: ptr[u8 x 8]) int
-    + static fn read_little_endian(from: ptr[u8 x 8]) int
+    + static fn read_big_endian(from: ptr) int
+    + static fn read_little_endian(from: ptr) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
     + fn to_base(base: int) String
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: int, to: ptr[u8 x 8]) void
-    + static fn write_little_endian(v: int, to: ptr[u8 x 8]) void
+    + static fn write_big_endian(v: int, to: ptr) void
+    + static fn write_little_endian(v: int, to: ptr) void
 }
 ```
 
@@ -436,6 +451,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class ptr {
     + fn clear_bytes(amount: uint) void
     + fn create_string(length: uint) String
+    + fn determine_float_length(max_bytes: uint) uint
     + fn determine_hex_int_length(max_bytes: uint) uint
     + fn determine_hex_uint_length(max_bytes: uint) uint
     + fn determine_int_length(max_bytes: uint) uint
@@ -452,6 +468,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_byte() u8
     + fn read_cstring(memory_size: uint) String
     + fn read_cstring_inf() String
+    + fn read_float(len: uint) float !SyntaxError
+    + fn read_float_dynamic(max_bytes: uint) (float, uint)
     + fn read_hex_int(len: uint) int !SyntaxError
     + fn read_hex_int_dynamic(max_bytes: uint) (int, uint)
     + fn read_hex_uint(len: uint) uint !SyntaxError
@@ -480,7 +498,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_buffer_all(buf: ByteBuffer, offset: uint (0)) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
     + fn write_from_ptr(from: ptr, len: uint) void
-    + fn write_int_ascii(v: int, base: u8 (10)) uint
+    + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint
     + fn write_little_endian(value: uint, bytes: uint) void
     + fn write_string(str: String) void
     + fn write_u16_be(v: u16) void
@@ -490,7 +508,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_u64_be(v: u64) void
     + fn write_u64_le(v: u64) void
     + fn write_u8(v: u8) void
-    + fn write_uint_ascii(v: uint, base: u8 (10)) uint
+    + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) uint
     + fn write_uint_be(v: uint) void
     + fn write_uint_le(v: uint) void
 }
@@ -502,16 +520,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u16) void
     + static fn random() u16
-    + static fn read_big_endian(from: ptr[u8 x 2]) u16
-    + static fn read_little_endian(from: ptr[u8 x 2]) u16
+    + static fn read_big_endian(from: ptr) u16
+    + static fn read_little_endian(from: ptr) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
     + fn to_base(base: u16) String
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u16, to: ptr[u8 x 2]) void
-    + static fn write_little_endian(v: u16, to: ptr[u8 x 2]) void
+    + static fn write_big_endian(v: u16, to: ptr) void
+    + static fn write_little_endian(v: u16, to: ptr) void
 }
 ```
 
@@ -521,16 +539,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u32) void
     + static fn random() u32
-    + static fn read_big_endian(from: ptr[u8 x 4]) u32
-    + static fn read_little_endian(from: ptr[u8 x 4]) u32
+    + static fn read_big_endian(from: ptr) u32
+    + static fn read_little_endian(from: ptr) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
     + fn to_base(base: u32) String
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u32, to: ptr[u8 x 4]) void
-    + static fn write_little_endian(v: u32, to: ptr[u8 x 4]) void
+    + static fn write_big_endian(v: u32, to: ptr) void
+    + static fn write_little_endian(v: u32, to: ptr) void
 }
 ```
 
@@ -540,16 +558,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u64) void
     + static fn random() u64
-    + static fn read_big_endian(from: ptr[u8 x 8]) u64
-    + static fn read_little_endian(from: ptr[u8 x 8]) u64
+    + static fn read_big_endian(from: ptr) u64
+    + static fn read_little_endian(from: ptr) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
     + fn to_base(base: u64) String
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u64, to: ptr[u8 x 8]) void
-    + static fn write_little_endian(v: u64, to: ptr[u8 x 8]) void
+    + static fn write_big_endian(v: u64, to: ptr) void
+    + static fn write_little_endian(v: u64, to: ptr) void
 }
 ```
 
@@ -573,8 +591,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_whitespace() bool
     + fn print(base: u8) void
     + static fn random() u8
-    + static fn read_big_endian(from: ptru8) u8
-    + static fn read_little_endian(from: ptru8) u8
+    + static fn read_big_endian(from: ptr) u8
+    + static fn read_little_endian(from: ptr) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
     + fn to_ascii_string() String
@@ -583,8 +601,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn to_hex() String
     + fn to_str() String
     + fn unescape() u8
-    + static fn write_big_endian(v: u8, to: ptru8) void
-    + static fn write_little_endian(v: u8, to: ptru8) void
+    + static fn write_big_endian(v: u8, to: ptr) void
+    + static fn write_little_endian(v: u8, to: ptr) void
 }
 ```
 
@@ -594,16 +612,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: uint) void
     + static fn random() uint
-    + static fn read_big_endian(from: ptr[u8 x 8]) uint
-    + static fn read_little_endian(from: ptr[u8 x 8]) uint
+    + static fn read_big_endian(from: ptr) uint
+    + static fn read_little_endian(from: ptr) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
     + fn to_base(base: uint) String
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: uint, to: ptr[u8 x 8]) void
-    + static fn write_little_endian(v: uint, to: ptr[u8 x 8]) void
+    + static fn write_big_endian(v: uint, to: ptr) void
+    + static fn write_little_endian(v: uint, to: ptr) void
 }
 ```
 
@@ -628,10 +646,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void
 + fn bcrypt_hash(password: String, cost: uint (12)) String
 + fn bcrypt_verify(password: String, hash: String) bool
-+ fn blowfish_encrypt_block(context: BlowfishContext, input: ptr[u8], output: ptr[u8]) void
-+ fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !valk:crypto:CryptoError
++ fn blowfish_encrypt_block(context: BlowfishContext, input: ptr, output: ptr) void
++ fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
 + fn blowfish_init_state(context: BlowfishContext) void
-+ fn blowfish_xor_block(data: &[u8], salt: ByteBuffer, saltIndex: &[uint]) void
++ fn blowfish_xor_block(data: &u8, salt: ByteBuffer, saltIndex: &uint) void
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```
@@ -640,10 +658,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Blake2b {
-    + fn finalize(out: ptr[u8]) void
-    + static fn hash_str(input: String, key: ?String (null), lowercase: bool (true)) String !valk:crypto:CryptoError
-    + static fn new(hash_size: uint, key: ?String (null)) Blake2b !valk:crypto:CryptoError
-    + fn update(data: ptr[u8], length: uint) void
+    + fn finalize(out: ptr) void
+    + static fn hash_str(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
+    + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
+    + fn update(data: ptr, length: uint) void
 }
 ```
 
@@ -654,8 +672,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Sha1 {
-    + fn add_hash_data(data: &[u8 x 20]) void
-    + fn add_raw_data_unsafe(data: ptr[u8], len: uint) void
+    + fn add_hash_data(data: &u8) void
+    + fn add_raw_data_unsafe(data: ptr, len: uint) void
     + fn add_string_data(str: String) void
     + fn final() [u8 x 20]
     + fn reset() void
@@ -664,8 +682,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Sha256 {
-    + fn add_hash_data(data: &[u8 x 32]) void
-    + fn add_raw_data_unsafe(data: ptr[u8], len: uint) void
+    + fn add_hash_data(data: &u8) void
+    + fn add_raw_data_unsafe(data: ptr, len: uint) void
     + fn add_string_data(str: String) void
     + fn final() [u8 x 32]
     + fn reset() void
@@ -684,6 +702,26 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + global sbox4 : [u32 x 256]
 ```
 
+# ext
+
+## Aliases for 'ext'
+
+```js
+alias DIR for ptr
+alias FILE for ptr
+type libc_addrinfo (libc_gen_addrinfo)
+type libc_dirent (libc_gen_dirent)
+type libc_epoll_event (libc_gen_epoll_event)
+type libc_jmp_buf (libc_gen___jmp_buf_tag)
+type libc_pollfd (libc_gen_pollfd)
+type libc_sockaddr (libc_gen_sockaddr)
+type libc_stat (libc_gen_stat)
+type libc_timespec (libc_gen_timespec)
+type libc_timeval (libc_gen_timeval)
+type libc_timezone (libc_gen_timezone)
+alias pid_t for i32
+```
+
 # fs
 
 ## Functions for 'fs'
@@ -692,36 +730,36 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
 + fn chdir(path: String) void
-+ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !valk:io:IoError
++ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !IoError
 + fn cwd() String
-+ fn delete(path: String) void !valk:io:IoError
++ fn delete(path: String) void !IoError
 + fn delete_recursive(path: String) void
 + fn dir_of(path: String) String
 + fn exe_dir() String
 + fn exe_path() String
 + fn exists(path: String) bool
 + fn ext(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (...)) Array[String]
++ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String]
 + fn home_dir() String !ExternError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
 + fn mime(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (493)) void !valk:io:IoError
-+ fn modified_time(path: String) uint !valk:io:IoError
-+ fn move(from_path: String, to_path: String) void !valk:io:IoError
-+ fn open(path: String, writable: bool, append_on_write: bool) i32 !valk:io:IoError
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (420)) i32 !valk:io:IoError
++ fn mkdir(path: String, permissions: u32 (0c755)) void !IoError
++ fn modified_time(path: String) uint !IoError
++ fn move(from_path: String, to_path: String) void !IoError
++ fn open(path: String, writable: bool, append_on_write: bool) i32 !IoError
++ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !IoError
 + fn path(path: String) Path
-+ fn read(path: String) String !valk:io:IoError
++ fn read(path: String) String !IoError
 + fn realpath(path: String) String
 + fn resolve(path: String) String
-+ fn rmdir(path: String) void !valk:io:IoError
++ fn rmdir(path: String) void !IoError
 + fn size(path: String) uint
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !valk:io:IoError
-+ fn symlink(link: String, target: String, is_directory: bool) void !valk:io:IoError
++ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !IoError
++ fn symlink(link: String, target: String, is_directory: bool) void !IoError
 + fn sync() void
-+ fn write(path: String, content: String, append: bool (false)) void !valk:io:IoError
-+ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !valk:io:IoError
++ fn write(path: String, content: String, append: bool (false)) void !IoError
++ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !IoError
 ```
 
 ## Classes for 'fs'
@@ -733,10 +771,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ reading: bool
 
     + fn close() void
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !valk:io:IoError
-    + fn write(str: String) void !valk:io:IoError
-    + fn write_buffer(buffer: ByteBuffer) void !valk:io:IoError
-    + fn write_from_ptr(from: ptr, len: uint) void !valk:io:IoError
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !IoError
+    + fn write(str: String) void !IoError
+    + fn write_buffer(buffer: ByteBuffer) void !IoError
+    + fn write_from_ptr(from: ptr, len: uint) void !IoError
 }
 ```
 
@@ -746,7 +784,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ size: uint
 
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !valk:io:IoError
+    + static fn create_from_file(path: String) InMemoryFile !IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn save(path: String) void
 }
@@ -754,8 +792,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + mode Path for String {
-    ~ bytes: uint
-
     + fn add(part: String) Path
     + fn dir_of() Path
     + static fn new(path: String) Path
@@ -776,6 +812,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn collect_shared() void
 + fn collect_shared_if_threshold_reached() void
 + fn lock() void
++ fn mem_usage() uint
 + fn unlock() void
 ```
 
@@ -814,10 +851,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'http'
 
 ```js
-+ fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !valk:http:HttpError
-+ fn download(url: String, to_path: String, method: String (""), options: ?Options (null)) void !valk:http:HttpError
-+ fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !valk:http:HttpParseError
-+ fn request(method: String, url: String, options: ?Options (null)) ClientResponse !valk:http:HttpError
++ fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError
++ fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
++ fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !HttpParseError
++ fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
 ```
 
 ## Classes for 'http'
@@ -835,9 +872,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ response_received: bool
     ~ sent_percent: uint
 
-    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !valk:http:HttpError
-    + fn progress() bool !valk:http:HttpError
-    + fn response() ClientResponse !valk:http:HttpError
+    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError
+    + fn progress() bool !HttpError
+    + fn response() ClientResponse !HttpError
 }
 ```
 
@@ -873,6 +910,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn body() String
     + fn data() Map[String]
+    + fn data_json() Value
     + fn files() Map[InMemoryFile]
     + fn headers() Map[String]
     + fn params() Map[String]
@@ -905,6 +943,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn body() String
     + fn data() Map[String]
+    + fn data_json() Value
     + fn files() Map[InMemoryFile]
     + fn headers() Map[String]
     + fn params() Map[String]
@@ -916,15 +955,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class Response {
     + body: String
     + content_type: String
+    + extra_headers: ?Array[String]
     + headers: ?Map[String]
     + status: u32
 
+    + fn add_header(name: String, value: String) void
     + static fn empty(code: u32, headers: ?Map[String] (null)) Response
     + static fn file(path: String, filename: ?String (null)) Response
     + static fn html(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
     + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
-    + static fn redirect(location: String, code: u32 (301), headers: ?Map[String] (null)) Response
-    + static fn text(body: String, code: u32 (200), content_type: String (""), headers: ?Map[String] (null)) Response
+    + static fn redirect(location: String, code: u32 (302), headers: ?Map[String] (null)) Response
+    + fn set_header(name: String, value: String, extend_existing: bool (false)) void
+    + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Map[String] (null)) Response
 }
 ```
 
@@ -932,7 +974,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class ResponseWriter {
     ~ responded: bool
 
-    + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null)) void
+    + static fn code_name(code: uint) String
+    + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null), extra_headers: ?Array[String] (null)) void
     + fn send_file(path: String, custom_filename: ?String (null)) void
     + fn send_file_stream(stream: FileStream, filename: ?String (null)) void
     + fn send_status(status_code: uint) void
@@ -963,12 +1006,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + show_info: bool
 
     + fn add_static_dir(path: String) void !LookupError
-    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !valk:http:HttpError
+    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !HttpError
     + fn start(worker_count: i32 (-1)) void
 }
 ```
 
 # io
+
+## Aliases for 'io'
+
+```js
+alias FD for i32
+```
 
 ## Functions for 'io'
 
@@ -979,15 +1028,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn print(msg: String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !valk:io:IoError
-+ fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !valk:io:IoError
-+ fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !valk:io:IoError
-+ fn set_mode(fd: i32, mode: valk:io:MODE(int)) void
++ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
++ fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
++ fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
++ fn set_mode(fd: i32, mode: int) void
 + fn set_non_block(fd: i32, value: bool) void
-+ fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !valk:io:IoError
-+ fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !valk:io:IoError
-+ fn write_from_ptr_sync(fd: i32, buf: ptr, amount: uint) uint !valk:io:IoError
-+ fn write_string(fd: i32, str: String) uint !valk:io:IoError
++ fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
++ fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !IoError
++ fn write_from_ptr_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
++ fn write_string(fd: i32, str: String) uint !IoError
 ```
 
 # json
@@ -995,9 +1044,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: String) Value !valk:json:ParseError
++ fn decode(json: String) Value !ParseError
 + fn encode(data: $T, pretty: bool (false), output: ?StringComposer (null), depth: uint (0)) StringComposer
 + fn encode_to_string(data: $T, pretty: bool (false)) String
++ fn new(type: int) Value
 + fn new_array(values: ?Array[Value] (null)) Value
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
@@ -1006,6 +1056,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn new_object(values: ?Map[Value] (null)) Value
 + fn new_string(text: String) Value
 + fn new_uint(value: uint) Value
++ fn to_type[T](data: Value) T
 + fn value(data: $T) Value
 ```
 
@@ -1040,11 +1091,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !valk:net:NetError
-+ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !valk:net:NetError
-+ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !valk:net:NetError
-+ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !valk:net:NetError
-+ fn send_string(fd: i32, str: String) uint !valk:net:NetError
++ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !NetError
++ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !NetError
++ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !NetError
++ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !NetError
++ fn send_string(fd: i32, str: String) uint !NetError
 ```
 
 ## Classes for 'net'
@@ -1054,7 +1105,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ data: libc_gen_addrinfo
 
     + fn addr_len() u32
-    + static fn new(host: String, port: u16) AddrInfo !valk:net:NetError
+    + static fn new(host: String, port: u16) AddrInfo !NetError
     + fn sock_addr() libc_gen_sockaddr
 }
 ```
@@ -1068,11 +1119,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn close() void
     + static fn new(fd: i32) Connection
-    + fn recv(buffer: ByteBuffer, bytes: uint) uint !valk:net:NetError
-    + fn send(data: String) void !valk:net:NetError
-    + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !valk:net:NetError
-    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !valk:net:NetError
-    + fn ssl_connect(ssl: SSL) void !valk:net:NetError
+    + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
+    + fn send(data: String) void !NetError
+    + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !NetError
+    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
+    + fn ssl_connect(ssl: SSL) void !NetError
 }
 ```
 
@@ -1086,18 +1137,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ fd: i32
     ~ ssl: OSSL
 
-    + fn connect(fd: i32) void !valk:net:NetError
-    + fn custom_error(msg: String) void !valk:net:NetError
+    + fn connect(fd: i32) void !NetError
+    + fn custom_error(msg: String) void !NetError
     + static fn default_ca_cert_paths() Array[String]
     + fn get_error() uint
     + fn get_error_message() String
     + static fn new() SSL
-    + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !valk:net:NetError
-    + fn set_ca_cert(path: ?String) void !valk:net:NetError
-    + fn set_ca_cert_dir(dir: ?String) void !valk:net:NetError
+    + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !NetError
+    + fn set_ca_cert(path: ?String) void !NetError
+    + fn set_ca_cert_dir(dir: ?String) void !NetError
     + fn set_host(host: String) void
     + fn set_verify(enable: bool) void
-    + fn write(from: ptr, len: uint) uint !valk:net:NetError
+    + fn write(from: ptr, len: uint) uint !NetError
 }
 ```
 
@@ -1107,10 +1158,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ host: String
     ~ port: u16
 
-    + static fn client(type: valk:net:SOCKET_TYPE(int), host: String, port: u16) Connection !valk:net:NetError
+    + static fn client(type: int, host: String, port: u16) Connection !NetError
     + fn close() void
     + static fn close_fd(fd: i32) void
-    + static fn server(type: valk:net:SOCKET_TYPE(int), host: String, port: u16) SocketServer !valk:net:NetError
+    + static fn server(type: int, host: String, port: u16) SocketServer !NetError
 }
 ```
 
@@ -1118,7 +1169,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class SocketServer {
     ~ socket: Socket
 
-    + fn accept() Connection !valk:net:NetError
+    + fn accept() Connection !NetError
     + fn close() void
 }
 ```
@@ -1128,7 +1179,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'template'
 
 ```js
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !valk:template:Error
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
 + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String
 + fn set_content(name: String, content: String) void
 + fn set_content_many(content: Map[String]) void
@@ -1212,5 +1263,51 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + query: String
     + scheme: String
 }
+```
+
+# validate
+
+## Functions for 'validate'
+
+```js
++ fn email(email: String) bool
+```
+
+## Classes for 'validate'
+
+```js
++ class Field {
+    + static fn array(of: ?Field) Field
+    + static fn bool() Field
+    + fn custom(func: fn(Value)(bool), error: String) Field
+    + fn default(val: $T) Field
+    + fn email() Field
+    + fn equals_string(str: ?String) Field
+    + static fn float() Field
+    + fn fmax(val: int) Field
+    + fn fmin(val: int) Field
+    + fn get_form_rules() Value
+    + static fn int() Field
+    + fn is_syntax(mask: String, mask_is_exclude: bool (false)) Field
+    + fn lower(val: bool (true)) Field
+    + fn max(val: int) Field
+    + fn min(val: int) Field
+    + fn nullable(value: bool (true)) Field
+    + static fn object(fields: ?Map[Field]) Field
+    + fn optional(value: bool (true)) Field
+    + static fn string() Field
+    + static fn translate_errors(errors: Map[String], translations: Map[String] (default_translations)) void
+    + fn try_cast(data: Value) Value
+    + fn upper(val: bool (true)) Field
+    + fn username(numbers: bool, underscore: bool) Field
+    + fn validate(data: Value, errors: ?Map[String] (null), field_name: ?String (null)) bool
+    + fn validate_and_translate(data: Value, errors: Map[String], translations: Map[String] (default_translations)) bool
+}
+```
+
+## Globals for 'validate'
+
+```js
++ global default_translations : Map[String]
 ```
 

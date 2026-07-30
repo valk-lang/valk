@@ -5,10 +5,13 @@ use valk:fs
 
 // Generate documentation for every namespace of the package being built.
 //
-// Runs on a `--docs` Build: aliases, class properties and function signatures are
-// resolved, but no function body is lowered. Everything below therefore reads the
-// compiler's own Class/Func/Global objects, and default argument values come
-// straight from their source span instead of being re-parsed.
+// Runs on a `--docs` Build: class properties and function signatures are resolved,
+// but no function body is lowered. Everything below therefore reads the compiler's
+// own Class/Func/Global objects, and default argument values come straight from
+// their source span instead of being re-parsed.
+//
+// Aliases are reported as aliases (`alias A for B`, `type A (B)`) rather than
+// followed, so a name never documents a second copy of what it points at.
 fn doc_gen(b: build:Build) {
     let options = b.options
     let no_private = options.docs_no_private
@@ -32,7 +35,9 @@ fn doc_gen(b: build:Build) {
         }
     }
     each b.scope.idfs() as idf, name {
-        let ns = idf_namespace(idf)
+        // A `$global` alias records its own declaring namespace; anything else on
+        // the build scope is placed by the declaration it points at.
+        let ns = b.lists.global_alias_ns.get(name) !? idf_namespace(idf)
         if !isset(ns) : continue
         if isset(main_pkg) && ns.pkg != main_pkg : continue
         doc_section(sections, ns.name).add(idf, name, no_private)
@@ -42,6 +47,7 @@ fn doc_gen(b: build:Build) {
         // Namespaces that document nothing are left out entirely
         if section.count == 0 : continue
         let space = json:new_object()
+        space.set("aliases", section.aliases)
         space.set("classes", section.classes)
         space.set("functions", section.funcs)
         space.set("globals", section.globals)
@@ -67,27 +73,80 @@ class DocSection {
     classes: json:Value
     funcs: json:Value
     globals: json:Value
+    aliases: json:Value
     count: uint (0)
 
     fn add(idf: build:Idf, name: String, no_private: bool) {
+        // `alias A for B` re-binds B's own Idf under the name A, so an entry whose
+        // binding name differs from the declaration's name is an alias. Reporting
+        // it as one keeps `alias pid_t for i32` from documenting a second copy of
+        // every i32 method under the name pid_t.
         if idf.type == build:IDF.class {
             let class = idf.class
             if !isset(class) : return
             if no_private && is_private(class.act) : return
-            this.classes.set(name, jclass(class, no_private))
+            if class.name != name {
+                this.add_alias(name, "alias", class_display_name(class))
+                return
+            }
+            this.classes.set(name, jclass(doc_class_for(class), no_private))
         } else if idf.type == build:IDF.func {
             let func = idf.func
             if !isset(func) : return
             if no_private && is_private(func.act) : return
-            this.funcs.set(name, jfunc(func))
+            if func.name != name {
+                this.add_alias(name, "alias", func.name)
+                return
+            }
+            this.funcs.set(name, jfunc(doc_func_for(func)))
         } else if idf.type == build:IDF.global {
             let g = idf.global
             if !isset(g) : return
             if no_private && is_private(g.act) : return
+            if g.name != name {
+                this.add_alias(name, "alias", g.name)
+                return
+            }
             this.globals.set(name, jglobal(g))
+        } else if idf.type == build:IDF.type {
+            // `type Name (T)` — a name bound straight to a type
+            let of_type = idf.of_type
+            if !isset(of_type) : return
+            this.add_alias(name, "type", of_type.compat_display_name())
+            return
+        } else if idf.type == build:IDF.error_type {
+            let e = idf.error_type
+            if !isset(e) : return
+            if no_private && is_private(e.act) : return
+            if e.name != name : this.add_alias(name, "alias", e.name)
+            return
+        } else if idf.type == build:IDF.enum {
+            let en = idf.enum
+            if !isset(en) : return
+            if no_private && is_private(en.act) : return
+            if en.name != name : this.add_alias(name, "alias", en.name)
+            return
+        } else if idf.type == build:IDF.trait {
+            let t = idf.trait
+            if !isset(t) : return
+            if t.name != name : this.add_alias(name, "alias", t.name)
+            return
         } else {
             return
         }
+        this.count++
+    }
+
+    // `kind` is the source form: `alias Name for Target` or `type Name (Target)`.
+    //
+    // No access marker is reported: both forms bind the name to the target's own
+    // Idf (or to a bare Type), so the marker written on the alias declaration is
+    // not retained anywhere, and the target's marker describes the target.
+    fn add_alias(name: String, kind: String, target: String) {
+        let a = json:new_object()
+        a.set("kind", json:new_string(kind))
+        a.set("for", json:new_string(target))
+        this.aliases.set(name, a)
         this.count++
     }
 }
@@ -98,6 +157,7 @@ fn doc_section(sections: Map[DocSection], name: String) DocSection {
         classes: json:new_object()
         funcs: json:new_object()
         globals: json:new_object()
+        aliases: json:new_object()
     }
     sections.set(name, section)
     return section
@@ -114,15 +174,62 @@ fn idf_namespace(idf: build:Idf) ?build:Namespace {
     } else if idf.type == build:IDF.global {
         let g = idf.global
         if isset(g) : return g.ns
+    } else if idf.type == build:IDF.error_type {
+        let e = idf.error_type
+        if isset(e) : return e.ns
+    } else if idf.type == build:IDF.enum {
+        let en = idf.enum
+        if isset(en) : return en.ns
     }
     return null
+}
+
+// A generic base holds no members of its own: properties and methods are only
+// materialized on a specialization. To document `Array[T]` rather than an empty
+// shell, specialize it with a stand-in type per parameter, named after the
+// parameter itself, so every signature still reads in terms of T.
+//
+// Falls back to the base when specializing fails; an incomplete class beats no
+// documentation at all.
+fn doc_class_for(class: build:Class) build:Class {
+    if !class.is_generic_base : return class
+    let names = class.generic_names
+    if !isset(names) : return class
+    return class.specialize(generic_placeholders(class.ns.build, names), class.exp) !? class
+}
+
+// Same for `fn name[T](...)`: a generic base only binds its parameter names, so
+// its arguments and return type are resolved on the specialization.
+fn doc_func_for(func: build:Func) build:Func {
+    if !func.is_generic_base : return func
+    let names = func.generic_names
+    if !isset(names) : return func
+    return func.specialize(generic_placeholders(func.ns.build, names), func.exp) !? func
+}
+
+fn generic_placeholders(b: build:Build, names: Array[String]) Array[build:Type] {
+    let types = Array[build:Type]{}
+    each names as name {
+        types.append(build:Type {
+            type: build:TYPE.any
+            build: b
+            custom_name: name
+        })
+    }
+    return types
 }
 
 fn jclass(class: build:Class, no_private: bool) json:Value {
     let c = json:new_object()
     c.set("act", json:new_string(act_str(class.act)))
 
+    // `mode_for` is resolved on the declaration, so a specialization made for
+    // documentation reads it from the base it came from.
     let mode_for = class.mode_for_class
+    if !isset(mode_for) {
+        let base = class.generic_from
+        if isset(base) : mode_for = base.mode_for_class
+    }
     if isset(mode_for) {
         c.set("mode_for", json:new_string(class_display_name(mode_for)))
     }
@@ -150,7 +257,9 @@ fn jclass(class: build:Class, no_private: bool) json:Value {
     let funcs = json:new_object()
     each class.funcs as func, name {
         if no_private && is_private(func.act) : continue
-        funcs.set(name, jfunc(func))
+        // A generic method (`fn map[U](...)`) needs the same treatment as a
+        // generic class before its signature is available.
+        funcs.set(name, jfunc(doc_func_for(func)))
     }
     c.set("functions", funcs)
 
