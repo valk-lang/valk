@@ -21,6 +21,11 @@ count=0
 echo ""
 echo "# Test LSP"
 
+# Scratch dir for the cases that need a file of their own: copies to format, and
+# output paths for the builds that check the CLI half of a diagnostic.
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+
 if [ ! -x "$VALK" ] && [ ! -f "$VALK" ]; then
     echo "Error: compiler not found: $VALK"
     exit 1
@@ -167,6 +172,63 @@ if [ "$cli_errors" -ne 1 ]; then
     failed=1
 fi
 
+# Warnings are diagnostics too. A file that compiles cleanly still gets reported
+# on, and severity 2 is what makes the editor show them as warnings instead of
+# errors.
+check "warns about an unused variable" "\"severity\":2,\"message\":\"Variable 'leftover' was declared but never used\"" \
+    "$(notify_save warn.valk)"
+check "warns about an unused import" "\"severity\":2,\"message\":\"Namespace 'valk:mem' is imported but never used\"" \
+    "$(notify_save warn.valk)"
+
+# The CLI half of the same split, here for the same reason as the one-error case
+# above: the two outputs come from one list of Messages and have to stay apart.
+#
+# The count is exact on purpose. warn.valk uses everything else it declares, so
+# over-reporting fails here, and one of the three warnings sits in a generic body
+# that is resolved once per specialization — reporting it twice fails too.
+count=$((count + 1))
+echo "> CLI prints the warnings, and --no-warn suppresses them"
+# Matched on the message rather than the ⚠️ prefix, which helper:msg drops when
+# the terminal has no ansi support.
+warn_out=$("$VALK" build "$DIR/warn.valk" -o "$workdir/warn" 2>&1)
+warn_count=$(printf '%s\n' "$warn_out" | grep -c 'never used')
+if [ "$warn_count" -ne 3 ]; then
+    echo "# CLI should report 3 warnings, got $warn_count"
+    echo "$warn_out"
+    failed=1
+fi
+# One line each, with a path:line:col a terminal can turn into a link
+case "$warn_out" in
+    *"never used @ $DIR/warn.valk:22:5"*) ;;
+    *)
+        echo "# A warning should report its location on the same line"
+        echo "$warn_out"
+        failed=1
+        ;;
+esac
+nowarn_out=$("$VALK" build "$DIR/warn.valk" --no-warn -o "$workdir/warn-nw" 2>&1)
+case "$nowarn_out" in
+    *"never used"*)
+        echo "# --no-warn should suppress every warning"
+        echo "$nowarn_out"
+        failed=1
+        ;;
+esac
+
+# Building for one platform must not report what another one needs. Both the
+# import and the local in this fixture are referenced only from a `#if` branch,
+# so on the target that compiles the branch out they look unused and are not.
+count=$((count + 1))
+echo "> conditionally compiled code is not reported as unused"
+cond_out=$("$VALK" build "$DIR/warn-conditional.valk" -o "$workdir/warn-cond" 2>&1)
+case "$cond_out" in
+    *"never used"*)
+        echo "# A reference inside a compiled-out branch still counts as a reference"
+        echo "$cond_out"
+        failed=1
+        ;;
+esac
+
 # Hover reports what the compiler resolved, including inferred types
 check "hover on a function" '"value":"```valk\nfn helper(count: uint, label: String) String\n```"' \
     "$(request textDocument/hover nav.valk 7 14)"
@@ -179,9 +241,6 @@ check "hover on an inferred local" '"value":"```valk\nString\n```"' \
 # order-dependent: a regression that rewrote the file in place would leave it
 # already formatted for whatever ran next, and the check below would see no
 # change and pass.
-workdir=$(mktemp -d)
-trap 'rm -rf "$workdir"' EXIT
-
 # request_path <method> <abs-file>
 request_path() {
     printf '{"jsonrpc":"2.0","id":2,"method":"%s","params":{"textDocument":{"uri":"file://%s"}}}' "$1" "$2"
