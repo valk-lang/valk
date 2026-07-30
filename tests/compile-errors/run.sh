@@ -15,11 +15,21 @@ fi
 
 # Read the file line by line
 while IFS=';' read -r file msg; do
-    # Remove any trailing whitespace from var2
-    msg=$(echo "$msg" | xargs)
+    # Trim surrounding whitespace. Deliberately not `xargs`, which also parses
+    # quotes: an expected message containing an apostrophe ("it's defined as
+    # private") made xargs fail and emit only the text before the quote, so those
+    # cases silently shrank to matching a single word.
+    msg="${msg#"${msg%%[![:space:]]*}"}"
+    msg="${msg%"${msg##*[![:space:]]}"}"
 
     if [[ "$file" == "#"* ]]; then
         continue  # Skips to next iteration
+    fi
+
+    # An empty expectation matches any output, which would make the case vacuous
+    if [[ -z "$msg" ]]; then
+        echo "# No expected error message for '$file' in $FILEPATH"
+        exit 1
     fi
 
     count=$((count+1))
