@@ -121,6 +121,27 @@ esac
 check "scope completion" '"label":"total"' \
     "$(request textDocument/completion nav.valk 7 15)"
 
+# Every broken function is reported, not just the first. The CLI deliberately
+# prints only one error; that half of the split is checked below.
+check "diagnostics report every broken function (1/3)" '"message":"Unknown identifier: bad_one_xyz"' \
+    "$(notify_save multi-error.valk)"
+check "diagnostics report every broken function (2/3)" '"message":"Unknown identifier: bad_two_xyz"' \
+    "$(notify_save multi-error.valk)"
+check "diagnostics report every broken function (3/3)" "Expected 'uint', got 'String'" \
+    "$(notify_save multi-error.valk)"
+
+# The CLI half of the same split: collecting many errors must not make the
+# command line print more than one.
+count=$((count + 1))
+echo "> CLI prints exactly one error for the same file"
+cli_out=$("$VALK" build "$DIR/multi-error.valk" --no-warn 2>&1)
+cli_errors=$(printf '%s\n' "$cli_out" | grep -c '^# Error')
+if [ "$cli_errors" -ne 1 ]; then
+    echo "# CLI should report exactly one error, got $cli_errors"
+    echo "$cli_out"
+    failed=1
+fi
+
 echo ""
 if [ "$failed" -ne 0 ]; then
     echo "# LSP tests failed"
