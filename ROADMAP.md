@@ -5,14 +5,12 @@
 
 ```
 - Release 0.2.0
-- Rewrite valk parser
-- Each on nullable value (shouldnt work) / auto wrap with if isset()
-- "default" token in class scope = default value for this type
-- Defer statements
-- Remove 'Token' class in compiler and use Value with 'void' return type instead
++ Rewrite entire compiler
++ valk code formatter
 
 # Upcoming version
-/
+- "default" token in class scope = default value for this type
+- Defer statements
 
 # Next steps
 
