@@ -135,6 +135,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
++ class ByteBufferRef {
+    + fn clear() void
+    + fn data() ptr
+    + fn equals(cmp: String) bool
+    + static fn new(buffer: ByteBuffer, offset: uint, length: uint) ByteBufferRef
+    + fn to_str() String
+}
+```
+
+```js
 + class ByteReader {
     + buf: ByteBuffer
     + pos: uint
@@ -240,6 +250,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn did_exit() bool
     + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !ExternError
     + fn stop() void
+}
+```
+
+```js
++ class Slice[T] {
+    + data: GcPtr
+    + length: uint
+
+    + fn append(item: T) Slice[T]
+    + fn get(index: uint) T !LookupError
+    + fn set(index: uint, value: T) void !LookupError
+    + fn set_all(value: T) void
 }
 ```
 
@@ -1058,6 +1080,57 @@ alias FD for i32
 + fn new_uint(value: uint) Value
 + fn to_type[T](data: Value) T
 + fn value(data: $T) Value
+```
+
+## Classes for 'json'
+
+```js
++ class Value {
+    + array_values: ?Array[Value]
+    + bool_value: bool
+    + float_value: float
+    + int_value: int
+    + object_values: ?Map[Value]
+    + string_value: String
+    + type: int
+
+    + fn append(val: $T) void
+    + fn array() Array[Value]
+    + fn bool() bool
+    + fn compose_json(str: StringComposer, pretty: bool, depth: uint) void
+    + fn encode(pretty: bool (false)) String
+    + fn float() float
+    + fn get(key: String) Value !LookupError
+    + fn get_index(index: uint) Value
+    + fn get_or(key: String, or: ?fn()(Value) (null)) Value
+    + fn get_or_set(key: String, or: ?fn()(Value) (null)) Value
+    + fn has(key: String) bool
+    + fn int() int
+    + fn is_array() bool
+    + fn is_bool() bool
+    + fn is_float() bool
+    + fn is_int() bool
+    + fn is_null() bool
+    + fn is_number() bool
+    + fn is_object() bool
+    + fn is_string() bool
+    + fn length() uint
+    + fn map() Map[Value]
+    + fn prepend(val: $T) void
+    + fn remove(key: String) void
+    + fn remove_index(index: uint) void
+    + fn set(key: String, val: $T) void
+    + fn set_array(key: String, values: Array[Value]) Value
+    + fn set_bool(key: String, value: bool) Value
+    + fn set_null(key: String) Value
+    + fn set_number_float(key: String, value: float) Value
+    + fn set_number_int(key: String, value: int) Value
+    + fn set_number_uint(key: String, value: uint) Value
+    + fn set_object(key: String, values: Map[Value]) Value
+    + fn set_string(key: String, value: String) Value
+    + fn string() String
+    + fn to_type[T]() T
+}
 ```
 
 # markdown
