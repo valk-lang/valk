@@ -210,6 +210,18 @@ cp "$DIR/nav.valk" "$clean_copy"
 check "formatting a clean file returns no edits" '"result":[]' \
     "$(request_path textDocument/formatting "$clean_copy")"
 
+# Replies carry file content verbatim, so the JSON encoder has to be right about
+# bytes it does not recognise. A byte >= 0x80 was being sent as a backslash
+# followed by whatever the escape table happened to read past its end, which made
+# the whole reply unparseable and had the client shut the server down.
+unicode_copy="$workdir/unicode.valk"
+cp "$DIR/unicode.valk" "$unicode_copy"
+check "formatting keeps non-ASCII bytes intact" 'em dash — is three bytes' \
+    "$(request_path textDocument/formatting "$unicode_copy")"
+# Control characters have no short escape and must not go out raw either
+check "formatting escapes a control character" 'vertical tab \u000b has no' \
+    "$(request_path textDocument/formatting "$unicode_copy")"
+
 # didOpen alone publishes diagnostics, and the editor's buffer wins over disk
 check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identifier: buffer_only_xyz"' \
     "$(notify_open diag.valk 's/nope_xyz/buffer_only_xyz/')"
