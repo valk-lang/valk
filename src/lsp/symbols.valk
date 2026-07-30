@@ -1,0 +1,224 @@
+
+use build
+use valk:json
+
+// textDocument/documentSymbol — the outline, breadcrumbs and symbol search of one
+// file.
+//
+// Built from the compiler's own Class / Func / Global / Enum / … objects rather
+// than from a re-scan of the text, so what the outline lists is what the compiler
+// resolved. Every top-level declaration of a namespace lives on that namespace's
+// scope, which spans all of its files, so the file being asked about is selected
+// by comparing declaration source paths.
+//
+// Deliberately not gated on a clean build: an outline is most useful while the
+// file is broken, and declarations exist from the first stages, long before any
+// body is resolved.
+extend Lsp {
+    fn document_symbol() {
+        let data = this.data
+        let params = data.get_or("params")
+        let doc = params.get_or("textDocument")
+        let uri = doc.get_or("uri").string()
+        if uri.is_empty() : return
+        uri = uri.ltrim("file://")
+        this.file = uri
+        // No cursor: the request covers the whole document
+        this.line = 0
+        this.col = 0
+        this.build()
+    }
+
+    fn send_symbols(b: build:Build) {
+        let found = Array[Symbol]{}
+        let main_pkg = b.main_pkg
+
+        each b.lists.namespaces as ns {
+            if isset(main_pkg) && ns.pkg != main_pkg : continue
+            each ns.scope.idfs() as idf, name {
+                this.collect_symbol(found, idf, name)
+            }
+        }
+        // `$global` declarations (Array, String, Map, …) bind on the build scope
+        // instead of a namespace scope.
+        each b.scope.idfs() as idf, name {
+            this.collect_symbol(found, idf, name)
+        }
+
+        // Array.sort swaps when the comparator is true, so this asks "is a after b"
+        found.sort(fn(a: Symbol, b: Symbol) bool {
+            return a.i > b.i
+        })
+
+        let list = json:new_array()
+        each found as sym : list.append(sym.to_json())
+        this.success(list)
+    }
+
+    // Append the symbol `idf` declares, when it was written in the file being
+    // asked about.
+    //
+    // An `alias A for B` re-binds B's own Idf under the name A, so an entry whose
+    // binding name differs from the declaration's own name is an alias, not a
+    // declaration. Skipped: the outline would otherwise list a second copy of the
+    // target under the alias' name, at the target's position.
+    fn collect_symbol(found: Array[Symbol], idf: build:Idf, name: String) {
+        if idf.type == build:IDF.func {
+            let func = idf.func ?! return
+            if func.name != name : return
+            let sym = this.symbol_for(func.exp, name, sk_function, build:func_signature_label(func)) ?! return
+            found.append(sym)
+            return
+        }
+        if idf.type == build:IDF.class {
+            let class = idf.class ?! return
+            if class.name != name : return
+            let sym = this.symbol_for(class.exp, name, class_symbol_kind(class), "") ?! return
+            this.add_class_members(sym, class)
+            found.append(sym)
+            return
+        }
+        if idf.type == build:IDF.global {
+            let g = idf.global ?! return
+            if g.name != name : return
+            let type = g.type
+            let detail = isset(type) ? type.compat_display_name() : ""
+            let sym = this.symbol_for(g.exp, name, sk_variable, detail) ?! return
+            found.append(sym)
+            return
+        }
+        if idf.type == build:IDF.enum {
+            let en = idf.enum ?! return
+            if en.name != name : return
+            let sym = this.symbol_for(en.exp, name, sk_enum, "") ?! return
+            // EnumItem records no span of its own, so the variants cannot be
+            // placed and are named in the detail instead.
+            let names = Array[String]{}
+            each en.items as item : names.append(item.name)
+            sym.detail = names.join(", ")
+            found.append(sym)
+            return
+        }
+        if idf.type == build:IDF.error_type {
+            let e = idf.error_type ?! return
+            if e.name != name : return
+            let sym = this.symbol_for(e.exp, name, sk_enum, e.codes.join(", ")) ?! return
+            found.append(sym)
+            return
+        }
+        if idf.type == build:IDF.trait {
+            let t = idf.trait ?! return
+            if t.name != name : return
+            let sym = this.symbol_for(t.exp, name, sk_interface, "") ?! return
+            found.append(sym)
+            return
+        }
+    }
+
+    // Properties, methods and `group` members, nested under their class so the
+    // outline collapses to one entry per type.
+    fn add_class_members(sym: Symbol, class: build:Class) {
+        each class.props as prop {
+            let pname = prop.name ?! continue
+            let child = this.symbol_for(prop.exp, pname, sk_field, prop.type.compat_display_name(), pname) ?! continue
+            sym.children.append(child)
+        }
+        each class.funcs as func, fname {
+            if func.name != fname : continue
+            let child = this.symbol_for(func.exp, fname, sk_method, method_label(func)) ?! continue
+            sym.children.append(child)
+        }
+        each class.groups as group, gname {
+            let child = this.symbol_for(group.exp, gname, sk_namespace, "") ?! continue
+            each group.funcs as func, fname {
+                if func.name != fname : continue
+                let sub = this.symbol_for(func.exp, fname, sk_method, method_label(func)) ?! continue
+                child.children.append(sub)
+            }
+            sym.children.append(child)
+        }
+        sym.children.sort(fn(a: Symbol, b: Symbol) bool {
+            return a.i > b.i
+        })
+    }
+
+    // Null when `exp` was not written in the file being asked about, which is also
+    // how declarations from the namespace's other files are filtered out.
+    //
+    // `starts_with_name` extends the span backwards over that name when it really
+    // does precede the expression: a property Exp begins at its `:`, and an outline
+    // should put the cursor on the name rather than one character past it.
+    fn symbol_for(exp: build:Exp, name: String, kind: int, detail: String, starts_with_name: ?String (null)) ?Symbol {
+        let start = build:message_resolve(exp.src, exp.i)
+        let path = start.src.path ?! return null
+        if path != this.file : return null
+        let before = starts_with_name
+        if isset(before) && start.i >= before.bytes.to(u32) {
+            let from_i = start.i - before.bytes.to(u32)
+            if start.src.content.part(from_i.to(uint), before.bytes) == before {
+                start.i = from_i
+            }
+        }
+        let end = build:message_resolve(exp.src, exp.i + exp.len)
+        let from = build:message_line_col(start.src.content, start.i)
+        let to = build:message_line_col(end.src.content, end.i)
+        return Symbol {
+            name: name
+            detail: detail
+            kind: kind
+            i: start.i
+            line: from.line
+            col: from.col
+            end_line: to.line
+            end_col: to.col
+        }
+    }
+}
+
+// One entry of a documentSymbol reply.
+class Symbol {
+    name: String
+    detail: String
+    kind: int
+    // Byte offset of the declaration, for sorting into source order
+    i: u32
+    line: u32
+    col: u32
+    end_line: u32
+    end_col: u32
+    children: Array[Symbol] (.{})
+
+    fn to_json() json:Value {
+        let out = json:new_object()
+        out.set("name", json:new_string(this.name))
+        if !this.detail.is_empty() : out.set("detail", json:new_string(this.detail))
+        out.set("kind", json:new_int(this.kind))
+        // `range` is what the editor highlights for the whole declaration and
+        // `selectionRange` where it puts the cursor. The compiler keeps one span
+        // per declaration, so both report it; the protocol only requires that
+        // selectionRange be contained in range.
+        let range = json_range(this.line, this.col, this.end_line, this.end_col)
+        out.set("range", range)
+        out.set("selectionRange", range)
+        if this.children.length > 0 {
+            let kids = json:new_array()
+            each this.children as child : kids.append(child.to_json())
+            out.set("children", kids)
+        }
+        return out
+    }
+}
+
+// The receiver of an instance method is args[0] and is never written at a call
+// site, so the outline leaves it out the same way signature help does.
+fn method_label(func: build:Func) String {
+    return build:func_signature_label(func, func.is_static ? 0 : 1)
+}
+
+// A struct is its own SymbolKind; the rest of the class kinds (slice, pointer,
+// integer, …) are the primitive declarations the standard library builds on and
+// read as classes in an outline.
+fn class_symbol_kind(class: build:Class) int {
+    if class.kind == build:CLASS_KIND.struct : return sk_struct
+    return sk_class
+}

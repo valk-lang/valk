@@ -106,6 +106,7 @@ check() {
 
 # Capabilities are what tells an editor which requests to send at all.
 check "initialize advertises providers" '"definitionProvider":true'
+check "initialize advertises the outline" '"documentSymbolProvider":true'
 
 # An identifier that does not exist is reported on the line and columns it spans
 check "diagnostics on save" '"message":"Unknown identifier: nope_xyz"' \
@@ -215,6 +216,26 @@ case "$nowarn_out" in
         ;;
 esac
 
+# A store nothing ever reads, and a statement nothing can reach. Both are true of
+# code that compiles, and both are reported on the declaration or statement itself.
+check "warns about a write-only variable" "\"severity\":2,\"message\":\"Variable 'dead' is assigned but never read\"" \
+    "$(notify_save warn-flow.valk)"
+check "warns about unreachable code" '"severity":2,"message":"Unreachable code: this statement can never run"' \
+    "$(notify_save warn-flow.valk)"
+
+# Exact again, and for the same reason: warn-flow.valk collects the cases that
+# must stay quiet — a compound assignment, `++`, a single returning branch, a loop
+# whose body continues — next to the two that must not.
+count=$((count + 1))
+echo "> flow warnings do not fire on the cases that read their variable"
+flow_out=$("$VALK" build "$DIR/warn-flow.valk" -o "$workdir/warn-flow" 2>&1)
+flow_count=$(printf '%s\n' "$flow_out" | grep -cE 'never read|Unreachable|never used')
+if [ "$flow_count" -ne 2 ]; then
+    echo "# warn-flow.valk should report 2 warnings, got $flow_count"
+    echo "$flow_out"
+    failed=1
+fi
+
 # Building for one platform must not report what another one needs. Both the
 # import and the local in this fixture are referenced only from a `#if` branch,
 # so on the target that compiles the branch out they look unused and are not.
@@ -224,6 +245,14 @@ cond_out=$("$VALK" build "$DIR/warn-conditional.valk" -o "$workdir/warn-cond" 2>
 case "$cond_out" in
     *"never used"*)
         echo "# A reference inside a compiled-out branch still counts as a reference"
+        echo "$cond_out"
+        failed=1
+        ;;
+esac
+# Same reasoning for reachability: which branch returns depends on the target
+case "$cond_out" in
+    *"Unreachable"*)
+        echo "# Reachability must not be reported for a statement list holding a #if"
         echo "$cond_out"
         failed=1
         ;;
@@ -280,6 +309,40 @@ check "formatting keeps non-ASCII bytes intact" 'em dash — is three bytes' \
 # Control characters have no short escape and must not go out raw either
 check "formatting escapes a control character" 'vertical tab \u000b has no' \
     "$(request_path textDocument/formatting "$unicode_copy")"
+
+# The outline. Every fixture in this directory belongs to one namespace and is
+# loaded together, so a reply that is not filtered to the requested file would
+# carry the whole directory's declarations.
+check "document symbols list a function with its signature" '"name":"sym_helper","detail":"fn(count: uint) String","kind":12' \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+check "document symbols nest members under their class" '"name":"describe","detail":"fn() String","kind":6' \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+# Declaration kinds the compiler models separately: global, enum, error, trait, struct
+check "document symbols cover every declaration kind" '"name":"SymPoint","kind":23' \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+# Source order, so the outline reads like the file rather than like a hash map
+check "document symbols come back in source order" '"result":[{"name":"sym_count"' \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+
+# `$global` declarations (Array, String, Map, …) bind on the build scope rather
+# than on a namespace, so the standard library's own symbols reach the same
+# collection pass and are kept out by source path alone.
+count=$((count + 1))
+echo "> document symbols are limited to the requested file"
+stream="$(frame "$init")$(frame "$(request_doc textDocument/documentSymbol symbols.valk)")"
+out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+case "$out" in
+    *'"name":"Array"'*|*'"name":"to_string"'*)
+        echo "# The standard library's declarations were reported for symbols.valk"
+        echo "$out" | head -c 2000
+        failed=1
+        ;;
+esac
+
+# An outline is most useful while the file is broken, and declarations exist long
+# before any body is resolved, so this must not be gated on a clean build.
+check "document symbols work on a file with errors" '"name":"three"' \
+    "$(request_doc textDocument/documentSymbol multi-error.valk)"
 
 # didOpen alone publishes diagnostics, and the editor's buffer wins over disk
 check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identifier: buffer_only_xyz"' \
