@@ -1,0 +1,120 @@
+// Leaving out the GC stack frame.
+//
+// A function normally opens a GC stack frame on entry and closes it on every
+// exit, so that the collector can find the locals pointing at GC memory. That
+// is an alloca, a handful of stores and a global load/store on each call, and
+// it only buys something if a collection can actually happen while the frame
+// is live.
+//
+// It cannot, if nothing the function reaches allocates. None of its locals is
+// then a root anybody ever looks for, and the frame can be dropped entirely,
+// with the declarations living in plain allocas instead.
+//
+// The two facts this rests on — "allocates" and "hands control somewhere
+// unknown" — are recorded during IR generation, by ir_note_allocates and
+// ir_note_unknown_code, not while a body is resolved. That is deliberate. In
+// this compiler, lowering is what introduces allocation: a body whose source
+// mentions none still gets pool calls for object construction, closure data and
+// coroutine frames, and only the generated text knows about them. The same goes
+// for the call graph they travel along, which is Func.functions_used — built by
+// ir_use_func, and complete for exactly the same reason (see reachable.valk).
+//
+// So the order is: lower every function normally, with its frame; settle the
+// two flags across the call graph; then lower the qualifying functions a second
+// time, without it. Only functions that could still qualify keep their resolved
+// body for that second pass, which is what bounds the memory this costs.
+
+// Whether this function has to wait for the call graph before its resolved body
+// can be dropped. Called once its IR has been generated the ordinary way, so
+// its own flags are already set.
+fn func_may_drop_gc_stack(func: Func) bool {
+    // The language server generates no IR, so there is nothing here to decide.
+    if isset(func.ns.build.options.lsp) : return false
+
+    // Already disqualified by its own body.
+    if func.info_creates_objects || func.info_calls_unknown_code : return false
+
+    // An entrance function sets up the thread's GC state before its body runs.
+    // It is not an ordinary frame, and its @allocas splice point has ordering
+    // rules of its own.
+    if func.is_entrance : return false
+
+    // Nothing to win when the frame holds no roots to begin with.
+    return func.gc_decl_count > 0
+}
+
+// Settle the flags over the call graph, then lower every function that came out
+// clean a second time, without its GC stack frame. Runs once, after every body
+// has been resolved and lowered.
+fn finish_deferred_gc_funcs(build: Build) !Error {
+    let deferred = build.pipeline.deferred_gc_funcs
+    if deferred.length == 0 : return
+
+    propagate_gc_effects(build)
+
+    each deferred as func {
+        let exps = func.pending_exps ?? Array[Exp]{}
+        if !func.info_creates_objects && !func.info_calls_unknown_code {
+            func.disable_gc_stack = true
+            func_regenerate_ir(func) !>
+        }
+        func_release_ast(func, exps)
+    }
+    deferred.clear()
+}
+
+// A function that calls something which allocates can have a collection happen
+// underneath it, so both flags travel from callee to caller until nothing
+// changes. Iterative: a call graph has cycles and no useful depth bound.
+fn propagate_gc_effects(build: Build) {
+    // Only a function that already carries a flag can change a caller, so those
+    // are the whole starting frontier. The edges point the other way, so they
+    // are inverted here rather than recorded twice during generation.
+    let queue = Array[Func]{}
+    each build.lists.units as unit {
+        each unit.functions as func {
+            each func.functions_used as callee : callee.called_by.append(func, true)
+            if func.info_creates_objects || func.info_calls_unknown_code {
+                queue.append(func)
+            }
+        }
+    }
+
+    while true {
+        let func = queue.pop_last() ! break
+        each func.called_by as caller {
+            let changed = false
+            if func.info_creates_objects && !caller.info_creates_objects {
+                caller.info_creates_objects = true
+                changed = true
+            }
+            if func.info_calls_unknown_code && !caller.info_calls_unknown_code {
+                caller.info_calls_unknown_code = true
+                changed = true
+            }
+            if changed : queue.append(caller)
+        }
+    }
+}
+
+// Lower the function again with disable_gc_stack set. func_finish_ast appends
+// to the generated scopes and prepends to the body, so those are put back the
+// way they were before it runs a second time.
+fn func_regenerate_ir(func: Func) !Error {
+    let alloca_scope = func.alloca_scope
+    let defer_scope = func.defer_scope
+    let body_scope = func.body_scope
+    if !isset(alloca_scope) || !isset(defer_scope) || !isset(body_scope) {
+        func.exp.bug("Deferred function lost its scopes: " + func.name)
+    }
+
+    // The generated prologue that func_finish_ast prepended to the body.
+    body_scope.values.remove(0)
+    alloca_scope.values.clear()
+    defer_scope.values.clear()
+    func.define_decls = .{}
+    func.stable_stack_decl = null
+
+    func_finish_ast(func) !>
+    generate_func_ir(func) !>
+}
