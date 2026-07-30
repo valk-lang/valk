@@ -18,6 +18,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'core'
 
 ```js
++ fn clone_value[T](value: T) T
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
