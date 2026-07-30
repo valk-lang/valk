@@ -25,11 +25,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn race_lock() void
 + fn race_unlock() void
 + fn raise(code: i32) void
-+ fn read_big_endian(from: ptr, bytes: uint) uint
-+ fn read_little_endian(from: ptr, bytes: uint) uint
++ fn read_big_endian(from: ptr[u8], bytes: uint) uint
++ fn read_little_endian(from: ptr[u8], bytes: uint) uint
 + fn signal_ignore(sig: int) void
-+ fn write_big_endian(to: ptr, v: uint, bytes: uint) void
-+ fn write_little_endian(to: ptr, v: uint, bytes: uint) void
++ fn write_big_endian(to: ptr[u8], v: uint, bytes: uint) void
++ fn write_little_endian(to: ptr[u8], v: uint, bytes: uint) void
 ```
 
 ## Classes for 'core'
@@ -271,7 +271,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn contains(part: String, start_index: uint (0)) bool
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
-    + fn data() ptr
+    + fn data() ptr[u8]
     + fn data_cstring() cstring
     + fn ends_with(part: String) bool
     + fn escape() String
@@ -380,16 +380,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i16) void
     + static fn random() i16
-    + static fn read_big_endian(from: ptr) i16
-    + static fn read_little_endian(from: ptr) i16
+    + static fn read_big_endian(from: ptr[u8 x 2]) i16
+    + static fn read_little_endian(from: ptr[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
     + fn to_base(base: i16) String
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i16, to: ptr) void
-    + static fn write_little_endian(v: i16, to: ptr) void
+    + static fn write_big_endian(v: i16, to: ptr[u8 x 2]) void
+    + static fn write_little_endian(v: i16, to: ptr[u8 x 2]) void
 }
 ```
 
@@ -399,16 +399,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i32) void
     + static fn random() i32
-    + static fn read_big_endian(from: ptr) i32
-    + static fn read_little_endian(from: ptr) i32
+    + static fn read_big_endian(from: ptr[u8 x 4]) i32
+    + static fn read_little_endian(from: ptr[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
     + fn to_base(base: i32) String
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i32, to: ptr) void
-    + static fn write_little_endian(v: i32, to: ptr) void
+    + static fn write_big_endian(v: i32, to: ptr[u8 x 4]) void
+    + static fn write_little_endian(v: i32, to: ptr[u8 x 4]) void
 }
 ```
 
@@ -418,16 +418,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i64) void
     + static fn random() i64
-    + static fn read_big_endian(from: ptr) i64
-    + static fn read_little_endian(from: ptr) i64
+    + static fn read_big_endian(from: ptr[u8 x 8]) i64
+    + static fn read_little_endian(from: ptr[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
     + fn to_base(base: i64) String
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i64, to: ptr) void
-    + static fn write_little_endian(v: i64, to: ptr) void
+    + static fn write_big_endian(v: i64, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: i64, to: ptr[u8 x 8]) void
 }
 ```
 
@@ -437,16 +437,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i8) void
     + static fn random() i8
-    + static fn read_big_endian(from: ptr) i8
-    + static fn read_little_endian(from: ptr) i8
+    + static fn read_big_endian(from: ptr[u8 x 1]) i8
+    + static fn read_little_endian(from: ptr[u8 x 1]) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
     + fn to_base(base: i8) String
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i8, to: ptr) void
-    + static fn write_little_endian(v: i8, to: ptr) void
+    + static fn write_big_endian(v: i8, to: ptr[u8 x 1]) void
+    + static fn write_little_endian(v: i8, to: ptr[u8 x 1]) void
 }
 ```
 
@@ -456,16 +456,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: int) void
     + static fn random() int
-    + static fn read_big_endian(from: ptr) int
-    + static fn read_little_endian(from: ptr) int
+    + static fn read_big_endian(from: ptr[u8 x 8]) int
+    + static fn read_little_endian(from: ptr[u8 x 8]) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
     + fn to_base(base: int) String
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: int, to: ptr) void
-    + static fn write_little_endian(v: int, to: ptr) void
+    + static fn write_big_endian(v: int, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: int, to: ptr[u8 x 8]) void
 }
 ```
 
@@ -542,16 +542,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u16) void
     + static fn random() u16
-    + static fn read_big_endian(from: ptr) u16
-    + static fn read_little_endian(from: ptr) u16
+    + static fn read_big_endian(from: ptr[u8 x 2]) u16
+    + static fn read_little_endian(from: ptr[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
     + fn to_base(base: u16) String
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u16, to: ptr) void
-    + static fn write_little_endian(v: u16, to: ptr) void
+    + static fn write_big_endian(v: u16, to: ptr[u8 x 2]) void
+    + static fn write_little_endian(v: u16, to: ptr[u8 x 2]) void
 }
 ```
 
@@ -561,16 +561,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u32) void
     + static fn random() u32
-    + static fn read_big_endian(from: ptr) u32
-    + static fn read_little_endian(from: ptr) u32
+    + static fn read_big_endian(from: ptr[u8 x 4]) u32
+    + static fn read_little_endian(from: ptr[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
     + fn to_base(base: u32) String
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u32, to: ptr) void
-    + static fn write_little_endian(v: u32, to: ptr) void
+    + static fn write_big_endian(v: u32, to: ptr[u8 x 4]) void
+    + static fn write_little_endian(v: u32, to: ptr[u8 x 4]) void
 }
 ```
 
@@ -580,16 +580,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u64) void
     + static fn random() u64
-    + static fn read_big_endian(from: ptr) u64
-    + static fn read_little_endian(from: ptr) u64
+    + static fn read_big_endian(from: ptr[u8 x 8]) u64
+    + static fn read_little_endian(from: ptr[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
     + fn to_base(base: u64) String
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u64, to: ptr) void
-    + static fn write_little_endian(v: u64, to: ptr) void
+    + static fn write_big_endian(v: u64, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: u64, to: ptr[u8 x 8]) void
 }
 ```
 
@@ -613,8 +613,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_whitespace() bool
     + fn print(base: u8) void
     + static fn random() u8
-    + static fn read_big_endian(from: ptr) u8
-    + static fn read_little_endian(from: ptr) u8
+    + static fn read_big_endian(from: ptr[u8 x 1]) u8
+    + static fn read_little_endian(from: ptr[u8 x 1]) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
     + fn to_ascii_string() String
@@ -623,8 +623,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn to_hex() String
     + fn to_str() String
     + fn unescape() u8
-    + static fn write_big_endian(v: u8, to: ptr) void
-    + static fn write_little_endian(v: u8, to: ptr) void
+    + static fn write_big_endian(v: u8, to: ptr[u8 x 1]) void
+    + static fn write_little_endian(v: u8, to: ptr[u8 x 1]) void
 }
 ```
 
@@ -634,16 +634,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: uint) void
     + static fn random() uint
-    + static fn read_big_endian(from: ptr) uint
-    + static fn read_little_endian(from: ptr) uint
+    + static fn read_big_endian(from: ptr[u8 x 8]) uint
+    + static fn read_little_endian(from: ptr[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
     + fn to_base(base: uint) String
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: uint, to: ptr) void
-    + static fn write_little_endian(v: uint, to: ptr) void
+    + static fn write_big_endian(v: uint, to: ptr[u8 x 8]) void
+    + static fn write_little_endian(v: uint, to: ptr[u8 x 8]) void
 }
 ```
 
@@ -668,7 +668,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void
 + fn bcrypt_hash(password: String, cost: uint (12)) String
 + fn bcrypt_verify(password: String, hash: String) bool
-+ fn blowfish_encrypt_block(context: BlowfishContext, input: ptr, output: ptr) void
++ fn blowfish_encrypt_block(context: BlowfishContext, input: ptr[u8], output: ptr[u8]) void
 + fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
 + fn blowfish_init_state(context: BlowfishContext) void
 + fn blowfish_xor_block(data: &u8, salt: ByteBuffer, saltIndex: &uint) void
@@ -680,10 +680,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Blake2b {
-    + fn finalize(out: ptr) void
+    + fn finalize(out: ptr[u8]) void
     + static fn hash_str(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
-    + fn update(data: ptr, length: uint) void
+    + fn update(data: ptr[u8], length: uint) void
 }
 ```
 
@@ -695,7 +695,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Sha1 {
     + fn add_hash_data(data: &u8) void
-    + fn add_raw_data_unsafe(data: ptr, len: uint) void
+    + fn add_raw_data_unsafe(data: ptr[u8], len: uint) void
     + fn add_string_data(str: String) void
     + fn final() [u8 x 20]
     + fn reset() void
@@ -705,7 +705,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Sha256 {
     + fn add_hash_data(data: &u8) void
-    + fn add_raw_data_unsafe(data: ptr, len: uint) void
+    + fn add_raw_data_unsafe(data: ptr[u8], len: uint) void
     + fn add_string_data(str: String) void
     + fn final() [u8 x 32]
     + fn reset() void
@@ -752,9 +752,9 @@ alias pid_t for i32
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
 + fn chdir(path: String) void
-+ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !IoError
++ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
 + fn cwd() String
-+ fn delete(path: String) void !IoError
++ fn delete(path: String) void !io:IoError
 + fn delete_recursive(path: String) void
 + fn dir_of(path: String) String
 + fn exe_dir() String
@@ -766,22 +766,22 @@ alias pid_t for i32
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
 + fn mime(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (0c755)) void !IoError
-+ fn modified_time(path: String) uint !IoError
-+ fn move(from_path: String, to_path: String) void !IoError
-+ fn open(path: String, writable: bool, append_on_write: bool) i32 !IoError
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !IoError
++ fn mkdir(path: String, permissions: u32 (0c755)) void !io:IoError
++ fn modified_time(path: String) uint !io:IoError
++ fn move(from_path: String, to_path: String) void !io:IoError
++ fn open(path: String, writable: bool, append_on_write: bool) i32 !io:IoError
++ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io:IoError
 + fn path(path: String) Path
-+ fn read(path: String) String !IoError
++ fn read(path: String) String !io:IoError
 + fn realpath(path: String) String
 + fn resolve(path: String) String
-+ fn rmdir(path: String) void !IoError
++ fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !IoError
-+ fn symlink(link: String, target: String, is_directory: bool) void !IoError
++ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io:IoError
++ fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync() void
-+ fn write(path: String, content: String, append: bool (false)) void !IoError
-+ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !IoError
++ fn write(path: String, content: String, append: bool (false)) void !io:IoError
++ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -793,10 +793,10 @@ alias pid_t for i32
     ~ reading: bool
 
     + fn close() void
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !IoError
-    + fn write(str: String) void !IoError
-    + fn write_buffer(buffer: ByteBuffer) void !IoError
-    + fn write_from_ptr(from: ptr, len: uint) void !IoError
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !io:IoError
+    + fn write(str: String) void !io:IoError
+    + fn write_buffer(buffer: ByteBuffer) void !io:IoError
+    + fn write_from_ptr(from: ptr, len: uint) void !io:IoError
 }
 ```
 
@@ -806,7 +806,7 @@ alias pid_t for i32
     ~ size: uint
 
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !IoError
+    + static fn create_from_file(path: String) InMemoryFile !io:IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn save(path: String) void
 }

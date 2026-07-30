@@ -57,6 +57,7 @@ test: valk
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all
 	./debug/test-all
 	@./tests/compile-errors/run.sh
+	@./tests/exit-code/run.sh
 
 test-gc-debug: valk
 	mkdir -p ./debug
