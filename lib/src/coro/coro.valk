@@ -11,7 +11,9 @@ global g_coros : Array[?Coro] (.new(16))
 global g_coro_indexes : core:Pool[uint] (.new(16))
 global g_coro_count : uint
 global run_coros : Array[Coro] (.new(16))
-global delay_coros : Array[Coro] (.new(16))
+// Spare run queue. Coroutines resumed from `run_coros` can schedule more work,
+// so they must append to a different queue from the one being iterated.
+global next_run_coros : Array[Coro] (.new(16))
 
 global main_state : <CoroState> (@undefined)
 
@@ -48,6 +50,13 @@ class Coro {
     // async results
     poll_event: io:PollEvent (0)
     completion_res: i64 (0)
+    #if OS == "linux"
+    // io_uring consumes timeout arguments when the SQE is submitted, which can
+    // happen after this coroutine has yielded. Coroutine locals live on the
+    // shared stack and are invalidated by the next resume, so keep this on the
+    // stable coroutine object instead.
+    timeout_ts: <io:kernel_timespec> (@undefined)
+    #end
     //
     started: bool (false)
     active: bool (false)
@@ -140,11 +149,11 @@ class Coro {
         #if OS == "linux"
         let sqe = io:sqe(this) ! return
         let nsec = ns.@cast(int)
-        let ts : <io:kernel_timespec> = {
+        this.timeout_ts = {
             tv_sec: nsec / 1_000_000_000
             tv_nsec: (nsec % 1_000_000_000)
         }
-        io:io_uring_prep_timeout(sqe, &ts, 0, 0)
+        io:io_uring_prep_timeout(sqe, @ref(this.timeout_ts), 0, 0)
 
         #elif OS == "macos"
         let ms = ns.to(i64) / 1_000_000
@@ -304,18 +313,20 @@ class Coro {
 
         while true {
 
-            // Run coroutines
-            each run_coros as coro {
-                coro.resume()
-            }
-            // Clear
+            // Swap queues before resuming. A resume may append itself, a newly
+            // spawned coroutine, or an await continuation to `run_coros`.
+            // Clearing the queue after iteration used to erase all such work,
+            // eventually leaving live coroutines with no runnable entry or
+            // io_uring request and blocking forever in wait_cqe.
+            let scheduled_coros = run_coros
+            run_coros = next_run_coros
+            next_run_coros = scheduled_coros
             run_coros.clear()
 
-            //
-            // each delay_coros as coro {
-            //     run_coros.append(coro)
-            // }
-            // delay_coros.clear()
+            each scheduled_coros as coro {
+                coro.resume()
+            }
+            scheduled_coros.clear()
 
             // Done check
             if isset(until) && until.done : break
