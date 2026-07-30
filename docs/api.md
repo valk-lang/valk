@@ -61,7 +61,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn join(divider: String) String
     + fn lock() void
     + fn merge(items: Array[T]) Array[T]
-    + static fn new(start_size: uint (2)) Array[T]
+    + static fn new(start_size: uint (0)) Array[T]
     + fn part(start: uint, amount: uint) Array[T]
     + fn pop_first() T !LookupError
     + fn pop_last() T !LookupError
