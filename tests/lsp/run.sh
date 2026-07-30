@@ -352,6 +352,30 @@ esac
 check "document symbols work on a file with errors" '"name":"three"' \
     "$(request_doc textDocument/documentSymbol multi-error.valk)"
 
+# The server reads stdin 1024 bytes at a time, so a didOpen carrying a real file
+# is split across reads and has to be resumed. Answering an earlier message in
+# between must not disturb that: the parser's half-read state is the only record
+# of where the message left off, and losing it made the server look for headers in
+# the middle of the body — dropping the message and every one after it.
+#
+# The didSave first is what makes this bite: it queues diagnostics, which are
+# flushed while the didOpen behind it is still half-read. warn-flow.valk is over
+# 1024 bytes, so the split is guaranteed.
+count=$((count + 1))
+echo "> a message split across reads survives an answer in between"
+stream="$(frame "$init")$(frame "$(notify_save diag.valk)")$(frame "$(notify_open warn-flow.valk)")"
+# Timed: the same desync leaves bytes that can never parse, and the read loop
+# used to spin on them forever rather than stop at end of input.
+out=$(printf '%s' "$stream" | timeout 60 "$VALK" lsp run 2>&1)
+case "$out" in
+    *"Variable 'dead' is assigned but never read"*) ;;
+    *)
+        echo "# The second message was dropped: no diagnostics for warn-flow.valk"
+        echo "$out" | head -c 1500
+        failed=1
+        ;;
+esac
+
 # didOpen alone publishes diagnostics, and the editor's buffer wins over disk
 check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identifier: buffer_only_xyz"' \
     "$(notify_open diag.valk 's/nope_xyz/buffer_only_xyz/')"
