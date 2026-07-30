@@ -58,6 +58,7 @@ test: valk
 	./debug/test-all
 	@./tests/compile-errors/run.sh
 	@./tests/exit-code/run.sh
+	@./tests/lsp/run.sh
 
 test-gc-debug: valk
 	mkdir -p ./debug
