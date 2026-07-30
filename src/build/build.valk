@@ -1,5 +1,7 @@
 
 use helper
+use doc
+use valk:core
 use valk:fs
 use valk:time
 use valk:gc
@@ -18,6 +20,9 @@ class Build {
     has_errors: bool (false)
     // Sources loaded with --fmt (print after pipeline so body_exps exist)
     format_sources: Array[Source] (.{})
+    // Non-source files the build read (#embed / #embed_dir targets), so --watch
+    // also rebuilds when an embedded asset changes.
+    watch_files: Array[String] (.{})
 
     // ########################################
     // INIT
@@ -87,6 +92,19 @@ class Build {
         return Build.init(options)
     }
 
+    // Entry point for the `valk build` CLI: parse the arguments, then either
+    // build once or hand over to the --watch loop.
+    static fn from_args(args: Array[String]) {
+        let options = BuildOptions.init_from_args(args) ! build_error(E.msg)
+        if options.is_watch {
+            build_watch(options)
+            return
+        }
+        let b = Build.init(options)
+        b.run() ! { }
+        b.print_results()
+    }
+
     // ########################################
     // RUN
     // ########################################
@@ -129,35 +147,31 @@ class Build {
             main_ns.load_file(helper:add(helper:add(helper:valk_lib_dir(), "templates"), "main-new.valk")) !>
         }
 
+        // --docs documents a package, not an entry point: pull in every namespace
+        // rather than only what the input files reach through `use`.
+        if this.options.mode == BUILDTYPE.doc {
+            main_pkg.load_all_namespaces() !>
+        }
+
         this.pipeline.run() !>
 
         // The pipeline timer ends after function AST lowering and per-function
         // IR generation. Unit assembly/verification is part of object work.
         this.stats.func_ir_us = time:microtime() - func_ir_start
 
-        // Formatting only needs the structured Exp trees and deliberately does
-        // not enter code generation/verification.
+        // Formatting and doc generation only need the structured Exp trees and
+        // deliberately do not enter code generation/verification.
         let object_start = time:microtime()
-        if !this.options.is_fmt : generate_unit_modules(this) !>
-        if !this.options.is_fmt && (this.options.mode == BUILDTYPE.exe || this.options.mode == BUILDTYPE.lib) {
-            emit_unit_objects(this) !>
-            this.stats.object_us = time:microtime() - object_start
-            link_unit_objects(this) !>
-        } else if !this.options.is_fmt {
-            this.stats.object_us = time:microtime() - object_start
-        }
-        if !this.options.is_fmt && this.options.mode == BUILDTYPE.ir {
-            let path = this.options.path_out
-            let units = this.lists.units
-            each units as unit {
-                if unit.ir_code.length == 0 : continue
-                if isset(path) {
-                    let out = units.length == 1 ? path : (path + "." + unit.name + ".ll")
-                    fs:write(out, unit.ir_code) ! this.error("Failed to write LLVM IR: " + out)
-                } else {
-                    println("; ===== Unit: " + unit.name + " =====")
-                    println(unit.ir_code)
-                }
+        if !this.options.front_end_only() {
+            generate_unit_modules(this) !>
+            let mode = this.options.mode
+            if mode == BUILDTYPE.exe || mode == BUILDTYPE.lib {
+                emit_unit_objects(this) !>
+                this.stats.object_us = time:microtime() - object_start
+                link_unit_objects(this) !>
+            } else {
+                this.stats.object_us = time:microtime() - object_start
+                if mode == BUILDTYPE.ir : this.write_ir_output() !>
             }
         }
 
@@ -167,31 +181,88 @@ class Build {
         }
     }
 
+    // --ir: write the module, or print it when there is no output path. --ir
+    // implies single_unit, so the whole program is one module.
+    fn write_ir_output() !Error {
+        let path = this.options.path_out
+        if isset(path) {
+            path = helper:resolve(path)
+            if !path.ends_with(".ll") && !path.ends_with(".ir") : path += ".ll"
+            this.options.path_out = path
+        }
+        each this.lists.units as unit {
+            if unit.ir_code.length == 0 : continue
+            if isset(path) {
+                fs:write(path, unit.ir_code) ! this.error("Failed to write LLVM IR: " + path)
+            } else {
+                println(unit.ir_code)
+            }
+        }
+    }
+
     // Fill `stats` with duration and peak memory (LOC is updated during parse).
     fn collect_build_stats(start: uint) {
         this.stats.duration_us = time:microtime() - start
         this.stats.mem_peak = gc:mem_usage_peak
     }
 
-    // Report outcome after run(): first error if any, otherwise warnings then stats.
-    // Exits the process when there is an error.
+    // Report outcome after run(): first error if any, otherwise warnings then
+    // stats. Exits the process when there is an error, and with --run replaces
+    // this process' exit code with the built program's.
     fn print_results() {
+        if !this.print_messages() : exit(1)
+
+        let o = this.options
+        if o.mode == BUILDTYPE.doc {
+            doc:doc_gen(this)
+            return
+        }
+        if o.mode == BUILDTYPE.ir {
+            this.stats.print(o.verbose, false)
+            let path = o.path_out
+            if isset(path) : helper:msg("✅", "IR output: " + path)
+            return
+        }
+        if o.run_exe && !o.is_fmt && o.mode == BUILDTYPE.exe {
+            this.stats.print(o.verbose, false)
+            this.run_output()
+            return
+        }
+        this.stats.print(o.verbose)
+    }
+
+    // Print the first error, or every warning when the build succeeded.
+    // Returns false when the build failed.
+    fn print_messages() bool {
         each this.messages as m {
             if m.type == MSG.error {
                 m.print()
-                exit(1)
+                return false
             }
         }
-
         if !this.options.no_warn {
             each this.messages as m {
-                if m.type == MSG.warning {
-                    m.print()
-                }
+                if m.type == MSG.warning : m.print()
             }
         }
+        return true
+    }
 
-        this.stats.print(this.options.verbose)
+    // --run: execute the linked program with the args after `--`, then exit with
+    // its exit code.
+    fn run_output() {
+        let path = this.options.path_out
+        if !isset(path) : return
+        if !this.options.target.host_is_target() {
+            helper:msg("❌", "Cannot run a program built for " + this.options.target.target + " on this machine")
+            return
+        }
+        let cmd = "\"" + path + "\""
+        each this.options.run_args as arg {
+            cmd += " \"" + arg + "\""
+        }
+        let code = core:exec(cmd, true)
+        exit(code)
     }
 
     // Resolve CLI inputs into files/dirs, determine the main package, and return the input files.
@@ -284,6 +355,30 @@ class Build {
             type: MSG.warning
             msg: msg
         })
+    }
+
+    // ########################################
+    // UNITS
+    // ########################################
+
+    // One Unit per source file, except with --release / --ir where every file
+    // shares a single LLVM module. Each Func/Global belongs to exactly one Unit
+    // (generic instances follow their base), so no definition is emitted twice;
+    // symbol *names* do need the source id in this mode, see ir_name_prefix.
+    fn get_unit_for_path(path: String) Unit {
+        if this.options.single_unit {
+            let shared = this.cache.single_unit
+            if isset(shared) : return shared
+            // Fixed name: no per-file names exist in this mode, so it is unique
+            shared = Unit { name: "valk-release" }
+            this.cache.used_unit_names.append(shared.name)
+            this.cache.single_unit = shared
+            this.lists.units.append(shared)
+            return shared
+        }
+        let unit = Unit.new(this.cache, path)
+        this.lists.units.append(unit)
+        return unit
     }
 
     // ########################################
