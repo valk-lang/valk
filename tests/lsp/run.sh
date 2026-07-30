@@ -44,6 +44,31 @@ notify_save() {
     printf '{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file://%s"}}}' "$DIR/$1"
 }
 
+# request_doc <method> <file>   — a whole-document request, no position
+request_doc() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"%s","params":{"textDocument":{"uri":"file://%s"}}}' \
+        "$1" "$DIR/$2"
+}
+
+# Escape stdin as a JSON string body (backslash, quote, tab, CR, then newlines).
+# Needed only for didOpen, which carries the editor's buffer.
+json_escape() {
+    sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r//g' | awk '{printf "%s\\n", $0}'
+}
+
+# notify_open <file> [sed-expr]  — didOpen carrying the file's text, optionally
+# transformed, so a buffer that differs from disk can be exercised.
+notify_open() {
+    local text
+    if [ -n "${2:-}" ]; then
+        text=$(sed "$2" "$DIR/$1" | json_escape)
+    else
+        text=$(json_escape < "$DIR/$1")
+    fi
+    printf '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://%s","text":"%s"}}}' \
+        "$DIR/$1" "$text"
+}
+
 # check <name> <expected-substring> <request-body>...
 check() {
     local name="$1"; shift
@@ -141,6 +166,74 @@ if [ "$cli_errors" -ne 1 ]; then
     echo "$cli_out"
     failed=1
 fi
+
+# Hover reports what the compiler resolved, including inferred types
+check "hover on a function" '"value":"```valk\nfn helper(count: uint, label: String) String\n```"' \
+    "$(request textDocument/hover nav.valk 7 14)"
+check "hover on an inferred local" '"value":"```valk\nString\n```"' \
+    "$(request textDocument/hover nav.valk 7 28)"
+
+# Formatting returns edits and must never touch the file on disk.
+#
+# Each case formats its own fresh copy. Sharing one file would make these
+# order-dependent: a regression that rewrote the file in place would leave it
+# already formatted for whatever ran next, and the check below would see no
+# change and pass.
+workdir=$(mktemp -d)
+trap 'rm -rf "$workdir"' EXIT
+
+# request_path <method> <abs-file>
+request_path() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"%s","params":{"textDocument":{"uri":"file://%s"}}}' "$1" "$2"
+}
+
+fmt_copy="$workdir/messy-edit.valk"
+cp "$DIR/messy.valk" "$fmt_copy"
+check "formatting returns an edit" '"newText":"fn add(a: uint, b: uint) uint {\n    return a + b\n}' \
+    "$(request_path textDocument/formatting "$fmt_copy")"
+
+count=$((count + 1))
+echo "> formatting leaves the file on disk untouched"
+untouched="$workdir/messy-untouched.valk"
+cp "$DIR/messy.valk" "$untouched"
+printf '%s' "$(frame "$init")$(frame "$(request_path textDocument/formatting "$untouched")")" \
+    | "$VALK" lsp run >/dev/null 2>&1
+if ! diff -q "$DIR/messy.valk" "$untouched" >/dev/null; then
+    echo "# textDocument/formatting rewrote the file; it must only return edits"
+    diff -u "$DIR/messy.valk" "$untouched"
+    failed=1
+fi
+
+# An already-formatted document reports no edits, so the buffer is not made dirty
+clean_copy="$workdir/clean.valk"
+cp "$DIR/nav.valk" "$clean_copy"
+check "formatting a clean file returns no edits" '"result":[]' \
+    "$(request_path textDocument/formatting "$clean_copy")"
+
+# didOpen alone publishes diagnostics, and the editor's buffer wins over disk
+check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identifier: buffer_only_xyz"' \
+    "$(notify_open diag.valk 's/nope_xyz/buffer_only_xyz/')"
+
+# Every request must be answered, or the client waits for its timeout
+check "unsupported request gets an error reply" '"code":-32601' \
+    '{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{}}'
+# Request ids may be strings; they are echoed back rather than coerced
+check "request id is echoed verbatim" '"id":"req-abc"' \
+    '{"jsonrpc":"2.0","id":"req-abc","method":"textDocument/codeAction","params":{}}'
+
+# `$/` messages are optional protocol traffic and must be ignored silently,
+# otherwise every cancelled keystroke shows up in the user's output panel.
+count=$((count + 1))
+echo "> \$/cancelRequest is ignored silently"
+stream="$(frame "$init")$(frame '{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}')"
+out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+case "$out" in
+    *Unsupported*)
+        echo "# \$/cancelRequest should not be reported as unsupported"
+        echo "$out"
+        failed=1
+        ;;
+esac
 
 echo ""
 if [ "$failed" -ne 0 ]; then

@@ -27,7 +27,14 @@ class Lsp {
     headers: Map[String] (Map[String]{})
     headers_str: String ("")
     data: json:Value (json:new_null())
-    id: int (0)
+    // Echoed back verbatim in the response. The protocol allows an integer or a
+    // string id, so it is kept as the JSON value it arrived as rather than being
+    // narrowed to an int — a client using string ids could not otherwise match
+    // our replies to its requests.
+    id: json:Value (json:new_null())
+    // True when the current message is a request (carries an id) rather than a
+    // notification. Requests must be answered exactly once, notifications never.
+    is_request: bool (false)
     method: String ("")
     // Which kind of request the current build is serving (req_* in type.valk).
     // The compiler's hook sites read this per resolved expression.
@@ -40,6 +47,12 @@ class Lsp {
     file: String ("")
     line: uint (0)
     col: uint (0)
+    // File to re-check for diagnostics once the input buffer has drained, so a
+    // batch of messages that arrived together costs one build instead of one
+    // each. Deliberately not set by didChange: with full-document sync every
+    // keystroke sends the whole file, and building per keystroke would mean a
+    // complete front-end pass per character.
+    pending_diagnostics: ?String (null)
     //
     shutdown: bool (false)
     responded: bool (false)
@@ -49,7 +62,8 @@ class Lsp {
         this.index = 0
         this.stage = 0
         this.data = json:new_null()
-        this.id = 0
+        this.id = json:new_null()
+        this.is_request = false
         this.method = ""
         this.request = req_none
         this.responded = false
@@ -60,6 +74,25 @@ class Lsp {
     }
 
     fn parse() {
+        this.parse_messages()
+        // Always runs, including on the paths that return early waiting for more
+        // input: the queued edit is itself complete, so there is no reason to
+        // hold its diagnostics back.
+        this.flush_pending()
+    }
+
+    // Diagnostics for the most recent edit, after every buffered message has been
+    // handled. Notifications, so there is no request id to answer.
+    fn flush_pending() {
+        let file = this.pending_diagnostics ?! return
+        this.pending_diagnostics = null
+        this.reset()
+        this.request = req_diagnostics
+        this.file = file
+        this.build()
+    }
+
+    fn parse_messages() {
 
         while this.buf.length > 0 {
             if this.stage == 0 {
@@ -133,11 +166,15 @@ class Lsp {
     fn handle() {
         let data = this.data
 
-        let id = data.get_or("id").int()
         let method = data.get_or("method").string()
         let params = data.get_or("params")
 
-        this.id = id
+        // A message carrying an `id` is a request and must be answered exactly
+        // once; one without is a notification and must never be answered. The
+        // presence of the member is what distinguishes them, not its value —
+        // `"id": 0` is a perfectly valid request id.
+        this.id = data.get_or("id")
+        this.is_request = data.has("id")
         this.method = method
         this.request = request_for_method(method)
 
@@ -155,6 +192,8 @@ class Lsp {
             this.shutdown = true
             this.send_empty_response()
         } else if method == "exit" {
+            // Any queued diagnostics are dropped rather than built: the client
+            // has asked to end the session and will never read them.
             exit(0)
         } else if method == "textDocument/didOpen" {
             this.handle_open()
@@ -173,28 +212,56 @@ class Lsp {
         } else if method == "textDocument/signatureHelp" {
             this.sighelp()
             this.send_empty_response()
+        } else if method == "textDocument/hover" {
+            this.hover()
+            this.send_empty_response()
+        } else if method == "textDocument/formatting" {
+            this.formatting()
+            this.send_empty_response()
+        } else if method.starts_with("$/") {
+            // The specification reserves `$/` for optional protocol messages and
+            // allows a server to ignore them. `$/cancelRequest` arrives here:
+            // this server processes one message at a time, so by the time a
+            // cancel is read the request it names has already been answered.
+            // Silently ignored rather than logged, or every keystroke that the
+            // client gives up on would show up in the user's output panel.
+            if this.is_request : this.error_response(-32601, "Unsupported request: " + method)
         } else {
-            this.log("Unsupported method: " + method)
+            // An unanswered request leaves the client waiting for its timeout, so
+            // reply with MethodNotFound. A notification gets no reply at all.
+            if this.is_request {
+                this.error_response(-32601, "Unsupported request: " + method)
+            } else {
+                this.log("Unsupported notification: " + method)
+            }
         }
     }
 
-    fn error(msg: String) {
+    // JSON-RPC error response. `code` is a protocol error code (-32601 is
+    // MethodNotFound).
+    fn error_response(code: int, msg: String) {
+        if !this.is_request : return
         let resp = json:new_object()
-        resp.set("id", json:new_int(this.id))
-        resp.set("error", json:new_string(msg))
+        resp.set("id", this.id)
+        let err = json:new_object()
+        err.set("code", json:new_int(code))
+        err.set("message", json:new_string(msg))
+        resp.set("error", err)
         this.respond(resp)
     }
 
     fn success(result: json:Value) {
+        if !this.is_request : return
         let resp = json:new_object()
-        resp.set("id", json:new_int(this.id))
+        resp.set("id", this.id)
         resp.set("result", result)
         this.respond(resp)
     }
 
     fn send_empty_response() {
+        if !this.is_request : return
         let resp = json:new_object()
-        resp.set("id", json:new_int(this.id))
+        resp.set("id", this.id)
         resp.set("result", json:new_object())
         this.respond(resp)
     }
@@ -235,6 +302,10 @@ class Lsp {
             return
         }
         b.options.lsp = this
+        // Formatting needs the reconstructable Exp tree that --fmt keeps. The
+        // write-back itself is suppressed for the LSP, which returns the text to
+        // the editor as an edit instead (see Build.run_stages).
+        if this.request == req_formatting : b.options.is_fmt = true
         // Errors are the normal outcome of compiling a file mid-edit: they are
         // the diagnostics. The build's own reporting (print_results) exits the
         // process, so it is deliberately not used here.
@@ -244,6 +315,10 @@ class Lsp {
         // and has already responded. Anything the build had not reached yet is
         // simply unexamined, not clean, so no diagnostics are published.
         if b.lsp_answered : return
+        if this.request == req_formatting {
+            this.send_formatting(b)
+            return
+        }
         this.send_errors(b)
     }
 
@@ -364,6 +439,8 @@ fn request_for_method(method: String) int {
     if method == "textDocument/definition" : return req_definition
     if method == "textDocument/completion" : return req_completion
     if method == "textDocument/signatureHelp" : return req_sig_help
+    if method == "textDocument/hover" : return req_hover
+    if method == "textDocument/formatting" : return req_formatting
     if method == "textDocument/didSave" : return req_diagnostics
     return req_none
 }
