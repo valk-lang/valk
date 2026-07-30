@@ -122,6 +122,7 @@ ci-linux: $(SRC)
 ci-macos: $(SRC)
 	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static -l zstd $(FLAGS) \
+	--sysroot "$$(xcrun --sdk macosx --show-sdk-path)" \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
 ci-win: $(SRC)
