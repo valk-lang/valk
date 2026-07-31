@@ -54,9 +54,11 @@ if [ ! -x "$VALK" ] && [ ! -f "$VALK" ]; then
     exit 1
 fi
 
-# Content-Length framing. The bodies below are ASCII, so character count is byte
-# count.
+# Content-Length is a byte count, not a character count. Bash string length uses
+# characters in a UTF-8 locale, so force byte semantics for messages containing
+# non-ASCII editor buffers.
 frame() {
+    local LC_ALL=C
     printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"
 }
 
@@ -70,6 +72,12 @@ request() {
 
 notify_save() {
     printf '{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file://%s"}}}' "$DIR/$1"
+}
+
+# notify_change <file> <JSON contentChanges array>
+notify_change() {
+    printf '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://%s"},"contentChanges":%s}}' \
+        "$DIR/$1" "$2"
 }
 
 # request_doc <method> <file>   — a whole-document request, no position
@@ -130,10 +138,24 @@ check() {
 # Capabilities are what tells an editor which requests to send at all.
 check "initialize advertises providers" '"definitionProvider":true'
 check "initialize advertises the outline" '"documentSymbolProvider":true'
+check "initialize advertises incremental text sync" '"change":2'
+check "initialize advertises save notifications" '"save":true'
 
 # An identifier that does not exist is reported on the line and columns it spans
 check "diagnostics on save" '"message":"Unknown identifier: nope_xyz"' \
     "$(notify_save diag.valk)"
+
+# Ranged changes are applied in order, and a burst publishes diagnostics once for
+# its final buffer without requiring a save. The second range is relative to the
+# result of the first (`nope_xyz` -> `buffer_xyz` -> `buffer_only_xyz`).
+check "incremental changes publish live diagnostics" '"message":"Unknown identifier: buffer_only_xyz"' \
+    "$(notify_open diag.valk)" \
+    "$(notify_change diag.valk '[{"range":{"start":{"line":2,"character":12},"end":{"line":2,"character":16}},"text":"buffer"},{"range":{"start":{"line":2,"character":19},"end":{"line":2,"character":22}},"text":"only_xyz"}]')"
+
+# LSP columns are UTF-16 code units, not UTF-8 bytes. A chicken is four UTF-8
+# bytes but two UTF-16 units, so the unknown identifier begins at character 19.
+check "diagnostic ranges use UTF-16 columns" '"start":{"line":2,"character":19}' \
+    "$(notify_open diag.valk 's/println(nope_xyz)/println("🐔" + nope_xyz)/')"
 
 # `helper` on line 8 is declared on line 1 (0-based line 0)
 check "definition of a function" '"line":0' \
@@ -295,6 +317,11 @@ check "hover on a function" '"value":"```valk\nfn helper(count: uint, label: Str
     "$(request textDocument/hover nav.valk 7 14)"
 check "hover on an inferred local" '"value":"```valk\nString\n```"' \
     "$(request textDocument/hover nav.valk 7 28)"
+
+# `name` follows a non-ASCII character on this line. Both locating the request
+# and reporting the hover range must use protocol columns rather than bytes.
+check "hover ranges use UTF-16 columns" '"start":{"line":3,"character":20}' \
+    "$(request textDocument/hover unicode.valk 3 21)"
 
 # Formatting returns edits and must never touch the file on disk.
 #

@@ -27,9 +27,88 @@ fn lsp_path_from_uri(uri: String) String {
     return fs:resolve(uri)
 }
 
-// One entry of a publishDiagnostics notification. Positions are the 1-based
-// line/col the compiler reports; converting to the protocol's 0-based numbers
-// happens where the JSON is built.
+// A protocol position counts UTF-16 code units, while the compiler stores byte
+// offsets into UTF-8 source. These helpers are the boundary between the two.
+// Keeping compiler positions byte-based avoids slowing down parsing and makes
+// the conversion cost proportional only to the line an LSP request touches.
+class LspLineCol {
+    line: u32
+    col: u32
+}
+
+fn lsp_utf8_width(ch: u8) uint {
+    if ch < 0x80 : return 1
+    if (ch & 0xE0) == 0xC0 : return 2
+    if (ch & 0xF0) == 0xE0 : return 3
+    if (ch & 0xF8) == 0xF0 : return 4
+    // Invalid UTF-8 is treated as one replacement code unit. The parser can
+    // still diagnose the source without an LSP position scan getting stuck.
+    return 1
+}
+
+fn lsp_utf16_width(ch: u8) u32 {
+    // A four-byte UTF-8 sequence represents a non-BMP code point, encoded as a
+    // surrogate pair in UTF-16. Every other sequence occupies one code unit.
+    return ((ch & 0xF8) == 0xF0) ? 2 : 1
+}
+
+// Convert a 1-based LSP line/column to the compiler's UTF-8 byte offset.
++ fn lsp_offset_for(content: String, line: u32, col: u32) u32 {
+    let data = content.data
+    let bytes = content.bytes
+    let cur_line: u32 = 1
+    let p: uint = 0
+    while p < bytes && cur_line < line {
+        if @ptrv(data, u8, p) == '\n' : cur_line++
+        p++
+    }
+
+    let target = col > 0 ? col - 1 : 0
+    let units: u32 = 0
+    while p < bytes && units < target {
+        let ch = @ptrv(data, u8, p)
+        if ch == '\n' : break
+        let width = lsp_utf8_width(ch)
+        let utf16 = lsp_utf16_width(ch)
+        // A valid client does not place a cursor between the halves of a
+        // surrogate pair. Clamp such a position to the code point's start.
+        if units + utf16 > target : break
+        if p + width > bytes : p++
+        else : p += width
+        units += utf16
+    }
+    return p.to(u32)
+}
+
+// Convert a compiler byte offset to a 1-based line/UTF-16 column. json_position
+// below performs the final conversion to the protocol's 0-based values.
+fn lsp_line_col(content: String, offset: u32) LspLineCol {
+    let data = content.data
+    let bytes = content.bytes
+    let limit = offset.to(uint)
+    if limit > bytes : limit = bytes
+    let line: u32 = 1
+    let col: u32 = 1
+    let p: uint = 0
+    while p < limit {
+        let ch = @ptrv(data, u8, p)
+        if ch == '\n' {
+            line++
+            col = 1
+            p++
+            continue
+        }
+        let width = lsp_utf8_width(ch)
+        if p + width > limit : break
+        p += width
+        col += lsp_utf16_width(ch)
+    }
+    return LspLineCol { line: line, col: col }
+}
+
+// One entry of a publishDiagnostics notification. Positions are 1-based lines
+// and UTF-16 columns; conversion to protocol 0-based values happens where the
+// JSON is built.
 class Diagnostic {
     severity: int
     msg: String
@@ -66,11 +145,10 @@ class Lsp {
     file: String ("")
     line: uint (0)
     col: uint (0)
-    // File to re-check for diagnostics once the input buffer has drained, so a
-    // batch of messages that arrived together costs one build instead of one
-    // each. Deliberately not set by didChange: with full-document sync every
-    // keystroke sends the whole file, and building per keystroke would mean a
-    // complete front-end pass per character.
+    // File to re-check for diagnostics once the input buffer has drained. Open,
+    // incremental change and save notifications all queue here, so a batch of
+    // messages that arrived together costs one front-end build instead of one
+    // per message.
     pending_diagnostics: ?String (null)
     //
     shutdown: bool (false)
@@ -398,8 +476,8 @@ class Lsp {
                 continue
             }
             let content = at.src.content
-            let start = build:message_line_col(content, at.i)
-            let end = build:message_line_col(content, at.i + m.len)
+            let start = lsp_line_col(content, at.i)
+            let end = lsp_line_col(content, at.i + m.len)
             let list = per_path.get(path) !? <{
                 let created = Array[Diagnostic]{}
                 per_path.set(path, created)
