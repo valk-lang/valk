@@ -1091,12 +1091,12 @@ alias FD for i32
 
 ```js
 + union Value : String | bool | float | int | ArrayValue | ObjectValue | null {
-    + fn append(value: Value) Value !ValueError
+    + fn append(value: Value) Value
     + fn array() ArrayValue
     + fn bool() bool
     + fn float() float
-    + fn get(key: Value) Value
-    + fn has(key: Value) bool
+    + fn get(key: uint | String) Value
+    + fn has(key: uint | String) bool
     + fn int() int
     + fn is_array() bool
     + fn is_bool() bool
@@ -1110,9 +1110,9 @@ alias FD for i32
     + fn kind_name() String
     + fn length() uint
     + fn object() ObjectValue
-    + fn prepend(value: Value) Value !ValueError
-    + fn remove(key: Value) Value !ValueError
-    + fn set(key: Value, value: Value) Value !ValueError
+    + fn prepend(value: Value) Value
+    + fn remove(key: uint | String) Value
+    + fn set(key: uint | String, value: Value) Value
     + fn string() String
 }
 ```

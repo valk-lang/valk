@@ -882,7 +882,7 @@ let age = document.get("age").int()
 // Bracket access is equivalent to get().
 let first = document["user"]["name"]["first"].string()
 
-document.set("active", true) ! panic("Expected an object")
+document = document.set("active", true)
 let encoded = json:encode(document)
 ```
 
@@ -891,6 +891,11 @@ let encoded = json:encode(document)
 always return their type's zero value when the value is missing or has another
 type. Arrays and objects return empty containers in the same situation.
 `length()` always returns a `uint`, and returns `0` for `null` and scalar values.
+For `get()`, `has()`, `set()`, and `remove()`, `String` keys address object
+properties and `uint` keys address array indexes. `set()` creates the required
+container when needed and fills skipped array positions with `null`. `append()`
+and `prepend()` likewise create an array when needed. `remove()` is safe when
+the key or container does not exist.
 
 Create mutable containers with `json:object()` and `json:array()`:
 
