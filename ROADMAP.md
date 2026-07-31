@@ -4,13 +4,12 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.0
-+ Rewrite entire compiler
-+ valk code formatter
-
-# Upcoming version
+- Release 0.2.1
 - "default" token in class scope = default value for this type
 - Defer statements
+
+# Upcoming version
+/
 
 # Next steps
 
@@ -53,6 +52,11 @@
 ## Done
 
 ```
++ Release 0.2.0
++ Rewrite entire compiler
++ valk code formatter
+
+
 + Release 0.1.14
 + Improve watch command
 + Validator functions
