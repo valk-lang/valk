@@ -284,6 +284,20 @@ fn describe(value: String | int | bool) String {
 A match that covers every alternative is exhaustive and does not need a
 `default` case. A type case must name one of the union's exact alternatives.
 
+When a case should intentionally do nothing, use `_` as its statement body.
+The arm still counts as a normal match case and keeps execution moving after
+the match:
+
+```rust
+fn only_describe_strings(value: String | int) String {
+    match value {
+        String as text => return text
+        default => _
+    }
+    return "not a string"
+}
+```
+
 `null` can be included as union syntax, even though it is not a standalone Valk
 type. It makes the complete union nullable:
 
