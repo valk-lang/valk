@@ -306,16 +306,17 @@ union MaybeValue : String | int | null {}
 
 fn describe_maybe(value: MaybeValue) String {
     return match value : String {
-        null => "missing"
         String as text => text
         int as number => "number: %number"
+        default => "missing"
     }
 }
 ```
 
-The `null` case must come before type cases in a nullable-union match. A named
-union containing `null` may still have instance methods: the method receives the
-nullable union value and can match `this` with a `null` case.
+A `default` arm also covers `null` and any unmatched alternatives. When matching
+exhaustively without `default`, put an explicit `null` case before type cases.
+A named union containing `null` may still have instance methods: the method
+receives the nullable union value and can match `this` directly.
 
 Alternatives keep their own type. For example, `int | uint` can distinguish
 between signed and unsigned values:
