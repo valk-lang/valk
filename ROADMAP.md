@@ -4,10 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.1
-+ `$default` type value hook
-+ LSP improvements
-+ Defer statements
+- Release 0.2.2
+/
 
 # Upcoming version
 /
@@ -41,6 +39,11 @@
 ## Done
 
 ```
++ Release 0.2.1
++ `$default` type value hook
++ LSP improvements
++ Defer statements
+
 + Release 0.2.0
 + Rewrite entire compiler
 + valk code formatter
