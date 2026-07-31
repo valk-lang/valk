@@ -8,6 +8,10 @@ set -u
 
 VALK="${VALK:-./valk}"
 DIR="./tests/exit-code"
+EXE_SUFFIX=""
+case "$(uname -s)" in
+    MINGW*|MSYS*) EXE_SUFFIX=".exe" ;;
+esac
 failed=0
 count=0
 
@@ -20,6 +24,9 @@ if [ ! -x "$VALK" ] && [ ! -f "$VALK" ]; then
 fi
 
 workdir=$(mktemp -d)
+if [ -n "$EXE_SUFFIX" ]; then
+    workdir=$(cygpath -m "$workdir")
+fi
 trap 'rm -rf "$workdir"' EXIT
 
 # fixture:expected exit status
@@ -37,7 +44,7 @@ for case in $cases; do
     fi
 
     count=$((count + 1))
-    exe="$workdir/$name"
+    exe="$workdir/$name$EXE_SUFFIX"
     echo "> Run: $VALK build $input -o $exe (expect exit $want)"
 
     set +e

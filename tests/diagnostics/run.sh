@@ -6,7 +6,19 @@ set -u
 
 VALK="${VALK:-./valk}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+EXE_SUFFIX=""
+case "$(uname -s)" in
+    MINGW*|MSYS*)
+        # Native Valk diagnostics use drive-letter paths, while Git Bash's pwd
+        # normally returns /d/... paths.
+        DIR="$(cd "$(dirname "$0")" && pwd -W)"
+        EXE_SUFFIX=".exe"
+        ;;
+esac
 workdir=$(mktemp -d)
+if [ -n "$EXE_SUFFIX" ]; then
+    workdir=$(cygpath -m "$workdir")
+fi
 trap 'rm -rf "$workdir"' EXIT
 
 failed=0
@@ -57,7 +69,7 @@ fi
 
 count=$((count + 1))
 echo "> failed assertion location"
-assert_bin="$workdir/assert-test"
+assert_bin="$workdir/assert-test$EXE_SUFFIX"
 assert_build=$("$VALK" build "$DIR/assert.valk" --test --no-warn -o "$assert_bin" 2>&1)
 assert_build_status=$?
 if [ "$assert_build_status" -ne 0 ]; then

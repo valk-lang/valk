@@ -12,6 +12,7 @@ BUILD_DEPS := $(SRC) $(LIB_SRC)
 VC ?= valk
 DIST_COMP ?= valk
 TEST_COMPILER ?= ./valk
+EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
 DIST_FLAGS := . src/*.valk --static --release -vv
@@ -66,8 +67,8 @@ update: valk
 # every standalone compiler/tooling test group used by CI.
 test: $(TEST_COMPILER)
 	mkdir -p ./debug
-	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core
-	./debug/test-core
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core$(EXE_SUFFIX)
+	./debug/test-core$(EXE_SUFFIX)
 
 test-compile-errors: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/compile-errors/run.sh

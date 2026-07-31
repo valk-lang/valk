@@ -18,7 +18,9 @@ VALK="${VALK:-./valk}"
 # `timeout` is GNU coreutils; macOS ships neither it nor gtimeout by default.
 # The guard below only exists to stop a hung server from wedging CI, so running
 # without one is an acceptable fallback — the CI job has its own time limit.
-if command -v timeout >/dev/null 2>&1; then
+# Windows also has a command named timeout, but it is an interactive console
+# delay rather than the GNU process limiter used here.
+if command -v timeout >/dev/null 2>&1 && timeout --version 2>/dev/null | grep -q 'GNU coreutils'; then
     TIMEOUT="timeout 60"
 elif command -v gtimeout >/dev/null 2>&1; then
     TIMEOUT="gtimeout 60"
@@ -26,6 +28,9 @@ else
     TIMEOUT=""
 fi
 DIR="$(cd "$(dirname "$0")" && pwd)"
+case "$(uname -s)" in
+    MINGW*|MSYS*) DIR="$(cd "$(dirname "$0")" && pwd -W)" ;;
+esac
 failed=0
 count=0
 
@@ -35,6 +40,9 @@ echo "# Test LSP"
 # Scratch dir for the cases that need a file of their own: copies to format, and
 # output paths for the builds that check the CLI half of a diagnostic.
 workdir=$(mktemp -d)
+case "$(uname -s)" in
+    MINGW*|MSYS*) workdir=$(cygpath -m "$workdir") ;;
+esac
 trap 'rm -rf "$workdir"' EXIT
 
 if [ ! -x "$VALK" ] && [ ! -f "$VALK" ]; then

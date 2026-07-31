@@ -26,6 +26,9 @@ if [ ! -d "$EXPECT_DIR" ]; then
 fi
 
 workdir=$(mktemp -d)
+case "$(uname -s)" in
+    MINGW*|MSYS*) workdir=$(cygpath -m "$workdir") ;;
+esac
 trap 'rm -rf "$workdir"' EXIT
 
 for expected in "$EXPECT_DIR"/*.valk; do
