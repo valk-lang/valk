@@ -94,6 +94,8 @@ fn func_release_ast(func: Func, exps: Array[Exp]) {
     func.body_scope = null
     func.alloca_scope = null
     func.defer_scope = null
+    func.user_defer_stack = null
+    func.user_defer_pop = null
     func.all_decls = .{}
     func.define_decls = .{}
     func.test_entry_decl = null
@@ -443,6 +445,7 @@ fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
     if exp.type == EXP.let : return value_from_let_exp(ctx, scope, exp) !>
     if exp.type == EXP.return : return value_from_return_exp(ctx, scope, exp) !>
+    if exp.type == EXP.defer : return value_from_defer_exp(ctx, scope, exp) !>
     if exp.type == EXP.assign : return value_from_assign_exp(ctx, scope, exp) !>
     if exp.type == EXP.stmt {
         let v = value_from_stmt_exp(ctx, scope, exp) !>
@@ -650,6 +653,139 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
 
     scope.did_return = true
     return vgen_return(retv, b, exp)
+}
+
+// Register a deferred call. Each execution creates a zero-argument closure,
+// which snapshots the locals it uses, and appends it to a hidden function-local
+// stack. This makes defer inside conditions and loops dynamic while keeping the
+// cleanup path shared by return, throw, error propagation, and fallthrough.
+fn value_from_defer_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let value_exp = exp.get(DEFER_EXP.value)
+    if !isset(value_exp) : exp.error("Expected a function call after 'defer'")
+
+    let deferred = value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
+    if !defer_value_is_call(deferred) {
+        value_exp.error("'defer' expects a function call")
+    }
+    if deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass {
+        value_exp.error("A deferred call must handle its error before the function exits")
+    }
+
+    let func = ctx.get_func() !>
+    let stack = ensure_user_defer_stack(func, exp) !>
+    let closure = make_defer_closure(func, scope, deferred, exp) !>
+    let stack_class = stack.type.get_class_or_null()
+    if !isset(stack_class) : exp.bug("Deferred-call stack has no Array class")
+    let append = stack_class.get_func("append")
+    if !isset(append) : exp.bug("Array[fn()].append is missing")
+    if !append.parsed_types : parse_func_types(append) !>
+
+    // Array.append has an optional `unique` argument, but generated calls use
+    // the complete ABI directly, so supply its default explicitly.
+    let call = vgen_call(
+        ctx,
+        vgen_func(append, vgen_decl(stack)),
+        Array[Value]{ closure, vgen_bool(false, type_bool(ctx.build)) },
+        append.get_rett()
+    )
+    call.exp = exp
+    return call
+}
+
+fn defer_value_is_call(value: Value) bool {
+    if value.type == VAL.call : return true
+    if value.type != VAL.error_handler : return false
+    let success = value.value1
+    return isset(success) && success.type == VAL.call
+}
+
+// Create the hidden Array[fn()()] on first use and splice its initialization
+// into the function prologue. The cleanup marker is inserted before the test
+// result and GC-frame cleanup values that func_finish_ast appends later.
+fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
+    let existing = func.user_defer_stack
+    if isset(existing) : return existing
+
+    let b = func.ns.build
+    let closure_type = Type {
+        type: TYPE.fn
+        build: b
+        sub_type: type_void(b)
+        sub_types: Array[Type]{}
+    }
+    let array_idf = valk_idf(b, "core", "Array") !>
+    let array_base = array_idf.class
+    if !isset(array_base) : at.bug("valk:core:Array is missing")
+    let array_class = array_base.specialize(Array[Type]{ closure_type }, at) !>
+    let stack_type = array_class.get_type() !>
+
+    let body_scope = func.body_scope
+    let alloca_scope = func.alloca_scope
+    let defer_scope = func.defer_scope
+    if !isset(body_scope) || !isset(alloca_scope) || !isset(defer_scope) {
+        at.bug("Function scopes are missing while creating a defer stack")
+    }
+    let stack = Decl.new(stack_type, false)
+    body_scope.add_decl(stack)
+    func.user_defer_stack = stack
+
+    let new_func = array_class.get_func("new")
+    let pop_func = array_class.get_func("pop_last")
+    if !isset(new_func) || !isset(pop_func) {
+        at.bug("Array[fn()] is missing new() or pop_last()")
+    }
+    if !new_func.parsed_types : parse_func_types(new_func) !>
+    if !pop_func.parsed_types : parse_func_types(pop_func) !>
+    func.user_defer_pop = pop_func
+
+    let init = vgen_call(
+        Context.for_func(func),
+        vgen_func(new_func),
+        Array[Value]{ vgen_int(0, type_from_core(b, "uint") !>) },
+        new_func.get_rett()
+    )
+    init.exp = at
+    alloca_scope.append_value(vgen_assign(vgen_decl(stack), init, ASSIGN_OP.set, b, at))
+    defer_scope.append_value(vgen_run_defers(stack, pop_func, b, at))
+    return stack
+}
+
+// A defer registration is represented as an ordinary closure. The existing
+// closure lowering copies referenced locals into its environment at the point
+// this Value is emitted, so loop iterations and later mutations behave as
+// independent registrations.
+fn make_defer_closure(owner: Func, scope: Scope, deferred: Value, at: Exp) Value !Error {
+    let arg_scope = scope.sub_scope()
+    let func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        // Include the owning specialization. A defer in a generic function is
+        // lowered once per concrete Func, while its source offset stays the
+        // same; the owner name keeps those LLVM symbols distinct.
+        name: "<defer." + owner.name + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        is_literal: true
+        parsed_types: true
+        parsed_ast: true
+    }
+    arg_scope.func = func
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = func
+    body_scope.append_value(deferred)
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    owner.unit.functions.append(func)
+
+    func_finish_ast(func) !>
+    func_prepare_closure(func) !>
+    if !isset(owner.ns.build.options.lsp) : generate_func_ir(func) !>
+
+    let closure = vgen_func(func)
+    closure.exp = at
+    return closure
 }
 
 // Return from a value scope: collect into vscope_returns / unify vscope_rett.

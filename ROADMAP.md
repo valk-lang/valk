@@ -6,7 +6,8 @@
 ```
 - Release 0.2.1
 - "default" token in class scope = default value for this type
-- Defer statements
++ LSP improvements
++ Defer statements
 
 # Upcoming version
 /

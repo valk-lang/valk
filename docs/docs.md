@@ -22,6 +22,7 @@
    * [Errors](#errors)
    * [Error handling](#error-handling)
    * [Throw functions](#throw-functions)
+   * [Deferred calls](#deferred-calls)
    * [Exit functions](#exit-functions)
    * [Closures](#closures)
 
@@ -352,6 +353,38 @@ fn main() {
     add()     // Compile error
 }
 ```
+
+### Deferred calls
+
+Use `defer` to schedule a function call for the end of the current function.
+Deferred calls run after the return value or thrown error has been evaluated,
+and before the function gives control back to its caller.
+
+```rust
+fn use_resource(resource: Resource) {
+    defer resource.close()
+
+    resource.write("done")
+}
+```
+
+Calls run in last-in, first-out order. A defer is registered only when execution
+reaches it, so defer statements in conditions and loops behave dynamically:
+
+```rust
+fn example(enabled: bool) {
+    defer println("first")
+    if enabled : defer println("conditional")
+    defer println("last")
+    // enabled: prints last, conditional, first
+}
+```
+
+Referenced local values are captured when the defer statement is reached. The
+call itself runs later. Deferred calls run for explicit and implicit returns,
+and when an error is returned with `throw` or `!>`. If a deferred call can
+return an error, handle it at the defer statement with `_`, `!!`, `!?`, or an
+error block; it cannot pass a new error after the function has begun returning.
 
 ### Errors
 
