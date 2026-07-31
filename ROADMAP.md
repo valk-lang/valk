@@ -13,9 +13,7 @@
 
 # Next steps
 
-- Valk fmt
 - Complete libc integration
-- Mysql or Postgres package
 - Interfaces
 - Union types
 
@@ -28,9 +26,7 @@
 -- This is the same as `let x : <StructName> = { ... }`
 -- but stackalloc can be used as a value, e.g. in function arguments
 - Allow @undefined for entire struct. E.g. let user = User { @undefined }
-~ Work out bad features: cothrow, imut
 - Full HTTP 1.1 protocol + Cookies
-- More atomic features
 ```
 
 ## Maybe
