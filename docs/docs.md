@@ -8,6 +8,7 @@
 
 * [Basic example](#basic-example)
 * [Multiple files](#multiple-files)
+* [Building and running](#building-and-running)
 * [Namespaces](#namespaces)
 * [Packages](#packages)
 * [Types](#types)
@@ -15,7 +16,6 @@
 * [Strings](#strings)
 * [Arrays](#arrays)
 * [Maps](#maps)
-* [Objects](#objects)
 * [Typehints](#typehints)
 * [Functions](#functions)
    * [Errors](#errors)
@@ -31,8 +31,6 @@
 * [Generics](#generics)
 * [Modes](#modes)
 * [Globals](#globals)
-* [Interface / Union types](#interface-union-types)
-
 - [Tokens](#tokens)
     * [Let](#variables)
     * [If/Else](#if-else)
@@ -81,13 +79,13 @@ See: [API docs](api.md)
 
 ## Getting started
 
-Install on linux, macos or WSL
+Install on Linux, macOS, or WSL:
 
 ```sh
 curl -s https://valk-lang.dev/install.sh | bash -s latest
 ```
 
-Windows (via powershell)
+Windows (via PowerShell):
 
 ```sh
 irm https://valk-lang.dev/install.ps1 | iex
@@ -111,7 +109,7 @@ valk build main.valk -o ./main
 
 ## Multiple files
 
-To build multiple files into a program, you simply add them to the build command. However, for big projects we use namespaces to organize our code (See next chapter).
+To build multiple files into a program, add them to the build command. For larger projects, use namespaces to organize the code.
 
 ```sh
 valk build file-1.valk file-2.valk -o ./main
@@ -120,57 +118,49 @@ valk build file-1.valk file-2.valk -o ./main
 
 ## Namespaces
 
-To organize your code we group files into different directories. Each namespace represents 1 directory. To create a namespace, you must define it in your config file `valk.json`. Which should be located in the root of your project.
+Each directory in your project represent a namespace. But first you have to define a package by creating a `valk.json` file.
 
-```json
-{
-    "namespaces": {
-        "my_namespace": "src/my-namespace"
-    }
-}
+By default your code must go in `./src`
+
+```
+./valk.json
+./src
+  | main.valk
+  > ./ns1
+    | MyClass.valk
+  > ./ns2
+    | MyOtherClass.valk
 ```
 
 ```rust
-// src/main.valk
-use my_namespace
-// Alternatives
-use my_namespace as mn // Alias for namespace
-use my_namespace { thumbs_up } // extract single identifier
-use my_namespace as mn { thumbs_up } // Both
+// main.valk
+use ns1
+use ns2
 
 fn main() {
-    // Calling a function from another namespace
-    my_namespace:thumbs_up()
-    mn:thumbs_up() // Using the alias
-    thumbs_up() // Direct import from `use my_namespace { thumbs_up }`
-}
-```
-
-```rust
-// src/my-namespace/demo.valk
-fn thumbs_up() {
-    println("👍")
+    let a  = ns1:MyClass {}
+    let b  = ns1:MyOtherClass {}
 }
 ```
 
 ```sh
-valk build src/main.valk -o ./myprogram
+valk build ./src -o ./myprogram
 ```
 
 ## Packages
 
-Packages are still in an early stage. You can install/manage packages for your project using the `vman` command.
+Packages are still in an early stage. Install and manage project packages with `vman`.
 
 ```sh
-vman install # Install pacakages defined in the valk.json config
-vman install {pkg} # Install pacakage globally
-vman remove {pkg} # Remove pacakage
+vman install # Install packages defined in valk.json
+vman install {pkg} # Install a package globally
+vman remove {pkg} # Remove a package
 # Example:
 vman install github.com/valk-lang/pkg-example
 vman remove example
 ```
 
-After you installed a package, it will added to your `valk.json` config. In this config you can also change the name you want to use in your code.
+After installing a package, it is added to `valk.json`. The configuration can also change the name used to import it.
 
 ```rust
 // Example: valk.json -> { "dependencies": "example": {...} }
@@ -185,13 +175,13 @@ Example package: [link](https://github.com/valk-lang/pkg-example)
 
 ## Types
 
-Integer types: `int`, `uint`, `i8` `i16` `i32` `i64` `u8` `u16` `u32` `u64`
+Integer types: `int`, `uint`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`
 
 Float types: `float`, `f32`, `f64`
 
-Built-in classes: `String` `Array` `Map` `HashMap`
+Built-in classes: `String`, `Array`, `Map`, `HashMap`
 
-Null-able types: `?String` (allows you to assign `null`. Only on pointer types, not numeric types)
+Nullable types: `?String` allows the value to be `null`
 
 Function pointer: `fn({arg-types})({return-types})` e.g. `fn(i32)()`
 
@@ -228,7 +218,7 @@ let v : u8 = "100".to(u8) // This works
 let name = "Peter"
 let msg1 = "Hello " + name + "!" // Concat strings
 let msg2 = "Hello %name!" // Short way
-let msg3 = "Name length x 2: %{ name.length * 2 }!" // Inline value (You can use any code inside %{} as long as it can be converter to String)
+let msg3 = "Name length x 2: %{ name.length * 2 }!" // Any expression that can be converted to String
 let msg4 = "Hello \%name!" // Prevent inlining using '\' before '%'
 let msg5 = r"Hello %name!" // Prevent inlining using 'r' (raw) at the start 
 // Basics
@@ -238,7 +228,7 @@ s.ends_with(x) bool
 s.is_empty() bool
 s.contains(x) bool
 s.lower() String // Convert to lowercase
-s.upper() String // Convert to lowercase
+s.upper() String // Convert to uppercase
 s.part(start_index, length) String // Sub string
 s.range(start_index, end_index) String // Sub string using end-index
 ```
@@ -247,7 +237,7 @@ Full `String` API: [valk:type](api.md#core)
 
 ## Arrays
 
-Important: always use `append` instead of `prepend` when possible. Appending is ALOT faster.
+Prefer `append` over `prepend` when possible; appending is significantly faster.
 
 ```rust
 let arr = Array[int]{ 1, 2, 3 } // Create array
@@ -266,7 +256,7 @@ Full `Array` API: [valk:type](api.md#core)
 
 ## Maps
 
-A `Map` is a key/value store. The keys are always strings and the value type you can choose. If you need non-string keys, use `HashMap`
+A `Map` is a key/value store with `String` keys and a configurable value type. Use `HashMap` when keys are not strings.
 
 ```rust
 let m = Map[uint]{ "a" => 1, "b" => 2 } // Create map
@@ -277,9 +267,9 @@ m.remove(key)
 m.has(key)
 m.clear()
 //
-each arr as value {}
-each arr as value, key {}
-each arr as value, key, index {}
+each m as value {}
+each m as value, key {}
+each m as value, key, index {}
 ```
 
 Full `Map` API: [valk:type](api.md#core)
@@ -298,7 +288,7 @@ Full `HashMap` API: [valk:type](api.md#core)
 
 ## Typehints
 
-When declaring variables, properties, globals, function arguments, ... you can or sometimes must provide a `type`. With `.` you can refer to this type when passing a value to that variable, property, ...
+Variables, properties, globals, and function arguments can have explicit type hints. When the expected type is known, `.` can construct a value of that type without repeating its name.
 
 ```rust
 // Variables
@@ -310,9 +300,9 @@ test(.{ 1, 2, 3})
 class A {
     list: Array[int]
 }
-let ob = A { list: .{1,2,3} }
+let ob = A { list: .{ 1, 2, 3 } }
 // Operators also typehint for the value on the right side
-let is_equal = (ob.list == .{3,2,1})
+let is_equal = (ob.list == .{ 3, 2, 1 })
 ```
 
 ## Functions
@@ -335,7 +325,7 @@ fn main() {
 
 Functions can return errors using `throw`. But first you need to define an error type or you can use one of the built-in ones.
 
-To define an error type you must provide atleast 1 error code or atleast extend 1 existing error type. Optionally you can define payload fields in case you want to pass error related data.
+An error type must provide at least one error code or extend at least one existing error type. Payload fields can carry additional error data.
 
 ```rust
 error {Error type name} ({codes}) [extends ({error types})] [payload { {field-name}: {type} }]
@@ -369,11 +359,12 @@ SyntaxError (syntax) // Common error
 When calling this function the error must always be handled. There are many ways to do this:
 
 ```rust
-// !? Provide a alternative value when an error occurs
+// !? Provide an alternative value when an error occurs
 let v = my_func() !? "hello"
 // ! Run code if the function returns an error
 my_func() ! { print("error") }
-// ! However, if you want the return value of the function call, then the error code must and with: return, break, continue, throw, panic or an exit-function
+// If the call's value is needed, the handler must return an alternative value
+// or exit through return, break, continue, throw, panic, or an exit function.
 let v = my_func() ! { print("error"); return }
 // ! You can also use a single line
 let v = my_func() ! return
@@ -406,22 +397,22 @@ fn main() {
 
 ### Throw functions
 
-Throw-functions are used to generate throw statements in order to reduce repetitive code. A throw function is just a normal function that's flagged with `$throw`
+Throw functions centralize repeated error construction. They are ordinary error-returning functions marked with `$throw`, which lets callers invoke them where a `throw` statement is required.
 
 Example
 
 ```rust
+error ParseError (invalid) payload {
+    message: String
+    line: uint
+    col: uint
+}
+
 fn parse_error(parser: MyParser, message: String) !ParseError $throw {
-    // Log message
-    parser.build.log("Parse error: " + message + " | at: " + parser.location.to_string())
-    // Return error
-    throw ParseError {
+    throw .invalid {
         message: message
         line: parser.location.line
         col: parser.location.col
-        file: parser.filepath ?? "<generated-code>"
-        content: parser.content
-        at_index: parser.location.index
     }
 }
 
@@ -530,21 +521,19 @@ fn main() {
 - Generic type names use the same naming conventions as variable names
 - Generic types can be modified: e.g. If `T` is `String`, then `?T` will become `?String`
 
-You can also generate a generic function based on the value of an argument
+The compiler can also infer a generic type from an argument by prefixing the type parameter with `$`:
 
 ```rust
-fn multiply(value: $T) T {
-    #if type_has_method(T, multi)
-    return value.multi()
-    #elif is_type_of_class(T, String)
-    return value + "x" + value
+fn combined_length(v1: $V1, v2: $V2) uint {
+    #if V2.$is_nullable
+    return v1.length
     #else
-    return value * 2
+    return v1.length + v2.length
     #end
 }
 ```
 
-Basically `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)`
+In other words, `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)` when `T` should be inferred from `arg`.
 
 ## Modes
 
@@ -572,10 +561,6 @@ fn main() {
 global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
 ```
-
-## Interface / Union types
-
-`interface` & `union` types are still under development and will be release in upcoming versions. 
 
 ## Tokens
 
@@ -609,8 +594,8 @@ let m = Map[String]{};
 m.set("a", "10")
 m.set("b", "20")
 m.set("c", "30")
-each m as k, v {
-    println(k + ":" + v)
+each m as value, key {
+    println(key + ":" + value)
 }
 // a:10 b:20 c:30
 each m as v {
@@ -771,23 +756,23 @@ let a = might_error() !? <{
 
 ## Compile macros
 
-With `compile macros` we can modify our code based on parameters we gave the compiler. We can also do checks on types. This can be useful when working with generic types.
+Compile macros select code using compiler definitions or type metadata. Built-in definitions include `OS`, `ARCH`, and `TEST`; additional values can be supplied with `--def`.
 
 ```rust
 fn main() {
-    #if OS == linux
+    #if OS == "linux"
     println("Linux")
-    #elif OS != macos
-    println("Not macOS or Linux")
+    #elif OS == "macos"
+    println("macOS")
     #else
-    println("...")
+    println("Not macOS or Linux")
     #end
 
-    #if is_pointer_type(T)
+    #if T.$is_pointer
     println("Type is a pointer")
-    #if is_gc_type(T)
-    println("Type is a garbage collected type")
     #end
+    #if T.$is_gc
+    println("Type is a garbage collected type")
     #end
 }
 ```
@@ -806,7 +791,7 @@ println(v) // 7
 
 ## Testing
 
-To test our project, we pass in the `--test` cli argument with our build command. Instead of calling our `main` function, the program will now run all your defined tests. In these tests we can use `assert` to check if something is an expected result.
+To test a project, pass `--test` with the build command. Test declarations are omitted from ordinary builds; in a test build, the generated entry point runs them instead of `main`. Use `assert` inside a test to record its results.
 
 ```rust
 test "My test" {
@@ -816,14 +801,36 @@ test "My test" {
 }
 ```
 
+Regular `test` declarations run concurrently. After every regular test has finished, `synctest` declarations run sequentially:
+
+```rust
+test "Can run concurrently" {
+    // This may overlap with other regular tests.
+}
+
+synctest "Requires isolation" {
+    // No other test is running while this test executes.
+    // Use this for tests that modify globals, collect garbage, or depend on
+    // other process-wide state.
+}
+```
+
+All regular tests run before any `synctest`, regardless of their declaration order. Synctests then run one at a time in their declaration order. A test that needs to verify concurrency can still create and await its own coroutines.
+
 ```sh
-valk build src/*.v --test --run
+valk build src/*.valk --test --run
 ```
 
 Or we can put our tests in a different directory.
 
 ```sh
-valk build src/*.v ./my-tests/*.valk --test --run
+valk build src/*.valk ./my-tests/*.valk --test --run
+```
+
+Use `--filter` to compile only tests whose names contain a string:
+
+```sh
+valk build ./src ./tests --test --filter "database" --run
 ```
 
 ## HTTP
@@ -884,7 +891,7 @@ use valk:net
 
 // Server
 fn server() {
-    let sock = net:Socket.server(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
+    let sock = net:Socket.server(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
     let buffer = ByteBuffer.new()
     while true {
         let con = sock.accept() ! {
@@ -895,7 +902,7 @@ fn server() {
         while true {
             buffer.clear()
             let bytes = con.recv(buffer, 1000) ! {
-                if E == E.closed : break // Connection closed
+                if error_is(E.code, closed) : break // Connection closed
                 println("# Server failed to read from connection")
                 break
             }
@@ -913,7 +920,7 @@ fn main() {
     // Start our server in the background
     let s = co server()
     // Open client
-    let con = net:Socket.client(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket: " + EMSG)
+    let con = net:Socket.client(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
     con.send("PING") ! panic("Client failed to send data")
     // Recv
@@ -926,7 +933,7 @@ fn main() {
 
 ## Templates
 
-`valk:template` is a small template engine. Currently it's funtionality is limited, but we will expand on it in the coming versions.
+`valk:template` is a small runtime template engine.
 
 Example template:
 
@@ -962,13 +969,11 @@ class PageData {
 }
 //
 fn main() {
-    let template_dir = __DIR__
     let options = template:RenderOptions {
-        // Adding html sanitizer to prevent XSS attacks
         sanitize: html:sanitize_filter
-        // Setting a template directory allows you to use @include("...")
-        template_directory: template_dir
     }
+    // Embed templates at compile time and register them by relative path.
+    template:set_content_many(#embed_dir("views"))
     // Template data
     let data = PageData {
         title: "Hello world"
@@ -980,7 +985,7 @@ fn main() {
         }
     }
     // Render the template
-    let result = template:render_path(template_dir + "/example.html", data, options) ! panic("Error: %EMSG")
+    let result = template:render("example.html", data, options) ! panic("Template error: %{E.message}")
 
     println(result)
 }
@@ -998,10 +1003,10 @@ Template engine tokens:
 {{ }} // Print sanitized (if sanitizer isset in the options)
 @{{ }} // Print without sanitization
 
-@include("...") // include other template (template_directory must be set in options)
+@include("...") // Include another template registered with set_content/set_content_many
 ```
 
-Note: `valk:template` works at runtime and can therefor not detect incorrect template syntax at compile time.
+Note: `valk:template` works at runtime and therefore cannot detect incorrect template syntax at compile time.
 
 ## Crypto
 
@@ -1046,15 +1051,15 @@ Note: `#embed_dir` is recursive. Also try to put an embed in a separate function
 
 ## Unsafe
 
-Although Valk aims to be a safe language, we also dont want to prevent people from doing unsafe things if they want. So which features are unsafe? 
+Although Valk aims to be safe, it still supports low-level operations when needed. Unsafe features include:
 
 - All tokens that start with `@`
-- Uses of `pointer` types e.g. `ptr` (pointer type = void pointer)
-- The `struct` types are unsafe in the sense of memory-leaks if you dont free them
+- Raw pointer types such as `ptr`
+- `struct` values whose manually managed allocations are not freed
 
 ## Structs
 
-A `struct` is basically a `class` without the garbage collection. You manage the allocation/free-ing yourself. Structs are compatible with the structs from `c`. This makes them useful for integrating with c libraries.
+A `struct` is similar to a `class` without garbage collection. Its allocation lifetime must be managed manually. Struct layouts are compatible with C structs, which makes them useful for integrating with C libraries.
 
 ```rust
 struct MyStruct {
@@ -1073,24 +1078,7 @@ fn main() {
 }
 ```
 
-Behind the scenes Valk allocates struct objects using `valk:mem:alloc`. So you can free them using `valk:mem:free`. These 2 functions basically map to `malloc` & `free` from libc. So memory that comes from a c library can be freed using the `valk:mem:free` function, and the other way around.
-
-But feel free to implement your own allocator.
-
-```rust
-fn alloc(size: uint) ptr {
-    // ... code ...
-}
-fn make[T]() T {
-    #if type_is_struct(T)
-    #error "You can only allocate struct types"
-    #end
-    return alloc(sizeof(<T>)).@cast(T)
-}
-fn main() {
-    let obj : MyStruct = make[MyStruct]()
-}
-```
+Valk allocates struct objects through `valk:mem:alloc`; release them with `valk:mem:free`. These functions map to libc's `malloc` and `free`, so memory can cross the Valk/C boundary when both sides agree on ownership.
 
 ## External libraries
 
@@ -1135,9 +1123,9 @@ The valk manager aka `vman` can be used to install/update new versions of `valk`
 vman use latest # Will install/use the latest version of valk
 vman use # Will install/use the valk version defined in your {cwd}/valk.json config -> { "use": "x.x.x" }
 vman use {version} # Install/use a specific version
-vman install # Install pacakages defined in the valk.json config
-vman install {pkg} # Install pacakage globally
-vman remove {pkg} # Remove pacakage
+vman install # Install packages defined in valk.json
+vman install {pkg} # Install a package globally
+vman remove {pkg} # Remove a package
 ```
 
 Project: [Link](https://github.com/valk-lang/vman)
@@ -1146,6 +1134,6 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-Currently we dont have a builtin solution/detection for data races. However `Array` & `Map` are protected against data races. For integers you can use `atomic()`. `String` is also safe because they are immutable. In other cases you will have to create a Mutex and lock/unlock when needed.
+Valk does not currently detect data races. `Array` and `Map` protect their internal mutations, and integer updates can use `atomic()`. Strings are immutable. Protect other shared mutable state with a `Mutex`.
 
 You can use `core:race_lock()` and `core:race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).
