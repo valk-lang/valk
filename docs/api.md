@@ -45,7 +45,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
     + fn clear(reduce_size: bool (false)) Array[T]
-    + fn compose_json(str: StringComposer, pretty: bool, depth: uint) void
+    + fn compose_json(str: ByteBuffer, pretty: bool, depth: uint) void
     + fn contains(value: T) bool
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
@@ -118,6 +118,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_buffer_part(buf: ByteBuffer, len: uint, offset: uint (0)) void
     + fn write_byte(v: u8) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
+    + fn write_f64_ascii(v: f64, decimals: uint (2), trim_zeros: bool (false)) void
     + fn write_f64_be(v: f64) void
     + fn write_f64_le(v: f64) void
     + fn write_from_ptr(data: ptr, length: uint) void
@@ -313,22 +314,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
-}
-```
-
-```js
-+ class StringComposer {
-    + fn append(buffer: StringComposer) StringComposer
-    + fn append_byte(byte: u8) StringComposer
-    + fn append_f64(value: f64, decimals: uint (2), trim_zeros: bool (false)) StringComposer
-    + fn append_from_ptr(data: ptr, length: uint) StringComposer
-    + fn append_int(value: int) StringComposer
-    + fn append_str(str: String) StringComposer
-    + fn append_str_json_escaped(add: String) StringComposer
-    + fn append_uint(value: uint) StringComposer
-    + fn clear() void
-    + static fn new(start_size: uint (256)) StringComposer
-    + fn to_string() String
 }
 ```
 
@@ -983,7 +968,7 @@ alias pid_t for i32
     + status: u32
 
     + fn add_header(name: String, value: String) void
-    + static fn empty(code: u32, headers: ?Map[String] (null)) Response
+    + static fn empty(code: u32 (200), headers: ?Map[String] (null)) Response
     + static fn file(path: String, filename: ?String (null)) Response
     + static fn html(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
     + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
@@ -1068,7 +1053,7 @@ alias FD for i32
 
 ```js
 + fn decode(json: String) Value !ParseError
-+ fn encode(data: $T, pretty: bool (false), output: ?StringComposer (null), depth: uint (0)) StringComposer
++ fn encode(data: $T, pretty: bool (false), output: ?ByteBuffer (null), depth: uint (0)) ByteBuffer
 + fn encode_to_string(data: $T, pretty: bool (false)) String
 + fn new(type: int) Value
 + fn new_array(values: ?Array[Value] (null)) Value
@@ -1098,7 +1083,7 @@ alias FD for i32
     + fn append(val: $T) void
     + fn array() Array[Value]
     + fn bool() bool
-    + fn compose_json(str: StringComposer, pretty: bool, depth: uint) void
+    + fn compose_json(str: ByteBuffer, pretty: bool, depth: uint) void
     + fn encode(pretty: bool (false)) String
     + fn float() float
     + fn get(key: String) Value !LookupError
@@ -1291,9 +1276,6 @@ alias FD for i32
 
 ```js
 + class Thread {
-    ~ finished: bool
-    ~ started: bool
-
     + static fn start(func: fn()()) Thread !InitError
     + fn wait() void
 }
