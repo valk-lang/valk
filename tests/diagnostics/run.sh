@@ -24,6 +24,12 @@ trap 'rm -rf "$workdir"' EXIT
 failed=0
 count=0
 
+# Compiler paths are native (`D:\\...`) on Windows, while Git Bash and `pwd -W`
+# use forward slashes. Normalize captured output before exact location checks.
+normalize_paths() {
+    tr '\\' '/'
+}
+
 echo ""
 echo "# Test diagnostic source locations"
 
@@ -38,6 +44,7 @@ check_build_error() {
     local out status
     out=$("$VALK" build "$DIR/$file.valk" --no-warn -o "$workdir/$file" 2>&1)
     status=$?
+    out=$(printf '%s' "$out" | normalize_paths)
     if [ "$status" -eq 0 ] || [[ "$out" != *"# File: $DIR/$file.valk"* ]] || \
        [[ "$out" != *"# Line: $location"* ]] || [[ "$out" != *"$message"* ]]; then
         echo "# Wrong build diagnostic"
@@ -59,6 +66,7 @@ count=$((count + 1))
 echo "> warning location"
 warn_out=$("$VALK" build "$DIR/warning.valk" -o "$workdir/warning" 2>&1)
 warn_status=$?
+warn_out=$(printf '%s' "$warn_out" | normalize_paths)
 if [ "$warn_status" -ne 0 ] || [[ "$warn_out" != *"unused_value' was declared but never used @ $DIR/warning.valk:3:5"* ]]; then
     echo "# Wrong warning location"
     echo "- Expected: $DIR/warning.valk:3:5"
@@ -79,6 +87,7 @@ if [ "$assert_build_status" -ne 0 ]; then
 else
     assert_out=$("$assert_bin" 2>&1)
     assert_status=$?
+    assert_out=$(printf '%s' "$assert_out" | normalize_paths)
     if [ "$assert_status" -eq 0 ] || [[ "$assert_out" != *"assert(actual == expected)"* ]] || \
        [[ "$assert_out" != *"[file] $DIR/assert.valk:4"* ]]; then
         echo "# Wrong failed-assertion location"
