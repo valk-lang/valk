@@ -34,6 +34,10 @@ esac
 failed=0
 count=0
 
+normalize_paths() {
+    tr '\\' '/'
+}
+
 echo ""
 echo "# Test LSP"
 
@@ -219,6 +223,7 @@ echo "> CLI prints the warnings, and --no-warn suppresses them"
 # Matched on the message rather than the ⚠️ prefix, which helper:msg drops when
 # the terminal has no ansi support.
 warn_out=$("$VALK" build "$DIR/warn.valk" -o "$workdir/warn" 2>&1)
+warn_out=$(printf '%s' "$warn_out" | normalize_paths)
 warn_count=$(printf '%s\n' "$warn_out" | grep -c 'never used')
 if [ "$warn_count" -ne 3 ]; then
     echo "# CLI should report 3 warnings, got $warn_count"
