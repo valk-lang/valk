@@ -876,19 +876,21 @@ fn describe(value: json:Value) String {
 use valk:json
 
 let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
-let name = document.get("name") ! panic("Missing name")
-let age = document.get("age") ! panic("Missing age")
-let name_text = name.as_string() ! panic("Name must be a string")
-let age_number = age.as_int() ! panic("Age must be an int")
+let name = document.get("name").string()
+let age = document.get("age").int()
+
+// Bracket access is equivalent to get().
+let first = document["user"]["name"]["first"].string()
 
 document.set("active", true) ! panic("Expected an object")
 let encoded = json:encode(document)
 ```
 
-Accessors are strict: `"12".as_int()` is an error rather than an implicit
-conversion, and missing keys or indexes are distinct from an actual JSON
-`null`. Value-level fallbacks such as `get_or_null`, `get_index_or_null`, and
-`get_or` are available when that behavior is wanted.
+`get()` and bracket access are safe: missing keys and invalid paths produce
+`null`. Typed accessors such as `.string()`, `.int()`, `.float()`, and `.bool()`
+always return their type's zero value when the value is missing or has another
+type. Arrays and objects return empty containers in the same situation.
+`length()` always returns a `uint`, and returns `0` for `null` and scalar values.
 
 Create mutable containers with `json:object()` and `json:array()`:
 

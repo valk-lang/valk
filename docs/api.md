@@ -1050,13 +1050,13 @@ alias FD for i32
 
 ```js
 + fn array(values: ?Array[Value] (null)) ArrayValue
++ fn decode(json: String) Value !ParseError
 + fn default_value(kind: int) Value
++ fn encode(data: Value, pretty: bool (false)) String
++ fn encode_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 + fn from(data: $T) Value
 + fn from_value[T](data: Value) T !ValueError
 + fn object(values: ?Map[Value] (null)) ObjectValue
-+ fn decode(json: String) Value !ParseError
-+ fn encode(data: Value, pretty: bool (false)) String
-+ fn encode_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 ```
 
 ## Classes for 'json'
@@ -1092,23 +1092,12 @@ alias FD for i32
 ```js
 + union Value : String | bool | float | int | ArrayValue | ObjectValue | null {
     + fn append(value: Value) Value !ValueError
-    + fn array_or_empty() ArrayValue
-    + fn as_array() ArrayValue !ValueError
-    + fn as_bool() bool !ValueError
-    + fn as_float() float !ValueError
-    + fn as_int() int !ValueError
-    + fn as_object() ObjectValue !ValueError
-    + fn as_string() String !ValueError
-    + fn bool_or(fallback: bool) bool
-    + fn float_or(fallback: float) float
-    + fn get(key: String) Value !ValueError
-    + fn get_index(index: uint) Value !ValueError
-    + fn get_index_or_null(index: uint) Value
-    + fn get_or(key: String, fallback: Value) Value
-    + fn get_or_else(key: String, fallback: fn()(Value)) Value
-    + fn get_or_null(key: String) Value
-    + fn has(key: String) bool
-    + fn int_or(fallback: int) int
+    + fn array() ArrayValue
+    + fn bool() bool
+    + fn float() float
+    + fn get(key: Value) Value
+    + fn has(key: Value) bool
+    + fn int() int
     + fn is_array() bool
     + fn is_bool() bool
     + fn is_float() bool
@@ -1119,13 +1108,12 @@ alias FD for i32
     + fn is_string() bool
     + fn kind() int
     + fn kind_name() String
-    + fn length() uint !ValueError
-    + fn object_or_empty() ObjectValue
+    + fn length() uint
+    + fn object() ObjectValue
     + fn prepend(value: Value) Value !ValueError
-    + fn remove(key: String) Value !ValueError
-    + fn remove_index(index: uint) Value !ValueError
-    + fn set(key: String, value: Value) Value !ValueError
-    + fn string_or(fallback: String) String
+    + fn remove(key: Value) Value !ValueError
+    + fn set(key: Value, value: Value) Value !ValueError
+    + fn string() String
 }
 ```
 
