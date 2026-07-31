@@ -13,6 +13,7 @@
 * [Namespaces](#namespaces)
 * [Packages](#packages)
 * [Types](#types)
+* [Tagged unions](#tagged-unions)
 * [Variables](#variables)
 * [Strings](#strings)
 * [Arrays](#arrays)
@@ -231,6 +232,60 @@ Other: `ptr` <- raw pointer (unsafe)
 `uint` becomes `u32` or `u64` based on the compile target
 
 `float` becomes `f32` or `f64` based on the compile target
+
+## Tagged unions
+
+A tagged union holds exactly one value from a fixed set of types. Use `|` to
+list its alternatives. Type aliases are useful for giving unions a name:
+
+```rust
+type JsonValue (JsonString | JsonInt | JsonBool | JsonNull)
+
+let value : JsonValue = JsonInt { value = 42 }
+```
+
+Values are widened to the union automatically. The order of the alternatives
+does not affect the type, so `String | int` and `int | String` are the same
+union.
+
+Use a type case in `match` to inspect and extract the active value. The name
+after `as` has the type named by that case:
+
+```rust
+fn describe(value: String | int | bool) String {
+    return match value : String {
+        String as text => text
+        int as number => "number: %number"
+        bool as enabled => enabled ? "enabled" : "disabled"
+    }
+}
+```
+
+A match that covers every alternative is exhaustive and does not need a
+`default` case. A type case must name one of the union's exact alternatives.
+
+`null` can be included as union syntax, even though it is not a standalone Valk
+type. It makes the complete union nullable:
+
+```rust
+type MaybeValue (String | int | null) // Equivalent to ?(String | int)
+
+fn describe_maybe(value: MaybeValue) String {
+    return match value : String {
+        null => "missing"
+        String as text => text
+        int as number => "number: %number"
+    }
+}
+```
+
+The `null` case must come before type cases in a nullable-union match.
+
+Exact duplicate alternatives collapse into one type. Distinct alternatives
+must not overlap; for example, `int | uint` is rejected because either
+alternative could accept the same numeric value. The initial implementation
+supports numeric and pointer-sized alternatives. Unions cannot currently be
+used in `extern` function signatures or globals.
 
 ## Variables
 

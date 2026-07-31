@@ -11,6 +11,7 @@ enum TYPE {
     inline     // <T>
     array      // [T x N]
     multi      // (T, U, ...)
+    union      // A | B (boxed tagged value)
     fn         // fn(...)(...)
     fnptr      // fnptr(...)(...)
     co         // co(...)
@@ -97,6 +98,11 @@ class Type {
         }
         if t == TYPE.fn : return psz * 2
 
+        // Tagged unions are boxed in the first implementation. This keeps
+        // their ABI pointer-sized and lets the existing GC/property machinery
+        // track a union stored in locals, objects, and generic containers.
+        if t == TYPE.union : return psz
+
         if t == TYPE.nullable {
             let sub = this.sub_type
             if !isset(sub) : return psz
@@ -164,7 +170,7 @@ class Type {
     // True if this type is stored as a pointer-sized word (no recursive layout).
     fn is_pointer_sized() bool {
         let t = this.type
-        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.any {
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.union || t == TYPE.any {
             return true
         }
         if t == TYPE.nullable {
@@ -253,7 +259,7 @@ class Type {
         if t == TYPE.array || t == TYPE.inline || t == TYPE.multi : return true
         if t == TYPE.int || t == TYPE.float || t == TYPE.bool : return true
         if t == TYPE.fn : return true
-        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.any || t == TYPE.void {
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.union || t == TYPE.any || t == TYPE.void {
             return false
         }
         if t == TYPE.nullable {
@@ -349,6 +355,9 @@ class Type {
     // inherit GC-ness through TYPE.ptr / TYPE.ref.
     fn is_gc_type() bool {
         let t = this.get_non_nullable()
+        // A union is represented by a compiler-owned GC box. The active
+        // managed alternative is stored in that box as an ordinary GC property.
+        if t.type == TYPE.union : return true
         // A coroutine handle is represented by a managed `coro:Coro` object
         // even though it has its own surface type. Containers and locals that
         // hold `co` values must therefore trace/root the pointer just like a
@@ -369,7 +378,7 @@ class Type {
     // Pointer-like storage: explicit ptr/ref/fn, or reference-class kinds.
     fn is_pointer_type() bool {
         let t = this.type
-        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fn || t == TYPE.fnptr || t == TYPE.co {
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fn || t == TYPE.fnptr || t == TYPE.co || t == TYPE.union {
             return true
         }
         if t == TYPE.nullable {
@@ -486,6 +495,14 @@ class Type {
         // through compat_class() / compat_numbers(), both of which unwrap it, so
         // every `?T` → `T` assignment would silently pass.
         if typ.is_nullable_type() : return false
+
+        // A union accepts one of its alternatives, or the same structural
+        // union. Union-to-non-union narrowing is never implicit.
+        if base.type == TYPE.union {
+            if typ.type == TYPE.union : return base.union_accepts_union(typ)
+            return isset(base.union_member_for(typ))
+        }
+        if typ.type == TYPE.union : return false
 
         // Bare `ptr` is the void-pointer-style type. It is compatible with typed
         // pointers and references in either direction. When both sides carry
@@ -724,6 +741,15 @@ class Type {
             }
             return "()"
         }
+        if this.type == TYPE.union {
+            let subs = this.sub_types
+            if isset(subs) {
+                let parts = Array[String]{}
+                each subs as st : parts.append(st.compat_display_name())
+                return parts.join(" | ")
+            }
+            return "union"
+        }
         if this.type == TYPE.fn || this.type == TYPE.fnptr {
             let name = this.type == TYPE.fn ? "fn" : "fnptr"
             let args = this.sub_types
@@ -758,6 +784,12 @@ class Type {
     fn can_convert_to(other: Type) bool {
         let a = this.get_non_nullable()
         let b = other.get_non_nullable()
+        // Dynamic conversion of an active union alternative is not part of the
+        // initial union implementation. Claiming the union can convert merely
+        // because it accepts `other` would instantiate invalid generic methods.
+        if a.type == TYPE.union {
+            return b.type == TYPE.union && a.union_accepts_union(b)
+        }
         // Same type or already assignable counts as a free conversion
         if a.compat(b) : return true
         let class = a.get_class_or_null()
@@ -817,6 +849,45 @@ class Type {
         this.cache_inline = t
         return t
     }
+
+    // Exact alternative lookup. Union construction deliberately uses type
+    // identity rather than broad representation compatibility: otherwise a
+    // value could silently select the wrong tag in unions such as int | uint.
+    fn union_member_for(other: Type) ?Type {
+        let t = this.get_non_nullable()
+        if t.type != TYPE.union : return null
+        let members = t.sub_types
+        if !isset(members) : return null
+        let key = type_identity_key(other.get_non_nullable())
+        each members as member {
+            if type_identity_key(member) == key : return member
+        }
+        return null
+    }
+
+    fn union_member_index(other: Type) ?uint {
+        let t = this.get_non_nullable()
+        if t.type != TYPE.union : return null
+        let members = t.sub_types
+        if !isset(members) : return null
+        let key = type_identity_key(other.get_non_nullable())
+        each members as member, i {
+            if type_identity_key(member) == key : return i
+        }
+        return null
+    }
+
+    fn union_accepts_union(other: Type) bool {
+        let members = other.get_non_nullable().sub_types
+        if !isset(members) : return false
+        let own = this.get_non_nullable().sub_types
+        if !isset(own) : return false
+        if own.length != members.length : return false
+        each members as member {
+            if !isset(this.union_member_for(member)) : return false
+        }
+        return true
+    }
 }
 
 // ---- Build-level singleton types ----
@@ -843,6 +914,81 @@ fn type_multi(b: Build, types: Array[Type], force_multi: bool (false)) Type {
         build: b
         sub_types: types
     }
+}
+
+fn type_identity_key(type: Type) String {
+    let out = ByteBuffer.new()
+    type_append_key(type, out)
+    return out.to_string()
+}
+
+// Normalize a structural tagged union: flatten nested unions, lift nullable
+// members to the whole union, remove exact duplicates, and sort by stable type
+// identity so A | B and B | A use the same runtime tag ordering.
+fn type_union(b: Build, input: Array[Type], at: Exp) Type !Error {
+    let members = Array[Type]{}
+    let nullable = false
+
+    each input as original {
+        let member = original
+        if member.is_nullable_type() {
+            nullable = true
+            member = member.get_non_nullable()
+        }
+        if member.type == TYPE.union {
+            let nested = member.sub_types
+            if isset(nested) {
+                each nested as item : members.append(item)
+            }
+        } else {
+            if member.is_void_type() : at.error("A union cannot contain void")
+            if member.type == TYPE.any : at.error("A union cannot contain any")
+            if !member.is_number_type() && !member.is_pointer_sized() {
+                at.error("Unsupported tagged-union alternative: " + member.compat_display_name())
+            }
+            members.append(member)
+        }
+    }
+
+    let sorted = Array[Type]{}
+    each members as member {
+        let key = type_identity_key(member)
+        let duplicate = false
+        each sorted as existing {
+            if type_identity_key(existing) == key {
+                duplicate = true
+                break
+            }
+            // Two alternatives that accept each other cannot be selected
+            // deterministically when a value is widened into the union.
+            if existing.compat(member) && member.compat(existing) {
+                at.error("Overlapping tagged-union alternatives: " + existing.compat_display_name() + " and " + member.compat_display_name())
+            }
+        }
+        if duplicate : continue
+
+        sorted.append(member)
+        let i = sorted.length - 1
+        while i > 0 {
+            let previous = sorted.get(i - 1) !? member
+            if type_identity_key(previous) <= key : break
+            sorted.set(i, previous) _
+            sorted.set(i - 1, member) _
+            i--
+        }
+    }
+
+    if sorted.length == 0 : at.error("A union must contain at least one type")
+    if sorted.length == 1 {
+        let only = sorted.get(0) !? type_void(b)
+        return nullable ? only.nullable() : only
+    }
+    let result = Type {
+        type: TYPE.union
+        build: b
+        sub_types: sorted
+    }
+    return nullable ? result.nullable() : result
 }
 
 fn type_any(b: Build) Type {
@@ -988,6 +1134,10 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
 
     if kind == TYPE_KIND.void : return type_void(b)
 
+    if kind == TYPE_KIND.null {
+        exp.error("'null' can only be used as an alternative in a tagged union")
+    }
+
     if kind == TYPE_KIND.nullable {
         let sub_exp = exp.get(TYPE_EXP.type)
         if !isset(sub_exp) : exp.bug("Missing inner type for '?'")
@@ -1072,6 +1222,25 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
 
     if kind == TYPE_KIND.multi {
         return type_from_multi_exp(exp, scope) !>
+    }
+
+    if kind == TYPE_KIND.union {
+        let members = Array[Type]{}
+        let has_null = false
+        let i: uint = 0
+        while true {
+            let member_exp = exp.get(i)
+            if !isset(member_exp) : break
+            if member_exp.kind == TYPE_KIND.null {
+                has_null = true
+            } else {
+                members.append(type_from_exp(member_exp, scope) !>)
+            }
+            i++
+        }
+        let result = type_union(b, members, exp) !>
+        if has_null && !result.is_nullable_type() : return result.nullable()
+        return result
     }
 
     if kind == TYPE_KIND.fn || kind == TYPE_KIND.fnptr {

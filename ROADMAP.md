@@ -14,7 +14,7 @@
 
 - Complete libc integration
 - Interfaces
-- Union types
+- Union extensions and optimized representations
 
 - on exit thread/process { ... }
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
@@ -43,6 +43,7 @@
 + `$default` type value hook
 + LSP improvements
 + Defer statements
+~ Tagged unions
 
 + Release 0.2.0
 + Rewrite entire compiler
