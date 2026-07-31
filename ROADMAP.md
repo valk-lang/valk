@@ -14,8 +14,6 @@
 
 - Complete libc integration
 - Interfaces
-- Union extensions and optimized representations
-
 - on exit thread/process { ... }
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
 -- This way people can be sure there is no hidden code inside the compiler
