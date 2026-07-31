@@ -1,30 +1,38 @@
 
-VALKV=0.2.0
-VERSION=0.2.1
+.DEFAULT_GOAL := valk
+.DELETE_ON_ERROR:
 
-SRC=$(wildcard src/*.valk)
-SRC_EXAMPLE=$(wildcard debug/*.valk)
-DIST_DEPS=
-DIST_COMP=valk
-vc=valk
+VALKV := 0.2.0
+VERSION := 0.2.1
 
-FLAGS=--def "VERSION=$(VERSION)"
-DIST_FLAGS=. src/*.valk --static --release -vv
-DEV_FLAGS=-L /opt/llvm15/lib
-TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
-TEST_COMPILER?=./valk
+SRC := $(wildcard src/*.valk src/*/*.valk)
+LIB_SRC := $(wildcard lib/src/*.valk lib/src/*/*.valk lib/src/*/*/*.valk lib/src/*/*/*/*.valk)
+BUILD_DEPS := $(SRC) $(LIB_SRC)
+
+VC ?= valk
+DIST_COMP ?= valk
+TEST_COMPILER ?= ./valk
+
+FLAGS := --def "VERSION=$(VERSION)"
+DIST_FLAGS := . src/*.valk --static --release -vv
+DEV_FLAGS := -L /opt/llvm15/lib
+TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
 
 # Build
-valk: $(SRC)
-	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
+valk: $(BUILD_DEPS)
+	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
+
 valk2: valk
 	./valk build -o ./valk2 -vvv $(FLAGS) $(DEV_FLAGS)
+
 valk3: valk2
 	./valk2 build -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
+
 valkvg: valk
 	valgrind ./valk build -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
-valkexe: $(SRC)
-	$(vc) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS) --target win-x64 --static
+
+valkexe: $(BUILD_DEPS)
+	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS) --target win-x64 --static
 
 doc: valk
 	./valk doc lib/ -o docs/api.md --markdown --no-private
@@ -33,9 +41,10 @@ valk-profile: valk2
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS)
 
-valkd: $(SRC)
+valkd: $(BUILD_DEPS)
 	gdb --args valk build . src/*.valk -o ./valk -vv $(FLAGS)
-static: $(SRC)
+
+static: $(BUILD_DEPS)
 	valk build . src/*.valk -o ./valk -vv --static -l zstd -L /opt/homebrew/opt/ncurses/lib -L /usr/local/opt/ncurses/lib -L /opt/homebrew/opt/llvm@15/lib -L /usr/local/opt/llvm@15/lib $(FLAGS)
 
 install: valk
@@ -114,7 +123,6 @@ test-cross-ir: valk
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-arm64-ir --target macos-arm64 --ir --clean
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-win-x64-ir --target win-x64 --ir --clean
 
-# Testing
 test-cross: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-linux-x64 -vv $(FLAGS) --target linux-x64
@@ -124,7 +132,7 @@ test-cross: valk
 
 # CI commands
 # For linux we have to add `/usr/lib/gcc/...` because that's where stdc++ is located 
-ci-linux: $(SRC)
+ci-linux: $(BUILD_DEPS)
 	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static $(FLAGS) \
 	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
@@ -133,20 +141,20 @@ ci-linux: $(SRC)
 	-L /usr/lib/gcc/x86_64-linux-gnu/11/ \
 	-L /usr/lib/llvm-15/lib/
 
-ci-macos: $(SRC)
+ci-macos: $(BUILD_DEPS)
 	valk -h || true
 	valk build . src/*.valk -o ./valk -vv --static -l zstd $(FLAGS) \
 	--sysroot "$$(xcrun --sdk macosx --show-sdk-path)" \
 	-L /usr/local/Cellar/ncurses/6.5/lib
 
-ci-win: $(SRC)
+ci-win: $(BUILD_DEPS)
 	ls -l "./llvm/lib/"
 	~/valk-dev/valk.exe -h || echo ""
 	~/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
 	-L "./llvm/lib/"
 
 # Distributions
-linux-x64: $(SRC) $(DIST_DEPS)
+linux-x64: $(BUILD_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
@@ -159,7 +167,7 @@ linux-x64: $(SRC) $(DIST_DEPS)
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
-macos-x64: $(SRC) $(DIST_DEPS)
+macos-x64: $(BUILD_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
@@ -169,7 +177,7 @@ macos-x64: $(SRC) $(DIST_DEPS)
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
-macos-arm64: $(SRC) $(DIST_DEPS)
+macos-arm64: $(BUILD_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
@@ -179,7 +187,7 @@ macos-arm64: $(SRC) $(DIST_DEPS)
 	cp -r ./lib ./dist/macos-arm64/
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
-win-x64: $(DIST_DEPS)
+win-x64: $(BUILD_DEPS)
 	vman use $(VALKV)
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
@@ -211,6 +219,13 @@ asm:
 clean:
 	rm -f ./valk
 	rm -f ./valk2
+	rm -f ./valk3
 # rm -rf ~/.valk/cache
 
-.PHONY: valk clean toolchains dist-all valkd static test test-all test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt test-gc-debug test-gc-shared-stress test-macos-build test-win-build test-cross-ir test-cross linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
+.PHONY: \
+	asm ci-linux ci-macos ci-win clean dist-all doc install \
+	linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
+	valk-profile valkvg watchtest win-x64 \
+	test test-all test-compile-errors test-cross test-cross-ir test-diagnostics \
+	test-exit-code test-fmt test-gc-debug test-gc-shared-stress test-lsp \
+	test-macos-build test-win test-win-build
