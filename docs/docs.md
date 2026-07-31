@@ -364,18 +364,20 @@ struct Point {
     x: int
     y: int
 
-    static fn origin() SELF $default {
-        return SELF { x: 0, y: 0 }
+    static fn origin(x: int (0), y: int (0)) SELF $default {
+        return SELF { x: x, y: y }
     }
 }
 
 let point: Point = Point.$default_value
 ```
 
-The function name is unrestricted, but it must be static, take no arguments,
-return exactly its owning type, and not return an error. Only one `$default`
-function is allowed per type, and the function cannot declare its own generic
-parameters. Nullable types always default to `null`; a
+The function name is unrestricted, but it must be static, return exactly its
+owning type, and not return an error. It may take arguments as long as every
+argument declares a default value; those defaults are used whenever the
+compiler invokes the function. Only one `$default` function is allowed per
+type, and the function cannot declare its own generic parameters. Nullable
+types always default to `null`; a
 non-null type's `$default` function is not called for `?Type.$default_value`.
 An omitted non-null property also uses its type's `$default` function unless
 the property declaration supplies its own explicit default.
