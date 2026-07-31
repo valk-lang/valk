@@ -1051,12 +1051,12 @@ alias FD for i32
 ```js
 + fn array(values: ?Array[Value] (null)) ArrayValue
 + fn default_value(kind: int) Value
++ fn from(data: $T) Value
 + fn from_value[T](data: Value) T !ValueError
 + fn object(values: ?Map[Value] (null)) ObjectValue
 + fn parse(json: String) Value !ParseError
 + fn stringify(data: Value, pretty: bool (false)) String
 + fn stringify_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
-+ fn to_value(data: $T) Value
 ```
 
 ## Classes for 'json'

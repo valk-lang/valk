@@ -885,7 +885,7 @@ class Data {
     hello: String
 }
 
-let value = json:to_value(Data { hello: "world" })
+let value = json:from(Data { hello: "world" })
 let text = json:stringify(value)
 let decoded = json:parse(text) ! panic("Invalid JSON")
 let data = json:from_value[Data](decoded) ! panic("Invalid Data document")
@@ -1066,7 +1066,7 @@ let data = Map[String]{ "key1" => "val1" }
 let res = http:request("GET", "http://some-website/api/endpoint", http:Options{ query_data: data }) ! panic("Request failed")
 
 // Send POST request with data
-let json_data = json:to_value(Map[String]{ "key1" => "val1" })
+let json_data = json:from(Map[String]{ "key1" => "val1" })
 let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json:stringify(json_data) }) ! panic("Request failed")
 
 // Download file
