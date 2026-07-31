@@ -32,17 +32,9 @@
 ## Maybe
 
 ```
-- Add `link_dir` token for header files
-- Convert grouped values to inline struct types
 - Data race solution
-- Change function syntax to `exampleFunc` instead of `example_func`
 - WASM support
-- Dont use shadow stack, use real stack
-- Only parse functions from imut classes when they are used so we no longer need `mut fn`
 - [value .. value] -> calls the $range function (from: uint, until: uint, inclusive: bool)
-- `construct new() {}` instead of `static fn new() {}`
--- This forces the use of the use of `new()` to create an object of that class (multiple constructors allowed)
--- if property is nullable, use `null` as value, if it has a `construct` without arguments, use that
 ```
 
 ## Done
