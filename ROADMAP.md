@@ -5,7 +5,7 @@
 
 ```
 - Release 0.2.1
-- "default" token in class scope = default value for this type
++ `$default` type value hook
 + LSP improvements
 + Defer statements
 

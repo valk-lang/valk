@@ -354,6 +354,32 @@ fn main() {
 }
 ```
 
+### Type default values
+
+A class, struct, or other named type can provide the value returned by
+`.$default_value` with a static function marked `$default`:
+
+```rust
+struct Point {
+    x: int
+    y: int
+
+    static fn origin() SELF $default {
+        return SELF { x: 0, y: 0 }
+    }
+}
+
+let point: Point = Point.$default_value
+```
+
+The function name is unrestricted, but it must be static, take no arguments,
+return exactly its owning type, and not return an error. Only one `$default`
+function is allowed per type, and the function cannot declare its own generic
+parameters. Nullable types always default to `null`; a
+non-null type's `$default` function is not called for `?Type.$default_value`.
+An omitted non-null property also uses its type's `$default` function unless
+the property declaration supplies its own explicit default.
+
 ### Deferred calls
 
 Use `defer` to schedule a function call for the end of the current function.
