@@ -63,6 +63,7 @@ frame() {
 }
 
 init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+init_live='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"initializationOptions":{"diagnosticsMode":"change"}}}'
 
 # request <method> <file> <line> <character>   (line/character are 0-based)
 request() {
@@ -78,6 +79,10 @@ notify_save() {
 notify_change() {
     printf '{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file://%s"},"contentChanges":%s}}' \
         "$DIR/$1" "$2"
+}
+
+notify_config() {
+    printf '{"jsonrpc":"2.0","method":"workspace/didChangeConfiguration","params":{"settings":{"valk":{"diagnosticsMode":"%s"}}}}' "$1"
 }
 
 # request_doc <method> <file>   — a whole-document request, no position
@@ -105,15 +110,16 @@ notify_open() {
         "$DIR/$1" "$text"
 }
 
-# check <name> <expected-substring> <request-body>...
-check() {
+# check_with_init <name> <expected-substring> <initialize-body> <request-body>...
+check_with_init() {
     local name="$1"; shift
     local want="$1"; shift
+    local initialize="$1"; shift
     count=$((count + 1))
     echo "> $name"
 
     local stream
-    stream=$(frame "$init")
+    stream=$(frame "$initialize")
     local body
     for body in "$@"; do
         stream="$stream$(frame "$body")"
@@ -135,6 +141,50 @@ check() {
     esac
 }
 
+
+# check <name> <expected-substring> <request-body>...
+check() {
+    local name="$1"; shift
+    local want="$1"; shift
+    check_with_init "$name" "$want" "$init" "$@"
+}
+
+
+# check_absent_with_init <name> <unexpected-substring> <initialize-body> <body>...
+check_absent_with_init() {
+    local name="$1"; shift
+    local unwanted="$1"; shift
+    local initialize="$1"; shift
+    count=$((count + 1))
+    echo "> $name"
+
+    local stream
+    stream=$(frame "$initialize")
+    local body
+    for body in "$@"; do
+        stream="$stream$(frame "$body")"
+    done
+
+    local out
+    out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+    case "$out" in
+        *"$unwanted"*)
+            echo "# Unexpected LSP reply"
+            echo "- Case: $name"
+            echo "- Should not contain: $unwanted"
+            echo "- Actual output:"
+            echo "$out"
+            failed=1
+            ;;
+    esac
+}
+
+check_absent() {
+    local name="$1"; shift
+    local unwanted="$1"; shift
+    check_absent_with_init "$name" "$unwanted" "$init" "$@"
+}
+
 # Capabilities are what tells an editor which requests to send at all.
 check "initialize advertises providers" '"definitionProvider":true'
 check "initialize advertises the outline" '"documentSymbolProvider":true'
@@ -148,9 +198,22 @@ check "diagnostics on save" '"message":"Unknown identifier: nope_xyz"' \
 # Ranged changes are applied in order, and a burst publishes diagnostics once for
 # its final buffer without requiring a save. The second range is relative to the
 # result of the first (`nope_xyz` -> `buffer_xyz` -> `buffer_only_xyz`).
-check "incremental changes publish live diagnostics" '"message":"Unknown identifier: buffer_only_xyz"' \
-    "$(notify_open diag.valk)" \
+check_with_init "initialization options enable live diagnostics" '"message":"Unknown identifier: buffer_only_xyz"' "$init_live" \
     "$(notify_change diag.valk '[{"range":{"start":{"line":2,"character":12},"end":{"line":2,"character":16}},"text":"buffer"},{"range":{"start":{"line":2,"character":19},"end":{"line":2,"character":22}},"text":"only_xyz"}]')"
+
+# The standard configuration notification can enable the same behavior while
+# the server is already running.
+check "workspace configuration enables live diagnostics" '"message":"Unknown identifier: configured_xyz"' \
+    "$(notify_config change)" \
+    "$(notify_change diag.valk '[{"range":{"start":{"line":2,"character":12},"end":{"line":2,"character":20}},"text":"configured_xyz"}]')"
+
+# Save-only is the default, and a runtime setting can return an opted-in server
+# to it. didChange still updates the buffer; it simply does not run the compiler.
+check_absent "live diagnostics are disabled by default" '"message":"Unknown identifier: default_xyz"' \
+    "$(notify_change diag.valk '[{"range":{"start":{"line":2,"character":12},"end":{"line":2,"character":20}},"text":"default_xyz"}]')"
+check_absent_with_init "workspace configuration can restore save-only diagnostics" '"message":"Unknown identifier: saved_xyz"' "$init_live" \
+    "$(notify_config save)" \
+    "$(notify_change diag.valk '[{"range":{"start":{"line":2,"character":12},"end":{"line":2,"character":20}},"text":"saved_xyz"}]')"
 
 # LSP columns are UTF-16 code units, not UTF-8 bytes. A chicken is four UTF-8
 # bytes but two UTF-16 units, so the unknown identifier begins at character 19.
