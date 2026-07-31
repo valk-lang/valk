@@ -35,12 +35,13 @@ while IFS=';' read -r file msg; do
     fi
 
     count=$((count+1))
-    cmd="$VALK build ./tests/compile-errors/$file.valk --no-warn"
+    input="./tests/compile-errors/$file.valk"
+    cmd="$VALK build $input --no-warn"
     echo "> Run: $cmd"
     # The rewrite compiler may write diagnostics to stderr (and its runtime
     # can terminate with a non-zero status after reporting them). Capture both
     # streams so the expected diagnostic is still checked reliably.
-    output=$($cmd 2>&1)
+    output=$("$VALK" build "$input" --no-warn 2>&1)
     status=$?
 
     # Check if build command failed
@@ -71,10 +72,58 @@ echo "# Test count: $count"
 
 echo ""
 echo "# Test type compatibility"
-"$VALK" ./tests/compile-errors/type-checks.valk
-if [[ $? != 0 ]]; then
-    exit 1
-fi
+
+type_dir="./tests/compile-errors"
+type_workdir=$(mktemp -d)
+trap 'rm -rf "$type_workdir"' EXIT
+type_input="$type_workdir/type-check.valk"
+type_output="$type_workdir/type-check"
+case "$(uname -s)" in
+    MINGW*|MSYS*) type_output="$type_output.exe" ;;
+esac
+
+check_types() {
+    local list="$1"
+    local compatible="$2"
+    local row t1 t2 output status
+
+    while IFS= read -r row || [ -n "$row" ]; do
+        row="${row%$'\r'}"
+        [ -n "$row" ] || continue
+        t1="${row%% <=> *}"
+        t2="${row#* <=> }"
+
+        if [ "$compatible" -eq 1 ]; then
+            echo "> Must be compatible: $row"
+        else
+            echo "> Must be incompatible: $row"
+        fi
+
+        sed -e "s|TYPE1|$t1|g" -e "s|TYPE2|$t2|g" \
+            "$type_dir/type-check-template.valk" > "$type_input"
+        output=$("$VALK" build "$type_input" --no-warn -o "$type_output" 2>&1)
+        status=$?
+
+        if [ "$compatible" -eq 1 ]; then
+            if [ "$status" -ne 0 ] || [[ "$output" != *"Compiled in "* ]]; then
+                echo "Types: $row"
+                echo "Exit code: $status"
+                echo "Output: $output"
+                echo "Error: Compatible types were not compatible"
+                return 1
+            fi
+        elif [ "$status" -eq 0 ] || [[ "$output" != *"Incompatible types"* ]]; then
+            echo "Types: $row"
+            echo "Exit code: $status"
+            echo "Output: $output"
+            echo "Error: Incompatible types were not incompatible"
+            return 1
+        fi
+    done < "$list"
+}
+
+check_types "$type_dir/types-compatible.txt" 1 || exit 1
+check_types "$type_dir/types-incompatible.txt" 0 || exit 1
 
 echo ""
 echo "# Done"
