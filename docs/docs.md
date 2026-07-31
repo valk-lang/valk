@@ -317,11 +317,25 @@ The `null` case must come before type cases in a nullable-union match. A named
 union containing `null` may still have instance methods: the method receives the
 nullable union value and can match `this` with a `null` case.
 
-Exact duplicate alternatives collapse into one type. Distinct alternatives
-must not overlap; for example, `int | uint` is rejected because either
-alternative could accept the same numeric value. The initial implementation
-supports numeric and pointer-sized alternatives. Unions cannot currently be
-used in `extern` function signatures or globals.
+Alternatives keep their own type. For example, `int | uint` can distinguish
+between signed and unsigned values:
+
+```rust
+union Number : int | uint {}
+
+let signed: Number = 5
+let unsigned: Number = 5.to(uint)
+```
+
+Structs and fixed arrays can also be union alternatives:
+
+```rust
+struct Point { x: int, y: int }
+
+union Value : String | <Point> | [u8 x 4] {}
+```
+
+Unions cannot currently be used in `extern` function signatures or globals.
 
 ## Variables
 
