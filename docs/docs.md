@@ -875,14 +875,14 @@ fn describe(value: json:Value) String {
 ```rust
 use valk:json
 
-let document = json:parse("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
+let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
 let name = document.get("name") ! panic("Missing name")
 let age = document.get("age") ! panic("Missing age")
 let name_text = name.as_string() ! panic("Name must be a string")
 let age_number = age.as_int() ! panic("Age must be an int")
 
 document.set("active", true) ! panic("Expected an object")
-let encoded = json:stringify(document)
+let encoded = json:encode(document)
 ```
 
 Accessors are strict: `"12".as_int()` is an error rather than an implicit
@@ -901,7 +901,7 @@ items.append(1)
 items.append(null)
 object.set("items", items)
 
-println(json:stringify(object, true))
+println(json:encode(object, true))
 ```
 
 Structural values can be converted to and from the JSON DOM. Conversion from
@@ -914,12 +914,12 @@ class Data {
 }
 
 let value = json:from(Data { hello: "world" })
-let text = json:stringify(value)
-let decoded = json:parse(text) ! panic("Invalid JSON")
+let text = json:encode(value)
+let decoded = json:decode(text) ! panic("Invalid JSON")
 let data = json:from_value[Data](decoded) ! panic("Invalid Data document")
 ```
 
-Use `json:stringify_to(value, buffer)` to append JSON directly to an existing
+Use `json:encode_to(value, buffer)` to append JSON directly to an existing
 `ByteBuffer`. Run `make bench-json` for parsing, encoding, traversal, and
 retained-memory measurements of the union representation.
 
@@ -1095,7 +1095,7 @@ let res = http:request("GET", "http://some-website/api/endpoint", http:Options{ 
 
 // Send POST request with data
 let json_data = json:from(Map[String]{ "key1" => "val1" })
-let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json:stringify(json_data) }) ! panic("Request failed")
+let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json:encode(json_data) }) ! panic("Request failed")
 
 // Download file
 http:download(url, to_path) ! panic("Failed to download file")

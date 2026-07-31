@@ -1054,9 +1054,9 @@ alias FD for i32
 + fn from(data: $T) Value
 + fn from_value[T](data: Value) T !ValueError
 + fn object(values: ?Map[Value] (null)) ObjectValue
-+ fn parse(json: String) Value !ParseError
-+ fn stringify(data: Value, pretty: bool (false)) String
-+ fn stringify_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
++ fn decode(json: String) Value !ParseError
++ fn encode(data: Value, pretty: bool (false)) String
++ fn encode_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 ```
 
 ## Classes for 'json'
@@ -1376,4 +1376,3 @@ alias FD for i32
 ```js
 + global default_translations : Map[String]
 ```
-
