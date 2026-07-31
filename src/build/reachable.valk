@@ -1,0 +1,113 @@
+// Reachability from the program's entry points.
+//
+// Every function body is resolved and lowered regardless of whether anything
+// calls it, because an error in unreachable code is still an error the language
+// server has to report. What reaches an LLVM module is a separate question:
+// LLVM's cost is proportional to the IR it is handed, and a program that prints
+// one line pulls in the whole standard library if nothing filters it.
+//
+// The edges come from IR generation rather than from the resolved bodies (see
+// ir_use_func / ir_use_global). Lowering introduces references of its own —
+// pool allocation, panics, coroutine helpers, closure adapters — that no
+// expression in the source mentions, and only the generated text knows them all.
+
+fn mark_reachable(build: Build) !Error {
+    // Runs more than once: `#loop globals` is expanded against the result and
+    // re-lowering changes the edges, so each pass starts from nothing rather
+    // than accumulating marks from an expansion that has been discarded
+    // (see globals-loop.valk).
+    each build.lists.units as unit {
+        unit.is_used = false
+        unit.string_used.set_all(false)
+        each unit.functions as func : func.info_used = false
+    }
+    each build.lists.globals as global : global.is_used = false
+
+    // A library is compiled for callers that are not part of this build, so it
+    // has no entry to walk from and everything it defines has to survive.
+    if build.options.mode == BUILDTYPE.lib {
+        each build.lists.units as unit {
+            unit.is_used = true
+            each unit.functions as func : func.info_used = true
+            each unit.globals as global : global.is_used = true
+            unit.string_used.set_all(true)
+        }
+        return
+    }
+
+    // The linker's entry point is the one function nothing in the program
+    // refers to, so it is the one thing that has to be assumed live. The other
+    // `$entrance` function is the thread entry, and that is not a root: it
+    // reaches the OS through the `pthread_create` call in Thread.init, which is
+    // an ordinary reference from code that has to be reachable itself. A
+    // program that starts no thread should not carry the threading stack.
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if func.is_entrance && func_ir_name(func) == "main" : mark_func_used(func)
+        }
+    }
+
+    // Allocator helpers are written straight into the module at assembly time
+    // rather than through a function body, so the pool functions they call are
+    // reached by none of the edges above. A helper can pull in a body that
+    // expands @INIT_ALLOCATORS in turn, hence the repeat.
+    while mark_allocator_helpers(build) !> {}
+}
+
+// Mirrors what ir_prepare_allocator_helpers declares and ir_write_allocator_helpers
+// emits. Returns true when this pass reached something new.
+fn mark_allocator_helpers(build: Build) bool !Error {
+    let found = false
+    each build.lists.allocator_init_sites as site {
+        let owner = site.ctx.func ?! continue
+        if !owner.info_used : continue
+        each build.lists.allocators as allocator {
+            let global = allocator.global
+            // Only the pools something reachable actually allocates from. The
+            // global is marked by ir_emit_class_alloc while lowering, so an
+            // allocator for a class only built by unreachable code stays out.
+            if !global.is_used : continue
+            let pool_class = (global.get_type() !>).get_class_or_null()
+            if !isset(pool_class) : build.bug("Generated allocator global is not a Pool")
+            let init = pool_class.get_func("init")
+            if isset(init) && mark_func_used(init) : found = true
+            let onfree = allocator.onfree
+            if isset(onfree) && mark_func_used(onfree) : found = true
+            let props_func = allocator.props_func
+            if isset(props_func) && mark_func_used(props_func) : found = true
+        }
+    }
+    return found
+}
+
+// True when this call is what marked `func` reachable.
+//
+// The walk runs off an explicit worklist: a call graph is as deep as the
+// program is, which is more than the coroutine stack this compiler runs on can
+// hold as recursion.
+fn mark_func_used(func: Func) bool {
+    if func.info_used : return false
+    let queue = Array[Func]{}
+    queue.append(func)
+    while true {
+        let item = queue.pop_last() ! break
+        if item.info_used : continue
+        item.info_used = true
+        // An extern function names a symbol defined elsewhere. Its `declare`
+        // costs nothing and keeps no module alive.
+        if !item.is_extern : item.unit.is_used = true
+
+        each item.strings_used as index : item.unit.string_used.set_expand(index, true, false)
+        each item.globals_used as global : mark_global_used(global)
+        each item.functions_used as sub {
+            if !sub.info_used : queue.append(sub)
+        }
+    }
+    return true
+}
+
+fn mark_global_used(global: Global) {
+    if global.is_used : return
+    global.is_used = true
+    if !global.is_extern : global.unit.is_used = true
+}

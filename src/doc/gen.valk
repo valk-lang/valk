@@ -3,158 +3,361 @@ use build
 use valk:json
 use valk:fs
 
+// Generate documentation for every namespace of the package being built.
+//
+// Runs on a `--docs` Build: class properties and function signatures are resolved,
+// but no function body is lowered. Everything below therefore reads the compiler's
+// own Class/Func/Global objects, and default argument values come straight from
+// their source span instead of being re-parsed.
+//
+// Aliases are reported as aliases (`alias A for B`, `type A (B)`) rather than
+// followed, so a name never documents a second copy of what it points at.
 fn doc_gen(b: build:Build) {
-    let cli = b.cli
-    let no_private = cli.flags.contains("--no-private")
+    let options = b.options
+    let no_private = options.docs_no_private
+    let main_pkg = b.main_pkg
 
     let doc = json:new_object()
     let spaces = json:new_object()
     doc.set("namespaces", spaces)
 
-    let pkc = b.get_main_nsc().pkc
-    let fake_func = b.fake_func()
-    fake_func.init_ast_scope()
-
-    each pkc.namespaces as nsc, name {
-        let space = json:new_object()
-        spaces.set(name, space)
-
-        let classes = json:new_object()
-        let funcs = json:new_object()
-        let globals = json:new_object()
-        space.set("classes", classes)
-        space.set("functions", funcs)
-        space.set("globals", globals)
-
-        // let u = nsc.unit
-        let units = nsc.units
-
-        each units as u {
-            each u.classes as class {
-                if no_private && build:act_is_private(class.act) : continue
-                if !class.gen_docs : continue
-                let gnames = class.generic_names
-
-                let c = json:new_object()
-                classes.set(class.name, c)
-                let props = json:new_object()
-                let funcs = json:new_object()
-                c.set("act", jact(class.act))
-                c.set("properties", props)
-                c.set("functions", funcs)
-                let mode_for = class.mode_for_class
-                if isset(mode_for) {
-                    c.set("mode_for", json:new_string(mode_for.get_type()))
-                }
-                if isset(gnames) {
-                    let arr = Array[json:Value]{}
-                    each gnames as gname : arr.append(json:new_string(gname.name))
-                    c.set("generics", json:new_array(arr))
-                }
-
-                each class.get_props() as prop, name, i {
-                    if no_private && build:act_is_private(prop.act) : continue
-                    if i == 0 && name == "_VTABLE" : continue
-                    let p = json:new_object()
-                    p.set("type", json:new_string(prop.type))
-                    p.set("act", jact(prop.act))
-                    props.set(prop.name, p)
-                }
-                each class.funcs as func {
-                    if no_private && build:act_is_private(func.act) : continue
-                    jfunc(funcs, func, fake_func)
-                }
-            }
-
-            each u.functions as func {
-                let class = func.class
-                if isset(class) : continue
-                if no_private && build:act_is_private(func.act) : continue
-                jfunc(funcs, func, fake_func)
-            }
-
-            each u.globals as g {
-                if no_private && build:act_is_private(g.act) : continue
-                let gl = json:new_object()
-                let type = g.type
-                if !isset(type) : type = build:type_void(b)
-                globals.set(g.name, gl)
-                gl.set("act", jact(g.act))
-                gl.set("type", json:new_string(type))
-                gl.set("shared", json:new_bool(g.shared))
-            }
+    // Every top-level declaration of a namespace lives on its scope, so one pass
+    // per namespace covers all of its files. `$global` declarations (Array,
+    // String, Map, …) are registered on the build scope instead, and are folded
+    // back into the namespace that declared them.
+    let sections = Map[DocSection]{}
+    each b.lists.namespaces as ns {
+        // Dependencies (including the built-in valk package) are not documented
+        if isset(main_pkg) && ns.pkg != main_pkg : continue
+        let section = doc_section(sections, ns.name)
+        each ns.scope.idfs() as idf, name {
+            section.add(idf, name, no_private)
         }
     }
+    each b.scope.idfs() as idf, name {
+        // A `$global` alias records its own declaring namespace; anything else on
+        // the build scope is placed by the declaration it points at.
+        let ns = b.lists.global_alias_ns.get(name) !? idf_namespace(idf)
+        if !isset(ns) : continue
+        if isset(main_pkg) && ns.pkg != main_pkg : continue
+        doc_section(sections, ns.name).add(idf, name, no_private)
+    }
 
-    let json = doc.encode(true)
-    // Output
-    let is_markdown = cli.flags.contains("--markdown")
-    let output = json
-    if is_markdown : output = convert_to_markdown(b, doc)
+    each sections as section, name {
+        // Namespaces that document nothing are left out entirely
+        if section.count == 0 : continue
+        let space = json:new_object()
+        space.set("aliases", section.aliases)
+        space.set("classes", section.classes)
+        space.set("functions", section.funcs)
+        space.set("globals", section.globals)
+        spaces.set(name, space)
+    }
 
-    // Write output
-    let outpath = cli.get_first_values_for("-o") !? null
-    if isset(outpath) {
-        let ext = is_markdown ? ".md" : ".json"
-        outpath = outpath.rtrim(".exe")
-        if !outpath.ends_with(ext) : outpath += ".doc" + ext
-        fs:write(outpath, output) ! panic("Failed to write file: " + outpath)
-    } else {
+    let is_markdown = options.docs_markdown
+    let output = is_markdown ? convert_to_markdown(b, doc) : doc.encode(true)
+
+    let outpath = options.path_out
+    if !isset(outpath) {
         println(output)
+        return
+    }
+    let ext = is_markdown ? ".md" : ".json"
+    outpath = outpath.rtrim(".exe")
+    if !outpath.ends_with(ext) : outpath += ".doc" + ext
+    fs:write(outpath, output) ! panic("Failed to write file: " + outpath)
+}
+
+// Documented declarations of one namespace, in JSON form.
+class DocSection {
+    classes: json:Value
+    funcs: json:Value
+    globals: json:Value
+    aliases: json:Value
+    // Namespace being documented. Error types thrown from elsewhere are qualified
+    // against it, so `!IoError` in the fs section reads as `io:IoError`.
+    ns_name: String
+    count: uint (0)
+
+    fn add(idf: build:Idf, name: String, no_private: bool) {
+        // `alias A for B` re-binds B's own Idf under the name A, so an entry whose
+        // binding name differs from the declaration's name is an alias. Reporting
+        // it as one keeps `alias pid_t for i32` from documenting a second copy of
+        // every i32 method under the name pid_t.
+        if idf.type == build:IDF.class {
+            let class = idf.class
+            if !isset(class) : return
+            if no_private && is_private(class.act) : return
+            if class.name != name {
+                this.add_alias(name, "alias", class_display_name(class))
+                return
+            }
+            this.classes.set(name, jclass(doc_class_for(class), no_private, this.ns_name))
+        } else if idf.type == build:IDF.func {
+            let func = idf.func
+            if !isset(func) : return
+            if no_private && is_private(func.act) : return
+            if func.name != name {
+                this.add_alias(name, "alias", func.name)
+                return
+            }
+            this.funcs.set(name, jfunc(doc_func_for(func), this.ns_name))
+        } else if idf.type == build:IDF.global {
+            let g = idf.global
+            if !isset(g) : return
+            if no_private && is_private(g.act) : return
+            if g.name != name {
+                this.add_alias(name, "alias", g.name)
+                return
+            }
+            this.globals.set(name, jglobal(g))
+        } else if idf.type == build:IDF.type {
+            // `type Name (T)` — a name bound straight to a type
+            let of_type = idf.of_type
+            if !isset(of_type) : return
+            this.add_alias(name, "type", of_type.compat_display_name())
+            return
+        } else if idf.type == build:IDF.error_type {
+            let e = idf.error_type
+            if !isset(e) : return
+            if no_private && is_private(e.act) : return
+            if e.name != name : this.add_alias(name, "alias", e.name)
+            return
+        } else if idf.type == build:IDF.enum {
+            let en = idf.enum
+            if !isset(en) : return
+            if no_private && is_private(en.act) : return
+            if en.name != name : this.add_alias(name, "alias", en.name)
+            return
+        } else if idf.type == build:IDF.trait {
+            let t = idf.trait
+            if !isset(t) : return
+            if t.name != name : this.add_alias(name, "alias", t.name)
+            return
+        } else {
+            return
+        }
+        this.count++
+    }
+
+    // `kind` is the source form: `alias Name for Target` or `type Name (Target)`.
+    //
+    // No access marker is reported: both forms bind the name to the target's own
+    // Idf (or to a bare Type), so the marker written on the alias declaration is
+    // not retained anywhere, and the target's marker describes the target.
+    fn add_alias(name: String, kind: String, target: String) {
+        let a = json:new_object()
+        a.set("kind", json:new_string(kind))
+        a.set("for", json:new_string(target))
+        this.aliases.set(name, a)
+        this.count++
     }
 }
 
-fn jact(act: int) json:Value {
-    let str = build:act_to_str_all(act)
-    return json:new_string(str)
+fn doc_section(sections: Map[DocSection], name: String) DocSection {
+    sections.get(name) -> existing : return existing
+    let section = DocSection {
+        ns_name: name
+        classes: json:new_object()
+        funcs: json:new_object()
+        globals: json:new_object()
+        aliases: json:new_object()
+    }
+    sections.set(name, section)
+    return section
 }
 
-fn jfunc(funcs: json:Value, func: build:Func, fake_func: build:Func) {
-    if !func.gen_docs : return
+// Namespace a `$global` declaration was declared in.
+fn idf_namespace(idf: build:Idf) ?build:Namespace {
+    if idf.type == build:IDF.class {
+        let class = idf.class
+        if isset(class) : return class.ns
+    } else if idf.type == build:IDF.func {
+        let func = idf.func
+        if isset(func) : return func.ns
+    } else if idf.type == build:IDF.global {
+        let g = idf.global
+        if isset(g) : return g.ns
+    } else if idf.type == build:IDF.error_type {
+        let e = idf.error_type
+        if isset(e) : return e.ns
+    } else if idf.type == build:IDF.enum {
+        let en = idf.enum
+        if isset(en) : return en.ns
+    }
+    return null
+}
 
+// A generic base holds no members of its own: properties and methods are only
+// materialized on a specialization. To document `Array[T]` rather than an empty
+// shell, specialize it with a stand-in type per parameter, named after the
+// parameter itself, so every signature still reads in terms of T.
+//
+// Falls back to the base when specializing fails; an incomplete class beats no
+// documentation at all.
+fn doc_class_for(class: build:Class) build:Class {
+    if !class.is_generic_base : return class
+    let names = class.generic_names
+    if !isset(names) : return class
+    return class.specialize(generic_placeholders(class.ns.build, names), class.exp) !? class
+}
+
+// Same for `fn name[T](...)`: a generic base only binds its parameter names, so
+// its arguments and return type are resolved on the specialization.
+fn doc_func_for(func: build:Func) build:Func {
+    if !func.is_generic_base : return func
+    let names = func.generic_names
+    if !isset(names) : return func
+    return func.specialize(generic_placeholders(func.ns.build, names), func.exp) !? func
+}
+
+fn generic_placeholders(b: build:Build, names: Array[String]) Array[build:Type] {
+    let types = Array[build:Type]{}
+    each names as name {
+        types.append(build:Type {
+            type: build:TYPE.any
+            build: b
+            custom_name: name
+        })
+    }
+    return types
+}
+
+fn jclass(class: build:Class, no_private: bool, ns_name: String) json:Value {
+    let c = json:new_object()
+    c.set("act", json:new_string(act_str(class.act)))
+
+    // `mode_for` is resolved on the declaration, so a specialization made for
+    // documentation reads it from the base it came from.
+    let mode_for = class.mode_for_class
+    if !isset(mode_for) {
+        let base = class.generic_from
+        if isset(base) : mode_for = base.mode_for_class
+    }
+    if isset(mode_for) {
+        c.set("mode_for", json:new_string(class_display_name(mode_for)))
+    }
+    let gnames = class.generic_names
+    if isset(gnames) {
+        let arr = Array[json:Value]{}
+        each gnames as gname : arr.append(json:new_string(gname))
+        c.set("generics", json:new_array(arr))
+    }
+
+    let props = json:new_object()
+    each class.props as prop {
+        let name = prop.name
+        // Nameless members (padding / unnamed struct fields) and the vtable slot
+        // are layout details rather than API
+        if !isset(name) || name == "_VTABLE" : continue
+        if no_private && is_private(prop.act) : continue
+        let p = json:new_object()
+        p.set("act", json:new_string(act_str(prop.act)))
+        p.set("type", json:new_string(prop.type.compat_display_name()))
+        props.set(name, p)
+    }
+    c.set("properties", props)
+
+    let funcs = json:new_object()
+    each class.funcs as func, name {
+        if no_private && is_private(func.act) : continue
+        // A generic method (`fn map[U](...)`) needs the same treatment as a
+        // generic class before its signature is available.
+        funcs.set(name, jfunc(doc_func_for(func), ns_name))
+    }
+    c.set("functions", funcs)
+
+    return c
+}
+
+fn jfunc(func: build:Func, ns_name: String) json:Value {
     let f = json:new_object()
-    funcs.set(func.name, f)
+    f.set("act", json:new_string(act_str(func.act)))
+    f.set("is_static", json:new_bool(func.is_static))
 
     let gnames = func.generic_names
     if isset(gnames) {
         let arr = Array[json:Value]{}
-        each gnames as gname : arr.append(json:new_string(gname.name))
+        each gnames as gname : arr.append(json:new_string(gname))
         f.set("generics", json:new_array(arr))
     }
 
-
-    f.set("act", jact(func.act))
-    f.set("is_static", json:new_bool(func.is_static))
     let class = func.class
-    
     let args = Array[json:Value]{}
     each func.args as arg, i {
+        // Methods carry their receiver as the first argument
         if i == 0 && isset(class) && !func.is_static : continue
         let a = json:new_object()
-        args.append(a)
         a.set("name", json:new_string(arg.name))
-        a.set("type", json:new_string(arg.type))
-
-        let default_chunk = arg.chunk_value
-        if isset(default_chunk) {
-            let p = build:Parser.new(default_chunk, null)
-            p.ctx.func = fake_func
-            p.ctx.unit = fake_func.fc.unit
-            p.suggest_type = arg.type
-            let scope = fake_func.fast().scope
-            scope.parent_idf = func.arg_scope
-            let v = build:read_value(p, scope)
-            a.set("default-value", jval(v))
+        a.set("type", json:new_string(arg.type.compat_display_name()))
+        let default = arg.default
+        if isset(default) {
+            a.set("default-value", json:new_string(exp_body_text(default)))
         }
+        args.append(a)
     }
-
     f.set("arguments", json:new_array(args))
-    f.set("return-type", json:new_string(func.rett))
+
+    // Signature types are only filled in once parse_func_types ran; an
+    // unresolved return type is reported as void, like the language does.
+    let rett = func.rett
+    f.set("return-type", json:new_string(isset(rett) ? rett.compat_display_name() : "void"))
 
     let etype = func.error_type
-    f.set("error_type", isset(etype) ? json:new_string(etype.display_name) : json:new_null())
+    f.set("error_type", isset(etype) ? json:new_string(error_type_display(etype, ns_name)) : json:new_null())
+
+    return f
 }
 
-fn jval(v: build:Value) json:Value {
-    return json:new_string(v.to_str() !? "...")
+fn jglobal(g: build:Global) json:Value {
+    let gl = json:new_object()
+    gl.set("act", json:new_string(act_str(g.act)))
+    let type = g.type
+    gl.set("type", json:new_string(isset(type) ? type.compat_display_name() : "void"))
+    gl.set("shared", json:new_bool(g.shared))
+    return gl
+}
+
+// How an error type is written at a use site. `$global` error types (AnError,
+// IterError, LookupError, …) are bound on the build scope and referred to bare, so
+// qualifying them would be wrong; anything else is declared in a namespace and
+// only unambiguous with it, which matters for the ones thrown across namespaces
+// (`io:IoError` from fs, `json:ParseError` from a decoder).
+fn error_type_display(et: build:ErrorType, ns_name: String) String {
+    let ns = et.ns
+    if ns.name == ns_name : return et.name
+    let global = ns.build.scope.get_idf(et.name)
+    if isset(global) && global.type == build:IDF.error_type {
+        let bound = global.error_type
+        if isset(bound) && bound == et : return et.name
+    }
+    return ns.name + ":" + et.name
+}
+
+fn class_display_name(class: build:Class) String {
+    let display = class.display_name
+    return display.length > 0 ? display : class.name
+}
+
+// Source text of a `(...)` default-value body, without the parentheses. Bodies
+// keep their original span, so this is the value exactly as it was written.
+fn exp_body_text(exp: build:Exp) String {
+    let text = exp.src.content.part(exp.i, exp.len)
+    if text.starts_with("(") && text.ends_with(")") {
+        return text.part(1, text.length - 2)
+    }
+    return text
+}
+
+// Access marker as it appears in source
+fn act_str(act: build:ACT) String {
+    if act == build:ACT.public : return "+"
+    if act == build:ACT.readonly : return "~"
+    return "-"
+}
+
+// A declaration without an access marker is private, which is also what act_str
+// reports for it, so --no-private has to hide those too.
+fn is_private(act: build:ACT) bool {
+    return act != build:ACT.public && act != build:ACT.readonly
 }

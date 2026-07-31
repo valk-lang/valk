@@ -1,0 +1,523 @@
+use helper
+
+// Turn a top-level Exp into compiler objects (Func, Class, Use, ...).
+// `state` carries #if skip / nesting so macro branches can suppress declarations.
+fn parse_base_exp(ns: Namespace, u: Unit, scope: Scope, state: ParseState, exp: Exp) !Error {
+    // Compile macros always run (they own skip/nest bookkeeping).
+    if exp.type == EXP.macro {
+        parse_macro_exp(ns, scope, state, exp) !>
+        return
+    }
+
+    // Everything else is suppressed inside a false #if / unused #elif / #else body.
+    if state.is_skipping() : return
+
+    // Comments are only kept for formatting; ignore during object creation.
+
+    if exp.type == EXP.func {
+        parse_func_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.class {
+        parse_class_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.use {
+        parse_use_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.link {
+        parse_link_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.ignore_access {
+        // Apply only when this branch is active (respects #if skip)
+        exp.src.ignore_access = true
+        return
+    }
+    if exp.type == EXP.trait {
+        parse_trait_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.global {
+        parse_global_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.alias || exp.type == EXP.alias_type || exp.type == EXP.alias_value {
+        // Defer until after all base ASTs (pipeline.parse_aliases)
+        parse_alias_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.error {
+        parse_error_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.enum {
+        parse_enum_exp(ns, u, scope, exp) !>
+        return
+    }
+    if exp.type == EXP.test {
+        // Only when building with --test / -t (tests are unused otherwise)
+        parse_test_exp(ns, u, scope, exp) !>
+        return
+    }
+
+    if exp.type == EXP.extend {
+        // Defer class lookup until after base ASTs + aliases (pipeline.parse_extends)
+        parse_extend_exp(ns, u, scope, exp) !>
+        return
+    }
+
+    exp.bug("Unhandled top-level expression type in parse_base_exp: " + exp.type)
+}
+
+// `test "name" { ... }` → Func; type resolution adds its implicit TestResults arg.
+// Skipped entirely when not compiling with --test (no Func, not on pipelines).
+fn parse_test_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    if !ns.build.options.is_test : return
+
+    let raw_name = exp.str1
+    if raw_name.length == 0 : exp.bug("Test is missing a name")
+    let test_name = strip_quotes(raw_name)
+
+    // Optional --filter: only keep tests whose name contains the filter (case-insensitive)
+    let filter = ns.build.options.filter
+    if isset(filter) {
+        if !test_name.lower().contains(filter.lower()) : return
+    }
+
+    let func_name = "test_" + helper:ctxhash(test_name)
+    let f = Func {
+        unit: u
+        ns: ns
+        name: func_name
+        act: ACT.public
+        exp: exp
+        arg_scope: scope.sub_scope()
+        body: exp.get(TEST_EXP.body)
+        is_test: true
+        test_name: test_name
+    }
+
+    // Tests are not bound as identifiers — only tracked as unit functions for the test runner
+    u.functions.append(f)
+    ns.build.lists.tests.append(f)
+    ns.build.pipeline.parse_func_types.append(f)
+    ns.build.pipeline.parse_func_asts.append(f)
+}
+
+// Create an Enum from EXP.enum, parse body items, register as IDF.enum.
+fn parse_enum_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Enum is missing a name")
+
+    let idf_scope = base_idf_scope(ns, scope, exp.act)
+    if idf_scope.has_local(name) {
+        exp.error("Name already used: " + name)
+    }
+
+    let body = exp.get(ENUM_EXP.body)
+    if !isset(body) : exp.bug("Enum is missing a body")
+
+    let items = parse_enum_body_items(body) !>
+
+    let enu = Enum {
+        unit: u
+        ns: ns
+        name: name
+        act: exp.act
+        exp: exp
+        scope: scope
+        type_exp: exp.get(ENUM_EXP.type)
+        body: body
+        items: items
+    }
+
+    idf_scope.set_idf(name, Idf.for_enum(enu))
+}
+
+// Create an ErrorType from EXP.error, register IDF.error_type, enqueue for pipeline.
+// `$global` errors go on Build.scope; otherwise private → file scope, public → ns.scope.
+// extends / payload are resolved later via parse_error_types.
+fn parse_error_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Error type is missing a name")
+
+    let is_global = exp.bool1
+    let idf_scope = is_global ? ns.build.scope : base_idf_scope(ns, scope, exp.act)
+    if idf_scope.has_local(name) {
+        exp.error("Name already used: " + name)
+    }
+
+    let codes = exp.list
+    if !isset(codes) : exp.error("Error type must define at least one code")
+    if codes.length == 0 : exp.error("Error type must define at least one code")
+
+    let e = ErrorType {
+        unit: u
+        ns: ns
+        name: name
+        act: exp.act
+        exp: exp
+        scope: scope
+        codes: codes
+        extends_exp: exp.get(ERROR_EXP.extends)
+        payload_exp: exp.get(ERROR_EXP.payload)
+        is_global: is_global
+    }
+
+    idf_scope.set_idf(name, Idf.for_error_type(e))
+    ns.build.pipeline.parse_error_types.append(e)
+}
+
+// Enqueue a top-level alias / type / value for pipeline.parse_aliases.
+fn parse_alias_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Alias is missing a name")
+    ns.build.pipeline.parse_aliases.append(ParseAlias {
+        ns: ns
+        scope: scope
+        exp: exp
+    })
+}
+
+// Create a Global from EXP.global and register it on the unit + scope.
+// Enqueued on pipeline.parse_global_types for type resolution after classes exist.
+fn parse_global_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Global is missing a name")
+
+    let idf_scope = base_idf_scope(ns, scope, exp.act)
+    if idf_scope.has_local(name) {
+        exp.error("Name already used: " + name)
+    }
+
+    let kind = exp.kind.@cast(GLOBAL_KIND)
+    let is_extern = exp.bool2
+    // shared / @shared
+    let shared = kind == GLOBAL_KIND.shared || kind == GLOBAL_KIND.at_shared
+    // @shared or extern shared may hold structural types without imut
+    let allow_unsafe = kind == GLOBAL_KIND.at_shared || (is_extern && kind == GLOBAL_KIND.shared)
+
+    let g = Global {
+        unit: u
+        ns: ns
+        name: name
+        act: exp.act
+        kind: kind
+        scope: scope
+        exp: exp
+        type_exp: exp.get(GLOBAL_EXP.type)
+        default_exp: exp.get(GLOBAL_EXP.default)
+        is_extern: is_extern
+        shared: shared
+        allow_unsafe: allow_unsafe
+    }
+
+    u.globals.append(g)
+    ns.build.lists.globals.append(g)
+    idf_scope.set_idf(name, Idf.for_global(g))
+    ns.build.pipeline.parse_global_types.append(g)
+}
+
+// Scope for a top-level declaration name binding.
+// All decls (including `-` private) go on the namespace scope so same-ns files can
+// resolve them — same as old `fc.set_idf` → `nsc.scope`. Privacy is enforced at
+// use sites via act checks (not by hiding the name). File `use`s stay on the
+// per-file scope (`scope` arg kept for callers / future access bookkeeping).
+fn base_idf_scope(ns: Namespace, scope: Scope, act: ACT) Scope {
+    return ns.scope
+}
+
+// Create a Func from EXP.func and register it on the unit + scope.
+fn parse_func_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Function is missing a name")
+
+    let idf_scope = base_idf_scope(ns, scope, exp.act)
+    if idf_scope.has_local(name) {
+        exp.error("Name already used: " + name)
+    }
+
+    let generics = exp.get(FUNC_EXP.generics)
+    let is_generic_base = isset(generics)
+
+    let f = Func {
+        unit: u
+        ns: ns
+        name: name
+        act: exp.act
+        exp: exp
+        // Argument / signature types resolve in this scope (parent = file scope)
+        arg_scope: scope.sub_scope()
+        generics: generics
+        args_exp: exp.get(FUNC_EXP.args)
+        rett_exp: exp.get(FUNC_EXP.type)
+        error: exp.get(FUNC_EXP.error)
+        body: exp.get(FUNC_EXP.body)
+        flags: exp.list
+        is_extern: exp.bool2
+        is_generic_base: is_generic_base
+    }
+
+    u.functions.append(f)
+    idf_scope.set_idf(name, Idf.for_func(f))
+    ns.build.pipeline.parse_func_types.append(f)
+    // Generic bases specialize before AST; `$G` bases set skip_ast during type parse.
+    if !is_generic_base {
+        ns.build.pipeline.parse_func_asts.append(f)
+    }
+}
+
+// Create a Class from EXP.class and register it on the unit + scope.
+// `$global` classes are registered on Build.scope (visible everywhere) instead of
+// the unit-local or namespace scope.
+fn parse_class_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Class is missing a name")
+
+    let kind = exp.kind.@cast(CLASS_KIND)
+    let is_global = class_exp_has_flag(exp, "$global")
+
+    // `$global` → Build.scope; otherwise private stays unit-local, public goes on namespace.
+    let idf_scope = is_global ? ns.build.scope : base_idf_scope(ns, scope, exp.act)
+    if idf_scope.has_local(name) {
+        exp.error("Name already used: " + name)
+    }
+
+    // bool1: integer → signed; struct → packed
+    let signed = false
+    let packed = false
+    if kind == CLASS_KIND.integer : signed = exp.bool1
+    else if kind == CLASS_KIND.struct : packed = exp.bool1
+
+    // Modes never allow new properties; classes/structs may set $noNewProperties
+    let no_new_props = kind == CLASS_KIND.mode || class_exp_has_flag(exp, "$noNewProperties")
+    let mode_for_exp = exp.get(CLASS_EXP.mode_for)
+    if kind == CLASS_KIND.mode && !isset(mode_for_exp) {
+        exp.bug("Mode is missing 'for' type")
+    }
+
+    // Generic parameter names from `class Foo[T, U]`
+    let generic_names: ?Array[String] = null
+    let generics_body = exp.get(CLASS_EXP.generics)
+    if isset(generics_body) {
+        generic_names = parse_class_generic_names(generics_body) !>
+    }
+    let is_generic_base = isset(generic_names)
+
+    let c = Class {
+        unit: u
+        ns: ns
+        name: name
+        display_name: name
+        act: exp.act
+        kind: kind
+        // Member / type-resolution scope; parent is the source-file scope
+        scope: scope.sub_scope()
+        exp: exp
+        generics: generics_body
+        body: exp.get(CLASS_EXP.body)
+        flags: exp.list
+        number_size: exp.number
+        signed: signed
+        packed: packed
+        is_async: exp.bool2
+        no_new_props: no_new_props
+        mode_for_exp: mode_for_exp
+        is_generic_base: is_generic_base
+        generic_names: generic_names
+    }
+    // SELF resolves to this class inside property/method type positions
+    // (generic bases still get SELF → base; specializations rebind SELF)
+    c.scope.set_idf("SELF", Idf.for_class(c))
+
+    idf_scope.set_idf(name, Idf.for_class(c))
+    // Generic bases are not property-parsed; specializations are enqueued when created
+    if !is_generic_base {
+        ns.build.lists.classes.append(c)
+        ns.build.pipeline.parse_properties.append(c)
+    }
+}
+
+// Create a Trait from EXP.trait, parse body members (with #if), register identifier.
+fn parse_trait_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Trait is missing a name")
+
+    let idf_scope = base_idf_scope(ns, scope, exp.act)
+    if idf_scope.has_local(name) {
+        exp.error("Name already used: " + name)
+    }
+
+    let generic_names: ?Array[String] = null
+    let generics_body = exp.get(TRAIT_EXP.generics)
+    if isset(generics_body) {
+        // Same name list syntax as class generics
+        generic_names = parse_class_generic_names(generics_body) !>
+    }
+
+    let t = Trait {
+        unit: u
+        ns: ns
+        name: name
+        act: exp.act
+        exp: exp
+        scope: scope.sub_scope()
+        generics: generics_body
+        body: exp.get(TRAIT_EXP.body)
+        generic_names: generic_names
+    }
+
+    // Parse body into member exps now so `use Trait` can expand them later
+    t.exps = parse_trait_body_exps(t) !>
+
+    idf_scope.set_idf(name, Idf.for_trait(t))
+}
+
+// Read trait body members and filter through #if / #elif / #else / #end.
+fn parse_trait_body_exps(trait: Trait) Array[Exp] !Error {
+    let body = trait.body
+    if !isset(body) : return Array[Exp]{}
+    let pos = body.pos
+    if !isset(pos) : body.bug("Trait body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let raw = read_class_body_exps(p) !>
+
+    let state = ParseState.new()
+    let result = Array[Exp]{}
+    each raw as exp {
+        if exp.type == EXP.macro {
+            parse_macro_exp(trait.ns, trait.scope, state, exp) !>
+            continue
+        }
+        if state.is_skipping() : continue
+        // Trait bodies should not contain trait_use (no nested use expansion here)
+        if exp.type == EXP.trait_use {
+            exp.error("Cannot use a trait inside another trait")
+        }
+        result.append(exp)
+    }
+    if state.has_open_if() || state.is_skipping() {
+        body.error("Missing compile macro '#end' in trait body")
+    }
+    return result
+}
+
+// True if EXP.class flags list contains `flag` (e.g. "$global", "$noNewProperties").
+fn class_exp_has_flag(exp: Exp, flag: String) bool {
+    let flags = exp.list
+    if !isset(flags) : return false
+    each flags as f {
+        if f == flag : return true
+    }
+    return false
+}
+
+// Parse `[T, U, V: PROP_TYPE]` style names from a class generics EXP.body.
+fn parse_class_generic_names(body: Exp) Array[String] !Error {
+    let pos = body.pos
+    if !isset(pos) : body.bug("Generics body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let names = Array[String]{}
+    while true {
+        let t = p.tok(true, true) !>
+        if t == TOK.end : body.error("Unexpected end of file in generic names")
+        if t == TOK.sign && p.word_is("]") : break
+        if t != TOK.word {
+            p.error("Expected generic type name, found: '" + p.word() + "'")
+        }
+        let gname = p.word()
+        each names as existing {
+            if existing == gname : body.error("Duplicate generic name: " + gname)
+        }
+        names.append(gname)
+
+        // Optional `: PROP_TYPE` (and future constraints) — skip until `,` or `]`
+        t = p.tok(true, true, false) !>
+        if t == TOK.sign && p.word_is(":") {
+            p.tok(true, true) !>
+            while true {
+                t = p.tok(true, true, false) !>
+                if t == TOK.sign && (p.word_is(",") || p.word_is("]")) : break
+                if t == TOK.end : body.error("Unexpected end of file in generic constraint")
+                p.tok(true, true) !>
+            }
+        }
+
+        t = p.tok(true, true) !>
+        if t == TOK.sign && p.word_is("]") : break
+        if t == TOK.sign && p.word_is(",") : continue
+        p.error("Expected ',' or ']' in generic names, found: '" + p.word() + "'")
+    }
+    if names.length == 0 : body.error("Generic list cannot be empty")
+    return names
+}
+
+// Create a Use from EXP.use, resolve/load the target package + namespace, track on Build.lists.
+//
+// Id forms (EXP.id):
+//   use helper          → namespace `helper` in the current package
+//   use some_pkg        → if `some_pkg` is a dependency, its `main` namespace
+//   use some_pkg:some_ns    → dependency package `some_pkg`, namespace `some_ns`
+//   use valk:fs         → built-in valk stdlib package, namespace `fs`
+fn parse_use_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let id = exp.get(USE_EXP.id)
+    if !isset(id) : exp.bug("Use expression is missing id")
+    if id.str1.length == 0 : exp.bug("Use id is missing a name")
+
+    // Resolve package + namespace from the id
+    let pkg = ns.pkg
+    let ns_name = id.str1
+    let pkg_name = id.str2
+    if isset(pkg_name) {
+        // `pkg:namespace` — first part is a dependency package name
+        pkg = pkg.load_sub_pkg(pkg_name) !>
+    } else if pkg.pkg_exists(id.str1) {
+        // Bare name that matches a dependency package → that package's main namespace
+        pkg = pkg.load_sub_pkg(id.str1) !>
+        ns_name = "main"
+    }
+    // else: bare name → namespace in the current package (ns_name already set)
+
+    let target_ns = pkg.load_namespace(ns_name) !>
+
+    // Name bound in this file scope: optional `as alias`, else the id's local name
+    // (namespace part of `pkg:ns`, or the bare name / package name).
+    let idf_name = exp.str2 ?? id.str1
+    if scope.has_local(idf_name) {
+        exp.error("Name already used: " + idf_name)
+    }
+    // Created before the binding: the Idf carries it, so that resolving `ns:name`
+    // marks this import as referenced (see warn_unused_uses).
+    let use_stmt = Use {
+        unit: u
+        ns: ns
+        exp: exp
+        id: id
+        alias: exp.str2
+    }
+    ns.build.lists.uses.append(use_stmt)
+
+    scope.set_idf(idf_name, Idf.for_scope(target_ns.scope, use_stmt))
+}
+
+// Create a Link from EXP.link and append it to Build.lists.links.
+// `auto` resolves to static when the build is static, otherwise dynamic.
+fn parse_link_exp(ns: Namespace, u: Unit, scope: Scope, exp: Exp) !Error {
+    let kind = exp.kind.@cast(LINK_KIND)
+    if kind == LINK_KIND.auto {
+        kind = ns.build.options.is_static ? LINK_KIND.static : LINK_KIND.dynamic
+    }
+    let lib = exp.str1
+    if lib.length == 0 : exp.bug("Link is missing a library name")
+
+    let link = Link {
+        unit: u
+        ns: ns
+        exp: exp
+        type: kind
+        lib: lib
+    }
+    ns.build.lists.links.append(link)
+}

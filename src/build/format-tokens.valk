@@ -1,0 +1,287 @@
+
+// Reformat a source file from its token stream.
+//
+// The older formatter (Exp.format) rebuilt the text from the parsed Exp tree, so
+// a construct with no format branch of its own came out as nothing at all: `co`,
+// `await` and `error_is` were silently deleted from the output. Echoing tokens
+// instead makes losing code impossible — every token the tokenizer produced is
+// written back verbatim — and the only decisions left are how much whitespace
+// goes between them, where the worst a bug can do is look wrong.
+//
+// It also needs nothing but the text, so a file that does not type check can
+// still be formatted, which is what an editor formatting half-typed code needs.
+//
+// Line breaks are the author's. This normalises indentation, the spacing between
+// tokens and runs of blank lines; it never joins or splits a line.
+
+class FmtTok {
+    // TOK.*, as returned by Parser.tok.
+    type: int
+    // Raw source slice, so strings, chars and numbers are echoed exactly.
+    text: String
+    // Newlines between the previous token and this one.
+    new_lines: u32
+    // Whether whitespace separated this token from the one before it. Several
+    // signs mean different things depending only on their spacing (`!Error`
+    // against `x ! return`, `?String` against `a ? b : c`, `-1` against `a - 1`),
+    // and which was meant cannot be recovered without parsing, so those keep
+    // what was written rather than being guessed at.
+    spaced: bool
+}
+
+// Format `src` from its tokens. Errors only when the text cannot be tokenized,
+// which means the token boundaries are unknown and no output would be safe.
+fn format_tokens(src: Source) String !Error {
+    let toks = fmt_tokenize(src) !>
+    return format_align_comments(fmt_render(toks))
+}
+
+fn fmt_tokenize(src: Source) Array[FmtTok] !Error {
+    let p = src.start().init_parser()
+    let toks = Array[FmtTok]{}
+    let prev_end: u32 = 0
+    while true {
+        let t = p.tok(true, true) !>
+        if t == TOK.end : break
+        let start = p.word_i
+        let len = p.word_len
+        toks.append(FmtTok {
+            type: t
+            text: src.content.part(start, len)
+            new_lines: p.new_lines
+            spaced: toks.length > 0 && start > prev_end
+        })
+        prev_end = start + len
+    }
+    return toks
+}
+
+fn fmt_render(toks: Array[FmtTok]) String {
+    let out = ByteBuffer.new()
+    // Indent level of the line each still-open bracket was written on. A
+    // bracket's contents sit one level in from that and its closer goes back to
+    // it, so a line opening several brackets at once — `thread:start(fn() {` —
+    // still indents its body only once, and the `})` lines up with the line that
+    // started it.
+    let opens = Array[uint]{}
+    // Indent level of the line being written.
+    let indent: uint = 0
+    let index: uint = 0
+    let count = toks.length
+    let prev: ?FmtTok = null
+    // Last token that was not a comment: a trailing comment must not change how
+    // the line below it is indented.
+    let prev_code: ?FmtTok = null
+    // First token of the line being written. Colon spacing depends on which kind
+    // of statement the line is, and that is what the first word says.
+    let line_first: ?FmtTok = null
+    // How many brackets were open when this line started. A `let` line spaces
+    // out the colon of its own declaration, but not one belonging to a class
+    // init it happens to contain: `let ir = IRFunc { func: func }`.
+    let line_depth: uint = 0
+    // A `?` is open on this line, so the next `:` closes a ternary.
+    let ternary = false
+
+    while index < count {
+        let tok = toks.get(index) ! break
+        let next: ?FmtTok = null
+        if index + 1 < count : next = toks.get(index + 1) !? null
+        index++
+
+        let closer = fmt_is_closer(tok)
+        let pv = prev
+        let pc = prev_code
+
+        let nl = tok.new_lines
+        if !isset(pv) {
+            // Files here conventionally open with one blank line. Keep it, and
+            // keep it at one.
+            if nl > 1 : nl = 1
+        } else {
+            if nl > 2 : nl = 2
+            // A blank line against the edge of a block reads as an accident.
+            if nl > 1 && fmt_is_opener(pv) : nl = 1
+            if nl > 1 && closer : nl = 1
+            if isset(pc) {
+                if nl > 1 && pc.text == ":" : nl = 1
+            }
+        }
+
+        if nl > 0 || !isset(pv) {
+            if closer && opens.length > 0 {
+                indent = opens.pop_last() !? 0
+            } else {
+                indent = 0
+                if opens.length > 0 : indent = (opens.get(opens.length - 1) !? 0) + 1
+                if isset(pc) && !closer {
+                    if fmt_is_continuation(pc, tok) : indent++
+                }
+            }
+            let n = nl
+            while n-- > 0 : out.write_byte('\n')
+            let d = indent
+            while d-- > 0 : out.write_string("    ")
+            line_first = tok
+            line_depth = opens.length
+            ternary = false
+        } else {
+            if closer && opens.length > 0 : opens.pop_last() !? 0
+            if isset(pv) {
+                let own = opens.length == line_depth
+                if fmt_space_between(pv, tok, next, line_first, ternary, own) : out.write_byte(' ')
+            }
+        }
+
+        out.write_string(tok.text)
+
+        if fmt_is_opener(tok) : opens.append(indent)
+        // `??` and `?!` are single tokens, so a lone `?` is either the ternary or
+        // a nullable type. Only the ternary has a value on its left.
+        if tok.text == "?" && tok.spaced && isset(pv) {
+            if fmt_ends_operand(pv) : ternary = true
+        } else if tok.text == ":" {
+            ternary = false
+        }
+
+        prev = tok
+        if tok.type != TOK.comment : prev_code = tok
+    }
+
+    out.write_byte('\n')
+    return out.to_string()
+}
+
+// Whether a line starting with `tok` carries on the line above rather than
+// beginning something of its own, and so is indented one level further.
+fn fmt_is_continuation(prev_code: FmtTok, tok: FmtTok) bool {
+    // An operator at the head of a line has its left side on the line above.
+    // Not `+`, which at the head of a line is the public access modifier of a
+    // member — and it precedes ordinary field names, so no keyword tells the two
+    // apart. Splitting an expression before a `+` loses its extra indent; taking
+    // a level off every public member would be far worse.
+    if fmt_is_binary(tok.text) && tok.text != "+" : return true
+    if tok.text == "." : return true
+    let w = prev_code.text
+    // The single-statement body of `if x :`, written on the line below.
+    if w == ":" : return true
+    // A condition split off from the keyword it belongs to.
+    if w == "if" || w == "while" || w == "each" : return true
+    return false
+}
+
+// Whether a space goes between two tokens that share a line. `own` is true while
+// no bracket opened on this line is still open, so what is being written still
+// belongs to the statement the line started.
+fn fmt_space_between(prev: FmtTok, tok: FmtTok, next: ?FmtTok, line_first: ?FmtTok, ternary: bool, own: bool) bool {
+    let t = tok.text
+    let p = prev.text
+
+    // Nothing sits against the inside of a bracket, or in front of a comma.
+    if t == "," : return false
+    if t == ")" || t == "]" : return false
+    if p == "(" || p == "[" : return false
+
+    // Nothing follows a `.`, but what precedes one is kept as written: `a.b` is
+    // member access while `throw .error` names an enum member, and only the
+    // space tells them apart.
+    if p == "." : return false
+    if t == "." : return tok.spaced
+
+    if tok.type == TOK.comment : return true
+    if p == "," : return true
+
+    // A `{` stands off what precedes it — `class Node {`, `fn f() {`, `Decls {}`
+    // — except after a `]`, which is either a generic being instantiated
+    // (`Array[String]{}`) or a return type before a body (`get d: ptr[u8] {`).
+    // Nothing but the spacing separates those, so there it stays as written.
+    if t == "{" {
+        if p == "]" : return tok.spaced
+        return true
+    }
+
+    if t == ":" {
+        let nx = next
+        if isset(nx) {
+            if fmt_colon_is_namespace(tok, nx) : return false
+        }
+        if !own : return false
+        return fmt_colon_wants_space(line_first, ternary)
+    }
+    if p == ":" {
+        if fmt_colon_is_namespace(prev, tok) : return false
+        return true
+    }
+
+    if fmt_is_binary(t) : return true
+    if fmt_is_binary(p) : return true
+
+    // A sign the language reads by its spacing. Keep what was written.
+    return tok.spaced
+}
+
+// `http:Request` is written tight on both sides, and every other colon in the
+// language has a space after it. Nothing but the spacing tells them apart
+// without parsing, so that is what decides.
+fn fmt_colon_is_namespace(colon: FmtTok, next: FmtTok) bool {
+    if colon.spaced : return false
+    if next.spaced : return false
+    return next.type == TOK.word
+}
+
+// Whether a colon takes a space on its left as well as its right. A declaration
+// naming a type (`let x : uint`) does; a field, parameter or class-init property
+// (`value: String`) does not.
+fn fmt_colon_wants_space(line_first: ?FmtTok, ternary: bool) bool {
+    if ternary : return true
+    let lf = line_first ?! return false
+    let w = lf.text
+    if w == "let" || w == "global" || w == "enum" || w == "match" : return true
+    // The single-statement body of a control structure: `if x : return`.
+    if w == "if" || w == "while" || w == "each" || w == "else" || w == "}" : return true
+    return false
+}
+
+// Operators that are only ever infix, so they always get a space on both sides.
+// The ambiguous signs are left out: `-` is also negation, `!` also `not` and the
+// error type marker, `?` also a nullable type, `&` also a reference, `*` also a
+// pointer type, `<`/`>` also the brackets of a type literal (`size_of(<SELF>)`),
+// `#` a macro.
+fn fmt_is_binary(t: String) bool {
+    if t == "=" : return true
+    if t == "==" || t == "!=" || t == "<=" || t == ">=" : return true
+    if t == "+" || t == "/" || t == "%" : return true
+    if t == "&&" || t == "||" : return true
+    if t == "<<" || t == ">>" : return true
+    if t == "|" || t == "^" : return true
+    if t == "+=" || t == "-=" || t == "*=" || t == "/=" : return true
+    if t == "%=" || t == "^=" || t == "&=" || t == "|=" : return true
+    if t == "=>" || t == "->" : return true
+    if t == "??" || t == "?!" || t == "!?" : return true
+    return false
+}
+
+fn fmt_is_opener(t: FmtTok) bool {
+    let s = t.text
+    return s == "{" || s == "<{" || s == "(" || s == "["
+}
+
+fn fmt_is_closer(t: FmtTok) bool {
+    let s = t.text
+    return s == "}" || s == ")" || s == "]"
+}
+
+// Whether a token can be the end of a value, which is what tells a sign in infix
+// position from the same sign used as a prefix.
+fn fmt_ends_operand(t: FmtTok) bool {
+    let s = t.text
+    if s == ")" || s == "]" || s == "}" : return true
+    let ty = t.type
+    if ty == TOK.word || ty == TOK.at_word || ty == TOK.flag : return true
+    if ty == TOK.string || ty == TOK.char : return true
+    return fmt_is_number(t)
+}
+
+fn fmt_is_number(t: FmtTok) bool {
+    let ty = t.type
+    return ty == TOK.int || ty == TOK.float || ty == TOK.hex || ty == TOK.octal
+}

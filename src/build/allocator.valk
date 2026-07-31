@@ -1,0 +1,127 @@
+// Build-wide GC allocator descriptors.
+//
+// The legacy compiler generated one Pool global per unique object layout and
+// reparsed the function containing @INIT_ALLOCATORS whenever a new allocator
+// was discovered. The rewrite parses every body, so it records initialization
+// sites and fills them once the function-body queue has reached its fixed point.
+
+use helper
+
+class AllocatorProp {
+    offset: u32
+}
+
+class Allocator {
+    build: Build
+    global: Global
+    size: u32
+    class: Class
+    props: Array[AllocatorProp] (.{})
+    props_func: ?Func (null)
+    onfree: ?Func (null)
+}
+
+fn allocator_pool_size(b: Build, size: u32) u32 {
+    let psz = b.options.target.ptr_size.to(u32)
+    let until = 16 * psz
+    if size <= until {
+        let slots = size / psz
+        if size % psz != 0 : slots++
+        return slots * psz
+    }
+    let result = until * 2
+    while result < size : result *= 2
+    return result
+}
+
+fn allocator_collect_props(type: Type, base_offset: u32, out: Array[AllocatorProp]) !Error {
+    if type.is_nullable_type() {
+        let sub = type.sub_type
+        if isset(sub) && !sub.is_pointer_sized() && sub.type != TYPE.fn {
+            allocator_collect_props(sub, base_offset + 1, out) !>
+            return
+        }
+    }
+    if type.get_non_nullable().type == TYPE.fn {
+        out.append(AllocatorProp {
+            offset: base_offset + type.build.options.target.ptr_size.to(u32)
+        })
+        return
+    }
+    if type.is_gc_type() {
+        out.append(AllocatorProp { offset: base_offset })
+        return
+    }
+    let t = type.get_non_nullable()
+    if t.type == TYPE.inline {
+        let sub = t.sub_type
+        if !isset(sub) : return
+        let class = sub.get_class_or_null()
+        if isset(class) {
+            class.compute_body_size() !>
+            each class.props as prop {
+                allocator_collect_props(prop.type, base_offset + prop.offset, out) !>
+            }
+        } else {
+            allocator_collect_props(sub, base_offset, out) !>
+        }
+        return
+    }
+    if t.type != TYPE.array : return
+    let sub = t.sub_type
+    if !isset(sub) : return
+    let stride = sub.size() !>
+    let i: u32 = 0
+    while i < t.array_size {
+        allocator_collect_props(sub, base_offset + stride * i, out) !>
+        i++
+    }
+}
+
+fn allocator_for_class(ctx: Context, class: Class, at: Exp) Allocator !Error {
+    let b = ctx.build
+    // Class names are only unique inside a namespace. Using the short name here
+    // made e.g. json:Parser and template:Parser share one pool even though their
+    // sizes and GC-property layouts differ.
+    let key = class.ns.pkg.name + ":" + class.ns.name + ":" + class.name
+    let cached = b.cache.allocators.get(key) !? null
+    if isset(cached) : return cached
+
+    let size = allocator_pool_size(b, class.compute_body_size() !>)
+    if size == 0 : at.error("Unknown allocator size for type: " + class.pretty_name())
+
+    let pool_idf = valk_idf(b, "gc", "Pool") !>
+    let pool_class = pool_idf.class
+    if !isset(pool_class) : at.bug("gc:Pool identifier is not a class")
+    let pool_type = pool_class.get_type() !>
+
+    // Generated globals belong to gc:Pool's unit/namespace, as in the legacy build.
+    let name = "ALC_" + size + "__" + class.name + "__" + helper:ctxhash(key)
+    let g = Global {
+        unit: pool_class.unit
+        ns: pool_class.ns
+        name: name
+        act: ACT.private
+        kind: GLOBAL_KIND.global
+        scope: pool_class.scope
+        exp: at
+        type: pool_type
+    }
+    pool_class.unit.globals.append(g)
+    b.lists.globals.append(g)
+
+    let alc = Allocator {
+        build: b
+        global: g
+        size: size
+        class: class
+        props_func: class.get_func("_props")
+        onfree: class.get_func("gc_free")
+    }
+    each class.props as prop {
+        allocator_collect_props(prop.type, prop.offset, alc.props) !>
+    }
+    b.cache.allocators.set(key, alc)
+    b.lists.allocators.append(alc)
+    return alc
+}

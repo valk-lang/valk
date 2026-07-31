@@ -1,115 +1,119 @@
 
+use helper
+use valk:core
 use valk:fs
 use valk:time
 use valk:gc
-use helper
 
-@ignore_access
-
-global last_build: ?Build
-
-fn run_build(options: BuildOptions, dirs: Array[String], files: Array[String], modtimes: Map[uint]) {
-
-    let b = Build.init(options) ! {
-        println(E.msg)
-        return
-    }
-    b.is_watch = true
-    last_build = b
-    await co b.run() _
-
-    each b.nsc_by_dir as nsc, dir {
-        dirs.append(dir, true)
-    }
-    each b.fc_by_path as fc, path {
-        files.append(path, true)
-        modtimes.set(path, helper:modified_time(path) !? 0)
-    }
-    each b.watch_files as path {
-        files.append(path, true)
-        modtimes.set(path, helper:modified_time(path) !? 0)
-    }
-}    
-
+// --watch: rebuild whenever a file that took part in the build changes.
+//
+// A Build holds the parsed state of exactly one compilation, so every iteration
+// constructs a new one. Compile errors do not end the loop; they are printed and
+// the watcher keeps waiting, because the file with the error is precisely the one
+// the user is about to edit.
 fn build_watch(options: BuildOptions) {
-
-    // Test leak
-    // gc:verify = true
+    // Modification time per watched path, from the moment the build read it
+    let modtimes = Map[uint]{}
     let files = Array[String]{}
     let dirs = Array[String]{}
-    let logmem = options.verbose > 0
-
-    let modtimes = Map[uint]{}
+    // The program started by --run, so it can be stopped before it gets relinked
+    let running : ?core:Process = null
 
     while true {
-        let lb = last_build
-        if isset(lb) {
-            let p = lb.run_process
-            if isset(p) : p.stop()
+        if isset(running) {
+            running.stop()
+            running = null
         }
 
         println("=======================================")
+        running = watch_run_build(options, files, dirs, modtimes)
 
-        helper:msg("ℹ️", "Files changed - build")
-        if logmem : helper:msg("ℹ️", "Watcher memory usage: " + (gc:mem_usage_shared / 1024 / 1024) + "mb")
-        // println((gc:mem_shared) + "b (s)")
-
-        run_build(options, dirs, files, modtimes)
-
-        // Clean up + Leak test
+        // The Build is unreachable once watch_run_build returns, so collecting
+        // here keeps the idle watcher from holding a full compilation in memory.
         gc:collect()
+        if options.verbose > 0 {
+            let mb = gc:mem_usage_shared.to(float) / 1024 / 1024
+            helper:msg("📈", "Watcher memory usage: " + mb + " mb")
+        }
 
-        // Find new files in directories
-        if find_new_files(dirs, files, modtimes) : continue
-
-        //
         if files.length == 0 {
             helper:msg("❌", "No files to watch")
             exit(1)
         }
 
-        // Watch for file changes
-        let count = 0
-        while true {
-            let lb = last_build
-            if isset(lb) {
-                let p = lb.run_process
-                if isset(p) : p.did_exit()
-            }
-            if count++ % 3 == 0 {
-                if find_new_files(dirs, files, modtimes) : break
-            }
-            let has_changes = false
-            each files as file, i {
-                let mod = helper:modified_time(file) ! {
-                    helper:msg("ℹ️", "File removed: " + file)
-                    files.remove(i--)
-                    has_changes = true
-                    break
-                }
-                if mod != modtimes.get(file) !? 0 {
-                    modtimes.set(file, mod)
-                    has_changes = true
-                    break
-                }
-            }
-            if has_changes : break
-            time:sleep_ms(500)
-        }
+        watch_wait_for_change(files, dirs, modtimes)
+        helper:msg("♻️", "Files changed - rebuild")
     }
 }
 
-fn find_new_files(dirs: Array[String], files: Array[String], modtimes: Map[uint]) bool {
-    let count = files.length
-    each dirs as dir {
-        let dfiles = fs:files_in(dir, false, true, false)
-        each dfiles as path {
-            if path.ends_with(".valk") && !files.contains(path) {
-                files.append(path)
-                modtimes.set(path, helper:modified_time(path) !? 0)
-                println("> New file: " + path)
+// One build iteration. Replaces `files` / `dirs` / `modtimes` with what this
+// build read, and returns the running program when --run is active.
+fn watch_run_build(options: BuildOptions, files: Array[String], dirs: Array[String], modtimes: Map[uint]) ?core:Process {
+    let b = Build.init(options)
+    b.run() ! { }
+    let ok = b.print_messages()
+    b.stats.print(options.verbose, ok)
+
+    // Sources actually loaded, plus #embed targets.
+    files.clear()
+    each b.cache.loaded_files as path : files.append(path, true)
+    each b.watch_files as path : files.append(path, true)
+    each files as path : modtimes.set(path, helper:modified_time(path) !? 0)
+
+    // Only namespace directories are scanned for new files: those are the ones
+    // where adding a .valk file changes the next build. Watching the directory
+    // of every loaded file would instead keep re-reporting unrelated sources
+    // that live next to one (lib/templates/, package roots, …).
+    dirs.clear()
+    each b.lists.namespaces as ns {
+        let dir = ns.dir
+        if isset(dir) : dirs.append(dir, true)
+    }
+
+    if !ok || !options.run_exe || options.mode != BUILDTYPE.exe : return null
+
+    let path = b.options.path_out
+    if !isset(path) : return null
+    helper:msg("⚡", "Run: " + path)
+    let p = core:Process.run(path, options.run_args, true) !? null
+    if !isset(p) : helper:msg("❌", "Failed to run: " + path)
+    return p
+}
+
+// Poll until a watched file changes or disappears, or a new .valk file shows up
+// in one of the watched directories.
+fn watch_wait_for_change(files: Array[String], dirs: Array[String], modtimes: Map[uint]) {
+    let count = 0
+    while true {
+        // Scanning directories costs more than stat'ing known files, so
+        // new-file detection runs at a lower rate.
+        if count++ % 4 == 0 {
+            if watch_find_new_files(files, dirs, modtimes) : return
+        }
+        each files as file {
+            let mod = helper:modified_time(file) ! {
+                helper:msg("ℹ️", "File removed: " + file)
+                return
             }
+            if mod != (modtimes.get(file) !? 0) : return
+        }
+        time:sleep_ms(500)
+    }
+}
+
+// True when a watched directory gained a .valk file the last build never saw.
+fn watch_find_new_files(files: Array[String], dirs: Array[String], modtimes: Map[uint]) bool {
+    let found = false
+    each dirs as dir {
+        let dir_files = fs:files_in(dir, false, true, false)
+        each dir_files as path {
+            if !path.ends_with(".valk") : continue
+            if files.contains(path) : continue
+            helper:msg("ℹ️", "New file: " + path)
+            files.append(path)
+            modtimes.set(path, helper:modified_time(path) !? 0)
+            found = true
         }
     }
-    return files.length > count
+    return found
 }

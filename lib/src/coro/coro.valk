@@ -11,15 +11,17 @@ global g_coros : Array[?Coro] (.new(16))
 global g_coro_indexes : core:Pool[uint] (.new(16))
 global g_coro_count : uint
 global run_coros : Array[Coro] (.new(16))
-global delay_coros : Array[Coro] (.new(16))
+// Spare run queue. Coroutines resumed from `run_coros` can schedule more work,
+// so they must append to a different queue from the one being iterated.
+global next_run_coros : Array[Coro] (.new(16))
 
 global main_state : <CoroState> (@undefined)
 
-#if OS == macos
+#if OS == "macos"
 global timer_id : uint
 #end
 
-#if OS == win
+#if OS == "win"
 global cport : ?ptr
 #end
 
@@ -40,7 +42,7 @@ class Coro {
     stack_base: ptr (@undefined)
     //
     start_func: fnptr()()
-    handler: fnptr()()
+    handler: fn()()
     follow_up: ?Coro
     g_list_index: uint (0)
     // Error result
@@ -48,19 +50,32 @@ class Coro {
     // async results
     poll_event: io:PollEvent (0)
     completion_res: i64 (0)
+    #if OS == "linux"
+    // io_uring consumes timeout arguments when the SQE is submitted, which can
+    // happen after this coroutine has yielded. Coroutine locals live on the
+    // shared stack and are invalidated by the next resume, so keep this on the
+    // stable coroutine object instead.
+    timeout_ts: <io:kernel_timespec> (@undefined)
+    #elif OS == "win"
+    // Windows retains the OVERLAPPED pointer until an IOCP completion arrives.
+    // Coroutine locals are on the shared stack and cannot back asynchronous
+    // state, so reserve stable per-coroutine storage for the largest overlap
+    // record (AcceptEx currently needs 176 bytes on x64).
+    win_async_data: [u8 x 256] ({ 0... })
+    #end
     //
     started: bool (false)
     active: bool (false)
     freed: bool (false)
     done: bool (false)
 
-    static fn new(handler: ptr, start_func: ptr) SELF {
+    static fn new(handler: fn()(), start_func: ptr) SELF {
 
         let coro = Coro {
             args: mem:alloc(128)
             //
             start_func: start_func.@cast(fnptr()())
-            handler: handler.@cast(fnptr()())
+            handler: handler
         }
 
         let indexes = g_coro_indexes
@@ -86,6 +101,12 @@ class Coro {
         mem:free(this.args)
     }
 
+    #if OS == "win"
+    + fn win_async_ptr() ptr {
+        return @ref(this.win_async_data)
+    }
+    #end
+
     fn free_stacks() {
         if this.freed : return
         this.freed = true
@@ -96,14 +117,14 @@ class Coro {
 
     fn init_stack(base: ptr) {
 
-        #if ARCH == x64
+        #if ARCH == "x64"
         let return_addr_space = 2 * size_of(ptr)
-        #if OS == win
+        #if OS == "win"
         let regs = 30
         #else
         let regs = 6
         #end
-        #elif ARCH == arm64
+        #elif ARCH == "arm64"
         let return_addr_space = size_of(ptr)
         let regs = 19
         #else
@@ -137,16 +158,16 @@ class Coro {
     }
 
     fn sleep(ns: uint) {
-        #if OS == linux
+        #if OS == "linux"
         let sqe = io:sqe(this) ! return
         let nsec = ns.@cast(int)
-        let ts : <io:kernel_timespec> = {
+        this.timeout_ts = {
             tv_sec: nsec / 1_000_000_000
             tv_nsec: (nsec % 1_000_000_000)
         }
-        io:io_uring_prep_timeout(sqe, &ts, 0, 0)
+        io:io_uring_prep_timeout(sqe, @ref(this.timeout_ts), 0, 0)
 
-        #elif OS == macos
+        #elif OS == "macos"
         let ms = ns.to(i64) / 1_000_000
         let ev : <ext:kEvent> = @undefined
         io:EV_SET(@ref(ev), timer_id++, io:EVFILT_TIMER, io:EV_ADD | io:EV_ENABLE | io:EV_ONESHOT, 0, ms, this)
@@ -171,17 +192,31 @@ class Coro {
             return
         }
 
-        let ov = io:overlap[io:OverlapData]
+        let ov = io:overlap[io:OverlapData]()
 
         let sig : bool = false
         status = ext:NtAssociateWaitCompletionPacket(wcp, io:iocp(), timer, null, ov, ext:STATUS_SUCCESS, 0, &sig)
         if status != 0 {
+            ext:CloseHandle(wcp)
+            ext:CloseHandle(timer)
+            return
+        }
+
+        // The timer may expire between SetWaitableTimer and association. In
+        // that case Windows reports it through AlreadySignaled and no later
+        // completion is guaranteed, so the sleep has already completed.
+        if sig {
+            ext:CloseHandle(wcp)
             ext:CloseHandle(timer)
             return
         }
 
         #end
         this.yield()
+        #if OS == "win"
+        ext:CloseHandle(wcp)
+        ext:CloseHandle(timer)
+        #end
     }
 
     fn await_last() {
@@ -239,7 +274,7 @@ class Coro {
 
             // Backup Main stack
             let size : uint = this.stack_base - this.state.rsp
-            let asize = this.backup_main_stack_alloc_size 
+            let asize = this.backup_main_stack_alloc_size
             if size > asize {
                 if asize > 0 : mem:free(this.backup_main_stack)
                 this.backup_main_stack = mem:alloc(size)
@@ -272,6 +307,9 @@ class Coro {
 
     fn complete() {
         this.done = true
+        // The handler has finished and must not keep its captured environment
+        // alive for as long as a completed task/result remains reachable.
+        this.handler = fn() {}
         current_coro = null
         g_coro_count--
         let index = this.g_list_index
@@ -290,39 +328,41 @@ class Coro {
         // Done check
         if isset(until) && until.done : return
 
-        #if OS == linux
+        #if OS == "linux"
         let ring = io:uring()
-        #elif OS == macos
+        #elif OS == "macos"
         let kq = io:kqueue()
-        #elif OS == win
+        #elif OS == "win"
         let cport = io:iocp()
         #end
 
         while true {
 
-            // Run coroutines
-            each run_coros as coro {
-                coro.resume()
-            }
-            // Clear
+            // Swap queues before resuming. A resume may append itself, a newly
+            // spawned coroutine, or an await continuation to `run_coros`.
+            // Clearing the queue after iteration used to erase all such work,
+            // eventually leaving live coroutines with no runnable entry or
+            // io_uring request and blocking forever in wait_cqe.
+            let scheduled_coros = run_coros
+            run_coros = next_run_coros
+            next_run_coros = scheduled_coros
             run_coros.clear()
 
-            //
-            // each delay_coros as coro {
-            //     run_coros.append(coro)
-            // }
-            // delay_coros.clear()
+            each scheduled_coros as coro {
+                coro.resume()
+            }
+            scheduled_coros.clear()
 
             // Done check
             if isset(until) && until.done : break
 
             // Wait for poll coros
-            #if OS == linux
+            #if OS == "linux"
             if io:uring_unsubmitted > 0 : io:uring_submit(ring)
             #end
 
             gc:collect_if_threshold_almost_reached()
-            #if OS == linux
+            #if OS == "linux"
             while true {
                 let cqe : ?ext:io_uring_cqe = null
                 if run_coros.length == 0 {
@@ -342,7 +382,7 @@ class Coro {
                 coro.completion_res = cqe.res
                 io:io_uring_cqe_seen(ring, cqe)
             }
-            #elif OS == macos
+            #elif OS == "macos"
             let events : [<ext:kEvent> x 64] = @undefined
             gc:unlock()
             let timeout : ?ext:libc_timespec = null
@@ -367,7 +407,7 @@ class Coro {
                 run_coros.append(coro)
             }
 
-            #elif OS == win
+            #elif OS == "win"
             gc:unlock()
             let first = run_coros.length == 0
 
@@ -376,9 +416,14 @@ class Coro {
                 let key: uint = 0
                 let ov: ?io:OverlapData = null
                 let result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, first ? ext:INFINITE : 0)
-                if !result || !isset(ov) : break
+                // A failed asynchronous operation is still a completed
+                // operation. GetQueuedCompletionStatus returns false for it,
+                // but supplies its OVERLAPPED pointer so the waiting
+                // coroutine can observe the error and continue.
+                if !isset(ov) : break
                 first = false
                 let coro = ov.base.coro.@cast(Coro)
+                coro.completion_res = bytes
                 run_coros.append(coro)
             }
             gc:lock()

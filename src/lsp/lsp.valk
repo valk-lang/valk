@@ -8,6 +8,18 @@ value lsp_msg_type_error (1)
 value lsp_msg_type_warn (2)
 value lsp_msg_type_info (3)
 
+// One entry of a publishDiagnostics notification. Positions are the 1-based
+// line/col the compiler reports; converting to the protocol's 0-based numbers
+// happens where the JSON is built.
+class Diagnostic {
+    severity: int
+    msg: String
+    line: u32
+    col: u32
+    end_line: u32
+    end_col: u32
+}
+
 class Lsp {
     buf: ByteBuffer
     index: uint (0)
@@ -15,26 +27,48 @@ class Lsp {
     headers: Map[String] (Map[String]{})
     headers_str: String ("")
     data: json:Value (json:new_null())
-    id: int (0)
+    // Echoed back verbatim in the response. The protocol allows an integer or a
+    // string id, so it is kept as the JSON value it arrived as rather than being
+    // narrowed to an int — a client using string ids could not otherwise match
+    // our replies to its requests.
+    id: json:Value (json:new_null())
+    // True when the current message is a request (carries an id) rather than a
+    // notification. Requests must be answered exactly once, notifications never.
+    is_request: bool (false)
     method: String ("")
+    // Which kind of request the current build is serving (req_* in type.valk).
+    // The compiler's hook sites read this per resolved expression.
+    request: int (req_none)
     // Files
     file_content: Map[String] (Map[String]{})
+    // Paths that currently have diagnostics published, so they can be cleared
     has_errors: Array[String] (Array[String]{})
     //
     file: String ("")
     line: uint (0)
     col: uint (0)
+    // File to re-check for diagnostics once the input buffer has drained, so a
+    // batch of messages that arrived together costs one build instead of one
+    // each. Deliberately not set by didChange: with full-document sync every
+    // keystroke sends the whole file, and building per keystroke would mean a
+    // complete front-end pass per character.
+    pending_diagnostics: ?String (null)
     //
     shutdown: bool (false)
     responded: bool (false)
 
-    fn reset() {
-        this.headers.clear()
-        this.index = 0
-        this.stage = 0
+    // Forget the message being handled, without touching the input parser.
+    //
+    // The two are separate on purpose: the next message can still be arriving
+    // while this one is answered, and the parser's half-read state (which stage it
+    // reached, the headers it has collected, how far into the buffer it is) is the
+    // only record of where that message left off.
+    fn reset_request() {
         this.data = json:new_null()
-        this.id = 0
+        this.id = json:new_null()
+        this.is_request = false
         this.method = ""
+        this.request = req_none
         this.responded = false
         //
         this.file = ""
@@ -42,14 +76,43 @@ class Lsp {
         this.col = 0
     }
 
+    // The above, plus the input parser, once a message has been read in full (or
+    // abandoned as malformed).
+    fn reset() {
+        this.headers.clear()
+        this.index = 0
+        this.stage = 0
+        this.reset_request()
+    }
+
     fn parse() {
+        this.parse_messages()
+        // Always runs, including on the paths that return early waiting for more
+        // input: the queued edit is itself complete, so there is no reason to
+        // hold its diagnostics back.
+        this.flush_pending()
+    }
+
+    // Diagnostics for the most recent edit, after every buffered message has been
+    // handled. Notifications, so there is no request id to answer.
+    fn flush_pending() {
+        let file = this.pending_diagnostics ?! return
+        this.pending_diagnostics = null
+        // Only the request state: this runs between messages, including while the
+        // next one is still half-read, and resetting the parser here would leave it
+        // looking for headers in the middle of that message's body.
+        this.reset_request()
+        this.request = req_diagnostics
+        this.file = file
+        this.build()
+    }
+
+    fn parse_messages() {
 
         while this.buf.length > 0 {
-            let str : String = this.buf 
             if this.stage == 0 {
                 this.parse_headers() ! {
                     if E.code == E.more {
-                        // this.log("Needs more (0) : " + this.buf)
                         return
                     }
                     this.log("Invalid headers")
@@ -118,12 +181,17 @@ class Lsp {
     fn handle() {
         let data = this.data
 
-        let id = data.get_or("id").int()
         let method = data.get_or("method").string()
         let params = data.get_or("params")
 
-        this.id = id
+        // A message carrying an `id` is a request and must be answered exactly
+        // once; one without is a notification and must never be answered. The
+        // presence of the member is what distinguishes them, not its value —
+        // `"id": 0` is a perfectly valid request id.
+        this.id = data.get_or("id")
+        this.is_request = data.has("id")
         this.method = method
+        this.request = request_for_method(method)
 
         if this.shutdown {
             if method == "exit" {
@@ -139,6 +207,8 @@ class Lsp {
             this.shutdown = true
             this.send_empty_response()
         } else if method == "exit" {
+            // Any queued diagnostics are dropped rather than built: the client
+            // has asked to end the session and will never read them.
             exit(0)
         } else if method == "textDocument/didOpen" {
             this.handle_open()
@@ -148,7 +218,6 @@ class Lsp {
             this.handle_change()
         } else if method == "textDocument/didSave" {
             this.handle_save()
-        // } else if method == "textDocument/formatting" {
         } else if method == "textDocument/definition" {
             this.definition()
             this.send_empty_response()
@@ -158,28 +227,59 @@ class Lsp {
         } else if method == "textDocument/signatureHelp" {
             this.sighelp()
             this.send_empty_response()
+        } else if method == "textDocument/hover" {
+            this.hover()
+            this.send_empty_response()
+        } else if method == "textDocument/formatting" {
+            this.formatting()
+            this.send_empty_response()
+        } else if method == "textDocument/documentSymbol" {
+            this.document_symbol()
+            this.send_empty_response()
+        } else if method.starts_with("$/") {
+            // The specification reserves `$/` for optional protocol messages and
+            // allows a server to ignore them. `$/cancelRequest` arrives here:
+            // this server processes one message at a time, so by the time a
+            // cancel is read the request it names has already been answered.
+            // Silently ignored rather than logged, or every keystroke that the
+            // client gives up on would show up in the user's output panel.
+            if this.is_request : this.error_response(-32601, "Unsupported request: " + method)
         } else {
-            this.log("Unsupported method: " + method)
+            // An unanswered request leaves the client waiting for its timeout, so
+            // reply with MethodNotFound. A notification gets no reply at all.
+            if this.is_request {
+                this.error_response(-32601, "Unsupported request: " + method)
+            } else {
+                this.log("Unsupported notification: " + method)
+            }
         }
     }
 
-    fn error(msg: String) {
+    // JSON-RPC error response. `code` is a protocol error code (-32601 is
+    // MethodNotFound).
+    fn error_response(code: int, msg: String) {
+        if !this.is_request : return
         let resp = json:new_object()
-        resp.set("id", json:new_int(this.id))
-        resp.set("error", json:new_string(msg))
+        resp.set("id", this.id)
+        let err = json:new_object()
+        err.set("code", json:new_int(code))
+        err.set("message", json:new_string(msg))
+        resp.set("error", err)
         this.respond(resp)
     }
 
     fn success(result: json:Value) {
+        if !this.is_request : return
         let resp = json:new_object()
-        resp.set("id", json:new_int(this.id))
+        resp.set("id", this.id)
         resp.set("result", result)
         this.respond(resp)
     }
 
     fn send_empty_response() {
+        if !this.is_request : return
         let resp = json:new_object()
-        resp.set("id", json:new_int(this.id))
+        resp.set("id", this.id)
         resp.set("result", json:new_object())
         this.respond(resp)
     }
@@ -190,16 +290,23 @@ class Lsp {
         this.responded = true
     }
     fn send(data: json:Value) {
-        let content = data.encode()
+        let content = encode(data)
         let resp = "Content-Length: " + (content.length) + "\r\n"
         resp += "\r\n" + content
         print(resp)
     }
 
+    // ########################################
+    // BUILD
+    // ########################################
+
     fn build() {
         this.build_wrap()
+        // A build holds the whole front end of the project. Releasing it between
+        // requests keeps an idle server from sitting on that memory.
         gc:collect()
     }
+
     fn build_wrap() {
         let args = Array[String]{}
 
@@ -212,118 +319,128 @@ class Lsp {
             this.log(E.msg)
             return
         }
-        b.lsp = this
+        b.options.lsp = this
+        // Formatting needs the reconstructable Exp tree that --fmt keeps. The
+        // write-back itself is suppressed for the LSP, which returns the text to
+        // the editor as an edit instead (see Build.run_stages).
+        if this.request == req_formatting : b.options.is_fmt = true
+        // Errors are the normal outcome of compiling a file mid-edit: they are
+        // the diagnostics. The build's own reporting (print_results) exits the
+        // process, so it is deliberately not used here.
+        b.run() ! { }
 
-        let t = co b.run()
-        await t _
+        // A cursor request that found its answer stopped the build on purpose
+        // and has already responded. Anything the build had not reached yet is
+        // simply unexamined, not clean, so no diagnostics are published.
+        if b.lsp_answered : return
+        if this.request == req_formatting {
+            this.send_formatting(b)
+            return
+        }
+        if this.request == req_doc_symbol {
+            this.send_symbols(b)
+            return
+        }
         this.send_errors(b)
     }
 
+    // ########################################
+    // DIAGNOSTICS
+    // ########################################
+
     fn send_errors(b: build:Build) {
-        if !this.is_diag : return
-        let parse_errors = b.parse_errors
-        // let warnings = b.warnings
+        if this.request != req_diagnostics : return
 
-        let errors_per_fc = Map[Array[build:ParseError]]{}
-        each parse_errors as err {
-            let fc = err.chunk.fc
-            let list = errors_per_fc.get(fc.path) !? <{
-                let list = Array[build:ParseError]{}
-                errors_per_fc.set(fc.path, list)
-                return list
+        // publishDiagnostics replaces the entire list for one file, so each file
+        // with messages needs exactly one notification.
+        let per_path = Map[Array[Diagnostic]]{}
+        // Messages with no source span (bad build arguments, missing files)
+        let no_location = Array[String]{}
+
+        // The saved file always gets a notification, even an empty one. Without
+        // it a file that compiles cleanly on the first save is never mentioned,
+        // and a client holding diagnostics from an earlier server run would keep
+        // showing them.
+        let saved = this.file
+        if !saved.is_empty() : per_path.set(saved, Array[Diagnostic]{})
+
+        each b.messages as m {
+            let src = m.src
+            if !isset(src) {
+                no_location.append(m.msg)
+                continue
             }
-            list.append(err)
+            // A span inside a `%{...}` interpolation belongs to the file the
+            // interpolation was written in, not to the expression's own Source.
+            let at = build:message_resolve(src, m.i)
+            let path = at.src.path
+            if !isset(path) {
+                no_location.append(m.msg)
+                continue
+            }
+            let content = at.src.content
+            let start = build:message_line_col(content, at.i)
+            let end = build:message_line_col(content, at.i + m.len)
+            let list = per_path.get(path) !? <{
+                let created = Array[Diagnostic]{}
+                per_path.set(path, created)
+                return created
+            }
+            list.append(Diagnostic {
+                severity: m.type == build:MSG.error ? lsp_msg_type_error : lsp_msg_type_warn
+                msg: m.msg
+                line: start.line
+                col: start.col
+                end_line: end.line
+                end_col: end.col
+            })
         }
 
-        // Send errors
-        each errors_per_fc as errors, path {
-            this.send_errors_for_path(path, errors)
+        let published = Array[String]{}
+        each per_path as list, path {
+            this.send_diagnostics(path, list)
+            published.append(path)
         }
 
-        // Check previous error paths
-        let new = Array[String]{}
         each this.has_errors as path {
-            if errors_per_fc.has(path) {
-                new.append(path)
+            if per_path.has(path) : continue
+            // A file this build never read keeps whatever was published for it.
+            // Editing one file only compiles that file's namespace and what it
+            // uses, so an unread file's errors are unexamined rather than fixed;
+            // clearing them would hide real problems.
+            if !b.cache.loaded_files.contains(path) && fs:exists(path) {
+                published.append(path)
                 continue
             }
-            if !b.fc_by_path.has(path) && fs:exists(path) {
-                new.append(path)
-                continue
-            }
-            this.send_errors_for_path(path, Array[build:ParseError]{})
+            this.send_diagnostics(path, Array[Diagnostic]{})
         }
-        this.has_errors = new
+        this.has_errors = published
 
-        // Add new error paths
-        each errors_per_fc as errors, path {
-            if !this.has_errors.contains(path) {
-                this.has_errors.append(path)
-            }
-        }
-
-        let build_errors = b.build_errors
-        if build_errors.length > 0 {
-            this.send_errors_for_build(build_errors)
-        }
+        let first = no_location.get(0) !? null
+        if isset(first) : this.log(first, lsp_msg_type_error)
     }
 
-    fn send_errors_for_path(path: String, errors: Array[build:ParseError]) {
-
+    fn send_diagnostics(path: String, items: Array[Diagnostic]) {
         let resp = json:new_object()
         let res = json:new_object()
         resp.set("method", json:new_string("textDocument/publishDiagnostics"))
         resp.set("params", res)
 
-        // Result
         let diag = json:new_array()
         res.set("uri", "file://" + path)
         res.set("diagnostics", diag)
 
-        //
-        each errors as err {
+        each items as d {
             let item = json:new_object()
-            let range = json:new_object()
-            let pos = json:new_object()
-            let pos2 = json:new_object()
-            let chunk = err.chunk
-            let chunk_end = err.chunk_end
-
-            let sev = 1
-            if err.type == build:err_type_warn : sev = 2
-
-            item.set("severity", json:new_int(sev))
-            item.set("message", json:new_string(err.msg))
-            item.set("range", range)
-
-            range.set("start", pos)
-            range.set("end", pos2)
-
-            pos.set("line", json:new_uint(chunk.line - 1))
-            pos.set("character", json:new_uint(chunk.col - 1))
-            pos2.set("line", json:new_uint(chunk_end.line - 1))
-            pos2.set("character", json:new_uint(chunk_end.col - 1))
-
+            item.set("severity", json:new_int(d.severity))
+            item.set("message", json:new_string(d.msg))
+            item.set("range", json_range(d.line, d.col, d.end_line, d.end_col))
             diag.append(item)
         }
 
         this.respond(resp)
-        this.responded = false
-    }
-
-    fn send_errors_for_build(errors: Array[build:BuildError]) {
-        let err = errors.get(0) ! return
-
-        let resp = json:new_object()
-        let res = json:new_object()
-        resp.set("method", json:new_string("window/logMessage"))
-        resp.set("params", res)
-
-        // Result
-        res.set("type", json:new_int(1))
-        res.set("message", json:new_string(err.msg))
-
-        this.respond(resp)
+        // Diagnostics are notifications, not a reply to a request: several files
+        // are published in one pass and none of them consumes the response slot.
         this.responded = false
     }
 
@@ -333,10 +450,36 @@ class Lsp {
         resp.set("method", json:new_string("window/logMessage"))
         resp.set("params", res)
 
-        // Result
         res.set("type", json:new_int(type))
         res.set("message", json:new_string(msg))
 
         this.send(resp)
     }
+}
+
+fn request_for_method(method: String) int {
+    if method == "textDocument/definition" : return req_definition
+    if method == "textDocument/completion" : return req_completion
+    if method == "textDocument/signatureHelp" : return req_sig_help
+    if method == "textDocument/hover" : return req_hover
+    if method == "textDocument/formatting" : return req_formatting
+    if method == "textDocument/documentSymbol" : return req_doc_symbol
+    if method == "textDocument/didSave" : return req_diagnostics
+    return req_none
+}
+
+// A protocol Range from 1-based compiler line/col. The protocol counts both
+// lines and characters from zero.
+fn json_range(line: u32, col: u32, end_line: u32, end_col: u32) json:Value {
+    let range = json:new_object()
+    range.set("start", json_position(line, col))
+    range.set("end", json_position(end_line, end_col))
+    return range
+}
+
+fn json_position(line: u32, col: u32) json:Value {
+    let pos = json:new_object()
+    pos.set("line", json:new_uint(line > 0 ? (line - 1).to(uint) : 0))
+    pos.set("character", json:new_uint(col > 0 ? (col - 1).to(uint) : 0))
+    return pos
 }

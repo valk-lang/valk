@@ -1,0 +1,818 @@
+// Error-handler value semantics after fallible calls:
+//   !  /  !?  /  !>  /  !!  /  _  /  ->
+// plus default pass when a call can_error and no handler is present.
+
+// For an indirect call through a `fn`/`fnptr`-typed value (no resolvable Func — e.g. a
+// local variable holding a closure): suggested arg type at position `i`, from the type's
+// own declared arg list.
+fn indirect_call_arg_type(callee: Value, i: uint) ?Type {
+    let t = callee.rett
+    if t.type != TYPE.fn && t.type != TYPE.fnptr : return null
+    let ptypes = t.sub_types
+    if !isset(ptypes) : return null
+    return ptypes.get(i) !? null
+}
+
+// Same, for the call's result type.
+fn indirect_call_rett(callee: Value, b: Build) Type {
+    let t = callee.rett
+    if t.type != TYPE.fn && t.type != TYPE.fnptr : return type_void(b)
+    let rett = t.sub_type
+    if isset(rett) : return rett
+    return type_void(b)
+}
+
+// Same, for the call's error type (`fn(...)(...)!ErrorName`), when the fn/fnptr type
+// declares one.
+fn indirect_call_error_type(callee: Value) ?ErrorType {
+    let t = callee.rett
+    if t.type != TYPE.fn && t.type != TYPE.fnptr : return null
+    return t.error_type
+}
+
+// Build a call Value; attach can_error/error_type from Func when known.
+// Applies default pass-handler when the call can error and was not already wrapped.
+fn value_from_call_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let assert_value = value_from_assert_call(exp, scope, ctx) !>
+    if isset(assert_value) : return assert_value
+    let ptr_offset = value_from_ptr_offset_call(exp, scope, ctx) !>
+    if isset(ptr_offset) : return ptr_offset
+    let property = value_from_property_intrinsic_call(exp, scope, ctx) !>
+    if isset(property) : return property
+    let atomic_value = value_from_atomic_intrinsic_call(exp, scope, ctx) !>
+    if isset(atomic_value) : return atomic_value
+
+    let callee_exp = exp.get(VALUE_EXP.left)
+    if !isset(callee_exp) : exp.bug("Missing call callee")
+    let callee_ctx = ctx.without_suggested_type()
+    if callee_exp.type == EXP.value && callee_exp.kind == VALUE_KIND.error_code : callee_ctx = ctx
+    let callee = value_from_exp(callee_exp, scope, callee_ctx) !>
+    callee = value_try_remove_nullable(callee, scope, ctx)
+    let call_func = callee.resolve_call_func()
+    let args_exp = exp.get(VALUE_EXP.right)
+    let args = value_from_call_args(callee, call_func, args_exp, scope, ctx, exp) !>
+    // LSP: signature help for the call the cursor sits in. Placed after the
+    // arguments are resolved so that in `outer(inner(x))` a cursor inside `x`
+    // reports inner's signature — a nested call reaches here before its parent.
+    if isset(call_func) {
+        lsp_sig_help_call(exp, call_func, args_exp, call_receiver_skip(callee, call_func)) !>
+    }
+    if isset(call_func) {
+        call_func = specialize_call_generic_args(call_func, callee, args, exp) !>
+    }
+
+    // Type meta-methods: T.$can_convert_to(U)
+    if callee.type == VAL.member {
+        let on = callee.value1
+        if isset(on) && on.type == VAL.type && callee.name.starts_with("$") {
+            let folded = value_type_method(on, callee.name, args, exp, ctx.build) !>
+            folded.exp = exp
+            return folded
+        }
+        // Built-in value conversion: v.to(Type) / v.$to(Type)
+        if (callee.name == "to" || callee.name == "$to") && isset(on) {
+            if args.length != 1 {
+                exp.error("'." + callee.name + "' expects 1 type argument, got " + args.length)
+            }
+            let arg = args.get(0) ! exp.bug("Missing .to argument")
+            let target = arg.as_type()
+            if !isset(target) {
+                exp.error("'." + callee.name + "' expects a type argument")
+            }
+            let converted = value_force_to(on, scope, ctx, target, exp) !>
+            converted.exp = exp
+            return converted
+        }
+    }
+
+    if isset(call_func) {
+        value_check_call_args(call_func, callee, args, scope, ctx, exp) !>
+        value_buffer_call_receiver(callee, ctx)
+        value_buffer_call_args(args, ctx)
+        let v = vgen_call(ctx, callee, args, call_func.get_rett())
+        v.exp = exp
+        if call_func.can_error {
+            v.can_error = true
+            v.error_type = call_func.error_type
+        }
+        // `$exit` / `@willexit` calls have no continuation path. This fact is
+        // required by surrounding `if` and error-handler flow analysis.
+        if call_func.must_exit || call_func.will_exit {
+            scope.did_return = true
+        }
+        // Bare call site (not already wrapped by error_handler Exp): default pass / must_throw
+        if v.can_error {
+            if call_func.must_throw {
+                // The default pass for a `$throw` function exits the current
+                // function; value_apply_error_pass records that on the scope.
+                return value_apply_error_pass(v, scope, ctx, exp) !>
+            }
+            // Default pass when caller can receive the error (old default path)
+            return value_apply_error_pass(v, scope, ctx, exp) !>
+        }
+        return v
+    }
+
+    value_buffer_call_receiver(callee, ctx)
+    value_buffer_call_args(args, ctx)
+    let v = vgen_call(ctx, callee, args, indirect_call_rett(callee, ctx.build))
+    v.exp = exp
+    let ierr = indirect_call_error_type(callee)
+    if isset(ierr) {
+        v.can_error = true
+        v.error_type = ierr
+        return value_apply_error_pass(v, scope, ctx, exp) !>
+    }
+    return v
+}
+
+// VALUE_KIND.error_handler — explicit handler after a call.
+fn value_from_error_handler_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let call_exp = exp.get(VALUE_EXP.left)
+    if !isset(call_exp) : exp.bug("error_handler missing call")
+
+    // Evaluate the call without auto-default pass: temporarily parse call kind directly
+    let call = value_from_call_raw(call_exp, scope, ctx) !>
+    if !call.can_error {
+        // Soft: still allow if void/unresolved; otherwise error
+        if !call.rett.is_void_type() {
+            exp.error("Error handler on a value that does not return errors")
+        }
+    }
+
+    let kind = exp.number.@cast(ERRH_KIND)
+    if kind == ERRH_KIND.pass {
+        return value_apply_error_pass(call, scope, ctx, exp) !>
+    }
+    if kind == ERRH_KIND.ignore {
+        return value_apply_error_ignore(call, exp, ctx)
+    }
+    if kind == ERRH_KIND.panic {
+        return value_apply_error_panic(call, scope, ctx, exp) !>
+    }
+    if kind == ERRH_KIND.value {
+        return value_apply_error_value(call, exp, scope, ctx) !>
+    }
+    if kind == ERRH_KIND.block {
+        return value_apply_error_block(call, exp, scope, ctx) !>
+    }
+    if kind == ERRH_KIND.success {
+        return value_apply_error_success(call, exp, scope, ctx) !>
+    }
+    exp.bug("Unknown error-handler kind: " + kind)
+}
+
+// Call evaluation without default pass-handler (used when an explicit handler wraps the call).
+fn value_from_call_raw(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    if exp.type == EXP.value && exp.kind == VALUE_KIND.offset {
+        // `arr[i] !? alt` etc. — raw offset access without the implicit default fallback.
+        return value_from_offset_raw_exp(exp, scope, ctx) !>
+    }
+    if exp.type == EXP.value && exp.kind == VALUE_KIND.await {
+        // `await task !? alt` etc. — raw await without the implicit default fallback.
+        return value_from_await_raw_exp(exp, scope, ctx) !>
+    }
+    if exp.type != EXP.value || exp.kind != VALUE_KIND.call {
+        // Nested paren etc. — fall back to normal conversion
+        return value_from_exp(exp, scope, ctx.without_suggested_type()) !>
+    }
+    let ptr_offset = value_from_ptr_offset_call(exp, scope, ctx) !>
+    if isset(ptr_offset) : return ptr_offset
+    let property = value_from_property_intrinsic_call(exp, scope, ctx) !>
+    if isset(property) : return property
+    let atomic_value = value_from_atomic_intrinsic_call(exp, scope, ctx) !>
+    if isset(atomic_value) : return atomic_value
+
+    let callee_exp = exp.get(VALUE_EXP.left)
+    if !isset(callee_exp) : exp.bug("Missing call callee")
+    let callee_ctx = ctx.without_suggested_type()
+    if callee_exp.type == EXP.value && callee_exp.kind == VALUE_KIND.error_code : callee_ctx = ctx
+    let callee = value_from_exp(callee_exp, scope, callee_ctx) !>
+    callee = value_try_remove_nullable(callee, scope, ctx)
+    let call_func = callee.resolve_call_func()
+    let args_exp = exp.get(VALUE_EXP.right)
+    let args = value_from_call_args(callee, call_func, args_exp, scope, ctx, exp) !>
+    // LSP: signature help for the call the cursor sits in. Placed after the
+    // arguments are resolved so that in `outer(inner(x))` a cursor inside `x`
+    // reports inner's signature — a nested call reaches here before its parent.
+    if isset(call_func) {
+        lsp_sig_help_call(exp, call_func, args_exp, call_receiver_skip(callee, call_func)) !>
+    }
+    if isset(call_func) {
+        call_func = specialize_call_generic_args(call_func, callee, args, exp) !>
+    }
+    if isset(call_func) {
+        value_check_call_args(call_func, callee, args, scope, ctx, exp) !>
+        value_buffer_call_receiver(callee, ctx)
+        value_buffer_call_args(args, ctx)
+        let v = vgen_call(ctx, callee, args, call_func.get_rett())
+        v.exp = exp
+        if call_func.can_error {
+            v.can_error = true
+            v.error_type = call_func.error_type
+        }
+        if call_func.must_exit || call_func.will_exit {
+            scope.did_return = true
+        }
+        return v
+    }
+    value_buffer_call_receiver(callee, ctx)
+    value_buffer_call_args(args, ctx)
+    let v = vgen_call(ctx, callee, args, indirect_call_rett(callee, ctx.build))
+    v.exp = exp
+    let ierr = indirect_call_error_type(callee)
+    if isset(ierr) {
+        v.can_error = true
+        v.error_type = ierr
+    }
+    return v
+}
+
+// Resolve `$T` argument types from the actual values and replace the callee
+// with the cached concrete Func before type checking and IR lowering.
+fn specialize_call_generic_args(func: Func, callee: Value, args: Array[Value], at: Exp) Func !Error {
+    if !func.has_generic_args : return func
+
+    let skip: uint = 0
+    if isset(func.class) && !func.is_static {
+        let on = callee.value1
+        if isset(on) && on.type != VAL.type : skip = 1
+    }
+
+    let names = func.generic_arg_names
+    let types = Array[Type]{}
+    each names as name {
+        let found = false
+        let pi = skip
+        while pi < func.args.length {
+            let param = func.args.get(pi) ! at.bug("Missing generic function argument")
+            if param.is_generic && param.generic_name == name {
+                let ai = pi - skip
+                let arg = args.get(ai) ! at.error("Cannot infer generic argument type '$" + name + "' for function: " + func.name)
+                types.append(arg.rett)
+                found = true
+                break
+            }
+            pi++
+        }
+        if !found {
+            at.error("Cannot infer generic argument type '$" + name + "' for function: " + func.name)
+        }
+    }
+
+    let specialized = func.specialize_generic_args(names, types, at) !>
+    callee.func = specialized
+    callee.name = specialized.name
+    callee.rett = specialized.get_value_type(isset(callee.value1))
+    return specialized
+}
+
+// Keep allocating GC-valued call arguments visible until the callee has
+// accepted them. This is especially important for freshly-created closure
+// environments passed directly to APIs such as thread:start(fn() {...}).
+fn value_buffer_call_receiver(callee: Value, ctx: Context) {
+    let receiver = callee.value1
+    if !isset(receiver) : return
+    if !receiver.rett.is_gc_type() && receiver.rett.get_non_nullable().type != TYPE.fn : return
+    if receiver.type == VAL.decl || receiver.type == VAL.global || receiver.type == VAL.prop || receiver.type == VAL.null || receiver.type == VAL.string {
+        return
+    }
+    let func = ctx.func ?! return
+    if func.no_buffers : return
+    let decl = Decl.new(receiver.rett, false, null)
+    decl.is_buffer = true
+    func.all_decls.append(decl)
+    let buffered = vgen_decl(decl)
+    buffered.exp = receiver.exp
+    buffered.pre_value = vgen_assign(vgen_decl(decl), receiver, ASSIGN_OP.set, ctx.build, receiver.exp)
+    callee.value1 = buffered
+}
+
+fn value_buffer_call_args(args: Array[Value], ctx: Context) {
+    let func = ctx.func ?! return
+    if func.no_buffers : return
+    each args as arg, i {
+        if !arg.rett.is_gc_type() && arg.rett.get_non_nullable().type != TYPE.fn : continue
+        if arg.type == VAL.decl || arg.type == VAL.global || arg.type == VAL.prop || arg.type == VAL.null || arg.type == VAL.string {
+            continue
+        }
+        let decl = Decl.new(arg.rett, false, null)
+        decl.is_buffer = true
+        func.all_decls.append(decl)
+        let buffered = vgen_decl(decl)
+        buffered.exp = arg.exp
+        buffered.pre_value = vgen_assign(vgen_decl(decl), arg, ASSIGN_OP.set, ctx.build, arg.exp)
+        args.set(i, buffered) _
+    }
+}
+
+fn value_is_default_arg_marker(exp: Exp) bool {
+    if exp.type != EXP.value || exp.kind != VALUE_KIND.id : return false
+    let id = exp.get(VALUE_EXP.left)
+    if !isset(id) : return false
+    return !isset(id.str2) && id.str1 == "_"
+}
+
+fn value_from_func_arg_default(func: Func, arg: Arg, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let body = arg.default
+    if !isset(body) {
+        at.error("Function argument '" + arg.name + "' has no default value, so '_' cannot be used here")
+    }
+    let default_exp = parse_body_as_value_exp(body) !>
+    let default_scope = func.arg_scope.sub_scope()
+    default_scope.func = scope.func
+    let value = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(arg.type)) !>
+    value = value_try_convert(value, scope, ctx, arg.type)
+    arg.type.compat_check(value.rett, default_exp) !>
+    return value
+}
+
+// Resolve positional call arguments, substituting `_` and omitted trailing
+// parameters from the declaration's default expressions.
+// Number of leading Func args the call site does not write out: an instance
+// method takes its `this` from the value before the dot.
+fn call_receiver_skip(callee: Value, call_func: ?Func) uint {
+    let f = call_func ?! return 0
+    if !isset(f.class) || f.is_static : return 0
+    let on = callee.value1
+    if isset(on) && on.type != VAL.type : return 1
+    return 0
+}
+
+fn value_from_call_args(callee: Value, call_func: ?Func, args_exp: ?Exp, scope: Scope, ctx: Context, at: Exp) Array[Value] !Error {
+    let args = Array[Value]{}
+    let skip = call_receiver_skip(callee, call_func)
+
+    if isset(args_exp) {
+        let i: uint = 0
+        while true {
+            let a = args_exp.get(i)
+            if !isset(a) : break
+            let arg_ctx = ctx.without_suggested_type()
+            let param: ?Arg = null
+            if isset(call_func) {
+                let params = call_func.args
+                let param_i = skip + i
+                if param_i < params.length {
+                    param = params.get(param_i) !? null
+                } else if call_func.infinite_args && params.length > 0 {
+                    param = params.get(params.length - 1) !? null
+                }
+                if isset(param) && !param.is_generic {
+                    arg_ctx = ctx.with_suggested_type(param.type)
+                }
+            } else {
+                let pt = indirect_call_arg_type(callee, i)
+                if isset(pt) : arg_ctx = ctx.with_suggested_type(pt)
+            }
+
+            if value_is_default_arg_marker(a) {
+                if !isset(call_func) || !isset(param) {
+                    a.error("Function argument has no default value, so '_' cannot be used here")
+                }
+                args.append(value_from_func_arg_default(call_func, param, scope, ctx, a) !>)
+            } else {
+                args.append(value_from_exp(a, scope, arg_ctx) !>)
+            }
+            i++
+        }
+    }
+
+    // A shorter call may omit only trailing parameters that have defaults.
+    if isset(call_func) && !call_func.infinite_args {
+        let params = call_func.args
+        let param_i = skip + args.length
+        while param_i < params.length {
+            let param = params.get(param_i) ! break
+            if !isset(param.default) : break
+            args.append(value_from_func_arg_default(call_func, param, scope, ctx, at) !>)
+            param_i++
+        }
+    }
+    return args
+}
+
+// atomic(lvalue OP value), atomic_store(lvalue, value), atomic_load(lvalue).
+// These remain distinct Values so the future LLVM lowering can emit atomicrmw,
+// release stores, and acquire loads like the legacy backend.
+fn value_from_atomic_intrinsic_call(exp: Exp, scope: Scope, ctx: Context) ?Value !Error {
+    let callee_exp = exp.get(VALUE_EXP.left)
+    if !isset(callee_exp) : return null
+    if callee_exp.type != EXP.value || callee_exp.kind != VALUE_KIND.id : return null
+    let id = callee_exp.get(VALUE_EXP.left)
+    if !isset(id) : return null
+    if isset(id.str2) : return null
+    let name = id.str1
+    if name != "atomic" && name != "atomic_store" && name != "atomic_load" : return null
+
+    let args_exp = exp.get(VALUE_EXP.right)
+    let expected: uint = name == "atomic_store" ? 2 : 1
+    let count: uint = 0
+    if isset(args_exp) {
+        while isset(args_exp.get(count)) : count++
+    }
+    if count != expected {
+        exp.error("'" + name + "' expects " + expected + " argument(s), got " + count)
+    }
+    let args = args_exp ?! exp.bug("Missing arguments for " + name)
+    let first_exp = args.get(0)
+    if !isset(first_exp) : exp.bug("Missing first argument for " + name)
+
+    if name == "atomic" {
+        let operation = value_from_exp(first_exp, scope, ctx.without_suggested_type()) !>
+        if operation.type != VAL.op {
+            first_exp.error("Invalid atomic statement")
+        }
+        let left = operation.value1
+        let right = operation.value2
+        if !isset(left) || !isset(right) : first_exp.bug("Missing atomic operator values")
+        let op = operation.op.@cast(VALUE_OP)
+        if op != VALUE_OP.add && op != VALUE_OP.sub && op != VALUE_OP.bit_and && op != VALUE_OP.bit_or && op != VALUE_OP.bit_xor {
+            first_exp.error("Atomic operations only allow: + - & | ^")
+        }
+        if !left.assignable() {
+            first_exp.error("Atomic operation: Left value must be an assignable value. e.g. a variable")
+        }
+        value_mark_mutable(left)
+        return vgen_atomic_op(left, right, op, exp)
+    }
+
+    let left = value_from_exp(first_exp, scope, ctx.without_suggested_type()) !>
+    if !left.assignable() {
+        first_exp.error((name == "atomic_load" ? "Atomic load" : "Atomic store") + ": Left value must be an assignable value. e.g. a variable")
+    }
+    if name == "atomic_load" {
+        return vgen_atomic_load(left, exp)
+    }
+
+    let second_exp = args.get(1)
+    if !isset(second_exp) : exp.bug("Missing second argument for atomic_store")
+    let right = value_from_exp(second_exp, scope, ctx.with_suggested_type(left.rett)) !>
+    right = value_try_convert(right, scope, ctx, left.rett)
+    left.rett.compat_check(right.rett, second_exp) !>
+    value_mark_mutable(left)
+    return vgen_atomic_store(left, right, exp)
+}
+
+fn value_mark_mutable(value: Value) {
+    if value.type != VAL.decl : return
+    let decl = value.decl
+    if isset(decl) : decl.is_mut = true
+}
+
+// GC-aware property storage intrinsics used by generic containers:
+//   @property_init(on, slot, value)
+//   @property_update(on, slot, value)
+//   @property_get(slot)
+//   @property_clear(on, slot)
+//
+// For non-GC values these collapse to ordinary loads/stores. GC values route through
+// valk:gc so ownership/share bookkeeping stays explicit in the lowered Value tree.
+fn value_from_property_intrinsic_call(exp: Exp, scope: Scope, ctx: Context) ?Value !Error {
+    let callee_exp = exp.get(VALUE_EXP.left)
+    if !isset(callee_exp) : return null
+    if callee_exp.type != EXP.value || callee_exp.kind != VALUE_KIND.id : return null
+    let id = callee_exp.get(VALUE_EXP.left)
+    if !isset(id) : return null
+    if isset(id.str2) : return null
+    let name = id.str1
+    if name != "@property_init" && name != "@property_update" && name != "@property_get" && name != "@property_clear" {
+        return null
+    }
+
+    let args_exp = exp.get(VALUE_EXP.right)
+    let expected: uint = name == "@property_get" ? 1 : (name == "@property_clear" ? 2 : 3)
+    let count: uint = 0
+    if isset(args_exp) {
+        while isset(args_exp.get(count)) : count++
+    }
+    if count != expected {
+        exp.error("'" + name + "' expects " + expected + " argument(s), got " + count)
+    }
+    let arg_list = args_exp ?! exp.bug("Missing arguments for " + name)
+
+    if name == "@property_get" {
+        let prop_exp = arg_list.get(0)
+        if !isset(prop_exp) : exp.bug("Missing property argument")
+        let prop = value_from_exp(prop_exp, scope, ctx.without_suggested_type()) !>
+        if !prop.assignable() {
+            prop_exp.error("Invalid 1st parameter for @property_get. Must be an assignable value.")
+        }
+        if !prop.rett.is_gc_type() {
+            prop.exp = exp
+            return prop
+        }
+        let func = value_get_valk_func(ctx.build, "gc", "property_get", exp) !>
+        let ref = vgen_ptr_of(prop, type_ptr(ctx.build), prop_exp)
+        let call = vgen_call(ctx, vgen_func(func), Array[Value]{ref}, func.get_rett())
+        call.exp = exp
+        let result = vgen_cast(call, prop.rett)
+        result.exp = exp
+        return result
+    }
+
+    let on_exp = arg_list.get(0)
+    let prop_exp = arg_list.get(1)
+    if !isset(on_exp) : exp.bug("Missing owner argument")
+    if !isset(prop_exp) : exp.bug("Missing property argument")
+    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    let prop = value_from_exp(prop_exp, scope, ctx.without_suggested_type()) !>
+    if !prop.assignable() {
+        prop_exp.error("Invalid 2nd parameter for " + name + ". Must be an assignable value.")
+    }
+
+    if name == "@property_clear" {
+        if on.rett.is_gc_type() && prop.rett.is_gc_type() {
+            let func = value_get_valk_func(ctx.build, "gc", "property_remove", exp) !>
+            let ref = vgen_ptr_of(prop, type_ptr(ctx.build), prop_exp)
+            let call = vgen_call(ctx, vgen_func(func), Array[Value]{on, ref}, func.get_rett())
+            call.exp = exp
+            return call
+        }
+        let v = vgen_null(type_ptr(ctx.build))
+        v.exp = exp
+        return v
+    }
+
+    let value_exp = arg_list.get(2)
+    if !isset(value_exp) : exp.bug("Missing new property value")
+    let value = value_from_exp(value_exp, scope, ctx.with_suggested_type(prop.rett)) !>
+    value = value_try_convert(value, scope, ctx, prop.rett)
+    prop.rett.compat_check(value.rett, value_exp) !>
+
+    if on.rett.is_gc_type() && prop.rett.is_gc_type() {
+        let func_name = name == "@property_init" ? "property_set" : "property_update"
+        let func = value_get_valk_func(ctx.build, "gc", func_name, exp) !>
+        let ref = vgen_ptr_of(prop, type_ptr(ctx.build), prop_exp)
+        let call = vgen_call(ctx, vgen_func(func), Array[Value]{on, ref, value}, func.get_rett())
+        call.exp = exp
+        return call
+    }
+    return vgen_assign(prop, value, ASSIGN_OP.set, ctx.build, exp)
+}
+
+// Resolve a runtime helper from a namespace in the built-in valk package.
+fn value_get_valk_func(b: Build, ns_name: String, name: String, at: Exp) Func !Error {
+    let idf = valk_idf(b, ns_name, name) !>
+    if idf.type != IDF.func : at.bug("Identifier in valk:" + ns_name + " is not a function: " + name)
+    let func = idf.func
+    if !isset(func) : at.bug("Function identifier is missing Func: valk:" + ns_name + ":" + name)
+    return func
+}
+
+// Pointer pseudo-methods are syntax-level operations, not class members:
+// `p.@offset(bytes)` and the legacy-safe spelling `p.$offset(bytes)`.
+fn value_from_ptr_offset_call(exp: Exp, scope: Scope, ctx: Context) ?Value !Error {
+    let callee_exp = exp.get(VALUE_EXP.left)
+    if !isset(callee_exp) : return null
+    if callee_exp.type != EXP.value || callee_exp.kind != VALUE_KIND.dot : return null
+    let name = callee_exp.str1
+    if name != "@offset" && name != "$offset" : return null
+
+    let on_exp = callee_exp.get(VALUE_EXP.left)
+    if !isset(on_exp) : callee_exp.bug("Pointer offset is missing its receiver")
+    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    if !on.rett.is_pointer_type() {
+        callee_exp.error("The '" + name + "' token can only be used on pointer types. Not on: " + on.rett.compat_display_name())
+    }
+
+    let args_exp = exp.get(VALUE_EXP.right)
+    if !isset(args_exp) : exp.error("'." + name + "' expects 1 argument, got 0")
+    let offset_exp = args_exp.get(0)
+    if !isset(offset_exp) : exp.error("'." + name + "' expects 1 argument, got 0")
+    if isset(args_exp.get(1)) : exp.error("'." + name + "' expects 1 argument")
+    let offset = value_from_exp(offset_exp, scope, ctx.with_suggested_type(type_int(ctx.build))) !>
+    if !offset.rett.is_integer_type() {
+        offset_exp.error("Pointer offset must be an integer, got: " + offset.rett.compat_display_name())
+    }
+    return vgen_ptr_offset(on, offset, exp)
+}
+
+// `await <task>` — core resolution, no default pass-handler applied (used when an
+// explicit handler wraps the await, via value_from_call_raw).
+fn value_from_await_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let task_exp = exp.get(VALUE_EXP.left)
+    if !isset(task_exp) : exp.bug("'await' is missing a task expression")
+    let task = value_from_exp(task_exp, scope, ctx.without_suggested_type()) !>
+    let t = task.rett.get_non_nullable()
+    if t.type != TYPE.co {
+        exp.error("'await' can only be used on a co(...) task value, not: " + task.rett.compat_display_name())
+    }
+    let rett = t.sub_type
+    let v = Value {
+        type: VAL.await
+        value1: task
+        rett: isset(rett) ? rett : type_void(ctx.build)
+        exp: exp
+    }
+    let et = t.error_type
+    if isset(et) {
+        v.can_error = true
+        v.error_type = et
+    }
+    return v
+}
+
+// `await <task>` — bare call site (not already wrapped by an error_handler Exp):
+// default pass, same as an unhandled fallible call.
+fn value_from_await_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let v = value_from_await_raw_exp(exp, scope, ctx) !>
+    if v.can_error {
+        return value_apply_error_pass(v, scope, ctx, exp) !>
+    }
+    return v
+}
+
+// Shared wrapper: handler as pre_value side chain; result is success value.
+fn value_error_result(call: Value, handler: Value, rett: Type, kind: ERRH_KIND, at: Exp) Value {
+    let success = call.trim_errors()
+    success.rett = rett
+    let v = Value {
+        type: VAL.error_handler
+        op: kind
+        value1: success
+        value2: handler
+        rett: rett
+        exp: at
+        can_error: false
+        pre_value: call
+    }
+    return v
+}
+
+// `!>` / default: rethrow to caller if types compatible.
+fn value_apply_error_pass(call: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let etype = call.error_type
+    if !isset(etype) {
+        // Unresolved — keep call as-is
+        return call
+    }
+    let func = ctx.func
+    if !isset(func) {
+        at.error("Error pass handler ('!>') requires a function context")
+    }
+    let to = func.error_type
+    if !isset(to) {
+        at.error("Throwing an error but your function has no error type")
+    }
+    if !to.is_compat(etype) {
+        at.error("Incompatible error types: " + etype.name + " -> " + to.name + ". The '" + to.name + "' type must contain '" + etype.name + "' in the 'extends' list")
+    }
+    // Represent pass as error_handler; IR will emit check + return error
+    let dummy = vgen_block(Array[Value]{}, ctx.build, at)
+    let v = value_error_result(call, dummy, call.rett, ERRH_KIND.pass, at)
+    // A `$throw` function has no success path, so passing its error always leaves
+    // the caller — the same as writing `throw` here. An ordinary fallible call
+    // only returns when the error actually occurs, so it does not.
+    //
+    // This drives which null-checking facts survive a branch: after
+    // `if !isset(x) : fail() !>` the code below is only reachable with x set, and
+    // that is only true because fail() cannot return (see value_from_if_exp).
+    let target = call_target_func(call)
+    scope.did_return = isset(target) && target.must_throw
+    return v
+}
+
+// The function a resolved call targets, when the callee is a direct reference
+// rather than a function pointer or closure.
+fn call_target_func(call: Value) ?Func {
+    if call.type != VAL.call : return null
+    let callee = call.value1 ?! return null
+    return callee.resolve_call_func()
+}
+
+// `_` — ignore error; result type void (statement-ish)
+fn value_apply_error_ignore(call: Value, at: Exp, ctx: Context) Value {
+    let dummy = vgen_block(Array[Value]{}, ctx.build, at)
+    return value_error_result(call, dummy, type_void(ctx.build), ERRH_KIND.ignore, at)
+}
+
+// `!!` — panic on error
+fn value_apply_error_panic(call: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    // Placeholder panic call until core:panic resolution is wired everywhere
+    let dummy = vgen_block(Array[Value]{}, ctx.build, at)
+    return value_error_result(call, dummy, call.rett, ERRH_KIND.panic, at)
+}
+
+// Sub-scope for an error-handler body/alt-expression, with `E` bound to the caught
+// error when its type is known (soft: unresolved call error types just skip the bind).
+fn bind_caught_error_scope(scope: Scope, error_type: ?ErrorType, b: Build) Scope {
+    let sub = scope.sub_scope()
+    if isset(error_type) {
+        let decl = Decl.new(type_error_code(error_type, true), false, "E")
+        let payloads = Map[Decl]{}
+        each error_type.payload as ptype, name {
+            let payload_decl = Decl.new(ptype, false)
+            sub.add_decl(payload_decl)
+            payloads.set(name, payload_decl)
+        }
+        decl.error_payloads = payloads
+        sub.add_decl(decl)
+        sub.set_idf("E", Idf.for_decl(decl))
+    }
+    return sub
+}
+
+fn caught_error_decl(scope: Scope) ?Decl {
+    let idf = scope.get_idf("E")
+    if !isset(idf) : return null
+    return idf.decl
+}
+
+// `!? alt` — on error, use alternative value
+fn value_apply_error_value(call: Value, exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let alt_exp = exp.get(VALUE_EXP.right)
+    if !isset(alt_exp) : exp.bug("!? missing alternative value")
+    let left = call.trim_errors()
+    let alt_scope = bind_caught_error_scope(scope, call.error_type, ctx.build)
+    let alt = value_from_exp(alt_exp, alt_scope, ctx.with_suggested_type(left.rett)) !>
+    alt = value_try_convert(alt, scope, ctx, left.rett)
+    if !left.rett.is_void_type() && !alt.rett.is_void_type() {
+        // Allow nullable match either way
+        if !left.rett.compat(alt.rett) && !alt.rett.compat(left.rett) {
+            left.rett.compat_check(alt.rett, exp) !>
+        }
+    }
+    let rett = alt.rett
+    if left.rett.is_nullable_type() && !rett.is_nullable_type() {
+        // keep alt's type
+    } else if !left.rett.is_void_type() {
+        rett = left.rett
+        if alt.rett.is_nullable_type() && !rett.is_nullable_type() {
+            rett = rett.nullable()
+        }
+    }
+    // cond = has_error; then=alt, else=success
+    let err_check = Value {
+        type: VAL.isset // reuse as "error flag" until dedicated VAL.error_check
+        value1: call
+        rett: type_bool(ctx.build)
+        exp: exp
+        name: "has_error"
+    }
+    let v = vgen_this_or_that(err_check, alt, left, rett)
+    v.exp = exp
+    v.can_error = false
+    v.type = VAL.error_handler
+    v.op = ERRH_KIND.value
+    v.pre_value = call
+    v.decl = caught_error_decl(alt_scope)
+    return v
+}
+
+// `! { body }` / `! stmt` — run body on error; if body returns/exits, success continues with value
+fn value_apply_error_block(call: Value, exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body_exp = exp.get(VALUE_EXP.right)
+    if !isset(body_exp) : exp.bug("! handler missing body")
+    let sub = bind_caught_error_scope(scope, call.error_type, ctx.build)
+    let body = value_body_from_block_exp(ctx, sub, body_exp) !>
+    let left = call.trim_errors()
+    let v = value_error_result(call, body, left.rett, ERRH_KIND.block, exp)
+    v.decl = caught_error_decl(sub)
+    if sub.did_return {
+        // Body exits on error → success path yields left
+        return v
+    }
+    // Body continues → result is void (statement)
+    v.rett = type_void(ctx.build)
+    return v
+}
+
+// `-> name { body }` success handler
+fn value_apply_error_success(call: Value, exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body_exp = exp.get(VALUE_EXP.right)
+    if !isset(body_exp) : exp.bug("-> handler missing body")
+    let left = call.trim_errors()
+    if left.rett.is_void_type() {
+        exp.error("You cannot use the '->' success handler on a function call that does not return a value")
+    }
+
+    let names = exp.list
+    let if_scope = scope.sub_scope()
+    let decls = Array[Decl]{}
+    let inits = Array[Value]{}
+
+    // Single return value: one name binds the success value
+    let parts = left.unroll()
+    if isset(names) && names.length > 0 {
+        let i: uint = 0
+        while i < names.length {
+            let name = names.get(i) ! break
+            let part = parts.get(i) ! {
+                exp.error("Too many names in success handler for return arity " + parts.length)
+            }
+            let decl = Decl.new(part.rett, false, name)
+            decls.append(decl)
+            inits.append(part)
+            if_scope.set_idf(name, Idf.for_decl(decl))
+            if_scope.add_decl(decl)
+            i++
+        }
+    }
+
+    let body = value_body_from_block_exp(ctx, if_scope, body_exp) !>
+    // Declarations are scope metadata; execute only their success-value stores.
+    let init = vgen_decl_initializers(decls, inits, ctx.build, exp)
+    let block = vgen_block(Array[Value]{ init, body }, ctx.build, exp)
+    return value_error_result(call, block, type_void(ctx.build), ERRH_KIND.success, exp)
+}

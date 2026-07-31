@@ -1,0 +1,162 @@
+
+use valk:gc
+
+class Pipeline {
+    build: ?Build (null)
+    parse_base_asts: Array[ParseBaseAst] (.{})
+    // EXP.alias / alias_type / alias_value — after all base ASTs so targets exist
+    parse_aliases: Array[ParseAlias] (.{})
+    // `extend Class { ... }` — after aliases so class id lookup works
+    parse_extends: Array[Extend] (.{})
+    // ErrorType extends + payload (after aliases so payload types resolve)
+    parse_error_types: Array[ErrorType] (.{})
+    parse_properties: Array[Class] (.{})
+    parse_global_types: Array[Global] (.{})
+    parse_func_asts: Array[Func] (.{})
+    // Lowered once with a GC stack frame, and possibly able to go without one.
+    // Their resolved bodies are held until the call graph can say (gc-stack.valk).
+    deferred_gc_funcs: Array[Func] (.{})
+    // Functions containing a `#loop globals` (globals-loop.valk).
+    globals_loop_funcs: Array[Func] (.{})
+    parse_func_types: Array[Func] (.{})
+
+    fn run() !Error {
+        // Parse base expressions (creates Func / Class / Global / ErrorType / … objects)
+        while true {
+            let item = this.parse_base_asts.pop_last() ! break
+            parse_base_ast(item.src, item.ns, item.unit) !>
+        }
+        this.print_memory("base ASTs")
+
+        // Register aliases in dependency order across files. Primitive/class
+        // identifier aliases (e.g. SOCKET -> uint) must exist before type
+        // aliases that use them. Some identifier aliases target a type alias
+        // (e.g. libc_addrinfo_fix), so those are completed afterward.
+        let deferred_id_aliases = Array[ParseAlias]{}
+        let type_aliases = Array[ParseAlias]{}
+        let value_aliases = Array[ParseAlias]{}
+        while true {
+            let item = this.parse_aliases.pop_last() ! break
+            if item.exp.type == EXP.alias {
+                if alias_target_exists(item) : parse_alias(item) !>
+                else : deferred_id_aliases.append(item)
+            } else if item.exp.type == EXP.alias_type {
+                type_aliases.append(item)
+            } else {
+                value_aliases.append(item)
+            }
+        }
+        while true {
+            let item = value_aliases.pop_last() ! break
+            parse_alias(item) !>
+        }
+        while true {
+            let item = type_aliases.pop_last() ! break
+            parse_alias(item) !>
+        }
+        while true {
+            let item = deferred_id_aliases.pop_last() ! break
+            parse_alias(item) !>
+        }
+        this.print_memory("aliases")
+
+        // Attach extend blocks to their target classes (before property parse)
+        while true {
+            let item = this.parse_extends.pop_last() ! break
+            resolve_extend(item) !>
+        }
+        this.print_memory("extends")
+
+        // Resolve error extends + payload (needs error ids + type aliases)
+        while true {
+            let item = this.parse_error_types.pop_last() ! break
+            parse_error_type(item) !>
+        }
+        this.print_memory("error types")
+
+        // Parse class properties (own body + attached extends)
+        while true {
+            let item = this.parse_properties.pop_last() ! break
+            parse_class_properties(item) !>
+        }
+        let build = this.build
+        if isset(build) {
+            each build.lists.classes as class {
+                class.compute_size() !>
+            }
+        }
+        this.print_memory("properties")
+
+        // Resolve global / shared types (after classes + type aliases exist)
+        while true {
+            let item = this.parse_global_types.pop_last() ! break
+            parse_global_type(item) !>
+        }
+        this.print_memory("global types")
+
+        // Parse func argument & return types
+        while true {
+            let item = this.parse_func_types.pop_last() ! break
+            parse_func_types(item) !>
+        }
+        this.print_memory("function types")
+
+        // `fn main() i32` hands its result to the process exit code, while a void
+        // `fn main()` exits 0. The entry template picks between the two forms on
+        // this def, which can only be resolved now that main's return type is known.
+        let b = this.build
+        if isset(b) {
+            let main_func = b.main_func
+            let rett: ?Type = isset(main_func) ? main_func.rett : null
+            b.set_macro_def_bool("MAIN_EXIT_CODE", isset(rett) && rett.is_integer_type())
+        }
+
+        // --docs is complete at this point: it documents signatures, and lowering
+        // bodies would only risk errors in code the documented package never runs
+        // for this target.
+        let doc_build = this.build
+        if isset(doc_build) && doc_build.options.mode == BUILDTYPE.doc : return
+
+        // Parse function bodies into Value sequences (if/while/let are void Values).
+        // parse_func_ast also performs per-function LLVM IR generation, so keep
+        // this phase timing together as one useful backend statistic.
+        //
+        // A body that fails does not stop the others. Function bodies are
+        // independent — each has its own scope and its declarations already
+        // exist — so continuing yields one error per broken function instead of
+        // one per build, which is what the language server publishes as
+        // diagnostics. The CLI still prints only the first (print_messages), so
+        // its output is unchanged; run_stages stops before lowering once any
+        // error has been recorded.
+        while true {
+            let item = this.parse_func_asts.pop_last() ! break
+            parse_func_ast(item) ! continue
+        }
+        this.print_memory("function ASTs")
+
+        // `#loop globals` expands over the globals that are used, so growing
+        // that set means expanding again. Before the GC-stack pass, whose
+        // answer depends on the calls this settles.
+        let loop_build = this.build
+        if isset(loop_build) : resolve_globals_loops(loop_build) !>
+        this.print_memory("globals loops")
+
+        // Re-lower the functions that turned out not to need a GC stack frame.
+        let gc_build = this.build
+        if isset(gc_build) : finish_deferred_gc_funcs(gc_build) !>
+        this.print_memory("GC stack elision")
+
+        // Allocator helpers are emitted during module finalization, after this
+        // queue has reached its fixed point, so source order cannot omit later
+        // allocation sites.
+        this.print_memory("allocator discovery")
+    }
+
+    fn print_memory(stage: String) {
+        let b = this.build ?! return
+        if b.options.verbose < 3 : return
+        gc:collect()
+        let used = gc:mem_usage_shared
+        println("> Front-end memory after " + stage + ": " + (used.to(float) / 1024 / 1024) + " mb")
+    }
+}
