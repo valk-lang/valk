@@ -5,7 +5,7 @@
 
 ```
 - Release 0.2.2
-/
++ Tagged unions
 
 # Upcoming version
 /
@@ -43,7 +43,6 @@
 + `$default` type value hook
 + LSP improvements
 + Defer statements
-~ Tagged unions
 
 + Release 0.2.0
 + Rewrite entire compiler
