@@ -12,6 +12,7 @@ FLAGS=--def "VERSION=$(VERSION)"
 DIST_FLAGS=. src/*.valk --static --release -vv
 DEV_FLAGS=-L /opt/llvm15/lib
 TEST_FLAGS=--test --def "DEF_TEST=TestValue" -vv
+TEST_COMPILER?=./valk
 
 # Build
 valk: $(SRC)
@@ -52,13 +53,29 @@ update: valk
 	sudo cp -r ./lib /opt/valk/${VERSION}/
 
 # Testing
-test: valk
+# `test` is the fast, compiled language/runtime suite. `test-all` also runs
+# every standalone compiler/tooling test group used by CI.
+test: $(TEST_COMPILER)
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all
-	./debug/test-all
-	@./tests/compile-errors/run.sh
-	@./tests/exit-code/run.sh
-	@./tests/lsp/run.sh
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core
+	./debug/test-core
+
+test-compile-errors: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/compile-errors/run.sh
+
+test-diagnostics: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/diagnostics/run.sh
+
+test-exit-code: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/exit-code/run.sh
+
+test-lsp: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/lsp/run.sh
+
+test-fmt: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/fmt/run.sh
+
+test-all: test test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt
 
 test-gc-debug: valk
 	mkdir -p ./debug
@@ -73,9 +90,6 @@ test-gc-shared-stress: valk
 		echo "Shared GC stress run $$run/10"; \
 		./debug/test-gc-shared-stress || exit $$?; \
 	done
-
-test-fmt: valk
-	./tests/fmt/run.sh
 
 watchtest: valk2
 	./valk2 build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w -v
@@ -199,4 +213,4 @@ clean:
 	rm -f ./valk2
 # rm -rf ~/.valk/cache
 
-.PHONY: valk clean toolchains dist-all valkd static test test-gc-debug test-gc-shared-stress test-macos-build test-win-build test-cross-ir test-cross linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3
+.PHONY: valk clean toolchains dist-all valkd static test test-all test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt test-gc-debug test-gc-shared-stress test-macos-build test-win-build test-cross-ir test-cross linux-x64 macos-x64 macos-arm64 win-x64 ci-linux valk2 valk3

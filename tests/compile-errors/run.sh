@@ -3,6 +3,8 @@
 echo ""
 echo "# Test compile errors"
 
+VALK="${VALK:-./valk}"
+
 # Set the filepath here
 FILEPATH="./tests/compile-errors/errors.txt"
 count=0
@@ -33,7 +35,7 @@ while IFS=';' read -r file msg; do
     fi
 
     count=$((count+1))
-    cmd="./valk build ./tests/compile-errors/$file.valk --no-warn"
+    cmd="$VALK build ./tests/compile-errors/$file.valk --no-warn"
     echo "> Run: $cmd"
     # The rewrite compiler may write diagnostics to stderr (and its runtime
     # can terminate with a non-zero status after reporting them). Capture both
@@ -69,7 +71,7 @@ echo "# Test count: $count"
 
 echo ""
 echo "# Test type compatibility"
-./valk ./tests/compile-errors/type-checks.valk
+"$VALK" ./tests/compile-errors/type-checks.valk
 if [[ $? != 0 ]]; then
     exit 1
 fi
