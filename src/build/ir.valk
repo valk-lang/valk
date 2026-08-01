@@ -1552,6 +1552,15 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         return rendered
     }
     if t == VAL.null : return (ir_type(value.rett) !>) == "ptr" ? "null" : "zeroinitializer"
+    if t == VAL.union_wrap {
+        return ir_emit_union_wrap(ir, value) !>
+    }
+    if t == VAL.union_is {
+        return ir_emit_union_is(ir, value) !>
+    }
+    if t == VAL.union_extract {
+        return ir_emit_union_extract(ir, value) !>
+    }
     if t == VAL.undefined : return "undef"
     if t == VAL.wrap || t == VAL.paren {
         let inner = value.value1
@@ -2030,6 +2039,7 @@ fn ir_emit_match_case(
         ir_emit_values(ir, case_value.values) !>
         if !ir.terminated : predecessors.append(ir.current_block)
     } else {
+        ir_emit_values(ir, case_value.values) !>
         let result = case_value.value2
         if !isset(result) : case_value.bug("Value-returning match case has no result")
         let rendered = ir_emit_value(ir, result) !>
@@ -2119,6 +2129,204 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     }
     ir.line_end()
     return out
+}
+
+fn ir_union_box_class(value: Value) Class !Error {
+    let idf = valk_idf(value.rett.build, "core", "TaggedUnion") !>
+    let class = idf.class
+    if !isset(class) : value.bug("core:TaggedUnion is not a class")
+    return class
+}
+
+fn ir_union_box_prop(value: Value, name: String) Prop !Error {
+    let class = ir_union_box_class(value) !>
+    return class.get_prop_by_name(name) ! value.bug("core:TaggedUnion is missing property: " + name)
+}
+
+fn ir_union_load_prop(ir: IRFunc, value: Value, box: String, name: String) String !Error {
+    let prop = ir_union_box_prop(value, name) !>
+    let address = ir_prop_address(ir, box, prop)
+    let out = ir.var()
+    ir.line(out + " = load " + (ir_type(prop.type) !>) + ", ptr " + address)
+    if !prop.type.is_gc_type() : return out
+
+    // Managed properties may carry ownership bits written by the collector.
+    let as_int = ir.var()
+    ir.line4(as_int, " = ptrtoint ptr ", out, " to i64")
+    let masked = ir.var()
+    ir.line4(masked, " = and i64 ", as_int, ", -4")
+    let clean = ir.var()
+    ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
+    return clean
+}
+
+fn ir_union_storage_prop(member: Type) String {
+    // Managed references and out-of-line inline payloads are both stored in
+    // the GC-traced pointer slot. Only scalar/raw-pointer alternatives fit in
+    // the compact bit payload.
+    if member.is_gc_type() || !member.is_pointer_sized() : return "gc_payload"
+    return "other_payload"
+}
+
+// Encode a non-managed union alternative into the shared u64 payload. Integer,
+// bool, and raw-pointer values use the normal ABI conversion; floating-point
+// values must preserve their bit pattern rather than undergo numeric rounding.
+fn ir_union_encode_payload(ir: IRFunc, value: String, type: Type, payload: Type) String !Error {
+    if !type.is_float_type() : return ir_emit_cast(ir, value, type, payload) !>
+
+    let width = type.number_byte_size() * 8
+    let bits_type = "i" + width
+    let bits = ir.var()
+    ir.line(bits + " = bitcast " + (ir_type(type) !>) + " " + value + " to " + bits_type)
+    if width == 64 : return bits
+
+    let widened = ir.var()
+    ir.line(widened + " = zext " + bits_type + " " + bits + " to i64")
+    return widened
+}
+
+// Decode a non-managed union alternative from the shared u64 payload.
+fn ir_union_decode_payload(ir: IRFunc, value: String, payload: Type, type: Type) String !Error {
+    if !type.is_float_type() : return ir_emit_cast(ir, value, payload, type) !>
+
+    let width = type.number_byte_size() * 8
+    let bits_type = "i" + width
+    let bits = value
+    if width < 64 {
+        bits = ir.var()
+        ir.line(bits + " = trunc i64 " + value + " to " + bits_type)
+    }
+    let out = ir.var()
+    ir.line(out + " = bitcast " + bits_type + " " + bits + " to " + (ir_type(type) !>))
+    return out
+}
+
+fn ir_emit_union_wrap(ir: IRFunc, value: Value) String !Error {
+    let inner = value.value1
+    if !isset(inner) : value.bug("Tagged-union construction is missing its value")
+    let union = value.rett.get_non_nullable()
+    let members = union.sub_types
+    if !isset(members) : value.bug("Tagged union is missing alternatives")
+    let member = members.get(value.int_val.to(uint)) !? null
+    if !isset(member) : value.bug("Tagged-union alternative index is out of bounds")
+
+    // Evaluate the payload before allocating its box. GC-producing expressions
+    // were buffered by vgen_union_wrap, so this remains rooted across the box
+    // allocation.
+    let rendered = ir_emit_value(ir, inner) !>
+    let class = ir_union_box_class(value) !>
+    let at = value.exp ?? ir.func.exp
+    value.allocator = allocator_for_class(Context.for_func(ir.func), class, at) !>
+    let box = ir_emit_class_alloc(ir, value, class, class.compute_body_size() !>) !>
+    ir.line("call void @llvm.memset.inline.p0.i64(ptr " + box + ", i8 0, i64 " + class.compute_body_size() !> + ", i1 false)")
+
+    let tag_prop = ir_union_box_prop(value, "tag") !>
+    let tag_address = ir_prop_address(ir, box, tag_prop)
+    ir.line("store " + (ir_type(tag_prop.type) !>) + " " + value.int_val + ", ptr " + tag_address)
+
+    let storage_name = ir_union_storage_prop(member)
+    let storage_prop = ir_union_box_prop(value, storage_name) !>
+    let stored = ""
+    if member.is_pointer_sized() {
+        stored = ir_union_encode_payload(ir, rendered, inner.rett, storage_prop.type) !>
+    } else {
+        // Inline alternatives cannot fit in the compact u64 slot. Allocate a
+        // GC-owned payload using the complete value layout, then store the
+        // aggregate into it. The generated pool descriptor traces nested
+        // managed fields (including arrays and closures).
+        let payload_type = member
+        let payload_size = payload_type.size() !>
+        let payload_allocator = allocator_for_type(Context.for_func(ir.func), payload_type, at) !>
+        let payload_value = Value {
+            type: VAL.class_init
+            rett: payload_type
+            exp: value.exp
+            allocator: payload_allocator
+        }
+        let payload = ir_emit_class_alloc(ir, payload_value, payload_allocator.class, payload_size) !>
+        ir.line("store " + (ir_type(payload_type) !>) + " " + rendered + ", ptr " + payload)
+        stored = payload
+    }
+    let storage_address = ir_prop_address(ir, box, storage_prop)
+    ir.line("store " + (ir_type(storage_prop.type) !>) + " " + stored + ", ptr " + storage_address)
+    return box
+}
+
+fn ir_emit_union_is(ir: IRFunc, value: Value) String !Error {
+    let on = value.value1
+    if !isset(on) : value.bug("Tagged-union type test is missing its value")
+    let box = ir_emit_value(ir, on) !>
+
+    // A nullable tagged union uses a null pointer for its outer null value.
+    // Do not load the tag field until the pointer is known to be non-null;
+    // this is what makes a `default` arm safely cover null without requiring
+    // a duplicate explicit `null` arm.
+    if on.rett.is_nullable_type() {
+        let null_block = ir.block("union.is.null")
+        let nonnull_block = ir.block("union.is.nonnull")
+        let after_block = ir.block("union.is.after")
+        let null_check = ir.var()
+        ir.line4(null_check, " = icmp eq ptr ", box, ", null")
+        ir.cond_jump(null_check, null_block, nonnull_block)
+
+        ir.label(null_block)
+        let null_predecessor = ir.current_block
+        ir.jump(after_block)
+
+        ir.label(nonnull_block)
+        let tag = ir_union_load_prop(ir, value, box, "tag") !>
+        let tag_prop = ir_union_box_prop(value, "tag") !>
+        let matched = ir.var()
+        ir.line_start()
+        ir.write(matched)
+        ir.write(" = icmp eq ")
+        ir.write(ir_type(tag_prop.type) !>)
+        ir.write(" ")
+        ir.write(tag)
+        ir.write(", ")
+        ir.write_int(value.int_val)
+        ir.line_end()
+        let nonnull_predecessor = ir.current_block
+        ir.jump(after_block)
+
+        ir.label(after_block)
+        let out = ir.var()
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = phi i1 [ 0, ")
+        ir.write("\%")
+        ir.write(null_predecessor)
+        ir.write(" ], [ ")
+        ir.write(matched)
+        ir.write(", ")
+        ir.write("\%")
+        ir.write(nonnull_predecessor)
+        ir.write(" ]")
+        ir.line_end()
+        return out
+    }
+
+    let tag = ir_union_load_prop(ir, value, box, "tag") !>
+    let tag_prop = ir_union_box_prop(value, "tag") !>
+    let out = ir.var()
+    ir.line(out + " = icmp eq " + (ir_type(tag_prop.type) !>) + " " + tag + ", " + value.int_val)
+    return out
+}
+
+fn ir_emit_union_extract(ir: IRFunc, value: Value) String !Error {
+    let on = value.value1
+    let member = value.of_type
+    if !isset(on) || !isset(member) : value.bug("Tagged-union extraction is incomplete")
+    let box = ir_emit_value(ir, on) !>
+    let prop = ir_union_box_prop(value, ir_union_storage_prop(member)) !>
+    let stored = ir_union_load_prop(ir, value, box, prop.name ?? "") !>
+    if !member.is_pointer_sized() {
+        let out = ir.var()
+        ir.line(out + " = load " + (ir_type(member) !>) + ", ptr " + stored)
+        return out
+    }
+    if member.is_gc_type() : return ir_emit_cast(ir, stored, prop.type, member) !>
+    return ir_union_decode_payload(ir, stored, prop.type, member) !>
 }
 
 fn ir_build_tagged_nullable(ir: IRFunc, type: Type, value: String) String !Error {

@@ -54,6 +54,11 @@ enum VAL : u8 {
     isset
     // Type-only wrap (nullable strip/add); value1=inner
     wrap
+    // Tagged-union operations. union_wrap stores value1 under tag int_val;
+    // union_is tests it; union_extract reads the known active alternative.
+    union_wrap
+    union_is
+    union_extract
     // Atomic read/modify/write primitives. atomic_op stores VALUE_OP in `.op`.
     atomic_op
     atomic_store
@@ -370,6 +375,12 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let v = vgen_undefined(b)
         v.exp = exp
         return v
+    }
+    if kind == VALUE_KIND.noop {
+        // A no-op is a void expression statement. Lower it to an empty block so
+        // IR emission has no instruction to generate while flow analysis keeps
+        // the surrounding path open.
+        return vgen_block(Array[Value]{}, b, exp)
     }
     if kind == VALUE_KIND.memcpy {
         return value_from_memcpy_exp(exp, scope, ctx) !>
@@ -1212,7 +1223,12 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         let get_func = resolve_offset_get_func(on_class)
         if isset(get_func) {
             if on.rett.is_nullable_type() {
-                exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+                let nullable_class = on.rett.get_non_nullable().class
+                if !isset(nullable_class) {
+                    exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+                } else if nullable_class.kind != CLASS_KIND.union {
+                    exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+                }
             }
             let arg_skip: uint = 0
             if isset(get_func.class) && !get_func.is_static : arg_skip = 1
@@ -1799,7 +1815,7 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
         exp.error("Missing array values. Expected amount '" + size + "', but found '" + values.length + "'")
     }
 
-    return vgen_array_init(values, suggested_type, exp)
+    return vgen_array_init(ctx, values, suggested_type, exp)
 }
 
 // Lower `match on [: Type] { case => ... }`.
@@ -1819,8 +1835,15 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let p = pos.copy().init_parser()
     let cases = Array[Value]{}
     let found_default = false
-    // A match must have a `default`, so when every arm ends the path the match
-    // does too — which is what lets a function end on one (see parse_func_ast).
+    let covered_union_members = Array[Type]{}
+    let covered_union_null = false
+    let union_type_before_null: ?Exp = null
+    let union_type: ?Type = null
+    let on_non_nullable = on.rett.get_non_nullable()
+    if on_non_nullable.type == TYPE.union : union_type = on_non_nullable
+    // A match either has a `default` arm or exhaustively covers a tagged union.
+    // In both cases, when every arm ends the path the match does too — which is
+    // what lets a function end on one (see parse_func_ast).
     let all_cases_return = true
 
     while true {
@@ -1838,27 +1861,100 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
 
         let cond: ?Value = null
+        let bound_name: ?String = null
+        let bound_type: ?Type = null
+        let bound_tag: ?uint = null
         let is_default = t == TOK.word && p.word_is("default")
         if is_default {
             p.tok(true, true) !>
             found_default = true
         } else {
-            let item_exp = read_value_exp(p, true, false) !>
-            let item = value_from_exp(item_exp, scope, ctx.with_suggested_type(on.rett)) !>
-            item = value_try_convert(item, scope, ctx, on.rett)
-            on.rett.compat_check(item.rett, item_exp) !>
-            cond = vgen_op(on, item, VALUE_OP.eq, type_bool(ctx.build))
-            cond.exp = item_exp
+            // Most type cases are identifiers (`String`, `MyStruct`) and are
+            // parsed as ordinary values that resolve to VAL.type. Structural
+            // types such as `<MyStruct>` and `[T x N]` start with punctuation,
+            // so parse those directly as a type expression here.
+            let raw_item_exp: ?Exp = null
+            let raw_item: ?Value = null
+            if t == TOK.sign && (p.word_is("<") || p.word_is("[") || p.word_is("*") || p.word_is("&")) {
+                let type_exp = read_type_exp(p, true, true) !>
+                let item_type = type_from_exp(type_exp, scope) !>
+                raw_item_exp = type_exp
+                raw_item = vgen_type(item_type, ctx.build)
+                raw_item.exp = type_exp
+            } else {
+                let value_exp = read_value_exp(p, true, false) !>
+                let is_null_case = value_exp.type == EXP.value && value_exp.kind == VALUE_KIND.null
+                let item_ctx = isset(union_type) && !is_null_case ? ctx.without_suggested_type() : ctx.with_suggested_type(on.rett)
+                raw_item_exp = value_exp
+                raw_item = value_from_exp(value_exp, scope, item_ctx) !>
+            }
+            let item_exp = raw_item_exp ?! exp.bug("Union match case is missing its expression")
+            let item = raw_item ?! exp.bug("Union match case is missing its value")
+            let is_null_case = item_exp.type == EXP.value && item_exp.kind == VALUE_KIND.null
+            if isset(union_type) && is_null_case {
+                if !on.rett.is_nullable_type() {
+                    item_exp.error("A non-nullable tagged union cannot match null")
+                }
+                if covered_union_null : item_exp.error("Duplicate tagged-union null case")
+                covered_union_null = true
+                cond = vgen_op(on, item, VALUE_OP.eq, type_bool(ctx.build))
+                cond.exp = item_exp
+            } else if isset(union_type) && item.type == VAL.type {
+                if on.rett.is_nullable_type() && !covered_union_null && !isset(union_type_before_null) {
+                    union_type_before_null = item_exp
+                }
+                let member = item.of_type
+                if !isset(member) : item_exp.bug("Union match type is missing its represented type")
+                let tag = union_type.union_member_index(member)
+                if !isset(tag) {
+                    item_exp.error("Type '" + member.compat_display_name() + "' is not an alternative of '" + union_type.compat_display_name() + "'")
+                }
+                each covered_union_members as covered {
+                    if type_identity_key(covered) == type_identity_key(member) {
+                        item_exp.error("Duplicate tagged-union match case: " + member.compat_display_name())
+                    }
+                }
+                covered_union_members.append(member)
+                bound_type = member
+                bound_tag = tag
+                cond = vgen_union_is(on, member, tag, item_exp)
+
+                let next = p.tok(true, true, false) !>
+                if next == TOK.word && p.word_is("as") {
+                    p.tok(true, true) !>
+                    bound_name = p.read_word(true, true) !>
+                }
+            } else if isset(union_type) {
+                item_exp.error("Tagged unions must be matched by type")
+            } else {
+                item = value_try_convert(item, scope, ctx, on.rett)
+                on.rett.compat_check(item.rett, item_exp) !>
+                cond = vgen_op(on, item, VALUE_OP.eq, type_bool(ctx.build))
+                cond.exp = item_exp
+            }
         }
 
         p.expect("=>", true, true) !>
         let case_scope = scope.sub_scope()
+        let case_prefix = Array[Value]{}
+        if isset(bound_name) && bound_name != "_" {
+            let member = bound_type ?! exp.bug("Union match binding is missing its type")
+            let tag = bound_tag ?! exp.bug("Union match binding is missing its tag")
+            if case_scope.has_local(bound_name) : exp.error("Name already used: " + bound_name)
+            let decl = Decl.new(member, false, bound_name)
+            decl.exp = exp
+            case_scope.add_decl(decl)
+            case_scope.set_idf(bound_name, Idf.for_decl(decl))
+            let extracted = vgen_union_extract(on, member, tag, exp)
+            case_prefix.append(vgen_assign(vgen_decl(decl), extracted, ASSIGN_OP.set, ctx.build, exp))
+        }
         let casev = Value {
             type: VAL.block
             value1: cond
             bool_val: is_default
             rett: result_type ?? type_void(ctx.build)
             exp: exp
+            values: case_prefix
         }
 
         if isset(result_type) {
@@ -1873,7 +1969,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             let stmt_exp = read_func_stmt_exp(p) !>
             let state = ParseState.new()
             let value = body_value_from_exp(ctx, case_scope, state, stmt_exp) !>
-            if isset(value) : casev.values = Array[Value]{ value }
+            if isset(value) : case_prefix.append(value)
             if !case_scope.did_return : all_cases_return = false
         }
         cases.append(casev)
@@ -1882,8 +1978,29 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if cases.length == 0 {
         exp.error("The match statement must have atleast 1 case")
     }
+    // An explicit null arm must still precede type arms when there is no
+    // default arm. A default arm covers null implicitly, so requiring a
+    // duplicate null arm would only add noise to otherwise exhaustive code.
+    if !found_default && covered_union_null && isset(union_type_before_null) {
+        let null_order = union_type_before_null ?! exp.bug("Union null-order expression is missing")
+        null_order.error("The null case must come before type cases when matching a nullable tagged union")
+    }
     if !found_default {
-        exp.error("The match statement must have a 'default' case because it does not cover all values")
+        let exhaustive_union = false
+        if isset(union_type) {
+            let union_members = union_type.sub_types
+            if isset(union_members) {
+                exhaustive_union = covered_union_members.length == union_members.length
+                    && (!on.rett.is_nullable_type() || covered_union_null)
+            }
+        }
+        if !exhaustive_union {
+            exp.error("The match statement must have a 'default' case because it does not cover all values")
+        }
+        // Once every other tag failed, the final covered alternative is
+        // guaranteed. Mark it as the IR default to avoid an impossible fallthrough.
+        let last = cases.get(cases.length - 1) !? null
+        if isset(last) : last.bool_val = true
     }
     if all_cases_return : scope.did_return = true
 
@@ -2397,8 +2514,18 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
 
     // Instance access requires a non-null class value
-    let on_nn = value_try_remove_nullable(on, scope, ctx)
-    if on_nn.rett.is_nullable_type() {
+    // A named union containing `null` is represented by a nullable union box,
+    // but its methods receive that complete value and may handle `null` in a
+    // match. Other nullable values still require an isset/?! check first.
+    let nullable_union_class = on.rett.get_non_nullable().class
+    let declared_union_type: ?Type = isset(nullable_union_class) ? nullable_union_class.type : null
+    let nullable_union_receiver = on.rett.is_nullable_type()
+        && isset(nullable_union_class)
+        && nullable_union_class.kind == CLASS_KIND.union
+        && isset(declared_union_type)
+        && on.rett == declared_union_type
+    let on_nn = nullable_union_receiver ? on : value_try_remove_nullable(on, scope, ctx)
+    if on_nn.rett.is_nullable_type() && !nullable_union_receiver {
         exp.error("You cannot access properties/functions on a nullable type: " + on_nn.rett.compat_display_name())
     }
 
@@ -2607,7 +2734,7 @@ fn value_generate_default(target: Type, scope: Scope, ctx: Context, at: Exp) Val
             values.append(value_generate_default(sub, scope, ctx, at) !>)
             i++
         }
-        value = vgen_array_init(values, target, at)
+        value = vgen_array_init(ctx, values, target, at)
     } else {
         let string_class = type_string(ctx.build).get_class_or_null()
         let target_class = target.get_class_or_null()

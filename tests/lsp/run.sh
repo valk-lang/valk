@@ -228,6 +228,16 @@ check "definition of a function" '"line":0' \
 check "definition of a local" '"line":5,"character":4' \
     "$(request textDocument/definition nav.valk 7 21)"
 
+# Test bodies are omitted from ordinary builds, but an LSP front-end build must
+# still resolve symbols inside the requested file's tests.
+check "definition inside a test body" '"line":0' \
+    "$(request textDocument/definition test-body.valk 6 17)"
+
+# A method reference inside a test body exercises both the test-body loading
+# path and ordinary class-member definition resolution.
+check "definition of a method inside a test body" '"line":225' \
+    "$(request textDocument/definition ../../tests/validate.valk 164 20)"
+
 # Cursor inside helper's argument list: the second argument is active
 check "signature help" '"label":"fn(count: uint, label: String) String"' \
     "$(request textDocument/signatureHelp nav.valk 7 28)"

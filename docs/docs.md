@@ -13,6 +13,7 @@
 * [Namespaces](#namespaces)
 * [Packages](#packages)
 * [Types](#types)
+* [Tagged unions](#tagged-unions)
 * [Variables](#variables)
 * [Strings](#strings)
 * [Arrays](#arrays)
@@ -231,6 +232,111 @@ Other: `ptr` <- raw pointer (unsafe)
 `uint` becomes `u32` or `u64` based on the compile target
 
 `float` becomes `f32` or `f64` based on the compile target
+
+## Tagged unions
+
+A tagged union holds exactly one value from a fixed set of alternatives. A
+named union is declared with `union`, followed by its alternatives and a body:
+
+```rust
+union JsonValue : String | int | bool | null {
+    fn describe() String {
+        return match this : String {
+            null => "null"
+            String as text => text
+            int as number => "number: %number"
+            bool as enabled => enabled ? "true" : "false"
+        }
+    }
+}
+
+let value : JsonValue = 42
+println(value.describe())
+```
+
+Named unions are nominal types. `union First : String | int {}` and
+`union Second : int | String {}` are distinct even though they contain the same
+alternatives. Values are widened to the expected union automatically.
+
+Functions and getters in the body belong to the union just like class methods.
+Instance functions receive the complete union as `this`; static functions are
+called through the type. Stored properties are not allowed because the active
+alternative is the union's storage. More functions can be added in another file
+with `extend JsonValue { ... }`.
+
+Anonymous structural unions remain available in type positions when a reusable
+name or methods are unnecessary. Their alternative order does not affect their
+identity, so `String | int` and `int | String` are the same anonymous type.
+
+Use a type case in `match` to inspect and extract the active value. The name
+after `as` has the type named by that case:
+
+```rust
+fn describe(value: String | int | bool) String {
+    return match value : String {
+        String as text => text
+        int as number => "number: %number"
+        bool as enabled => enabled ? "enabled" : "disabled"
+    }
+}
+```
+
+A match that covers every alternative is exhaustive and does not need a
+`default` case. A type case must name one of the union's exact alternatives.
+
+When a case should intentionally do nothing, use `_` as its statement body.
+The arm still counts as a normal match case and keeps execution moving after
+the match:
+
+```rust
+fn only_describe_strings(value: String | int) String {
+    match value {
+        String as text => return text
+        default => _
+    }
+    return "not a string"
+}
+```
+
+`null` can be included as union syntax, even though it is not a standalone Valk
+type. It makes the complete union nullable:
+
+```rust
+union MaybeValue : String | int | null {}
+
+fn describe_maybe(value: MaybeValue) String {
+    return match value : String {
+        String as text => text
+        int as number => "number: %number"
+        default => "missing"
+    }
+}
+```
+
+A `default` arm also covers `null` and any unmatched alternatives. When matching
+exhaustively without `default`, put an explicit `null` case before type cases.
+A named union containing `null` may still have instance methods: the method
+receives the nullable union value and can match `this` directly.
+
+Alternatives keep their own type. For example, `int | uint` can distinguish
+between signed and unsigned values:
+
+```rust
+union Number : int | uint {}
+
+let signed: Number = 5
+let unsigned: Number = 5.to(uint)
+```
+
+Structs and fixed arrays can also be union alternatives:
+
+```rust
+struct Point { x: int, y: int }
+
+union Value : String | <Point> | [u8 x 4] {}
+```
+
+Unions cannot currently be used in `extern` function signatures or globals.
 
 ## Variables
 
@@ -745,32 +851,91 @@ fn main() {
 
 API for [valk:json](api.md#json)
 
-The `valk:json` namespaces provides multiple ways to convert data from and to json. You can either work with:
+`json:Value` is a tagged union containing `String`, `int`, `float`, `bool`,
+`json:ArrayValue`, `json:ObjectValue`, or `null`. Scalar alternatives retain
+their own types; the array and object wrappers make recursive documents
+possible and provide type-safe mutation methods.
 
-- use json values directly
-- use classes
-- use objects
-
-Example: using json values directly
+Because it is an ordinary tagged union, code that needs to handle every JSON
+kind can match it directly and gets the usual exhaustiveness checking:
 
 ```rust
-let data = json:new_object(Map[json:Value]{ "hello": json:new_string("world") })
-let json = data.encode()
-println(json) // { "hello": "world" }
-let data2 = json:decode(json) ! panic("Invalid json syntax")
+fn describe(value: json:Value) String {
+    return match value : String {
+        null => "null"
+        String as _ => "string"
+        int as _ => "integer"
+        float as _ => "float"
+        bool as _ => "boolean"
+        json:ArrayValue as _ => "array"
+        json:ObjectValue as _ => "object"
+    }
+}
 ```
 
-Example: using classes
+```rust
+use valk:json
+
+let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
+let name = document.get("name").string()
+let age = document.get("age").int()
+
+// Bracket access is equivalent to get().
+let first = document["user"]["name"]["first"].string()
+
+document = document.set("active", true)
+let encoded = json:encode(document)
+```
+
+`get()` and bracket access are safe: missing keys and invalid paths produce
+`null`. Typed accessors such as `.string()`, `.int()`, `.float()`, and `.bool()`
+always return their type's zero value when the value is missing or has another
+type. Arrays and objects return empty containers in the same situation.
+`length()` always returns a `uint`, and returns `0` for `null` and scalar values.
+For `get()`, `has()`, `set()`, and `remove()`, `String` keys address object
+properties and `uint` keys address array indexes. `set()` creates the required
+container when needed and fills skipped array positions with `null`. `append()`
+and `prepend()` likewise create an array when needed. `remove()` is safe when
+the key or container does not exist.
+
+Create JSON values with `json:new_null()`, `json:new_string(value)`,
+`json:new_int(value)`, `json:new_float(value)`, and `json:new_bool(value)`.
+Create mutable containers with `json:new_object()` and `json:new_array()`:
+
+```rust
+let missing = json:new_null()
+let answer = json:new_int(42)
+let message = json:new_string("hello")
+let enabled = json:new_bool(true)
+let object = json:new_object()
+object.set("hello", "world")
+
+let items = json:new_array()
+items.append(1)
+items.append(null)
+object.set("items", items)
+
+println(json:encode(object, true))
+```
+
+Structural values can be converted to and from the JSON DOM. Conversion from
+JSON is fallible because missing properties and incompatible JSON types are
+reported instead of silently becoming zero or an empty string.
 
 ```rust
 class Data {
-    hello: String ("world")
+    hello: String
 }
-let data = json:value(Data{})
-let json = data.encode()
-println(json) // { "hello": "world" }
-let data2 = json:to_type[Data](json)
+
+let value = json:from(Data { hello: "world" })
+let text = json:encode(value)
+let decoded = json:decode(text) ! panic("Invalid JSON")
+let data = json:from_value[Data](decoded) ! panic("Invalid Data document")
 ```
+
+Use `json:encode_to(value, buffer)` to append JSON directly to an existing
+`ByteBuffer`. Run `make bench-json` for parsing, encoding, traversal, and
+retained-memory measurements of the union representation.
 
 ## Coroutines
 
@@ -943,8 +1108,8 @@ let data = Map[String]{ "key1" => "val1" }
 let res = http:request("GET", "http://some-website/api/endpoint", http:Options{ query_data: data }) ! panic("Request failed")
 
 // Send POST request with data
-let json_data = Map[String]{ "key1" => "val1" }.to(json:Value)
-let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json_data.encode() }) ! panic("Request failed")
+let json_data = json:from(Map[String]{ "key1" => "val1" })
+let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json:encode(json_data) }) ! panic("Request failed")
 
 // Download file
 http:download(url, to_path) ! panic("Failed to download file")

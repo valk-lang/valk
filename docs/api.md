@@ -12,7 +12,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn supported() bool
 ```
-
 # core
 
 ## Functions for 'core'
@@ -45,14 +44,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
     + fn clear(reduce_size: bool (false)) Array[T]
-    + fn compose_json(str: ByteBuffer, pretty: bool, depth: uint) void
     + fn contains(value: T) bool
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
     + fn equal_ignore_order(array: Array[T]) bool
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn fit_index(index: uint) void
-    + static fn from_json_value_auto[X](val: X) Array[T]
+    + static fn from_json_value_auto[X](value: X) Array[T] !json:ValueError
     + fn get(index: uint) T !LookupError
     + fn increase_size(new_size: uint) GcPtr
     + fn index_of(item: T) uint !LookupError
@@ -77,7 +75,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn slice(start: uint, amount: uint) Slice[T]
     + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
-    + fn to_json_value() Value
     + fn unique() Array[T]
     + fn unlock() void
 }
@@ -256,7 +253,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ class Slice[T] {
++ slice Slice[T] {
     + data: GcPtr
     + length: uint
 
@@ -277,7 +274,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn data_cstring() cstring
     + fn ends_with(part: String) bool
     + fn escape() String
-    + static fn from_json_value(val: Value) String
     + fn get(index: uint) u8
     + fn hex_to_int() int !SyntaxError
     + fn hex_to_uint() uint !SyntaxError
@@ -309,7 +305,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn starts_with(part: String) bool
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
-    + fn to_json_value() Value
     + fn to_uint() uint !SyntaxError
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
@@ -1053,44 +1048,58 @@ alias FD for i32
 
 ```js
 + fn decode(json: String) Value !ParseError
-+ fn encode(data: $T, pretty: bool (false), output: ?ByteBuffer (null), depth: uint (0)) ByteBuffer
-+ fn encode_to_string(data: $T, pretty: bool (false)) String
-+ fn new(type: int) Value
-+ fn new_array(values: ?Array[Value] (null)) Value
++ fn default_value(kind: int) Value
++ fn encode(data: Value, pretty: bool (false)) String
++ fn encode_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
++ fn from(data: $T) Value
++ fn from_value[T](data: Value) T !ValueError
++ fn new_array(values: ?Array[Value] (null)) ArrayValue
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
 + fn new_int(value: int) Value
 + fn new_null() Value
-+ fn new_object(values: ?Map[Value] (null)) Value
-+ fn new_string(text: String) Value
-+ fn new_uint(value: uint) Value
-+ fn to_type[T](data: Value) T
-+ fn value(data: $T) Value
++ fn new_object(values: ?Map[Value] (null)) ObjectValue
++ fn new_string(value: String) Value
 ```
 
 ## Classes for 'json'
 
 ```js
-+ class Value {
-    + array_values: ?Array[Value]
-    + bool_value: bool
-    + float_value: float
-    + int_value: int
-    + object_values: ?Map[Value]
-    + string_value: String
-    + type: int
++ class ArrayValue {
+    + values: Array[Value]
 
-    + fn append(val: $T) void
-    + fn array() Array[Value]
-    + fn bool() bool
-    + fn compose_json(str: ByteBuffer, pretty: bool, depth: uint) void
-    + fn encode(pretty: bool (false)) String
-    + fn float() float
-    + fn get(key: String) Value !LookupError
-    + fn get_index(index: uint) Value
-    + fn get_or(key: String, or: ?fn()(Value) (null)) Value
-    + fn get_or_set(key: String, or: ?fn()(Value) (null)) Value
+    + fn append(value: Value) ArrayValue
+    + fn get(index: uint) Value !ValueError
+    + fn get_or_null(index: uint) Value
+    + fn length() uint
+    + fn prepend(value: Value) ArrayValue
+    + fn remove(index: uint) ArrayValue
+}
+```
+
+```js
++ class ObjectValue {
+    + values: Map[Value]
+
+    + fn get(key: String) Value !ValueError
+    + fn get_or(key: String, fallback: Value) Value
+    + fn get_or_else(key: String, fallback: fn()(Value)) Value
+    + fn get_or_null(key: String) Value
     + fn has(key: String) bool
+    + fn length() uint
+    + fn remove(key: String) ObjectValue
+    + fn set(key: String, value: Value) ObjectValue
+}
+```
+
+```js
++ union Value : String | bool | float | int | ArrayValue | ObjectValue | null {
+    + fn append(value: Value) Value
+    + fn array() ArrayValue
+    + fn bool() bool
+    + fn float() float
+    + fn get(key: String | uint) Value
+    + fn has(key: String | uint) bool
     + fn int() int
     + fn is_array() bool
     + fn is_bool() bool
@@ -1100,22 +1109,14 @@ alias FD for i32
     + fn is_number() bool
     + fn is_object() bool
     + fn is_string() bool
+    + fn kind() int
+    + fn kind_name() String
     + fn length() uint
-    + fn map() Map[Value]
-    + fn prepend(val: $T) void
-    + fn remove(key: String) void
-    + fn remove_index(index: uint) void
-    + fn set(key: String, val: $T) void
-    + fn set_array(key: String, values: Array[Value]) Value
-    + fn set_bool(key: String, value: bool) Value
-    + fn set_null(key: String) Value
-    + fn set_number_float(key: String, value: float) Value
-    + fn set_number_int(key: String, value: int) Value
-    + fn set_number_uint(key: String, value: uint) Value
-    + fn set_object(key: String, values: Map[Value]) Value
-    + fn set_string(key: String, value: String) Value
+    + fn object() ObjectValue
+    + fn prepend(value: Value) Value
+    + fn remove(key: String | uint) Value
+    + fn set(key: String | uint, value: Value) Value
     + fn string() String
-    + fn to_type[T]() T
 }
 ```
 
@@ -1366,4 +1367,3 @@ alias FD for i32
 ```js
 + global default_translations : Map[String]
 ```
-
