@@ -1049,14 +1049,19 @@ alias FD for i32
 ## Functions for 'json'
 
 ```js
-+ fn array(values: ?Array[Value] (null)) ArrayValue
 + fn decode(json: String) Value !ParseError
 + fn default_value(kind: int) Value
 + fn encode(data: Value, pretty: bool (false)) String
 + fn encode_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 + fn from(data: $T) Value
 + fn from_value[T](data: Value) T !ValueError
-+ fn object(values: ?Map[Value] (null)) ObjectValue
++ fn new_array(values: ?Array[Value] (null)) ArrayValue
++ fn new_bool(value: bool) Value
++ fn new_float(value: float) Value
++ fn new_int(value: int) Value
++ fn new_null() Value
++ fn new_object(values: ?Map[Value] (null)) ObjectValue
++ fn new_string(value: String) Value
 ```
 
 ## Classes for 'json'
@@ -1095,8 +1100,8 @@ alias FD for i32
     + fn array() ArrayValue
     + fn bool() bool
     + fn float() float
-    + fn get(key: uint | String) Value
-    + fn has(key: uint | String) bool
+    + fn get(key: String | uint) Value
+    + fn has(key: String | uint) bool
     + fn int() int
     + fn is_array() bool
     + fn is_bool() bool
@@ -1111,8 +1116,8 @@ alias FD for i32
     + fn length() uint
     + fn object() ObjectValue
     + fn prepend(value: Value) Value
-    + fn remove(key: uint | String) Value
-    + fn set(key: uint | String, value: Value) Value
+    + fn remove(key: String | uint) Value
+    + fn set(key: String | uint, value: Value) Value
     + fn string() String
 }
 ```

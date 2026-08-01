@@ -852,9 +852,9 @@ fn main() {
 API for [valk:json](api.md#json)
 
 `json:Value` is a tagged union containing `String`, `int`, `float`, `bool`,
-`json:ArrayValue`, `json:ObjectValue`, or `null`. Scalars are stored directly;
-the array and object wrappers make recursive documents possible and provide
-type-safe mutation methods.
+`json:ArrayValue`, `json:ObjectValue`, or `null`. Scalar alternatives retain
+their own types; the array and object wrappers make recursive documents
+possible and provide type-safe mutation methods.
 
 Because it is an ordinary tagged union, code that needs to handle every JSON
 kind can match it directly and gets the usual exhaustiveness checking:
@@ -898,13 +898,19 @@ container when needed and fills skipped array positions with `null`. `append()`
 and `prepend()` likewise create an array when needed. `remove()` is safe when
 the key or container does not exist.
 
-Create mutable containers with `json:object()` and `json:array()`:
+Create JSON values with `json:new_null()`, `json:new_string(value)`,
+`json:new_int(value)`, `json:new_float(value)`, and `json:new_bool(value)`.
+Create mutable containers with `json:new_object()` and `json:new_array()`:
 
 ```rust
-let object = json:object()
+let missing = json:new_null()
+let answer = json:new_int(42)
+let message = json:new_string("hello")
+let enabled = json:new_bool(true)
+let object = json:new_object()
 object.set("hello", "world")
 
-let items = json:array()
+let items = json:new_array()
 items.append(1)
 items.append(null)
 object.set("items", items)
