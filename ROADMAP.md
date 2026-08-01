@@ -4,16 +4,11 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.3
-+ Json improvements
-+ Http lowercase header keys
-+ Extend access types `~+ -+ -~ -~+`
-+ IR & type improvements
+- Release 0.2.4
 
 # Next steps
 
 - Data race solution
-+ [start-index .. length] -> calls the $range function (start_index: uint, length: uint)
 
 # Other
 
@@ -38,6 +33,13 @@
 ## Done
 
 ```
++ Release 0.2.3
++ Json improvements
++ Http lowercase header keys
++ Extend access types `~+ -+ -~ -~+`
++ IR & type improvements
++ [start-index .. length] -> calls the $range function (start_index: uint, length: uint)
+
 + Release 0.2.2
 + Tagged unions
 + Class interfaces
