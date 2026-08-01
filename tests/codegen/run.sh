@@ -33,9 +33,55 @@ if [ -z "$body" ]; then
     echo "# Missing coalesced_roots in generated IR"
     exit 1
 fi
-if [[ "$body" != *"store i64 2, ptr %valk.gc.stack.count"* ]]; then
-    echo "# Expected two temporary root slots"
+if [[ "$body" != *"alloca { ptr, ptr, [16 x i8] }"* ]] \
+    || [[ "$body" != *"store ptr @\"valk.gc.stack.marker.func."* ]]; then
+    echo "# Expected one explicit frame wrapper containing two pointer values"
     echo "$body"
+    exit 1
+fi
+
+marker_body=$(sed -n '/^define internal void @"valk\.gc\.stack\.marker\.func\..*__coalesced_roots__/,/^}/p' "$ir")
+marker_calls=$(grep -c 'call void .*collect_stack_item' <<< "$marker_body")
+if [[ "$marker_body" != *"ptr %frame.values, i64 0"* ]] \
+    || [[ "$marker_body" != *"ptr %frame.values, i64 8"* ]] \
+    || [ "$marker_calls" -ne 2 ]; then
+    echo "# Expected the generated frame marker to visit exactly two roots"
+    echo "$marker_body"
+    exit 1
+fi
+
+coro_helper=$(sed -n '/^define internal void @"valk\.coro\./,/^}/p' "$ir")
+if [[ "$coro_helper" != *"alloca { ptr, ptr, [16 x i8] }"* ]] \
+    || [[ "$coro_helper" != *"store ptr @\"valk.gc.stack.marker.coro."* ]]; then
+    echo "# Expected one explicit coroutine frame wrapper with typed argument and result values"
+    echo "$coro_helper"
+    exit 1
+fi
+
+coro_marker=$(awk '
+    /^define internal void @"valk\.gc\.stack\.marker\.coro\./ {
+        capture = 1
+        body = $0 ORS
+        next
+    }
+    capture {
+        body = body $0 ORS
+        if ($0 == "}") {
+            if (body ~ /\[16 x i8\]/) {
+                printf "%s", body
+                exit
+            }
+            capture = 0
+            body = ""
+        }
+    }
+' "$ir")
+coro_marker_calls=$(grep -c 'call void .*collect_stack_item' <<< "$coro_marker")
+if [[ "$coro_marker" != *"ptr %frame.values, i64 0"* ]] \
+    || [[ "$coro_marker" != *"ptr %frame.values, i64 8"* ]] \
+    || [ "$coro_marker_calls" -ne 2 ]; then
+    echo "# Expected the generated coroutine frame marker to visit exactly two roots"
+    echo "$coro_marker"
     exit 1
 fi
 

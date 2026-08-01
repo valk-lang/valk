@@ -134,26 +134,12 @@ fn func_release_exps(func: Func, exps: Array[Exp]) {
     }
 }
 
-// A temporary GC value is rooted only while its containing statement is being
-// evaluated. Function values use a separate pointer slot for their captured
-// environment; capture-free functions need no root at all.
-fn decl_buffer_root_count(decl: Decl) uint !Error {
-    if !decl.is_buffer : return 0
-    if decl.type.get_non_nullable().type == TYPE.fn {
-        return decl.closure_holds_captures ? 1 : 0
-    }
-    return decl.type.gc_root_count() !>
-}
-
-fn decl_set_buffer_root_offset(decl: Decl, offset: uint, count: uint) {
-    if decl.type.get_non_nullable().type == TYPE.fn {
-        decl.closure_root_offset = offset
-    } else if decl.is_gc {
-        decl.offset = offset
-    } else {
-        decl.gc_field_root_offset = offset
-        decl.gc_field_root_count = count
-    }
+// Only direct managed-reference buffers share storage. Their representation
+// and marker operation are always one pointer, so reusing a slot for a later
+// statement cannot reinterpret scalar bytes as a GC pointer. Inline buffers
+// keep their own typed storage in the frame.
+fn decl_is_coalesced_gc_buffer(decl: Decl) bool {
+    return decl.is_buffer && decl.is_gc
 }
 
 // Give every temporary needed by one statement a distinct slot. Later
@@ -165,30 +151,30 @@ fn values_assign_buffer_roots(
     first_offset: uint,
     ptr_size: uint,
     assigned: Array[Decl]
-) uint !Error {
+) uint {
     let peak: uint = 0
     each values as statement {
         let buffers = Array[Decl]{}
         value_collect_buffers(statement, buffers)
         let count: uint = 0
         each buffers as decl {
-            let roots = decl_buffer_root_count(decl) !>
-            if roots == 0 : continue
-            decl_set_buffer_root_offset(decl, first_offset + count * ptr_size, roots)
+            if !decl_is_coalesced_gc_buffer(decl) : continue
+            let slot_offset: uint = first_offset + count * ptr_size
+            decl.gc_stack_offset = slot_offset
             assigned.append(decl, true)
-            count += roots
+            count++
         }
         if count > peak : peak = count
     }
     return peak
 }
 
-fn func_assign_buffer_roots(func: Func, first_offset: uint, ptr_size: uint) uint !Error {
+fn func_assign_buffer_roots(func: Func, first_offset: uint, ptr_size: uint) uint {
     let assigned = Array[Decl]{}
     let peak: uint = 0
     let body = func.body_scope
     if isset(body) {
-        peak = values_assign_buffer_roots(body.values, first_offset, ptr_size, assigned) !>
+        peak = values_assign_buffer_roots(body.values, first_offset, ptr_size, assigned)
     }
 
     // Cleanup can run while a return value's statement temporaries are still
@@ -200,19 +186,41 @@ fn func_assign_buffer_roots(func: Func, first_offset: uint, ptr_size: uint) uint
             first_offset + peak * ptr_size,
             ptr_size,
             assigned
-        ) !>
+        )
         peak += cleanup_peak
     }
 
     // Preserve correctness for any future generated value that owns a buffer
     // outside the body/defer statement trees: give it a dedicated tail slot.
     each func.all_decls as decl {
-        let roots = decl_buffer_root_count(decl) !>
-        if roots == 0 || assigned.contains(decl) : continue
-        decl_set_buffer_root_offset(decl, first_offset + peak * ptr_size, roots)
-        peak += roots
+        if !decl_is_coalesced_gc_buffer(decl) || assigned.contains(decl) : continue
+        let slot_offset: uint = first_offset + peak * ptr_size
+        decl.gc_stack_offset = slot_offset
+        peak++
     }
     return peak
+}
+
+fn decl_needs_gc_stack_storage(decl: Decl) bool {
+    if decl.skip_gc_field_roots : return false
+    if decl.is_gc {
+        if decl.is_buffer : return true
+        // Immutable managed arguments remain rooted by their caller.
+        return !decl.is_arg || decl.is_mut
+    }
+    if decl.type.get_non_nullable().type == TYPE.fn {
+        // Arguments may contain captures supplied by unknown callers. Locals
+        // need the slot only once a captured closure can reach them.
+        return decl.is_arg || decl.closure_holds_captures
+    }
+    return decl.type.has_gc_refs()
+}
+
+fn decl_assign_gc_stack_storage(decl: Decl, offset: uint) uint !Error {
+    let alignment = decl.type.largest_property_offset() !>.to(uint)
+    if alignment > 0 : offset = offset.round_up(alignment)
+    decl.gc_stack_offset = offset
+    return offset + (decl.type.size() !>).to(uint)
 }
 
 // Finalize function-local storage after the complete AST has marked declarations
@@ -229,73 +237,43 @@ fn func_finish_ast(func: Func) !Error {
     let roots = !func.disable_gc_stack
 
     each func.all_decls as decl {
-        // A closure's captured data is rooted through this slot. Cleared rather
-        // than left behind, so a second run without a frame does not keep
-        // pointing lowering at a GC stack that is no longer emitted.
-        if !roots : decl.closure_root_offset = null
-        if !roots {
-            decl.gc_field_root_offset = null
-            decl.gc_field_root_count = 0
-        }
+        // Arguments survive a second lowering pass, so never retain offsets
+        // from the discarded frame.
+        decl.gc_stack_offset = null
         // Compiler-generated buffers receive coalesced slots after permanent
-        // roots have been laid out. GC buffers still need their entrance-time
-        // declaration address emitted.
-        if roots && (decl_buffer_root_count(decl) !>) > 0 {
-            if decl.is_gc : func.define_decls.append(decl, true)
+        // roots have been laid out. Only direct GC buffers take that path;
+        // inline buffers need their complete typed value in the frame.
+        if roots && decl_is_coalesced_gc_buffer(decl) {
+            func.define_decls.append(decl, true)
             continue
         }
-        if roots && decl.type.get_non_nullable().type == TYPE.fn {
-            // An argument is whatever the caller passed, so its captured data
-            // always has to be rooted. A local only needs it once something
-            // carrying captures can reach it (see decl_note_closure_value).
-            if decl.is_arg || decl.closure_holds_captures {
-                decl.closure_root_offset = alloca_size
-                alloca_size += psz
-                gc_count++
-            } else {
-                decl.closure_root_offset = null
-            }
-            if decl.is_mut : func.define_decls.append(decl, true)
-            continue
-        }
-        if roots && !decl.skip_gc_field_roots && !decl.is_gc {
-            let field_roots = decl.type.gc_root_count() !>
-            if field_roots > 0 {
-                decl.gc_field_root_offset = alloca_size
-                decl.gc_field_root_count = field_roots
-                alloca_size += field_roots * psz
-                gc_count += field_roots
-            }
-        }
-        if !decl.is_gc || !roots {
-            if decl.must_be_stable {
-                decl.offset = stable_size
-                let size = decl.type.size() !>.to(uint)
-                stable_size += size.round_up(psz)
-            }
-            if decl.is_mut : func.define_decls.append(decl, true)
-            continue
-        }
-        if !decl.is_arg || decl.is_mut {
-            decl.offset = alloca_size
-            alloca_size += psz
+        if decl.must_be_stable {
+            decl.offset = stable_size
+            let size = decl.type.size() !>.to(uint)
+            stable_size += size.round_up(psz)
+        } else if roots && decl_needs_gc_stack_storage(decl) {
+            alloca_size = decl_assign_gc_stack_storage(decl, alloca_size) !>
             gc_count++
             func.define_decls.append(decl, true)
+            continue
         }
+        if decl.is_mut : func.define_decls.append(decl, true)
     }
 
     if stable_size > 0 {
         let decl = Decl.new(type_ptr(b), false, "valk_stable_stack")
         decl.ir_name = "\%valk_stable_stack"
-        decl.offset = alloca_size
-        alloca_size += psz
+        let root_offset = alloca_size.round_up(psz)
+        decl.gc_stack_offset = root_offset
+        alloca_size = root_offset + psz
         func.define_decls.append(decl)
         func.stable_stack_decl = decl
         gc_count++
     }
 
     if roots {
-        let buffer_roots = func_assign_buffer_roots(func, alloca_size, psz) !>
+        alloca_size = alloca_size.round_up(psz)
+        let buffer_roots = func_assign_buffer_roots(func, alloca_size, psz)
         alloca_size += buffer_roots * psz
         gc_count += buffer_roots
     }
