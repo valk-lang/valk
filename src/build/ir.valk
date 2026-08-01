@@ -1561,6 +1561,9 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.union_extract {
         return ir_emit_union_extract(ir, value) !>
     }
+    if t == VAL.interface_wrap {
+        return ir_emit_interface_wrap(ir, value) !>
+    }
     if t == VAL.undefined : return "undef"
     if t == VAL.wrap || t == VAL.paren {
         let inner = value.value1
@@ -1723,7 +1726,19 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if op == VALUE_OP.and || op == VALUE_OP.or {
             return ir_emit_short_circuit(ir, left, right, op) !>
         }
-        return ir_emit_binary(ir, ir_emit_value(ir, left) !>, ir_emit_value(ir, right) !>, op, left.rett) !>
+        let rendered_left = ir_emit_value(ir, left) !>
+        let rendered_right = ir_emit_value(ir, right) !>
+        let class = left.rett.get_non_nullable().get_class_or_null()
+        if (op == VALUE_OP.eq || op == VALUE_OP.ne)
+            && isset(class) && class.kind == CLASS_KIND.interface
+        {
+            if left.rett.is_nullable_type() || right.rett.is_nullable_type() {
+                return ir_emit_nullable_interface_compare(ir, rendered_left, rendered_right, op)
+            }
+            rendered_left = ir_interface_object(ir, rendered_left)
+            rendered_right = ir_interface_object(ir, rendered_right)
+        }
+        return ir_emit_binary(ir, rendered_left, rendered_right, op, left.rett) !>
     }
     if t == VAL.unary {
         let inner = value.value1
@@ -1864,6 +1879,12 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if value.rett.type == TYPE.fn {
             return ir_emit_closure(ir, value, func) !>
         }
+        return "@\"" + func_ir_name(func) + "\""
+    }
+    if t == VAL.interface_method {
+        let func = value.func
+        if !isset(func) : value.bug("Interface adapter entry has no function")
+        ir_use_func(ir, func)
         return "@\"" + func_ir_name(func) + "\""
     }
 
@@ -2808,6 +2829,80 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     return out
 }
 
+fn ir_emit_interface_wrap(ir: IRFunc, value: Value) String !Error {
+    let adapter = value.class_ref
+    if !isset(adapter) : value.bug("Interface conversion has no adapter layout")
+    let at = value.exp
+    if !isset(at) : value.bug("Interface conversion has no source expression")
+    let init = Value {
+        type: VAL.class_init
+        values: value.values
+        rett: value.rett
+        class_ref: adapter
+        exp: at
+        allocator: allocator_for_class(Context.for_func(ir.func), adapter, at) !>
+    }
+    return ir_emit_class_init(ir, init) !>
+}
+
+// Load the concrete object retained by an interface adapter. GC property
+// pointers can carry ownership bits, so clear them before using the receiver.
+fn ir_interface_object(ir: IRFunc, adapter: String) String {
+    let tagged = ir.var()
+    ir.line(tagged + " = load ptr, ptr " + adapter)
+    let as_int = ir.var()
+    ir.line4(as_int, " = ptrtoint ptr ", tagged, " to i64")
+    let masked = ir.var()
+    ir.line4(masked, " = and i64 ", as_int, ", -4")
+    let clean = ir.var()
+    ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
+    return clean
+}
+
+fn ir_emit_nullable_interface_compare(ir: IRFunc, left: String, right: String, op: VALUE_OP) String {
+    let left_null = ir.var()
+    let right_null = ir.var()
+    let any_null = ir.var()
+    ir.line(left_null + " = icmp eq ptr " + left + ", null")
+    ir.line(right_null + " = icmp eq ptr " + right + ", null")
+    ir.line(any_null + " = or i1 " + left_null + ", " + right_null)
+
+    let null_block = ir.block("interface.compare.null")
+    let value_block = ir.block("interface.compare.value")
+    let after_block = ir.block("interface.compare.after")
+    ir.cond_jump(any_null, null_block, value_block)
+
+    ir.label(null_block)
+    let null_result = ir.var()
+    let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
+    ir.line(null_result + " = " + compare + " i1 " + left_null + ", " + right_null)
+    let null_predecessor = ir.current_block
+    ir.jump(after_block)
+
+    ir.label(value_block)
+    let left_object = ir_interface_object(ir, left)
+    let right_object = ir_interface_object(ir, right)
+    let value_result = ir.var()
+    ir.line(value_result + " = " + compare + " ptr " + left_object + ", " + right_object)
+    let value_predecessor = ir.current_block
+    ir.jump(after_block)
+
+    ir.label(after_block)
+    let out = ir.var()
+    ir.line(out + " = phi i1 [ " + null_result + ", \%" + null_predecessor
+        + " ], [ " + value_result + ", \%" + value_predecessor + " ]")
+    return out
+}
+
+fn ir_interface_method_target(ir: IRFunc, adapter: String, method: Func) String {
+    let address = ir.var()
+    let offset = (method.interface_slot + 1) * method.ns.build.options.target.ptr_size.to(uint)
+    ir.line(address + " = getelementptr i8, ptr " + adapter + ", i64 " + offset)
+    let target = ir.var()
+    ir.line(target + " = load ptr, ptr " + address)
+    return target
+}
+
 fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String !Error {
     let allocator = value.allocator
     if isset(allocator) {
@@ -2848,7 +2943,7 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
 
 fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
     let name = "valk.closure.adapter." + func_ir_name(func)
-    ir_use_func(parent, func)
+    if !func.is_interface : ir_use_func(parent, func)
     if ir_reuse_adapter(parent, name) : return name
     parent.func.unit.closure_adapters.set(name, parent.func)
 
@@ -2881,6 +2976,14 @@ fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Err
         receiver = ir_coro_load_prop(ir, "\%closure.data", prop) !>
     }
 
+    let call_target = "@\"" + func_ir_name(func) + "\""
+    if func.is_interface {
+        let adapter = receiver
+        call_target = ir_interface_method_target(ir, adapter, func)
+        receiver = ir_interface_object(ir, adapter)
+        ir_note_unknown_code(parent)
+    }
+
     let raw = ""
     let has_result = !func.get_rett().is_void_type() || func.can_error
     ir.line_start()
@@ -2891,9 +2994,9 @@ fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Err
     }
     ir.write("call ")
     ir.write(ir_func_rett_type(func) !>)
-    ir.write(" @\"")
-    ir.write(func_ir_name(func))
-    ir.write("\"(")
+    ir.write(" ")
+    ir.write(call_target)
+    ir.write("(")
     let wrote = false
     each func.args as arg, i {
         if bound && i == 0 {
@@ -3080,6 +3183,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let rendered_types = Array[String]{}
     let rendered_values = Array[String]{}
     let direct_func: ?Func = callee.type == VAL.func ? callee.func : null
+    let interface_call = isset(direct_func) && direct_func.is_interface
     let closure_call = callee.rett.get_non_nullable().type == TYPE.fn && callee.type != VAL.func
     if callee.type == VAL.func {
         let direct_func = callee.func
@@ -3087,7 +3191,17 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     }
 
     let target = ""
-    if closure_call {
+    if interface_call {
+        let method = direct_func
+        if !isset(method) : value.bug("Interface method call has no method")
+        let receiver = callee.value1
+        if !isset(receiver) : value.bug("Interface method call has no receiver")
+        let adapter = ir_emit_value(ir, receiver) !>
+        target = ir_interface_method_target(ir, adapter, method)
+        rendered_types.append("ptr")
+        rendered_values.append(ir_interface_object(ir, adapter))
+        ir_note_unknown_code(ir)
+    } else if closure_call {
         let closure = ir_emit_value(ir, callee) !>
         target = ir.var()
         ir.line_start()
@@ -3112,7 +3226,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     }
 
     // Bound method receiver is the implicit first argument.
-    if callee.type == VAL.func {
+    if callee.type == VAL.func && !interface_call {
         let receiver = callee.value1
         if isset(receiver) {
             let expected: ?Type = null
@@ -3152,7 +3266,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         }
     }
 
-    if !closure_call {
+    if !closure_call && !interface_call {
         if callee.type == VAL.func {
             let direct_func = callee.func
             if isset(direct_func) {

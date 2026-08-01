@@ -6,6 +6,7 @@
 ```
 - Release 0.2.2
 + Tagged unions
++ Class interfaces
 
 # Upcoming version
 /
@@ -13,7 +14,6 @@
 # Next steps
 
 - Complete libc integration
-- Interfaces
 - on exit thread/process { ... }
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
 -- This way people can be sure there is no hidden code inside the compiler
