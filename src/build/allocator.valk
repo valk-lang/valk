@@ -7,8 +7,14 @@
 
 use helper
 
+class AllocatorCondition {
+    offset: u32
+    tag: uint
+}
+
 class AllocatorProp {
     offset: u32
+    conditions: Array[AllocatorCondition] (.{})
 }
 
 class Allocator {
@@ -34,25 +40,67 @@ fn allocator_pool_size(b: Build, size: u32) u32 {
     return result
 }
 
-fn allocator_collect_props(type: Type, base_offset: u32, out: Array[AllocatorProp]) !Error {
+fn allocator_copy_conditions(conditions: Array[AllocatorCondition]) Array[AllocatorCondition] {
+    let copy = Array[AllocatorCondition]{}
+    each conditions as condition : copy.append(condition)
+    return copy
+}
+
+fn allocator_add_prop(offset: u32, conditions: Array[AllocatorCondition], out: Array[AllocatorProp]) {
+    out.append(AllocatorProp {
+        offset: offset
+        conditions: allocator_copy_conditions(conditions)
+    })
+}
+
+fn allocator_collect_props(
+    type: Type,
+    base_offset: u32,
+    out: Array[AllocatorProp],
+    conditions: Array[AllocatorCondition] (.{})
+) !Error {
     if type.is_nullable_type() {
         let sub = type.sub_type
         if isset(sub) && !sub.is_pointer_sized() && sub.type != TYPE.fn {
-            allocator_collect_props(sub, base_offset + 1, out) !>
+            // Tagged nullable values reserve one pointer-sized header for the
+            // presence bit. This is also the layout emitted by ir_type(), so a
+            // nested value has the same address in allocator and stack markers.
+            allocator_collect_props(sub, base_offset + type.ptr_size(), out, conditions) !>
             return
         }
     }
     if type.get_non_nullable().type == TYPE.fn {
-        out.append(AllocatorProp {
-            offset: base_offset + type.build.options.target.ptr_size.to(u32)
-        })
+        allocator_add_prop(base_offset + type.build.options.target.ptr_size.to(u32), conditions, out)
         return
     }
     if type.is_gc_type() {
-        out.append(AllocatorProp { offset: base_offset })
+        allocator_add_prop(base_offset, conditions, out)
         return
     }
     let t = type.get_non_nullable()
+    if t.type == TYPE.union {
+        if t.union_has_gc_payload() {
+            allocator_add_prop(base_offset + t.union_gc_payload_offset(), conditions, out)
+        }
+        let members = t.sub_types
+        if isset(members) {
+            each members as member, tag {
+                if member.is_gc_type() || !member.has_gc_refs() : continue
+                let active = allocator_copy_conditions(conditions)
+                active.append(AllocatorCondition {
+                    offset: base_offset
+                    tag: tag
+                })
+                allocator_collect_props(
+                    member,
+                    base_offset + t.union_other_payload_offset(),
+                    out,
+                    active
+                ) !>
+            }
+        }
+        return
+    }
     if t.type == TYPE.inline {
         let sub = t.sub_type
         if !isset(sub) : return
@@ -60,10 +108,10 @@ fn allocator_collect_props(type: Type, base_offset: u32, out: Array[AllocatorPro
         if isset(class) {
             class.compute_body_size() !>
             each class.props as prop {
-                allocator_collect_props(prop.type, base_offset + prop.offset, out) !>
+                allocator_collect_props(prop.type, base_offset + prop.offset, out, conditions) !>
             }
         } else {
-            allocator_collect_props(sub, base_offset, out) !>
+            allocator_collect_props(sub, base_offset, out, conditions) !>
         }
         return
     }
@@ -72,7 +120,8 @@ fn allocator_collect_props(type: Type, base_offset: u32, out: Array[AllocatorPro
         if !isset(subs) : return
         let offset: u32 = 0
         each subs as sub {
-            allocator_collect_props(sub, base_offset + offset, out) !>
+            offset = sub.ir_align_offset(offset) !>
+            allocator_collect_props(sub, base_offset + offset, out, conditions) !>
             offset += sub.size() !>
         }
         return
@@ -83,16 +132,13 @@ fn allocator_collect_props(type: Type, base_offset: u32, out: Array[AllocatorPro
     let stride = sub.size() !>
     let i: u32 = 0
     while i < t.array_size {
-        allocator_collect_props(sub, base_offset + stride * i, out) !>
+        allocator_collect_props(sub, base_offset + stride * i, out, conditions) !>
         i++
     }
 }
 
-// Create a pool for an arbitrary inline payload. Unlike a class allocator,
-// the layout is described directly by the Type: this is needed for fixed
-// arrays, function closures, and multi-values used as union alternatives.
-// The pool still uses the normal generated GC property callback, so nested
-// managed references remain visible to the collector.
+// Create a pool for an arbitrary compiler-owned payload. Inline tagged unions
+// do not use this path; they are copied directly as value aggregates.
 fn allocator_for_type(ctx: Context, type: Type, at: Exp) Allocator !Error {
     let b = ctx.build
     let layout = type.get_non_nullable()
@@ -103,9 +149,8 @@ fn allocator_for_type(ctx: Context, type: Type, at: Exp) Allocator !Error {
     let size = allocator_pool_size(b, layout.size() !>)
     if size == 0 : at.error("Unknown allocator size for type: " + layout.compat_display_name())
 
-    // Reuse TaggedUnion as the owner of generated Pool globals. The allocator
-    // class is only used for names and for resolving gc:Pool; its actual
-    // property layout is collected from `layout` below.
+    // Reuse the legacy TaggedUnion class as a namespace owner for generated
+    // Pool globals. Its property layout is not used here.
     let box_idf = valk_idf(b, "core", "TaggedUnion") !>
     let box_class = box_idf.class
     if !isset(box_class) : at.bug("core:TaggedUnion is not a class")

@@ -11,7 +11,7 @@ enum TYPE {
     inline     // <T>
     array      // [T x N]
     multi      // (T, U, ...)
-    union      // A | B (boxed tagged value)
+    union      // A | B (inline tagged value)
     fn         // fn(...)(...)
     fnptr      // fnptr(...)(...)
     co         // co(...)
@@ -98,11 +98,16 @@ class Type {
         }
         if t == TYPE.fn : return psz * 2
 
-        // A union value is a pointer to its GC-managed header. Larger
-        // alternatives live in a separately sized payload allocation selected
-        // by the active tag, so the source-level union remains pointer-sized
-        // while its storage still follows the alternative's layout.
-        if t == TYPE.union : return psz
+        // Tagged unions are ordinary value aggregates. Their fixed header is a
+        // u64 tag, followed by an optional direct-GC slot and an optional byte
+        // payload large enough for the largest remaining alternative.
+        if t == TYPE.union {
+            let size: u32 = 8
+            if this.union_has_gc_payload() : size += psz
+            size += this.union_other_payload_size() !>
+            if size % psz != 0 : size += psz - (size % psz)
+            return size
+        }
 
         if t == TYPE.nullable {
             let sub = this.sub_type
@@ -111,10 +116,13 @@ class Type {
             if sub.is_pointer_sized() : return psz
             // Closures use a null function pointer as their empty state.
             if sub.type == TYPE.fn : return sub.size() !>
-            // Match the classic compiler's nullable-inline storage budget.
-            // The presence field occupies a pointer-sized slot for layout/GC
-            // purposes even though LLVM represents the flag itself as i1.
-            return psz + (sub.size() !>)
+            // The presence field occupies a pointer-sized header even though
+            // LLVM represents the flag itself as i1. Round the complete value
+            // like LLVM's natural struct layout so fixed-array strides agree.
+            let size = psz + (sub.size() !>)
+            let alignment = this.ir_alignment() !>
+            if alignment > 1 : size = size.round_up(alignment)
+            return size
         }
 
         if t == TYPE.inline {
@@ -143,8 +151,11 @@ class Type {
             if !isset(subs) : this.build.bug("Multi type is missing sub_types")
             let total: u32 = 0
             each subs as st {
+                total = st.ir_align_offset(total) !>
                 total += st.size() !>
             }
+            let alignment = this.ir_alignment() !>
+            if alignment > 1 : total = total.round_up(alignment)
             return total
         }
 
@@ -168,10 +179,168 @@ class Type {
         return 0
     }
 
+    // Whether this union needs the dedicated pointer field used by alternatives
+    // whose value is itself a managed reference. Keeping it separate from the
+    // raw payload lets the collector visit it without interpreting scalar bits.
+    fn union_has_gc_payload() bool {
+        let t = this.get_non_nullable()
+        if t.type != TYPE.union : return false
+        let members = t.sub_types
+        if !isset(members) : return false
+        each members as member {
+            if member.is_gc_type() : return true
+        }
+        return false
+    }
+
+    fn union_has_other_payload() bool {
+        let t = this.get_non_nullable()
+        if t.type != TYPE.union : return false
+        let members = t.sub_types
+        if !isset(members) : return false
+        each members as member {
+            if !member.is_gc_type() : return true
+        }
+        return false
+    }
+
+    // Size of the shared byte payload. Managed references use their dedicated
+    // pointer field; every other alternative is copied into this region.
+    fn union_other_payload_size() u32 !Error {
+        let t = this.get_non_nullable()
+        if t.type != TYPE.union : return 0
+        let members = t.sub_types
+        if !isset(members) : return 0
+        let largest: u32 = 0
+        each members as member {
+            if member.is_gc_type() : continue
+            let size = member.size() !>
+            if size > largest : largest = size
+        }
+        return largest
+    }
+
+    fn union_gc_payload_offset() u32 {
+        return 8
+    }
+
+    fn union_other_payload_offset() u32 {
+        let t = this.get_non_nullable()
+        return 8 + (t.union_has_gc_payload() ? t.ptr_size() : 0)
+    }
+
+    fn union_gc_payload_index() uint {
+        return 1
+    }
+
+    fn union_other_payload_index() uint {
+        let t = this.get_non_nullable()
+        return t.union_has_gc_payload() ? 2 : 1
+    }
+
+    // ABI alignment of the LLVM value produced by ir_type(). Keep this
+    // separate from class-body layout: inline class bodies are emitted as byte
+    // arrays and therefore have LLVM alignment 1, while a natural multi-value
+    // must use the exact alignment LLVM assigns to each member.
+    fn ir_alignment() u32 !Error {
+        let t = this.get_non_nullable()
+        let psz = this.ptr_size()
+
+        if t.is_pointer_sized() || t.type == TYPE.fn : return psz
+        if t.type == TYPE.void || t.type == TYPE.bool || t.type == TYPE.inline : return 1
+        if t.type == TYPE.error_code : return 4
+
+        if t.type == TYPE.union {
+            let alignment = psz < 8 ? psz : 8
+            if t.union_has_gc_payload() && psz > alignment : alignment = psz
+            return alignment
+        }
+        if t.type == TYPE.array {
+            let sub = t.sub_type
+            if !isset(sub) : return 1
+            return sub.ir_alignment() !>
+        }
+        if t.type == TYPE.multi {
+            let members = t.sub_types
+            if !isset(members) : return 1
+            let largest: u32 = 1
+            each members as member {
+                let alignment = member.ir_alignment() !>
+                if alignment > largest : largest = alignment
+            }
+            return largest
+        }
+
+        let size = t.size() !>
+        if size == 0 : return 1
+        let alignment: u32 = 1
+        while alignment < size && alignment < psz : alignment *= 2
+        return alignment > psz ? psz : alignment
+    }
+
+    // Align a byte offset exactly as LLVM does before placing this type in a
+    // natural struct. LLVM alignments are powers of two, but round_up also
+    // keeps this helper correct for every target-supported scalar size.
+    fn ir_align_offset(offset: u32) u32 !Error {
+        let alignment = this.ir_alignment() !>
+        if alignment <= 1 : return offset
+        return offset.round_up(alignment)
+    }
+
+    // Preferred alignment when the compiler controls a byte-backed buffer
+    // (GC frames, coroutine storage, globals). Unlike ir_alignment(), this
+    // looks through inline byte arrays so embedded managed pointers can still
+    // land on naturally aligned addresses whenever their field offsets allow.
+    fn storage_alignment() u32 !Error {
+        // Resolve the byte size first so invalid recursive inline layouts fail
+        // with the normal diagnostic instead of recursing through this walk.
+        this.size() !>
+        let t = this.get_non_nullable()
+        if t.type == TYPE.inline {
+            let sub = t.sub_type
+            if !isset(sub) : return 1
+            let class = sub.get_class_or_null()
+            if !isset(class) : return sub.storage_alignment() !>
+            let largest: u32 = 1
+            each class.props as prop {
+                let alignment = prop.type.storage_alignment() !>
+                if alignment > largest : largest = alignment
+            }
+            return largest
+        }
+        if t.type == TYPE.array {
+            let sub = t.sub_type
+            if !isset(sub) : return 1
+            return sub.storage_alignment() !>
+        }
+        if t.type == TYPE.multi {
+            let members = t.sub_types
+            if !isset(members) : return 1
+            let largest: u32 = 1
+            each members as member {
+                let alignment = member.storage_alignment() !>
+                if alignment > largest : largest = alignment
+            }
+            return largest
+        }
+        if t.type == TYPE.union {
+            let largest = this.ir_alignment() !>
+            let members = t.sub_types
+            if isset(members) {
+                each members as member {
+                    let alignment = member.storage_alignment() !>
+                    if alignment > largest : largest = alignment
+                }
+            }
+            return largest
+        }
+        return this.ir_alignment() !>
+    }
+
     // True if this type is stored as a pointer-sized word (no recursive layout).
     fn is_pointer_sized() bool {
         let t = this.type
-        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.union || t == TYPE.any {
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.any {
             return true
         }
         if t == TYPE.nullable {
@@ -257,10 +426,10 @@ class Type {
     // Used by compile-time meta-properties such as `T.$is_inline`.
     fn is_inline_type() bool {
         let t = this.type
-        if t == TYPE.array || t == TYPE.inline || t == TYPE.multi : return true
+        if t == TYPE.array || t == TYPE.inline || t == TYPE.multi || t == TYPE.union : return true
         if t == TYPE.int || t == TYPE.float || t == TYPE.bool : return true
         if t == TYPE.fn : return true
-        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.union || t == TYPE.any || t == TYPE.void {
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fnptr || t == TYPE.co || t == TYPE.any || t == TYPE.void {
             return false
         }
         if t == TYPE.nullable {
@@ -356,9 +525,6 @@ class Type {
     // inherit GC-ness through TYPE.ptr / TYPE.ref.
     fn is_gc_type() bool {
         let t = this.get_non_nullable()
-        // A union is represented by a compiler-owned GC box. The active
-        // managed alternative is stored in that box as an ordinary GC property.
-        if t.type == TYPE.union : return true
         // A coroutine handle is represented by a managed `coro:Coro` object
         // even though it has its own surface type. Containers and locals that
         // hold `co` values must therefore trace/root the pointer just like a
@@ -376,10 +542,79 @@ class Type {
         return false
     }
 
+    // True when a value's representation contains one or more managed
+    // pointers. Unlike is_gc_type(), this also covers by-value aggregates such
+    // as closures, inline objects, fixed arrays, and tagged unions.
+    fn has_gc_refs() bool {
+        if this.is_gc_type() : return true
+        let t = this.get_non_nullable()
+        if t.type == TYPE.fn : return true
+        if t.type == TYPE.union || t.type == TYPE.multi {
+            let members = t.sub_types
+            if !isset(members) : return false
+            each members as member {
+                if member.has_gc_refs() : return true
+            }
+            return false
+        }
+        if t.type == TYPE.array {
+            let sub = t.sub_type
+            return isset(sub) && t.array_size > 0 && sub.has_gc_refs()
+        }
+        if t.type != TYPE.inline : return false
+        let sub = t.sub_type
+        if !isset(sub) : return false
+        let class = sub.get_class_or_null()
+        if !isset(class) : return sub.has_gc_refs()
+        each class.props as prop {
+            if prop.type.has_gc_refs() : return true
+        }
+        return false
+    }
+
+    // Maximum number of simultaneous GC roots held by this value. A tagged
+    // union uses the maximum alternative count because exactly one tag is
+    // active; ordinary aggregates sum their independent fields.
+    fn gc_root_count() uint !Error {
+        if this.is_gc_type() : return 1
+        let t = this.get_non_nullable()
+        if t.type == TYPE.fn : return 1
+        if t.type == TYPE.union {
+            let members = t.sub_types
+            if !isset(members) : return 0
+            let largest: uint = 0
+            each members as member {
+                let count = member.gc_root_count() !>
+                if count > largest : largest = count
+            }
+            return largest
+        }
+        if t.type == TYPE.array {
+            let sub = t.sub_type
+            if !isset(sub) : return 0
+            return (sub.gc_root_count() !>) * t.array_size.to(uint)
+        }
+        if t.type == TYPE.multi {
+            let members = t.sub_types
+            if !isset(members) : return 0
+            let count: uint = 0
+            each members as member : count += member.gc_root_count() !>
+            return count
+        }
+        if t.type != TYPE.inline : return 0
+        let sub = t.sub_type
+        if !isset(sub) : return 0
+        let class = sub.get_class_or_null()
+        if !isset(class) : return sub.gc_root_count() !>
+        let count: uint = 0
+        each class.props as prop : count += prop.type.gc_root_count() !>
+        return count
+    }
+
     // Pointer-like storage: explicit ptr/ref/fn, or reference-class kinds.
     fn is_pointer_type() bool {
         let t = this.type
-        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fn || t == TYPE.fnptr || t == TYPE.co || t == TYPE.union {
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.fn || t == TYPE.fnptr || t == TYPE.co {
             return true
         }
         if t == TYPE.nullable {
@@ -961,7 +1196,7 @@ fn type_union(b: Build, input: Array[Type], at: Exp, owner: ?Class (null)) Type 
             member = member.get_non_nullable()
         }
         // Anonymous unions are structural and flatten into a surrounding union.
-        // A named union is one nominal alternative and retains its own box/tag.
+        // A named union is one nominal alternative and retains its own tag/identity.
         if member.type == TYPE.union && !isset(member.class) {
             let nested = member.sub_types
             if isset(nested) {
@@ -970,9 +1205,8 @@ fn type_union(b: Build, input: Array[Type], at: Exp, owner: ?Class (null)) Type 
         } else {
             if member.is_void_type() : at.error("A union cannot contain void")
             if member.type == TYPE.any : at.error("A union cannot contain any")
-            // Every statically-sized value can be a union alternative. Scalar
-            // and pointer-sized members use the compact inline payload; larger
-            // values are copied into a GC-owned payload allocation. Layout
+            // Every statically-sized value can be a union alternative. Values
+            // are copied into the union's shared inline payload; layout
             // resolution is deferred until all class bodies have been parsed.
             members.append(member)
         }
