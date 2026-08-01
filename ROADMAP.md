@@ -5,7 +5,8 @@
 
 ```
 - Release 0.2.3
-/
++ Json improvements
++ Http lowercase header keys
 
 # Next steps
 
