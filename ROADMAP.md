@@ -8,11 +8,12 @@
 + Json improvements
 + Http lowercase header keys
 + Extend access types `~+ -+ -~ -~+`
++ IR & type improvements
 
 # Next steps
 
 - Data race solution
-- [value .. value] -> calls the $range function (from: uint, until: uint, inclusive: bool)
++ [start-index .. length] -> calls the $range function (start_index: uint, length: uint)
 
 # Other
 

@@ -257,6 +257,7 @@ s.lower() String // Convert to lowercase
 s.upper() String // Convert to uppercase
 s.part(start_index, length) String // Sub string
 s.range(start_index, end_index) String // Sub string using end-index
+let middle = s[1 .. 3] // Three characters starting at index 1
 ```
 
 Full `String` API: [valk:type](api.md#core)
@@ -272,6 +273,7 @@ let arr : Array[int] = .{ 1, 2, 3 } // Using typehint
 arr.append(4)
 arr.prepend(5)
 let v = arr.get(0) ! panic("Empty array")
+let first_three = arr[0 .. 3]
 arr.clear()
 //
 each arr as value {}
@@ -279,6 +281,10 @@ each arr as value, index {}
 ```
 
 Full `Array` API: [valk:type](api.md#core)
+
+Bracket ranges call an instance method marked `$range`. The hook must accept
+`(start_index: uint, length: uint)` and return one value. This lets custom
+collection types support the same `value[start_index .. length]` syntax.
 
 ## Maps
 
