@@ -90,7 +90,10 @@ test-lsp: $(TEST_COMPILER)
 test-fmt: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/fmt/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt
+test-codegen: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/codegen/run.sh
+
+test-all: test test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt test-codegen
 
 # Build once, then measure the union representation in fresh processes so
 # allocator pools and GC high-water state do not cross benchmark modes.

@@ -134,6 +134,77 @@ fn func_release_exps(func: Func, exps: Array[Exp]) {
     }
 }
 
+// A temporary GC value is rooted only while its containing statement is being
+// evaluated. Function values use a separate pointer slot for their captured
+// environment; capture-free functions need no root at all.
+fn decl_is_rooted_buffer(decl: Decl) bool {
+    if !decl.is_buffer : return false
+    if decl.type.get_non_nullable().type == TYPE.fn {
+        return decl.closure_holds_captures
+    }
+    return decl.is_gc
+}
+
+fn decl_set_buffer_root_offset(decl: Decl, offset: uint) {
+    if decl.type.get_non_nullable().type == TYPE.fn {
+        decl.closure_root_offset = offset
+    } else {
+        decl.offset = offset
+    }
+}
+
+// Give every temporary needed by one statement a distinct slot. Later
+// statements reuse the same offsets because ir_emit_values clears their
+// temporary roots after each statement. The returned count is the peak number
+// of simultaneously reserved temporary roots, not the total number of temps.
+fn values_assign_buffer_roots(values: Array[Value], first_offset: uint, ptr_size: uint, assigned: Array[Decl]) uint {
+    let peak: uint = 0
+    each values as statement {
+        let buffers = Array[Decl]{}
+        value_collect_buffers(statement, buffers)
+        let count: uint = 0
+        each buffers as decl {
+            if !decl_is_rooted_buffer(decl) : continue
+            decl_set_buffer_root_offset(decl, first_offset + count * ptr_size)
+            assigned.append(decl, true)
+            count++
+        }
+        if count > peak : peak = count
+    }
+    return peak
+}
+
+fn func_assign_buffer_roots(func: Func, first_offset: uint, ptr_size: uint) uint {
+    let assigned = Array[Decl]{}
+    let peak: uint = 0
+    let body = func.body_scope
+    if isset(body) {
+        peak = values_assign_buffer_roots(body.values, first_offset, ptr_size, assigned)
+    }
+
+    // Cleanup can run while a return value's statement temporaries are still
+    // live, so its sequentially reused region follows the body's peak region.
+    let cleanup = func.defer_scope
+    if isset(cleanup) {
+        let cleanup_peak = values_assign_buffer_roots(
+            cleanup.values,
+            first_offset + peak * ptr_size,
+            ptr_size,
+            assigned
+        )
+        peak += cleanup_peak
+    }
+
+    // Preserve correctness for any future generated value that owns a buffer
+    // outside the body/defer statement trees: give it a dedicated tail slot.
+    each func.all_decls as decl {
+        if !decl_is_rooted_buffer(decl) || assigned.contains(decl) : continue
+        decl_set_buffer_root_offset(decl, first_offset + peak * ptr_size)
+        peak++
+    }
+    return peak
+}
+
 // Finalize function-local storage after the complete AST has marked declarations
 // used/mutable/stable. Mirrors the legacy FuncAST alloca/defer scope generation.
 fn func_finish_ast(func: Func) !Error {
@@ -152,6 +223,13 @@ fn func_finish_ast(func: Func) !Error {
         // than left behind, so a second run without a frame does not keep
         // pointing lowering at a GC stack that is no longer emitted.
         if !roots : decl.closure_root_offset = null
+        // Compiler-generated buffers receive coalesced slots after permanent
+        // roots have been laid out. GC buffers still need their entrance-time
+        // declaration address emitted.
+        if roots && decl_is_rooted_buffer(decl) {
+            if decl.is_gc : func.define_decls.append(decl, true)
+            continue
+        }
         if roots && decl.type.get_non_nullable().type == TYPE.fn {
             // An argument is whatever the caller passed, so its captured data
             // always has to be rooted. A local only needs it once something
@@ -191,6 +269,12 @@ fn func_finish_ast(func: Func) !Error {
         func.define_decls.append(decl)
         func.stable_stack_decl = decl
         gc_count++
+    }
+
+    if roots {
+        let buffer_roots = func_assign_buffer_roots(func, alloca_size, psz)
+        alloca_size += buffer_roots * psz
+        gc_count += buffer_roots
     }
 
     func.alloca_size = alloca_size
