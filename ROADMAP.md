@@ -4,12 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.2
-+ Tagged unions
-+ Class interfaces
-+ Lib bug fixes
-
-# Upcoming version
+- Release 0.2.3
 /
 
 # Next steps
@@ -38,6 +33,11 @@
 ## Done
 
 ```
++ Release 0.2.2
++ Tagged unions
++ Class interfaces
++ Lib bug fixes
+
 + Release 0.2.1
 + `$default` type value hook
 + LSP improvements
