@@ -11,25 +11,27 @@
 
 # Next steps
 
+- Data race solution
+- [value .. value] -> calls the $range function (from: uint, until: uint, inclusive: bool)
+
+# Other
+
 - Complete libc integration
-- on exit thread/process { ... }
 - Provide a `IR` build so people can build valk with `clang` instead of `valk`
--- This way people can be sure there is no hidden code inside the compiler
 - vman templates -> vman template http-server-router ./src
 - Allow all types of 128 bit and lower as function arguments
-- @stack(StructName) -> stackalloc StructName { ... }
--- This is the same as `let x : <StructName> = { ... }`
--- but stackalloc can be used as a value, e.g. in function arguments
-- Allow @undefined for entire struct. E.g. let user = User { @undefined }
 - Full HTTP 1.1 protocol + Cookies
 ```
 
 ## Maybe
 
 ```
-- Data race solution
+- on exit thread/process { ... }
 - WASM support
-- [value .. value] -> calls the $range function (from: uint, until: uint, inclusive: bool)
+- Allow @undefined for entire struct. E.g. let user = User { @undefined }
+- @stack(StructName) -> stackalloc StructName { ... }
+-- This is the same as `let x : <StructName> = { ... }`
+-- but stackalloc can be used as a value, e.g. in function arguments
 ```
 
 ## Done
