@@ -12,7 +12,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn supported() bool
 ```
-
 # core
 
 ## Functions for 'core'
@@ -76,7 +75,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn slice(start: uint, amount: uint) Slice[T]
     + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
-    + fn to_json_value_with_stack(stack: Array[ptr]) Value
     + fn unique() Array[T]
     + fn unlock() void
 }
