@@ -31,6 +31,7 @@
 <br></td><td width=200px><br>
 
 * [Classes](#classes)
+* [Interfaces](#interfaces)
 * [Generics](#generics)
 * [Modes](#modes)
 * [Globals](#globals)
@@ -685,6 +686,41 @@ fn main() {
     User.my_static_function() // output: Hello from my static function
 }
 ```
+
+## Interfaces
+
+Interfaces define methods that different classes can provide. Interface methods
+end in `;`, and a class lists its interfaces with `is`.
+
+```rust
+interface Named {
+    get name: String;
+}
+
+interface Printable {
+    fn text(prefix: String) String;
+}
+
+class User is Named, Printable {
+    first_name: String
+
+    get name: String {
+        return this.first_name
+    }
+
+    fn text(prefix: String) String {
+        return prefix + this.first_name
+    }
+}
+
+fn print(value: Printable) {
+    println(value.text("User: "))
+}
+```
+
+Only classes can implement interfaces. The compiler verifies that every method
+has the same arguments, return type, getter or function form, and error type as
+the interface declaration.
 
 ## Generics
 
