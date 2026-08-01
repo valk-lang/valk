@@ -7,6 +7,7 @@
 - Release 0.2.2
 + Tagged unions
 + Class interfaces
++ Lib bug fixes
 
 # Upcoming version
 /
