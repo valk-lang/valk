@@ -19,6 +19,10 @@
 * [Arrays](#arrays)
 * [Maps](#maps)
 * [Typehints](#typehints)
+
+
+<br></td><td width=200px><br>
+
 * [Functions](#functions)
    * [Errors](#errors)
    * [Error handling](#error-handling)
@@ -26,10 +30,6 @@
    * [Deferred calls](#deferred-calls)
    * [Exit functions](#exit-functions)
    * [Closures](#closures)
-
-
-<br></td><td width=200px><br>
-
 * [Classes](#classes)
 * [Interfaces](#interfaces)
 * [Generics](#generics)
@@ -97,36 +97,6 @@ irm https://valk-lang.dev/install.ps1 | iex
 
 Manual download: [Download page](https://valk-lang.dev/download)
 
-## Editor and language server
-
-Start the language server over standard input/output with:
-
-```sh
-valk lsp run
-```
-
-Diagnostics are checked when a document is opened or saved by default. This
-avoids rebuilding the front end after every keystroke in large projects. To
-enable live diagnostics, pass the following LSP initialization options through
-your editor or Valk extension:
-
-```json
-{
-  "diagnosticsMode": "change"
-}
-```
-
-Supported modes are `"save"` (the default) and `"change"`. A client can change
-the mode without restarting the server by sending
-`workspace/didChangeConfiguration` with these settings:
-
-```json
-{
-  "valk": {
-    "diagnosticsMode": "save"
-  }
-}
-```
 
 ## Basic example
 
