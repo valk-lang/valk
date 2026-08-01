@@ -1081,7 +1081,7 @@ alias FD for i32
     + values: Map[Value]
 
     + fn get(key: String) Value !ValueError
-    + fn get_or(key: String) Value !ValueError
+    + fn get_or(key: String) Value !LookupError
     + fn has(key: String) bool
     + fn length() uint
     + fn remove(key: String) ObjectValue
@@ -1093,11 +1093,15 @@ alias FD for i32
 + union Value : String | bool | float | int | ArrayValue | ObjectValue | null {
     + fn append(value: Value) Value
     + fn array() ArrayValue
+    + fn array_or() ArrayValue !LookupError
     + fn bool() bool
+    + fn bool_or() bool !LookupError
     + fn float() float
+    + fn float_or() float !LookupError
     + fn get(key: String | uint) Value
     + fn has(key: String | uint) bool
     + fn int() int
+    + fn int_or() int !LookupError
     + fn is_array() bool
     + fn is_bool() bool
     + fn is_float() bool
@@ -1110,10 +1114,12 @@ alias FD for i32
     + fn kind_name() String
     + fn length() uint
     + fn object() ObjectValue
+    + fn object_or() ObjectValue !LookupError
     + fn prepend(value: Value) Value
     + fn remove(key: String | uint) Value
     + fn set(key: String | uint, value: Value) Value
     + fn string() String
+    + fn string_or() String !LookupError
 }
 ```
 
