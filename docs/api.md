@@ -1070,7 +1070,6 @@ alias FD for i32
 
     + fn append(value: Value) ArrayValue
     + fn get(index: uint) Value !ValueError
-    + fn get_or_null(index: uint) Value
     + fn length() uint
     + fn prepend(value: Value) ArrayValue
     + fn remove(index: uint) ArrayValue
@@ -1082,9 +1081,7 @@ alias FD for i32
     + values: Map[Value]
 
     + fn get(key: String) Value !ValueError
-    + fn get_or(key: String, fallback: Value) Value
-    + fn get_or_else(key: String, fallback: fn()(Value)) Value
-    + fn get_or_null(key: String) Value
+    + fn get_or(key: String) Value !ValueError
     + fn has(key: String) bool
     + fn length() uint
     + fn remove(key: String) ObjectValue
