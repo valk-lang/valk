@@ -39,7 +39,7 @@ if [[ "$body" != *"store i64 2, ptr %valk.gc.stack.count"* ]]; then
     exit 1
 fi
 
-echo "> Store scalar tagged-union alternatives directly in the box"
+echo "> Lower tagged unions to inline value aggregates"
 
 scalar_ir="$workdir/tagged-union-scalars.ll"
 out=$("$VALK" build "$DIR/tagged-union-scalars.valk" --ir --no-warn -o "$scalar_ir" 2>&1)
@@ -50,31 +50,46 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-for name in box_int box_i32 box_u8 box_bool box_f32 box_f64; do
+for name in box_int box_i32 box_u8 box_bool box_f32 box_f64 box_scalar_only box_gc_only; do
     scalar_body=$(sed -n "/^define .*__${name}__/,/^}/p" "$scalar_ir")
     if [ -z "$scalar_body" ]; then
         echo "# Missing $name in generated IR"
         exit 1
     fi
-    if [[ "$scalar_body" != *"__Pool__get__"* ]] || [[ "$scalar_body" == *"__Payload__"* ]]; then
-        echo "# $name did not use one-word tagged-union storage"
+    if [[ "$scalar_body" == *"__Pool__get__"* ]] || [[ "$scalar_body" == *"__Payload__"* ]]; then
+        echo "# $name allocated boxed tagged-union storage"
         echo "$scalar_body"
         exit 1
     fi
 done
 
+int_body=$(sed -n '/^define .*__box_int__/,/^}/p' "$scalar_ir")
 i32_body=$(sed -n '/^define .*__box_i32__/,/^}/p' "$scalar_ir")
 u8_body=$(sed -n '/^define .*__box_u8__/,/^}/p' "$scalar_ir")
 bool_body=$(sed -n '/^define .*__box_bool__/,/^}/p' "$scalar_ir")
 f32_body=$(sed -n '/^define .*__box_f32__/,/^}/p' "$scalar_ir")
 f64_body=$(sed -n '/^define .*__box_f64__/,/^}/p' "$scalar_ir")
-if [[ "$i32_body" != *"sext i32"* ]] \
-    || [[ "$u8_body" != *"zext i8"* ]] \
-    || [[ "$bool_body" != *"zext i1"* ]] \
-    || [[ "$f32_body" != *"bitcast float"* ]] \
-    || [[ "$f32_body" != *"zext i32"* ]] \
-    || [[ "$f64_body" != *"bitcast double"* ]]; then
-    echo "# Scalar tagged-union encoding did not preserve the source representation"
+scalar_only_body=$(sed -n '/^define .*__box_scalar_only__/,/^}/p' "$scalar_ir")
+gc_only_body=$(sed -n '/^define .*__box_gc_only__/,/^}/p' "$scalar_ir")
+
+if [[ "$int_body" != *"{ i64, ptr, [8 x i8] }"* ]] \
+    || [[ "$i32_body" != *"{ i64, ptr, [4 x i8] }"* ]] \
+    || [[ "$u8_body" != *"{ i64, ptr, [1 x i8] }"* ]] \
+    || [[ "$bool_body" != *"{ i64, ptr, [1 x i8] }"* ]] \
+    || [[ "$f32_body" != *"{ i64, ptr, [4 x i8] }"* ]] \
+    || [[ "$f64_body" != *"{ i64, ptr, [8 x i8] }"* ]] \
+    || [[ "$scalar_only_body" != *"{ i64, [8 x i8] }"* ]] \
+    || [[ "$gc_only_body" != *"{ i64, ptr }"* ]]; then
+    echo "# Tagged-union aggregate layout did not match tag / GC / raw payload fields"
+    exit 1
+fi
+
+if [[ "$i32_body" != *"store i32"* ]] \
+    || [[ "$u8_body" != *"store i8"* ]] \
+    || [[ "$bool_body" != *"store i1"* ]] \
+    || [[ "$f32_body" != *"store float"* ]] \
+    || [[ "$f64_body" != *"store double"* ]]; then
+    echo "# Tagged-union payloads were not stored with their source types"
     exit 1
 fi
 

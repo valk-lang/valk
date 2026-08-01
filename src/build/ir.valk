@@ -158,6 +158,79 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
     }
 }
 
+fn ir_write_allocator_prop(out: ByteBuffer, prop: AllocatorProp, index: uint) {
+    let conditions = prop.conditions
+    if conditions.length > 0 {
+        let previous = ""
+        each conditions as condition, ci {
+            out.write_string("  \%condition.address.")
+            out.write_uint_ascii(index)
+            out.write_string(".")
+            out.write_uint_ascii(ci)
+            out.write_string(" = getelementptr i8, ptr \%item, i64 ")
+            out.write_uint_ascii(condition.offset)
+            out.write_string("\n  \%condition.tag.")
+            out.write_uint_ascii(index)
+            out.write_string(".")
+            out.write_uint_ascii(ci)
+            out.write_string(" = load i64, ptr \%condition.address.")
+            out.write_uint_ascii(index)
+            out.write_string(".")
+            out.write_uint_ascii(ci)
+            out.write_string("\n  \%condition.match.")
+            out.write_uint_ascii(index)
+            out.write_string(".")
+            out.write_uint_ascii(ci)
+            out.write_string(" = icmp eq i64 \%condition.tag.")
+            out.write_uint_ascii(index)
+            out.write_string(".")
+            out.write_uint_ascii(ci)
+            out.write_string(", ")
+            out.write_uint_ascii(condition.tag)
+            out.write_string("\n")
+            let current = "\%condition.match." + index + "." + ci
+            if ci > 0 {
+                out.write_string("  \%condition.all.")
+                out.write_uint_ascii(index)
+                out.write_string(".")
+                out.write_uint_ascii(ci)
+                out.write_string(" = and i1 ")
+                out.write_string(previous)
+                out.write_string(", ")
+                out.write_string(current)
+                out.write_string("\n")
+                current = "\%condition.all." + index + "." + ci
+            }
+            previous = current
+        }
+        out.write_string("  br i1 ")
+        out.write_string(previous)
+        out.write_string(", label \%prop.")
+        out.write_uint_ascii(index)
+        out.write_string(".active, label \%prop.")
+        out.write_uint_ascii(index)
+        out.write_string(".after\nprop.")
+        out.write_uint_ascii(index)
+        out.write_string(".active:\n")
+    }
+
+    out.write_string("  \%ref.")
+    out.write_uint_ascii(index)
+    out.write_string(" = getelementptr i8, ptr \%item, i64 ")
+    out.write_uint_ascii(prop.offset)
+    out.write_string("\n  call void \%callback.fn(ptr \%callback.data, ptr \%ref.")
+    out.write_uint_ascii(index)
+    out.write_string(", ptr \%list)\n")
+
+    if conditions.length > 0 {
+        out.write_string("  br label \%prop.")
+        out.write_uint_ascii(index)
+        out.write_string(".after\nprop.")
+        out.write_uint_ascii(index)
+        out.write_string(".after:\n")
+    }
+}
+
 fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error {
     each build.lists.allocator_init_sites as site {
         let owner = site.ctx.func
@@ -176,13 +249,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             out.write_string("  \%callback.fn = extractvalue { ptr, ptr } \%callback, 0\n")
             out.write_string("  \%callback.data = extractvalue { ptr, ptr } \%callback, 1\n")
             each allocator.props as prop, pi {
-                out.write_string("  \%ref.")
-                out.write_uint_ascii(pi)
-                out.write_string(" = getelementptr i8, ptr \%item, i64 ")
-                out.write_uint_ascii(prop.offset)
-                out.write_string("\n  call void \%callback.fn(ptr \%callback.data, ptr \%ref.")
-                out.write_uint_ascii(pi)
-                out.write_string(", ptr \%list)\n")
+                ir_write_allocator_prop(out, prop, pi)
             }
             if isset(props_func) {
                 out.write_string("  call void @\"")
@@ -571,11 +638,13 @@ fn generate_func_ir(func: Func) !Error {
         ir.write(arg.decl.ir_name)
         ir.line_end()
         ir_sync_closure_root(ir, arg.decl, "\%arg." + i) !>
+        ir_sync_decl_field_roots(ir, arg.decl) !>
     }
 
-    each scope.values as value {
-        ir_emit_stmt(ir, value) !>
-    }
+    // Top-level statements have the same temporary-root lifetime as statements
+    // nested in a block. Use the shared emitter so compiler-generated argument
+    // and property-RHS buffers are cleared as soon as their statement ends.
+    ir_emit_values(ir, scope.values) !>
 
     if !ir.terminated {
         let rett = func.get_rett()
@@ -624,6 +693,299 @@ fn ir_sync_closure_root(ir: IRFunc, decl: Decl, closure: String) !Error {
     ir.write(", ptr ")
     ir.write(address)
     ir.line_end()
+}
+
+fn ir_root_address(ir: IRFunc, base: String, offset: uint) String {
+    let address = ir.var()
+    ir.line(address + " = getelementptr i8, ptr " + base + ", i64 " + offset)
+    return address
+}
+
+fn ir_gc_stack_root_address(ir: IRFunc, offset: uint) String {
+    return ir_root_address(ir, "\%valk.gc.stack.values", offset)
+}
+
+// Copy managed pointers embedded in an inline value into the ordinary pointer
+// slots understood by the GC stack scanner. Inactive union payloads were
+// cleared during construction, and tag-dependent nested fields are visited
+// only along the active alternative.
+fn ir_sync_type_roots(
+    ir: IRFunc,
+    type: Type,
+    address: String,
+    root_offset: uint,
+    root_index: uint,
+    root_base: String ("\%valk.gc.stack.values")
+) uint !Error {
+    let psz = type.ptr_size().to(uint)
+    if type.is_gc_type() {
+        let pointer = ir.var()
+        ir.line(pointer + " = load ptr, ptr " + address)
+        pointer = ir_union_clean_gc_pointer(ir, pointer)
+        let root = ir_root_address(ir, root_base, root_offset + root_index * psz)
+        ir.line("store ptr " + pointer + ", ptr " + root)
+        return root_index + 1
+    }
+
+    let t = type.get_non_nullable()
+    if t.type == TYPE.fn {
+        let environment_address = ir.var()
+        ir.line(environment_address + " = getelementptr i8, ptr " + address + ", i64 " + psz)
+        let environment = ir.var()
+        ir.line(environment + " = load ptr, ptr " + environment_address)
+        environment = ir_union_clean_gc_pointer(ir, environment)
+        let root = ir_root_address(ir, root_base, root_offset + root_index * psz)
+        ir.line("store ptr " + environment + ", ptr " + root)
+        return root_index + 1
+    }
+
+    if type.is_nullable_type() && ir_is_tagged_nullable(type) {
+        let present = ir.var()
+        ir.line(present + " = load i1, ptr " + address)
+        let yes = ir.block("roots.nullable.present")
+        let after = ir.block("roots.nullable.after")
+        ir.cond_jump(present, yes, after)
+        ir.label(yes)
+        let inner_address = ir.var()
+        ir.line(inner_address + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 1")
+        ir_sync_type_roots(ir, t, inner_address, root_offset, root_index, root_base) !>
+        ir.jump(after)
+        ir.label(after)
+        return root_index + (t.gc_root_count() !>)
+    }
+
+    if t.type == TYPE.union {
+        let start = root_index
+        let members = t.sub_types
+        if isset(members) {
+            let tag = ir.var()
+            ir.line(tag + " = load i64, ptr " + address)
+            let after = ir.block("roots.union.after")
+            let emitted = false
+            each members as member, member_index {
+                if !member.has_gc_refs() : continue
+                emitted = true
+                let yes = ir.block("roots.union.member")
+                let next = ir.block("roots.union.next")
+                let active = ir.var()
+                ir.line(active + " = icmp eq i64 " + tag + ", " + member_index)
+                ir.cond_jump(active, yes, next)
+                ir.label(yes)
+                let payload = ir.var()
+                let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
+                ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
+                ir_sync_type_roots(ir, member, payload, root_offset, start, root_base) !>
+                ir.jump(after)
+                ir.label(next)
+            }
+            if emitted : ir.jump(after)
+            if emitted : ir.label(after)
+        }
+        return start + (t.gc_root_count() !>)
+    }
+
+    if t.type == TYPE.inline {
+        let sub = t.sub_type
+        if !isset(sub) : return root_index
+        let class = sub.get_class_or_null()
+        if !isset(class) : return ir_sync_type_roots(ir, sub, address, root_offset, root_index, root_base) !>
+        each class.props as prop {
+            if !prop.type.has_gc_refs() : continue
+            let field = ir.var()
+            ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
+            root_index = ir_sync_type_roots(ir, prop.type, field, root_offset, root_index, root_base) !>
+        }
+        return root_index
+    }
+
+    if t.type == TYPE.array {
+        let sub = t.sub_type
+        if !isset(sub) : return root_index
+        let stride = sub.size() !>
+        let i: u32 = 0
+        while i < t.array_size {
+            if sub.has_gc_refs() {
+                let element = ir.var()
+                ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + (stride * i))
+                root_index = ir_sync_type_roots(ir, sub, element, root_offset, root_index, root_base) !>
+            }
+            i++
+        }
+        return root_index
+    }
+
+    if t.type == TYPE.multi {
+        let members = t.sub_types
+        if !isset(members) : return root_index
+        let offset: u32 = 0
+        each members as member {
+            if member.has_gc_refs() {
+                let field = ir.var()
+                ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
+                root_index = ir_sync_type_roots(ir, member, field, root_offset, root_index, root_base) !>
+            }
+            offset += member.size() !>
+        }
+    }
+    return root_index
+}
+
+fn ir_sync_decl_field_roots(ir: IRFunc, decl: Decl) !Error {
+    let root_offset = decl.gc_field_root_offset
+    if !isset(root_offset) || decl.gc_field_root_count == 0 : return
+    let bytes = decl.gc_field_root_count * decl.type.ptr_size().to(uint)
+    let first = ir_gc_stack_root_address(ir, root_offset)
+    ir.line("call void @llvm.memset.inline.p0.i64(ptr " + first + ", i8 0, i64 " + bytes + ", i1 false)")
+    ir_sync_type_roots(ir, decl.type, decl.ir_name, root_offset, 0) !>
+}
+
+fn ir_visit_gc_field(
+    ir: IRFunc,
+    value: Value,
+    address: String,
+    action: String,
+    owner: String,
+    list: String,
+    callback_target: String,
+    callback_data: String
+) !Error {
+    if action == "remove" {
+        ir_emit_gc_property_remove(ir, value, owner, address) !>
+        return
+    }
+    if action == "trace" {
+        ir_note_unknown_code(ir)
+        ir.line("call void " + callback_target + "(ptr " + callback_data + ", ptr " + address + ", ptr " + list + ")")
+        return
+    }
+
+    let pointer = ir.var()
+    ir.line(pointer + " = load ptr, ptr " + address)
+    pointer = ir_union_clean_gc_pointer(ir, pointer)
+    if action == "set" {
+        ir_emit_gc_property_set(ir, value, owner, address, pointer) !>
+    } else if action == "share" {
+        ir_emit_gc_share_null_check(ir, value, pointer) !>
+    } else {
+        ir.line("store ptr " + pointer + ", ptr " + address)
+    }
+}
+
+// Visit every active managed field in a by-value representation. The same
+// traversal powers property reads, ownership updates, and dynamic container
+// tracing, keeping their tag interpretation identical.
+fn ir_visit_type_gc_fields(
+    ir: IRFunc,
+    value: Value,
+    type: Type,
+    address: String,
+    action: String,
+    owner: String (""),
+    list: String (""),
+    callback_target: String (""),
+    callback_data: String ("")
+) !Error {
+    if type.is_gc_type() {
+        ir_visit_gc_field(ir, value, address, action, owner, list, callback_target, callback_data) !>
+        return
+    }
+
+    let t = type.get_non_nullable()
+    if t.type == TYPE.fn {
+        let environment = ir.var()
+        ir.line(environment + " = getelementptr i8, ptr " + address + ", i64 " + t.ptr_size())
+        ir_visit_gc_field(ir, value, environment, action, owner, list, callback_target, callback_data) !>
+        return
+    }
+
+    if type.is_nullable_type() && ir_is_tagged_nullable(type) {
+        let present = ir.var()
+        ir.line(present + " = load i1, ptr " + address)
+        let yes = ir.block("fields.nullable.present")
+        let after = ir.block("fields.nullable.after")
+        ir.cond_jump(present, yes, after)
+        ir.label(yes)
+        let inner = ir.var()
+        ir.line(inner + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 1")
+        ir_visit_type_gc_fields(ir, value, t, inner, action, owner, list, callback_target, callback_data) !>
+        ir.jump(after)
+        ir.label(after)
+        return
+    }
+
+    if t.type == TYPE.union {
+        let members = t.sub_types
+        if !isset(members) : return
+        let tag = ir.var()
+        ir.line(tag + " = load i64, ptr " + address)
+        let after = ir.block("fields.union.after")
+        let emitted = false
+        each members as member, member_index {
+            if !member.has_gc_refs() : continue
+            emitted = true
+            let yes = ir.block("fields.union.member")
+            let next = ir.block("fields.union.next")
+            let active = ir.var()
+            ir.line(active + " = icmp eq i64 " + tag + ", " + member_index)
+            ir.cond_jump(active, yes, next)
+            ir.label(yes)
+            let payload = ir.var()
+            let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
+            ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
+            ir_visit_type_gc_fields(ir, value, member, payload, action, owner, list, callback_target, callback_data) !>
+            ir.jump(after)
+            ir.label(next)
+        }
+        if emitted : ir.jump(after)
+        if emitted : ir.label(after)
+        return
+    }
+
+    if t.type == TYPE.inline {
+        let sub = t.sub_type
+        if !isset(sub) : return
+        let class = sub.get_class_or_null()
+        if !isset(class) {
+            ir_visit_type_gc_fields(ir, value, sub, address, action, owner, list, callback_target, callback_data) !>
+            return
+        }
+        each class.props as prop {
+            if !prop.type.has_gc_refs() : continue
+            let field = ir.var()
+            ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
+            ir_visit_type_gc_fields(ir, value, prop.type, field, action, owner, list, callback_target, callback_data) !>
+        }
+        return
+    }
+
+    if t.type == TYPE.array {
+        let sub = t.sub_type
+        if !isset(sub) : return
+        if !sub.has_gc_refs() : return
+        let stride = sub.size() !>
+        let i: u32 = 0
+        while i < t.array_size {
+            let element = ir.var()
+            ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + (stride * i))
+            ir_visit_type_gc_fields(ir, value, sub, element, action, owner, list, callback_target, callback_data) !>
+            i++
+        }
+        return
+    }
+
+    if t.type == TYPE.multi {
+        let members = t.sub_types
+        if !isset(members) : return
+        let offset: u32 = 0
+        each members as member {
+            if member.has_gc_refs() {
+                let field = ir.var()
+                ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
+                ir_visit_type_gc_fields(ir, value, member, field, action, owner, list, callback_target, callback_data) !>
+            }
+            offset += member.size() !>
+        }
+    }
 }
 
 fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
@@ -887,6 +1249,14 @@ fn ir_type(type: Type) String !Error {
         return "{ i1, " + (ir_type(t) !>) + " }"
     }
     if t.type == TYPE.fn : return "{ ptr, ptr }"
+    if t.type == TYPE.union {
+        let out = "{ i64"
+        if t.union_has_gc_payload() : out += ", ptr"
+        if t.union_has_other_payload() {
+            out += ", [" + (t.union_other_payload_size() !>) + " x i8]"
+        }
+        return out + " }"
+    }
     if t.is_pointer_sized() : return "ptr"
     if t.type == TYPE.void : return "void"
     if t.type == TYPE.bool : return "i1"
@@ -959,8 +1329,20 @@ fn ir_clear_statement_buffers(ir: IRFunc, value: Value) !Error {
     let buffers = Array[Decl]{}
     value_collect_buffers(value, buffers)
     each buffers as decl {
+        // A nested literal may reference an enclosing buffer through its
+        // capture environment. That declaration is named and cleared by its
+        // owning function; it has no local address in this function's IR.
+        if !ir.func.all_decls.contains(decl) : continue
         if decl.is_gc {
             ir.line("store ptr null, ptr " + decl.ir_name)
+            continue
+        }
+        let field_root_offset = decl.gc_field_root_offset
+        if isset(field_root_offset) && decl.gc_field_root_count > 0 {
+            let address = ir.var()
+            ir.line(address + " = getelementptr i8, ptr \%valk.gc.stack.values, i64 " + field_root_offset)
+            let bytes = decl.gc_field_root_count * decl.type.ptr_size().to(uint)
+            ir.line("call void @llvm.memset.inline.p0.i64(ptr " + address + ", i8 0, i64 " + bytes + ", i1 false)")
             continue
         }
         let offset = decl.closure_root_offset
@@ -1026,6 +1408,14 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
         ir_emit_func_cleanup(ir) !>
         ir_emit_error_return(ir, "undef", ir.func.get_rett(), code) !>
         ir.terminated = true
+        return
+    }
+    if t == VAL.property_init || t == VAL.property_update || t == VAL.property_clear {
+        ir_emit_embedded_property_op(ir, value) !>
+        return
+    }
+    if t == VAL.property_trace {
+        ir_emit_embedded_property_trace(ir, value) !>
         return
     }
     if t == VAL.assign {
@@ -1371,6 +1761,21 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
             ir_emit_gc_property_update(ir, value, owner_value, address, result) !>
             return
         }
+        if owner.rett.is_gc_type() && left.rett.has_gc_refs() {
+            let owner_value = ir_emit_value(ir, owner) !>
+            let address = ir.var()
+            ir.line_start()
+            ir.write(address)
+            ir.write(" = getelementptr i8, ptr ")
+            ir.write(owner_value)
+            ir.write(", i64 ")
+            ir.write_uint(prop.offset)
+            ir.line_end()
+            let op = value.op.@cast(ASSIGN_OP)
+            if op != ASSIGN_OP.set : value.bug("Compound assignment is not valid for a property with embedded GC references")
+            ir_emit_embedded_property_store(ir, value, left.rett, owner_value, address, right, true) !>
+            return
+        }
     }
 
     let address = ir_emit_address(ir, left) !>
@@ -1405,9 +1810,18 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
     ir.write(", ptr ")
     ir.write(address)
     ir.line_end()
+    if left.type == VAL.global && left.rett.has_gc_refs() && !left.rett.is_gc_type() {
+        let g = left.global
+        if isset(g) && g.shared {
+            ir_visit_type_gc_fields(ir, value, left.rett, address, "share") !>
+        }
+    }
     if left.type == VAL.decl {
         let decl = left.decl
-        if isset(decl) : ir_sync_closure_root(ir, decl, result) !>
+        if isset(decl) {
+            ir_sync_closure_root(ir, decl, result) !>
+            ir_sync_decl_field_roots(ir, decl) !>
+        }
     }
 }
 
@@ -1418,6 +1832,126 @@ fn ir_emit_gc_property_update(ir: IRFunc, value: Value, owner: String, address: 
     if !update.parsed_types : parse_func_types(update) !>
     ir_use_func(ir, update)
     ir.line("call void @\"" + func_ir_name(update) + "\"(ptr " + owner + ", ptr " + address + ", ptr " + result + ")")
+}
+
+fn ir_emit_gc_property_set(ir: IRFunc, value: Value, owner: String, address: String, result: String) !Error {
+    let idf = valk_idf(ir.func.ns.build, "gc", "property_set") !>
+    let set = idf.func
+    if !isset(set) : value.bug("gc:property_set is not a function")
+    if !set.parsed_types : parse_func_types(set) !>
+    ir_use_func(ir, set)
+    ir.line("call void @\"" + func_ir_name(set) + "\"(ptr " + owner + ", ptr " + address + ", ptr " + result + ")")
+}
+
+fn ir_emit_gc_property_remove(ir: IRFunc, value: Value, owner: String, address: String) !Error {
+    let idf = valk_idf(ir.func.ns.build, "gc", "property_remove") !>
+    let remove = idf.func
+    if !isset(remove) : value.bug("gc:property_remove is not a function")
+    if !remove.parsed_types : parse_func_types(remove) !>
+    ir_use_func(ir, remove)
+    ir.line("call void @\"" + func_ir_name(remove) + "\"(ptr " + owner + ", ptr " + address + ")")
+}
+
+// Copy a by-value property to private scratch storage before stripping the
+// collector's ownership bits. Cleaning the original property in place would
+// destroy the metadata used by the next marking/update pass.
+fn ir_emit_clean_embedded_load(ir: IRFunc, value: Value, type: Type, address: String) String !Error {
+    let lowered = ir_type(type) !>
+    let raw = ir.var()
+    ir.line(raw + " = load " + lowered + ", ptr " + address)
+
+    let slot = ""
+    let storage = value.decl
+    if isset(storage) {
+        slot = storage.ir_name
+    } else {
+        slot = ir.var()
+        ir.line3(slot, " = alloca ", lowered)
+    }
+    ir.line("store " + lowered + " " + raw + ", ptr " + slot)
+    ir_visit_type_gc_fields(ir, value, type, slot, "clean") !>
+
+    let clean = ir.var()
+    ir.line(clean + " = load " + lowered + ", ptr " + slot)
+    return clean
+}
+
+fn ir_emit_embedded_property_store(
+    ir: IRFunc,
+    value: Value,
+    type: Type,
+    owner: String,
+    address: String,
+    right: Value,
+    remove_old: bool
+) !Error {
+    // Evaluate first while the old property is still intact. Front-end
+    // buffering gives a temporary aggregate its own field roots across the
+    // runtime ownership calls below.
+    let rendered = ir_emit_value(ir, right) !>
+    if remove_old {
+        ir_visit_type_gc_fields(ir, value, type, address, "remove", owner) !>
+    }
+    ir.line("store " + (ir_type(type) !>) + " " + rendered + ", ptr " + address)
+    ir_visit_type_gc_fields(ir, value, type, address, "set", owner) !>
+}
+
+fn ir_emit_embedded_property_op(ir: IRFunc, value: Value) !Error {
+    let owner_value = value.value1
+    let slot_value = value.value2
+    if !isset(owner_value) || !isset(slot_value) : value.bug("Embedded property operation is incomplete")
+    let owner = ir_emit_value(ir, owner_value) !>
+    let address = ir_emit_address(ir, slot_value) !>
+
+    if value.type == VAL.property_clear {
+        ir_visit_type_gc_fields(ir, value, slot_value.rett, address, "remove", owner) !>
+        return
+    }
+
+    let values = value.values
+    if !isset(values) : value.bug("Embedded property store has no value")
+    let right = values.get(0) !? null
+    if !isset(right) : value.bug("Embedded property store has no value")
+    ir_emit_embedded_property_store(
+        ir,
+        value,
+        slot_value.rett,
+        owner,
+        address,
+        right,
+        value.type == VAL.property_update
+    ) !>
+}
+
+fn ir_emit_embedded_property_trace(ir: IRFunc, value: Value) !Error {
+    let slot_value = value.value1
+    let list_value = value.value2
+    let callbacks = value.values
+    if !isset(slot_value) || !isset(list_value) || !isset(callbacks) {
+        value.bug("Embedded property trace is incomplete")
+    }
+    let callback_value = callbacks.get(0) !? null
+    if !isset(callback_value) : value.bug("Embedded property trace has no callback")
+
+    let address = ir_emit_address(ir, slot_value) !>
+    let list = ir_emit_value(ir, list_value) !>
+    let callback = ir_emit_value(ir, callback_value) !>
+    let target = ir.var()
+    ir.line(target + " = extractvalue " + (ir_type(callback_value.rett) !>) + " " + callback + ", 0")
+    let data = ir.var()
+    ir.line(data + " = extractvalue " + (ir_type(callback_value.rett) !>) + " " + callback + ", 1")
+    data = ir_union_clean_gc_pointer(ir, data)
+    ir_visit_type_gc_fields(
+        ir,
+        value,
+        slot_value.rett,
+        address,
+        "trace",
+        "",
+        list,
+        target,
+        data
+    ) !>
 }
 
 fn ir_emit_gc_share_null_check(ir: IRFunc, value: Value, result: String) !Error {
@@ -1572,6 +2106,12 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.union_extract {
         return ir_emit_union_extract(ir, value) !>
     }
+    if t == VAL.property_get {
+        let source = value.value1
+        if !isset(source) : value.bug("Embedded property get has no source")
+        let address = ir_emit_address(ir, source) !>
+        return ir_emit_clean_embedded_load(ir, value, value.rett, address) !>
+    }
     if t == VAL.interface_wrap {
         return ir_emit_interface_wrap(ir, value) !>
     }
@@ -1633,6 +2173,13 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     }
     if t == VAL.prop {
         let address = ir_emit_address(ir, value) !>
+        // Aggregate properties can contain several managed pointers, selected
+        // dynamically by union tags. Copy before cleaning so ownership bits in
+        // the heap object remain available to the collector.
+        if value.rett.has_gc_refs() && !value.rett.is_gc_type()
+            && value.rett.get_non_nullable().type != TYPE.fn {
+            return ir_emit_clean_embedded_load(ir, value, value.rett, address) !>
+        }
         let out = ir.var()
         ir.line_start()
         ir.write(out)
@@ -2163,82 +2710,21 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     return out
 }
 
-fn ir_union_box_class(value: Value) Class !Error {
-    let idf = valk_idf(value.rett.build, "core", "TaggedUnion") !>
-    let class = idf.class
-    if !isset(class) : value.bug("core:TaggedUnion is not a class")
-    return class
-}
-
-fn ir_union_box_prop(value: Value, name: String) Prop !Error {
-    let class = ir_union_box_class(value) !>
-    return class.get_prop_by_name(name) ! value.bug("core:TaggedUnion is missing property: " + name)
-}
-
-fn ir_union_load_prop(ir: IRFunc, value: Value, box: String, name: String) String !Error {
-    let prop = ir_union_box_prop(value, name) !>
-    let address = ir_prop_address(ir, box, prop)
+fn ir_union_inner_value(ir: IRFunc, on: Value, rendered: String) String !Error {
+    if !on.rett.is_nullable_type() : return rendered
     let out = ir.var()
-    ir.line(out + " = load " + (ir_type(prop.type) !>) + ", ptr " + address)
-    if !prop.type.is_gc_type() : return out
+    ir.line(out + " = extractvalue " + (ir_type(on.rett) !>) + " " + rendered + ", 1")
+    return out
+}
 
-    // Managed properties may carry ownership bits written by the collector.
+fn ir_union_clean_gc_pointer(ir: IRFunc, pointer: String) String {
     let as_int = ir.var()
-    ir.line4(as_int, " = ptrtoint ptr ", out, " to i64")
+    ir.line4(as_int, " = ptrtoint ptr ", pointer, " to i64")
     let masked = ir.var()
     ir.line4(masked, " = and i64 ", as_int, ", -4")
     let clean = ir.var()
     ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
     return clean
-}
-
-// True when an alternative fits directly in one tagged-union payload word.
-// `is_pointer_sized` describes pointer-shaped language values, so it does not
-// include ordinary numbers even when their representation is at most 64 bits.
-fn ir_union_member_fits_word(member: Type) bool {
-    if member.is_pointer_sized() : return true
-    return member.is_number_type() && member.number_byte_size() <= 8
-}
-
-fn ir_union_storage_prop(member: Type) String {
-    // Managed references and out-of-line inline payloads are both stored in
-    // the GC-traced pointer slot. Only scalar/raw-pointer alternatives fit in
-    // the compact bit payload.
-    if member.is_gc_type() || !ir_union_member_fits_word(member) : return "gc_payload"
-    return "other_payload"
-}
-
-// Encode a non-managed union alternative into the shared u64 payload. Integer,
-// bool, and raw-pointer values use the normal ABI conversion; floating-point
-// values must preserve their bit pattern rather than undergo numeric rounding.
-fn ir_union_encode_payload(ir: IRFunc, value: String, type: Type, payload: Type) String !Error {
-    if !type.is_float_type() : return ir_emit_cast(ir, value, type, payload) !>
-
-    let width = type.number_byte_size() * 8
-    let bits_type = "i" + width
-    let bits = ir.var()
-    ir.line(bits + " = bitcast " + (ir_type(type) !>) + " " + value + " to " + bits_type)
-    if width == 64 : return bits
-
-    let widened = ir.var()
-    ir.line(widened + " = zext " + bits_type + " " + bits + " to i64")
-    return widened
-}
-
-// Decode a non-managed union alternative from the shared u64 payload.
-fn ir_union_decode_payload(ir: IRFunc, value: String, payload: Type, type: Type) String !Error {
-    if !type.is_float_type() : return ir_emit_cast(ir, value, payload, type) !>
-
-    let width = type.number_byte_size() * 8
-    let bits_type = "i" + width
-    let bits = value
-    if width < 64 {
-        bits = ir.var()
-        ir.line(bits + " = trunc i64 " + value + " to " + bits_type)
-    }
-    let out = ir.var()
-    ir.line(out + " = bitcast " + bits_type + " " + bits + " to " + (ir_type(type) !>))
-    return out
 }
 
 fn ir_emit_union_wrap(ir: IRFunc, value: Value) String !Error {
@@ -2250,106 +2736,77 @@ fn ir_emit_union_wrap(ir: IRFunc, value: Value) String !Error {
     let member = members.get(value.int_val.to(uint)) !? null
     if !isset(member) : value.bug("Tagged-union alternative index is out of bounds")
 
-    // Evaluate the payload before allocating its box. GC-producing expressions
-    // were buffered by vgen_union_wrap, so this remains rooted across the box
-    // allocation.
     let rendered = ir_emit_value(ir, inner) !>
-    let class = ir_union_box_class(value) !>
-    let at = value.exp ?? ir.func.exp
-    value.allocator = allocator_for_class(Context.for_func(ir.func), class, at) !>
-    let box = ir_emit_class_alloc(ir, value, class, class.compute_body_size() !>) !>
-    ir.line("call void @llvm.memset.inline.p0.i64(ptr " + box + ", i8 0, i64 " + class.compute_body_size() !> + ", i1 false)")
-
-    let tag_prop = ir_union_box_prop(value, "tag") !>
-    let tag_address = ir_prop_address(ir, box, tag_prop)
-    ir.line("store " + (ir_type(tag_prop.type) !>) + " " + value.int_val + ", ptr " + tag_address)
-
-    let storage_name = ir_union_storage_prop(member)
-    let storage_prop = ir_union_box_prop(value, storage_name) !>
-    let stored = ""
-    if ir_union_member_fits_word(member) {
-        stored = ir_union_encode_payload(ir, rendered, inner.rett, storage_prop.type) !>
-    } else {
-        // Inline alternatives cannot fit in the compact u64 slot. Allocate a
-        // GC-owned payload using the complete value layout, then store the
-        // aggregate into it. The generated pool descriptor traces nested
-        // managed fields (including arrays and closures).
-        let payload_type = member
-        let payload_size = payload_type.size() !>
-        let payload_allocator = allocator_for_type(Context.for_func(ir.func), payload_type, at) !>
-        let payload_value = Value {
-            type: VAL.class_init
-            rett: payload_type
-            exp: value.exp
-            allocator: payload_allocator
+    let nullable_present = ""
+    let rendered_type = inner.rett
+    if inner.rett.is_nullable_type() {
+        // `?Member` -> `?(Member | ...)` is one representation conversion, not
+        // a promise that the source is present. Preserve its null state while
+        // packing the non-null payload into the inline union aggregate.
+        if ir_is_tagged_nullable(inner.rett) {
+            nullable_present = ir.var()
+            ir.line(nullable_present + " = extractvalue " + (ir_type(inner.rett) !>) + " " + rendered + ", 0")
+            rendered = ir_extract_tagged_nullable_value(ir, rendered, inner.rett) !>
+        } else if inner.rett.get_non_nullable().type == TYPE.fn {
+            let target = ir.var()
+            ir.line(target + " = extractvalue " + (ir_type(inner.rett) !>) + " " + rendered + ", 0")
+            nullable_present = ir.var()
+            ir.line(nullable_present + " = icmp ne ptr " + target + ", null")
+        } else {
+            nullable_present = ir.var()
+            ir.line(nullable_present + " = icmp ne ptr " + rendered + ", null")
         }
-        let payload = ir_emit_class_alloc(ir, payload_value, payload_allocator.class, payload_size) !>
-        ir.line("store " + (ir_type(payload_type) !>) + " " + rendered + ", ptr " + payload)
-        stored = payload
+        rendered_type = inner.rett.get_non_nullable()
     }
-    let storage_address = ir_prop_address(ir, box, storage_prop)
-    ir.line("store " + (ir_type(storage_prop.type) !>) + " " + stored + ", ptr " + storage_address)
-    return box
+    rendered = ir_emit_cast(ir, rendered, rendered_type, member) !>
+
+    let lowered = ir_type(union) !>
+    let slot = ""
+    let storage = value.decl
+    if isset(storage) {
+        slot = storage.ir_name
+    } else {
+        slot = ir.var()
+        ir.line3(slot, " = alloca ", lowered)
+    }
+    ir.line("call void @llvm.memset.inline.p0.i64(ptr " + slot + ", i8 0, i64 " + (union.size() !>) + ", i1 false)")
+    ir.line("store i64 " + value.int_val + ", ptr " + slot)
+
+    let payload = ir.var()
+    if member.is_gc_type() {
+        ir.line(payload + " = getelementptr i8, ptr " + slot + ", i64 " + union.union_gc_payload_offset())
+    } else {
+        ir.line(payload + " = getelementptr i8, ptr " + slot + ", i64 " + union.union_other_payload_offset())
+    }
+    ir.line("store " + (ir_type(member) !>) + " " + rendered + ", ptr " + payload)
+
+    let out = ir.var()
+    ir.line(out + " = load " + lowered + ", ptr " + slot)
+    if value.rett.is_nullable_type() {
+        if nullable_present.length > 0 {
+            return ir_build_tagged_nullable_with_presence(ir, value.rett, out, nullable_present) !>
+        }
+        return ir_build_tagged_nullable(ir, value.rett, out) !>
+    }
+    return out
 }
 
 fn ir_emit_union_is(ir: IRFunc, value: Value) String !Error {
     let on = value.value1
     if !isset(on) : value.bug("Tagged-union type test is missing its value")
-    let box = ir_emit_value(ir, on) !>
+    let rendered = ir_emit_value(ir, on) !>
+    let union = on.rett.get_non_nullable()
+    let inner = ir_union_inner_value(ir, on, rendered) !>
+    let tag = ir.var()
+    ir.line(tag + " = extractvalue " + (ir_type(union) !>) + " " + inner + ", 0")
+    let matched = ir.var()
+    ir.line(matched + " = icmp eq i64 " + tag + ", " + value.int_val)
+    if !on.rett.is_nullable_type() : return matched
 
-    // A nullable tagged union uses a null pointer for its outer null value.
-    // Do not load the tag field until the pointer is known to be non-null;
-    // this is what makes a `default` arm safely cover null without requiring
-    // a duplicate explicit `null` arm.
-    if on.rett.is_nullable_type() {
-        let null_block = ir.block("union.is.null")
-        let nonnull_block = ir.block("union.is.nonnull")
-        let after_block = ir.block("union.is.after")
-        let null_check = ir.var()
-        ir.line4(null_check, " = icmp eq ptr ", box, ", null")
-        ir.cond_jump(null_check, null_block, nonnull_block)
-
-        ir.label(null_block)
-        let null_predecessor = ir.current_block
-        ir.jump(after_block)
-
-        ir.label(nonnull_block)
-        let tag = ir_union_load_prop(ir, value, box, "tag") !>
-        let tag_prop = ir_union_box_prop(value, "tag") !>
-        let matched = ir.var()
-        ir.line_start()
-        ir.write(matched)
-        ir.write(" = icmp eq ")
-        ir.write(ir_type(tag_prop.type) !>)
-        ir.write(" ")
-        ir.write(tag)
-        ir.write(", ")
-        ir.write_int(value.int_val)
-        ir.line_end()
-        let nonnull_predecessor = ir.current_block
-        ir.jump(after_block)
-
-        ir.label(after_block)
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = phi i1 [ 0, ")
-        ir.write("\%")
-        ir.write(null_predecessor)
-        ir.write(" ], [ ")
-        ir.write(matched)
-        ir.write(", ")
-        ir.write("\%")
-        ir.write(nonnull_predecessor)
-        ir.write(" ]")
-        ir.line_end()
-        return out
-    }
-
-    let tag = ir_union_load_prop(ir, value, box, "tag") !>
-    let tag_prop = ir_union_box_prop(value, "tag") !>
+    let present = ir.var()
+    ir.line(present + " = extractvalue " + (ir_type(on.rett) !>) + " " + rendered + ", 0")
     let out = ir.var()
-    ir.line(out + " = icmp eq " + (ir_type(tag_prop.type) !>) + " " + tag + ", " + value.int_val)
+    ir.line(out + " = and i1 " + present + ", " + matched)
     return out
 }
 
@@ -2357,19 +2814,37 @@ fn ir_emit_union_extract(ir: IRFunc, value: Value) String !Error {
     let on = value.value1
     let member = value.of_type
     if !isset(on) || !isset(member) : value.bug("Tagged-union extraction is incomplete")
-    let box = ir_emit_value(ir, on) !>
-    let prop = ir_union_box_prop(value, ir_union_storage_prop(member)) !>
-    let stored = ir_union_load_prop(ir, value, box, prop.name ?? "") !>
-    if !ir_union_member_fits_word(member) {
-        let out = ir.var()
-        ir.line(out + " = load " + (ir_type(member) !>) + ", ptr " + stored)
-        return out
+    let rendered = ir_emit_value(ir, on) !>
+    let union = on.rett.get_non_nullable()
+    let inner = ir_union_inner_value(ir, on, rendered) !>
+    if member.is_gc_type() {
+        let stored = ir.var()
+        ir.line(stored + " = extractvalue " + (ir_type(union) !>) + " " + inner + ", " + union.union_gc_payload_index())
+        return ir_union_clean_gc_pointer(ir, stored)
     }
-    if member.is_gc_type() : return ir_emit_cast(ir, stored, prop.type, member) !>
-    return ir_union_decode_payload(ir, stored, prop.type, member) !>
+
+    let lowered = ir_type(union) !>
+    let slot = ""
+    let storage = value.decl
+    if isset(storage) {
+        slot = storage.ir_name
+    } else {
+        slot = ir.var()
+        ir.line3(slot, " = alloca ", lowered)
+    }
+    ir.line("store " + lowered + " " + inner + ", ptr " + slot)
+    let payload = ir.var()
+    ir.line(payload + " = getelementptr i8, ptr " + slot + ", i64 " + union.union_other_payload_offset())
+    let out = ir.var()
+    ir.line(out + " = load " + (ir_type(member) !>) + ", ptr " + payload)
+    return out
 }
 
 fn ir_build_tagged_nullable(ir: IRFunc, type: Type, value: String) String !Error {
+    return ir_build_tagged_nullable_with_presence(ir, type, value, "true")
+}
+
+fn ir_build_tagged_nullable_with_presence(ir: IRFunc, type: Type, value: String, present: String) String !Error {
     let lowered = ir_type(type) !>
     let inner = type.get_non_nullable()
     let with_tag = ir.var()
@@ -2377,7 +2852,9 @@ fn ir_build_tagged_nullable(ir: IRFunc, type: Type, value: String) String !Error
     ir.write(with_tag)
     ir.write(" = insertvalue ")
     ir.write(lowered)
-    ir.write(" undef, i1 true, 0")
+    ir.write(" undef, i1 ")
+    ir.write(present)
+    ir.write(", 0")
     ir.line_end()
     let out = ir.var()
     ir.line_start()
@@ -3258,8 +3735,14 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                 rendered_types.append(ir_type(expected) !>)
                 rendered_values.append(ir_emit_inline_call_address(ir, receiver) !>)
             } else {
-                rendered_types.append(ir_type(receiver.rett) !>)
-                rendered_values.append(ir_emit_value(ir, receiver) !>)
+                let rendered = ir_emit_value(ir, receiver) !>
+                let rendered_type = receiver.rett
+                if isset(expected) {
+                    rendered = ir_emit_cast(ir, rendered, receiver.rett, expected) !>
+                    rendered_type = expected
+                }
+                rendered_types.append(ir_type(rendered_type) !>)
+                rendered_values.append(rendered)
             }
         }
     }
@@ -3279,8 +3762,14 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                 rendered_types.append(ir_type(expected) !>)
                 rendered_values.append(ir_emit_raw_function(ir, arg) !>)
             } else {
-                rendered_types.append(ir_type(arg.rett) !>)
-                rendered_values.append(ir_emit_value(ir, arg) !>)
+                let rendered = ir_emit_value(ir, arg) !>
+                let rendered_type = arg.rett
+                if isset(expected) {
+                    rendered = ir_emit_cast(ir, rendered, arg.rett, expected) !>
+                    rendered_type = expected
+                }
+                rendered_types.append(ir_type(rendered_type) !>)
+                rendered_values.append(rendered)
             }
         }
     }
@@ -3575,6 +4064,160 @@ fn ir_coro_pop_gc(ir: IRFunc, value: Value, gc_args: String) String !Error {
     return ir_extract_error_success(ir, raw, pop.get_rett()) !>
 }
 
+fn ir_coro_append_null_roots(ir: IRFunc, value: Value, gc_args: String, count: uint) !Error {
+    let i: uint = 0
+    while i < count {
+        ir_coro_append_gc(ir, value, gc_args, "null") !>
+        i++
+    }
+}
+
+// Preserve the GC fields of a raw coroutine argument/result in Coro.gc_args.
+// Every type contributes a fixed gc_root_count() entries; inactive union and
+// nullable slots are padded with null so later result offsets remain static.
+fn ir_coro_append_type_roots(
+    ir: IRFunc,
+    value: Value,
+    type: Type,
+    address: String,
+    gc_args: String
+) !Error {
+    let root_count = type.gc_root_count() !>
+    if root_count == 0 : return
+
+    if type.is_gc_type() {
+        let pointer = ir.var()
+        ir.line(pointer + " = load ptr, ptr " + address)
+        pointer = ir_union_clean_gc_pointer(ir, pointer)
+        ir_coro_append_gc(ir, value, gc_args, pointer) !>
+        return
+    }
+
+    let t = type.get_non_nullable()
+    if t.type == TYPE.fn {
+        let environment_address = ir.var()
+        ir.line(environment_address + " = getelementptr i8, ptr " + address + ", i64 " + t.ptr_size())
+        let environment = ir.var()
+        ir.line(environment + " = load ptr, ptr " + environment_address)
+        environment = ir_union_clean_gc_pointer(ir, environment)
+        ir_coro_append_gc(ir, value, gc_args, environment) !>
+        return
+    }
+
+    if type.is_nullable_type() && ir_is_tagged_nullable(type) {
+        let present = ir.var()
+        ir.line(present + " = load i1, ptr " + address)
+        let yes = ir.block("coro.roots.nullable.present")
+        let no = ir.block("coro.roots.nullable.absent")
+        let after = ir.block("coro.roots.nullable.after")
+        ir.cond_jump(present, yes, no)
+        ir.label(yes)
+        let inner = ir.var()
+        ir.line(inner + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 1")
+        ir_coro_append_type_roots(ir, value, t, inner, gc_args) !>
+        ir.jump(after)
+        ir.label(no)
+        ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+        ir.jump(after)
+        ir.label(after)
+        return
+    }
+
+    if t.type == TYPE.union {
+        let members = t.sub_types
+        if !isset(members) {
+            ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+            return
+        }
+        let tag = ir.var()
+        ir.line(tag + " = load i64, ptr " + address)
+        let after = ir.block("coro.roots.union.after")
+        each members as member, member_index {
+            let yes = ir.block("coro.roots.union.member")
+            let next = ir.block("coro.roots.union.next")
+            let active = ir.var()
+            ir.line(active + " = icmp eq i64 " + tag + ", " + member_index)
+            ir.cond_jump(active, yes, next)
+            ir.label(yes)
+            let member_roots = member.gc_root_count() !>
+            if member_roots > 0 {
+                let payload = ir.var()
+                let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
+                ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
+                ir_coro_append_type_roots(ir, value, member, payload, gc_args) !>
+            }
+            ir_coro_append_null_roots(ir, value, gc_args, root_count - member_roots) !>
+            ir.jump(after)
+            ir.label(next)
+        }
+        // Invalid tags cannot arise from a language value, but keeping this
+        // path verifier-complete also avoids reading arbitrary payload bytes.
+        ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+        ir.jump(after)
+        ir.label(after)
+        return
+    }
+
+    if t.type == TYPE.inline {
+        let sub = t.sub_type
+        if !isset(sub) {
+            ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+            return
+        }
+        let class = sub.get_class_or_null()
+        if !isset(class) {
+            ir_coro_append_type_roots(ir, value, sub, address, gc_args) !>
+            return
+        }
+        each class.props as prop {
+            if !prop.type.has_gc_refs() : continue
+            let field = ir.var()
+            ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
+            ir_coro_append_type_roots(ir, value, prop.type, field, gc_args) !>
+        }
+        return
+    }
+
+    if t.type == TYPE.array {
+        let sub = t.sub_type
+        if !isset(sub) {
+            ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+            return
+        }
+        let stride = sub.size() !>
+        let i: u32 = 0
+        while i < t.array_size {
+            if sub.has_gc_refs() {
+                let element = ir.var()
+                ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + (stride * i))
+                ir_coro_append_type_roots(ir, value, sub, element, gc_args) !>
+            }
+            i++
+        }
+        return
+    }
+
+    if t.type == TYPE.multi {
+        let members = t.sub_types
+        if !isset(members) {
+            ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+            return
+        }
+        let offset: u32 = 0
+        each members as member {
+            if member.has_gc_refs() {
+                let field = ir.var()
+                ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
+                ir_coro_append_type_roots(ir, value, member, field, gc_args) !>
+            }
+            offset += member.size() !>
+        }
+        return
+    }
+
+    ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
+}
+
 fn ir_coro_result_types(type: Type) Array[Type] {
     let result = Array[Type]{}
     if type.is_void_type() : return result
@@ -3678,6 +4321,9 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
             ir.write(", ptr ")
             ir.write(address)
             ir.line_end()
+            if type.has_gc_refs() {
+                ir_coro_append_type_roots(ir, value, type, address, gc_args) !>
+            }
             offset += type.size() !>
         }
     }
@@ -3744,11 +4390,12 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     let result_types = ir_coro_result_types(call.rett)
     let root_count: uint = 0
     each arg_types as type {
-        if type.is_gc_type() : root_count++
+        root_count += type.gc_root_count() !>
     }
     each result_types as type {
-        if type.is_gc_type() : root_count++
+        root_count += type.gc_root_count() !>
     }
+    let root_ptr_size = value.rett.ptr_size().to(uint)
     let root_global = ""
     let root_previous = ""
     let root_values = ""
@@ -3765,7 +4412,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         ir.line_start()
         ir.write(frame)
         ir.write(" = alloca [")
-        ir.write_uint(16 + root_count * 8)
+        ir.write_uint(16 + root_count * root_ptr_size)
         ir.write(" x i8]")
         ir.line_end()
         ir.line_start()
@@ -3801,7 +4448,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
         ir.write(root_values)
         ir.write(", i8 0, i64 ")
-        ir.write_uint(root_count * 8)
+        ir.write_uint(root_count * root_ptr_size)
         ir.write(", i1 false)")
         ir.line_end()
         ir.line_start()
@@ -3881,6 +4528,18 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             ir.write(", i64 ")
             ir.write_uint(offset)
             ir.line_end()
+            let embedded_roots = type.gc_root_count() !>
+            if embedded_roots > 0 {
+                ir_sync_type_roots(ir, type, address, 0, root_index, root_values) !>
+                let ri: uint = 0
+                while ri < embedded_roots {
+                    // Removing the fixed side-table entries leaves the raw
+                    // aggregate's mirrored pointers as the live roots.
+                    ir_coro_pop_gc(ir, value, gc_args) !>
+                    ri++
+                }
+                root_index += embedded_roots
+            }
             rendered = ir.var()
             ir.line_start()
             ir.write(rendered)
@@ -4005,6 +4664,23 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             ir.write(", ptr ")
             ir.write(address)
             ir.line_end()
+            let embedded_roots = type.gc_root_count() !>
+            if embedded_roots > 0 {
+                ir_sync_type_roots(ir, type, address, 0, root_index, root_values) !>
+                let ri: uint = 0
+                while ri < embedded_roots {
+                    let root_address = ir_root_address(
+                        ir,
+                        root_values,
+                        (root_index + ri) * root_ptr_size
+                    )
+                    let pointer = ir.var()
+                    ir.line(pointer + " = load ptr, ptr " + root_address)
+                    ir_coro_append_gc(ir, value, gc_args, pointer) !>
+                    ri++
+                }
+                root_index += embedded_roots
+            }
             result_offset += type.size() !>
         }
     }
@@ -4098,6 +4774,9 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
             ir.write(address)
             ir.line_end()
             offset += type.size() !>
+            // Embedded results occupy fixed side-table entries even though
+            // their by-value bytes are read from Coro.args.
+            gc_index += type.gc_root_count() !>
         }
         if value.rett.type == TYPE.multi {
             let next = ir.var()
@@ -4206,7 +4885,98 @@ fn ir_emit_short_circuit(ir: IRFunc, left: Value, right: Value, op: VALUE_OP) St
     return out
 }
 
+fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) String !Error {
+    let lowered = ir_type(type) !>
+    let left_tag = ir.var()
+    let right_tag = ir.var()
+    ir.line(left_tag + " = extractvalue " + lowered + " " + left + ", 0")
+    ir.line(right_tag + " = extractvalue " + lowered + " " + right + ", 0")
+    let equal = ir.var()
+    ir.line(equal + " = icmp eq i64 " + left_tag + ", " + right_tag)
+
+    if type.union_has_gc_payload() {
+        let index = type.union_gc_payload_index()
+        let left_gc = ir.var()
+        let right_gc = ir.var()
+        ir.line(left_gc + " = extractvalue " + lowered + " " + left + ", " + index)
+        ir.line(right_gc + " = extractvalue " + lowered + " " + right + ", " + index)
+        left_gc = ir_union_clean_gc_pointer(ir, left_gc)
+        right_gc = ir_union_clean_gc_pointer(ir, right_gc)
+        let pointer_equal = ir.var()
+        ir.line(pointer_equal + " = icmp eq ptr " + left_gc + ", " + right_gc)
+        let combined = ir.var()
+        ir.line(combined + " = and i1 " + equal + ", " + pointer_equal)
+        equal = combined
+    }
+
+    if type.union_has_other_payload() {
+        let size = type.union_other_payload_size() !>
+        let index = type.union_other_payload_index()
+        let payload_type = "[" + size + " x i8]"
+        let left_payload = ir.var()
+        let right_payload = ir.var()
+        ir.line(left_payload + " = extractvalue " + lowered + " " + left + ", " + index)
+        ir.line(right_payload + " = extractvalue " + lowered + " " + right + ", " + index)
+        let i: u32 = 0
+        while i < size {
+            let left_byte = ir.var()
+            let right_byte = ir.var()
+            ir.line(left_byte + " = extractvalue " + payload_type + " " + left_payload + ", " + i)
+            ir.line(right_byte + " = extractvalue " + payload_type + " " + right_payload + ", " + i)
+            let byte_equal = ir.var()
+            ir.line(byte_equal + " = icmp eq i8 " + left_byte + ", " + right_byte)
+            let combined = ir.var()
+            ir.line(combined + " = and i1 " + equal + ", " + byte_equal)
+            equal = combined
+            i++
+        }
+    }
+    return equal
+}
+
 fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type) String !Error {
+    if ir_is_tagged_nullable(type) && type.get_non_nullable().type == TYPE.union
+        && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
+        if right == "zeroinitializer" || left == "zeroinitializer" {
+            let value = right == "zeroinitializer" ? left : right
+            let present = ir.var()
+            ir.line(present + " = extractvalue " + (ir_type(type) !>) + " " + value + ", 0")
+            let out = ir.var()
+            let expected = op == VALUE_OP.eq ? "0" : "1"
+            ir.line(out + " = icmp eq i1 " + present + ", " + expected)
+            return out
+        }
+
+        let lowered = ir_type(type) !>
+        let left_present = ir.var()
+        let right_present = ir.var()
+        ir.line(left_present + " = extractvalue " + lowered + " " + left + ", 0")
+        ir.line(right_present + " = extractvalue " + lowered + " " + right + ", 0")
+        let left_inner = ir.var()
+        let right_inner = ir.var()
+        ir.line(left_inner + " = extractvalue " + lowered + " " + left + ", 1")
+        ir.line(right_inner + " = extractvalue " + lowered + " " + right + ", 1")
+        let inner_equal = ir_emit_union_equal(ir, left_inner, right_inner, type.get_non_nullable()) !>
+        let presence_equal = ir.var()
+        ir.line(presence_equal + " = icmp eq i1 " + left_present + ", " + right_present)
+        let left_missing = ir.var()
+        ir.line(left_missing + " = xor i1 " + left_present + ", true")
+        let value_equal = ir.var()
+        ir.line(value_equal + " = or i1 " + left_missing + ", " + inner_equal)
+        let equal = ir.var()
+        ir.line(equal + " = and i1 " + presence_equal + ", " + value_equal)
+        if op == VALUE_OP.eq : return equal
+        let out = ir.var()
+        ir.line(out + " = xor i1 " + equal + ", true")
+        return out
+    }
+    if type.get_non_nullable().type == TYPE.union && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
+        let equal = ir_emit_union_equal(ir, left, right, type.get_non_nullable()) !>
+        if op == VALUE_OP.eq : return equal
+        let out = ir.var()
+        ir.line(out + " = xor i1 " + equal + ", true")
+        return out
+    }
     if type.get_non_nullable().type == TYPE.fn && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
         let lt = ir.var()
         let ld = ir.var()
