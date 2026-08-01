@@ -809,25 +809,36 @@ fn main() {
 
 ## Access types
 
-Declarations are package-private by default. Use `+` to make a declaration
-public to other packages. Use `~` for values that other packages may read but
-not change. `-` explicitly marks a declaration as package-private.
+Declarations without a marker are available throughout their package and
+private outside it. Use `-` to keep a declaration in its source file, `~` to
+make it read-only outside that source, and `+` to make it public everywhere.
+
+Combined markers widen as code gets closer to the declaration. They use `-`,
+`~`, `+` in that order:
+
+- `~+` is public in its namespace and read-only elsewhere.
+- `-~` is read-only in its namespace and private elsewhere.
+- `-+` is public in its namespace and private elsewhere.
+- `-~+` is public in its namespace, read-only in its package, and private
+  outside the package.
 
 ```rust
-fn helper() {}       // Package-private by default
-- fn internal() {}   // Explicitly package-private
-+ fn public_api() {} // Public to other packages
+fn helper() {}       // Available in this package
+- fn internal() {}   // Available only in this source file
+-+ fn ns_helper() {} // Available only in this namespace
++ fn public_api() {} // Available everywhere
 
 class Config {
-    value: int         // Package-private by default
-    - secret: String   // Explicitly package-private
-    + name: String     // Public
-    ~ version: String  // Read-only outside the package
+    value: int         // Available in this package
+    - secret: String   // Available only in this source file
+    ~ version: String  // Read-only outside this source file
+    ~+ state: uint     // Read-only outside this namespace
+    + name: String     // Available everywhere
 }
 ```
 
-`-` is not class- or file-private: other code in the same package can still
-access the declaration.
+`-` is source-private rather than class-private: other code in the same file
+can still access the declaration.
 
 Low-level code can place `@ignore_access` at the top of a file to bypass access
 checks.
