@@ -1047,10 +1047,10 @@ alias FD for i32
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: String) Value !ParseError
++ fn decode(json: String | ByteBuffer) Value !ParseError
 + fn default_value(kind: int) Value
-+ fn encode(data: Value, pretty: bool (false)) String
-+ fn encode_to(data: Value, output: ByteBuffer, pretty: bool (false)) ByteBuffer
++ fn encode(data: $T, pretty: bool (false)) String
++ fn encode_to(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 + fn from(data: $T) Value
 + fn from_value[T](data: Value) T !ValueError
 + fn new_array(values: ?Array[Value] (null)) ArrayValue
@@ -1096,6 +1096,8 @@ alias FD for i32
     + fn array_or() ArrayValue !LookupError
     + fn bool() bool
     + fn bool_or() bool !LookupError
+    + fn encode(pretty: bool (false)) String
+    + fn encode_to(output: ByteBuffer, pretty: bool (false)) ByteBuffer
     + fn float() float
     + fn float_or() float !LookupError
     + fn get(key: String | uint) Value
