@@ -6,10 +6,10 @@
 <table>
 <tr><td width=200px><br>
 
+* [Standard library API](#standard-library-api)
+* [Getting started](#getting-started)
 * [Basic example](#basic-example)
 * [Multiple files](#multiple-files)
-* [Building and running](#building-and-running)
-* [Editor and language server](#editor-and-language-server)
 * [Namespaces](#namespaces)
 * [Packages](#packages)
 * [Types](#types)
@@ -35,7 +35,7 @@
 * [Generics](#generics)
 * [Modes](#modes)
 * [Globals](#globals)
-- [Tokens](#tokens)
+* [Tokens](#tokens)
     * [Let](#variables)
     * [If/Else](#if-else)
     * [While](#while)
@@ -46,7 +46,7 @@
 
 * [Null checking](#null-checking)
 * [Files](#files)
-    - [Paths](#paths)
+    * [Paths](#paths)
 * [JSON](#json)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
@@ -67,12 +67,9 @@
 * [Unsafe](#unsafe)
     * [Structs](#structs)
     * [External libraries](#external-libraries)
-    * [Linking](#linking)
 
 * [Valk manager](#valk-manager)
-
-* [Misc](#misc)
-    * [Data races](#data-races)
+* [Data races](#data-races)
 
 <br></td></tr>
 </table>
@@ -123,9 +120,8 @@ valk build file-1.valk file-2.valk -o ./main
 
 ## Namespaces
 
-Each directory in your project represent a namespace. But first you have to define a package by creating a `valk.json` file.
-
-By default your code must go in `./src`
+Each directory in a project represents a namespace. Create a `valk.json` file
+at the project root; source code goes in `./src` by default.
 
 ```
 ./valk.json
@@ -143,8 +139,8 @@ use ns1
 use ns2
 
 fn main() {
-    let a  = ns1:MyClass {}
-    let b  = ns1:MyOtherClass {}
+    let a = ns1:MyClass {}
+    let b = ns2:MyOtherClass {}
 }
 ```
 
@@ -168,7 +164,7 @@ vman remove example
 After installing a package, it is added to `valk.json`. The configuration can also change the name used to import it.
 
 ```rust
-// Example: valk.json -> { "dependencies": "example": {...} }
+// valk.json -> { "dependencies": { "example": { ... } } }
 use example:funcs
 
 fn main() {
@@ -206,120 +202,40 @@ Other: `ptr` <- raw pointer (unsafe)
 
 ## Tagged unions
 
-A tagged union holds exactly one value from a fixed set of alternatives. A
-named union is declared with `union`, followed by its alternatives and a body:
+A tagged union lets a value be one of several types. Give the union a name when
+you want to reuse it:
 
 ```rust
-union JsonValue : String | int | bool | null {
-    fn describe() String {
-        return match this : String {
-            null => "null"
-            String as text => text
-            int as number => "number: %number"
-            bool as enabled => enabled ? "true" : "false"
-        }
-    }
-}
+union Value : String | int | bool | null {}
 
-let value : JsonValue = 42
-println(value.describe())
-```
-
-Named unions are nominal types. `union First : String | int {}` and
-`union Second : int | String {}` are distinct even though they contain the same
-alternatives. Values are widened to the expected union automatically.
-
-Functions and getters in the body belong to the union just like class methods.
-Instance functions receive the complete union as `this`; static functions are
-called through the type. Stored properties are not allowed because the active
-alternative is the union's storage. More functions can be added in another file
-with `extend JsonValue { ... }`.
-
-Anonymous structural unions remain available in type positions when a reusable
-name or methods are unnecessary. Their alternative order does not affect their
-identity, so `String | int` and `int | String` are the same anonymous type.
-
-Use a type case in `match` to inspect and extract the active value. The name
-after `as` has the type named by that case:
-
-```rust
-fn describe(value: String | int | bool) String {
+fn describe(value: Value) String {
     return match value : String {
+        null => "missing"
         String as text => text
         int as number => "number: %number"
         bool as enabled => enabled ? "enabled" : "disabled"
     }
 }
+
+let value: Value = 42
+println(describe(value))
 ```
 
-A match that covers every alternative is exhaustive and does not need a
-`default` case. A type case must name one of the union's exact alternatives.
+Use `as` to access the value in a `match` case. When every type is handled, a
+`default` case is not needed. Add `null` when the value may be missing.
 
-When a case should intentionally do nothing, use `_` as its statement body.
-The arm still counts as a normal match case and keeps execution moving after
-the match:
-
-```rust
-fn only_describe_strings(value: String | int) String {
-    match value {
-        String as text => return text
-        default => _
-    }
-    return "not a string"
-}
-```
-
-`null` can be included as union syntax, even though it is not a standalone Valk
-type. It makes the complete union nullable:
-
-```rust
-union MaybeValue : String | int | null {}
-
-fn describe_maybe(value: MaybeValue) String {
-    return match value : String {
-        String as text => text
-        int as number => "number: %number"
-        default => "missing"
-    }
-}
-```
-
-A `default` arm also covers `null` and any unmatched alternatives. When matching
-exhaustively without `default`, put an explicit `null` case before type cases.
-A named union containing `null` may still have instance methods: the method
-receives the nullable union value and can match `this` directly.
-
-Alternatives keep their own type. For example, `int | uint` can distinguish
-between signed and unsigned values:
-
-```rust
-union Number : int | uint {}
-
-let signed: Number = 5
-let unsigned: Number = 5.to(uint)
-```
-
-Structs and fixed arrays can also be union alternatives:
-
-```rust
-struct Point { x: int, y: int }
-
-union Value : String | <Point> | [u8 x 4] {}
-```
-
-Unions cannot currently be used in `extern` function signatures or globals.
+For a union used only once, write it directly as a type, such as
+`String | int`. Named unions can also contain functions and getters.
 
 ## Variables
 
 ```rust
 // let {name} [: {type}] = {value}
-let v = 5             // Integers will be of type `int` by default if no typehint is available
-let v : uint = 5      // Using type hint, now the compiler knows the integer should be a `uint` instead of `int`
-let v = 5.to(uint)    // With .to() you can always convert any number value to any other number type
-let v = 5.to(String)  // String is not a number type, but the compiler will try to find a converter function for these types
-let v : String = 5    // The compiler will always automatically convert a value to String if needed/possible
-let v : u8 = "100"    // Compile error because the types are not compatible
-let v : u8 = "100".to(u8) // This works
+let count = 5                  // Inferred as int
+let unsigned: uint = 5         // Explicit type
+let converted = count.to(uint)
+let text: String = count       // Converted to String automatically
+let parsed = "100".to(u8)
 ```
 
 ## Strings
@@ -329,8 +245,8 @@ let name = "Peter"
 let msg1 = "Hello " + name + "!" // Concat strings
 let msg2 = "Hello %name!" // Short way
 let msg3 = "Name length x 2: %{ name.length * 2 }!" // Any expression that can be converted to String
-let msg4 = "Hello \%name!" // Prevent inlining using '\' before '%'
-let msg5 = r"Hello %name!" // Prevent inlining using 'r' (raw) at the start 
+let msg4 = "Hello \%name!" // Escape the %
+let msg5 = r"Hello %name!" // Raw string
 // Basics
 s.length // Length of string
 s.starts_with(x) bool
@@ -449,15 +365,9 @@ struct Point {
 let point: Point = Point.$default_value
 ```
 
-The function name is unrestricted, but it must be static, return exactly its
-owning type, and not return an error. It may take arguments as long as every
-argument declares a default value; those defaults are used whenever the
-compiler invokes the function. Only one `$default` function is allowed per
-type, and the function cannot declare its own generic parameters. Nullable
-types always default to `null`; a
-non-null type's `$default` function is not called for `?Type.$default_value`.
-An omitted non-null property also uses its type's `$default` function unless
-the property declaration supplies its own explicit default.
+The function must be static and return its own type. Its arguments, if any,
+must have default values. Omitted non-null properties use the same default;
+nullable types default to `null`.
 
 ### Deferred calls
 
@@ -473,23 +383,9 @@ fn use_resource(resource: Resource) {
 }
 ```
 
-Calls run in last-in, first-out order. A defer is registered only when execution
-reaches it, so defer statements in conditions and loops behave dynamically:
-
-```rust
-fn example(enabled: bool) {
-    defer println("first")
-    if enabled : defer println("conditional")
-    defer println("last")
-    // enabled: prints last, conditional, first
-}
-```
-
-Referenced local values are captured when the defer statement is reached. The
-call itself runs later. Deferred calls run for explicit and implicit returns,
-and when an error is returned with `throw` or `!>`. If a deferred call can
-return an error, handle it at the defer statement with `_`, `!!`, `!?`, or an
-error block; it cannot pass a new error after the function has begun returning.
+Deferred calls run in reverse order when the function returns or passes an
+error to its caller. Values are captured when `defer` is reached. If the call
+can return an error, handle it on the `defer` line.
 
 ### Errors
 
@@ -651,7 +547,7 @@ fn main() {
     let u = User {
         first_name: "John"
     }
-    u.last_name += " The Geat"
+    u.last_name += " The Great"
     u.print_name() // output: John Doe The Great
     User.my_static_function() // output: Hello from my static function
 }
@@ -742,7 +638,8 @@ In other words, `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)` wh
 
 ## Modes
 
-With `mode` you can write a wrapper around an existing class. Allowing you to overwrite functions for custom behaviour. You cannot add new properties. Mode types are always compatible with its base type.
+Use `mode` to wrap an existing class and change its behavior. A mode cannot add
+properties and remains compatible with its base type.
 
 ```rust
 mode LowerCaseString for String {
@@ -811,7 +708,7 @@ each m as v {
 
 ## Null-checking
 
-When having a value with a nullable type e.g. `?String`, we often need to prove to the compiler it's not `null` before being able to use it.
+Before using a nullable value such as `?String`, check that it is not `null`.
 
 ```rust
 fn print(msg: ?String) {
@@ -833,7 +730,7 @@ fn print(msg: ?String) {
 
 API for [valk:fs](api.md#fs)
 
-use `valk:fs` to access all file system related functions
+Use `valk:fs` for file-system operations.
 
 ## Paths
 
@@ -857,144 +754,83 @@ fn main() {
 
 API for [valk:json](api.md#json)
 
-`json:Value` is a tagged union containing `String`, `int`, `float`, `bool`,
-`json:ArrayValue`, `json:ObjectValue`, or `null`. Scalar alternatives retain
-their own types; the array and object wrappers make recursive documents
-possible and provide type-safe mutation methods.
-
-Because it is an ordinary tagged union, code that needs to handle every JSON
-kind can match it directly and gets the usual exhaustiveness checking:
-
-```rust
-fn describe(value: json:Value) String {
-    return match value : String {
-        null => "null"
-        String as _ => "string"
-        int as _ => "integer"
-        float as _ => "float"
-        bool as _ => "boolean"
-        json:ArrayValue as _ => "array"
-        json:ObjectValue as _ => "object"
-    }
-}
-```
-
 ```rust
 use valk:json
 
 let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
-let name = document.get("name").string()
+let name = document["name"].string()
 let age = document.get("age").int()
-
-// Bracket access is equivalent to get().
-let first = document["user"]["name"]["first"].string()
-
 document = document.set("active", true)
-let encoded = json:encode(document)
+println(json:encode(document))
 ```
 
-`get()` and bracket access are safe: missing keys and invalid paths produce
-`null`. Typed accessors such as `.string()`, `.int()`, `.float()`, and `.bool()`
-always return their type's zero value when the value is missing or has another
-type. Arrays and objects return empty containers in the same situation.
-`length()` always returns a `uint`, and returns `0` for `null` and scalar values.
-For `get()`, `has()`, `set()`, and `remove()`, `String` keys address object
-properties and `uint` keys address array indexes. `set()` creates the required
-container when needed and fills skipped array positions with `null`. `append()`
-and `prepend()` likewise create an array when needed. `remove()` is safe when
-the key or container does not exist.
+Both `get()` and bracket access are safe when a path is missing. Use typed
+accessors such as `.string()`, `.int()`, `.float()`, and `.bool()` to read a
+value.
 
-Create JSON values with `json:new_null()`, `json:new_string(value)`,
-`json:new_int(value)`, `json:new_float(value)`, and `json:new_bool(value)`.
-Create mutable containers with `json:new_object()` and `json:new_array()`:
+Use `json:new_object()` and `json:new_array()` to build a document:
 
 ```rust
-let missing = json:new_null()
-let answer = json:new_int(42)
-let message = json:new_string("hello")
-let enabled = json:new_bool(true)
 let object = json:new_object()
-object.set("hello", "world")
+object.set("name", "Alice")
 
 let items = json:new_array()
 items.append(1)
-items.append(null)
 object.set("items", items)
 
 println(json:encode(object, true))
 ```
 
-Structural values can be converted to and from the JSON DOM. Conversion from
-JSON is fallible because missing properties and incompatible JSON types are
-reported instead of silently becoming zero or an empty string.
-
-```rust
-class Data {
-    hello: String
-}
-
-let value = json:from(Data { hello: "world" })
-let text = json:encode(value)
-let decoded = json:decode(text) ! panic("Invalid JSON")
-let data = json:from_value[Data](decoded) ! panic("Invalid Data document")
-```
-
-Use `json:encode_to(value, buffer)` to append JSON directly to an existing
-`ByteBuffer`. Run `make bench-json` for parsing, encoding, traversal, and
-retained-memory measurements of the union representation.
+`json:from(value)` converts classes and other values to JSON.
+`json:from_value[T](value)` converts JSON back to a Valk type and returns an
+error when the document does not match that type.
 
 ## Coroutines
 
-With coroutines we can run multiple functions at the same time on a single thread.
+Coroutines let multiple functions make progress on one thread.
 
 ```rust
-// By using `co` we are able to send both requests at the same time
-// Instead of waiting for request_1 to finish before starting request_2
 let request_1 = co http:request("GET", "http://some-website/api/endpoint1")
 let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
-// Now we `await` the results
-// Because `http:request` can fail we must also do some error handling
 let response_1 = await request_1 !? http:Response.empty(400)
 let response_2 = await request_2 !? http:Response.empty(400)
 ```
 
-It can be used on any function.
+Use `co` to start a coroutine and `await` to wait for its result.
 
 ```rust
-fn hi() { println("Hello") } 
+fn hi() { println("Hello") }
 fn main() {
-    hi() // Normal function call
-    co hi() // Run function call in a coroutine
-    let task = co hi() // Same
-    await task // Wait until it's finished
-    await co fn(){ hi() }() // Makes no sense, but you can and it works
+    let task = co hi()
+    await task
 }
 ```
 
 
 ## Access types
 
-With access types we control who can access what. By default your declared types, functions, properties, etc. are public, but we can use `-` (private) and `~` (readonly) to limit the access to them.
+Declarations are package-private by default. Use `+` to make a declaration
+public to other packages. Use `~` for values that other packages may read but
+not change. `-` explicitly marks a declaration as package-private.
 
 ```rust
-fn ... // default (public within your own package, private outside the package)
-+ fn ... // public everywhere
-- fn ... // private everywhere
+fn helper() {}       // Package-private by default
+- fn internal() {}   // Explicitly package-private
++ fn public_api() {} // Public to other packages
 
-class MyClass {
-    {prop-name}: ... // default
-    + {prop-name}: ... // public
-    - {prop-name}: ...    // private
-    ~ {prop-name}: ...    // readonly
+class Config {
+    value: int         // Package-private by default
+    - secret: String   // Explicitly package-private
+    + name: String     // Public
+    ~ version: String  // Read-only outside the package
 }
-
-// Advanced
--[ns+] // Private, but public in it's own namespace
--[pkg+] // Private, but public in it's own package (The default access type)
--[pkg~ns+] // Private, readonly in own package, public in own namespace
 ```
 
-For rare cases when you want to ignore access types, you can type `@ignore_access` at the top of file.
+`-` is not class- or file-private: other code in the same package can still
+access the declaration.
+
+Low-level code can place `@ignore_access` at the top of a file to bypass access
+checks.
 
 ## Value scopes
 
@@ -1103,7 +939,7 @@ API for [valk:http](api.md#http)
 
 ### HTTP Client
 
-With `valk:http` you can send HTTP requests to APIs or download files from a url.
+With `valk:http` you can send HTTP requests or download files from a URL.
 
 ```rust
 // Send basic request
@@ -1123,7 +959,7 @@ http:download(url, to_path) ! panic("Failed to download file")
 
 ### HTTP Server
 
-```js
+```rust
 use valk:http
 
 fn handler(req: http:Request) http:Response {
@@ -1393,8 +1229,6 @@ vman remove {pkg} # Remove a package
 ```
 
 Project: [Link](https://github.com/valk-lang/vman)
-
-## Misc
 
 ## Data races
 
