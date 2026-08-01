@@ -931,7 +931,7 @@ alias pid_t for i32
     + query_data: ?Map[String]
     + verify_ssl_cert: bool
 
-    + fn clear_headers(key: String, value: String) Options
+    + fn clear_headers() Options
     + fn get_headers() Map[String]
     + fn set_header(key: String, value: String) Options
     + fn set_headers(headers: Map[String]) Options
