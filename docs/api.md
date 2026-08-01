@@ -642,8 +642,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'crypto'
 
 ```js
-+ fn base64_decode(str: String) String
-+ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void
++ fn base64_decode(str: String) String !CryptoError
++ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void !CryptoError
 + fn base64_encode(str: String) String
 + fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void
@@ -1341,8 +1341,8 @@ alias FD for i32
     + fn email() Field
     + fn equals_string(str: ?String) Field
     + static fn float() Field
-    + fn fmax(val: int) Field
-    + fn fmin(val: int) Field
+    + fn fmax(val: float) Field
+    + fn fmin(val: float) Field
     + fn get_form_rules() Value
     + static fn int() Field
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) Field
