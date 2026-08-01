@@ -85,28 +85,30 @@ if [[ "$coro_marker" != *"ptr %frame.values, i64 0"* ]] \
     exit 1
 fi
 
-echo "> Keep inline nullable and multi-value GC layouts byte-accurate"
+echo "> Keep inline nullable and multi-value GC layouts naturally aligned"
 
 layout_body=$(sed -n '/^define .*__inline_layout_roots__/,/^}/p' "$ir")
 layout_marker=$(sed -n '/^define internal void @"valk\.gc\.stack\.marker\.func\..*__inline_layout_roots__/,/^}/p' "$ir")
-layout_union=$(sed -n '/^define .*__packed_layout_union__/,/^}/p' "$ir")
+layout_union=$(sed -n '/^define .*__aligned_layout_union__/,/^}/p' "$ir")
 layout_marker_calls=$(grep -c 'call void .*collect_stack_item' <<< "$layout_marker")
+layout_eight_offsets=$(grep -c 'getelementptr i8, ptr .*i64 8' <<< "$layout_marker")
+layout_one_offsets=$(grep -c 'getelementptr i8, ptr .*i64 1$' <<< "$layout_marker")
 
-if [[ "$layout_body" != *"[2 x <{ i1, [7 x i8], [8 x i8] }>]"* ]] \
+if [[ "$layout_body" != *"[2 x { i1, [7 x i8], [8 x i8] }]"* ]] \
     || [[ "$layout_body" != *"alloca { ptr, ptr, [56 x i8] }"* ]] \
-    || [[ "$layout_union" != *"insertvalue <{ i8, ptr }>"* ]] \
-    || [[ "$layout_union" != *"store <{ i8, ptr }>"* ]]; then
-    echo "# Inline nullable or packed multi-value storage disagreed with its byte layout"
+    || [[ "$layout_union" != *"insertvalue { i1, ptr }"* ]] \
+    || [[ "$layout_union" != *"store { i1, ptr }"* ]]; then
+    echo "# Inline nullable or naturally aligned multi-value storage disagreed with its byte layout"
     exit 1
 fi
 
 if [[ "$layout_marker" != *"i32 0, i32 2"* ]] \
     || [[ "$layout_marker" != *"ptr %frame.values, i64 32"* ]] \
-    || [[ "$layout_marker" != *"i64 8"* ]] \
-    || [[ "$layout_marker" != *"i64 1"* ]] \
-    || [[ "$layout_marker" != *"load ptr"*"align 1"* ]] \
+    || [ "$layout_eight_offsets" -ne 2 ] \
+    || [ "$layout_one_offsets" -ne 0 ] \
+    || [[ "$layout_marker" != *"load ptr"*"align 8"* ]] \
     || [ "$layout_marker_calls" -ne 3 ]; then
-    echo "# Generated frame marker did not follow the inline nullable / multi-value layout"
+    echo "# Generated frame marker did not follow the aligned inline nullable / multi-value layout"
     echo "$layout_marker"
     exit 1
 fi

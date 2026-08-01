@@ -44,4 +44,7 @@ io uring does not work in a sandbox environment.
 
 - If 2 functions do or almost do the exact same thing, try converting them into 1 function
 - Try avoiding concatenating strings in the IR gen, prefer adding directly to the ByteBuffer
+- Always try to make things memory aligned when possible unless the code specificly tells the compiler for it to be packed
+- Try caching data that's calculated by a function but never or almost never changes
+- Performance is important
 

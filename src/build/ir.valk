@@ -99,7 +99,10 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
         if !global.shared : out.write_string("thread_local(initialexec) ")
         out.write_string("global ")
         out.write_string(ir_type(type) !>)
-        if !external : out.write_string(" zeroinitializer")
+        if !external {
+            out.write_string(" zeroinitializer, align ")
+            out.write_uint_ascii((type.storage_alignment() !>).to(uint))
+        }
         out.write_string("\n")
     }
     each unit.extern_globals as global {
@@ -675,6 +678,16 @@ fn ir_decl_uses_gc_stack(func: Func, decl: Decl) bool {
     return isset(decl.gc_stack_offset)
 }
 
+// Alignment that remains guaranteed after adding a byte offset to an address.
+// All compiler-selected storage alignments are powers of two, so repeatedly
+// halving produces the greatest alignment LLVM may safely assume.
+fn ir_offset_alignment(base_alignment: u32, offset: u32) u32 {
+    let alignment = base_alignment
+    if alignment <= 1 || offset == 0 : return alignment
+    while alignment > 1 && offset % alignment != 0 : alignment /= 2
+    return alignment
+}
+
 fn ir_visit_gc_field(
     ir: IRFunc,
     value: ?Value,
@@ -683,7 +696,8 @@ fn ir_visit_gc_field(
     owner: String,
     list: String,
     callback_target: String,
-    callback_data: String
+    callback_data: String,
+    alignment: u32
 ) !Error {
     if action == "remove" {
         let source = value
@@ -698,10 +712,7 @@ fn ir_visit_gc_field(
     }
 
     let pointer = ir.var()
-    // Managed fields may live in legacy packed class bodies or packed
-    // multi-values. Their byte offset is authoritative; never promise LLVM a
-    // stronger alignment than the representation guarantees.
-    ir.line(pointer + " = load ptr, ptr " + address + ", align 1")
+    ir.line(pointer + " = load ptr, ptr " + address + ", align " + alignment)
     pointer = ir_union_clean_gc_pointer(ir, pointer)
     if action == "mark" {
         let present = ir.var()
@@ -722,7 +733,7 @@ fn ir_visit_gc_field(
         if !isset(source) : ir.func.exp.bug("GC field share is missing its source value")
         ir_emit_gc_share_null_check(ir, source, pointer) !>
     } else {
-        ir.line("store ptr " + pointer + ", ptr " + address)
+        ir.line("store ptr " + pointer + ", ptr " + address + ", align " + alignment)
     }
 }
 
@@ -738,10 +749,11 @@ fn ir_visit_type_gc_fields(
     owner: String (""),
     list: String (""),
     callback_target: String (""),
-    callback_data: String ("")
+    callback_data: String (""),
+    alignment: u32 (1)
 ) !Error {
     if type.is_gc_type() {
-        ir_visit_gc_field(ir, value, address, action, owner, list, callback_target, callback_data) !>
+        ir_visit_gc_field(ir, value, address, action, owner, list, callback_target, callback_data, alignment) !>
         return
     }
 
@@ -749,20 +761,22 @@ fn ir_visit_type_gc_fields(
     if t.type == TYPE.fn {
         let environment = ir.var()
         ir.line(environment + " = getelementptr i8, ptr " + address + ", i64 " + t.ptr_size())
-        ir_visit_gc_field(ir, value, environment, action, owner, list, callback_target, callback_data) !>
+        let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
+        ir_visit_gc_field(ir, value, environment, action, owner, list, callback_target, callback_data, inner_alignment) !>
         return
     }
 
     if type.is_nullable_type() && ir_is_tagged_nullable(type) {
         let present = ir.var()
-        ir.line(present + " = load i1, ptr " + address)
+        ir.line(present + " = load i1, ptr " + address + ", align " + alignment)
         let yes = ir.block("fields.nullable.present")
         let after = ir.block("fields.nullable.after")
         ir.cond_jump(present, yes, after)
         ir.label(yes)
         let inner = ir.var()
         ir.line(inner + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 2")
-        ir_visit_type_gc_fields(ir, value, t, inner, action, owner, list, callback_target, callback_data) !>
+        let inner_alignment = ir_offset_alignment(alignment, type.ptr_size())
+        ir_visit_type_gc_fields(ir, value, t, inner, action, owner, list, callback_target, callback_data, inner_alignment) !>
         ir.jump(after)
         ir.label(after)
         return
@@ -772,7 +786,7 @@ fn ir_visit_type_gc_fields(
         let members = t.sub_types
         if !isset(members) : return
         let tag = ir.var()
-        ir.line(tag + " = load i64, ptr " + address + ", align 1")
+        ir.line(tag + " = load i64, ptr " + address + ", align " + alignment)
         let after = ir.block("fields.union.after")
         let emitted = false
         each members as member, member_index {
@@ -787,7 +801,8 @@ fn ir_visit_type_gc_fields(
             let payload = ir.var()
             let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
             ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
-            ir_visit_type_gc_fields(ir, value, member, payload, action, owner, list, callback_target, callback_data) !>
+            let payload_alignment = ir_offset_alignment(alignment, payload_offset)
+            ir_visit_type_gc_fields(ir, value, member, payload, action, owner, list, callback_target, callback_data, payload_alignment) !>
             ir.jump(after)
             ir.label(next)
         }
@@ -801,14 +816,15 @@ fn ir_visit_type_gc_fields(
         if !isset(sub) : return
         let class = sub.get_class_or_null()
         if !isset(class) {
-            ir_visit_type_gc_fields(ir, value, sub, address, action, owner, list, callback_target, callback_data) !>
+            ir_visit_type_gc_fields(ir, value, sub, address, action, owner, list, callback_target, callback_data, alignment) !>
             return
         }
         each class.props as prop {
             if !prop.type.has_gc_refs() : continue
             let field = ir.var()
             ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
-            ir_visit_type_gc_fields(ir, value, prop.type, field, action, owner, list, callback_target, callback_data) !>
+            let field_alignment = ir_offset_alignment(alignment, prop.offset)
+            ir_visit_type_gc_fields(ir, value, prop.type, field, action, owner, list, callback_target, callback_data, field_alignment) !>
         }
         return
     }
@@ -821,8 +837,10 @@ fn ir_visit_type_gc_fields(
         let i: u32 = 0
         while i < t.array_size {
             let element = ir.var()
-            ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + (stride * i))
-            ir_visit_type_gc_fields(ir, value, sub, element, action, owner, list, callback_target, callback_data) !>
+            let element_offset = stride * i
+            ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + element_offset)
+            let element_alignment = ir_offset_alignment(alignment, element_offset)
+            ir_visit_type_gc_fields(ir, value, sub, element, action, owner, list, callback_target, callback_data, element_alignment) !>
             i++
         }
         return
@@ -833,10 +851,12 @@ fn ir_visit_type_gc_fields(
         if !isset(members) : return
         let offset: u32 = 0
         each members as member {
+            offset = member.ir_align_offset(offset) !>
             if member.has_gc_refs() {
                 let field = ir.var()
                 ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
-                ir_visit_type_gc_fields(ir, value, member, field, action, owner, list, callback_target, callback_data) !>
+                let field_alignment = ir_offset_alignment(alignment, offset)
+                ir_visit_type_gc_fields(ir, value, member, field, action, owner, list, callback_target, callback_data, field_alignment) !>
             }
             offset += member.size() !>
         }
@@ -861,11 +881,12 @@ fn ir_gc_stack_append_type_layout(
     type: Type,
     frame_size: uint
 ) uint !Error {
-    let alignment = type.largest_property_offset() !>.to(uint)
+    let size = (type.size() !>).to(uint)
+    let alignment = type.storage_alignment() !>.to(uint)
     if alignment > 0 : frame_size = frame_size.round_up(alignment)
     types.append(type)
     offsets.append(frame_size)
-    return frame_size + (type.size() !>).to(uint)
+    return frame_size + size
 }
 
 fn ir_gc_stack_collect_func(ir: IRFunc) Func !Error {
@@ -905,7 +926,8 @@ fn ir_gc_stack_mark_address(ir: IRFunc, type: Type, address: String, collect: Fu
         "",
         "",
         "@\"" + func_ir_name(collect) + "\"",
-        "\%gc"
+        "\%gc",
+        type.storage_alignment() !>
     ) !>
 }
 
@@ -1227,12 +1249,11 @@ fn global_ir_name(global: Global) String {
 fn ir_type(type: Type) String !Error {
     let t = type.get_non_nullable()
     if ir_is_tagged_nullable(type) {
-        // Keep the classic pointer-sized presence header explicit. Relying on
-        // LLVM's natural padding was not enough for byte-array inline values:
-        // `{ i1, [N x i8] }` has no padding and therefore disagreed with
-        // Type.size() and fixed-array strides.
+        // Keep the pointer-sized presence header explicit, then let LLVM align
+        // the payload and the aggregate naturally. The explicit byte padding
+        // is still required when the payload itself is a byte-array value.
         let padding = type.ptr_size() - 1
-        return "<{ i1, [" + padding + " x i8], " + (ir_type(t) !>) + " }>"
+        return "{ i1, [" + padding + " x i8], " + (ir_type(t) !>) + " }"
     }
     if t.type == TYPE.fn : return "{ ptr, ptr }"
     if t.type == TYPE.union {
@@ -1277,15 +1298,14 @@ fn ir_type(type: Type) String !Error {
             let first = subs.get(0) !? null
             if isset(first) : return ir_type(first) !>
         }
-        // Multi-values use the language's packed, copy-by-value layout. This
-        // makes Type.size() (the sum of member sizes) authoritative and keeps
-        // union payloads and recursive marker offsets byte-for-byte identical.
-        let out = "<{ "
+        // Multi-values use LLVM's natural aggregate layout. Type.size() and
+        // every byte-offset consumer use Type.ir_alignment() to mirror it.
+        let out = "{ "
         each subs as sub, i {
             if i > 0 : out += ", "
             out += ir_type(sub) !>
         }
-        return out + " }>"
+        return out + " }"
     }
     // Inline class/struct storage.
     if t.type == TYPE.class {
@@ -4055,14 +4075,15 @@ fn ir_coro_append_type_roots(
     value: Value,
     type: Type,
     address: String,
-    gc_args: String
+    gc_args: String,
+    alignment: u32 (1)
 ) !Error {
     let root_count = type.gc_root_count() !>
     if root_count == 0 : return
 
     if type.is_gc_type() {
         let pointer = ir.var()
-        ir.line(pointer + " = load ptr, ptr " + address)
+        ir.line(pointer + " = load ptr, ptr " + address + ", align " + alignment)
         pointer = ir_union_clean_gc_pointer(ir, pointer)
         ir_coro_append_gc(ir, value, gc_args, pointer) !>
         return
@@ -4073,7 +4094,8 @@ fn ir_coro_append_type_roots(
         let environment_address = ir.var()
         ir.line(environment_address + " = getelementptr i8, ptr " + address + ", i64 " + t.ptr_size())
         let environment = ir.var()
-        ir.line(environment + " = load ptr, ptr " + environment_address)
+        let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
+        ir.line(environment + " = load ptr, ptr " + environment_address + ", align " + inner_alignment)
         environment = ir_union_clean_gc_pointer(ir, environment)
         ir_coro_append_gc(ir, value, gc_args, environment) !>
         return
@@ -4081,7 +4103,7 @@ fn ir_coro_append_type_roots(
 
     if type.is_nullable_type() && ir_is_tagged_nullable(type) {
         let present = ir.var()
-        ir.line(present + " = load i1, ptr " + address)
+        ir.line(present + " = load i1, ptr " + address + ", align " + alignment)
         let yes = ir.block("coro.roots.nullable.present")
         let no = ir.block("coro.roots.nullable.absent")
         let after = ir.block("coro.roots.nullable.after")
@@ -4089,7 +4111,8 @@ fn ir_coro_append_type_roots(
         ir.label(yes)
         let inner = ir.var()
         ir.line(inner + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 2")
-        ir_coro_append_type_roots(ir, value, t, inner, gc_args) !>
+        let inner_alignment = ir_offset_alignment(alignment, type.ptr_size())
+        ir_coro_append_type_roots(ir, value, t, inner, gc_args, inner_alignment) !>
         ir.jump(after)
         ir.label(no)
         ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
@@ -4105,7 +4128,7 @@ fn ir_coro_append_type_roots(
             return
         }
         let tag = ir.var()
-        ir.line(tag + " = load i64, ptr " + address)
+        ir.line(tag + " = load i64, ptr " + address + ", align " + alignment)
         let after = ir.block("coro.roots.union.after")
         each members as member, member_index {
             let yes = ir.block("coro.roots.union.member")
@@ -4119,7 +4142,8 @@ fn ir_coro_append_type_roots(
                 let payload = ir.var()
                 let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
                 ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
-                ir_coro_append_type_roots(ir, value, member, payload, gc_args) !>
+                let payload_alignment = ir_offset_alignment(alignment, payload_offset)
+                ir_coro_append_type_roots(ir, value, member, payload, gc_args, payload_alignment) !>
             }
             ir_coro_append_null_roots(ir, value, gc_args, root_count - member_roots) !>
             ir.jump(after)
@@ -4141,14 +4165,15 @@ fn ir_coro_append_type_roots(
         }
         let class = sub.get_class_or_null()
         if !isset(class) {
-            ir_coro_append_type_roots(ir, value, sub, address, gc_args) !>
+            ir_coro_append_type_roots(ir, value, sub, address, gc_args, alignment) !>
             return
         }
         each class.props as prop {
             if !prop.type.has_gc_refs() : continue
             let field = ir.var()
             ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
-            ir_coro_append_type_roots(ir, value, prop.type, field, gc_args) !>
+            let field_alignment = ir_offset_alignment(alignment, prop.offset)
+            ir_coro_append_type_roots(ir, value, prop.type, field, gc_args, field_alignment) !>
         }
         return
     }
@@ -4164,8 +4189,10 @@ fn ir_coro_append_type_roots(
         while i < t.array_size {
             if sub.has_gc_refs() {
                 let element = ir.var()
-                ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + (stride * i))
-                ir_coro_append_type_roots(ir, value, sub, element, gc_args) !>
+                let element_offset = stride * i
+                ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + element_offset)
+                let element_alignment = ir_offset_alignment(alignment, element_offset)
+                ir_coro_append_type_roots(ir, value, sub, element, gc_args, element_alignment) !>
             }
             i++
         }
@@ -4180,10 +4207,12 @@ fn ir_coro_append_type_roots(
         }
         let offset: u32 = 0
         each members as member {
+            offset = member.ir_align_offset(offset) !>
             if member.has_gc_refs() {
                 let field = ir.var()
                 ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
-                ir_coro_append_type_roots(ir, value, member, field, gc_args) !>
+                let field_alignment = ir_offset_alignment(alignment, offset)
+                ir_coro_append_type_roots(ir, value, member, field, gc_args, field_alignment) !>
             }
             offset += member.size() !>
         }
@@ -4280,6 +4309,8 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
         if type.is_gc_type() {
             ir_coro_append_gc(ir, value, gc_args, rendered) !>
         } else {
+            let alignment = type.storage_alignment() !>.to(uint)
+            if alignment > 1 : offset = offset.round_up(alignment)
             let address = ir.var()
             ir.line_start()
             ir.write(address)
@@ -4295,9 +4326,11 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
             ir.write(rendered)
             ir.write(", ptr ")
             ir.write(address)
+            ir.write(", align ")
+            ir.write_uint(alignment)
             ir.line_end()
             if type.has_gc_refs() {
-                ir_coro_append_type_roots(ir, value, type, address, gc_args) !>
+                ir_coro_append_type_roots(ir, value, type, address, gc_args, alignment.to(u32)) !>
             }
             offset += type.size() !>
         }
@@ -4504,6 +4537,8 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             ir.write(root_address)
             ir.line_end()
         } else {
+            let alignment = type.storage_alignment() !>.to(uint)
+            if alignment > 1 : offset = offset.round_up(alignment)
             let address = ir.var()
             ir.line_start()
             ir.write(address)
@@ -4519,6 +4554,8 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             ir.write(ir_type(type) !>)
             ir.write(", ptr ")
             ir.write(address)
+            ir.write(", align ")
+            ir.write_uint(alignment)
             ir.line_end()
             let embedded_roots = type.gc_root_count() !>
             if embedded_roots > 0 {
@@ -4635,6 +4672,8 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             ir.line_end()
             ir_coro_append_gc(ir, value, gc_args, rendered) !>
         } else {
+            let alignment = type.storage_alignment() !>.to(uint)
+            if alignment > 1 : result_offset = result_offset.round_up(alignment)
             let address = ir.var()
             ir.line_start()
             ir.write(address)
@@ -4665,9 +4704,11 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             ir.write(rendered)
             ir.write(", ptr ")
             ir.write(address)
+            ir.write(", align ")
+            ir.write_uint(alignment)
             ir.line_end()
             if embedded_roots > 0 {
-                ir_coro_append_type_roots(ir, value, type, root_address, gc_args) !>
+                ir_coro_append_type_roots(ir, value, type, root_address, gc_args, type.storage_alignment() !>) !>
             }
             result_offset += type.size() !>
         }
@@ -4758,6 +4799,8 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
             rendered = ir_coro_get_gc(ir, value, gc_args, gc_index) !>
             gc_index++
         } else {
+            let alignment = type.storage_alignment() !>.to(uint)
+            if alignment > 1 : offset = offset.round_up(alignment)
             let address = ir.var()
             ir.line_start()
             ir.write(address)
@@ -4773,6 +4816,8 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
             ir.write(ir_type(type) !>)
             ir.write(", ptr ")
             ir.write(address)
+            ir.write(", align ")
+            ir.write_uint(alignment)
             ir.line_end()
             offset += type.size() !>
             // Embedded results occupy fixed side-table entries even though
