@@ -110,7 +110,7 @@ test-gc-debug: valk
 
 test-gc-shared-stress: valk
 	mkdir -p ./debug
-	./valk build ./tests/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress --def "GC_DEBUG=1"
+	./valk build ./tests/src/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress --def "GC_DEBUG=1"
 	@run=0; while [ $$run -lt 10 ]; do \
 		run=$$((run + 1)); \
 		echo "Shared GC stress run $$run/10"; \

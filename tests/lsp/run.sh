@@ -236,7 +236,7 @@ check "definition inside a test body" '"line":0' \
 # A method reference inside a test body exercises both the test-body loading
 # path and ordinary class-member definition resolution.
 check "definition of a method inside a test body" '"line":225' \
-    "$(request textDocument/definition ../../tests/validate.valk 183 20)"
+    "$(request textDocument/definition ../../tests/src/validate.valk 183 20)"
 
 # Cursor inside helper's argument list: the second argument is active
 check "signature help" '"label":"fn(count: uint, label: String) String"' \
