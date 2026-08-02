@@ -23,6 +23,7 @@ global timer_id : uint
 
 #if OS == "win"
 global cport : ?ptr
+global sleep_coros : Array[Coro] (.new(16))
 #end
 
 struct CoroState {
@@ -57,6 +58,10 @@ class Coro {
     // stable coroutine object instead.
     timeout_ts: <io:kernel_timespec> (@undefined)
     #elif OS == "win"
+    // Monotonic scheduler deadline in milliseconds. Windows sleeps are
+    // integrated into the IOCP wait rather than represented by a kernel timer
+    // completion packet.
+    sleep_deadline_ms: u64 (0)
     // Windows retains the OVERLAPPED pointer until an IOCP completion arrives.
     // Coroutine locals are on the shared stack and cannot back asynchronous
     // state, so reserve stable per-coroutine storage for the largest overlap
@@ -175,47 +180,13 @@ class Coro {
         ext:kevent(kq, @ref(ev), 1, null, 0, null)
 
         #else
-        let timer = ext:CreateWaitableTimerExW(null, null, 0, ext:TIMER_ALL_ACCESS)
-        if timer == 0 : return
-
-        let due : i64 = (ns.to(int) / 100) * -1
-        let ok = ext:SetWaitableTimer(timer, &due, 0, null, null, false)
-        if !ok {
-            ext:CloseHandle(timer)
-            return
-        }
-
-        let wcp : ext:HANDLE = 0
-        let status = ext:NtCreateWaitCompletionPacket(&wcp, ext:MAXIMUM_ALLOWED, null)
-        if status != 0 {
-            ext:CloseHandle(timer)
-            return
-        }
-
-        let ov = io:overlap[io:OverlapData]()
-
-        let sig : bool = false
-        status = ext:NtAssociateWaitCompletionPacket(wcp, io:iocp(), timer, null, ov, ext:STATUS_SUCCESS, 0, &sig)
-        if status != 0 {
-            ext:CloseHandle(wcp)
-            ext:CloseHandle(timer)
-            return
-        }
-
-        // The timer may expire between SetWaitableTimer and association. In
-        // that case Windows reports it through AlreadySignaled and no later
-        // completion is guaranteed, so the sleep has already completed.
-        if sig {
-            ext:CloseHandle(wcp)
-            ext:CloseHandle(timer)
-            return
-        }
-
+        let delay_ms = (ns.to(u64) + 999_999) / 1_000_000
+        this.sleep_deadline_ms = ext:GetTickCount64() + delay_ms
+        sleep_coros.append(this)
         #end
         this.yield()
         #if OS == "win"
-        ext:CloseHandle(wcp)
-        ext:CloseHandle(timer)
+        this.sleep_deadline_ms = 0
         #end
     }
 
@@ -409,19 +380,21 @@ class Coro {
 
             #elif OS == "win"
             gc:unlock()
+            win_wake_sleepers()
             let first = run_coros.length == 0
+            let wait_ms = first ? win_sleep_timeout() : 0
 
             while true {
                 let bytes: u32 = 0
                 let key: uint = 0
                 let ov: ?io:OverlapData = null
-                let result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, first ? ext:INFINITE : 0)
+                let result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, wait_ms)
                 // A failed asynchronous operation is still a completed
                 // operation. GetQueuedCompletionStatus returns false for it,
                 // but supplies its OVERLAPPED pointer so the waiting
                 // coroutine can observe the error and continue.
                 if !isset(ov) : break
-                first = false
+                wait_ms = 0
                 let coro = ov.base.coro.@cast(Coro)
                 coro.completion_res = bytes
                 run_coros.append(coro)
@@ -434,3 +407,42 @@ class Coro {
         }
     }
 }
+
+#if OS == "win"
+// Move due scheduler timers onto the normal coroutine run queue. The array is
+// also the GC root that keeps sleeping coroutines alive while they are yielded.
+fn win_wake_sleepers() {
+    let now = ext:GetTickCount64()
+    let i: uint = 0
+    while i < sleep_coros.length {
+        let coro = sleep_coros.get(i) !? null
+        if !isset(coro) {
+            sleep_coros.remove(i)
+            continue
+        }
+        if coro.done || coro.sleep_deadline_ms <= now {
+            sleep_coros.remove(i)
+            if !coro.done : run_coros.append(coro)
+            continue
+        }
+        i++
+    }
+}
+
+// Return the nearest sleep deadline for GetQueuedCompletionStatus. A zero
+// timeout is handled by the run queue before this function is called.
+fn win_sleep_timeout() u32 {
+    if sleep_coros.length == 0 : return ext:INFINITE
+    let now = ext:GetTickCount64()
+    let nearest: u64 = 0
+    each sleep_coros as coro {
+        if coro.done : continue
+        if coro.sleep_deadline_ms <= now : return 0
+        if nearest == 0 || coro.sleep_deadline_ms < nearest : nearest = coro.sleep_deadline_ms
+    }
+    if nearest == 0 : return ext:INFINITE
+    let delay = nearest - now
+    if delay > 0xffffffff : return 0xffffffff
+    return delay.to(u32)
+}
+#end
