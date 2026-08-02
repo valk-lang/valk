@@ -4,7 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.4
+- Release 0.2.5
+/
 
 # Next steps
 
@@ -33,6 +34,10 @@
 ## Done
 
 ```
++ Release 0.2.4
++ load "define" from config (alternative for --def)
++ valk command output & usage improvements
+
 + Release 0.2.3
 + Json improvements
 + Http lowercase header keys
