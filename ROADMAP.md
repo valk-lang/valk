@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.5
+- Release 0.2.6
 /
 
 # Next steps
@@ -34,6 +34,9 @@
 ## Done
 
 ```
++ Release 0.2.5
++ Bugfixing
+
 + Release 0.2.4
 + load "define" from config (alternative for --def)
 + valk command output & usage improvements
