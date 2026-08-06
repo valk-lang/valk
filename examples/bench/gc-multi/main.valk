@@ -1,0 +1,362 @@
+// Stronger GC comparison suite (Valk).
+// Stresses cases where industry concurrent/tracing GCs usually compete harder:
+//   1. multi-thread local churn   (no sharing — per-thread heaps)
+//   2. multi-thread shared churn  (cross-thread share + shared collect STW)
+//   3. natural pacing             (no forced GC; threshold only)
+//   4. fragmentation / retention  (mixed keep/drop, many rounds)
+//   5. pause proxy                (max batch latency under alloc pressure)
+//   6. sustained live + churn     (natural GC with large live set)
+//
+// Pair with main.go. Prefer wall time + peak memory + max-batch latency over
+// forced-collect rate (that is covered in examples/bench/gc).
+
+use valk:time
+use valk:gc
+use valk:thread
+use valk:core
+
+class Node {
+    next: ?Node
+    payload: uint (0)
+}
+
+class Tree {
+    left: ?Tree
+    right: ?Tree
+    tag: uint (0)
+
+    static fn build(depth: int) Tree {
+        if depth <= 0 : return Tree {}
+        return Tree {
+            left: Tree.build(depth - 1)
+            right: Tree.build(depth - 1)
+        }
+    }
+}
+
+class Keep {
+    items: Array[?Node]
+}
+
+fn print_time(us: uint) {
+    println("time_us:  %us")
+    println("time_ms:  %{ us / 1000 }")
+}
+
+fn header(name: String) {
+    println("")
+    println("=== " + name + " ===")
+}
+
+fn mem_kb() uint {
+    return gc:mem_usage() / 1024
+}
+
+fn peak_kb() uint {
+    return gc:mem_usage_peak / 1024
+}
+
+fn chain(n: uint) Node {
+    let first = Node {}
+    let prev = first
+    let i: uint = 1
+    while i < n {
+        let node = Node { payload: i }
+        prev.next = node
+        prev = node
+        i++
+    }
+    return first
+}
+
+// ---------- 1) Multi-thread local (no share) ----------
+// Each thread allocates short-lived objects only on its own heap.
+
+global g_local_per_thread: uint (2_000_000)
+global g_local_threads: uint (4)
+
+// Global overwrite sink: every alloc escapes, only the last stays live.
+// Matches Go's atomic sink so both sides force real heap/pool traffic.
+global g_sink: ?Node (null)
+
+fn local_worker() {
+    let n = g_local_per_thread
+    let i = n
+    while i-- > 0 {
+        let x = Node { payload: i }
+        g_sink = x
+    }
+}
+
+fn bench_mt_local() {
+    header("mt-local churn (no share)")
+    let threads = g_local_threads
+    let per = g_local_per_thread
+
+    let start = time:microtime()
+    let tt = Array[thread:Thread]{}
+    let t: uint = 0
+    while t < threads {
+        let thr = thread:start(fn() {
+            local_worker()
+        }) ! panic("thread start failed")
+        tt.append(thr)
+        t++
+    }
+    each tt as thr {
+        thr.wait()
+    }
+    let us = time:microtime() - start
+
+    println("threads:  %threads")
+    println("per_thr:  %per")
+    println("total:    %{ threads * per }")
+    print_time(us)
+    println("rate:     %{ threads * per * 1000 / (us + 1) } allocs/ms")
+    println("mem_kb:   %{ mem_kb() }")
+    println("peak_kb:  %{ peak_kb() }")
+}
+
+// ---------- 2) Multi-thread shared publish/replace ----------
+// Threads replace a shared tree root under a mutex — forces share + shared GC.
+
+@shared g_shared_root: ?Tree (null)
+@shared g_shared_lock: core:SyncMutex (core:SyncMutex.new())
+global g_shared_threads: uint (4)
+global g_shared_iters: uint (80)
+global g_shared_depth: int (10)
+
+fn shared_worker() {
+    let iters = g_shared_iters
+    let depth = g_shared_depth
+    let i: uint = 0
+    while i < iters {
+        let t = Tree.build(depth)
+        g_shared_lock.lock()
+        g_shared_root = t
+        g_shared_lock.unlock()
+        i++
+    }
+}
+
+fn bench_mt_shared() {
+    header("mt-shared publish/replace")
+    let threads = g_shared_threads
+    let iters = g_shared_iters
+    let depth = g_shared_depth
+    // ~2^(depth+1)-1 nodes per tree
+    let nodes_per = ((1 << (depth + 1)) - 1).to(uint)
+
+    g_shared_root = null
+    gc:collect_shared()
+    let mem_before = mem_kb()
+
+    let start = time:microtime()
+    let tt = Array[thread:Thread]{}
+    let t: uint = 0
+    while t < threads {
+        let thr = thread:start(fn() {
+            shared_worker()
+        }) ! panic("thread start failed")
+        tt.append(thr)
+        t++
+    }
+    each tt as thr {
+        thr.wait()
+    }
+    // Drop last shared graph and reclaim.
+    g_shared_lock.lock()
+    g_shared_root = null
+    g_shared_lock.unlock()
+    gc:collect_shared()
+    gc:collect_shared()
+    let us = time:microtime() - start
+
+    println("threads:  %threads")
+    println("iters:    %iters / thread")
+    println("depth:    %depth (~%{ nodes_per } nodes/tree)")
+    println("publishes:%{ threads * iters }")
+    print_time(us)
+    println("mem_kb:   %{ mem_kb() } (before %{ mem_before })")
+    println("peak_kb:  %{ peak_kb() }")
+}
+
+// ---------- 3) Natural pacing (no forced GC mid-run) ----------
+// Mixed short-lived + occasional retain, GC only on allocation thresholds.
+
+fn bench_natural() {
+    header("natural pacing (no forced GC)")
+    let amount: uint = 8_000_000
+    let keep_every: uint = 64
+    let keep = Keep { items: Array[?Node].new(amount / keep_every + 8) }
+
+    let start = time:microtime()
+    let i: uint = 0
+    while i < amount {
+        let n = Node { payload: i }
+        g_sink = n
+        if i % keep_every == 0 {
+            keep.items.append(n)
+        }
+        i++
+    }
+    let us = time:microtime() - start
+
+    // End-of-bench reclaim so later cases start clean-ish (not timed).
+    let kept = keep.items.length
+    keep.items = Array[?Node].new(0)
+
+    println("allocs:   %amount")
+    println("retained: %kept (1/%keep_every)")
+    print_time(us)
+    println("rate:     %{ amount * 1000 / (us + 1) } allocs/ms")
+    println("mem_kb:   %{ mem_kb() }")
+    println("peak_kb:  %{ peak_kb() }")
+}
+
+// ---------- 4) Fragmentation / retention rounds ----------
+// Keep every other node from size-class A, free, then allocate size-class B
+// patterns (via payload-carrying chains of different lengths).
+
+fn bench_fragment() {
+    header("fragmentation / mixed retention")
+    let rounds: uint = 40
+    let batch: uint = 50_000
+
+    let start = time:microtime()
+    let r: uint = 0
+    let checksum: uint = 0
+    while r < rounds {
+        let keep = Keep { items: Array[?Node].new(batch / 2 + 8) }
+        let i: uint = 0
+        while i < batch {
+            // Alternate "small graph" vs "tiny chain" survival patterns.
+            if (r + i) % 2 == 0 {
+                let n = Node { payload: i }
+                g_sink = n
+                if i % 2 == 0 : keep.items.append(n)
+            } else {
+                let a = Node { payload: i }
+                let b = Node { payload: i + 1 }
+                a.next = b
+                g_sink = a
+                if i % 3 == 0 : keep.items.append(a)
+            }
+            i++
+        }
+        checksum += keep.items.length
+        // Drop keep → free survivors of this round.
+        keep.items = Array[?Node].new(0)
+        r++
+    }
+    let us = time:microtime() - start
+
+    println("rounds:   %rounds")
+    println("batch:    %batch")
+    println("checksum: %checksum")
+    print_time(us)
+    println("mem_kb:   %{ mem_kb() }")
+    println("peak_kb:  %{ peak_kb() }")
+}
+
+// ---------- 5) Pause proxy: max batch latency ----------
+// Time every BATCH allocs; max spike ≈ mutator delay when GC runs.
+
+fn bench_pause_proxy() {
+    header("pause proxy (max batch latency)")
+    let total: uint = 6_000_000
+    let batch: uint = 50_000
+    let live = chain(300_000) // background live set
+
+    let max_us: uint = 0
+    let sum_us: uint = 0
+    let batches: uint = 0
+
+    let start_all = time:microtime()
+    let done: uint = 0
+    while done < total {
+        let start = time:microtime()
+        let i: uint = 0
+        while i < batch {
+            let n = Node { payload: i }
+            g_sink = n
+            i++
+        }
+        let us = time:microtime() - start
+        if us > max_us : max_us = us
+        sum_us += us
+        batches++
+        done += batch
+    }
+    let wall = time:microtime() - start_all
+    let avg = sum_us / (batches + 1)
+
+    // Keep live set rooted until end.
+    let verify = 0
+    let n: ?Node = live
+    while isset(n) {
+        verify++
+        n = n.next
+    }
+
+    println("live:     300000")
+    println("allocs:   %total")
+    println("batch:    %batch")
+    println("batches:  %batches")
+    print_time(wall)
+    println("max_batch_us: %max_us")
+    println("avg_batch_us: %avg")
+    println("mem_kb:   %{ mem_kb() }")
+    println("peak_kb:  %{ peak_kb() }")
+    println("verify:   %verify")
+}
+
+// ---------- 6) Sustained live + natural churn ----------
+
+fn bench_live_natural() {
+    header("large live set + natural churn")
+    let live_n: uint = 1_000_000
+    let churn: uint = 8_000_000
+    let live = chain(live_n)
+
+    let start = time:microtime()
+    let i = churn
+    while i-- > 0 {
+        let n = Node { payload: i }
+        g_sink = n
+    }
+    let us = time:microtime() - start
+
+    let c: uint = 0
+    let p: ?Node = live
+    while isset(p) {
+        c++
+        p = p.next
+    }
+
+    println("live:     %live_n")
+    println("churn:    %churn")
+    print_time(us)
+    println("rate:     %{ churn * 1000 / (us + 1) } allocs/ms")
+    println("mem_kb:   %{ mem_kb() }")
+    println("peak_kb:  %{ peak_kb() }")
+    println("verify:   %c")
+}
+
+fn main() {
+    println("Valk GC hard suite")
+    println("mem_kb:  %{ mem_kb() }")
+    println("peak_kb: %{ peak_kb() }")
+
+    bench_mt_local()
+    bench_mt_shared()
+    bench_natural()
+    bench_fragment()
+    bench_pause_proxy()
+    bench_live_natural()
+
+    println("")
+    println("=== done ===")
+    println("mem_kb:  %{ mem_kb() }")
+    println("peak_kb: %{ peak_kb() }")
+}

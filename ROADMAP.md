@@ -5,7 +5,8 @@
 
 ```
 - Release 0.2.6
-/
++ Adjust package directory lookup
+- Date/time classes
 
 # Next steps
 
