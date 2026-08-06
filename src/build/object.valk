@@ -1,40 +1,84 @@
 use llvm
+use valkir
 use helper
 use valk:fs
 
 // Emit one native object for every Unit/LLVM module. Linking deliberately
 // remains a separate stage.
 fn emit_unit_objects(build: Build) !Error {
+    if build.options.use_valkir {
+        emit_unit_objects_valkir(build) !>
+        return
+    }
+    emit_unit_objects_llvm(build) !>
+}
+
+// LLVM backend: parse textual IR, optionally optimize, write a relocatable object.
+fn emit_unit_objects_llvm(build: Build) !Error {
     llvm_init_object_target(build.options.target)
     let machine = llvm_create_object_target(build) !>
 
     each build.lists.units as unit {
-        if unit.ir_code.length == 0 : continue
-        let dir = object_output_dir(build) !>
-        unit.path_o = helper:add(dir, unit.name + ".o")
-        unit.path_ir = helper:add(dir, unit.name + ".ir")
-
-        let unchanged = !build.options.is_clean_build
-            && fs:exists(unit.path_o)
-            && helper:file_has_same_content(unit.path_ir, unit.ir_code)
-        if unchanged {
-            unit.ir_code = ""
-            continue
-        }
-
+        if prepare_unit_object(build, unit) !> : continue
         build.print_verbose(3, "> Generating object file: " + unit.path_o)
         emit_unit_object(build, unit, machine) !>
-        // Only publish the IR cache entry after LLVM successfully created the
-        // matching object. A failed emission therefore cannot mark a stale or
-        // missing object as current on the next build.
-        fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write cached LLVM IR: " + unit.path_ir)
-        // The parsed AST was already released after per-function IR emission,
-        // and executable builds no longer need the textual module after its
-        // object has been produced.
-        unit.ir_code = ""
+        commit_unit_object_cache(build, unit) !>
     }
 
     llvm:LLVMDisposeTargetMachine(machine)
+}
+
+// valkir backend: same cache layout as LLVM, but objects come from valkir:compile.
+fn emit_unit_objects_valkir(build: Build) !Error {
+    let target = valkir:Target.parse(build.options.target.target) ! {
+        build.error("valkir does not support target: " + build.options.target.target)
+    }
+
+    each build.lists.units as unit {
+        if prepare_unit_object(build, unit) !> : continue
+        build.print_verbose(3, "> Generating object file (valkir): " + unit.path_o)
+        valkir:compile(unit.ir_code, unit.path_o, target) ! {
+            emit_fail_with_ir(build, unit, "valkir failed while emitting unit '" + unit.name + "':\n" + E.message) !>
+        }
+        commit_unit_object_cache(build, unit) !>
+    }
+}
+
+// path_ir       — IR about to be compiled (written before emit; kept on failure)
+// path_ir-prev  — IR that produced path_o (updated only after a successful emit)
+// Returns true when the object is already up to date (or the unit has no IR).
+fn prepare_unit_object(build: Build, unit: Unit) bool !Error {
+    if unit.ir_code.length == 0 : return true
+    let dir = object_output_dir(build) !>
+    unit.path_o = helper:add(dir, unit.name + ".o")
+    unit.path_ir = helper:add(dir, unit.name + ".ir")
+
+    let path_prev = unit.path_ir + "-prev"
+    let unchanged = !build.options.is_clean_build
+        && fs:exists(unit.path_o)
+        && helper:file_has_same_content(path_prev, unit.ir_code)
+    if unchanged {
+        unit.ir_code = ""
+        return true
+    }
+
+    fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write LLVM IR: " + unit.path_ir)
+    return false
+}
+
+// Mark the object as matching this IR after a successful emit.
+fn commit_unit_object_cache(build: Build, unit: Unit) !Error {
+    let path_prev = unit.path_ir + "-prev"
+    fs:write(path_prev, unit.ir_code) ! build.error("Failed to write cached LLVM IR: " + path_prev)
+    // The parsed AST was already released after per-function IR emission,
+    // and executable builds no longer need the textual module after its
+    // object has been produced.
+    unit.ir_code = ""
+}
+
+// path_ir was already written by prepare_unit_object; include it in the error.
+fn emit_fail_with_ir(build: Build, unit: Unit, msg: String) !Error {
+    build.error(msg + "\nIR: " + unit.path_ir)
 }
 
 fn object_output_dir(build: Build) String !Error {
@@ -52,6 +96,9 @@ fn object_output_dir(build: Build) String !Error {
     identity += build.options.optimize ? "|opt" : "|no-opt"
     identity += build.options.debug ? "|debug" : "|no-debug"
     identity += build.options.is_test ? "|test" : "|no-test"
+    // Keep LLVM and valkir object caches separate so switching backends never
+    // reuses an object produced by the other.
+    identity += build.options.use_valkir ? "|valkir" : "|llvm"
     let dir = helper:add(root, helper:ctxhash(identity))
     if !fs:is_dir(dir) : fs:mkdir(dir) ! build.error("Failed to create object cache directory: " + dir)
     build.cache.object_dir = dir
@@ -74,11 +121,11 @@ fn emit_unit_object(build: Build, unit: Unit, machine: llvm:LLVMTargetMachineRef
         let detail = llvm_message_text(message)
         if isset(message) : llvm:LLVMDisposeMessage(message)
         llvm:LLVMContextDispose(context)
-        build.error("LLVM IR parse failed while emitting unit '" + unit.name + "':\n" + detail)
+        emit_fail_with_ir(build, unit, "LLVM IR parse failed while emitting unit '" + unit.name + "':\n" + detail) !>
     }
     if !isset(module) {
         llvm:LLVMContextDispose(context)
-        build.error("LLVM IR parser did not create a module while emitting unit: " + unit.name)
+        emit_fail_with_ir(build, unit, "LLVM IR parser did not create a module while emitting unit: " + unit.name) !>
     }
 
     message = null
@@ -87,7 +134,7 @@ fn emit_unit_object(build: Build, unit: Unit, machine: llvm:LLVMTargetMachineRef
         if isset(message) : llvm:LLVMDisposeMessage(message)
         llvm:LLVMDisposeModule(module)
         llvm:LLVMContextDispose(context)
-        build.error("LLVM IR verification failed while emitting unit '" + unit.name + "':\n" + detail)
+        emit_fail_with_ir(build, unit, "LLVM IR verification failed while emitting unit '" + unit.name + "':\n" + detail) !>
     }
     if isset(message) {
         llvm:LLVMDisposeMessage(message)
@@ -104,7 +151,7 @@ fn emit_unit_object(build: Build, unit: Unit, machine: llvm:LLVMTargetMachineRef
         if isset(message) : llvm:LLVMDisposeMessage(message)
         llvm:LLVMDisposeModule(module)
         llvm:LLVMContextDispose(context)
-        build.error("LLVM failed to emit object for unit '" + unit.name + "':\n" + detail)
+        emit_fail_with_ir(build, unit, "LLVM failed to emit object for unit '" + unit.name + "':\n" + detail) !>
     }
 
     if isset(message) : llvm:LLVMDisposeMessage(message)

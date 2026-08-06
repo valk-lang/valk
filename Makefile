@@ -75,6 +75,12 @@ test: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core$(EXE_SUFFIX)
 	./debug/test-core$(EXE_SUFFIX)
 
+# Same suite as `test`, but objects are produced by valkir instead of LLVM.
+test-valkir: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --valkir -o ./debug/test-valkir$(EXE_SUFFIX) -c
+	./debug/test-valkir$(EXE_SUFFIX)
+
 test-compile-errors: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/compile-errors/run.sh
 
@@ -248,4 +254,4 @@ clean:
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-gc-debug test-gc-shared-stress test-lsp \
-	test-macos-build test-win test-win-build
+	test-macos-build test-valkir test-win test-win-build
