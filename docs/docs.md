@@ -397,12 +397,16 @@ can return an error, handle it on the `defer` line.
 
 Functions can return errors using `throw`. But first you need to define an error type or you can use one of the built-in ones.
 
-An error type must provide at least one error code or extend at least one existing error type. Payload fields can carry additional error data.
+An error type must provide at least one error code or extend at least one existing error type. Payload fields can carry additional error data. Each field may declare an explicit default with the same `(value)` syntax used for class properties and function arguments.
 
 ```rust
-error {Error type name} ({codes}) [extends ({error types})] [payload { {field-name}: {type} }]
+error {Error type name} ({codes}) [extends ({error types})] [payload { {field-name}: {type} [(default)] }]
 // Example
-error MyError (invalid_input, missing_key) extends (LookupError) payload { message: String, key: Key }
+error MyError (invalid_input, missing_key) extends (LookupError) payload {
+    message: String
+    key: Key
+    detail: String ("")
+}
 ```
 
 Usage:
@@ -410,10 +414,16 @@ Usage:
 ```rust
 fn find_value(key: Key) Value !MyError {
     //...
-    throw .missing_key { message: "Key not found", key: Key }
+    // Required payload fields must be set; fields with an explicit default may be omitted.
+    throw .missing_key { message: "Key not found", key: key }
     //...
 }
 ```
+
+When rethrowing inside an error handler, omitted fields that already exist on a
+compatible caught `E` are passed through. Language-generated defaults for extra
+payload fields (empty string / zero / null) are only filled in when *passing* an
+error to a wider error type with `!>` (or the default pass).
 
 Built-in error types:
 
