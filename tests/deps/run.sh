@@ -33,6 +33,11 @@ case "$(uname -s)" in
 esac
 trap 'rm -rf "$workdir"' EXIT
 
+# Compiler paths are native (`D:\...`) on Windows; match expectations with `/`.
+normalize_paths() {
+    tr '\\' '/'
+}
+
 # Build a package fixture that should succeed, then run it and match stdout.
 # args: fixture_name expected_stdout
 check_ok() {
@@ -96,6 +101,7 @@ check_fail() {
     out=$("$VALK" build "$fixture" --no-warn -o "$exe" 2>&1)
     status=$?
     set -e
+    out=$(printf '%s' "$out" | normalize_paths)
 
     if [ "$status" -eq 0 ]; then
         echo "# Build should have failed: $name"
@@ -147,6 +153,7 @@ set +e
 out=$("$VALK" build "$current_only" --no-warn -o "$workdir/github-current-prefers$EXE_SUFFIX" 2>&1)
 status=$?
 set -e
+out=$(printf '%s' "$out" | normalize_paths)
 if [ "$status" -eq 0 ]; then
     echo "# Build should have failed when only version dir exists and current differs"
     echo "- Output:"
