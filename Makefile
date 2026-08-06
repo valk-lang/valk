@@ -78,7 +78,7 @@ test: $(TEST_COMPILER)
 # Same suite as `test`, but objects are produced by valkir instead of LLVM.
 test-valkir: $(TEST_COMPILER)
 	mkdir -p ./debug
-	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --valkir -o ./debug/test-valkir$(EXE_SUFFIX) -c
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --valkir -o ./debug/test-valkir$(EXE_SUFFIX) -c -vvv
 	./debug/test-valkir$(EXE_SUFFIX)
 
 test-compile-errors: $(TEST_COMPILER)
