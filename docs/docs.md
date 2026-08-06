@@ -421,9 +421,17 @@ fn find_value(key: Key) Value !MyError {
 ```
 
 When rethrowing inside an error handler, omitted fields that already exist on a
-compatible caught `E` are passed through. Language-generated defaults for extra
-payload fields (empty string / zero / null) are only filled in when *passing* an
-error to a wider error type with `!>` (or the default pass).
+compatible caught `E` are passed through.
+
+Pure pass (`!>` / the default pass) keeps the original error code and payload. If
+the caller error type adds **required** payload fields (no explicit default) that
+the callee does not have, the pass is a compile error — set them with a rethrow:
+
+```rust
+inner() ! throw E { detail: "missing on the inner error" }
+```
+
+Fields with an explicit payload default may still be omitted on both throw and pass.
 
 Built-in error types:
 

@@ -6,6 +6,7 @@
 ```
 - Release 0.2.6
 + Adjust package directory lookup
++ Improve error payload parsing
 - Date/time classes
 
 # Next steps
