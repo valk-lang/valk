@@ -4,10 +4,14 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.6
+- Release 0.2.7
+- Date/time classes
+
++ Release 0.2.6
 + Adjust package directory lookup
 + Improve error payload parsing
-- Date/time classes
++ Fix Array prepend many
++ Implement `--valkir` flag
 
 # Next steps
 

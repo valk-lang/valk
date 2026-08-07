@@ -29,10 +29,10 @@ valk: $(COMPILER_DEPS)
 	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(DEV_FLAGS)
 
 valk2: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk2 -vvv $(FLAGS) $(DEV_FLAGS)
+	./valk build . src/*.valk -o ./valk2 -vvv $(FLAGS) $(DEV_FLAGS) --valkir
 
 valk3: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS)
+	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) $(DEV_FLAGS) --valkir
 
 valkvg: $(COMPILER_DEPS)
 	valgrind $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS) $(DEV_FLAGS)
