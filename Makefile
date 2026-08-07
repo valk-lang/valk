@@ -181,7 +181,8 @@ ci-win: $(COMPILER_DEPS)
 
 # Distributions
 linux-x64: $(DIST_DEPS)
-	vman use $(VALKV)
+	vman use
+	vman install
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(FLAGS) $(DIST_FLAGS) \
@@ -194,7 +195,8 @@ linux-x64: $(DIST_DEPS)
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
 macos-x64: $(DIST_DEPS)
-	vman use $(VALKV)
+	vman use
+	vman install
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
 	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(FLAGS) $(DIST_FLAGS) \
@@ -204,7 +206,8 @@ macos-x64: $(DIST_DEPS)
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
 macos-arm64: $(DIST_DEPS)
-	vman use $(VALKV)
+	vman use
+	vman install
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
 	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(FLAGS) $(DIST_FLAGS) \
@@ -214,7 +217,8 @@ macos-arm64: $(DIST_DEPS)
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
 win-x64: $(DIST_DEPS)
-	vman use $(VALKV)
+	vman use
+	vman install
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
 	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) \
