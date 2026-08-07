@@ -127,11 +127,20 @@ check_ok "github-current" "current-ok"
 # When `current` is absent, fall back to `version`.
 check_ok "github-version" "version-ok"
 
+# Fall back to the nested layout: vendor/github.com/{user}/{repo}/{version}.
+check_ok "github-nested" "nested-ok"
+
+# Fall back to the '@' layout: vendor/github-{user}@{repo}/{version}.
+check_ok "github-at" "at-ok"
+
 # Fall back to the dotted vendor layout: vendor/github.com.{user}.{repo}/{version}.
 check_ok "github-dotted" "dotted-ok"
 
 # The dashed assoc dir wins when both layouts exist.
 check_ok "github-dotted-prefers-new" "dashed-new"
+
+# Among the fallbacks, nested is tried first.
+check_ok "github-fallback-order" "nested-first"
 
 # Missing vendor dir reports the new assoc path (not github.com.user.repo).
 check_fail "github-missing" "vendor/github-acme-widget/9.9.9"
