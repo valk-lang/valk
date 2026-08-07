@@ -5,6 +5,7 @@
 
 ```
 - Release 0.2.7
++ Cache directory hash fix + race lock
 - Date/time classes
 
 + Release 0.2.6
