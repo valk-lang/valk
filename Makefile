@@ -16,6 +16,11 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
+# Extra defines for a single CI job, so one platform can be built differently
+# without changing the others. `--def` reaches the bundled valk:* sources, which
+# is what makes `--def GC_DEBUG=1` able to turn on the GC's own assertions even
+# though the compiler is built by the previous release.
+CI_FLAGS ?=
 DIST_FLAGS := . src/*.valk --static --release -vv
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
 BENCH_JSON_ITERATIONS ?= 500
@@ -162,7 +167,7 @@ ci-linux: $(COMPILER_DEPS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) \
+	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(CI_FLAGS) \
 	--sysroot "$$(xcrun --sdk macosx --show-sdk-path)"
 
 ci-win: $(COMPILER_DEPS)
