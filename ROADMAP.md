@@ -8,7 +8,7 @@
 + Cache directory hash fix + race lock
 - Date/time classes
 - 'export' functions + build library
-- Remove LLVM
++ Remove LLVM (valkir is the default backend, `--clang` compiles the IR instead)
 
 + Release 0.2.6
 + Adjust package directory lookup

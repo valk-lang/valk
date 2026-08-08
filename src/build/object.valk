@@ -1,34 +1,20 @@
-use llvm
 use valkir
 use helper
+use valk:core
 use valk:fs
 
-// Emit one native object for every Unit/LLVM module. Linking deliberately
+// Emit one native object for every Unit/IR module. Linking deliberately
 // remains a separate stage.
 fn emit_unit_objects(build: Build) !Error {
-    if build.options.use_valkir {
-        emit_unit_objects_valkir(build) !>
+    if build.options.use_clang {
+        emit_unit_objects_clang(build) !>
         return
     }
-    emit_unit_objects_llvm(build) !>
+    emit_unit_objects_valkir(build) !>
 }
 
-// LLVM backend: parse textual IR, optionally optimize, write a relocatable object.
-fn emit_unit_objects_llvm(build: Build) !Error {
-    llvm_init_object_target(build.options.target)
-    let machine = llvm_create_object_target(build) !>
-
-    each build.lists.units as unit {
-        if prepare_unit_object(build, unit) !> : continue
-        build.print_verbose(3, "> Generating object file: " + unit.path_o)
-        emit_unit_object(build, unit, machine) !>
-        commit_unit_object_cache(build, unit) !>
-    }
-
-    llvm:LLVMDisposeTargetMachine(machine)
-}
-
-// valkir backend: same cache layout as LLVM, but objects come from valkir:compile.
+// Default backend: valkir turns the textual IR into a relocatable object
+// in-process, so a build needs no external toolchain besides the linker.
 fn emit_unit_objects_valkir(build: Build) !Error {
     let target = valkir:Target.parse(build.options.target.target) ! {
         build.error("valkir does not support target: " + build.options.target.target)
@@ -36,12 +22,48 @@ fn emit_unit_objects_valkir(build: Build) !Error {
 
     each build.lists.units as unit {
         if prepare_unit_object(build, unit) !> : continue
-        build.print_verbose(3, "> Generating object file (valkir): " + unit.path_o)
+        build.print_verbose(3, "> Generating object file: " + unit.path_o)
         valkir:compile(unit.ir_code, unit.path_o, target) ! {
             emit_fail_with_ir(build, unit, "valkir failed while emitting unit '" + unit.name + "':\n" + E.message) !>
         }
         commit_unit_object_cache(build, unit) !>
     }
+}
+
+// --clang backend: same cache layout, but each unit's IR file is handed to a
+// `clang` on PATH. One process per unit, and it is clang that decides how the
+// IR is optimized and encoded.
+fn emit_unit_objects_clang(build: Build) !Error {
+    each build.lists.units as unit {
+        if prepare_unit_object(build, unit) !> : continue
+        build.print_verbose(3, "> Generating object file (clang): " + unit.path_o)
+        let command = clang_object_command(build, unit)
+        build.print_verbose(3, "# " + command)
+        let code, output = core:exec(command)
+        if code != 0 {
+            emit_fail_with_ir(build, unit, "clang failed while emitting unit '" + unit.name + "':\n# Exit code: " + code + "\n# Output: " + output) !>
+        }
+        commit_unit_object_cache(build, unit) !>
+    }
+}
+
+// The IR file was already written by prepare_unit_object. `-x ir` is required
+// because the extension is `.ir`, and the explicit triple keeps cross builds
+// from following the host default.
+fn clang_object_command(build: Build, unit: Unit) String {
+    let target = build.options.target
+    let cmd = "clang -c -x ir \""
+    cmd += unit.path_ir
+    cmd += "\" -o \""
+    cmd += unit.path_o
+    cmd += "\" --target="
+    cmd += ir_target_triple(target)
+    // The linker builds a PIE; Windows objects are position independent anyway
+    // and clang rejects the flag as unused there.
+    if target.os != "win" : cmd += " -fPIC"
+    // No -g: the generated IR carries no debug metadata for clang to keep.
+    cmd += build.options.optimize ? " -O3" : " -O0"
+    return cmd
 }
 
 // path_ir       — IR about to be compiled (written before emit; kept on failure)
@@ -62,14 +84,14 @@ fn prepare_unit_object(build: Build, unit: Unit) bool !Error {
         return true
     }
 
-    fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write LLVM IR: " + unit.path_ir)
+    fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write IR: " + unit.path_ir)
     return false
 }
 
 // Mark the object as matching this IR after a successful emit.
 fn commit_unit_object_cache(build: Build, unit: Unit) !Error {
     let path_prev = unit.path_ir + "-prev"
-    fs:write(path_prev, unit.ir_code) ! build.error("Failed to write cached LLVM IR: " + path_prev)
+    fs:write(path_prev, unit.ir_code) ! build.error("Failed to write cached IR: " + path_prev)
     // The parsed AST was already released after per-function IR emission,
     // and executable builds no longer need the textual module after its
     // object has been produced.
@@ -96,9 +118,9 @@ fn object_output_dir(build: Build) String !Error {
     identity += build.options.optimize ? "|opt" : "|no-opt"
     identity += build.options.debug ? "|debug" : "|no-debug"
     identity += build.options.is_test ? "|test" : "|no-test"
-    // Keep LLVM and valkir object caches separate so switching backends never
-    // reuses an object produced by the other.
-    identity += build.options.use_valkir ? "|valkir" : "|llvm"
+    // Keep the valkir and clang object caches separate so switching backends
+    // never reuses an object produced by the other.
+    identity += build.options.use_clang ? "|clang" : "|valkir"
     // Same IR does not mean same object: the compiler that turns one into the
     // other is an input too. Without this, a codegen change is invisible to
     // every unit whose IR text happens not to have moved.
@@ -109,139 +131,4 @@ fn object_output_dir(build: Build) String !Error {
     build.cache.object_dir = dir
     build.print_verbose(1, "📦 Cache directory: " + dir)
     return dir
-}
-
-fn emit_unit_object(build: Build, unit: Unit, machine: llvm:LLVMTargetMachineRef) !Error {
-    let context = llvm:LLVMContextCreate()
-    llvm:LLVMContextSetOpaquePointers(context, true)
-    let name = unit.name + ".ll"
-    let buffer = llvm:LLVMCreateMemoryBufferWithMemoryRangeCopy(
-        unit.ir_code.data,
-        unit.ir_code.bytes,
-        name.data
-    )
-    let module: ?llvm:LLVMModuleRef = null
-    let message: ?cstring = null
-
-    if llvm:LLVMParseIRInContext(context, buffer, @ref(module), @ref(message)) {
-        let detail = llvm_message_text(message)
-        if isset(message) : llvm:LLVMDisposeMessage(message)
-        llvm:LLVMContextDispose(context)
-        emit_fail_with_ir(build, unit, "LLVM IR parse failed while emitting unit '" + unit.name + "':\n" + detail) !>
-    }
-    if !isset(module) {
-        llvm:LLVMContextDispose(context)
-        emit_fail_with_ir(build, unit, "LLVM IR parser did not create a module while emitting unit: " + unit.name) !>
-    }
-
-    message = null
-    if llvm:LLVMVerifyModule(module, llvm:LLVMReturnStatusAction, @ref(message)) {
-        let detail = llvm_message_text(message)
-        if isset(message) : llvm:LLVMDisposeMessage(message)
-        llvm:LLVMDisposeModule(module)
-        llvm:LLVMContextDispose(context)
-        emit_fail_with_ir(build, unit, "LLVM IR verification failed while emitting unit '" + unit.name + "':\n" + detail) !>
-    }
-    if isset(message) {
-        llvm:LLVMDisposeMessage(message)
-        message = null
-    }
-
-    llvm_configure_object_module(build, module, machine)
-    // Target-aware passes (notably vectorization and pointer/layout folding)
-    // need the real data layout while they inspect the IR.
-    if build.options.optimize : optimize_object_module(module)
-
-    if llvm:LLVMTargetMachineEmitToFile(machine, module, unit.path_o.data, llvm:LLVMObjectFile, @ref(message)) {
-        let detail = llvm_message_text(message)
-        if isset(message) : llvm:LLVMDisposeMessage(message)
-        llvm:LLVMDisposeModule(module)
-        llvm:LLVMContextDispose(context)
-        emit_fail_with_ir(build, unit, "LLVM failed to emit object for unit '" + unit.name + "':\n" + detail) !>
-    }
-
-    if isset(message) : llvm:LLVMDisposeMessage(message)
-    llvm:LLVMDisposeModule(module)
-    llvm:LLVMContextDispose(context)
-}
-
-fn llvm_message_text(message: ?cstring) String {
-    if !isset(message) : return "<no LLVM diagnostic>"
-    return message
-}
-
-fn optimize_object_module(module: llvm:LLVMModuleRef) {
-    let builder = llvm:LLVMPassManagerBuilderCreate()
-    llvm:LLVMPassManagerBuilderSetOptLevel(builder, 3)
-    llvm:LLVMPassManagerBuilderSetSizeLevel(builder, 0)
-    llvm:LLVMPassManagerBuilderUseInlinerWithThreshold(builder, 1000)
-
-    let func_passes = llvm:LLVMCreateFunctionPassManagerForModule(module)
-    let module_passes = llvm:LLVMCreatePassManager()
-    llvm:LLVMPassManagerBuilderPopulateFunctionPassManager(builder, func_passes)
-    llvm:LLVMPassManagerBuilderPopulateModulePassManager(builder, module_passes)
-    llvm:LLVMPassManagerBuilderDispose(builder)
-
-    llvm:LLVMInitializeFunctionPassManager(func_passes)
-    let func = llvm:LLVMGetFirstFunction(module)
-    while isset(func) {
-        llvm:LLVMRunFunctionPassManager(func_passes, func)
-        func = llvm:LLVMGetNextFunction(func)
-    }
-    llvm:LLVMFinalizeFunctionPassManager(func_passes)
-    llvm:LLVMRunPassManager(module_passes, module)
-    llvm:LLVMDisposePassManager(func_passes)
-    llvm:LLVMDisposePassManager(module_passes)
-}
-
-fn llvm_init_object_target(target: Target) {
-    if target.arch == "x64" {
-        llvm:LLVMInitializeX86TargetInfo()
-        llvm:LLVMInitializeX86Target()
-        llvm:LLVMInitializeX86TargetMC()
-        llvm:LLVMInitializeX86AsmPrinter()
-    } else {
-        llvm:LLVMInitializeAArch64TargetInfo()
-        llvm:LLVMInitializeAArch64Target()
-        llvm:LLVMInitializeAArch64TargetMC()
-        llvm:LLVMInitializeAArch64AsmPrinter()
-    }
-}
-
-fn llvm_create_object_target(build: Build) llvm:LLVMTargetMachineRef !Error {
-    let triple = ir_target_triple(build.options.target)
-    let target: ?llvm:LLVMTargetRef = null
-    let message: ?cstring = null
-    if llvm:LLVMGetTargetFromTriple(triple.data, @ref(target), @ref(message)) {
-        let detail = llvm_message_text(message)
-        if isset(message) : llvm:LLVMDisposeMessage(message)
-        build.error("LLVM could not select target '" + triple + "': " + detail)
-    }
-    if !isset(target) : build.error("LLVM did not create a target for: " + triple)
-
-    let cpu = "generic"
-    let codegen_level: i32 = build.options.optimize
-        ? llvm:LLVMCodeGenLevelAggressive
-        : llvm:LLVMCodeGenLevelDefault
-    let machine = llvm:LLVMCreateTargetMachine(
-        target,
-        triple.data,
-        cpu.data,
-        null,
-        codegen_level,
-        llvm:LLVMRelocPIC,
-        llvm:LLVMCodeModelDefault
-    )
-    if !isset(machine) : build.error("LLVM failed to create a target machine for: " + triple)
-    return machine
-}
-
-fn llvm_configure_object_module(build: Build, module: llvm:LLVMModuleRef, machine: llvm:LLVMTargetMachineRef) {
-    let triple = ir_target_triple(build.options.target)
-    llvm:LLVMSetTarget(module, triple.data)
-    let layout = llvm:LLVMCreateTargetDataLayout(machine)
-    let layout_text = llvm:LLVMCopyStringRepOfTargetData(layout)
-    llvm:LLVMSetDataLayout(module, layout_text)
-    llvm:LLVMDisposeMessage(layout_text)
-    llvm:LLVMDisposeTargetData(layout)
 }
