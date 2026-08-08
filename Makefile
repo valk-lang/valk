@@ -156,15 +156,9 @@ test-cross: valk
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-win-x64.exe -vv $(FLAGS) --target win-x64
 
 # CI commands
-# For linux we have to add `/usr/lib/gcc/...` because that's where the C runtime
-# startup objects (crtbeginS.o / crtendS.o) are located
 ci-linux: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) \
-	-L /usr/lib/gcc/x86_64-linux-gnu/14/ \
-	-L /usr/lib/gcc/x86_64-linux-gnu/13/ \
-	-L /usr/lib/gcc/x86_64-linux-gnu/12/ \
-	-L /usr/lib/gcc/x86_64-linux-gnu/11/
+	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
@@ -182,7 +176,6 @@ linux-x64: $(DIST_DEPS)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(FLAGS) $(DIST_FLAGS) \
-	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" \
 	-L "toolchains/toolchains/linux-amd64/lib64" \
 	--sysroot toolchains/toolchains/linux-amd64 -l pthread -l dl
