@@ -7,6 +7,8 @@
 - Release 0.2.7
 + Cache directory hash fix + race lock
 - Date/time classes
+- 'export' functions + build library
+- Remove LLVM
 
 + Release 0.2.6
 + Adjust package directory lookup
