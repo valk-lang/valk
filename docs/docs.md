@@ -48,6 +48,7 @@
 * [Files](#files)
     * [Paths](#paths)
 * [JSON](#json)
+* [Datetime](#datetime)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
@@ -808,6 +809,36 @@ println(json:encode(object, true))
 `json:from(value)` converts classes and other values to JSON.
 `json:from_value[T](value)` converts JSON back to a Valk type and returns an
 error when the document does not match that type.
+
+## Datetime
+
+API for [valk:time](api.md#time)
+
+`time:Datetime` represents UTC dates from year 1 through 9999 with microsecond
+precision. Constructor components are optional and default to the current time.
+
+```rust
+use valk:time
+
+// Init
+let now = time:Datetime.new()
+let datetime = time:Datetime.new(2026, 8, 8, 19, 7, 6, 123_456)
+let from_str = time:Datetime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
+
+// Change
+let changed = datetime.add_days(1) // Returns a new Datetime
+datetime.modify_add_hours(2)       // Modifies the existing object
+
+// Format to string
+let text = datetime.format("Y-m-d H:i:s.u")
+println(datetime.to_iso8601())
+println(datetime) // Defaults to to_iso8601 string
+```
+
+`with_*` and `add_*` methods return a new object. Methods starting with
+`modify_` update the existing object. Format tokens are `Y` (year), `m`
+(month), `d` (day), `H` (hour), `i` (minute), `s` (second), `v`
+(milliseconds), and `u` (microseconds).
 
 ## Coroutines
 
