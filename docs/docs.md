@@ -1260,6 +1260,19 @@ extern fn malloc(size: uint) ptr;
 extern fn free(adr: ptr);
 ```
 
+Definitions that must be visible to external code use `export`. Exported
+symbols keep their declared name in the generated IR and are emitted even when
+they are not referenced by Valk code. `extern` and `export` are mutually
+exclusive.
+
+```rust
+export fn add(a: int, b: int) int {
+    return a + b
+}
+
+export shared library_state: int
+```
+
 To link with your library you have 2 options:
 
 - Define the link information inside your code
