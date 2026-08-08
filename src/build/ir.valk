@@ -340,22 +340,61 @@ fn ir_write_string_constant(out: ByteBuffer, index: uint, value: String) {
     out.write_string("\\00\" }>\n")
 }
 
+// LLVM parameter/return attributes. Every value reaching a call boundary is
+// the result of a defined expression (no path leaves a param or return as a
+// bare `undef`), so `noundef` is unconditional. `nonnull` follows the type's
+// own nullability: non-nullable + pointer-sized means the bit pattern can
+// never be zero — this includes bare `ptr`, which tracks nullability via
+// `?ptr` exactly like every other type. (A prior version of this rule
+// special-cased `ptr` away after `gc:property_get`'s declared `ptr` return
+// turned out to lie about its own contract — it can read back a null slot.
+// That was a bug in property_get's signature, fixed there instead; see
+// lib/src/gc/properties.valk.)
+fn ir_value_attr_suffix(type: Type) String {
+    if !type.is_nullable_type() && type.is_pointer_sized() : return " noundef nonnull"
+    return " noundef"
+}
+
+// Same attribute set formatted for placement before a return type
+// (`define <attrs><type> ...`). Empty for void so "void" prints unattributed.
+// A fallible return's ABI type is either a bare i32 (void success case) or an
+// aggregate struct — never a bare pointer — so nonnull never applies there.
+fn ir_ret_attr_prefix(func: Func) String {
+    let rett = func.get_rett()
+    if !func.can_error && rett.is_void_type() : return ""
+    // `$noalias` (returns_noalias) promises the returned pointer never aliases
+    // anything else the caller can see — only meaningful on a bare pointer
+    // return, never the aggregate ABI wrapper a fallible function uses.
+    if !func.can_error && rett.is_pointer_sized() {
+        let noalias = func.returns_noalias ? "noalias " : ""
+        if !rett.is_nullable_type() : return noalias + "noundef nonnull "
+        return noalias + "noundef "
+    }
+    return "noundef "
+}
+
 fn ir_write_func_signature(out: ByteBuffer, func: Func, declare: bool) !Error {
     out.write_string(declare ? "declare " : "define ")
+    out.write_string(ir_ret_attr_prefix(func))
     out.write_string(ir_func_rett_type(func) !>)
     out.write_string(" @\"")
     out.write_string(func_ir_name(func))
     out.write_string("\"(")
-    if func.is_literal : out.write_string("ptr")
+    // A non-capturing closure passes a literal `null` environment, so its
+    // implicit data pointer is never `nonnull`.
+    if func.is_literal : out.write_string("ptr noundef")
     each func.args as arg, i {
         if i > 0 || func.is_literal : out.write_string(", ")
         out.write_string(ir_type(arg.type) !>)
+        out.write_string(ir_value_attr_suffix(arg.type))
     }
     if func.infinite_args {
         if func.args.length > 0 : out.write_string(", ")
         out.write_string("...")
     }
-    out.write_string(")\n")
+    out.write_string(")")
+    if func.must_exit || func.will_exit : out.write_string(" cold")
+    out.write_string("\n")
 }
 
 fn ir_target_triple(target: Target) String {
@@ -565,14 +604,16 @@ fn generate_func_ir(func: Func) !Error {
     } else {
         ir.code.write_string("define dso_local ")
     }
+    ir.code.write_string(ir_ret_attr_prefix(func))
     ir.code.write_string(ir_func_rett_type(func) !>)
     ir.code.write_string(" @\"")
     ir.code.write_string(func.ir_name)
     ir.code.write_string("\"(")
-    if func.is_literal : ir.code.write_string("ptr \%closure.data")
+    if func.is_literal : ir.code.write_string("ptr noundef \%closure.data")
     each func.args as arg, i {
         if i > 0 || func.is_literal : ir.code.write_string(", ")
         ir.code.write_string(ir_type(arg.type) !>)
+        ir.code.write_string(ir_value_attr_suffix(arg.type))
         ir.code.write_string(" \%arg.")
         ir.code.write_uint_ascii(i)
     }
@@ -583,6 +624,7 @@ fn generate_func_ir(func: Func) !Error {
     ir.code.write_string(")")
     if func.is_inline : ir.code.write_string(" alwaysinline")
     if func.is_hot : ir.code.write_string(" hot")
+    if func.must_exit || func.will_exit : ir.code.write_string(" cold")
     ir.code.write_string(" {\n")
     ir.label("entry")
 
@@ -3712,6 +3754,10 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         let direct_func = callee.func
         if isset(direct_func) && direct_func.is_literal : closure_call = true
     }
+    // Param/return attributes reflect the declared callee signature, so they
+    // only apply when the `call` instruction names that function directly —
+    // not when dispatch goes through an extracted closure/interface pointer.
+    let direct_call = isset(direct_func) && !interface_call && !closure_call
 
     let target = ""
     if interface_call {
@@ -3759,7 +3805,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                 }
             }
             if isset(expected) && ir_call_arg_needs_inline_address(receiver.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
+                rendered_types.append(ir_type(expected) !> + (direct_call ? ir_value_attr_suffix(expected) : ""))
                 rendered_values.append(ir_emit_inline_call_address(ir, receiver) !>)
             } else {
                 let rendered = ir_emit_value(ir, receiver) !>
@@ -3768,7 +3814,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                     rendered = ir_emit_cast(ir, rendered, receiver.rett, expected) !>
                     rendered_type = expected
                 }
-                rendered_types.append(ir_type(rendered_type) !>)
+                rendered_types.append(ir_type(rendered_type) !> + (direct_call ? ir_value_attr_suffix(rendered_type) : ""))
                 rendered_values.append(rendered)
             }
         }
@@ -3783,10 +3829,10 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                 }
             }
             if isset(expected) && ir_call_arg_needs_inline_address(arg.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
+                rendered_types.append(ir_type(expected) !> + (direct_call ? ir_value_attr_suffix(expected) : ""))
                 rendered_values.append(ir_emit_inline_call_address(ir, arg) !>)
             } else if isset(expected) && ir_call_arg_needs_raw_function(arg.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
+                rendered_types.append(ir_type(expected) !> + (direct_call ? ir_value_attr_suffix(expected) : ""))
                 rendered_values.append(ir_emit_raw_function(ir, arg) !>)
             } else {
                 let rendered = ir_emit_value(ir, arg) !>
@@ -3795,7 +3841,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                     rendered = ir_emit_cast(ir, rendered, arg.rett, expected) !>
                     rendered_type = expected
                 }
-                rendered_types.append(ir_type(rendered_type) !>)
+                rendered_types.append(ir_type(rendered_type) !> + (direct_call ? ir_value_attr_suffix(rendered_type) : ""))
                 rendered_values.append(rendered)
             }
         }
@@ -3818,11 +3864,13 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     }
     let exits = false
     let call_type = ir_type(value.rett) !>
+    let ret_attrs = ""
     if callee.type == VAL.func {
         let func = callee.func
         if isset(func) {
             exits = func.must_exit || func.will_exit
             call_type = ir_func_rett_type(func) !>
+            if direct_call : ret_attrs = ir_ret_attr_prefix(func)
         }
     } else if value.can_error || isset(value.error_type) {
         call_type = ir_error_abi_type(value.rett) !>
@@ -3838,12 +3886,17 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         ir.write(" = ")
     }
     ir.write("call ")
+    ir.write(ret_attrs)
     ir.write(call_type)
     // The callee's variadic function type is significant on Apple ARM64.
     // Without it LLVM treats the call as a non-variadic prototype and passes
     // trailing arguments in registers, while Darwin's variadic ABI expects
     // them on the stack (for example fcntl's third argument and open's mode).
     if isset(direct_func) && direct_func.infinite_args {
+        // This is a bare function *type* used only to give the call the
+        // correct variadic prototype (see comment above) — LLVM's verifier
+        // rejects parameter attributes here, unlike on the actual argument
+        // list below.
         ir.write(" (")
         if direct_func.is_literal : ir.write("ptr")
         each direct_func.args as arg, i {
