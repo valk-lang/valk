@@ -1308,18 +1308,19 @@ This produces a shared library: `libmylib.so` on Linux,
 `libmylib.dylib` on macOS, or `libmylib.dll` on Windows. Its automatic
 dependencies are linked dynamically.
 
-Use `--static` to produce a static archive instead. The archive leaves
+Use `--static-lib` to produce a static archive instead. The archive leaves
 automatic dependencies for the final consumer to link dynamically.
 
 ```bash
-valk build src/*.valk --lib --static -o libmylib
+valk build src/*.valk --lib --static-lib -o libmylib
 ```
 
 The output is `libmylib.a` on Linux and macOS, or `libmylib.lib` on Windows.
-To fold automatic static dependencies into that archive, add `--full-static`:
+Use `--static` to link dependencies statically. With `--static-lib`, those
+dependencies are folded into the archive:
 
 ```bash
-valk build src/*.valk --lib --static --full-static -o libmylib
+valk build src/*.valk --lib --static-lib --static -o libmylib
 ```
 
 ## Valk manager

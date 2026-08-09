@@ -29,8 +29,9 @@ trap 'rm -rf "$workdir"' EXIT
 
 cc="${CC:-cc}"
 shared="$workdir/libanswer$shared_ext"
+static_shared="$workdir/libanswer-static$shared_ext"
 archive="$workdir/libanswer-static$archive_ext"
-full_archive="$workdir/libanswer-full$archive_ext"
+static_archive="$workdir/libanswer-static-deps$archive_ext"
 plain_archive="$workdir/libplain$archive_ext"
 
 check_build() {
@@ -53,11 +54,20 @@ run_dynamic() {
 echo ""
 echo "# Test library output modes"
 
-echo "> Reject full static without a static library"
+echo "> Reject removed --full-static"
 out=$("$VALK" build "$DIR/library.valk" --lib --full-static --no-warn -o "$workdir/invalid" 2>&1)
 status=$?
-if [ "$status" -eq 0 ] || [[ "$out" != *"'--full-static' requires '--lib --static'"* ]]; then
-    echo "# Expected --full-static validation error"
+if [ "$status" -eq 0 ] || [[ "$out" != *"Unknown build argument: --full-static"* ]]; then
+    echo "# Expected --full-static to be rejected"
+    echo "$out"
+    exit 1
+fi
+
+echo "> Reject static archive output without a library"
+out=$("$VALK" build "$DIR/library.valk" --static-lib --no-warn -o "$workdir/invalid" 2>&1)
+status=$?
+if [ "$status" -eq 0 ] || [[ "$out" != *"'--static-lib' requires '--lib'"* ]]; then
+    echo "# Expected --static-lib validation error"
     echo "$out"
     exit 1
 fi
@@ -72,28 +82,34 @@ if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
         exit 1
     fi
 
+    echo "> Build dynamic library with static dependencies"
+    out=$("$VALK" build "$DIR/library.valk" --lib --static --no-warn -o "$static_shared" 2>&1)
+    status=$?
+    check_build "$out" "dynamic library with static dependencies"
+    [ -f "$static_shared" ] || exit 1
+
     echo "> Build static library without main"
-    out=$("$VALK" build "$DIR/library.valk" --lib --static --no-warn -o "$archive" 2>&1)
+    out=$("$VALK" build "$DIR/library.valk" --lib --static-lib --no-warn -o "$archive" 2>&1)
     status=$?
     check_build "$out" "static library"
     "$cc" "$DIR/consumer.c" "$archive" -o "$workdir/consumer-static$exe_ext" || exit $?
     "$workdir/consumer-static$exe_ext" || exit $?
 
-    echo "> Build full static library"
-    out=$("$VALK" build "$DIR/library.valk" --lib --static --full-static --no-warn -o "$full_archive" 2>&1)
+    echo "> Build static library with static dependencies"
+    out=$("$VALK" build "$DIR/library.valk" --lib --static-lib --static --no-warn -o "$static_archive" 2>&1)
     status=$?
-    check_build "$out" "full static library"
-    "$cc" "$DIR/consumer.c" "$full_archive" -o "$workdir/consumer-full$exe_ext" || exit $?
-    "$workdir/consumer-full$exe_ext" || exit $?
+    check_build "$out" "static library with static dependencies"
+    "$cc" "$DIR/consumer.c" "$static_archive" -o "$workdir/consumer-static-deps$exe_ext" || exit $?
+    "$workdir/consumer-static-deps$exe_ext" || exit $?
 
     echo "> Build static library without an FFI export"
-    out=$("$VALK" build "$DIR/no-export.valk" --lib --static --no-warn -o "$plain_archive" 2>&1)
+    out=$("$VALK" build "$DIR/no-export.valk" --lib --static-lib --no-warn -o "$plain_archive" 2>&1)
     status=$?
     check_build "$out" "ordinary static library"
     [ -f "$plain_archive" ] || exit 1
 
     echo "# Library tests passed"
-    echo "# Test count: 5"
+    echo "# Test count: 7"
     exit 0
 fi
 
@@ -116,24 +132,38 @@ check_build "$out" "dynamic library"
 "$cc" "$DIR/consumer.c" "$shared" -L "$workdir" -lanswerdep -Wl,-rpath,"$workdir" -o "$workdir/consumer-dynamic" || exit $?
 run_dynamic "$workdir/consumer-dynamic" || exit $?
 
+echo "> Build dynamic library with static dependencies"
+out=$("$VALK" build "$DIR/dependency.valk" --lib --static --no-warn -L "$workdir" -o "$static_shared" 2>&1)
+status=$?
+check_build "$out" "dynamic library with static dependencies"
+[ -f "$static_shared" ] || exit 1
+mv "$dependency_shared" "$dependency_shared.hidden" || exit $?
+"$cc" "$DIR/consumer.c" "$static_shared" -o "$workdir/consumer-dynamic-static" || exit $?
+run_dynamic "$workdir/consumer-dynamic-static" || exit $?
+mv "$dependency_shared.hidden" "$dependency_shared" || exit $?
+
 echo "> Build static library with dynamic dependencies"
-out=$("$VALK" build "$DIR/dependency.valk" --lib --static --no-warn -L "$workdir" -o "$archive" 2>&1)
+out=$("$VALK" build "$DIR/dependency.valk" --lib --static-lib --no-warn -L "$workdir" -o "$archive" 2>&1)
 status=$?
 check_build "$out" "static library"
 [ -f "$archive" ] || exit 1
 "$cc" "$DIR/consumer.c" "$archive" -L "$workdir" -lanswerdep -Wl,-rpath,"$workdir" -o "$workdir/consumer-static" || exit $?
 run_dynamic "$workdir/consumer-static" || exit $?
 
-echo "> Build full static library with static dependencies"
-out=$("$VALK" build "$DIR/dependency.valk" --lib --static --full-static --no-warn -L "$workdir" -o "$full_archive" 2>&1)
+echo "> Build static library with static dependencies"
+out=$("$VALK" build "$DIR/dependency.valk" --lib --static-lib --static --no-warn -L "$workdir" -o "$static_archive" 2>&1)
 status=$?
-check_build "$out" "full static library"
-[ -f "$full_archive" ] || exit 1
-"$cc" "$DIR/consumer.c" "$full_archive" -o "$workdir/consumer-full" || exit $?
-"$workdir/consumer-full" || exit $?
+check_build "$out" "static library with static dependencies"
+[ -f "$static_archive" ] || exit 1
+if [[ "$(uname -s)" == Darwin* ]] && ar t "$static_archive" | grep -q '^__.SYMDEF'; then
+    echo "# Static library contains archive metadata members"
+    exit 1
+fi
+"$cc" "$DIR/consumer.c" "$static_archive" -o "$workdir/consumer-static-deps" || exit $?
+"$workdir/consumer-static-deps" || exit $?
 
 echo "> Build static library without an FFI export"
-out=$("$VALK" build "$DIR/no-export.valk" --lib --static --no-warn -o "$plain_archive" 2>&1)
+out=$("$VALK" build "$DIR/no-export.valk" --lib --static-lib --no-warn -o "$plain_archive" 2>&1)
 status=$?
 check_build "$out" "ordinary static library"
 if [ ! -f "$plain_archive" ]; then
@@ -146,4 +176,4 @@ if [ "$archive_ext" = ".a" ] && [ -z "$(ar t "$plain_archive")" ]; then
 fi
 
 echo "# Library tests passed"
-echo "# Test count: 5"
+echo "# Test count: 7"
