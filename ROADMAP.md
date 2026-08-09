@@ -4,18 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.7
-+ Cache directory hash fix + race lock
-+ Date/time classes
-+ Remove LLVM (valkir is the default backend, `--clang` compiles the IR instead)
-+ 'export' functions + build library instead of executable
-+ Fix access types in extend
-
-+ Release 0.2.6
-+ Adjust package directory lookup
-+ Improve error payload parsing
-+ Fix Array prepend many
-+ Implement `--valkir` flag
+- Release 0.2.8
+- Improve standard library
 
 # Next steps
 
@@ -44,6 +34,19 @@
 ## Done
 
 ```
++ Release 0.2.7
++ Cache directory hash fix + race lock
++ Date/time classes
++ Remove LLVM (valkir is the default backend, `--clang` compiles the IR instead)
++ 'export' functions + build library instead of executable
++ Fix access types in extend
+
++ Release 0.2.6
++ Adjust package directory lookup
++ Improve error payload parsing
++ Fix Array prepend many
++ Implement `--valkir` flag
+
 + Release 0.2.5
 + Bugfixing
 
