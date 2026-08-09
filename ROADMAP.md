@@ -5,6 +5,7 @@
 
 ```
 - Release 0.3.1
++ Remove llvm-lib dependency
 - Improve standard library
 
 # Next steps
