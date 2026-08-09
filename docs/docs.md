@@ -68,6 +68,8 @@
 * [Unsafe](#unsafe)
     * [Structs](#structs)
     * [External libraries](#external-libraries)
+    * [Linking](#linking)
+    * [Building native libraries](#building-native-libraries)
 
 * [Valk manager](#valk-manager)
 * [Data races](#data-races)
@@ -1260,24 +1262,7 @@ extern fn malloc(size: uint) ptr;
 extern fn free(adr: ptr);
 ```
 
-To make a Valk function callable by a native linker, mark it `export`. Exported
-functions keep their source name as the symbol name and must have a concrete,
-non-generic signature.
-
-```rust
-export fn add(left: int, right: int) int {
-    return left + right
-}
-```
-
-Build those exported functions into a static library with `--lib`. A library
-has no executable entry point, so it does not need `fn main()`.
-
-```bash
-valk build src/*.valk --lib -o libmylib
-```
-
-The output is `libmylib.a` on Linux and macOS, or `libmylib.lib` on Windows.
+## Linking
 
 To link with your library you have 2 options:
 
@@ -1298,6 +1283,44 @@ Option 2: Use CLI arguments
 # This will look for libmylib.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
 valk build src/*.valk -l mylib -L "/usr/my-libs"
 valk build src/*.valk -l mylib -L "/usr/my-libs" --static
+```
+
+## Building native libraries
+
+To make a Valk function callable by a native linker, mark it `export`. Exported
+functions keep their source name as the symbol name and must have a concrete,
+non-generic signature.
+
+```rust
+export fn add(left: int, right: int) int {
+    return left + right
+}
+```
+
+Build those exported functions into a library with `--lib`. A library has no
+executable entry point, so it does not need `fn main()`.
+
+```bash
+valk build src/*.valk --lib -o libmylib
+```
+
+This produces a shared library: `libmylib.so` on Linux,
+`libmylib.dylib` on macOS, or `libmylib.dll` on Windows. Its automatic
+dependencies are linked dynamically.
+
+Use `--static-lib` to produce a static archive instead. The archive leaves
+automatic dependencies for the final consumer to link dynamically.
+
+```bash
+valk build src/*.valk --lib --static-lib -o libmylib
+```
+
+The output is `libmylib.a` on Linux and macOS, or `libmylib.lib` on Windows.
+Use `--static` to link dependencies statically. With `--static-lib`, those
+dependencies are folded into the archive:
+
+```bash
+valk build src/*.valk --lib --static-lib --static -o libmylib
 ```
 
 ## Valk manager
