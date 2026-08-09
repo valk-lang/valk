@@ -6,19 +6,27 @@ use valk:time
 fn link_unit_objects(build: Build) !Error {
     let start = time:microtime()
     let target = build.options.target
+    let is_shared = build.options.mode == BUILDTYPE.lib
 
-    let output = link_output_path(build) !>
+    let output = ""
+    if is_shared : output = shared_library_output_path(build) !>
+    else : output = link_output_path(build) !>
 
     let root = target_sysroot(build)
     let dirs = target_link_dirs(build, root)
     let missing = Array[String]{}
     let args = ByteBuffer.new(16384)
     if target.os == "win" {
-        args.write_string("/stack:8388608,65536 ")
+        if is_shared : args.write_string("/dll /noentry ")
+        else : args.write_string("/stack:8388608,65536 ")
         if build.options.debug : args.write_string("/DEBUG ")
         args.write_string("/out:\"")
     } else {
-        args.write_string("-pie -o \"")
+        if is_shared {
+            args.write_string(target.os == "linux" ? "-shared -o \"" : "-dylib -o \"")
+        } else {
+            args.write_string("-pie -o \"")
+        }
     }
     args.write_string(output)
     args.write_string("\" ")
@@ -44,14 +52,18 @@ fn link_unit_objects(build: Build) !Error {
         args.write_string(root)
         args.write_string("\" ")
         if target.arch == "x64" {
-            args.write_string("-m elf_x86_64 --dynamic-linker /lib64/ld-linux-x86-64.so.2 ")
+            args.write_string("-m elf_x86_64 ")
+            if !is_shared : args.write_string("--dynamic-linker /lib64/ld-linux-x86-64.so.2 ")
         } else {
-            args.write_string("-m aarch64linux --dynamic-linker /lib/ld-linux-aarch64.so.1 ")
+            args.write_string("-m aarch64linux ")
+            if !is_shared : args.write_string("--dynamic-linker /lib/ld-linux-aarch64.so.1 ")
         }
-        // crtbeginS.o/crtendS.o are GCC's, not glibc's. They stay because
-        // libc_nonshared.a's __cxa_atexit compat needs __dso_handle, which
-        // crtbegin defines. Dropping them needs Valk to emit that symbol itself.
-        args.write_string("-l:Scrt1.o -l:crti.o -l:crtbeginS.o ")
+        if !is_shared {
+            // crtbeginS.o/crtendS.o are GCC's, not glibc's. They stay because
+            // libc_nonshared.a's __cxa_atexit compat needs __dso_handle, which
+            // crtbegin defines. Dropping them needs Valk to emit that symbol itself.
+            args.write_string("-l:Scrt1.o -l:crti.o -l:crtbeginS.o ")
+        }
     } else if target.os == "macos" {
         args.write_string("-syslibroot \"")
         args.write_string(root)
@@ -89,10 +101,11 @@ fn link_unit_objects(build: Build) !Error {
         linker_write_lib(args, link.lib, link.type == LINK_KIND.static, dirs, missing, target)
     }
     each build.options.link_libs as lib {
-        linker_write_lib(args, lib, false, dirs, missing, target)
+        linker_write_lib(args, lib, build.options.static_link_deps(), dirs, missing, target)
     }
 
-    if target.os == "linux" : args.write_string("-l:crtendS.o -l:crtn.o ")
+    if target.os == "linux" && !is_shared : args.write_string("-l:crtendS.o -l:crtn.o ")
+    if target.os == "win" && is_shared : linker_write_shared_exports(args, build)
     each build.options.link_args_append as arg {
         args.write_string(arg)
         args.write_string(" ")
@@ -102,10 +115,7 @@ fn link_unit_objects(build: Build) !Error {
     let text = args.to_string()
     fs:write(argfile, text) ! build.error("Failed to write linker response file: " + argfile)
 
-    let linker = "ld"
-    if target.os == "linux" && !target.host_is_target() : linker = "ld.lld"
-    else if target.os == "macos" && !target.host_is_target() : linker = "ld64.lld"
-    else if target.os == "win" : linker = "lld-link"
+    let linker = target_linker(target)
     let command = linker + " \"@" + argfile + "\""
     build.print_verbose(2, "🔗 Link command: " + command)
     build.print_verbose(3, "# Full link command: " + linker + " " + text)
@@ -116,7 +126,7 @@ fn link_unit_objects(build: Build) !Error {
 
     let code, result = core:exec(command)
     if code != 0 {
-        build.error("Failed to link executable\n# Exit code: " + code + "\n# Output: " + result)
+        build.error("Failed to link " + (is_shared ? "dynamic library" : "executable") + "\n# Exit code: " + code + "\n# Output: " + result)
     }
     build.stats.link_us = time:microtime() - start
 }
@@ -124,9 +134,28 @@ fn link_unit_objects(build: Build) !Error {
 fn archive_unit_objects(build: Build) !Error {
     let start = time:microtime()
     let target = build.options.target
-    let output = library_output_path(build) !>
+    let output = static_library_output_path(build) !>
     if fs:exists(output) {
         fs:delete(output) ! build.error("Failed to replace library: " + output)
+    }
+
+    let objects = Array[String]{}
+    if build.options.is_full_static && target.os == "linux" {
+        objects.append(link_full_static_library_objects(build) !>)
+    } else {
+        each build.lists.units as unit {
+            if unit.path_o.length > 0 : objects.append(unit.path_o)
+        }
+        if build.options.is_full_static {
+            let root = target_sysroot(build)
+            let dirs = target_link_dirs(build, root)
+            let inputs = full_static_library_inputs(build, dirs) !>
+            if target.os == "macos" {
+                each static_library_archive_objects(build, inputs) as path : objects.append(path, true)
+            } else {
+                each inputs as path : objects.append(path, true)
+            }
+        }
     }
 
     let args = ByteBuffer.new(16384)
@@ -138,10 +167,9 @@ fn archive_unit_objects(build: Build) !Error {
     }
     args.write_string(output)
     args.write_string("\" ")
-    each build.lists.units as unit {
-        if unit.path_o.length == 0 : continue
+    each objects as path {
         args.write_string("\"")
-        args.write_string(unit.path_o)
+        args.write_string(path)
         args.write_string("\" ")
     }
 
@@ -152,6 +180,107 @@ fn archive_unit_objects(build: Build) !Error {
         build.error("Failed to build static library\n# Exit code: " + code + "\n# Output: " + result)
     }
     build.stats.link_us = time:microtime() - start
+}
+
+fn link_full_static_library_objects(build: Build) String !Error {
+    let target = build.options.target
+    if target.os != "linux" : build.error("Unsupported full static library target: " + target.target)
+    let output = helper:add(object_output_dir(build) !>, "library-full-static.o")
+    let root = target_sysroot(build)
+    let dirs = target_link_dirs(build, root)
+    let args = ByteBuffer.new(16384)
+
+    args.write_string("-r -o \"")
+    args.write_string(output)
+    args.write_string("\" --sysroot=\"")
+    args.write_string(root)
+    args.write_string("\" ")
+    args.write_string(target.arch == "x64" ? "-m elf_x86_64 " : "-m aarch64linux ")
+
+    each build.lists.units as unit {
+        if unit.path_o.length == 0 : continue
+        args.write_string("\"")
+        args.write_string(unit.path_o)
+        args.write_string("\" ")
+    }
+    each full_static_library_inputs(build, dirs) as path {
+        args.write_string("\"")
+        args.write_string(path)
+        args.write_string("\" ")
+    }
+
+    let linker = target_linker(target)
+    let command = linker + " " + args.to_string()
+    build.print_verbose(2, "🔗 Full static library command: " + command)
+    let code, result = core:exec(command)
+    if code != 0 {
+        build.error("Failed to include static library dependencies\n# Exit code: " + code + "\n# Output: " + result)
+    }
+    return output
+}
+
+fn full_static_library_inputs(build: Build, dirs: Array[String]) Array[String] !Error {
+    let paths = Array[String]{}
+    each build.lists.links as link {
+        if link.type != LINK_KIND.static : continue
+        // Skip unused thin MSVC archives whose original objects are not packaged.
+        if build.options.target.os == "win" && !link.unit.is_used : continue
+        paths.append(static_library_input_path(build, link.lib, dirs) !>, true)
+    }
+    each build.options.link_libs as lib {
+        paths.append(static_library_input_path(build, lib, dirs) !>, true)
+    }
+    return paths
+}
+
+fn static_library_archive_objects(build: Build, inputs: Array[String]) Array[String] !Error {
+    let objects = Array[String]{}
+    let root = object_output_dir(build) !>
+    each inputs as input, i {
+        if !input.ends_with(".a") && !input.ends_with(".lib") {
+            objects.append(input, true)
+            continue
+        }
+
+        let dir = helper:add(root, "full-static-" + i)
+        if !fs:is_dir(dir) : fs:mkdir(dir) ! build.error("Failed to create full static library directory: " + dir)
+        let list_code, listed = core:exec("ar t \"" + input + "\"")
+        if list_code != 0 {
+            build.error("Failed to read static dependency: " + input + "\n# Output: " + listed)
+        }
+        let extract_code, extracted = core:exec("cd \"" + dir + "\" && ar x \"" + input + "\"")
+        if extract_code != 0 {
+            build.error("Failed to extract static dependency: " + input + "\n# Output: " + extracted)
+        }
+        each listed.split("\n") as member {
+            member = member.trim("\r").trim(" ")
+            if member.length == 0 : continue
+            let path = helper:add(dir, member)
+            if !fs:exists(path) : build.error("Static dependency member was not extracted: " + path)
+            objects.append(path, true)
+        }
+    }
+    return objects
+}
+
+fn static_library_input_path(build: Build, raw_name: String, dirs: Array[String]) String !Error {
+    let name = raw_name
+    if name.starts_with(":") : name = name.part(1, name.length)
+    let is_path = name.contains("/") || name.contains("\\")
+    if is_path {
+        let path = helper:resolve(name)
+        if fs:exists(path) : return path
+        build.error("Static dependency not found: " + raw_name)
+    }
+
+    let strict = name.contains(".")
+    let filename = ""
+    if strict : filename = name
+    else if build.options.target.os == "win" : filename = name + ".lib"
+    else : filename = "lib" + name + ".a"
+    let path = linker_find_lib(filename, dirs)
+    if isset(path) : return path
+    build.error("Static dependency not found: " + filename)
 }
 
 // A build without -o still needs a concrete executable when --run is used.
@@ -168,7 +297,7 @@ fn link_output_path(build: Build) String !Error {
     return output
 }
 
-fn library_output_path(build: Build) String !Error {
+fn static_library_output_path(build: Build) String !Error {
     let output = build.options.path_out
     if isset(output) : output = helper:resolve(output)
     else : output = helper:add(object_output_dir(build) !>, "out")
@@ -177,6 +306,43 @@ fn library_output_path(build: Build) String !Error {
     if !output.ends_with(extension) : output += extension
     build.options.path_out = output
     return output
+}
+
+fn shared_library_output_path(build: Build) String !Error {
+    let output = build.options.path_out
+    if isset(output) : output = helper:resolve(output)
+    else : output = helper:add(object_output_dir(build) !>, "out")
+
+    let extension = ".so"
+    if build.options.target.os == "macos" : extension = ".dylib"
+    else if build.options.target.os == "win" : extension = ".dll"
+    if !output.ends_with(extension) : output += extension
+    build.options.path_out = output
+    return output
+}
+
+fn linker_write_shared_exports(out: ByteBuffer, build: Build) {
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if !func.is_export : continue
+            out.write_string("/export:\"")
+            out.write_string(func.name)
+            out.write_string("\" ")
+        }
+    }
+    each build.lists.globals as global {
+        if !global.is_export : continue
+        out.write_string("/export:\"")
+        out.write_string(global.name)
+        out.write_string("\" ")
+    }
+}
+
+fn target_linker(target: Target) String {
+    if target.os == "win" : return "lld-link"
+    if target.os == "linux" && !target.host_is_target() : return "ld.lld"
+    if target.os == "macos" && !target.host_is_target() : return "ld64.lld"
+    return "ld"
 }
 
 fn target_sysroot(build: Build) String {
@@ -213,7 +379,7 @@ fn target_link_dirs(build: Build, root: String) Array[String] {
 
     // Search order is: explicit -L, host directories, Valk's bundled libraries,
     // then packages. The host comes first so a native build uses what the system
-    // already has; --static is what pins a build to the bundled copies instead.
+    // already has; static dependency mode is what selects bundled archives instead.
     // On macOS the SDK is also where frameworks live, which is why the sysroot
     // stays in this list even though libSystem is bundled.
     if !build.options.no_system_libs && target.host_is_target() {

@@ -1270,14 +1270,30 @@ export fn add(left: int, right: int) int {
 }
 ```
 
-Build those exported functions into a static library with `--lib`. A library
-has no executable entry point, so it does not need `fn main()`.
+Build those exported functions into a library with `--lib`. A library has no
+executable entry point, so it does not need `fn main()`.
 
 ```bash
 valk build src/*.valk --lib -o libmylib
 ```
 
+This produces a shared library: `libmylib.so` on Linux,
+`libmylib.dylib` on macOS, or `libmylib.dll` on Windows. Its automatic
+dependencies are linked dynamically.
+
+Use `--static` to produce a static archive instead. The archive leaves
+automatic dependencies for the final consumer to link dynamically.
+
+```bash
+valk build src/*.valk --lib --static -o libmylib
+```
+
 The output is `libmylib.a` on Linux and macOS, or `libmylib.lib` on Windows.
+To fold automatic static dependencies into that archive, add `--full-static`:
+
+```bash
+valk build src/*.valk --lib --static --full-static -o libmylib
+```
 
 To link with your library you have 2 options:
 
