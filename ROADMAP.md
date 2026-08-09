@@ -7,10 +7,11 @@
 - Release 0.3.1
 + Remove llvm-lib dependency
 - Improve standard library
+- Data race solution
+- Dont allow inline GC types in unions
 
 # Next steps
-
-- Data race solution
+/
 
 # Other
 
