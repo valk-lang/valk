@@ -28,7 +28,7 @@ exe="$workdir/extend-access$exe_ext"
 
 echo ""
 echo "# Test extend access modifiers"
-echo "> Build public extension member from a dependency package"
+echo "> Build a public extension member from a dependency package"
 
 out=$("$VALK" build "$DIR" --no-warn -o "$exe" 2>&1)
 status=$?
