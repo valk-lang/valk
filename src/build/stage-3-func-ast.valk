@@ -49,8 +49,8 @@ fn parse_func_ast(func: Func) !Error {
     func_finish_ast(func) !>
     warn_unused_decls(func)
 
-    // Closure capture detection still needs the complete body graph. Cache it
-    // before IR generation and the subsequent AST release.
+    // Capture registration happens while identifier expressions are resolved;
+    // prepare the resulting environment before IR and AST release.
     if func.is_literal : func_prepare_closure(func) !>
 
     // The LSP answers from the resolved AST and never links anything, so IR for
@@ -241,6 +241,9 @@ fn func_finish_ast(func: Func) !Error {
         // Arguments survive a second lowering pass, so never retain offsets
         // from the discarded frame.
         decl.gc_stack_offset = null
+        // Hidden capture arguments are properties of the closure environment,
+        // not independent frame storage.
+        if decl.is_bind : continue
         // Compiler-generated buffers receive coalesced slots after permanent
         // roots have been laid out. Only direct GC buffers take that path;
         // inline buffers need their complete typed value in the frame.
@@ -262,7 +265,7 @@ fn func_finish_ast(func: Func) !Error {
     }
 
     if stable_size > 0 {
-        let decl = Decl.new(type_ptr(b), false, "valk_stable_stack")
+        let decl = Decl.new(func, type_ptr(b), false, "valk_stable_stack")
         decl.ir_name = "\%valk_stable_stack"
         let root_offset = alloca_size.round_up(psz)
         decl.gc_stack_offset = root_offset
@@ -721,7 +724,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             if scope.has_local(name) {
                 exp.error("Name already used in this scope: " + name)
             }
-            let decl = Decl.new(decl_type, false, name)
+            let decl = Decl.new(ctx.get_func() !>, decl_type, false, name)
             decl.exp = exp
             scope.add_decl(decl)
             scope.set_idf(name, Idf.for_decl(decl))
@@ -786,17 +789,9 @@ fn value_from_defer_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let value_exp = exp.get(DEFER_EXP.value)
     if !isset(value_exp) : exp.error("Expected a function call after 'defer'")
 
-    let deferred = value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
-    if !defer_value_is_call(deferred) {
-        value_exp.error("'defer' expects a function call")
-    }
-    if deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass {
-        value_exp.error("A deferred call must handle its error before the function exits")
-    }
-
     let func = ctx.get_func() !>
+    let closure = make_defer_closure(func, scope, value_exp, exp) !>
     let stack = ensure_user_defer_stack(func, exp) !>
-    let closure = make_defer_closure(func, scope, deferred, exp) !>
     let stack_class = stack.type.get_class_or_null()
     if !isset(stack_class) : exp.bug("Deferred-call stack has no Array class")
     let append = stack_class.get_func("append")
@@ -848,7 +843,7 @@ fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
     if !isset(body_scope) || !isset(alloca_scope) || !isset(defer_scope) {
         at.bug("Function scopes are missing while creating a defer stack")
     }
-    let stack = Decl.new(stack_type, false)
+    let stack = Decl.new(func, stack_type, false)
     body_scope.add_decl(stack)
     func.user_defer_stack = stack
 
@@ -873,11 +868,10 @@ fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
     return stack
 }
 
-// A defer registration is represented as an ordinary closure. The existing
-// closure lowering copies referenced locals into its environment at the point
-// this Value is emitted, so loop iterations and later mutations behave as
-// independent registrations.
-fn make_defer_closure(owner: Func, scope: Scope, deferred: Value, at: Exp) Value !Error {
+// A defer registration is represented as an ordinary closure. Resolve its call
+// in that closure's context so identifier evaluation creates hidden capture
+// arguments directly, just as it does for a source-level function literal.
+fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Value !Error {
     let arg_scope = scope.sub_scope()
     let func = Func {
         unit: owner.unit
@@ -896,6 +890,22 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred: Value, at: Exp) Value
     arg_scope.func = func
     let body_scope = arg_scope.sub_scope()
     body_scope.func = func
+    let inner_ctx = Context.for_func(func).without_suggested_type()
+    let deferred_value: ?Value = null
+    if deferred_exp.type == EXP.value && deferred_exp.kind == VALUE_KIND.call {
+        // A bare fallible call must be diagnosed as an invalid defer, not
+        // automatically passed through the synthetic closure.
+        deferred_value = value_from_call_raw(deferred_exp, body_scope, inner_ctx) !>
+    } else {
+        deferred_value = value_from_exp(deferred_exp, body_scope, inner_ctx) !>
+    }
+    let deferred = deferred_value ?! deferred_exp.bug("Deferred call did not produce a value")
+    if !defer_value_is_call(deferred) {
+        deferred_exp.error("'defer' expects a function call")
+    }
+    if deferred.can_error || (deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass) {
+        deferred_exp.error("A deferred call must handle its error before the function exits")
+    }
     body_scope.append_value(deferred)
     func.body_scope = body_scope
     func.alloca_scope = body_scope.sub_scope()
@@ -1220,11 +1230,11 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     // Scope holding the `on` / index temporaries around the while loop.
     let each_scope = scope.sub_scope()
 
-    let on_decl = Decl.new(on_nn.rett, false, null)
+    let on_decl = Decl.new(ctx.get_func() !>, on_nn.rett, false, null)
     each_scope.add_decl(on_decl)
     let on_init = vgen_assign(vgen_decl(on_decl), on_nn, ASSIGN_OP.set, b, exp)
 
-    let index_decl = Decl.new(index_type, false, null)
+    let index_decl = Decl.new(ctx.get_func() !>, index_type, false, null)
     index_decl.is_mut = true
     each_scope.add_decl(index_decl)
 
@@ -1262,7 +1272,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         let name = names.get(i) ! exp.bug("Missing each variable name")
         let part = item_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
         let item_type = item_types.get(i) ! exp.bug("Missing each item type")
-        let decl = Decl.new(item_type, false, name)
+        let decl = Decl.new(ctx.get_func() !>, item_type, false, name)
         decl.exp = exp
         bind_decls.append(decl)
         bind_inits.append(part)
@@ -1272,7 +1282,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     }
     if has_index_name {
         let index_name = names.get(names.length - 1) ! exp.bug("Missing each index name")
-        let index_user_decl = Decl.new(index_type, false, index_name)
+        let index_user_decl = Decl.new(ctx.get_func() !>, index_type, false, index_name)
         index_user_decl.exp = exp
         bind_decls.append(index_user_decl)
         bind_inits.append(vgen_decl(index_decl))
