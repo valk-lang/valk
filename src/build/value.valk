@@ -7,6 +7,12 @@ use valk:fs
 
 // Everything in a function body is a Value — including control flow.
 // if / while / let / return / assign / block have rett = void (side-effecting).
+enum CALL_KIND : u8 {
+    direct
+    closure
+    interface_dispatch
+}
+
 enum VAL : u8 {
     undefined
     int
@@ -26,7 +32,10 @@ enum VAL : u8 {
     type     // compile-time type value (of_type); rett is String; props like .$is_inline
     op       // binary op (VALUE_OP in .op); left/right in value1/value2
     unary    // unary op (VALUE_OP in .op); operand in value1
-    call     // callee in value1; args in values
+    call     // callee in value1; args in values; CALL_KIND in op
+    // Success projection of a fallible call/value; value1 is the original
+    // fallible producer. IR extracts its success payload without re-emitting it.
+    error_success
     cast     // value.@cast(Type); value1 = on, rett = target Type
     paren    // grouping; value1 = inner (usually folded away)
     multi    // argument list only (values array); not a runtime value alone
@@ -77,8 +86,8 @@ enum VAL : u8 {
     atomic_load
     // Raw memory copy: values = [source ptr, destination ptr, byte length].
     memcpy
-    // Fallible call with handler applied — value1=success value, value2=handler side-effect tree
-    // (IR lowers to error-check + branch). op = ERRH_KIND.
+    // Fallible call with handler applied — value2=handler side-effect tree;
+    // pre_value is the fallible producer. IR lowers it to a check and branch.
     error_handler
     // `co <call>` — value1 = the launched call; rett = TYPE.co wrapping its return/error
     co
@@ -124,7 +133,8 @@ class Value {
     value1: ?Value (null)
     value2: ?Value (null)
     values: ?Array[Value] (null)
-    // Operators: VALUE_OP for op/unary; ASSIGN_OP for VAL.assign; ERRH_KIND for error_handler
+    // Operators: VALUE_OP for op/unary; CALL_KIND for call; ASSIGN_OP for
+    // VAL.assign; ERRH_KIND for error_handler.
     op: u8 (0)
     // Literal payloads
     int_val: int (0)
@@ -154,7 +164,8 @@ class Value {
     // Fallible call metadata (before error handler trims it)
     can_error: bool (false)
     error_type: ?ErrorType (null)
-    // Side-effect / pre-value chain (old this_but_that / error-check scaffolding)
+    // Side-effect / pre-value chain (old this_but_that scaffolding and the
+    // original fallible producer for an error handler).
     pre_value: ?Value (null)
 
     // Report an error at this value's source span when available.
@@ -189,102 +200,46 @@ class Value {
 
     // Multi-return / multi-value unpack: VAL.multi → values array; vscope/phi via value1.
     fn unroll() Array[Value] {
-        if this.type == VAL.multi {
-            let vals = this.values
-            if isset(vals) : return vals
+        let vals = this.values
+        if this.type == VAL.multi && isset(vals) : return vals
+        // A phi of multi values unrolls through its first arm.
+        if this.type == VAL.phi && isset(vals) {
+            let first = vals.get(0) !? null
+            if isset(first) && first.type == VAL.multi : return first.unroll()
         }
-        // Keep the value scope itself as the runtime producer. Its VAL.phi is
-        // merge metadata; IR builds the actual phi while emitting the body.
-        if this.type == VAL.vscope {
-            if this.rett.type == TYPE.multi {
-                let subs = this.rett.sub_types
-                if isset(subs) {
-                    let out = Array[Value]{}
-                    each subs as st, i {
-                        out.append(Value {
-                            type: VAL.multi
-                            name: "part"
-                            int_val: i.@cast(int)
-                            value1: this
-                            rett: st
-                            exp: this.exp
-                        })
-                    }
-                    return out
-                }
-            }
-            return Array[Value]{ this }
-        }
-        if this.type == VAL.phi {
-            // Phi of multi values still multi; single-value phi is one arm
-            let vals = this.values
-            if isset(vals) && vals.length > 0 {
-                let first = vals.get(0) !? null
-                if isset(first) && first.type == VAL.multi : return first.unroll()
-                // Multi rett without stored multi value: one extract per subtype
-                if this.rett.type == TYPE.multi {
-                    let subs = this.rett.sub_types
-                    if isset(subs) {
-                        let out = Array[Value]{}
-                        each subs as st, i {
-                            // Placeholder extracts for let-unpack; IR fills later
-                            out.append(Value {
-                                type: VAL.multi
-                                name: "phi_part"
-                                int_val: i.@cast(int)
-                                value1: this
-                                rett: st
-                                exp: this.exp
-                            })
-                        }
-                        return out
-                    }
-                }
-            }
-        }
-        // Multi-typed value without VAL.multi (e.g. call returning (T,U))
-        if this.rett.type == TYPE.multi {
-            let subs = this.rett.sub_types
-            if isset(subs) {
-                let out = Array[Value]{}
-                each subs as st, i {
-                    out.append(Value {
-                        type: VAL.multi
-                        name: "part"
-                        int_val: i.@cast(int)
-                        value1: this
-                        rett: st
-                        exp: this.exp
-                    })
-                }
-                return out
-            }
-        }
+        // A vscope stays the runtime producer: its VAL.phi is merge metadata and
+        // IR builds the actual phi while emitting the body.
+        let parts = this.multi_parts()
+        if isset(parts) : return parts
         return Array[Value]{ this }
     }
 
-    // Success value of a fallible call (errors trimmed conceptually).
-    fn trim_errors() Value {
+    // One extract per subtype of a multi-valued producer.
+    fn multi_parts() ?Array[Value] {
+        if this.rett.type != TYPE.multi : return null
+        let subs = this.rett.sub_types ?! return null
+        let out = Array[Value]{}
+        each subs as st, i {
+            out.append(Value {
+                type: VAL.multi
+                name: "part"
+                int_val: i.@cast(int)
+                value1: this
+                rett: st
+                exp: this.exp
+            })
+        }
+        return out
+    }
+
+    // Explicit success projection of a fallible value.
+    fn success_value() Value {
         if !this.can_error : return this
         return Value {
-            type: this.type
+            type: VAL.error_success
+            value1: this
             rett: this.rett
             exp: this.exp
-            value1: this.value1
-            value2: this.value2
-            values: this.values
-            op: this.op
-            int_val: this.int_val
-            float_val: this.float_val
-            bool_val: this.bool_val
-            string_val: this.string_val
-            name: this.name
-            decl: this.decl
-            func: this.func
-            of_type: this.of_type
-            can_error: false
-            error_type: null
-            pre_value: this
         }
     }
 
@@ -334,6 +289,10 @@ class Value {
         return this.func
     }
 }
+
+////////////////////////////
+// Expression dispatch
+////////////////////////////
 
 // Convert a structured EXP.value into a Value.
 // `scope` for name lookup; `ctx` for the function and suggested type.
@@ -664,6 +623,10 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     exp.bug("Unknown value kind: " + kind)
 }
 
+////////////////////////////
+// Embeds and coroutines
+////////////////////////////
+
 // Package-root-relative base dir for `#embed`/`#embed_dir` (matches the classic
 // compiler: paths resolve against the containing package's directory, not the
 // individual file's directory or the process cwd).
@@ -731,7 +694,7 @@ fn value_from_embed_dir_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let vv = vgen_string(content, str_t)
         let callee = vgen_func(set_f, construct)
         let args = Array[Value]{ kv, vv }
-        let call = vgen_call(ctx, callee, args, set_f.get_rett())
+        let call = vgen_call(ctx, callee, args, set_f.get_rett(), scope)
         call.exp = exp
         if !call.rett.is_void_type() && call.rett.compat(rett) {
             construct = call
@@ -760,13 +723,10 @@ fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let callee = call.value1
     if !isset(callee) : exp.bug("'co' call has no callable")
     if callee.rett.get_non_nullable().type == TYPE.fn {
-        let decl = Decl.new(callee.rett, false, null)
-        decl.is_buffer = true
-        enclosing.all_decls.append(decl)
-        let buffered = vgen_decl(decl)
-        buffered.exp = exp
-        buffered.pre_value = vgen_assign(vgen_decl(decl), callee, ASSIGN_OP.set, ctx.build, exp)
-        call.value1 = buffered
+        call.value1 = buffer_value(ctx, enclosing, callee)
+        // The coroutine stores and later invokes the buffered closure value,
+        // regardless of whether its source was a direct function reference.
+        call.op = CALL_KIND.closure
     }
 
     let sub_type: ?Type = null
@@ -814,68 +774,14 @@ fn value_from_error_is_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     return v
 }
 
-// Recursively collect Decl references across a resolved body-Value tree. Ownership
-// comes from Func.all_decls; local declarations are not executable AST values.
-fn value_tree_collect_decls(v: Value, used: Array[Decl]) {
-    if v.type == VAL.decl {
-        let d = v.decl
-        if isset(d) && !used.contains(d) : used.append(d)
-    }
-    // Nested closure construction must be able to supply the nested
-    // environment's captures.
-    if v.type == VAL.func {
-        let nested = v.func
-        if isset(nested) && nested.is_literal {
-            each nested.capture_decls as d {
-                if !used.contains(d) : used.append(d)
-            }
-        }
-    }
-    let v1 = v.value1
-    if isset(v1) : value_tree_collect_decls(v1, used)
-    let v2 = v.value2
-    if isset(v2) : value_tree_collect_decls(v2, used)
-    let vs = v.values
-    if isset(vs) {
-        each vs as sub : value_tree_collect_decls(sub, used)
-    }
-    let pv = v.pre_value
-    if isset(pv) : value_tree_collect_decls(pv, used)
-}
-
-// True if a closure literal's body references any Decl it doesn't itself own (args or
-// its own `let` bindings) — i.e. it captures something from an enclosing scope, and so
-// can never convert to a bare `fnptr` (matches the classic compiler: a non-capturing
-// literal is just a raw function pointer; a capturing one never is). Top-level fns and
-// methods are lexically closed and can never capture, so this is always false for them.
-fn func_has_captures(f: Func) bool {
-    if !f.is_literal : return false
-    let cached = f.captures
-    if isset(cached) : return cached
-
-    let owned = f.all_decls
-    let used = Array[Decl]{}
-    let scope = f.body_scope
-    if isset(scope) {
-        each scope.values as v : value_tree_collect_decls(v, used)
-    }
-
-    let has_cap = false
-    each used as d {
-        if !owned.contains(d) {
-            has_cap = true
-            f.capture_decls.append(d)
-        }
-    }
-    f.captures = has_cap
-    return has_cap
-}
+////////////////////////////
+// Closures and captures
+////////////////////////////
 
 // Build the typed GC data object used by a closure. The function pointer lives
 // in the inline fn value; this object contains bindings only.
 fn func_prepare_closure(f: Func) !Error {
     if isset(f.capture_class) : return
-    if f.is_literal : func_has_captures(f)
 
     // A closure's environment is GC-managed and can outlive the stack frame
     // that created it. Borrowed references therefore cannot be captured.
@@ -900,7 +806,7 @@ fn func_prepare_closure(f: Func) !Error {
     if isset(f.class) && !f.is_static {
         let receiver_arg = f.args.get(0) !? null
         if !isset(receiver_arg) : f.exp.bug("Instance closure target has no receiver argument")
-        class.props.append(Prop {
+        class.add_prop(Prop {
             class: class
             name: "receiver"
             act: ACT.private
@@ -909,7 +815,7 @@ fn func_prepare_closure(f: Func) !Error {
         })
     }
     each f.capture_decls as decl, i {
-        class.props.append(Prop {
+        class.add_prop(Prop {
             class: class
             name: "capture_" + i
             act: ACT.private
@@ -928,6 +834,56 @@ fn func_prepare_closure(f: Func) !Error {
 fn value_resolve_func_ref(v: Value) ?Func {
     if v.type != VAL.func : return null
     return v.func
+}
+
+// Make an outer declaration available in `func`. Each lexical function gets
+// its own hidden binding, so a deeply nested literal captures from its direct
+// parent rather than reaching through that parent's closure environment.
+fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error {
+    if decl.owner == func : return decl
+    if !func.is_literal {
+        at.bug("A non-literal function cannot capture declaration: " + name)
+    }
+
+    let parent_scope = func.arg_scope.parent
+    if !isset(parent_scope) : at.bug("Closure has no enclosing scope: " + name)
+    let parent = parent_scope.func
+    if !isset(parent) : at.bug("Closure has no enclosing function: " + name)
+
+    let source = decl
+    if source.owner != parent {
+        source = func_capture_decl(parent, source, name, at) !>
+    }
+
+    // Propagation through a nested literal may have installed this binding
+    // before its own body directly references the name.
+    let local_idf = func.arg_scope.identifiers
+    if isset(local_idf) {
+        local_idf.get(name) -> existing_idf {
+            if existing_idf.type == IDF.decl {
+                let existing = existing_idf.decl
+                if isset(existing) && existing.owner == func && existing.is_bind {
+                    return existing
+                }
+            }
+        }
+    }
+
+    let captured = Decl.new(func, source.type, true, name)
+    captured.exp = source.exp
+    captured.is_bind = true
+    captured.capture_index = func.capture_args.length
+    func.capture_free = false
+    func.capture_decls.append(source)
+    func.capture_args.append(captured)
+    // Freshly created, so it cannot already be listed.
+    func.all_decls.append(captured)
+    func.arg_scope.set_idf(name, Idf.for_decl(captured))
+
+    // A closure created under an established non-null fact snapshots a value
+    // satisfying that fact. Carry it onto the hidden binding.
+    if parent_scope.not_null_check(source) : func.arg_scope.mark_not_null(captured)
+    return captured
 }
 
 // `fn(args) rett! { body }` — anonymous function literal (closure). Builds a synthetic
@@ -977,6 +933,10 @@ fn value_from_func_lit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     v.exp = exp
     return v
 }
+
+////////////////////////////
+// Value scopes and raw memory
+////////////////////////////
 
 // `<{ ... }` — body re-parsed as statements; returns form the value (phi).
 fn value_from_vscope_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -1115,6 +1075,10 @@ fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     return vgen_ptr_of(on, rett, exp)
 }
 
+////////////////////////////
+// Offset access
+////////////////////////////
+
 // Re-parse the captured `[...]` body once its receiver is known not to be a
 // generic declaration. Requiring the closing bracket here also prevents an
 // invalid `value[a, b]` from being silently accepted as `value[a]`.
@@ -1153,16 +1117,15 @@ fn parse_offset_access(body: Exp) Exp !Error {
 // error handler (`!?`, `! {}`, …) — see value_from_call_raw for the wrapped case.
 fn value_from_offset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let v = value_from_offset_raw_exp(exp, scope, ctx) !>
-    if v.can_error : return value_apply_offset_default(v, scope, ctx, exp) !>
+    if v.can_error : return value_apply_offset_default(v, exp)
     return v
 }
 
 // No explicit handler after `[]` — fall back to a default/zero value instead of
 // rethrowing (matches Array/Map `[]` semantics: an out-of-bounds read yields the
 // zero value / null, it does not propagate an error to the caller).
-fn value_apply_offset_default(call: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
-    let left = call.trim_errors()
-    let default_v = vgen_default_value(left.rett)
+fn value_apply_offset_default(call: Value, at: Exp) Value {
+    let default_v = vgen_default_value(call.rett)
     return value_error_result(call, default_v, default_v.rett, ERRH_KIND.value, at)
 }
 
@@ -1258,8 +1221,7 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         let callee = vgen_func(range_func, on)
         value_check_call_args(range_func, callee, args, scope, ctx, exp) !>
         value_buffer_call_receiver(callee, ctx)
-        value_buffer_call_args(args, ctx)
-        let call = vgen_call(ctx, callee, args, range_func.get_rett())
+        let call = vgen_call(ctx, callee, args, range_func.get_rett(), scope)
         call.exp = exp
         if range_func.can_error {
             call.can_error = true
@@ -1319,7 +1281,7 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             index_arg.type.compat_check(index.rett, index_exp) !>
 
             let callee = vgen_func(get_func, on)
-            let call = vgen_call(ctx, callee, Array[Value]{ index }, get_func.get_rett())
+            let call = vgen_call(ctx, callee, Array[Value]{ index }, get_func.get_rett(), scope)
             call.exp = exp
             if get_func.can_error {
                 call.can_error = true
@@ -1376,7 +1338,7 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     value_arg.type.compat_check(right.rett, right_exp) !>
 
     let callee = vgen_func(set_func, on)
-    let call = vgen_call(ctx, callee, Array[Value]{ index, right }, set_func.get_rett())
+    let call = vgen_call(ctx, callee, Array[Value]{ index, right }, set_func.get_rett(), scope)
     call.exp = at
     if set_func.can_error {
         call.can_error = true
@@ -1408,6 +1370,10 @@ fn offset_generic_func(on: Value) ?Func {
     if isset(f) && f.is_generic_base : return f
     return null
 }
+
+////////////////////////////
+// Class initializers
+////////////////////////////
 
 // Type { … } or bare { … } — right is EXP.body.
 // Body items: `prop: v` (fields), `v` ($append), `k => v` ($set_key).
@@ -1776,7 +1742,7 @@ fn value_from_class_init_hooks(class: Class, rett: Type, elem_exps: Array[Exp], 
             let args = Array[Value]{ ev }
             value_fill_trailing_defaults(append_f, call_receiver_skip(callee, append_f), args, scope, ctx, eexp) !>
             value_check_call_args(append_f, callee, args, scope, ctx, eexp) !>
-            let call = vgen_call(ctx, callee, args, append_f.get_rett())
+            let call = vgen_call(ctx, callee, args, append_f.get_rett(), scope)
             call.exp = eexp
             hooks.append(call)
             // Chain when append returns SELF
@@ -1809,7 +1775,7 @@ fn value_from_class_init_hooks(class: Class, rett: Type, elem_exps: Array[Exp], 
             let args = Array[Value]{ kv, vv }
             value_fill_trailing_defaults(set_f, call_receiver_skip(callee, set_f), args, scope, ctx, pexp) !>
             value_check_call_args(set_f, callee, args, scope, ctx, pexp) !>
-            let call = vgen_call(ctx, callee, args, set_f.get_rett())
+            let call = vgen_call(ctx, callee, args, set_f.get_rett(), scope)
             call.exp = pexp
             hooks.append(call)
             if !call.rett.is_void_type() && call.rett.compat(rett) {
@@ -1838,7 +1804,7 @@ fn class_empty_construct(class: Class, rett: Type, scope: Scope, ctx: Context, a
         let callee = vgen_func(f)
         let args = value_from_call_args(callee, f, null, scope, ctx, at) !>
         value_check_call_args(f, callee, args, scope, ctx, at) !>
-        let call = vgen_call(ctx, callee, args, f.get_rett())
+        let call = vgen_call(ctx, callee, args, f.get_rett(), scope)
         call.exp = at
         if call.rett.is_void_type() : call.rett = rett
         return call
@@ -1869,18 +1835,23 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
 
     let elems_exp = parse_body_as_array_init_elements(body) !>
     let values = Array[Value]{}
-    let last_values: ?Array[Value] = null
+    // A range into `values` covering the most recent non-repeat element. It is
+    // read only by the `repeat` operator to re-emit those values, so no
+    // separate copy of them needs to be kept.
+    let last_start: uint = 0
+    let last_len: uint = 0
     let i: uint = 0
     while true {
         let eexp = elems_exp.get(i)
         if !isset(eexp) : break
         if eexp.type == EXP.value && eexp.kind == VALUE_KIND.repeat {
-            if !isset(last_values) : eexp.error("No value to repeat")
-            if last_values.length == 0 : eexp.error("No value to repeat")
+            if last_len == 0 : eexp.error("No value to repeat")
             while values.length < size {
-                each last_values as last {
+                let k = last_start
+                while k < last_start + last_len {
                     if values.length == size : break
-                    values.append(last)
+                    values.append(values.get(k) ! break)
+                    k++
                 }
             }
             i++
@@ -1891,7 +1862,8 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
         }
         let ev = value_from_exp(eexp, scope, ctx.with_suggested_type(sub)) !>
         let unrolled = ev.unroll()
-        let converted = Array[Value]{}
+        last_start = values.length
+        let appended: uint = 0
         each unrolled as item {
             if values.length >= size {
                 eexp.error("Too many values")
@@ -1903,9 +1875,9 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
                 else : sub.compat_check(item.rett, eexp) !>
             }
             values.append(item)
-            converted.append(item)
+            appended++
         }
-        last_values = converted
+        last_len = appended
         i++
     }
     if values.length < size {
@@ -1914,6 +1886,10 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
 
     return vgen_array_init(ctx, values, suggested_type, exp)
 }
+
+////////////////////////////
+// Match
+////////////////////////////
 
 // Lower `match on [: Type] { case => ... }`.
 fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -2002,7 +1978,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 }
                 let member = item.of_type
                 if !isset(member) : item_exp.bug("Union match type is missing its represented type")
-                let tag = union_type.union_member_index(member)
+                let tag = union_type.union_member_index(member) !? null
                 if !isset(tag) {
                     item_exp.error("Type '" + member.compat_display_name() + "' is not an alternative of '" + union_type.compat_display_name() + "'")
                 }
@@ -2038,7 +2014,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             let member = bound_type ?! exp.bug("Union match binding is missing its type")
             let tag = bound_tag ?! exp.bug("Union match binding is missing its tag")
             if case_scope.has_local(bound_name) : exp.error("Name already used: " + bound_name)
-            let decl = Decl.new(member, false, bound_name)
+            let decl = Decl.new(ctx.get_func() !>, member, false, bound_name)
             decl.exp = exp
             case_scope.add_decl(decl)
             case_scope.set_idf(bound_name, Idf.for_decl(decl))
@@ -2127,6 +2103,10 @@ fn class_from_inline_init_type(t: Type) ?Class {
 
 // ---- helpers ----
 
+////////////////////////////
+// Literals and identifiers
+////////////////////////////
+
 fn value_from_int_literal(exp: Exp, b: Build) Value !Error {
     let text = exp.str1.replace("_", "")
     let n: int = 0
@@ -2207,7 +2187,14 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         // references go through vgen_decl directly and do not count.
         d.is_used = true
         if !ctx.is_store_target : d.is_read = true
-        let v = vgen_decl(d)
+        let current = ctx.func
+        if !isset(current) {
+            exp.error("A declaration cannot be evaluated outside a function")
+        }
+        let resolved = func_capture_decl(current, d, name, exp) !>
+        resolved.is_used = true
+        if !ctx.is_store_target : resolved.is_read = true
+        let v = vgen_decl(resolved)
         v.exp = exp
         return v
     }
@@ -2409,6 +2396,10 @@ fn value_as_rett_type(on: Value, at: Exp, b: Build) Value !Error {
     return vgen_type(on.rett, b)
 }
 
+////////////////////////////
+// Member access
+////////////////////////////
+
 // `left.name` — type meta, static members, instance methods/getters, or object props.
 fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let b = ctx.build
@@ -2479,7 +2470,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             if f.is_getter {
                 let callee = vgen_func(f, receiver)
                 callee.exp = exp
-                let call = vgen_call(ctx, callee, Array[Value]{}, f.get_rett())
+                let call = vgen_call(ctx, callee, Array[Value]{}, f.get_rett(), scope)
                 call.exp = exp
                 if f.can_error {
                     call.can_error = true
@@ -2701,7 +2692,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                     if group_func.is_getter {
                         let callee = vgen_func(group_func, on_nn)
                         callee.exp = exp
-                        let call = vgen_call(ctx, callee, Array[Value]{}, group_func.get_rett())
+                        let call = vgen_call(ctx, callee, Array[Value]{}, group_func.get_rett(), scope)
                         call.exp = exp
                         if group_func.can_error {
                             call.can_error = true
@@ -2725,7 +2716,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 // Getter call with implicit this (no arg list in source)
                 let callee = vgen_func(f, on_nn)
                 callee.exp = exp
-                let call = vgen_call(ctx, callee, Array[Value]{}, f.get_rett())
+                let call = vgen_call(ctx, callee, Array[Value]{}, f.get_rett(), scope)
                 call.exp = exp
                 if f.can_error {
                     call.can_error = true
@@ -2773,6 +2764,10 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     exp.error("Type '" + on_class.pretty_name() + "' has no property or method named: '" + name + "'")
 }
+
+////////////////////////////
+// Default values
+////////////////////////////
 
 fn value_from_default_value(on: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
     let target = value_default_target_type(on, at) !>
@@ -2852,7 +2847,7 @@ fn value_generate_default(target: Type, scope: Scope, ctx: Context, at: Exp) Val
                 // lookup, suggested types, conversions, and argument checks.
                 let args = value_from_call_args(callee, hook, null, scope, ctx, at) !>
                 value_check_call_args(hook, callee, args, scope, ctx, at) !>
-                let call = vgen_call(ctx, callee, args, hook.get_rett())
+                let call = vgen_call(ctx, callee, args, hook.get_rett(), scope)
                 call.exp = at
                 value = call
             }
@@ -2882,6 +2877,10 @@ fn type_has_generated_default(target: Type, b: Build) bool {
     if isset(string_class) && target_class == string_class : return true
     return isset(target_class) && isset(target_class.default_hook)
 }
+
+////////////////////////////
+// Errors and enums
+////////////////////////////
 
 // `value.$is_shared` — test the shared bit in the GC header.
 // This mirrors the classic compiler: flags live at byte offset -4 and bit 2
@@ -3153,6 +3152,10 @@ fn value_from_enum_item(enu: Enum, name: String, at: Exp, scope: Scope, ctx: Con
     at.bug("Enum item not found after scan: " + name)
 }
 
+////////////////////////////
+// Compile-time type members
+////////////////////////////
+
 // Pure meta-properties on VAL.type (`T.$is_inline` → bool, `T.$notnull` → VAL.type).
 // Returns null for method-style meta that must be folded at the call site.
 fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
@@ -3171,7 +3174,7 @@ fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
     }
 
     // Bool queries
-    if name == "$is_inline" : return vgen_bool(t.is_meta_inline_type(), type_bool(b))
+    if name == "$is_inline" : return vgen_bool(t.is_inline_type() && !t.is_number_type(), type_bool(b))
     if name == "$is_nullable" : return vgen_bool(t.is_nullable_type(), type_bool(b))
     if name == "$is_void" : return vgen_bool(t.is_void_type(), type_bool(b))
     if name == "$is_integer" : return vgen_bool(t.is_integer_type(), type_bool(b))
@@ -3181,8 +3184,8 @@ fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
     if name == "$is_structural" : return vgen_bool(t.is_structural_type(), type_bool(b))
     if name == "$is_gc" : return vgen_bool(t.is_gc_type(), type_bool(b))
     if name == "$has_gc_refs" : return vgen_bool(t.has_gc_refs(), type_bool(b))
-    if name == "$is_pointer" : return vgen_bool(t.is_pointer_type(), type_bool(b))
-    if name == "$is_raw_pointer" : return vgen_bool(t.is_raw_pointer_type(), type_bool(b))
+    if name == "$is_pointer" : return vgen_bool(t.is_pointer(), type_bool(b))
+    if name == "$is_raw_pointer" : return vgen_bool(t.is_raw_pointer(), type_bool(b))
     if name == "$has_vtable" : return vgen_bool(t.has_vtable(), type_bool(b))
 
     // Method-style meta: keep as `.name` so `.(args)` folds via value_type_method
@@ -3220,7 +3223,7 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
         }
         let other = (args.get(0) ! at.bug("Missing $is_type_of arg")).as_type()
         if !isset(other) : return vgen_bool(false, type_bool(b))
-        return vgen_bool(t.is_type_of_class(other), type_bool(b))
+        return vgen_bool(t.is_same_type(other), type_bool(b))
     }
 
     if name == "$is_compatible_with" {
@@ -3229,7 +3232,7 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
         }
         let other = (args.get(0) ! at.bug("Missing $is_compatible_with arg")).as_type()
         if !isset(other) : return vgen_bool(false, type_bool(b))
-        return vgen_bool(t.is_compatible_with(other), type_bool(b))
+        return vgen_bool(t.compat(other), type_bool(b))
     }
 
     if name == "$has_method" {
@@ -3243,6 +3246,10 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
 
     at.error("Unknown type method: '" + name + "'")
 }
+
+////////////////////////////
+// Constant folding and call checks
+////////////////////////////
 
 // Fold a binary op when both sides are compile-time constants. Returns null if not foldable.
 fn value_try_fold_op(left: Value, right: Value, op: VALUE_OP, b: Build) ?Value {
@@ -3415,6 +3422,10 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         i++
     }
 }
+
+////////////////////////////
+// String literals
+////////////////////////////
 
 // Strip surrounding quotes from a string/char token (keeps escapes as written).
 fn strip_quotes(s: String) String {

@@ -5,6 +5,10 @@
 //
 // Prerequisites: parse_func_types (args + this bound as IDF.decl on arg_scope).
 
+////////////////////////////
+// Body resolution entry
+////////////////////////////
+
 fn parse_func_ast(func: Func) !Error {
     if func.parsed_ast : return
     if func.skip_ast || func.is_generic_base : return
@@ -49,8 +53,8 @@ fn parse_func_ast(func: Func) !Error {
     func_finish_ast(func) !>
     warn_unused_decls(func)
 
-    // Closure capture detection still needs the complete body graph. Cache it
-    // before IR generation and the subsequent AST release.
+    // Capture registration happens while identifier expressions are resolved;
+    // prepare the resulting environment before IR and AST release.
     if func.is_literal : func_prepare_closure(func) !>
 
     // The LSP answers from the resolved AST and never links anything, so IR for
@@ -98,6 +102,8 @@ fn func_release_ast(func: Func, exps: Array[Exp]) {
     func.user_defer_pop = null
     func.all_decls = .{}
     func.define_decls = .{}
+    func.buffer_pool = .{}
+    func.buffers_used = .{}
     func.test_entry_decl = null
     func.stable_stack_decl = null
 }
@@ -134,72 +140,9 @@ fn func_release_exps(func: Func, exps: Array[Exp]) {
     }
 }
 
-// Only direct managed-reference buffers share storage. Their representation
-// and marker operation are always one pointer, so reusing a slot for a later
-// statement cannot reinterpret scalar bytes as a GC pointer. Inline buffers
-// keep their own typed storage in the frame.
-fn decl_is_coalesced_gc_buffer(decl: Decl) bool {
-    return decl.is_buffer && decl.is_gc
-}
-
-// Give every temporary needed by one statement a distinct slot. Later
-// statements reuse the same offsets because ir_emit_values clears their
-// temporary roots after each statement. The returned count is the peak number
-// of simultaneously reserved temporary roots, not the total number of temps.
-fn values_assign_buffer_roots(
-    values: Array[Value],
-    first_offset: uint,
-    ptr_size: uint,
-    assigned: Array[Decl]
-) uint {
-    let peak: uint = 0
-    each values as statement {
-        let buffers = Array[Decl]{}
-        value_collect_buffers(statement, buffers)
-        let count: uint = 0
-        each buffers as decl {
-            if !decl_is_coalesced_gc_buffer(decl) : continue
-            let slot_offset: uint = first_offset + count * ptr_size
-            decl.gc_stack_offset = slot_offset
-            assigned.append(decl, true)
-            count++
-        }
-        if count > peak : peak = count
-    }
-    return peak
-}
-
-fn func_assign_buffer_roots(func: Func, first_offset: uint, ptr_size: uint) uint {
-    let assigned = Array[Decl]{}
-    let peak: uint = 0
-    let body = func.body_scope
-    if isset(body) {
-        peak = values_assign_buffer_roots(body.values, first_offset, ptr_size, assigned)
-    }
-
-    // Cleanup can run while a return value's statement temporaries are still
-    // live, so its sequentially reused region follows the body's peak region.
-    let cleanup = func.defer_scope
-    if isset(cleanup) {
-        let cleanup_peak = values_assign_buffer_roots(
-            cleanup.values,
-            first_offset + peak * ptr_size,
-            ptr_size,
-            assigned
-        )
-        peak += cleanup_peak
-    }
-
-    // Preserve correctness for any future generated value that owns a buffer
-    // outside the body/defer statement trees: give it a dedicated tail slot.
-    each func.all_decls as decl {
-        if !decl_is_coalesced_gc_buffer(decl) || assigned.contains(decl) : continue
-        let slot_offset: uint = first_offset + peak * ptr_size
-        decl.gc_stack_offset = slot_offset
-        peak++
-    }
-    return peak
-}
+////////////////////////////
+// Function-local storage
+////////////////////////////
 
 fn decl_needs_gc_stack_storage(decl: Decl) bool {
     if decl.skip_gc_field_roots : return false
@@ -241,13 +184,9 @@ fn func_finish_ast(func: Func) !Error {
         // Arguments survive a second lowering pass, so never retain offsets
         // from the discarded frame.
         decl.gc_stack_offset = null
-        // Compiler-generated buffers receive coalesced slots after permanent
-        // roots have been laid out. Only direct GC buffers take that path;
-        // inline buffers need their complete typed value in the frame.
-        if roots && decl_is_coalesced_gc_buffer(decl) {
-            func.define_decls.append(decl, true)
-            continue
-        }
+        // Hidden capture arguments are properties of the closure environment,
+        // not independent frame storage.
+        if decl.is_bind : continue
         if decl.must_be_stable {
             decl.offset = stable_size
             let size = decl.type.size() !>.to(uint)
@@ -255,14 +194,15 @@ fn func_finish_ast(func: Func) !Error {
         } else if roots && decl_needs_gc_stack_storage(decl) {
             alloca_size = decl_assign_gc_stack_storage(decl, alloca_size) !>
             gc_count++
-            func.define_decls.append(decl, true)
+            // Each declaration is visited once, so it is listed at most once.
+            func.define_decls.append(decl)
             continue
         }
-        if decl.is_mut : func.define_decls.append(decl, true)
+        if decl.is_mut : func.define_decls.append(decl)
     }
 
     if stable_size > 0 {
-        let decl = Decl.new(type_ptr(b), false, "valk_stable_stack")
+        let decl = Decl.new(func, type_ptr(b), false, "valk_stable_stack")
         decl.ir_name = "\%valk_stable_stack"
         let root_offset = alloca_size.round_up(psz)
         decl.gc_stack_offset = root_offset
@@ -270,13 +210,6 @@ fn func_finish_ast(func: Func) !Error {
         func.define_decls.append(decl)
         func.stable_stack_decl = decl
         gc_count++
-    }
-
-    if roots {
-        alloca_size = alloca_size.round_up(psz)
-        let buffer_roots = func_assign_buffer_roots(func, alloca_size, psz)
-        alloca_size += buffer_roots * psz
-        gc_count += buffer_roots
     }
 
     func.alloca_size = alloca_size
@@ -328,6 +261,60 @@ fn func_finish_ast(func: Func) !Error {
     }
 }
 
+////////////////////////////
+// Statement temporaries
+////////////////////////////
+
+fn append_buffer_clears(ctx: Context, values: Array[Value], func: Func, first: uint, at: ?Exp) {
+    let i = first
+    while i < func.buffers_used.length {
+        let decl = func.buffers_used.get(i) ! break
+        i++
+        // Direct managed references can keep a large object graph alive and
+        // make every later collection walk it. Clear those roots explicitly;
+        // aggregate buffers may retain their value until the frame exits.
+        if !decl.is_gc : continue
+        values.append(vgen_assign(
+            vgen_decl(decl),
+            vgen_null(decl.type),
+            ASSIGN_OP.set,
+            ctx.build,
+            at
+        ))
+    }
+}
+
+// True when releasing back to `first` would leave a managed object rooted for
+// the rest of the frame. Asked first so a statement needing no clears builds no
+// block wrapper. Same handful of entries the clear loop walks; keeping the count
+// instead would mean threading a second mark through every caller.
+fn buffers_need_clear(func: Func, first: uint) bool {
+    let i = first
+    while i < func.buffers_used.length {
+        let decl = func.buffers_used.get(i) ! return false
+        if decl.is_gc : return true
+        i++
+    }
+    return false
+}
+
+fn finish_body_value_buffers(ctx: Context, func: Func, first: uint, at: Exp, value: ?Value) ?Value {
+    if !buffers_need_clear(func, first) {
+        func_release_buffers(func, first)
+        return value
+    }
+
+    let statements = Array[Value]{}
+    if isset(value) : statements.append(value)
+    append_buffer_clears(ctx, statements, func, first, at)
+    func_release_buffers(func, first)
+    return vgen_block(statements, ctx.build, at)
+}
+
+////////////////////////////
+// Body expression ranges
+////////////////////////////
+
 // Lower a contiguous body-expression range. `#loop globals G T` recursively
 // lowers its enclosed range once for every Global, with G and T rebound for
 // that iteration.
@@ -362,14 +349,36 @@ fn append_body_exp_range(ctx: Context, scope: Scope, state: ParseState, exps: Ar
     }
 }
 
-fn append_gc_roots_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+// Validate a `#loop` directive against its syntax. Upper-case words in the
+// syntax are bindings, the rest must match literally.
+fn loop_words(loop_exp: Exp, syntax: String) Array[String] !Error {
+    let expected = syntax.split(" ")
     let words = loop_exp.list
-    if !isset(words) {
-        loop_exp.error("Expected '#loop gc_roots GLOBAL OFFSET'")
+    if !isset(words) || words.length != expected.length {
+        loop_exp.error("Expected '#loop " + syntax + "'")
     }
-    if words.length != 3 || (words.get(0) !? "") != "gc_roots" {
-        loop_exp.error("Expected '#loop gc_roots GLOBAL OFFSET'")
+    each expected as word, i {
+        let first = word.get(0)
+        if first >= 'A' && first <= 'Z' : continue
+        if (words.get(i) !? "") != word {
+            loop_exp.error("Expected '#loop " + syntax + "'")
+        }
     }
+    return words
+}
+
+// Lower the loop body once into `iter_scope` and hand its values to `scope`.
+fn append_loop_iteration(ctx: Context, scope: Scope, iter_scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let state = ParseState.new()
+    append_body_exp_range(ctx, iter_scope, state, exps, start, end) !>
+    if state.has_open_if() || state.is_skipping() {
+        loop_exp.error("Missing compile macro '#end' inside '#loop'")
+    }
+    each iter_scope.values as v : scope.append_value(v)
+}
+
+fn append_gc_roots_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "gc_roots GLOBAL OFFSET") !>
     let global_name = words.get(1) ! loop_exp.bug("Missing #loop gc_roots global")
     let offset_name = words.get(2) ! loop_exp.bug("Missing #loop gc_roots offset binding")
     let idf = scope.get_idf(global_name)
@@ -386,14 +395,7 @@ fn append_gc_roots_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uin
     each offsets as offset {
         let iter_scope = scope.sub_scope()
         iter_scope.set_idf(offset_name, Idf.for_value(vgen_int(offset.to(int), type_int(ctx.build))))
-        let iter_state = ParseState.new()
-        append_body_exp_range(ctx, iter_scope, iter_state, exps, start, end) !>
-        if iter_state.has_open_if() || iter_state.is_skipping() {
-            loop_exp.error("Missing compile macro '#end' inside '#loop gc_roots'")
-        }
-        each iter_scope.values as v {
-            scope.append_value(v)
-        }
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
     }
 }
 
@@ -419,17 +421,7 @@ fn find_macro_loop_end(exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) 
 }
 
 fn append_globals_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
-    let words = loop_exp.list
-    if !isset(words) {
-        loop_exp.error("Expected '#loop globals GLOBAL TYPE'")
-    }
-    if words.length != 3 {
-        loop_exp.error("Expected '#loop globals GLOBAL TYPE'")
-    }
-    let loop_kind = words.get(0) !? ""
-    if loop_kind != "globals" {
-        loop_exp.error("Expected '#loop globals GLOBAL TYPE'")
-    }
+    let words = loop_words(loop_exp, "globals GLOBAL TYPE") !>
     let global_name = words.get(1) ! loop_exp.bug("Missing #loop global binding")
     let type_name = words.get(2) ! loop_exp.bug("Missing #loop type binding")
 
@@ -447,25 +439,12 @@ fn append_globals_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint
         let iter_scope = scope.sub_scope()
         iter_scope.set_idf(global_name, Idf.for_global(global))
         iter_scope.set_idf(type_name, Idf.for_type(global.get_type() !>))
-        let iter_state = ParseState.new()
-        append_body_exp_range(ctx, iter_scope, iter_state, exps, start, end) !>
-        if iter_state.has_open_if() || iter_state.is_skipping() {
-            loop_exp.error("Missing compile macro '#end' inside '#loop globals'")
-        }
-        each iter_scope.values as v {
-            scope.append_value(v)
-        }
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
     }
 }
 
 fn append_object_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
-    let words = loop_exp.list
-    if !isset(words) {
-        loop_exp.error("Expected '#loop object VALUE as PROPERTY'")
-    }
-    if words.length != 4 || (words.get(0) !? "") != "object" || (words.get(2) !? "") != "as" {
-        loop_exp.error("Expected '#loop object VALUE as PROPERTY'")
-    }
+    let words = loop_words(loop_exp, "object VALUE as PROPERTY") !>
     let value_name = words.get(1) ! loop_exp.bug("Missing object-loop value")
     let prop_name = words.get(3) ! loop_exp.bug("Missing object-loop binding")
     let idf = scope.get_idf(value_name)
@@ -483,53 +462,25 @@ fn append_object_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint,
 
     each class.props as prop {
         let iter_scope = scope.sub_scope()
-        iter_scope.func = scope.func
         iter_scope.set_idf(prop_name, Idf.for_object_property(prop, vgen_prop(prop, owner)))
-        let iter_state = ParseState.new()
-        append_body_exp_range(ctx, iter_scope, iter_state, exps, start, end) !>
-        if iter_state.has_open_if() || iter_state.is_skipping() {
-            loop_exp.error("Missing compile macro '#end' inside '#loop object'")
-        }
-        each iter_scope.values as v {
-            scope.append_value(v)
-        }
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
     }
 }
 
 fn append_tests_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
-    let words = loop_exp.list
-    if !isset(words) {
-        loop_exp.error("Expected '#loop tests as TEST_FUNC'")
-    }
-    if words.length != 3 || (words.get(0) !? "") != "tests" || (words.get(1) !? "") != "as" {
-        loop_exp.error("Expected '#loop tests as TEST_FUNC'")
-    }
+    let words = loop_words(loop_exp, "tests as TEST_FUNC") !>
     let func_name = words.get(2) ! loop_exp.bug("Missing #loop test binding")
 
     each ctx.build.lists.tests as func {
         let iter_scope = scope.sub_scope()
-        iter_scope.func = scope.func
         iter_scope.set_idf(func_name, Idf.for_func(func))
         iter_scope.set_idf("TEST_IS_SYNC", Idf.for_value(vgen_bool(func.is_sync, type_bool(ctx.build))))
-        let iter_state = ParseState.new()
-        append_body_exp_range(ctx, iter_scope, iter_state, exps, start, end) !>
-        if iter_state.has_open_if() || iter_state.is_skipping() {
-            loop_exp.error("Missing compile macro '#end' inside '#loop tests'")
-        }
-        each iter_scope.values as v {
-            scope.append_value(v)
-        }
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
     }
 }
 
 fn append_properties_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
-    let words = loop_exp.list
-    if !isset(words) {
-        loop_exp.error("Expected '#loop properties TYPE as PROPERTY'")
-    }
-    if words.length != 4 || (words.get(0) !? "") != "properties" || (words.get(2) !? "") != "as" {
-        loop_exp.error("Expected '#loop properties TYPE as PROPERTY'")
-    }
+    let words = loop_words(loop_exp, "properties TYPE as PROPERTY") !>
     let type_name = words.get(1) ! loop_exp.bug("Missing property-loop type")
     let prop_name = words.get(3) ! loop_exp.bug("Missing property-loop binding")
     let type = property_loop_type(scope, type_name, loop_exp) !>
@@ -538,21 +489,24 @@ fn append_properties_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: u
 
     each class.props as prop {
         let iter_scope = scope.sub_scope()
-        iter_scope.func = scope.func
         iter_scope.set_idf(prop_name, Idf.for_property(prop))
-        let iter_state = ParseState.new()
-        append_body_exp_range(ctx, iter_scope, iter_state, exps, start, end) !>
-        if iter_state.has_open_if() || iter_state.is_skipping() {
-            loop_exp.error("Missing compile macro '#end' inside '#loop properties'")
-        }
-        each iter_scope.values as v {
-            scope.append_value(v)
-        }
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
     }
 }
 
+////////////////////////////
+// Statement lowering
+////////////////////////////
+
 // Convert one body-level EXP into a Value. Returns null for comments / skipped #if.
 fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
+    let func = ctx.get_func() !>
+    let first = func.buffers_used.length
+    let value = body_value_from_exp_inner(ctx, scope, state, exp) !>
+    return finish_body_value_buffers(ctx, func, first, exp, value)
+}
+
+fn body_value_from_exp_inner(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
     if exp.type == EXP.macro {
         let func = ctx.get_func() !>
         state.saw_macro = true
@@ -571,12 +525,7 @@ fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     if exp.type == EXP.defer : return value_from_defer_exp(ctx, scope, exp) !>
     if exp.type == EXP.assign : return value_from_assign_exp(ctx, scope, exp) !>
     if exp.type == EXP.stmt {
-        let v = value_from_stmt_exp(ctx, scope, exp) !>
-        // A call to `$exit` / `@willexit` code does not come back, so nothing
-        // after it runs — `panic(...)` as the last statement of a function that
-        // returns a value is complete.
-        if isset(v) && stmt_never_returns(v) : scope.did_return = true
-        return v
+        return value_from_stmt_exp(ctx, scope, exp) !>
     }
     if exp.type == EXP.if : return value_from_if_exp(ctx, scope, state, exp) !>
     if exp.type == EXP.while : return value_from_while_exp(ctx, scope, state, exp) !>
@@ -721,7 +670,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             if scope.has_local(name) {
                 exp.error("Name already used in this scope: " + name)
             }
-            let decl = Decl.new(decl_type, false, name)
+            let decl = Decl.new(ctx.get_func() !>, decl_type, false, name)
             decl.exp = exp
             scope.add_decl(decl)
             scope.set_idf(name, Idf.for_decl(decl))
@@ -778,6 +727,10 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     return vgen_return(retv, b, exp)
 }
 
+////////////////////////////
+// Defer
+////////////////////////////
+
 // Register a deferred call. Each execution creates a zero-argument closure,
 // which snapshots the locals it uses, and appends it to a hidden function-local
 // stack. This makes defer inside conditions and loops dynamic while keeping the
@@ -785,18 +738,13 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
 fn value_from_defer_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let value_exp = exp.get(DEFER_EXP.value)
     if !isset(value_exp) : exp.error("Expected a function call after 'defer'")
-
-    let deferred = value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
-    if !defer_value_is_call(deferred) {
+    if !defer_exp_is_call(value_exp) {
         value_exp.error("'defer' expects a function call")
-    }
-    if deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass {
-        value_exp.error("A deferred call must handle its error before the function exits")
     }
 
     let func = ctx.get_func() !>
+    let closure = make_defer_closure(func, scope, value_exp, exp) !>
     let stack = ensure_user_defer_stack(func, exp) !>
-    let closure = make_defer_closure(func, scope, deferred, exp) !>
     let stack_class = stack.type.get_class_or_null()
     if !isset(stack_class) : exp.bug("Deferred-call stack has no Array class")
     let append = stack_class.get_func("append")
@@ -809,17 +757,19 @@ fn value_from_defer_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
         ctx,
         vgen_func(append, vgen_decl(stack)),
         Array[Value]{ closure, vgen_bool(false, type_bool(ctx.build)) },
-        append.get_rett()
+        append.get_rett(),
+        scope
     )
     call.exp = exp
     return call
 }
 
-fn defer_value_is_call(value: Value) bool {
-    if value.type == VAL.call : return true
-    if value.type != VAL.error_handler : return false
-    let success = value.value1
-    return isset(success) && success.type == VAL.call
+fn defer_exp_is_call(exp: Exp) bool {
+    if exp.type != EXP.value : return false
+    if exp.kind == VALUE_KIND.call : return true
+    if exp.kind != VALUE_KIND.error_handler : return false
+    let call = exp.get(VALUE_EXP.left)
+    return isset(call) && call.type == EXP.value && call.kind == VALUE_KIND.call
 }
 
 // Create the hidden Array[fn()()] on first use and splice its initialization
@@ -848,7 +798,7 @@ fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
     if !isset(body_scope) || !isset(alloca_scope) || !isset(defer_scope) {
         at.bug("Function scopes are missing while creating a defer stack")
     }
-    let stack = Decl.new(stack_type, false)
+    let stack = Decl.new(func, stack_type, false)
     body_scope.add_decl(stack)
     func.user_defer_stack = stack
 
@@ -865,7 +815,8 @@ fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
         Context.for_func(func),
         vgen_func(new_func),
         Array[Value]{ vgen_int(0, type_from_core(b, "uint") !>) },
-        new_func.get_rett()
+        new_func.get_rett(),
+        alloca_scope
     )
     init.exp = at
     alloca_scope.append_value(vgen_assign(vgen_decl(stack), init, ASSIGN_OP.set, b, at))
@@ -873,11 +824,10 @@ fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
     return stack
 }
 
-// A defer registration is represented as an ordinary closure. The existing
-// closure lowering copies referenced locals into its environment at the point
-// this Value is emitted, so loop iterations and later mutations behave as
-// independent registrations.
-fn make_defer_closure(owner: Func, scope: Scope, deferred: Value, at: Exp) Value !Error {
+// A defer registration is represented as an ordinary closure. Resolve its call
+// in that closure's context so identifier evaluation creates hidden capture
+// arguments directly, just as it does for a source-level function literal.
+fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Value !Error {
     let arg_scope = scope.sub_scope()
     let func = Func {
         unit: owner.unit
@@ -896,7 +846,23 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred: Value, at: Exp) Value
     arg_scope.func = func
     let body_scope = arg_scope.sub_scope()
     body_scope.func = func
+    let inner_ctx = Context.for_func(func).without_suggested_type()
+    let first_buffer = func.buffers_used.length
+    let deferred_value: ?Value = null
+    if deferred_exp.type == EXP.value && deferred_exp.kind == VALUE_KIND.call {
+        // A bare fallible call must be diagnosed as an invalid defer, not
+        // automatically passed through the synthetic closure.
+        deferred_value = value_from_call_raw(deferred_exp, body_scope, inner_ctx) !>
+    } else {
+        deferred_value = value_from_exp(deferred_exp, body_scope, inner_ctx) !>
+    }
+    let deferred = deferred_value ?! deferred_exp.bug("Deferred call did not produce a value")
+    if deferred.can_error || (deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass) {
+        deferred_exp.error("A deferred call must handle its error before the function exits")
+    }
     body_scope.append_value(deferred)
+    append_buffer_clears(inner_ctx, body_scope.values, func, first_buffer, deferred_exp)
+    func_release_buffers(func, first_buffer)
     func.body_scope = body_scope
     func.alloca_scope = body_scope.sub_scope()
     func.defer_scope = body_scope.sub_scope()
@@ -910,6 +876,10 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred: Value, at: Exp) Value
     closure.exp = at
     return closure
 }
+
+////////////////////////////
+// Value scopes and assignment
+////////////////////////////
 
 // Return from a value scope: collect into vscope_returns / unify vscope_rett.
 fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: Exp, value_exp: ?Exp) Value !Error {
@@ -938,7 +908,7 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
                 each returns as prev {
                     let pv = prev.value1
                     if !isset(pv) : exp.bug("Value scope return has no value")
-                    prev.value1 = value_make_nullable(pv, prev.exp ?? exp) !>
+                    prev.value1 = value_make_nullable(pv)
                 }
             }
             retv = value_try_convert(retv, scope, ctx, known)
@@ -1064,6 +1034,10 @@ fn value_from_stmt_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if !isset(value_exp) : exp.bug("statement is missing value")
     return value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
 }
+
+////////////////////////////
+// Control flow
+////////////////////////////
 
 fn value_from_if_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
     let b = ctx.build
@@ -1220,11 +1194,11 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     // Scope holding the `on` / index temporaries around the while loop.
     let each_scope = scope.sub_scope()
 
-    let on_decl = Decl.new(on_nn.rett, false, null)
+    let on_decl = Decl.new(ctx.get_func() !>, on_nn.rett, false, null)
     each_scope.add_decl(on_decl)
     let on_init = vgen_assign(vgen_decl(on_decl), on_nn, ASSIGN_OP.set, b, exp)
 
-    let index_decl = Decl.new(index_type, false, null)
+    let index_decl = Decl.new(ctx.get_func() !>, index_type, false, null)
     index_decl.is_mut = true
     each_scope.add_decl(index_decl)
 
@@ -1246,13 +1220,12 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     body_scope.is_loop = true
 
     let callee = vgen_func(next_func, vgen_decl(on_decl))
-    let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett)
+    let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett, body_scope)
     next_call.exp = exp
     next_call.can_error = true
     next_call.error_type = next_func.error_type
 
-    let success = next_call.trim_errors()
-    let handled = value_error_result(next_call, vgen_break(b, exp), success.rett, ERRH_KIND.block, exp)
+    let handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
     let item_parts = handled.unroll()
 
     let bind_decls = Array[Decl]{}
@@ -1262,7 +1235,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         let name = names.get(i) ! exp.bug("Missing each variable name")
         let part = item_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
         let item_type = item_types.get(i) ! exp.bug("Missing each item type")
-        let decl = Decl.new(item_type, false, name)
+        let decl = Decl.new(ctx.get_func() !>, item_type, false, name)
         decl.exp = exp
         bind_decls.append(decl)
         bind_inits.append(part)
@@ -1272,7 +1245,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     }
     if has_index_name {
         let index_name = names.get(names.length - 1) ! exp.bug("Missing each index name")
-        let index_user_decl = Decl.new(index_type, false, index_name)
+        let index_user_decl = Decl.new(ctx.get_func() !>, index_type, false, index_name)
         index_user_decl.exp = exp
         bind_decls.append(index_user_decl)
         bind_inits.append(vgen_decl(index_decl))
@@ -1348,6 +1321,10 @@ fn value_from_throw_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     return vgen_throw(v, b, exp)
 }
 
+////////////////////////////
+// Scope helpers
+////////////////////////////
+
 // A closure may be nested lexically inside a loop, but its break/continue must
 // not target that outer loop. Scope.func identifies the function boundary.
 fn scope_has_loop(scope: Scope, func: ?Func) bool {
@@ -1359,21 +1336,6 @@ fn scope_has_loop(scope: Scope, func: ?Func) bool {
         current = current.parent
     }
     return false
-}
-
-// True when this statement hands control somewhere it never comes back from.
-fn stmt_never_returns(value: Value) bool {
-    let v = value
-    // The call may sit under the error handler / conversion wrappers that
-    // lowering puts around it.
-    while v.type == VAL.wrap || v.type == VAL.paren {
-        v = v.value1 ?! return false
-    }
-    if v.type != VAL.call : return false
-    let callee = v.value1 ?! return false
-    if callee.type != VAL.func : return false
-    let f = callee.func ?! return false
-    return f.must_exit || f.will_exit
 }
 
 // Record a `break` on the loop it leaves. Same walk as scope_has_loop, which

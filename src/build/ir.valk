@@ -3,6 +3,10 @@ use helper
 // Textual LLVM function generation. This follows the classic compiler's
 // per-function lifecycle: resolve AST -> emit textual IR -> release AST.
 
+////////////////////////////
+// Module assembly
+////////////////////////////
+
 fn generate_unit_modules(build: Build) !Error {
     mark_reachable(build) !>
 
@@ -84,7 +88,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
         out.write_string(global_ir_name(global))
         out.write_string("\" = ")
         if external : out.write_string("external ")
-        else if build.options.single_unit && build.options.mode == BUILDTYPE.exe {
+        else if !global.is_export && build.options.single_unit && build.options.mode == BUILDTYPE.exe {
             // A whole-program executable has no Valk symbols for a later
             // object to resolve. Keeping them internal lets LLVM fold globals
             // with known initial values and delete functions reached only by
@@ -164,7 +168,6 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
 fn ir_write_allocator_prop(out: ByteBuffer, prop: AllocatorProp, index: uint) {
     let conditions = prop.conditions
     if conditions.length > 0 {
-        let previous = ""
         each conditions as condition, ci {
             out.write_string("  \%condition.address.")
             out.write_uint_ascii(index)
@@ -191,23 +194,36 @@ fn ir_write_allocator_prop(out: ByteBuffer, prop: AllocatorProp, index: uint) {
             out.write_string(", ")
             out.write_uint_ascii(condition.tag)
             out.write_string("\n")
-            let current = "\%condition.match." + index + "." + ci
             if ci > 0 {
                 out.write_string("  \%condition.all.")
                 out.write_uint_ascii(index)
                 out.write_string(".")
                 out.write_uint_ascii(ci)
-                out.write_string(" = and i1 ")
-                out.write_string(previous)
-                out.write_string(", ")
-                out.write_string(current)
+                out.write_string(" = and i1 \%condition.")
+                if ci == 1 {
+                    out.write_string("match.")
+                } else {
+                    out.write_string("all.")
+                }
+                out.write_uint_ascii(index)
+                out.write_string(".")
+                out.write_uint_ascii(ci - 1)
+                out.write_string(", \%condition.match.")
+                out.write_uint_ascii(index)
+                out.write_string(".")
+                out.write_uint_ascii(ci)
                 out.write_string("\n")
-                current = "\%condition.all." + index + "." + ci
             }
-            previous = current
         }
-        out.write_string("  br i1 ")
-        out.write_string(previous)
+        out.write_string("  br i1 \%condition.")
+        if conditions.length == 1 {
+            out.write_string("match.")
+        } else {
+            out.write_string("all.")
+        }
+        out.write_uint_ascii(index)
+        out.write_string(".")
+        out.write_uint_ascii(conditions.length - 1)
         out.write_string(", label \%prop.")
         out.write_uint_ascii(index)
         out.write_string(".active, label \%prop.")
@@ -369,10 +385,19 @@ fn ir_target_triple(target: Target) String {
     return "aarch64-pc-windows-msvc"
 }
 
+////////////////////////////
+// Function writer
+////////////////////////////
+
 class IRFunc {
     func: Func
     code: ByteBuffer (.new(4096))
     coro_helpers: ByteBuffer (.new(2048))
+    // Rendered "<type> <value>" argument lists, and field values of an aggregate
+    // initializer. Both are stacks: a nested call/initializer finishes and takes
+    // its entries back out before the enclosing one appends.
+    arg_list: ByteBuffer (.new(512))
+    field_values: Array[String] (.{})
     varc: uint (0)
     blockc: uint (0)
     terminated: bool (false)
@@ -448,36 +473,63 @@ class IRFunc {
         this.code.write_string("\n")
     }
 
+    fn write_arg(mark: uint, type: String, value: String) {
+        if this.arg_list.length > mark : this.arg_list.write_string(", ")
+        this.arg_list.write_string(type)
+        this.arg_list.write_string(" ")
+        this.arg_list.write_string(value)
+    }
+
+    // Move the list started at `mark` into the line being written.
+    fn flush_args(mark: uint) {
+        this.code.write_buffer_part(this.arg_list, this.arg_list.length - mark, mark)
+        this.arg_list.length = mark
+    }
+
+    fn release_field_values(mark: uint) {
+        while this.field_values.length > mark {
+            this.field_values.remove(this.field_values.length - 1)
+        }
+    }
+
     fn comment(text: String) {
-        // Every physical line must remain an LLVM comment. Embedded source
-        // strings (JSON/templates/etc.) commonly contain newlines.
-        this.line("; " + text.replace("\n", "\n  ; "))
+        this.line_start()
+        this.write("; ")
+        this.write(text.replace("\n", "\n  ; "))
+        this.line_end()
     }
 
     fn var() String {
-        return "\%." + this.varc++
+        let id = this.varc++
+        let buf = ByteBuffer.new(16)
+        buf.write_string("\%.")
+        buf.write_uint_ascii(id)
+        return buf.to_string()
     }
 
     fn block(prefix: String) String {
-        return prefix + "." + this.blockc++
+        let id = this.blockc++
+        let buf = ByteBuffer.new(prefix.bytes + 16)
+        buf.write_string(prefix)
+        buf.write_byte('.')
+        buf.write_uint_ascii(id)
+        return buf.to_string()
     }
 
+    // Only a literal registers captures and it never has a bound receiver, so
+    // environment properties are the captures in registration order.
     fn captured_address(decl: Decl) String !Error {
-        each this.func.capture_decls as captured, i {
-            if captured != decl : continue
-            let class = this.func.capture_class
-            if !isset(class) : this.func.exp.bug("Literal capture environment is missing")
-            let prop = class.props.get(i) !? null
-            if !isset(prop) : this.func.exp.bug("Literal capture property is missing")
-            let address = this.var()
-            this.line_start()
-            this.write(address)
-            this.write(" = getelementptr i8, ptr \%closure.data, i64 ")
-            this.write_uint(prop.offset)
-            this.line_end()
-            return address
-        }
-        this.func.exp.bug("Literal references an unregistered capture")
+        let class = this.func.capture_class
+        if !isset(class) : this.func.exp.bug("Literal capture environment is missing")
+        let prop = class.props.get(decl.capture_index) !? null
+        if !isset(prop) : this.func.exp.bug("Literal capture property is missing")
+        let address = this.var()
+        this.line_start()
+        this.write(address)
+        this.write(" = getelementptr i8, ptr \%closure.data, i64 ")
+        this.write_uint(prop.offset)
+        this.line_end()
+        return address
     }
 
     fn label(name: String) {
@@ -556,18 +608,19 @@ fn generate_func_ir(func: Func) !Error {
     if !isset(scope) : return
 
     let ir = IRFunc { func: func }
-    func.ir_name = func_ir_name(func)
+    let ir_name = func_ir_name(func)
 
     if func.ns.build.options.single_unit
         && func.ns.build.options.mode == BUILDTYPE.exe
-        && func.ir_name != "main" {
+        && !func.is_export
+        && ir_name != "main" {
         ir.code.write_string("define internal ")
     } else {
         ir.code.write_string("define dso_local ")
     }
     ir.code.write_string(ir_func_rett_type(func) !>)
     ir.code.write_string(" @\"")
-    ir.code.write_string(func.ir_name)
+    ir.code.write_string(ir_name)
     ir.code.write_string("\"(")
     if func.is_literal : ir.code.write_string("ptr \%closure.data")
     each func.args as arg, i {
@@ -595,27 +648,22 @@ fn generate_func_ir(func: Func) !Error {
         stable_stack_decl.ir_name = "\%valk_stable_stack"
         let stable_offset = stable_stack_decl.gc_stack_offset
         if !isset(stable_offset) : func.exp.bug("Stable stack root has no GC-frame offset")
-        ir.line_start()
-        ir.write(stable_stack_decl.ir_name)
-        ir.write(" = getelementptr i8, ptr \%valk.gc.stack.values, i64 ")
-        ir.write_uint(stable_offset)
-        ir.line_end()
+        ir_name_offset_address(ir, stable_stack_decl.ir_name, "\%valk.gc.stack.values", stable_offset)
     }
 
     // Allocate every local once in the entry block. The old backend used the
     // generated decl_offset nodes; emitting them here has the same LLVM shape
     // and keeps later value lowering independent of declaration order.
     each func.all_decls as decl, i {
-        decl.ir_name = "\%decl." + i
+        // Hidden capture arguments live in the closure environment rather than
+        // this function's stack frame.
+        if decl.is_bind : continue
+        decl.ir_name = ir_decl_name(i)
         if ir_decl_uses_gc_stack(func, decl) {
             if !func.is_entrance {
                 let offset = decl.gc_stack_offset
                 if !isset(offset) : func.exp.bug("GC-backed declaration has no frame offset")
-                ir.line_start()
-                ir.write(decl.ir_name)
-                ir.write(" = getelementptr i8, ptr \%valk.gc.stack.values, i64 ")
-                ir.write_uint(offset)
-                ir.line_end()
+                ir_name_offset_address(ir, decl.ir_name, "\%valk.gc.stack.values", offset)
             }
         } else if decl.must_be_stable {
             // Address comes from the stable stack block, set up just below once
@@ -678,9 +726,13 @@ fn ir_decl_uses_gc_stack(func: Func, decl: Decl) bool {
     return isset(decl.gc_stack_offset)
 }
 
-// Alignment that remains guaranteed after adding a byte offset to an address.
-// All compiler-selected storage alignments are powers of two, so repeatedly
-// halving produces the greatest alignment LLVM may safely assume.
+fn ir_decl_name(i: uint) String {
+    let buf = ByteBuffer.new(16)
+    buf.write_string("\%decl.")
+    buf.write_uint_ascii(i)
+    return buf.to_string()
+}
+
 fn ir_offset_alignment(base_alignment: u32, offset: u32) u32 {
     let alignment = base_alignment
     if alignment <= 1 || offset == 0 : return alignment
@@ -688,52 +740,80 @@ fn ir_offset_alignment(base_alignment: u32, offset: u32) u32 {
     return alignment
 }
 
+////////////////////////////
+// Managed field walks
+////////////////////////////
+
+// What the walk below does with each managed field it reaches.
+enum GC_FIELD_OP : u8 {
+    mark    // hand the pointer to the collector
+    trace   // hand the field address to a user callback
+    remove  // drop this object's ownership of the field
+    set     // take ownership for a new owner
+    share   // publish the field alongside a shared global
+    clean   // strip ownership bits from a loaded copy
+}
+
 fn ir_visit_gc_field(
     ir: IRFunc,
     value: ?Value,
     address: String,
-    action: String,
+    action: GC_FIELD_OP,
     owner: String,
     list: String,
     callback_target: String,
     callback_data: String,
     alignment: u32
 ) !Error {
-    if action == "remove" {
+    if action == GC_FIELD_OP.remove {
         let source = value
         if !isset(source) : ir.func.exp.bug("GC field removal is missing its source value")
-        ir_emit_gc_property_remove(ir, source, owner, address) !>
+        ir_emit_gc_helper_call(ir, source, "property_remove", owner, address) !>
         return
     }
-    if action == "trace" {
+    if action == GC_FIELD_OP.trace {
         ir_note_unknown_code(ir)
-        ir.line("call void " + callback_target + "(ptr " + callback_data + ", ptr " + address + ", ptr " + list + ")")
+        ir.line4("call void ", callback_target, "(ptr ", callback_data)
+        ir.write(", ptr ")
+        ir.write(address)
+        ir.write(", ptr ")
+        ir.write(list)
+        ir.write(")")
+        ir.line_end()
         return
     }
 
-    let pointer = ir.var()
-    ir.line(pointer + " = load ptr, ptr " + address + ", align " + alignment)
+    let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
     pointer = ir_union_clean_gc_pointer(ir, pointer)
-    if action == "mark" {
+    if action == GC_FIELD_OP.mark {
         let present = ir.var()
-        ir.line(present + " = icmp ne ptr " + pointer + ", null")
+        ir.line2(present, " = icmp ne ptr ")
+        ir.write(pointer)
+        ir.write(", null")
+        ir.line_end()
         let yes = ir.block("stack.mark")
         let after = ir.block("stack.after")
         ir.cond_jump(present, yes, after)
         ir.label(yes)
-        ir.line("call void " + callback_target + "(ptr " + callback_data + ", ptr " + pointer + ")")
+        ir.line2("call void ", callback_target)
+        ir.write("(ptr ")
+        ir.write(callback_data)
+        ir.write(", ptr ")
+        ir.write(pointer)
+        ir.write(")")
+        ir.line_end()
         ir.jump(after)
         ir.label(after)
-    } else if action == "set" {
+    } else if action == GC_FIELD_OP.set {
         let source = value
         if !isset(source) : ir.func.exp.bug("GC field set is missing its source value")
-        ir_emit_gc_property_set(ir, source, owner, address, pointer) !>
-    } else if action == "share" {
+        ir_emit_gc_helper_call(ir, source, "property_set", owner, address, pointer) !>
+    } else if action == GC_FIELD_OP.share {
         let source = value
         if !isset(source) : ir.func.exp.bug("GC field share is missing its source value")
-        ir_emit_gc_share_null_check(ir, source, pointer) !>
+        ir_emit_gc_helper_call(ir, source, "share_null_check", pointer) !>
     } else {
-        ir.line("store ptr " + pointer + ", ptr " + address + ", align " + alignment)
+        ir_emit_aligned_store(ir, "ptr", pointer, address, alignment)
     }
 }
 
@@ -745,7 +825,7 @@ fn ir_visit_type_gc_fields(
     value: ?Value,
     type: Type,
     address: String,
-    action: String,
+    action: GC_FIELD_OP,
     owner: String (""),
     list: String (""),
     callback_target: String (""),
@@ -759,22 +839,27 @@ fn ir_visit_type_gc_fields(
 
     let t = type.get_non_nullable()
     if t.type == TYPE.fn {
-        let environment = ir.var()
-        ir.line(environment + " = getelementptr i8, ptr " + address + ", i64 " + t.ptr_size())
+        let environment = ir_offset_address(ir, address, t.ptr_size().to(uint))
         let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
         ir_visit_gc_field(ir, value, environment, action, owner, list, callback_target, callback_data, inner_alignment) !>
         return
     }
 
     if type.is_nullable_type() && ir_is_tagged_nullable(type) {
-        let present = ir.var()
-        ir.line(present + " = load i1, ptr " + address + ", align " + alignment)
+        let present = ir_emit_aligned_load(ir, "i1", address, alignment)
         let yes = ir.block("fields.nullable.present")
         let after = ir.block("fields.nullable.after")
         ir.cond_jump(present, yes, after)
         ir.label(yes)
         let inner = ir.var()
-        ir.line(inner + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 2")
+        ir.line_start()
+        ir.write(inner)
+        ir.write(" = getelementptr ")
+        ir.write(ir_type(type) !>)
+        ir.write(", ptr ")
+        ir.write(address)
+        ir.write(", i32 0, i32 2")
+        ir.line_end()
         let inner_alignment = ir_offset_alignment(alignment, type.ptr_size())
         ir_visit_type_gc_fields(ir, value, t, inner, action, owner, list, callback_target, callback_data, inner_alignment) !>
         ir.jump(after)
@@ -785,8 +870,8 @@ fn ir_visit_type_gc_fields(
     if t.type == TYPE.union {
         let members = t.sub_types
         if !isset(members) : return
-        let tag = ir.var()
-        ir.line(tag + " = load i64, ptr " + address + ", align " + alignment)
+        let layout = t.union_layout() !>
+        let tag = ir_emit_aligned_load(ir, "i64", address, alignment)
         let after = ir.block("fields.union.after")
         let emitted = false
         each members as member, member_index {
@@ -795,12 +880,17 @@ fn ir_visit_type_gc_fields(
             let yes = ir.block("fields.union.member")
             let next = ir.block("fields.union.next")
             let active = ir.var()
-            ir.line(active + " = icmp eq i64 " + tag + ", " + member_index)
+            ir.line_start()
+            ir.write(active)
+            ir.write(" = icmp eq i64 ")
+            ir.write(tag)
+            ir.write(", ")
+            ir.write_uint(member_index)
+            ir.line_end()
             ir.cond_jump(active, yes, next)
             ir.label(yes)
-            let payload = ir.var()
-            let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
-            ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
+            let payload_offset = member.is_gc_type() ? layout.gc_offset() : layout.other_offset
+            let payload = ir_offset_address(ir, address, payload_offset.to(uint))
             let payload_alignment = ir_offset_alignment(alignment, payload_offset)
             ir_visit_type_gc_fields(ir, value, member, payload, action, owner, list, callback_target, callback_data, payload_alignment) !>
             ir.jump(after)
@@ -821,8 +911,7 @@ fn ir_visit_type_gc_fields(
         }
         each class.props as prop {
             if !prop.type.has_gc_refs() : continue
-            let field = ir.var()
-            ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
+            let field = ir_prop_address(ir, address, prop)
             let field_alignment = ir_offset_alignment(alignment, prop.offset)
             ir_visit_type_gc_fields(ir, value, prop.type, field, action, owner, list, callback_target, callback_data, field_alignment) !>
         }
@@ -836,9 +925,8 @@ fn ir_visit_type_gc_fields(
         let stride = sub.size() !>
         let i: u32 = 0
         while i < t.array_size {
-            let element = ir.var()
             let element_offset = stride * i
-            ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + element_offset)
+            let element = ir_offset_address(ir, address, element_offset.to(uint))
             let element_alignment = ir_offset_alignment(alignment, element_offset)
             ir_visit_type_gc_fields(ir, value, sub, element, action, owner, list, callback_target, callback_data, element_alignment) !>
             i++
@@ -853,8 +941,7 @@ fn ir_visit_type_gc_fields(
         each members as member {
             offset = member.ir_align_offset(offset) !>
             if member.has_gc_refs() {
-                let field = ir.var()
-                ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
+                let field = ir_offset_address(ir, address, offset.to(uint))
                 let field_alignment = ir_offset_alignment(alignment, offset)
                 ir_visit_type_gc_fields(ir, value, member, field, action, owner, list, callback_target, callback_data, field_alignment) !>
             }
@@ -863,16 +950,30 @@ fn ir_visit_type_gc_fields(
     }
 }
 
+////////////////////////////
+// GC stack frames and markers
+////////////////////////////
+
 fn ir_gc_stack_marker_name(func: Func) String {
-    return "valk.gc.stack.marker.func." + func_ir_name(func)
+    let buf = ByteBuffer.new(32 + func_ir_name(func).bytes)
+    buf.write_string("valk.gc.stack.marker.func.")
+    buf.write_string(func_ir_name(func))
+    return buf.to_string()
 }
 
 fn ir_gc_stack_coro_marker_name(value: Value) String {
-    return "valk.gc.stack.marker.coro." + value.name
+    let buf = ByteBuffer.new(32 + value.name.bytes)
+    buf.write_string("valk.gc.stack.marker.coro.")
+    buf.write_string(value.name)
+    return buf.to_string()
 }
 
 fn ir_gc_stack_frame_type(frame_size: uint) String {
-    return "{ ptr, ptr, [" + frame_size + " x i8] }"
+    let buf = ByteBuffer.new(24)
+    buf.write_string("{ ptr, ptr, [")
+    buf.write_uint_ascii(frame_size)
+    buf.write_string(" x i8] }")
+    return buf.to_string()
 }
 
 fn ir_gc_stack_append_type_layout(
@@ -906,7 +1007,11 @@ fn ir_begin_gc_stack_marker(func: Func, name: String, frame_size: uint) IRFunc {
     ir.code.write_string(name)
     ir.code.write_string("\"(ptr \%frame, ptr \%gc) {\n")
     ir.label("entry")
-    ir.line("\%frame.values = getelementptr " + (ir_gc_stack_frame_type(frame_size)) + ", ptr \%frame, i32 0, i32 2, i32 0")
+    ir.line_start()
+    ir.write("\%frame.values = getelementptr ")
+    ir.write(ir_gc_stack_frame_type(frame_size))
+    ir.write(", ptr \%frame, i32 0, i32 2, i32 0")
+    ir.line_end()
     return ir
 }
 
@@ -917,18 +1022,11 @@ fn ir_finish_gc_stack_marker(out: ByteBuffer, ir: IRFunc) {
 }
 
 fn ir_gc_stack_mark_address(ir: IRFunc, type: Type, address: String, collect: Func) !Error {
-    ir_visit_type_gc_fields(
-        ir,
-        null,
-        type,
-        address,
-        "mark",
-        "",
-        "",
-        "@\"" + func_ir_name(collect) + "\"",
-        "\%gc",
-        type.storage_alignment() !>
-    ) !>
+    let buf = ByteBuffer.new(32 + func_ir_name(collect).bytes)
+    buf.write_string("@\"")
+    buf.write_string(func_ir_name(collect))
+    buf.write_string("\"")
+    ir_visit_type_gc_fields(ir, null, type, address, GC_FIELD_OP.mark, "", "", buf.to_string(), "\%gc", type.storage_alignment() !>) !>
 }
 
 // The stable block is itself managed memory, and declarations whose address
@@ -940,22 +1038,33 @@ fn ir_gc_stack_mark_stable(ir: IRFunc, func: Func, collect: Func) !Error {
     let offset = stable.gc_stack_offset
     if !isset(offset) : func.exp.bug("Stable stack root has no GC-frame offset")
 
-    let address = ir.var()
-    ir.line(address + " = getelementptr i8, ptr \%frame.values, i64 " + offset)
+    let address = ir_offset_address(ir, "\%frame.values", offset)
     let stack = ir.var()
-    ir.line(stack + " = load ptr, ptr " + address)
+    ir.line_start()
+    ir.write(stack)
+    ir.write(" = load ptr, ptr ")
+    ir.write(address)
+    ir.line_end()
     stack = ir_union_clean_gc_pointer(ir, stack)
     let present = ir.var()
-    ir.line(present + " = icmp ne ptr " + stack + ", null")
+    ir.line2(present, " = icmp ne ptr ")
+    ir.write(stack)
+    ir.write(", null")
+    ir.line_end()
     let yes = ir.block("stable.mark")
     let after = ir.block("stable.after")
     ir.cond_jump(present, yes, after)
     ir.label(yes)
-    ir.line("call void @\"" + func_ir_name(collect) + "\"(ptr \%gc, ptr " + stack + ")")
+    ir.line_start()
+    ir.write("call void @\"")
+    ir.write(func_ir_name(collect))
+    ir.write("\"(ptr \%gc, ptr ")
+    ir.write(stack)
+    ir.write(")")
+    ir.line_end()
     each func.all_decls as decl {
         if !decl.must_be_stable || decl.skip_gc_field_roots || !decl.type.has_gc_refs() : continue
-        let field = ir.var()
-        ir.line(field + " = getelementptr i8, ptr " + stack + ", i64 " + decl.offset)
+        let field = ir_offset_address(ir, stack, decl.offset.to(uint))
         ir_gc_stack_mark_address(ir, decl.type, field, collect) !>
     }
     ir.jump(after)
@@ -969,14 +1078,11 @@ fn ir_write_func_gc_stack_marker(out: ByteBuffer, func: Func, collect: Func) !Er
     let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size)
     ir_gc_stack_mark_stable(ir, func, collect) !>
 
-    let visited = Array[uint]{}
+    // One frame region per rooted declaration, so every offset is distinct.
     each func.all_decls as decl {
         let offset = decl.gc_stack_offset
         if !isset(offset) : continue
-        if visited.contains(offset) : continue
-        visited.append(offset)
-        let address = ir.var()
-        ir.line(address + " = getelementptr i8, ptr \%frame.values, i64 " + offset)
+        let address = ir_offset_address(ir, "\%frame.values", offset)
         ir_gc_stack_mark_address(ir, decl.type, address, collect) !>
     }
     ir_finish_gc_stack_marker(out, ir)
@@ -994,8 +1100,7 @@ fn ir_write_coro_gc_stack_marker(
     let ir = ir_begin_gc_stack_marker(func, name, frame_size)
     each types as type, i {
         let offset = offsets.get(i) ! func.exp.bug("Coroutine GC-frame layout is incomplete")
-        let address = ir.var()
-        ir.line(address + " = getelementptr i8, ptr \%frame.values, i64 " + offset)
+        let address = ir_offset_address(ir, "\%frame.values", offset)
         ir_gc_stack_mark_address(ir, type, address, collect) !>
     }
     ir_finish_gc_stack_marker(out, ir)
@@ -1010,7 +1115,11 @@ fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
     if !isset(global) : func.exp.bug("coro:gc_stack_sp is not a global")
     ir_use_global(ir, global)
 
-    let global_name = "@\"" + global_ir_name(global) + "\""
+    let buf = ByteBuffer.new(32 + global_ir_name(global).bytes)
+    buf.write_string("@\"")
+    buf.write_string(global_ir_name(global))
+    buf.write_string("\"")
+    let global_name = buf.to_string()
     let frame_type = ir_gc_stack_frame_type(func.alloca_size)
     ir.gc_stack_global = global_name
     ir.gc_stack_previous = "\%valk.gc.stack.previous"
@@ -1019,11 +1128,27 @@ fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
     ir.write(frame_type)
     ir.line_end()
     ir.line3(ir.gc_stack_previous, " = load ptr, ptr ", global_name)
-    ir.line("\%valk.gc.stack.next = getelementptr " + frame_type + ", ptr \%valk.gc.stack, i32 0, i32 0")
+    ir.line_start()
+    ir.write("\%valk.gc.stack.next = getelementptr ")
+    ir.write(frame_type)
+    ir.write(", ptr \%valk.gc.stack, i32 0, i32 0")
+    ir.line_end()
     ir.line3("store ptr ", ir.gc_stack_previous, ", ptr \%valk.gc.stack.next")
-    ir.line("\%valk.gc.stack.marker = getelementptr " + frame_type + ", ptr \%valk.gc.stack, i32 0, i32 1")
-    ir.line("store ptr @\"" + ir_gc_stack_marker_name(func) + "\", ptr \%valk.gc.stack.marker")
-    ir.line("\%valk.gc.stack.values = getelementptr " + frame_type + ", ptr \%valk.gc.stack, i32 0, i32 2, i32 0")
+    ir.line_start()
+    ir.write("\%valk.gc.stack.marker = getelementptr ")
+    ir.write(frame_type)
+    ir.write(", ptr \%valk.gc.stack, i32 0, i32 1")
+    ir.line_end()
+    ir.line_start()
+    ir.write("store ptr @\"")
+    ir.write(ir_gc_stack_marker_name(func))
+    ir.write("\", ptr \%valk.gc.stack.marker")
+    ir.line_end()
+    ir.line_start()
+    ir.write("\%valk.gc.stack.values = getelementptr ")
+    ir.write(frame_type)
+    ir.write(", ptr \%valk.gc.stack, i32 0, i32 2, i32 0")
+    ir.line_end()
     if func.alloca_size > 0 {
         ir.line_start()
         ir.write("call void @llvm.memset.inline.p0.i64(ptr \%valk.gc.stack.values, i8 0, i64 ")
@@ -1062,6 +1187,10 @@ fn ir_emit_func_cleanup(ir: IRFunc) !Error {
     if !restored_gc_stack : ir_emit_gc_stack_defer(ir)
     ir.cleanup_active = false
 }
+
+////////////////////////////
+// Error return ABI
+////////////////////////////
 
 fn ir_build_error_result(ir: IRFunc, rendered: String, rett: Type, code: String) String !Error {
     if rett.is_void_type() : return code
@@ -1138,6 +1267,10 @@ fn ir_emit_error_return(ir: IRFunc, rendered: String, rett: Type, code: String) 
     ir.line_end()
 }
 
+////////////////////////////
+// Reference tracking
+////////////////////////////
+
 // Record that the function currently being written refers to `func`, and
 // declare it when the definition lives in another module. Every reference to a
 // function symbol goes through here, so the recorded edges are exactly the
@@ -1192,8 +1325,22 @@ fn ir_use_string(ir: IRFunc, value: String) uint {
     return index
 }
 
+////////////////////////////
+// Symbol names and lowered types
+////////////////////////////
+
+// Named by every call site, `declare` and adapter, and nothing it is built from
+// changes once lowering starts.
 fn func_ir_name(func: Func) String {
-    if func.is_extern : return func.name
+    let cached = func.ir_name
+    if cached.length > 0 : return cached
+    let out = func_ir_name_uncached(func)
+    func.ir_name = out
+    return out
+}
+
+fn func_ir_name_uncached(func: Func) String {
+    if func.is_extern || func.is_export : return func.name
     if func.name == "__valk_main__" : return "main"
     let out = ir_name_prefix(func.unit, func.ns, func.exp)
     let class = func.class
@@ -1216,7 +1363,16 @@ fn ir_func_rett_type(func: Func) String !Error {
     return ir_error_abi_type(func.get_rett()) !>
 }
 
+// Fallible return ABI: the result widened with an error code. Cached like ir_type.
 fn ir_error_abi_type(rett: Type) String !Error {
+    let cached = rett.cached_error_abi_type
+    if isset(cached) : return cached
+    let result = ir_error_abi_type_uncached(rett) !>
+    rett.cached_error_abi_type = result
+    return result
+}
+
+fn ir_error_abi_type_uncached(rett: Type) String !Error {
     if rett.is_void_type() : return "i32"
     if rett.type == TYPE.multi {
         let subs = rett.sub_types
@@ -1248,13 +1404,26 @@ fn ir_normal_rett_count(rett: Type) uint {
 }
 
 fn global_ir_name(global: Global) String {
-    if global.is_extern : return global.name
-    return ir_name_prefix(global.unit, global.ns, global.exp) + "__" + global.name
+    let cached = global.ir_name
+    if cached.length > 0 : return cached
+    let name = (global.is_extern || global.is_export) ? global.name : ir_name_prefix(global.unit, global.ns, global.exp) + "__" + global.name
+    global.ir_name = name
+    return name
+}
+
+fn ir_global_address(global: Global) String {
+    let name = global_ir_name(global)
+    let out = ByteBuffer.new(name.bytes + 3)
+    out.write_string("@\"")
+    out.write_string(name)
+    out.write_string("\"")
+    return out.to_string()
 }
 
 fn ir_type(type: Type) String !Error {
     let cached = type.cached_ir_type
     if isset(cached) : return cached
+    if type.has_unresolved_generic() : type.build.bug("Unresolved generic type reached IR")
     let result = ir_type_uncached(type) !>
     type.cached_ir_type = result
     return result
@@ -1277,18 +1446,19 @@ fn ir_type_uncached(type: Type) String !Error {
     }
     if t.type == TYPE.fn : return "{ ptr, ptr }"
     if t.type == TYPE.union {
+        let layout = t.union_layout() !>
         let out = ByteBuffer.new()
         out.write_string("{ i64")
-        if t.union_has_gc_payload() : out.write_string(", ptr")
-        if t.union_has_other_payload() {
+        if layout.has_gc : out.write_string(", ptr")
+        if layout.has_other {
             out.write_string(", [")
-            out.write_uint_ascii((t.union_other_payload_size() !>).to(uint))
+            out.write_uint_ascii(layout.other_size.to(uint))
             out.write_string(" x i8]")
         }
         out.write_string(" }")
         return out.to_string()
     }
-    if t.is_pointer_sized() : return "ptr"
+    if t.is_pointer() : return "ptr"
     if t.type == TYPE.void : return "void"
     if t.type == TYPE.bool : return "i1"
     if t.type == TYPE.error_code : return "i32"
@@ -1361,37 +1531,17 @@ fn ir_is_tagged_nullable(type: Type) bool {
     if !type.is_nullable_type() : return false
     let sub = type.sub_type
     if !isset(sub) : return false
-    return !sub.is_pointer_sized() && sub.type != TYPE.fn
+    return !sub.is_pointer() && sub.type != TYPE.fn
 }
+
+////////////////////////////
+// Statements and control flow
+////////////////////////////
 
 fn ir_emit_values(ir: IRFunc, values: ?Array[Value]) !Error {
     if !isset(values) : return
     each values as value {
         ir_emit_stmt(ir, value) !>
-        ir_clear_statement_buffers(ir, value) !>
-    }
-}
-
-// Argument/receiver buffers are GC roots only for the duration of the
-// statement that evaluates them. Leaving their last value in the function's
-// GC frame retains otherwise-dead object graphs until the function returns
-// (and indefinitely inside loops).
-fn ir_clear_statement_buffers(ir: IRFunc, value: Value) !Error {
-    if ir.terminated : return
-    let buffers = Array[Decl]{}
-    value_collect_buffers(value, buffers)
-    each buffers as decl {
-        // A nested literal may reference an enclosing buffer through its
-        // capture environment. That declaration is named and cleared by its
-        // owning function; it has no local address in this function's IR.
-        if !ir.func.all_decls.contains(decl) : continue
-        if !isset(decl.gc_stack_offset) : continue
-        if decl.is_gc {
-            ir.line("store ptr null, ptr " + decl.ir_name)
-            continue
-        }
-        let bytes = (decl.type.size() !>).to(uint)
-        ir.line("call void @llvm.memset.inline.p0.i64(ptr " + decl.ir_name + ", i8 0, i64 " + bytes + ", i1 false)")
     }
 }
 
@@ -1404,9 +1554,11 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
         return
     }
     if t == VAL.init_allocators {
-        // The helper body is emitted at module finalization, after allocator
-        // discovery has reached its fixed point.
-        ir.line("call void @\"valk.init.allocators." + value.int_val + "\"()")
+        ir.line_start()
+        ir.write("call void @\"valk.init.allocators.")
+        ir.write_int(value.int_val)
+        ir.write("\"()")
+        ir.line_end()
         return
     }
     if t == VAL.run_defers {
@@ -1434,7 +1586,14 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
             let rendered = ir_emit_value(ir, retv) !>
             ir_emit_func_cleanup(ir) !>
             if ir.func.can_error : ir_emit_error_return(ir, rendered, ir.func.get_rett(), "0") !>
-            else : ir.line("ret " + (ir_type(retv.rett) !>) + " " + rendered)
+            else {
+                ir.line_start()
+                ir.write("ret ")
+                ir.write(ir_type(retv.rett) !>)
+                ir.write(" ")
+                ir.write(rendered)
+                ir.line_end()
+            }
         }
         ir.terminated = true
         return
@@ -1500,7 +1659,7 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
                 if !isset(stable) || stable != decl {
                     let offset = decl.gc_stack_offset
                     if !isset(offset) : value.bug("GC-backed declaration has no frame offset")
-                    ir.line(decl.ir_name + " = getelementptr i8, ptr \%valk.gc.stack.values, i64 " + offset)
+                    ir_name_offset_address(ir, decl.ir_name, "\%valk.gc.stack.values", offset)
                 }
             }
         }
@@ -1567,13 +1726,18 @@ fn ir_emit_user_defers(ir: IRFunc, value: Value) !Error {
     let data = ir_emit_value(ir, vgen_prop(data_prop, stack_value)) !>
     let closure_type = ir_type(pop.get_rett()) !>
     let closure_address = ir.var()
-    ir.line(closure_address + " = getelementptr " + closure_type + ", ptr " + data + ", i64 " + index)
-    let closure = ir.var()
-    ir.line(closure + " = load " + closure_type + ", ptr " + closure_address)
-    let target = ir.var()
-    ir.line(target + " = extractvalue " + closure_type + " " + closure + ", 0")
-    let tagged_environment = ir.var()
-    ir.line(tagged_environment + " = extractvalue " + closure_type + " " + closure + ", 1")
+    ir.line_start()
+    ir.write(closure_address)
+    ir.write(" = getelementptr ")
+    ir.write(closure_type)
+    ir.write(", ptr ")
+    ir.write(data)
+    ir.write(", i64 ")
+    ir.write(index)
+    ir.line_end()
+    let closure = ir_emit_load(ir, closure_type, closure_address)
+    let target = ir_emit_extract(ir, closure_type, closure, 0)
+    let tagged_environment = ir_emit_extract(ir, closure_type, closure, 1)
     let environment_as_int = ir.var()
     ir.line4(environment_as_int, " = ptrtoint ptr ", tagged_environment, " to i64")
     let masked_environment = ir.var()
@@ -1581,7 +1745,13 @@ fn ir_emit_user_defers(ir: IRFunc, value: Value) !Error {
     let environment = ir.var()
     ir.line4(environment, " = inttoptr i64 ", masked_environment, " to ptr")
     ir_note_unknown_code(ir)
-    ir.line("call void " + target + "(ptr " + environment + ")")
+    ir.line_start()
+    ir.write("call void ")
+    ir.write(target)
+    ir.write("(ptr ")
+    ir.write(environment)
+    ir.write(")")
+    ir.line_end()
 
     let pop_call = vgen_call(
         Context.for_func(ir.func),
@@ -1605,7 +1775,7 @@ fn ir_emit_stable_stack_init(ir: IRFunc, stack_decl: Decl, size: uint) !Error {
     if ir.func.is_entrance {
         let offset = stack_decl.gc_stack_offset
         if !isset(offset) : at.bug("Stable stack root has no GC-frame offset")
-        ir.line(stack_decl.ir_name + " = getelementptr i8, ptr \%valk.gc.stack.values, i64 " + offset)
+        ir_name_offset_address(ir, stack_decl.ir_name, "\%valk.gc.stack.values", offset)
     }
 
     let build = ir.func.ns.build
@@ -1636,14 +1806,7 @@ fn ir_emit_stable_stack_init(ir: IRFunc, stack_decl: Decl, size: uint) !Error {
     ir.write_uint(index)
     ir.line_end()
 
-    let pool = ir.var()
-    ir.line_start()
-    ir.write(pool)
-    ir.write(" = load ")
-    ir.write(ir_type(pool_type) !>)
-    ir.write(", ptr ")
-    ir.write(pool_address)
-    ir.line_end()
+    let pool = ir_emit_load(ir, ir_type(pool_type) !>, pool_address)
 
     let stack = ir.var()
     ir.line_start()
@@ -1657,25 +1820,13 @@ fn ir_emit_stable_stack_init(ir: IRFunc, stack_decl: Decl, size: uint) !Error {
     ir.write(")")
     ir.line_end()
 
-    // Publish the stable block only after all potential managed fields are
-    // zero. Its generated frame marker may inspect those fields immediately.
-    ir.line("call void @llvm.memset.inline.p0.i64(ptr " + stack + ", i8 0, i64 " + size + ", i1 false)")
-    ir.line_start()
-    ir.write("store ptr ")
-    ir.write(stack)
-    ir.write(", ptr ")
-    ir.write(stack_decl.ir_name)
-    ir.line_end()
+    // Publish only after its managed fields are zero.
+    ir_emit_zero(ir, stack, size)
+    ir_emit_store(ir, "ptr", stack, stack_decl.ir_name)
 
     each ir.func.all_decls as decl {
         if !decl.must_be_stable : continue
-        ir.line_start()
-        ir.write(decl.ir_name)
-        ir.write(" = getelementptr i8, ptr ")
-        ir.write(stack)
-        ir.write(", i64 ")
-        ir.write_uint(decl.offset)
-        ir.line_end()
+        ir_name_offset_address(ir, decl.ir_name, stack, decl.offset.to(uint))
     }
 }
 
@@ -1744,6 +1895,17 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     ir.label(after_block)
 }
 
+////////////////////////////
+// Assignment and property ownership
+////////////////////////////
+
+// `x OP= v`: fold the stored value into the result. Plain `=` keeps it as is.
+fn ir_emit_compound(ir: IRFunc, address: String, result: String, op: ASSIGN_OP, type: Type) String !Error {
+    if op == ASSIGN_OP.set : return result
+    let old = ir_emit_load(ir, ir_type(type) !>, address)
+    return ir_emit_binary(ir, old, result, assign_value_op(op), type) !>
+}
+
 fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
     let left = value.value1
     let right = value.value2
@@ -1758,14 +1920,7 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
         if !isset(owner) || !isset(prop) : value.bug("IR property assignment is incomplete")
         if owner.rett.is_gc_type() && left.rett.get_non_nullable().type == TYPE.fn {
             let owner_value = ir_emit_value(ir, owner) !>
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(owner_value)
-            ir.write(", i64 ")
-            ir.write_uint(prop.offset)
-            ir.line_end()
+            let address = ir_prop_address(ir, owner_value, prop)
             let result = ir_emit_value(ir, right) !>
             let op = value.op.@cast(ASSIGN_OP)
             if op != ASSIGN_OP.set : value.bug("Compound assignment is not valid for a closure property")
@@ -1773,49 +1928,22 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
             ir.line4(function, " = extractvalue { ptr, ptr } ", result, ", 0")
             let environment = ir.var()
             ir.line4(environment, " = extractvalue { ptr, ptr } ", result, ", 1")
-            let environment_address = ir.var()
-            ir.line(environment_address + " = getelementptr i8, ptr " + address + ", i64 " + owner.rett.ptr_size())
-            ir_emit_gc_property_update(ir, value, owner_value, environment_address, environment) !>
+            let environment_address = ir_offset_address(ir, address, owner.rett.ptr_size().to(uint))
+            ir_emit_gc_helper_call(ir, value, "property_update", owner_value, environment_address, environment) !>
             ir.line4("store ptr ", function, ", ptr ", address)
             return
         }
         if owner.rett.is_gc_type() && left.rett.is_gc_type() {
             let owner_value = ir_emit_value(ir, owner) !>
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(owner_value)
-            ir.write(", i64 ")
-            ir.write_uint(prop.offset)
-            ir.line_end()
+            let address = ir_prop_address(ir, owner_value, prop)
             let result = ir_emit_value(ir, right) !>
-            let op = value.op.@cast(ASSIGN_OP)
-            if op != ASSIGN_OP.set {
-                let old = ir.var()
-                let type = ir_type(left.rett) !>
-                ir.line_start()
-                ir.write(old)
-                ir.write(" = load ")
-                ir.write(type)
-                ir.write(", ptr ")
-                ir.write(address)
-                ir.line_end()
-                result = ir_emit_binary(ir, old, result, assign_value_op(op), left.rett) !>
-            }
-            ir_emit_gc_property_update(ir, value, owner_value, address, result) !>
+            result = ir_emit_compound(ir, address, result, value.op.@cast(ASSIGN_OP), left.rett) !>
+            ir_emit_gc_helper_call(ir, value, "property_update", owner_value, address, result) !>
             return
         }
         if owner.rett.is_gc_type() && left.rett.has_gc_refs() {
             let owner_value = ir_emit_value(ir, owner) !>
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(owner_value)
-            ir.write(", i64 ")
-            ir.write_uint(prop.offset)
-            ir.line_end()
+            let address = ir_prop_address(ir, owner_value, prop)
             let op = value.op.@cast(ASSIGN_OP)
             if op != ASSIGN_OP.set : value.bug("Compound assignment is not valid for a property with embedded GC references")
             ir_emit_embedded_property_store(ir, value, left.rett, owner_value, address, right, true) !>
@@ -1825,26 +1953,14 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
 
     let address = ir_emit_address(ir, left) !>
     let result = ir_emit_value(ir, right) !>
-    let op = value.op.@cast(ASSIGN_OP)
-    if op != ASSIGN_OP.set {
-        let old = ir.var()
-        let type = ir_type(left.rett) !>
-        ir.line_start()
-        ir.write(old)
-        ir.write(" = load ")
-        ir.write(type)
-        ir.write(", ptr ")
-        ir.write(address)
-        ir.line_end()
-        result = ir_emit_binary(ir, old, result, assign_value_op(op), left.rett) !>
-    }
+    result = ir_emit_compound(ir, address, result, value.op.@cast(ASSIGN_OP), left.rett) !>
     // When assigning to a shared global with a GC type, mark the value's
     // object graph as shared before the store so the collector treats it
     // correctly across threads.
     if left.type == VAL.global && left.rett.is_gc_type() {
         let g = left.global
         if isset(g) && g.shared {
-            ir_emit_gc_share_null_check(ir, value, result) !>
+            ir_emit_gc_helper_call(ir, value, "share_null_check", result) !>
         }
     }
     ir.line_start()
@@ -1858,60 +1974,61 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
     if left.type == VAL.global && left.rett.has_gc_refs() && !left.rett.is_gc_type() {
         let g = left.global
         if isset(g) && g.shared {
-            ir_visit_type_gc_fields(ir, value, left.rett, address, "share") !>
+            ir_visit_type_gc_fields(ir, value, left.rett, address, GC_FIELD_OP.share) !>
         }
     }
 }
 
-fn ir_emit_gc_property_update(ir: IRFunc, value: Value, owner: String, address: String, result: String) !Error {
-    let idf = valk_idf(ir.func.ns.build, "gc", "property_update") !>
-    let update = idf.func
-    if !isset(update) : value.bug("gc:property_update is not a function")
-    if !update.parsed_types : parse_func_types(update) !>
-    ir_use_func(ir, update)
-    ir.line("call void @\"" + func_ir_name(update) + "\"(ptr " + owner + ", ptr " + address + ", ptr " + result + ")")
+// Ownership helpers take pointers only; an omitted argument is one it lacks.
+fn ir_emit_gc_helper_call(
+    ir: IRFunc,
+    value: Value,
+    name: String,
+    first: String,
+    second: String (""),
+    third: String ("")
+) !Error {
+    let idf = valk_idf(ir.func.ns.build, "gc", name) !>
+    let func = idf.func
+    if !isset(func) : value.bug("gc:" + name + " is not a function")
+    if !func.parsed_types : parse_func_types(func) !>
+    ir_use_func(ir, func)
+    ir.line_start()
+    ir.write("call void @\"")
+    ir.write(func_ir_name(func))
+    ir.write("\"(ptr ")
+    ir.write(first)
+    if second.length > 0 {
+        ir.write(", ptr ")
+        ir.write(second)
+    }
+    if third.length > 0 {
+        ir.write(", ptr ")
+        ir.write(third)
+    }
+    ir.write(")")
+    ir.line_end()
 }
 
-fn ir_emit_gc_property_set(ir: IRFunc, value: Value, owner: String, address: String, result: String) !Error {
-    let idf = valk_idf(ir.func.ns.build, "gc", "property_set") !>
-    let set = idf.func
-    if !isset(set) : value.bug("gc:property_set is not a function")
-    if !set.parsed_types : parse_func_types(set) !>
-    ir_use_func(ir, set)
-    ir.line("call void @\"" + func_ir_name(set) + "\"(ptr " + owner + ", ptr " + address + ", ptr " + result + ")")
+// Reuse lowering-reserved aggregate scratch.
+fn ir_value_slot(ir: IRFunc, value: Value, lowered: String) String {
+    let storage = value.decl
+    if isset(storage) : return storage.ir_name
+    let slot = ir.var()
+    ir.line3(slot, " = alloca ", lowered)
+    return slot
 }
 
-fn ir_emit_gc_property_remove(ir: IRFunc, value: Value, owner: String, address: String) !Error {
-    let idf = valk_idf(ir.func.ns.build, "gc", "property_remove") !>
-    let remove = idf.func
-    if !isset(remove) : value.bug("gc:property_remove is not a function")
-    if !remove.parsed_types : parse_func_types(remove) !>
-    ir_use_func(ir, remove)
-    ir.line("call void @\"" + func_ir_name(remove) + "\"(ptr " + owner + ", ptr " + address + ")")
-}
-
-// Copy a by-value property to private scratch storage before stripping the
-// collector's ownership bits. Cleaning the original property in place would
-// destroy the metadata used by the next marking/update pass.
+// Clean a copy; heap ownership tags must remain intact.
 fn ir_emit_clean_embedded_load(ir: IRFunc, value: Value, type: Type, address: String) String !Error {
     let lowered = ir_type(type) !>
-    let raw = ir.var()
-    ir.line(raw + " = load " + lowered + ", ptr " + address)
+    let raw = ir_emit_load(ir, lowered, address)
 
-    let slot = ""
-    let storage = value.decl
-    if isset(storage) {
-        slot = storage.ir_name
-    } else {
-        slot = ir.var()
-        ir.line3(slot, " = alloca ", lowered)
-    }
-    ir.line("store " + lowered + " " + raw + ", ptr " + slot)
-    ir_visit_type_gc_fields(ir, value, type, slot, "clean") !>
+    let slot = ir_value_slot(ir, value, lowered)
+    ir_emit_store(ir, lowered, raw, slot)
+    ir_visit_type_gc_fields(ir, value, type, slot, GC_FIELD_OP.clean) !>
 
-    let clean = ir.var()
-    ir.line(clean + " = load " + lowered + ", ptr " + slot)
-    return clean
+    return ir_emit_load(ir, lowered, slot)
 }
 
 fn ir_emit_embedded_property_store(
@@ -1923,15 +2040,13 @@ fn ir_emit_embedded_property_store(
     right: Value,
     remove_old: bool
 ) !Error {
-    // Evaluate first while the old property is still intact. Front-end
-    // buffering gives a temporary aggregate its own field roots across the
-    // runtime ownership calls below.
+    // Evaluate before removing old GC fields.
     let rendered = ir_emit_value(ir, right) !>
     if remove_old {
-        ir_visit_type_gc_fields(ir, value, type, address, "remove", owner) !>
+        ir_visit_type_gc_fields(ir, value, type, address, GC_FIELD_OP.remove, owner) !>
     }
-    ir.line("store " + (ir_type(type) !>) + " " + rendered + ", ptr " + address)
-    ir_visit_type_gc_fields(ir, value, type, address, "set", owner) !>
+    ir_emit_store(ir, ir_type(type) !>, rendered, address)
+    ir_visit_type_gc_fields(ir, value, type, address, GC_FIELD_OP.set, owner) !>
 }
 
 fn ir_emit_embedded_property_op(ir: IRFunc, value: Value) !Error {
@@ -1942,7 +2057,7 @@ fn ir_emit_embedded_property_op(ir: IRFunc, value: Value) !Error {
     let address = ir_emit_address(ir, slot_value) !>
 
     if value.type == VAL.property_clear {
-        ir_visit_type_gc_fields(ir, value, slot_value.rett, address, "remove", owner) !>
+        ir_visit_type_gc_fields(ir, value, slot_value.rett, address, GC_FIELD_OP.remove, owner) !>
         return
     }
 
@@ -1974,31 +2089,21 @@ fn ir_emit_embedded_property_trace(ir: IRFunc, value: Value) !Error {
     let address = ir_emit_address(ir, slot_value) !>
     let list = ir_emit_value(ir, list_value) !>
     let callback = ir_emit_value(ir, callback_value) !>
-    let target = ir.var()
-    ir.line(target + " = extractvalue " + (ir_type(callback_value.rett) !>) + " " + callback + ", 0")
-    let data = ir.var()
-    ir.line(data + " = extractvalue " + (ir_type(callback_value.rett) !>) + " " + callback + ", 1")
+    let callback_type = ir_type(callback_value.rett) !>
+    let target = ir_emit_extract(ir, callback_type, callback, 0)
+    let data = ir_emit_extract(ir, callback_type, callback, 1)
     data = ir_union_clean_gc_pointer(ir, data)
     ir_visit_type_gc_fields(
         ir,
         value,
         slot_value.rett,
         address,
-        "trace",
+        GC_FIELD_OP.trace,
         "",
         list,
         target,
         data
     ) !>
-}
-
-fn ir_emit_gc_share_null_check(ir: IRFunc, value: Value, result: String) !Error {
-    let idf = valk_idf(ir.func.ns.build, "gc", "share_null_check") !>
-    let func = idf.func
-    if !isset(func) : value.bug("gc:share_null_check is not a function")
-    if !func.parsed_types : parse_func_types(func) !>
-    ir_use_func(ir, func)
-    ir.line("call void @\"" + func_ir_name(func) + "\"(ptr " + result + ")")
 }
 
 fn assign_value_op(op: ASSIGN_OP) VALUE_OP {
@@ -2012,37 +2117,183 @@ fn assign_value_op(op: ASSIGN_OP) VALUE_OP {
     return VALUE_OP.bit_xor
 }
 
+////////////////////////////
+// Addresses and values
+////////////////////////////
+
+fn ir_emit_load(ir: IRFunc, type: String, address: String) String {
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = load ")
+    ir.write(type)
+    ir.write(", ptr ")
+    ir.write(address)
+    ir.line_end()
+    return out
+}
+
+fn ir_emit_store(ir: IRFunc, type: String, value: String, address: String) {
+    ir.line_start()
+    ir.write("store ")
+    ir.write(type)
+    ir.write(" ")
+    ir.write(value)
+    ir.write(", ptr ")
+    ir.write(address)
+    ir.line_end()
+}
+
+fn ir_emit_aligned_load(ir: IRFunc, type: String, address: String, alignment: u32) String {
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = load ")
+    ir.write(type)
+    ir.write(", ptr ")
+    ir.write(address)
+    ir.write(", align ")
+    ir.write_uint(alignment)
+    ir.line_end()
+    return out
+}
+
+fn ir_emit_aligned_store(ir: IRFunc, type: String, value: String, address: String, alignment: u32) {
+    ir.line_start()
+    ir.write("store ")
+    ir.write(type)
+    ir.write(" ")
+    ir.write(value)
+    ir.write(", ptr ")
+    ir.write(address)
+    ir.write(", align ")
+    ir.write_uint(alignment)
+    ir.line_end()
+}
+
+fn ir_emit_extract(ir: IRFunc, type: String, value: String, index: uint) String {
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = extractvalue ")
+    ir.write(type)
+    ir.write(" ")
+    ir.write(value)
+    ir.write(", ")
+    ir.write_uint(index)
+    ir.line_end()
+    return out
+}
+
+fn ir_emit_insert(ir: IRFunc, type: String, aggregate: String, item_type: String, value: String, index: uint) String {
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = insertvalue ")
+    ir.write(type)
+    ir.write(" ")
+    ir.write(aggregate)
+    ir.write(", ")
+    ir.write(item_type)
+    ir.write(" ")
+    ir.write(value)
+    ir.write(", ")
+    ir.write_uint(index)
+    ir.line_end()
+    return out
+}
+
+fn ir_emit_binary_instruction(ir: IRFunc, instruction: String, type: String, left: String, right: String) String {
+    let out = ir.var()
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = ")
+    ir.write(instruction)
+    ir.write(" ")
+    ir.write(type)
+    ir.write(" ")
+    ir.write(left)
+    ir.write(", ")
+    ir.write(right)
+    ir.line_end()
+    return out
+}
+
+fn ir_emit_zero(ir: IRFunc, address: String, size: uint) {
+    ir.line_start()
+    ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
+    ir.write(address)
+    ir.write(", i8 0, i64 ")
+    ir.write_uint(size)
+    ir.write(", i1 false)")
+    ir.line_end()
+}
+
+fn ir_byte_array_type(size: uint) String {
+    let out = ByteBuffer.new(16)
+    out.write_byte('[')
+    out.write_uint_ascii(size)
+    out.write_string(" x i8]")
+    return out.to_string()
+}
+
+fn ir_offset_address(ir: IRFunc, base: String, offset: uint) String {
+    let address = ir.var()
+    ir.line_start()
+    ir.write(address)
+    ir.write(" = getelementptr i8, ptr ")
+    ir.write(base)
+    ir.write(", i64 ")
+    ir.write_uint(offset)
+    ir.line_end()
+    return address
+}
+
+// Same, for a slot that already has a name of its own.
+fn ir_name_offset_address(ir: IRFunc, name: String, base: String, offset: uint) {
+    ir.line_start()
+    ir.write(name)
+    ir.write(" = getelementptr i8, ptr ")
+    ir.write(base)
+    ir.write(", i64 ")
+    ir.write_uint(offset)
+    ir.line_end()
+}
+
+fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
+    return ir_offset_address(ir, on, prop.offset.to(uint))
+}
+
+fn ir_require_runtime_value(value: Value) !Error {
+    let type = value.rett
+    if !isset(type.cached_ir_type) && type.has_unresolved_generic() {
+        value.bug("Unresolved generic value reached IR")
+    }
+}
+
 fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
+    ir_require_runtime_value(value) !>
     if value.type == VAL.decl {
         let decl = value.decl
         if !isset(decl) : value.bug("IR declaration value is missing its Decl")
-        if decl.ir_name == "-nameless-" || decl.ir_name.starts_with("\%.") || decl.ir_name.starts_with("\%capture.") {
-            // Captured outer declarations need closure-environment lowering.
-            // Materialize a verifier-safe placeholder until that layout exists.
-            return ir.captured_address(decl) !>
-        }
+        // A bind lives in the closure environment; the rest were named by
+        // generate_func_ir.
+        if decl.is_bind : return ir.captured_address(decl) !>
+        if decl.ir_name == "-nameless-" : value.bug("IR declaration has no frame storage")
         return decl.ir_name
     }
     if value.type == VAL.global {
         let global = value.global
         if !isset(global) : value.bug("IR global value is missing its Global")
         ir_use_global(ir, global)
-        return "@\"" + global_ir_name(global) + "\""
+        return ir_global_address(global)
     }
     if value.type == VAL.prop {
         let on = value.value1
         let prop = value.prop
         if !isset(on) || !isset(prop) : value.bug("IR property value is incomplete")
         let base = (on.rett.type == TYPE.array || on.rett.type == TYPE.inline) ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = getelementptr i8, ptr ")
-        ir.write(base)
-        ir.write(", i64 ")
-        ir.write_uint(prop.offset)
-        ir.line_end()
-        return out
+        return ir_prop_address(ir, base, prop)
     }
     if value.type == VAL.ptrv {
         let on = value.value1
@@ -2051,7 +2302,15 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let base = (on.rett.type == TYPE.array || on.rett.type == TYPE.inline) ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
         let off = ir_emit_gep_index(ir, index) !>
         let out = ir.var()
-        ir.line(out + " = getelementptr " + (ir_type(value.rett) !>) + ", ptr " + base + ", " + off)
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = getelementptr ")
+        ir.write(ir_type(value.rett) !>)
+        ir.write(", ptr ")
+        ir.write(base)
+        ir.write(", ")
+        ir.write(off)
+        ir.line_end()
         return out
     }
     // Address-taking of a temporary aggregate (for example a fixed-array
@@ -2060,14 +2319,7 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
     let type = ir_type(value.rett) !>
     ir.line3(temporary, " = alloca ", type)
     let rendered = ir_emit_value(ir, value) !>
-    ir.line_start()
-    ir.write("store ")
-    ir.write(type)
-    ir.write(" ")
-    ir.write(rendered)
-    ir.write(", ptr ")
-    ir.write(temporary)
-    ir.line_end()
+    ir_emit_store(ir, type, rendered, temporary)
     return temporary
 }
 
@@ -2081,18 +2333,30 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
 fn ir_emit_gep_index(ir: IRFunc, index: Value) String !Error {
     let value = ir_emit_value(ir, index) !>
     let from = index.rett
+    let from_ir = ir_type(from) !>
     let ptr_bits = ir.func.ns.build.options.target.ptr_size.to(uint) * 8
-    if !from.is_integer_type() : return (ir_type(from) !>) + " " + value
-    if (from.size() !>).to(uint) * 8 >= ptr_bits : return (ir_type(from) !>) + " " + value
+    if !from.is_integer_type() : return from_ir + " " + value
+    if (from.size() !>).to(uint) * 8 >= ptr_bits : return from_ir + " " + value
 
     let to = "i" + ptr_bits
     let inst = from.is_signed_type() ? "sext" : "zext"
     let out = ir.var()
-    ir.line(out + " = " + inst + " " + (ir_type(from) !>) + " " + value + " to " + to)
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = ")
+    ir.write(inst)
+    ir.write(" ")
+    ir.write(from_ir)
+    ir.write(" ")
+    ir.write(value)
+    ir.write(" to ")
+    ir.write(to)
+    ir.line_end()
     return to + " " + out
 }
 
 fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
+    ir_require_runtime_value(value) !>
     let match_value = ir.match_value
     if isset(match_value) && match_value == value {
         return ir.match_rendered
@@ -2101,15 +2365,14 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.error_handler {
         return ir_emit_error_handler(ir, value) !>
     }
+    if t == VAL.error_success {
+        let call = value.value1
+        if !isset(call) : value.bug("IR error-success value has no fallible producer")
+        let raw = ir.cached_error_result(call) ?? (ir_emit_value(ir, call) !>)
+        return ir_extract_error_success(ir, raw, call.rett) !>
+    }
 
     let pre = value.pre_value
-    // trim_errors() represents the success projection as a non-fallible clone
-    // whose pre_value is the original call. Reuse that call's ABI result rather
-    // than issuing the call a second time.
-    if t == VAL.call && !value.can_error && isset(pre) && pre.type == VAL.call && pre.can_error {
-        let raw = ir.cached_error_result(pre) ?? (ir_emit_value(ir, pre) !>)
-        return ir_extract_error_success(ir, raw, pre.rett) !>
-    }
     if isset(pre) : ir_emit_stmt(ir, pre) !>
 
     if t == VAL.int {
@@ -2159,7 +2422,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if !isset(inner) : value.bug("IR wrapped value is missing its child")
         if t == VAL.wrap && value.rett.type == TYPE.fnptr && inner.type == VAL.func {
             let func = inner.func
-            if isset(func) && !func_has_captures(func) {
+            if isset(func) && func.capture_free {
                 ir_note_unknown_code(ir)
                 if func.is_literal {
                     return "@\"" + (ir_emit_fnptr_adapter(ir, value, func) !>) + "\""
@@ -2184,83 +2447,28 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     }
     if t == VAL.decl || t == VAL.global || t == VAL.ptrv {
         let address = ir_emit_address(ir, value) !>
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = load ")
-        ir.write(ir_type(value.rett) !>)
-        ir.write(", ptr ")
-        ir.write(address)
-        ir.line_end()
-        // A captured declaration is physically a property of the closure
-        // environment. Unlike an ordinary local/global slot, the collector
-        // may tag that property in place.
+        let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
+        // Captures live in taggable closure properties.
         if t == VAL.decl && value.rett.is_gc_type() {
             let decl = value.decl
-            if isset(decl) && ir.func.capture_decls.contains(decl) {
-                let as_int = ir.var()
-                ir.line4(as_int, " = ptrtoint ptr ", out, " to i64")
-                let masked = ir.var()
-                ir.line4(masked, " = and i64 ", as_int, ", -4")
-                let clean = ir.var()
-                ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
+            if isset(decl) && decl.is_bind {
+                let clean = ir_union_clean_gc_pointer(ir, out)
                 return clean
             }
         }
         return out
     }
     if t == VAL.prop {
+        let prop = value.prop
+        if !isset(prop) : value.bug("IR property value is missing its property")
         let address = ir_emit_address(ir, value) !>
-        // Aggregate properties can contain several managed pointers, selected
-        // dynamically by union tags. Copy before cleaning so ownership bits in
-        // the heap object remain available to the collector.
+        // Clean aggregate copies without changing heap tags.
         if value.rett.has_gc_refs() && !value.rett.is_gc_type()
             && value.rett.get_non_nullable().type != TYPE.fn {
             return ir_emit_clean_embedded_load(ir, value, value.rett, address) !>
         }
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = load ")
-        ir.write(ir_type(value.rett) !>)
-        ir.write(", ptr ")
-        ir.write(address)
-        ir.line_end()
-        // GC-tracked properties carry ownership tag bits (prop_owned /
-        // prop_co_owned, see lib/src/gc/gc-data.valk) written in place by
-        // the collector's marking pass (lib/src/gc/marking.valk). Every read
-        // must mask them off before the value is used as a real pointer.
-        let prop = value.prop
-        if isset(prop) && prop.type.is_gc_type() {
-            let as_int = ir.var()
-            ir.line4(as_int, " = ptrtoint ptr ", out, " to i64")
-            let masked = ir.var()
-            ir.line4(masked, " = and i64 ", as_int, ", -4")
-            let clean = ir.var()
-            ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
-            return clean
-        }
-        // A closure property stores its managed environment in aggregate
-        // element 1. The collector tags that pointer just like an ordinary
-        // class property, while element 0 remains the function pointer.
-        if isset(prop) && prop.type.get_non_nullable().type == TYPE.fn {
-            let func = ir.var()
-            ir.line4(func, " = extractvalue { ptr, ptr } ", out, ", 0")
-            let environment = ir.var()
-            ir.line4(environment, " = extractvalue { ptr, ptr } ", out, ", 1")
-            let as_int = ir.var()
-            ir.line4(as_int, " = ptrtoint ptr ", environment, " to i64")
-            let masked = ir.var()
-            ir.line4(masked, " = and i64 ", as_int, ", -4")
-            let clean_environment = ir.var()
-            ir.line4(clean_environment, " = inttoptr i64 ", masked, " to ptr")
-            let clean = ir.var()
-            ir.line4(clean, " = insertvalue { ptr, ptr } undef, ptr ", func, ", 0")
-            let complete = ir.var()
-            ir.line(complete + " = insertvalue { ptr, ptr } " + clean + ", ptr " + clean_environment + ", 1")
-            return complete
-        }
-        return out
+        let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
+        return ir_clean_property_value(ir, prop.type, out)
     }
     if t == VAL.ptr_of {
         let inner = value.value1
@@ -2274,21 +2482,20 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         let base = ir_emit_value(ir, on) !>
         let amount = ir_emit_gep_index(ir, offset) !>
         let out = ir.var()
-        ir.line(out + " = getelementptr i8, ptr " + base + ", " + amount)
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = getelementptr i8, ptr ")
+        ir.write(base)
+        ir.write(", ")
+        ir.write(amount)
+        ir.line_end()
         return out
     }
     if t == VAL.load {
         let on = value.value1
         if !isset(on) : value.bug("IR load is missing its pointer")
         let address = ir_emit_value(ir, on) !>
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = load ")
-        ir.write(ir_type(value.rett) !>)
-        ir.write(", ptr ")
-        ir.write(address)
-        ir.line_end()
+        let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
         return out
     }
     if t == VAL.op {
@@ -2298,24 +2505,10 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         // ++/-- are represented as an op with no right child.
         if !isset(right) {
             let address = ir_emit_address(ir, left) !>
-            let old = ir.var()
             let type = ir_type(left.rett) !>
-            ir.line_start()
-            ir.write(old)
-            ir.write(" = load ")
-            ir.write(type)
-            ir.write(", ptr ")
-            ir.write(address)
-            ir.line_end()
+            let old = ir_emit_load(ir, type, address)
             let next = ir_emit_binary(ir, old, "1", value.op.@cast(VALUE_OP), left.rett) !>
-            ir.line_start()
-            ir.write("store ")
-            ir.write(type)
-            ir.write(" ")
-            ir.write(next)
-            ir.write(", ptr ")
-            ir.write(address)
-            ir.line_end()
+            ir_emit_store(ir, type, next, address)
             return value.bool_val ? next : old
         }
         let op = value.op.@cast(VALUE_OP)
@@ -2341,21 +2534,13 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if !isset(inner) : value.bug("IR unary operator is missing its operand")
         let val = ir_emit_value(ir, inner) !>
         let op = value.op.@cast(VALUE_OP)
-        if op == VALUE_OP.not {
-            let out = ir.var()
-            ir.line(out + " = xor i1 " + val + ", true")
-            return out
-        }
+        if op == VALUE_OP.not : return ir_emit_binary_instruction(ir, "xor", "i1", val, "true")
         if op == VALUE_OP.neg {
-            let out = ir.var()
             let type = ir_type(inner.rett) !>
             let inst = inner.rett.is_float_type() ? "fsub" : "sub"
-            ir.line(out + " = " + inst + " " + type + " 0, " + val)
-            return out
+            return ir_emit_binary_instruction(ir, inst, type, "0", val)
         }
-        let out = ir.var()
-        ir.line(out + " = xor " + (ir_type(inner.rett) !>) + " " + val + ", -1")
-        return out
+        return ir_emit_binary_instruction(ir, "xor", ir_type(inner.rett) !>, val, "-1")
     }
     if t == VAL.cast {
         let inner = value.value1
@@ -2363,7 +2548,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         // Aggregate-to-pointer casts take the aggregate's address. Numeric
         // pointer casts are actual inttoptr conversions; returning the address
         // of an integer temporary leaks a stack pointer as the runtime value.
-        if value.rett.is_pointer_sized() && !inner.rett.is_pointer_sized() && !inner.rett.is_integer_type() {
+        if value.rett.is_pointer() && !inner.rett.is_pointer() && !inner.rett.is_integer_type() {
             return ir_emit_address(ir, inner) !>
         }
         return ir_emit_cast(ir, ir_emit_value(ir, inner) !>, inner.rett, value.rett) !>
@@ -2418,7 +2603,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
                 if !isset(global) : value.bug("Error payload global is missing: " + et.name + "." + field.name)
                 ir_use_global(ir, global)
                 let rendered = ir_emit_value(ir, field) !>
-                ir.line("store " + (ir_type(field.rett) !>) + " " + rendered + ", ptr @\"" + global_ir_name(global) + "\"")
+                ir_emit_store(ir, ir_type(field.rett) !>, rendered, ir_global_address(global))
             }
         }
         // Dynamic code (`throw E` / `throw E { ... }`): emit the runtime code value.
@@ -2468,7 +2653,12 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.string || t == VAL.property_meta {
         let index = ir_use_string(ir, value.string_val)
         let out = ir.var()
-        ir.line(out + " = getelementptr i8, ptr @\"valk.str." + index + "\", i64 8")
+        ir.line_start()
+        ir.write(out)
+        ir.write(" = getelementptr i8, ptr @\"valk.str.")
+        ir.write_uint(index)
+        ir.write("\", i64 8")
+        ir.line_end()
         return out
     }
     if t == VAL.func {
@@ -2492,6 +2682,10 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
 
     value.bug("Value kind reached IR without lowering: " + t)
 }
+
+////////////////////////////
+// Atomics
+////////////////////////////
 
 fn ir_emit_atomic_op(ir: IRFunc, value: Value) String !Error {
     let left = value.value1
@@ -2570,6 +2764,10 @@ fn ir_atomic_align(type: Type) u32 !Error {
     if size >= ptr_size : return ptr_size
     return 4
 }
+
+////////////////////////////
+// Match
+////////////////////////////
 
 fn ir_emit_match(ir: IRFunc, value: Value) String !Error {
     let on = value.value1
@@ -2675,92 +2873,40 @@ fn ir_emit_match_case(
     ir.jump(after)
 }
 
+////////////////////////////
+// Nullables and unions
+////////////////////////////
+
 fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     let on = value.value1
     if !isset(on) : value.bug("IR isset is missing its operand")
 
-    // Error handlers use VAL.isset as their internal has-error condition.
-    // Keep this path usable independently as well as through
-    // ir_emit_error_handler.
-    if value.name == "has_error" {
-        let raw = ir.cached_error_result(on) ?? (ir_emit_value(ir, on) !>)
-        ir.cache_error_result(on, raw)
-        let code = ir_extract_error_code(ir, raw, on.rett) !>
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = icmp ne i32 ")
-        ir.write(code)
-        ir.write(", 0")
-        ir.line_end()
-        return out
-    }
-
     let rendered = ir_emit_value(ir, on) !>
     let type = on.rett.get_non_nullable()
     let lowered = ir_type(on.rett) !>
-    let out = ir.var()
-    if ir_is_tagged_nullable(on.rett) {
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = extractvalue ")
-        ir.write(lowered)
-        ir.write(" ")
-        ir.write(rendered)
-        ir.write(", 0")
-        ir.line_end()
-        return out
-    }
+    if ir_is_tagged_nullable(on.rett) : return ir_emit_extract(ir, lowered, rendered, 0)
     if type.type == TYPE.fn {
-        let target = ir.var()
-        ir.line_start()
-        ir.write(target)
-        ir.write(" = extractvalue ")
-        ir.write(lowered)
-        ir.write(" ")
-        ir.write(rendered)
-        ir.write(", 0")
-        ir.line_end()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = icmp ne ptr ")
-        ir.write(target)
-        ir.write(", null")
-        ir.line_end()
-        return out
+        let target = ir_emit_extract(ir, lowered, rendered, 0)
+        return ir_emit_binary_instruction(ir, "icmp ne", "ptr", target, "null")
     }
-    ir.line_start()
-    ir.write(out)
-    if type.is_pointer_sized() {
-        ir.write(" = icmp ne ptr ")
-        ir.write(rendered)
-        ir.write(", null")
+    if type.is_pointer() {
+        return ir_emit_binary_instruction(ir, "icmp ne", "ptr", rendered, "null")
     } else if type.is_float_type() {
-        ir.write(" = fcmp one ")
-        ir.write(lowered)
-        ir.write(" ")
-        ir.write(rendered)
-        ir.write(", 0.0")
+        return ir_emit_binary_instruction(ir, "fcmp one", lowered, rendered, "0.0")
     } else if type.is_integer_type() || type.is_bool_type() || type.type == TYPE.error_code {
-        ir.write(" = icmp ne ")
-        ir.write(lowered)
-        ir.write(" ")
-        ir.write(rendered)
-        ir.write(", 0")
+        return ir_emit_binary_instruction(ir, "icmp ne", lowered, rendered, "0")
     } else {
         value.bug("IR isset cannot test nullable type: " + on.rett.compat_display_name())
     }
-    ir.line_end()
-    return out
 }
 
 fn ir_union_inner_value(ir: IRFunc, on: Value, rendered: String) String !Error {
     if !on.rett.is_nullable_type() : return rendered
-    let out = ir.var()
-    ir.line(out + " = extractvalue " + (ir_type(on.rett) !>) + " " + rendered + ", 2")
-    return out
+    return ir_emit_extract(ir, ir_type(on.rett) !>, rendered, 2)
 }
 
+// Managed pointers carry ownership tag bits (see lib/src/gc/gc-data.valk),
+// written in place by the collector. Mask them off before use.
 fn ir_union_clean_gc_pointer(ir: IRFunc, pointer: String) String {
     let as_int = ir.var()
     ir.line4(as_int, " = ptrtoint ptr ", pointer, " to i64")
@@ -2769,6 +2915,21 @@ fn ir_union_clean_gc_pointer(ir: IRFunc, pointer: String) String {
     let clean = ir.var()
     ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
     return clean
+}
+
+fn ir_clean_closure(ir: IRFunc, closure: String) String {
+    let target = ir_emit_extract(ir, "{ ptr, ptr }", closure, 0)
+    let environment = ir_emit_extract(ir, "{ ptr, ptr }", closure, 1)
+    environment = ir_union_clean_gc_pointer(ir, environment)
+    let clean = ir_emit_insert(ir, "{ ptr, ptr }", "undef", "ptr", target, 0)
+    return ir_emit_insert(ir, "{ ptr, ptr }", clean, "ptr", environment, 1)
+}
+
+// Property pointers can carry collector ownership bits.
+fn ir_clean_property_value(ir: IRFunc, type: Type, value: String) String {
+    if type.is_gc_type() : return ir_union_clean_gc_pointer(ir, value)
+    if type.get_non_nullable().type == TYPE.fn : return ir_clean_closure(ir, value)
+    return value
 }
 
 fn ir_emit_union_wrap(ir: IRFunc, value: Value) String !Error {
@@ -2784,54 +2945,38 @@ fn ir_emit_union_wrap(ir: IRFunc, value: Value) String !Error {
     let nullable_present = ""
     let rendered_type = inner.rett
     if inner.rett.is_nullable_type() {
-        // `?Member` -> `?(Member | ...)` is one representation conversion, not
-        // a promise that the source is present. Preserve its null state while
-        // packing the non-null payload into the inline union aggregate.
+        // Preserve nullable presence while packing the union payload.
         if ir_is_tagged_nullable(inner.rett) {
-            nullable_present = ir.var()
-            ir.line(nullable_present + " = extractvalue " + (ir_type(inner.rett) !>) + " " + rendered + ", 0")
+            nullable_present = ir_emit_extract(ir, ir_type(inner.rett) !>, rendered, 0)
             rendered = ir_extract_tagged_nullable_value(ir, rendered, inner.rett) !>
         } else if inner.rett.get_non_nullable().type == TYPE.fn {
-            let target = ir.var()
-            ir.line(target + " = extractvalue " + (ir_type(inner.rett) !>) + " " + rendered + ", 0")
+            let target = ir_emit_extract(ir, ir_type(inner.rett) !>, rendered, 0)
             nullable_present = ir.var()
-            ir.line(nullable_present + " = icmp ne ptr " + target + ", null")
+            ir.line4(nullable_present, " = icmp ne ptr ", target, ", null")
         } else {
             nullable_present = ir.var()
-            ir.line(nullable_present + " = icmp ne ptr " + rendered + ", null")
+            ir.line4(nullable_present, " = icmp ne ptr ", rendered, ", null")
         }
         rendered_type = inner.rett.get_non_nullable()
     }
     rendered = ir_emit_cast(ir, rendered, rendered_type, member) !>
 
     let lowered = ir_type(union) !>
-    let slot = ""
-    let storage = value.decl
-    if isset(storage) {
-        slot = storage.ir_name
-    } else {
-        slot = ir.var()
-        ir.line3(slot, " = alloca ", lowered)
-    }
+    let slot = ir_value_slot(ir, value, lowered)
+    ir_emit_zero(ir, slot, (union.size() !>).to(uint))
     ir.line_start()
-    ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
+    ir.write("store i64 ")
+    ir.write_int(value.int_val)
+    ir.write(", ptr ")
     ir.write(slot)
-    ir.write(", i8 0, i64 ")
-    ir.write_uint((union.size() !>).to(uint))
-    ir.write(", i1 false)")
     ir.line_end()
-    ir.line("store i64 " + value.int_val + ", ptr " + slot)
 
-    let payload = ir.var()
-    if member.is_gc_type() {
-        ir.line(payload + " = getelementptr i8, ptr " + slot + ", i64 " + union.union_gc_payload_offset())
-    } else {
-        ir.line(payload + " = getelementptr i8, ptr " + slot + ", i64 " + union.union_other_payload_offset())
-    }
-    ir.line("store " + (ir_type(member) !>) + " " + rendered + ", ptr " + payload)
+    let layout = union.union_layout() !>
+    let payload_offset = member.is_gc_type() ? layout.gc_offset() : layout.other_offset
+    let payload = ir_offset_address(ir, slot, payload_offset.to(uint))
+    ir_emit_store(ir, ir_type(member) !>, rendered, payload)
 
-    let out = ir.var()
-    ir.line(out + " = load " + lowered + ", ptr " + slot)
+    let out = ir_emit_load(ir, lowered, slot)
     if value.rett.is_nullable_type() {
         if nullable_present.length > 0 {
             return ir_build_tagged_nullable_with_presence(ir, value.rett, out, nullable_present) !>
@@ -2847,17 +2992,19 @@ fn ir_emit_union_is(ir: IRFunc, value: Value) String !Error {
     let rendered = ir_emit_value(ir, on) !>
     let union = on.rett.get_non_nullable()
     let inner = ir_union_inner_value(ir, on, rendered) !>
-    let tag = ir.var()
-    ir.line(tag + " = extractvalue " + (ir_type(union) !>) + " " + inner + ", 0")
+    let tag = ir_emit_extract(ir, ir_type(union) !>, inner, 0)
     let matched = ir.var()
-    ir.line(matched + " = icmp eq i64 " + tag + ", " + value.int_val)
+    ir.line_start()
+    ir.write(matched)
+    ir.write(" = icmp eq i64 ")
+    ir.write(tag)
+    ir.write(", ")
+    ir.write_int(value.int_val)
+    ir.line_end()
     if !on.rett.is_nullable_type() : return matched
 
-    let present = ir.var()
-    ir.line(present + " = extractvalue " + (ir_type(on.rett) !>) + " " + rendered + ", 0")
-    let out = ir.var()
-    ir.line(out + " = and i1 " + present + ", " + matched)
-    return out
+    let present = ir_emit_extract(ir, ir_type(on.rett) !>, rendered, 0)
+    return ir_emit_binary_instruction(ir, "and", "i1", present, matched)
 }
 
 fn ir_emit_union_extract(ir: IRFunc, value: Value) String !Error {
@@ -2867,27 +3014,17 @@ fn ir_emit_union_extract(ir: IRFunc, value: Value) String !Error {
     let rendered = ir_emit_value(ir, on) !>
     let union = on.rett.get_non_nullable()
     let inner = ir_union_inner_value(ir, on, rendered) !>
+    let layout = union.union_layout() !>
     if member.is_gc_type() {
-        let stored = ir.var()
-        ir.line(stored + " = extractvalue " + (ir_type(union) !>) + " " + inner + ", " + union.union_gc_payload_index())
+        let stored = ir_emit_extract(ir, ir_type(union) !>, inner, layout.gc_index())
         return ir_union_clean_gc_pointer(ir, stored)
     }
 
     let lowered = ir_type(union) !>
-    let slot = ""
-    let storage = value.decl
-    if isset(storage) {
-        slot = storage.ir_name
-    } else {
-        slot = ir.var()
-        ir.line3(slot, " = alloca ", lowered)
-    }
-    ir.line("store " + lowered + " " + inner + ", ptr " + slot)
-    let payload = ir.var()
-    ir.line(payload + " = getelementptr i8, ptr " + slot + ", i64 " + union.union_other_payload_offset())
-    let out = ir.var()
-    ir.line(out + " = load " + (ir_type(member) !>) + ", ptr " + payload)
-    return out
+    let slot = ir_value_slot(ir, value, lowered)
+    ir_emit_store(ir, lowered, inner, slot)
+    let payload = ir_offset_address(ir, slot, layout.other_offset.to(uint))
+    return ir_emit_load(ir, ir_type(member) !>, payload)
 }
 
 fn ir_build_tagged_nullable(ir: IRFunc, type: Type, value: String) String !Error {
@@ -2897,43 +3034,17 @@ fn ir_build_tagged_nullable(ir: IRFunc, type: Type, value: String) String !Error
 fn ir_build_tagged_nullable_with_presence(ir: IRFunc, type: Type, value: String, present: String) String !Error {
     let lowered = ir_type(type) !>
     let inner = type.get_non_nullable()
-    let with_tag = ir.var()
-    ir.line_start()
-    ir.write(with_tag)
-    ir.write(" = insertvalue ")
-    ir.write(lowered)
-    ir.write(" undef, i1 ")
-    ir.write(present)
-    ir.write(", 0")
-    ir.line_end()
-    let out = ir.var()
-    ir.line_start()
-    ir.write(out)
-    ir.write(" = insertvalue ")
-    ir.write(lowered)
-    ir.write(" ")
-    ir.write(with_tag)
-    ir.write(", ")
-    ir.write(ir_type(inner) !>)
-    ir.write(" ")
-    ir.write(value)
-    ir.write(", 2")
-    ir.line_end()
-    return out
+    let with_tag = ir_emit_insert(ir, lowered, "undef", "i1", present, 0)
+    return ir_emit_insert(ir, lowered, with_tag, ir_type(inner) !>, value, 2)
 }
 
 fn ir_extract_tagged_nullable_value(ir: IRFunc, value: String, type: Type) String !Error {
-    let out = ir.var()
-    ir.line_start()
-    ir.write(out)
-    ir.write(" = extractvalue ")
-    ir.write(ir_type(type) !>)
-    ir.write(" ")
-    ir.write(value)
-    ir.write(", 2")
-    ir.line_end()
-    return out
+    return ir_emit_extract(ir, ir_type(type) !>, value, 2)
 }
+
+////////////////////////////
+// Branch merges
+////////////////////////////
 
 fn ir_emit_this_or_that(ir: IRFunc, value: Value) String !Error {
     let cond = value.value1
@@ -3039,46 +3150,28 @@ fn ir_emit_vscope(ir: IRFunc, value: Value) String !Error {
     return out
 }
 
+////////////////////////////
+// Error handlers
+////////////////////////////
+
 fn ir_extract_error_code(ir: IRFunc, raw: String, rett: Type) String !Error {
     let count = ir_normal_rett_count(rett)
     if count == 0 : return raw
-    let out = ir.var()
-    ir.line_start()
-    ir.write(out)
-    ir.write(" = extractvalue ")
-    ir.write(ir_error_abi_type(rett) !>)
-    ir.write(" ")
-    ir.write(raw)
-    ir.write(", ")
-    ir.write_uint(count)
-    ir.line_end()
-    return out
+    return ir_emit_extract(ir, ir_error_abi_type(rett) !>, raw, count)
 }
 
 fn ir_extract_error_success(ir: IRFunc, raw: String, rett: Type) String !Error {
     if rett.is_void_type() : return ""
     let abi = ir_error_abi_type(rett) !>
     if rett.type != TYPE.multi {
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = extractvalue ")
-        ir.write(abi)
-        ir.write(" ")
-        ir.write(raw)
-        ir.write(", 0")
-        ir.line_end()
-        return out
+        return ir_emit_extract(ir, abi, raw, 0)
     }
     let subs = rett.sub_types
     if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
     let current = "undef"
     each subs as sub, i {
-        let part = ir.var()
-        ir.line(part + " = extractvalue " + abi + " " + raw + ", " + i)
-        let next = ir.var()
-        ir.line(next + " = insertvalue " + (ir_type(rett) !>) + " " + current + ", " + (ir_type(sub) !>) + " " + part + ", " + i)
-        current = next
+        let part = ir_emit_extract(ir, abi, raw, i)
+        current = ir_emit_insert(ir, ir_type(rett) !>, current, ir_type(sub) !>, part, i)
     }
     return current
 }
@@ -3086,12 +3179,7 @@ fn ir_extract_error_success(ir: IRFunc, raw: String, rett: Type) String !Error {
 fn ir_store_caught_error(ir: IRFunc, value: Value, code: String) !Error {
     let decl = value.decl
     if !isset(decl) : return
-    ir.line_start()
-    ir.write("store i32 ")
-    ir.write(code)
-    ir.write(", ptr ")
-    ir.write(decl.ir_name)
-    ir.line_end()
+    ir_emit_store(ir, "i32", code, decl.ir_name)
 
     let payloads = decl.error_payloads
     let pre = value.pre_value
@@ -3103,9 +3191,8 @@ fn ir_store_caught_error(ir: IRFunc, value: Value, code: String) !Error {
         if !isset(global) : continue
         ir_use_global(ir, global)
         let type = ir_type(payload_decl.type) !>
-        let loaded = ir.var()
-        ir.line(loaded + " = load " + type + ", ptr @\"" + global_ir_name(global) + "\"")
-        ir.line("store " + type + " " + loaded + ", ptr " + payload_decl.ir_name)
+        let loaded = ir_emit_load(ir, type, ir_global_address(global))
+        ir_emit_store(ir, type, loaded, payload_decl.ir_name)
     }
 }
 
@@ -3120,7 +3207,7 @@ fn ir_default_pass_payloads(ir: IRFunc, value: Value, from: ?ErrorType, to: ?Err
         if !isset(global) : value.bug("Error payload global is missing: " + to.name + "." + field.name)
         ir_use_global(ir, global)
         let rendered = ir_emit_value(ir, field) !>
-        ir.line("store " + (ir_type(field.rett) !>) + " " + rendered + ", ptr @\"" + global_ir_name(global) + "\"")
+        ir_emit_store(ir, ir_type(field.rett) !>, rendered, ir_global_address(global))
     }
 }
 
@@ -3239,6 +3326,10 @@ fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
     return success_result
 }
 
+////////////////////////////
+// Aggregates and interfaces
+////////////////////////////
+
 fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
     let values = value.values
     if !isset(values) : value.bug("IR fixed-array initializer has no elements")
@@ -3247,9 +3338,7 @@ fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
     let whole = ir_type(aggregate_type) !>
     each values as item, i {
         let item_value = ir_emit_value(ir, item) !>
-        let out = ir.var()
-        ir.line(out + " = insertvalue " + whole + " " + aggregate + ", " + (ir_type(item.rett) !>) + " " + item_value + ", " + i)
-        aggregate = out
+        aggregate = ir_emit_insert(ir, whole, aggregate, ir_type(item.rett) !>, item_value, i)
     }
     if ir_is_tagged_nullable(value.rett) {
         return ir_build_tagged_nullable(ir, value.rett, aggregate) !>
@@ -3258,14 +3347,12 @@ fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
 }
 
 fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
-    // Hook-based collection initializers carry their constructed object in
-    // value1 and the append/set calls in values.
+    // Hook initializers keep their object in value1.
     let base = value.value1
     if isset(base) {
         let hooks = value.values
         if isset(hooks) {
-            // When a hook returns SELF, value1 is the final call in a nested
-            // receiver chain; emitting it also emits every preceding call.
+            // The final SELF call includes its receiver chain.
             each hooks as hook {
                 if hook == base : return ir_emit_value(ir, base) !>
             }
@@ -3285,20 +3372,22 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     let class = value.class_ref ?? storage_type.get_class_or_null()
     if !isset(class) : value.bug("Aggregate class initializer has no class")
 
-    // Evaluate fields first. In particular, a nested GC allocation must happen
-    // before the new object exists but has not yet been rooted.
+    // Evaluate fields before allocating their owner.
     let fields = value.values
-    let rendered = Array[String]{}
+    let field_mark = ir.field_values.length
     if isset(fields) {
         each fields as field {
-            rendered.append(ir_emit_value(ir, field) !>)
+            ir.field_values.append(ir_emit_value(ir, field) !>)
         }
     }
 
     let result_type = ir_is_tagged_nullable(value.rett) ? value.rett.get_non_nullable() : value.rett
     let lowered = ir_type(result_type) !>
     let size = class.compute_body_size() !>
-    if size == 0 && lowered == "ptr" : return "null"
+    if size == 0 && lowered == "ptr" {
+        ir.release_field_values(field_mark)
+        return "null"
+    }
 
     let slot = ""
     if lowered == "ptr" {
@@ -3308,7 +3397,7 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         ir.line3(slot, " = alloca ", lowered)
     }
     if size > 0 {
-        ir.line("call void @llvm.memset.inline.p0.i64(ptr " + slot + ", i8 0, i64 " + size + ", i1 false)")
+        ir_emit_zero(ir, slot, size.to(uint))
     }
 
     if isset(fields) {
@@ -3317,35 +3406,15 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
             if field.name != "" : prop = class.get_prop_by_name(field.name) !? null
             if !isset(prop) : prop = class.props.get(i) !? null
             if !isset(prop) : value.bug("Cannot match aggregate initializer field to a property")
-            let field_value = rendered.get(i) !? "undef"
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(slot)
-            ir.write(", i64 ")
-            ir.write_uint(prop.offset)
-            ir.line_end()
-            ir.line_start()
-            ir.write("store ")
-            ir.write(ir_type(prop.type) !>)
-            ir.write(" ")
-            ir.write(field_value)
-            ir.write(", ptr ")
-            ir.write(address)
-            ir.line_end()
+            let field_value = ir.field_values.get(field_mark + i) !? "undef"
+            let address = ir_prop_address(ir, slot, prop)
+            ir_emit_store(ir, ir_type(prop.type) !>, field_value, address)
         }
     }
+    ir.release_field_values(field_mark)
     if lowered == "ptr" : return slot
 
-    let out = ir.var()
-    ir.line_start()
-    ir.write(out)
-    ir.write(" = load ")
-    ir.write(lowered)
-    ir.write(", ptr ")
-    ir.write(slot)
-    ir.line_end()
+    let out = ir_emit_load(ir, lowered, slot)
     if ir_is_tagged_nullable(value.rett) {
         return ir_build_tagged_nullable(ir, value.rett, out) !>
     }
@@ -3368,27 +3437,15 @@ fn ir_emit_interface_wrap(ir: IRFunc, value: Value) String !Error {
     return ir_emit_class_init(ir, init) !>
 }
 
-// Load the concrete object retained by an interface adapter. GC property
-// pointers can carry ownership bits, so clear them before using the receiver.
+// Interface objects are stored as tagged GC properties.
 fn ir_interface_object(ir: IRFunc, adapter: String) String {
-    let tagged = ir.var()
-    ir.line(tagged + " = load ptr, ptr " + adapter)
-    let as_int = ir.var()
-    ir.line4(as_int, " = ptrtoint ptr ", tagged, " to i64")
-    let masked = ir.var()
-    ir.line4(masked, " = and i64 ", as_int, ", -4")
-    let clean = ir.var()
-    ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
-    return clean
+    return ir_union_clean_gc_pointer(ir, ir_emit_load(ir, "ptr", adapter))
 }
 
 fn ir_emit_nullable_interface_compare(ir: IRFunc, left: String, right: String, op: VALUE_OP) String {
-    let left_null = ir.var()
-    let right_null = ir.var()
-    let any_null = ir.var()
-    ir.line(left_null + " = icmp eq ptr " + left + ", null")
-    ir.line(right_null + " = icmp eq ptr " + right + ", null")
-    ir.line(any_null + " = or i1 " + left_null + ", " + right_null)
+    let left_null = ir_emit_binary_instruction(ir, "icmp eq", "ptr", left, "null")
+    let right_null = ir_emit_binary_instruction(ir, "icmp eq", "ptr", right, "null")
+    let any_null = ir_emit_binary_instruction(ir, "or", "i1", left_null, right_null)
 
     let null_block = ir.block("interface.compare.null")
     let value_block = ir.block("interface.compare.value")
@@ -3396,35 +3453,53 @@ fn ir_emit_nullable_interface_compare(ir: IRFunc, left: String, right: String, o
     ir.cond_jump(any_null, null_block, value_block)
 
     ir.label(null_block)
-    let null_result = ir.var()
     let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
-    ir.line(null_result + " = " + compare + " i1 " + left_null + ", " + right_null)
+    let null_result = ir_emit_binary_instruction(ir, compare, "i1", left_null, right_null)
     let null_predecessor = ir.current_block
     ir.jump(after_block)
 
     ir.label(value_block)
     let left_object = ir_interface_object(ir, left)
     let right_object = ir_interface_object(ir, right)
-    let value_result = ir.var()
-    ir.line(value_result + " = " + compare + " ptr " + left_object + ", " + right_object)
+    let value_result = ir_emit_binary_instruction(ir, compare, "ptr", left_object, right_object)
     let value_predecessor = ir.current_block
     ir.jump(after_block)
 
     ir.label(after_block)
     let out = ir.var()
-    ir.line(out + " = phi i1 [ " + null_result + ", \%" + null_predecessor
-        + " ], [ " + value_result + ", \%" + value_predecessor + " ]")
+    ir.line_start()
+    ir.write(out)
+    ir.write(" = phi i1 [ ")
+    ir.write(null_result)
+    ir.write(", \%")
+    ir.write(null_predecessor)
+    ir.write(" ], [ ")
+    ir.write(value_result)
+    ir.write(", \%")
+    ir.write(value_predecessor)
+    ir.write(" ]")
+    ir.line_end()
     return out
 }
 
 fn ir_interface_method_target(ir: IRFunc, adapter: String, method: Func) String {
     let address = ir.var()
     let offset = (method.interface_slot + 1) * method.ns.build.options.target.ptr_size.to(uint)
-    ir.line(address + " = getelementptr i8, ptr " + adapter + ", i64 " + offset)
+    ir.line_start()
+    ir.write(address)
+    ir.write(" = getelementptr i8, ptr ")
+    ir.write(adapter)
+    ir.write(", i64 ")
+    ir.write_uint(offset)
+    ir.line_end()
     let target = ir.var()
-    ir.line(target + " = load ptr, ptr " + address)
+    ir.line3(target, " = load ptr, ptr ", address)
     return target
 }
+
+////////////////////////////
+// Allocation
+////////////////////////////
 
 fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String !Error {
     let allocator = value.allocator
@@ -3433,18 +3508,29 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
         let global = allocator.global
         ir_use_global(ir, global)
         let pool_type = global.get_type() !>
-        let pool_class = pool_type.get_class_or_null()
-        if !isset(pool_class) : value.bug("Generated allocator global is not a Pool")
-        let method_name = isset(allocator.onfree) ? "get_vtable" : "get"
-        let pool_get = pool_class.get_func(method_name)
-        if !isset(pool_get) : value.bug("gc:Pool has no '" + method_name + "' method")
-        if !pool_get.parsed_types : parse_func_types(pool_get) !>
+        let pool_get = allocator.pool_get
         ir_use_func(ir, pool_get)
 
         let pool = ir.var()
-        ir.line(pool + " = load " + (ir_type(pool_type) !>) + ", ptr @\"" + global_ir_name(global) + "\"")
+        ir.line_start()
+        ir.write(pool)
+        ir.write(" = load ")
+        ir.write(ir_type(pool_type) !>)
+        ir.write(", ptr @\"")
+        ir.write(global_ir_name(global))
+        ir.write("\"")
+        ir.line_end()
         let result = ir.var()
-        ir.line(result + " = call " + (ir_type(pool_get.get_rett()) !>) + " @\"" + func_ir_name(pool_get) + "\"(ptr " + pool + ")")
+        ir.line_start()
+        ir.write(result)
+        ir.write(" = call ")
+        ir.write(ir_type(pool_get.get_rett()) !>)
+        ir.write(" @\"")
+        ir.write(func_ir_name(pool_get))
+        ir.write("\"(ptr ")
+        ir.write(pool)
+        ir.write(")")
+        ir.line_end()
         return result
     }
 
@@ -3457,38 +3543,111 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
         if !alloc.parsed_types : parse_func_types(alloc) !>
         ir_use_func(ir, alloc)
         let result = ir.var()
-        ir.line(result + " = call " + (ir_type(alloc.get_rett()) !>) + " @\"" + func_ir_name(alloc) + "\"(i64 " + size + ")")
+        ir.line_start()
+        ir.write(result)
+        ir.write(" = call ")
+        ir.write(ir_type(alloc.get_rett()) !>)
+        ir.write(" @\"")
+        ir.write(func_ir_name(alloc))
+        ir.write("\"(i64 ")
+        ir.write_uint(size.to(uint))
+        ir.write(")")
+        ir.line_end()
         return result
     }
 
     value.bug("GC class initializer has no allocator: " + class.pretty_name())
 }
 
-fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
-    let name = "valk.closure.adapter." + func_ir_name(func)
-    if !func.is_interface : ir_use_func(parent, func)
-    if ir_reuse_adapter(parent, name) : return name
-    parent.func.unit.closure_adapters.set(name, parent.func)
+////////////////////////////
+// Closures
+////////////////////////////
 
-    let ir = IRFunc {
+// Adapters are written once per module, into the parent's helper buffer.
+fn ir_adapter_ir(parent: IRFunc, name: String) IRFunc {
+    parent.func.unit.closure_adapters.set(name, parent.func)
+    return IRFunc {
         func: parent.func
         code: parent.coro_helpers
     }
-    let bound = isset(func.class) && !func.is_static
+}
+
+// `define internal <rett> @"name"(...)`. A closure adapter takes the environment
+// as its first parameter, and a bound one takes its receiver from there.
+fn ir_write_adapter_signature(ir: IRFunc, func: Func, name: String, closure_data: bool, skip_receiver: bool) !Error {
     ir.code.write_string("define internal ")
     ir.code.write_string(ir_func_rett_type(func) !>)
     ir.code.write_string(" @\"")
     ir.code.write_string(name)
-    ir.code.write_string("\"(ptr \%closure.data")
+    ir.code.write_string("\"(")
+    if closure_data : ir.code.write_string("ptr \%closure.data")
     each func.args as arg, i {
-        if bound && i == 0 : continue
-        ir.code.write_string(", ")
+        if skip_receiver && i == 0 : continue
+        if closure_data || i > 0 : ir.code.write_string(", ")
         ir.code.write_string(ir_type(arg.type) !>)
         ir.code.write_string(" \%arg.")
         ir.code.write_uint_ascii(i)
     }
     ir.code.write_string(") {\n")
     ir.label("entry")
+}
+
+// Adapter body: forward the arguments to `target` and return its result.
+// `prefix` is a complete leading argument; `receiver` replaces argument 0.
+fn ir_emit_adapter_call(ir: IRFunc, func: Func, target: String, prefix: String, receiver: String) !Error {
+    let raw = ""
+    let has_result = !func.get_rett().is_void_type() || func.can_error
+    ir.line_start()
+    if has_result {
+        raw = ir.var()
+        ir.write(raw)
+        ir.write(" = ")
+    }
+    ir.write("call ")
+    ir.write(ir_func_rett_type(func) !>)
+    ir.write(" ")
+    ir.write(target)
+    ir.write("(")
+    let wrote = false
+    if prefix.length > 0 {
+        ir.write(prefix)
+        wrote = true
+    }
+    each func.args as arg, i {
+        if wrote : ir.write(", ")
+        ir.write(ir_type(arg.type) !>)
+        ir.write(" ")
+        if i == 0 && receiver.length > 0 {
+            ir.write(receiver)
+        } else {
+            ir.write("\%arg.")
+            ir.write_uint(i)
+        }
+        wrote = true
+    }
+    ir.write(")")
+    ir.line_end()
+    if !has_result {
+        ir.line("ret void")
+        ir.code.write_string("}\n\n")
+        return
+    }
+    ir.line_start()
+    ir.write("ret ")
+    ir.write(ir_func_rett_type(func) !>)
+    ir.write(" ")
+    ir.write(raw)
+    ir.line_end()
+    ir.code.write_string("}\n\n")
+}
+
+fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
+    let name = "valk.closure.adapter." + func_ir_name(func)
+    if !func.is_interface : ir_use_func(parent, func)
+    if ir_reuse_adapter(parent, name) : return name
+    let ir = ir_adapter_ir(parent, name)
+    let bound = isset(func.class) && !func.is_static
+    ir_write_adapter_signature(ir, func, name, true, bound) !>
 
     let receiver = ""
     if bound {
@@ -3506,48 +3665,7 @@ fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Err
         receiver = ir_interface_object(ir, adapter)
         ir_note_unknown_code(parent)
     }
-
-    let raw = ""
-    let has_result = !func.get_rett().is_void_type() || func.can_error
-    ir.line_start()
-    if has_result {
-        raw = ir.var()
-        ir.write(raw)
-        ir.write(" = ")
-    }
-    ir.write("call ")
-    ir.write(ir_func_rett_type(func) !>)
-    ir.write(" ")
-    ir.write(call_target)
-    ir.write("(")
-    let wrote = false
-    each func.args as arg, i {
-        if bound && i == 0 {
-            ir.write(ir_type(arg.type) !>)
-            ir.write(" ")
-            ir.write(receiver)
-            wrote = true
-            continue
-        }
-        if wrote : ir.write(", ")
-        ir.write(ir_type(arg.type) !>)
-        ir.write(" \%arg.")
-        ir.write_uint(i)
-        wrote = true
-    }
-    ir.write(")")
-    ir.line_end()
-    if has_result {
-        ir.line_start()
-        ir.write("ret ")
-        ir.write(ir_func_rett_type(func) !>)
-        ir.write(" ")
-        ir.write(raw)
-        ir.line_end()
-    } else {
-        ir.line("ret void")
-    }
-    ir.code.write_string("}\n\n")
+    ir_emit_adapter_call(ir, func, call_target, "", receiver) !>
     return name
 }
 
@@ -3555,57 +3673,9 @@ fn ir_emit_fnptr_adapter(parent: IRFunc, value: Value, func: Func) String !Error
     let name = "valk.fnptr.adapter." + func_ir_name(func)
     ir_use_func(parent, func)
     if ir_reuse_adapter(parent, name) : return name
-    parent.func.unit.closure_adapters.set(name, parent.func)
-
-    let ir = IRFunc {
-        func: parent.func
-        code: parent.coro_helpers
-    }
-    ir.code.write_string("define internal ")
-    ir.code.write_string(ir_func_rett_type(func) !>)
-    ir.code.write_string(" @\"")
-    ir.code.write_string(name)
-    ir.code.write_string("\"(")
-    each func.args as arg, i {
-        if i > 0 : ir.code.write_string(", ")
-        ir.code.write_string(ir_type(arg.type) !>)
-        ir.code.write_string(" \%arg.")
-        ir.code.write_uint_ascii(i)
-    }
-    ir.code.write_string(") {\n")
-    ir.label("entry")
-    let raw = ""
-    let has_result = !func.get_rett().is_void_type() || func.can_error
-    ir.line_start()
-    if has_result {
-        raw = ir.var()
-        ir.write(raw)
-        ir.write(" = ")
-    }
-    ir.write("call ")
-    ir.write(ir_func_rett_type(func) !>)
-    ir.write(" @\"")
-    ir.write(func_ir_name(func))
-    ir.write("\"(ptr null")
-    each func.args as arg, i {
-        ir.write(", ")
-        ir.write(ir_type(arg.type) !>)
-        ir.write(" \%arg.")
-        ir.write_uint(i)
-    }
-    ir.write(")")
-    ir.line_end()
-    if has_result {
-        ir.line_start()
-        ir.write("ret ")
-        ir.write(ir_func_rett_type(func) !>)
-        ir.write(" ")
-        ir.write(raw)
-        ir.line_end()
-    } else {
-        ir.line("ret void")
-    }
-    ir.code.write_string("}\n\n")
+    let ir = ir_adapter_ir(parent, name)
+    ir_write_adapter_signature(ir, func, name, false, false) !>
+    ir_emit_adapter_call(ir, func, "@\"" + func_ir_name(func) + "\"", "ptr null", "") !>
     return name
 }
 
@@ -3699,19 +3769,38 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     return ir_build_closure_value(ir, value.rett, "@\"" + target_name + "\"", environment) !>
 }
 
+////////////////////////////
+// Calls
+////////////////////////////
+
+// Render one argument — receiver or ordinary — into the list started at `mark`.
+fn ir_write_call_arg(ir: IRFunc, mark: uint, arg: Value, expected: ?Type) !Error {
+    if !isset(expected) {
+        ir.write_arg(mark, ir_type(arg.rett) !>, ir_emit_value(ir, arg) !>)
+        return
+    }
+    let type = ir_type(expected) !>
+    if ir_call_arg_needs_inline_address(arg.rett, expected) {
+        ir.write_arg(mark, type, ir_emit_inline_call_address(ir, arg) !>)
+        return
+    }
+    if ir_call_arg_needs_raw_function(arg.rett, expected) {
+        ir.write_arg(mark, type, ir_emit_raw_function(ir, arg) !>)
+        return
+    }
+    let rendered = ir_emit_value(ir, arg) !>
+    ir.write_arg(mark, type, ir_emit_cast(ir, rendered, arg.rett, expected) !>)
+}
+
 fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let callee = value.value1
     if !isset(callee) : value.bug("IR call is missing its callee")
     let args = value.values
-    let rendered_types = Array[String]{}
-    let rendered_values = Array[String]{}
+    let arg_mark = ir.arg_list.length
     let direct_func: ?Func = callee.type == VAL.func ? callee.func : null
-    let interface_call = isset(direct_func) && direct_func.is_interface
-    let closure_call = callee.rett.get_non_nullable().type == TYPE.fn && callee.type != VAL.func
-    if callee.type == VAL.func {
-        let direct_func = callee.func
-        if isset(direct_func) && direct_func.is_literal : closure_call = true
-    }
+    let call_kind = value.op.@cast(CALL_KIND)
+    let interface_call = call_kind == CALL_KIND.interface_dispatch
+    let closure_call = call_kind == CALL_KIND.closure
 
     let target = ""
     if interface_call {
@@ -3721,8 +3810,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         if !isset(receiver) : value.bug("Interface method call has no receiver")
         let adapter = ir_emit_value(ir, receiver) !>
         target = ir_interface_method_target(ir, adapter, method)
-        rendered_types.append("ptr")
-        rendered_values.append(ir_interface_object(ir, adapter))
+        ir.write_arg(arg_mark, "ptr", ir_interface_object(ir, adapter))
         ir_note_unknown_code(ir)
     } else if closure_call {
         let closure = ir_emit_value(ir, callee) !>
@@ -3744,8 +3832,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         ir.write(closure)
         ir.write(", 1")
         ir.line_end()
-        rendered_types.append("ptr")
-        rendered_values.append(environment)
+        ir.write_arg(arg_mark, "ptr", environment)
     }
 
     // Bound method receiver is the implicit first argument.
@@ -3758,19 +3845,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                     expected = func_arg.type
                 }
             }
-            if isset(expected) && ir_call_arg_needs_inline_address(receiver.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
-                rendered_values.append(ir_emit_inline_call_address(ir, receiver) !>)
-            } else {
-                let rendered = ir_emit_value(ir, receiver) !>
-                let rendered_type = receiver.rett
-                if isset(expected) {
-                    rendered = ir_emit_cast(ir, rendered, receiver.rett, expected) !>
-                    rendered_type = expected
-                }
-                rendered_types.append(ir_type(rendered_type) !>)
-                rendered_values.append(rendered)
-            }
+            ir_write_call_arg(ir, arg_mark, receiver, expected) !>
         }
     }
     if isset(args) {
@@ -3782,35 +3857,16 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                     expected = func_arg.type
                 }
             }
-            if isset(expected) && ir_call_arg_needs_inline_address(arg.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
-                rendered_values.append(ir_emit_inline_call_address(ir, arg) !>)
-            } else if isset(expected) && ir_call_arg_needs_raw_function(arg.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
-                rendered_values.append(ir_emit_raw_function(ir, arg) !>)
-            } else {
-                let rendered = ir_emit_value(ir, arg) !>
-                let rendered_type = arg.rett
-                if isset(expected) {
-                    rendered = ir_emit_cast(ir, rendered, arg.rett, expected) !>
-                    rendered_type = expected
-                }
-                rendered_types.append(ir_type(rendered_type) !>)
-                rendered_values.append(rendered)
-            }
+            ir_write_call_arg(ir, arg_mark, arg, expected) !>
         }
     }
 
+    // A direct call names its symbol instead of computing a value for it.
+    let target_symbol: ?Func = null
     if !closure_call && !interface_call {
-        if callee.type == VAL.func {
-            let direct_func = callee.func
-            if isset(direct_func) {
-                ir_use_func(ir, direct_func)
-                target = "@\"" + func_ir_name(direct_func) + "\""
-            } else {
-                ir_note_unknown_code(ir)
-                target = ir_emit_value(ir, callee) !>
-            }
+        if callee.type == VAL.func && isset(direct_func) {
+            ir_use_func(ir, direct_func)
+            target_symbol = direct_func
         } else {
             ir_note_unknown_code(ir)
             target = ir_emit_value(ir, callee) !>
@@ -3854,14 +3910,15 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         ir.write("...)")
     }
     ir.write(" ")
-    ir.write(target)
-    ir.write("(")
-    each rendered_values as rendered, i {
-        if i > 0 : ir.write(", ")
-        ir.write(rendered_types.get(i) !? "")
-        ir.write(" ")
-        ir.write(rendered)
+    if isset(target_symbol) {
+        ir.write("@\"")
+        ir.write(func_ir_name(target_symbol))
+        ir.write("\"")
+    } else {
+        ir.write(target)
     }
+    ir.write("(")
+    ir.flush_args(arg_mark)
     ir.write(")")
     ir.line_end()
     if exits {
@@ -3883,7 +3940,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
 // and placing it directly in the call changes the native ABI (and made libc
 // write through an unrelated register value for calls such as stat()).
 fn ir_call_arg_needs_inline_address(actual: Type, expected: Type) bool {
-    if actual.type != TYPE.inline || !expected.is_pointer_sized() : return false
+    if actual.type != TYPE.inline || !expected.is_pointer() : return false
     let actual_class = actual.get_class_or_null()
     let expected_class = expected.get_class_or_null()
     return isset(actual_class) && actual_class == expected_class
@@ -3906,9 +3963,7 @@ fn ir_emit_raw_function(ir: IRFunc, value: Value) String !Error {
     }
 
     let closure = ir_emit_value(ir, value) !>
-    let function = ir.var()
-    ir.line(function + " = extractvalue " + (ir_type(value.rett) !>) + " " + closure + ", 0")
-    return function
+    return ir_emit_extract(ir, ir_type(value.rett) !>, closure, 0)
 }
 
 fn ir_emit_inline_call_address(ir: IRFunc, value: Value) String !Error {
@@ -3937,6 +3992,10 @@ fn ir_emit_inline_call_address(ir: IRFunc, value: Value) String !Error {
     return slot
 }
 
+////////////////////////////
+// Coroutines
+////////////////////////////
+
 fn ir_coro_class(value: Value) Class !Error {
     let idf = valk_idf(value.rett.build, "coro", "Coro") !>
     let class = idf.class
@@ -3956,60 +4015,10 @@ fn ir_coro_prop(value: Value, class: Class, name: String) Prop !Error {
     return class.get_prop_by_name(name) ! value.bug("coro:Coro has no property named '" + name + "'")
 }
 
-fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
-    let address = ir.var()
-    ir.line_start()
-    ir.write(address)
-    ir.write(" = getelementptr i8, ptr ")
-    ir.write(on)
-    ir.write(", i64 ")
-    ir.write_uint(prop.offset)
-    ir.line_end()
-    return address
-}
-
 fn ir_coro_load_prop(ir: IRFunc, coro: String, prop: Prop) String !Error {
     let address = ir_prop_address(ir, coro, prop)
-    let result = ir.var()
-    ir.line_start()
-    ir.write(result)
-    ir.write(" = load ")
-    ir.write(ir_type(prop.type) !>)
-    ir.write(", ptr ")
-    ir.write(address)
-    ir.line_end()
-    // Coro lowering accesses properties directly instead of going through
-    // VAL.prop/ir_emit_value. The collector stores ownership tags in managed
-    // property pointers, so apply the same cleanup ordinary property reads do.
-    if prop.type.is_gc_type() {
-        let as_int = ir.var()
-        ir.line4(as_int, " = ptrtoint ptr ", result, " to i64")
-        let masked = ir.var()
-        ir.line4(masked, " = and i64 ", as_int, ", -4")
-        let clean = ir.var()
-        ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
-        return clean
-    }
-    // Inline closures are `{ function, environment }`. Their environment is
-    // the managed property and may be tagged independently of the function.
-    if prop.type.get_non_nullable().type == TYPE.fn {
-        let func = ir.var()
-        ir.line4(func, " = extractvalue { ptr, ptr } ", result, ", 0")
-        let environment = ir.var()
-        ir.line4(environment, " = extractvalue { ptr, ptr } ", result, ", 1")
-        let as_int = ir.var()
-        ir.line4(as_int, " = ptrtoint ptr ", environment, " to i64")
-        let masked = ir.var()
-        ir.line4(masked, " = and i64 ", as_int, ", -4")
-        let clean_environment = ir.var()
-        ir.line4(clean_environment, " = inttoptr i64 ", masked, " to ptr")
-        let clean = ir.var()
-        ir.line4(clean, " = insertvalue { ptr, ptr } undef, ptr ", func, ", 0")
-        let complete = ir.var()
-        ir.line(complete + " = insertvalue { ptr, ptr } " + clean + ", ptr " + clean_environment + ", 1")
-        return complete
-    }
-    return result
+    let result = ir_emit_load(ir, ir_type(prop.type) !>, address)
+    return ir_clean_property_value(ir, prop.type, result)
 }
 
 fn ir_coro_append_gc(ir: IRFunc, value: Value, gc_args: String, item: String) !Error {
@@ -4060,12 +4069,7 @@ fn ir_coro_get_gc(ir: IRFunc, value: Value, gc_args: String, index: uint) String
     ir.line_end()
     // Array[GcPtr] entries are managed properties too and may carry ownership
     // tags after a collection.
-    let as_int = ir.var()
-    ir.line4(as_int, " = ptrtoint ptr ", item, " to i64")
-    let masked = ir.var()
-    ir.line4(masked, " = and i64 ", as_int, ", -4")
-    let clean = ir.var()
-    ir.line4(clean, " = inttoptr i64 ", masked, " to ptr")
+    let clean = ir_union_clean_gc_pointer(ir, item)
     return clean
 }
 
@@ -4114,8 +4118,7 @@ fn ir_coro_append_type_roots(
     if root_count == 0 : return
 
     if type.is_gc_type() {
-        let pointer = ir.var()
-        ir.line(pointer + " = load ptr, ptr " + address + ", align " + alignment)
+        let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
         pointer = ir_union_clean_gc_pointer(ir, pointer)
         ir_coro_append_gc(ir, value, gc_args, pointer) !>
         return
@@ -4123,26 +4126,30 @@ fn ir_coro_append_type_roots(
 
     let t = type.get_non_nullable()
     if t.type == TYPE.fn {
-        let environment_address = ir.var()
-        ir.line(environment_address + " = getelementptr i8, ptr " + address + ", i64 " + t.ptr_size())
-        let environment = ir.var()
+        let environment_address = ir_offset_address(ir, address, t.ptr_size().to(uint))
         let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
-        ir.line(environment + " = load ptr, ptr " + environment_address + ", align " + inner_alignment)
+        let environment = ir_emit_aligned_load(ir, "ptr", environment_address, inner_alignment)
         environment = ir_union_clean_gc_pointer(ir, environment)
         ir_coro_append_gc(ir, value, gc_args, environment) !>
         return
     }
 
     if type.is_nullable_type() && ir_is_tagged_nullable(type) {
-        let present = ir.var()
-        ir.line(present + " = load i1, ptr " + address + ", align " + alignment)
+        let present = ir_emit_aligned_load(ir, "i1", address, alignment)
         let yes = ir.block("coro.roots.nullable.present")
         let no = ir.block("coro.roots.nullable.absent")
         let after = ir.block("coro.roots.nullable.after")
         ir.cond_jump(present, yes, no)
         ir.label(yes)
         let inner = ir.var()
-        ir.line(inner + " = getelementptr " + (ir_type(type) !>) + ", ptr " + address + ", i32 0, i32 2")
+        ir.line_start()
+        ir.write(inner)
+        ir.write(" = getelementptr ")
+        ir.write(ir_type(type) !>)
+        ir.write(", ptr ")
+        ir.write(address)
+        ir.write(", i32 0, i32 2")
+        ir.line_end()
         let inner_alignment = ir_offset_alignment(alignment, type.ptr_size())
         ir_coro_append_type_roots(ir, value, t, inner, gc_args, inner_alignment) !>
         ir.jump(after)
@@ -4159,21 +4166,26 @@ fn ir_coro_append_type_roots(
             ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
             return
         }
-        let tag = ir.var()
-        ir.line(tag + " = load i64, ptr " + address + ", align " + alignment)
+        let layout = t.union_layout() !>
+        let tag = ir_emit_aligned_load(ir, "i64", address, alignment)
         let after = ir.block("coro.roots.union.after")
         each members as member, member_index {
             let yes = ir.block("coro.roots.union.member")
             let next = ir.block("coro.roots.union.next")
             let active = ir.var()
-            ir.line(active + " = icmp eq i64 " + tag + ", " + member_index)
+            ir.line_start()
+            ir.write(active)
+            ir.write(" = icmp eq i64 ")
+            ir.write(tag)
+            ir.write(", ")
+            ir.write_uint(member_index)
+            ir.line_end()
             ir.cond_jump(active, yes, next)
             ir.label(yes)
             let member_roots = member.gc_root_count() !>
             if member_roots > 0 {
-                let payload = ir.var()
-                let payload_offset = member.is_gc_type() ? t.union_gc_payload_offset() : t.union_other_payload_offset()
-                ir.line(payload + " = getelementptr i8, ptr " + address + ", i64 " + payload_offset)
+                let payload_offset = member.is_gc_type() ? layout.gc_offset() : layout.other_offset
+                let payload = ir_offset_address(ir, address, payload_offset.to(uint))
                 let payload_alignment = ir_offset_alignment(alignment, payload_offset)
                 ir_coro_append_type_roots(ir, value, member, payload, gc_args, payload_alignment) !>
             }
@@ -4202,8 +4214,7 @@ fn ir_coro_append_type_roots(
         }
         each class.props as prop {
             if !prop.type.has_gc_refs() : continue
-            let field = ir.var()
-            ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + prop.offset)
+            let field = ir_offset_address(ir, address, prop.offset.to(uint))
             let field_alignment = ir_offset_alignment(alignment, prop.offset)
             ir_coro_append_type_roots(ir, value, prop.type, field, gc_args, field_alignment) !>
         }
@@ -4220,9 +4231,8 @@ fn ir_coro_append_type_roots(
         let i: u32 = 0
         while i < t.array_size {
             if sub.has_gc_refs() {
-                let element = ir.var()
                 let element_offset = stride * i
-                ir.line(element + " = getelementptr i8, ptr " + address + ", i64 " + element_offset)
+                let element = ir_offset_address(ir, address, element_offset.to(uint))
                 let element_alignment = ir_offset_alignment(alignment, element_offset)
                 ir_coro_append_type_roots(ir, value, sub, element, gc_args, element_alignment) !>
             }
@@ -4241,8 +4251,7 @@ fn ir_coro_append_type_roots(
         each members as member {
             offset = member.ir_align_offset(offset) !>
             if member.has_gc_refs() {
-                let field = ir.var()
-                ir.line(field + " = getelementptr i8, ptr " + address + ", i64 " + offset)
+                let field = ir_offset_address(ir, address, offset.to(uint))
                 let field_alignment = ir_offset_alignment(alignment, offset)
                 ir_coro_append_type_roots(ir, value, member, field, gc_args, field_alignment) !>
             }
@@ -4266,13 +4275,6 @@ fn ir_coro_result_types(type: Type) Array[Type] {
         result.append(type)
     }
     return result
-}
-
-fn ir_is_closure_callable(value: Value) bool {
-    if value.rett.get_non_nullable().type != TYPE.fn : return false
-    if value.type != VAL.func : return true
-    let func = value.func
-    return isset(func) && func.is_literal
 }
 
 fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
@@ -4343,14 +4345,7 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
         } else {
             let alignment = type.storage_alignment() !>.to(uint)
             if alignment > 1 : offset = offset.round_up(alignment)
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(raw_args)
-            ir.write(", i64 ")
-            ir.write_uint(offset)
-            ir.line_end()
+            let address = ir_offset_address(ir, raw_args, offset)
             ir.line_start()
             ir.write("store ")
             ir.write(ir_type(type) !>)
@@ -4426,7 +4421,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
 
     let callee = call.value1
     if !isset(callee) : value.bug("Coroutine helper call has no callable")
-    let closure_handler = ir_is_closure_callable(callee)
+    let closure_handler = call.op.@cast(CALL_KIND) == CALL_KIND.closure
     let result_types = ir_coro_result_types(call.rett)
     let root_types = Array[Type]{}
     let root_offsets = Array[uint]{}
@@ -4560,8 +4555,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             // the value into its typed stack slot immediately.
             rendered = ir_coro_pop_gc(ir, value, gc_args) !>
             let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine argument root has no frame slot")
-            let root_address = ir.var()
-            ir.line(root_address + " = getelementptr i8, ptr " + root_values + ", i64 " + root_offset)
+            let root_address = ir_offset_address(ir, root_values, root_offset.to(uint))
             ir.line_start()
             ir.write("store ptr ")
             ir.write(rendered)
@@ -4571,14 +4565,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         } else {
             let alignment = type.storage_alignment() !>.to(uint)
             if alignment > 1 : offset = offset.round_up(alignment)
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(raw_args)
-            ir.write(", i64 ")
-            ir.write_uint(offset)
-            ir.line_end()
+            let address = ir_offset_address(ir, raw_args, offset)
             rendered = ir.var()
             ir.line_start()
             ir.write(rendered)
@@ -4592,8 +4579,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             let embedded_roots = type.gc_root_count() !>
             if embedded_roots > 0 {
                 let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine argument root has no frame slot")
-                let root_address = ir.var()
-                ir.line(root_address + " = getelementptr i8, ptr " + root_values + ", i64 " + root_offset)
+                let root_address = ir_offset_address(ir, root_values, root_offset.to(uint))
                 ir.line_start()
                 ir.write("store ")
                 ir.write(ir_type(type) !>)
@@ -4694,8 +4680,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         }
         if type.is_gc_type() {
             let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine result root has no frame slot")
-            let root_address = ir.var()
-            ir.line(root_address + " = getelementptr i8, ptr " + root_values + ", i64 " + root_offset)
+            let root_address = ir_offset_address(ir, root_values, root_offset.to(uint))
             ir.line_start()
             ir.write("store ptr ")
             ir.write(rendered)
@@ -4706,20 +4691,12 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         } else {
             let alignment = type.storage_alignment() !>.to(uint)
             if alignment > 1 : result_offset = result_offset.round_up(alignment)
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(raw_args)
-            ir.write(", i64 ")
-            ir.write_uint(result_offset)
-            ir.line_end()
+            let address = ir_offset_address(ir, raw_args, result_offset)
             let embedded_roots = type.gc_root_count() !>
             let root_address = ""
             if embedded_roots > 0 {
                 let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine result root has no frame slot")
-                root_address = ir.var()
-                ir.line(root_address + " = getelementptr i8, ptr " + root_values + ", i64 " + root_offset)
+                root_address = ir_offset_address(ir, root_values, root_offset)
                 ir.line_start()
                 ir.write("store ")
                 ir.write(ir_type(type) !>)
@@ -4833,14 +4810,7 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
         } else {
             let alignment = type.storage_alignment() !>.to(uint)
             if alignment > 1 : offset = offset.round_up(alignment)
-            let address = ir.var()
-            ir.line_start()
-            ir.write(address)
-            ir.write(" = getelementptr i8, ptr ")
-            ir.write(raw_args)
-            ir.write(", i64 ")
-            ir.write_uint(offset)
-            ir.line_end()
+            let address = ir_offset_address(ir, raw_args, offset)
             rendered = ir.var()
             ir.line_start()
             ir.write(rendered)
@@ -4890,25 +4860,19 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
     return raw
 }
 
+////////////////////////////
+// Multi values and short circuit
+////////////////////////////
+
 fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
     let source = value.value1
-    if isset(source) && (value.name == "part" || value.name == "phi_part") {
+    if isset(source) && value.name == "part" {
         let aggregate = ir.cached_multi(source)
         if !isset(aggregate) {
             aggregate = ir_emit_value(ir, source) !>
             ir.cache_multi(source, aggregate)
         }
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = extractvalue ")
-        ir.write(ir_type(source.rett) !>)
-        ir.write(" ")
-        ir.write(aggregate)
-        ir.write(", ")
-        ir.write_int(value.int_val)
-        ir.line_end()
-        return out
+        return ir_emit_extract(ir, ir_type(source.rett) !>, aggregate, value.int_val.to(uint))
     }
     let values = value.values
     if !isset(values) : return "undef"
@@ -4917,9 +4881,7 @@ fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
     let whole = ir_type(value.rett) !>
     each values as item, i {
         let item_value = ir_emit_value(ir, item) !>
-        let out = ir.var()
-        ir.line(out + " = insertvalue " + whole + " " + current + ", " + (ir_type(item.rett) !>) + " " + item_value + ", " + i)
-        current = out
+        current = ir_emit_insert(ir, whole, current, ir_type(item.rett) !>, item_value, i)
     }
     return current
 }
@@ -4963,49 +4925,39 @@ fn ir_emit_short_circuit(ir: IRFunc, left: Value, right: Value, op: VALUE_OP) St
     return out
 }
 
+////////////////////////////
+// Operators and casts
+////////////////////////////
+
 fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) String !Error {
     let lowered = ir_type(type) !>
-    let left_tag = ir.var()
-    let right_tag = ir.var()
-    ir.line(left_tag + " = extractvalue " + lowered + " " + left + ", 0")
-    ir.line(right_tag + " = extractvalue " + lowered + " " + right + ", 0")
-    let equal = ir.var()
-    ir.line(equal + " = icmp eq i64 " + left_tag + ", " + right_tag)
+    let layout = type.union_layout() !>
+    let left_tag = ir_emit_extract(ir, lowered, left, 0)
+    let right_tag = ir_emit_extract(ir, lowered, right, 0)
+    let equal = ir_emit_binary_instruction(ir, "icmp eq", "i64", left_tag, right_tag)
 
-    if type.union_has_gc_payload() {
-        let index = type.union_gc_payload_index()
-        let left_gc = ir.var()
-        let right_gc = ir.var()
-        ir.line(left_gc + " = extractvalue " + lowered + " " + left + ", " + index)
-        ir.line(right_gc + " = extractvalue " + lowered + " " + right + ", " + index)
+    if layout.has_gc {
+        let index = layout.gc_index()
+        let left_gc = ir_emit_extract(ir, lowered, left, index)
+        let right_gc = ir_emit_extract(ir, lowered, right, index)
         left_gc = ir_union_clean_gc_pointer(ir, left_gc)
         right_gc = ir_union_clean_gc_pointer(ir, right_gc)
-        let pointer_equal = ir.var()
-        ir.line(pointer_equal + " = icmp eq ptr " + left_gc + ", " + right_gc)
-        let combined = ir.var()
-        ir.line(combined + " = and i1 " + equal + ", " + pointer_equal)
-        equal = combined
+        let pointer_equal = ir_emit_binary_instruction(ir, "icmp eq", "ptr", left_gc, right_gc)
+        equal = ir_emit_binary_instruction(ir, "and", "i1", equal, pointer_equal)
     }
 
-    if type.union_has_other_payload() {
-        let size = type.union_other_payload_size() !>
-        let index = type.union_other_payload_index()
-        let payload_type = "[" + size + " x i8]"
-        let left_payload = ir.var()
-        let right_payload = ir.var()
-        ir.line(left_payload + " = extractvalue " + lowered + " " + left + ", " + index)
-        ir.line(right_payload + " = extractvalue " + lowered + " " + right + ", " + index)
+    if layout.has_other {
+        let size = layout.other_size
+        let index = layout.other_index()
+        let payload_type = ir_byte_array_type(size.to(uint))
+        let left_payload = ir_emit_extract(ir, lowered, left, index)
+        let right_payload = ir_emit_extract(ir, lowered, right, index)
         let i: u32 = 0
         while i < size {
-            let left_byte = ir.var()
-            let right_byte = ir.var()
-            ir.line(left_byte + " = extractvalue " + payload_type + " " + left_payload + ", " + i)
-            ir.line(right_byte + " = extractvalue " + payload_type + " " + right_payload + ", " + i)
-            let byte_equal = ir.var()
-            ir.line(byte_equal + " = icmp eq i8 " + left_byte + ", " + right_byte)
-            let combined = ir.var()
-            ir.line(combined + " = and i1 " + equal + ", " + byte_equal)
-            equal = combined
+            let left_byte = ir_emit_extract(ir, payload_type, left_payload, i.to(uint))
+            let right_byte = ir_emit_extract(ir, payload_type, right_payload, i.to(uint))
+            let byte_equal = ir_emit_binary_instruction(ir, "icmp eq", "i8", left_byte, right_byte)
+            equal = ir_emit_binary_instruction(ir, "and", "i1", equal, byte_equal)
             i++
         }
     }
@@ -5017,69 +4969,45 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
         && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
         if right == "zeroinitializer" || left == "zeroinitializer" {
             let value = right == "zeroinitializer" ? left : right
-            let present = ir.var()
-            ir.line(present + " = extractvalue " + (ir_type(type) !>) + " " + value + ", 0")
-            let out = ir.var()
+            let present = ir_emit_extract(ir, ir_type(type) !>, value, 0)
             let expected = op == VALUE_OP.eq ? "0" : "1"
-            ir.line(out + " = icmp eq i1 " + present + ", " + expected)
-            return out
+            return ir_emit_binary_instruction(ir, "icmp eq", "i1", present, expected)
         }
 
         let lowered = ir_type(type) !>
-        let left_present = ir.var()
-        let right_present = ir.var()
-        ir.line(left_present + " = extractvalue " + lowered + " " + left + ", 0")
-        ir.line(right_present + " = extractvalue " + lowered + " " + right + ", 0")
-        let left_inner = ir.var()
-        let right_inner = ir.var()
-        ir.line(left_inner + " = extractvalue " + lowered + " " + left + ", 2")
-        ir.line(right_inner + " = extractvalue " + lowered + " " + right + ", 2")
+        let left_present = ir_emit_extract(ir, lowered, left, 0)
+        let right_present = ir_emit_extract(ir, lowered, right, 0)
+        let left_inner = ir_emit_extract(ir, lowered, left, 2)
+        let right_inner = ir_emit_extract(ir, lowered, right, 2)
         let inner_equal = ir_emit_union_equal(ir, left_inner, right_inner, type.get_non_nullable()) !>
-        let presence_equal = ir.var()
-        ir.line(presence_equal + " = icmp eq i1 " + left_present + ", " + right_present)
-        let left_missing = ir.var()
-        ir.line(left_missing + " = xor i1 " + left_present + ", true")
-        let value_equal = ir.var()
-        ir.line(value_equal + " = or i1 " + left_missing + ", " + inner_equal)
-        let equal = ir.var()
-        ir.line(equal + " = and i1 " + presence_equal + ", " + value_equal)
+        let presence_equal = ir_emit_binary_instruction(ir, "icmp eq", "i1", left_present, right_present)
+        let left_missing = ir_emit_binary_instruction(ir, "xor", "i1", left_present, "true")
+        let value_equal = ir_emit_binary_instruction(ir, "or", "i1", left_missing, inner_equal)
+        let equal = ir_emit_binary_instruction(ir, "and", "i1", presence_equal, value_equal)
         if op == VALUE_OP.eq : return equal
-        let out = ir.var()
-        ir.line(out + " = xor i1 " + equal + ", true")
-        return out
+        return ir_emit_binary_instruction(ir, "xor", "i1", equal, "true")
     }
     if type.get_non_nullable().type == TYPE.union && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
         let equal = ir_emit_union_equal(ir, left, right, type.get_non_nullable()) !>
         if op == VALUE_OP.eq : return equal
-        let out = ir.var()
-        ir.line(out + " = xor i1 " + equal + ", true")
-        return out
+        return ir_emit_binary_instruction(ir, "xor", "i1", equal, "true")
     }
     if type.get_non_nullable().type == TYPE.fn && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
-        let lt = ir.var()
-        let ld = ir.var()
-        let rt = ir.var()
-        let rd = ir.var()
         let closure_type = ir_type(type) !>
-        ir.line(lt + " = extractvalue " + closure_type + " " + left + ", 0")
-        ir.line(ld + " = extractvalue " + closure_type + " " + left + ", 1")
-        ir.line(rt + " = extractvalue " + closure_type + " " + right + ", 0")
-        ir.line(rd + " = extractvalue " + closure_type + " " + right + ", 1")
-        let tc = ir.var()
-        let dc = ir.var()
-        let result = ir.var()
+        let lt = ir_emit_extract(ir, closure_type, left, 0)
+        let ld = ir_emit_extract(ir, closure_type, left, 1)
+        let rt = ir_emit_extract(ir, closure_type, right, 0)
+        let rd = ir_emit_extract(ir, closure_type, right, 1)
         let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
         let combine = op == VALUE_OP.eq ? "and" : "or"
-        ir.line(tc + " = " + compare + " ptr " + lt + ", " + rt)
-        ir.line(dc + " = " + compare + " ptr " + ld + ", " + rd)
-        ir.line(result + " = " + combine + " i1 " + tc + ", " + dc)
-        return result
+        let tc = ir_emit_binary_instruction(ir, compare, "ptr", lt, rt)
+        let dc = ir_emit_binary_instruction(ir, compare, "ptr", ld, rd)
+        return ir_emit_binary_instruction(ir, combine, "i1", tc, dc)
     }
-    let out = ir.var()
     let irt = ir_type(type) !>
     let inst = ""
 
-    if type.is_pointer_sized() && op != VALUE_OP.eq && op != VALUE_OP.ne && op != VALUE_OP.lt && op != VALUE_OP.gt && op != VALUE_OP.lte && op != VALUE_OP.gte {
+    if type.is_pointer() && op != VALUE_OP.eq && op != VALUE_OP.ne && op != VALUE_OP.lt && op != VALUE_OP.gt && op != VALUE_OP.lte && op != VALUE_OP.gte {
         type.build.bug("Pointer/class operator reached native IR lowering for type '" + type.compat_display_name() + "': " + op)
     }
 
@@ -5107,31 +5035,12 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     else if op == VALUE_OP.shr : inst = type.is_signed_type() ? "ashr" : "lshr"
     else : inst = "add"
 
-    ir.line_start()
-    ir.write(out)
-    ir.write(" = ")
-    ir.write(inst)
-    ir.write(" ")
-    ir.write(irt)
-    ir.write(" ")
-    ir.write(left)
-    ir.write(", ")
-    ir.write(right)
-    ir.line_end()
-    return out
+    return ir_emit_binary_instruction(ir, inst, irt, left, right)
 }
 
 fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
     if ir_is_tagged_nullable(from) {
-        let tag = ir.var()
-        ir.line_start()
-        ir.write(tag)
-        ir.write(" = extractvalue ")
-        ir.write(ir_type(from) !>)
-        ir.write(" ")
-        ir.write(value)
-        ir.write(", 0")
-        ir.line_end()
+        let tag = ir_emit_extract(ir, ir_type(from) !>, value, 0)
         let inner_value = ir_extract_tagged_nullable_value(ir, value, from) !>
         let from_inner = from.get_non_nullable()
         if !ir_is_tagged_nullable(to) {
@@ -5140,29 +5049,8 @@ fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
         let to_inner = to.get_non_nullable()
         let converted = ir_emit_cast(ir, inner_value, from_inner, to_inner) !>
         let lowered = ir_type(to) !>
-        let with_tag = ir.var()
-        ir.line_start()
-        ir.write(with_tag)
-        ir.write(" = insertvalue ")
-        ir.write(lowered)
-        ir.write(" undef, i1 ")
-        ir.write(tag)
-        ir.write(", 0")
-        ir.line_end()
-        let out = ir.var()
-        ir.line_start()
-        ir.write(out)
-        ir.write(" = insertvalue ")
-        ir.write(lowered)
-        ir.write(" ")
-        ir.write(with_tag)
-        ir.write(", ")
-        ir.write(ir_type(to_inner) !>)
-        ir.write(" ")
-        ir.write(converted)
-        ir.write(", 2")
-        ir.line_end()
-        return out
+        let with_tag = ir_emit_insert(ir, lowered, "undef", "i1", tag, 0)
+        return ir_emit_insert(ir, lowered, with_tag, ir_type(to_inner) !>, converted, 2)
     }
     if ir_is_tagged_nullable(to) {
         let inner = to.get_non_nullable()
@@ -5175,8 +5063,8 @@ fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
     if ft == tt : return value
 
     let inst = "bitcast"
-    if from.is_pointer_sized() && to.is_integer_type() : inst = "ptrtoint"
-    else if from.is_integer_type() && to.is_pointer_sized() : inst = "inttoptr"
+    if from.is_pointer() && to.is_integer_type() : inst = "ptrtoint"
+    else if from.is_integer_type() && to.is_pointer() : inst = "inttoptr"
     else if from.is_bool_type() && to.is_integer_type() : inst = "zext"
     else if from.is_integer_type() && to.is_bool_type() : inst = "trunc"
     else if from.is_integer_type() && to.is_integer_type() {

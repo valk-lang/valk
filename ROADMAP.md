@@ -7,8 +7,9 @@
 - Release 0.2.7
 + Cache directory hash fix + race lock
 + Date/time classes
-- 'export' functions + build library
 + Remove LLVM (valkir is the default backend, `--clang` compiles the IR instead)
++ 'export' functions + build library instead of executable
++ Fix access types in extend
 
 + Release 0.2.6
 + Adjust package directory lookup

@@ -1260,6 +1260,25 @@ extern fn malloc(size: uint) ptr;
 extern fn free(adr: ptr);
 ```
 
+To make a Valk function callable by a native linker, mark it `export`. Exported
+functions keep their source name as the symbol name and must have a concrete,
+non-generic signature.
+
+```rust
+export fn add(left: int, right: int) int {
+    return left + right
+}
+```
+
+Build those exported functions into a static library with `--lib`. A library
+has no executable entry point, so it does not need `fn main()`.
+
+```bash
+valk build src/*.valk --lib -o libmylib
+```
+
+The output is `libmylib.a` on Linux and macOS, or `libmylib.lib` on Windows.
+
 To link with your library you have 2 options:
 
 - Define the link information inside your code

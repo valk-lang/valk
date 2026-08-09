@@ -47,4 +47,9 @@ io uring does not work in a sandbox environment.
 - Always try to make things memory aligned when possible unless the code specificly tells the compiler for it to be packed
 - Try caching data that's calculated by a function but never or almost never changes
 - Performance is important
+- Try not to generate extra logic in IR gen. Adding logic belongs in the Expr -> Value lowering phase
+- Keep your code short, keep your comments very minimal and only comment when it's very important
+- Place large comment blocks (3 lines) between sections that contain functions that belongs together
+- Avoid using nullable types when possible, prefer throwing LookupErrors when lookup is optional
+
 
