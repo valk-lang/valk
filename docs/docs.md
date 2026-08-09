@@ -68,6 +68,8 @@
 * [Unsafe](#unsafe)
     * [Structs](#structs)
     * [External libraries](#external-libraries)
+    * [Linking](#linking)
+    * [Building native libraries](#building-native-libraries)
 
 * [Valk manager](#valk-manager)
 * [Data races](#data-races)
@@ -1260,6 +1262,31 @@ extern fn malloc(size: uint) ptr;
 extern fn free(adr: ptr);
 ```
 
+## Linking
+
+To link with your library you have 2 options:
+
+- Define the link information inside your code
+- Use command line arguments `-L` and `-l`
+
+Option 1: Inside the code
+
+```rust
+link "mylib" // Will link with libmylib.so/.a/.dll/.lib/.dylib/.tbd
+link [dynamic|static] "mylib" // Optional: you can force it to link static or dynamic
+link ":mylib.a" // use ':' the specify the exact name. This will link with `mylib.a`
+```
+
+Option 2: Use CLI arguments
+
+```bash
+# This will look for libmylib.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
+valk build src/*.valk -l mylib -L "/usr/my-libs"
+valk build src/*.valk -l mylib -L "/usr/my-libs" --static
+```
+
+## Building native libraries
+
 To make a Valk function callable by a native linker, mark it `export`. Exported
 functions keep their source name as the symbol name and must have a concrete,
 non-generic signature.
@@ -1293,27 +1320,6 @@ To fold automatic static dependencies into that archive, add `--full-static`:
 
 ```bash
 valk build src/*.valk --lib --static --full-static -o libmylib
-```
-
-To link with your library you have 2 options:
-
-- Define the link information inside your code
-- Use command line arguments `-L` and `-l`
-
-Option 1: Inside the code
-
-```rust
-link "mylib" // Will link with libmylib.so/.a/.dll/.lib/.dylib/.tbd
-link [dynamic|static] "mylib" // Optional: you can force it to link static or dynamic
-link ":mylib.a" // use ':' the specify the exact name. This will link with `mylib.a`
-```
-
-Option 2: Use CLI arguments
-
-```bash
-# This will look for libmylib.so in all library directories. It will also add "/usr/my-libs" to that set of directories.
-valk build src/*.valk -l mylib -L "/usr/my-libs"
-valk build src/*.valk -l mylib -L "/usr/my-libs" --static
 ```
 
 ## Valk manager
