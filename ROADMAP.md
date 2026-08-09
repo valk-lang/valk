@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.2.8
+- Release 0.3.1
 - Improve standard library
 
 # Next steps
