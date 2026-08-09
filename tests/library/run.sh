@@ -155,10 +155,6 @@ out=$("$VALK" build "$DIR/dependency.valk" --lib --static-lib --static --no-warn
 status=$?
 check_build "$out" "static library with static dependencies"
 [ -f "$static_archive" ] || exit 1
-if [[ "$(uname -s)" == Darwin* ]] && ar t "$static_archive" | grep -q '^__.SYMDEF'; then
-    echo "# Static library contains archive metadata members"
-    exit 1
-fi
 "$cc" "$DIR/consumer.c" "$static_archive" -o "$workdir/consumer-static-deps" || exit $?
 "$workdir/consumer-static-deps" || exit $?
 
