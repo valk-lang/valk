@@ -22,6 +22,25 @@ enum TYPE {
     error_code
 }
 
+class UnionLayout {
+    has_gc: bool
+    has_other: bool
+    other_size: u32
+    other_offset: u32
+
+    fn gc_offset() u32 {
+        return 8
+    }
+
+    fn gc_index() uint {
+        return 1
+    }
+
+    fn other_index() uint {
+        return this.has_gc ? 2 : 1
+    }
+}
+
 // Compiler Type object produced from EXP.type (and similar).
 //
 // Immutable after creation: type-defining fields are never reassigned.
@@ -51,12 +70,17 @@ class Type {
     cached_size: u32 (0)
     size_known: bool (false)
     size_computing: bool (false) // true while resolving; detects recursive deps
+    cached_ir_alignment: u32 (1)
+    ir_alignment_known: bool (false)
+    cached_storage_alignment: u32 (1)
+    storage_alignment_known: bool (false)
     // ---- GC-root count cache (filled once the type graph is complete) ----
     cached_gc_root_count: uint (0)
     gc_root_count_known: bool (false)
     // ---- managed-reference cache (same lifetime rule as the size cache) ----
     cached_has_gc_refs: bool (false)
     has_gc_refs_known: bool (false)
+    cached_union_layout: ?UnionLayout (null)
     // ---- immutable string conversions ----
     cached_display_name: ?String (null)
     cached_identity_key: ?String (null)
@@ -113,9 +137,8 @@ class Type {
         // u64 tag, followed by an optional direct-GC slot and an optional byte
         // payload large enough for the largest remaining alternative.
         if t == TYPE.union {
-            let size: u32 = 8
-            if this.union_has_gc_payload() : size += psz
-            size += this.union_other_payload_size() !>
+            let layout = this.union_layout() !>
+            let size = layout.other_offset + layout.other_size
             if size % psz != 0 : size += psz - (size % psz)
             return size
         }
@@ -190,63 +213,33 @@ class Type {
         return 0
     }
 
-    // Whether this union needs the dedicated pointer field used by alternatives
-    // whose value is itself a managed reference. Keeping it separate from the
-    // raw payload lets the collector visit it without interpreting scalar bits.
-    fn union_has_gc_payload() bool {
+    fn union_layout() UnionLayout !Error {
         let t = this.get_non_nullable()
-        if t.type != TYPE.union : return false
-        let members = t.sub_types
-        if !isset(members) : return false
-        each members as member {
-            if member.is_gc_type() : return true
-        }
-        return false
-    }
+        if t.type != TYPE.union : t.build.bug("Expected tagged union layout")
+        let cached = t.cached_union_layout
+        if isset(cached) : return cached
 
-    fn union_has_other_payload() bool {
-        let t = this.get_non_nullable()
-        if t.type != TYPE.union : return false
-        let members = t.sub_types
-        if !isset(members) : return false
+        let members = t.sub_types ?! t.build.bug("Tagged union is missing alternatives")
+        let has_gc = false
+        let has_other = false
+        let other_size: u32 = 0
         each members as member {
-            if !member.is_gc_type() : return true
-        }
-        return false
-    }
-
-    // Size of the shared byte payload. Managed references use their dedicated
-    // pointer field; every other alternative is copied into this region.
-    fn union_other_payload_size() u32 !Error {
-        let t = this.get_non_nullable()
-        if t.type != TYPE.union : return 0
-        let members = t.sub_types
-        if !isset(members) : return 0
-        let largest: u32 = 0
-        each members as member {
-            if member.is_gc_type() : continue
+            if member.is_gc_type() {
+                has_gc = true
+                continue
+            }
+            has_other = true
             let size = member.size() !>
-            if size > largest : largest = size
+            if size > other_size : other_size = size
         }
-        return largest
-    }
-
-    fn union_gc_payload_offset() u32 {
-        return 8
-    }
-
-    fn union_other_payload_offset() u32 {
-        let t = this.get_non_nullable()
-        return 8 + (t.union_has_gc_payload() ? t.ptr_size() : 0)
-    }
-
-    fn union_gc_payload_index() uint {
-        return 1
-    }
-
-    fn union_other_payload_index() uint {
-        let t = this.get_non_nullable()
-        return t.union_has_gc_payload() ? 2 : 1
+        let layout = UnionLayout {
+            has_gc: has_gc
+            has_other: has_other
+            other_size: other_size
+            other_offset: 8 + (has_gc ? t.ptr_size() : 0)
+        }
+        t.cached_union_layout = layout
+        return layout
     }
 
     // ABI alignment of the LLVM value produced by ir_type(). Keep this
@@ -254,6 +247,14 @@ class Type {
     // arrays and therefore have LLVM alignment 1, while a natural multi-value
     // must use the exact alignment LLVM assigns to each member.
     fn ir_alignment() u32 !Error {
+        if this.ir_alignment_known : return this.cached_ir_alignment
+        let alignment = this.compute_ir_alignment() !>
+        this.cached_ir_alignment = alignment
+        this.ir_alignment_known = true
+        return alignment
+    }
+
+    fn compute_ir_alignment() u32 !Error {
         let t = this.get_non_nullable()
         let psz = this.ptr_size()
 
@@ -263,7 +264,8 @@ class Type {
 
         if t.type == TYPE.union {
             let alignment = psz < 8 ? psz : 8
-            if t.union_has_gc_payload() && psz > alignment : alignment = psz
+            let layout = t.union_layout() !>
+            if layout.has_gc && psz > alignment : alignment = psz
             return alignment
         }
         if t.type == TYPE.array {
@@ -303,6 +305,14 @@ class Type {
     // looks through inline byte arrays so embedded managed pointers can still
     // land on naturally aligned addresses whenever their field offsets allow.
     fn storage_alignment() u32 !Error {
+        if this.storage_alignment_known : return this.cached_storage_alignment
+        let alignment = this.compute_storage_alignment() !>
+        this.cached_storage_alignment = alignment
+        this.storage_alignment_known = true
+        return alignment
+    }
+
+    fn compute_storage_alignment() u32 !Error {
         // Resolve the byte size first so invalid recursive inline layouts fail
         // with the normal diagnostic instead of recursing through this walk.
         this.size() !>
@@ -359,15 +369,7 @@ class Type {
             if isset(sub) : return sub.is_pointer_sized()
             return true
         }
-        // Named class/struct/slice/mode/pointer values are reference-sized.
-        let c = this.class
-        if isset(c) {
-            let kind = c.kind
-            if kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.struct || kind == CLASS_KIND.slice || kind == CLASS_KIND.mode || kind == CLASS_KIND.pointer {
-                return true
-            }
-        }
-        return false
+        return this.is_reference_class()
     }
 
     // Alignment unit used by the classic class layout algorithm. Structural
@@ -416,16 +418,9 @@ class Type {
         let t = this.get_non_nullable()
         let c = t.class
         if isset(c) : return c
-        // `<Struct>` stores the class on the inner type
-        if t.type == TYPE.inline {
-            let sub = t.sub_type
-            if isset(sub) : return sub.get_class_or_null()
-        }
-        if t.type == TYPE.ptr || t.type == TYPE.ref {
-            let sub = t.sub_type
-            if isset(sub) : return sub.get_class_or_null()
-        }
-        return null
+        if t.type != TYPE.inline && t.type != TYPE.ptr && t.type != TYPE.ref : return null
+        let sub = t.sub_type
+        return isset(sub) ? sub.get_class_or_null() : null
     }
 
     // True if this type is nullable (`?T`). Used by `T.$is_nullable`.
@@ -485,25 +480,23 @@ class Type {
         return this.get_non_nullable().type == TYPE.void
     }
 
-    fn is_integer_type() bool {
+    fn is_number_kind(type: TYPE, class_kind: CLASS_KIND) bool {
         let t = this.get_non_nullable()
-        if t.type == TYPE.int : return true
+        if t.type == type : return true
         let c = t.class
-        return isset(c) && c.kind == CLASS_KIND.integer
+        return isset(c) && c.kind == class_kind
+    }
+
+    fn is_integer_type() bool {
+        return this.is_number_kind(TYPE.int, CLASS_KIND.integer)
     }
 
     fn is_float_type() bool {
-        let t = this.get_non_nullable()
-        if t.type == TYPE.float : return true
-        let c = t.class
-        return isset(c) && c.kind == CLASS_KIND.float
+        return this.is_number_kind(TYPE.float, CLASS_KIND.float)
     }
 
     fn is_bool_type() bool {
-        let t = this.get_non_nullable()
-        if t.type == TYPE.bool : return true
-        let c = t.class
-        return isset(c) && c.kind == CLASS_KIND.boolean
+        return this.is_number_kind(TYPE.bool, CLASS_KIND.boolean)
     }
 
     // Signed integer (or other class with `signed` set).
@@ -518,6 +511,14 @@ class Type {
         let c = this.get_class_or_null()
         if !isset(c) : return false
         return c.kind == CLASS_KIND.struct || c.kind == CLASS_KIND.class
+    }
+
+    fn is_reference_class() bool {
+        let c = this.class
+        if !isset(c) : return false
+        let kind = c.kind
+        return kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.struct
+            || kind == CLASS_KIND.slice || kind == CLASS_KIND.mode || kind == CLASS_KIND.pointer
     }
 
     // GC-managed object reference.
@@ -651,12 +652,7 @@ class Type {
             if isset(sub) : return sub.is_pointer_type()
             return false
         }
-        let c = this.class
-        if isset(c) {
-            let kind = c.kind
-            return kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.struct || kind == CLASS_KIND.slice || kind == CLASS_KIND.mode || kind == CLASS_KIND.pointer
-        }
-        return false
+        return this.is_reference_class()
     }
 
     // Bare `ptr` (CLASS_KIND.pointer / void-style pointer), not `*T`.
@@ -731,193 +727,125 @@ class Type {
         return s
     }
 
-    // Can a value of type `other` be passed where `this` is expected?
-    // (Mirrors old `Type.compat` — assignability / parameter matching.)
-    //
-    // Numbers: same kind (int/float/bool) and same byte size; integers also need
-    // matching signedness (old rule). Classes compare by identity (modes unwrap).
-    fn compat(other: Type, ignore_imut: bool (false)) bool {
-        if this == other : return true
+    fn compat_inner(other: Type) bool {
+        let own = this.sub_type ?! return false
+        let theirs = other.sub_type ?! return false
+        return own.compat(theirs)
+    }
 
-        // `any` is permissive (docs / incomplete generics)
+    fn compat_optional_inner(other: Type) bool {
+        let own = this.sub_type
+        let theirs = other.sub_type
+        if !isset(own) || !isset(theirs) : return true
+        return own.compat(theirs)
+    }
+
+    fn compat_array(other: Type) bool {
+        if this.array_size > 0 && other.array_size > 0 && this.array_size > other.array_size {
+            return false
+        }
+        return this.compat_inner(other)
+    }
+
+    fn compat_multi(other: Type) bool {
+        let own = this.sub_types ?! return false
+        let theirs = other.sub_types ?! return false
+        if own.length != theirs.length : return false
+        each own as member, i {
+            let other_member = theirs.get(i) ! return false
+            if !member.compat(other_member) : return false
+        }
+        return true
+    }
+
+    fn compat_callable(other: Type) bool {
+        let own = this.sub_types
+        let theirs = other.sub_types
+        if !isset(own) || !isset(theirs) : return !isset(own) && !isset(theirs)
+        if own.length != theirs.length : return false
+        each own as member, i {
+            let other_member = theirs.get(i) ! return false
+            if !member.compat(other_member) && !other_member.compat(member) : return false
+        }
+        return true
+    }
+
+    fn single_multi_member() Type !LookupError {
+        if this.type != TYPE.multi : throw .missing
+        let members = this.sub_types ?! throw .missing
+        if members.length != 1 : throw .missing
+        return members.get(0) !>
+    }
+
+    fn compat_different_kind(other: Type) bool {
+        if this.type == TYPE.multi {
+            let own = this.single_multi_member() !? null
+            if isset(own) : return own.compat(other)
+        }
+        if other.type == TYPE.multi {
+            let theirs = other.single_multi_member() !? null
+            if isset(theirs) : return this.compat(theirs)
+        }
+        if (this.type == TYPE.ptr && other.type == TYPE.ref)
+            || (this.type == TYPE.ref && other.type == TYPE.ptr)
+        {
+            return this.compat_inner(other)
+        }
+        if this.type != TYPE.class && other.type != TYPE.class : return false
+        let own_class = this.compat_class()
+        let other_class = other.compat_class()
+        return isset(own_class) && isset(other_class) && own_class == other_class
+    }
+
+    fn compat_same_kind(other: Type) bool {
+        let own_enum = this.enum
+        if isset(own_enum) && own_enum != other.enum : return false
+
+        let t = this.type
+        if t == TYPE.ptr || t == TYPE.ref || t == TYPE.inline : return this.compat_inner(other)
+        if t == TYPE.array : return this.compat_array(other)
+        if t == TYPE.multi : return this.compat_multi(other)
+        if t == TYPE.fn || t == TYPE.fnptr : return this.compat_callable(other)
+        if t == TYPE.co : return this.compat_optional_inner(other)
+        if t == TYPE.error_code : return this.error_type == other.error_type
+
+        let own_class = this.compat_class()
+        let other_class = other.compat_class()
+        if !isset(own_class) && !isset(other_class) : return true
+        if isset(own_class) && own_class.kind == CLASS_KIND.interface {
+            return isset(other_class) && class_implements_interface(other_class, own_class)
+        }
+        return own_class == other_class
+    }
+
+    // Can a value of type `other` be passed where `this` is expected?
+    fn compat(other: Type) bool {
+        if this == other : return true
         if this.type == TYPE.any || other.type == TYPE.any : return true
 
         let base = this
         let typ = other
-
-        // Expected `?X` accepts non-null `X`
-        if base.is_nullable_type() && !typ.is_nullable_type() {
-            base = base.get_non_nullable()
-        }
-
-        // Both nullable: compare inners
+        if base.is_nullable_type() && !typ.is_nullable_type() : base = base.get_non_nullable()
         if base.is_nullable_type() {
             if !typ.is_nullable_type() : return false
-            let bs = base.sub_type
-            let ts = typ.sub_type
-            if !isset(bs) || !isset(ts) : return false
-            return bs.compat(ts, ignore_imut)
+            return base.compat_inner(typ)
         }
-
-        // Expected non-null `X` does not accept `?X`. The value has to be narrowed
-        // first (isset / ?? / ?!). Without this the checks below reach a nullable
-        // through compat_class() / compat_numbers(), both of which unwrap it, so
-        // every `?T` → `T` assignment would silently pass.
         if typ.is_nullable_type() : return false
 
-        // A union accepts one of its alternatives, or the same structural
-        // union. Union-to-non-union narrowing is never implicit.
         if base.type == TYPE.union {
             if typ.type == TYPE.union : return base.union_accepts_union(typ)
-            return isset(base.union_member_for(typ))
+            return isset(base.union_member_index(typ) !? null)
         }
         if typ.type == TYPE.union : return false
 
-        // Bare `ptr` is the void-pointer-style type. It is compatible with typed
-        // pointers and references in either direction. When both sides carry
-        // pointee metadata, the pointer comparison below still validates it.
         if (base.is_raw_pointer_type() && typ.is_pointer_type())
             || (typ.is_raw_pointer_type() && base.is_pointer_type())
         {
             return true
         }
-
-        // Numbers: same numeric kind + same byte size (not class identity)
-        if base.is_number_type() && typ.is_number_type() {
-            return base.compat_numbers(typ)
-        }
-
-        // Kind mismatch — allow &T ↔ *T (same as old)
-        if base.type != typ.type {
-            // A single-element `(T)` multi (e.g. a `fn()(T)` return clause) is just `T`.
-            if base.type == TYPE.multi {
-                let bs = base.sub_types
-                if isset(bs) && bs.length == 1 {
-                    let only = bs.get(0) !? null
-                    if isset(only) : return only.compat(typ, ignore_imut)
-                }
-            }
-            if typ.type == TYPE.multi {
-                let ts = typ.sub_types
-                if isset(ts) && ts.length == 1 {
-                    let only = ts.get(0) !? null
-                    if isset(only) : return base.compat(only, ignore_imut)
-                }
-            }
-            if base.type == TYPE.ref && typ.type == TYPE.ptr {
-                // fall through to pointer-style sub compare
-            } else if base.type == TYPE.ptr && typ.type == TYPE.ref {
-                // fall through
-            } else if base.type == TYPE.class || typ.type == TYPE.class {
-                // class vs non-class already failed number path
-                let bc = base.compat_class()
-                let tc = typ.compat_class()
-                if isset(bc) && isset(tc) && bc == tc : return true
-                return false
-            } else {
-                return false
-            }
-        }
-
-        // Enums: when the *expected* type is an enum, actual must be the same enum
-        // (old rule). A plain underlying type on the expected side still accepts
-        // enum-tagged values (e.g. String accepts Enum2:String).
-        let be = base.enum
-        if isset(be) {
-            if be != typ.enum : return false
-        }
-
-        // *T / &T — compare pointed-to types
-        if base.type == TYPE.ptr || base.type == TYPE.ref {
-            let bs = base.sub_type
-            let ts = typ.sub_type
-            if !isset(bs) || !isset(ts) : return false
-            // Pointer-info bounds (`&[T x N]`, `ptr[T]`) do not affect pointer
-            // compatibility. They are retained for offset/load checks only.
-            return bs.compat(ts, ignore_imut)
-        }
-
-        // Inline <T>
-        if base.type == TYPE.inline {
-            let bs = base.sub_type
-            let ts = typ.sub_type
-            if !isset(bs) || !isset(ts) : return false
-            return bs.compat(ts, ignore_imut)
-        }
-
-        // Fixed arrays [T x N]
-        if base.type == TYPE.array {
-            let bs = base.sub_type
-            let ts = typ.sub_type
-            if !isset(bs) || !isset(ts) : return false
-            // If both sizes known and non-zero, base must not require a larger array
-            if base.array_size > 0 && typ.array_size > 0 && base.array_size > typ.array_size {
-                return false
-            }
-            return bs.compat(ts, ignore_imut)
-        }
-
-        // Multi (T, U, …)
-        if base.type == TYPE.multi {
-            let bs = base.sub_types
-            let ts = typ.sub_types
-            if !isset(bs) || !isset(ts) : return false
-            if bs.length != ts.length : return false
-            each bs as bt, i {
-                let ot = ts.get(i) ! return false
-                if !bt.compat(ot, ignore_imut) : return false
-            }
-            return true
-        }
-
-        // Function types — arity and arg/rett compatibility (simplified)
-        if base.type == TYPE.fn || base.type == TYPE.fnptr {
-            if typ.type != base.type : return false
-            let bs = base.sub_types
-            let ts = typ.sub_types
-            if isset(bs) || isset(ts) {
-                if !isset(bs) || !isset(ts) : return false
-                if bs.length != ts.length : return false
-                // First N-1 are args (contravariant: expected arg accepts actual), last is rett
-                // Without a fixed split, require pairwise compat both ways for now
-                each bs as bt, i {
-                    let ot = ts.get(i) ! return false
-                    if !bt.compat(ot, ignore_imut) && !ot.compat(bt, ignore_imut) : return false
-                }
-            }
-            return true
-        }
-
-        // co(…) — compare the wrapped return type when both sides declare one
-        if base.type == TYPE.co {
-            if typ.type != TYPE.co : return false
-            let bs = base.sub_type
-            let ts = typ.sub_type
-            if isset(bs) && isset(ts) : return bs.compat(ts, ignore_imut)
-            return true
-        }
-
-        // Error code values: same ErrorType (regardless of instance/plain-code flavor)
-        if base.type == TYPE.error_code {
-            if typ.type != TYPE.error_code : return false
-            return base.error_type == typ.error_type
-        }
-
-        // Class / struct / slice / mode / pointer-kind: same class identity
-        let base_class = base.compat_class()
-        let type_class = typ.compat_class()
-        if isset(base_class) || isset(type_class) {
-            if isset(base_class) && base_class.kind == CLASS_KIND.interface {
-                return isset(type_class) && class_implements_interface(type_class, base_class)
-            }
-            if base_class != type_class : return false
-            return true
-        }
-
-        // void / other primitives with no class
-        if base.type == TYPE.void : return typ.type == TYPE.void
-
-        return true
+        if base.is_number_type() && typ.is_number_type() : return base.compat_numbers(typ)
+        if base.type != typ.type : return base.compat_different_kind(typ)
+        return base.compat_same_kind(typ)
     }
 
     // Number-only branch of compat: same kind family + same byte size.
@@ -1145,28 +1073,21 @@ class Type {
     // Exact alternative lookup. Union construction deliberately uses type
     // identity rather than broad representation compatibility: otherwise a
     // value could silently select the wrong tag in unions such as int | uint.
-    fn union_member_for(other: Type) ?Type {
+    fn union_member_index(other: Type) uint !LookupError {
         let t = this.get_non_nullable()
-        if t.type != TYPE.union : return null
-        let members = t.sub_types
-        if !isset(members) : return null
+        if t.type != TYPE.union : throw .missing
+        let members = t.sub_types ?! throw .missing
         let key = type_identity_key(other.get_non_nullable())
-        each members as member {
-            if type_identity_key(member) == key : return member
+        let first: uint = 0
+        let after = members.length
+        while first < after {
+            let i = first + (after - first) / 2
+            let member_key = type_identity_key(members.get(i) !>)
+            if member_key == key : return i
+            if member_key < key : first = i + 1
+            else : after = i
         }
-        return null
-    }
-
-    fn union_member_index(other: Type) ?uint {
-        let t = this.get_non_nullable()
-        if t.type != TYPE.union : return null
-        let members = t.sub_types
-        if !isset(members) : return null
-        let key = type_identity_key(other.get_non_nullable())
-        each members as member, i {
-            if type_identity_key(member) == key : return i
-        }
-        return null
+        throw .missing
     }
 
     fn union_accepts_union(other: Type) bool {
@@ -1180,8 +1101,9 @@ class Type {
         let own = this.get_non_nullable().sub_types
         if !isset(own) : return false
         if own.length != members.length : return false
-        each members as member {
-            if !isset(this.union_member_for(member)) : return false
+        each own as member, i {
+            let other_member = members.get(i) ! return false
+            if type_identity_key(member) != type_identity_key(other_member) : return false
         }
         return true
     }
@@ -1257,32 +1179,18 @@ fn type_union(b: Build, input: Array[Type], at: Exp, owner: ?Class (null)) Type 
         }
     }
 
+    members.sort(fn(a: Type, b: Type) bool {
+        return type_identity_key(a) > type_identity_key(b)
+    })
     let sorted = Array[Type]{}
+    let previous = ""
+    let first = true
     each members as member {
         let key = type_identity_key(member)
-        let duplicate = false
-        each sorted as existing {
-            if type_identity_key(existing) == key {
-                duplicate = true
-                break
-            }
-            // Distinct alternatives are allowed even when their assignment
-            // representations are compatible. The runtime tag preserves the
-            // source type identity (for example, `int` and `uint` remain
-            // distinguishable); union construction resolves implicit numeric
-            // conversions separately and refuses ambiguous cases.
-        }
-        if duplicate : continue
-
+        if !first && key == previous : continue
         sorted.append(member)
-        let i = sorted.length - 1
-        while i > 0 {
-            let previous = sorted.get(i - 1) !? member
-            if type_identity_key(previous) <= key : break
-            sorted.set(i, previous) _
-            sorted.set(i - 1, member) _
-            i--
-        }
+        previous = key
+        first = false
     }
 
     if sorted.length == 0 : at.error("A union must contain at least one type")
@@ -1305,13 +1213,7 @@ fn type_union(b: Build, input: Array[Type], at: Exp, owner: ?Class (null)) Type 
     return result
 }
 
-// Resolve the alternatives of a named union. Unlike an anonymous `A | B`, a
-// named union remains a TYPE.union even when only one non-null alternative is
-// left after normalization (`union Maybe : String | null`).
-fn type_named_union(owner: Class, exp: Exp) Type !Error {
-    if exp.type != EXP.type || exp.kind != TYPE_KIND.union {
-        exp.bug("Named union alternatives are not a union type expression")
-    }
+fn type_union_from_exp(exp: Exp, scope: Scope, owner: ?Class (null)) Type !Error {
     let members = Array[Type]{}
     let has_null = false
     let i: uint = 0
@@ -1321,17 +1223,28 @@ fn type_named_union(owner: Class, exp: Exp) Type !Error {
         if member_exp.kind == TYPE_KIND.null {
             has_null = true
         } else {
-            members.append(type_from_exp(member_exp, owner.scope) !>)
+            members.append(type_from_exp(member_exp, scope) !>)
         }
         i++
     }
-    let result = type_union(owner.ns.build, members, exp, owner) !>
+
+    let b = exp.src.build
+    if isset(owner) : b = owner.ns.build
+    let result = type_union(b, members, exp, owner) !>
     if has_null && !result.is_nullable_type() {
         let wrapped = result.nullable()
-        wrapped.custom_name = owner.pretty_name()
+        if isset(owner) : wrapped.custom_name = owner.pretty_name()
         return wrapped
     }
     return result
+}
+
+// Resolve a named union without collapsing its final non-null alternative.
+fn type_named_union(owner: Class, exp: Exp) Type !Error {
+    if exp.type != EXP.type || exp.kind != TYPE_KIND.union {
+        exp.bug("Named union alternatives are not a union type expression")
+    }
+    return type_union_from_exp(exp, owner.scope, owner) !>
 }
 
 fn type_any(b: Build) Type {
@@ -1472,6 +1385,62 @@ fn type_ptr(b: Build) Type {
     return prim
 }
 
+fn type_slice_pointer(kind: TYPE, b: Build, sub: Type, size: u32) Type {
+    return Type {
+        type: kind
+        build: b
+        sub_type: sub
+        array_size: size
+        is_slice_ptr: true
+    }
+}
+
+fn type_from_inner_exp(exp: Exp, scope: Scope, missing: String) Type !Error {
+    let inner = exp.get(TYPE_EXP.type)
+    if !isset(inner) : exp.bug(missing)
+    return type_from_exp(inner, scope) !>
+}
+
+fn type_error_from_exp(exp: Exp, scope: Scope) ?ErrorType !Error {
+    let err_exp = exp.get(TYPE_EXP.error)
+    if !isset(err_exp) : return null
+    let idf = resolve_idf_from_id(err_exp, scope) !>
+    if idf.type != IDF.error_type : err_exp.error("Identifier must be an error type")
+    let error_type = idf.error_type
+    if !isset(error_type) : err_exp.bug("Error-type idf is missing error_type")
+    return error_type
+}
+
+fn type_callable_from_exp(exp: Exp, scope: Scope, kind: TYPE) Type !Error {
+    let args: ?Array[Type] = null
+    let args_exp = exp.get(TYPE_EXP.args)
+    if kind != TYPE.co && isset(args_exp) {
+        args = (type_from_multi_exp(args_exp, scope, true) !>).sub_types
+    }
+
+    let rett: ?Type = null
+    let rett_exp = exp.get(TYPE_EXP.rett)
+    if isset(rett_exp) : rett = type_from_exp(rett_exp, scope) !>
+    let error_type = type_error_from_exp(exp, scope) !>
+
+    if kind == TYPE.co {
+        return Type {
+            type: kind
+            build: exp.src.build
+            sub_type: rett
+            error_type: error_type
+        }
+    }
+
+    return Type {
+        type: kind
+        build: exp.src.build
+        sub_type: rett
+        sub_types: args
+        error_type: error_type
+    }
+}
+
 ////////////////////////////
 // Type expressions
 ////////////////////////////
@@ -1490,52 +1459,29 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
     }
 
     if kind == TYPE_KIND.nullable {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for '?'")
-        return type_from_exp(sub_exp, scope) !>.nullable()
+        return type_from_inner_exp(exp, scope, "Missing inner type for '?'") !>.nullable()
     }
 
     if kind == TYPE_KIND.ptr {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for '*'")
-        return type_from_exp(sub_exp, scope) !>.pointer()
+        return type_from_inner_exp(exp, scope, "Missing inner type for '*'") !>.pointer()
     }
     if kind == TYPE_KIND.ptr_slice {
-        // Slice pointers are not cached (size/element vary); build fully initialized.
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for '*[]'")
         let size = resolve_type_size(exp, scope) !>
-        return Type {
-            type: TYPE.ptr
-            build: b
-            sub_type: type_from_exp(sub_exp, scope) !>
-            array_size: size
-            is_slice_ptr: true
-        }
+        let sub = type_from_inner_exp(exp, scope, "Missing inner type for '*[]'") !>
+        return type_slice_pointer(TYPE.ptr, b, sub, size)
     }
 
     if kind == TYPE_KIND.ref {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for '&'")
-        return type_from_exp(sub_exp, scope) !>.reference()
+        return type_from_inner_exp(exp, scope, "Missing inner type for '&'") !>.reference()
     }
     if kind == TYPE_KIND.ref_slice {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for '&[]'")
         let size = resolve_type_size(exp, scope) !>
-        return Type {
-            type: TYPE.ref
-            build: b
-            sub_type: type_from_exp(sub_exp, scope) !>
-            array_size: size
-            is_slice_ptr: true
-        }
+        let sub = type_from_inner_exp(exp, scope, "Missing inner type for '&[]'") !>
+        return type_slice_pointer(TYPE.ref, b, sub, size)
     }
 
     if kind == TYPE_KIND.inline {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for inline")
-        let sub = type_from_exp(sub_exp, scope) !>
+        let sub = type_from_inner_exp(exp, scope, "Missing inner type for inline") !>
         let class = sub.get_non_nullable().get_class_or_null()
         if isset(class) && class.kind == CLASS_KIND.interface {
             exp.error("Interfaces do not have an inline representation")
@@ -1544,9 +1490,7 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
     }
 
     if kind == TYPE_KIND.notnull {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing inner type for notnull")
-        let t = type_from_exp(sub_exp, scope) !>
+        let t = type_from_inner_exp(exp, scope, "Missing inner type for notnull") !>
         // Strip one nullable layer if present
         if t.type == TYPE.nullable {
             let inner = t.sub_type
@@ -1564,14 +1508,12 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
     }
 
     if kind == TYPE_KIND.array {
-        let sub_exp = exp.get(TYPE_EXP.type)
-        if !isset(sub_exp) : exp.bug("Missing element type for array")
         let size = resolve_type_size(exp, scope) !>
         if size == 0 : exp.error("Array size must be larger than 0")
         return Type {
             type: TYPE.array
             build: b
-            sub_type: type_from_exp(sub_exp, scope) !>
+            sub_type: type_from_inner_exp(exp, scope, "Missing element type for array") !>
             array_size: size
         }
     }
@@ -1581,83 +1523,12 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
     }
 
     if kind == TYPE_KIND.union {
-        let members = Array[Type]{}
-        let has_null = false
-        let i: uint = 0
-        while true {
-            let member_exp = exp.get(i)
-            if !isset(member_exp) : break
-            if member_exp.kind == TYPE_KIND.null {
-                has_null = true
-            } else {
-                members.append(type_from_exp(member_exp, scope) !>)
-            }
-            i++
-        }
-        let result = type_union(b, members, exp) !>
-        if has_null && !result.is_nullable_type() : return result.nullable()
-        return result
+        return type_union_from_exp(exp, scope) !>
     }
 
-    if kind == TYPE_KIND.fn || kind == TYPE_KIND.fnptr {
-        let args_types: ?Array[Type] = null
-        let args = exp.get(TYPE_EXP.args)
-        if isset(args) {
-            // Function arguments are always a list. Preserve empty and single-item
-            // lists instead of normalizing them to void/T.
-            let args_t = type_from_multi_exp(args, scope, true) !>
-            args_types = args_t.sub_types
-        }
-        let rett_type: ?Type = null
-        let rett = exp.get(TYPE_EXP.rett)
-        if isset(rett) {
-            rett_type = type_from_exp(rett, scope) !>
-        }
-        // Reuses the same `error_type` field TYPE.error_code uses: the ErrorType this
-        // function value can throw, when declared (`fn(...)(...) !ErrorName`).
-        let fn_error_type: ?ErrorType = null
-        let err_exp = exp.get(TYPE_EXP.error)
-        if isset(err_exp) {
-            let idf = resolve_idf_from_id(err_exp, scope) !>
-            if idf.type != IDF.error_type {
-                err_exp.error("Identifier must be an error type")
-            }
-            fn_error_type = idf.error_type
-            if !isset(fn_error_type) : err_exp.bug("Error-type idf is missing error_type")
-        }
-        return Type {
-            type: kind == TYPE_KIND.fn ? TYPE.fn : TYPE.fnptr
-            build: b
-            sub_type: rett_type
-            sub_types: args_types
-            error_type: fn_error_type
-        }
-    }
-
-    if kind == TYPE_KIND.co {
-        let rett_type: ?Type = null
-        let rett = exp.get(TYPE_EXP.rett)
-        if isset(rett) {
-            rett_type = type_from_exp(rett, scope) !>
-        }
-        // Reuses the same `error_type` field TYPE.error_code / TYPE.fn use: the
-        // ErrorType this coroutine can throw, when declared (`co(...) !ErrorName`).
-        let co_error_type: ?ErrorType = null
-        let err_exp = exp.get(TYPE_EXP.error)
-        if isset(err_exp) {
-            let idf = resolve_idf_from_id(err_exp, scope) !>
-            if idf.type != IDF.error_type {
-                err_exp.error("Identifier must be an error type")
-            }
-            co_error_type = idf.error_type
-            if !isset(co_error_type) : err_exp.bug("Error-type idf is missing error_type")
-        }
-        return Type {
-            type: TYPE.co
-            build: b
-            sub_type: rett_type
-            error_type: co_error_type
-        }
+    if kind == TYPE_KIND.fn || kind == TYPE_KIND.fnptr || kind == TYPE_KIND.co {
+        let resolved_kind = kind == TYPE_KIND.fn ? TYPE.fn : kind == TYPE_KIND.fnptr ? TYPE.fnptr : TYPE.co
+        return type_callable_from_exp(exp, scope, resolved_kind) !>
     }
 
     if kind == TYPE_KIND.suggested {
