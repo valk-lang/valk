@@ -34,7 +34,7 @@
 ## Done
 
 ```
-+ Release 0.2.7
++ Release 0.3.0
 + Cache directory hash fix + race lock
 + Date/time classes
 + Remove LLVM (valkir is the default backend, `--clang` compiles the IR instead)
