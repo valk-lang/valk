@@ -101,7 +101,13 @@ test-codegen: $(TEST_COMPILER)
 test-deps: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/deps/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt test-codegen test-deps
+test-library: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/library/run.sh
+
+test-extend-access: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
+
+test-all: test test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt test-codegen test-deps test-library test-extend-access
 
 # Build once, then measure the union representation in fresh processes so
 # allocator pools and GC high-water state do not cross benchmark modes.
@@ -212,10 +218,11 @@ win-x64: $(DIST_DEPS)
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64
 	cp -r ./lib ./dist/win-x64/
-# lld is the Windows linker; the compiler itself no longer needs anything from LLVM.
+# Windows uses LLVM's linker and archive writer.
 	cp ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
+	cp ./toolchains/libraries/win-llvm-15-x64/llvm-lib.exe ./dist/win-x64/llvm-lib.exe
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
-	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
+	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe llvm-lib.exe
 
 dist-all: win-x64 linux-x64 macos-x64 macos-arm64
 

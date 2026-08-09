@@ -167,6 +167,30 @@ if [[ "$i32_body" != *"store i32"* ]] \
     exit 1
 fi
 
+echo "> Keep exported symbols unmangled and reachable"
+
+export_ir="$workdir/export.ll"
+out=$("$VALK" build "$DIR/export.valk" --ir --no-warn -o "$export_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build exported-symbol IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+if ! grep -q '^define dso_local i64 @"exported_function"' "$export_ir" \
+    || ! grep -q '^@"exported_global" = thread_local(initialexec) global i64 ' "$export_ir"; then
+    echo "# Exported definitions were not emitted with their raw symbol names"
+    exit 1
+fi
+
+if ! grep -q '^define dso_local i64 @".*__export_helper__' "$export_ir" \
+    || grep -q 'unreachable_function' "$export_ir" \
+    || grep -q 'unreachable_global' "$export_ir"; then
+    echo "# Export reachability did not retain dependencies and discard unused definitions"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 3"
+echo "# Test count: 4"
 echo ""
