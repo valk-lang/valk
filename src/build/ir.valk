@@ -373,6 +373,16 @@ class IRFunc {
     func: Func
     code: ByteBuffer (.new(4096))
     coro_helpers: ByteBuffer (.new(2048))
+    // Rendered argument lists. An argument's own instructions go to `code`
+    // while its "<type> <value>" text accumulates here, so a call site needs no
+    // per-call collection of the arguments it has rendered so far. A nested
+    // call is finished (and its text taken back out) before the enclosing call
+    // appends anything, which keeps every list contiguous from its own mark.
+    arg_list: ByteBuffer (.new(512))
+    // Field values of an aggregate initializer, which must all be evaluated
+    // before the object they belong to is allocated. Same nesting discipline as
+    // arg_list: one reused stack instead of an array per initializer.
+    field_values: Array[String] (.{})
     varc: uint (0)
     blockc: uint (0)
     terminated: bool (false)
@@ -448,6 +458,27 @@ class IRFunc {
         this.code.write_string("\n")
     }
 
+    // Append one rendered argument to the list started at `mark`.
+    fn write_arg(mark: uint, type: String, value: String) {
+        if this.arg_list.length > mark : this.arg_list.write_string(", ")
+        this.arg_list.write_string(type)
+        this.arg_list.write_string(" ")
+        this.arg_list.write_string(value)
+    }
+
+    // Move the list started at `mark` into the line being written, releasing
+    // the space it used back to the enclosing call.
+    fn flush_args(mark: uint) {
+        this.code.write_buffer_part(this.arg_list, this.arg_list.length - mark, mark)
+        this.arg_list.length = mark
+    }
+
+    fn release_field_values(mark: uint) {
+        while this.field_values.length > mark {
+            this.field_values.remove(this.field_values.length - 1)
+        }
+    }
+
     fn comment(text: String) {
         // Every physical line must remain an LLVM comment. Embedded source
         // strings (JSON/templates/etc.) commonly contain newlines.
@@ -462,22 +493,22 @@ class IRFunc {
         return prefix + "." + this.blockc++
     }
 
+    // Address of a hidden capture argument inside the closure environment.
+    // Only a literal registers captures, and a literal never carries a bound
+    // receiver, so its environment properties are exactly the captures in
+    // registration order (see func_prepare_closure).
     fn captured_address(decl: Decl) String !Error {
-        each this.func.capture_args as captured, i {
-            if captured != decl : continue
-            let class = this.func.capture_class
-            if !isset(class) : this.func.exp.bug("Literal capture environment is missing")
-            let prop = class.props.get(i) !? null
-            if !isset(prop) : this.func.exp.bug("Literal capture property is missing")
-            let address = this.var()
-            this.line_start()
-            this.write(address)
-            this.write(" = getelementptr i8, ptr \%closure.data, i64 ")
-            this.write_uint(prop.offset)
-            this.line_end()
-            return address
-        }
-        this.func.exp.bug("Literal references an unregistered capture")
+        let class = this.func.capture_class
+        if !isset(class) : this.func.exp.bug("Literal capture environment is missing")
+        let prop = class.props.get(decl.capture_index) !? null
+        if !isset(prop) : this.func.exp.bug("Literal capture property is missing")
+        let address = this.var()
+        this.line_start()
+        this.write(address)
+        this.write(" = getelementptr i8, ptr \%closure.data, i64 ")
+        this.write_uint(prop.offset)
+        this.line_end()
+        return address
     }
 
     fn label(name: String) {
@@ -608,7 +639,7 @@ fn generate_func_ir(func: Func) !Error {
     each func.all_decls as decl, i {
         // Hidden capture arguments live in the closure environment rather than
         // this function's stack frame.
-        if func.capture_args.contains(decl) : continue
+        if decl.is_bind : continue
         decl.ir_name = "\%decl." + i
         if ir_decl_uses_gc_stack(func, decl) {
             if !func.is_entrance {
@@ -691,24 +722,35 @@ fn ir_offset_alignment(base_alignment: u32, offset: u32) u32 {
     return alignment
 }
 
+// What the walk below does with each managed field it reaches. Selected once
+// by the caller rather than re-matched against a string at every field.
+enum GC_FIELD_OP : u8 {
+    mark    // hand the pointer to the collector
+    trace   // hand the field address to a user callback
+    remove  // drop this object's ownership of the field
+    set     // take ownership for a new owner
+    share   // publish the field alongside a shared global
+    clean   // strip ownership bits from a loaded copy
+}
+
 fn ir_visit_gc_field(
     ir: IRFunc,
     value: ?Value,
     address: String,
-    action: String,
+    action: GC_FIELD_OP,
     owner: String,
     list: String,
     callback_target: String,
     callback_data: String,
     alignment: u32
 ) !Error {
-    if action == "remove" {
+    if action == GC_FIELD_OP.remove {
         let source = value
         if !isset(source) : ir.func.exp.bug("GC field removal is missing its source value")
         ir_emit_gc_property_remove(ir, source, owner, address) !>
         return
     }
-    if action == "trace" {
+    if action == GC_FIELD_OP.trace {
         ir_note_unknown_code(ir)
         ir.line("call void " + callback_target + "(ptr " + callback_data + ", ptr " + address + ", ptr " + list + ")")
         return
@@ -717,7 +759,7 @@ fn ir_visit_gc_field(
     let pointer = ir.var()
     ir.line(pointer + " = load ptr, ptr " + address + ", align " + alignment)
     pointer = ir_union_clean_gc_pointer(ir, pointer)
-    if action == "mark" {
+    if action == GC_FIELD_OP.mark {
         let present = ir.var()
         ir.line(present + " = icmp ne ptr " + pointer + ", null")
         let yes = ir.block("stack.mark")
@@ -727,11 +769,11 @@ fn ir_visit_gc_field(
         ir.line("call void " + callback_target + "(ptr " + callback_data + ", ptr " + pointer + ")")
         ir.jump(after)
         ir.label(after)
-    } else if action == "set" {
+    } else if action == GC_FIELD_OP.set {
         let source = value
         if !isset(source) : ir.func.exp.bug("GC field set is missing its source value")
         ir_emit_gc_property_set(ir, source, owner, address, pointer) !>
-    } else if action == "share" {
+    } else if action == GC_FIELD_OP.share {
         let source = value
         if !isset(source) : ir.func.exp.bug("GC field share is missing its source value")
         ir_emit_gc_share_null_check(ir, source, pointer) !>
@@ -748,7 +790,7 @@ fn ir_visit_type_gc_fields(
     value: ?Value,
     type: Type,
     address: String,
-    action: String,
+    action: GC_FIELD_OP,
     owner: String (""),
     list: String (""),
     callback_target: String (""),
@@ -925,7 +967,7 @@ fn ir_gc_stack_mark_address(ir: IRFunc, type: Type, address: String, collect: Fu
         null,
         type,
         address,
-        "mark",
+        GC_FIELD_OP.mark,
         "",
         "",
         "@\"" + func_ir_name(collect) + "\"",
@@ -972,12 +1014,11 @@ fn ir_write_func_gc_stack_marker(out: ByteBuffer, func: Func, collect: Func) !Er
     let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size)
     ir_gc_stack_mark_stable(ir, func, collect) !>
 
-    let visited = Array[uint]{}
+    // func_finish_ast hands out one frame region per rooted declaration, so
+    // every offset here is distinct and each is marked once.
     each func.all_decls as decl {
         let offset = decl.gc_stack_offset
         if !isset(offset) : continue
-        if visited.contains(offset) : continue
-        visited.append(offset)
         let address = ir.var()
         ir.line(address + " = getelementptr i8, ptr \%frame.values, i64 " + offset)
         ir_gc_stack_mark_address(ir, decl.type, address, collect) !>
@@ -1219,7 +1260,18 @@ fn ir_func_rett_type(func: Func) String !Error {
     return ir_error_abi_type(func.get_rett()) !>
 }
 
+// ABI shape of a fallible return: the natural result widened with an error
+// code. Named on every fallible call site and function signature, so it is
+// built once per return type like ir_type.
 fn ir_error_abi_type(rett: Type) String !Error {
+    let cached = rett.cached_error_abi_type
+    if isset(cached) : return cached
+    let result = ir_error_abi_type_uncached(rett) !>
+    rett.cached_error_abi_type = result
+    return result
+}
+
+fn ir_error_abi_type_uncached(rett: Type) String !Error {
     if rett.is_void_type() : return "i32"
     if rett.type == TYPE.multi {
         let subs = rett.sub_types
@@ -1837,7 +1889,7 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
     if left.type == VAL.global && left.rett.has_gc_refs() && !left.rett.is_gc_type() {
         let g = left.global
         if isset(g) && g.shared {
-            ir_visit_type_gc_fields(ir, value, left.rett, address, "share") !>
+            ir_visit_type_gc_fields(ir, value, left.rett, address, GC_FIELD_OP.share) !>
         }
     }
 }
@@ -1886,7 +1938,7 @@ fn ir_emit_clean_embedded_load(ir: IRFunc, value: Value, type: Type, address: St
         ir.line3(slot, " = alloca ", lowered)
     }
     ir.line("store " + lowered + " " + raw + ", ptr " + slot)
-    ir_visit_type_gc_fields(ir, value, type, slot, "clean") !>
+    ir_visit_type_gc_fields(ir, value, type, slot, GC_FIELD_OP.clean) !>
 
     let clean = ir.var()
     ir.line(clean + " = load " + lowered + ", ptr " + slot)
@@ -1907,10 +1959,10 @@ fn ir_emit_embedded_property_store(
     // runtime ownership calls below.
     let rendered = ir_emit_value(ir, right) !>
     if remove_old {
-        ir_visit_type_gc_fields(ir, value, type, address, "remove", owner) !>
+        ir_visit_type_gc_fields(ir, value, type, address, GC_FIELD_OP.remove, owner) !>
     }
     ir.line("store " + (ir_type(type) !>) + " " + rendered + ", ptr " + address)
-    ir_visit_type_gc_fields(ir, value, type, address, "set", owner) !>
+    ir_visit_type_gc_fields(ir, value, type, address, GC_FIELD_OP.set, owner) !>
 }
 
 fn ir_emit_embedded_property_op(ir: IRFunc, value: Value) !Error {
@@ -1921,7 +1973,7 @@ fn ir_emit_embedded_property_op(ir: IRFunc, value: Value) !Error {
     let address = ir_emit_address(ir, slot_value) !>
 
     if value.type == VAL.property_clear {
-        ir_visit_type_gc_fields(ir, value, slot_value.rett, address, "remove", owner) !>
+        ir_visit_type_gc_fields(ir, value, slot_value.rett, address, GC_FIELD_OP.remove, owner) !>
         return
     }
 
@@ -1963,7 +2015,7 @@ fn ir_emit_embedded_property_trace(ir: IRFunc, value: Value) !Error {
         value,
         slot_value.rett,
         address,
-        "trace",
+        GC_FIELD_OP.trace,
         "",
         list,
         target,
@@ -1995,12 +2047,11 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
     if value.type == VAL.decl {
         let decl = value.decl
         if !isset(decl) : value.bug("IR declaration value is missing its Decl")
-        if ir.func.capture_args.contains(decl) : return ir.captured_address(decl) !>
-        if decl.ir_name == "-nameless-" || decl.ir_name.starts_with("\%.") || decl.ir_name.starts_with("\%capture.") {
-            // Captured outer declarations need closure-environment lowering.
-            // Materialize a verifier-safe placeholder until that layout exists.
-            return ir.captured_address(decl) !>
-        }
+        // A captured outer declaration owns no slot in this frame: its storage
+        // is a property of the closure environment.
+        if decl.is_bind : return ir.captured_address(decl) !>
+        // Every other declaration was named by generate_func_ir.
+        if decl.ir_name == "-nameless-" : value.bug("IR declaration has no frame storage")
         return decl.ir_name
     }
     if value.type == VAL.global {
@@ -2176,7 +2227,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         // may tag that property in place.
         if t == VAL.decl && value.rett.is_gc_type() {
             let decl = value.decl
-            if isset(decl) && ir.func.capture_args.contains(decl) {
+            if isset(decl) && decl.is_bind {
                 let as_int = ir.var()
                 ir.line4(as_int, " = ptrtoint ptr ", out, " to i64")
                 let masked = ir.var()
@@ -3262,20 +3313,20 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     // Evaluate fields first. In particular, a nested GC allocation must happen
     // before the new object exists but has not yet been rooted.
     let fields = value.values
-    // Avoid a throwaway array for the (common) fieldless aggregate literal.
-    let rendered: ?Array[String] = null
+    let field_mark = ir.field_values.length
     if isset(fields) {
-        let buffered = Array[String]{}
         each fields as field {
-            buffered.append(ir_emit_value(ir, field) !>)
+            ir.field_values.append(ir_emit_value(ir, field) !>)
         }
-        rendered = buffered
     }
 
     let result_type = ir_is_tagged_nullable(value.rett) ? value.rett.get_non_nullable() : value.rett
     let lowered = ir_type(result_type) !>
     let size = class.compute_body_size() !>
-    if size == 0 && lowered == "ptr" : return "null"
+    if size == 0 && lowered == "ptr" {
+        ir.release_field_values(field_mark)
+        return "null"
+    }
 
     let slot = ""
     if lowered == "ptr" {
@@ -3294,7 +3345,7 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
             if field.name != "" : prop = class.get_prop_by_name(field.name) !? null
             if !isset(prop) : prop = class.props.get(i) !? null
             if !isset(prop) : value.bug("Cannot match aggregate initializer field to a property")
-            let field_value = (rendered ?! value.bug("No initializer fields buffered")).get(i) !? "undef"
+            let field_value = ir.field_values.get(field_mark + i) !? "undef"
             let address = ir.var()
             ir.line_start()
             ir.write(address)
@@ -3313,6 +3364,7 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
             ir.line_end()
         }
     }
+    ir.release_field_values(field_mark)
     if lowered == "ptr" : return slot
 
     let out = ir.var()
@@ -3676,12 +3728,31 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     return ir_build_closure_value(ir, value.rett, "@\"" + target_name + "\"", environment) !>
 }
 
+// Render one call argument — receiver or ordinary — and append it to the list
+// started at `mark`. `expected` is the parameter type when the callee is known.
+fn ir_write_call_arg(ir: IRFunc, mark: uint, arg: Value, expected: ?Type) !Error {
+    if isset(expected) {
+        if ir_call_arg_needs_inline_address(arg.rett, expected) {
+            ir.write_arg(mark, ir_type(expected) !>, ir_emit_inline_call_address(ir, arg) !>)
+            return
+        }
+        if ir_call_arg_needs_raw_function(arg.rett, expected) {
+            ir.write_arg(mark, ir_type(expected) !>, ir_emit_raw_function(ir, arg) !>)
+            return
+        }
+        let rendered = ir_emit_value(ir, arg) !>
+        ir.write_arg(mark, ir_type(expected) !>, ir_emit_cast(ir, rendered, arg.rett, expected) !>)
+        return
+    }
+    let rendered = ir_emit_value(ir, arg) !>
+    ir.write_arg(mark, ir_type(arg.rett) !>, rendered)
+}
+
 fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let callee = value.value1
     if !isset(callee) : value.bug("IR call is missing its callee")
     let args = value.values
-    let rendered_types = Array[String]{}
-    let rendered_values = Array[String]{}
+    let arg_mark = ir.arg_list.length
     let direct_func: ?Func = callee.type == VAL.func ? callee.func : null
     let call_kind = value.op.@cast(CALL_KIND)
     let interface_call = call_kind == CALL_KIND.interface_dispatch
@@ -3695,8 +3766,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         if !isset(receiver) : value.bug("Interface method call has no receiver")
         let adapter = ir_emit_value(ir, receiver) !>
         target = ir_interface_method_target(ir, adapter, method)
-        rendered_types.append("ptr")
-        rendered_values.append(ir_interface_object(ir, adapter))
+        ir.write_arg(arg_mark, "ptr", ir_interface_object(ir, adapter))
         ir_note_unknown_code(ir)
     } else if closure_call {
         let closure = ir_emit_value(ir, callee) !>
@@ -3718,8 +3788,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         ir.write(closure)
         ir.write(", 1")
         ir.line_end()
-        rendered_types.append("ptr")
-        rendered_values.append(environment)
+        ir.write_arg(arg_mark, "ptr", environment)
     }
 
     // Bound method receiver is the implicit first argument.
@@ -3732,19 +3801,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                     expected = func_arg.type
                 }
             }
-            if isset(expected) && ir_call_arg_needs_inline_address(receiver.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
-                rendered_values.append(ir_emit_inline_call_address(ir, receiver) !>)
-            } else {
-                let rendered = ir_emit_value(ir, receiver) !>
-                let rendered_type = receiver.rett
-                if isset(expected) {
-                    rendered = ir_emit_cast(ir, rendered, receiver.rett, expected) !>
-                    rendered_type = expected
-                }
-                rendered_types.append(ir_type(rendered_type) !>)
-                rendered_values.append(rendered)
-            }
+            ir_write_call_arg(ir, arg_mark, receiver, expected) !>
         }
     }
     if isset(args) {
@@ -3756,22 +3813,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                     expected = func_arg.type
                 }
             }
-            if isset(expected) && ir_call_arg_needs_inline_address(arg.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
-                rendered_values.append(ir_emit_inline_call_address(ir, arg) !>)
-            } else if isset(expected) && ir_call_arg_needs_raw_function(arg.rett, expected) {
-                rendered_types.append(ir_type(expected) !>)
-                rendered_values.append(ir_emit_raw_function(ir, arg) !>)
-            } else {
-                let rendered = ir_emit_value(ir, arg) !>
-                let rendered_type = arg.rett
-                if isset(expected) {
-                    rendered = ir_emit_cast(ir, rendered, arg.rett, expected) !>
-                    rendered_type = expected
-                }
-                rendered_types.append(ir_type(rendered_type) !>)
-                rendered_values.append(rendered)
-            }
+            ir_write_call_arg(ir, arg_mark, arg, expected) !>
         }
     }
 
@@ -3830,12 +3872,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     ir.write(" ")
     ir.write(target)
     ir.write("(")
-    each rendered_values as rendered, i {
-        if i > 0 : ir.write(", ")
-        ir.write(rendered_types.get(i) !? "")
-        ir.write(" ")
-        ir.write(rendered)
-    }
+    ir.flush_args(arg_mark)
     ir.write(")")
     ir.line_end()
     if exits {
