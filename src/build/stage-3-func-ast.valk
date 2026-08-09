@@ -98,6 +98,8 @@ fn func_release_ast(func: Func, exps: Array[Exp]) {
     func.user_defer_pop = null
     func.all_decls = .{}
     func.define_decls = .{}
+    func.buffer_pool = .{}
+    func.buffers_used = .{}
     func.test_entry_decl = null
     func.stable_stack_decl = null
 }
@@ -132,73 +134,6 @@ fn func_release_exps(func: Func, exps: Array[Exp]) {
         scope.decls.clear()
         scope.not_null.clear()
     }
-}
-
-// Only direct managed-reference buffers share storage. Their representation
-// and marker operation are always one pointer, so reusing a slot for a later
-// statement cannot reinterpret scalar bytes as a GC pointer. Inline buffers
-// keep their own typed storage in the frame.
-fn decl_is_coalesced_gc_buffer(decl: Decl) bool {
-    return decl.is_buffer && decl.is_gc
-}
-
-// Give every temporary needed by one statement a distinct slot. Later
-// statements reuse the same offsets because ir_emit_values clears their
-// temporary roots after each statement. The returned count is the peak number
-// of simultaneously reserved temporary roots, not the total number of temps.
-fn values_assign_buffer_roots(
-    values: Array[Value],
-    first_offset: uint,
-    ptr_size: uint,
-    assigned: Array[Decl]
-) uint {
-    let peak: uint = 0
-    each values as statement {
-        let buffers = Array[Decl]{}
-        value_collect_buffers(statement, buffers)
-        let count: uint = 0
-        each buffers as decl {
-            if !decl_is_coalesced_gc_buffer(decl) : continue
-            let slot_offset: uint = first_offset + count * ptr_size
-            decl.gc_stack_offset = slot_offset
-            assigned.append(decl, true)
-            count++
-        }
-        if count > peak : peak = count
-    }
-    return peak
-}
-
-fn func_assign_buffer_roots(func: Func, first_offset: uint, ptr_size: uint) uint {
-    let assigned = Array[Decl]{}
-    let peak: uint = 0
-    let body = func.body_scope
-    if isset(body) {
-        peak = values_assign_buffer_roots(body.values, first_offset, ptr_size, assigned)
-    }
-
-    // Cleanup can run while a return value's statement temporaries are still
-    // live, so its sequentially reused region follows the body's peak region.
-    let cleanup = func.defer_scope
-    if isset(cleanup) {
-        let cleanup_peak = values_assign_buffer_roots(
-            cleanup.values,
-            first_offset + peak * ptr_size,
-            ptr_size,
-            assigned
-        )
-        peak += cleanup_peak
-    }
-
-    // Preserve correctness for any future generated value that owns a buffer
-    // outside the body/defer statement trees: give it a dedicated tail slot.
-    each func.all_decls as decl {
-        if !decl_is_coalesced_gc_buffer(decl) || assigned.contains(decl) : continue
-        let slot_offset: uint = first_offset + peak * ptr_size
-        decl.gc_stack_offset = slot_offset
-        peak++
-    }
-    return peak
 }
 
 fn decl_needs_gc_stack_storage(decl: Decl) bool {
@@ -244,13 +179,6 @@ fn func_finish_ast(func: Func) !Error {
         // Hidden capture arguments are properties of the closure environment,
         // not independent frame storage.
         if decl.is_bind : continue
-        // Compiler-generated buffers receive coalesced slots after permanent
-        // roots have been laid out. Only direct GC buffers take that path;
-        // inline buffers need their complete typed value in the frame.
-        if roots && decl_is_coalesced_gc_buffer(decl) {
-            func.define_decls.append(decl, true)
-            continue
-        }
         if decl.must_be_stable {
             decl.offset = stable_size
             let size = decl.type.size() !>.to(uint)
@@ -273,13 +201,6 @@ fn func_finish_ast(func: Func) !Error {
         func.define_decls.append(decl)
         func.stable_stack_decl = decl
         gc_count++
-    }
-
-    if roots {
-        alloca_size = alloca_size.round_up(psz)
-        let buffer_roots = func_assign_buffer_roots(func, alloca_size, psz)
-        alloca_size += buffer_roots * psz
-        gc_count += buffer_roots
     }
 
     func.alloca_size = alloca_size
@@ -329,6 +250,38 @@ fn func_finish_ast(func: Func) !Error {
     if !func.is_entrance {
         body_scope.values.prepend(vgen_allocas(alloca_scope.values, b))
     }
+}
+
+fn append_buffer_clears(ctx: Context, values: Array[Value], func: Func, first: uint, at: ?Exp) {
+    let i = first
+    while i < func.buffers_used.length {
+        let decl = func.buffers_used.get(i) ! break
+        i++
+        // Direct managed references can keep a large object graph alive and
+        // make every later collection walk it. Clear those roots explicitly;
+        // aggregate buffers may retain their value until the frame exits.
+        if !decl.is_gc : continue
+        values.append(vgen_assign(
+            vgen_decl(decl),
+            vgen_null(decl.type),
+            ASSIGN_OP.set,
+            ctx.build,
+            at
+        ))
+    }
+}
+
+fn finish_body_value_buffers(ctx: Context, func: Func, first: uint, at: Exp, value: ?Value) ?Value {
+    if func.buffers_used.length == first : return value
+
+    let statements = Array[Value]{}
+    if isset(value) : statements.append(value)
+    append_buffer_clears(ctx, statements, func, first, at)
+    func_release_buffers(func, first)
+
+    if statements.length == 0 : return null
+    if statements.length == 1 && isset(value) : return value
+    return vgen_block(statements, ctx.build, at)
 }
 
 // Lower a contiguous body-expression range. `#loop globals G T` recursively
@@ -556,6 +509,13 @@ fn append_properties_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: u
 
 // Convert one body-level EXP into a Value. Returns null for comments / skipped #if.
 fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
+    let func = ctx.get_func() !>
+    let first = func.buffers_used.length
+    let value = body_value_from_exp_inner(ctx, scope, state, exp) !>
+    return finish_body_value_buffers(ctx, func, first, exp, value)
+}
+
+fn body_value_from_exp_inner(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
     if exp.type == EXP.macro {
         let func = ctx.get_func() !>
         state.saw_macro = true
@@ -891,6 +851,7 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Val
     let body_scope = arg_scope.sub_scope()
     body_scope.func = func
     let inner_ctx = Context.for_func(func).without_suggested_type()
+    let first_buffer = func.buffers_used.length
     let deferred_value: ?Value = null
     if deferred_exp.type == EXP.value && deferred_exp.kind == VALUE_KIND.call {
         // A bare fallible call must be diagnosed as an invalid defer, not
@@ -907,6 +868,8 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Val
         deferred_exp.error("A deferred call must handle its error before the function exits")
     }
     body_scope.append_value(deferred)
+    append_buffer_clears(inner_ctx, body_scope.values, func, first_buffer, deferred_exp)
+    func_release_buffers(func, first_buffer)
     func.body_scope = body_scope
     func.alloca_scope = body_scope.sub_scope()
     func.defer_scope = body_scope.sub_scope()
