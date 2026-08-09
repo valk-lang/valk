@@ -218,11 +218,10 @@ win-x64: $(DIST_DEPS)
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64
 	cp -r ./lib ./dist/win-x64/
-# Windows uses LLVM's linker and archive writer.
+# Windows uses LLVM's linker, which also writes archives when called with `/lib`.
 	cp ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
-	cp ./toolchains/libraries/win-llvm-15-x64/llvm-lib.exe ./dist/win-x64/llvm-lib.exe
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
-	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe llvm-lib.exe
+	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
 dist-all: win-x64 linux-x64 macos-x64 macos-arm64
 
