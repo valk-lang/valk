@@ -7,7 +7,7 @@
 - Release 0.3.1
 + Remove llvm-lib dependency
 ~ Data race solution (Threads done via shared type, MutexValue not done)
-- Dont allow inline GC types in unions
++ Remove union gc slot
 - uslice (cstring) / slice (String)
 
 # Next steps
