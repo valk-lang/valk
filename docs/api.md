@@ -1263,7 +1263,7 @@ alias FD for i32
 ## Functions for 'thread'
 
 ```js
-+ fn start(func: fn()()) Thread !InitError
++ fn start(func: fn()()) Thread[void] !InitError
 + fn suspend_ms(ms: uint) void
 + fn suspend_ns(ns: uint) void
 + fn task(handler: fn()()) Task !InitError
@@ -1281,8 +1281,10 @@ alias FD for i32
 ```
 
 ```js
-+ class Thread {
-    + static fn start(func: fn()()) Thread !InitError
++ class Thread[T] {
+    ~ result: T
+
+    + static fn start(func: fn()(T)) Thread[T] !InitError
     + fn wait() void
 }
 ```

@@ -2416,6 +2416,9 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.interface_wrap {
         return ir_emit_interface_wrap(ir, value) !>
     }
+    if t == VAL.fn_clone {
+        return ir_emit_fn_clone(ir, value) !>
+    }
     if t == VAL.undefined : return "undef"
     if t == VAL.wrap || t == VAL.paren {
         let inner = value.value1
@@ -3653,8 +3656,7 @@ fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Err
     if bound {
         let class = func.capture_class
         if !isset(class) : value.bug("Bound closure data class is missing")
-        let prop = class.props.get(0) !? null
-        if !isset(prop) : value.bug("Bound closure receiver property is missing")
+        let prop = class.get_prop_by_name("receiver") ! value.bug("Bound closure receiver property is missing")
         receiver = ir_coro_load_prop(ir, "\%closure.data", prop) !>
     }
 
@@ -3736,9 +3738,21 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     else : target_name = ir_emit_closure_adapter(ir, value, func) !>
 
     let capture_base: uint = 0
+    let clone_prop = class.props.get(0) !? null
+    if isset(clone_prop) && clone_prop.name == "__clone" {
+        let clone_name = ir_emit_closure_clone(ir, value, func) !>
+        let clone_addr = ir_prop_address(ir, environment, clone_prop)
+        ir.line_start()
+        ir.write("store ptr @\"")
+        ir.write(clone_name)
+        ir.write("\", ptr ")
+        ir.write(clone_addr)
+        ir.line_end()
+        capture_base = 1
+    }
     let receiver = value.value1
     if isset(receiver) && isset(func.class) && !func.is_static {
-        let prop = class.props.get(0) !? null
+        let prop = class.props.get(capture_base) !? null
         if !isset(prop) : value.bug("Bound closure receiver property is missing")
         let rendered = ir_emit_value(ir, receiver) !>
         let address = ir_prop_address(ir, environment, prop)
@@ -3767,6 +3781,168 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
         ir.line_end()
     }
     return ir_build_closure_value(ir, value.rett, "@\"" + target_name + "\"", environment) !>
+}
+
+// Deep-copy one closure environment. `__clone` is copied as a raw pointer;
+// every other property is passed through core:clone_value.
+fn ir_emit_closure_clone(parent: IRFunc, value: Value, func: Func) String !Error {
+    let name = "valk.closure.clone." + func_ir_name(func)
+    if ir_reuse_adapter(parent, name) : return name
+    let class = func.capture_class
+    let allocator = func.capture_allocator
+    if !isset(class) : value.bug("Closure clone is missing its capture class")
+    if !isset(allocator) : value.bug("Closure clone is missing its allocator")
+
+    let ir = ir_adapter_ir(parent, name)
+    ir.code.write_string("define internal ptr @\"")
+    ir.code.write_string(name)
+    ir.code.write_string("\"(ptr \%closure.data) {\n")
+    ir.label("entry")
+
+    let alloc_value = Value {
+        type: VAL.class_init
+        rett: class.get_type() !>
+        allocator: allocator
+        exp: value.exp
+    }
+    let size = class.compute_body_size() !>
+    let environment = ir_emit_class_alloc(ir, alloc_value, class, size) !>
+    ir.line_start()
+    ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
+    ir.write(environment)
+    ir.write(", i8 0, i64 ")
+    ir.write_uint(size)
+    ir.write(", i1 false)")
+    ir.line_end()
+
+    each class.props as prop {
+        let src = ir_prop_address(ir, "\%closure.data", prop)
+        let dst = ir_prop_address(ir, environment, prop)
+        if prop.name == "__clone" {
+            let loaded = ir.var()
+            ir.line_start()
+            ir.write(loaded)
+            ir.write(" = load ptr, ptr ")
+            ir.write(src)
+            ir.line_end()
+            ir.line_start()
+            ir.write("store ptr ")
+            ir.write(loaded)
+            ir.write(", ptr ")
+            ir.write(dst)
+            ir.line_end()
+            continue
+        }
+        let loaded = ir_emit_load(ir, ir_type(prop.type) !>, src)
+        let cleaned = loaded
+        if prop.type.is_gc_type() {
+            cleaned = ir_union_clean_gc_pointer(ir, loaded)
+        }
+        let cloned = ir_emit_clone_value_call(ir, value, prop.type, cleaned) !>
+        ir.line_start()
+        ir.write("store ")
+        ir.write(ir_type(prop.type) !>)
+        ir.write(" ")
+        ir.write(cloned)
+        ir.write(", ptr ")
+        ir.write(dst)
+        ir.line_end()
+    }
+
+    ir.line_start()
+    ir.write("ret ptr ")
+    ir.write(environment)
+    ir.line_end()
+    ir.code.write_string("}\n\n")
+    return name
+}
+
+fn ir_emit_clone_value_call(ir: IRFunc, at: Value, type: Type, rendered: String) String !Error {
+    let idf = valk_idf(ir.func.ns.build, "core", "clone_value") !>
+    let base = idf.func
+    if !isset(base) : at.bug("core:clone_value is not a function")
+    let at_exp = at.exp ?? ir.func.exp
+    let specialized = base.specialize(Array[Type]{ type }, at_exp) !>
+    ir_use_func(ir, specialized)
+    let result = ir.var()
+    ir.line_start()
+    ir.write(result)
+    ir.write(" = call ")
+    ir.write(ir_type(type) !>)
+    ir.write(" @\"")
+    ir.write(func_ir_name(specialized))
+    ir.write("\"(")
+    ir.write(ir_type(type) !>)
+    ir.write(" ")
+    ir.write(rendered)
+    ir.write(")")
+    ir.line_end()
+    return result
+}
+
+// Runtime deep-copy of a function value via the env's `__clone` entry.
+fn ir_emit_fn_clone(ir: IRFunc, value: Value) String !Error {
+    let source = value.value1
+    if !isset(source) : value.bug("Closure clone is missing its source")
+    let closure = ir_emit_value(ir, source) !>
+    let fn_type = ir_type(value.rett) !>
+    let target = ir_emit_extract(ir, fn_type, closure, 0)
+    let environment = ir_emit_extract(ir, fn_type, closure, 1)
+
+    let has_env = ir.var()
+    ir.line_start()
+    ir.write(has_env)
+    ir.write(" = icmp ne ptr ")
+    ir.write(environment)
+    ir.write(", null")
+    ir.line_end()
+
+    let copy_block = ir.block("closure.clone")
+    let keep_block = ir.block("closure.copy")
+    let after_block = ir.block("closure.clone.after")
+    ir.cond_jump(has_env, copy_block, keep_block)
+
+    ir.label(copy_block)
+    let clone_fn = ir.var()
+    ir.line_start()
+    ir.write(clone_fn)
+    ir.write(" = load ptr, ptr ")
+    ir.write(environment)
+    ir.line_end()
+    let new_env = ir.var()
+    ir.line_start()
+    ir.write(new_env)
+    ir.write(" = call ptr ")
+    ir.write(clone_fn)
+    ir.write("(ptr ")
+    ir.write(environment)
+    ir.write(")")
+    ir.line_end()
+    let copied = ir_build_closure_value(ir, value.rett, target, new_env) !>
+    let copy_pred = ir.current_block
+    ir.jump(after_block)
+
+    ir.label(keep_block)
+    let keep_pred = ir.current_block
+    ir.jump(after_block)
+
+    ir.label(after_block)
+    let result = ir.var()
+    ir.line_start()
+    ir.write(result)
+    ir.write(" = phi ")
+    ir.write(fn_type)
+    ir.write(" [ ")
+    ir.write(copied)
+    ir.write(", \%")
+    ir.write(copy_pred)
+    ir.write(" ], [ ")
+    ir.write(closure)
+    ir.write(", \%")
+    ir.write(keep_pred)
+    ir.write(" ]")
+    ir.line_end()
+    return result
 }
 
 ////////////////////////////
