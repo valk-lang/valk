@@ -1,0 +1,317 @@
+
+// Managed fields inside by-value storage, as generic Values.
+//
+// An inline struct, fixed array, union or nullable can hold managed pointers
+// anywhere inside it. Reading, replacing or tracing such storage means visiting
+// each of those fields, which is what the walk below does: it recurses over the
+// type and emits ordinary load / store / call / if Values per managed field.
+
+// What the walk does with each managed field it reaches.
+enum GC_WALK : u8 {
+    remove  // drop the owner's reference to the field
+    set     // hand the field to a new owner
+    share   // publish the field's object graph across threads
+    clean   // strip ownership bits from a loaded copy
+    trace   // hand the field address to a user callback
+}
+
+class GcWalk {
+    ctx: Context
+    scope: Scope
+    at: Exp
+    action: GC_WALK
+    // remove / set: the object the storage belongs to
+    owner: ?Value (null)
+    // trace: the collector's work list and the per-field callback
+    list: ?Value (null)
+    callback: ?Value (null)
+    out: Array[Value] (.{})
+}
+
+// Every managed field of `type`, reached through `address`.
+fn gc_walk(
+    ctx: Context,
+    scope: Scope,
+    at: Exp,
+    action: GC_WALK,
+    address: Value,
+    type: Type,
+    owner: ?Value (null)
+) Array[Value] !Error {
+    let w = GcWalk { ctx: ctx, scope: scope, at: at, action: action, owner: owner }
+    return gc_walk_from(w, address, type) !>
+}
+
+fn gc_walk_from(w: GcWalk, address: Value, type: Type) Array[Value] !Error {
+    gc_walk_type(w, gc_bind_pointer(w.ctx, w.at, address, w.out) !>, type) !>
+    return w.out
+}
+
+// A walk reaches its address once per managed field, and the expression that
+// produced it may have side effects. Evaluate it once, up front.
+fn gc_bind_pointer(ctx: Context, at: Exp, address: Value, body: Array[Value]) Value !Error {
+    if address.type == VAL.decl : return address
+    let b = ctx.build
+    let slot = vgen_scratch_value(ctx.get_func() !>, type_ptr(b), at)
+    body.append(vgen_assign(slot, address, ASSIGN_OP.set, b, at))
+    return slot
+}
+
+fn gc_walk_type(w: GcWalk, address: Value, type: Type) !Error {
+    let b = w.ctx.build
+    let at = w.at
+    if type.is_gc_type() {
+        gc_walk_field(w, address) !>
+        return
+    }
+
+    let t = type.get_non_nullable()
+    if t.type == TYPE.fn {
+        // Only the environment word of a function value is managed.
+        gc_walk_field(w, gc_walk_offset(address, t.ptr_size(), b, at)) !>
+        return
+    }
+
+    if type.is_tagged_nullable() {
+        let present = vgen_load(address, type_bool(b), at)
+        let body = gc_walk_body(w, gc_walk_offset(address, type.ptr_size(), b, at), t) !>
+        w.out.append(vgen_if(present, body, null, b, at))
+        return
+    }
+
+    if t.type == TYPE.union {
+        let members = t.sub_types ?! return
+        let layout = t.union_layout() !>
+        let tag = vgen_load(address, type_i64(b), at)
+        each members as member, index {
+            if !member.has_gc_refs() : continue
+            let offset = member.is_gc_type() ? layout.gc_offset() : layout.other_offset
+            let body = gc_walk_body(w, gc_walk_offset(address, offset, b, at), member) !>
+            let active = vgen_op(tag, vgen_int(index.@cast(int), type_i64(b)), VALUE_OP.eq, type_bool(b))
+            active.exp = at
+            w.out.append(vgen_if(active, body, null, b, at))
+        }
+        return
+    }
+
+    if t.type == TYPE.inline {
+        let sub = t.sub_type ?! return
+        let class = sub.get_class_or_null()
+        if !isset(class) {
+            gc_walk_type(w, address, sub) !>
+            return
+        }
+        each class.props as prop {
+            if !prop.type.has_gc_refs() : continue
+            gc_walk_type(w, gc_walk_offset(address, prop.offset, b, at), prop.type) !>
+        }
+        return
+    }
+
+    if t.type == TYPE.array {
+        let sub = t.sub_type ?! return
+        if !sub.has_gc_refs() : return
+        let stride = sub.size() !>
+        let i: u32 = 0
+        while i < t.array_size {
+            gc_walk_type(w, gc_walk_offset(address, stride * i, b, at), sub) !>
+            i++
+        }
+        return
+    }
+
+    if t.type == TYPE.multi {
+        let members = t.sub_types ?! return
+        let offset: u32 = 0
+        each members as member {
+            offset = member.ir_align_offset(offset) !>
+            if member.has_gc_refs() {
+                gc_walk_type(w, gc_walk_offset(address, offset, b, at), member) !>
+            }
+            offset += member.size() !>
+        }
+    }
+}
+
+// One managed pointer, at `address`.
+fn gc_walk_field(w: GcWalk, address: Value) !Error {
+    let b = w.ctx.build
+    let at = w.at
+    if w.action == GC_WALK.trace {
+        let callback = w.callback ?! at.bug("GC trace walk has no callback")
+        let list = w.list ?! at.bug("GC trace walk has no list")
+        w.out.append(gc_walk_call(w, callback, Array[Value]{ address, list }, type_void(b)))
+        return
+    }
+    if w.action == GC_WALK.remove {
+        w.out.append(gc_walk_gc_call(w, "property_remove", Array[Value]{ gc_walk_owner(w) !>, address }) !>)
+        return
+    }
+
+    let ptr_t = type_ptr(b)
+    let pointer = vgen_clean_gc_pointer(vgen_load(address, ptr_t, at), b)
+    if w.action == GC_WALK.set {
+        w.out.append(gc_walk_gc_call(w, "property_set", Array[Value]{ gc_walk_owner(w) !>, address, pointer }) !>)
+        return
+    }
+    if w.action == GC_WALK.share {
+        w.out.append(gc_walk_gc_call(w, "share_null_check", Array[Value]{ pointer }) !>)
+        return
+    }
+    // clean: the copy keeps the pointer but not the owner's tag bits
+    let slot = vgen_ptrv(address, vgen_int(0, type_i64(b)), ptr_t, at)
+    w.out.append(vgen_assign(slot, pointer, ASSIGN_OP.set, b, at))
+}
+
+fn gc_walk_owner(w: GcWalk) Value !Error {
+    let owner = w.owner ?! w.at.bug("GC ownership walk has no owner")
+    return vgen_cast(owner, type_ptr(w.ctx.build))
+}
+
+// The walk emits into a shared list; a conditional branch needs its own.
+fn gc_walk_body(w: GcWalk, address: Value, type: Type) Array[Value] !Error {
+    let outer = w.out
+    w.out = Array[Value]{}
+    gc_walk_type(w, address, type) !>
+    let body = w.out
+    w.out = outer
+    return body
+}
+
+fn gc_walk_offset(address: Value, offset: u32, b: Build, at: Exp) Value {
+    if offset == 0 : return address
+    return vgen_ptr_offset(address, vgen_int(offset.to(int), type_i64(b)), at)
+}
+
+fn gc_walk_gc_call(w: GcWalk, name: String, args: Array[Value]) Value !Error {
+    return gc_helper_call(w.ctx, w.scope, w.at, name, args) !>
+}
+
+fn gc_walk_call(w: GcWalk, callee: Value, args: Array[Value], rett: Type) Value {
+    let call = vgen_call(w.ctx, callee, args, rett, w.scope)
+    call.exp = w.at
+    return call
+}
+
+// Call into valk:gc — the collector's ownership bookkeeping entry points.
+fn gc_helper_call(ctx: Context, scope: Scope, at: Exp, name: String, args: Array[Value]) Value !Error {
+    let func = value_get_valk_func(ctx.build, "gc", name, at) !>
+    let callee = vgen_func(func)
+    callee.exp = at
+    let call = vgen_call(ctx, callee, args, func.get_rett(), scope)
+    call.exp = at
+    return call
+}
+
+////////////////////////////
+// Managed stores
+////////////////////////////
+
+// Assignment through a store target. A property of a managed object has to tell
+// the collector about the reference change; anything else is a plain store.
+fn vgen_store(left: Value, right: Value, op: ASSIGN_OP, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let b = ctx.build
+    if left.type == VAL.global : return vgen_shared_store(left, right, op, ctx, scope, at) !>
+    if left.type != VAL.prop : return vgen_assign(left, right, op, b, at, ctx)
+    let owner = left.value1 ?! at.bug("Property assignment is missing its object")
+    if !owner.rett.is_gc_type() || !left.rett.has_gc_refs() {
+        return vgen_assign(left, right, op, b, at, ctx)
+    }
+
+    let ptr_t = type_ptr(b)
+    let prop = left.prop ?! at.bug("Property assignment is missing its property")
+    let nn = left.rett.get_non_nullable()
+    // The object can come from an expression with side effects, and the store
+    // below reaches it more than once: evaluate it exactly once.
+    let body = Array[Value]{}
+    let object = gc_bind_pointer(ctx, at, vgen_cast(owner, ptr_t), body) !>
+    let address = gc_walk_offset(object, prop.offset, b, at)
+
+    // A managed pointer is a single field: one ownership update.
+    if left.rett.is_gc_type() {
+        let value = right
+        if op != ASSIGN_OP.set {
+            value = vgen_op(vgen_load(address, left.rett, at), right, assign_value_op(op), left.rett)
+            value.exp = at
+        }
+        body.append(gc_helper_call(ctx, scope, at, "property_update", Array[Value]{ object, address, value }) !>)
+        return vgen_block(body, b, at)
+    }
+
+    if op != ASSIGN_OP.set {
+        at.error("Compound assignment is not valid for a property holding managed references")
+    }
+
+    // A function value is a code pointer next to a managed environment.
+    if nn.type == TYPE.fn {
+        let slot = vgen_scratch_value(ctx.get_func() !>, left.rett, at)
+        let env = gc_walk_offset(address, nn.ptr_size(), b, at)
+        body.append(vgen_assign(slot, right, ASSIGN_OP.set, b, at))
+        body.append(gc_helper_call(ctx, scope, at, "property_update", Array[Value]{ object, env, vgen_multi_part(slot, 1, ptr_t, at) }) !>)
+        body.append(vgen_assign(vgen_ptrv(address, vgen_int(0, type_i64(b)), ptr_t, at), vgen_multi_part(slot, 0, ptr_t, at), ASSIGN_OP.set, b, at))
+        return vgen_block(body, b, at)
+    }
+
+    each (gc_store(ctx, scope, at, address, left.rett, object, right, true) !>) as v : body.append(v)
+    return vgen_block(body, b, at)
+}
+
+// A shared global is visible to every thread, so whatever lands in it has to
+// be published before (or as soon as) it is reachable from there.
+fn vgen_shared_store(left: Value, right: Value, op: ASSIGN_OP, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let b = ctx.build
+    let global = left.global ?! at.bug("Global assignment is missing its Global")
+    if !global.shared || !left.rett.has_gc_refs() : return vgen_assign(left, right, op, b, at, ctx)
+
+    let body = Array[Value]{}
+    let address = gc_bind_pointer(ctx, at, vgen_ptr_of(left, type_ptr(b), at), body) !>
+    let store = vgen_ptrv(address, vgen_int(0, type_i64(b)), left.rett, at)
+
+    // A managed pointer is published before it becomes reachable from the global.
+    if left.rett.is_gc_type() {
+        let value = right
+        if op != ASSIGN_OP.set {
+            value = vgen_op(vgen_load(address, left.rett, at), right, assign_value_op(op), left.rett)
+            value.exp = at
+        }
+        let slot = vgen_scratch_value(ctx.get_func() !>, left.rett, at)
+        body.append(vgen_assign(slot, value, ASSIGN_OP.set, b, at))
+        body.append(gc_helper_call(ctx, scope, at, "share_null_check", Array[Value]{ slot }) !>)
+        body.append(vgen_assign(store, slot, ASSIGN_OP.set, b, at))
+        return vgen_block(body, b, at)
+    }
+
+    // Embedded managed fields are published from the stored copy.
+    body.append(vgen_assign(store, right, op, b, at, ctx))
+    let shared = gc_walk(ctx, scope, at, GC_WALK.share, address, left.rett) !>
+    each shared as v : body.append(v)
+    return vgen_block(body, b, at)
+}
+
+// Write `value` into managed by-value storage at `address`. The value is
+// computed before the old one is released, stored raw, and then each of its
+// managed fields is handed to `owner`.
+fn gc_store(
+    ctx: Context,
+    scope: Scope,
+    at: Exp,
+    address: Value,
+    type: Type,
+    owner: Value,
+    value: Value,
+    replace: bool
+) Array[Value] !Error {
+    let b = ctx.build
+    let slot = vgen_scratch_value(ctx.get_func() !>, type, at)
+    let body = Array[Value]{}
+    let target = gc_bind_pointer(ctx, at, address, body) !>
+    body.append(vgen_assign(slot, value, ASSIGN_OP.set, b, at))
+    if replace {
+        let old = gc_walk(ctx, scope, at, GC_WALK.remove, target, type, owner) !>
+        each old as v : body.append(v)
+    }
+    body.append(vgen_assign(vgen_ptrv(target, vgen_int(0, type_i64(b)), type, at), slot, ASSIGN_OP.set, b, at))
+    let owned = gc_walk(ctx, scope, at, GC_WALK.set, target, type, owner) !>
+    each owned as v : body.append(v)
+    return body
+}
