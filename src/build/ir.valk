@@ -38,6 +38,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     out.write_string(ir_target_triple(build.options.target))
     out.write_string("\"\n\n")
     out.write_string("declare void @llvm.memset.inline.p0.i64(ptr, i8, i64, i1)\n")
+    out.write_string("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n")
     out.write_string("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n")
 
     // Constants keep their index in the name, so skipping one leaves the rest
@@ -277,8 +278,7 @@ fn ir_write_string_constant(out: ByteBuffer, index: uint, value: String) {
     out.write_string("@\"valk.str.")
     out.write_uint_ascii(index)
     // GcData immediately precedes the String value. The collector updates its
-    // on-stack/ownership flags even for literal strings, so this storage must
-    // remain writable (the classic backend also emits `private global`).
+    // on-stack/ownership flags even for literals, so storage stays writable.
     out.write_string("\" = private global <{ i64, i64, [")
     out.write_uint_ascii(size)
     out.write_string(" x i8] }> <{ i64 0, i64 ")
@@ -429,7 +429,7 @@ class IRFunc {
     // Move the list started at `mark` into the line being written.
     fn flush_args(mark: uint) {
         this.code.write_buffer_part(this.arg_list, this.arg_list.length - mark, mark)
-        this.arg_list.length = mark
+        this.arg_list.clear_part(mark, this.arg_list.length - mark)
     }
 
     fn release_field_values(mark: uint) {
@@ -1103,7 +1103,7 @@ fn ir_reuse_adapter(ir: IRFunc, name: String) bool {
     return false
 }
 
-// The characters of a string constant start after its two-word header.
+// The String slice object starts after its GC header.
 fn ir_emit_string_data(ir: IRFunc, text: String) String {
     let index = ir_use_string(ir, text)
     let out = ir.var()
@@ -2178,6 +2178,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.prop {
         let prop = value.prop
         if !isset(prop) : value.bug("IR property value is missing its property")
+        if prop.is_slice_data : return ir_emit_address(ir, value) !>
         if value_is_shared_storage(value) && value.rett.is_integer_type() {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
@@ -2873,6 +2874,60 @@ fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
     return aggregate
 }
 
+fn ir_emit_dynamic_zero(ir: IRFunc, address: String, size: String) {
+    ir.line_start()
+    ir.write("call void @llvm.memset.p0.i64(ptr ")
+    ir.write(address)
+    ir.write(", i8 0, i64 ")
+    ir.write(size)
+    ir.write(", i1 false)")
+    ir.line_end()
+}
+
+fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Value], field_mark: uint) String !Error {
+    let element = class.slice_type
+    if !isset(element) : value.bug("Slice initializer has no element type")
+    let length = ""
+    if isset(fields) {
+        each fields as field, i {
+            let prop: ?Prop = null
+            if field.name != "" : prop = class.get_prop_by_name(field.name) !? null
+            if !isset(prop) : prop = class.props.get(i) !? null
+            if isset(prop) && prop.name == "length" {
+                length = ir.field_values.get(field_mark + i) !? ""
+                break
+            }
+        }
+    }
+    if length == "" : value.bug("Slice initializer is missing length")
+
+    let bytes = length
+    let element_size = element.size() !>
+    if element_size != 1 {
+        bytes = ir_emit_binary_index(ir, "mul", "i64", length, element_size.to(uint))
+    }
+    let total = ir_emit_binary_index(ir, "add", "i64", bytes, (class.slice_data_offset() !>).to(uint))
+
+    let idf = valk_idf(ir.func.ns.build, "gc", "alloc_typed") !>
+    let alloc = idf.func
+    if !isset(alloc) : value.bug("gc:alloc_typed is not a function")
+    if !alloc.parsed_types : parse_func_types(alloc) !>
+    ir_use_func(ir, alloc)
+    ir_note_allocates(ir)
+
+    let props = class.get_func("_props")
+    if isset(props) {
+        if !props.parsed_types : parse_func_types(props) !>
+        ir_use_func(ir, props)
+    }
+    let mark = ir.arg_list.length
+    ir.write_arg(mark, "i64", total)
+    ir.write_arg(mark, "ptr", isset(props) ? ir_func_address(props) : "null")
+    let slot = ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
+    ir_emit_dynamic_zero(ir, slot, total)
+    return slot
+}
+
 fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     // Hook initializers keep their object in value1.
     let base = value.value1
@@ -2918,12 +2973,14 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
 
     let slot = ""
     if lowered == "ptr" {
-        slot = ir_emit_class_alloc(ir, value, class, size) !>
+        slot = class.kind == CLASS_KIND.slice
+            ? (ir_emit_slice_alloc(ir, value, class, fields, field_mark) !>)
+            : (ir_emit_class_alloc(ir, value, class, size) !>)
     } else {
         slot = ir.var()
         ir.line3(slot, " = alloca ", lowered)
     }
-    if size > 0 {
+    if size > 0 && class.kind != CLASS_KIND.slice {
         ir_emit_zero(ir, slot, size.to(uint))
     }
 

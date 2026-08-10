@@ -12,13 +12,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn supported() bool
 ```
+
 # core
 
 ## Functions for 'core'
 
 ```js
 + fn clone_value(value: $T) T
-// Prefer language token `$clone(value)` — clone_value is the same operation.
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
@@ -37,47 +37,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Array[T] {
-    ~ data: GcPtr
-    ~ each_slice: ?Slice[T]
-    ~ length: uint
-    ~ size: uint
-
-    + fn append(item: T, unique: bool (false)) Array[T]
-    + fn append_many(items: Array[T]) Array[T]
-    + fn clear(reduce_size: bool (false)) Array[T]
-    + fn contains(value: T) bool
-    + fn copy() Array[T]
-    + fn equal(array: Array[T]) bool
-    + fn equal_ignore_order(array: Array[T]) bool
-    + fn filter(func: ?fn(T)(bool) (null)) Array[T]
-    + fn fit_index(index: uint) void
-    + static fn from_json_value_auto[X](value: X) Array[T] !json:ValueError
-    + fn get(index: uint) T !LookupError
-    + fn increase_size(new_size: uint) GcPtr
-    + fn index_of(item: T) uint !LookupError
-    + fn intersect(with: Array[T]) Array[T]
-    + fn iter() Slice[T]
-    + fn join(divider: String) String
-    + fn lock() void
-    + fn merge(items: Array[T]) Array[T]
-    + static fn new(start_size: uint (0)) Array[T]
-    + fn part(start: uint, amount: uint) Array[T]
-    + fn pop_first() T !LookupError
-    + fn pop_last() T !LookupError
-    + fn prepend(item: T, unique: bool (false)) Array[T]
-    + fn prepend_many(items: Array[T]) Array[T]
-    + fn range(start: uint, end: uint, inclusive: bool (true)) Array[T]
-    + fn remove(index: uint) Array[T]
-    + fn remove_value(value: T) Array[T]
-    + fn reverse() Array[T]
-    + fn set(index: uint, value: T) void !LookupError
-    + fn set_all(value: T) void
-    + fn set_expand(index: uint, value: T, filler_value: T) void
-    + fn slice(start: uint, amount: uint) Slice[T]
-    + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
-    + fn swap(index_a: uint, index_b: uint) void
-    + fn unique() Array[T]
-    + fn unlock() void
 }
 ```
 
@@ -105,12 +64,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn reduce_size(size: uint) void
     + fn ref(offset: uint, length: uint) ByteBufferRef
     + fn reserve_space(length: uint) void
+    + fn resize(length: uint) void
     + fn rtrim(filter: fnptr(u8)(bool)) void
     + fn set(index: uint, v: u8) void
     + fn skip(amount: uint) void
     + fn starts_with(str: String, offset: uint) bool
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
+    + fn truncate(length: uint) void
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_buffer(buf: ByteBuffer, offset: uint (0)) void
     + fn write_buffer_part(buf: ByteBuffer, len: uint, offset: uint (0)) void
@@ -181,48 +142,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class FlatMap[K, T] {
-    + fn clear() FlatMap[K, T]
-    + fn copy() FlatMap[K, T]
-    + fn get(key: K) T !LookupError
-    + fn has(key: K) bool
-    + fn has_value(value: T) bool
-    + fn keys() Array[K]
-    + fn length() uint
-    + fn merge(map: FlatMap[K, T]) FlatMap[K, T]
-    + static fn new() FlatMap[K, T]
-    + fn remove(key: K) FlatMap[K, T]
-    + fn set(key: K, value: T) FlatMap[K, T]
-    + fn set_many(map: FlatMap[K, T]) FlatMap[K, T]
-    + fn set_unique(key: K, value: T) void !LookupError
-    + fn sort_keys() FlatMap[K, T]
-    + fn values() Array[T]
 }
 ```
 
 ```js
 + class HashMap[K, T] {
-    + fn clear() HashMap[K, T]
-    + fn copy() HashMap[K, T]
-    + fn get(key: K) T !LookupError
-    + fn has(key: K) bool
-    + fn has_value(value: T) bool
-    + fn keys() Array[K]
-    + fn length() uint
-    + fn lock() void
-    + fn merge(map: HashMap[K, T]) HashMap[K, T]
-    + static fn new() HashMap[K, T]
-    + fn remove(key: K) HashMap[K, T]
-    + fn set(key: K, value: T) HashMap[K, T]
-    + fn set_unique(key: K, value: T) HashMap[K, T]
-    + fn sort_keys() HashMap[K, T]
-    + fn unlock() void
-    + fn values() Array[T]
 }
 ```
 
 ```js
-+ mode Map[T] for HashMap[String, T] {
-    + static fn new() Map[T]
++ mode Map[T] {
 }
 ```
 
@@ -254,24 +183,25 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ slice Slice[T] {
-    + data: GcPtr
-    + length: uint
++ slice Slice[T] of T {
+    ~ data: ptr[T]
+    ~ length: uint
 
-    + fn append(item: T) Slice[T]
-    + fn get(index: uint) T !LookupError
-    + fn set(index: uint, value: T) void !LookupError
-    + fn set_all(value: T) void
+    + fn append() void
+    + fn get() void
+    + fn set() void
+    + fn set_all() void
 }
 ```
 
 ```js
-+ class String {
-    ~ bytes: uint
++ slice String of u8 {
+    ~ data: ptr[u8]
+    ~ length: uint
 
+    + fn bytes() uint
     + fn contains(part: String, start_index: uint (0)) bool
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
-    + fn data() ptr[u8]
     + fn data_cstring() cstring
     + fn ends_with(part: String) bool
     + fn escape() String
@@ -288,7 +218,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_number() bool
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) bool
     + fn is_upper() bool
-    + fn length() uint
     + fn lower() String
     + fn ltrim(part: String, limit: uint (0)) String
     + static fn make_empty(length: uint) String
@@ -785,11 +714,14 @@ alias pid_t for i32
 ```js
 + class InMemoryFile {
     ~ data: ptr
+    ~ filename: String
+    ~ mime_type: String
     ~ size: uint
 
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
     + static fn create_from_file(path: String) InMemoryFile !io:IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
+    + fn read_all() String
     + fn save(path: String) void
 }
 ```
@@ -810,6 +742,7 @@ alias pid_t for i32
 
 ```js
 + fn alloc(size: uint) GcPtr
+~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, Lifo)()) GcPtr
 + fn collect() void
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
@@ -823,9 +756,9 @@ alias pid_t for i32
 ## Globals for 'gc'
 
 ```js
-~ global gc : Gc
-~ shared mem_usage_peak : uint
-~ shared mem_usage_shared : uint
+~+ global gc : Gc
+~+ shared mem_usage_peak : uint
+~+ shared mem_usage_shared : uint
 + shared verify : bool
 ```
 
@@ -892,9 +825,9 @@ alias pid_t for i32
 
 ```js
 + class Connection {
-    ~ fd: i32
-    ~ netcon: Connection
-    ~ worker: Worker
+    ~+ fd: i32
+    ~+ netcon: Connection
+    ~+ worker: Worker
 
     + fn close() void
 }
@@ -902,15 +835,15 @@ alias pid_t for i32
 
 ```js
 + class Context {
-    ~ body_received: uint
-    ~ chunked: bool
-    ~ content_length: uint
-    ~ has_host: bool
-    ~ method: ByteBufferRef
-    ~ parsed_index: uint
-    ~ path: ByteBufferRef
-    ~ query_string: ByteBufferRef
-    ~ status: uint
+    ~+ body_received: uint
+    ~+ chunked: bool
+    ~+ content_length: uint
+    ~+ has_host: bool
+    ~+ method: ByteBufferRef
+    ~+ parsed_index: uint
+    ~+ path: ByteBufferRef
+    ~+ query_string: ByteBufferRef
+    ~+ status: uint
 
     + fn body() String
     + fn data() Map[String]
@@ -988,9 +921,6 @@ alias pid_t for i32
 
 ```js
 + class Route[T] {
-    + handler: T
-
-    + fn params(path: String) Map[String]
 }
 ```
 
@@ -1048,7 +978,7 @@ alias FD for i32
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: String | ByteBuffer) Value !ParseError
++ fn decode(json: ByteBuffer | String) Value !ParseError
 + fn default_value(kind: int) Value
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_to(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
@@ -1149,6 +1079,7 @@ alias FD for i32
 + fn equal(a: ptr, b: ptr, length: uint) bool
 + fn find_char(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(adr: ptr) void
++ fn move(from: ptr, to: ptr, length: uint) void
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
 ```
 
@@ -1179,7 +1110,7 @@ alias FD for i32
 ```js
 + class Connection {
     ~ fd: i32
-    ~ host: String
+    ~+ host: String
     ~ ssl: ?SSL
     ~ ssl_enabled: bool
 
@@ -1212,7 +1143,7 @@ alias FD for i32
     + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !NetError
     + fn set_ca_cert(path: ?String) void !NetError
     + fn set_ca_cert_dir(dir: ?String) void !NetError
-    + fn set_host(host: String) void
+    + fn set_host(host: String) void !NetError
     + fn set_verify(enable: bool) void
     + fn write(from: ptr, len: uint) uint !NetError
 }
@@ -1233,7 +1164,7 @@ alias FD for i32
 
 ```js
 + class SocketServer {
-    ~ socket: Socket
+    ~+ socket: Socket
 
     + fn accept() Connection !NetError
     + fn close() void
@@ -1283,10 +1214,6 @@ alias FD for i32
 
 ```js
 + class Thread[T] {
-    ~ result: T
-
-    + static fn start(func: shared fn()(T)) Thread[T] !InitError
-    + fn wait() void
 }
 ```
 
@@ -1307,6 +1234,62 @@ alias FD for i32
 + fn mstime() uint
 + fn sleep_ms(ms: uint) void
 + fn sleep_ns(ns: uint) void
+```
+
+## Classes for 'time'
+
+```js
++ class Datetime {
+    + fn add_days(amount: int) Datetime
+    + fn add_hours(amount: int) Datetime
+    + fn add_microseconds(amount: int) Datetime
+    + fn add_minutes(amount: int) Datetime
+    + fn add_months(amount: int) Datetime
+    + fn add_seconds(amount: int) Datetime
+    + fn add_years(amount: int) Datetime
+    + fn copy() Datetime
+    + fn day() uint
+    + fn day_of_week() uint
+    + fn day_of_year() uint
+    + fn format(pattern: String) String
+    + static fn from_format(pattern: String, value: String) Datetime !SyntaxError
+    + static fn from_timestamp(timestamp: int) Datetime
+    + static fn from_unix_microseconds(timestamp: int) Datetime
+    + fn hour() uint
+    + fn is_leap_year() bool
+    + fn microsecond() uint
+    + fn minute() uint
+    + fn modify_add_days(amount: int) Datetime
+    + fn modify_add_hours(amount: int) Datetime
+    + fn modify_add_microseconds(amount: int) Datetime
+    + fn modify_add_minutes(amount: int) Datetime
+    + fn modify_add_months(amount: int) Datetime
+    + fn modify_add_seconds(amount: int) Datetime
+    + fn modify_add_years(amount: int) Datetime
+    + fn modify_day(day: uint) Datetime
+    + fn modify_hour(hour: uint) Datetime
+    + fn modify_microsecond(microsecond: uint) Datetime
+    + fn modify_minute(minute: uint) Datetime
+    + fn modify_month(month: uint) Datetime
+    + fn modify_second(second: uint) Datetime
+    + fn modify_year(year: int) Datetime
+    + fn month() uint
+    + static fn new(year: ?int (null), month: ?uint (null), day: ?uint (null), hour: ?uint (null), minute: ?uint (null), second: ?uint (null), microsecond: ?uint (null)) Datetime
+    + static fn now() Datetime
+    + fn second() uint
+    + fn timestamp() int
+    + fn to_iso8601() String
+    + fn to_string() String
+    + fn unix_microseconds() int
+    + fn with_day(day: uint) Datetime
+    + fn with_hour(hour: uint) Datetime
+    + fn with_microsecond(microsecond: uint) Datetime
+    + fn with_minute(minute: uint) Datetime
+    + fn with_month(month: uint) Datetime
+    + fn with_second(second: uint) Datetime
+    + fn with_year(year: int) Datetime
+    + fn year() int
+}
 ```
 
 # url
