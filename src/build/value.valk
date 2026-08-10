@@ -86,8 +86,11 @@ enum VAL : u8 {
     atomic_load
     // Raw memory copy: values = [source ptr, destination ptr, byte length].
     memcpy
-    // Deep-copy of a function value's capture environment. value1 is the source.
-    fn_clone
+    // Function value layout access: value1 is the fn value.
+    // fn_code / fn_env extract the two words; fn_pair rebuilds them (value1=code, value2=env).
+    fn_code
+    fn_env
+    fn_pair
     // Fallible call with handler applied — value2=handler side-effect tree;
     // pre_value is the fallible producer. IR lowers it to a check and branch.
     error_handler
@@ -357,6 +360,9 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     if kind == VALUE_KIND.memcpy {
         return value_from_memcpy_exp(exp, scope, ctx) !>
+    }
+    if kind == VALUE_KIND.clone {
+        return value_from_clone_exp(exp, scope, ctx) !>
     }
     if kind == VALUE_KIND.string {
         return value_from_string_exp(exp, scope, ctx) !>
@@ -780,9 +786,9 @@ fn value_from_error_is_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 // Closures and captures
 ////////////////////////////
 
-// Build the typed GC data object used by a closure. The function pointer lives
-// in the inline fn value; this object contains bindings only. Non-empty envs
-// start with `__clone`, used by `fn.clone()` / clone_value to deep-copy captures.
+// Build the typed GC data object used by a closure. Captures are normal props.
+// A fixed header (not a Prop) holds the `$clone` function pointer so the env
+// stays a pure data layout for GC marking.
 fn func_prepare_closure(f: Func) !Error {
     if isset(f.capture_class) : return
 
@@ -806,25 +812,7 @@ fn func_prepare_closure(f: Func) !Error {
         scope: f.arg_scope
         exp: f.exp
     }
-    let has_receiver = isset(f.class) && !f.is_static
-    let has_env = has_receiver || f.capture_decls.length > 0
-    if has_env {
-        class.add_prop(Prop {
-            class: class
-            name: "__clone"
-            act: ACT.private
-            exp: f.exp
-            type: type_ptr(f.ns.build)
-        })
-        // capture_index was 0..n-1 for capture-only props; shift past __clone
-        // and an optional receiver so body loads hit the right slots.
-        let index_base: uint = 1
-        if has_receiver : index_base++
-        each f.capture_args as capt {
-            capt.capture_index = capt.capture_index + index_base
-        }
-    }
-    if has_receiver {
+    if isset(f.class) && !f.is_static {
         let receiver_arg = f.args.get(0) !? null
         if !isset(receiver_arg) : f.exp.bug("Instance closure target has no receiver argument")
         class.add_prop(Prop {
@@ -834,6 +822,9 @@ fn func_prepare_closure(f: Func) !Error {
             exp: f.exp
             type: receiver_arg.type
         })
+        each f.capture_args as capt {
+            capt.capture_index = capt.capture_index + 1
+        }
     }
     each f.capture_decls as decl, i {
         class.add_prop(Prop {
@@ -845,9 +836,19 @@ fn func_prepare_closure(f: Func) !Error {
         })
     }
     let capture_size = class.compute_body_size() !>
+    // Reserve a leading pointer for the env's `$clone` routine. Shift props so
+    // GC and body loads still use prop.offset against the object pointer.
+    let header = f.ns.build.options.target.ptr_size.to(u32)
     f.capture_class = class
     if capture_size > 0 {
+        each class.props as prop {
+            prop.offset = prop.offset + header
+        }
+        class.size = capture_size + header
+        f.capture_header_size = header
         f.capture_allocator = allocator_for_class(Context.for_func(f), class, f.exp) !>
+        // Value-AST clone helper (not IR emission).
+        ensure_closure_clone_func(f) !>
     }
 }
 
@@ -1040,6 +1041,28 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
 
     return vgen_ptrv(on, offset, elem, exp)
+}
+
+// `$clone(value)` — deep-copy intrinsic. Function values expand to Values via
+// value_fn_clone; everything else calls core:clone_value_impl.
+fn value_from_clone_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = exp.get(VALUE_EXP.left)
+    if !isset(arg_exp) : exp.bug("$clone is missing its argument")
+    let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    if arg.rett.get_non_nullable().type == TYPE.fn {
+        return value_fn_clone(arg, ctx, scope, exp) !>
+    }
+    let idf = valk_idf(ctx.build, "core", "clone_value_impl") !>
+    let base = idf.func
+    if !isset(base) : exp.bug("core:clone_value_impl is not a function")
+    let names = base.generic_arg_names
+    if names.length == 0 : exp.bug("core:clone_value_impl has no generic argument names")
+    let specialized = base.specialize_generic_args(names, Array[Type]{ arg.rett }, exp) !>
+    let callee = vgen_func(specialized)
+    callee.exp = exp
+    let call = vgen_call(ctx, callee, Array[Value]{ arg }, specialized.get_rett(), scope)
+    call.exp = exp
+    return call
 }
 
 // @memcpy(from, to, length) — both addresses are raw-pointer compatible and
@@ -2780,7 +2803,9 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         return v
     }
 
-    // Deep-copy of a closure and its capture data (see VAL.fn_clone).
+    // Deep-copy of a closure and its capture data (same as `$clone(fn)`).
+    // Returned as a bound method-style member so `f.clone()` is a call that
+    // value_from_type_method expands into value_fn_clone.
     if name == "clone" && on_nn.rett.get_non_nullable().type == TYPE.fn {
         let v = vgen_dot(on_nn, name, on_nn.rett)
         v.exp = exp

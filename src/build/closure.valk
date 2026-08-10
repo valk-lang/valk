@@ -1,0 +1,199 @@
+// Closure capture-env helpers built as value-AST (not hand-written IR).
+
+// Create the env clone helper for a capture-owning literal, if needed.
+// Called from func_prepare_closure so IR emission only references the result.
+fn ensure_closure_clone_func(owner: Func) !Error {
+    if isset(owner.capture_clone_func) : return
+    if owner.capture_header_size == 0 : return
+    owner.capture_clone_func = make_closure_clone_func(owner) !>
+}
+
+//   fn clone(this: Env) Env {
+//       let result = Env { p0: $clone(this.p0), ... }  // buffers GC fields first
+//       // copy protocol header (clone fn ptr) from this → result
+//       return result
+//   }
+fn make_closure_clone_func(owner: Func) Func !Error {
+    let class = owner.capture_class
+    if !isset(class) : owner.exp.bug("Closure clone is missing its capture class")
+    let at = owner.exp
+    let env_type = class.get_type() !>
+    let b = owner.ns.build
+    let ptr_t = type_ptr(b)
+    let header = owner.capture_header_size.to(uint)
+
+    let arg_scope = Scope.new(class.scope)
+    let clone_func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<closure.clone." + owner.name + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        class: class
+        is_static: false
+        parsed_types: true
+        parsed_ast: true
+        rett: env_type
+    }
+    arg_scope.func = clone_func
+    append_func_arg(clone_func, "this", env_type)
+    bind_func_arg_decls(clone_func) !>
+
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = clone_func
+    clone_func.body_scope = body_scope
+    clone_func.alloca_scope = body_scope.sub_scope()
+    clone_func.defer_scope = body_scope.sub_scope()
+
+    let ctx = Context.for_func(clone_func)
+    let this_arg = clone_func.args.get(0) ! at.bug("Closure clone is missing this")
+    let this_v = vgen_decl(this_arg.decl)
+
+    let idf = valk_idf(b, "core", "clone_value_impl") !>
+    let clone_base = idf.func
+    if !isset(clone_base) : at.bug("core:clone_value_impl is not a function")
+    let gnames = clone_base.generic_arg_names
+    if gnames.length == 0 : at.bug("core:clone_value_impl has no generic argument names")
+
+    let fields = Array[Value]{}
+    each class.props as prop {
+        let prop_v = vgen_prop(prop, this_v, ctx)
+        prop_v.exp = at
+        let specialized = clone_base.specialize_generic_args(gnames, Array[Type]{ prop.type }, at) !>
+        let callee = vgen_func(specialized)
+        callee.exp = at
+        let cloned = vgen_call(ctx, callee, Array[Value]{ prop_v }, prop.type, body_scope)
+        cloned.exp = at
+        let pname = prop.name
+        if isset(pname) : cloned.name = pname
+        fields.append(cloned)
+    }
+
+    // 1) Clone each field (GC values land on stack buffers via vgen_class_init).
+    // 2) Allocate the new env and assign fields.
+    let init = vgen_class_init(ctx, class, fields, env_type, at) !>
+
+    let result_decl = Decl.new(clone_func, env_type, false, "result")
+    result_decl.is_mut = true
+    result_decl.exp = at
+    body_scope.add_decl(result_decl)
+    clone_func.all_decls.append(result_decl)
+    let result_v = vgen_decl(result_decl)
+    body_scope.append_value(vgen_assign(result_v, init, ASSIGN_OP.set, b, at))
+
+    // 3) Copy the leading `$clone` header word from the source env (this).
+    if header > 0 {
+        let from_ptr = vgen_cast(this_v, ptr_t)
+        let to_ptr = vgen_cast(result_v, ptr_t)
+        let len = vgen_int(header.to(int), type_from_core(b, "uint") !>)
+        body_scope.append_value(vgen_memcpy(Array[Value]{ from_ptr, to_ptr, len }, b, at))
+    }
+
+    body_scope.append_value(vgen_return(result_v, b, at))
+    body_scope.did_return = true
+
+    owner.unit.functions.append(clone_func)
+    func_finish_ast(clone_func) !>
+    if !isset(owner.ns.build.options.lsp) : generate_func_ir(clone_func) !>
+    return clone_func
+}
+
+// Runtime helper: env is the second word of a function value.
+//   if env == null: return null
+//   else: call the `$clone` routine stored in the env header
+fn ensure_fn_env_clone_caller(b: Build, host: Func) Func !Error {
+    let cached = b.cache.fn_env_clone_caller
+    if isset(cached) : return cached
+
+    let unit = host.unit
+    let at = host.exp
+    let ptr_t = type_ptr(b)
+    let arg_scope = Scope.new(host.ns.scope)
+    let helper = Func {
+        unit: unit
+        ns: host.ns
+        name: "<fn.env_clone>"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: ptr_t
+    }
+    arg_scope.func = helper
+    append_func_arg(helper, "env", ptr_t)
+    bind_func_arg_decls(helper) !>
+
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = helper
+    helper.body_scope = body_scope
+    helper.alloca_scope = body_scope.sub_scope()
+    helper.defer_scope = body_scope.sub_scope()
+
+    let ctx = Context.for_func(helper)
+    let env_arg = helper.args.get(0) ! at.bug("fn env clone missing env")
+    let env_v = vgen_decl(env_arg.decl)
+
+    // if env == null: return null
+    let is_null = vgen_op(env_v, vgen_null(ptr_t), VALUE_OP.eq, type_bool(b))
+    is_null.exp = at
+    let then_ret = vgen_return(vgen_null(ptr_t), b, at)
+    // else: load header clone fn and call it
+    let clone_slot = vgen_ptrv(env_v, vgen_int(0, type_int(b)), ptr_t, at)
+    let fnptr_t = Type {
+        type: TYPE.fnptr
+        build: b
+        sub_types: Array[Type]{ ptr_t }
+        sub_type: ptr_t
+    }
+    let clone_fn = vgen_cast(clone_slot, fnptr_t)
+    clone_fn.exp = at
+    let call = vgen_call(ctx, clone_fn, Array[Value]{ env_v }, ptr_t, body_scope)
+    call.exp = at
+    let else_ret = vgen_return(call, b, at)
+    let else_block = vgen_block(Array[Value]{ else_ret }, b, at)
+    body_scope.append_value(vgen_if(is_null, Array[Value]{ then_ret }, else_block, b, at))
+    body_scope.did_return = true
+
+    unit.functions.append(helper)
+    func_finish_ast(helper) !>
+    if !isset(b.options.lsp) : generate_func_ir(helper) !>
+    b.cache.fn_env_clone_caller = helper
+    return helper
+}
+
+// `$clone` / `.clone()` of a function value as pure Values:
+//   code = f.code
+//   env  = f.env
+//   return { code, clone_env(env) }
+fn value_fn_clone(f: Value, ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let b = ctx.build
+    let ptr_t = type_ptr(b)
+    let host = ctx.get_func() ! exp.bug("$clone of a function requires an enclosing function")
+    let helper = ensure_fn_env_clone_caller(b, host) !>
+
+    let code = Value {
+        type: VAL.fn_code
+        value1: f
+        rett: ptr_t
+        exp: exp
+    }
+    let env = Value {
+        type: VAL.fn_env
+        value1: f
+        rett: ptr_t
+        exp: exp
+    }
+    let callee = vgen_func(helper)
+    callee.exp = exp
+    let new_env = vgen_call(ctx, callee, Array[Value]{ env }, ptr_t, scope)
+    new_env.exp = exp
+    return Value {
+        type: VAL.fn_pair
+        value1: code
+        value2: new_env
+        rett: f.rett
+        exp: exp
+    }
+}

@@ -18,6 +18,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn clone_value(value: $T) T
+// Prefer language token `$clone(value)` — clone_value is the same operation.
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
