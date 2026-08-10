@@ -191,6 +191,24 @@ if ! grep -q '^define dso_local i64 @".*__export_helper__' "$export_ir" \
     exit 1
 fi
 
+echo "> Reuse one allocator pool for local and shared objects"
+
+pool_ir="$workdir/shared-pool.ll"
+out=$("$VALK" build "$DIR/shared-pool.valk" --ir --no-warn -o "$pool_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build shared-pool IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+pool_globals=$(grep -c '^@".*__ALC_.*__SharedPoolValue__' "$pool_ir")
+pool_loads=$(grep -c '= load ptr, ptr @".*__ALC_.*__SharedPoolValue__' "$pool_ir")
+if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
+    echo "# Expected local and shared SharedPoolValue allocations to use one pool"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 4"
+echo "# Test count: 5"
 echo ""

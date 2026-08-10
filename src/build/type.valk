@@ -48,6 +48,7 @@ class UnionLayout {
 class Type {
     type: TYPE
     build: Build
+    shared: bool (false)
     // Linked class when type is a class/struct/integer/float/boolean/pointer/mode
     class: ?Class (null)
     // Linked enum when this Type is an enum (or item type tagged as enum)
@@ -91,6 +92,52 @@ class Type {
     cache_pointer: ?Type (null)
     cache_ref: ?Type (null)
     cache_inline: ?Type (null)
+    cache_shared: ?Type (null)
+
+    fn shared_type() Type {
+        if this.is_nullable_type() {
+            return this.get_non_nullable().shared_type().nullable()
+        }
+        if this.shared : return this
+        if !this.is_gc_type() && this.type != TYPE.fn : return this
+        let cached = this.cache_shared
+        if isset(cached) : return cached
+        let result = Type {
+            type: this.type
+            build: this.build
+            shared: true
+            class: this.class
+            enum: this.enum
+            error_type: this.error_type
+            error_is_instance: this.error_is_instance
+            sub_type: this.sub_type
+            sub_types: this.sub_types
+            array_size: this.array_size
+            custom_name: this.custom_name
+            is_slice_ptr: this.is_slice_ptr
+        }
+        this.cache_shared = result
+        return result
+    }
+
+    fn shared_storage_type() Type {
+        if this.type == TYPE.multi {
+            let types = Array[Type]{}
+            let sub_types = this.sub_types
+            if isset(sub_types) {
+                each sub_types as type : types.append(type.shared_storage_type())
+            }
+            return type_multi(this.build, types, true)
+        }
+        let string_class = type_string(this.build).get_class_or_null()
+        let class = this.get_non_nullable().get_class_or_null()
+        let base = class
+        while isset(base) && base.kind == CLASS_KIND.mode {
+            base = base.mode_for_class
+        }
+        if isset(string_class) && base == string_class : return this
+        return this.shared_type()
+    }
 
     // Target pointer size in bytes
     fn ptr_size() u32 {
@@ -352,6 +399,15 @@ class Type {
             return largest
         }
         return this.ir_alignment() !>
+    }
+
+    // Nullable values that cannot encode absence in the value itself get an
+    // explicit presence flag: `{ i1, [n x u8], <value> }`.
+    fn is_tagged_nullable() bool {
+        if !this.is_nullable_type() : return false
+        let sub = this.sub_type
+        if !isset(sub) : return false
+        return !sub.is_pointer() && sub.type != TYPE.fn
     }
 
     fn is_pointer() bool {
@@ -657,6 +713,7 @@ class Type {
     }
 
     fn is_same_type(other: Type) bool {
+        if this.shared != other.shared : return false
         let ca = this.compat_class()
         let cb = other.compat_class()
         if isset(ca) || isset(cb) : return isset(ca) && isset(cb) && ca == cb
@@ -804,6 +861,8 @@ class Type {
         }
         if typ.is_nullable_type() : return false
 
+        if base.shared != typ.shared : return false
+
         if base.type == TYPE.union {
             if typ.type == TYPE.union : return base.union_accepts_union(typ)
             return isset(base.union_member_index(typ) !? null)
@@ -854,6 +913,7 @@ class Type {
     }
 
     fn compute_compat_display_name() String {
+        let prefix = this.shared ? "shared " : ""
         // Class-backed types: always prefer pretty name (`Array[String]`, not mangled id)
         let c = this.class
         if isset(c) {
@@ -864,10 +924,10 @@ class Type {
             let sub = this.sub_type
             if isset(sub) {
                 let n = this.array_size
-                if n > 0 : return c.pretty_name() + "[" + sub.compat_display_name() + " x " + n + "]"
-                return c.pretty_name() + "[" + sub.compat_display_name() + "]"
+                if n > 0 : return prefix + c.pretty_name() + "[" + sub.compat_display_name() + " x " + n + "]"
+                return prefix + c.pretty_name() + "[" + sub.compat_display_name() + "]"
             }
-            return c.pretty_name()
+            return prefix + c.pretty_name()
         }
         if this.custom_name.length > 0 : return this.custom_name
         if this.type == TYPE.void : return "void"
@@ -940,7 +1000,7 @@ class Type {
                     ? rett.compat_display_name()
                     : "(" + rett.compat_display_name() + ")"
             }
-            return name + "(" + parts.join(", ") + ")" + rett_name
+            return prefix + name + "(" + parts.join(", ") + ")" + rett_name
         }
         if this.type == TYPE.co {
             let rett = this.sub_type
@@ -950,9 +1010,28 @@ class Type {
     }
 
     fn has_method(name: String) bool {
+        // Non-null function values expose `.clone()` via the env `$clone` header.
+        // Nullable `?fn` is handled by `$clone` / clone_value's null check.
+        if name == "clone" && this.type == TYPE.fn : return true
         let class = this.get_non_nullable().get_class_or_null()
         if !isset(class) : return false
         return isset(class.get_func(name))
+    }
+
+    // True if a structural copy of this type would share a raw pointer field.
+    // Used by clone_value to fall back to a shallow copy instead of erroring.
+    fn has_raw_pointer_props() bool {
+        let class = this.get_non_nullable().get_class_or_null()
+        if !isset(class) : return false
+        if class.kind != CLASS_KIND.struct && class.kind != CLASS_KIND.class : return false
+        each class.props as prop {
+            if prop.type.is_raw_pointer() : return true
+            // Inline aggregates embed their fields in this object.
+            if prop.type.get_non_nullable().type == TYPE.inline && prop.type.has_raw_pointer_props() {
+                return true
+            }
+        }
+        return false
     }
 
     // True if a value of this type can convert (via `compat` or a `$to` hook) to `other`.
@@ -1321,6 +1400,30 @@ fn type_bool(b: Build) Type {
     if isset(t) : return t
     return type_prim_bool(b)
 }
+
+// Union tags are a fixed 64-bit field, whatever the target's pointer size is.
+fn type_i64(b: Build) Type {
+    let t = type_from_core_or_null(b, "i64")
+    if isset(t) : return t
+    return type_prim_int(b)
+}
+
+// Raw `[n x u8]` storage: the untyped payload slot of a union and the padding
+// between a nullable's presence flag and its value.
+fn type_byte_array(b: Build, size: u32) Type {
+    let key = size.to_str()
+    let cached = b.cache.byte_array_types.get(key) !? null
+    if isset(cached) : return cached
+    let sub = type_from_core_or_null(b, "u8") ?? type_prim_int(b)
+    let t = Type {
+        type: TYPE.array
+        build: b
+        sub_type: sub
+        array_size: size
+    }
+    b.cache.byte_array_types.set(key, t)
+    return t
+}
 fn type_string(b: Build) Type {
     let t = type_from_core_or_null(b, "String")
     if isset(t) : return t
@@ -1427,6 +1530,14 @@ fn type_from_exp(exp: Exp, scope: Scope, suggested_type: ?Type (null)) Type !Err
 
     if kind == TYPE_KIND.nullable {
         return type_from_inner_exp(exp, scope, "Missing inner type for '?'") !>.nullable()
+    }
+
+    if kind == TYPE_KIND.shared {
+        let inner = type_from_inner_exp(exp, scope, "Missing inner type for 'shared'") !>
+        if inner.is_nullable_type() {
+            return inner.get_non_nullable().shared_type().nullable()
+        }
+        return inner.shared_type()
     }
 
     if kind == TYPE_KIND.ptr {

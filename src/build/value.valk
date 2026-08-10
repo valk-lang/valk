@@ -37,7 +37,6 @@ enum VAL : u8 {
     // fallible producer. IR extracts its success payload without re-emitting it.
     error_success
     cast     // value.@cast(Type); value1 = on, rett = target Type
-    paren    // grouping; value1 = inner (usually folded away)
     multi    // argument list only (values array); not a runtime value alone
     // Class / struct construction: Type { prop: value, ... }
     // value1 = type side; values = field inits (each Value.name = prop name)
@@ -66,20 +65,8 @@ enum VAL : u8 {
     isset
     // Type-only wrap (nullable strip/add); value1=inner
     wrap
-    // Tagged-union operations. union_wrap stores value1 under tag int_val;
-    // union_is tests it; union_extract reads the known active alternative.
-    union_wrap
-    union_is
-    union_extract
-    // GC-aware operations on by-value storage with embedded managed fields.
-    property_get
-    property_init
-    property_update
-    property_clear
-    property_trace
-    // Concrete class widened to an interface adapter box. value1 is the object,
-    // values are object + raw method entry points, class_ref is the adapter layout.
-    interface_wrap
+    // Read-only shared view; value1=ordinary class value, published to shared GC
+    shared_view
     // Atomic read/modify/write primitives. atomic_op stores VALUE_OP in `.op`.
     atomic_op
     atomic_store
@@ -199,9 +186,11 @@ class Value {
     }
 
     // Multi-return / multi-value unpack: VAL.multi → values array; vscope/phi via value1.
+    // Only a group whose result really is a multi type unpacks; the same value
+    // kind also assembles single aggregates (fn pairs, …) from their fields.
     fn unroll() Array[Value] {
         let vals = this.values
-        if this.type == VAL.multi && isset(vals) : return vals
+        if this.type == VAL.multi && isset(vals) && this.rett.type == TYPE.multi : return vals
         // A phi of multi values unrolls through its first arm.
         if this.type == VAL.phi && isset(vals) {
             let first = vals.get(0) !? null
@@ -343,7 +332,7 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         return v
     }
     if kind == VALUE_KIND.undefined {
-        let v = vgen_undefined(b)
+        let v = vgen_undefined(type_void(b))
         v.exp = exp
         return v
     }
@@ -355,6 +344,9 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     if kind == VALUE_KIND.memcpy {
         return value_from_memcpy_exp(exp, scope, ctx) !>
+    }
+    if kind == VALUE_KIND.clone {
+        return value_from_clone_exp(exp, scope, ctx) !>
     }
     if kind == VALUE_KIND.string {
         return value_from_string_exp(exp, scope, ctx) !>
@@ -405,6 +397,7 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 exp.error("The '&' operator can only be used on local/global variables")
             }
             act_check_assign(operand, exp) !>
+            value_check_shared_address(operand, exp) !>
             if isset(ref) && ref.type == VAL.decl {
                 let decl = ref.decl
                 if isset(decl) : decl.make_stable()
@@ -778,8 +771,9 @@ fn value_from_error_is_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 // Closures and captures
 ////////////////////////////
 
-// Build the typed GC data object used by a closure. The function pointer lives
-// in the inline fn value; this object contains bindings only.
+// Build the typed GC data object used by a closure. Captures are normal props.
+// A fixed header (not a Prop) holds the `$clone` function pointer so the env
+// stays a pure data layout for GC marking.
 fn func_prepare_closure(f: Func) !Error {
     if isset(f.capture_class) : return
 
@@ -813,8 +807,11 @@ fn func_prepare_closure(f: Func) !Error {
             exp: f.exp
             type: receiver_arg.type
         })
+        each f.capture_args as capt {
+            capt.capture_index = capt.capture_index + 1
+        }
     }
-    each f.capture_decls as decl, i {
+    each f.capture_args as decl, i {
         class.add_prop(Prop {
             class: class
             name: "capture_" + i
@@ -824,9 +821,20 @@ fn func_prepare_closure(f: Func) !Error {
         })
     }
     let capture_size = class.compute_body_size() !>
+    // Reserve a leading pointer for the env's `$clone` routine. Shift props so
+    // GC and body loads still use prop.offset against the object pointer.
+    let header: u32 = f.is_shared ? 0 : f.ns.build.options.target.ptr_size.to(u32)
     f.capture_class = class
     if capture_size > 0 {
+        if header > 0 {
+            each class.props as prop {
+                prop.offset = prop.offset + header
+            }
+        }
+        class.size = capture_size + header
+        f.capture_header_size = header
         f.capture_allocator = allocator_for_class(Context.for_func(f), class, f.exp) !>
+        if !f.is_shared : ensure_closure_clone_func(f) !>
     }
 }
 
@@ -869,9 +877,17 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
         }
     }
 
-    let captured = Decl.new(func, source.type, true, name)
+    let captured_type = source.type
+    if func.is_shared && (source.type.has_gc_refs() || source.type.get_non_nullable().type == TYPE.fn)
+        && !source.type.get_non_nullable().shared
+    {
+        if source.type.is_gc_type() : captured_type = source.type.shared_storage_type()
+        else : at.error("A shared function cannot capture non-shared data of type '" + source.type.compat_display_name() + "'")
+    }
+    let captured = Decl.new(func, captured_type, true, name)
     captured.exp = source.exp
     captured.is_bind = true
+    captured.is_shared_capture = func.is_shared
     captured.capture_index = func.capture_args.length
     func.capture_free = false
     func.capture_decls.append(source)
@@ -894,6 +910,8 @@ fn value_from_func_lit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let args_exp = exp.get(FUNC_LIT_EXP.args)
     if !isset(args_exp) : exp.bug("Function literal is missing an argument list")
 
+    let suggested = ctx.suggested_type
+    let shared = isset(suggested) && suggested.get_non_nullable().type == TYPE.fn && suggested.get_non_nullable().shared
     let f = Func {
         unit: enclosing.unit
         ns: enclosing.ns
@@ -906,6 +924,7 @@ fn value_from_func_lit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         error: exp.get(FUNC_LIT_EXP.error)
         body: exp.get(FUNC_LIT_EXP.body)
         is_literal: true
+        is_shared: shared
     }
     f.arg_scope.func = f
     // Function literals are real functions owned by the containing source
@@ -923,6 +942,7 @@ fn value_from_func_lit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let fn_type = Type {
         type: TYPE.fn
         build: b
+        shared: shared
         sub_type: sub_type
         sub_types: arg_types
         error_type: f.error_type
@@ -1021,6 +1041,29 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     return vgen_ptrv(on, offset, elem, exp)
 }
 
+// `$clone(value)` — deep-copy intrinsic. Function values expand to Values via
+// value_fn_clone; everything else calls core:clone_value_impl.
+fn value_from_clone_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = exp.get(VALUE_EXP.left)
+    if !isset(arg_exp) : exp.bug("$clone is missing its argument")
+    let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    if arg.rett.get_non_nullable().shared : return arg
+    if arg.rett.get_non_nullable().type == TYPE.fn {
+        return value_fn_clone(arg, ctx, scope, exp) !>
+    }
+    let idf = valk_idf(ctx.build, "core", "clone_value_impl") !>
+    let base = idf.func
+    if !isset(base) : exp.bug("core:clone_value_impl is not a function")
+    let names = base.generic_arg_names
+    if names.length == 0 : exp.bug("core:clone_value_impl has no generic argument names")
+    let specialized = base.specialize_generic_args(names, Array[Type]{ arg.rett }, exp) !>
+    let callee = vgen_func(specialized)
+    callee.exp = exp
+    let call = vgen_call(ctx, callee, Array[Value]{ arg }, specialized.get_rett(), scope)
+    call.exp = exp
+    return call
+}
+
 // @memcpy(from, to, length) — both addresses are raw-pointer compatible and
 // length uses core:uint, matching the LLVM intrinsic and legacy compiler.
 fn value_from_memcpy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -1056,6 +1099,7 @@ fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         exp.error("Cannot use '@ref on this value. It can only be used on assignable values, like variable names or object properties.")
     }
     act_check_assign(on, exp) !>
+    value_check_shared_address(on, exp) !>
 
     // A raw pointer to a local may outlive a coroutine suspension (or be
     // passed to another thread). Keep that local in the stable stack storage
@@ -1147,6 +1191,14 @@ fn resolve_offset_assign_func(class: Class) ?Func {
     return null
 }
 
+fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
+    if !on.rett.get_non_nullable().shared || func.is_static || func.shared_unsafe : return func
+    if func.mutates_receiver {
+        at.error("Cannot call mutating method '" + func.name + "' on shared data of type '" + on.rett.compat_display_name() + "'")
+    }
+    return get_func_shared_receiver(func) !>
+}
+
 // Same as value_from_offset_exp but without the implicit default-value fallback —
 // used both as the main entry point (wrapped there) and directly by value_from_call_raw
 // when an explicit error handler already wraps the access.
@@ -1211,6 +1263,7 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         if on.rett.is_nullable_type() {
             exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
         }
+        range_func = func_for_receiver(range_func, on, exp) !>
 
         // `$range` signatures are validated when their flag is registered, so
         // both arguments always receive the canonical uint suggestion/conversion.
@@ -1274,6 +1327,7 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
                     exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
                 }
             }
+            get_func = func_for_receiver(get_func, on, exp) !>
             let arg_skip: uint = 0
             if isset(get_func.class) && !get_func.is_static : arg_skip = 1
             let index_arg = get_func.args.get(arg_skip) ! exp.bug("'$offset' function is missing its index parameter")
@@ -1322,6 +1376,7 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     if on.rett.is_nullable_type() {
         left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
     }
+    set_func = func_for_receiver(set_func, on, left_exp) !>
 
     let index_exp = access
     let index = value_from_exp(index_exp, scope, ctx.without_suggested_type()) !>
@@ -1557,6 +1612,10 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         if !isset(class) {
             exp.error("Class init requires a class or struct type before '{'")
         }
+        if left_val.type == VAL.type {
+            let explicit = left_val.of_type
+            if isset(explicit) : rett = explicit
+        }
     } else {
         // Bare `{ fields }` — need a suggested type (assign / prop field / arg / return)
         let suggested_type = ctx.suggested_type
@@ -1628,7 +1687,8 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         if field_exps.length == 0 && class.kind == CLASS_KIND.class {
             let new_func = class.get_func("new")
             let current_func = ctx.func
-            if isset(new_func) && new_func.is_static && (!isset(current_func) || current_func != new_func) {
+            let in_factory = isset(current_func) && current_func == new_func
+            if isset(new_func) && new_func.is_static && !in_factory {
                 return class_empty_construct(class, rett, scope, ctx, exp) !>
             }
         }
@@ -1659,11 +1719,15 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             // Setting a field is a store, so `~` read-only rejects it too
             if isset(prop) : act_check(fexp, prop.act, prop.exp, true, "property") !>
             let field_ctx = ctx.without_suggested_type()
-            if isset(prop) : field_ctx = ctx.with_suggested_type(prop.type)
-            let fv = value_from_exp(vexp, field_scope, field_ctx) !>
+            let field_type: ?Type = null
             if isset(prop) {
-                fv = value_try_convert(fv, field_scope, ctx, prop.type)
-                prop.type.compat_check(fv.rett, vexp) !>
+                field_type = prop.type
+                field_ctx = ctx.with_suggested_type(field_type)
+            }
+            let fv = value_from_exp(vexp, field_scope, field_ctx) !>
+            if isset(field_type) {
+                fv = value_try_convert(fv, field_scope, ctx, field_type)
+                field_type.compat_check(fv.rett, vexp) !>
             }
             fv.name = fname
             fvals.append(fv)
@@ -1687,26 +1751,27 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             }
             if already_set : continue
             let default_body = prop.default
+            let field_type = prop.type
             let fv: ?Value = null
             let default_at = prop.exp
             if isset(default_body) {
                 let default_exp = parse_body_as_value_exp(default_body) !>
                 let default_scope = prop.class.scope.sub_scope()
                 default_scope.func = scope.func
-                fv = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(prop.type)) !>
+                fv = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(field_type)) !>
                 default_at = default_exp
             } else {
                 if prop.type.is_nullable_type() : continue
                 let prop_class = prop.type.get_class_or_null()
                 if !isset(prop_class) : continue
                 if !isset(prop_class.default_hook) : continue
-                fv = value_generate_default(prop.type, scope, ctx, prop.exp) !>
+                fv = value_generate_default(field_type, scope, ctx, prop.exp) !>
             }
             let field_value = fv ?! prop.exp.bug("Property default did not produce a value")
             // `@undefined` deliberately contributes no initialization store.
             if field_value.type == VAL.undefined : continue
-            field_value = value_try_convert(field_value, scope, ctx, prop.type)
-            prop.type.compat_check(field_value.rett, default_at) !>
+            field_value = value_try_convert(field_value, scope, ctx, field_type)
+            field_type.compat_check(field_value.rett, default_at) !>
             field_value.name = prop_name
             fvals.append(field_value)
         }
@@ -1936,7 +2001,6 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let cond: ?Value = null
         let bound_name: ?String = null
         let bound_type: ?Type = null
-        let bound_tag: ?uint = null
         let is_default = t == TOK.word && p.word_is("default")
         if is_default {
             p.tok(true, true) !>
@@ -1989,8 +2053,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 }
                 covered_union_members.append(member)
                 bound_type = member
-                bound_tag = tag
-                cond = vgen_union_is(on, member, tag, item_exp)
+                cond = vgen_union_is(on, tag, item_exp)
 
                 let next = p.tok(true, true, false) !>
                 if next == TOK.word && p.word_is("as") {
@@ -2012,13 +2075,12 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let case_prefix = Array[Value]{}
         if isset(bound_name) && bound_name != "_" {
             let member = bound_type ?! exp.bug("Union match binding is missing its type")
-            let tag = bound_tag ?! exp.bug("Union match binding is missing its tag")
             if case_scope.has_local(bound_name) : exp.error("Name already used: " + bound_name)
             let decl = Decl.new(ctx.get_func() !>, member, false, bound_name)
             decl.exp = exp
             case_scope.add_decl(decl)
             case_scope.set_idf(bound_name, Idf.for_decl(decl))
-            let extracted = vgen_union_extract(on, member, tag, ctx, exp)
+            let extracted = vgen_union_extract(on, member, ctx, exp) !>
             case_prefix.append(vgen_assign(vgen_decl(decl), extracted, ASSIGN_OP.set, ctx.build, exp))
         }
         let casev = Value {
@@ -2710,6 +2772,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         // Methods / getters (modes fall through to `mode_for_class`)
         let f = on_class.get_func(name)
         if isset(f) {
+            f = func_for_receiver(f, on_nn, exp) !>
             act_check(exp, f.act, f.exp, false, "function") !>
             lsp_goto(exp, f.exp) !>
             if f.is_getter {
@@ -2737,6 +2800,9 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             act_check(exp, prop.act, prop.exp, false, "property") !>
             lsp_goto(exp, prop.exp) !>
             let v = vgen_prop(prop, on_nn, ctx)
+            if on_nn.rett.get_non_nullable().shared {
+                v.rett = prop.type.shared_storage_type()
+            }
             v.exp = exp
             return v
         }
@@ -2755,6 +2821,15 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     // Real methods/props named `to` take precedence (checked above).
     if name == "to" || name == "$to" {
         let v = vgen_dot(on_nn, name, type_void(b))
+        v.exp = exp
+        return v
+    }
+
+    // Deep-copy of a closure and its capture data (same as `$clone(fn)`).
+    // Returned as a bound method-style member so `f.clone()` is a call that
+    // value_from_type_method expands into value_fn_clone.
+    if name == "clone" && on_nn.rett.get_non_nullable().type == TYPE.fn {
+        let v = vgen_dot(on_nn, name, on_nn.rett)
         v.exp = exp
         return v
     }
@@ -3186,6 +3261,7 @@ fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
     if name == "$has_gc_refs" : return vgen_bool(t.has_gc_refs(), type_bool(b))
     if name == "$is_pointer" : return vgen_bool(t.is_pointer(), type_bool(b))
     if name == "$is_raw_pointer" : return vgen_bool(t.is_raw_pointer(), type_bool(b))
+    if name == "$has_raw_pointer_props" : return vgen_bool(t.has_raw_pointer_props(), type_bool(b))
     if name == "$has_vtable" : return vgen_bool(t.has_vtable(), type_bool(b))
 
     // Method-style meta: keep as `.name` so `.(args)` folds via value_type_method

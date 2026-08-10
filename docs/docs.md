@@ -1340,6 +1340,6 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-Valk does not currently detect data races. `Array` and `Map` protect their internal mutations, and integer updates can use `atomic()`. Strings are immutable. Protect other shared mutable state with a `Mutex`.
+`shared T` is a read-only view used to pass data across threads. Data-race-unsafe properties cannot be changed through that view, while integer properties use atomic access. Converting `T` to `shared T` publishes its object graph to the shared GC; existing normal aliases remain on the single mutating thread. A shared view cannot be converted back to `T`.
 
 You can use `core:race_lock()` and `core:race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).

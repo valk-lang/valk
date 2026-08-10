@@ -86,6 +86,7 @@ class Func {
     has_globals_loop: bool (false)
     auto_to: bool (false)     // $auto (also registers as $to)
     no_buffers: bool (false)  // @nobuffers
+    shared_unsafe: bool (false)
     skip_ast: bool (false)    // generic-arg bases (and similar) skip body parse until specialized
     // `test "name" { ... }` — receives an implicit TestResults argument;
     // only built when options.is_test
@@ -100,6 +101,9 @@ class Func {
     group: ?Group (null)
     is_static: bool (false)
     is_getter: bool (false) // `get name: Type { ... }`
+    mutates_receiver: bool (false)
+    is_shared_receiver: bool (false)
+    shared_receiver_func: ?Func (null)
     // Signature-only interface method and its stable slot in the interface adapter.
     is_interface: bool (false)
     interface_slot: uint (0)
@@ -129,6 +133,8 @@ class Func {
     // True for anonymous `fn(...) {...}` value literals (VALUE_KIND.func_lit) — only these
     // can capture outer locals; top-level fns/methods are lexically closed and never do.
     is_literal: bool (false)
+    // A shared literal publishes one capture environment for concurrent readers.
+    is_shared: bool (false)
     // Cleared as soon as identifier resolution captures an outer declaration.
     capture_free: bool (true)
     // Outer declarations copied into a closure environment, paired by index
@@ -138,8 +144,15 @@ class Func {
     // GC-allocated binding data for a closure, prepared after body resolution.
     capture_class: ?Class (null)
     capture_allocator: ?Allocator (null)
+    // When non-zero, the capture object reserves this many leading bytes for the
+    // `$clone` protocol (clone fn pointer) before property storage. Not a Prop.
+    capture_header_size: u32 (0)
+    // Value-AST clone helper for this literal's capture env (generated on demand).
+    capture_clone_func: ?Func (null)
     // Textual LLVM generated immediately after func_finish_ast.
     ir_name: String ("")
+    // `@"ir_name"`, the operand form (ir_func_address)
+    ir_address: String ("")
     ir_code: String ("")
     // ---- Reachability (reachable.valk) ----
     // What this function's generated IR refers to. Filled while that IR is
@@ -239,6 +252,7 @@ fn parse_func_types(func: Func) !Error {
     let owner = func.class
     if isset(owner) && !func.is_static {
         let this_type = owner.get_type() !>
+        if func.is_shared_receiver : this_type = this_type.shared_type()
         append_func_arg(func, "this", this_type)
     }
 
@@ -251,6 +265,20 @@ fn parse_func_types(func: Func) !Error {
     }
     if func.is_export && func.has_generic_args {
         func.exp.error("Exported functions cannot declare generic parameters")
+    }
+
+    // `$T` argument generics are collected while parsing args. Bind them as
+    // type identifiers so the return type / error type can name them
+    // (`fn clone_value(value: $T) T`).
+    if func.has_generic_args && !func.generic_args_defined {
+        each func.generic_arg_names as gname {
+            let t = Type {
+                type: TYPE.any
+                build: func.ns.build
+                custom_name: gname
+            }
+            func.arg_scope.set_idf(gname, Idf.for_type(t))
+        }
     }
 
     // The application's `main` receives the command-line arguments.  This is
@@ -324,6 +352,91 @@ fn parse_func_types(func: Func) !Error {
     bind_func_arg_decls(func) !>
 }
 
+fn get_func_shared_receiver(base: Func) Func !Error {
+    if base.is_shared_receiver : return base
+    let cached = base.shared_receiver_func
+    if isset(cached) : return cached
+    let func = get_func_shared_variant(base) !>
+    base.shared_receiver_func = func
+    return func
+}
+
+fn get_func_shared_variant(base: Func) Func !Error {
+    let scope = Scope.new(base.arg_scope.parent)
+    let generics: ?Exp = null
+    let args_exp: ?Exp = null
+    let rett_exp: ?Exp = null
+    let error: ?Exp = null
+    let body: ?Exp = null
+    let source = base.generics
+    if isset(source) : generics = source.copy_tree()
+    source = base.args_exp
+    if isset(source) : args_exp = source.copy_tree()
+    source = base.rett_exp
+    if isset(source) : rett_exp = source.copy_tree()
+    source = base.error
+    if isset(source) : error = source.copy_tree()
+    source = base.body
+    if isset(source) : body = source.copy_tree()
+    let func = Func {
+        unit: base.unit
+        ns: base.ns
+        name: base.name + "__shared"
+        act: base.act
+        exp: base.exp
+        arg_scope: scope
+        generics: generics
+        args_exp: args_exp
+        rett_exp: rett_exp
+        error: error
+        body: body
+        generic_names: base.generic_names
+        generic_types: base.generic_types
+        generic_from: base.generic_from
+        generic_args_defined: base.generic_args_defined
+        generic_type_map: base.generic_type_map
+        generic_arg_names: base.generic_arg_names
+        is_extern: base.is_extern
+        is_export: base.is_export
+        is_entrance: base.is_entrance
+        must_exit: base.must_exit
+        will_exit: base.will_exit
+        must_throw: base.must_throw
+        is_hot: base.is_hot
+        is_inline: base.is_inline
+        is_global: base.is_global
+        info_calls_unknown_code: base.info_calls_unknown_code
+        auto_to: base.auto_to
+        no_buffers: base.no_buffers
+        shared_unsafe: base.shared_unsafe
+        class: base.class
+        group: base.group
+        is_static: base.is_static
+        is_getter: base.is_getter
+        mutates_receiver: base.mutates_receiver
+        is_interface: base.is_interface
+        interface_slot: base.interface_slot
+        is_shared_receiver: true
+    }
+    let generic_map = base.generic_type_map
+    if isset(generic_map) {
+        each generic_map as type, name : scope.set_idf(name, Idf.for_type(type))
+    }
+    let owner = base.class
+    if isset(owner) && !owner.is_generic_base {
+        scope.set_idf("SELF", Idf.for_class(owner))
+    }
+
+    parse_func_types(func) !>
+    if (isset(owner) && owner.offset == base) || base.name == "_next" {
+        let rett = func.rett
+        if isset(rett) : func.rett = rett.shared_storage_type()
+    }
+    func.unit.functions.append(func)
+    if !func.skip_ast : func.ns.build.pipeline.parse_func_asts.append(func)
+    return func
+}
+
 // Look up EXP.id error type and store on Func.
 fn resolve_func_error_type(func: Func) !Error {
     let err_exp = func.error
@@ -378,6 +491,7 @@ fn apply_func_flags(func: Func) !Error {
             owner.offset = func
         } else if flag == "$offset_assign" {
             if !isset(owner) : at.error("'$offset_assign' is only valid on class methods")
+            func.mutates_receiver = true
             if isset(owner.offset_assign) {
                 at.error("Multiple functions marked with $offset_assign for the same type")
             }
@@ -391,12 +505,14 @@ fn apply_func_flags(func: Func) !Error {
             owner.range_hook = func
         } else if flag == "$append" {
             if !isset(owner) : at.error("'$append' is only valid on class methods")
+            func.mutates_receiver = true
             if isset(owner.append_hook) {
                 at.error("Multiple functions marked with $append for the same type")
             }
             owner.append_hook = func
         } else if flag == "$set_key" {
             if !isset(owner) : at.error("'$set_key' is only valid on class methods")
+            func.mutates_receiver = true
             if isset(owner.set_key_hook) {
                 at.error("Multiple functions marked with $set_key for the same type")
             }
@@ -439,6 +555,9 @@ fn apply_func_flags(func: Func) !Error {
             owner.add_hooks.append(func)
         } else if flag == "@nobuffers" {
             func.no_buffers = true
+        } else if flag == "@shared_unsafe" {
+            if !isset(owner) || func.is_static : at.error("'@shared_unsafe' is only valid on instance methods")
+            func.shared_unsafe = true
         } else {
             at.error("Unknown function flag: " + flag)
         }
@@ -769,6 +888,7 @@ fn get_func_generic(base: Func, types: Array[Type], generic_arg_names: ?Array[St
         info_calls_unknown_code: base.info_calls_unknown_code
         auto_to: base.auto_to
         no_buffers: base.no_buffers
+        shared_unsafe: base.shared_unsafe
         is_test: base.is_test
         is_sync: base.is_sync
         test_name: base.test_name
@@ -776,6 +896,7 @@ fn get_func_generic(base: Func, types: Array[Type], generic_arg_names: ?Array[St
         group: base.group
         is_static: base.is_static
         is_getter: base.is_getter
+        mutates_receiver: base.mutates_receiver
     }
 
     // Bind type params: [T, U] names then `$G` names

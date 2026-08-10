@@ -17,7 +17,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'core'
 
 ```js
-+ fn clone_value[T](value: T) T
++ fn clone_value(value: $T) T
+// Prefer language token `$clone(value)` — clone_value is the same operation.
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
@@ -1003,13 +1004,13 @@ alias pid_t for i32
 
 ```js
 + class Server {
-    + fast_handler: ?fn(Context, ResponseWriter)()
+    + fast_handler: ?shared fn(Context, ResponseWriter)()
     ~ host: String
     ~ port: u16
     + show_info: bool
 
     + fn add_static_dir(path: String) void !LookupError
-    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !HttpError
+    + static fn new(host: String, port: u16, handler: shared fn(Request)(Response)) Server !HttpError
     + fn start(worker_count: i32 (-1)) void
 }
 ```
@@ -1226,7 +1227,7 @@ alias FD for i32
     + static fn client(type: int, host: String, port: u16) Connection !NetError
     + fn close() void
     + static fn close_fd(fd: i32) void
-    + static fn server(type: int, host: String, port: u16) SocketServer !NetError
+    + static fn server(type: int, host: String, port: u16) shared SocketServer !NetError
 }
 ```
 
@@ -1263,7 +1264,7 @@ alias FD for i32
 ## Functions for 'thread'
 
 ```js
-+ fn start(func: fn()()) Thread !InitError
++ fn start(func: shared fn()()) Thread[void] !InitError
 + fn suspend_ms(ms: uint) void
 + fn suspend_ns(ns: uint) void
 + fn task(handler: fn()()) Task !InitError
@@ -1281,8 +1282,10 @@ alias FD for i32
 ```
 
 ```js
-+ class Thread {
-    + static fn start(func: fn()()) Thread !InitError
++ class Thread[T] {
+    ~ result: T
+
+    + static fn start(func: shared fn()(T)) Thread[T] !InitError
     + fn wait() void
 }
 ```
