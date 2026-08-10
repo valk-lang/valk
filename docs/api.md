@@ -230,7 +230,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class Mutex {
     + fn await_unlock() void
     + fn lock() void
-    + static fn new() shared Mutex !InitError
+    + static fn new() Mutex !InitError
     + fn unlock() void
 }
 ```
@@ -1004,13 +1004,13 @@ alias pid_t for i32
 
 ```js
 + class Server {
-    + fast_handler: ?fn(Context, ResponseWriter)()
+    + fast_handler: ?shared fn(Context, ResponseWriter)()
     ~ host: String
     ~ port: u16
     + show_info: bool
 
     + fn add_static_dir(path: String) void !LookupError
-    + static fn new(host: String, port: u16, handler: fn(Request)(Response)) Server !HttpError
+    + static fn new(host: String, port: u16, handler: shared fn(Request)(Response)) Server !HttpError
     + fn start(worker_count: i32 (-1)) void
 }
 ```
@@ -1227,7 +1227,7 @@ alias FD for i32
     + static fn client(type: int, host: String, port: u16) Connection !NetError
     + fn close() void
     + static fn close_fd(fd: i32) void
-    + static fn server(type: int, host: String, port: u16) SocketServer !NetError
+    + static fn server(type: int, host: String, port: u16) shared SocketServer !NetError
 }
 ```
 
