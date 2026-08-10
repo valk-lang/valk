@@ -6,14 +6,12 @@
 ```
 - Release 0.3.1
 + Remove llvm-lib dependency
-- Improve standard library
-- Data race solution
+~ Data race solution (Threads done via shared type, MutexValue not done)
 - Dont allow inline GC types in unions
 - uslice (cstring) / slice (String)
-- shared type
 
 # Next steps
-/
+- Improve standard library
 
 # Other
 
