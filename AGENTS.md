@@ -54,13 +54,22 @@ io uring does not work in a sandbox environment.
 
 ## Shared data
 
-Shared data is protected by the language design to prevent data races.
-The language uses 2 features to achieve this: shared types and mutex unlock scopes
+Valk prevents data races in safe code with two mechanisms: shared types and lock scopes. Raw pointers and extern calls are outside both.
+A value may only cross into another thread if it is a shared type, a mutex, or a copied value type. Anything else is a compile error at the thread boundary.
 
-Shared types `shared T` are prefixed with the word `shared`. It can be used on any type but only has an effect on `class` types (otherwise ignored).
-A shared object its properties are immutable if it contains GC data and integer properties are atomic.
-You cannot convert a value to a shared type. Shared data must always be manually initialized.
-Shared types are not compatible with their non-shared type. Shared objects are allocated with their own allocator and use reference counting to detect freeing.
+## Shared types
 
-We still want to be able to share mutable data. For this we use mutex unlock scopes. The unlocked value is borrowed and cannot be assigned to other stores.
-The mutex unlocks at the end of the scope. `unlock {mutex-store} as {var} { ... }`
+shared T marks a type as shared. It applies to class types; on other types it is accepted and ignored, so generic code can name it.
+After construction, a shared object's properties containing GC data are immutable. Integer properties are read and written atomically. [state floats/bool/ptr]
+Shared types are not compatible with their non-shared counterparts, and no value converts to one — shared data is always constructed directly.
+A shared object's properties may only be shared types; String and other immutable builtins are permitted.
+
+Because their GC-typed properties never change, shared objects cannot form reference cycles.
+They are allocated from their own allocator and freed by reference counting, with no collector pass.
+
+## Lock scopes
+
+Mutable shared data lives behind a mutex, reachable only inside a lock scope: `lock {mutex} as {name} { ... }`
+The mutex is held for the scope and released on every exit. {name} is borrowed:
+it cannot be assigned to another store, returned, captured, referenced with @ref, or passed where it would escape.
+Any GC-typed value derived from it is borrowed in the same way. co and await are not allowed inside the scope.
