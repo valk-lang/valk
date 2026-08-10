@@ -7,6 +7,18 @@ DO NOT MODIFY THIS FILE!
 
 NEVER BOOTSTRAP THE COMPILER! The compiler must always be built by an older version and the compiler code from the repository should never be expected to be able to compile itself!
 
+## Guidelines
+
+- If 2 functions do or almost do the exact same thing, try converting them into 1 function
+- Try avoiding concatenating strings in the IR gen, prefer adding directly to the ByteBuffer
+- Always try to make things memory aligned when possible unless the code specificly tells the compiler for it to be packed
+- Try caching data that's calculated by a function but never or almost never changes
+- Performance is important
+- Try not to generate extra logic in IR gen. Adding logic belongs in the Expr -> Value lowering phase
+- Keep your code short, keep your comments very minimal and only comment when it's very important
+- Place large comment blocks (3 lines) between sections that contain functions that belongs together
+- Avoid using nullable types when possible, prefer throwing LookupErrors when lookup is optional
+
 ## Terms
 
 Gc type: any type that's a pointer than object of a `class` or `slice` type. (interface, coroutine types are also GC types because they are technically class types)
@@ -40,16 +52,15 @@ Global variables are seen as part of the stack
 
 io uring does not work in a sandbox environment.
 
-## Guidelines
+## Shared data
 
-- If 2 functions do or almost do the exact same thing, try converting them into 1 function
-- Try avoiding concatenating strings in the IR gen, prefer adding directly to the ByteBuffer
-- Always try to make things memory aligned when possible unless the code specificly tells the compiler for it to be packed
-- Try caching data that's calculated by a function but never or almost never changes
-- Performance is important
-- Try not to generate extra logic in IR gen. Adding logic belongs in the Expr -> Value lowering phase
-- Keep your code short, keep your comments very minimal and only comment when it's very important
-- Place large comment blocks (3 lines) between sections that contain functions that belongs together
-- Avoid using nullable types when possible, prefer throwing LookupErrors when lookup is optional
+Shared data is protected by the language design to prevent data races.
+The language uses 2 features to achieve this: shared types and mutex unlock scopes
 
+Shared types `shared T` are prefixed with the word `shared`. It can be used on any type but only has an effect on `class` types (otherwise ignored).
+A shared object its properties are immutable if it contains GC data and integer properties are atomic.
+You cannot convert a value to a shared type. Shared data must always be manually initialized.
+Shared types are not compatible with their non-shared type. Shared objects are allocated with their own allocator and use reference counting to detect freeing.
 
+We still want to be able to share mutable data. For this we use mutex unlock scopes. The unlocked value is borrowed and cannot be assigned to other stores.
+The mutex unlocks at the end of the scope. `unlock {mutex-store} as {var} { ... }`
