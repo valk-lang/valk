@@ -9,6 +9,8 @@
 - Improve standard library
 - Data race solution
 - Dont allow inline GC types in unions
+- uslice (cstring) / slice (String)
+- shared type
 
 # Next steps
 /
