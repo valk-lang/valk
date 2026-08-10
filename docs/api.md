@@ -230,7 +230,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class Mutex {
     + fn await_unlock() void
     + fn lock() void
-    + static fn new() Mutex !InitError
+    + static fn new() shared Mutex !InitError
     + fn unlock() void
 }
 ```

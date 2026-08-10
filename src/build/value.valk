@@ -563,6 +563,9 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             if isset(class) {
                 let func = class.get_func(exp.str1)
                 if isset(func) && func.is_static {
+                    if suggested_type.get_non_nullable().shared && exp.str1 == "new" {
+                        func = get_func_shared_factory(func) !>
+                    }
                     let member = vgen_func(func)
                     member.exp = exp
                     return member
@@ -831,7 +834,7 @@ fn func_prepare_closure(f: Func) !Error {
         }
         class.size = capture_size + header
         f.capture_header_size = header
-        f.capture_allocator = allocator_for_class(Context.for_func(f), class, f.exp) !>
+        f.capture_allocator = allocator_for_class(Context.for_func(f), class, f.exp, f.is_shared) !>
         if !f.is_shared : ensure_closure_clone_func(f) !>
     }
 }
@@ -875,7 +878,11 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
         }
     }
 
-    let captured_type = func.is_shared ? source.type.shared_type() : source.type
+    if func.is_shared && (source.type.has_gc_refs() || source.type.get_non_nullable().type == TYPE.fn)
+        && !source.type.get_non_nullable().shared {
+        at.error("A shared function cannot capture non-shared data of type '" + source.type.compat_display_name() + "'")
+    }
+    let captured_type = source.type
     let captured = Decl.new(func, captured_type, true, name)
     captured.exp = source.exp
     captured.is_bind = true
@@ -1549,6 +1556,14 @@ fn append_class_init_item_range(out: ClassInitItems, items: Exp, start: uint, en
     }
 }
 
+fn class_init_field_type(type: Type, owner: Type, ctx: Context) Type {
+    if !owner.get_non_nullable().shared : return type
+    let func = ctx.func
+    if isset(func) && func.shared_unsafe : return type
+
+    return type.shared_storage_type()
+}
+
 fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let body = exp.get(VALUE_EXP.right)
     if !isset(body) : exp.bug("class_init is missing body")
@@ -1668,7 +1683,9 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         if field_exps.length == 0 && class.kind == CLASS_KIND.class {
             let new_func = class.get_func("new")
             let current_func = ctx.func
-            if isset(new_func) && new_func.is_static && (!isset(current_func) || current_func != new_func) {
+            let in_factory = isset(current_func) && (current_func == new_func
+                || (current_func.is_shared_factory && current_func.class == class))
+            if isset(new_func) && new_func.is_static && !in_factory {
                 return class_empty_construct(class, rett, scope, ctx, exp) !>
             }
         }
@@ -1699,11 +1716,15 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             // Setting a field is a store, so `~` read-only rejects it too
             if isset(prop) : act_check(fexp, prop.act, prop.exp, true, "property") !>
             let field_ctx = ctx.without_suggested_type()
-            if isset(prop) : field_ctx = ctx.with_suggested_type(prop.type)
-            let fv = value_from_exp(vexp, field_scope, field_ctx) !>
+            let field_type: ?Type = null
             if isset(prop) {
-                fv = value_try_convert(fv, field_scope, ctx, prop.type)
-                prop.type.compat_check(fv.rett, vexp) !>
+                field_type = class_init_field_type(prop.type, rett, ctx)
+                field_ctx = ctx.with_suggested_type(field_type)
+            }
+            let fv = value_from_exp(vexp, field_scope, field_ctx) !>
+            if isset(field_type) {
+                fv = value_try_convert(fv, field_scope, ctx, field_type)
+                field_type.compat_check(fv.rett, vexp) !>
             }
             fv.name = fname
             fvals.append(fv)
@@ -1727,26 +1748,27 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             }
             if already_set : continue
             let default_body = prop.default
+            let field_type = class_init_field_type(prop.type, rett, ctx)
             let fv: ?Value = null
             let default_at = prop.exp
             if isset(default_body) {
                 let default_exp = parse_body_as_value_exp(default_body) !>
                 let default_scope = prop.class.scope.sub_scope()
                 default_scope.func = scope.func
-                fv = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(prop.type)) !>
+                fv = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(field_type)) !>
                 default_at = default_exp
             } else {
                 if prop.type.is_nullable_type() : continue
                 let prop_class = prop.type.get_class_or_null()
                 if !isset(prop_class) : continue
                 if !isset(prop_class.default_hook) : continue
-                fv = value_generate_default(prop.type, scope, ctx, prop.exp) !>
+                fv = value_generate_default(field_type, scope, ctx, prop.exp) !>
             }
             let field_value = fv ?! prop.exp.bug("Property default did not produce a value")
             // `@undefined` deliberately contributes no initialization store.
             if field_value.type == VAL.undefined : continue
-            field_value = value_try_convert(field_value, scope, ctx, prop.type)
-            prop.type.compat_check(field_value.rett, default_at) !>
+            field_value = value_try_convert(field_value, scope, ctx, field_type)
+            field_type.compat_check(field_value.rett, default_at) !>
             field_value.name = prop_name
             fvals.append(field_value)
         }
@@ -1840,6 +1862,7 @@ fn value_from_class_init_hooks(class: Class, rett: Type, elem_exps: Array[Exp], 
 fn class_empty_construct(class: Class, rett: Type, scope: Scope, ctx: Context, at: Exp) Value !Error {
     let f = class.get_func("new")
     if isset(f) && f.is_static {
+        if rett.get_non_nullable().shared : f = get_func_shared_factory(f) !>
         if !f.parsed_types : parse_func_types(f) !>
         let callee = vgen_func(f)
         let args = value_from_call_args(callee, f, null, scope, ctx, at) !>
@@ -2747,6 +2770,9 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         // Methods / getters (modes fall through to `mode_for_class`)
         let f = on_class.get_func(name)
         if isset(f) {
+            if on_nn.rett.get_non_nullable().shared && !f.is_static && !f.shared_unsafe {
+                f = get_func_shared_receiver(f) !>
+            }
             act_check(exp, f.act, f.exp, false, "function") !>
             lsp_goto(exp, f.exp) !>
             if f.is_getter {
