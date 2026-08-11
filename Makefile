@@ -25,10 +25,10 @@ BENCH_JSON_MEMORY_DOCUMENTS ?= 100
 # release's bundled valk:* namespaces. The in-tree lib is a distribution/test
 # input for the resulting compiler, never a source dependency of ./src.
 valk: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS)
+	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --release --clang
 
 valk2: $(COMPILER_DEPS)
-	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) --release
+	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) --release -vvv -c
 
 valk3: $(COMPILER_DEPS)
 	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) --release

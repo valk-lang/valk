@@ -167,6 +167,15 @@ if [[ "$i32_body" != *"store i32"* ]] \
     exit 1
 fi
 
+for name in union_equal_member member_equal_union; do
+    compare_body=$(sed -n "/^define .*__${name}__/,/^}/p" "$scalar_ir")
+    if [ -z "$compare_body" ] || grep -Eq 'extractvalue \{[^}]+\} [0-9]+,' <<< "$compare_body"; then
+        echo "# Tagged-union member comparison did not wrap both operands"
+        echo "$compare_body"
+        exit 1
+    fi
+done
+
 echo "> Keep exported symbols unmangled and reachable"
 
 export_ir="$workdir/export.ll"
