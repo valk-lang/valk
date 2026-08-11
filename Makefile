@@ -16,7 +16,7 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
-DIST_FLAGS := . src/*.valk --static --release -vv
+DIST_FLAGS := . src/*.valk --static --release -vv --clang
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
 BENCH_JSON_ITERATIONS ?= 500
 BENCH_JSON_MEMORY_DOCUMENTS ?= 100

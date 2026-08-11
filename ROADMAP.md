@@ -4,11 +4,15 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.3.1
+- Release 0.3.2
+~ Data race solution (Threads done via shared type, MutexValue not done)
+~ uslice (cstring) / slice (String)
+
++ Release 0.3.1
 + Remove llvm-lib dependency
 ~ Data race solution (Threads done via shared type, MutexValue not done)
 + Remove union gc slot
-- uslice (cstring) / slice (String)
+~ uslice (cstring) / slice (String)
 
 # Next steps
 - Improve standard library
