@@ -8,12 +8,6 @@
 ~ Data race solution (Threads done via shared type, MutexValue not done)
 ~ uslice (cstring) / slice (String)
 
-+ Release 0.3.2
-+ Fix alignment
-+ Multi thread IR compiling
-+ Upgrade valkir version
-+ Remove --no-opt / Add --opt
-
 # Next steps
 - Improve standard library
 
@@ -40,6 +34,12 @@
 ## Done
 
 ```
++ Release 0.3.2
++ Fix alignment
++ Multi thread IR compiling
++ Upgrade valkir version
++ Remove --no-opt / Add --opt
+
 + Release 0.3.1
 + Remove llvm-lib dependency
 ~ Data race solution (Threads done via shared type, MutexValue not done)
