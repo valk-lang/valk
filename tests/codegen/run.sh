@@ -113,6 +113,26 @@ if [[ "$layout_marker" != *"i32 0, i32 2"* ]] \
     exit 1
 fi
 
+echo "> Use natural alignment for atomic property accesses"
+
+atomic_ir="$workdir/atomic-alignment.ll"
+out=$("$VALK" build "$DIR/atomic-alignment.valk" --ir --no-warn -o "$atomic_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build atomic-alignment IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+atomic_body=$(sed -n '/^define .*@"atomic_alignment"/,/^}/p' "$atomic_ir")
+if [[ "$atomic_body" != *"load atomic i8"*"align 1"* ]] \
+    || [[ "$atomic_body" != *"load atomic i16"*"align 2"* ]] \
+    || [[ "$atomic_body" != *"load atomic i32"*"align 4"* ]]; then
+    echo "# Atomic property access overstated its alignment"
+    echo "$atomic_body"
+    exit 1
+fi
+
 echo "> Lower tagged unions to inline value aggregates"
 
 scalar_ir="$workdir/tagged-union-scalars.ll"
@@ -226,5 +246,5 @@ if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 5"
+echo "# Test count: 6"
 echo ""
