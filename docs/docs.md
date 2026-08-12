@@ -10,12 +10,12 @@
 * [Getting started](#getting-started)
 * [Basic example](#basic-example)
 * [Types](#types)
-* [Tagged unions](#tagged-unions)
 * [Variables](#variables)
 * [Strings](#strings)
 * [Arrays](#arrays)
 * [Maps](#maps)
 * [Typehints](#typehints)
+* [Tagged unions](#tagged-unions)
 
 
 <br></td><td width=200px><br>
@@ -136,33 +136,6 @@ Other: `ptr` <- raw pointer (unsafe)
 
 `float` becomes `f32` or `f64` based on the compile target
 
-## Tagged unions
-
-A tagged union lets a value be one of several types. Give the union a name when
-you want to reuse it:
-
-```rust
-union Value : String | int | bool | null {}
-
-fn describe(value: Value) String {
-    return match value : String {
-        null => "missing"
-        String as text => text
-        int as number => "number: %number"
-        bool as enabled => enabled ? "enabled" : "disabled"
-    }
-}
-
-let value: Value = 42
-println(describe(value))
-```
-
-Use `as` to access the value in a `match` case. When every type is handled, a
-`default` case is not needed. Add `null` when the value may be missing.
-
-For a union used only once, write it directly as a type, such as
-`String | int`. Named unions can also contain functions and getters.
-
 ## Variables
 
 ```rust
@@ -272,6 +245,33 @@ let ob = A { list: .{ 1, 2, 3 } }
 // Operators also typehint for the value on the right side
 let is_equal = (ob.list == .{ 3, 2, 1 })
 ```
+
+## Tagged unions
+
+A tagged union lets a value be one of several types. Give the union a name when
+you want to reuse it:
+
+```rust
+union Value : String | int | bool | null {}
+
+fn describe(value: Value) String {
+    return match value : String {
+        null => "missing"
+        String as text => text
+        int as number => "number: %number"
+        bool as enabled => enabled ? "enabled" : "disabled"
+    }
+}
+
+let value: Value = 42
+println(describe(value))
+```
+
+Use `as` to access the value in a `match` case. When every type is handled, a
+`default` case is not needed. Add `null` when the value may be missing.
+
+For a union used only once, write it directly as a type, such as
+`String | int`. Named unions can also contain functions and getters.
 
 ## Functions
 
