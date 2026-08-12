@@ -9,9 +9,6 @@
 * [Standard library API](#standard-library-api)
 * [Getting started](#getting-started)
 * [Basic example](#basic-example)
-* [Multiple files](#multiple-files)
-* [Namespaces](#namespaces)
-* [Packages](#packages)
 * [Types](#types)
 * [Tagged unions](#tagged-unions)
 * [Variables](#variables)
@@ -64,6 +61,7 @@
 <br></td><td width=200px><br>
 
 * [Embed](#embed)
+* [Namespaces](#namespaces)
 
 * [Unsafe](#unsafe)
     * [Structs](#structs)
@@ -111,71 +109,6 @@ fn main() {
 valk build main.valk -o ./main
 ./main
 ```
-
-## Multiple files
-
-To build multiple files into a program, add them to the build command. For larger projects, use namespaces to organize the code.
-
-```sh
-valk build file-1.valk file-2.valk -o ./main
-./main
-```
-
-## Namespaces
-
-Each directory in a project represents a namespace. Create a `valk.json` file
-at the project root; source code goes in `./src` by default.
-
-```
-./valk.json
-./src
-  | main.valk
-  > ./ns1
-    | MyClass.valk
-  > ./ns2
-    | MyOtherClass.valk
-```
-
-```rust
-// main.valk
-use ns1
-use ns2
-
-fn main() {
-    let a = ns1:MyClass {}
-    let b = ns2:MyOtherClass {}
-}
-```
-
-```sh
-valk build ./src -o ./myprogram
-```
-
-## Packages
-
-Packages are still in an early stage. Install and manage project packages with `vman`.
-
-```sh
-vman install # Install packages defined in valk.json
-vman install {pkg} # Install a package globally
-vman remove {pkg} # Remove a package
-# Example:
-vman install github.com/valk-lang/pkg-example
-vman remove example
-```
-
-After installing a package, it is added to `valk.json`. The configuration can also change the name used to import it.
-
-```rust
-// valk.json -> { "dependencies": { "example": { ... } } }
-use example:funcs
-
-fn main() {
-    funcs:print_hello()
-}
-```
-
-Example package: [link](https://github.com/valk-lang/pkg-example)
 
 ## Types
 
@@ -1216,6 +1149,36 @@ fn main() {
 ```
 
 Note: `#embed_dir` is recursive. Also try to put an embed in a separate function if you need it in multiple places. Embedding the same file in multiple places is a waste of spaces and results in a larger binary size.
+
+## Namespaces
+
+Each directory in a project represents a namespace. Create a `valk.json` file
+at the project root; source code goes in `./src` by default.
+
+```
+./valk.json
+./src
+  | main.valk
+  > ./ns1
+    | MyClass.valk
+  > ./ns2
+    | MyOtherClass.valk
+```
+
+```rust
+// main.valk
+use ns1
+use ns2
+
+fn main() {
+    let a = ns1:MyClass {}
+    let b = ns2:MyOtherClass {}
+}
+```
+
+```sh
+valk build ./src -o ./myprogram
+```
 
 ## Unsafe
 
