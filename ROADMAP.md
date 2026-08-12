@@ -12,6 +12,7 @@
 + Fix alignment
 + Multi thread IR compiling
 + Upgrade valkir version
++ Remove --no-opt / Add --opt
 
 # Next steps
 - Improve standard library

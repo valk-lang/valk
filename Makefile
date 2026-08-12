@@ -89,6 +89,9 @@ test-diagnostics: $(TEST_COMPILER)
 test-exit-code: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/exit-code/run.sh
 
+test-cli: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/cli/run.sh
+
 test-lsp: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/lsp/run.sh
 
@@ -107,7 +110,7 @@ test-library: $(TEST_COMPILER)
 test-extend-access: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-lsp test-fmt test-codegen test-deps test-library test-extend-access
+test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-codegen test-deps test-library test-extend-access
 
 # Build once, then measure the union representation in fresh processes so
 # allocator pools and GC high-water state do not cross benchmark modes.
