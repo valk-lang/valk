@@ -57,6 +57,15 @@ if [ "$status" -eq 0 ] || [[ "$no_opt_out" != *"Unknown build argument: --no-opt
     exit 1
 fi
 
-echo "# CLI tests passed"
-echo "# Test count: 4"
+validate_out=$("$VALK" build "$input" --no-warn -v -c 2>&1) || {
+    echo "$validate_out"
+    exit 1
+}
+if [[ "$validate_out" == *"Cache directory:"* ]]; then
+    echo "# A build without an output path generated an object or executable"
+    echo "$validate_out"
+    exit 1
+fi
 
+echo "# CLI tests passed"
+echo "# Test count: 5"
