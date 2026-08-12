@@ -67,5 +67,10 @@ if [[ "$validate_out" == *"Cache directory:"* ]]; then
     exit 1
 fi
 
+def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o "$output" 2>&1) || {
+    echo "$def_out"
+    exit 1
+}
+
 echo "# CLI tests passed"
-echo "# Test count: 5"
+echo "# Test count: 6"
