@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-+ Release 0.3.3
++ Release 0.3.4
 ~ Data race solution (Threads done via shared type, MutexValue not done)
 ~ uslice (cstring) / slice (String)
 
@@ -34,6 +34,10 @@
 ## Done
 
 ```
++ Release 0.3.3
++ Fix code gen bug
++ Optimize compile speed
+
 + Release 0.3.2
 + Fix alignment
 + Multi thread IR compiling
