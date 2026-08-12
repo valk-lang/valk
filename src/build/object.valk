@@ -2,51 +2,122 @@ use valkir
 use helper
 use valk:core
 use valk:fs
+use valk:thread
+use valk:time
+
+class ObjectTask {
+    unit_name: String
+    ir_code: String
+    path_o: String
+    path_ir: String
+    target: String
+    clang_command: String
+    optimize: bool
+    duration_us: uint (0)
+
+    fn run() ?String {
+        let start = time:microtime()
+        if this.clang_command.length > 0 {
+            let code, output = core:exec(this.clang_command)
+            if code != 0 {
+                return this.finish(start, this.failure("clang failed while emitting unit '" + this.unit_name + "':\n# Exit code: " + code + "\n# Output: " + output))
+            }
+        } else {
+            let target = valkir:Target.parse(this.target) ! {
+                return this.finish(start, "valkir does not support target: " + this.target)
+            }
+            let options = valkir:Options { optimize: this.optimize }
+            valkir:compile(this.ir_code, this.path_o, target, options) ! {
+                return this.finish(start, this.failure("valkir failed while emitting unit '" + this.unit_name + "':\n" + E.message))
+            }
+        }
+
+        fs:write(this.path_ir + "-prev", this.ir_code) ! {
+            return this.finish(start, "Failed to write cached IR: " + this.path_ir + "-prev")
+        }
+        return this.finish(start, null)
+    }
+
+    fn finish(start: uint, error: ?String) ?String {
+        this.duration_us = time:microtime() - start
+        return error
+    }
+
+    fn failure(message: String) String {
+        return message + "\nIR: " + this.path_ir
+    }
+}
 
 // Emit one native object for every Unit/IR module. Linking deliberately
 // remains a separate stage.
 fn emit_unit_objects(build: Build) !Error {
-    if build.options.use_clang {
-        emit_unit_objects_clang(build) !>
-        return
-    }
-    emit_unit_objects_valkir(build) !>
-}
-
-// Default backend: valkir turns the textual IR into a relocatable object
-// in-process, so a build needs no external toolchain besides the linker.
-fn emit_unit_objects_valkir(build: Build) !Error {
-    let target = valkir:Target.parse(build.options.target.target) ! {
-        build.error("valkir does not support target: " + build.options.target.target)
-    }
+    let tasks = Array[ObjectTask]{}
+    let units = Array[Unit]{}
 
     each build.lists.units as unit {
         if prepare_unit_object(build, unit) !> : continue
-        build.print_verbose(3, "> Generating object file: " + unit.path_o)
-        let options = valkir:Options {
+        let command = ""
+        if build.options.use_clang {
+            command = clang_object_command(build, unit)
+            build.print_verbose(3, "# " + command)
+        }
+        tasks.append(ObjectTask {
+            unit_name: unit.name
+            ir_code: unit.ir_code
+            path_o: unit.path_o
+            path_ir: unit.path_ir
+            target: build.options.target.target
+            clang_command: command
             optimize: build.options.optimize
-        }
-        valkir:compile(unit.ir_code, unit.path_o, target, options) ! {
-            emit_fail_with_ir(build, unit, "valkir failed while emitting unit '" + unit.name + "':\n" + E.message) !>
-        }
-        commit_unit_object_cache(build, unit) !>
+        })
+        units.append(unit)
     }
+
+    run_object_tasks(build, tasks, units) !>
 }
 
-// --clang backend: same cache layout, but each unit's IR file is handed to a
-// `clang` on PATH. One process per unit, and it is clang that decides how the
-// IR is optimized and encoded.
-fn emit_unit_objects_clang(build: Build) !Error {
-    each build.lists.units as unit {
-        if prepare_unit_object(build, unit) !> : continue
-        build.print_verbose(3, "> Generating object file (clang): " + unit.path_o)
-        let command = clang_object_command(build, unit)
-        build.print_verbose(3, "# " + command)
-        let code, output = core:exec(command)
-        if code != 0 {
-            emit_fail_with_ir(build, unit, "clang failed while emitting unit '" + unit.name + "':\n# Exit code: " + code + "\n# Output: " + output) !>
+fn start_object_task(task: ObjectTask) ?thread:Thread[?String] {
+    return thread:Thread[?String].start(fn() ?String {
+        return task.run()
+    }) ! { return null }
+}
+
+fn run_object_tasks(build: Build, tasks: Array[ObjectTask], units: Array[Unit]) !Error {
+    let offset = 0
+    while offset < tasks.length {
+        let workers = Array[thread:Thread[?String]]{}
+        let count = tasks.length - offset
+        if count > 16 : count = 16
+        let start_failed = false
+
+        let i = 0
+        while i < count {
+            let task = tasks.get(offset + i) ! build.error("Missing object generation task (bug)")
+            let worker = start_object_task(task)
+            if !isset(worker) {
+                start_failed = true
+                break
+            }
+            workers.append(worker)
+            i++
         }
-        commit_unit_object_cache(build, unit) !>
+
+        let errors = Array[String]{}
+        each workers as worker, index {
+            let error = worker.await_result()
+            let task = tasks.get(offset + index) ! build.error("Missing completed object generation task (bug)")
+            let duration_ms = task.duration_us.to(float) / 1000
+            build.print_verbose(3, "> Object task: " + duration_ms + "ms: " + task.path_ir)
+            if isset(error) {
+                errors.append(error)
+            } else {
+                let unit = units.get(offset + index) ! build.error("Missing object generation unit (bug)")
+                unit.ir_code = ""
+            }
+        }
+        if start_failed : errors.append("Failed to start object generation thread")
+        if errors.length > 0 : build.error(errors.join("\n\n"))
+        offset += count
     }
 }
 
@@ -89,21 +160,6 @@ fn prepare_unit_object(build: Build, unit: Unit) bool !Error {
 
     fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write IR: " + unit.path_ir)
     return false
-}
-
-// Mark the object as matching this IR after a successful emit.
-fn commit_unit_object_cache(build: Build, unit: Unit) !Error {
-    let path_prev = unit.path_ir + "-prev"
-    fs:write(path_prev, unit.ir_code) ! build.error("Failed to write cached IR: " + path_prev)
-    // The parsed AST was already released after per-function IR emission,
-    // and executable builds no longer need the textual module after its
-    // object has been produced.
-    unit.ir_code = ""
-}
-
-// path_ir was already written by prepare_unit_object; include it in the error.
-fn emit_fail_with_ir(build: Build, unit: Unit, msg: String) !Error {
-    build.error(msg + "\nIR: " + unit.path_ir)
 }
 
 fn object_output_dir(build: Build) String !Error {
