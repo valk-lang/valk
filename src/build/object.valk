@@ -48,6 +48,75 @@ class ObjectTask {
     }
 }
 
+class ObjectThreadCompletionQueue {
+    mutex: shared core:SyncMutex (.new())
+    gate: shared thread:ThreadSuspendGate (.new())
+    completed: Array[uint] (.new())
+
+    fn push(index: uint) @shared_unsafe {
+        this.mutex.lock()
+        this.completed.append(index)
+        this.mutex.unlock()
+        this.gate.signal()
+    }
+
+    fn pop() ?uint @shared_unsafe {
+        this.mutex.lock()
+        let index: ?uint = this.completed.pop_first() !? null
+        this.mutex.unlock()
+        return index
+    }
+
+    fn is_empty() bool @shared_unsafe {
+        this.mutex.lock()
+        let empty = this.completed.length == 0
+        this.mutex.unlock()
+        return empty
+    }
+
+    fn await_next() uint @shared_unsafe {
+        while true {
+            let index = this.pop()
+            if isset(index) : return index
+            this.gate.wait(fn() bool { return this.is_empty() })
+        }
+    }
+}
+
+class ObjectThreadGroup {
+    state: shared ObjectThreadCompletionQueue (.{})
+    workers: Array[thread:Thread[?String]] (.new())
+    pending: uint (0)
+
+    static fn new() SELF {
+        return SELF {}
+    }
+
+    fn start(index: uint, task: ObjectTask) bool {
+        let state = this.state
+        let worker = thread:Thread[?String].start(fn() ?String {
+            let result = task.run()
+            state.push(index)
+            return result
+        }) ! { return false }
+        this.workers.append(worker)
+        this.pending++
+        return true
+    }
+
+    fn has_pending() bool {
+        return this.pending > 0
+    }
+
+    fn await_next() (uint, ?String) {
+        let index = this.state.await_next()
+        let worker = this.workers.get(index) ! { panic("Object thread group received an invalid completion index") }
+        let result = worker.await_result()
+        this.pending--
+        return (index, result)
+    }
+}
+
 // Emit one native object for every Unit/IR module. Linking deliberately
 // remains a separate stage.
 fn emit_unit_objects(build: Build) !Error {
@@ -76,49 +145,47 @@ fn emit_unit_objects(build: Build) !Error {
     run_object_tasks(build, tasks, units) !>
 }
 
-fn start_object_task(task: ObjectTask) ?thread:Thread[?String] {
-    return thread:Thread[?String].start(fn() ?String {
-        return task.run()
-    }) ! { return null }
-}
-
 fn run_object_tasks(build: Build, tasks: Array[ObjectTask], units: Array[Unit]) !Error {
-    let offset = 0
-    while offset < tasks.length {
-        let workers = Array[thread:Thread[?String]]{}
-        let count = tasks.length - offset
-        if count > 16 : count = 16
-        let start_failed = false
+    let group = ObjectThreadGroup.new()
+    let errors = Array[String]{}
+    let next = 0
+    let stopped = false
 
-        let i = 0
-        while i < count {
-            let task = tasks.get(offset + i) ! build.error("Missing object generation task (bug)")
-            let worker = start_object_task(task)
-            if !isset(worker) {
-                start_failed = true
-                break
-            }
-            workers.append(worker)
-            i++
+    while next < tasks.length && next < 16 {
+        let task = tasks.get(next) ! build.error("Missing object generation task (bug)")
+        if !group.start(next, task) {
+            errors.append("Failed to start object generation thread")
+            stopped = true
+            break
         }
-
-        let errors = Array[String]{}
-        each workers as worker, index {
-            let error = worker.await_result()
-            let task = tasks.get(offset + index) ! build.error("Missing completed object generation task (bug)")
-            let duration_ms = task.duration_us.to(float) / 1000
-            build.print_verbose(3, "> Object task: " + duration_ms + "ms: " + task.path_ir)
-            if isset(error) {
-                errors.append(error)
-            } else {
-                let unit = units.get(offset + index) ! build.error("Missing object generation unit (bug)")
-                unit.ir_code = ""
-            }
-        }
-        if start_failed : errors.append("Failed to start object generation thread")
-        if errors.length > 0 : build.error(errors.join("\n\n"))
-        offset += count
+        next++
     }
+
+    while group.has_pending() {
+        let index, error = group.await_next()
+        let task = tasks.get(index) ! build.error("Missing completed object generation task (bug)")
+        let duration_ms = task.duration_us.to(float) / 1000
+        build.print_verbose(3, "> Object task: " + duration_ms + "ms: " + task.path_ir)
+        if isset(error) {
+            errors.append(error)
+            stopped = true
+        } else {
+            let unit = units.get(index) ! build.error("Missing object generation unit (bug)")
+            unit.ir_code = ""
+        }
+
+        if !stopped && next < tasks.length {
+            let next_task = tasks.get(next) ! build.error("Missing object generation task (bug)")
+            if group.start(next, next_task) {
+                next++
+            } else {
+                errors.append("Failed to start object generation thread")
+                stopped = true
+            }
+        }
+    }
+
+    if errors.length > 0 : build.error(errors.join("\n\n"))
 }
 
 // The IR file was already written by prepare_unit_object. `-x ir` is required
