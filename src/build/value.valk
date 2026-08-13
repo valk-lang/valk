@@ -1152,8 +1152,7 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     return vgen_ptrv(on, offset, elem, exp)
 }
 
-// `$clone(value)` — deep-copy intrinsic. Aggregate types expand to Values;
-// ordinary objects call core:clone_value_impl.
+// `$clone(value)` — deep-copy intrinsic.
 fn value_from_clone_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let arg_exp = exp.get(VALUE_EXP.left)
     if !isset(arg_exp) : exp.bug("$clone is missing its argument")
@@ -1161,25 +1160,131 @@ fn value_from_clone_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     return value_clone(arg, ctx, scope, exp) !>
 }
 
-fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool (true)) Value !Error {
     let type = value.rett
     let nn = type.get_non_nullable()
     if nn.shared : return value
     if nn.type == TYPE.fn : return value_fn_clone(value, ctx, scope, at) !>
-    if nn.type == TYPE.array : return value_clone_array(value, ctx, scope, at) !>
-    if nn.type == TYPE.union : return value_clone_union(value, ctx, scope, at) !>
+    let class = nn.get_class_or_null()
+    if isset(class) {
+        let method = class.get_func("clone")
+        if isset(method) && (!check_access || act_allows(at, method.act, method.exp, false)) {
+            return value_clone_method(value, method, ctx, scope, at) !>
+        }
+    }
+    if nn.type == TYPE.array : return value_clone_array(value, ctx, scope, at, check_access) !>
+    if nn.type == TYPE.union : return value_clone_union(value, ctx, scope, at, check_access) !>
+    if isset(class) && nn.is_structural_type() {
+        return value_clone_object(value, class, ctx, scope, at, check_access) !>
+    }
+    return value
+}
 
-    let idf = valk_idf(ctx.build, "core", "clone_value_impl") !>
-    let base = idf.func
-    if !isset(base) : at.bug("core:clone_value_impl is not a function")
-    let names = base.generic_arg_names
-    if names.length == 0 : at.bug("core:clone_value_impl has no generic argument names")
-    let specialized = base.specialize_generic_args(names, Array[Type]{ type }, at) !>
-    let callee = vgen_func(specialized)
-    callee.exp = at
-    let call = vgen_call(ctx, callee, Array[Value]{ value }, specialized.get_rett(), scope)
-    call.exp = at
-    return call
+fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    if !method.parsed_types : parse_func_types(method) !>
+    let expected = value.rett.get_non_nullable()
+    let actual = method.get_rett()
+    if type_identity_key(actual) != type_identity_key(expected) {
+        at.error("Method '" + expected.compat_display_name() + ".clone()' must return '" + expected.compat_display_name() + "', got '" + actual.compat_display_name() + "'")
+    }
+
+    let body = Array[Value]{}
+    let source = value_clone_bind(value, ctx, at, body)
+    let receiver = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    method = func_for_receiver(method, receiver, at) !>
+    let callee = vgen_func(method, receiver)
+    let args = Array[Value]{}
+    value_fill_trailing_defaults(method, call_receiver_skip(callee, method), args, scope, ctx, at) !>
+    value_check_call_args(method, callee, args, scope, ctx, at) !>
+    value_buffer_call_receiver(callee, ctx)
+    let cloned = vgen_call(ctx, callee, args, actual, scope)
+    cloned.exp = at
+    let result = cloned
+    if method.can_error {
+        cloned.can_error = true
+        cloned.set_error_type(method.error_type)
+        result = value_apply_error_pass(cloned, scope, ctx, at) !>
+    }
+    if value.rett.is_nullable_type() {
+        result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(result),
+            vgen_null(value.rett),
+            value.rett
+        )
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool) Value !Error {
+    if check_access {
+        each class.props as prop : act_check(at, prop.act, prop.exp, true, "property") !>
+    }
+    if value.rett.has_raw_pointer_props() : return value
+
+    let body = Array[Value]{}
+    let source = value_clone_bind(value, ctx, at, body)
+    let clone_source = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    let clone_func = value_clone_func(value.rett.get_non_nullable(), class, ctx, at, check_access) !>
+    let cloned = vgen_call(ctx, vgen_func(clone_func), Array[Value]{ clone_source }, clone_func.get_rett(), scope)
+    cloned.exp = at
+    let result = cloned
+    if value.rett.is_nullable_type() {
+        result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(cloned),
+            vgen_null(value.rett),
+            value.rett
+        )
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool) Func !Error {
+    let source = access_root_source(at.src)
+    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access
+    ctx.build.cache.clone_funcs.get(key) -> cached : return cached
+
+    let owner = ctx.get_func() !>
+    let arg_scope = Scope.new(owner.ns.scope)
+    let clone_func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<clone." + class.name + "." + helper:ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: type
+    }
+    ctx.build.cache.clone_funcs.set(key, clone_func)
+    arg_scope.func = clone_func
+    append_func_arg(clone_func, "value", type)
+    bind_func_arg_decls(clone_func) !>
+
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = clone_func
+    clone_func.body_scope = body_scope
+    clone_func.alloca_scope = body_scope.sub_scope()
+    clone_func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(clone_func)
+    let value_arg = clone_func.args.get(0) ! at.bug("Clone helper is missing its value")
+    let source_value = vgen_decl(value_arg.decl)
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        fields.set(prop, value_clone(vgen_prop(prop, source_value, inner_ctx), inner_ctx, body_scope, at, check_access) !>)
+    }
+    let result = vgen_class_init(inner_ctx, class, fields, type, at) !>
+    body_scope.append_value(vgen_return(result, ctx.build, at))
+    body_scope.did_return = true
+
+    owner.unit.functions.append(clone_func)
+    func_finish_ast(clone_func) !>
+    if !isset(ctx.build.options.lsp) : generate_func_ir(clone_func) !>
+    return clone_func
 }
 
 fn value_clone_bind(value: Value, ctx: Context, at: Exp, body: Array[Value]) Value {
@@ -1197,7 +1302,7 @@ fn value_clone_bind(value: Value, ctx: Context, at: Exp, body: Array[Value]) Val
     return slot
 }
 
-fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool) Value !Error {
     let type = value.rett
     let array = type.get_non_nullable()
     let sub = array.sub_type ?! at.bug("Fixed-array clone has no element type")
@@ -1208,7 +1313,7 @@ fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp) Value !E
     let elements = Array[Value]{}
     let i: uint = 0
     while i < array.array_size {
-        elements.append(value_clone(vgen_multi_part(clone_source, i, sub, at), ctx, scope, at) !>)
+        elements.append(value_clone(vgen_multi_part(clone_source, i, sub, at), ctx, scope, at, check_access) !>)
         i++
     }
     let cloned = vgen_array_init(ctx, elements, array, at)
@@ -1225,7 +1330,7 @@ fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp) Value !E
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool) Value !Error {
     let type = value.rett
     let union = type.get_non_nullable()
     let members = union.sub_types ?! at.bug("Tagged-union clone has no alternatives")
@@ -1236,7 +1341,7 @@ fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp) Value !E
     while i-- > 0 {
         let member = members.get(i) ! at.bug("Tagged-union clone alternative is missing")
         let extracted = vgen_union_extract(source, member, ctx, at) !>
-        let cloned = value_clone(extracted, ctx, scope, at) !>
+        let cloned = value_clone(extracted, ctx, scope, at, check_access) !>
         let wrapped = vgen_union_wrap(cloned, type, i, ctx) ?! at.bug("Failed to rebuild cloned tagged union")
         result = vgen_this_or_that(vgen_union_is(source, i, at), wrapped, result, type)
     }
