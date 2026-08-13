@@ -1688,6 +1688,14 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
     }
 
     let address = ir_emit_address(ir, left) !>
+    let inline_init = right.type == VAL.class_init
+        && right.rett.get_non_nullable().type == TYPE.inline
+        && !isset(right.value1)
+        && value.op.@cast(ASSIGN_OP) == ASSIGN_OP.set
+    if inline_init {
+        ir_emit_inline_class_init(ir, right, address) !>
+        return
+    }
     let result = ir_emit_value(ir, right) !>
     result = ir_emit_compound(ir, address, result, value.op.@cast(ASSIGN_OP), left.rett) !>
     ir_emit_store(ir, ir_type(left.rett) !>, result, address)
@@ -2158,16 +2166,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.shared_view {
         let inner = value.value1
         if !isset(inner) : value.bug("Shared view is missing its value")
-        let rendered = ir_emit_value(ir, inner) !>
-        let at = value.exp
-        if !isset(at) : value.bug("Shared view is missing its source expression")
-        let share = value_get_valk_func(ir.func.ns.build, "gc", "share_null_check", at) !>
-        if !share.parsed_types : parse_func_types(share) !>
-        ir_use_func(ir, share)
-        let mark = ir.arg_list.length
-        ir.write_arg(mark, "ptr", rendered)
-        ir_emit_arg_call(ir, "void", ir_func_address(share), mark)
-        return rendered
+        return ir_emit_value(ir, inner) !>
     }
     if t == VAL.decl || t == VAL.global || t == VAL.ptrv {
         if value_is_shared_storage(value) && value.rett.is_integer_type() {
@@ -2900,13 +2899,10 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let length = ""
     if isset(fields) {
         each fields as field, i {
-            let prop : ?Prop = null
-            if field.get_name() != "" : prop = class.get_prop_by_name(field.get_name()) !? null
-            if !isset(prop) : prop = class.props.get(i) !? null
-            if isset(prop) && prop.name == "length" {
-                length = ir.field_values.get(field_mark + i) !? ""
-                break
-            }
+            let prop = field.get_init_prop()
+            if !isset(prop) || prop.name != "length" : continue
+            length = ir.field_values.get(field_mark + i) !? ""
+            break
         }
     }
     if length == "" : value.bug("Slice initializer is missing length")
@@ -2996,10 +2992,8 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
 
     if isset(fields) {
         each fields as field, i {
-            let prop : ?Prop = null
-            if field.get_name() != "" : prop = class.get_prop_by_name(field.get_name()) !? null
-            if !isset(prop) : prop = class.props.get(i) !? null
-            if !isset(prop) : value.bug("Cannot match aggregate initializer field to a property")
+            let prop = field.get_init_prop()
+            if !isset(prop) : value.bug("Aggregate initializer field has no property")
             let field_value = ir.field_values.get(field_mark + i) !? "undef"
             let address = ir_prop_address(ir, slot, prop)
             ir_emit_store(ir, ir_type(prop.type) !>, field_value, address)
@@ -3013,6 +3007,39 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         return ir_build_tagged_nullable(ir, value.rett, out) !>
     }
     return out
+}
+
+fn ir_collect_inline_init_fields(value: Value, offset: u32, fields: Array[Value], offsets: Array[u32]) !Error {
+    let values = value.values ?! return
+    each values as field {
+        let prop = field.get_init_prop()
+        if !isset(prop) : value.bug("Inline initializer field has no property")
+        let field_offset = offset + prop.offset
+        if field.type == VAL.class_init && field.rett.get_non_nullable().type == TYPE.inline && !isset(field.value1) {
+            ir_collect_inline_init_fields(field, field_offset, fields, offsets) !>
+        } else {
+            fields.append(field)
+            offsets.append(field_offset)
+        }
+    }
+}
+
+fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
+    let class = value.get_class_ref()
+    if !isset(class) : value.bug("Inline class initializer has no class")
+    let fields = Array[Value]{}
+    let offsets = Array[u32]{}
+    ir_collect_inline_init_fields(value, 0, fields, offsets) !>
+
+    let rendered = Array[String]{}
+    each fields as field : rendered.append(ir_emit_value(ir, field) !>)
+    let size = class.compute_body_size() !>
+    if size > 0 : ir_emit_zero(ir, address, size.to(uint))
+    each fields as field, i {
+        let stored = rendered.get(i) ! value.bug("Inline initializer value is missing")
+        let offset = offsets.get(i) ! value.bug("Inline initializer offset is missing")
+        ir_emit_store(ir, ir_type(field.rett) !>, stored, ir_offset_address(ir, address, offset))
+    }
 }
 
 // Interface objects are stored as tagged GC properties.
@@ -3223,13 +3250,12 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     let at = value.exp
     if !isset(at) : value.bug("Closure construction is missing its source expression")
     let env_type = class.get_type() !>
-    let fields = Array[Value]{}
+    let fields = HashMap[Prop, Value]{}
     let capture_base : uint = 0
     let receiver = value.value1
     if isset(receiver) && isset(func.class) && !func.is_static {
-        let field = receiver
-        field.set_name("receiver")
-        fields.append(field)
+        let receiver_prop = class.get_prop_by_name("receiver") ! value.bug("Closure receiver property is missing")
+        fields.set(receiver_prop, receiver)
         capture_base = 1
     }
     each func.capture_decls as decl, i {
@@ -3237,32 +3263,23 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
         if !isset(prop) : value.bug("Closure capture property is missing")
         let field = vgen_decl(decl)
         field.exp = at
-        let pname = prop.name
-        if isset(pname) : field.set_name(pname)
-        fields.append(field)
+        fields.set(prop, field)
     }
     let init = vgen_class_init(ctx, class, fields, env_type, at) !>
-    each func.capture_decls as _, i {
-        let field_index = i + capture_base
-        let field = fields.get(field_index) !? null
-        if !isset(field) : value.bug("Closure capture field is missing")
-        let prop = class.props.get(i + capture_base) !? null
-        if !isset(prop) : value.bug("Closure capture property is missing")
-        if prop.type.get_non_nullable().shared && !field.rett.get_non_nullable().shared {
-            fields.set(field_index, value_shared_view(field, prop.type)) _
+    let init_fields = init.values
+    if isset(init_fields) {
+        each init_fields as field, i {
+            let prop = field.get_init_prop()
+            if !isset(prop) : value.bug("Closure capture field has no property")
+            if !prop.type.get_non_nullable().shared || field.rett.get_non_nullable().shared : continue
+            let shared = value_shared_view(field, prop.type)
+            shared.set_init_prop(prop)
+            init_fields.set(i, shared) _
         }
     }
     // Keep the prepared allocator (header-aware size) on the init value.
     init.set_allocator(allocator)
     let environment = ir_emit_value(ir, init) !>
-    if func.is_shared {
-        let share = value_get_valk_func(ir.func.ns.build, "gc", "share_null_check", at) !>
-        if !share.parsed_types : parse_func_types(share) !>
-        ir_use_func(ir, share)
-        let mark = ir.arg_list.length
-        ir.write_arg(mark, "ptr", environment)
-        ir_emit_arg_call(ir, "void", ir_func_address(share), mark)
-    }
 
     // Protocol header: pointer to the value-AST clone helper.
     let clone_func = func.capture_clone_func
