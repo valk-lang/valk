@@ -139,7 +139,7 @@ watchtest: valk2
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1" --debug
+	./valk build ./tests $(TEST_FLAGS) -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1"
 	./debug/test-win.exe
 
 test-macos-build: valk

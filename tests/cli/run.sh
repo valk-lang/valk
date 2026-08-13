@@ -57,6 +57,22 @@ if [ "$status" -eq 0 ] || [[ "$no_opt_out" != *"Unknown build argument: --no-opt
     exit 1
 fi
 
+debug_out=$(build --debug)
+status=$?
+if [ "$status" -eq 0 ] || [[ "$debug_out" != *"Unknown build argument: --debug"* ]]; then
+    echo "# Expected --debug to be rejected"
+    echo "$debug_out"
+    exit 1
+fi
+
+debug_short_out=$(build -d)
+status=$?
+if [ "$status" -eq 0 ] || [[ "$debug_short_out" != *"Unknown build argument: -d"* ]]; then
+    echo "# Expected -d to be rejected"
+    echo "$debug_short_out"
+    exit 1
+fi
+
 validate_out=$("$VALK" build "$input" --no-warn -v -c 2>&1) || {
     echo "$validate_out"
     exit 1
@@ -73,4 +89,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 6"
+echo "# Test count: 8"
