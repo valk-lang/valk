@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.3.5
+- Release 0.3.6
 ~ Data race solution (Threads done via shared type, MutexValue not done)
 ~ uslice (cstring) / slice (String)
 
@@ -34,6 +34,9 @@
 ## Done
 
 ```
++ Release 0.3.5
++ Upgrade valkir version
+
 + Release 0.3.4
 + Bug fixes (parsing / stdlib / $clone)
 
