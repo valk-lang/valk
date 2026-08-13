@@ -39,7 +39,7 @@ enum VAL : u8 {
     cast     // value.@cast(Type); value1 = on, rett = target Type
     multi    // argument list only (values array); not a runtime value alone
     // Class / struct construction: Type { prop: value, ... }
-    // value1 = type side; values = field inits (each Value.name = prop name)
+    // value1 = type side; values = field inits (each Value.init_prop = Prop)
     class_init
     // Fixed-array construction: { v0, v1, ... } — values = elements; rett = array type
     array_init
@@ -120,6 +120,7 @@ class ValueMeta {
     not_issets: ?Array[Decl] (null)
     error_type: ?ErrorType (null)
     pre_value: ?Value (null)
+    init_prop: ?Prop (null)
 }
 
 class Value {
@@ -181,6 +182,11 @@ class Value {
     }
 
     fn set_name(name: String) $inline { this.ensure_meta().name = name }
+    fn get_init_prop() ?Prop $inline {
+        let data = this.meta
+        return isset(data) ? data.init_prop : null
+    }
+    fn set_init_prop(prop: Prop) $inline { this.ensure_meta().init_prop = prop }
     fn get_string() String $inline {
         let data = this.meta
         return isset(data) ? data.string_val : ""
@@ -1797,67 +1803,50 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
                 return class_empty_construct(class, rett, scope, ctx, exp) !>
             }
         }
-        let fvals = Array[Value]{}
+        let fvals = HashMap[Prop, Value]{}
         each field_exps as fexp, field_i {
             let field_scope = expanded.field_scopes.get(field_i) ! exp.bug("Missing class-init field scope")
             let fname = fexp.str1
             let field_idf = field_scope.get_idf(fname)
+            let prop: ?Prop = null
             if isset(field_idf) && field_idf.type == IDF.property {
                 let loop_prop = field_idf.prop
                 if !isset(loop_prop) : fexp.bug("Property idf is missing Prop")
                 let loop_name = loop_prop.name
-                if !isset(loop_name) : fexp.bug("Loop property has no name")
-                fname = loop_name
+                if isset(loop_name) {
+                    fname = loop_name
+                    prop = init_class.get_prop_by_name(loop_name) !? null
+                } else if loop_prop.class == init_class {
+                    prop = loop_prop
+                }
             }
+            if !isset(prop) : prop = init_class.get_prop_by_name(fname) !? null
+            if !isset(prop) {
+                fexp.error("There's no property named: '" + fname + "' on '" + init_class.pretty_name() + "'")
+            }
+            if fvals.has(prop) {
+                fexp.error("Property '" + (prop.name ?? fname) + "' is already set in this class initializer")
+            }
+            if prop.is_slice_data : fexp.error("Slice data is computed and cannot be initialized")
+            act_check(fexp, prop.act, prop.exp, true, "property") !>
             let vexp = fexp.get(VALUE_EXP.left)
             if !isset(vexp) : fexp.bug("class_init field is missing value")
-            let prop = init_class.get_prop_by_name(fname) !? null
-            if !isset(prop) && init_class.props.length > 0 {
-                let has_named = false
-                each init_class.props as p {
-                    if isset(p.name) : has_named = true
-                }
-                if has_named {
-                    fexp.error("There's no property named: '" + fname + "'")
-                }
-            }
-            // Setting a field is a store, so `~` read-only rejects it too
-            if isset(prop) {
-                if prop.is_slice_data : fexp.error("Slice data is computed and cannot be initialized")
-                act_check(fexp, prop.act, prop.exp, true, "property") !>
-            }
-            let field_ctx = ctx.without_suggested_type()
-            let field_type: ?Type = null
-            if isset(prop) {
-                field_type = prop.type
-                field_ctx = ctx.with_suggested_type(field_type)
-            }
-            let fv = value_from_exp(vexp, field_scope, field_ctx) !>
-            if isset(field_type) {
+            let field_type = prop.type
+            let fv = value_from_exp(vexp, field_scope, ctx.with_suggested_type(field_type)) !>
+            if fv.type != VAL.undefined {
                 fv = value_try_convert(fv, field_scope, ctx, field_type)
                 field_type.compat_check(fv.rett, vexp) !>
             }
-            fv.set_name(fname)
-            fvals.append(fv)
+            fvals.set(prop, fv)
         }
 
-        // Unspecified fields with declaration defaults are evaluated before
-        // allocation just like explicit fields. A non-null property whose type
-        // defines `$default` uses that hook as its generated default. Nullable
-        // properties deliberately keep their zero/null representation instead
-        // of invoking the wrapped type's hook. vgen_class_init then buffers GC
-        // values and performs the final plain stores into the new object.
+        // Unspecified fields use a declaration default or the type's `$default`
+        // hook. Nullable properties stay null. Anything else must be provided.
+        // vgen_class_init then buffers GC values and stores into the object.
+        let missing = Array[String]{}
         each init_class.props as prop {
-            let prop_name = prop.name
-            if !isset(prop_name) : continue
-            let already_set = false
-            each fvals as field {
-                if field.get_name() == prop_name {
-                    already_set = true
-                    break
-                }
-            }
-            if already_set : continue
+            if prop.is_slice_data : continue
+            if fvals.has(prop) : continue
             let default_body = prop.default
             let field_type = prop.type
             let fv: ?Value = null
@@ -1871,17 +1860,23 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             } else {
                 if prop.type.is_nullable_type() : continue
                 let prop_class = prop.type.get_class_or_null()
-                if !isset(prop_class) : continue
-                if !isset(prop_class.default_hook) : continue
-                fv = value_generate_default(field_type, scope, ctx, prop.exp) !>
+                if isset(prop_class) && isset(prop_class.default_hook) {
+                    fv = value_generate_default(field_type, scope, ctx, prop.exp) !>
+                } else {
+                    let prop_name = prop.name
+                    if isset(prop_name) : missing.append(prop_name)
+                    continue
+                }
             }
             let field_value = fv ?! prop.exp.bug("Property default did not produce a value")
             // `@undefined` deliberately contributes no initialization store.
             if field_value.type == VAL.undefined : continue
             field_value = value_try_convert(field_value, scope, ctx, field_type)
             field_type.compat_check(field_value.rett, default_at) !>
-            field_value.set_name(prop_name)
-            fvals.append(field_value)
+            fvals.set(prop, field_value)
+        }
+        if missing.length > 0 {
+            class_init_missing_fields_error(exp, init_class, missing) !>
         }
         return vgen_class_init(ctx, init_class, fvals, rett, exp) !>
     }
@@ -1969,6 +1964,16 @@ fn value_from_class_init_hooks(class: Class, rett: Type, elem_exps: Array[Exp], 
     return v
 }
 
+fn class_init_missing_fields_error(at: Exp, class: Class, missing: Array[String]) !Error {
+    let fields = ""
+    each missing as name, i {
+        if i > 0 : fields += ", "
+        fields += "'" + name + "'"
+    }
+    let noun = missing.length == 1 ? "field" : "fields"
+    at.error("Missing " + noun + " in class initializer for '" + class.pretty_name() + "': " + fields + ". Provide " + (missing.length == 1 ? "it" : "them") + ", or declare a default on the property")
+}
+
 // Empty instance: prefer static `new()` (defaults allowed), else empty field class_init.
 fn class_empty_construct(class: Class, rett: Type, scope: Scope, ctx: Context, at: Exp) Value !Error {
     let f = class.get_func("new")
@@ -1982,7 +1987,7 @@ fn class_empty_construct(class: Class, rett: Type, scope: Scope, ctx: Context, a
         if call.rett.is_void_type() : call.rett = rett
         return call
     }
-    return vgen_class_init(ctx, class, Array[Value]{}, rett, at) !>
+    return vgen_class_init(ctx, class, HashMap[Prop, Value]{}, rett, at) !>
 }
 
 // Param type of a method after implicit `this` (instance) or without (static).
