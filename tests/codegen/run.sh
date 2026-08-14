@@ -166,14 +166,14 @@ f64_body=$(sed -n '/^define .*__box_f64__/,/^}/p' "$scalar_ir")
 scalar_only_body=$(sed -n '/^define .*__box_scalar_only__/,/^}/p' "$scalar_ir")
 gc_only_body=$(sed -n '/^define .*__box_gc_only__/,/^}/p' "$scalar_ir")
 
-if [[ "$int_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$i32_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$u8_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$bool_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$f32_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$f64_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$scalar_only_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$gc_only_body" != *"{ i64, [8 x i8] }"* ]]; then
+if [[ "$int_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$i32_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$u8_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$bool_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$f32_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$f64_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$scalar_only_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$gc_only_body" != *"{ i8, [1 x i64] }"* ]]; then
     echo "# Tagged-union aggregate layout did not match tag / shared payload fields"
     exit 1
 fi
