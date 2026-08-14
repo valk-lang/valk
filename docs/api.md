@@ -584,7 +584,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn blowfish_encrypt_block(context: BlowfishContext, input: @[u8], output: @[u8]) void
 + fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
 + fn blowfish_init_state(context: BlowfishContext) void
-+ fn blowfish_xor_block(data: &[u8], salt: ByteBuffer, saltIndex: &[uint]) void
++ fn blowfish_xor_block(data: @[u8], salt: ByteBuffer, saltIndex: @[uint]) void
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```
