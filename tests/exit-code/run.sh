@@ -30,7 +30,7 @@ fi
 trap 'rm -rf "$workdir"' EXIT
 
 # fixture:expected exit status
-cases="return-3:3 return-0:0 void-main:0 return-int:7 return-non-integer:0"
+cases="return-3:3 return-0:0 void-main:0 return-int:7 return-non-integer:0 fixed-array-bounds:1"
 
 for case in $cases; do
     name="${case%%:*}"

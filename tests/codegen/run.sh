@@ -258,6 +258,26 @@ if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
     exit 1
 fi
 
+echo "> Check variable indices for every known-length sequence"
+
+bounds_ir="$workdir/fixed-array-bounds.ll"
+out=$("$VALK" build "$DIR/fixed-array-bounds.valk" --ir --no-warn -o "$bounds_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build fixed-array bounds IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+for name in fixed_read bounded_read named_bounded_read fixed_write; do
+    bounds_body=$(sed -n "/^define .*__${name}__/,/^}/p" "$bounds_ir")
+    if [[ "$bounds_body" != *"icmp uge"* ]] || [[ "$bounds_body" != *"__panic__"* ]]; then
+        echo "# $name did not check its known sequence bound before indexing"
+        echo "$bounds_body"
+        exit 1
+    fi
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 7"
+echo "# Test count: 8"
 echo ""
