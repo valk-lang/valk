@@ -60,6 +60,7 @@ class TypeCache {
     ptr_of: ?Type (null)
     ref_of: ?Type (null)
     inline: ?Type (null)
+    non_inline: ?Type (null)
     nullable: ?Type (null)
     array: ?Type (null)
     slice: ?Type (null)
@@ -313,7 +314,11 @@ class Type {
         if this.is_fixed_array_type() {
             let sub = this.get_sub_type()
             if !isset(sub) : this.build.bug("Inline sequence is missing element type")
-            return sub.byte_size() !> * this.length.to(u32)
+            let element_size = sub.byte_size() !>
+            if element_size > 0 && this.length > (4294967295 / element_size).to(uint) {
+                this.build.error("Fixed inline sequence byte size exceeds 4294967295")
+            }
+            return element_size * this.length.to(u32)
         }
 
         // Class-backed types (class / struct / int / float / bool / pointer / …)
@@ -491,9 +496,9 @@ class Type {
         if this.is_inline : return false
         let c = this.class
         if !isset(c) : return false
-        let kind = c.kind
+        let kind = c.representation_class().kind
         return kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.struct
-            || kind == CLASS_KIND.slice || kind == CLASS_KIND.mode || kind == CLASS_KIND.pointer
+            || kind == CLASS_KIND.slice || kind == CLASS_KIND.array || kind == CLASS_KIND.unbound || kind == CLASS_KIND.pointer
     }
 
     fn has_unresolved_generic() bool {
@@ -504,6 +509,12 @@ class Type {
         if isset(subs) {
             each subs as member {
                 if member.has_unresolved_generic() : return true
+            }
+        }
+        let returns = this.get_returns()
+        if isset(returns) {
+            each returns as rett {
+                if rett.has_unresolved_generic() : return true
             }
         }
         let c = this.class
@@ -569,7 +580,7 @@ class Type {
         // is handled above as TYPE.inline.
         let c = this.class
         if isset(c) {
-            let kind = c.kind
+            let kind = c.representation_class().kind
             if kind == CLASS_KIND.integer || kind == CLASS_KIND.float || kind == CLASS_KIND.boolean : return true
             // class / slice / mode / pointer are reference types
             return false
@@ -585,7 +596,7 @@ class Type {
         let t = this.get_non_nullable()
         if t.kind == type : return true
         let c = t.class
-        return isset(c) && c.kind == class_kind
+        return isset(c) && c.representation_class().kind == class_kind
     }
 
     fn is_integer_type() bool {
@@ -611,7 +622,8 @@ class Type {
     fn is_structural_type() bool {
         let c = this.get_class_or_null()
         if !isset(c) : return false
-        return c.kind == CLASS_KIND.struct || c.kind == CLASS_KIND.class
+        let kind = c.representation_class().kind
+        return kind == CLASS_KIND.struct || kind == CLASS_KIND.class
     }
 
     // GC-managed object reference.
@@ -640,12 +652,8 @@ class Type {
         if t.kind != TYPE.gcptr && t.kind != TYPE.struct : return false
         let c = t.class
         if !isset(c) : return false
-        let kind = c.kind
+        let kind = c.representation_class().kind
         if kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.slice || kind == CLASS_KIND.array : return true
-        if kind == CLASS_KIND.mode {
-            let mode_for = c.mode_for_class
-            if isset(mode_for) : return mode_for.kind == CLASS_KIND.class
-        }
         return false
     }
 
@@ -769,9 +777,7 @@ class Type {
     fn compat_class() ?Class {
         let c = this.get_class_or_null()
         if !isset(c) : return null
-        let mode_for = c.mode_for_class
-        if isset(mode_for) : return mode_for
-        return c
+        return c.representation_class()
     }
 
     // True for integer / float / bool (including class-backed number types).
@@ -817,9 +823,16 @@ class Type {
     fn compat_pointer_inner(other: Type) bool {
         let own = this.get_sub_type() ?! return false
         let theirs = other.get_sub_type() ?! return false
-        if own.kind == TYPE.unbound : own = own.get_sub_type() ?! return false
-        if theirs.kind == TYPE.unbound : theirs = theirs.get_sub_type() ?! return false
         return own.compat(theirs)
+    }
+
+    fn compat_unbound_pointer(other: Type) bool {
+        let unbound = this.kind == TYPE.unbound ? this : other
+        let pointer = this.kind == TYPE.unbound ? other : this
+        if this.kind == TYPE.unbound && this.length > 0 : return false
+        let element = unbound.get_sub_type() ?! return false
+        let pointed = pointer.get_sub_type() ?! return false
+        return element.compat(pointed)
     }
 
     fn compat_array(other: Type) bool {
@@ -846,12 +859,19 @@ class Type {
         let own_info = this.get_function_info()
         let their_info = other.get_function_info()
         if !isset(own_info) || !isset(their_info) : return !isset(own_info) && !isset(their_info)
-        let own = own_info.args
-        let theirs = their_info.args
-        if own.length != theirs.length : return false
-        each own as member, i {
-            let other_member = theirs.get(i) ! return false
-            if !member.compat(other_member) && !other_member.compat(member) : return false
+        if !this.type_arrays_compatible(their_info.args, own_info.args) : return false
+        if !this.type_arrays_compatible(own_info.returns, their_info.returns) : return false
+        let expected_error = own_info.error_type
+        let actual_error = their_info.error_type
+        if !isset(actual_error) : return true
+        return isset(expected_error) && expected_error.is_compat(actual_error)
+    }
+
+    fn type_arrays_compatible(expected: Array[Type], actual: Array[Type]) bool {
+        if expected.length != actual.length : return false
+        each expected as type, i {
+            let other = actual.get(i) ! return false
+            if !type.compat(other) : return false
         }
         return true
     }
@@ -881,7 +901,7 @@ class Type {
             || (other.kind == TYPE.unbound && (this.kind == TYPE.ptr_of || this.kind == TYPE.ref_of))
         {
             if !this.is_pointer() || !other.is_pointer() : return false
-            return this.compat_pointer_inner(other)
+            return this.compat_unbound_pointer(other)
         }
         let own_class = this.compat_class()
         let other_class = other.compat_class()
@@ -898,13 +918,14 @@ class Type {
         if t == TYPE.nullable : return this.compat_inner(other)
         if t == TYPE.unbound {
             if this.is_inline && this.length != other.length : return false
+            if !this.is_inline && !this.compat_min_length(other) : return false
             return this.compat_inner(other)
         }
         if t == TYPE.slice && (this.is_fixed_array_type() || other.is_fixed_array_type()) : return this.compat_array(other)
         if t == TYPE.slice && !this.compat_min_length(other) : return false
         if t == TYPE.struct && this.is_inline && !isset(this.class) : return this.compat_multi(other)
         if t == TYPE.closure || t == TYPE.fnptr : return this.compat_callable(other)
-        if t == TYPE.co : return this.compat_optional_inner(other)
+        if t == TYPE.co : return this.compat_callable(other)
         if t == TYPE.error_code : return this.get_error_type() == other.get_error_type()
 
         let own_class = this.compat_class()
@@ -1015,17 +1036,17 @@ class Type {
         if this.kind == TYPE.any : return "any"
         if this.kind == TYPE.nullable {
             let sub = this.get_sub_type()
-            if isset(sub) : return "?" + sub.compat_display_name()
+            if isset(sub) : return type_wrapped_display("?", sub)
             return "?"
         }
         if this.kind == TYPE.ptr_of {
             let sub = this.get_sub_type()
-            if isset(sub) : return "*" + sub.compat_display_name()
+            if isset(sub) : return type_wrapped_display("*", sub)
             return "*"
         }
         if this.kind == TYPE.ref_of {
             let sub = this.get_sub_type()
-            if isset(sub) : return "&" + sub.compat_display_name()
+            if isset(sub) : return type_wrapped_display("&", sub)
             return "&"
         }
         if this.kind == TYPE.unbound {
@@ -1083,14 +1104,21 @@ class Type {
                 each func_info.returns as rett : return_parts.append(rett.compat_display_name())
                 rett_name = "(" + return_parts.join(", ") + ")"
             }
-            return prefix + name + "(" + parts.join(", ") + ")" + rett_name
+            let result = prefix + name + "(" + parts.join(", ") + ")" + rett_name
+            let error_type = this.get_error_type()
+            if isset(error_type) : result += "!" + error_type.name
+            return result
         }
         if this.kind == TYPE.co {
             let info = this.get_function_info()
-            if !isset(info) || info.returns.length == 0 : return "co()"
             let parts = Array[String]{}
-            each info.returns as rett : parts.append(rett.compat_display_name())
-            return "co(" + parts.join(", ") + ")"
+            if isset(info) {
+                each info.returns as rett : parts.append(rett.compat_display_name())
+            }
+            let result = prefix + "co(" + parts.join(", ") + ")"
+            let error_type = this.get_error_type()
+            if isset(error_type) : result += "!" + error_type.name
+            return result
         }
         return "type"
     }
@@ -1211,6 +1239,26 @@ class Type {
             is_shared: this.is_shared
         }
         this.get_cache().inline = t
+        t.get_cache().non_inline = this
+        return t
+    }
+
+    fn non_inline() Type {
+        if !this.is_inline : return this
+        let cached = this.cache
+        let non_inline = isset(cached) ? cached.non_inline : null
+        if isset(non_inline) : return non_inline
+        let t = Type {
+            build: this.build
+            class: this.class
+            info: this.info
+            length: this.length
+            kind: this.kind
+            unsigned: this.unsigned
+            is_shared: this.is_shared
+        }
+        this.get_cache().non_inline = t
+        t.get_cache().inline = this
         return t
     }
 
@@ -1291,6 +1339,11 @@ class Type {
         }
         return true
     }
+}
+
+fn type_wrapped_display(prefix: String, sub: Type) String {
+    let name = sub.compat_display_name()
+    return sub.get_non_nullable().kind == TYPE.union ? prefix + "(" + name + ")" : prefix + name
 }
 
 // ---- Build-level singleton types ----
@@ -1637,6 +1690,9 @@ fn type_callable_from_exp(exp: Exp, scope: Scope, kind: TYPE) Type !Error {
     let args_exp = exp.get(TYPE_EXP.args)
     if kind != TYPE.co && isset(args_exp) {
         args = (type_from_multi_exp(args_exp, scope, true) !>).get_members() ?? Array[Type]{}
+        each args as arg {
+            if arg.is_void_type() : exp.error("Callable arguments cannot be void")
+        }
     }
 
     let returns = Array[Type]{}
@@ -1645,7 +1701,10 @@ fn type_callable_from_exp(exp: Exp, scope: Scope, kind: TYPE) Type !Error {
         let rett = type_from_exp(rett_exp, scope) !>
         let members = rett.get_members()
         if rett.kind == TYPE.struct && rett.is_inline && !isset(rett.class) && isset(members) {
-            each members as member : returns.append(member)
+            each members as member {
+                if member.is_void_type() : exp.error("Callable return lists cannot contain void")
+                returns.append(member)
+            }
         } else if !rett.is_void_type() {
             returns.append(rett)
         }
@@ -1791,7 +1850,9 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
     }
 
     if kind == TYPE_KIND.nullable {
-        return type_from_inner_exp(exp, scope, "Missing inner type for '?'") !>.nullable()
+        let inner = type_from_inner_exp(exp, scope, "Missing inner type for '?'") !>
+        if inner.is_void_type() : exp.error("'void' cannot be nullable")
+        return inner.nullable()
     }
 
     if kind == TYPE_KIND.shared {
@@ -1803,10 +1864,15 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
     }
 
     if kind == TYPE_KIND.ptr {
-        return type_from_inner_exp(exp, scope, "Missing inner type for '*'") !>.pointer()
+        let inner = type_from_inner_exp(exp, scope, "Missing inner type for '*'") !>
+        if inner.is_void_type() : exp.error("Use 'ptr' for an untyped pointer instead of '*void'")
+        if inner.is_inline && (inner.kind == TYPE.unbound || inner.kind == TYPE.struct) : return inner.non_inline()
+        return inner.pointer()
     }
     if kind == TYPE_KIND.ref {
-        return type_from_inner_exp(exp, scope, "Missing inner type for '&'") !>.reference()
+        let inner = type_from_inner_exp(exp, scope, "Missing inner type for '&'") !>
+        if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
+        return inner.reference()
     }
 
     if kind == TYPE_KIND.inline {
@@ -1817,6 +1883,9 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
         }
         if isset(class) && class.kind == CLASS_KIND.class {
             exp.error("Classes cannot be stored inline safely; use a struct instead")
+        }
+        if isset(class) && class.kind == CLASS_KIND.mode {
+            exp.error("Mode types cannot be stored inline; use their wrapped type instead")
         }
         if sub.kind == TYPE.unbound && sub.length == 0 {
             exp.error("An inline unbound type requires a known length")
@@ -1902,6 +1971,11 @@ fn type_from_multi_exp(exp: Exp, scope: Scope, force_multi: bool (false)) Type !
         if !isset(sub) : break
         types.append(type_from_exp(sub, scope) !>)
         i++
+    }
+    if types.length > 1 {
+        each types as type {
+            if type.is_void_type() : exp.error("Multi-value types cannot contain void")
+        }
     }
     return type_multi(b, types, force_multi)
 }
