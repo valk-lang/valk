@@ -169,13 +169,13 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
 
 // One managed field of an allocated object: hand its address to the collector's
 // callback, guarded by the union tags that make the field active.
-fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, data: String) !Error {
+fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, data: String, base: String ("\%item")) !Error {
     let conditions = prop.conditions
     let after = ""
     if conditions.length > 0 {
         let matched = ""
         each conditions as condition {
-            let tag = ir_emit_load(ir, "i8", ir_offset_address(ir, "\%item", condition.offset.to(uint)))
+            let tag = ir_emit_load(ir, "i8", ir_offset_address(ir, base, condition.offset.to(uint)))
             let is_active = ir_emit_binary_index(ir, "icmp eq", "i8", tag, condition.tag)
             matched = matched == "" ? is_active : ir_emit_binary_instruction(ir, "and", "i1", matched, is_active)
         }
@@ -185,7 +185,7 @@ fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, da
         ir.label(active)
     }
 
-    let field = ir_offset_address(ir, "\%item", prop.offset.to(uint))
+    let field = ir_offset_address(ir, base, prop.offset.to(uint))
     let mark = ir.arg_list.length
     ir.write_arg(mark, "ptr", data)
     ir.write_arg(mark, "ptr", field)
@@ -198,6 +198,42 @@ fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, da
     }
 }
 
+fn ir_write_sequence_props(
+    ir: IRFunc,
+    props: Array[AllocatorProp],
+    element_size: u32,
+    length: String,
+    data: String,
+    callback: String,
+    callback_data: String
+) !Error {
+    let entry = ir.current_block
+    let cond = ir.block("sequence.cond")
+    let body = ir.block("sequence.body")
+    let next = ir.block("sequence.next")
+    let done = ir.block("sequence.done")
+    ir.jump(cond)
+    ir.label(cond)
+    let index = ir_emit_phi2(ir, "i64", "0", entry, "\%sequence.index.next", next)
+    let more = ir_emit_binary_instruction(ir, "icmp ult", "i64", index, length)
+    ir.cond_jump(more, body, done)
+    ir.label(body)
+    let offset = element_size == 1 ? index : ir_emit_binary_index(ir, "mul", "i64", index, element_size.to(uint))
+    let element = ir_dynamic_offset_address(ir, data, offset)
+    each props as prop {
+        ir_write_allocator_prop(ir, prop, callback, callback_data, element) !>
+    }
+    ir.jump(next)
+    ir.label(next)
+    ir.line_start()
+    ir.write("\%sequence.index.next = add i64 ")
+    ir.write(index)
+    ir.write(", 1")
+    ir.line_end()
+    ir.jump(cond)
+    ir.label(done)
+}
+
 fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error {
     each build.lists.allocator_init_sites as site {
         let owner = site.ctx.func
@@ -207,7 +243,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
         each build.lists.allocators as allocator, i {
             if !allocator.global.is_used : continue
             let props_func = allocator.props_func
-            if allocator.props.length == 0 && !isset(props_func) : continue
+            if allocator.props.length == 0 && allocator.element_props.length == 0 && !isset(props_func) : continue
             let ir = IRFunc {func: owner}
             ir.code.write_string("define internal void @\"valk.allocator.props.")
             ir.code.write_int_ascii(site.value.int_val)
@@ -219,6 +255,11 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             let data = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 1)
             each allocator.props as prop {
                 ir_write_allocator_prop(ir, prop, callback, data) !>
+            }
+            if allocator.element_props.length > 0 {
+                let length = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", allocator.length_offset.to(uint)))
+                let elements = ir_union_clean_gc_pointer(ir, ir_emit_load(ir, "ptr", ir_offset_address(ir, "\%item", allocator.data_offset.to(uint))))
+                ir_write_sequence_props(ir, allocator.element_props, allocator.element_size, length, elements, callback, data) !>
             }
             if isset(props_func) {
                 let mark = ir.arg_list.length
@@ -252,7 +293,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             ir.write("(i64 ")
             ir.write_uint(allocator.size.to(uint))
             ir.write(", ptr ")
-            if allocator.props.length > 0 || isset(allocator.props_func) {
+            if allocator.props.length > 0 || allocator.element_props.length > 0 || isset(allocator.props_func) {
                 ir.write("@\"valk.allocator.props.")
                 ir.write_int(site.value.int_val)
                 ir.write(".")
@@ -1987,6 +2028,15 @@ fn ir_offset_address(ir: IRFunc, base: String, offset: uint) String {
     return address
 }
 
+fn ir_dynamic_offset_address(ir: IRFunc, base: String, offset: String) String {
+    let address = ir.var()
+    ir_open_element_address(ir, address, "i8", base)
+    ir.write("i64 ")
+    ir.write(offset)
+    ir.line_end()
+    return address
+}
+
 // Same, for a slot that already has a name of its own.
 fn ir_name_offset_address(ir: IRFunc, name: String, base: String, offset: uint) {
     ir_open_element_address(ir, name, "i8", base)
@@ -2888,6 +2938,32 @@ fn ir_emit_dynamic_zero(ir: IRFunc, address: String, size: String) {
     ir.line_end()
 }
 
+fn ir_emit_slice_props(parent: IRFunc, value: Value, class: Class) ?String !Error {
+    let element = class.slice_type
+    if !isset(element) : value.bug("Slice initializer has no element type")
+    if !element.has_gc_refs() : return null
+    let name = "valk.slice.props." + helper:ctxhash(type_identity_key(class.get_type() !>))
+    if ir_reuse_adapter(parent, name) : return name
+
+    let props = Array[AllocatorProp]{}
+    allocator_collect_props(element, 0, props) !>
+    let ir = ir_adapter_ir(parent, name)
+    ir.code.write_string("define internal void @\"")
+    ir.code.write_string(name)
+    ir.code.write_string("\"(ptr \%item, ptr \%list, { ptr, ptr } \%callback) {\n")
+    ir.label("entry")
+    let callback = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 0)
+    let callback_data = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 1)
+    let length_prop = class.get_prop_by_name("length") !? null
+    if !isset(length_prop) : value.bug("Slice length property is missing")
+    let length = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", length_prop.offset.to(uint)))
+    let data = ir_offset_address(ir, "\%item", (class.slice_data_offset() !>).to(uint))
+    ir_write_sequence_props(ir, props, element.byte_size() !>, length, data, callback, callback_data) !>
+    ir.line("ret void")
+    ir.code.write_string("}\n\n")
+    return name
+}
+
 fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Value], field_mark: uint) String !Error {
     let element = class.slice_type
     if !isset(element) : value.bug("Slice initializer has no element type")
@@ -2916,14 +2992,10 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     ir_use_func(ir, alloc)
     ir_note_allocates(ir)
 
-    let props = class.get_func("_props")
-    if isset(props) {
-        if !props.parsed_types : parse_func_types(props) !>
-        ir_use_func(ir, props)
-    }
+    let props = ir_emit_slice_props(ir, value, class) !>
     let mark = ir.arg_list.length
     ir.write_arg(mark, "i64", total)
-    ir.write_arg(mark, "ptr", isset(props) ? ir_func_address(props) : "null")
+    ir.write_arg(mark, "ptr", isset(props) ? ir_symbol_address(props) : "null")
     let slot = ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
     ir_emit_dynamic_zero(ir, slot, total)
     return slot
