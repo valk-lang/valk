@@ -121,6 +121,7 @@ class ValueMeta {
     error_type: ?ErrorType (null)
     pre_value: ?Value (null)
     init_prop: ?Prop (null)
+    implicit_borrow: bool (false)
 }
 
 class Value {
@@ -232,6 +233,16 @@ class Value {
         return isset(data) ? data.pre_value : null
     }
     fn set_pre_value(value: ?Value) $inline { this.ensure_meta().pre_value = value }
+
+    fn is_implicit_borrow() bool $inline {
+        let data = this.meta
+        if isset(data) && data.implicit_borrow : return true
+        if this.type != VAL.decl : return false
+        let decl = this.decl
+        return isset(decl) && decl.implicit_borrow
+    }
+
+    fn mark_implicit_borrow() $inline { this.ensure_meta().implicit_borrow = true }
 
     // Report an error at this value's source span when available.
     fn error(msg: String) !Error $throw {
@@ -965,6 +976,10 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
     if source.owner != parent {
         source = func_capture_decl(parent, source, name, at) !>
     }
+    source.is_captured = true
+    if source.implicit_borrow {
+        at.error("An implicit pointer borrow cannot be captured; use '@ref' explicitly")
+    }
 
     // Propagation through a nested literal may have installed this binding
     // before its own body directly references the name.
@@ -1122,7 +1137,7 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     let ptr_t = type_ptr(b)
     let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
-    on = value_try_convert(on, scope, ctx, ptr_t)
+    on = value_try_convert(on, scope, ctx, ptr_t, true, true)
     ptr_t.compat_check(on.rett, on_exp) !>
 
     let elem = type_from_exp(type_exp, scope) !>
@@ -1349,7 +1364,7 @@ fn value_from_memcpy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     each arg_exps as arg_exp, i {
         let target = i < 2 ? ptr_t : uint_t
         let value = value_from_exp(arg_exp, scope, ctx.with_suggested_type(target)) !>
-        value = value_try_convert(value, scope, ctx, target)
+        value = value_try_convert(value, scope, ctx, target, true, i < 2)
         target.compat_check(value.rett, arg_exp) !>
         values.append(value)
     }
@@ -1421,6 +1436,64 @@ fn parse_offset_access(body: Exp) Exp !Error {
     }
 
     p.error("Expected '..' or ']' in offset, found: '" + p.word() + "'")
+}
+
+fn type_has_native_sequence_length(type: Type) bool {
+    let t = type.get_non_nullable()
+    return t.is_fixed_array_type() || t.kind == TYPE.array || t.kind == TYPE.slice
+        || (t.kind == TYPE.unbound && t.length > 0)
+}
+
+fn type_native_sequence_element(type: Type) ?Type {
+    let t = type.get_non_nullable()
+    let element = t.get_sub_type()
+    if isset(element) : return element
+    let class = t.get_class_or_null()
+    return isset(class) ? class.slice_type : null
+}
+
+fn value_native_sequence_length(on: Value, type: Type, ctx: Context, at: Exp) ?Value !Error {
+    let t = type.get_non_nullable()
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    if t.is_fixed_array_type() || (t.kind == TYPE.unbound && t.length > 0) {
+        return vgen_int(t.length.to(int), uint_t)
+    }
+    if t.kind != TYPE.array && t.kind != TYPE.slice : return null
+    let class = t.get_class_or_null()
+    if isset(class) {
+        let prop = class.get_prop_by_name("length") !? null
+        if !isset(prop) : at.bug("Sequence type has no length property")
+        let value = vgen_prop(prop, on, ctx)
+        value.exp = at
+        return value
+    }
+    return vgen_ptrv(on, vgen_int(0, uint_t), uint_t, at)
+}
+
+fn value_native_sequence_data(on: Value, type: Type, ctx: Context, at: Exp) Value !Error {
+    let t = type.get_non_nullable()
+    if t.is_fixed_array_type() || t.kind == TYPE.unbound : return on
+    let class = t.get_class_or_null()
+    if isset(class) {
+        let prop = class.get_prop_by_name("data") !? null
+        if !isset(prop) : at.bug("Sequence type has no data property")
+        let value = vgen_prop(prop, on, ctx)
+        value.exp = at
+        return value
+    }
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    if t.kind == TYPE.array {
+        return vgen_ptrv(on, vgen_int(1, uint_t), type_ptr(ctx.build), at)
+    }
+    return vgen_ptr_offset(on, vgen_int(t.ptr_size().to(int), uint_t), at)
+}
+
+fn value_native_sequence_item(on: Value, index: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let t = on.rett.get_non_nullable()
+    let element = type_native_sequence_element(t)
+    if !isset(element) : at.bug("Sequence type has no element type")
+    let data = value_native_sequence_data(on, t, ctx, at) !>
+    return value_property_get(vgen_ptrv(data, index, element, at), scope, ctx, at) !>
 }
 
 // `base[…]` — body is EXP.body; re-parse as type list (specialize), a single
@@ -1521,11 +1594,46 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         let start_exp = access.get(VALUE_EXP.left)
         let length_exp = access.get(VALUE_EXP.right)
         if !isset(start_exp) || !isset(length_exp) : access.bug("Bracket range is missing an argument")
+        let uint_t = type_from_core(b, "uint") !>
+        let start_index = value_from_exp(start_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        let length = value_from_exp(length_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        start_index = value_try_convert(start_index, scope, ctx, uint_t)
+        length = value_try_convert(length, scope, ctx, uint_t)
+        uint_t.compat_check(start_index.rett, start_exp) !>
+        uint_t.compat_check(length.rett, length_exp) !>
+        let inline_length_is_const = length.type == VAL.int
+        let inline_length: uint = inline_length_is_const && length.int_val > 0 ? length.int_val.to(uint) : 0
         let on_class = on_t.get_class_or_null()
-        if !isset(on_class) {
-            exp.error("Type: '" + on.rett.compat_display_name() + "' has no '$range' function")
+        let range_func = isset(on_class) ? on_class.get_range_hook() : null
+        if (on_t.is_fixed_array_type() || on_t.kind == TYPE.unbound) && on_t.length > 0 {
+            let checked_start, checked_length = value_check_known_length_range(start_index, length, on_t, on_t.length, ctx, exp) !>
+            start_index = checked_start
+            length = checked_length
         }
-        let range_func = on_class.get_range_hook()
+        if !isset(range_func) && (on_t.is_fixed_array_type() || (on_t.kind == TYPE.unbound && on_t.length > 0)) {
+            if !inline_length_is_const {
+                length_exp.error("Inline range length must be a compile-time integer")
+            }
+            if inline_length == 0 {
+                length_exp.error("Inline range length must be greater than zero")
+            }
+            let element = on_t.get_sub_type()
+            if !isset(element) : exp.bug("Sequence type has no element type")
+            let values = Array[Value]{}
+            let i: uint = 0
+            while i < inline_length {
+                let base_index = start_index
+                if i > 0 && isset(start_index.get_pre_value()) {
+                    let decl = start_index.decl
+                    if !isset(decl) : exp.bug("Checked range start has no declaration")
+                    base_index = vgen_decl(decl)
+                }
+                let index = i == 0 ? base_index : vgen_op(base_index, vgen_int(i.to(int), uint_t), VALUE_OP.add, uint_t)
+                values.append(value_native_sequence_item(on, index, scope, ctx, exp) !>)
+                i++
+            }
+            return vgen_array_init(ctx, values, element.fixed_array(inline_length), exp)
+        }
         if !isset(range_func) {
             exp.error("Type: '" + on.rett.compat_display_name() + "' has no '$range' function")
         }
@@ -1534,11 +1642,6 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         }
         range_func = func_for_receiver(range_func, on, exp) !>
 
-        // `$range` signatures are validated when their flag is registered, so
-        // both arguments always receive the canonical uint suggestion/conversion.
-        let uint_t = type_from_core(b, "uint") !>
-        let start_index = value_from_exp(start_exp, scope, ctx.with_suggested_type(uint_t)) !>
-        let length = value_from_exp(length_exp, scope, ctx.with_suggested_type(uint_t)) !>
         let args = Array[Value]{ start_index, length }
         let callee = vgen_func(range_func, on)
         value_check_call_args(range_func, callee, args, scope, ctx, exp) !>
@@ -1664,6 +1767,57 @@ fn value_check_known_length_index(
         vgen_if(past_end, Array[Value]{ panic_call }, null, ctx.build, at)
     }, ctx.build, at))
     return result_index
+}
+
+fn value_check_known_length_range(
+    start: Value,
+    length: Value,
+    on_type: Type,
+    size: uint,
+    ctx: Context,
+    at: Exp
+) (Value, Value) !Error {
+    if start.type == VAL.int && length.type == VAL.int {
+        if start.int_val < 0 || length.int_val < 0
+            || start.int_val.@cast(uint) > size
+            || length.int_val.@cast(uint) > size - start.int_val.@cast(uint)
+        {
+            at.error("Out of bounds range on type: " + on_type.compat_display_name())
+        }
+        return (start, length)
+    }
+
+    let func = ctx.get_func() !>
+    let start_slot = vgen_scratch_value(func, start.rett, at)
+    let length_slot = vgen_scratch_value(func, length.rett, at)
+    let start_decl = start_slot.decl
+    let length_decl = length_slot.decl
+    if !isset(start_decl) || !isset(length_decl) : at.bug("Range bounds have no scratch declarations")
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let checked_start = vgen_cast(vgen_decl(start_decl), uint_t)
+    let checked_length = vgen_cast(vgen_decl(length_decl), uint_t)
+    let limit = vgen_int(size.to(int), uint_t)
+    let start_past = vgen_op(checked_start, limit, VALUE_OP.gt, type_bool(ctx.build))
+    let remaining = vgen_op(limit, checked_start, VALUE_OP.sub, uint_t)
+    let length_past = vgen_op(checked_length, remaining, VALUE_OP.gt, type_bool(ctx.build))
+    let invalid = vgen_op(start_past, length_past, VALUE_OP.or, type_bool(ctx.build))
+
+    let panic = value_get_valk_func(ctx.build, "core", "panic", at) !>
+    if !panic.parsed_types : parse_func_types(panic) !>
+    let panic_call = vgen_call(
+        ctx,
+        vgen_func(panic),
+        Array[Value]{ vgen_string("Range out of bounds", type_string(ctx.build)) },
+        panic.get_rett()
+    )
+    panic_call.exp = at
+    let result_start = vgen_decl(start_decl)
+    result_start.set_pre_value(vgen_block(Array[Value]{
+        vgen_assign(start_slot, start, ASSIGN_OP.set, ctx.build, at)
+        vgen_assign(length_slot, length, ASSIGN_OP.set, ctx.build, at)
+        vgen_if(invalid, Array[Value]{ panic_call }, null, ctx.build, at)
+    }, ctx.build, at))
+    return (result_start, vgen_decl(length_decl))
 }
 
 // `on[index] = value` — only handled here when `on` resolves to a class with a
@@ -2044,6 +2198,9 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             if fv.type != VAL.undefined {
                 fv = value_try_convert(fv, field_scope, ctx, field_type)
                 field_type.compat_check(fv.rett, vexp) !>
+                if fv.is_implicit_borrow() {
+                    vexp.error("An implicit pointer borrow cannot be stored in an object; use '@ref' explicitly")
+                }
             }
             fvals.set(prop, fv)
         }
@@ -3130,6 +3287,14 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
     }
 
+    if name == "length" && type_has_native_sequence_length(on_nn.rett) {
+        let length = value_native_sequence_length(on_nn, on_nn.rett, ctx, exp) !>
+        if isset(length) {
+            length.exp = exp
+            return length
+        }
+    }
+
     // Built-in conversion: `.to(Type)` / `.$to(Type)` — folded at the call site.
     // Real methods/props named `to` take precedence (checked above).
     if name == "to" || name == "$to" {
@@ -3827,7 +3992,14 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         let av = args.get(i) ! break
         if !param.is_generic {
             // Convert first (literal int → i32, nullable strip, $to hooks, …)
-            av = value_try_convert(av, scope, ctx, param.type)
+            let param_kind = param.type.get_non_nullable().kind
+            let param_class = param.type.get_non_nullable().get_class_or_null()
+            let struct_borrow = param_kind == TYPE.struct && isset(param_class) && param_class.kind == CLASS_KIND.struct
+            let accepts_borrow = struct_borrow || param_kind == TYPE.voidptr || param_kind == TYPE.ptr_of || param_kind == TYPE.ref_of || param_kind == TYPE.unbound
+            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow)
+            if av.is_implicit_borrow() && !accepts_borrow {
+                at.error("An implicit pointer borrow cannot be passed to raw pointer storage; use '@ref' explicitly")
+            }
             args.set(i, av) ! at.bug("value_check_call_args: args.set out of range")
             let avt = av.rett
             if !avt.is_void_type() {

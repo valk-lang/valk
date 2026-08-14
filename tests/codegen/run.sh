@@ -278,6 +278,13 @@ for name in fixed_read bounded_read named_bounded_read fixed_write; do
     fi
 done
 
+native_each_body=$(sed -n '/^define .*__native_array_each__/,/^}/p' "$bounds_ir")
+if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_next"* ]]; then
+    echo "# Array each did not use native length/data iteration"
+    echo "$native_each_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 8"
+echo "# Test count: 9"
 echo ""
