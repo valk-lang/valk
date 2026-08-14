@@ -113,6 +113,19 @@ if [[ "$layout_marker" != *"i32 0, i32 2"* ]] \
     exit 1
 fi
 
+echo "> Construct fixed inline values in stack storage"
+
+fixed_body=$(sed -n '/^define .*__inline_fixed_value__/,/^}/p' "$ir")
+if [[ "$fixed_body" != *"alloca [3 x i8]"* ]] \
+    || [[ "$fixed_body" != *"store i8 1"* ]] \
+    || [[ "$fixed_body" != *"store i8 2"* ]] \
+    || [[ "$fixed_body" != *"store i8 3"* ]] \
+    || [[ "$fixed_body" == *"call "* ]]; then
+    echo "# Fixed inline value did not use stack storage"
+    echo "$fixed_body"
+    exit 1
+fi
+
 echo "> Use natural alignment for atomic property accesses"
 
 atomic_ir="$workdir/atomic-alignment.ll"
@@ -246,5 +259,5 @@ if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 6"
+echo "# Test count: 7"
 echo ""

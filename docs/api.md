@@ -607,20 +607,20 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Sha1 {
-    + fn add_hash_data(data: &[u8 x 20]) void
+    + fn add_hash_data(data: &<@[u8 x 20]>) void
     + fn add_raw_data_unsafe(data: @[u8], len: uint) void
     + fn add_string_data(str: String) void
-    + fn final() [u8 x 20]
+    + fn final() <@[u8 x 20]>
     + fn reset() void
 }
 ```
 
 ```js
 + class Sha256 {
-    + fn add_hash_data(data: &[u8 x 32]) void
+    + fn add_hash_data(data: &<@[u8 x 32]>) void
     + fn add_raw_data_unsafe(data: @[u8], len: uint) void
     + fn add_string_data(str: String) void
-    + fn final() [u8 x 32]
+    + fn final() <@[u8 x 32]>
     + fn reset() void
 }
 ```
@@ -628,13 +628,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Globals for 'crypto'
 
 ```js
-+ global IV : [u64 x 8]
-+ global SIGMA : [[u8 x 16] x 12]
-+ global parray : [u32 x 18]
-+ global sbox1 : [u32 x 256]
-+ global sbox2 : [u32 x 256]
-+ global sbox3 : [u32 x 256]
-+ global sbox4 : [u32 x 256]
++ global IV : <@[u64 x 8]>
++ global SIGMA : <@[<@[u8 x 16]> x 12]>
++ global parray : <@[u32 x 18]>
++ global sbox1 : <@[u32 x 256]>
++ global sbox2 : <@[u32 x 256]>
++ global sbox3 : <@[u32 x 256]>
++ global sbox4 : <@[u32 x 256]>
 ```
 
 # ext
