@@ -110,7 +110,10 @@ test-library: $(TEST_COMPILER)
 test-extend-access: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-codegen test-deps test-library test-extend-access
+test-doc: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/doc/run.sh
+
+test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-codegen test-deps test-library test-extend-access test-doc
 
 # Build once, then measure the union representation in fresh processes so
 # allocator pools and GC high-water state do not cross benchmark modes.

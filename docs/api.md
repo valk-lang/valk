@@ -18,7 +18,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'core'
 
 ```js
-+ fn clone_value(value: any) any
++ fn clone_value(value: $T) T
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
@@ -169,9 +169,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class Pool[T] {
     ~ count: uint
 
-    + fn add(item: any) void
-    + fn get() any !LookupError
-    + static fn new(start_size: uint (2)) Pool[any]
+    + fn add(item: T) void
+    + fn get() T !LookupError
+    + static fn new(start_size: uint (2)) Pool[T]
 }
 ```
 
@@ -184,8 +184,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ slice Slice[T] of any {
-    ~ data: ptr[any]
++ slice Slice[T] of T {
+    ~ data: ptr[T]
     ~ length: uint
 
     + fn append() void
@@ -744,7 +744,7 @@ alias pid_t for i32
 
 ```js
 + fn alloc(size: uint) GcPtr
-~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, Lifo)()) GcPtr
+~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo)()) GcPtr
 + fn collect() void
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
@@ -760,7 +760,7 @@ alias pid_t for i32
 ## Globals for 'gc'
 
 ```js
-~+ global gc : Gc
+~+ global gc : *Gc
 ~+ shared mem_usage_peak : uint
 ~+ shared mem_usage_shared : uint
 + global pause_last_us : uint
@@ -934,9 +934,9 @@ alias pid_t for i32
 
 ```js
 + class Router[T] {
-    + fn add(method: String, url: String, handler: any) void
-    + fn find(method: String, url: String) Route[any] !LookupError
-    + static fn new() Router[any]
+    + fn add(method: String, url: String, handler: T) void
+    + fn find(method: String, url: String) Route[T] !LookupError
+    + static fn new() Router[T]
 }
 ```
 
@@ -988,10 +988,10 @@ alias FD for i32
 ```js
 + fn decode(json: ByteBuffer | String) Value !ParseError
 + fn default_value(kind: int) Value
-+ fn encode(data: any, pretty: bool (false)) String
-+ fn encode_to(data: any, output: ByteBuffer, pretty: bool (false)) ByteBuffer
-+ fn from(data: any) Value
-+ fn from_value[T](data: Value) any !ValueError
++ fn encode(data: $T, pretty: bool (false)) String
++ fn encode_to(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
++ fn from(data: $T) Value
++ fn from_value[T](data: Value) T !ValueError
 + fn new_array(values: ?Array[Value] (null)) ArrayValue
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
@@ -1107,11 +1107,11 @@ alias FD for i32
 
 ```js
 + class AddrInfo {
-    ~ data: libc_gen_addrinfo
+    ~ data: *libc_gen_addrinfo
 
     + fn addr_len() u32
     + static fn new(host: String, port: u16) AddrInfo !NetError
-    + fn sock_addr() libc_gen_sockaddr
+    + fn sock_addr() *libc_gen_sockaddr
 }
 ```
 
@@ -1184,8 +1184,8 @@ alias FD for i32
 ## Functions for 'template'
 
 ```js
-+ fn render(name: String, data: any, options: ?RenderOptions (null)) String !ParseError
-+ fn render_content(content: String, data: any, options: ?RenderOptions (null)) String
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
++ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String
 + fn set_content(name: String, content: String) void
 + fn set_content_many(content: Map[String]) void
 ```
@@ -1344,7 +1344,7 @@ alias FD for i32
     + static fn array(of: ?Field) Field
     + static fn bool() Field
     + fn custom(func: fn(Value)(bool), error: String) Field
-    + fn default(val: any) Field
+    + fn default(val: $T) Field
     + fn email() Field
     + fn equals_string(str: ?String) Field
     + static fn float() Field
@@ -1374,3 +1374,4 @@ alias FD for i32
 ```js
 + global default_translations : Map[String]
 ```
+
