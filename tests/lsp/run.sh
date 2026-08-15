@@ -202,6 +202,9 @@ check "initialize advertises save notifications" '"save":true'
 check "diagnostics on save" '"message":"Unknown identifier: nope_xyz"' \
     "$(notify_save diag.valk)"
 
+check_absent "compile-time print stays out of LSP stdout" 'LSP_PRINT_MUST_NOT_ESCAPE' \
+    "$(notify_save print.valk)"
+
 # Ranged changes are applied in order, and a burst publishes diagnostics once for
 # its final buffer without requiring a save. The second range is relative to the
 # result of the first (`nope_xyz` -> `buffer_xyz` -> `buffer_only_xyz`).
