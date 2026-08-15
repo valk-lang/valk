@@ -169,14 +169,14 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
 
 // One managed field of an allocated object: hand its address to the collector's
 // callback, guarded by the union tags that make the field active.
-fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, data: String) !Error {
+fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, data: String, base: String ("\%item")) !Error {
     let conditions = prop.conditions
     let after = ""
     if conditions.length > 0 {
         let matched = ""
         each conditions as condition {
-            let tag = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", condition.offset.to(uint)))
-            let is_active = ir_emit_binary_index(ir, "icmp eq", "i64", tag, condition.tag)
+            let tag = ir_emit_load(ir, "i8", ir_offset_address(ir, base, condition.offset.to(uint)))
+            let is_active = ir_emit_binary_index(ir, "icmp eq", "i8", tag, condition.tag)
             matched = matched == "" ? is_active : ir_emit_binary_instruction(ir, "and", "i1", matched, is_active)
         }
         let active = ir.block("prop.active")
@@ -185,7 +185,7 @@ fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, da
         ir.label(active)
     }
 
-    let field = ir_offset_address(ir, "\%item", prop.offset.to(uint))
+    let field = ir_offset_address(ir, base, prop.offset.to(uint))
     let mark = ir.arg_list.length
     ir.write_arg(mark, "ptr", data)
     ir.write_arg(mark, "ptr", field)
@@ -198,6 +198,42 @@ fn ir_write_allocator_prop(ir: IRFunc, prop: AllocatorProp, callback: String, da
     }
 }
 
+fn ir_write_sequence_props(
+    ir: IRFunc,
+    props: Array[AllocatorProp],
+    element_size: u32,
+    length: String,
+    data: String,
+    callback: String,
+    callback_data: String
+) !Error {
+    let entry = ir.current_block
+    let cond = ir.block("sequence.cond")
+    let body = ir.block("sequence.body")
+    let next = ir.block("sequence.next")
+    let done = ir.block("sequence.done")
+    ir.jump(cond)
+    ir.label(cond)
+    let index = ir_emit_phi2(ir, "i64", "0", entry, "\%sequence.index.next", next)
+    let more = ir_emit_binary_instruction(ir, "icmp ult", "i64", index, length)
+    ir.cond_jump(more, body, done)
+    ir.label(body)
+    let offset = element_size == 1 ? index : ir_emit_binary_index(ir, "mul", "i64", index, element_size.to(uint))
+    let element = ir_dynamic_offset_address(ir, data, offset)
+    each props as prop {
+        ir_write_allocator_prop(ir, prop, callback, callback_data, element) !>
+    }
+    ir.jump(next)
+    ir.label(next)
+    ir.line_start()
+    ir.write("\%sequence.index.next = add i64 ")
+    ir.write(index)
+    ir.write(", 1")
+    ir.line_end()
+    ir.jump(cond)
+    ir.label(done)
+}
+
 fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error {
     each build.lists.allocator_init_sites as site {
         let owner = site.ctx.func
@@ -207,7 +243,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
         each build.lists.allocators as allocator, i {
             if !allocator.global.is_used : continue
             let props_func = allocator.props_func
-            if allocator.props.length == 0 && !isset(props_func) : continue
+            if allocator.props.length == 0 && allocator.element_props.length == 0 && !isset(props_func) : continue
             let ir = IRFunc {func: owner}
             ir.code.write_string("define internal void @\"valk.allocator.props.")
             ir.code.write_int_ascii(site.value.int_val)
@@ -219,6 +255,11 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             let data = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 1)
             each allocator.props as prop {
                 ir_write_allocator_prop(ir, prop, callback, data) !>
+            }
+            if allocator.element_props.length > 0 {
+                let length = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", allocator.length_offset.to(uint)))
+                let elements = ir_union_clean_gc_pointer(ir, ir_emit_load(ir, "ptr", ir_offset_address(ir, "\%item", allocator.data_offset.to(uint))))
+                ir_write_sequence_props(ir, allocator.element_props, allocator.element_size, length, elements, callback, data) !>
             }
             if isset(props_func) {
                 let mark = ir.arg_list.length
@@ -252,7 +293,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             ir.write("(i64 ")
             ir.write_uint(allocator.size.to(uint))
             ir.write(", ptr ")
-            if allocator.props.length > 0 || isset(allocator.props_func) {
+            if allocator.props.length > 0 || allocator.element_props.length > 0 || isset(allocator.props_func) {
                 ir.write("@\"valk.allocator.props.")
                 ir.write_int(site.value.int_val)
                 ir.write(".")
@@ -750,7 +791,7 @@ fn ir_visit_type_gc_fields(
     }
 
     let t = type.get_non_nullable()
-    if t.type == TYPE.fn {
+    if t.kind == TYPE.closure {
         let environment = ir_offset_address(ir, address, t.ptr_size().to(uint))
         let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
         ir_visit_gc_field(ir, environment, action, callback_target, callback_data, inner_alignment) !>
@@ -771,11 +812,11 @@ fn ir_visit_type_gc_fields(
         return
     }
 
-    if t.type == TYPE.union {
-        let members = t.sub_types
+    if t.kind == TYPE.union {
+        let members = t.get_members()
         if !isset(members) : return
         let layout = t.union_layout() !>
-        let tag = ir_emit_aligned_load(ir, "i64", address, alignment)
+        let tag = ir_emit_aligned_load(ir, "i8", address, alignment)
         let after = ir.block("fields.union.after")
         let emitted = false
         each members as member, member_index {
@@ -783,7 +824,7 @@ fn ir_visit_type_gc_fields(
             emitted = true
             let yes = ir.block("fields.union.member")
             let next = ir.block("fields.union.next")
-            let active = ir_emit_binary_index(ir, "icmp eq", "i64", tag, member_index)
+            let active = ir_emit_binary_index(ir, "icmp eq", "i8", tag, member_index)
             ir.cond_jump(active, yes, next)
             ir.label(yes)
             let payload = ir_offset_address(ir, address, layout.payload_offset.to(uint))
@@ -797,30 +838,13 @@ fn ir_visit_type_gc_fields(
         return
     }
 
-    if t.type == TYPE.inline {
-        let sub = t.sub_type
-        if !isset(sub) : return
-        let class = sub.get_class_or_null()
-        if !isset(class) {
-            ir_visit_type_gc_fields(ir, sub, address, action, callback_target, callback_data, alignment) !>
-            return
-        }
-        each class.props as prop {
-            if !prop.type.has_gc_refs() : continue
-            let field = ir_prop_address(ir, address, prop)
-            let field_alignment = ir_offset_alignment(alignment, prop.offset)
-            ir_visit_type_gc_fields(ir, prop.type, field, action, callback_target, callback_data, field_alignment) !>
-        }
-        return
-    }
-
-    if t.type == TYPE.array {
-        let sub = t.sub_type
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
         if !isset(sub) : return
         if !sub.has_gc_refs() : return
-        let stride = sub.size() !>
+        let stride = sub.byte_size() !>
         let i : u32 = 0
-        while i < t.array_size {
+        while i < t.length {
             let element_offset = stride * i
             let element = ir_offset_address(ir, address, element_offset.to(uint))
             let element_alignment = ir_offset_alignment(alignment, element_offset)
@@ -830,8 +854,20 @@ fn ir_visit_type_gc_fields(
         return
     }
 
-    if t.type == TYPE.multi {
-        let members = t.sub_types
+    let inline_class = t.class
+    if t.is_inline && isset(inline_class) {
+        let class = inline_class
+        each class.props as prop {
+            if !prop.type.has_gc_refs() : continue
+            let field = ir_prop_address(ir, address, prop)
+            let field_alignment = ir_offset_alignment(alignment, prop.offset)
+            ir_visit_type_gc_fields(ir, prop.type, field, action, callback_target, callback_data, field_alignment) !>
+        }
+        return
+    }
+
+    if t.is_tuple_type() {
+        let members = t.get_members()
         if !isset(members) : return
         let offset : u32 = 0
         each members as member {
@@ -841,7 +877,7 @@ fn ir_visit_type_gc_fields(
                 let field_alignment = ir_offset_alignment(alignment, offset)
                 ir_visit_type_gc_fields(ir, member, field, action, callback_target, callback_data, field_alignment) !>
             }
-            offset += member.size() !>
+            offset += member.byte_size() !>
         }
     }
 }
@@ -878,7 +914,7 @@ fn ir_gc_stack_append_type_layout(
     type: Type,
     frame_size: uint
 ) uint !Error {
-    let size = (type.size() !>).to(uint)
+    let size = (type.byte_size() !>).to(uint)
     let alignment = type.storage_alignment() !>.to(uint)
     if alignment > 0 : frame_size = frame_size.round_up(alignment)
     types.append(type)
@@ -1038,8 +1074,8 @@ fn ir_build_error_result(ir: IRFunc, rendered: String, rett: Type, code: String)
     if rett.is_void_type() : return code
     let abi = ir_error_abi_type(rett) !>
     let current = "undef"
-    if rett.type == TYPE.multi {
-        let subs = rett.sub_types
+    if rett.is_tuple_type() {
+        let subs = rett.get_members()
         if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
         each subs as sub, i {
             let part = ir_emit_extract(ir, ir_type(rett) !>, rendered, i)
@@ -1183,8 +1219,8 @@ fn ir_error_abi_type(rett: Type) String !Error {
 
 fn ir_error_abi_type_uncached(rett: Type) String !Error {
     if rett.is_void_type() : return "i32"
-    if rett.type == TYPE.multi {
-        let subs = rett.sub_types
+    if rett.is_tuple_type() {
+        let subs = rett.get_members()
         if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
         let out = ByteBuffer.new()
         out.write_string("{ ")
@@ -1205,8 +1241,8 @@ fn ir_error_abi_type_uncached(rett: Type) String !Error {
 
 fn ir_normal_rett_count(rett: Type) uint {
     if rett.is_void_type() : return 0
-    if rett.type == TYPE.multi {
-        let subs = rett.sub_types
+    if rett.is_tuple_type() {
+        let subs = rett.get_members()
         return isset(subs) ? subs.length : 0
     }
     return 1
@@ -1269,56 +1305,52 @@ fn ir_type_uncached(type: Type) String !Error {
         out.write_string(" }")
         return out.to_string()
     }
-    if t.type == TYPE.fn : return "{ ptr, ptr }"
-    if t.type == TYPE.union {
+    if t.kind == TYPE.closure : return "{ ptr, ptr }"
+    if t.kind == TYPE.union {
         let layout = t.union_layout() !>
         let out = ByteBuffer.new()
-        out.write_string("{ i64, [")
-        out.write_uint_ascii(layout.payload_size.to(uint))
-        out.write_string(" x i8] }")
+        out.write_string("{ i8, [")
+        out.write_uint_ascii((layout.payload_size / 8).to(uint))
+        out.write_string(" x i64] }")
         return out.to_string()
     }
     if t.is_pointer() : return "ptr"
-    if t.type == TYPE.void : return "void"
-    if t.type == TYPE.bool : return "i1"
-    if t.type == TYPE.error_code : return "i32"
-    if t.type == TYPE.int {
+    if t.kind == TYPE.void : return "void"
+    if t.kind == TYPE.bool : return "i1"
+    if t.kind == TYPE.error_code : return "i32"
+    if t.kind == TYPE.int {
         let out = ByteBuffer.new()
         out.write_string("i")
-        out.write_uint_ascii((t.size() !>).to(uint) * 8)
+        out.write_uint_ascii((t.byte_size() !>).to(uint) * 8)
         return out.to_string()
     }
-    if t.type == TYPE.float {
-        let size = t.size() !>
+    if t.kind == TYPE.float {
+        let size = t.byte_size() !>
         if size == 4 : return "float"
         if size == 8 : return "double"
         type.build.error("Unsupported LLVM float size: " + size)
     }
-    if t.type == TYPE.array {
-        let sub = t.sub_type
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
         if !isset(sub) : type.build.bug("Array type is missing its element type during IR generation")
         let out = ByteBuffer.new()
         out.write_string("[")
-        out.write_uint_ascii(t.array_size.to(uint))
+        out.write_uint_ascii(t.length.to(uint))
         out.write_string(" x ")
         out.write_string(ir_type(sub) !>)
         out.write_string("]")
         return out.to_string()
     }
-    if t.type == TYPE.inline {
-        let sub = t.sub_type
-        if !isset(sub) : type.build.bug("Inline type is missing its subtype during IR generation")
-        // A named struct/class value is pointer-sized, but its explicit `<T>`
-        // form is the inline body. Use the wrapper's computed size rather than
-        // asking the named subtype for its (pointer) representation size.
+    if t.is_inline && isset(t.class) {
+        // Named inline aggregates use their computed body size.
         let out = ByteBuffer.new()
         out.write_string("[")
-        out.write_uint_ascii((t.size() !>).to(uint))
+        out.write_uint_ascii((t.byte_size() !>).to(uint))
         out.write_string(" x i8]")
         return out.to_string()
     }
-    if t.type == TYPE.multi {
-        let subs = t.sub_types
+    if t.is_tuple_type() {
+        let subs = t.get_members()
         if !isset(subs) : type.build.bug("Multi type is missing subtypes during IR generation")
         if subs.length == 0 : return "void"
         if subs.length == 1 {
@@ -1337,10 +1369,10 @@ fn ir_type_uncached(type: Type) String !Error {
         return out.to_string()
     }
     // Inline class/struct storage.
-    if t.type == TYPE.class {
+    if t.kind == TYPE.gcptr {
         let out = ByteBuffer.new()
         out.write_string("[")
-        out.write_uint_ascii((t.size() !>).to(uint))
+        out.write_uint_ascii((t.byte_size() !>).to(uint))
         out.write_string(" x i8]")
         return out.to_string()
     }
@@ -1559,7 +1591,7 @@ fn ir_emit_stable_stack_init(ir: IRFunc, stack_decl: Decl, size: uint) !Error {
     ir_use_global(ir, pools)
 
     let pools_type = pools.get_type() !>
-    let pool_type = pools_type.sub_type
+    let pool_type = pools_type.get_sub_type()
     if !isset(pool_type) : at.bug("gc:pools has no element type")
     let pool_class = pool_type.get_class_or_null()
     if !isset(pool_class) : at.bug("gc:pools does not contain Pool values")
@@ -1689,7 +1721,7 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
 
     let address = ir_emit_address(ir, left) !>
     let inline_init = right.type == VAL.class_init
-        && right.rett.get_non_nullable().type == TYPE.inline
+        && right.rett.get_non_nullable().is_inline
         && !isset(right.value1)
         && value.op.@cast(ASSIGN_OP) == ASSIGN_OP.set
     if inline_init {
@@ -1994,6 +2026,15 @@ fn ir_offset_address(ir: IRFunc, base: String, offset: uint) String {
     return address
 }
 
+fn ir_dynamic_offset_address(ir: IRFunc, base: String, offset: String) String {
+    let address = ir.var()
+    ir_open_element_address(ir, address, "i8", base)
+    ir.write("i64 ")
+    ir.write(offset)
+    ir.line_end()
+    return address
+}
+
 // Same, for a slot that already has a name of its own.
 fn ir_name_offset_address(ir: IRFunc, name: String, base: String, offset: uint) {
     ir_open_element_address(ir, name, "i8", base)
@@ -2034,14 +2075,14 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let on = value.value1
         let prop = value.prop
         if !isset(on) || !isset(prop) : value.bug("IR property value is incomplete")
-        let base = (on.rett.type == TYPE.array || on.rett.type == TYPE.inline) ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
+        let base = on.rett.is_inline ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
         return ir_prop_address(ir, base, prop)
     }
     if value.type == VAL.ptrv {
         let on = value.value1
         let index = value.value2
         if !isset(on) || !isset(index) : value.bug("IR pointer access is incomplete")
-        let base = (on.rett.type == TYPE.array || on.rett.type == TYPE.inline) ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
+        let base = on.rett.is_inline ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
         let off_type, off = ir_emit_gep_index(ir, index) !>
         return ir_element_address(ir, ir_type(value.rett) !>, base, off_type, off)
     }
@@ -2067,7 +2108,7 @@ fn ir_emit_gep_index(ir: IRFunc, index: Value) (String, String) !Error {
     let from_ir = ir_type(from) !>
     let ptr_bits = ir.func.ns.build.options.target.ptr_size.to(uint) * 8
     if !from.is_integer_type() : return (from_ir, value)
-    if (from.size() !>).to(uint) * 8 >= ptr_bits : return (from_ir, value)
+    if (from.byte_size() !>).to(uint) * 8 >= ptr_bits : return (from_ir, value)
 
     let to = "i" + ptr_bits
     let inst = from.is_signed_type() ? "sext" : "zext"
@@ -2138,7 +2179,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.wrap {
         let inner = value.value1
         if !isset(inner) : value.bug("IR wrapped value is missing its child")
-        if value.rett.type == TYPE.fnptr && inner.type == VAL.func {
+        if value.rett.kind == TYPE.fnptr && inner.type == VAL.func {
             let func = inner.func
             if isset(func) && func.capture_free {
                 ir_note_unknown_code(ir)
@@ -2149,7 +2190,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
                 return ir_func_address(func)
             }
         }
-        if value.rett.type == TYPE.fn && inner.rett.type == TYPE.fnptr {
+        if value.rett.kind == TYPE.closure && inner.rett.kind == TYPE.fnptr {
             return ir_emit_fnptr_closure(ir, value, inner) !>
         }
         if value.rett.is_tagged_nullable() {
@@ -2194,7 +2235,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         let address = ir_emit_address(ir, value) !>
         // Clean aggregate copies without changing heap tags.
         if value.rett.has_gc_refs() && !value.rett.is_gc_type()
-            && value.rett.get_non_nullable().type != TYPE.fn {
+            && value.rett.get_non_nullable().kind != TYPE.closure {
                 return ir_emit_clean_embedded_load(ir, value, value.rett, address) !>
             }
         let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
@@ -2267,6 +2308,14 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.cast {
         let inner = value.value1
         if !isset(inner) : value.bug("IR cast is missing its operand")
+        let inner_kind = inner.rett.get_non_nullable().kind
+        let target_kind = value.rett.get_non_nullable().kind
+        if inner_kind == TYPE.closure && (target_kind == TYPE.fnptr || target_kind == TYPE.voidptr) {
+            return ir_emit_raw_function(ir, inner) !>
+        }
+        if inner_kind == TYPE.fnptr && target_kind == TYPE.voidptr {
+            return ir_emit_value(ir, inner) !>
+        }
         // Aggregate-to-pointer casts take the aggregate's address. Numeric
         // pointer casts are actual inttoptr conversions; returning the address
         // of an integer temporary leaks a stack pointer as the runtime value.
@@ -2316,7 +2365,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         return ir_emit_class_init(ir, value) !>
     }
     if t == VAL.error_value {
-        let et = value.rett.get_non_nullable().error_type
+        let et = value.rett.get_non_nullable().get_error_type()
         if !isset(et) : value.bug("IR error value has no ErrorType")
         let payload = value.values
         if isset(payload) {
@@ -2382,7 +2431,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         // target itself.
         ir_note_unknown_code(ir)
         ir_use_func(ir, func)
-        if value.rett.type == TYPE.fn {
+        if value.rett.kind == TYPE.closure {
             return ir_emit_closure(ir, value, func) !>
         }
         return ir_func_address(func)
@@ -2473,7 +2522,7 @@ fn ir_emit_atomic_load(ir: IRFunc, value: Value) String !Error {
 }
 
 fn ir_atomic_align(type: Type) u32 !Error {
-    let size = type.size() !>
+    let size = type.byte_size() !>
     let ptr_size = type.build.options.target.ptr_size.to(u32)
     if size >= ptr_size : return ptr_size
     return size
@@ -2584,7 +2633,7 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     let type = on.rett.get_non_nullable()
     let lowered = ir_type(on.rett) !>
     if on.rett.is_tagged_nullable() : return ir_emit_extract(ir, lowered, rendered, 0)
-    if type.type == TYPE.fn {
+    if type.kind == TYPE.closure {
         let target = ir_emit_extract(ir, lowered, rendered, 0)
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", target, "null")
     }
@@ -2592,7 +2641,7 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", rendered, "null")
     } else if type.is_float_type() {
         return ir_emit_binary_instruction(ir, "fcmp one", lowered, rendered, "0.0")
-    } else if type.is_integer_type() || type.is_bool_type() || type.type == TYPE.error_code {
+    } else if type.is_integer_type() || type.is_bool_type() || type.kind == TYPE.error_code {
         return ir_emit_binary_instruction(ir, "icmp ne", lowered, rendered, "0")
     } else {
         value.bug("IR isset cannot test nullable type: " + on.rett.compat_display_name())
@@ -2622,7 +2671,7 @@ fn ir_clean_closure(ir: IRFunc, closure: String) String {
 // Property pointers can carry collector ownership bits.
 fn ir_clean_property_value(ir: IRFunc, type: Type, value: String) String {
     if type.is_gc_type() : return ir_union_clean_gc_pointer(ir, value)
-    if type.get_non_nullable().type == TYPE.fn : return ir_clean_closure(ir, value)
+    if type.get_non_nullable().kind == TYPE.closure : return ir_clean_closure(ir, value)
     return value
 }
 
@@ -2733,10 +2782,10 @@ fn ir_extract_error_code(ir: IRFunc, raw: String, rett: Type) String !Error {
 fn ir_extract_error_success(ir: IRFunc, raw: String, rett: Type) String !Error {
     if rett.is_void_type() : return ""
     let abi = ir_error_abi_type(rett) !>
-    if rett.type != TYPE.multi {
+    if !rett.is_tuple_type() {
         return ir_emit_extract(ir, abi, raw, 0)
     }
-    let subs = rett.sub_types
+    let subs = rett.get_members()
     if !isset(subs) : rett.build.bug("Fallible multi return is missing subtypes")
     let current = "undef"
     each subs as sub, i {
@@ -2870,13 +2919,15 @@ fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
 fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
     let values = value.values
     if !isset(values) : value.bug("IR fixed-array initializer has no elements")
-    let aggregate = "undef"
     let aggregate_type = value.rett.is_tagged_nullable() ? value.rett.get_non_nullable() : value.rett
     let whole = ir_type(aggregate_type) !>
+    let slot = ir_emit_alloca(ir, whole)
     each values as item, i {
         let item_value = ir_emit_value(ir, item) !>
-        aggregate = ir_emit_insert(ir, whole, aggregate, ir_type(item.rett) !>, item_value, i)
+        let item_type = ir_type(item.rett) !>
+        ir_emit_store(ir, item_type, item_value, ir_index_address(ir, item_type, slot, i))
     }
+    let aggregate = ir_emit_load(ir, whole, slot)
     if value.rett.is_tagged_nullable() {
         return ir_build_tagged_nullable(ir, value.rett, aggregate) !>
     }
@@ -2891,6 +2942,32 @@ fn ir_emit_dynamic_zero(ir: IRFunc, address: String, size: String) {
     ir.write(size)
     ir.write(", i1 false)")
     ir.line_end()
+}
+
+fn ir_emit_slice_props(parent: IRFunc, value: Value, class: Class) ?String !Error {
+    let element = class.slice_type
+    if !isset(element) : value.bug("Slice initializer has no element type")
+    if !element.has_gc_refs() : return null
+    let name = "valk.slice.props." + helper:ctxhash(type_identity_key(class.get_type() !>))
+    if ir_reuse_adapter(parent, name) : return name
+
+    let props = Array[AllocatorProp]{}
+    allocator_collect_props(element, 0, props) !>
+    let ir = ir_adapter_ir(parent, name)
+    ir.code.write_string("define internal void @\"")
+    ir.code.write_string(name)
+    ir.code.write_string("\"(ptr \%item, ptr \%list, { ptr, ptr } \%callback) {\n")
+    ir.label("entry")
+    let callback = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 0)
+    let callback_data = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 1)
+    let length_prop = class.get_prop_by_name("length") !? null
+    if !isset(length_prop) : value.bug("Slice length property is missing")
+    let length = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", length_prop.offset.to(uint)))
+    let data = ir_offset_address(ir, "\%item", (class.slice_data_offset() !>).to(uint))
+    ir_write_sequence_props(ir, props, element.byte_size() !>, length, data, callback, callback_data) !>
+    ir.line("ret void")
+    ir.code.write_string("}\n\n")
+    return name
 }
 
 fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Value], field_mark: uint) String !Error {
@@ -2908,7 +2985,7 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     if length == "" : value.bug("Slice initializer is missing length")
 
     let bytes = length
-    let element_size = element.size() !>
+    let element_size = element.byte_size() !>
     if element_size != 1 {
         bytes = ir_emit_binary_index(ir, "mul", "i64", length, element_size.to(uint))
     }
@@ -2921,14 +2998,10 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     ir_use_func(ir, alloc)
     ir_note_allocates(ir)
 
-    let props = class.get_func("_props")
-    if isset(props) {
-        if !props.parsed_types : parse_func_types(props) !>
-        ir_use_func(ir, props)
-    }
+    let props = ir_emit_slice_props(ir, value, class) !>
     let mark = ir.arg_list.length
     ir.write_arg(mark, "i64", total)
-    ir.write_arg(mark, "ptr", isset(props) ? ir_func_address(props) : "null")
+    ir.write_arg(mark, "ptr", isset(props) ? ir_symbol_address(props) : "null")
     let slot = ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
     ir_emit_dynamic_zero(ir, slot, total)
     return slot
@@ -2952,11 +3025,6 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
 
     let type = value.rett.get_non_nullable()
     let storage_type = type
-    if type.type == TYPE.inline {
-        let sub = type.sub_type
-        if !isset(sub) : value.bug("Inline class initializer has no subtype")
-        storage_type = sub
-    }
     let class = value.get_class_ref() ?? storage_type.get_class_or_null()
     if !isset(class) : value.bug("Aggregate class initializer has no class")
 
@@ -3015,7 +3083,7 @@ fn ir_collect_inline_init_fields(value: Value, offset: u32, fields: Array[Value]
         let prop = field.get_init_prop()
         if !isset(prop) : value.bug("Inline initializer field has no property")
         let field_offset = offset + prop.offset
-        if field.type == VAL.class_init && field.rett.get_non_nullable().type == TYPE.inline && !isset(field.value1) {
+        if field.type == VAL.class_init && field.rett.get_non_nullable().is_inline && !isset(field.value1) {
             ir_collect_inline_init_fields(field, field_offset, fields, offsets) !>
         } else {
             fields.append(field)
@@ -3271,7 +3339,7 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
         each init_fields as field, i {
             let prop = field.get_init_prop()
             if !isset(prop) : value.bug("Closure capture field has no property")
-            if !prop.type.get_non_nullable().shared || field.rett.get_non_nullable().shared : continue
+            if !prop.type.get_non_nullable().is_shared || field.rett.get_non_nullable().is_shared : continue
             let shared = value_shared_view(field, prop.type)
             shared.set_init_prop(prop)
             init_fields.set(i, shared) _
@@ -3422,12 +3490,12 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     return out
 }
 
-// `<Struct>` is an inline byte aggregate, but passing it to a parameter of
-// named type `Struct` passes the address of that storage. Loading the aggregate
+// A struct is an inline byte aggregate, but passing it to a pointer parameter
+// passes the address of that storage. Loading the aggregate
 // and placing it directly in the call changes the native ABI (and made libc
 // write through an unrelated register value for calls such as stat()).
 fn ir_call_arg_needs_inline_address(actual: Type, expected: Type) bool {
-    if actual.type != TYPE.inline || !expected.is_pointer() : return false
+    if !actual.is_inline || !expected.is_pointer() : return false
     let actual_class = actual.get_class_or_null()
     let expected_class = expected.get_class_or_null()
     return isset(actual_class) && actual_class == expected_class
@@ -3439,7 +3507,7 @@ fn ir_call_arg_needs_inline_address(actual: Type, expected: Type) bool {
 // its code pointer; callback context is supplied through the API's separate
 // data argument.
 fn ir_call_arg_needs_raw_function(actual: Type, expected: Type) bool {
-    return actual.get_non_nullable().type == TYPE.fn && expected.get_non_nullable().type == TYPE.ptr
+    return actual.get_non_nullable().kind == TYPE.closure && expected.get_non_nullable().kind == TYPE.voidptr
 }
 
 fn ir_emit_raw_function(ir: IRFunc, value: Value) String !Error {
@@ -3448,7 +3516,6 @@ fn ir_emit_raw_function(ir: IRFunc, value: Value) String !Error {
         ir_use_func(ir, direct)
         return ir_func_address(direct)
     }
-
     let closure = ir_emit_value(ir, value) !>
     return ir_emit_extract(ir, ir_type(value.rett) !>, closure, 0)
 }
@@ -3575,7 +3642,7 @@ fn ir_coro_append_type_roots(
     }
 
     let t = type.get_non_nullable()
-    if t.type == TYPE.fn {
+    if t.kind == TYPE.closure {
         let environment_address = ir_offset_address(ir, address, t.ptr_size().to(uint))
         let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
         let environment = ir_emit_aligned_load(ir, "ptr", environment_address, inner_alignment)
@@ -3602,19 +3669,19 @@ fn ir_coro_append_type_roots(
         return
     }
 
-    if t.type == TYPE.union {
-        let members = t.sub_types
+    if t.kind == TYPE.union {
+        let members = t.get_members()
         if !isset(members) {
             ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
             return
         }
         let layout = t.union_layout() !>
-        let tag = ir_emit_aligned_load(ir, "i64", address, alignment)
+        let tag = ir_emit_aligned_load(ir, "i8", address, alignment)
         let after = ir.block("coro.roots.union.after")
         each members as member, member_index {
             let yes = ir.block("coro.roots.union.member")
             let next = ir.block("coro.roots.union.next")
-            let active = ir_emit_binary_index(ir, "icmp eq", "i64", tag, member_index)
+            let active = ir_emit_binary_index(ir, "icmp eq", "i8", tag, member_index)
             ir.cond_jump(active, yes, next)
             ir.label(yes)
             let member_roots = member.gc_root_count() !>
@@ -3635,35 +3702,15 @@ fn ir_coro_append_type_roots(
         return
     }
 
-    if t.type == TYPE.inline {
-        let sub = t.sub_type
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
         if !isset(sub) {
             ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
             return
         }
-        let class = sub.get_class_or_null()
-        if !isset(class) {
-            ir_coro_append_type_roots(ir, value, sub, address, gc_args, alignment) !>
-            return
-        }
-        each class.props as prop {
-            if !prop.type.has_gc_refs() : continue
-            let field = ir_offset_address(ir, address, prop.offset.to(uint))
-            let field_alignment = ir_offset_alignment(alignment, prop.offset)
-            ir_coro_append_type_roots(ir, value, prop.type, field, gc_args, field_alignment) !>
-        }
-        return
-    }
-
-    if t.type == TYPE.array {
-        let sub = t.sub_type
-        if !isset(sub) {
-            ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
-            return
-        }
-        let stride = sub.size() !>
+        let stride = sub.byte_size() !>
         let i : u32 = 0
-        while i < t.array_size {
+        while i < t.length {
             if sub.has_gc_refs() {
                 let element_offset = stride * i
                 let element = ir_offset_address(ir, address, element_offset.to(uint))
@@ -3675,8 +3722,20 @@ fn ir_coro_append_type_roots(
         return
     }
 
-    if t.type == TYPE.multi {
-        let members = t.sub_types
+    let inline_class = t.class
+    if t.is_inline && isset(inline_class) {
+        let class = inline_class
+        each class.props as prop {
+            if !prop.type.has_gc_refs() : continue
+            let field = ir_offset_address(ir, address, prop.offset.to(uint))
+            let field_alignment = ir_offset_alignment(alignment, prop.offset)
+            ir_coro_append_type_roots(ir, value, prop.type, field, gc_args, field_alignment) !>
+        }
+        return
+    }
+
+    if t.is_tuple_type() {
+        let members = t.get_members()
         if !isset(members) {
             ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
             return
@@ -3689,7 +3748,7 @@ fn ir_coro_append_type_roots(
                 let field_alignment = ir_offset_alignment(alignment, offset)
                 ir_coro_append_type_roots(ir, value, member, field, gc_args, field_alignment) !>
             }
-            offset += member.size() !>
+            offset += member.byte_size() !>
         }
         return
     }
@@ -3700,8 +3759,8 @@ fn ir_coro_append_type_roots(
 fn ir_coro_result_types(type: Type) Array[Type] {
     let result = Array[Type]{}
     if type.is_void_type() : return result
-    if type.type == TYPE.multi {
-        let subs = type.sub_types
+    if type.is_tuple_type() {
+        let subs = type.get_members()
         if isset(subs) {
             each subs as sub : result.append(sub)
         }
@@ -3774,7 +3833,7 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
             if type.has_gc_refs() {
                 ir_coro_append_type_roots(ir, value, type, address, gc_args, alignment.to(u32)) !>
             }
-            offset += type.size() !>
+            offset += type.byte_size() !>
         }
     }
 
@@ -3901,7 +3960,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
                     ri++
                 }
             }
-            offset += type.size() !>
+            offset += type.byte_size() !>
         }
         rendered_args.append(rendered)
     }
@@ -3934,7 +3993,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     let result_offset : uint = 0
     each result_types as type, i {
         let rendered = success
-        if call.rett.type == TYPE.multi {
+        if call.rett.is_tuple_type() {
             rendered = ir_emit_extract(ir, ir_type(call.rett) !>, success, i)
         }
         if type.is_gc_type() {
@@ -3956,7 +4015,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             if embedded_roots > 0 {
                 ir_coro_append_type_roots(ir, value, type, root_address, gc_args, type.storage_alignment() !>) !>
             }
-            result_offset += type.size() !>
+            result_offset += type.byte_size() !>
         }
     }
     if has_roots : ir_emit_store(ir, "ptr", root_previous, root_global)
@@ -4017,12 +4076,12 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
             if alignment > 1 : offset = offset.round_up(alignment)
             let address = ir_offset_address(ir, raw_args, offset)
             rendered = ir_emit_aligned_load(ir, ir_type(type) !>, address, alignment.to(u32))
-            offset += type.size() !>
+            offset += type.byte_size() !>
             // Embedded results occupy fixed side-table entries even though
             // their by-value bytes are read from Coro.args.
             gc_index += type.gc_root_count() !>
         }
-        if value.rett.type == TYPE.multi {
+        if value.rett.is_tuple_type() {
             aggregate = ir_emit_insert(ir, ir_type(value.rett) !>, aggregate, ir_type(type) !>, rendered, i)
         } else {
             aggregate = rendered
@@ -4098,36 +4157,34 @@ fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) Stri
     let layout = type.union_layout() !>
     let left_tag = ir_emit_extract(ir, lowered, left, 0)
     let right_tag = ir_emit_extract(ir, lowered, right, 0)
-    let equal = ir_emit_binary_instruction(ir, "icmp eq", "i64", left_tag, right_tag)
+    let equal = ir_emit_binary_instruction(ir, "icmp eq", "i8", left_tag, right_tag)
 
     let size = layout.payload_size
-    let payload_type = ir_byte_array_type(size.to(uint))
-    let left_payload = ir_emit_extract(ir, lowered, left, 1)
-    let right_payload = ir_emit_extract(ir, lowered, right, 1)
+    let left_slot = ir_emit_alloca(ir, lowered)
+    let right_slot = ir_emit_alloca(ir, lowered)
+    ir_emit_store(ir, lowered, left, left_slot)
+    ir_emit_store(ir, lowered, right, right_slot)
     let payload_equal = "true"
     let i : u32 = 0
     while i < size {
-        let left_byte = ir_emit_extract(ir, payload_type, left_payload, i.to(uint))
-        let right_byte = ir_emit_extract(ir, payload_type, right_payload, i.to(uint))
+        let offset = layout.payload_offset.to(uint) + i.to(uint)
+        let left_byte = ir_emit_load(ir, "i8", ir_offset_address(ir, left_slot, offset))
+        let right_byte = ir_emit_load(ir, "i8", ir_offset_address(ir, right_slot, offset))
         let byte_equal = ir_emit_binary_instruction(ir, "icmp eq", "i8", left_byte, right_byte)
         payload_equal = ir_emit_binary_instruction(ir, "and", "i1", payload_equal, byte_equal)
         i++
     }
 
     let direct = ""
-    let members = type.sub_types
+    let members = type.get_members()
     if isset(members) {
         each members as member, index {
             if !member.is_gc_type() : continue
-            let active = ir_emit_binary_index(ir, "icmp eq", "i64", left_tag, index)
+            let active = ir_emit_binary_index(ir, "icmp eq", "i8", left_tag, index)
             direct = direct == "" ? active : ir_emit_binary_instruction(ir, "or", "i1", direct, active)
         }
     }
     if direct != "" {
-        let left_slot = ir_emit_alloca(ir, lowered)
-        let right_slot = ir_emit_alloca(ir, lowered)
-        ir_emit_store(ir, lowered, left, left_slot)
-        ir_emit_store(ir, lowered, right, right_slot)
         let left_gc = ir_emit_load(ir, "ptr", ir_offset_address(ir, left_slot, layout.payload_offset.to(uint)))
         let right_gc = ir_emit_load(ir, "ptr", ir_offset_address(ir, right_slot, layout.payload_offset.to(uint)))
         left_gc = ir_union_clean_gc_pointer(ir, left_gc)
@@ -4150,7 +4207,7 @@ fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) Stri
 }
 
 fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type) String !Error {
-    if type.is_tagged_nullable() && type.get_non_nullable().type == TYPE.union
+    if type.is_tagged_nullable() && type.get_non_nullable().kind == TYPE.union
         && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
             if right == "zeroinitializer" || left == "zeroinitializer" {
                 let value = right == "zeroinitializer" ? left : right
@@ -4172,12 +4229,12 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
             if op == VALUE_OP.eq : return equal
             return ir_emit_binary_instruction(ir, "xor", "i1", equal, "true")
         }
-    if type.get_non_nullable().type == TYPE.union && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
+    if type.get_non_nullable().kind == TYPE.union && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
         let equal = ir_emit_union_equal(ir, left, right, type.get_non_nullable()) !>
         if op == VALUE_OP.eq : return equal
         return ir_emit_binary_instruction(ir, "xor", "i1", equal, "true")
     }
-    if type.get_non_nullable().type == TYPE.fn && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
+    if type.get_non_nullable().kind == TYPE.closure && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
         let closure_type = ir_type(type) !>
         let lt = ir_emit_extract(ir, closure_type, left, 0)
         let ld = ir_emit_extract(ir, closure_type, left, 1)
@@ -4253,12 +4310,12 @@ fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
     else if from.is_bool_type() && to.is_integer_type() : inst = "zext"
     else if from.is_integer_type() && to.is_bool_type() : inst = "trunc"
     else if from.is_integer_type() && to.is_integer_type() {
-        let fs = from.size() !>
-        let ts = to.size() !>
+        let fs = from.byte_size() !>
+        let ts = to.byte_size() !>
         if fs > ts : inst = "trunc"
         else : inst = from.is_signed_type() ? "sext" : "zext"
     } else if from.is_float_type() && to.is_float_type() {
-        inst = (from.size() !>) > (to.size() !>) ? "fptrunc" : "fpext"
+        inst = (from.byte_size() !>) > (to.byte_size() !>) ? "fptrunc" : "fpext"
     } else if from.is_integer_type() && to.is_float_type() {
         inst = from.is_signed_type() ? "sitofp" : "uitofp"
     } else if from.is_float_type() && to.is_integer_type() {

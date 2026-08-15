@@ -95,13 +95,15 @@ esac
 check_types() {
     local list="$1"
     local compatible="$2"
-    local row t1 t2 output status
+    local row t1 t2 sed_t1 sed_t2 output status
 
     while IFS= read -r row || [ -n "$row" ]; do
         row="${row%$'\r'}"
         [ -n "$row" ] || continue
         t1="${row%% <=> *}"
         t2="${row#* <=> }"
+        sed_t1="${t1//&/\\&}"
+        sed_t2="${t2//&/\\&}"
 
         if [ "$compatible" -eq 1 ]; then
             echo "> Must be compatible: $row"
@@ -109,7 +111,7 @@ check_types() {
             echo "> Must be incompatible: $row"
         fi
 
-        sed -e "s|TYPE1|$t1|g" -e "s|TYPE2|$t2|g" \
+        sed -e "s|TYPE1|$sed_t1|g" -e "s|TYPE2|$sed_t2|g" \
             "$type_dir/type-check-template.valk" > "$type_input"
         output=$("$VALK" build "$type_input" --no-warn -o "$type_output" 2>&1)
         status=$?

@@ -27,9 +27,10 @@ class Class {
     is_async: bool (false)
     // Modes / $noNewProperties — extensions may not add properties (own body may)
     no_new_props: bool (false)
-    // mode X for Type — raw type exp + resolved target class
+    // mode X for Type — raw type exp + resolved target
     mode_for_exp: ?Exp (null)
     mode_for_class: ?Class (null)
+    mode_for_type: ?Type (null)
     // Alternatives of a named `union`; resolved lazily so declarations can
     // refer to types registered later in the same package.
     union_type_exp: ?Exp (null)
@@ -91,11 +92,23 @@ class Class {
     size: u32 (0)
     size_known: bool (false)
     size_computing: bool (false) // true while resolving; detects recursive deps
+    struct_gc_known: bool (false)
+    struct_gc: bool (false)
 
     // Pretty name for diagnostics: `X[String]` not the mangled export id.
     fn pretty_name() String {
         if this.display_name.length > 0 : return this.display_name
         return this.name
+    }
+
+    fn representation_class() Class {
+        let class = this
+        while class.kind == CLASS_KIND.mode {
+            let target = class.mode_for_class
+            if !isset(target) : return class
+            class = target
+        }
+        return class
     }
 
     // Method/getter lookup with `mode X for Y` fallthrough to Y.
@@ -206,17 +219,44 @@ class Class {
             return res
         }
 
-        let t: TYPE = TYPE.class
+        let t: TYPE = TYPE.struct
+        if kind == CLASS_KIND.interface : t = TYPE.gcptr
         if kind == CLASS_KIND.integer : t = TYPE.int
         else if kind == CLASS_KIND.float : t = TYPE.float
         else if kind == CLASS_KIND.boolean : t = TYPE.bool
-        else if kind == CLASS_KIND.pointer : t = TYPE.ptr
+        else if kind == CLASS_KIND.pointer : t = TYPE.voidptr
+        else if kind == CLASS_KIND.struct : t = TYPE.struct
+        else if kind == CLASS_KIND.array : t = TYPE.array
+        else if kind == CLASS_KIND.slice : t = TYPE.slice
+        else if kind == CLASS_KIND.unbound : t = TYPE.ptr_of
 
+        let info: ?TypeInfo = null
+        let length: uint = 0
+        let inline = kind == CLASS_KIND.struct
+        let unsigned = kind == CLASS_KIND.integer && !this.signed
+        if kind == CLASS_KIND.mode {
+            if !isset(this.mode_for_type) : resolve_mode_for(this) !>
+            let target = this.mode_for_type
+            if !isset(target) : this.exp.bug("Mode target type is unresolved")
+            t = target.kind
+            info = target.info
+            length = target.length
+            inline = target.is_inline
+            unsigned = target.unsigned
+        }
+        let element = this.slice_type
+        if (t == TYPE.array || t == TYPE.slice || kind == CLASS_KIND.unbound) && isset(element) {
+            info = UnaryTypeInfo { sub: element }
+        }
         let res = Type {
-            type: t
             build: this.ns.build
+            kind: t
             class: this
+            info: info
+            length: length
             custom_name: this.pretty_name()
+            unsigned: unsigned
+            is_inline: inline
         }
         this.type = res
         return res
@@ -233,8 +273,7 @@ class Class {
     // - mode: layout of the class it wraps
     // - pointer / slice: pointer-sized representation
     //
-    // `Type.size()` separately returns ptr_size for a named class/struct value;
-    // `<Class>` / `<Struct>` asks for this body layout.
+    // `Type.size()` separately returns ptr_size for a named class value.
     fn compute_size() u32 !Error {
         let kind = this.kind
         let psz = this.ptr_size()
@@ -253,17 +292,17 @@ class Class {
             this.size_known = true
             return 1
         }
-        if kind == CLASS_KIND.class || kind == CLASS_KIND.struct {
+        if kind == CLASS_KIND.class || kind == CLASS_KIND.struct || kind == CLASS_KIND.array {
             return this.compute_body_size() !>
         }
         if kind == CLASS_KIND.mode {
-            let for_class = this.mode_for_class
-            if !isset(for_class) {
+            let for_type = this.mode_for_type
+            if !isset(for_type) {
                 this.ns.build.bug("Mode target is unresolved while computing size: " + this.name)
             }
-            return for_class.compute_size() !>
+            return for_type.byte_size() !>
         }
-        if kind == CLASS_KIND.pointer || kind == CLASS_KIND.slice || kind == CLASS_KIND.union || kind == CLASS_KIND.interface {
+        if kind == CLASS_KIND.pointer || kind == CLASS_KIND.slice || kind == CLASS_KIND.unbound || kind == CLASS_KIND.union || kind == CLASS_KIND.interface {
             // Reference-sized values — do not walk properties (avoids false recursion)
             return psz
         }
@@ -285,7 +324,7 @@ class Class {
         let total: u32 = 0
         each this.props as prop {
             if prop.is_slice_data : continue
-            let prop_size = prop.type.size() !>
+            let prop_size = prop.type.byte_size() !>
             let alignment = prop.type.storage_alignment() !>
             if !this.packed && alignment > 1 : total = total.round_up(alignment)
             prop.offset = total
@@ -424,14 +463,40 @@ fn generic_types_key(types: Array[Type]) String {
     return helper:ctxhash(buf.to_string())
 }
 
+fn type_append_class_key(c: Class, buf: ByteBuffer) {
+    let ns = c.ns
+    buf.write_string(ns.pkg.name)
+    buf.write_string(":")
+    buf.write_string(ns.name)
+    buf.write_string(":")
+    buf.write_string(c.name)
+    let gts = c.generic_types
+    if !isset(gts) : return
+    buf.write_string("<")
+    each gts as gt, i {
+        if i > 0 : buf.write_string(",")
+        type_append_key(gt, buf)
+    }
+    buf.write_string(">")
+}
+
+fn type_append_error_key(e: ErrorType, buf: ByteBuffer) {
+    let ns = e.ns
+    buf.write_string(ns.pkg.name)
+    buf.write_string(":")
+    buf.write_string(ns.name)
+    buf.write_string(":")
+    buf.write_string(e.name)
+}
+
 fn type_append_key(t: Type, buf: ByteBuffer) {
-    if t.shared : buf.write_string("shared ")
+    if t.is_shared : buf.write_string("shared ")
     // Prefer identity of interned types: class name (+ specialization name), wrappers, etc.
-    if t.type == TYPE.void {
+    if t.kind == TYPE.void {
         buf.write_string("void")
         return
     }
-    if t.type == TYPE.any {
+    if t.kind == TYPE.any {
         buf.write_string("any")
         // A named `any` is a distinct type: --docs specializes each generic base
         // with one `any` per parameter, named after that parameter, and `Array[T]`
@@ -442,48 +507,70 @@ fn type_append_key(t: Type, buf: ByteBuffer) {
         }
         return
     }
-    if t.type == TYPE.nullable {
+    if t.kind == TYPE.nullable {
         buf.write_string("?")
-        let sub = t.sub_type
+        let sub = t.get_sub_type()
         if isset(sub) : type_append_key(sub, buf)
         return
     }
-    if t.type == TYPE.ptr {
-        buf.write_string("*")
-        if t.is_slice_ptr : buf.write_string("[]")
-        let sub = t.sub_type
-        if isset(sub) : type_append_key(sub, buf)
-        if t.array_size > 0 {
-            buf.write_string("x")
-            buf.write_uint_ascii(t.array_size.to(uint))
+    if t.kind == TYPE.ptr_of && !isset(t.class) {
+        let sub = t.get_sub_type()
+        if t.length == 0 {
+            buf.write_string("*")
+            if isset(sub) : type_append_key(sub, buf)
+            return
         }
-        return
-    }
-    if t.type == TYPE.ref {
-        buf.write_string("&")
-        if t.is_slice_ptr : buf.write_string("[]")
-        let sub = t.sub_type
-        if isset(sub) : type_append_key(sub, buf)
-        return
-    }
-    if t.type == TYPE.inline {
-        buf.write_string("<>")
-        let sub = t.sub_type
-        if isset(sub) : type_append_key(sub, buf)
-        return
-    }
-    if t.type == TYPE.array {
-        buf.write_string("[")
-        let sub = t.sub_type
+        buf.write_string("*[")
         if isset(sub) : type_append_key(sub, buf)
         buf.write_string("x")
-        buf.write_uint_ascii(t.array_size.to(uint))
+        buf.write_uint_ascii(t.length)
         buf.write_string("]")
         return
     }
-    if t.type == TYPE.multi {
+    if t.kind == TYPE.ref_of {
+        buf.write_string("&")
+        let sub = t.get_sub_type()
+        if isset(sub) : type_append_key(sub, buf)
+        return
+    }
+    if (t.kind == TYPE.array || t.kind == TYPE.slice) && !isset(t.class) {
+        buf.write_string(t.kind == TYPE.array ? "array[" : "slice[")
+        let sub = t.get_sub_type()
+        if isset(sub) : type_append_key(sub, buf)
+        if t.length > 0 {
+            buf.write_string("x")
+            buf.write_uint_ascii(t.length)
+        }
+        buf.write_string("]")
+        return
+    }
+    if t.kind == TYPE.fixed_array {
+        buf.write_string("[")
+        let sub = t.get_sub_type()
+        if isset(sub) : type_append_key(sub, buf)
+        buf.write_string("x")
+        buf.write_uint_ascii(t.length)
+        buf.write_string("]")
+        return
+    }
+    if t.is_inline && isset(t.class) {
+        buf.write_string("<>")
+        let c = t.class
+        if isset(c) : type_append_class_key(c, buf)
+        return
+    }
+    if t.kind == TYPE.slice && t.is_inline {
+        buf.write_string("[")
+        let sub = t.get_sub_type()
+        if isset(sub) : type_append_key(sub, buf)
+        buf.write_string("x")
+        buf.write_uint_ascii(t.length)
+        buf.write_string("]")
+        return
+    }
+    if t.kind == TYPE.struct && t.is_inline && !isset(t.class) {
         buf.write_string("(")
-        let subs = t.sub_types
+        let subs = t.get_members()
         if isset(subs) {
             each subs as st, i {
                 if i > 0 : buf.write_string(",")
@@ -493,20 +580,15 @@ fn type_append_key(t: Type, buf: ByteBuffer) {
         buf.write_string(")")
         return
     }
-    if t.type == TYPE.union {
+    if t.kind == TYPE.union {
         let union_class = t.class
         if isset(union_class) {
-            let ns = union_class.ns
             buf.write_string("named-union:")
-            buf.write_string(ns.pkg.name)
-            buf.write_string(":")
-            buf.write_string(ns.name)
-            buf.write_string(":")
-            buf.write_string(union_class.name)
+            type_append_class_key(union_class, buf)
             return
         }
         buf.write_string("union(")
-        let subs = t.sub_types
+        let subs = t.get_members()
         if isset(subs) {
             each subs as st, i {
                 if i > 0 : buf.write_string("|")
@@ -516,25 +598,29 @@ fn type_append_key(t: Type, buf: ByteBuffer) {
         buf.write_string(")")
         return
     }
-    if t.type == TYPE.fn || t.type == TYPE.fnptr || t.type == TYPE.co {
+    if t.kind == TYPE.closure || t.kind == TYPE.fnptr || t.kind == TYPE.co {
         buf.write_string("callable:")
-        buf.write_uint_ascii(t.type.@cast(u32).to(uint))
+        buf.write_uint_ascii(t.kind.@cast(u32).to(uint))
         buf.write_string("(")
-        let args = t.sub_types
-        if isset(args) {
-            each args as arg, i {
+        let info = t.get_function_info()
+        if isset(info) {
+            each info.args as arg, i {
                 if i > 0 : buf.write_string(",")
                 type_append_key(arg, buf)
             }
         }
         buf.write_string(")(")
-        let rett = t.sub_type
-        if isset(rett) : type_append_key(rett, buf)
+        if isset(info) {
+            each info.returns as rett, i {
+                if i > 0 : buf.write_string(",")
+                type_append_key(rett, buf)
+            }
+        }
         buf.write_string(")")
-        let error_type = t.error_type
+        let error_type = t.get_error_type()
         if isset(error_type) {
             buf.write_string("!")
-            buf.write_string(error_type.name)
+            type_append_error_key(error_type, buf)
         }
         return
     }
@@ -547,26 +633,16 @@ fn type_append_key(t: Type, buf: ByteBuffer) {
         // Deliberately not the package directory, which would make the key — and
         // through it the mangled class name and its symbols — depend on where the
         // source tree happens to live.
-        let ns = c.ns
-        buf.write_string(ns.pkg.name)
-        buf.write_string(":")
-        buf.write_string(ns.name)
-        buf.write_string(":")
-        buf.write_string(c.name)
-        // Include resolved generic args if this class is itself a specialization
-        let gts = c.generic_types
-        if isset(gts) {
-            buf.write_string("<")
-            each gts as gt, i {
-                if i > 0 : buf.write_string(",")
-                type_append_key(gt, buf)
-            }
-            buf.write_string(">")
+        type_append_class_key(c, buf)
+        if t.length > 0 {
+            buf.write_string("[x")
+            buf.write_uint_ascii(t.length)
+            buf.write_string("]")
         }
         return
     }
     buf.write_string("#")
-    buf.write_uint_ascii(t.type.@cast(u32).to(uint))
+    buf.write_uint_ascii(t.kind.@cast(u32).to(uint))
     if t.custom_name.length > 0 {
         buf.write_string(":")
         buf.write_string(t.custom_name)

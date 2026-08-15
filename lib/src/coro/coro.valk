@@ -15,7 +15,7 @@ global run_coros : Array[Coro] (.new(16))
 // so they must append to a different queue from the one being iterated.
 global next_run_coros : Array[Coro] (.new(16))
 
-global main_state : <CoroState> (@undefined)
+global main_state : CoroState (@undefined)
 
 #if OS == "macos"
 global timer_id : uint
@@ -34,7 +34,7 @@ class Coro {
     args: ptr
     gc_args: Array[gc:GcPtr] (.{})
     // Coro state
-    state: <CoroState> (@undefined)
+    state: CoroState (@undefined)
     // Stack info
     backup_main_stack: ptr (@undefined)
     backup_main_stack_size: uint (0)
@@ -56,17 +56,13 @@ class Coro {
     // happen after this coroutine has yielded. Coroutine locals live on the
     // shared stack and are invalidated by the next resume, so keep this on the
     // stable coroutine object instead.
-    timeout_ts: <io:kernel_timespec> (@undefined)
+    timeout_ts: io:kernel_timespec (@undefined)
     #elif OS == "win"
     // Monotonic scheduler deadline in milliseconds. Windows sleeps are
     // integrated into the IOCP wait rather than represented by a kernel timer
     // completion packet.
     sleep_deadline_ms: u64 (0)
-    // Windows retains the OVERLAPPED pointer until an IOCP completion arrives.
-    // Coroutine locals are on the shared stack and cannot back asynchronous
-    // state, so reserve stable per-coroutine storage for the largest overlap
-    // record (AcceptEx currently needs 176 bytes on x64).
-    win_async_data: [u8 x 256] ({ 0... })
+    iocp_ready: bool (false)
     #end
     //
     started: bool (false)
@@ -106,12 +102,6 @@ class Coro {
         mem:free(this.args)
     }
 
-    #if OS == "win"
-    + fn win_async_ptr() ptr {
-        return @ref(this.win_async_data)
-    }
-    #end
-
     fn free_stacks() {
         if this.freed : return
         this.freed = true
@@ -142,8 +132,8 @@ class Coro {
 
         mem:clear(stack_start, regs * size_of(ptr)) // Required for windows
 
-        @ptrv(stack_start, ptr, regs) = this.start_func
-        this.state.rsp = stack_start
+        @ptrv(stack_start, ptr, regs) = this.start_func.@cast(ptr)
+        this.state.rsp = stack_start.@cast(ptr)
     }
 
     //////////////
@@ -174,8 +164,8 @@ class Coro {
 
         #elif OS == "macos"
         let ms = ns.to(i64) / 1_000_000
-        let ev : <ext:kEvent> = @undefined
-        io:EV_SET(@ref(ev), timer_id++, io:EVFILT_TIMER, io:EV_ADD | io:EV_ENABLE | io:EV_ONESHOT, 0, ms, this)
+        let ev : ext:kEvent = @undefined
+        io:EV_SET(@ref(ev), timer_id++, io:EVFILT_TIMER, io:EV_ADD | io:EV_ENABLE | io:EV_ONESHOT, 0, ms, this.@cast(ptr))
         let kq = io:kqueue()
         ext:kevent(kq, @ref(ev), 1, null, 0, null)
 
@@ -335,7 +325,7 @@ class Coro {
             gc:collect_if_threshold_almost_reached()
             #if OS == "linux"
             while true {
-                let cqe : ?ext:io_uring_cqe = null
+                let cqe : ?*ext:io_uring_cqe = null
                 if run_coros.length == 0 {
                     gc:unlock()
                     io:io_uring_wait_cqe(ring, @ref(cqe))
@@ -354,14 +344,14 @@ class Coro {
                 io:io_uring_cqe_seen(ring, cqe)
             }
             #elif OS == "macos"
-            let events : [<ext:kEvent> x 64] = @undefined
+            let events : [ext:kEvent x 64] = @undefined
             gc:unlock()
-            let timeout : ?ext:libc_timespec = null
+            let timeout : ?&ext:libc_gen_timespec = null
             if run_coros.length > 0 {
-                let t : <ext:libc_timespec> = { tv_sec: 0, tv_nsec: 0 }
+                let t : ext:libc_timespec = { tv_sec: 0, tv_nsec: 0 }
                 timeout = @ref(t)
             }
-            let nevents = ext:kevent(kq, null, 0, @ref(events), 64, timeout)
+            let nevents = ext:kevent(kq, null, 0, @ref(events[0]), 64, timeout)
             gc:lock()
             while nevents-- > 0 {
                 let ev = events[nevents]
@@ -379,27 +369,49 @@ class Coro {
             }
 
             #elif OS == "win"
-            gc:unlock()
             win_wake_sleepers()
             let first = run_coros.length == 0
             let wait_ms = first ? win_sleep_timeout() : 0
 
+            let bytes: u32 = 0
+            let key: uint = 0
+            let ov: ?io:OverlapData = null
+            let result = false
+            if wait_ms == 0 {
+                result = ext:GetQueuedCompletionStatus(cport, @ref(bytes), @ref(key), @ref(ov), 0)
+            } else {
+                gc:unlock()
+                result = ext:GetQueuedCompletionStatus(cport, @ref(bytes), @ref(key), @ref(ov), wait_ms)
+                gc:lock()
+            }
+
             while true {
-                let bytes: u32 = 0
-                let key: uint = 0
-                let ov: ?io:OverlapData = null
-                let result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, wait_ms)
                 // A failed asynchronous operation is still a completed
                 // operation. GetQueuedCompletionStatus returns false for it,
                 // but supplies its OVERLAPPED pointer so the waiting
                 // coroutine can observe the error and continue.
-                if !isset(ov) : break
-                wait_ms = 0
+                if !isset(ov) {
+                    if !result && ext:GetLastError() != ext:WAIT_TIMEOUT {
+                        panic("GetQueuedCompletionStatus failed")
+                    }
+                    break
+                }
                 let coro = ov.base.coro.@cast(Coro)
+                ov.base.completed = true
                 coro.completion_res = bytes
-                run_coros.append(coro)
+                if !ov.base.cancel_requested {
+                    coro.poll_event = coro.poll_event | io:completion_event(ov, result)
+                }
+                if !coro.iocp_ready {
+                    coro.iocp_ready = true
+                    run_coros.append(coro)
+                }
+
+                bytes = 0
+                key = 0
+                ov = null
+                result = ext:GetQueuedCompletionStatus(cport, @ref(bytes), @ref(key), @ref(ov), 0)
             }
-            gc:lock()
 
             #else
             panic("Unsupported OS for: coroutine loop")

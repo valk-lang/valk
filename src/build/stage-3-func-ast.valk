@@ -167,7 +167,7 @@ fn decl_needs_gc_stack_storage(decl: Decl) bool {
         // Immutable managed arguments remain rooted by their caller.
         return !decl.is_arg || decl.is_mut
     }
-    if decl.type.get_non_nullable().type == TYPE.fn {
+    if decl.type.get_non_nullable().kind == TYPE.closure {
         // Arguments may contain captures supplied by unknown callers. Locals
         // need the slot only once a captured closure can reach them.
         return decl.is_arg || decl.closure_holds_captures
@@ -176,7 +176,7 @@ fn decl_needs_gc_stack_storage(decl: Decl) bool {
 }
 
 fn decl_assign_gc_stack_storage(decl: Decl, offset: uint) uint !Error {
-    let size = (decl.type.size() !>).to(uint)
+    let size = (decl.type.byte_size() !>).to(uint)
     let alignment = decl.type.storage_alignment() !>.to(uint)
     if alignment > 0 : offset = offset.round_up(alignment)
     decl.gc_stack_offset = offset
@@ -205,7 +205,7 @@ fn func_finish_ast(func: Func) !Error {
         if decl.is_bind : continue
         if decl.must_be_stable {
             decl.offset = stable_size
-            let size = decl.type.size() !>.to(uint)
+            let size = decl.type.byte_size() !>.to(uint)
             stable_size += size.round_up(psz)
         } else if roots && decl_needs_gc_stack_storage(decl) {
             alloca_size = decl_assign_gc_stack_storage(decl, alloca_size) !>
@@ -695,7 +695,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                 let explicit = type_from_exp(te, scope) !>
                 if !part.rett.is_void_type() {
                     // Apply int→ptr / number widen / $to before requiring exact compat
-                    part = value_try_convert(part, scope, ctx, explicit)
+                    part = value_try_convert(part, scope, ctx, explicit, true, true)
                     // Prefer RHS value span for errors (not the whole `let` line)
                     let at = part.exp ?? exp
                     explicit.compat_check(part.rett, at) !>
@@ -761,6 +761,9 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             retv = value_try_convert(retv, scope, ctx, rett)
             let at = retv.exp ?? exp
             rett.compat_check(retv.rett, at) !>
+            if retv.is_implicit_borrow() {
+                exp.error("An implicit pointer borrow cannot escape through a return; use '@ref' explicitly")
+            }
         }
     }
 
@@ -821,12 +824,7 @@ fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
     if isset(existing) : return existing
 
     let b = func.ns.build
-    let closure_type = Type {
-        type: TYPE.fn
-        build: b
-        sub_type: type_void(b)
-        sub_types: Array[Type]{}
-    }
+    let closure_type = type_callable(b, TYPE.closure, Array[Type]{}, type_void(b), null)
     let array_idf = valk_idf(b, "core", "Array") !>
     let array_base = array_idf.class
     if !isset(array_base) : at.bug("valk:core:Array is missing")
@@ -991,7 +989,10 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     }
     let left = value_from_exp(left_exp, scope, left_ctx) !>
     value_check_shared_store(left, exp) !>
-    let pointer_offset_assign = left.rett.get_non_nullable().type == TYPE.ptr && (op == ASSIGN_OP.add || op == ASSIGN_OP.sub)
+    let pointer_kind = left.rett.get_non_nullable().kind
+    let pointer_offset_assign = left.rett.is_pointer()
+        && (pointer_kind == TYPE.voidptr || pointer_kind == TYPE.ptr_of)
+        && (op == ASSIGN_OP.add || op == ASSIGN_OP.sub)
     // Suggest the left-hand type for the RHS (null, class init, etc.)
     let right_ctx = ctx.without_suggested_type()
     if pointer_offset_assign : right_ctx = ctx.with_suggested_type(type_int(b))
@@ -1051,7 +1052,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             right = vgen_ptr_offset(left, right, exp)
             op = ASSIGN_OP.set
         } else {
-            right = value_try_convert(right, scope, ctx, left.rett)
+            right = value_try_convert(right, scope, ctx, left.rett, true, left.type == VAL.decl)
             let at = right.exp ?? exp
             left.rett.compat_check(right.rett, at) !>
         }
@@ -1087,7 +1088,7 @@ fn value_from_if_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Va
     if !isset(cond_exp) : exp.bug("if is missing condition")
     let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
     let cr = cond.rett
-    if !cr.is_void_type() && !cr.is_bool_type() && cr.type != TYPE.any {
+    if !cr.is_void_type() && !cr.is_bool_type() && cr.kind != TYPE.any {
         exp.error("The if condition value must be of type bool")
     }
 
@@ -1156,7 +1157,7 @@ fn value_from_while_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp)
     if !isset(cond_exp) : exp.bug("while is missing condition")
     let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
     let cr = cond.rett
-    if !cr.is_void_type() && !cr.is_bool_type() && cr.type != TYPE.any {
+    if !cr.is_void_type() && !cr.is_bool_type() && cr.kind != TYPE.any {
         exp.error("The while condition value must be of type bool")
     }
 
@@ -1181,16 +1182,6 @@ fn value_from_while_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp)
 
 // `each on [skip n] as name[, name...] { ... }` / `each ... : stmt`
 //
-// Desugars to:
-//   let __on = on
-//   let __i: index_type = skip ?? 0
-//   while true {
-//     let name1[, name2, ...][, index_name] = __on._next(__i) ! { break }
-//     __i += 1
-//     <body>
-//   }
-// The index-advance runs before <body> so an early `continue` in the body still
-// advances the loop (there is no loop-aware lowering for `continue` to rely on).
 fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
     let b = ctx.build
     let on_exp = exp.get(EACH_EXP.on)
@@ -1201,29 +1192,38 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     if on_nn.rett.is_nullable_type() {
         on_exp.error("Cannot use 'each' on a nullable type: " + on_nn.rett.compat_display_name())
     }
-    let class = on_nn.rett.get_class_or_null()
-    if !isset(class) {
-        on_exp.error("Cannot use 'each' on type: " + on_nn.rett.compat_display_name())
+    let native = type_has_native_sequence_length(on_nn.rett)
+    let next_func: ?Func = null
+    let item_rett = type_void(b)
+    let index_type = type_from_core(b, "uint") !>
+    if native {
+        let element = type_native_sequence_element(on_nn.rett)
+        if !isset(element) : on_exp.bug("Sequence type has no element type")
+        item_rett = element
+    } else {
+        let class = on_nn.rett.get_class_or_null()
+        if !isset(class) {
+            on_exp.error("Cannot use 'each' on type: " + on_nn.rett.compat_display_name())
+        }
+        next_func = class.get_func("_next")
+        if !isset(next_func) {
+            on_exp.error("Cannot use 'each' on type '" + on_nn.rett.compat_display_name() + "'. This type does not have a '_next' function")
+        }
+        next_func = func_for_receiver(next_func, on_nn, on_exp) !>
+        let next_arg_skip: uint = 0
+        if isset(next_func.class) && !next_func.is_static : next_arg_skip = 1
+        let index_arg = next_func.args.get(next_arg_skip) ! exp.bug("'_next' is missing its index parameter")
+        index_type = index_arg.type
+        item_rett = next_func.get_rett()
     }
-    let next_func = class.get_func("_next")
-    if !isset(next_func) {
-        on_exp.error("Cannot use 'each' on type '" + on_nn.rett.compat_display_name() + "'. This type does not have a '_next' function")
-    }
-    next_func = func_for_receiver(next_func, on_nn, on_exp) !>
-    // `_next`'s args include an implicit `this` first for instance methods.
-    let next_arg_skip: uint = 0
-    if isset(next_func.class) && !next_func.is_static : next_arg_skip = 1
-    let index_arg = next_func.args.get(next_arg_skip) ! exp.bug("'_next' is missing its index parameter")
-    let index_type = index_arg.type
 
     let names = exp.list
     if !isset(names) : exp.bug("each is missing variable names")
     if names.length == 0 : exp.bug("each is missing variable names")
 
-    let item_rett = next_func.get_rett()
     let item_types = Array[Type]{}
-    if item_rett.type == TYPE.multi {
-        let subs = item_rett.sub_types
+    if item_rett.is_tuple_type() {
+        let subs = item_rett.get_members()
         if isset(subs) : item_types = subs
     }
     if item_types.length == 0 : item_types.append(item_rett)
@@ -1262,13 +1262,23 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     let body_scope = each_scope.sub_scope()
     body_scope.is_loop = true
 
-    let callee = vgen_func(next_func, vgen_decl(on_decl))
-    let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett, body_scope)
-    next_call.exp = exp
-    next_call.can_error = true
-    next_call.set_error_type(next_func.error_type)
-
-    let handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+    let handled = vgen_undefined(item_rett, exp)
+    let loop_condition = vgen_bool(true, type_bool(b))
+    if native {
+        let current_on = vgen_decl(on_decl)
+        let length = value_native_sequence_length(current_on, current_on.rett, ctx, exp) !>
+        if !isset(length) : exp.bug("Native sequence has no length")
+        loop_condition = vgen_op(vgen_decl(index_decl), length, VALUE_OP.lt, type_bool(b))
+        handled = value_native_sequence_item(current_on, vgen_decl(index_decl), body_scope, ctx, exp) !>
+    } else {
+        if !isset(next_func) : exp.bug("Iterator has no '_next' function")
+        let callee = vgen_func(next_func, vgen_decl(on_decl))
+        let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett, body_scope)
+        next_call.exp = exp
+        next_call.can_error = true
+        next_call.set_error_type(next_func.error_type)
+        handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+    }
     let item_parts = handled.unroll()
 
     let bind_decls = Array[Decl]{}
@@ -1311,7 +1321,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     let body_vals = Array[Value]{ bind_init, advance }
     body_vals.append_many(user_vals)
 
-    let loop = vgen_while(vgen_bool(true, type_bool(b)), body_vals, b, exp)
+    let loop = vgen_while(loop_condition, body_vals, b, exp)
 
     return vgen_block(Array[Value]{ on_init, index_init, loop }, b, exp)
 }
@@ -1333,7 +1343,7 @@ fn value_from_throw_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let value_exp = exp.get(RETURN_EXP.value)
     if !isset(value_exp) : exp.bug("throw is missing value")
     let v = value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
-    let thrown_type = v.rett.get_non_nullable().error_type
+    let thrown_type = v.rett.get_non_nullable().get_error_type()
     if !isset(thrown_type) {
         value_exp.error("This is not an error. Value type: " + v.rett.compat_display_name())
     }

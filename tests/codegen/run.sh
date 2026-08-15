@@ -113,6 +113,19 @@ if [[ "$layout_marker" != *"i32 0, i32 2"* ]] \
     exit 1
 fi
 
+echo "> Construct fixed inline values in stack storage"
+
+fixed_body=$(sed -n '/^define .*__inline_fixed_value__/,/^}/p' "$ir")
+if [[ "$fixed_body" != *"alloca [3 x i8]"* ]] \
+    || [[ "$fixed_body" != *"store i8 1"* ]] \
+    || [[ "$fixed_body" != *"store i8 2"* ]] \
+    || [[ "$fixed_body" != *"store i8 3"* ]] \
+    || [[ "$fixed_body" == *"call "* ]]; then
+    echo "# Fixed inline value did not use stack storage"
+    echo "$fixed_body"
+    exit 1
+fi
+
 echo "> Use natural alignment for atomic property accesses"
 
 atomic_ir="$workdir/atomic-alignment.ll"
@@ -166,14 +179,14 @@ f64_body=$(sed -n '/^define .*__box_f64__/,/^}/p' "$scalar_ir")
 scalar_only_body=$(sed -n '/^define .*__box_scalar_only__/,/^}/p' "$scalar_ir")
 gc_only_body=$(sed -n '/^define .*__box_gc_only__/,/^}/p' "$scalar_ir")
 
-if [[ "$int_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$i32_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$u8_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$bool_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$f32_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$f64_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$scalar_only_body" != *"{ i64, [8 x i8] }"* ]] \
-    || [[ "$gc_only_body" != *"{ i64, [8 x i8] }"* ]]; then
+if [[ "$int_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$i32_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$u8_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$bool_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$f32_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$f64_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$scalar_only_body" != *"{ i8, [1 x i64] }"* ]] \
+    || [[ "$gc_only_body" != *"{ i8, [1 x i64] }"* ]]; then
     echo "# Tagged-union aggregate layout did not match tag / shared payload fields"
     exit 1
 fi
@@ -245,6 +258,33 @@ if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
     exit 1
 fi
 
+echo "> Check variable indices for every known-length sequence"
+
+bounds_ir="$workdir/fixed-array-bounds.ll"
+out=$("$VALK" build "$DIR/fixed-array-bounds.valk" --ir --no-warn -o "$bounds_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build fixed-array bounds IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+for name in fixed_read bounded_read named_bounded_read fixed_write; do
+    bounds_body=$(sed -n "/^define .*__${name}__/,/^}/p" "$bounds_ir")
+    if [[ "$bounds_body" != *"icmp uge"* ]] || [[ "$bounds_body" != *"__panic__"* ]]; then
+        echo "# $name did not check its known sequence bound before indexing"
+        echo "$bounds_body"
+        exit 1
+    fi
+done
+
+native_each_body=$(sed -n '/^define .*__native_array_each__/,/^}/p' "$bounds_ir")
+if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_next"* ]]; then
+    echo "# Array each did not use native length/data iteration"
+    echo "$native_each_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 6"
+echo "# Test count: 9"
 echo ""

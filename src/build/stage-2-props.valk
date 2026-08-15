@@ -5,6 +5,24 @@ fn parse_class_properties(class: Class) !Error {
 
     // Resolve `mode X for Type` now that generic params (if any) are bound on scope
     resolve_mode_for(class) !>
+    if class.kind == CLASS_KIND.slice || class.kind == CLASS_KIND.array || class.kind == CLASS_KIND.unbound {
+        let slice_type_exp = class.slice_type_exp
+        if !isset(slice_type_exp) : class.exp.bug("Sequence type is missing its element type")
+        let slice_type = type_from_exp(slice_type_exp, class.scope) !>
+        type_validate_sequence_element(slice_type, slice_type_exp) !>
+        class.slice_type = slice_type
+    }
+    if class.kind == CLASS_KIND.slice {
+        let slice_type = class.slice_type
+        if !isset(slice_type) : class.exp.bug("Slice is missing its element type")
+        add_builtin_sequence_prop(class, "length", type_from_core(class.ns.build, "uint") !>)
+        add_builtin_sequence_prop(class, "data", type_ptr_of(class.ns.build, slice_type), true)
+    } else if class.kind == CLASS_KIND.array {
+        let b = class.ns.build
+        add_builtin_sequence_prop(class, "length", type_from_core(b, "uint") !>)
+        add_builtin_sequence_prop(class, "data", type_from_valk_namespace(b, "gc", "GcPtr") !>, false, true)
+        add_builtin_sequence_prop(class, "cap", type_from_core(b, "uint") !>)
+    }
     // Resolve every named union even when no signature happens to reference it,
     // so invalid alternatives are diagnosed at the declaration.
     if class.kind == CLASS_KIND.union : class.get_type() !>
@@ -25,25 +43,10 @@ fn parse_class_properties(class: Class) !Error {
         parse_class_extend(class, ex) !>
     }
 
-    // Slice storage is part of the language ABI rather than its source
-    // declaration. Keep these visible to ordinary member resolution too.
     if class.kind == CLASS_KIND.slice {
-        let slice_type_exp = class.slice_type_exp
-        if !isset(slice_type_exp) : class.exp.bug("Slice is missing its element type")
-        let slice_type = type_from_exp(slice_type_exp, class.scope) !>
-        class.slice_type = slice_type
-        add_builtin_slice_prop(class, "length", type_from_core(class.ns.build, "uint") !>, false)
-        let data_prop = add_builtin_slice_prop(
-            class,
-            "data",
-            type_ptr_of(class.ns.build, slice_type),
-            true
-        )
-        // Slice properties are compiler-provided, so no source declaration
-        // forces their object layout before a generic method first reads one.
-        // Resolve it here; otherwise both properties still have offset zero
-        // until a Slice initializer happens to be lowered.
         class.compute_body_size() !>
+        let data_prop = class.get_prop_by_name("data") !? null
+        if !isset(data_prop) : class.exp.bug("Slice data property is missing")
         data_prop.offset = class.slice_data_offset() !>
     }
 
@@ -61,8 +64,7 @@ fn parse_class_properties(class: Class) !Error {
     class.flags = null
 }
 
-fn add_builtin_slice_prop(class: Class, name: String, type: Type, is_slice_data: bool) Prop {
-    class.get_prop_by_name(name) -> prop : return prop
+fn add_builtin_sequence_prop(class: Class, name: String, type: Type, is_slice_data: bool (false), zero_default: bool (false)) Prop {
     let prop = Prop {
         class: class
         name: name
@@ -70,6 +72,7 @@ fn add_builtin_slice_prop(class: Class, name: String, type: Type, is_slice_data:
         exp: class.exp
         type: type
         is_slice_data: is_slice_data
+        zero_default: zero_default
     }
     class.add_prop(prop)
     return prop
@@ -113,16 +116,28 @@ fn parse_class_extend(class: Class, ex: Extend) !Error {
 // For `mode Name for Type`: resolve Type to a class and store on the mode.
 fn resolve_mode_for(class: Class) !Error {
     if class.kind != CLASS_KIND.mode : return
+    if isset(class.mode_for_type) : return
+    if class.type_resolving : class.exp.error("Circular mode target")
     let for_exp = class.mode_for_exp
     if !isset(for_exp) : class.exp.bug("Mode is missing 'for' type expression")
 
+    class.type_resolving = true
     let for_type = type_from_exp(for_exp, class.scope) !>
+    class.type_resolving = false
     let for_class = for_type.class
     if !isset(for_class) {
         for_exp.error("You cannot create a 'mode' for the type: " + for_type.compat_display_name())
     }
     // Modes wrap another class — inherit layout traits from the target
     class.mode_for_class = for_class
+    class.mode_for_type = for_type
+    let current = for_class
+    while current.kind == CLASS_KIND.mode {
+        if current == class : for_exp.error("Circular mode target: " + class.pretty_name())
+        let next = current.mode_for_class
+        if !isset(next) : break
+        current = next
+    }
     class.signed = for_class.signed
     class.packed = for_class.packed
     class.is_async = for_class.is_async
@@ -357,15 +372,8 @@ fn parse_class_trait_use(class: Class, exp: Exp) !Error {
 // Type is resolved via `scope` (class scope, or trait-use scope with generics bound).
 // `is_extend`: props from `extend` are blocked when the class has `$noNewProperties` / is a mode.
 fn parse_class_prop(class: Class, exp: Exp, scope: Scope, is_extend: bool (false)) !Error {
-    // Modes never declare their own storage props (they wrap another type).
-    if class.kind == CLASS_KIND.mode {
-        exp.error("You cannot define new properties on mode '" + class.name + "'")
-    }
-    if class.kind == CLASS_KIND.union {
-        exp.error("You cannot define stored properties on union '" + class.name + "'")
-    }
-    if class.kind == CLASS_KIND.interface {
-        exp.error("You cannot define stored properties on interface '" + class.name + "'")
+    if class.kind != CLASS_KIND.class && class.kind != CLASS_KIND.struct {
+        exp.error("Properties can only be defined on classes and structs")
     }
     // `$noNewProperties` only blocks *extensions* adding props — own body is fine
     if is_extend && class.no_new_props {
@@ -388,7 +396,7 @@ fn parse_class_prop(class: Class, exp: Exp, scope: Scope, is_extend: bool (false
     // References borrow storage owned by the current scope. Embedding one in
     // a heap object would let that borrow outlive its owner, so the language
     // rejects reference-typed properties at declaration time.
-    if type.type == TYPE.ref {
+    if type.kind == TYPE.ref_of {
         exp.error("You cannot store references inside objects. Type not allowed: " + type.compat_display_name())
     }
 

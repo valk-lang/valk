@@ -39,6 +39,7 @@ fn vgen_wrap(on: Value, rett: Type) Value {
     result.set_not_issets(on.get_not_issets())
     result.set_error_type(on.get_error_type())
     result.set_pre_value(on.get_pre_value())
+    if on.is_implicit_borrow() : result.mark_implicit_borrow()
     return result
 }
 
@@ -80,16 +81,15 @@ fn value_force_to(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) V
 
 fn value_retype_function(v: Value, kind: TYPE) Value {
     return vgen_wrap(v, Type {
-        type: kind
         build: v.rett.build
-        sub_type: v.rett.sub_type
-        sub_types: v.rett.sub_types
-        error_type: v.rett.error_type
+        kind: kind
+        info: v.rett.info
+        is_shared: v.rett.is_shared
     })
 }
 
 fn union_numeric_member(target_union: Type, source: Type) ?uint {
-    let members = target_union.sub_types
+    let members = target_union.get_members()
     if !isset(members) : return null
 
     let family: ?uint = null
@@ -116,7 +116,7 @@ fn union_numeric_member(target_union: Type, source: Type) ?uint {
 
 fn value_try_union_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto: bool) ?Value {
     let target_union = target.get_non_nullable()
-    if target_union.type != TYPE.union || v.rett.get_non_nullable().type == TYPE.union {
+    if target_union.kind != TYPE.union || v.rett.get_non_nullable().kind == TYPE.union {
         return null
     }
     if v.rett.is_nullable_type() && !target.is_nullable_type() : return null
@@ -124,7 +124,7 @@ fn value_try_union_convert(v: Value, scope: Scope, ctx: Context, target: Type, i
     if isset(exact) : return vgen_union_wrap(v, target, exact, ctx)
     let index = union_numeric_member(target_union, v.rett)
     if !isset(index) : return null
-    let members = target_union.sub_types
+    let members = target_union.get_members()
     if !isset(members) : return null
     let member = members.get(index) !? v.rett
     let converted = value_try_convert(v, scope, ctx, member, is_auto)
@@ -141,12 +141,42 @@ fn value_shared_view(v: Value, target: Type) Value {
     }
 }
 
-fn value_try_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto: bool (true)) Value {
+fn fixed_array_pointer_compat(source: Type, target: Type) bool {
+    let element = source.get_sub_type()
+    if !isset(element) : return false
+    if target.kind == TYPE.voidptr : return true
+    if target.kind != TYPE.ptr_of && target.kind != TYPE.ref_of : return false
+    let pointed = target.get_sub_type()
+    if !isset(pointed) : return false
+    if target.length > source.length : return false
+    if pointed.is_fixed_array_type() : return pointed.compat(source)
+    return pointed.compat(element)
+}
+
+fn inline_pointer_compat(source: Type, target: Type) bool {
+    if source.is_fixed_array_type() : return fixed_array_pointer_compat(source, target)
+    if target.kind == TYPE.voidptr : return true
+    if target.kind == TYPE.ptr_of || target.kind == TYPE.ref_of {
+        let pointed = target.get_sub_type()
+        return isset(pointed) && pointed.compat(source)
+    }
+    return source.kind == TYPE.struct && target.kind == TYPE.struct
+        && isset(source.class) && source.class == target.class
+}
+
+fn value_try_convert(
+    v: Value,
+    scope: Scope,
+    ctx: Context,
+    target: Type,
+    is_auto: bool (true),
+    allow_inline_borrow: bool (false)
+) Value {
     if target.is_void_type() : return v
 
     let result = v
 
-    if target.type == TYPE.fn && target.shared && result.rett.type == TYPE.fn && !result.rett.shared {
+    if target.kind == TYPE.closure && target.is_shared && result.rett.kind == TYPE.closure && !result.rett.is_shared {
         let func = value_resolve_func_ref(result)
         if isset(func) && func.capture_free {
             result.rett = target
@@ -171,7 +201,7 @@ fn value_try_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto
 
     let target_nn = target.get_non_nullable()
     let source_nn = result.rett.get_non_nullable()
-    if target_nn.shared && !source_nn.shared && target_nn.is_gc_type()
+    if target_nn.is_shared && !source_nn.is_shared && target_nn.is_gc_type()
         && target_nn.get_class_or_null() == source_nn.get_class_or_null()
         && (target.is_nullable_type() || !result.rett.is_nullable_type())
     {
@@ -194,10 +224,19 @@ fn value_try_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto
         }
     }
 
-    if result.rett.type == TYPE.fn && target.get_non_nullable().type == TYPE.ptr {
+    if !is_auto && result.rett.kind == TYPE.closure && target.get_non_nullable().kind == TYPE.voidptr {
         let func = value_resolve_func_ref(result)
         if isset(func) && !func.is_literal {
             return value_retype_function(result, TYPE.fnptr)
+        }
+    }
+
+    if !target.is_nullable_type() && !result.rett.is_nullable_type() {
+        if target.is_raw_pointer() && result.rett.is_integer_type() {
+            return vgen_cast(result, target)
+        }
+        if result.rett.is_raw_pointer() && target.is_integer_type() {
+            return vgen_cast(result, target)
         }
     }
 
@@ -205,44 +244,51 @@ fn value_try_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto
         return result
     }
 
-    if result.rett.type == TYPE.fn && target.type == TYPE.fnptr {
+    if result.rett.kind == TYPE.closure && target.kind == TYPE.fnptr {
         let func = value_resolve_func_ref(result)
         if isset(func) && func.capture_free {
             result = value_retype_function(result, TYPE.fnptr)
         }
     }
-    if result.rett.type == TYPE.fnptr && target.type == TYPE.fn {
-        result = value_retype_function(result, TYPE.fn)
+    if result.rett.kind == TYPE.fnptr && target.kind == TYPE.closure {
+        result = value_retype_function(result, TYPE.closure)
     }
 
     if target.is_nullable_type() {
         let nnt = target.get_non_nullable()
-        result = value_try_convert(result, scope, ctx, nnt, is_auto)
+        result = value_try_convert(result, scope, ctx, nnt, is_auto, allow_inline_borrow)
         if result.rett.is_nullable_type() : return result
         return vgen_wrap(result, result.rett.nullable())
     }
 
-    // Inline value → pointer target: take its address (e.g. passing a stack struct
-    // where a raw `ptr` parameter is expected). Explicit aggregate literals are
-    // addressable temporaries too: the classic parser gives a fixed-array literal
-    // an anonymous backing declaration before passing its reference.
+    // Inline value → reference target: take its address. Explicit aggregate
+    // literals are addressable temporaries too.
     // Numbers are inline values too, but a number passed to raw `ptr` is an
     // address value and must reach the inttoptr conversion below. Taking its
     // stack address turns Windows HANDLE arguments into pointers to locals.
-    if result.rett.is_inline_type() && !result.rett.is_number_type() && result.rett.type != TYPE.fn && target.is_pointer() {
+    if allow_inline_borrow && result.rett.is_inline_type() && !result.rett.is_number_type() && result.rett.kind != TYPE.closure
+        && target.get_non_nullable().kind == TYPE.ref_of && inline_pointer_compat(result.rett, target)
+    {
         if result.assignable() || result.type == VAL.array_init || result.type == VAL.class_init {
-            return vgen_ptr_of(result, target, result.exp)
+            let borrowed = vgen_ptr_of(result, target, result.exp)
+            borrowed.mark_implicit_borrow()
+            return borrowed
         }
     }
 
-    // &[T x N] / *[T x N] → [T x N]: copy the fixed array out of the
-    // referenced storage. Pointer-info types keep T in sub_type and N in
-    // array_size, matching the classic compiler's get_inline()/vgen_load path.
-    if target.type == TYPE.array && (result.rett.type == TYPE.ptr || result.rett.type == TYPE.ref) {
-        let target_sub = target.sub_type
-        let source_sub = result.rett.sub_type
-        if isset(target_sub) && isset(source_sub) {
-            let enough_values = result.rett.array_size == 0 || target.array_size <= result.rett.array_size
+    // A pointer view can be copied into fixed inline sequence storage.
+    if target.is_fixed_array_type() && (result.rett.kind == TYPE.ptr_of || result.rett.kind == TYPE.ref_of) {
+        let target_sub = target.get_sub_type()
+        let source = result.rett.get_sub_type()
+        if isset(target_sub) && isset(source) {
+            let source_sub = source
+            let source_size: uint = result.rett.length > 0 ? result.rett.length : 1
+            if source.is_fixed_array_type() {
+                let element = source.get_sub_type()
+                if isset(element) : source_sub = element
+                source_size = source.length
+            }
+            let enough_values = source_size > 0 && target.length <= source_size
             if enough_values && target_sub.compat(source_sub) {
                 return vgen_load(result, target, result.exp)
             }
@@ -287,24 +333,18 @@ fn value_try_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto
 
     // To bare `ptr`: other pointers retype; ints inttoptr (old TYPE.voidptr path)
     if target.is_raw_pointer() {
-        // Don't convert `&T` → `ptr` automatically (old rule)
-        if result.rett.type == TYPE.ref {
-            // keep as-is
-        } else if result.rett.is_pointer() {
+        if result.rett.is_pointer()
+            && (!is_auto || result.rett.is_raw_pointer() || result.rett.kind == TYPE.ptr_of
+                || result.rett.kind == TYPE.ref_of || result.rett.is_struct_object())
+        {
             return vgen_wrap(result, target)
-        } else if result.rett.is_integer_type() {
-            return vgen_cast(result, target)
         }
     }
 
-    // Bare `ptr` → typed `ptr[T]` / `ptr[T x N]`. Unsafe address producers
-    // such as `@ref(x)` intentionally return a raw core ptr; the argument's
-    // pointer-info supplies the element type and bounds (classic compiler
-    // behavior). Do not apply this to `&T`, which retains reference semantics.
-    if result.rett.is_raw_pointer() && target.type == TYPE.ptr && !target.is_raw_pointer() {
+    // Bare `ptr` → `*T` / `&T`.
+    if result.rett.is_raw_pointer() && (target.kind == TYPE.ptr_of || target.kind == TYPE.ref_of) {
         return vgen_wrap(result, target)
     }
-
     return result
 }
 
@@ -440,6 +480,7 @@ fn class_get_to_hook(class: Class, target: Type, is_auto: bool) ?Func {
             let fc = fr.get_class_or_null()
             if tc == fc : return func
             if !isset(tc) && !isset(fc) : return func
+            if target.kind == TYPE.ptr_of && fr.is_raw_pointer() : return func
         }
     }
     return null
@@ -577,7 +618,10 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let left = value_from_exp(left_exp, scope, left_ctx) !>
     left = value_try_remove_nullable(left, scope, ctx)
 
-    if left.rett.get_non_nullable().type == TYPE.ptr && (op == VALUE_OP.add || op == VALUE_OP.sub) {
+    let left_pointer_kind = left.rett.get_non_nullable().kind
+    let left_is_raw_pointer = left.rett.is_pointer()
+        && (left_pointer_kind == TYPE.voidptr || left_pointer_kind == TYPE.ptr_of)
+    if left_is_raw_pointer && (op == VALUE_OP.add || op == VALUE_OP.sub) {
         let offset = value_from_exp(right_exp, scope, ctx.with_suggested_type(type_int(b))) !>
         offset = value_try_convert(offset, scope, ctx, type_int(b))
         if op == VALUE_OP.sub && offset.rett.is_raw_pointer() {
@@ -597,7 +641,7 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         return vgen_ptr_offset(left, offset, exp)
     }
 
-    if left.rett.get_non_nullable().type == TYPE.ptr {
+    if left_is_raw_pointer {
         let ptr_uint = type_ptr_uint(b)
         left = vgen_cast(left, ptr_uint)
     }
@@ -647,7 +691,7 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
 fn value_native_comparable(type: Type) bool {
     let t = type.get_non_nullable()
-    return t.is_number_type() || t.is_pointer() || t.type == TYPE.error_code
+    return t.is_number_type() || t.is_pointer() || t.kind == TYPE.error_code
 }
 
 fn value_structural_equal_part(result: Value, left: Value, right: Value, offset: u32, type: Type,
@@ -670,31 +714,26 @@ fn value_structural_equal(left: Value, right: Value, scope: Scope, ctx: Context,
     let right_address = vgen_cast(right_slot, type_ptr(b))
     let result = vgen_bool(true, type_bool(b))
 
-    if type.type == TYPE.array {
-        let member = type.sub_type ?! at.bug("Fixed array comparison has no element type")
-        let stride = member.size() !>
+    if type.is_fixed_array_type() {
+        let member = type.get_sub_type() ?! at.bug("Fixed array comparison has no element type")
+        let stride = member.byte_size() !>
         let i: u32 = 0
-        while i < type.array_size {
+        while i < type.length {
             result = value_structural_equal_part(result, left_address, right_address, stride * i, member, scope, ctx, at) !>
             i++
         }
-    } else if type.type == TYPE.multi {
-        let members = type.sub_types ?! at.bug("Multi-value comparison has no member types")
+    } else if type.is_tuple_type() {
+        let members = type.get_members() ?! at.bug("Multi-value comparison has no member types")
         let offset: u32 = 0
         each members as member {
             offset = member.ir_align_offset(offset) !>
             result = value_structural_equal_part(result, left_address, right_address, offset, member, scope, ctx, at) !>
-            offset += member.size() !>
+            offset += member.byte_size() !>
         }
     } else {
-        let sub = type.sub_type ?! at.bug("Inline comparison has no value type")
-        let class = sub.get_class_or_null()
-        if isset(class) {
-            each class.props as prop {
-                result = value_structural_equal_part(result, left_address, right_address, prop.offset, prop.type, scope, ctx, at) !>
-            }
-        } else {
-            result = value_structural_equal_part(result, left_address, right_address, 0, sub, scope, ctx, at) !>
+        let class = type.class ?! at.bug("Inline comparison has no class")
+        each class.props as prop {
+            result = value_structural_equal_part(result, left_address, right_address, prop.offset, prop.type, scope, ctx, at) !>
         }
     }
 
@@ -709,7 +748,7 @@ fn value_union_equal(left: Value, right: Value, scope: Scope, ctx: Context, at: 
     let b = ctx.build
     let bool_t = type_bool(b)
     let union = left.rett.get_non_nullable()
-    let members = union.sub_types
+    let members = union.get_members()
     if !isset(members) : at.bug("Tagged union comparison has no alternatives")
     let func = ctx.get_func() !>
     let left_slot = vgen_scratch_value(func, union, at)
@@ -767,10 +806,10 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
     if cmp_op != VALUE_OP.eq {
         let left_type = l.rett.get_non_nullable()
         let right_type = r.rett.get_non_nullable()
-        if l.rett.is_nullable_type() || left_type.type == TYPE.union || left_type.type == TYPE.fn {
+        if l.rett.is_nullable_type() || left_type.kind == TYPE.union || left_type.kind == TYPE.closure {
             exp.error("The left value type does not support compare operators: '" + l.rett.compat_display_name() + "'")
         }
-        if r.rett.is_nullable_type() || right_type.type == TYPE.union || right_type.type == TYPE.fn {
+        if r.rett.is_nullable_type() || right_type.kind == TYPE.union || right_type.kind == TYPE.closure {
             exp.error("The right value type does not support compare operators: '" + r.rett.compat_display_name() + "'")
         }
     }
@@ -814,17 +853,17 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
                 nnl.rett.compat_check(nnr.rett, exp) !>
             }
         }
-        let compare_type = nnl.rett.get_non_nullable().type
+        let compare_type = nnl.rett.get_non_nullable().kind
         if compare_type == TYPE.union {
             cmp = value_union_equal(nnl, nnr, scope, ctx, exp) !>
         } else if cmp_op == VALUE_OP.eq
-            && (compare_type == TYPE.array || compare_type == TYPE.multi || compare_type == TYPE.inline) {
+            && nnl.rett.get_non_nullable().is_inline {
             cmp = value_structural_equal(nnl, nnr, scope, ctx, exp) !>
         } else {
-            if compare_type != TYPE.fn && !value_native_comparable(nnl.rett) {
+            if compare_type != TYPE.closure && !value_native_comparable(nnl.rett) {
                 exp.error("The left value type does not support compare operators: '" + nnl.rett.compat_display_name() + "'")
             }
-            if nnr.rett.get_non_nullable().type != TYPE.fn && !value_native_comparable(nnr.rett) {
+            if nnr.rett.get_non_nullable().kind != TYPE.closure && !value_native_comparable(nnr.rett) {
                 exp.error("The right value type does not support compare operators: '" + nnr.rett.compat_display_name() + "'")
             }
             cmp = vgen_op(nnl, nnr, cmp_op, type_bool(b))
@@ -1045,7 +1084,7 @@ fn value_body_from_block_exp(ctx: Context, scope: Scope, body_exp: Exp) Value !E
 }
 
 fn vgen_this_or_that(cond: Value, then_v: Value, else_v: Value, rett: Type) Value {
-    return Value {
+    let result = Value {
         type: VAL.this_or_that
         value1: cond
         value2: then_v
@@ -1053,4 +1092,6 @@ fn vgen_this_or_that(cond: Value, then_v: Value, else_v: Value, rett: Type) Valu
         rett: rett
         exp: cond.exp
     }
+    if then_v.is_implicit_borrow() || else_v.is_implicit_borrow() : result.mark_implicit_borrow()
+    return result
 }
