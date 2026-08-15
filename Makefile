@@ -240,8 +240,10 @@ ir: $(DIST_DEPS)
 			$(FLAGS) $(filter-out --clang,$(DIST_FLAGS)) --ir || exit $$?; \
 		cp ./lib/libs/$$target/valk-stack-swap.o ./dist/ir/libs/$$target/ || exit $$?; \
 	done
+	cp ./misc/dist/ir/build-* ./dist/ir/
+	chmod +x ./dist/ir/build-*.sh
 	cd ./dist/ir/ && rm -f ../valk-$(VERSION)-ir.tar.gz
-	cd ./dist/ir/ && tar -czf ../valk-$(VERSION)-ir.tar.gz *.ll libs
+	cd ./dist/ir/ && tar -czf ../valk-$(VERSION)-ir.tar.gz *.ll build-* libs
 
 dist-all: win-x64 linux-x64 macos-x64 macos-arm64 ir
 
