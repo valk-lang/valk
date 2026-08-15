@@ -148,10 +148,8 @@ class Lsp {
     file: String ("")
     line: uint (0)
     col: uint (0)
-    // File to re-check for diagnostics once the input buffer has drained. Open
-    // and save always queue here; incremental changes do so when the user opted
-    // into live diagnostics. Buffered notifications for the most recently
-    // changed file cost one front-end build instead of one per message.
+    // File that triggered the next workspace diagnostic build. Open and save
+    // always queue here; incremental changes do so in live-diagnostics mode.
     pending_diagnostics: ?String (null)
     //
     shutdown: bool (false)
@@ -185,12 +183,9 @@ class Lsp {
         this.reset_request()
     }
 
-    fn parse() {
+    fn parse(flush: bool (true)) {
         this.parse_messages()
-        // Always runs, including on the paths that return early waiting for more
-        // input: the queued edit is itself complete, so there is no reason to
-        // hold its diagnostics back.
-        this.flush_pending()
+        if flush : this.flush_pending()
     }
 
     // Diagnostics for the most recent edit, after every buffered message has been
@@ -429,12 +424,14 @@ class Lsp {
     }
 
     fn build_wrap() {
+        if this.request == req_diagnostics {
+            this.build_diagnostics()
+            return
+        }
         let args = Array[String]{}
 
         let file = this.file
-        if !file.is_empty() {
-            args.append(file)
-        }
+        if !file.is_empty() : args.append(file, true)
 
         let b = build:Build.init_from_args(args) ! {
             this.log(E.msg)
@@ -462,33 +459,69 @@ class Lsp {
             this.send_symbols(b)
             return
         }
-        this.send_errors(b)
     }
 
     // ########################################
     // DIAGNOSTICS
     // ########################################
 
-    fn send_errors(b: build:Build) {
-        if this.request != req_diagnostics : return
-
-        // publishDiagnostics replaces the entire list for one file, so each file
-        // with messages needs exactly one notification.
+    fn build_diagnostics() {
         let per_path = Map[Array[Diagnostic]]{}
-        // Messages with no source span (bad build arguments, missing files)
         let no_location = Array[String]{}
+        let loaded_files = Map[bool]{}
+        let seen_messages = Map[bool]{}
 
-        // The saved file always gets a notification, even an empty one. Without
-        // it a file that compiles cleanly on the first save is never mentioned,
-        // and a client holding diagnostics from an earlier server run would keep
-        // showing them.
+        each this.file_content as _, path : per_path.set(path, Array[Diagnostic]{})
         let saved = this.file
         if !saved.is_empty() : per_path.set(saved, Array[Diagnostic]{})
+
+        let classifier = build:Build.init_from_args(Array[String]{}) ! {
+            this.log(E.msg)
+            return
+        }
+        let package_files = Map[Array[String]]{}
+        let loose_files = Array[String]{}
+        each this.file_content as _, path {
+            lsp_group_diagnostic_file(classifier, package_files, loose_files, path)
+        }
+        if !saved.is_empty() && !this.file_content.has(saved) {
+            lsp_group_diagnostic_file(classifier, package_files, loose_files, saved)
+        }
+
+        let groups = Array[Array[String]]{}
+        each package_files as files, _ : groups.append(files)
+        each loose_files as path {
+            let files = Array[String]{}
+            files.append(path)
+            groups.append(files)
+        }
+        each groups as files {
+            this.collect_diagnostic_build(files, per_path, no_location, loaded_files, seen_messages)
+            gc:collect()
+        }
+
+        this.publish_errors(per_path, no_location, loaded_files)
+    }
+
+    fn collect_diagnostic_build(
+        args: Array[String],
+        per_path: Map[Array[Diagnostic]],
+        no_location: Array[String],
+        loaded_files: Map[bool],
+        seen_messages: Map[bool]
+    ) {
+        let b = build:Build.init_from_args(args) ! {
+            no_location.append(E.msg, true)
+            return
+        }
+        b.options.lsp = this
+        b.run() ! { }
+        each b.cache.loaded_files as _, path : loaded_files.set(path, true)
 
         each b.messages as m {
             let src = m.src
             if !isset(src) {
-                no_location.append(m.msg)
+                no_location.append(m.msg, true)
                 continue
             }
             // A span inside a `%{...}` interpolation belongs to the file the
@@ -496,9 +529,12 @@ class Lsp {
             let at = build:message_resolve(src, m.i)
             let path = at.src.path
             if !isset(path) {
-                no_location.append(m.msg)
+                no_location.append(m.msg, true)
                 continue
             }
+            let key = path + ":" + at.i + ":" + m.len + ":" + m.type.to(int) + ":" + m.msg
+            if seen_messages.has(key) : continue
+            seen_messages.set(key, true)
             let content = at.src.content
             let start = lsp_line_col(content, at.i)
             let end = lsp_line_col(content, at.i + m.len)
@@ -516,7 +552,13 @@ class Lsp {
                 end_col: end.col
             })
         }
+    }
 
+    fn publish_errors(
+        per_path: Map[Array[Diagnostic]],
+        no_location: Array[String],
+        loaded_files: Map[bool]
+    ) {
         let published = Array[String]{}
         each per_path as list, path {
             this.send_diagnostics(path, list)
@@ -529,7 +571,7 @@ class Lsp {
             // Editing one file only compiles that file's namespace and what it
             // uses, so an unread file's errors are unexamined rather than fixed;
             // clearing them would hide real problems.
-            if !b.cache.loaded_files.has(path) && fs:exists(path) {
+            if !loaded_files.has(path) && fs:exists(path) {
                 published.append(path)
                 continue
             }
@@ -576,6 +618,30 @@ class Lsp {
 
         this.send(resp)
     }
+}
+
+fn lsp_group_diagnostic_file(
+    classifier: build:Build,
+    package_files: Map[Array[String]],
+    loose_files: Array[String],
+    path: String
+) {
+    let pkg = classifier.find_pkg_for_path(path)
+    if !isset(pkg) {
+        loose_files.append(path, true)
+        return
+    }
+    let dir = pkg.dir
+    if !isset(dir) {
+        loose_files.append(path, true)
+        return
+    }
+    let files = package_files.get(dir) !? <{
+        let created = Array[String]{}
+        package_files.set(dir, created)
+        return created
+    }
+    files.append(path, true)
 }
 
 fn request_for_method(method: String) int {

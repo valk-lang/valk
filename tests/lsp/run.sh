@@ -110,6 +110,13 @@ notify_open() {
         "$DIR/$1" "$text"
 }
 
+notify_open_path() {
+    local text
+    text=$(json_escape < "$1")
+    printf '{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file://%s","text":"%s"}}}' \
+        "$1" "$text"
+}
+
 # check_with_init <name> <expected-substring> <initialize-body> <request-body>...
 check_with_init() {
     local name="$1"; shift
@@ -503,6 +510,49 @@ esac
 # didOpen alone publishes diagnostics, and the editor's buffer wins over disk
 check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identifier: buffer_only_xyz"' \
     "$(notify_open diag.valk 's/nope_xyz/buffer_only_xyz/')"
+
+# A restart reopens documents from every package in the workspace. One
+# diagnostic batch keeps those package builds independent.
+mkdir -p "$workdir/pkg-one/src/check" "$workdir/pkg-two/src/check"
+printf '{}\n' > "$workdir/pkg-one/valk.json"
+printf '{}\n' > "$workdir/pkg-two/valk.json"
+printf 'fn package_one() {}\n' > "$workdir/pkg-one/src/main.valk"
+printf 'fn package_two() {}\n' > "$workdir/pkg-two/src/main.valk"
+printf 'use main\nfn check_one() { main:package_one(); missing_from_one }\n' > "$workdir/pkg-one/src/check/check.valk"
+printf 'use main\nfn check_two() { main:package_two(); missing_from_two }\n' > "$workdir/pkg-two/src/check/check.valk"
+count=$((count + 1))
+echo "> diagnostics batch open files from multiple packages"
+stream="$(frame "$init")$(frame "$(notify_open_path "$workdir/pkg-one/src/check/check.valk")")$(frame "$(notify_open_path "$workdir/pkg-two/src/check/check.valk")")"
+out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+case "$out" in
+    *'Unknown identifier: missing_from_one'*'Unknown identifier: missing_from_two'*) ;;
+    *)
+        echo "# Expected diagnostics from both package roots"
+        echo "$out" | head -c 2000
+        failed=1
+        ;;
+esac
+
+printf 'fn same_loose_name() { missing_loose_one }\n' > "$workdir/loose-one.valk"
+printf 'fn same_loose_name() { missing_loose_two }\n' > "$workdir/loose-two.valk"
+count=$((count + 1))
+echo "> diagnostics build loose files independently"
+stream="$(frame "$init")$(frame "$(notify_open_path "$workdir/loose-one.valk")")$(frame "$(notify_open_path "$workdir/loose-two.valk")")"
+out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+case "$out" in
+    *'Unknown identifier: missing_loose_one'*'Unknown identifier: missing_loose_two'*) ;;
+    *)
+        echo "# Expected diagnostics from both loose files"
+        echo "$out" | head -c 2000
+        failed=1
+        ;;
+esac
+case "$out" in
+    *'Name already used: same_loose_name'*)
+        echo "# Loose files were incorrectly compiled together"
+        failed=1
+        ;;
+esac
 
 # Every request must be answered, or the client waits for its timeout
 check "unsupported request gets an error reply" '"code":-32601' \
