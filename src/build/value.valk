@@ -235,6 +235,7 @@ class Value {
     fn set_pre_value(value: ?Value) $inline { this.ensure_meta().pre_value = value }
 
     fn is_implicit_borrow() bool $inline {
+        if this.rett.get_non_nullable().kind == TYPE.ref_of : return true
         let data = this.meta
         if isset(data) && data.implicit_borrow : return true
         if this.type != VAL.decl : return false
@@ -1135,10 +1136,10 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         p.expect(")", true, true) !>
     }
 
-    let ptr_t = type_ptr(b)
     let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
-    on = value_try_convert(on, scope, ctx, ptr_t, true, true)
-    ptr_t.compat_check(on.rett, on_exp) !>
+    let pointer_t = on.rett.is_inline_type() ? on.rett.reference() : type_ptr(b)
+    on = value_try_convert(on, scope, ctx, pointer_t, true, true)
+    pointer_t.compat_check(on.rett, on_exp) !>
 
     let elem = type_from_exp(type_exp, scope) !>
 
@@ -1364,6 +1365,7 @@ fn value_from_memcpy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     each arg_exps as arg_exp, i {
         let target = i < 2 ? ptr_t : uint_t
         let value = value_from_exp(arg_exp, scope, ctx.with_suggested_type(target)) !>
+        if i < 2 && value.rett.is_inline_type() : target = value.rett.reference()
         value = value_try_convert(value, scope, ctx, target, true, i < 2)
         target.compat_check(value.rett, arg_exp) !>
         values.append(value)
@@ -1438,14 +1440,25 @@ fn parse_offset_access(body: Exp) Exp !Error {
     p.error("Expected '..' or ']' in offset, found: '" + p.word() + "'")
 }
 
-fn type_has_native_sequence_length(type: Type) bool {
+fn type_native_sequence(type: Type) Type {
     let t = type.get_non_nullable()
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of {
+        let sub = t.get_sub_type()
+        if isset(sub) && (sub.is_fixed_array_type() || sub.kind == TYPE.array || sub.kind == TYPE.slice || sub.kind == TYPE.unbound) {
+            return sub
+        }
+    }
+    return t
+}
+
+fn type_has_native_sequence_length(type: Type) bool {
+    let t = type_native_sequence(type)
     return t.is_fixed_array_type() || t.kind == TYPE.array || t.kind == TYPE.slice
         || (t.kind == TYPE.unbound && t.length > 0)
 }
 
 fn type_native_sequence_element(type: Type) ?Type {
-    let t = type.get_non_nullable()
+    let t = type_native_sequence(type)
     let element = t.get_sub_type()
     if isset(element) : return element
     let class = t.get_class_or_null()
@@ -1453,7 +1466,7 @@ fn type_native_sequence_element(type: Type) ?Type {
 }
 
 fn value_native_sequence_length(on: Value, type: Type, ctx: Context, at: Exp) ?Value !Error {
-    let t = type.get_non_nullable()
+    let t = type_native_sequence(type)
     let uint_t = type_from_core(ctx.build, "uint") !>
     if t.is_fixed_array_type() || (t.kind == TYPE.unbound && t.length > 0) {
         return vgen_int(t.length.to(int), uint_t)
@@ -1471,7 +1484,7 @@ fn value_native_sequence_length(on: Value, type: Type, ctx: Context, at: Exp) ?V
 }
 
 fn value_native_sequence_data(on: Value, type: Type, ctx: Context, at: Exp) Value !Error {
-    let t = type.get_non_nullable()
+    let t = type_native_sequence(type)
     if t.is_fixed_array_type() || t.kind == TYPE.unbound : return on
     let class = t.get_class_or_null()
     if isset(class) {
@@ -1489,7 +1502,7 @@ fn value_native_sequence_data(on: Value, type: Type, ctx: Context, at: Exp) Valu
 }
 
 fn value_native_sequence_item(on: Value, index: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
-    let t = on.rett.get_non_nullable()
+    let t = type_native_sequence(on.rett)
     let element = type_native_sequence_element(t)
     if !isset(element) : at.bug("Sequence type has no element type")
     let data = value_native_sequence_data(on, t, ctx, at) !>
@@ -1677,13 +1690,19 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     if on_t.kind == TYPE.ptr_of || on_t.kind == TYPE.ref_of || (on_t.kind == TYPE.unbound && !isset(unbound_hook)) {
         let sub = on_t.get_sub_type()
         if isset(sub) {
+            let element = sub
             if !index.rett.is_integer_type() {
                 index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
             }
-            if on_t.kind == TYPE.unbound && on_t.length > 0 {
+            if sub.is_fixed_array_type() {
+                index = value_check_known_length_index(index, sub, sub.length, ctx, exp) !>
+                let fixed_element = sub.get_sub_type()
+                if !isset(fixed_element) : exp.bug("Array type is missing sub_type")
+                element = fixed_element
+            } else if on_t.kind == TYPE.unbound && on_t.length > 0 {
                 index = value_check_known_length_index(index, on_t, on_t.length, ctx, exp) !>
             }
-            return vgen_ptrv(on, index, sub, exp)
+            return vgen_ptrv(on, index, element, exp)
         }
     }
 
@@ -3993,9 +4012,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         if !param.is_generic {
             // Convert first (literal int → i32, nullable strip, $to hooks, …)
             let param_kind = param.type.get_non_nullable().kind
-            let param_class = param.type.get_non_nullable().get_class_or_null()
-            let struct_borrow = param_kind == TYPE.struct && isset(param_class) && param_class.kind == CLASS_KIND.struct
-            let accepts_borrow = struct_borrow || param_kind == TYPE.voidptr || param_kind == TYPE.ptr_of || param_kind == TYPE.ref_of || param_kind == TYPE.unbound
+            let accepts_borrow = param_kind == TYPE.ref_of
             av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow)
             if av.is_implicit_borrow() && !accepts_borrow {
                 at.error("An implicit pointer borrow cannot be passed to raw pointer storage; use '@ref' explicitly")
