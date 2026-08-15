@@ -483,6 +483,22 @@ esac
 check "document symbols work on a file with errors" '"name":"three"' \
     "$(request_doc textDocument/documentSymbol multi-error.valk)"
 
+count=$((count + 1))
+echo "> document symbols reuse the cached result"
+stream="$(frame "$init")$(frame "$(request_doc textDocument/documentSymbol symbols.valk)")$(frame "$(request_doc textDocument/documentSymbol symbols.valk)")"
+out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+hits=$(printf '%s' "$out" | grep -o '"name":"sym_helper"' | wc -l | tr -d ' ')
+if [ "$hits" != "2" ]; then
+    echo "# Expected two document-symbol replies"
+    echo "$out" | head -c 2000
+    failed=1
+fi
+
+check_with_init "an edit invalidates cached document symbols" '"name":"cached_helper"' "$init" \
+    "$(request_doc textDocument/documentSymbol symbols.valk)" \
+    "$(notify_open symbols.valk 's/sym_helper/cached_helper/')" \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+
 # The server reads stdin 1024 bytes at a time, so a didOpen carrying a real file
 # is split across reads and has to be resumed. Answering an earlier message in
 # between must not disturb that: the parser's half-read state is the only record
@@ -516,7 +532,7 @@ check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identi
 mkdir -p "$workdir/pkg-one/src/check" "$workdir/pkg-two/src/check"
 printf '{}\n' > "$workdir/pkg-one/valk.json"
 printf '{}\n' > "$workdir/pkg-two/valk.json"
-printf 'fn package_one() {}\n' > "$workdir/pkg-one/src/main.valk"
+printf 'fn package_one() {}\nfn unopened_bad() { missing_unopened_body }\n' > "$workdir/pkg-one/src/main.valk"
 printf 'fn package_two() {}\n' > "$workdir/pkg-two/src/main.valk"
 printf 'use main\nfn check_one() { main:package_one(); missing_from_one }\n' > "$workdir/pkg-one/src/check/check.valk"
 printf 'use main\nfn check_two() { main:package_two(); missing_from_two }\n' > "$workdir/pkg-two/src/check/check.valk"
@@ -529,6 +545,12 @@ case "$out" in
     *)
         echo "# Expected diagnostics from both package roots"
         echo "$out" | head -c 2000
+        failed=1
+        ;;
+esac
+case "$out" in
+    *'Unknown identifier: missing_unopened_body'*)
+        echo "# Parsed a function body from an unopened file"
         failed=1
         ;;
 esac
