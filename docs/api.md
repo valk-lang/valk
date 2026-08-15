@@ -26,11 +26,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn race_lock() void
 + fn race_unlock() void
 + fn raise(code: i32) void
-+ fn read_big_endian(from: @[u8], bytes: uint) uint
-+ fn read_little_endian(from: @[u8], bytes: uint) uint
++ fn read_big_endian(from: *u8, bytes: uint) uint
++ fn read_little_endian(from: *u8, bytes: uint) uint
 + fn signal_ignore(sig: int) void
-+ fn write_big_endian(to: @[u8], v: uint, bytes: uint) void
-+ fn write_little_endian(to: @[u8], v: uint, bytes: uint) void
++ fn write_big_endian(to: *u8, v: uint, bytes: uint) void
++ fn write_little_endian(to: *u8, v: uint, bytes: uint) void
 ```
 
 ## Classes for 'core'
@@ -185,7 +185,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + slice Slice[T] of any {
-    ~ data: *any
+    ~ data: ptr[any]
     ~ length: uint
 
     + fn append() void
@@ -197,7 +197,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + slice String of u8 {
-    ~ data: *u8
+    ~ data: ptr[u8]
     ~ length: uint
 
     + fn bytes() uint
@@ -293,16 +293,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i16) void
     + static fn random() i16
-    + static fn read_big_endian(from: @[u8 x 2]) i16
-    + static fn read_little_endian(from: @[u8 x 2]) i16
+    + static fn read_big_endian(from: *[u8 x 2]) i16
+    + static fn read_little_endian(from: *[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
     + fn to_base(base: i16) String
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i16, to: @[u8 x 2]) void
-    + static fn write_little_endian(v: i16, to: @[u8 x 2]) void
+    + static fn write_big_endian(v: i16, to: *[u8 x 2]) void
+    + static fn write_little_endian(v: i16, to: *[u8 x 2]) void
 }
 ```
 
@@ -312,16 +312,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i32) void
     + static fn random() i32
-    + static fn read_big_endian(from: @[u8 x 4]) i32
-    + static fn read_little_endian(from: @[u8 x 4]) i32
+    + static fn read_big_endian(from: *[u8 x 4]) i32
+    + static fn read_little_endian(from: *[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
     + fn to_base(base: i32) String
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i32, to: @[u8 x 4]) void
-    + static fn write_little_endian(v: i32, to: @[u8 x 4]) void
+    + static fn write_big_endian(v: i32, to: *[u8 x 4]) void
+    + static fn write_little_endian(v: i32, to: *[u8 x 4]) void
 }
 ```
 
@@ -331,16 +331,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i64) void
     + static fn random() i64
-    + static fn read_big_endian(from: @[u8 x 8]) i64
-    + static fn read_little_endian(from: @[u8 x 8]) i64
+    + static fn read_big_endian(from: *[u8 x 8]) i64
+    + static fn read_little_endian(from: *[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
     + fn to_base(base: i64) String
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i64, to: @[u8 x 8]) void
-    + static fn write_little_endian(v: i64, to: @[u8 x 8]) void
+    + static fn write_big_endian(v: i64, to: *[u8 x 8]) void
+    + static fn write_little_endian(v: i64, to: *[u8 x 8]) void
 }
 ```
 
@@ -350,16 +350,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: i8) void
     + static fn random() i8
-    + static fn read_big_endian(from: @[u8 x 1]) i8
-    + static fn read_little_endian(from: @[u8 x 1]) i8
+    + static fn read_big_endian(from: *[u8 x 1]) i8
+    + static fn read_little_endian(from: *[u8 x 1]) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
     + fn to_base(base: i8) String
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: i8, to: @[u8 x 1]) void
-    + static fn write_little_endian(v: i8, to: @[u8 x 1]) void
+    + static fn write_big_endian(v: i8, to: *[u8 x 1]) void
+    + static fn write_little_endian(v: i8, to: *[u8 x 1]) void
 }
 ```
 
@@ -369,16 +369,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: int) void
     + static fn random() int
-    + static fn read_big_endian(from: @[u8 x 8]) int
-    + static fn read_little_endian(from: @[u8 x 8]) int
+    + static fn read_big_endian(from: *[u8 x 8]) int
+    + static fn read_little_endian(from: *[u8 x 8]) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
     + fn to_base(base: int) String
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: int, to: @[u8 x 8]) void
-    + static fn write_little_endian(v: int, to: @[u8 x 8]) void
+    + static fn write_big_endian(v: int, to: *[u8 x 8]) void
+    + static fn write_little_endian(v: int, to: *[u8 x 8]) void
 }
 ```
 
@@ -455,16 +455,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u16) void
     + static fn random() u16
-    + static fn read_big_endian(from: @[u8 x 2]) u16
-    + static fn read_little_endian(from: @[u8 x 2]) u16
+    + static fn read_big_endian(from: *[u8 x 2]) u16
+    + static fn read_little_endian(from: *[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
     + fn to_base(base: u16) String
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u16, to: @[u8 x 2]) void
-    + static fn write_little_endian(v: u16, to: @[u8 x 2]) void
+    + static fn write_big_endian(v: u16, to: *[u8 x 2]) void
+    + static fn write_little_endian(v: u16, to: *[u8 x 2]) void
 }
 ```
 
@@ -474,16 +474,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u32) void
     + static fn random() u32
-    + static fn read_big_endian(from: @[u8 x 4]) u32
-    + static fn read_little_endian(from: @[u8 x 4]) u32
+    + static fn read_big_endian(from: *[u8 x 4]) u32
+    + static fn read_little_endian(from: *[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
     + fn to_base(base: u32) String
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u32, to: @[u8 x 4]) void
-    + static fn write_little_endian(v: u32, to: @[u8 x 4]) void
+    + static fn write_big_endian(v: u32, to: *[u8 x 4]) void
+    + static fn write_little_endian(v: u32, to: *[u8 x 4]) void
 }
 ```
 
@@ -493,16 +493,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: u64) void
     + static fn random() u64
-    + static fn read_big_endian(from: @[u8 x 8]) u64
-    + static fn read_little_endian(from: @[u8 x 8]) u64
+    + static fn read_big_endian(from: *[u8 x 8]) u64
+    + static fn read_little_endian(from: *[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
     + fn to_base(base: u64) String
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: u64, to: @[u8 x 8]) void
-    + static fn write_little_endian(v: u64, to: @[u8 x 8]) void
+    + static fn write_big_endian(v: u64, to: *[u8 x 8]) void
+    + static fn write_little_endian(v: u64, to: *[u8 x 8]) void
 }
 ```
 
@@ -526,8 +526,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_whitespace() bool
     + fn print(base: u8) void
     + static fn random() u8
-    + static fn read_big_endian(from: @[u8 x 1]) u8
-    + static fn read_little_endian(from: @[u8 x 1]) u8
+    + static fn read_big_endian(from: *[u8 x 1]) u8
+    + static fn read_little_endian(from: *[u8 x 1]) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
     + fn to_ascii_string() String
@@ -536,8 +536,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn to_hex() String
     + fn to_str() String
     + fn unescape() u8
-    + static fn write_big_endian(v: u8, to: @[u8 x 1]) void
-    + static fn write_little_endian(v: u8, to: @[u8 x 1]) void
+    + static fn write_big_endian(v: u8, to: *[u8 x 1]) void
+    + static fn write_little_endian(v: u8, to: *[u8 x 1]) void
 }
 ```
 
@@ -547,16 +547,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_str(str: String) bool
     + fn print(base: uint) void
     + static fn random() uint
-    + static fn read_big_endian(from: @[u8 x 8]) uint
-    + static fn read_little_endian(from: @[u8 x 8]) uint
+    + static fn read_big_endian(from: *[u8 x 8]) uint
+    + static fn read_little_endian(from: *[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
     + fn to_base(base: uint) String
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_str() String
-    + static fn write_big_endian(v: uint, to: @[u8 x 8]) void
-    + static fn write_little_endian(v: uint, to: @[u8 x 8]) void
+    + static fn write_big_endian(v: uint, to: *[u8 x 8]) void
+    + static fn write_little_endian(v: uint, to: *[u8 x 8]) void
 }
 ```
 
@@ -581,10 +581,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void
 + fn bcrypt_hash(password: String, cost: uint (12)) String
 + fn bcrypt_verify(password: String, hash: String) bool
-+ fn blowfish_encrypt_block(context: BlowfishContext, input: @[u8], output: @[u8]) void
++ fn blowfish_encrypt_block(context: BlowfishContext, input: *[u8 x 8], output: *[u8 x 8]) void
 + fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
 + fn blowfish_init_state(context: BlowfishContext) void
-+ fn blowfish_xor_block(data: @[u8], salt: ByteBuffer, saltIndex: @[uint]) void
++ fn blowfish_xor_block(data: *u8, salt: ByteBuffer, saltIndex: *uint) void
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```
@@ -593,10 +593,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Blake2b {
-    + fn finalize(out: @[u8]) void
+    + fn finalize(out: *u8) void
     + static fn hash_str(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
-    + fn update(data: @[u8], length: uint) void
+    + fn update(data: *u8, length: uint) void
 }
 ```
 
@@ -607,20 +607,20 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Sha1 {
-    + fn add_hash_data(data: &<@[u8 x 20]>) void
-    + fn add_raw_data_unsafe(data: @[u8], len: uint) void
+    + fn add_hash_data(data: *[u8 x 20]) void
+    + fn add_raw_data_unsafe(data: *u8, len: uint) void
     + fn add_string_data(str: String) void
-    + fn final() <@[u8 x 20]>
+    + fn final() [u8 x 20]
     + fn reset() void
 }
 ```
 
 ```js
 + class Sha256 {
-    + fn add_hash_data(data: &<@[u8 x 32]>) void
-    + fn add_raw_data_unsafe(data: @[u8], len: uint) void
+    + fn add_hash_data(data: *[u8 x 32]) void
+    + fn add_raw_data_unsafe(data: *u8, len: uint) void
     + fn add_string_data(str: String) void
-    + fn final() <@[u8 x 32]>
+    + fn final() [u8 x 32]
     + fn reset() void
 }
 ```
@@ -628,13 +628,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Globals for 'crypto'
 
 ```js
-+ global IV : <@[u64 x 8]>
-+ global SIGMA : <@[<@[u8 x 16]> x 12]>
-+ global parray : <@[u32 x 18]>
-+ global sbox1 : <@[u32 x 256]>
-+ global sbox2 : <@[u32 x 256]>
-+ global sbox3 : <@[u32 x 256]>
-+ global sbox4 : <@[u32 x 256]>
++ global IV : [u64 x 8]
++ global SIGMA : [[u8 x 16] x 12]
++ global parray : [u32 x 18]
++ global sbox1 : [u32 x 256]
++ global sbox2 : [u32 x 256]
++ global sbox3 : [u32 x 256]
++ global sbox4 : [u32 x 256]
 ```
 
 # ext

@@ -213,7 +213,7 @@
 + Update HTTP client options
 + Release 0.0.6
 
-+ Allow identifiers for numbers in types, e.g. @[u8 x fs:PATH_MAX_LEN] or global list : [uint x MAX_ITEMS]
++ Allow identifiers for numbers in types, e.g. *[u8 x fs:PATH_MAX_LEN] or global list : [uint x MAX_ITEMS]
 + Add more standard library functions
 + Update docs
 + Release 0.0.5
