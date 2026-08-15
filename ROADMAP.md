@@ -36,6 +36,7 @@
 ```
 + Release 0.4.0/1
 + Rework Type logic + syntax
++ LSP improvements
 
 + Release 0.3.5
 + Upgrade valkir version
