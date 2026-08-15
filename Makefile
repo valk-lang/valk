@@ -17,6 +17,7 @@ EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
 DIST_FLAGS := . src/*.valk --static --release -vv --clang
+IR_TARGETS := linux-x64 macos-x64 macos-arm64 win-x64
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
 BENCH_JSON_ITERATIONS ?= 500
 BENCH_JSON_MEMORY_DOCUMENTS ?= 100
@@ -229,7 +230,20 @@ win-x64: $(DIST_DEPS)
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
 	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
-dist-all: win-x64 linux-x64 macos-x64 macos-arm64
+ir: $(DIST_DEPS)
+	vman use
+	vman install
+	rm -rf dist/ir/*
+	mkdir -p $(addprefix dist/ir/libs/,$(IR_TARGETS))
+	@for target in $(IR_TARGETS); do \
+		$(DIST_COMP) build -o ./dist/ir/valk-$$target.ll --target $$target \
+			$(FLAGS) $(filter-out --clang,$(DIST_FLAGS)) --ir || exit $$?; \
+		cp ./lib/libs/$$target/valk-stack-swap.o ./dist/ir/libs/$$target/ || exit $$?; \
+	done
+	cd ./dist/ir/ && rm -f ../valk-$(VERSION)-ir.tar.gz
+	cd ./dist/ir/ && tar -czf ../valk-$(VERSION)-ir.tar.gz *.ll libs
+
+dist-all: win-x64 linux-x64 macos-x64 macos-arm64 ir
 
 # Toolchains for building distributions
 toolchains:
@@ -251,7 +265,7 @@ clean:
 
 .PHONY: \
 	valk2 valk3 \
-	asm ci-linux ci-macos ci-win clean dist-all doc install \
+	asm ci-linux ci-macos ci-win clean dist-all doc install ir \
 	linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-compile-errors test-cross test-cross-ir test-diagnostics \
