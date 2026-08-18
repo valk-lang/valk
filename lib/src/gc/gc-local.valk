@@ -25,11 +25,6 @@ struct ConditionalGlobalRoot {
     tag: uint
 }
 
-struct ItemChain {
-    prev: u32 (0)
-    item: GcItem
-}
-
 struct Gc {
     nr: uint (atomic(gc_nr + 1))
     mutex: *core:MutexStruct[void] (core:MutexStruct[void].new())
@@ -46,10 +41,11 @@ struct Gc {
     mark_list: *Lifo (Lifo.new())
     // props_removed: *Lifo (Lifo.new())
 
-    reclaim_chain: *LifoFor[ItemChain] (.new())
-    reclaim_chain_current: *LifoFor[ItemChain] (.new())
-    update_chain: *LifoFor[ItemChain] (.new())
-    update_chain_current: *LifoFor[ItemChain] (.new())
+    chain: *Lifo (.new())
+    chain_current: *Lifo (.new())
+    chain_now: *Lifo (.new())
+    chain_pending: *Lifo (.new())
+    chain_pending_next: *Lifo (.new())
 
     // Colors
     colors_invalid: *LifoFor[u32] (.new())
@@ -109,14 +105,10 @@ struct Gc {
         // mem_marked; ownership loss is accounted for below.
         let reset_pools_needed = this.did_shutdown || this.pools_dirty || this.mem_new != this.mem_marked
 
-        // Copy chains
-        this.reclaim_chain_current.copy_from(this.reclaim_chain)
-        this.update_chain_current.copy_from(this.update_chain)
-        this.reclaim_chain.clear()
-        this.update_chain.clear()
-        // Index 0 is not allowed, so put fake data here
-        this.reclaim_chain.add(.{item:null.@cast(ptr)})
-        this.update_chain.add(.{item:null.@cast(ptr)})
+        // Rotate the chain: entries recorded since the last collect are
+        // consumed by this one, anything found now is consumed by the next.
+        this.chain.swap(this.chain_current)
+        this.chain.clear()
 
         // 
         if !this.did_shutdown : this.collect_stack_items()
@@ -219,9 +211,11 @@ struct Gc {
         let data = item.data()
 
         if !data.is_valid() {
+            detach_root(data, item)
             let c = get_color()
             let col = &colors[c]
             col.parent_color = 1
+            col.root = item
             if data.color == 0 && data.offset > 0 {
                 let block = data.block()
                 block.slots_used++
@@ -391,20 +385,99 @@ struct Gc {
     //     }
     // }
 
+    // Re-walk every item that was seen pointing outside its own color. A color
+    // that lost its root is recaptured here, before the disconnect pass decides
+    // what to free.
+    //
+    // An entry whose own color is invalid cannot be walked yet: marking from
+    // garbage would revive it. It is held back instead, because another entry
+    // in this same pass can still recapture its color. Repeat until a round
+    // recaptures nothing new, then keep what is left for a later collect.
     fn loop_recapture() {
-        let list = this.colors_valid
-        let data = list.data
-        let adr = data
-        let end = data + list.index * size_of(u32)
+        let pending = this.chain_pending
+        let next = this.chain_pending_next
+        pending.clear()
+        next.clear()
 
+        this.walk_chain(this.chain_current, pending)
+        while true {
+            let walked = this.drain_now()
+            if this.revive_colors() : walked = true
+            if pending.index > 0 {
+                if this.walk_chain(pending, next) : walked = true
+                let swap = pending
+                pending = next
+                next = swap
+            }
+            if !walked : break
+        }
+
+        // Whatever stayed unreachable keeps its place in the chain
+        let adr = pending.data
+        let end = adr + pending.index * size_of(ptr)
+        while adr < end {
+            this.chain.add(@ptrv(adr, GcItem))
+            adr = adr.$offset(size_of(ptr))
+        }
+    }
+
+    fn drain_now() bool {
+        let list = this.chain_now
+        let walked = false
+        while true {
+            let item = (list.pop() ! break).@cast(GcItem)
+            let data = item.data()
+            data.remove_in_updates()
+            if data.color == 0 : continue
+            if !data.is_valid() : continue
+            loop_items(item, mark_item)
+            walked = true
+        }
+        return walked
+    }
+
+    fn walk_chain(list: *Lifo, hold: *Lifo) bool {
+        let adr = list.data
+        let end = adr + list.index * size_of(ptr)
+        list.clear()
+        let walked = false
+
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            let data = item.data()
+            if data.color == 0 {
+                data.remove_in_updates()
+                continue
+            }
+            if !data.is_valid() {
+                hold.add(item)
+                continue
+            }
+            data.remove_in_updates()
+            loop_items(item, mark_item)
+            walked = true
+        }
+        return walked
+    }
+
+    // Marking can hand a color's ancestor back its validity. Descendants have
+    // to follow before anything is freed, or their items are swept while the
+    // region they belong to is alive again. A revived color can also unblock a
+    // held chain entry, so this runs inside the recapture loop.
+    fn revive_colors() bool {
+        let list = this.colors_invalid
+        let adr = list.data
+        let end = adr + list.index * size_of(u32)
+        let revived = false
         while adr < end {
             let col = @ptrv(adr, u32)
             adr = adr.$offset(size_of(u32))
             let color = get_color_object(col)
-
-            color.recapture()
-            color.handle_updates()
+            if color.valid : continue
+            if color.revive(col) : revived = true
         }
+        return revived
     }
 
     fn loop_disconnects() {
@@ -739,6 +812,11 @@ struct Gc {
         // this.updated_list.free()
         this.blanks.free()
         this.disconnect_list.free()
+        this.chain.free()
+        this.chain_current.free()
+        this.chain_now.free()
+        this.chain_pending.free()
+        this.chain_pending_next.free()
         // this.re_own_list.free()
         this.shared_items.free()
         this.mark_list.free()
