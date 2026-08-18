@@ -17,8 +17,6 @@ package main
 import (
 	"fmt"
 	"runtime"
-	"runtime/debug"
-	"sync/atomic"
 	"time"
 )
 
@@ -31,16 +29,8 @@ type Tree struct {
 	right *Tree
 }
 
-// Force heap allocation (escape analysis would otherwise stack-allocate /
-// eliminate most short-lived nodes). Overwrite so only one stays live.
-var sink atomic.Pointer[Node]
-
-//go:noinline
-func heapNode() *Node {
-	n := &Node{}
-	sink.Store(n)
-	return n
-}
+// Overwrite sink: every alloc escapes; only the last stays live.
+var gSink *Node
 
 func chain(n int) *Node {
 	first := &Node{}
@@ -102,29 +92,21 @@ func header(name string) {
 	fmt.Printf("\n=== %s ===\n", name)
 }
 
-func fullGC() {
-	runtime.GC()
-	debug.FreeOSMemory()
-}
-
 func collectN(n int) {
 	for i := 0; i < n; i++ {
 		runtime.GC()
 	}
-	debug.FreeOSMemory()
 }
 
-// 1) Objects that die without escaping.
+// 1) Objects that die while only the final allocation remains rooted.
 func benchShortLived() {
 	header("short-lived alloc")
 	const amount = 10_000_000
-	sink := &Node{}
-
-	// Local root for verify; separate from package sink used to force heap.
 	root := &Node{}
 	start := time.Now()
 	for i := amount; i > 0; i-- {
-		n := heapNode()
+		n := &Node{}
+		gSink = n
 		if i == 1 {
 			root.next = n
 		}
@@ -146,7 +128,7 @@ func benchStableCollect() {
 	const collects = 5_000
 	list := chain(live)
 
-	fullGC()
+	runtime.GC()
 
 	start := time.Now()
 	for c := 0; c < collects; c++ {
@@ -220,7 +202,7 @@ func benchMutateLinks() {
 	const live = 200_000
 	const rounds = 50
 	list := chain(live)
-	fullGC()
+	runtime.GC()
 
 	start := time.Now()
 	for r := 0; r < rounds; r++ {
@@ -238,7 +220,7 @@ func benchMutateLinks() {
 		list = second
 	}
 	us := usSince(start)
-	fullGC()
+	runtime.GC()
 
 	fmt.Printf("live:     %d\n", live)
 	fmt.Printf("rounds:   %d\n", rounds)
@@ -257,11 +239,12 @@ func benchChurnWithLive() {
 	const live = 500_000
 	const churn = 5_000_000
 	list := chain(live)
-	fullGC()
+	runtime.GC()
 
 	start := time.Now()
 	for i := churn; i > 0; i-- {
-		heapNode()
+		n := &Node{}
+		gSink = n
 	}
 	runtime.GC()
 	us := usSince(start)
@@ -304,10 +287,6 @@ func benchTreeChurn() {
 func main() {
 	fmt.Println("Go GC bench suite")
 	fmt.Printf("mem_kb before: %d\n", memKB())
-	fmt.Printf("GOGC: %s\n", func() string {
-		// default GOGC is 100; leave it alone for a fair "normal Go" run
-		return "default"
-	}())
 
 	benchShortLived()
 	benchStableCollect()
