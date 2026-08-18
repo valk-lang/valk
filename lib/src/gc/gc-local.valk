@@ -25,6 +25,11 @@ struct ConditionalGlobalRoot {
     tag: uint
 }
 
+struct ItemChain {
+    prev: ?*ItemChain
+    item: ptr
+}
+
 struct Gc {
     nr: uint (atomic(gc_nr + 1))
     mutex: *core:MutexStruct[void] (core:MutexStruct[void].new())
@@ -33,13 +38,26 @@ struct Gc {
     conditional_globals: *Bump (Bump.new())
     stack_items: *Bump (Bump.new())
     prev_stack_items: *Bump (Bump.new())
-    updated_list: *Bump (Bump.new())
+    // updated_list: *Bump (Bump.new())
     blanks: *Bump (Bump.new())
-    dis_owned_list: *Bump (Bump.new())
-    re_own_list: *Bump (Bump.new())
+    disconnect_list: *Lifo (.new())
+    // re_own_list: *Bump (Bump.new())
     shared_items: *Bump (Bump.new())
     mark_list: *Lifo (Lifo.new())
-    props_removed: *Lifo (Lifo.new())
+    // props_removed: *Lifo (Lifo.new())
+
+    reclaim_chain: *LifoFor[ItemChain] (.new())
+    reclaim_chain_current: *LifoFor[ItemChain] (.new())
+    update_chain: *LifoFor[ItemChain] (.new())
+    update_chain_current: *LifoFor[ItemChain] (.new())
+
+    // Colors
+    colors_invalid: *LifoFor[u32] (.new())
+    colors_new: *LifoFor[u32] (.new())
+    colors_valid: *LifoFor[u32] (.new())
+    colors_pool: *LifoFor[u32] (.new())
+    color_next : u32
+    color_max : u32
 
     // Refs
     gc_stack_sp: ptr (@ref(coro:gc_stack_sp))
@@ -91,21 +109,37 @@ struct Gc {
         // mem_marked; ownership loss is accounted for below.
         let reset_pools_needed = this.did_shutdown || this.pools_dirty || this.mem_new != this.mem_marked
 
+        // Copy chains
+        this.reclaim_chain_current.copy_from(this.reclaim_chain)
+        this.update_chain_current.copy_from(this.update_chain)
+        this.reclaim_chain.clear()
+        this.update_chain.clear()
+        // Index 0 is not allowed, so put fake data here
+        this.reclaim_chain.add(.{item:null.@cast(ptr)})
+        this.update_chain.add(.{item:null.@cast(ptr)})
+
         // 
         if !this.did_shutdown : this.collect_stack_items()
 
         // Check if items have dissapeared from the stack
         this.loop_previous_stack_items()
-        this.loop_props_removed()
+        // this.loop_props_removed()
+
+        // Group valid / invalid colors by backtracing
+        this.loop_colors()
 
         // Mark stack items
         if !this.did_shutdown : this.loop_stack_items(Gc.mark_stack_item)
 
         //
-        this.loop_dis_own()
-        if !this.did_shutdown : this.loop_updates()
-        else : this.clean_updates()
-        if !this.did_shutdown : this.loop_re_own()
+        this.loop_recapture()
+        this.loop_disconnects()
+        this.free_up_colors()
+
+        // this.loop_dis_own()
+        // if !this.did_shutdown : this.loop_updates()
+        // else : this.clean_updates()
+        // if !this.did_shutdown : this.loop_re_own()
 
         this.check_blanks()
 
@@ -179,49 +213,58 @@ struct Gc {
         this.loop_stack_items(fn(item: ptr){ mark_leak_rec(item, false) })
     }
 
-    static fn mark_stack_item(item: ptr) {
-        let data: *GcData = item.$offset(-8)
-        if data.is_shared() : return // Prevent race conditions
-        if data.is_not_owned() {
-            mark_used(item)
-            gc.prev_stack_items.add_ptr(item)
-        } else if data.is_still_co_owned() {
-            data.remove_still_co_owned()
+    static fn mark_stack_item(item: GcItem) {
+        let data = item.data()
+
+        if !data.is_valid() {
+            let c = get_color()
+            let col = &colors[c]
+            col.parent_color = 1
+            data.color = c
+            loop_items(item, mark_item)
             gc.prev_stack_items.add_ptr(item)
         }
+
+        // if data.is_not_owned() {
+        //     mark_used(item)
+        //     gc.prev_stack_items.add_ptr(item)
+        // } else if data.is_still_co_owned() {
+        //     data.remove_still_co_owned()
+        //     gc.prev_stack_items.add_ptr(item)
+        // }
     }
 
-    fn loop_props_removed() {
-        let list = this.props_removed
-        while true {
-            let v = list.pop() ! break
-            if v & prop_owned == prop_owned {
-                let item : ptr = v - prop_owned
-                #if GC_DEBUG
-                if item == null : panic("GC error: removed 'owned' property is not a tagged pointer; its memory was reused")
-                #end
-                let data = gcdata(item)
-                data.set_no_owner()
-                gc.dis_owned_list.add_ptr(item)
-            } else {
-                // The else branch assumes co-owned rather than testing for it,
-                // so a value carrying neither tag would be decoded as one.
-                #if GC_DEBUG
-                if v & prop_mask != prop_co_owned : panic("GC error: removed property has no ownership tag")
-                #end
-                let item : ptr = v - prop_co_owned
-                #if GC_DEBUG
-                if item == null : panic("GC error: removed 'co-owned' property is not a tagged pointer; its memory was reused")
-                #end
-                let data = gcdata(item)
-                data.dis_co_own()
-            }
-        }
-    }
+    // fn loop_props_removed() {
+    //     let list = this.props_removed
+    //     while true {
+    //         let v = list.pop() ! break
+    //         if v & prop_owned == prop_owned {
+    //             let item : ptr = v - prop_owned
+    //             #if GC_DEBUG
+    //             if item == null : panic("GC error: removed 'owned' property is not a tagged pointer; its memory was reused")
+    //             #end
+    //             let data = gcdata(item)
+    //             data.set_no_owner()
+    //             gc.dis_owned_list.add_ptr(item)
+    //         } else {
+    //             // The else branch assumes co-owned rather than testing for it,
+    //             // so a value carrying neither tag would be decoded as one.
+    //             #if GC_DEBUG
+    //             if v & prop_mask != prop_co_owned : panic("GC error: removed property has no ownership tag")
+    //             #end
+    //             let item : ptr = v - prop_co_owned
+    //             #if GC_DEBUG
+    //             if item == null : panic("GC error: removed 'co-owned' property is not a tagged pointer; its memory was reused")
+    //             #end
+    //             let data = gcdata(item)
+    //             data.dis_co_own()
+    //         }
+    //     }
+    // }
 
     fn loop_previous_stack_items() {
 
-        let discs = this.dis_owned_list
+        let discs = this.disconnect_list
         let list = this.prev_stack_items
         let data = list.data
         let adr = data
@@ -239,140 +282,203 @@ struct Gc {
 
             // A stack item can become shared
             if data.is_shared() {
-                data.set_no_owner()
                 continue
             }
 
-            if data.is_on_stack() {
+            let color = data.get_color()
+            if data.is_on_stack() && color.valid {
                 let adr = list.get(size_of(ptr))
                 @ptrv(adr, ptr) = item
             } else {
-                let adr = discs.get(size_of(ptr))
-                @ptrv(adr, ptr) = item
-                data.set_no_owner()
+                discs.add(item)
+                color.remove_parent()
             }
         }
     }
 
-    fn loop_dis_own() {
+    fn loop_colors() {
+        let list_invalid = this.colors_invalid
+        let list = this.colors_valid
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.clear()
 
-        let list = this.dis_owned_list
+        while adr < end {
+            let col = @ptrv(adr, u32)
+            adr = adr.$offset(size_of(u32))
+            let color = get_color_object(col)
+            let valid = color.backtrace()
+            if valid {
+                list.add(col)
+            } else {
+                list_invalid.add(col)
+            }
+        }
+    }
+
+    // fn loop_dis_own() {
+
+    //     let list = this.dis_owned_list
+    //     let i : uint = 0 
+    //     let disowned: uint = 0
+    //     let unmarked_bytes: uint = 0
+
+    //     // The dis-own list can grow while running this code
+    //     while i < list.index {
+    //         let item = @ptrv(list.data, ptr, i / size_of(ptr))
+    //         i += size_of(ptr)
+
+    //         #if GC_DEBUG
+    //         if item == null : panic("Dis own list contains a null value")
+    //         #end
+
+    //         let data: *GcData = item.$offset(-8)
+
+    //         // A dis-owned item can become shared, so we need to make sure it's ignored
+    //         if data.is_no_owner_not_shared() {
+    //             let count, bytes = dis_own_rec(item)
+    //             disowned += count
+    //             unmarked_bytes += bytes
+    //         }
+    //     }
+
+    //     list.reset()
+    //     this.dis_own_count = disowned
+    //     this.mem_marked -= unmarked_bytes
+    // }
+
+    // fn loop_re_own() {
+
+    //     let list = this.re_own_list
+    //     let data = list.data
+    //     let adr = data
+    //     let end = adr + list.index
+    //     list.reset()
+
+    //     while adr < end {
+    //         let item = @ptrv(adr, ptr)
+    //         let data: *GcData = item.$offset(-8)
+    //         adr = adr.$offset(size_of(ptr))
+
+    //         // if data.is_shared() : panic("Shared re-own item")
+
+    //         if data.is_new() && data.co_count > 0 {
+    //             mark_used(item)
+    //             // Co ownership can be from stack or an object
+    //             if data.is_on_stack() : this.prev_stack_items.add_ptr(item)
+    //             else : data.set_still_co_owned()
+    //         }
+    //     }
+    // }
+
+    fn loop_recapture() {
+        let list = this.colors_valid
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.clear()
+
+        while adr < end {
+            let col = @ptrv(adr, u32)
+            adr = adr.$offset(size_of(u32))
+            let color = get_color_object(col)
+
+            color.recapture()
+            color.handle_updates()
+        }
+    }
+
+    fn loop_disconnects() {
+
+        let list = this.disconnect_list
         let i : uint = 0 
         let disowned: uint = 0
         let unmarked_bytes: uint = 0
 
         // The dis-own list can grow while running this code
-        while i < list.index {
-            let item = @ptrv(list.data, ptr, i / size_of(ptr))
-            i += size_of(ptr)
-
-            #if GC_DEBUG
-            if item == null : panic("Dis own list contains a null value")
-            #end
-
-            let data: *GcData = item.$offset(-8)
-
-            // A dis-owned item can become shared, so we need to make sure it's ignored
-            if data.is_no_owner_not_shared() {
-                let count, bytes = dis_own_rec(item)
-                disowned += count
-                unmarked_bytes += bytes
+        while true {
+            let item : GcItem = list.pop() ! break
+            let data = item.data()
+            let color = data.get_color()
+            if !color.valid {
+                let v1, v2 = disconnect(item)
+                disowned += v1
+                unmarked_bytes += v2
             }
         }
 
-        list.reset()
         this.dis_own_count = disowned
         this.mem_marked -= unmarked_bytes
     }
 
-    fn loop_re_own() {
-
-        let list = this.re_own_list
-        let data = list.data
-        let adr = data
-        let end = adr + list.index
-        list.reset()
-
-        while adr < end {
-            let item = @ptrv(adr, ptr)
-            let data: *GcData = item.$offset(-8)
-            adr = adr.$offset(size_of(ptr))
-
-            // if data.is_shared() : panic("Shared re-own item")
-
-            if data.is_new() && data.co_count > 0 {
-                mark_used(item)
-                // Co ownership can be from stack or an object
-                if data.is_on_stack() : this.prev_stack_items.add_ptr(item)
-                else : data.set_still_co_owned()
-            }
-        }
+    fn free_up_colors() {
     }
 
-    fn loop_updates() {
+    // fn loop_updates() {
 
-        let list = this.updated_list
-        let data = list.data
-        let adr = data
-        let end = adr + list.index
-        list.reset()
+    //     let list = this.updated_list
+    //     let data = list.data
+    //     let adr = data
+    //     let end = adr + list.index
+    //     list.reset()
 
-        let ml = this.mark_list
+    //     let ml = this.mark_list
 
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
+    //     while adr < end {
+    //         let item = @ptrv(adr, GcItem)
+    //         adr = adr.$offset(size_of(ptr))
 
-            let data = gcdata(item)
-            data.remove_in_updates()
-            if data.offset == 0 : continue
+    //         let data = gcdata(item)
+    //         data.remove_in_updates()
+    //         if data.offset == 0 : continue
 
-            if data.is_owned_not_shared() {
+    //         // if data.is_owned_not_shared() {
 
-                let block = data.block()
-                let pf = block.props
-                if isset(pf) {
-                    let f = fn(ref: ptr, list: *Lifo) {
-                        let sub = @ptrv(ref, ?ptr)
-                        if !isset(sub) : return
-                        if sub & prop_mask == 0 {
-                            let sub_data = gcdata(sub)
-                            if sub_data.is_not_owned_not_shared() {
-                                @ptrv(ref, ptr) = sub | prop_owned
-                                if sub_data.is_new() && sub_data.offset > 0 {
-                                    let sub_block = sub_data.block()
-                                    sub_block.slots_used++
-                                    gc.mem_marked += sub_block.isize
-                                }
-                                sub_data.set_owned()
-                                list.add(sub)
-                            } else {
-                                @ptrv(ref, ptr) = sub | prop_co_owned
-                                sub_data.co_own()
-                            }
-                        }
-                    }
-                    pf(item, ml, f)
-                }
-            }
-        }
+    //         //     let block = data.block()
+    //         //     let pf = block.props
+    //         //     if isset(pf) {
+    //         //         let f = fn(ref: ptr, list: *Lifo) {
+    //         //             let sub = @ptrv(ref, ?ptr)
+    //         //             if !isset(sub) : return
+    //         //             if sub & prop_mask == 0 {
+    //         //                 let sub_data = gcdata(sub)
+    //         //                 if sub_data.is_not_owned_not_shared() {
+    //         //                     @ptrv(ref, ptr) = sub | prop_owned
+    //         //                     if sub_data.is_new() && sub_data.offset > 0 {
+    //         //                         let sub_block = sub_data.block()
+    //         //                         sub_block.slots_used++
+    //         //                         gc.mem_marked += sub_block.isize
+    //         //                     }
+    //         //                     sub_data.set_owned()
+    //         //                     list.add(sub)
+    //         //                 } else {
+    //         //                     @ptrv(ref, ptr) = sub | prop_co_owned
+    //         //                     sub_data.co_own()
+    //         //                 }
+    //         //             }
+    //         //         }
+    //         //         pf(item, ml, f)
+    //         //     }
+    //         // }
+    //     }
 
-        mark_used(null)
-    }
+    //     // mark_used(null)
+    // }
 
-    fn clean_updates() {
-        let list = this.updated_list
-        let adr = list.data
-        let end = adr + list.index
-        list.reset()
+    // fn clean_updates() {
+    //     let list = this.updated_list
+    //     let adr = list.data
+    //     let end = adr + list.index
+    //     list.reset()
 
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-            let data = gcdata(item)
-            data.remove_in_updates()
-        }
-    }
+    //     while adr < end {
+    //         let item = @ptrv(adr, GcItem)
+    //         adr = adr.$offset(size_of(ptr))
+    //         let data = gcdata(item)
+    //         data.remove_in_updates()
+    //     }
+    // }
 
     fn check_blanks() {
 
@@ -387,9 +493,13 @@ struct Gc {
             adr = adr.$offset(size_of(ptr))
 
             let data = gcdata(item)
-            if data.is_not_new() : continue
+            let color = data.get_color()
+            if color.valid : continue
 
-            free_blank(item)
+            let block = data.block()
+            let onfree = block.onfree
+            if isset(onfree) : onfree(item)
+            // free_blank(item)
         }
     }
 
@@ -419,7 +529,7 @@ struct Gc {
             let item = @ptrv(adr, GcItem)
             adr = adr.$offset(size_of(ptr))
             let data = gcdata(item)
-            data.co_count--
+            // data.co_count--
             data.remove_on_stack()
         }
     }
@@ -436,7 +546,7 @@ struct Gc {
         let data = gcdata(item)
         if data.is_on_stack() : return
         data.set_on_stack()
-        data.co_count++
+        // data.co_count++
         this.stack_items.add_ptr(item)
     }
     fn collect_stack_items() {
@@ -509,47 +619,49 @@ struct Gc {
     //////////////////////////
 
     fn update_marks() {
-        this.loop_stack_items(fn(item: ptr) {
-            let data = gcdata(item)
-            if data.is_shared() && !data.is_marked() : update_mark(item)
-        })
-        this.clear_stack_items()
+        panic("Disabled : update marks")
+        // this.loop_stack_items(fn(item: ptr) {
+        //     let data = gcdata(item)
+        //     if data.is_shared() && !data.is_marked() : update_mark(item)
+        // })
+        // this.clear_stack_items()
 
-        let list = this.shared_items
-        let adr = list.data
-        let end = adr + list.index
+        // let list = this.shared_items
+        // let adr = list.data
+        // let end = adr + list.index
 
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-            let data = gcdata(item)
+        // while adr < end {
+        //     let item = @ptrv(adr, GcItem)
+        //     adr = adr.$offset(size_of(ptr))
+        //     let data = gcdata(item)
 
-            if !data.is_marked() && (data.is_owned() || data.co_count > 0) {
-                update_mark(item)
-            }
-        }
+        //     if !data.is_marked() && (data.is_owned() || data.co_count > 0) {
+        //         update_mark(item)
+        //     }
+        // }
     }
 
     fn clear_shared() {
-        let list = this.shared_items
-        let data = list.data
-        let adr = data
-        let end = adr + list.index
-        list.reset()
+        panic("Disabled : clear shared")
+        // let list = this.shared_items
+        // let data = list.data
+        // let adr = data
+        // let end = adr + list.index
+        // list.reset()
 
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-            let data = gcdata(item)
+        // while adr < end {
+        //     let item = @ptrv(adr, GcItem)
+        //     adr = adr.$offset(size_of(ptr))
+        //     let data = gcdata(item)
 
-            if data.is_marked() {
-                data.remove_mark()
-                list.add_ptr(item)
-                continue
-            }
+        //     if data.is_marked() {
+        //         data.remove_mark()
+        //         list.add_ptr(item)
+        //         continue
+        //     }
 
-            free_shared_item(item)
-        }
+        //     free_shared_item(item)
+        // }
     }
 
     //////////////////////////
@@ -581,13 +693,13 @@ struct Gc {
         this.globals.free()
         this.conditional_globals.free()
         this.stack_items.free()
-        this.updated_list.free()
+        // this.updated_list.free()
         this.blanks.free()
-        this.dis_owned_list.free()
-        this.re_own_list.free()
+        this.disconnect_list.free()
+        // this.re_own_list.free()
         this.shared_items.free()
         this.mark_list.free()
-        this.props_removed.free()
+        // this.props_removed.free()
         //
         mem:free(this)
     }
