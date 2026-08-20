@@ -1,7 +1,8 @@
 set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR AMD64)
 
-get_filename_component(VALK_TOOLCHAINS "${CMAKE_CURRENT_LIST_DIR}" ABSOLUTE)
+get_filename_component(VALK_PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+set(VALK_TOOLCHAINS "${VALK_PROJECT_ROOT}/toolchains")
 set(VALK_WINDOWS_SDK "${VALK_TOOLCHAINS}/toolchains/win-sdk-x64")
 
 set(CMAKE_C_COMPILER clang-cl)
@@ -13,7 +14,7 @@ set(CMAKE_AR llvm-lib)
 set(CMAKE_LINKER lld-link)
 set(VALK_MSVC "${VALK_WINDOWS_SDK}/MSVC/14.36.32532")
 set(VALK_WINSDK "${VALK_WINDOWS_SDK}/Include/10.0.22621.0")
-set(VALK_WIN_INCLUDES "-imsvc${VALK_TOOLCHAINS}/include/windows -imsvc${VALK_MSVC}/include -imsvc${VALK_WINSDK}/ucrt -imsvc${VALK_WINSDK}/shared -imsvc${VALK_WINSDK}/um -imsvc${VALK_WINSDK}/winrt")
+set(VALK_WIN_INCLUDES "-imsvc${CMAKE_CURRENT_LIST_DIR}/include/windows -imsvc${VALK_MSVC}/include -imsvc${VALK_WINSDK}/ucrt -imsvc${VALK_WINSDK}/shared -imsvc${VALK_WINSDK}/um -imsvc${VALK_WINSDK}/winrt")
 set(CMAKE_C_FLAGS_INIT "${VALK_WIN_INCLUDES}")
 set(CMAKE_CXX_FLAGS_INIT "${VALK_WIN_INCLUDES}")
 set(VALK_WIN_LIBS "/libpath:${VALK_MSVC}/lib/x64 /libpath:${VALK_WINDOWS_SDK}/Lib/10.0.22621.0/ucrt/x64 /libpath:${VALK_WINDOWS_SDK}/Lib/10.0.22621.0/um/x64")

@@ -264,8 +264,8 @@ dist-all: win-x64 linux-x64 macos-x64 macos-arm64 ir
 
 # Toolchains for building distributions
 toolchains:
-	chmod +x ./toolchains/setup.sh
-	./toolchains/setup.sh
+	chmod +x ./misc/toolchains/setup.sh
+	./misc/toolchains/setup.sh
 
 asm:
 	clang-22 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o

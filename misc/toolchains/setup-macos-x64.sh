@@ -1,5 +1,6 @@
 
-DIST_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+DIST_DIR=$( cd -- "$SCRIPT_DIR/../.." &> /dev/null && pwd )/toolchains
 TC_DIR="$DIST_DIR/toolchains"
 LIB_DIR="$DIST_DIR/libraries"
 

@@ -7,6 +7,10 @@
 # sudo dpkg --add-architecture arm64
 # sudo apt update
 
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+PROJECT_ROOT=$( cd -- "$SCRIPT_DIR/../.." &> /dev/null && pwd )
+TC_DIR="$PROJECT_ROOT/toolchains/toolchains"
+
 create_tc() {
     ARCH=$1
     echo "Toolchain: linux-$ARCH"
@@ -33,6 +37,9 @@ create_tc() {
     cd ..
     mv linux-$ARCH/linux-$ARCH.tar.gz .
 }
+
+mkdir -p "$TC_DIR"
+cd "$TC_DIR"
 
 create_tc "amd64"
 create_tc "arm64"
