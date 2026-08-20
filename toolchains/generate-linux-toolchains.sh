@@ -14,7 +14,7 @@ create_tc() {
     rm -rf linux-$ARCH/*
     cd linux-$ARCH
 
-    PACKAGES="libgcc-12-dev:$ARCH libssl-dev:$ARCH libcurl4-openssl-dev:$ARCH llvm-15-dev:$ARCH libstdc++-12-dev:$ARCH zlib1g-dev:$ARCH 	libncurses-dev:$ARCH libxml2-dev:$ARCH"
+    PACKAGES="libgcc-12-dev:$ARCH libssl-dev:$ARCH libcurl4-openssl-dev:$ARCH libstdc++-12-dev:$ARCH zlib1g-dev:$ARCH libncurses-dev:$ARCH libxml2-dev:$ARCH"
 
     apt-get download --print-uris $(apt-cache depends --recurse --no-recommends --no-suggests \
     --no-conflicts --no-breaks --no-replaces --no-enhances \

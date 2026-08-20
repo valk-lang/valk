@@ -23,14 +23,14 @@ HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_SYSTEM),Darwin)
 HOST_TOOLCHAIN := toolchains/toolchains/macos-11-3
 ifeq ($(HOST_ARCH),arm64)
-LLVM_DIR := toolchains/libraries/macos-llvm-15-arm64
+LLVM_DIR := toolchains/libraries/macos-llvm-22-arm64
 else
-LLVM_DIR := toolchains/libraries/macos-llvm-15-x64
+LLVM_DIR := toolchains/libraries/macos-llvm-22-x64
 endif
 LLVM_FLAGS := --sysroot $(HOST_TOOLCHAIN) -L $(LLVM_DIR)/lib
 else
 HOST_TOOLCHAIN := toolchains/toolchains/linux-amd64
-LLVM_DIR := toolchains/libraries/linux-llvm-15-x64
+LLVM_DIR := toolchains/libraries/linux-llvm-22-x64
 LLVM_FLAGS := --sysroot $(HOST_TOOLCHAIN) \
 	-L $(LLVM_DIR)/lib \
 	-L $(HOST_TOOLCHAIN)/usr/lib/gcc/x86_64-linux-gnu/12 \
@@ -61,7 +61,7 @@ valkexe: $(COMPILER_DEPS)
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
-	-L toolchains/libraries/win-llvm-15-x64/lib
+	-L toolchains/libraries/win-llvm-22-x64/lib
 
 doc: valk
 	./valk doc lib/ -o docs/api.md --markdown --no-private
@@ -206,7 +206,7 @@ ci-win: $(COMPILER_DEPS)
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
-	-L toolchains/libraries/win-llvm-15-x64/lib
+	-L toolchains/libraries/win-llvm-22-x64/lib
 
 # Distributions
 linux-x64: $(DIST_DEPS)
@@ -218,7 +218,7 @@ linux-x64: $(DIST_DEPS)
 	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" \
 	-L "toolchains/toolchains/linux-amd64/lib64" \
-	-L "toolchains/libraries/linux-llvm-15-x64/lib" \
+	-L "toolchains/libraries/linux-llvm-22-x64/lib" \
 	--sysroot toolchains/toolchains/linux-amd64 -l pthread -l dl
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
@@ -230,7 +230,7 @@ macos-x64: $(DIST_DEPS)
 	mkdir -p dist/macos-x64
 	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/macos-11-3 \
-	-L toolchains/libraries/macos-llvm-15-x64/lib
+	-L toolchains/libraries/macos-llvm-22-x64/lib
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
@@ -241,7 +241,7 @@ macos-arm64: $(DIST_DEPS)
 	mkdir -p dist/macos-arm64
 	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/macos-11-3 \
-	-L toolchains/libraries/macos-llvm-15-arm64/lib
+	-L toolchains/libraries/macos-llvm-22-arm64/lib
 	cp -r ./lib ./dist/macos-arm64/
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
@@ -254,13 +254,12 @@ win-x64: $(DIST_DEPS)
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
-	-L toolchains/libraries/win-llvm-15-x64/lib
+	-L toolchains/libraries/win-llvm-22-x64/lib
 	cp -r ./lib ./dist/win-x64/
 # Windows uses LLVM's linker, which also writes archives when called with `/lib`.
-	cp ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
-	cp ./toolchains/libraries/win-llvm-15-x64/LLVM-C.dll ./dist/win-x64/
+	cp ./toolchains/libraries/win-llvm-22-x64/lld.exe ./dist/win-x64/lld-link.exe
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
-	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe LLVM-C.dll
+	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
 ir: $(DIST_DEPS)
 	vman use
@@ -285,10 +284,10 @@ toolchains:
 	./toolchains/setup.sh
 
 asm:
-	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
 
 # Misc
 clean:

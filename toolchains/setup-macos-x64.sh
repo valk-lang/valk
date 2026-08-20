@@ -7,7 +7,7 @@ mkdir -p $TC_DIR
 mkdir -p $LIB_DIR
 
 MAC_ANY="$TC_DIR/macos-11-3"
-LLVM_MAC_X64="$LIB_DIR/macos-llvm-15-x64"
+LLVM_MAC_X64="$LIB_DIR/macos-llvm-22-x64"
 
 if [ ! -d "$MAC_ANY" ]; then
 	echo "Download macos toolchain"
@@ -21,7 +21,7 @@ fi
 if [ ! -d "$LLVM_MAC_X64" ]; then
 	echo "Download LLVM macos x64"
 	cd $LIB_DIR
-	wget "https://files.valk-cdn.dev/toolchains/macos-llvm-15-x64.tar.gz"
-	tar -xf "macos-llvm-15-x64.tar.gz" --checkpoint=.100
-	rm "macos-llvm-15-x64.tar.gz"
+	wget "https://files.valk-cdn.dev/toolchains/macos-llvm-22-x64.tar.gz"
+	tar -xf "macos-llvm-22-x64.tar.gz" --checkpoint=.100
+	rm "macos-llvm-22-x64.tar.gz"
 fi
