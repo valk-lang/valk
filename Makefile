@@ -235,7 +235,7 @@ win-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
-	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) \
+	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(filter-out --clang,$(DIST_FLAGS)) \
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
