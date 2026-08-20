@@ -5,6 +5,7 @@
 
 ```
 - Release 0.4.2
++ Restore embedded LLVM and remove the valkir dependency
 ~ Data race solution (Threads done via shared type, MutexValue not done)
 ~ uslice (cstring) / slice (String)
 

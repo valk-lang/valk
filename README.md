@@ -50,7 +50,7 @@ valk build main.valk -o ./main
 
 valk/vman: `curl -s https://valk-lang.dev/install.sh | bash`
 
-The compiler generates object files itself and only needs a linker.
+The compiler embeds LLVM 15 and uses it to generate object files.
 
 Ubuntu / Debian: `sudo apt-get install lld`
 
@@ -58,6 +58,7 @@ Ubuntu / Debian: `sudo apt-get install lld`
 git clone https://github.com/valk-lang/valk.git
 cd valk
 vman use
+make toolchains
 make
 # optional: make test
 ```
@@ -142,7 +143,7 @@ When not to use Valk:
 
 - Co routines are single threaded. A co-routine will always run on the same thread it started on.
 
-- We are a self hosted language. The compiler emits textual IR and turns it into object files itself, so it does not depend on LLVM. Pass `--clang` to let clang compile that IR instead. We depend on libc for system calls. We use the native linux & macos linker. For windows we use lld-link.
+- We are a self hosted language with an embedded LLVM 15 backend. Pass `--clang` to compile the emitted textual IR with external clang instead. We depend on libc for system calls. We use the native linux & macos linker. For windows we use lld-link.
 
 - How to trust a self hosted compiler? You can compile the valk source with --ir to a single IR file. Then you can compile that IR file with clang to create your new valk compiler and at that point you know there is no hidden code inside the compiler.
 

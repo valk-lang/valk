@@ -1,16 +1,16 @@
-use valkir
 use helper
 use valk:core
 use valk:fs
 use valk:thread
 use valk:time
+use llvm
 
 class ObjectTask {
     unit_name: String
     ir_code: String
     path_o: String
     path_ir: String
-    target: String
+    llvm_triple: String
     clang_command: String
     // Keep shared integers before byte-sized fields for legacy compilers.
     duration_us: uint (0)
@@ -24,13 +24,8 @@ class ObjectTask {
                 return this.finish(start, this.failure("clang failed while emitting unit '" + this.unit_name + "':\n# Exit code: " + code + "\n# Output: " + output))
             }
         } else {
-            let target = valkir:Target.parse(this.target) ! {
-                return this.finish(start, "valkir does not support target: " + this.target)
-            }
-            let options = valkir:Options { optimize: this.optimize }
-            valkir:compile(this.ir_code, this.path_o, target, options) ! {
-                return this.finish(start, this.failure("valkir failed while emitting unit '" + this.unit_name + "':\n" + E.message))
-            }
+            let error = llvm_emit_object(this)
+            if isset(error) : return this.finish(start, this.failure(error))
         }
 
         fs:write(this.path_ir + "-prev", this.ir_code) ! {
@@ -124,6 +119,8 @@ fn emit_unit_objects(build: Build) !Error {
     let tasks = Array[ObjectTask]{}
     let units = Array[Unit]{}
 
+    if !build.options.use_clang : llvm_init_object_target(build.options.target)
+
     each build.lists.units as unit {
         if prepare_unit_object(build, unit) !> : continue
         let command = ""
@@ -136,7 +133,7 @@ fn emit_unit_objects(build: Build) !Error {
             ir_code: unit.ir_code
             path_o: unit.path_o
             path_ir: unit.path_ir
-            target: build.options.target.target
+            llvm_triple: ir_target_triple(build.options.target)
             clang_command: command
             optimize: build.options.optimize
         })
@@ -248,9 +245,10 @@ fn object_output_dir(build: Build) String !Error {
     identity += build.options.target.target
     identity += build.options.optimize ? "|opt" : "|no-opt"
     identity += build.options.is_test ? "|test" : "|no-test"
-    // Keep the valkir and clang object caches separate so switching backends
-    // never reuses an object produced by the other.
-    identity += build.options.use_clang ? "|clang" : "|valkir"
+    // Keep backend object caches separate so switching never reuses an object
+    // produced by another backend.
+    if build.options.use_clang : identity += "|clang"
+    else : identity += "|llvm"
     // Same IR does not mean same object: the compiler that turns one into the
     // other is an input too. Without this, a codegen change is invisible to
     // every unit whose IR text happens not to have moved.
@@ -261,4 +259,123 @@ fn object_output_dir(build: Build) String !Error {
     build.cache.object_dir = dir
     build.print_verbose(1, "📦 Cache directory: " + dir)
     return dir
+}
+
+fn llvm_emit_object(task: shared ObjectTask) ?String {
+    let target: ?llvm:LLVMTargetRef = null
+    let message: ?cstring = null
+    if llvm:LLVMGetTargetFromTriple(task.llvm_triple.data, @ref(target), @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        return "LLVM could not select target '" + task.llvm_triple + "': " + detail
+    }
+    if !isset(target) : return "LLVM did not create a target for: " + task.llvm_triple
+
+    let cpu = "generic"
+    let level: i32 = task.optimize ? llvm:LLVMCodeGenLevelAggressive : llvm:LLVMCodeGenLevelDefault
+    let machine = llvm:LLVMCreateTargetMachine(target, task.llvm_triple.data, cpu.data, null, level, llvm:LLVMRelocPIC, llvm:LLVMCodeModelDefault)
+    if !isset(machine) : return "LLVM failed to create a target machine for: " + task.llvm_triple
+
+    let context = llvm:LLVMContextCreate()
+    llvm:LLVMContextSetOpaquePointers(context, true)
+    let name = task.unit_name + ".ll"
+    let buffer = llvm:LLVMCreateMemoryBufferWithMemoryRangeCopy(task.ir_code.data, task.ir_code.bytes, name.data)
+    let module: ?llvm:LLVMModuleRef = null
+    message = null
+
+    if llvm:LLVMParseIRInContext(context, buffer, @ref(module), @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM IR parse failed while emitting unit '" + task.unit_name + "':\n" + detail
+    }
+    if !isset(module) {
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM IR parser did not create a module while emitting unit: " + task.unit_name
+    }
+
+    message = null
+    if llvm:LLVMVerifyModule(module, llvm:LLVMReturnStatusAction, @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMDisposeModule(module)
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM IR verification failed while emitting unit '" + task.unit_name + "':\n" + detail
+    }
+    if isset(message) {
+        llvm:LLVMDisposeMessage(message)
+        message = null
+    }
+
+    llvm_configure_object_module(module, machine, task.llvm_triple)
+    if task.optimize : llvm_optimize_object_module(module)
+
+    if llvm:LLVMTargetMachineEmitToFile(machine, module, task.path_o.data, llvm:LLVMObjectFile, @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMDisposeModule(module)
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM failed to emit object for unit '" + task.unit_name + "':\n" + detail
+    }
+
+    if isset(message) : llvm:LLVMDisposeMessage(message)
+    llvm:LLVMDisposeModule(module)
+    llvm:LLVMContextDispose(context)
+    llvm:LLVMDisposeTargetMachine(machine)
+    return null
+}
+
+fn llvm_message_text(message: ?cstring) String {
+    if !isset(message) : return "<no LLVM diagnostic>"
+    return message
+}
+
+fn llvm_configure_object_module(module: llvm:LLVMModuleRef, machine: llvm:LLVMTargetMachineRef, triple: String) {
+    llvm:LLVMSetTarget(module, triple.data)
+    let layout = llvm:LLVMCreateTargetDataLayout(machine)
+    let text = llvm:LLVMCopyStringRepOfTargetData(layout)
+    llvm:LLVMSetDataLayout(module, text)
+    llvm:LLVMDisposeMessage(text)
+    llvm:LLVMDisposeTargetData(layout)
+}
+
+fn llvm_optimize_object_module(module: llvm:LLVMModuleRef) {
+    let builder = llvm:LLVMPassManagerBuilderCreate()
+    llvm:LLVMPassManagerBuilderSetOptLevel(builder, 3)
+    llvm:LLVMPassManagerBuilderSetSizeLevel(builder, 0)
+    llvm:LLVMPassManagerBuilderUseInlinerWithThreshold(builder, 64)
+    let functions = llvm:LLVMCreateFunctionPassManagerForModule(module)
+    let module_passes = llvm:LLVMCreatePassManager()
+    llvm:LLVMPassManagerBuilderPopulateFunctionPassManager(builder, functions)
+    llvm:LLVMPassManagerBuilderPopulateModulePassManager(builder, module_passes)
+    llvm:LLVMPassManagerBuilderDispose(builder)
+
+    llvm:LLVMInitializeFunctionPassManager(functions)
+    let func = llvm:LLVMGetFirstFunction(module)
+    while isset(func) {
+        llvm:LLVMRunFunctionPassManager(functions, func)
+        func = llvm:LLVMGetNextFunction(func)
+    }
+    llvm:LLVMFinalizeFunctionPassManager(functions)
+    llvm:LLVMRunPassManager(module_passes, module)
+    llvm:LLVMDisposePassManager(functions)
+    llvm:LLVMDisposePassManager(module_passes)
+}
+
+fn llvm_init_object_target(target: Target) {
+    if target.arch == "x64" {
+        llvm:LLVMInitializeX86TargetInfo()
+        llvm:LLVMInitializeX86Target()
+        llvm:LLVMInitializeX86TargetMC()
+        llvm:LLVMInitializeX86AsmPrinter()
+    } else {
+        llvm:LLVMInitializeAArch64TargetInfo()
+        llvm:LLVMInitializeAArch64Target()
+        llvm:LLVMInitializeAArch64TargetMC()
+        llvm:LLVMInitializeAArch64AsmPrinter()
+    }
 }
