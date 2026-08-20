@@ -16,7 +16,7 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
-DIST_FLAGS := . src/*.valk --static --release -vv --clang
+DIST_FLAGS := . src/*.valk --static --release -vv -c
 IR_TARGETS := linux-x64 macos-x64 macos-arm64 win-x64
 HOST_SYSTEM := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
@@ -93,7 +93,7 @@ test: $(TEST_COMPILER)
 # Same suite as `test`, but objects are produced by external clang.
 test-clang: $(TEST_COMPILER)
 	mkdir -p ./debug
-	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --clang -o ./debug/test-clang$(EXE_SUFFIX) -c -vvv
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-clang$(EXE_SUFFIX) -c -vvv
 	./debug/test-clang$(EXE_SUFFIX)
 
 test-compile-errors: $(TEST_COMPILER)
@@ -235,7 +235,7 @@ win-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
-	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(filter-out --clang,$(DIST_FLAGS)) \
+	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
@@ -252,7 +252,7 @@ ir: $(DIST_DEPS)
 	mkdir -p $(addprefix dist/ir/libs/,$(IR_TARGETS))
 	@for target in $(IR_TARGETS); do \
 		$(DIST_COMP) build -o ./dist/ir/valk-$$target.ll --target $$target \
-			$(FLAGS) $(filter-out --clang,$(DIST_FLAGS)) --ir || exit $$?; \
+			$(FLAGS) $(DIST_FLAGS) --ir || exit $$?; \
 		cp ./lib/libs/$$target/valk-stack-swap.o ./dist/ir/libs/$$target/ || exit $$?; \
 	done
 	cp ./misc/dist/ir/build-* ./dist/ir/
