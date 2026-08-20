@@ -17,10 +17,6 @@ fi
 
 # Read the file line by line
 while IFS=';' read -r file msg; do
-    # Trim surrounding whitespace. Deliberately not `xargs`, which also parses
-    # quotes: an expected message containing an apostrophe ("it's defined as
-    # private") made xargs fail and emit only the text before the quote, so those
-    # cases silently shrank to matching a single word.
     msg="${msg#"${msg%%[![:space:]]*}"}"
     msg="${msg%"${msg##*[![:space:]]}"}"
 
@@ -37,8 +33,6 @@ while IFS=';' read -r file msg; do
     count=$((count+1))
     inputs=()
     if [[ "$file" == "@"* ]]; then
-        # `@dir` builds a package fixture. This is needed for access checks
-        # between two namespaces of the same package.
         inputs+=("./tests/compile-errors/${file#@}")
     else
         IFS=',' read -r -a source_names <<< "$file"
@@ -48,9 +42,6 @@ while IFS=';' read -r file msg; do
     fi
     cmd="$VALK build ${inputs[*]} --no-warn"
     echo "> Run: $cmd"
-    # The rewrite compiler may write diagnostics to stderr (and its runtime
-    # can terminate with a non-zero status after reporting them). Capture both
-    # streams so the expected diagnostic is still checked reliably.
     output=$("$VALK" build "${inputs[@]}" --no-warn 2>&1)
     status=$?
 

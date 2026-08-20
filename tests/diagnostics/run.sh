@@ -1,6 +1,4 @@
 #!/bin/bash
-# Regression tests for user-facing source locations. Compiler diagnostics use
-# 1-based line/column numbers; LSP ranges are covered separately in tests/lsp.
 
 set -u
 
@@ -9,8 +7,6 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 EXE_SUFFIX=""
 case "$(uname -s)" in
     MINGW*|MSYS*)
-        # Native Valk diagnostics use drive-letter paths, while Git Bash's pwd
-        # normally returns /d/... paths.
         DIR="$(cd "$(dirname "$0")" && pwd -W)"
         EXE_SUFFIX=".exe"
         ;;
@@ -24,8 +20,6 @@ trap 'rm -rf "$workdir"' EXIT
 failed=0
 count=0
 
-# Compiler paths are native (`D:\\...`) on Windows, while Git Bash and `pwd -W`
-# use forward slashes. Normalize captured output before exact location checks.
 normalize_paths() {
     tr '\\' '/'
 }

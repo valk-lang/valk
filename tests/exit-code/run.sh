@@ -1,8 +1,4 @@
 #!/bin/bash
-# Build each fixture and check the process exit status it produces.
-# `fn main() i32` returns the exit code; a void `fn main()` always exits 0.
-# Usage (from repo root): ./tests/exit-code/run.sh
-# Optional: VALK=./valk-new ./tests/exit-code/run.sh
 
 set -u
 

@@ -1,8 +1,4 @@
 #!/bin/bash
-# Compare in-place `valk build --fmt` against snapshots in tests/fmt/expected/.
-# Formats a temp copy of each input so fixtures stay unformatted.
-# Usage (from repo root): ./tests/fmt/run.sh
-# Optional: VALK=./valk-new ./tests/fmt/run.sh
 
 set -u
 

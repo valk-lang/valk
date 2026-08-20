@@ -1,12 +1,3 @@
-
-# sudo vim /etc/apt/sources.list
-# deb [arch=arm64] http://ports.ubuntu.com/ jammy main multiverse universe
-# deb [arch=arm64] http://ports.ubuntu.com/ jammy-security main multiverse universe
-# deb [arch=arm64] http://ports.ubuntu.com/ jammy-backports main multiverse universe
-# deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main multiverse universe
-# sudo dpkg --add-architecture arm64
-# sudo apt update
-
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 PROJECT_ROOT=$( cd -- "$SCRIPT_DIR/../.." &> /dev/null && pwd )
 TC_DIR="$PROJECT_ROOT/toolchains/toolchains"

@@ -1,7 +1,4 @@
 #!/bin/bash
-# Resolve GitHub dependency paths from valk.json (`current`, vendor assoc).
-# Usage (from repo root): ./tests/deps/run.sh
-# Optional: VALK=./valk ./tests/deps/run.sh
 
 set -u
 
@@ -38,8 +35,6 @@ normalize_paths() {
     tr '\\' '/'
 }
 
-# Build a package fixture that should succeed, then run it and match stdout.
-# args: fixture_name expected_stdout
 check_ok() {
     local name="$1"
     local want="$2"
@@ -86,8 +81,6 @@ check_ok() {
     fi
 }
 
-# Build a package fixture that should fail; require a substring in the diagnostics.
-# args: fixture_name expected_message_substring
 check_fail() {
     local name="$1"
     local want="$2"
@@ -145,8 +138,6 @@ check_ok "github-fallback-order" "nested-first"
 # Missing vendor dir reports the new assoc path (not github.com.user.repo).
 check_fail "github-missing" "vendor/github-acme-widget/9.9.9"
 
-# Prefer `current` even when only the `version` tree exists under vendor.
-# Copy the version fixture and point `current` at a different semver that is not installed.
 current_only="$workdir/github-current-prefers"
 mkdir -p "$current_only"
 cp -a "$DIR/github-version/." "$current_only/"

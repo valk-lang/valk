@@ -36,9 +36,6 @@ TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
 BENCH_JSON_ITERATIONS ?= 500
 BENCH_JSON_MEMORY_DOCUMENTS ?= 100
 
-# Compiler source is always built by the official compiler in $(VC), using that
-# release's bundled valk:* namespaces. The in-tree lib is a distribution/test
-# input for the resulting compiler, never a source dependency of ./src.
 valk: $(COMPILER_DEPS)
 	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
@@ -83,8 +80,6 @@ update: valk
 	sudo cp -r ./lib /opt/valk/${VERSION}/
 
 # Testing
-# `test` is the fast, compiled language/runtime suite. `test-all` also runs
-# every standalone compiler/tooling test group used by CI.
 test: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core$(EXE_SUFFIX)
@@ -131,8 +126,6 @@ test-doc: $(TEST_COMPILER)
 
 test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-codegen test-deps test-library test-extend-access test-doc
 
-# Build once, then measure the union representation in fresh processes so
-# allocator pools and GC high-water state do not cross benchmark modes.
 bench-json: valk
 	mkdir -p ./debug
 	./valk build ./examples/bench/json/main.valk --release -o ./debug/bench-json
@@ -278,7 +271,6 @@ clean:
 	rm -f ./valk
 	rm -f ./valk2
 	rm -f ./valk3
-# rm -rf ~/.valk/cache
 
 .PHONY: \
 	valk2 valk3 \
