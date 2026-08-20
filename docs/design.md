@@ -8,10 +8,14 @@
 // Booleans: bool
 // Integer: i8 i16 i32 i64 int u8 u16 u32 u64 uint
 // Float: f32 f64 float
-// Arrays: array[T]
-// Slices: slice[T], String (slice of u8)
+// Arrays: Array[T]
+// Slices: Slice[T], String (slice of u8)
 // Fixed array: fixed[T x {amount}]
-// Unsafe array: unsafe[T]
+//
+// Void pointer: @ptr
+// Unsafe array pointer: @ptr[T]
+//
+// Inline: inline T (can only be used on fixed arrays & structs, compile error otherwise)
 
 // ----------------
 
@@ -125,6 +129,10 @@ enum MyEnum {
 }
 
 // Value tokens
+fn example() {
+}
+
+// Built-in values
 fn example() {
 }
 ```
