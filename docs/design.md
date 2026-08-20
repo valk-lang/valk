@@ -4,6 +4,17 @@
 ## Overview
 
 ```rust
+// Built-in types
+// Booleans: bool
+// Integer: i8 i16 i32 i64 int u8 u16 u32 u64 uint
+// Float: f32 f64 float
+// Arrays: array[T]
+// Slices: slice[T], String (slice of u8)
+// Fixed array: fixed[T x {amount}]
+// Unsafe array: unsafe[T]
+
+// ----------------
+
 // Token 'use'
 // Syntax: use {namespace/pacakge} [as {alias}] [{ id1 [as {alias}], id2 [as {alias}], ... }]
 // Import {namespace or package}
@@ -100,6 +111,17 @@ union C : String | int | bool {
             default => println("Other value")
         }
     }
+}
+
+// Enum (default type: int)
+// Syntax: [pub/ns/local] union {name} [: Type1] { {name} [= {value}], ... }
+// Values are required if non-integer type
+enum MyEnum {
+    A // 0
+    B = 2 // 2
+    C // 1
+    D // 3 (tries to avoid duplicate values)
+    E = 2 // 2 (duplicate values allowed)
 }
 
 // Value tokens
