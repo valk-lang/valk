@@ -72,14 +72,22 @@ struct B {
     // Same syntax as class
 }
 
-// Interface (tagged union)
-interface Printable {
-    fn print();
-}
-
 // Trait (re-usable code for classes & structs)
+// Syntax [pub/ns/local] trait {name} { ... }
 trait MyTrait {
     // properties & functions
+}
+// Usage:
+class MyClass {
+    use MyTrait
+}
+
+// Interface: define which functions a class must have (only for classes, not other types)
+// Syntax: [pub/ns/local] interface {name} { ... }
+interface Printable {
+    // Functions
+    fn print();
+    fn to_string() String;
 }
 
 // Union (tagged union)
