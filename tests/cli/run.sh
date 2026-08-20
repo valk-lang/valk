@@ -73,6 +73,14 @@ if [ "$status" -eq 0 ] || [[ "$debug_short_out" != *"Unknown build argument: -d"
     exit 1
 fi
 
+backend_out=$(build --valkir)
+status=$?
+if [ "$status" -eq 0 ] || [[ "$backend_out" != *"Unknown build argument: --valkir"* ]]; then
+    echo "# Expected the removed valkir backend to be rejected"
+    echo "$backend_out"
+    exit 1
+fi
+
 validate_out=$("$VALK" build "$input" --no-warn -v -c 2>&1) || {
     echo "$validate_out"
     exit 1
@@ -89,4 +97,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 8"
+echo "# Test count: 9"

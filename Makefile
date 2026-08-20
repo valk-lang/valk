@@ -18,6 +18,20 @@ EXE_SUFFIX ?=
 FLAGS := --def "VERSION=$(VERSION)"
 DIST_FLAGS := . src/*.valk --static --release -vv --clang
 IR_TARGETS := linux-x64 macos-x64 macos-arm64 win-x64
+HOST_SYSTEM := $(shell uname -s)
+HOST_ARCH := $(shell uname -m)
+ifeq ($(HOST_SYSTEM),Darwin)
+ifeq ($(HOST_ARCH),arm64)
+LLVM_DIR := toolchains/libraries/macos-llvm-22-arm64
+else
+LLVM_DIR := toolchains/libraries/macos-llvm-22-x64
+endif
+NATIVE_LINK_FLAGS := -L $(LLVM_DIR)/lib
+else
+LLVM_DIR := toolchains/libraries/linux-llvm-22-x64
+GCC_LIB_DIR := $(dir $(shell g++ -print-file-name=libstdc++.a))
+NATIVE_LINK_FLAGS := -L $(LLVM_DIR)/lib -L $(GCC_LIB_DIR)
+endif
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
 BENCH_JSON_ITERATIONS ?= 500
 BENCH_JSON_MEMORY_DOCUMENTS ?= 100
@@ -26,32 +40,33 @@ BENCH_JSON_MEMORY_DOCUMENTS ?= 100
 # release's bundled valk:* namespaces. The in-tree lib is a distribution/test
 # input for the resulting compiler, never a source dependency of ./src.
 valk: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS)
+	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 valk2: $(COMPILER_DEPS)
-	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) -vvv
+	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS) -vvv
 
 valk3: $(COMPILER_DEPS)
-	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) -vvv
+	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) $(NATIVE_LINK_FLAGS) -vvv
 
 valkvg: $(COMPILER_DEPS)
-	valgrind $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS)
+	valgrind $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 valkexe: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static
+	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static \
+	-L toolchains/libraries/win-llvm-22-x64/lib
 
 doc: valk
 	./valk doc lib/ -o docs/api.md --markdown --no-private
 
 valk-profile: $(COMPILER_DEPS)
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
-	$(VC) build . src/*.valk -o ./valk3 -vv $(FLAGS)
+	$(VC) build . src/*.valk -o ./valk3 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 valkd: $(COMPILER_DEPS)
-	gdb --args $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS)
+	gdb --args $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 static: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS)
+	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 install: valk
 	rm -rf ~/.vman/versions/${VERSION}/
@@ -75,7 +90,7 @@ test: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core$(EXE_SUFFIX)
 	./debug/test-core$(EXE_SUFFIX)
 
-# Same suite as `test`, but objects are produced by clang instead of valkir.
+# Same suite as `test`, but objects are produced by external clang.
 test-clang: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --clang -o ./debug/test-clang$(EXE_SUFFIX) -c -vvv
@@ -171,68 +186,68 @@ test-cross: valk
 # CI commands
 ci-linux: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS)
+	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) \
-	--sysroot "$$(xcrun --sdk macosx --show-sdk-path)"
+	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 ci-win: $(COMPILER_DEPS)
 	~/valk-dev/valk.exe -h || echo ""
-	$$HOME/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS)
+	$$HOME/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
+	-L toolchains/libraries/win-llvm-22-x64/lib $(CI_SYSTEM_LIB_FLAGS)
 
 # Distributions
 linux-x64: $(DIST_DEPS)
 	vman use
-	vman install
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(FLAGS) $(DIST_FLAGS) \
+	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" \
 	-L "toolchains/toolchains/linux-amd64/lib64" \
+	-L "toolchains/libraries/linux-llvm-22-x64/lib" \
 	--sysroot toolchains/toolchains/linux-amd64 -l pthread -l dl
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
 macos-x64: $(DIST_DEPS)
 	vman use
-	vman install
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
 	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(FLAGS) $(DIST_FLAGS) \
-	--sysroot toolchains/toolchains/macos-11-3
+	--sysroot toolchains/toolchains/macos-11-3 \
+	-L toolchains/libraries/macos-llvm-22-x64/lib
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
 macos-arm64: $(DIST_DEPS)
 	vman use
-	vman install
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
 	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(FLAGS) $(DIST_FLAGS) \
-	--sysroot toolchains/toolchains/macos-11-3
+	--sysroot toolchains/toolchains/macos-11-3 \
+	-L toolchains/libraries/macos-llvm-22-arm64/lib
 	cp -r ./lib ./dist/macos-arm64/
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
 win-x64: $(DIST_DEPS)
 	vman use
-	vman install
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
 	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
-	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64
+	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
+	-L toolchains/libraries/win-llvm-22-x64/lib
 	cp -r ./lib ./dist/win-x64/
 # Windows uses LLVM's linker, which also writes archives when called with `/lib`.
-	cp ./toolchains/libraries/win-llvm-15-x64/lld.exe ./dist/win-x64/lld-link.exe
+	cp ./toolchains/libraries/win-llvm-22-x64/lld.exe ./dist/win-x64/lld-link.exe
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
 	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
 
 ir: $(DIST_DEPS)
 	vman use
-	vman install
 	rm -rf dist/ir/*
 	mkdir -p $(addprefix dist/ir/libs/,$(IR_TARGETS))
 	@for target in $(IR_TARGETS); do \
@@ -253,10 +268,10 @@ toolchains:
 	./toolchains/setup.sh
 
 asm:
-	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
-	clang-15 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/x64.s --target=x86_64-pc-linux-gnu -o ./lib/libs/linux-x64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
 
 # Misc
 clean:

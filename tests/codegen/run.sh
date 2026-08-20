@@ -146,6 +146,30 @@ if [[ "$atomic_body" != *"load atomic i8"*"align 1"* ]] \
     exit 1
 fi
 
+echo "> Compare pointers with integer sentinels through pointer-sized integers"
+
+pointer_ir="$workdir/pointer-integer-compare.ll"
+out=$("$VALK" build "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn -o "$pointer_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build pointer-integer comparison IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+pointer_left=$(sed -n '/^define .*@"pointer_equal_invalid"/,/^}/p' "$pointer_ir")
+pointer_right=$(sed -n '/^define .*@"invalid_equal_pointer"/,/^}/p' "$pointer_ir")
+if [[ "$pointer_left" != *"ptrtoint ptr"* ]] \
+    || [[ "$pointer_left" != *"icmp eq i64"*", -1"* ]] \
+    || [[ "$pointer_right" != *"ptrtoint ptr"* ]] \
+    || [[ "$pointer_right" != *"icmp eq i64 -1,"* ]] \
+    || grep -Eq 'icmp (eq|ne) ptr [^,]+, -?[0-9]+' "$pointer_ir"; then
+    echo "# Pointer/integer comparison was not lowered through pointer-sized integers"
+    echo "$pointer_left"
+    echo "$pointer_right"
+    exit 1
+fi
+
 echo "> Lower tagged unions to inline value aggregates"
 
 scalar_ir="$workdir/tagged-union-scalars.ll"
@@ -286,5 +310,5 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 9"
+echo "# Test count: 10"
 echo ""
