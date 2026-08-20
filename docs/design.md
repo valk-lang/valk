@@ -13,7 +13,7 @@
 // Fixed array: fixed[T x {amount}]
 //
 // Void pointer: @ptr
-// Unsafe array pointer: @ptr[T]
+// Unsafe array pointer: @arrayptr[T]
 //
 // Inline: inline T (can only be used on fixed arrays & structs, compile error otherwise)
 
@@ -95,6 +95,18 @@ trait MyTrait {
 // Usage:
 class MyClass {
     use MyTrait
+}
+
+// Extend (extends a type with properties (if possible) and functions)
+// You cannot extend fixed[T x N] or inline T (because those dont have a type api, aka. they dont have functions)
+// Syntax: extend [type-identifer] { ... }
+extend Array[T] {
+    fn print_all() {
+        println("Printing %{ this.length } items of type: %T")
+        each this as item {
+            println(item)
+        }
+    }
 }
 
 // Interface: define which functions a class must have (only for classes, not other types)
