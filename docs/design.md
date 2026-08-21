@@ -8,14 +8,17 @@
 // Booleans: bool
 // Integer: i8 i16 i32 i64 int u8 u16 u32 u64 uint
 // Float: f32 f64 float
-// Arrays: Array[T]
-// Slices: Slice[T], String (slice of u8)
+// Arrays: Array[T] (array of T)
+// Slices: Slice[T] (slice of T), String (slice of u8)
 // Fixed array: fixed[T x {amount}]
 //
-// Void pointer: @ptr
-// Unsafe array pointer: @arrayptr[T]
+// Nullable: ?T (value is either type of T or null)
+// Borrow: &T (value cannot be assigned to anything, it's only for reading data)
+// Inline: inline T (inlines the type)
+// Immutable: imut T (cannot change properties (recursively))
 //
-// Inline: inline T (can only be used on fixed arrays & structs, compile error otherwise)
+// Unsafe void pointer: @ptr (rawpointer)
+// Unsafe pointer of T: @ptrof[T] (rawpointer of T), cstring (rawpointer of u8)
 
 // ----------------
 
@@ -142,9 +145,29 @@ enum MyEnum {
 
 // Value tokens
 fn example() {
+    // Create class object
+    let a = MyClass {
+        myprop: 123
+    }
+    // Create struct object
+    let b = MyStruct {
+        myprop: 123
+    }
+    // Create Array/Slice/Fixed
+    let c = Array[String]{ "a", "b", "c" } // Dynamic array that can grow/shrink in size
+    let d = Slice[String]{ "a", "b", "c" } // Static array with length stored in hidden property
+    let e = fixed[String x 3]{ "a", "b", "c" } // Static array with length stored in type
+    // Create object on stack
+    let c : &MyStruct = inline MyStruct{ myprop: 123 }
+    let d : &Slice[u8] = inline Slice[u8]{ 1, 2, 3 }
+    let e : &fixed[u8 x 100] = inline fixed[u8 x 100]{ 0... }
+    // Maps
+    let a = Map[u8]{ "a" => 10, "b" => 20 }
 }
 
 // Built-in values
 fn example() {
 }
 ```
+
+## Compiler language rules
