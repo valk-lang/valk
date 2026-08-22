@@ -14,7 +14,7 @@
 //
 // Nullable: ?T (value is either type of T or null)
 // Borrow: &T (value cannot be assigned to anything, it's only for reading data)
-// Inline: inline T (inlines the type)
+// Inline: inline T (an inline type cannot be or contain a GC type, if so, compile error)
 // Immutable: imut T (cannot change properties (recursively))
 //
 // Unsafe void pointer: @ptr (rawpointer)
@@ -69,7 +69,7 @@ fn example() i32 !MyError {
     while a-- > 0 : println("Looping...")
 }
 
-// Classes (structure which objects are managed by GC)
+// Classes (structure which objects are managed by the GC)
 // Syntax: [pub/ns/local] class {name} [is {interface1, ...}] { ... }
 class A {
     // Properties
@@ -143,8 +143,21 @@ enum MyEnum {
     E = 2 // 2 (duplicate values allowed)
 }
 
-// Value tokens
+// Value creation
 fn example() {
+    // Integer
+    let v = 100
+    let v = 100_000 // Underscores are ignored by the lexer
+    // Float
+    let v = 100_000.0 // {int}.{int} = float
+    let v : f32 = 100.0 // float 32 bit
+    // String
+    let v1 = "123"
+    let v2 = "123 %v1" // 123 123
+    let v3 = "123 %{v1.length + 1}" // 123 4
+    let v4 = "123 " + v1.length + 2 // 123 32
+    let v5 = "123 " + (v1.length + 2) // 123 5
+    let v6 = v1.length + 2 + " 123" // 5 123
     // Create class object
     let a = MyClass {
         myprop: 123
@@ -157,17 +170,28 @@ fn example() {
     let c = Array[String]{ "a", "b", "c" } // Dynamic array that can grow/shrink in size
     let d = Slice[String]{ "a", "b", "c" } // Static array with length stored in hidden property
     let e = fixed[String x 3]{ "a", "b", "c" } // Static array with length stored in type
-    // Create object on stack
-    let c : &MyStruct = inline MyStruct{ myprop: 123 }
-    let d : &Slice[u8] = inline Slice[u8]{ 1, 2, 3 }
+    // Create object on stack using `inline` (only types that dont contain or are GC types)
     let e : &fixed[u8 x 100] = inline fixed[u8 x 100]{ 0... }
     // Maps
     let a = Map[u8]{ "a" => 10, "b" => 20 }
+    // Math
+    let v = v1 + v2 // Add
+    let v = v1 - v2 // Subtract
+    let v = v1 / v2 // Divide
+    let v = v1 * v2 // Multiply
+    let v = v1 % v2 // Modulo
+    let v = v1 & v2 // Bitwise AND
+    let v = v1 | v2 // Bitwise OR
+    let v = v1 ^ v2 // Xor
+    let v = v1 << v2 // Shift left
+    let v = v1 >> v2 // Shift rigtht
+    // Comparison
+    if v1 == v2 : println("Equal")
+    if v1 != v2 : println("Not equal")
+    if v1 <= v2 : println("Less or equal")
+    if v1 >= v2 : println("Greater or equal")
+    if v1 < v2 : println("Less than")
+    if v1 > v2 : println("Greater than")
 }
 
-// Built-in values
-fn example() {
-}
 ```
-
-## Compiler language rules
