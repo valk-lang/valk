@@ -11,6 +11,8 @@
 // Arrays: Array[T] (array of T)
 // Slices: Slice[T] (slice of T), String (slice of u8)
 // Fixed array: fixed[T x {amount}]
+// Closures: fn()()  fn({arg-types})({return-type}) [!Error]
+// Coroutines: co()  co({return-type}) // Coroutines cannot return errors
 //
 // Nullable: ?T (value is either type of T or null)
 // Borrow: &T (value cannot be assigned to anything, it's only for reading data)
@@ -34,7 +36,9 @@ use mysql:validator as mval
 // Functions
 // Syntax: [pub/ns/local] fn {name}({argName}: {argType}, ...) [{return-type}] [!{error-type}] { ... }
 // Function `main` is where your program starts (default return type i32, if other defined: compiler must error)
-fn main() {}
+fn main() {
+    let u = models.User {}
+}
 
 // Declare error type
 // Syntax: error {name} ({code1}, {code2}, ...) [extends (Type1, Type2)] [payload { message: String [= {default-value}], ... }]
@@ -114,6 +118,7 @@ extend Array[T] {
 
 // Interface: define which functions a class must have (only for classes, not other types)
 // Syntax: [pub/ns/local] interface {name} { ... }
+// Using interfaces on a class add a hidden VTABLE property that refers to a table with pointers to the functions for this object
 interface Printable {
     // Functions
     fn print();
@@ -122,6 +127,7 @@ interface Printable {
 
 // Union (tagged union)
 // Syntax: [pub/ns/local] union {name} : Type1 | Type2 | ... { ... }
+// Memory layout: { u8, T }
 union C : String | int | bool {
     fn print() {
         match this {
@@ -192,6 +198,37 @@ fn example() {
     if v1 >= v2 : println("Greater or equal")
     if v1 < v2 : println("Less than")
     if v1 > v2 : println("Greater than")
+    // Closures
+    let message = "hello"
+    let myfunc = fn(name: String) { println(message + " " + name) }
+    myfunc("world")
+    // Coroutine
+    let plusone = fn(v: int) int { return v + 1 }
+    let task : co(int) = co plusone(123)
+    let result : int = await task
 }
 
 ```
+
+## Complex parsing logic
+
+- How the parser handles `{`
+-- `{` in a if/while condition is an AST body
+-- `{` after an identifier or `]` is a init body
+-- `{` after a `!` is a error handler AST body
+-- `{` at the start of a value is an inline init body
+-- otherwise build error
+
+- How the parser handles `!`
+-- `!` after a `)` or `]` on the same line is an error handler
+-- otherwise it's a not-value (!{value})
+
+- How the parser handles `[`
+-- After the word `fixed` it's fixed-array-type-info `[{expr} x {expr}]`
+-- Otherwise it's an offset body `[{expr}, {expr}, ...]`
+
+- How the parser handles `?`
+-- A `?` at the starts it's a nullable-type-expr
+-- A trailing `?` is a this-or-that-expr `{expr} ? {expr} : {expr}`
+
+
