@@ -1,6 +1,12 @@
 
 # Language design
 
+## Goal
+
+- We must be able to parse code/syntax without resolving the identifiers
+- We aim for max parsing/compile speed
+- Unsafe tokens start with `@` (use with caution)
+
 ## Overview
 
 ```rust
@@ -10,17 +16,19 @@
 // Float: f32 f64 float
 // Arrays: Array[T] (array of T)
 // Slices: Slice[T] (slice of T), String (slice of u8)
-// Fixed array: fixed[T x {amount}]
-// Closures: fn()()  fn({arg-types})({return-type}) [!Error]
+// Closures: fn()  fn({arg-types}) [{return-type}] [!{error-type}]
 // Coroutines: co()  co({return-type}) // Coroutines cannot return errors
+// Aggregate array type: [T x {amount}] copied by value
+// Aggregate struct type: (T, T, ...) copied by value
+// Structs: named aggregates copied by value
+// Classes: named aggregates used by reference and managed by the GC (allocated by gc:alloc)
 //
 // Nullable: ?T (value is either type of T or null)
-// Borrow: &T (value cannot be assigned to anything, it's only for reading data)
-// Inline: inline T (an inline type cannot be or contain a GC type, if so, compile error)
+// Borrow: &T (value can only be assigned to local variables, cannot be captured (by e.g. closures))
 // Immutable: imut T (cannot change properties (recursively))
 //
-// Unsafe void pointer: @ptr (rawpointer)
-// Unsafe pointer of T: @ptrof[T] (rawpointer of T), cstring (rawpointer of u8)
+// Unsafe void pointer: *void (rawpointer), @ptr
+// Unsafe pointer of T: *T (rawpointer of T), cstring (rawpointer of u8)
 
 // ----------------
 
@@ -105,14 +113,22 @@ class MyClass {
 }
 
 // Extend (extends a type with properties (if possible) and functions)
-// You cannot extend fixed[T x N] or inline T (because those dont have a type api, aka. they dont have functions)
 // Syntax: extend [type-identifer] { ... }
+// We can extend properties because there are no late definitions of types in our language and all 'use' statements are processed before reading types
 extend Array[T] {
     fn print_all() {
         println("Printing %{ this.length } items of type: %T")
         each this as item {
             println(item)
         }
+    }
+}
+
+// Mode (different name for another class which allows changing the functions)
+// Syntax: mode {name} for {name} { ... }
+mode Path for String {
+    fn add(part: String) Path {
+        // ...
     }
 }
 
@@ -127,7 +143,8 @@ interface Printable {
 
 // Union (tagged union)
 // Syntax: [pub/ns/local] union {name} : Type1 | Type2 | ... { ... }
-// Memory layout: { u8, T }
+// Memory layout: { u8, T } where T has the alignment and size of the largest type
+// Max types = max value of u8
 union C : String | int | bool {
     fn print() {
         match this {
@@ -175,9 +192,9 @@ fn example() {
     // Create Array/Slice/Fixed
     let c = Array[String]{ "a", "b", "c" } // Dynamic array that can grow/shrink in size
     let d = Slice[String]{ "a", "b", "c" } // Static array with length stored in hidden property
-    let e = fixed[String x 3]{ "a", "b", "c" } // Static array with length stored in type
-    // Create object on stack using `inline` (only types that dont contain or are GC types)
-    let e : &fixed[u8 x 100] = inline fixed[u8 x 100]{ 0... }
+    // Stack allocation
+    let e : [u8 x 100] = { 0... }
+    let f : MyStruct = { name: "Steve", age: 20 }
     // Maps
     let a = Map[u8]{ "a" => 10, "b" => 20 }
     // Math
@@ -223,12 +240,49 @@ fn example() {
 -- `!` after a `)` or `]` on the same line is an error handler
 -- otherwise it's a not-value (!{value})
 
-- How the parser handles `[`
--- After the word `fixed` it's fixed-array-type-info `[{expr} x {expr}]`
--- Otherwise it's an offset body `[{expr}, {expr}, ...]`
-
 - How the parser handles `?`
 -- A `?` at the starts it's a nullable-type-expr
 -- A trailing `?` is a this-or-that-expr `{expr} ? {expr} : {expr}`
 
 
+## Borrow values
+
+- Can only be assigned to local variables
+- Cannot be captured by other compiler mechanisms
+- Borrow checks on function arguments of known functions are done lazy
+-- e.g. passing a `&User` value a `fn myfunc(u: User)` is done lazy by storing info on the Func object
+-- If after parsing of `myfunc` the `u` argument abides all borrow rules, then there's no compile error
+- If a previous reference is kept that is a non-borrow, that's fine, that reference can still escape
+
+## Immutable values
+
+- Any sub property is also immutable
+- If a previous reference is kept that is mutable, that's fine, that reference can still mutate
+
+## GC walking
+
+- The compiler generates a function for each type that extracts every GC pointer and adds it to a list
+- For union types our compiler generates `match` logic in our walk function (only for types that contain GC data) 
+
+## Alignment
+
+- Alignment of data is same as the `c` language
+- `struct`s can have `$packed` to make the structure packed
+
+## Allocating memory
+
+- Class initializers use `gc:alloc`
+
+## Inline/stack allocation
+
+- Cannot be or contain GC types
+- Cannot be captured or escape a function
+
+## Access types
+
+- By default everything can be accessed from the same package
+- Options: pub/ns/local
+-- pub: access from everywhere
+-- ns: access from same namespace
+-- local: access from same file
+- use `@ignoreAccess` to ignore access limitations
