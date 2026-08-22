@@ -14,14 +14,14 @@
 // Booleans: bool
 // Integer: i8 i16 i32 i64 int u8 u16 u32 u64 uint
 // Float: f32 f64 float
-// Arrays: Array[T] (array of T)
-// Slices: Slice[T] (slice of T), String (slice of u8)
 // Closures: fn()  fn({arg-types}) [{return-type}] [!{error-type}]
 // Coroutines: co()  co({return-type}) // Coroutines cannot return errors
 // Aggregate array type: [T x {amount}] copied by value
 // Aggregate struct type: (T, T, ...) copied by value
 // Structs: named aggregates copied by value
 // Classes: named aggregates used by reference and managed by the GC (allocated by gc:alloc)
+// Arrays: Array[T] (array of T) // Passed by reference & managed by the GC
+// Slices: Slice[T] (slice of T), String (slice of u8) // Passed by reference & managed by the GC
 //
 // Nullable: ?T (value is either type of T or null)
 // Borrow: &T (value can only be assigned to local variables, cannot be captured (by e.g. closures))
