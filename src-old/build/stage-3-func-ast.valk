@@ -1,0 +1,1283 @@
+
+////////////////////////////
+// Body resolution entry
+////////////////////////////
+
+fn parse_func_ast(func: Func) !Error {
+    if func.parsed_ast : return
+    if func.skip_ast || func.is_generic_base : return
+    if func.is_clone_hook && !isset(func.clone_at) : return
+    if !lsp_should_parse_func_ast(func) : return
+
+    func.parsed_ast = true
+
+    let body = func.body
+    if !isset(body) : return
+
+    // Body scope parents arg_scope (args + this already bound as IDF.decl)
+    let scope = func.arg_scope.sub_scope()
+    scope.func = func
+    func.body_scope = scope
+    let alloca_scope = scope.sub_scope()
+    let defer_scope = scope.sub_scope()
+    func.alloca_scope = alloca_scope
+    func.defer_scope = defer_scope
+
+    let rett = func.get_rett()
+    if !rett.is_void_type() : scope.must_return = true
+    if func.must_exit : scope.must_exit = true
+    if func.must_throw : scope.must_throw = true
+
+    let ctx = Context.for_func(func)
+    if func.is_test {
+        test_init_scope(func, scope, ctx) !>
+    }
+    let exps = read_func_body_exps(body) !>
+    let state = ParseState.new()
+    append_body_exp_range(ctx, scope, state, exps, 0, exps.length) !>
+    if state.has_open_if() || state.is_skipping() {
+        body.error("Missing compile macro '#end' in function body")
+    }
+    if scope.must_return && !scope.did_return && !scope.must_exit && !scope.must_throw {
+        body.error("Missing 'return' statement")
+    }
+    warn_unused_decls(func)
+
+    // The LSP never links, and unreachable CLI bodies need validation only.
+    let emitted_ir = func.ns.build.options.needs_ir() && func.info_used
+    if emitted_ir {
+        func_finish_ast(func) !>
+        if func.is_literal : func_prepare_closure(func) !>
+        generate_func_ir(func) !>
+    }
+
+    if func.has_globals_loop {
+        func.pending_exps = exps
+        return
+    }
+
+    if emitted_ir && func_may_drop_gc_stack(func) {
+        let body_exp = func.body
+        func_release_ast(func, exps)
+        func.body = body_exp
+        func.ns.build.pipeline.deferred_gc_funcs.append(func)
+        return
+    }
+
+    func_release_ast(func, exps)
+}
+
+fn func_release_ast(func: Func, exps: Array[Exp]) {
+    func_release_exps(func, exps)
+
+    func.body_scope = null
+    func.alloca_scope = null
+    func.defer_scope = null
+    func.user_defer_stack = null
+    func.user_defer_pop = null
+    func.all_decls = .{}
+    func.define_decls = .{}
+    func.buffer_pool = .{}
+    func.buffers_used = .{}
+    func.test_entry_decl = null
+    func.stable_stack_decl = null
+}
+
+fn func_release_exps(func: Func, exps: Array[Exp]) {
+    let retain = isset(func.class) && !func.is_static
+        && !func.is_shared_receiver && !func.shared_unsafe
+    func.pending_exps = null
+    if !retain {
+        each exps as exp : exp.release_children()
+    }
+    if !retain {
+        func.exp.sub_exps = null
+        func.generics = null
+        func.args_exp = null
+        func.rett_exp = null
+        func.error = null
+        func.body = null
+    }
+
+    func.arg_scope.identifiers = null
+    func.arg_scope.decls.clear()
+    func.arg_scope.not_null.clear()
+    let scope = func.body_scope
+    if isset(scope) {
+        scope.identifiers = null
+        scope.decls.clear()
+        scope.not_null.clear()
+    }
+}
+
+fn func_release_shared_source(func: Func) {
+    if !isset(func.class) || func.is_static || func.is_shared_receiver || func.shared_unsafe : return
+    func.exp.sub_exps = null
+    func.generics = null
+    func.args_exp = null
+    func.rett_exp = null
+    func.error = null
+    func.body = null
+}
+
+////////////////////////////
+// Function-local storage
+////////////////////////////
+
+fn decl_needs_gc_stack_storage(decl: Decl) bool {
+    if decl.skip_gc_field_roots : return false
+    if decl.is_gc {
+        if decl.is_buffer : return true
+        // Immutable managed arguments remain rooted by their caller.
+        return !decl.is_arg || decl.is_mut
+    }
+    if decl.type.get_non_nullable().kind == TYPE.closure {
+        return decl.is_arg || decl.closure_holds_captures
+    }
+    return decl.type.has_gc_refs()
+}
+
+fn decl_assign_gc_stack_storage(decl: Decl, offset: uint) uint !Error {
+    let size = (decl.type.byte_size() !>).to(uint)
+    let alignment = decl.type.storage_alignment() !>.to(uint)
+    if alignment > 0 : offset = offset.round_up(alignment)
+    decl.gc_stack_offset = offset
+    return offset + size
+}
+
+fn func_finish_ast(func: Func) !Error {
+    let b = func.ns.build
+    let psz = b.options.target.ptr_size.to(uint)
+    let alloca_size: uint = 0
+    let stable_size: uint = 0
+    let gc_count: uint = 0
+
+    let roots = !func.disable_gc_stack
+
+    each func.all_decls as decl {
+        decl.gc_stack_offset = null
+        if decl.is_bind : continue
+        if decl.must_be_stable {
+            decl.offset = stable_size
+            let size = decl.type.byte_size() !>.to(uint)
+            stable_size += size.round_up(psz)
+        } else if roots && decl_needs_gc_stack_storage(decl) {
+            alloca_size = decl_assign_gc_stack_storage(decl, alloca_size) !>
+            gc_count++
+            // Each declaration is visited once, so it is listed at most once.
+            func.define_decls.append(decl)
+            continue
+        }
+        if decl.is_mut : func.define_decls.append(decl)
+    }
+
+    if stable_size > 0 {
+        let decl = Decl.new(func, type_ptr(b), false, "valk_stable_stack")
+        decl.ir_name = "\%valk_stable_stack"
+        let root_offset = alloca_size.round_up(psz)
+        decl.gc_stack_offset = root_offset
+        alloca_size = root_offset + psz
+        func.define_decls.append(decl)
+        func.stable_stack_decl = decl
+        gc_count++
+    }
+
+    func.alloca_size = alloca_size
+    func.stable_alloca_size = stable_size
+    func.gc_decl_count = gc_count
+
+    let alloca_scope = func.alloca_scope
+    let defer_scope = func.defer_scope
+    let body_scope = func.body_scope
+    if !isset(alloca_scope) || !isset(defer_scope) || !isset(body_scope) {
+        func.exp.bug("Function setup scopes are missing: " + func.name)
+    }
+
+    if func.is_test {
+        test_finish_scope(func, defer_scope) !>
+    }
+
+    if gc_count > 0 {
+        alloca_scope.append_value(vgen_ir_comment("INCREASE GC STACK", b))
+        alloca_scope.append_value(vgen_gc_stack_init(alloca_size, gc_count, b))
+        if !func.is_entrance {
+            defer_scope.append_value(vgen_ir_comment("REDUCE GC STACK", b))
+            defer_scope.append_value(vgen_gc_stack_defer(b))
+        }
+    }
+    if stable_size > 0 && func.is_entrance {
+        let decl = func.stable_stack_decl
+        if !isset(decl) : func.exp.bug("Stable stack declaration is missing")
+        alloca_scope.append_value(vgen_ir_comment("STABLE STACK", b))
+        alloca_scope.append_value(vgen_stable_stack_init(decl, stable_size, b))
+    }
+    if func.define_decls.length > 0 {
+        alloca_scope.append_value(vgen_ir_comment("INIT LOCAL VARIABLES", b))
+    }
+    each func.define_decls as decl {
+        alloca_scope.append_value(vgen_decl_offset(decl, b))
+    }
+    if func.define_decls.length > 0 {
+        alloca_scope.append_value(vgen_ir_comment("END LOCAL VARIABLES", b))
+    }
+
+    if !func.is_entrance {
+        body_scope.values.prepend(vgen_allocas(alloca_scope.values, b))
+    }
+}
+
+////////////////////////////
+// Statement temporaries
+////////////////////////////
+
+fn append_buffer_clears(ctx: Context, values: Array[Value], func: Func, first: uint, at: ?Exp) {
+    let i = first
+    while i < func.buffers_used.length {
+        let decl = func.buffers_used.get(i) ! break
+        i++
+        if !decl.is_gc : continue
+        values.append(vgen_assign(
+            vgen_decl(decl),
+            vgen_null(decl.type),
+            ASSIGN_OP.set,
+            ctx.build,
+            at
+        ))
+    }
+}
+
+fn buffers_need_clear(func: Func, first: uint) bool {
+    let i = first
+    while i < func.buffers_used.length {
+        let decl = func.buffers_used.get(i) ! return false
+        if decl.is_gc : return true
+        i++
+    }
+    return false
+}
+
+fn finish_body_value_buffers(ctx: Context, func: Func, first: uint, at: Exp, value: ?Value) ?Value {
+    if !buffers_need_clear(func, first) {
+        func_release_buffers(func, first)
+        return value
+    }
+
+    let statements = Array[Value]{}
+    if isset(value) : statements.append(value)
+    append_buffer_clears(ctx, statements, func, first, at)
+    func_release_buffers(func, first)
+    return vgen_block(statements, ctx.build, at)
+}
+
+////////////////////////////
+// Body expression ranges
+////////////////////////////
+
+fn append_body_exp_range(ctx: Context, scope: Scope, state: ParseState, exps: Array[Exp], start: uint, end: uint) !Error {
+    let i = start
+    while i < end {
+        let exp = exps.get(i) ! ctx.build.bug("Missing function-body expression")
+        if exp.type == EXP.macro && exp.kind == MACRO_KIND.loop && !state.is_skipping() {
+            state.saw_macro = true
+            let close = find_macro_loop_end(exps, i, end, exp) !>
+            let words = exp.list
+            let loop_kind = isset(words) ? (words.get(0) !? "") : ""
+            if loop_kind == "globals" {
+                append_globals_loop(ctx, scope, exps, i + 1, close, exp) !>
+            } else if loop_kind == "gc_roots" {
+                append_gc_roots_loop(ctx, scope, exps, i + 1, close, exp) !>
+            } else if loop_kind == "gc_conditional_roots" {
+                append_gc_conditional_roots_loop(ctx, scope, exps, i + 1, close, exp) !>
+            } else if loop_kind == "tests" {
+                append_tests_loop(ctx, scope, exps, i + 1, close, exp) !>
+            } else if loop_kind == "object" {
+                append_object_loop(ctx, scope, exps, i + 1, close, exp) !>
+            } else if loop_kind == "properties" {
+                append_properties_loop(ctx, scope, exps, i + 1, close, exp) !>
+            } else {
+                exp.error("Unknown '#loop' kind: " + loop_kind)
+            }
+            i = close + 1
+            continue
+        }
+        let v = body_value_from_exp(ctx, scope, state, exp) !>
+        if isset(v) : scope.append_value(v)
+        i++
+    }
+}
+
+fn loop_words(loop_exp: Exp, syntax: String) Array[String] !Error {
+    let expected = syntax.split(" ")
+    let words = loop_exp.list
+    if !isset(words) || words.length != expected.length {
+        loop_exp.error("Expected '#loop " + syntax + "'")
+    }
+    each expected as word, i {
+        let first = word.get(0)
+        if first >= 'A' && first <= 'Z' : continue
+        if (words.get(i) !? "") != word {
+            loop_exp.error("Expected '#loop " + syntax + "'")
+        }
+    }
+    return words
+}
+
+// Lower the loop body once into `iter_scope` and hand its values to `scope`.
+fn append_loop_iteration(ctx: Context, scope: Scope, iter_scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let state = ParseState.new()
+    append_body_exp_range(ctx, iter_scope, state, exps, start, end) !>
+    if state.has_open_if() || state.is_skipping() {
+        loop_exp.error("Missing compile macro '#end' inside '#loop'")
+    }
+    each iter_scope.values as v : scope.append_value(v)
+}
+
+fn append_gc_roots_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "gc_roots GLOBAL OFFSET") !>
+    let global_name = words.get(1) ! loop_exp.bug("Missing #loop gc_roots global")
+    let offset_name = words.get(2) ! loop_exp.bug("Missing #loop gc_roots offset binding")
+    let idf = scope.get_idf(global_name)
+    if !isset(idf) {
+        loop_exp.error("Expected a global after '#loop gc_roots'")
+    }
+    if idf.type != IDF.global {
+        loop_exp.error("Expected a global after '#loop gc_roots'")
+    }
+    let global = idf.global
+    if !isset(global) : loop_exp.bug("GC-roots loop global binding is missing its global")
+    let offsets = global.get_gc_root_offsets() !>
+
+    each offsets as offset {
+        let iter_scope = scope.sub_scope()
+        iter_scope.set_idf(offset_name, Idf.for_value(vgen_int(offset.to(int), type_int(ctx.build))))
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
+    }
+}
+
+fn append_gc_conditional_roots_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "gc_conditional_roots GLOBAL OFFSET TAG_OFFSET TAG") !>
+    let global_name = words.get(1) ! loop_exp.bug("Missing #loop gc_conditional_roots global")
+    let offset_name = words.get(2) ! loop_exp.bug("Missing #loop gc_conditional_roots offset binding")
+    let tag_offset_name = words.get(3) ! loop_exp.bug("Missing #loop gc_conditional_roots tag offset binding")
+    let tag_name = words.get(4) ! loop_exp.bug("Missing #loop gc_conditional_roots tag binding")
+    let idf = scope.get_idf(global_name)
+    if !isset(idf) || idf.type != IDF.global {
+        loop_exp.error("Expected a global after '#loop gc_conditional_roots'")
+    }
+    let global = idf.global
+    if !isset(global) : loop_exp.bug("GC-conditional-roots loop global binding is missing its global")
+    let roots = global.get_conditional_gc_roots() !>
+
+    each roots as root {
+        let iter_scope = scope.sub_scope()
+        iter_scope.set_idf(offset_name, Idf.for_value(vgen_int(root.offset.to(int), type_int(ctx.build))))
+        iter_scope.set_idf(tag_offset_name, Idf.for_value(vgen_int(root.tag_offset.to(int), type_int(ctx.build))))
+        iter_scope.set_idf(tag_name, Idf.for_value(vgen_int(root.tag.to(int), type_int(ctx.build))))
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
+    }
+}
+
+fn find_macro_loop_end(exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) uint !Error {
+    let depth: uint = 0
+    let i = start + 1
+    while i < end {
+        let exp = exps.get(i) ! loop_exp.bug("Missing function-body expression")
+        if exp.type == EXP.macro {
+            let kind = exp.kind.@cast(MACRO_KIND)
+            if kind == MACRO_KIND.if || kind == MACRO_KIND.loop {
+                depth++
+            } else if kind == MACRO_KIND.end {
+                if depth == 0 : return i
+                depth--
+            }
+        }
+        i++
+    }
+    loop_exp.error("Missing compile macro '#end' for '#loop'")
+}
+
+fn append_globals_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "globals GLOBAL TYPE") !>
+    let global_name = words.get(1) ! loop_exp.bug("Missing #loop global binding")
+    let type_name = words.get(2) ! loop_exp.bug("Missing #loop type binding")
+
+    let owner = ctx.func
+    if isset(owner) && owner.info_used && !owner.has_globals_loop {
+        owner.has_globals_loop = true
+        ctx.build.pipeline.globals_loop_funcs.append(owner, true)
+    }
+
+    each ctx.build.lists.globals as global {
+        if !global.is_used : continue
+        let iter_scope = scope.sub_scope()
+        iter_scope.set_idf(global_name, Idf.for_global(global))
+        iter_scope.set_idf(type_name, Idf.for_type(global.get_type() !>))
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
+    }
+}
+
+fn append_object_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "object VALUE as PROPERTY") !>
+    let value_name = words.get(1) ! loop_exp.bug("Missing object-loop value")
+    let prop_name = words.get(3) ! loop_exp.bug("Missing object-loop binding")
+    let idf = scope.get_idf(value_name)
+    if !isset(idf) {
+        loop_exp.error("Expected a variable after '#loop object'")
+    }
+    if idf.type != IDF.decl {
+        loop_exp.error("Expected a variable after '#loop object'")
+    }
+    let decl = idf.decl
+    if !isset(decl) : loop_exp.bug("Object-loop variable is missing its declaration")
+    let class = decl.type.get_non_nullable().get_class_or_null()
+    if !isset(class) : return
+    let owner = vgen_decl(decl)
+
+    each class.props as prop {
+        let iter_scope = scope.sub_scope()
+        iter_scope.set_idf(prop_name, Idf.for_object_property(prop, vgen_prop(prop, owner)))
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
+    }
+}
+
+fn append_tests_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "tests as TEST_FUNC") !>
+    let func_name = words.get(2) ! loop_exp.bug("Missing #loop test binding")
+
+    each ctx.build.lists.tests as func {
+        let iter_scope = scope.sub_scope()
+        iter_scope.set_idf(func_name, Idf.for_func(func))
+        iter_scope.set_idf("TEST_IS_SYNC", Idf.for_value(vgen_bool(func.is_sync, type_bool(ctx.build))))
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
+    }
+}
+
+fn append_properties_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp) !Error {
+    let words = loop_words(loop_exp, "properties TYPE as PROPERTY") !>
+    let type_name = words.get(1) ! loop_exp.bug("Missing property-loop type")
+    let prop_name = words.get(3) ! loop_exp.bug("Missing property-loop binding")
+    let type = property_loop_type(scope, type_name, loop_exp) !>
+    let class = type.get_non_nullable().get_class_or_null()
+    if !isset(class) : return
+
+    each class.props as prop {
+        let iter_scope = scope.sub_scope()
+        iter_scope.set_idf(prop_name, Idf.for_property(prop))
+        append_loop_iteration(ctx, scope, iter_scope, exps, start, end, loop_exp) !>
+    }
+}
+
+////////////////////////////
+// Statement lowering
+////////////////////////////
+
+// Convert one body-level EXP into a Value. Returns null for comments / skipped #if.
+fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
+    let func = ctx.get_func() !>
+    let first = func.buffers_used.length
+    let value = body_value_from_exp_inner(ctx, scope, state, exp) !>
+    return finish_body_value_buffers(ctx, func, first, exp, value)
+}
+
+fn body_value_from_exp_inner(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
+    if exp.type == EXP.macro {
+        let func = ctx.get_func() !>
+        state.saw_macro = true
+        parse_macro_exp(func.ns, scope, state, exp) !>
+        return null
+    }
+    if state.is_skipping() : return null
+
+    if scope.did_return && !state.saw_macro : warn_unreachable(ctx, scope, exp)
+
+    if exp.type == EXP.let : return value_from_let_exp(ctx, scope, exp) !>
+    if exp.type == EXP.return : return value_from_return_exp(ctx, scope, exp) !>
+    if exp.type == EXP.defer : return value_from_defer_exp(ctx, scope, exp) !>
+    if exp.type == EXP.assign : return value_from_assign_exp(ctx, scope, exp) !>
+    if exp.type == EXP.stmt {
+        return value_from_stmt_exp(ctx, scope, exp) !>
+    }
+    if exp.type == EXP.if : return value_from_if_exp(ctx, scope, state, exp) !>
+    if exp.type == EXP.while : return value_from_while_exp(ctx, scope, state, exp) !>
+    if exp.type == EXP.each : return value_from_each_exp(ctx, scope, state, exp) !>
+    if exp.type == EXP.block : return value_from_block_exp(ctx, scope, state, exp) !>
+    if exp.type == EXP.break {
+        if !scope_has_loop(scope, ctx.func) {
+            exp.error("Using 'break' without being inside a loop")
+        }
+        scope.did_return = true
+        scope_mark_break(scope, ctx.func)
+        return vgen_break(ctx.build, exp)
+    }
+    if exp.type == EXP.continue {
+        if !scope_has_loop(scope, ctx.func) {
+            exp.error("Using 'continue' without being inside a loop")
+        }
+        // Same path-termination semantics as break for flow analysis.
+        scope.did_return = true
+        return vgen_continue(ctx.build, exp)
+    }
+    if exp.type == EXP.allocas {
+        let func = ctx.get_func() !>
+        if !func.is_entrance {
+            exp.error("@allocas can only be used inside a function that's flagged with $entrance")
+        }
+        let alloca_scope = func.alloca_scope
+        if !isset(alloca_scope) : exp.bug("Function is missing its generated alloca scope")
+        return vgen_allocas(alloca_scope.values, ctx.build, exp)
+    }
+    if exp.type == EXP.init_allocators {
+        return vgen_init_allocators(scope, ctx, exp)
+    }
+    if exp.type == EXP.ir_comment {
+        return vgen_ir_comment(strip_quotes(exp.str1), ctx.build, exp)
+    }
+    if exp.type == EXP.throw : return value_from_throw_exp(ctx, scope, exp) !>
+
+    // Already an EXP.value used as a statement
+    if exp.type == EXP.value {
+        return value_from_exp(exp, scope, ctx.without_suggested_type()) !>
+    }
+
+    exp.bug("Unhandled body expression type: " + exp.type)
+}
+
+// ---- Body value constructors ----
+
+fn scope_check_loop_trusted_facts(body_scope: Scope, exp: Exp) !Error {
+    each body_scope.loop_trusted as decl {
+        if !body_scope.loop_invalidated.contains(decl) : continue
+        let name = decl.name ?? "value"
+        exp.error("'" + name + "' is used as a non-null value inside this loop, but the loop also assigns it a possibly-null value. The check before the loop only covers the first iteration — check it inside the loop instead (e.g. with 'isset').")
+    }
+}
+
+fn scope_clear_facts_invalidated_by(scope: Scope, body_scope: Scope) {
+    let loop_facts = scope.not_null.copy()
+    each loop_facts as decl {
+        if body_scope.loop_invalidated.contains(decl) : scope.clear_not_null(decl)
+    }
+}
+
+fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let b = ctx.build
+    let names = exp.list
+    if !isset(names) : exp.bug("let is missing names")
+    if names.length == 0 : exp.bug("let is missing names")
+
+    let types_exp = exp.get(LET_EXP.types)
+    let value_exp = exp.get(LET_EXP.value)
+    if !isset(value_exp) : exp.bug("let is missing RHS value")
+
+    // Single declared type becomes a suggestion for the whole RHS (null, class init, …)
+    let rhs_ctx = ctx.without_suggested_type()
+    if isset(types_exp) && names.length == 1 {
+        let te = types_exp.get(0)
+        if isset(te) && te.type == EXP.type {
+            rhs_ctx = ctx.with_suggested_type(type_from_exp(te, scope) !>)
+        }
+    }
+
+    let rhs = value_from_exp(value_exp, scope, rhs_ctx) !>
+    let rhs_parts = rhs.unroll()
+
+    if names.length > rhs_parts.length {
+        exp.error("Right side of '=' does not return enough values for the declared variables")
+    }
+
+    let statements = Array[Value]{}
+    let i: uint = 0
+    each names as name {
+        let part = rhs_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
+        let part_is_non_null = value_stores_non_null(part, scope)
+        let decl_type = part.rett
+        if isset(types_exp) {
+            let te = types_exp.get(i)
+            if isset(te) && te.type == EXP.type {
+                let explicit = type_from_exp(te, scope) !>
+                if !part.rett.is_void_type() {
+                    // Apply int→ptr / number widen / $to before requiring exact compat
+                    part = value_try_convert(part, scope, ctx, explicit, true, true)
+                    // Prefer RHS value span for errors (not the whole `let` line)
+                    let at = part.exp ?? exp
+                    explicit.compat_check(part.rett, at) !>
+                }
+                decl_type = explicit
+            }
+        }
+        if decl_type.is_void_type() {
+            exp.error("You cannot declare a variable of type 'void'")
+        }
+
+        if name != "_" {
+            if scope.has_local(name) {
+                exp.error("Name already used in this scope: " + name)
+            }
+            let decl = Decl.new(ctx.get_func() !>, decl_type, false, name)
+            decl.exp = exp
+            scope.add_decl(decl)
+            scope.set_idf(name, Idf.for_decl(decl))
+            if part.type != VAL.undefined {
+                statements.append(vgen_assign(vgen_decl(decl), part, ASSIGN_OP.set, b, exp))
+                if part_is_non_null : scope.mark_not_null(decl)
+            }
+        } else if part.type != VAL.undefined {
+            // `_` still evaluates its RHS, but has no destination storage.
+            statements.append(part)
+        }
+        i++
+    }
+
+    return vgen_block(statements, b, exp)
+}
+
+fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let b = ctx.build
+    let value_exp = exp.get(RETURN_EXP.value)
+
+    // `return` inside `<{...}` yields a value for the vscope (not the function).
+    let vscope = scope.find_vscope()
+    if isset(vscope) {
+        return value_from_vscope_return_exp(ctx, scope, vscope, exp, value_exp) !>
+    }
+
+    let func = ctx.get_func() !>
+    if func.must_exit || func.will_exit {
+        exp.error("You cannot use 'return' in a function that's marked with '$exit'")
+    }
+
+    let rett = func.get_rett()
+    let retv: ?Value = null
+
+    if rett.is_void_type() {
+        if isset(value_exp) {
+            exp.error("Function returns void; 'return' must not have a value")
+        }
+    } else {
+        if !isset(value_exp) {
+            exp.error("Function must return a value of type matching the signature")
+        }
+        retv = value_from_exp(value_exp, scope, ctx.with_suggested_type(rett)) !>
+        // Skip when returned type is still void (incomplete typing)
+        if !retv.rett.is_void_type() {
+            retv = value_try_convert(retv, scope, ctx, rett)
+            let at = retv.exp ?? exp
+            rett.compat_check(retv.rett, at) !>
+            if retv.is_implicit_borrow() {
+                exp.error("An implicit pointer borrow cannot escape through a return; use '@ref' explicitly")
+            }
+        }
+    }
+
+    scope.did_return = true
+    return vgen_return(retv, b, exp)
+}
+
+////////////////////////////
+// Defer
+////////////////////////////
+
+fn value_from_defer_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let value_exp = exp.get(DEFER_EXP.value)
+    if !isset(value_exp) : exp.error("Expected a function call after 'defer'")
+    if !defer_exp_is_call(value_exp) {
+        value_exp.error("'defer' expects a function call")
+    }
+
+    let func = ctx.get_func() !>
+    let closure = make_defer_closure(func, scope, value_exp, exp) !>
+    let stack = ensure_user_defer_stack(func, exp) !>
+    let stack_class = stack.type.get_class_or_null()
+    if !isset(stack_class) : exp.bug("Deferred-call stack has no Array class")
+    let append = stack_class.get_func("append")
+    if !isset(append) : exp.bug("Array[fn()].append is missing")
+    if !append.parsed_types : parse_func_types(append) !>
+
+    let call = vgen_call(
+        ctx,
+        vgen_func(append, vgen_decl(stack)),
+        Array[Value]{ closure, vgen_bool(false, type_bool(ctx.build)) },
+        append.get_rett(),
+        scope
+    )
+    call.exp = exp
+    return call
+}
+
+fn defer_exp_is_call(exp: Exp) bool {
+    if exp.type != EXP.value : return false
+    if exp.kind == VALUE_KIND.call : return true
+    if exp.kind != VALUE_KIND.error_handler : return false
+    let call = exp.get(VALUE_EXP.left)
+    return isset(call) && call.type == EXP.value && call.kind == VALUE_KIND.call
+}
+
+fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
+    let existing = func.user_defer_stack
+    if isset(existing) : return existing
+
+    let b = func.ns.build
+    let closure_type = type_callable(b, TYPE.closure, Array[Type]{}, type_void(b), null)
+    let array_idf = valk_idf(b, "core", "Array") !>
+    let array_base = array_idf.class
+    if !isset(array_base) : at.bug("valk:core:Array is missing")
+    let array_class = array_base.specialize(Array[Type]{ closure_type }, at) !>
+    let stack_type = array_class.get_type() !>
+
+    let body_scope = func.body_scope
+    let alloca_scope = func.alloca_scope
+    let defer_scope = func.defer_scope
+    if !isset(body_scope) || !isset(alloca_scope) || !isset(defer_scope) {
+        at.bug("Function scopes are missing while creating a defer stack")
+    }
+    let stack = Decl.new(func, stack_type, false)
+    body_scope.add_decl(stack)
+    func.user_defer_stack = stack
+
+    let new_func = array_class.get_func("new")
+    let pop_func = array_class.get_func("pop_last")
+    if !isset(new_func) || !isset(pop_func) {
+        at.bug("Array[fn()] is missing new() or pop_last()")
+    }
+    if !new_func.parsed_types : parse_func_types(new_func) !>
+    if !pop_func.parsed_types : parse_func_types(pop_func) !>
+    func.user_defer_pop = pop_func
+
+    let init = vgen_call(
+        Context.for_func(func),
+        vgen_func(new_func),
+        Array[Value]{ vgen_int(0, type_from_core(b, "uint") !>) },
+        new_func.get_rett(),
+        alloca_scope
+    )
+    init.exp = at
+    alloca_scope.append_value(vgen_assign(vgen_decl(stack), init, ASSIGN_OP.set, b, at))
+    defer_scope.append_value(vgen_run_defers(stack, pop_func, b, at))
+    return stack
+}
+
+fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Value !Error {
+    let arg_scope = scope.sub_scope()
+    let func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<defer." + owner.name + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        is_literal: true
+        parsed_types: true
+        parsed_ast: true
+    }
+    arg_scope.func = func
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = func
+    let inner_ctx = Context.for_func(func).without_suggested_type()
+    let first_buffer = func.buffers_used.length
+    let deferred_value: ?Value = null
+    if deferred_exp.type == EXP.value && deferred_exp.kind == VALUE_KIND.call {
+        deferred_value = value_from_call_raw(deferred_exp, body_scope, inner_ctx) !>
+    } else {
+        deferred_value = value_from_exp(deferred_exp, body_scope, inner_ctx) !>
+    }
+    let deferred = deferred_value ?! deferred_exp.bug("Deferred call did not produce a value")
+    if deferred.can_error || (deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass) {
+        deferred_exp.error("A deferred call must handle its error before the function exits")
+    }
+    body_scope.append_value(deferred)
+    append_buffer_clears(inner_ctx, body_scope.values, func, first_buffer, deferred_exp)
+    func_release_buffers(func, first_buffer)
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    owner.unit.functions.append(func)
+
+    func_finish_ast(func) !>
+    func_prepare_closure(func) !>
+    if !isset(owner.ns.build.options.lsp) : generate_func_ir(func) !>
+
+    let closure = vgen_func(func)
+    closure.exp = at
+    return closure
+}
+
+////////////////////////////
+// Value scopes and assignment
+////////////////////////////
+
+// Return from a value scope: collect into vscope_returns / unify vscope_rett.
+fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: Exp, value_exp: ?Exp) Value !Error {
+    let b = ctx.build
+    if !isset(value_exp) {
+        exp.error("Value scope return must have a value")
+    }
+    let returns = vscope.vscope_returns ?! exp.bug("Missing value scope return values")
+    let known = vscope.vscope_rett
+    let ret_ctx = ctx.without_suggested_type()
+    if isset(known) : ret_ctx = ctx.with_suggested_type(known)
+
+    let retv = value_from_exp(value_exp, scope, ret_ctx) !>
+    if isset(known) {
+        if !retv.rett.is_void_type() && !known.is_void_type() {
+            if retv.rett.is_nullable_type() && !known.is_nullable_type() {
+                known = known.nullable()
+                vscope.vscope_rett = known
+                each returns as prev {
+                    let pv = prev.value1
+                    if !isset(pv) : exp.bug("Value scope return has no value")
+                    prev.value1 = value_make_nullable(pv)
+                }
+            }
+            retv = value_try_convert(retv, scope, ctx, known)
+            let at = retv.exp ?? exp
+            known.compat_check(retv.rett, at) !>
+        }
+    } else {
+        retv = value_try_remove_nullable(retv, scope, ctx)
+        vscope.vscope_rett = retv.rett
+    }
+    scope.did_return = true
+    // Represent as a return of the value (IR later jumps to vscope after-block)
+    let ret = vgen_return(retv, b, exp)
+    returns.append(ret)
+    return ret
+}
+
+fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let b = ctx.build
+    let left_exp = exp.get(ASSIGN_EXP.left)
+    let right_exp = exp.get(ASSIGN_EXP.right)
+    if !isset(left_exp) || !isset(right_exp) : exp.bug("assign is missing operands")
+
+    if left_exp.type == EXP.value && left_exp.kind == VALUE_KIND.offset && exp.kind.@cast(ASSIGN_OP) == ASSIGN_OP.set {
+        let handled = value_from_offset_assign_exp(ctx, scope, left_exp, right_exp, exp) !>
+        if isset(handled) : return handled
+    }
+
+    let op = exp.kind.@cast(ASSIGN_OP)
+    let left_ctx = ctx.without_suggested_type()
+    if op == ASSIGN_OP.set && left_exp.type == EXP.value && left_exp.kind == VALUE_KIND.id {
+        left_ctx = ctx.for_store_target()
+    }
+    let left = value_from_exp(left_exp, scope, left_ctx) !>
+    value_check_shared_store(left, exp) !>
+    let pointer_kind = left.rett.get_non_nullable().kind
+    let pointer_offset_assign = left.rett.is_pointer()
+        && (pointer_kind == TYPE.voidptr || pointer_kind == TYPE.ptr_of)
+        && (op == ASSIGN_OP.add || op == ASSIGN_OP.sub)
+    // Suggest the left-hand type for the RHS (null, class init, etc.)
+    let right_ctx = ctx.without_suggested_type()
+    if pointer_offset_assign : right_ctx = ctx.with_suggested_type(type_int(b))
+    else if !left.rett.is_void_type() : right_ctx = ctx.with_suggested_type(left.rett)
+    let right = value_from_exp(right_exp, scope, right_ctx) !>
+    if right.type == VAL.undefined {
+        return vgen_block(Array[Value]{}, b, exp)
+    }
+    let right_is_non_null = value_stores_non_null(right, scope)
+
+    if !left.assignable() {
+        exp.error("Left side of assignment is not assignable")
+    }
+    act_check_assign(left, exp) !>
+    value_mark_mutable(left)
+
+    if right.type == VAL.null && left.type == VAL.decl {
+        let ld = left.decl
+        if isset(ld) : ld.is_read = true
+    }
+
+    if op == ASSIGN_OP.add {
+        let hook_left = value_try_remove_nullable(left, scope, ctx)
+        let hook_right = value_try_remove_nullable(right, scope, ctx)
+        let hooked = value_try_add_hook(hook_left, hook_right, scope, ctx, exp) !>
+        if isset(hooked) {
+            right = hooked
+            op = ASSIGN_OP.set
+        } else if !pointer_offset_assign {
+            let left_class = left.rett.get_class_or_null()
+            if isset(left_class) && !left.rett.is_number_type() {
+                exp.error("Cannot do math operations on types: '" + left.rett.compat_display_name() + "' <> '" + right.rett.compat_display_name() + "'")
+            }
+        }
+    }
+
+    if !left.rett.is_void_type() && !right.rett.is_void_type() {
+        if pointer_offset_assign {
+            right = value_try_convert(right, scope, ctx, type_int(b))
+            if !right.rett.is_integer_type() {
+                right_exp.error("Pointer offset must be an integer, got: " + right.rett.compat_display_name())
+            }
+            if op == ASSIGN_OP.sub {
+                right = vgen_unary(right, VALUE_OP.neg, right.rett)
+            }
+            right = vgen_ptr_offset(left, right, exp)
+            op = ASSIGN_OP.set
+        } else {
+            right = value_try_convert(right, scope, ctx, left.rett, true, left.type == VAL.decl)
+            let at = right.exp ?? exp
+            left.rett.compat_check(right.rett, at) !>
+        }
+    }
+
+    if op == ASSIGN_OP.set && left.type == VAL.decl && right_is_non_null {
+        let decl = left.decl
+        if isset(decl) : scope.mark_not_null(decl)
+    } else if op == ASSIGN_OP.set && left.type == VAL.decl {
+        let decl = left.decl
+        if isset(decl) : scope.clear_not_null(decl)
+    }
+
+    return vgen_store(left, right, op, ctx, scope, exp) !>
+}
+
+fn value_from_stmt_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    // Expression statement — the value itself (call, etc.); not wrapped
+    let value_exp = exp.get(STMT_EXP.value)
+    if !isset(value_exp) : exp.bug("statement is missing value")
+    return value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
+}
+
+////////////////////////////
+// Control flow
+////////////////////////////
+
+fn value_from_if_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = ctx.build
+    let cond_exp = exp.get(IF_EXP.cond)
+    if !isset(cond_exp) : exp.bug("if is missing condition")
+    let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
+    let cr = cond.rett
+    if !cr.is_void_type() && !cr.is_bool_type() && cr.kind != TYPE.any {
+        exp.error("The if condition value must be of type bool")
+    }
+
+    // True branch: decls proven non-null by isset / && in the condition
+    let then_scope = scope.sub_scope()
+    then_scope.apply_issets(cond.get_issets())
+    let then_body = exp.get(IF_EXP.then_body)
+    let then_vals = Array[Value]{}
+    if isset(then_body) {
+        then_vals = body_values_from_nested(ctx, then_scope, state, then_body) !>
+    }
+
+    let else_v: ?Value = null
+    let es = scope.sub_scope()
+    es.apply_issets(cond.get_not_issets())
+    let else_body = exp.get(IF_EXP.else_body)
+    if isset(else_body) {
+        // False branch: not_issets from `||` / `!isset` style conditions
+        let else_vals = body_values_from_nested(ctx, es, state, else_body) !>
+        else_v = vgen_block(else_vals, b, else_body)
+        if then_scope.did_return && es.did_return {
+            scope.did_return = true
+        }
+    }
+
+    if !then_scope.did_return {
+        each then_scope.not_null_removed as decl {
+            scope.clear_not_null(decl)
+        }
+    }
+    if !es.did_return {
+        each es.not_null_removed as decl {
+            scope.clear_not_null(decl)
+        }
+    }
+
+    // Facts after the if are those guaranteed by every reachable branch.
+    if then_scope.did_return {
+        scope.apply_issets(es.not_null)
+    } else if es.did_return {
+        scope.apply_issets(then_scope.not_null)
+    } else {
+        let common = Array[Decl]{}
+        each then_scope.not_null as decl {
+            if es.not_null_check(decl) : common.append(decl, true)
+        }
+        each es.not_null as decl {
+            if then_scope.not_null_check(decl) : common.append(decl, true)
+        }
+        scope.apply_issets(common)
+    }
+
+    return vgen_if(cond, then_vals, else_v, b, exp)
+}
+
+fn value_from_while_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = ctx.build
+    let cond_exp = exp.get(WHILE_EXP.cond)
+    if !isset(cond_exp) : exp.bug("while is missing condition")
+    let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
+    let cr = cond.rett
+    if !cr.is_void_type() && !cr.is_bool_type() && cr.kind != TYPE.any {
+        exp.error("The while condition value must be of type bool")
+    }
+
+    // Body runs only when condition is true — apply isset proofs
+    let body_scope = scope.sub_scope()
+    body_scope.is_loop = true
+    body_scope.apply_issets(cond.get_issets())
+    let body_exp = exp.get(WHILE_EXP.body)
+    let body_vals = Array[Value]{}
+    if isset(body_exp) {
+        body_vals = body_values_from_nested(ctx, body_scope, state, body_exp) !>
+    }
+    scope_check_loop_trusted_facts(body_scope, exp) !>
+    scope_clear_facts_invalidated_by(scope, body_scope)
+    if cond.type == VAL.bool && cond.bool_val && !body_scope.did_break {
+        scope.did_return = true
+    }
+    return vgen_while(cond, body_vals, b, exp)
+}
+
+fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = ctx.build
+    let on_exp = exp.get(EACH_EXP.on)
+    if !isset(on_exp) : exp.bug("each is missing the iterated value")
+
+    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    let on_nn = value_try_remove_nullable(on, scope, ctx)
+    if on_nn.rett.is_nullable_type() {
+        on_exp.error("Cannot use 'each' on a nullable type: " + on_nn.rett.compat_display_name())
+    }
+    let native = type_has_native_sequence_length(on_nn.rett)
+    let next_func: ?Func = null
+    let item_rett = type_void(b)
+    let index_type = type_from_core(b, "uint") !>
+    if native {
+        let element = type_native_sequence_element(on_nn.rett)
+        if !isset(element) : on_exp.bug("Sequence type has no element type")
+        item_rett = element
+    } else {
+        let class = on_nn.rett.get_class_or_null()
+        if !isset(class) {
+            on_exp.error("Cannot use 'each' on type: " + on_nn.rett.compat_display_name())
+        }
+        next_func = class.get_func("_next")
+        if !isset(next_func) {
+            on_exp.error("Cannot use 'each' on type '" + on_nn.rett.compat_display_name() + "'. This type does not have a '_next' function")
+        }
+        next_func = func_for_receiver(next_func, on_nn, on_exp) !>
+        let next_arg_skip: uint = 0
+        if isset(next_func.class) && !next_func.is_static : next_arg_skip = 1
+        let index_arg = next_func.args.get(next_arg_skip) ! exp.bug("'_next' is missing its index parameter")
+        index_type = index_arg.type
+        item_rett = next_func.get_rett()
+    }
+
+    let names = exp.list
+    if !isset(names) : exp.bug("each is missing variable names")
+    if names.length == 0 : exp.bug("each is missing variable names")
+
+    let item_types = Array[Type]{}
+    if item_rett.is_tuple_type() {
+        let subs = item_rett.get_members()
+        if isset(subs) : item_types = subs
+    }
+    if item_types.length == 0 : item_types.append(item_rett)
+
+    if names.length > item_types.length + 1 {
+        exp.error("Too many variables for this each statement")
+    }
+    let has_index_name = names.length == item_types.length + 1
+    let item_names_count = has_index_name ? names.length - 1 : names.length
+
+    // Scope holding the `on` / index temporaries around the while loop.
+    let each_scope = scope.sub_scope()
+
+    let on_decl = Decl.new(ctx.get_func() !>, on_nn.rett, false, null)
+    each_scope.add_decl(on_decl)
+    let on_init = vgen_assign(vgen_decl(on_decl), on_nn, ASSIGN_OP.set, b, exp)
+
+    let index_decl = Decl.new(ctx.get_func() !>, index_type, false, null)
+    index_decl.is_mut = true
+    each_scope.add_decl(index_decl)
+
+    let start_value = vgen_int(0, index_type)
+    let skip_exp = exp.get(EACH_EXP.skip)
+    if isset(skip_exp) {
+        let skip_v = value_from_exp(skip_exp, scope, ctx.with_suggested_type(index_type)) !>
+        if !skip_v.rett.is_integer_type() {
+            skip_exp.error("Expected an integer value for 'skip', not: " + skip_v.rett.compat_display_name())
+        }
+        skip_v = value_try_convert(skip_v, scope, ctx, index_type)
+        index_type.compat_check(skip_v.rett, skip_exp) !>
+        start_value = skip_v
+    }
+    let index_init = vgen_assign(vgen_decl(index_decl), start_value, ASSIGN_OP.set, b, exp)
+
+    // Loop body scope: item/index names declared here are visible to the user body.
+    let body_scope = each_scope.sub_scope()
+    body_scope.is_loop = true
+
+    let handled = vgen_undefined(item_rett, exp)
+    let loop_condition = vgen_bool(true, type_bool(b))
+    if native {
+        let current_on = vgen_decl(on_decl)
+        let length = value_native_sequence_length(current_on, current_on.rett, ctx, exp) !>
+        if !isset(length) : exp.bug("Native sequence has no length")
+        loop_condition = vgen_op(vgen_decl(index_decl), length, VALUE_OP.lt, type_bool(b))
+        handled = value_native_sequence_item(current_on, vgen_decl(index_decl), body_scope, ctx, exp) !>
+    } else {
+        if !isset(next_func) : exp.bug("Iterator has no '_next' function")
+        let callee = vgen_func(next_func, vgen_decl(on_decl))
+        let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett, body_scope)
+        next_call.exp = exp
+        next_call.can_error = true
+        next_call.set_error_type(next_func.error_type)
+        handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+    }
+    let item_parts = handled.unroll()
+
+    let bind_decls = Array[Decl]{}
+    let bind_inits = Array[Value]{}
+    let i: uint = 0
+    while i < item_names_count {
+        let name = names.get(i) ! exp.bug("Missing each variable name")
+        let part = item_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
+        let item_type = item_types.get(i) ! exp.bug("Missing each item type")
+        let decl = Decl.new(ctx.get_func() !>, item_type, false, name)
+        decl.exp = exp
+        bind_decls.append(decl)
+        bind_inits.append(part)
+        body_scope.add_decl(decl)
+        body_scope.set_idf(name, Idf.for_decl(decl))
+        i++
+    }
+    if has_index_name {
+        let index_name = names.get(names.length - 1) ! exp.bug("Missing each index name")
+        let index_user_decl = Decl.new(ctx.get_func() !>, index_type, false, index_name)
+        index_user_decl.exp = exp
+        bind_decls.append(index_user_decl)
+        bind_inits.append(vgen_decl(index_decl))
+        body_scope.add_decl(index_user_decl)
+        body_scope.set_idf(index_name, Idf.for_decl(index_user_decl))
+    }
+    let bind_init = vgen_decl_initializers(bind_decls, bind_inits, b, exp)
+
+    let advance = vgen_assign(vgen_decl(index_decl), vgen_int(1, index_type), ASSIGN_OP.add, b, exp)
+
+    let body_exp = exp.get(EACH_EXP.body)
+    let user_vals = Array[Value]{}
+    if isset(body_exp) {
+        user_vals = body_values_from_nested(ctx, body_scope, state, body_exp) !>
+    }
+
+    scope_check_loop_trusted_facts(body_scope, exp) !>
+    scope_clear_facts_invalidated_by(scope, body_scope)
+
+    let body_vals = Array[Value]{ bind_init, advance }
+    body_vals.append_many(user_vals)
+
+    let loop = vgen_while(loop_condition, body_vals, b, exp)
+
+    return vgen_block(Array[Value]{ on_init, index_init, loop }, b, exp)
+}
+
+fn value_from_block_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Value !Error {
+    let b = ctx.build
+    let body = scope.sub_scope()
+    let vals = body_values_from_nested(ctx, body, state, exp) !>
+    if body.did_return : scope.did_return = true
+    return vgen_block(vals, b, exp)
+}
+
+fn value_from_throw_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
+    let b = ctx.build
+    let func = ctx.get_func() !>
+    if func.must_exit {
+        exp.error("You cannot 'throw' in a function that's flagged with '$exit'")
+    }
+    let value_exp = exp.get(RETURN_EXP.value)
+    if !isset(value_exp) : exp.bug("throw is missing value")
+    let v = value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
+    let thrown_type = v.rett.get_non_nullable().get_error_type()
+    if !isset(thrown_type) {
+        value_exp.error("This is not an error. Value type: " + v.rett.compat_display_name())
+    }
+    let expected = func.error_type
+    if !isset(expected) {
+        exp.error("Throwing an error but your function has no error type")
+    }
+    if !expected.is_compat(thrown_type) {
+        exp.error("Error types are not compatible: " + expected.name + " <> " + thrown_type.name)
+    }
+    if v.type == VAL.error_value {
+        value_complete_error_payload(v, scope, ctx, exp) !>
+    } else {
+        let result = Value {
+            type: VAL.error_value
+            value1: v
+            values: Array[Value]{}
+            rett: type_error_code(expected)
+            exp: exp
+        }
+        value_complete_error_payload(result, scope, ctx, exp) !>
+        v = result
+    }
+    scope.did_return = true
+    return vgen_throw(v, b, exp)
+}
+
+////////////////////////////
+// Scope helpers
+////////////////////////////
+
+fn scope_has_loop(scope: Scope, func: ?Func) bool {
+    let current: ?Scope = scope
+    while isset(current) {
+        let owner = current.func
+        if isset(owner) && owner != func : break
+        if current.is_loop : return true
+        current = current.parent
+    }
+    return false
+}
+
+fn scope_mark_break(scope: Scope, func: ?Func) {
+    let current: ?Scope = scope
+    while isset(current) {
+        let owner = current.func
+        if isset(owner) && owner != func : return
+        if current.is_loop {
+            current.did_break = true
+            return
+        }
+        current = current.parent
+    }
+}
+
+// Collect Values for a then/else/while/block nested body.
+fn body_values_from_nested(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Array[Value] !Error {
+    let out = Array[Value]{}
+
+    if exp.type == EXP.if {
+        let v = body_value_from_exp(ctx, scope, state, exp) !>
+        if isset(v) : out.append(v)
+        return out
+    }
+
+    if exp.type == EXP.block {
+        let members = exp.body_exps
+        if isset(members) {
+            each members as mem {
+                let v = body_value_from_exp(ctx, scope, state, mem) !>
+                if isset(v) : out.append(v)
+            }
+            return out
+        }
+        let body = exp.get(BLOCK_EXP.body)
+        if isset(body) {
+            let exps = read_func_body_exps(body) !>
+            each exps as mem {
+                let v = body_value_from_exp(ctx, scope, state, mem) !>
+                if isset(v) : out.append(v)
+            }
+        }
+        return out
+    }
+
+    let v = body_value_from_exp(ctx, scope, state, exp) !>
+    if isset(v) : out.append(v)
+    return out
+}

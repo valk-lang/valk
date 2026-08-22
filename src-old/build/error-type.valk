@@ -1,0 +1,191 @@
+class ErrorType {
+    unit: Unit
+    ns: Namespace
+    name: String
+    act: ACT
+    exp: Exp
+    // File scope for extends id lookup and payload type resolution
+    scope: Scope
+    // Error code names (own codes first; inherited codes appended during parse)
+    codes: Array[String] (.{})
+    // Raw EXP.body until parse_error_type
+    extends_exp: ?Exp (null) // `(OtherError, ...)`
+    payload_exp: ?Exp (null) // `{ name: Type [(default)], ... }`
+    // `$global` — registered on Build.scope
+    is_global: bool (false)
+    // Resolved parents (direct + transitive)
+    extends: Array[ErrorType] (.{})
+    // Payload field name → Type (own + inherited)
+    payload: Map[Type] (.{})
+    // Explicit payload defaults: field name → EXP.body `(...)` (only when defined)
+    payload_defaults: Map[Exp] (.{})
+    // Thread-local transport storage used by the error ABI.
+    payload_globals: Map[Global] (.{})
+    // parse_error_type bookkeeping (handles circular extends)
+    parsing: bool (false)
+    parsed: bool (false)
+
+    fn is_compat(with: ErrorType) bool {
+        if this == with : return true
+        return this.extends.contains(with)
+    }
+}
+
+// Resolve extends + payload. Safe to call multiple times; recurses into parents first.
+fn parse_error_type(e: ErrorType) !Error {
+    if e.parsed : return
+    if e.parsing {
+        e.exp.error("Circular extend for error type: " + e.name)
+    }
+    e.parsing = true
+
+    let extends_body = e.extends_exp
+    if isset(extends_body) {
+        parse_error_extends(e, extends_body) !>
+    }
+
+    let payload_body = e.payload_exp
+    if isset(payload_body) {
+        parse_error_payload(e, payload_body) !>
+    }
+
+    if e.codes.length == 0 {
+        e.exp.error("Error types need to have at least 1 error code defined")
+    }
+
+    e.parsed = true
+    e.parsing = false
+}
+
+// Parse `extends (A, ns:B, ...)` — lookup error types, merge codes/payloads, record hierarchy.
+fn parse_error_extends(e: ErrorType, body: Exp) !Error {
+    let pos = body.pos
+    if !isset(pos) : body.bug("Error extends body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let scope = e.scope
+
+    while true {
+        if p.next_word_is(")", true, true, true) !> : break
+
+        let id = p.read_id(true, true) !>
+        let idf = resolve_idf_from_id(id, scope) !>
+        if idf.type != IDF.error_type {
+            id.error("Not an error type: " + id.str1)
+        }
+        let parent = idf.error_type
+        if !isset(parent) : id.bug("Error-type idf is missing error_type")
+
+        // Resolve parent first (detects cycles via parsing flag)
+        parse_error_type(parent) !>
+
+        if parent.extends.contains(e) {
+            id.error("Circular extend for error type: " + e.name + " <> " + parent.name)
+        }
+
+        // Direct parent
+        if !e.extends.contains(parent) {
+            e.extends.append(parent)
+        }
+        // Transitive parents
+        each parent.extends as sub {
+            if !e.extends.contains(sub) {
+                e.extends.append(sub)
+            }
+        }
+
+        // Merge inherited codes (by name)
+        each parent.codes as code {
+            if !e.codes.contains(code) {
+                e.codes.append(code)
+            }
+        }
+
+        // Merge inherited payload fields (and any explicit defaults)
+        each parent.payload as ptype, pname {
+            let pg = parent.payload_globals.get(pname) !? null
+            if isset(pg) : e.payload_globals.set(pname, pg)
+            let pdef = parent.payload_defaults.get(pname) !? null
+            error_add_payload(e, body, pname, ptype, pdef) !>
+        }
+
+        // Trailing `,` or `)`
+        let t = p.tok(true, true) !>
+        if t == TOK.sign && p.word_is(")") : break
+        if t == TOK.sign && p.word_is(",") : continue
+        p.error("Expected ',' or ')' in error extends, found: '" + p.word() + "'")
+    }
+}
+
+// Parse `payload { name: Type [(default)], ... }`
+fn parse_error_payload(e: ErrorType, body: Exp) !Error {
+    let pos = body.pos
+    if !isset(pos) : body.bug("Error payload body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let scope = e.scope
+
+    while true {
+        if p.next_word_is("}", true, true, true) !> : break
+
+        let t = p.tok(true, true) !>
+        if t != TOK.word {
+            p.error("Expected payload field name, found: '" + p.word() + "'")
+        }
+        let name = p.word()
+        p.expect(":", true, false) !>
+        let type_exp = read_type_exp(p, true, false) !>
+        let of_type = type_from_exp(type_exp, scope) !>
+
+        // Optional default: ( ... ) — same form as class props / function args
+        let default_exp: ?Exp = null
+        t = p.tok(true, true, false) !>
+        if t == TOK.sign && p.word_is("(") {
+            p.tok(true, true) !>
+            default_exp = read_body_exp(p, "(", ")") !>
+        }
+
+        error_add_payload(e, body, name, of_type, default_exp) !>
+
+        // Optional comma between fields (also allow bare next field / `}`)
+        t = p.tok(true, true, false) !>
+        if t == TOK.sign && p.word_is(",") {
+            p.tok(true, true) !>
+        }
+    }
+}
+
+// Register a payload field; duplicate names must be type-compatible.
+fn error_add_payload(e: ErrorType, at: Exp, name: String, of_type: Type, default_exp: ?Exp (null)) !Error {
+    if name == "code" {
+        at.error("You cannot use 'code' for a payload property name, this is a reserved name")
+    }
+    if e.codes.contains(name) {
+        at.error("The payload property name '" + name + "' is already used as an error code")
+    }
+    e.payload.get(name) -> existing {
+        if existing.compat(of_type) : return
+        if of_type.compat(existing) : return
+        at.error("Duplicate payload '" + name + "' with incompatible types on error " + e.name)
+    }
+    e.payload.set(name, of_type)
+    if isset(default_exp) : e.payload_defaults.set(name, default_exp)
+    error_add_payload_global(e, name, of_type)
+}
+
+fn error_add_payload_global(e: ErrorType, name: String, of_type: Type) {
+    if e.payload_globals.has(name) : return
+    let g = Global {
+        unit: e.unit
+        ns: e.ns
+        name: "__error_payload_" + e.name + "_" + name
+        act: ACT.private
+        kind: GLOBAL_KIND.global
+        scope: e.scope
+        exp: e.exp
+        shared: false
+        allow_unsafe: true
+        type: of_type.nullable()
+    }
+    e.unit.globals.append(g)
+    e.ns.build.lists.globals.append(g)
+    e.payload_globals.set(name, g)
+}

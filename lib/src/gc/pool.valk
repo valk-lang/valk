@@ -1,0 +1,425 @@
+
+use mem
+
+global pools: [?*Pool x 64]
+global alc_list: *Bump
+global typed_pools: *Bump
+
+value POOL_DATA_OFFSET ((size_of(ptr) * 7.to(uint)))
+value POOL_PUBLIC_OFFSET ((size_of(ptr) * 4))
+
+fn pools_init() {
+    alc_list = Bump.new(64)
+    typed_pools = Bump.new(65 * size_of(ptr))
+    //
+    let list : *[?*Pool] = &pools
+    let i : uint = size_of(ptr)
+    let c : uint = 0
+    let until : uint = 16 * size_of(ptr)
+    while i <= until {
+        let pool = Pool.init(i, null, null)
+        list[c++] = pool
+        i += size_of(ptr)
+    }
+    i = 16 * size_of(ptr) * 2
+    while i <= 2147483648 {
+        let pool = Pool.init(i, null, null)
+        list[c++] = pool
+        i *= 2
+    }
+}
+
+fn pools_free() {
+    let adr = alc_list.data
+    let end = adr + alc_list.index
+    while adr < end {
+        let alc = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        alc.free()
+    }
+    alc_list.free()
+    typed_pools.free()
+}
+
+fn get_pool_index_for_size(size: uint) uint $inline {
+    let until : uint = 16 * size_of(ptr)
+    if size <= until {
+        let index = (size - 1) / size_of(ptr)
+        return index
+    }
+    let s = size - 1
+    let bits : uint = 0
+    if s > 0xffffffff : { bits += 32; s = s >> 32 }
+    if s > 0xffff : { bits += 16; s = s >> 16 }
+    if s > 0xff : { bits += 8; s = s >> 8 }
+    if s > 0xf : { bits += 4; s = s >> 4 }
+    if s > 0x3 : { bits += 2; s = s >> 2 }
+    if s > 0x1 : { bits += 1; s = s >> 1 }
+    if s > 0 : { bits += 1 }
+
+    // index 16 corresponds to size 256 (2^8), so offset is bits - 8 + 16 = bits + 8
+    return bits + 8
+}
+
+fn get_pool_for_size(size: uint) *Pool $inline {
+    let index, isize = get_pool_slot(size)
+    return get_pool(index, isize)
+}
+
+fn get_pool_slot(size: uint) (uint, uint) $inline {
+    let index = get_pool_index_for_size(size)
+    if index < 16 : return (index, (index + 1) * size_of(ptr))
+    return (index, (1.to(uint)) << (index - 8))
+}
+
+fn get_typed_pool(size: uint, props: ?fnptr(ptr, *Lifo)()) *Pool {
+    let index, isize = get_pool_slot(size)
+    let record_size = 65 * size_of(ptr)
+    let record = typed_pools.data
+    let end = record + typed_pools.index
+    while record < end {
+        if @ptrv(record, ?fnptr(ptr, *Lifo)()) == props {
+            let slot = record + (index + 1) * size_of(ptr)
+            let pool = @ptrv(slot, ?*Pool)
+            if isset(pool) : return pool
+            pool = Pool.init(isize, props, null)
+            @ptrv(slot, *Pool) = pool
+            return pool
+        }
+        record += record_size
+    }
+    record = typed_pools.get(record_size)
+    mem:clear(record, record_size)
+    @ptrv(record, ?fnptr(ptr, *Lifo)()) = props
+    let pool = Pool.init(isize, props, null)
+    @ptrv(record + (index + 1) * size_of(ptr), *Pool) = pool
+    return pool
+}
+
+fn get_pool(i: uint, size: uint) *Pool {
+    let pool = @ptrv(pools, ?*Pool, i)
+    if isset(pool) : return pool
+    pool = Pool.init(size, null, null)
+    @ptrv(pools, *Pool, i) = pool
+    return pool
+}
+
+fn reset_pools(list: *Bump) bool {
+    let adr = list.data
+    let end = adr + list.index
+    let needs_followup = false
+    while adr < end {
+        let alc = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        if alc.reset() : needs_followup = true
+    }
+    return needs_followup
+}
+
+fn leak_check_pools(list: *Bump) {
+    let adr = list.data
+    let end = adr + list.index
+    while adr < end {
+        let alc = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        alc.leak_check()
+    }
+}
+
+struct Pool {
+    blockc: uint
+    first: ?ptr
+    block: ?ptr
+    item: ptr (null.@cast(ptr))
+    last: ptr (null.@cast(ptr))
+    props: ?fnptr(ptr, *Lifo)()
+    onfree: ?fnptr(ptr)()
+    isize: uint (0)
+
+    + static fn init(size: uint, props: ?fnptr(ptr, *Lifo)(), onfree: ?fnptr(ptr)()) *Pool {
+
+        let p: *Pool = .{
+            isize: size + 8
+            first: null
+            block: null
+            blockc: size < 512 ? 4 : 1
+            props: props
+            onfree: onfree
+        }
+        alc_list.add_ptr(p)
+
+        return p
+    }
+
+    fn free() {
+        mem:free(this)
+    }
+
+    static fn create_block(size: uint, isize: uint, props: ?fnptr(ptr, *Lifo)(), onfree: ?fnptr(ptr)()) ptr {
+        let max: uint = 65000 / isize
+        if max > 240 : max = 240
+        if size > max : size = max
+        if size == 0 : size = 1
+        let alloc_size : uint = size * isize + POOL_DATA_OFFSET
+        let b = mem:alloc(alloc_size)
+        // Settings
+        @ptrv(b, ?ptr, b_next) = null
+        @ptrv(b, uint, b_slots_total) = size
+        @ptrv(b, uint, b_slots_used_percent) = 0
+        @ptrv(b, uint, b_isize) = isize
+        @ptrv(b, uint, b_slots_used) = 0
+        @ptrv(b, ?ptr, b_props) = props.@cast(?ptr)
+        @ptrv(b, ?ptr, b_onfree) = onfree.@cast(?ptr)
+
+        // Set offsets
+        let data = b + POOL_DATA_OFFSET
+        let i : uint = 0
+        while i < size {
+            let offset = i * isize
+            let item : ptr = data + offset
+            @ptrv(item, u64) = 0
+            let data: *GcData = item
+            data.offset = offset.to(u16) + POOL_PUBLIC_OFFSET
+            i++
+        }
+        // Track memory usage
+        gc.mem_usage_thread += alloc_size
+        let before = atomic(mem_usage_shared + alloc_size)
+        let usage = before + alloc_size
+        if usage > mem_usage_peak : mem_usage_peak = usage
+        //
+        return b
+    }
+
+    fn get_vtable() ptr $hot {
+        let item = this.get()
+        gc.blanks.add_ptr(item)
+        return item
+    }
+
+    fn get() ptr $inline {
+        let item = this.item
+        if item != this.last {
+            let data: *GcData = item
+            if data.is_new() {
+                let isize = this.isize
+                this.item = item + isize
+                gc.mem_new += isize
+                return item + 8
+            }
+        }
+        return this.get_slow()
+    }
+
+    fn get_slow() ptr $hot {
+
+        let isize = this.isize
+        if this.block == null {
+            let block = Pool.create_block(this.blockc * 2, isize, this.props, this.onfree)
+            this.first = block
+            this.set_block(block)
+        }
+
+        let item = this.item
+        let last = this.last
+        while true {
+
+            if item == last {
+                this.set_next_block(this.block ?! panic("Pool has no active block"))
+                item = this.item
+                last = this.last
+                continue
+            }
+
+            let data: *GcData = item
+            if data.is_not_new() {
+                item += isize
+                continue
+            }
+
+            this.item = item + isize
+
+            #if GC_DEBUG
+            if data.co_count != 0 : panic("co_count not 0 at alloc")
+            if data.flags != 0 {
+                print("Flags: ")
+                data.flags.print(10)
+                print("\n")
+                panic("GC error: Flags not 0 on alloc")
+            }
+            #end
+
+            // Increase mem usage
+            gc.mem_new += isize
+
+            return item + 8
+        }
+
+        panic("Failed to allocate memory")
+    }
+
+    fn set_next_block(block: ptr) {
+        while true {
+            let next = @ptrv(block, ?ptr, b_next)
+
+            if isset(next) {
+                if @ptrv(next, uint, b_slots_used_percent) > 95 {
+                    block = next
+                    continue
+                }
+
+                this.set_block(next)
+            } else {
+                // Create new block
+                let blockc = ++this.blockc
+                // let new = get_unused_block(this.isize) !? Pool.create_block(blockc * blockc, this.isize, this.props, this.onfree)
+                let new = Pool.create_block(blockc * blockc, this.isize, this.props, this.onfree)
+                // Set next
+                @ptrv(block, ptr, b_next) = new
+                this.set_block(new)
+            }
+            break
+        }
+
+        // GC check
+        collect_if_threshold_reached()
+    }
+
+    fn set_block(block: ?ptr) {
+        this.block = block
+        if isset(block) {
+            this.item = block + POOL_DATA_OFFSET
+            this.last = block + POOL_DATA_OFFSET + @ptrv(block, uint, b_slots_total) * this.isize
+        } else {
+            // The cursor must not point into a block that was just released
+            this.item = null.@cast(ptr)
+            this.last = null.@cast(ptr)
+        }
+    }
+
+    fn reset() bool {
+        let block = this.first
+        if block == null : return false
+
+        let current = this.block
+        let isize = this.isize
+
+        let reached_current = gc.did_shutdown
+
+        let first_non_empty : ?ptr = null
+        let last_non_empty : ?ptr = null
+        let first_empty : ?ptr = null
+        let last_empty : ?ptr = null
+        let empty_count : uint = 0
+
+        while block != null {
+            let b = block ?! break
+            let next = @ptrv(b, ?ptr, b_next)
+            let total = @ptrv(b, uint, b_slots_total)
+            let used = @ptrv(b, uint, b_slots_used)
+
+            @ptrv(b, ?ptr, b_next) = null // clear next
+
+            // Validate used amount
+            #if GC_DEBUG
+            let base = b + POOL_DATA_OFFSET
+            let end = base + total * isize
+            while base < end {
+                let data: *GcData = base
+                if data.is_new() {
+                    if data.co_count != 0 : panic("GC error: item with state 'new' has a co_count > 0")
+                    if data.flags != 0 {
+                        print("Flags: ")
+                        data.flags.print(10)
+                        print("\n")
+                        panic("GC error: item with state 'new' contains 'flag' bits")
+                    }
+                }
+                base += isize
+            }
+            #end
+
+            //
+            if used == 0 {
+                // Empty blocks
+                if reached_current == false {
+                    empty_count++
+                    @ptrv(b, uint, b_slots_used_percent) = 0
+                    if isset(last_empty) {
+                        @ptrv(last_empty, ptr, b_next) = b
+                        last_empty = b
+                    } else {
+                        first_empty = b
+                        last_empty = b
+                    }
+                } else {
+                    let alloc_size = total * isize + POOL_DATA_OFFSET
+                    gc.mem_usage_thread -= alloc_size
+                    atomic(mem_usage_shared - alloc_size)
+                    mem:free(b)
+                    this.blockc--
+                }
+            } else {
+                // Update usage percent
+                @ptrv(b, uint, b_slots_used_percent) = used * 100 / total
+                //
+                if isset(last_non_empty) {
+                    @ptrv(last_non_empty, ptr, b_next) = b
+                    last_non_empty = b
+                } else {
+                    first_non_empty = b
+                    last_non_empty = b
+                }
+            }
+            if b == current : reached_current = true
+            block = next
+        }
+
+        let first : ?ptr = first_non_empty
+        if isset(last_non_empty) {
+            @ptrv(last_non_empty, ?ptr, b_next) = first_empty
+        } else {
+            first = first_empty
+        }
+
+        this.first = first
+        this.set_block(first)
+
+        if isset(first_non_empty) : return empty_count > 0
+        return empty_count > 1
+    }
+
+    fn leak_check() {
+        let block = this.first
+        if block == null : return
+
+        let isize = this.isize
+
+        while block != null {
+            let b = block ?! break
+            let next = @ptrv(b, ?ptr, b_next)
+            let total = @ptrv(b, uint, b_slots_total)
+
+            let base = b + POOL_DATA_OFFSET
+            let end = base + total * isize
+            while base < end {
+                let data: *GcData = base
+                if data.is_new() {
+                    if data.co_count != 0 : panic("GC error: item with state 'new' has a co_count > 0 (leak-check)")
+                    if data.flags != 0 {
+                        print("Flags: ")
+                        data.flags.print(10)
+                        print("\n")
+                        panic("GC error: item with state 'new' contains 'flag' bits")
+                    }
+                } else if !data.has_leak_mark() && !data.is_shared() {
+                    print_item_info(data.item())
+                    panic("Memory leak")
+                }
+                base += isize
+            }
+
+            block = next
+        }
+    }
+}

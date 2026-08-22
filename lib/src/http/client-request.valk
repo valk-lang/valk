@@ -1,0 +1,227 @@
+
+use net
+use fs
+use url
+
++ class ClientRequest {
+    ~ recv_buffer: ByteBuffer
+    - ctx: Context
+    ~ con: net:Connection
+    - payload: ByteBuffer
+    //
+    - output_file: ?fs:FileStream
+    // Progress
+    - stage: uint (0)
+    ~ bytes_to_send: uint (0)
+    ~ bytes_sent: uint (0)
+    ~ bytes_to_recv: uint (0)
+    ~ bytes_received: uint (0)
+    ~ sent_percent: uint (0)
+    ~ recv_percent: uint (0)
+    ~ request_sent: bool (false)
+    ~ response_received: bool (false)
+    // Final
+    - resp: ?ClientResponse
+
+    //////////////////////////////
+    // Request initialization
+    //////////////////////////////
+
+    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError {
+
+        // Validate URL
+        let u = url:parse(url)
+        let is_https = u.scheme == "https"
+
+        let split = u.host.split(":")
+        let host = u.host
+        let port : u16 = is_https ? 443 : 80
+        if split.length > 2 : throw .invalid_url
+        if split.length == 2 {
+            host = split.get(0) !? ""
+            let p = split.get(1) ! throw .invalid_url
+            port = (p.to_uint() ! throw .invalid_url).@cast(u16)
+        }
+
+        // Connect
+        let con = net:Socket.client(net:SOCKET_TYPE.TCP, host, port) !>
+
+        if is_https {
+            let ssl = net:SSL.new()
+            if isset(options) {
+                ssl.set_verify(options.verify_ssl_cert)
+                let cert = options.ca_cert
+                if isset(cert) : ssl.set_ca_cert(cert)
+            }
+            con.ssl_connect(ssl) ! {
+                con.close()
+                throw .ssl
+            }
+        }
+
+        // Request
+        let recv_buffer = ByteBuffer.new(2048)
+        let ctx = Context.new(recv_buffer)
+
+        // Options for context
+        if isset(options) {
+            let out_path = options.output_to_file
+            if isset(out_path) {
+                let file = fs:stream(out_path, true, true, false, true) !>
+                ctx.save_to_file = file
+            }
+        }
+
+        //
+        let payload = SELF.create_payload(method, u, options)
+
+        //
+        return SELF {
+            recv_buffer: recv_buffer
+            ctx: ctx
+            con: con
+            payload: payload
+            bytes_to_send: payload.length
+        }
+    }
+
+    - static fn create_payload(method: String, url: url:Url, options: ?Options) ByteBuffer {
+
+        let body = ""
+        let headers : ?Map[String] = null
+        let has_custom_agent = false
+
+        if isset(options) {
+            body = options.body
+            headers = options.headers
+            has_custom_agent = isset(headers) && (headers.has("user-agent") || headers.has("User-Agent"))
+            let qdata = options.query_data
+            if isset(qdata) {
+                let qstr = ""
+                each qdata as v, k, i {
+                    if i > 0 : qstr += "&"
+                    qstr += "%{url:encode(k)}=%{url:encode(v)}"
+                }
+                url.query += url.query.length > 0 ? "&" + qstr : "?" + qstr 
+            }
+        }
+
+
+        let len = body.bytes
+        let buf = ByteBuffer.new(len + 256)
+
+        buf.write_string(method)
+        buf.write_string(" ")
+        buf.write_string(url.path)
+        if !url.query.is_empty() {
+            buf.write_string("?")
+            buf.write_string(url.query)
+        }
+        buf.write_string(" HTTP/1.1\r\n")
+
+        buf.write_string("Host: ")
+        buf.write_string(url.host)
+        buf.write_string("\r\n")
+
+        buf.write_string("Content-Length: ")
+        buf.write_string(body.bytes)
+        buf.write_string("\r\n")
+
+        if !has_custom_agent {
+            buf.write_string("User-Agent: Valk http client\r\n")
+        }
+
+        if isset(headers) {
+            each headers as v, k {
+                buf.write_string(k)
+                buf.write_string(": ")
+                buf.write_string(v)
+                buf.write_string("\r\n")
+            }
+        }
+
+        buf.write_string("\r\n")
+        buf.write_string(body)
+
+        return buf
+    }
+
+    //////////////////////////////
+    // Run / Progress
+    //////////////////////////////
+
+    - fn stop() {
+        this.con.close()
+        this.ctx.reset()
+        this.request_sent = true
+        this.response_received = true
+    }
+
+    + fn progress() bool !HttpError {
+        
+        if this.response_received : return false
+
+        let con = this.con
+
+        if this.stage == 0 {
+            // Send request
+            let sent_count = con.send_buffer(this.payload, this.bytes_sent, false) ! {
+                this.stop()
+                throw .write
+            }
+            this.bytes_sent += sent_count
+            this.sent_percent = this.bytes_sent * 100 / this.bytes_to_send
+            if this.bytes_sent < this.bytes_to_send : return true
+            // Done
+            this.stage = 1
+            this.sent_percent = 100
+        }
+
+        //
+        this.request_sent = true
+
+        // Receive response
+        let context = this.ctx
+        let recv_buf = this.recv_buffer
+        if !context.done {
+            let bytes = con.recv(recv_buf, 1024 * 32) ! {
+                this.stop()
+                throw .read
+            }
+            this.bytes_received += bytes
+            if context.content_length > 0 {
+                this.recv_percent = this.bytes_received * 100 / context.content_length
+            }
+
+            if bytes == 0 {
+                this.stop()
+                throw .read
+            }
+            // Parse bytes
+            parse_http(recv_buf, context, true) ! {
+                if E.code == E.incomplete : return true
+                this.stop()
+                throw .invalid_response
+            }
+
+            this.recv_percent = 100
+        }
+
+        // Create response
+        let resp = ClientResponse {
+            status: context.status
+            headers: context.headers()
+            body: context.body
+        }
+
+        this.stop()
+        this.resp = resp
+
+        return false
+    }
+
+    + fn response() ClientResponse !HttpError {
+        if !this.response_received : throw .in_progress
+        return this.resp ?! throw .invalid_response
+    }
+}

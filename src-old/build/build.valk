@@ -1,0 +1,482 @@
+
+use helper
+use doc
+use valk:core
+use valk:fs
+use valk:time
+use valk:gc
+
+class Build {
+    options: BuildOptions
+    cache: BuildCache
+    pipeline: Pipeline
+    lists: BuildLists
+    stats: BuildStats
+    //
+    main_pkg: ?Pkg (null)
+    main_func: ?Func (null)
+    scope: Scope (.new())
+    // Messages
+    messages: Array[Message] (.{})
+    has_errors: bool (false)
+    struct_gc_validation_ready: bool (false)
+    type_parse_depth: uint (0)
+    //
+    warned_spans: Map[bool] (.{})
+    format_sources: Array[Source] (.{})
+    watch_files: Array[String] (.{})
+    //
+    lsp_src: ?Source (null)
+    lsp_cursor: u32 (0)
+    lsp_answered: bool (false)
+
+    // ########################################
+    // INIT
+    // ########################################
+
+    static fn init(options: BuildOptions) Build {
+        let b = Build {
+            options: options
+            cache: BuildCache {}
+            pipeline: Pipeline {}
+            lists: BuildLists {}
+            stats: BuildStats {}
+        }
+        b.pipeline.build = b
+        b.set_macro_defs()
+        return b
+    }
+
+    fn set_macro_defs() {
+        let o = this.options
+        this.set_macro_def_string("OS", o.target.os)
+        this.set_macro_def_string("ARCH", o.target.arch)
+        this.set_macro_def_bool("TEST", o.is_test)
+        this.set_macro_def_bool("STATIC", o.static_link_deps())
+        this.set_macro_def_bool("GC_DEBUG", false)
+        // Replaced once main's return type is known (see Pipeline.run)
+        this.set_macro_def_bool("MAIN_EXIT_CODE", false)
+        this.set_macro_def_bool("DEBUG", false)
+        this.set_macro_def_string("VALK_VERSION", VERSION)
+
+        this.set_cli_macro_defs_in(this.scope)
+    }
+
+    fn set_macro_def_string(name: String, val: String) {
+        this.set_macro_def_string_in(this.scope, name, val)
+    }
+
+    fn set_macro_def_string_in(scope: Scope, name: String, val: String) {
+        // Primitive string type: core String may not exist yet at Build.init time
+        let v = vgen_string(val, type_prim_string(this))
+        scope.set_idf(name, Idf.for_value(v))
+    }
+
+    fn set_macro_def_bool(name: String, val: bool) {
+        this.set_macro_def_bool_in(this.scope, name, val)
+    }
+
+    fn set_macro_def_bool_in(scope: Scope, name: String, val: bool) {
+        let v = vgen_bool(val, type_prim_bool(this))
+        scope.set_idf(name, Idf.for_value(v))
+    }
+
+    // "0" / "1" are boolean values in the CLI --def syntax.
+    fn set_macro_def_value_in(scope: Scope, name: String, val: String) {
+        if val == "0" {
+            this.set_macro_def_bool_in(scope, name, false)
+        } else if val == "1" {
+            this.set_macro_def_bool_in(scope, name, true)
+        } else {
+            this.set_macro_def_string_in(scope, name, val)
+        }
+    }
+
+    fn set_package_def_value_in(scope: Scope, name: String, val: String) {
+        let numeric = val.is_integer()
+        if !numeric && val.starts_with("-") && val.length > 1 {
+            numeric = val.part(1, val.length).is_integer()
+        }
+        if numeric {
+            let number = val.to_int() !? 0
+            scope.set_idf(name, Idf.for_value(vgen_int(number, type_int(this))))
+            return
+        }
+        this.set_macro_def_string_in(scope, name, val)
+    }
+
+    fn set_cli_macro_defs_in(scope: Scope) {
+        each this.options.defs as def {
+            this.set_macro_def_pairs(scope, def)
+        }
+    }
+
+    // Parse the same comma-separated --def syntax into an arbitrary scope.
+    fn set_macro_def_pairs(scope: Scope, defs: String) {
+        let parts = defs.split(",")
+        each parts as pair {
+            pair = pair.trim(" ")
+            if pair.length == 0 : continue
+            let kv = pair.split("=")
+            if kv.length == 1 {
+                this.set_macro_def_bool_in(scope, pair, true)
+            } else {
+                let name = kv.pop_first() ! continue
+                let val = kv.join("=")
+                this.set_macro_def_value_in(scope, name, val)
+            }
+        }
+    }
+
+    static fn init_from_args(args: Array[String]) Build !InitError {
+        let options = BuildOptions.init_from_args(args) !>
+        return Build.init(options)
+    }
+
+    static fn from_args(args: Array[String]) {
+        let options = BuildOptions.init_from_args(args) ! build_error(E.msg)
+        if options.is_watch {
+            build_watch(options)
+            return
+        }
+        let b = Build.init(options)
+        b.run() ! { }
+        b.print_results()
+    }
+
+    // ########################################
+    // RUN
+    // ########################################
+
+    fn run() !Error {
+        let start = time:microtime()
+
+        this.run_stages() ! {
+            this.collect_build_stats(start)
+            throw .error
+        }
+        this.collect_build_stats(start)
+    }
+
+    fn run_stages() !Error {
+        let func_ir_start = time:microtime()
+        let input_files = this.parse_inputs() !>
+
+        // Always load built-in valk:core (stdlib primitives used throughout the compiler).
+        let main_pkg = this.main_pkg ?! this.error("Main package not found (bug)")
+        let valk = main_pkg.load_sub_pkg("valk") !>
+        valk.load_namespace("core") !>
+
+        each input_files as file {
+            let ns = this.get_namespace_for_file(file) !>
+            ns.load_file(file, this.options.is_fmt) !>
+            // Then load the rest of the namespace (same-file paths are skipped).
+            ns.load_files() !>
+        }
+
+        if this.options.is_fmt {
+            if !isset(this.options.lsp) {
+                each this.format_sources as src {
+                    src.write_format() !>
+                }
+            }
+            return
+        }
+
+        let entry_mode = this.options.mode == BUILDTYPE.exe || this.options.mode == BUILDTYPE.ir
+        if this.options.needs_ir() && entry_mode {
+            let main_ns = main_pkg.get_namespace("main") !>
+            main_ns.load_file(helper:add(helper:add(helper:valk_lib_dir(), "templates"), "main.valk")) !>
+        }
+
+        if this.options.mode == BUILDTYPE.doc {
+            main_pkg.load_all_namespaces() !>
+        }
+
+        this.pipeline.run() !>
+
+        this.stats.func_ir_us = time:microtime() - func_ir_start
+
+        if !this.has_errors && this.options.mode != BUILDTYPE.doc {
+            warn_unused_uses(this)
+        }
+
+        if this.has_errors : return
+
+        let object_start = time:microtime()
+        if this.options.needs_ir() {
+            generate_unit_modules(this) !>
+            let mode = this.options.mode
+            if mode == BUILDTYPE.exe || mode == BUILDTYPE.lib {
+                let lock_path = helper:add(object_output_dir(this) !>, "cache.lock")
+                let lock = helper:lock_acquire(lock_path) ! this.error("Failed to lock the object cache: " + lock_path)
+                defer helper:lock_release(lock)
+
+                emit_unit_objects(this) !>
+                this.stats.object_us = time:microtime() - object_start
+                if this.options.static_library() : archive_unit_objects(this) !>
+                else : link_unit_objects(this) !>
+            } else {
+                this.stats.object_us = time:microtime() - object_start
+                if mode == BUILDTYPE.ir : this.write_ir_output() !>
+            }
+        }
+    }
+
+    fn write_ir_output() !Error {
+        let path = this.options.path_out
+        if isset(path) {
+            path = helper:resolve(path)
+            if !path.ends_with(".ll") && !path.ends_with(".ir") : path += ".ll"
+            this.options.path_out = path
+        }
+        each this.lists.units as unit {
+            if unit.ir_code.length == 0 : continue
+            if isset(path) {
+                fs:write(path, unit.ir_code) ! this.error("Failed to write IR: " + path)
+            } else {
+                println(unit.ir_code)
+            }
+        }
+    }
+
+    // Fill `stats` with duration and peak memory (LOC is updated during parse).
+    fn collect_build_stats(start: uint) {
+        this.stats.duration_us = time:microtime() - start
+        this.stats.mem_peak = gc:mem_usage_peak
+    }
+
+    fn print_verbose(level: int, message: String) bool {
+        if isset(this.options.lsp) || this.options.verbose < level : return false
+        println(message)
+        return true
+    }
+
+    fn print_results() {
+        if !this.print_messages() : exit(1)
+
+        let o = this.options
+        if o.mode == BUILDTYPE.doc {
+            doc:doc_gen(this)
+            return
+        }
+        if o.mode == BUILDTYPE.ir {
+            this.stats.print(o.verbose, false)
+            let path = o.path_out
+            if isset(path) : helper:msg("✅", "IR output: " + path)
+            return
+        }
+        if o.mode == BUILDTYPE.lib {
+            this.stats.print(o.verbose, false)
+            let path = o.path_out
+            if isset(path) : helper:msg("✅", "Library output: " + path)
+            return
+        }
+        if o.run_exe && !o.is_fmt && o.mode == BUILDTYPE.exe {
+            this.stats.print(o.verbose, false)
+            this.run_output()
+            return
+        }
+        this.stats.print(o.verbose)
+    }
+
+    fn print_messages() bool {
+        each this.messages as m {
+            if m.type == MSG.error {
+                m.print()
+                return false
+            }
+        }
+        if !this.options.no_warn {
+            each this.messages as m {
+                if m.type == MSG.warning : m.print()
+            }
+        }
+        return true
+    }
+
+    fn run_output() {
+        let path = this.options.path_out
+        if !isset(path) : return
+        if !this.options.target.host_is_target() {
+            helper:msg("❌", "Cannot run a program built for " + this.options.target.target + " on this machine")
+            return
+        }
+        let cmd = "\"" + path + "\""
+        each this.options.run_args as arg {
+            cmd += " \"" + arg + "\""
+        }
+        let code = core:exec(cmd, true)
+        exit(code)
+    }
+
+    fn parse_inputs() Array[String] !Error {
+        let input_dirs = Array[String]{}
+        let input_files = Array[String]{}
+        each this.options.inputs as input {
+            let path = helper:resolve(input)
+            if !fs:exists(path) : this.error("File/directory not found: " + path)
+            if path.ends_with(".valk") {
+                input_files.append(path, true)
+                continue
+            }
+            if fs:is_dir(path) {
+                input_dirs.append(path)
+                continue
+            }
+            this.error("Invalid file/directory: " + input)
+        }
+        if input_files.length == 0 && input_dirs.length == 0 {
+            input_dirs.append(fs:cwd())
+        }
+
+        let main_pkg : ?Pkg = null
+
+        // Expand directory inputs into concrete source files
+        each input_dirs as dir {
+            dir = helper:resolve(dir)
+            let files_from = dir
+            if this.is_pkg_dir(dir) {
+                let pkg = this.find_closest_pkg(dir)
+                if !isset(pkg) : this.error("Cannot find package for directory: " + dir)
+                if isset(main_pkg) && main_pkg != pkg {
+                    this.error("Build command contains files from 2 different packages. You can only build 1 package and dependent packages must be included via a valk.json config.")
+                }
+                main_pkg = pkg
+                let srcdir = pkg.srcdir
+                if !isset(srcdir) : this.error("Missing package source directory: " + dir)
+                files_from = srcdir
+            }
+            // Non-recursive: namespaces load via `use` / load_files, not by walking the tree
+            let files = fs:files_in(files_from, false, true, false)
+            each files as file {
+                if file.ends_with(".valk") : input_files.append(file, true)
+            }
+        }
+
+        input_files.sort(fn(a: String, b: String) bool {
+            return a < b
+        })
+
+        // Determine which package (if any) each input file belongs to
+        each input_files as file {
+            let pkg = this.find_pkg_for_path(file)
+            if isset(pkg) {
+                if isset(main_pkg) && main_pkg != pkg {
+                    this.error("Build command contains files from 2 different packages. You can only build 1 package and dependent packages must be included via a valk.json config.")
+                }
+                main_pkg = pkg
+                pkg.name = "main"
+            }
+        }
+
+        // Loose files outside a package still need a main package to hang namespaces on
+        if !isset(main_pkg) : main_pkg = Pkg.new_main(this)
+
+        this.main_pkg = main_pkg
+        return input_files
+    }
+
+    // ########################################
+    // MESSAGES
+    // ########################################
+
+    fn error(msg: String) !Error $throw {
+        this.has_errors = true
+        this.messages.append(Message {
+            type: MSG.error
+            msg: msg
+        })
+        throw .error
+    }
+
+    fn lsp_stop() !Error $throw {
+        this.lsp_answered = true
+        throw .error
+    }
+
+    // Like error, for situations that should be impossible if the compiler is correct.
+    fn bug(msg: String) !Error $throw {
+        this.error("(Compiler bug) " + msg)
+    }
+
+    fn warn(msg: String) {
+        this.messages.append(Message {
+            type: MSG.warning
+            msg: msg
+        })
+    }
+
+    // ########################################
+    // UNITS
+    // ########################################
+
+    fn get_unit_for_path(path: String) Unit {
+        if this.options.single_unit {
+            let shared = this.cache.single_unit
+            if isset(shared) : return shared
+            // Fixed name: no per-file names exist in this mode, so it is unique
+            shared = Unit { name: "valk-release" }
+            this.cache.used_unit_names.append(shared.name)
+            this.cache.single_unit = shared
+            this.lists.units.append(shared)
+            return shared
+        }
+        let unit = Unit.new(this.cache, path)
+        this.lists.units.append(unit)
+        return unit
+    }
+
+    // ########################################
+    // PACKAGES
+    // ########################################
+
+    fn find_pkg_for_path(path: String) ?Pkg {
+        path = helper:resolve(path)
+        let dir = fs:is_dir(path) ? path : fs:dir_of(path)
+        let pkg = this.find_closest_pkg(dir)
+        if !isset(pkg) : return null
+        if pkg.contains_path(path) : return pkg
+        return null
+    }
+
+    // Walk dir and parents until a directory containing valk.json is found.
+    fn find_closest_pkg(dir: String) ?Pkg {
+        dir = helper:resolve(dir)
+        this.cache.package_dirs.get(dir) -> pkg : return pkg
+
+        if this.is_pkg_dir(dir) {
+            let pkg = Pkg.new(this, dir)
+            this.cache.package_dirs.set(dir, pkg)
+            return pkg
+        }
+
+        let parent = fs:dir_of(dir)
+        if parent == dir : return null
+
+        let pkg = this.find_closest_pkg(parent)
+        if isset(pkg) : this.cache.package_dirs.set(dir, pkg)
+        return pkg
+    }
+
+    fn is_pkg_dir(dir: String) bool {
+        return fs:exists(helper:add(dir, "valk.json"))
+    }
+
+    // ########################################
+    // NAMESPACES
+    // ########################################
+
+    // Resolve which namespace a source file belongs to from its path under the package src dir.
+    fn get_namespace_for_file(path: String) Namespace !Error {
+        path = helper:resolve(path)
+        let pkg = this.find_pkg_for_path(path) ?? (this.main_pkg ?! this.error("Main package not found (bug)"))
+        let dir = fs:dir_of(path)
+        let srcdir = pkg.srcdir
+        if !isset(srcdir) : return pkg.get_namespace("main") !>
+        if srcdir == dir : return pkg.get_namespace("main") !>
+
+        let rel = dir.part(srcdir.length, dir.length - srcdir.length).trim("/").trim("\\")
+        return pkg.get_namespace(rel) !>
+    }
+}

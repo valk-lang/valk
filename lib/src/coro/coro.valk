@@ -1,0 +1,432 @@
+
+use ext
+use core
+use coro
+use mem
+use gc
+use io
+
+global current_coro : ?Coro
+global g_coros : Array[?Coro] (.new(16))
+global g_coro_indexes : core:Pool[uint] (.new(16))
+global g_coro_count : uint
+global run_coros : Array[Coro] (.new(16))
+global next_run_coros : Array[Coro] (.new(16))
+
+global main_state : CoroState (@undefined)
+
+#if OS == "macos"
+global timer_id : uint
+#end
+
+#if OS == "win"
+global cport : ?ptr
+global sleep_coros : Array[Coro] (.new(16))
+#end
+
+struct CoroState {
+    rsp: ptr
+}
+class Coro {
+    // Args & results
+    args: ptr
+    gc_args: Array[gc:GcPtr] (.{})
+    // Coro state
+    state: CoroState (@undefined)
+    // Stack info
+    backup_main_stack: ptr (@undefined)
+    backup_main_stack_size: uint (0)
+    backup_main_stack_alloc_size: uint (0)
+    backup_gc_sp: ?ptr (null)
+    stack_base: ptr (@undefined)
+    //
+    start_func: fnptr()()
+    handler: fn()()
+    follow_up: ?Coro
+    g_list_index: uint (0)
+    // Error result
+    error_code: u32 (0)
+    // async results
+    poll_event: io:PollEvent (0)
+    completion_res: i64 (0)
+    #if OS == "linux"
+    timeout_ts: io:kernel_timespec (@undefined)
+    #elif OS == "win"
+    sleep_deadline_ms: u64 (0)
+    iocp_ready: bool (false)
+    #end
+    //
+    started: bool (false)
+    active: bool (false)
+    freed: bool (false)
+    done: bool (false)
+
+    static fn new(handler: fn()(), start_func: ptr) SELF {
+
+        let coro = Coro {
+            args: mem:alloc(128)
+            //
+            start_func: start_func.@cast(fnptr()())
+            handler: handler
+        }
+
+        let indexes = g_coro_indexes
+        if indexes.count == 0 {
+            let index = g_coros.length
+            g_coros.append(coro)
+            coro.g_list_index = index
+        } else {
+            let index = indexes.get() !? 0
+            g_coros.set(index, coro) _
+            coro.g_list_index = index
+        }
+
+        run_coros.append(coro)
+
+        g_coro_count++
+
+        return coro
+    }
+
+    fn gc_free() {
+        this.free_stacks()
+        mem:free(this.args)
+    }
+
+    fn free_stacks() {
+        if this.freed : return
+        this.freed = true
+        if this.backup_main_stack_alloc_size > 0 {
+            mem:free(this.backup_main_stack)
+        }
+    }
+
+    fn init_stack(base: ptr) {
+
+        #if ARCH == "x64"
+        let return_addr_space = 2 * size_of(ptr)
+        #if OS == "win"
+        let regs = 30
+        #else
+        let regs = 6
+        #end
+        #elif ARCH == "arm64"
+        let return_addr_space = size_of(ptr)
+        let regs = 19
+        #else
+        #error "Unsupported OS: coroutines"
+        #end
+
+        let stack_start = base - (regs * size_of(ptr)) - return_addr_space
+        // Make sure stack is 16 byte aligned (ptr size)
+        stack_start = stack_start - (stack_start & 0xF)
+
+        mem:clear(stack_start, regs * size_of(ptr)) // Required for windows
+
+        @ptrv(stack_start, ptr, regs) = this.start_func.@cast(ptr)
+        this.state.rsp = stack_start
+    }
+
+    //////////////
+    // AWAIT
+    //////////////
+
+    fn await_coro(coro: Coro) {
+        if coro.done : return
+        let ob = coro
+        let ref = ob.follow_up
+        while isset(ref) {
+            ob = ref
+            ref = ref.follow_up
+        }
+        ob.follow_up = this
+        this.yield()
+    }
+
+    fn sleep(ns: uint) {
+        #if OS == "linux"
+        let sqe = io:sqe(this) ! return
+        let nsec = ns.@cast(int)
+        this.timeout_ts = {
+            tv_sec: nsec / 1_000_000_000
+            tv_nsec: (nsec % 1_000_000_000)
+        }
+        io:io_uring_prep_timeout(sqe, @ref(this.timeout_ts), 0, 0)
+
+        #elif OS == "macos"
+        let ms = ns.to(i64) / 1_000_000
+        let ev : ext:kEvent = @undefined
+        io:EV_SET(&ev, timer_id++, io:EVFILT_TIMER, io:EV_ADD | io:EV_ENABLE | io:EV_ONESHOT, 0, ms, this.@cast(ptr))
+        let kq = io:kqueue()
+        ext:kevent(kq, &ev, 1, null, 0, null)
+
+        #else
+        let delay_ms = (ns.to(u64) + 999_999) / 1_000_000
+        this.sleep_deadline_ms = ext:GetTickCount64() + delay_ms
+        sleep_coros.append(this)
+        #end
+        this.yield()
+        #if OS == "win"
+        this.sleep_deadline_ms = 0
+        #end
+    }
+
+    fn await_last() {
+        run_coros.append(this)
+        this.yield()
+    }
+
+    //////////////
+    // FLOW
+    //////////////
+
+    fn yield() $undefined {
+        SELF.swap(@ref(this.state), &main_state)
+    }
+
+    static fn swap(from: ptr, to: ptr) $undefined {
+        ext:valk_stack_swap(from, to)
+    }
+
+    fn resume() $undefined {
+        if this.done : return
+
+        current_coro = this
+
+        // Set stack base
+        let sp = @ref(main_stack) + STACK_SIZE - size_of(ptr)
+        gc_stack_sp_backup = gc_stack_sp
+        this.active = true
+
+        if this.started {
+            if this.stack_base != sp : panic("Resuming coroutine from another stack position (SP)")
+            // Restore stack
+            if this.backup_main_stack_size > 0 {
+                mem:copy(this.backup_main_stack, this.state.rsp, this.backup_main_stack_size)
+            }
+            gc_stack_sp = this.backup_gc_sp
+        } else {
+            // Init stack
+            this.stack_base = sp
+            gc_stack_sp = null
+            this.init_stack(sp)
+            this.started = true
+        }
+
+        // Swap
+        SELF.swap(&main_state, @ref(this.state))
+
+        // Restore backup
+        if !this.done {
+            this.backup_gc_sp = gc_stack_sp
+
+            // Backup Main stack
+            let size : uint = this.stack_base - this.state.rsp
+            let asize = this.backup_main_stack_alloc_size
+            if size > asize {
+                if asize > 0 : mem:free(this.backup_main_stack)
+                this.backup_main_stack = mem:alloc(size)
+                this.backup_main_stack_alloc_size = size
+            }
+            this.backup_main_stack_size = size
+
+            if size > 0 {
+                mem:copy(this.state.rsp, this.backup_main_stack, this.backup_main_stack_size)
+            }
+        }
+
+        // Restore stack base
+        this.active = false
+        gc_stack_sp = gc_stack_sp_backup
+        current_coro = null
+
+        if this.done {
+            // Clean up
+            this.free_stacks()
+
+            // Next
+            let next = this.follow_up
+            if isset(next) {
+                this.follow_up = null
+                run_coros.append(next)
+            }
+        }
+    }
+
+    fn complete() {
+        this.done = true
+        this.handler = fn() {}
+        current_coro = null
+        g_coro_count--
+        let index = this.g_list_index
+
+        g_coros.set(index, null) _
+        g_coro_indexes.add(index)
+
+        this.yield()
+    }
+
+    //////////////
+    // LOOP
+    //////////////
+
+    static fn loop(until: ?Coro (null)) {
+        // Done check
+        if isset(until) && until.done : return
+
+        #if OS == "linux"
+        let ring = io:uring()
+        #elif OS == "macos"
+        let kq = io:kqueue()
+        #elif OS == "win"
+        let cport = io:iocp()
+        #end
+
+        while true {
+
+            let scheduled_coros = run_coros
+            run_coros = next_run_coros
+            next_run_coros = scheduled_coros
+            run_coros.clear()
+
+            each scheduled_coros as coro {
+                coro.resume()
+            }
+            scheduled_coros.clear()
+
+            // Done check
+            if isset(until) && until.done : break
+
+            // Wait for poll coros
+            #if OS == "linux"
+            if io:uring_unsubmitted > 0 : io:uring_submit(ring)
+            #end
+
+            gc:collect_if_threshold_almost_reached()
+            #if OS == "linux"
+            while true {
+                let cqe : ?*ext:io_uring_cqe = null
+                if run_coros.length == 0 {
+                    gc:unlock()
+                    io:io_uring_wait_cqe(ring, &cqe)
+                    gc:lock()
+                } else {
+                    io:io_uring_peek_cqe(ring, &cqe)
+                }
+                if !isset(cqe) {
+                    break
+                }
+                //
+                let coro = cqe.user_data.@cast(Coro)
+                run_coros.append(coro)
+                coro.poll_event = cqe.res.@cast(io:PollEvent)
+                coro.completion_res = cqe.res
+                io:io_uring_cqe_seen(ring, cqe)
+            }
+            #elif OS == "macos"
+            let events : [ext:kEvent x 64] = @undefined
+            gc:unlock()
+            let timeout : ?&ext:libc_gen_timespec = null
+            if run_coros.length > 0 {
+                let t : ext:libc_timespec = { tv_sec: 0, tv_nsec: 0 }
+                timeout = &t
+            }
+            let nevents = ext:kevent(kq, null, 0, &events[0], 64, timeout)
+            gc:lock()
+            while nevents-- > 0 {
+                let ev = events[nevents]
+                let coro = ev.udata.@cast(Coro)
+                if ev.filter == io:EVFILT_READ {
+                    coro.poll_event = ext:POLLIN
+                    coro.completion_res = ev.data
+                    if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = ext:POLLHUP
+                } else if ev.filter == io:EVFILT_WRITE {
+                    coro.poll_event = ext:POLLOUT
+                    coro.completion_res = ev.data
+                    if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = ext:POLLHUP
+                }
+                run_coros.append(coro)
+            }
+
+            #elif OS == "win"
+            win_wake_sleepers()
+            let first = run_coros.length == 0
+            let wait_ms = first ? win_sleep_timeout() : 0
+
+            let bytes: u32 = 0
+            let key: uint = 0
+            let ov: ?io:OverlapData = null
+            let result = false
+            if wait_ms == 0 {
+                result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, 0)
+            } else {
+                gc:unlock()
+                result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, wait_ms)
+                gc:lock()
+            }
+
+            while true {
+                if !isset(ov) {
+                    if !result && ext:GetLastError() != ext:WAIT_TIMEOUT {
+                        panic("GetQueuedCompletionStatus failed")
+                    }
+                    break
+                }
+                let coro = ov.base.coro.@cast(Coro)
+                ov.base.completed = true
+                coro.completion_res = bytes
+                if !ov.base.cancel_requested {
+                    coro.poll_event = coro.poll_event | io:completion_event(ov, result)
+                }
+                if !coro.iocp_ready {
+                    coro.iocp_ready = true
+                    run_coros.append(coro)
+                }
+
+                bytes = 0
+                key = 0
+                ov = null
+                result = ext:GetQueuedCompletionStatus(cport, &bytes, &key, &ov, 0)
+            }
+
+            #else
+            panic("Unsupported OS for: coroutine loop")
+            #end
+        }
+    }
+}
+
+#if OS == "win"
+fn win_wake_sleepers() {
+    let now = ext:GetTickCount64()
+    let i: uint = 0
+    while i < sleep_coros.length {
+        let coro = sleep_coros.get(i) !? null
+        if !isset(coro) {
+            sleep_coros.remove(i)
+            continue
+        }
+        if coro.done || coro.sleep_deadline_ms <= now {
+            sleep_coros.remove(i)
+            if !coro.done : run_coros.append(coro)
+            continue
+        }
+        i++
+    }
+}
+
+fn win_sleep_timeout() u32 {
+    if sleep_coros.length == 0 : return ext:INFINITE
+    let now = ext:GetTickCount64()
+    let nearest: u64 = 0
+    each sleep_coros as coro {
+        if coro.done : continue
+        if coro.sleep_deadline_ms <= now : return 0
+        if nearest == 0 || coro.sleep_deadline_ms < nearest : nearest = coro.sleep_deadline_ms
+    }
+    if nearest == 0 : return ext:INFINITE
+    let delay = nearest - now
+    if delay > 0xffffffff : return 0xffffffff
+    return delay.to(u32)
+}
+#end

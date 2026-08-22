@@ -1,0 +1,363 @@
+use helper
+use valk:core
+use valk:fs
+use valk:thread
+use valk:time
+use llvm
+
+class ObjectTask {
+    unit_name: String
+    ir_code: String
+    path_o: String
+    path_ir: String
+    llvm_triple: String
+    clang_command: String
+    // Keep shared integers before byte-sized fields for legacy compilers.
+    duration_us: uint (0)
+    optimize: bool
+
+    fn run() ?String {
+        let start = time:microtime()
+        if this.clang_command.length > 0 {
+            let code, output = core:exec(this.clang_command)
+            if code != 0 {
+                return this.finish(start, this.failure("clang failed while emitting unit '" + this.unit_name + "':\n# Exit code: " + code + "\n# Output: " + output))
+            }
+        } else {
+            let error = llvm_emit_object(this)
+            if isset(error) : return this.finish(start, this.failure(error))
+        }
+
+        fs:write(this.path_ir + "-prev", this.ir_code) ! {
+            return this.finish(start, "Failed to write cached IR: " + this.path_ir + "-prev")
+        }
+        return this.finish(start, null)
+    }
+
+    fn finish(start: uint, error: ?String) ?String {
+        this.duration_us = time:microtime() - start
+        return error
+    }
+
+    fn failure(message: String) String {
+        return message + "\nIR: " + this.path_ir
+    }
+}
+
+class ObjectThreadCompletionQueue {
+    mutex: shared core:SyncMutex (.new())
+    gate: shared thread:ThreadSuspendGate (.new())
+    completed: Array[uint] (.new())
+
+    fn push(index: uint) @shared_unsafe {
+        this.mutex.lock()
+        this.completed.append(index)
+        this.mutex.unlock()
+        this.gate.signal()
+    }
+
+    fn pop() ?uint @shared_unsafe {
+        this.mutex.lock()
+        let index: ?uint = this.completed.pop_first() !? null
+        this.mutex.unlock()
+        return index
+    }
+
+    fn is_empty() bool @shared_unsafe {
+        this.mutex.lock()
+        let empty = this.completed.length == 0
+        this.mutex.unlock()
+        return empty
+    }
+
+    fn await_next() uint @shared_unsafe {
+        while true {
+            let index = this.pop()
+            if isset(index) : return index
+            this.gate.wait(fn() bool { return this.is_empty() })
+        }
+    }
+}
+
+class ObjectThreadGroup {
+    state: shared ObjectThreadCompletionQueue (.{})
+    workers: Array[thread:Thread[?String]] (.new())
+    pending: uint (0)
+
+    static fn new() SELF {
+        return SELF {}
+    }
+
+    fn start(index: uint, task: ObjectTask) bool {
+        let state = this.state
+        let worker = thread:Thread[?String].start(fn() ?String {
+            let result = task.run()
+            state.push(index)
+            return result
+        }) ! { return false }
+        this.workers.append(worker)
+        this.pending++
+        return true
+    }
+
+    fn has_pending() bool {
+        return this.pending > 0
+    }
+
+    fn await_next() (uint, ?String) {
+        let index = this.state.await_next()
+        let worker = this.workers.get(index) ! { panic("Object thread group received an invalid completion index") }
+        let result = worker.await_result()
+        this.pending--
+        return (index, result)
+    }
+}
+
+fn emit_unit_objects(build: Build) !Error {
+    let tasks = Array[ObjectTask]{}
+    let units = Array[Unit]{}
+
+    if !build.options.use_clang : llvm_init_object_target(build.options.target)
+
+    each build.lists.units as unit {
+        if prepare_unit_object(build, unit) !> : continue
+        let command = ""
+        if build.options.use_clang {
+            command = clang_object_command(build, unit)
+            build.print_verbose(3, "# " + command)
+        }
+        tasks.append(ObjectTask {
+            unit_name: unit.name
+            ir_code: unit.ir_code
+            path_o: unit.path_o
+            path_ir: unit.path_ir
+            llvm_triple: ir_target_triple(build.options.target)
+            clang_command: command
+            optimize: build.options.optimize
+        })
+        units.append(unit)
+    }
+
+    run_object_tasks(build, tasks, units) !>
+}
+
+fn run_object_tasks(build: Build, tasks: Array[ObjectTask], units: Array[Unit]) !Error {
+    let group = ObjectThreadGroup.new()
+    let errors = Array[String]{}
+    let next = 0
+    let stopped = false
+
+    while next < tasks.length && next < 8 {
+        let task = tasks.get(next) ! build.error("Missing object generation task (bug)")
+        if !group.start(next, task) {
+            errors.append("Failed to start object generation thread")
+            stopped = true
+            break
+        }
+        next++
+    }
+
+    while group.has_pending() {
+        let index, error = group.await_next()
+        let task = tasks.get(index) ! build.error("Missing completed object generation task (bug)")
+        let duration_ms = task.duration_us.to(float) / 1000
+        build.print_verbose(3, "> Object task: " + duration_ms + "ms: " + task.path_ir)
+        if isset(error) {
+            errors.append(error)
+            stopped = true
+        } else {
+            let unit = units.get(index) ! build.error("Missing object generation unit (bug)")
+            unit.ir_code = ""
+        }
+
+        if !stopped && next < tasks.length {
+            let next_task = tasks.get(next) ! build.error("Missing object generation task (bug)")
+            if group.start(next, next_task) {
+                next++
+            } else {
+                errors.append("Failed to start object generation thread")
+                stopped = true
+            }
+        }
+    }
+
+    if errors.length > 0 : build.error(errors.join("\n\n"))
+}
+
+fn clang_object_command(build: Build, unit: Unit) String {
+    let target = build.options.target
+    let cmd = "clang -c -x ir \""
+    cmd += unit.path_ir
+    cmd += "\" -o \""
+    cmd += unit.path_o
+    cmd += "\" --target="
+    cmd += ir_target_triple(target)
+    if target.os != "win" : cmd += " -fPIC"
+    // No -g: the generated IR carries no debug metadata for clang to keep.
+    cmd += build.options.optimize ? " -O3" : " -O0"
+    return cmd
+}
+
+fn prepare_unit_object(build: Build, unit: Unit) bool !Error {
+    if unit.ir_code.length == 0 : return true
+    let dir = object_output_dir(build) !>
+    unit.path_o = helper:add(dir, unit.name + ".o")
+    unit.path_ir = helper:add(dir, unit.name + ".ir")
+
+    let path_prev = unit.path_ir + "-prev"
+    let unchanged = !build.options.is_clean_build
+        && fs:exists(unit.path_o)
+        && helper:file_has_same_content(path_prev, unit.ir_code)
+    if unchanged {
+        unit.ir_code = ""
+        return true
+    }
+
+    fs:write(unit.path_ir, unit.ir_code) ! build.error("Failed to write IR: " + unit.path_ir)
+    return false
+}
+
+fn object_output_dir(build: Build) String !Error {
+    if build.cache.object_dir.length > 0 : return build.cache.object_dir
+
+    let home = fs:home_dir() ! build.error("Cannot find the home directory for the object cache")
+    let root = helper:add(home, ".valk")
+    if !fs:is_dir(root) : fs:mkdir(root) ! build.error("Failed to create object cache directory: " + root)
+    root = helper:add(root, "cache")
+    if !fs:is_dir(root) : fs:mkdir(root) ! build.error("Failed to create object cache directory: " + root)
+
+    let identity = build.options.path_out ?? fs:cwd()
+    identity += "|"
+    if build.options.mode == BUILDTYPE.lib : identity += "lib"
+    else if build.options.mode == BUILDTYPE.ir : identity += "ir"
+    else : identity += "exe"
+    identity += "|"
+    identity += build.options.target.target
+    identity += build.options.optimize ? "|opt" : "|no-opt"
+    identity += build.options.is_test ? "|test" : "|no-test"
+    if build.options.use_clang : identity += "|clang"
+    else : identity += "|llvm"
+    identity += "|"
+    identity += VERSION
+    let dir = helper:add(root, helper:ctxhash(identity))
+    if !fs:is_dir(dir) : fs:mkdir(dir) ! build.error("Failed to create object cache directory: " + dir)
+    build.cache.object_dir = dir
+    build.print_verbose(1, "📦 Cache directory: " + dir)
+    return dir
+}
+
+fn llvm_emit_object(task: shared ObjectTask) ?String {
+    let target: ?llvm:LLVMTargetRef = null
+    let message: ?cstring = null
+    if llvm:LLVMGetTargetFromTriple(task.llvm_triple.data, @ref(target), @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        return "LLVM could not select target '" + task.llvm_triple + "': " + detail
+    }
+    if !isset(target) : return "LLVM did not create a target for: " + task.llvm_triple
+
+    let cpu = "generic"
+    let features = ""
+    let level: i32 = task.optimize ? llvm:LLVMCodeGenLevelAggressive : llvm:LLVMCodeGenLevelDefault
+    let machine = llvm:LLVMCreateTargetMachine(target, task.llvm_triple.data, cpu.data, features.data, level, llvm:LLVMRelocPIC, llvm:LLVMCodeModelDefault)
+    if !isset(machine) : return "LLVM failed to create a target machine for: " + task.llvm_triple
+
+    let context = llvm:LLVMContextCreate()
+    let name = task.unit_name + ".ll"
+    let buffer = llvm:LLVMCreateMemoryBufferWithMemoryRangeCopy(task.ir_code.data, task.ir_code.bytes, name.data)
+    let module: ?llvm:LLVMModuleRef = null
+    message = null
+
+    if llvm:LLVMParseIRInContext(context, buffer, @ref(module), @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM IR parse failed while emitting unit '" + task.unit_name + "':\n" + detail
+    }
+    if !isset(module) {
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM IR parser did not create a module while emitting unit: " + task.unit_name
+    }
+
+    message = null
+    if llvm:LLVMVerifyModule(module, llvm:LLVMReturnStatusAction, @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMDisposeModule(module)
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM IR verification failed while emitting unit '" + task.unit_name + "':\n" + detail
+    }
+    if isset(message) {
+        llvm:LLVMDisposeMessage(message)
+        message = null
+    }
+
+    llvm_configure_object_module(module, machine, task.llvm_triple)
+    if task.optimize {
+        let error = llvm_optimize_object_module(module, machine)
+        if isset(error) {
+            llvm:LLVMDisposeModule(module)
+            llvm:LLVMContextDispose(context)
+            llvm:LLVMDisposeTargetMachine(machine)
+            return "LLVM optimization failed for unit '" + task.unit_name + "':\n" + error
+        }
+    }
+
+    if llvm:LLVMTargetMachineEmitToFile(machine, module, task.path_o.data, llvm:LLVMObjectFile, @ref(message)) {
+        let detail = llvm_message_text(message)
+        if isset(message) : llvm:LLVMDisposeMessage(message)
+        llvm:LLVMDisposeModule(module)
+        llvm:LLVMContextDispose(context)
+        llvm:LLVMDisposeTargetMachine(machine)
+        return "LLVM failed to emit object for unit '" + task.unit_name + "':\n" + detail
+    }
+
+    if isset(message) : llvm:LLVMDisposeMessage(message)
+    llvm:LLVMDisposeModule(module)
+    llvm:LLVMContextDispose(context)
+    llvm:LLVMDisposeTargetMachine(machine)
+    return null
+}
+
+fn llvm_message_text(message: ?cstring) String {
+    if !isset(message) : return "<no LLVM diagnostic>"
+    return message
+}
+
+fn llvm_configure_object_module(module: llvm:LLVMModuleRef, machine: llvm:LLVMTargetMachineRef, triple: String) {
+    llvm:LLVMSetTarget(module, triple.data)
+    let layout = llvm:LLVMCreateTargetDataLayout(machine)
+    let text = llvm:LLVMCopyStringRepOfTargetData(layout)
+    llvm:LLVMSetDataLayout(module, text)
+    llvm:LLVMDisposeMessage(text)
+    llvm:LLVMDisposeTargetData(layout)
+}
+
+fn llvm_optimize_object_module(module: llvm:LLVMModuleRef, machine: llvm:LLVMTargetMachineRef) ?String {
+    let options = llvm:LLVMCreatePassBuilderOptions()
+    let passes = "default<O3>"
+    let error = llvm:LLVMRunPasses(module, passes.data, machine, options)
+    llvm:LLVMDisposePassBuilderOptions(options)
+    if !isset(error) : return null
+    let message = llvm:LLVMGetErrorMessage(error)
+    let detail: String = message
+    llvm:LLVMDisposeErrorMessage(message)
+    return detail
+}
+
+fn llvm_init_object_target(target: Target) {
+    if target.arch == "x64" {
+        llvm:LLVMInitializeX86TargetInfo()
+        llvm:LLVMInitializeX86Target()
+        llvm:LLVMInitializeX86TargetMC()
+        llvm:LLVMInitializeX86AsmPrinter()
+    } else {
+        llvm:LLVMInitializeAArch64TargetInfo()
+        llvm:LLVMInitializeAArch64Target()
+        llvm:LLVMInitializeAArch64TargetMC()
+        llvm:LLVMInitializeAArch64AsmPrinter()
+    }
+}

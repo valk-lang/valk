@@ -1,0 +1,206 @@
+
+class ParseState {
+    // For each open #if: true once some branch body has been accepted
+    if_taken: Array[bool] (.{})
+    // True while skipping a false (or already-taken) branch body
+    skip: bool (false)
+    // Nested #if / #loop depth while skip is true (0 = at the branch being skipped)
+    skip_nest: uint (0)
+    saw_macro: bool (false)
+
+    static fn new() SELF {
+        return SELF {}
+    }
+
+    fn is_skipping() bool {
+        return this.skip
+    }
+
+    fn has_open_if() bool {
+        return this.if_taken.length > 0
+    }
+
+    fn begin_skip(at: Exp) {
+        this.skip = true
+        this.skip_nest = 0
+        at.src.skipped_code = true
+    }
+}
+
+fn parse_macro_exp(ns: Namespace, scope: Scope, state: ParseState, exp: Exp) !Error {
+    let kind = exp.kind.@cast(MACRO_KIND)
+
+    if kind == MACRO_KIND.if {
+        parse_macro_if(ns, scope, state, exp) !>
+        return
+    }
+    if kind == MACRO_KIND.elif {
+        parse_macro_elif(ns, scope, state, exp) !>
+        return
+    }
+    if kind == MACRO_KIND.else {
+        parse_macro_else(state, exp) !>
+        return
+    }
+    if kind == MACRO_KIND.end {
+        parse_macro_end(state, exp) !>
+        return
+    }
+
+    // Nested #loop inside a skipped region must still nest so #end matches correctly
+    if state.is_skipping() {
+        if kind == MACRO_KIND.loop {
+            state.skip_nest++
+        }
+        return
+    }
+
+    if kind == MACRO_KIND.error {
+        exp.error(exp.str2 ?? "#error")
+    }
+    if kind == MACRO_KIND.print {
+        print_macro_value(ns, scope, exp) !>
+        return
+    }
+
+    // #loop is expanded by the caller, which has the enclosing statement range.
+}
+
+fn print_macro_value(ns: Namespace, scope: Scope, exp: Exp) !Error {
+    let value_exp = exp.get(MACRO_EXP.value)
+    if !isset(value_exp) : exp.bug("Missing '#print' value")
+    normalize_legacy_macro_names(value_exp, scope)
+    let ctx = Context.for_scope(ns.build, scope)
+    let v = value_from_exp(value_exp, scope, ctx) !>
+    if isset(ns.build.options.lsp) : return
+
+    if v.type == VAL.string : println(v.get_string())
+    else if v.type == VAL.int : println(v.int_val)
+    else if v.type == VAL.float : println(v.float_val)
+    else if v.type == VAL.bool : println(v.bool_val ? "true" : "false")
+    else if v.type == VAL.null : println("null")
+    else if v.type == VAL.type {
+        let t = v.as_type()
+        if isset(t) : println(t.compat_display_name())
+        else : println("<type>")
+    } else {
+        println(v.rett.compat_display_name())
+    }
+}
+
+fn parse_macro_if(ns: Namespace, scope: Scope, state: ParseState, exp: Exp) !Error {
+    if state.skip {
+        // Nested #if inside a skipped branch — only track depth
+        state.skip_nest++
+        return
+    }
+
+    let ok = eval_macro_condition(ns, scope, exp) !>
+    state.if_taken.append(ok)
+    if !ok {
+        state.begin_skip(exp)
+    }
+}
+
+fn parse_macro_elif(ns: Namespace, scope: Scope, state: ParseState, exp: Exp) !Error {
+    if state.skip {
+        if state.skip_nest > 0 : return
+        // At the #if level we are skipping — maybe this branch matches
+        if !state.has_open_if() {
+            exp.error("Unexpected '#elif'. There is no matching '#if'")
+        }
+        let i = state.if_taken.length - 1
+        let taken = state.if_taken.get(i) ! exp.bug("Missing #if frame")
+        if taken {
+            // A prior branch was already accepted; skip this elif body
+            state.begin_skip(exp)
+            return
+        }
+        let ok = eval_macro_condition(ns, scope, exp) !>
+        if ok {
+            state.if_taken.set(i, true) ! exp.bug("Missing #if frame")
+            state.skip = false
+        } else {
+            state.begin_skip(exp)
+        }
+        return
+    }
+
+    // Currently in a live branch body — subsequent elif/else bodies are skipped
+    if !state.has_open_if() {
+        exp.error("Unexpected '#elif'. There is no matching '#if'")
+    }
+    state.begin_skip(exp)
+}
+
+fn parse_macro_else(state: ParseState, exp: Exp) !Error {
+    if state.skip {
+        if state.skip_nest > 0 : return
+        if !state.has_open_if() {
+            exp.error("Unexpected '#else'. There is no matching '#if'")
+        }
+        let i = state.if_taken.length - 1
+        let taken = state.if_taken.get(i) ! exp.bug("Missing #if frame")
+        if taken {
+            state.begin_skip(exp)
+        } else {
+            state.if_taken.set(i, true) ! exp.bug("Missing #if frame")
+            state.skip = false
+        }
+        return
+    }
+
+    if !state.has_open_if() {
+        exp.error("Unexpected '#else'. There is no matching '#if'")
+    }
+    // Live branch already taken — skip the else body
+    state.begin_skip(exp)
+}
+
+fn parse_macro_end(state: ParseState, exp: Exp) !Error {
+    if state.skip {
+        if state.skip_nest > 0 {
+            state.skip_nest--
+            return
+        }
+        // Matching #end for the branch we were skipping
+        if !state.has_open_if() {
+            exp.error("Unexpected '#end'. There is no matching '#if' or '#loop'")
+        }
+        state.if_taken.pop_last() ! exp.bug("Missing #if frame")
+        state.skip = false
+        return
+    }
+
+    if !state.has_open_if() {
+        exp.error("Unexpected '#end'. There is no matching '#if' or '#loop'")
+    }
+    state.if_taken.pop_last() ! exp.bug("Missing #if frame")
+}
+
+// Evaluate #if / #elif condition: value_from_exp must resolve to a constant VAL.bool.
+fn eval_macro_condition(ns: Namespace, scope: Scope, macro_exp: Exp) bool !Error {
+    let cond = macro_exp.get(MACRO_EXP.value)
+    if !isset(cond) : macro_exp.bug("Missing macro condition value")
+    normalize_legacy_macro_names(cond, scope)
+    let ctx = Context.for_scope(ns.build, scope)
+    let v = value_from_exp(cond, scope, ctx.with_suggested_type(type_bool(ns.build))) !>
+    if v.type == VAL.bool : return v.bool_val
+    macro_exp.error("Cannot resolve compile-time condition to a boolean value")
+}
+
+fn normalize_legacy_macro_names(exp: Exp, scope: Scope) {
+    if exp.type == EXP.value && exp.kind == VALUE_KIND.id {
+        let id = exp.get(VALUE_EXP.left)
+        if isset(id) && !isset(id.str2) && !isset(scope.get_idf(id.str1)) {
+            exp.kind = VALUE_KIND.string
+            exp.str1 = id.str1
+            return
+        }
+    }
+    let subs = exp.sub_exps
+    if !isset(subs) : return
+    each subs as sub {
+        if isset(sub) : normalize_legacy_macro_names(sub, scope)
+    }
+}

@@ -1,0 +1,183 @@
+use helper
+use valk:fs
+
+class Pkg {
+    build: Build
+    dir: ?String (null)
+    srcdir: ?String (null)
+    config: ?helper:Config (null)
+    name: String ("main")
+    namespaces: Map[Namespace] (.{})
+    // Dependency packages loaded from this package (by dependency name)
+    sub_pkgs: Map[Pkg] (.{})
+    scope: Scope
+
+    static fn new(b: Build, dir: String) Pkg {
+        dir = helper:resolve(dir)
+
+        let srcdir = helper:add(dir, "src")
+        let config = helper:Config.load(helper:add(dir, "valk.json")) !? null
+        if isset(config) {
+            let src = config.json.get("src")
+            if src.is_string() {
+                srcdir = helper:resolve(helper:add(dir, src.string()))
+            }
+        }
+
+        let pkg = Pkg {
+            build: b
+            dir: dir
+            srcdir: srcdir
+            config: config
+            scope: b.scope.sub_scope()
+        }
+        pkg.load_config_defs()
+        b.cache.package_dirs.set(dir, pkg)
+        return pkg
+    }
+
+    fn load_config_defs() {
+        let config = this.config ?! return
+        let defs = config.json.get("define").object().values
+        each defs as value, name {
+            if value.is_bool() {
+                this.build.set_macro_def_bool_in(this.scope, name, value.bool())
+            } else if value.is_string() {
+                this.build.set_package_def_value_in(this.scope, name, value.string())
+            }
+        }
+        this.build.set_cli_macro_defs_in(this.scope)
+    }
+
+    // Package with no filesystem root (used when building loose files outside a valk.json package).
+    static fn new_main(b: Build) Pkg {
+        return Pkg {
+            build: b
+            name: "main"
+            scope: b.scope.sub_scope()
+        }
+    }
+
+    // True if path is the package source root or a path inside it.
+    fn contains_path(path: String) bool {
+        path = helper:resolve(path)
+        let srcdir = this.srcdir
+        if !isset(srcdir) : return false
+        if path == srcdir : return true
+        return path.starts_with(srcdir + fs:PATH_DIV)
+    }
+
+    // True if `name` is a dependency package (or the built-in `valk` / `main` packages).
+    fn pkg_exists(name: String) bool {
+        if name == "valk" || name == "main" : return true
+        let config = this.config
+        if !isset(config) : return false
+        return config.has_pkg(name)
+    }
+
+    // Resolve the filesystem directory for a dependency package name.
+    fn sub_pkg_dir(name: String) String !Error {
+        if name == "valk" : return helper:valk_lib_dir()
+
+        let config = this.config
+        if !isset(config) {
+            this.build.error("Cannot load package '" + name + "', missing config file")
+        }
+        let d = config.get_package_dir(name) ! {
+            if E.code == E.nosrc : this.build.error("The package named '" + name + "' has no valid 'src' defined in your dependencies")
+            if E.code == E.noversion : this.build.error("The package named '" + name + "' has no valid 'version' defined in your dependencies")
+            this.build.error("No package named '" + name + "' found in your dependencies")
+        }
+        if !fs:exists(d) {
+            this.build.error("Have you installed all your dependencies? Package directory not found: " + d)
+        }
+        return d
+    }
+
+    // Load a dependency package by name (sub-package of this package).
+    fn load_sub_pkg(name: String) Pkg !Error {
+        if name == "main" {
+            return this.build.main_pkg ?! this.build.error("Missing 'main' package (bug)")
+        }
+
+        this.sub_pkgs.get(name) -> existing : return existing
+
+        let dir = this.sub_pkg_dir(name) !>
+        dir = helper:resolve(dir)
+
+        // Reuse package if this directory was already loaded under another name/path.
+        this.build.cache.package_dirs.get(dir) -> existing {
+            this.sub_pkgs.set(name, existing)
+            if existing.name == "main" || name == "valk" : existing.name = name
+            return existing
+        }
+
+        let pkg = Pkg.new(this.build, dir)
+        pkg.name = name
+        this.sub_pkgs.set(name, pkg)
+        return pkg
+    }
+
+    fn load_all_namespaces() !Error {
+        let srcdir = this.srcdir
+        if !isset(srcdir) : return
+        this.load_namespace("main", false) !>
+        let dirs = fs:files_in(srcdir, true, false, true, "")
+        each dirs as dir {
+            this.load_namespace(dir, false) !>
+        }
+    }
+
+    // Resolve namespace and load its source files into the pipeline.
+    fn load_namespace(name: String, must_exist: bool (true)) Namespace !Error {
+        let ns = this.get_namespace(name, must_exist) !>
+        ns.load_files() !>
+        return ns
+    }
+
+    fn get_namespace(name: String, must_exist: bool (true)) Namespace !Error {
+        this.namespaces.get(name) -> ns : return ns
+
+        let srcdir = this.srcdir
+        if !isset(srcdir) {
+            if name == "main" {
+                let ns = Namespace {
+                    pkg: this
+                    name: name
+                    build: this.build
+                    scope: this.scope.sub_scope()
+                }
+                this.namespaces.set(name, ns)
+                this.build.lists.namespaces.append(ns)
+                return ns
+            }
+            this.build.error("You cannot load a namespace without having a `valk.json` config. This config defines where your namespaces are located. Default location: {config-dir}/src/{namespace}")
+        }
+
+        // Prefer explicit path from config.namespaces, else {srcdir}/{name}.
+        let dir: String = (name == "main") ? srcdir : helper:add(srcdir, name)
+        let config = this.config
+        let pkg_dir = this.dir
+        if isset(config) && isset(pkg_dir) {
+            let rel = config.get_nsc_dir(name)
+            if isset(rel) {
+                dir = helper:resolve(helper:add(pkg_dir, rel))
+            }
+        }
+
+        if must_exist && !fs:is_dir(dir) {
+            this.build.error("Cannot find the '" + name + "' namespace directory: " + dir)
+        }
+
+        let ns = Namespace {
+            pkg: this
+            name: name
+            build: this.build
+            dir: dir
+            scope: this.scope.sub_scope()
+        }
+        this.namespaces.set(name, ns)
+        this.build.lists.namespaces.append(ns)
+        return ns
+    }
+}

@@ -1,0 +1,228 @@
+
+use helper
+
+class AllocatorCondition {
+    offset: u32
+    tag: uint
+}
+
+class AllocatorProp {
+    offset: u32
+    conditions: Array[AllocatorCondition] (.{})
+}
+
+class Allocator {
+    build: Build
+    global: Global
+    size: u32
+    class: Class
+    props: Array[AllocatorProp] (.{})
+    element_props: Array[AllocatorProp] (.{})
+    element_size: u32 (0)
+    length_offset: u32 (0)
+    data_offset: u32 (0)
+    props_func: ?Func (null)
+    onfree: ?Func (null)
+    pool_get: Func
+}
+
+fn allocator_pool_size(b: Build, size: u32) u32 {
+    let psz = b.options.target.ptr_size.to(u32)
+    let until = 16 * psz
+    if size <= until {
+        let slots = size / psz
+        if size % psz != 0 : slots++
+        return slots * psz
+    }
+    let result = until * 2
+    while result < size : result *= 2
+    return result
+}
+
+fn allocator_copy_conditions(conditions: Array[AllocatorCondition]) Array[AllocatorCondition] {
+    let copy = Array[AllocatorCondition]{}
+    each conditions as condition : copy.append(condition)
+    return copy
+}
+
+fn allocator_add_prop(offset: u32, conditions: Array[AllocatorCondition], out: Array[AllocatorProp]) {
+    out.append(AllocatorProp {
+        offset: offset
+        conditions: allocator_copy_conditions(conditions)
+    })
+}
+
+fn allocator_collect_props(
+    type: Type,
+    base_offset: u32,
+    out: Array[AllocatorProp],
+    conditions: Array[AllocatorCondition] (.{})
+) !Error {
+    if type.is_nullable_type() {
+        let sub = type.get_sub_type()
+        if isset(sub) && !sub.is_pointer() && sub.kind != TYPE.closure {
+            allocator_collect_props(sub, base_offset + type.ptr_size(), out, conditions) !>
+            return
+        }
+    }
+    if type.get_non_nullable().kind == TYPE.closure {
+        allocator_add_prop(base_offset + type.build.options.target.ptr_size.to(u32), conditions, out)
+        return
+    }
+    if type.is_gc_type() {
+        allocator_add_prop(base_offset, conditions, out)
+        return
+    }
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.union {
+        let layout = t.union_layout() !>
+        let members = t.get_members()
+        if isset(members) {
+            each members as member, tag {
+                if !member.has_gc_refs() : continue
+                let active = allocator_copy_conditions(conditions)
+                active.append(AllocatorCondition {
+                    offset: base_offset
+                    tag: tag
+                })
+                allocator_collect_props(
+                    member,
+                    base_offset + layout.payload_offset,
+                    out,
+                    active
+                ) !>
+            }
+        }
+        return
+    }
+    if t.is_tuple_type() {
+        let subs = t.get_members()
+        if !isset(subs) : return
+        let offset: u32 = 0
+        each subs as sub {
+            offset = sub.ir_align_offset(offset) !>
+            allocator_collect_props(sub, base_offset + offset, out, conditions) !>
+            offset += sub.byte_size() !>
+        }
+        return
+    }
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
+        if !isset(sub) : return
+        let stride = sub.byte_size() !>
+        let i: u32 = 0
+        while i < t.length {
+            allocator_collect_props(sub, base_offset + stride * i, out, conditions) !>
+            i++
+        }
+        return
+    }
+    let inline_class = t.class
+    if t.is_inline && isset(inline_class) {
+        inline_class.compute_body_size() !>
+        each inline_class.props as prop {
+            allocator_collect_props(prop.type, base_offset + prop.offset, out, conditions) !>
+        }
+    }
+}
+
+fn allocator_pool_global(b: Build, name: String, at: Exp) Global !Error {
+    let pool_idf = valk_idf(b, "gc", "Pool") !>
+    let pool_class = pool_idf.class
+    if !isset(pool_class) : at.bug("gc:Pool identifier is not a class")
+    let g = Global {
+        unit: pool_class.unit
+        ns: pool_class.ns
+        name: name
+        act: ACT.private
+        kind: GLOBAL_KIND.global
+        scope: pool_class.scope
+        exp: at
+        type: (pool_class.get_type() !>).pointer()
+    }
+    pool_class.unit.globals.append(g)
+    b.lists.globals.append(g)
+    return g
+}
+
+fn allocator_pool_get(g: Global, name: String, at: Exp) Func !Error {
+    let pool_class = (g.get_type() !>).get_class_or_null() ?! at.bug("Generated allocator global is not a Pool")
+    let pool_get = pool_class.get_func(name) ?! at.bug("gc:Pool has no '" + name + "' method")
+    if !pool_get.parsed_types : parse_func_types(pool_get) !>
+    return pool_get
+}
+
+fn allocator_for_type(ctx: Context, type: Type, at: Exp) Allocator !Error {
+    let b = ctx.build
+    let layout = type.get_non_nullable()
+    let key = "payload:" + type_identity_key(layout)
+    let cached = b.cache.allocators.get(key) !? null
+    if isset(cached) : return cached
+
+    let size = allocator_pool_size(b, layout.byte_size() !>)
+    if size == 0 : at.error("Unknown allocator size for type: " + layout.compat_display_name())
+
+    let box_idf = valk_idf(b, "core", "TaggedUnion") !>
+    let box_class = box_idf.class
+    if !isset(box_class) : at.bug("core:TaggedUnion is not a class")
+    let g = allocator_pool_global(b, "ALC_" + size + "__Payload__" + helper:ctxhash(key), at) !>
+
+    let alc = Allocator {
+        build: b
+        global: g
+        size: size
+        class: box_class
+        props_func: null
+        onfree: null
+        pool_get: allocator_pool_get(g, "get", at) !>
+    }
+    allocator_collect_props(layout, 0, alc.props) !>
+    b.cache.allocators.set(key, alc)
+    b.lists.allocators.append(alc)
+    return alc
+}
+
+fn allocator_for_class(ctx: Context, class: Class, at: Exp) Allocator !Error {
+    let b = ctx.build
+    let key = class.ns.pkg.name + ":" + class.ns.name + ":" + class.name
+    let cached = b.cache.allocators.get(key) !? null
+    if isset(cached) : return cached
+
+    let size = allocator_pool_size(b, class.compute_body_size() !>)
+    if size == 0 : at.error("Unknown allocator size for type: " + class.pretty_name())
+
+    let g = allocator_pool_global(b, "ALC_" + size + "__" + class.name + "__" + helper:ctxhash(key), at) !>
+
+    let onfree = class.get_func("gc_free")
+    let get_name = isset(onfree) ? "get_vtable" : "get"
+
+    let alc = Allocator {
+        build: b
+        global: g
+        size: size
+        class: class
+        props_func: (class.kind == CLASS_KIND.array || class.kind == CLASS_KIND.slice) ? null : class.get_func("_props")
+        onfree: onfree
+        pool_get: allocator_pool_get(g, get_name, at) !>
+    }
+    each class.props as prop {
+        allocator_collect_props(prop.type, prop.offset, alc.props) !>
+    }
+    if class.kind == CLASS_KIND.array {
+        let element = class.slice_type
+        if !isset(element) : class.exp.bug("Array is missing its element type")
+        if element.has_gc_refs() {
+            allocator_collect_props(element, 0, alc.element_props) !>
+            alc.element_size = element.byte_size() !>
+            let length_prop = class.get_prop_by_name("length") !? null
+            if !isset(length_prop) : class.exp.bug("Array length property is missing")
+            let data_prop = class.get_prop_by_name("data") !? null
+            if !isset(data_prop) : class.exp.bug("Array data property is missing")
+            alc.length_offset = length_prop.offset
+            alc.data_offset = data_prop.offset
+        }
+    }
+    b.cache.allocators.set(key, alc)
+    b.lists.allocators.append(alc)
+    return alc
+}

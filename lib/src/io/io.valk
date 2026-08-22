@@ -1,0 +1,293 @@
+
+use ext
+use coro
+use core
+use mem
+
++ enum MODE {
+    text
+    binary
+}
+
++ fn set_mode(fd: FD, mode: MODE) {
+    #if OS == "win"
+    if mode == MODE.text {
+        ext:_setmode(fd.to(i32), ext:O_TEXT)
+    } else if mode == MODE.binary {
+        ext:_setmode(fd.to(i32), ext:O_BINARY)
+    }
+    #end
+}
+
+// Read
++ fn read(fd: FD, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError {
+    buf.reserve_space(amount)
+    let res = read_to_ptr(fd, buf.data.@offset(buf.length), amount, offset) !>
+    buf.skip(res)
+    return res
+}
++ fn read_to_ptr_sync(fd: FD, buf: ptr, amount: uint, offset: uint) uint !IoError {
+    let rcvd = ext:read(fd.to(i32), buf, amount.to(u32))
+    if rcvd < 0 : throw .read
+    return rcvd
+}
++ fn read_to_ptr(fd: FD, buf: ptr, amount: uint, offset: uint) uint !IoError {
+
+    let coro = coro:current_coro
+    if !isset(coro) : return read_to_ptr_sync(fd, buf, amount, offset) !>
+
+    #if OS == "linux"
+    let sqe = sqe(coro) ! throw .os
+    io_uring_prep_read(sqe, fd, buf, amount.to(u32), offset)
+
+    #elif OS == "win"
+    let ov = overlap[OverlapRecv]()
+    ov.buflen = amount
+    ov.buf = buf
+    ov.base.sys.Offset = (offset & 0xFFFFFFFF).to(u32)
+    ov.base.sys.OffsetHigh = (offset >> 32).to(u32)
+
+    let ok = ext:ReadFile(fd, buf, amount.to(u32), null, ov.@cast(ptr))
+    if !ok && ext:GetLastError() != ext:ERROR_IO_PENDING : throw .read
+    coro:yield()
+
+    ok = ext:GetOverlappedResult(fd, ov.@cast(ptr), @ref(ov.rcvd), true)
+    if !ok || ov.base.sys.Internal != 0 {
+        throw .read
+    }
+
+    let rcvd = ov.rcvd
+    return rcvd
+
+    #elif OS == "macos"
+    while true {
+        let res = ext:read(fd, buf, amount.to(u32))
+        if res < 0 {
+            if ext:errno == ext:EAGAIN {
+                let ev = await_fd(fd, true, false)
+                if ev.is_closed() || !ev.is_readable() : throw .read
+                continue
+            }
+            throw .read
+        }
+        return res.to(uint)
+    }
+    return 0
+
+    #elif OS == "bsd"
+    let cb = aio()
+    cb.fd = fd
+    cb.offset = offset.to(i64)
+    cb.buf = buf
+    cb.len = amount.to(i64)
+
+    let kq = kqueue()
+    cb.sig.kq = kq
+    cb.sig.kevent_flags = EV_ADD | EV_ENABLE | EV_ONESHOT
+    cb.sig.notify = SIGEV_KEVENT
+
+    ext:aio_read(cb)
+
+    #else
+    #error "IO read: Unsupported OS"
+    #end
+
+    #if OS == "linux" || OS == "bsd"
+    coro:yield()
+    #if OS == "bsd"
+    let rcvd = ext:aio_return(cb)
+    aio_free(cb)
+    #else
+    let rcvd = coro.completion_res
+    #end
+    if rcvd < 0 : throw .read
+    return rcvd.@cast(uint)
+    #end
+}
+
+// Write
++ fn write(fd: FD, buf: ByteBuffer, amount: uint) uint !IoError {
+    if amount > buf.length : amount = buf.length
+    return write_from_ptr(fd, buf.data, amount) !>
+}
++ fn write_string(fd: FD, str: String) uint !IoError {
+    return write_from_ptr(fd, str.data, str.length) !>
+}
++ fn write_from_ptr_sync(fd: FD, buf: ptr, amount: uint) uint !IoError {
+    let sent = ext:write(fd.to(i32), buf, amount.to(u32))
+    if sent < 0 : throw .write
+    return sent
+}
++ fn write_from_ptr(fd: FD, buf: ptr, amount: uint) uint !IoError {
+
+    let coro = coro:current_coro
+
+    #if OS == "linux"
+    if !isset(coro) {
+        let sent = ext:write(fd, buf, amount.to(u32))
+        if sent < 0 : throw .write
+        return sent
+    }
+    //
+    let sqe = sqe(coro) ! throw .os
+    io_uring_prep_write(sqe, fd, buf, amount.to(u32), -1)
+    coro:yield()
+    let sent = coro.completion_res
+    if sent < 0 : throw .write
+    return sent.@cast(uint)
+
+    #elif OS == "win"
+
+    let ov = overlap[OverlapSend]()
+    ov.buflen = amount
+    ov.buf = buf
+    ov.base.sys.Offset = 0xFFFFFFFF
+    ov.base.sys.OffsetHigh = 0xFFFFFFFF
+
+    let ok = ext:WriteFile(fd, buf, amount.to(u32), null, ov.@cast(ptr))
+    if !ok && ext:GetLastError() != ext:ERROR_IO_PENDING {
+        throw .write
+    }
+    coro:yield()
+
+    ok = ext:GetOverlappedResult(fd, ov.@cast(ptr), @ref(ov.sent), true)
+    if !ok || ov.base.sys.Internal != 0 {
+        throw .write
+    }
+
+    let sent = ov.sent
+    return sent
+
+    #elif OS == "macos"
+    let sent = ext:write(fd, buf, amount.to(u32))
+    if sent < 0 : throw .write
+    return sent.@cast(uint)
+
+    #else
+    #error "IO write: Unsupported OS"
+    #end
+}
+
+
++ fn await_fd(fd: FD, read: bool, write: bool) PollEvent {
+
+    if !read && !write : return 0
+
+    let coro = coro:current_coro
+    if !isset(coro) {
+        panic("Polling outside coroutine")
+    }
+
+    #if OS == "linux"
+    let sqe = sqe(coro) ! return ext:POLLERR
+    let events : u32 = ext:POLLERR | ext:POLLHUP | ext:POLLRDHUP
+    if read : events = events | ext:POLLIN
+    if write : events = events | ext:POLLOUT
+    io_uring_prep_poll_add(sqe, fd, events)
+
+    #elif OS == "macos"
+    let kq = kqueue()
+    let ev : ext:kEvent = @undefined
+
+    if read {
+        EV_SET(&ev, fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, 0, coro.@cast(ptr));
+        if ext:kevent(kq, &ev, 1, null, 0, null) < 0 {
+            return ext:POLLERR
+        }
+    } else if write {
+        EV_SET(&ev, fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, 0, coro.@cast(ptr));
+        if ext:kevent(kq, &ev, 1, null, 0, null) < 0 {
+            return ext:POLLERR
+        }
+    }
+
+    #elif OS == "win"
+    if read && write {
+        let read_ov = overlap[OverlapData]()
+        let write_ov = overlap[OverlapData]()
+        read_ov.base.event = ext:POLLIN
+        write_ov.base.event = ext:POLLOUT
+
+        let read_ok = ext:ReadFile(fd, null, 0, null, read_ov.@cast(ptr))
+        if !read_ok && ext:GetLastError() != ext:ERROR_IO_PENDING : return ext:POLLERR
+        let write_ok = ext:WriteFile(fd, null, 0, null, write_ov.@cast(ptr))
+        if !write_ok && ext:GetLastError() != ext:ERROR_IO_PENDING {
+            cancel_overlap(fd, read_ov.@cast(ptr), coro)
+            return ext:POLLERR
+        }
+        return await_overlaps(fd, read_ov.@cast(ptr), write_ov.@cast(ptr), coro)
+    }
+
+    let ov = overlap[OverlapData]()
+    let ok = false
+    if read {
+        ov.base.event = ext:POLLIN
+        ok = ext:ReadFile(fd, null, 0, null, ov.@cast(ptr))
+    } else {
+        ov.base.event = ext:POLLOUT
+        ok = ext:WriteFile(fd, null, 0, null, ov.@cast(ptr))
+    }
+    if !ok && ext:GetLastError() != ext:ERROR_IO_PENDING : return ext:POLLERR
+
+    #else
+    #error "IO poll: Unsupported OS"
+    #end
+
+    coro.yield()
+    return coro.poll_event
+}
+
++ fn await_socket_fd(fd: FD, read: bool, write: bool) PollEvent {
+
+    #if OS != "win"
+    return await_fd(fd, read, write)
+    #else
+
+    if !read && !write : return 0
+
+    let coro = coro:current_coro
+    if !isset(coro) {
+        panic("Polling outside coroutine")
+    }
+
+    if read && write {
+        let read_ov = overlap[OverlapRecv]()
+        let write_ov = overlap[OverlapSend]()
+        read_ov.buf = null
+        read_ov.base.socket_read = true
+        read_ov.base.fd = fd
+        write_ov.buf = null
+        read_ov.base.event = ext:POLLIN
+        write_ov.base.event = ext:POLLOUT
+
+        let read_res = ext:WSARecv(fd, @ref(read_ov.buflen), 1, null, @ref(read_ov.flags), read_ov.@cast(ptr), null)
+        if read_res == ext:SOCKET_ERROR && socket_io_failed() : return ext:POLLERR
+        let write_res = ext:WSASend(fd, @ref(write_ov.buflen), 1, null, 0, write_ov.@cast(ptr), null)
+        if write_res == ext:SOCKET_ERROR && socket_io_failed() {
+            cancel_overlap(fd, read_ov.@cast(ptr), coro)
+            return ext:POLLERR
+        }
+        return await_overlaps(fd, read_ov.@cast(ptr), write_ov.@cast(ptr), coro)
+    }
+
+    if read {
+        let ov = overlap[OverlapRecv]()
+        ov.buf = null
+        ov.base.socket_read = true
+        ov.base.fd = fd
+        ov.base.event = ext:POLLIN
+        let res = ext:WSARecv(fd, @ref(ov.buflen), 1, null, @ref(ov.flags), ov.@cast(ptr), null)
+        if res == ext:SOCKET_ERROR && socket_io_failed() : return ext:POLLERR
+        coro.yield()
+        return coro.poll_event
+    } else {
+        let ov = overlap[OverlapSend]()
+        ov.buf = null
+        ov.base.event = ext:POLLOUT
+        let res = ext:WSASend(fd, @ref(ov.buflen), 1, null, 0, ov.@cast(ptr), null)
+        if res == ext:SOCKET_ERROR && socket_io_failed() : return ext:POLLERR
+        coro.yield()
+        return coro.poll_event
+    }
+    #end
+}

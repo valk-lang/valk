@@ -1,0 +1,390 @@
+
+fn parse_class_properties(class: Class) !Error {
+    // Generic base classes have no concrete T bindings yet — only specializations are parsed
+    if class.is_generic_base : return
+
+    // Resolve `mode X for Type` now that generic params (if any) are bound on scope
+    resolve_mode_for(class) !>
+    if class.kind == CLASS_KIND.slice || class.kind == CLASS_KIND.array || class.kind == CLASS_KIND.unbound {
+        let slice_type_exp = class.slice_type_exp
+        if !isset(slice_type_exp) : class.exp.bug("Sequence type is missing its element type")
+        let slice_type = type_from_exp(slice_type_exp, class.scope) !>
+        type_validate_sequence_element(slice_type, slice_type_exp) !>
+        class.slice_type = slice_type
+    }
+    if class.kind == CLASS_KIND.slice {
+        let slice_type = class.slice_type
+        if !isset(slice_type) : class.exp.bug("Slice is missing its element type")
+        add_builtin_sequence_prop(class, "length", type_from_core(class.ns.build, "uint") !>)
+        add_builtin_sequence_prop(class, "data", slice_type.pointer(0), true)
+    } else if class.kind == CLASS_KIND.array {
+        let b = class.ns.build
+        add_builtin_sequence_prop(class, "length", type_from_core(b, "uint") !>)
+        add_builtin_sequence_prop(class, "data", type_from_valk_namespace(b, "gc", "GcPtr") !>, false, true)
+        add_builtin_sequence_prop(class, "cap", type_from_core(b, "uint") !>)
+    }
+    if class.kind == CLASS_KIND.union : class.get_type() !>
+
+    let exps = parse_class_body_exps(class) !>
+    let state = ParseState.new()
+    each exps as exp {
+        parse_class_body_member(class, state, exp, class.scope, null, false) !>
+    }
+    if state.has_open_if() || state.is_skipping() {
+        let body = class.body
+        if isset(body) : body.error("Missing compile macro '#end' in class body")
+        class.ns.build.error("Missing compile macro '#end' in class " + class.name)
+    }
+
+    // Apply `extend Class { ... }` blocks (generic names remapped for specializations)
+    each class.extends as ex {
+        parse_class_extend(class, ex) !>
+    }
+
+    if class.kind == CLASS_KIND.slice {
+        class.compute_body_size() !>
+        let data_prop = class.get_prop_by_name("data") !? null
+        if !isset(data_prop) : class.exp.bug("Slice data property is missing")
+        data_prop.offset = class.slice_data_offset() !>
+    }
+
+    class.exp.sub_exps = null
+    class.generics = null
+    class.body = null
+    class.mode_for_exp = null
+    class.union_type_exp = null
+    class.slice_type_exp = null
+    class.flags = null
+}
+
+fn add_builtin_sequence_prop(class: Class, name: String, type: Type, is_slice_data: bool (false), zero_default: bool (false)) Prop {
+    let prop = Prop {
+        class: class
+        name: name
+        act: ACT.readonly
+        exp: class.exp
+        type: type
+        is_slice_data: is_slice_data
+        zero_default: zero_default
+    }
+    class.add_prop(prop)
+    return prop
+}
+
+// Mix one extend body's members into `class` (used for concrete + specialized classes).
+fn parse_class_extend(class: Class, ex: Extend) !Error {
+    let body = ex.body
+    if !isset(body) : return
+
+    // Scope for type resolution in the extend body: file scope → remapped generics → SELF
+    let scope = ex.scope.sub_scope()
+    let gtypes = class.generic_types
+    if isset(gtypes) {
+        let names = ex.generic_names
+        if !isset(names) : class.ns.build.error("(Compiler bug) Missing extend generic names for: " + class.name)
+        let i: uint = 0
+        each names as gname {
+            let gt = gtypes.get(i) ! class.ns.build.error("(Compiler bug) Missing generic type for extend of: " + class.name)
+            scope.set_idf(gname, Idf.for_type(gt))
+            i++
+        }
+    }
+    // SELF is the class being extended (specialized instance when applicable)
+    scope.set_idf("SELF", Idf.for_class(class))
+
+    let pos = body.pos
+    if !isset(pos) : body.bug("Extend body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let members = read_class_body_exps(p) !>
+
+    let state = ParseState.new()
+    each members as mem {
+        parse_class_body_member(class, state, mem, scope, null, true) !>
+    }
+    if state.has_open_if() || state.is_skipping() {
+        body.error("Missing compile macro '#end' in extend body")
+    }
+}
+
+// For `mode Name for Type`: resolve Type to a class and store on the mode.
+fn resolve_mode_for(class: Class) !Error {
+    if class.kind != CLASS_KIND.mode : return
+    if isset(class.mode_for_type) : return
+    if class.type_resolving : class.exp.error("Circular mode target")
+    let for_exp = class.mode_for_exp
+    if !isset(for_exp) : class.exp.bug("Mode is missing 'for' type expression")
+
+    class.type_resolving = true
+    let for_type = type_from_exp(for_exp, class.scope) !>
+    class.type_resolving = false
+    let for_class = for_type.class
+    if !isset(for_class) {
+        for_exp.error("You cannot create a 'mode' for the type: " + for_type.compat_display_name())
+    }
+    // Modes wrap another class — inherit layout traits from the target
+    class.mode_for_class = for_class
+    class.mode_for_type = for_type
+    let current = for_class
+    while current.kind == CLASS_KIND.mode {
+        if current == class : for_exp.error("Circular mode target: " + class.pretty_name())
+        let next = current.mode_for_class
+        if !isset(next) : break
+        current = next
+    }
+    class.signed = for_class.signed
+    class.packed = for_class.packed
+    class.is_async = for_class.is_async
+    class.number_size = for_class.number_size
+}
+
+
+
+fn parse_class_body_member(class: Class, state: ParseState, exp: Exp, scope: Scope, group: ?Group (null), is_extend: bool (false)) !Error {
+    // Compile macros always run (own skip/nest bookkeeping)
+    if exp.type == EXP.macro {
+        parse_macro_exp(class.ns, scope, state, exp) !>
+        return
+    }
+    // Suppressed inside a false #if / unused #elif / #else body
+    if state.is_skipping() : return
+
+    // Comments are formatting-only
+
+    if exp.type == EXP.prop {
+        if isset(group) : exp.error("You cannot define properties inside a 'group'")
+        parse_class_prop(class, exp, scope, is_extend) !>
+        return
+    }
+    if exp.type == EXP.trait_use {
+        if isset(group) : exp.error("You cannot use traits inside a 'group'")
+        parse_class_trait_use(class, exp) !>
+        return
+    }
+    if exp.type == EXP.func {
+        parse_class_method(class, exp, scope, group) !>
+        return
+    }
+    if exp.type == EXP.group {
+        if isset(group) : exp.error("Nested groups are not allowed")
+        parse_class_group(class, exp, scope) !>
+        return
+    }
+    exp.bug("Unhandled class-body expression type in parse_class_body_member: " + exp.type)
+}
+
+// `fn` / `get` / `static fn` / `static get` inside a class (or group).
+fn parse_class_method(class: Class, exp: Exp, scope: Scope, group: ?Group) !Error {
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Method is missing a name")
+
+    let is_static = exp.bool1
+    let is_getter = exp.kind == FUNC_KIND.get
+
+    if class.kind == CLASS_KIND.interface {
+        if isset(group) : exp.error("Interfaces cannot contain groups")
+        if is_static : exp.error("Interface methods cannot be static")
+        if isset(exp.get(FUNC_EXP.generics)) : exp.error("Interface methods cannot be generic")
+        if isset(exp.get(FUNC_EXP.body)) : exp.error("Interface methods must be declarations ending in ';'")
+        if isset(exp.list) : exp.error("Interface methods cannot use function flags")
+    }
+
+    // Name uniqueness within class or group
+    if isset(group) {
+        if group.funcs.has(name) {
+            exp.error("Function name is already used in group '" + group.name + "': " + name)
+        }
+    } else {
+        if class_member_name_used(class, name) {
+            exp.error("Function name is already used for something else in this class: " + name)
+        }
+    }
+
+    let generics = exp.get(FUNC_EXP.generics)
+    let is_generic_base = isset(generics)
+
+    let f = Func {
+        unit: class.unit
+        ns: class.ns
+        name: name
+        act: exp.act
+        exp: exp
+        // Parent is class/trait scope so SELF and generic params resolve
+        arg_scope: scope.sub_scope()
+        generics: generics
+        args_exp: exp.get(FUNC_EXP.args)
+        rett_exp: exp.get(FUNC_EXP.type)
+        error: exp.get(FUNC_EXP.error)
+        body: exp.get(FUNC_EXP.body)
+        flags: exp.list
+        is_extern: exp.bool2
+        is_export: exp.bool3
+        is_generic_base: is_generic_base
+        class: class
+        group: group
+        is_static: is_static
+        is_getter: is_getter
+        is_interface: class.kind == CLASS_KIND.interface
+        interface_slot: class.interface_method_count
+    }
+
+    if class.kind == CLASS_KIND.interface : class.interface_method_count++
+
+    if isset(group) {
+        group.funcs.set(name, f)
+    } else {
+        class.funcs.set(name, f)
+    }
+
+    class.unit.functions.append(f)
+    class.ns.build.pipeline.parse_func_types.append(f)
+    if !is_generic_base {
+        class.ns.build.pipeline.parse_func_asts.append(f)
+    }
+}
+
+// `group name { ... }` — parse nested members into the group.
+fn parse_class_group(class: Class, exp: Exp, scope: Scope) !Error {
+    if class.kind == CLASS_KIND.interface {
+        exp.error("Interfaces cannot contain groups")
+    }
+    let name = exp.str1
+    if name.length == 0 : exp.bug("Group is missing a name")
+
+    if class_member_name_used(class, name) {
+        exp.error("Group name is already used for something else in this class: " + name)
+    }
+
+    let g = Group {
+        class: class
+        name: name
+        act: exp.act
+        exp: exp
+    }
+    class.groups.set(name, g)
+
+    let body = exp.get(GROUP_EXP.body)
+    if !isset(body) : return
+
+    let pos = body.pos
+    if !isset(pos) : body.bug("Group body is missing a Pos")
+    let p = pos.copy().init_parser()
+    let members = read_class_body_exps(p) !>
+
+    let state = ParseState.new()
+    each members as mem {
+        parse_class_body_member(class, state, mem, scope, g, false) !>
+    }
+    if state.has_open_if() || state.is_skipping() {
+        body.error("Missing compile macro '#end' in group '" + name + "'")
+    }
+}
+
+fn class_member_name_used(class: Class, name: String) bool {
+    each class.props as prop {
+        let n = prop.name
+        if isset(n) && n == name : return true
+    }
+    if class.funcs.has(name) : return true
+    if class.groups.has(name) : return true
+    return false
+}
+
+// Mix a trait's member expressions into this class (as if written in the class body).
+fn parse_class_trait_use(class: Class, exp: Exp) !Error {
+    if class.kind == CLASS_KIND.interface {
+        exp.error("Interfaces cannot use traits")
+    }
+    let id = exp.get(TRAIT_USE_EXP.id)
+    if !isset(id) : exp.bug("Trait use is missing id")
+
+    let name = id.str1
+    let ns_name = id.str2
+    let idf: ?Idf = null
+    if isset(ns_name) {
+        let ns_idf = class.scope.get_scope_idf(ns_name)
+        if !isset(ns_idf) : exp.error("Unknown namespace: " + ns_name)
+        let ns_scope = ns_idf.scope
+        if !isset(ns_scope) : exp.bug("Scope idf is missing scope")
+        idf = ns_scope.get_idf(name)
+        if !isset(idf) : exp.error("Unknown trait: " + ns_name + ":" + name)
+    } else {
+        idf = class.scope.get_idf(name)
+        if !isset(idf) : exp.error("Unknown trait: " + name)
+    }
+    if idf.type != IDF.trait {
+        exp.error("Identifier is not a trait: " + name)
+    }
+    let trait = idf.trait
+    if !isset(trait) : exp.bug("Trait idf is missing trait")
+
+    let use_scope = trait.scope.sub_scope()
+    use_scope.set_idf("SELF", Idf.for_class(class))
+    let gnames = trait.generic_names
+    let gens = exp.get(TRAIT_USE_EXP.generics)
+    if isset(gnames) {
+        if !isset(gens) {
+            exp.error("Generic trait '" + trait.name + "' requires type arguments")
+        }
+        let i: uint = 0
+        each gnames as gname {
+            let gexp = gens.get(i)
+            if !isset(gexp) {
+                exp.error("Generic trait '" + trait.name + "' expects " + gnames.length + " type argument(s)")
+            }
+            // Generic type args are written at the use site → resolve in class scope
+            let gt = type_from_exp(gexp, class.scope) !>
+            use_scope.set_idf(gname, Idf.for_type(gt))
+            i++
+        }
+        // Extra type args?
+        if isset(gens.get(i)) {
+            exp.error("Generic trait '" + trait.name + "' expects " + gnames.length + " type argument(s)")
+        }
+    } else if isset(gens) {
+        exp.error("Trait '" + trait.name + "' is not generic")
+    }
+
+    // Expand trait members with the same handling as native class body expressions
+    let dummy_state = ParseState.new()
+    each trait.get_exps() as te {
+        parse_class_body_member(class, dummy_state, te, use_scope, null, false) !>
+    }
+}
+
+fn parse_class_prop(class: Class, exp: Exp, scope: Scope, is_extend: bool (false)) !Error {
+    if class.kind != CLASS_KIND.class && class.kind != CLASS_KIND.struct {
+        exp.error("Properties can only be defined on classes and structs")
+    }
+    // `$noNewProperties` only blocks *extensions* adding props — own body is fine
+    if is_extend && class.no_new_props {
+        exp.error("This class does not allow new properties by using 'extend'")
+    }
+
+    let name: ?String = null
+    if exp.str1.length > 0 : name = exp.str1
+
+    if isset(name) {
+        // Duplicate names are not allowed among named properties.
+        let existing = class.get_prop_by_name(name) !? null
+        if isset(existing) : exp.error("Property name already used: " + name)
+    }
+
+    let type_exp = exp.get(PROP_EXP.type)
+    if !isset(type_exp) : exp.bug("Property is missing a type")
+    let type = type_from_exp(type_exp, scope) !>
+
+    if type.kind == TYPE.ref_of {
+        exp.error("You cannot store references inside objects. Type not allowed: " + type.compat_display_name())
+    }
+
+    let prop = Prop {
+        class: class
+        name: name
+        act: exp.act
+        exp: exp
+        type: type
+        default: exp.get(PROP_EXP.default)
+        flags: exp.list
+    }
+    class.add_prop(prop)
+}

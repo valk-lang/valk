@@ -1,0 +1,593 @@
+
+use valk:json
+use build
+use valk:fs
+use valk:gc
+
+value lsp_msg_type_error (1)
+value lsp_msg_type_warn (2)
+value lsp_msg_type_info (3)
+
+fn lsp_path_from_uri(uri: String) String {
+    if uri.starts_with("file://") {
+        uri = uri.part(7, uri.length - 7)
+    }
+    #if OS == "win"
+    if uri.length > 2 && uri.get(0) == '/' && uri.get(2) == ':' {
+        uri = uri.part(1, uri.length - 1)
+    }
+    #end
+    return fs:resolve(uri)
+}
+
+class LspLineCol {
+    line: u32
+    col: u32
+}
+
+fn lsp_utf8_width(ch: u8) uint {
+    if ch < 0x80 : return 1
+    if (ch & 0xE0) == 0xC0 : return 2
+    if (ch & 0xF0) == 0xE0 : return 3
+    if (ch & 0xF8) == 0xF0 : return 4
+    return 1
+}
+
+fn lsp_utf16_width(ch: u8) u32 {
+    return ((ch & 0xF8) == 0xF0) ? 2 : 1
+}
+
+// Convert a 1-based LSP line/column to the compiler's UTF-8 byte offset.
++ fn lsp_offset_for(content: String, line: u32, col: u32) u32 {
+    let data = content.data
+    let bytes = content.bytes
+    let cur_line: u32 = 1
+    let p: uint = 0
+    while p < bytes && cur_line < line {
+        if @ptrv(data, u8, p) == '\n' : cur_line++
+        p++
+    }
+
+    let target = col > 0 ? col - 1 : 0
+    let units: u32 = 0
+    while p < bytes && units < target {
+        let ch = @ptrv(data, u8, p)
+        if ch == '\n' : break
+        let width = lsp_utf8_width(ch)
+        let utf16 = lsp_utf16_width(ch)
+        if units + utf16 > target : break
+        if p + width > bytes : p++
+        else : p += width
+        units += utf16
+    }
+    return p.to(u32)
+}
+
+fn lsp_line_col(content: String, offset: u32) LspLineCol {
+    let data = content.data
+    let bytes = content.bytes
+    let limit = offset.to(uint)
+    if limit > bytes : limit = bytes
+    let line: u32 = 1
+    let col: u32 = 1
+    let p: uint = 0
+    while p < limit {
+        let ch = @ptrv(data, u8, p)
+        if ch == '\n' {
+            line++
+            col = 1
+            p++
+            continue
+        }
+        let width = lsp_utf8_width(ch)
+        if p + width > limit : break
+        p += width
+        col += lsp_utf16_width(ch)
+    }
+    return LspLineCol { line: line, col: col }
+}
+
+class Diagnostic {
+    severity: int
+    msg: String
+    line: u32
+    col: u32
+    end_line: u32
+    end_col: u32
+}
+
+class Lsp {
+    buf: ByteBuffer
+    index: uint (0)
+    stage: uint (0)
+    headers: Map[String] (Map[String]{})
+    headers_str: String ("")
+    data: json:Value (json:new_null())
+    id: json:Value (json:new_null())
+    is_request: bool (false)
+    method: String ("")
+    request: int (req_none)
+    // Files
+    file_content: Map[String] (Map[String]{})
+    document_symbols: Map[json:Value] (Map[json:Value]{})
+    // Paths that currently have diagnostics published, so they can be cleared
+    has_errors: Array[String] (Array[String]{})
+    diagnostics_on_change: bool (false)
+    //
+    file: String ("")
+    line: uint (0)
+    col: uint (0)
+    pending_diagnostics: ?String (null)
+    //
+    shutdown: bool (false)
+    responded: bool (false)
+
+    fn reset_request() {
+        this.data = json:new_null()
+        this.id = json:new_null()
+        this.is_request = false
+        this.method = ""
+        this.request = req_none
+        this.responded = false
+        //
+        this.file = ""
+        this.line = 0
+        this.col = 0
+    }
+
+    fn reset() {
+        this.headers.clear()
+        this.index = 0
+        this.stage = 0
+        this.reset_request()
+    }
+
+    fn parse(flush: bool (true)) {
+        this.parse_messages()
+        if flush : this.flush_pending()
+    }
+
+    fn flush_pending() {
+        let file = this.pending_diagnostics ?! return
+        this.pending_diagnostics = null
+        this.reset_request()
+        this.request = req_diagnostics
+        this.file = file
+        this.build()
+    }
+
+    fn parse_messages() {
+
+        while this.buf.length > 0 {
+            if this.stage == 0 {
+                this.parse_headers() ! {
+                    if E.code == E.more {
+                        return
+                    }
+                    this.log("Invalid headers")
+                    this.reset()
+                    return
+                }
+            }
+            if this.stage == 1 {
+                this.parse_content() ! {
+                    if E.code == E.more : return
+                    this.reset()
+                    return
+                }
+            }
+
+            this.handle()
+            this.reset()
+        }
+    }
+
+    fn parse_headers() !LspError {
+        let buf = this.buf
+        let pos = this.index
+
+        while true {
+            let index = buf.index_of('\r', pos) ! throw .more
+            if index + 1 >= buf.length : throw .more
+            if buf.get(index + 1) != '\n' : throw .invalid
+
+            if index == pos {
+                // End of headers
+                pos += 2
+                break
+            }
+
+            // Read header
+            let index2 = buf.index_of(':', pos) ! throw .invalid
+            let key = buf.part(pos, index2 - pos).trim(" ").trim("\t")
+            let value = buf.part(index2 + 1, index - index2 - 1).trim(" ").trim("\t")
+            pos = index + 2
+            this.index = pos
+
+            this.headers.set(key.lower(), value)
+        }
+
+        this.stage = 1
+        this.headers_str = this.buf.part(0, pos)
+        this.buf.clear_until(pos)
+        this.index = 0
+    }
+
+    fn parse_content() !LspError {
+        let len = (this.headers.get("content-length") !? "0").to_uint() ! throw .invalid
+        if this.buf.length < len : throw .more
+        let content = this.buf.part(0, len)
+        this.buf.clear_until(len)
+
+        let data = json:decode(content) ! {
+            this.log("Invalid JSON-RPC input: '%content' | length: %len/%{content.length} | Headers: " + this.headers_str)
+            throw .invalid
+        }
+
+        this.data = data
+    }
+
+    fn handle() {
+        let data = this.data
+
+        let method = data.get("method").string()
+        let params = data.get("params")
+
+        this.id = data.get("id")
+        this.is_request = data.has("id")
+        this.method = method
+        this.request = request_for_method(method)
+
+        if this.shutdown {
+            if method == "exit" {
+                exit(0)
+            }
+            return
+        }
+
+        if method == "initialize" {
+            this.init(params)
+        } else if method == "initialized" {
+        } else if method == "shutdown" {
+            this.shutdown = true
+            this.send_empty_response()
+        } else if method == "exit" {
+            exit(0)
+        } else if method == "textDocument/didOpen" {
+            this.handle_open()
+        } else if method == "textDocument/didClose" {
+            this.handle_close()
+        } else if method == "textDocument/didChange" {
+            this.handle_change()
+        } else if method == "textDocument/didSave" {
+            this.handle_save()
+        } else if method == "workspace/didChangeConfiguration" {
+            this.handle_configuration()
+        } else if method == "textDocument/definition" {
+            this.definition()
+            this.send_empty_response()
+        } else if method == "textDocument/completion" {
+            this.completion()
+            this.send_empty_response()
+        } else if method == "textDocument/signatureHelp" {
+            this.sighelp()
+            this.send_empty_response()
+        } else if method == "textDocument/hover" {
+            this.hover()
+            this.send_empty_response()
+        } else if method == "textDocument/formatting" {
+            this.formatting()
+            this.send_empty_response()
+        } else if method == "textDocument/documentSymbol" {
+            this.document_symbol()
+            this.send_empty_response()
+        } else if method.starts_with("$/") {
+            if this.is_request : this.error_response(-32601, "Unsupported request: " + method)
+        } else {
+            if this.is_request {
+                this.error_response(-32601, "Unsupported request: " + method)
+            } else {
+                this.log("Unsupported notification: " + method)
+            }
+        }
+    }
+
+    fn error_response(code: int, msg: String) {
+        if !this.is_request : return
+        let resp = json:new_object()
+        resp.set("id", this.id)
+        let err = json:new_object()
+        err.set("code", json:from(code))
+        err.set("message", json:from(msg))
+        resp.set("error", err)
+        this.respond(resp)
+    }
+
+    fn success(result: json:Value) {
+        if !this.is_request : return
+        let resp = json:new_object()
+        resp.set("id", this.id)
+        resp.set("result", result)
+        this.respond(resp)
+    }
+
+    fn send_empty_response() {
+        if !this.is_request : return
+        let resp = json:new_object()
+        resp.set("id", this.id)
+        resp.set("result", json:new_object())
+        this.respond(resp)
+    }
+
+    fn respond(data: json:Value) {
+        if this.responded : return
+        this.send(data)
+        this.responded = true
+    }
+    fn send(data: json:Value) {
+        let content = encode(data)
+        let resp = "Content-Length: " + (content.length) + "\r\n"
+        resp += "\r\n" + content
+        print(resp)
+    }
+
+    // ########################################
+    // BUILD
+    // ########################################
+
+    // Path of the document a request refers to.
+    fn request_file() ?String {
+        let uri = this.data.get("params").get("textDocument").get("uri").string()
+        if uri.is_empty() : return null
+        return lsp_path_from_uri(uri)
+    }
+
+    // Every position-based request carries the same textDocument/position pair.
+    fn build_at_cursor() {
+        let params = this.data.get("params")
+        let pos = params.get("position")
+        let uri = params.get("textDocument").get("uri").string()
+        if uri.is_empty() : return
+        this.file = lsp_path_from_uri(uri)
+        this.line = pos.get("line").int().to(uint) + 1
+        this.col = pos.get("character").int().to(uint) + 1
+        this.build()
+    }
+
+    fn build() {
+        this.build_wrap()
+        gc:collect()
+    }
+
+    fn build_wrap() {
+        if this.request == req_diagnostics {
+            this.build_diagnostics()
+            return
+        }
+        let args = Array[String]{}
+
+        let file = this.file
+        if !file.is_empty() : args.append(file, true)
+
+        let b = build:Build.init_from_args(args) ! {
+            this.log(E.msg)
+            return
+        }
+        b.options.lsp = this
+        if this.request == req_formatting : b.options.is_fmt = true
+        b.run() ! { }
+
+        if b.lsp_answered : return
+        if this.request == req_formatting {
+            this.send_formatting(b)
+            return
+        }
+        if this.request == req_doc_symbol {
+            this.send_symbols(b)
+            return
+        }
+    }
+
+    // ########################################
+    // DIAGNOSTICS
+    // ########################################
+
+    fn build_diagnostics() {
+        let per_path = Map[Array[Diagnostic]]{}
+        let no_location = Array[String]{}
+        let loaded_files = Map[bool]{}
+        let seen_messages = Map[bool]{}
+
+        each this.file_content as _, path : per_path.set(path, Array[Diagnostic]{})
+        let saved = this.file
+        if !saved.is_empty() : per_path.set(saved, Array[Diagnostic]{})
+
+        let classifier = build:Build.init_from_args(Array[String]{}) ! {
+            this.log(E.msg)
+            return
+        }
+        let package_files = Map[Array[String]]{}
+        let loose_files = Array[String]{}
+        each this.file_content as _, path {
+            lsp_group_diagnostic_file(classifier, package_files, loose_files, path)
+        }
+        if !saved.is_empty() && !this.file_content.has(saved) {
+            lsp_group_diagnostic_file(classifier, package_files, loose_files, saved)
+        }
+
+        let groups = Array[Array[String]]{}
+        each package_files as files, _ : groups.append(files)
+        each loose_files as path {
+            let files = Array[String]{}
+            files.append(path)
+            groups.append(files)
+        }
+        each groups as files {
+            this.collect_diagnostic_build(files, per_path, no_location, loaded_files, seen_messages)
+        }
+
+        this.publish_errors(per_path, no_location, loaded_files)
+    }
+
+    fn collect_diagnostic_build(
+        args: Array[String],
+        per_path: Map[Array[Diagnostic]],
+        no_location: Array[String],
+        loaded_files: Map[bool],
+        seen_messages: Map[bool]
+    ) {
+        let b = build:Build.init_from_args(args) ! {
+            no_location.append(E.msg, true)
+            return
+        }
+        b.options.lsp = this
+        b.run() ! { }
+        each args as path {
+            if this.file_content.has(path) {
+                this.document_symbols.set(path, this.symbols_for(b, path))
+            }
+        }
+        each b.cache.loaded_files as _, path : loaded_files.set(path, true)
+
+        each b.messages as m {
+            let src = m.src
+            if !isset(src) {
+                no_location.append(m.msg, true)
+                continue
+            }
+            let at = build:message_resolve(src, m.i)
+            let path = at.src.path
+            if !isset(path) {
+                no_location.append(m.msg, true)
+                continue
+            }
+            let key = path + ":" + at.i + ":" + m.len + ":" + m.type.to(int) + ":" + m.msg
+            if seen_messages.has(key) : continue
+            seen_messages.set(key, true)
+            let content = at.src.content
+            let start = lsp_line_col(content, at.i)
+            let end = lsp_line_col(content, at.i + m.len)
+            let list = per_path.get(path) !? <{
+                let created = Array[Diagnostic]{}
+                per_path.set(path, created)
+                return created
+            }
+            list.append(Diagnostic {
+                severity: m.type == build:MSG.error ? lsp_msg_type_error : lsp_msg_type_warn
+                msg: m.msg
+                line: start.line
+                col: start.col
+                end_line: end.line
+                end_col: end.col
+            })
+        }
+    }
+
+    fn publish_errors(
+        per_path: Map[Array[Diagnostic]],
+        no_location: Array[String],
+        loaded_files: Map[bool]
+    ) {
+        let published = Array[String]{}
+        each per_path as list, path {
+            this.send_diagnostics(path, list)
+            published.append(path)
+        }
+
+        each this.has_errors as path {
+            if per_path.has(path) : continue
+            if !loaded_files.has(path) && fs:exists(path) {
+                published.append(path)
+                continue
+            }
+            this.send_diagnostics(path, Array[Diagnostic]{})
+        }
+        this.has_errors = published
+
+        let first = no_location.get(0) !? null
+        if isset(first) : this.log(first, lsp_msg_type_error)
+    }
+
+    fn send_diagnostics(path: String, items: Array[Diagnostic]) {
+        let resp = json:new_object()
+        let res = json:new_object()
+        resp.set("method", json:from("textDocument/publishDiagnostics"))
+        resp.set("params", res)
+
+        let diag = json:new_array()
+        res.set("uri", "file://" + path)
+        res.set("diagnostics", diag)
+
+        each items as d {
+            let item = json:new_object()
+            item.set("severity", json:from(d.severity))
+            item.set("message", json:from(d.msg))
+            item.set("range", json_range(d.line, d.col, d.end_line, d.end_col))
+            diag.append(item)
+        }
+
+        this.respond(resp)
+        this.responded = false
+    }
+
+    fn log(msg: String, type: int (lsp_msg_type_info)) {
+        let resp = json:new_object()
+        let res = json:new_object()
+        resp.set("method", json:from("window/logMessage"))
+        resp.set("params", res)
+
+        res.set("type", json:from(type))
+        res.set("message", json:from(msg))
+
+        this.send(resp)
+    }
+}
+
+fn lsp_group_diagnostic_file(
+    classifier: build:Build,
+    package_files: Map[Array[String]],
+    loose_files: Array[String],
+    path: String
+) {
+    let pkg = classifier.find_pkg_for_path(path)
+    if !isset(pkg) {
+        loose_files.append(path, true)
+        return
+    }
+    let dir = pkg.dir
+    if !isset(dir) {
+        loose_files.append(path, true)
+        return
+    }
+    let files = package_files.get(dir) !? <{
+        let created = Array[String]{}
+        package_files.set(dir, created)
+        return created
+    }
+    files.append(path, true)
+}
+
+fn request_for_method(method: String) int {
+    if method == "textDocument/definition" : return req_definition
+    if method == "textDocument/completion" : return req_completion
+    if method == "textDocument/signatureHelp" : return req_sig_help
+    if method == "textDocument/hover" : return req_hover
+    if method == "textDocument/formatting" : return req_formatting
+    if method == "textDocument/documentSymbol" : return req_doc_symbol
+    if method == "textDocument/didSave" : return req_diagnostics
+    return req_none
+}
+
+fn json_range(line: u32, col: u32, end_line: u32, end_col: u32) json:Value {
+    let range = json:new_object()
+    range.set("start", json_position(line, col))
+    range.set("end", json_position(end_line, end_col))
+    return range
+}
+
+fn json_position(line: u32, col: u32) json:Value {
+    let pos = json:new_object()
+    pos.set("line", json:from(line > 0 ? (line - 1).to(uint) : 0))
+    pos.set("character", json:from(col > 0 ? (col - 1).to(uint) : 0))
+    return pos
+}
