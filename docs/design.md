@@ -1,6 +1,10 @@
 
 # Language design
 
+## Goal
+
+- We must be able to parse code/syntax without resolving the identifiers
+
 ## Overview
 
 ```rust
