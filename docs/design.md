@@ -7,7 +7,7 @@ is not a collection of independent syntax experiments.
 Valk distinguishes value aggregates from reference objects. Structs and fixed
 arrays are copied values, while classes are references. The language defines
 its own syntax, GC, tagged unions, error handling, modes, and inferred borrow
-and mutation effects.
+and uniqueness effects.
 
 ## Goals
 
@@ -28,7 +28,7 @@ The compiler separates syntax from semantic resolution:
 3. Register named declarations, aliases, errors, traits, and extensions.
 4. Resolve types and finalize aggregate layouts.
 5. Parse and type-check function bodies when required.
-6. Infer and cache per-parameter mutation and escape effects.
+6. Infer and cache per-parameter escape and uniqueness effects.
 7. Determine reachability and lower required functions to IR.
 8. Generate objects and link only when the selected command requires them.
 
@@ -351,13 +351,11 @@ rules as a direct `&T`.
 
 ### Inferred parameter effects
 
-Borrow compatibility and parameter mutation behavior are inferred from
-function bodies rather than requiring developers to repeat effects in every
-signature.
+Borrow compatibility and uniqueness preservation are inferred from function
+bodies rather than requiring developers to repeat effects in every signature.
 
 For every parameter, the compiler computes and caches:
 
-- `mutates`: the function may modify data reachable through the parameter.
 - `escapes`: the function may return, store, capture, publish, or otherwise
   retain data reachable through the parameter.
 - `invalidates_unique`: the function may insert an external alias into data
@@ -380,7 +378,6 @@ the conservative effects. These summaries are compiler metadata, not source
 annotations or part of the language's API.
 
 - A borrowed argument is accepted when the target parameter does not escape.
-- Mutation summaries support diagnostics and shared-data validation.
 - For an indirect call, the callable carries the combined effects of its
   possible targets; an unknown target is treated conservatively.
 - Extern calls have no analyzable body and form an explicit unsafe boundary.
