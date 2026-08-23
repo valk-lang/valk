@@ -461,8 +461,9 @@ Traits reuse declarations inside classes or structs. Generic trait parameters
 are resolved in the receiving type's scope. Conflicting member names are compile
 errors.
 
-Extensions attach methods, getters, hooks, and—unless the type uses
-`$noNewProperties`—stored properties to classes and structs:
+Extensions attach methods, getters, and hooks to classes and structs. An
+extension in the type's defining package may also add stored properties unless
+the type uses `$noNewProperties`:
 
 ```valk
 extend User {
@@ -472,13 +473,14 @@ extend User {
 }
 ```
 
-All declarations and extensions in the build's package graph are discovered
-before type layouts are finalized. Therefore:
+Extensions from other packages may add only methods and getters. Exported ABI
+types cannot receive extension properties. All declarations and extensions in
+the build's package graph are discovered before type layouts are finalized.
+Therefore:
 
 - Extension discovery order must not affect the final layout.
 - Duplicate stored property names are errors.
 - Adding an extension property changes the extended type's ABI.
-- A type used as a stable external ABI should use `$noNewProperties`.
 - Precompiled code cannot assume an extended layout unless it was built against
   the same complete extension set.
 
