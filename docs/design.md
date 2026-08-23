@@ -1,294 +1,528 @@
-
 # Language design
 
-## Goal
+This document defines the intended language and compiler model. It is a design
+contract for the compiler, standard library, diagnostics, and generated ABI. It
+is not a collection of independent syntax experiments.
 
-- We must be able to parse code/syntax without resolving the identifiers
-- We aim for max parsing/compile speed
-- Unsafe tokens start with `@`, rawpointers use `*` but should only be achievable through using unsafe tokens
+Valk distinguishes value aggregates from reference objects. Structs and fixed
+arrays are copied values, while classes are references. The language defines
+its own syntax, GC, tagged unions, error handling, modes, and inferred borrow
+and mutation effects.
 
-## Overview
+## Goals
 
-```rust
-// Built-in types
-// Booleans: bool
-// Integer: i8 i16 i32 i64 int u8 u16 u32 u64 uint
-// Float: f32 f64 float
-// Closures: fn()  fn({arg-types}) [{return-type}] [!{error-type}]
-// Coroutines: co()  co({return-type}) // Coroutines cannot return errors
-// Aggregate array type: [T x {amount}] copied by value
-// Aggregate struct type: (T, T, ...) copied by value
-// Structs: named aggregates copied by value
-// Classes: named aggregates used by reference and managed by the GC (allocated by gc:alloc)
-// Arrays: Array[T] (array of T) // Passed by reference & managed by the GC
-// Slices: Slice[T] (slice of T), String (slice of u8) // Passed by reference & managed by the GC
-//
-// Nullable: ?T (value is either type of T or null)
-// Borrow: &T (value can only be assigned to local variables, cannot be captured (by e.g. closures))
-// Immutable: imut T (cannot change properties (recursively))
-//
-// Unsafe void pointer: *void (rawpointer), @ptr
-// Unsafe pointer of T: *T (rawpointer of T), cstring (rawpointer of u8)
+- Syntax must be parseable without resolving identifiers.
+- Parsing and ordinary incremental builds should remain fast.
+- Value and reference behavior must be predictable from the type.
+- Safe code must not create dangling references or untracked GC pointers.
+- Unsafe operations must be explicit and visually recognizable.
+- The compiler should infer mechanical safety contracts when it can do so
+  cheaply and deterministically.
 
-// ----------------
+## Compiler stages
 
-// Token 'use'
-// Syntax: use {namespace/pacakge} [as {alias}] [{ id1 [as {alias}], id2 [as {alias}], ... }]
-// Import {namespace or package}
-use models
-// Import namespace "validator" from package "mysql"
-use mysql:validator
-// Import alias
-use mysql:validator as mval
+The compiler separates syntax from semantic resolution:
 
-// Functions
-// Syntax: [pub/ns/local] fn {name}({argName}: {argType}, ...) [{return-type}] [!{error-type}] { ... }
-// Function `main` is where your program starts (default return type i32, if other defined: compiler must error)
-fn main() {
-    let u = models.User {}
+1. Lex and parse declarations and raw function bodies.
+2. Load packages and namespaces from `use` declarations.
+3. Register named declarations, aliases, errors, traits, and extensions.
+4. Resolve types and finalize aggregate layouts.
+5. Parse and type-check function bodies when required.
+6. Infer and cache per-parameter mutation and escape effects.
+7. Determine reachability and lower required functions to IR.
+8. Generate objects and link only when the selected command requires them.
+
+Syntax parsing may use grammar context, but never the resolved meaning of an
+identifier. Semantic stages may resolve identifiers and specialize generics.
+
+## Core type model
+
+### Scalar values
+
+- `bool` is one byte.
+- Signed integers: `i8`, `i16`, `i32`, `i64`, and pointer-sized `int`.
+- Unsigned integers: `u8`, `u16`, `u32`, `u64`, and pointer-sized `uint`.
+- Floating-point values: `f32`, `f64`, and pointer-sized `float`.
+- `void` represents no value.
+
+Scalar values are copied by value.
+
+### Value aggregates
+
+The following types have inline storage and are copied by value:
+
+- Fixed arrays: `[T x N]`.
+- Tuples and multiple values: `(T1, T2, ...)`.
+- `struct` values.
+- Tagged unions.
+- Closures, represented as a function pointer and an optional environment
+  pointer.
+
+Copying a value aggregate copies its fields. It does not recursively clone
+referenced class or array objects stored in those fields.
+
+```valk
+struct Point {
+    x: int
+    y: int
 }
 
-// Declare error type
-// Syntax: error {name} ({code1}, {code2}, ...) [extends (Type1, Type2)] [payload { message: String [= {default-value}], ... }]
-error MyError (error, notfound) payload { message: String }
+fn move(point: Point) Point {
+    point.x++
+    return point
+}
+```
 
-// Function AST tokens
-fn example() i32 !MyError {
-    // Define variable: let {name} [: {type}] = {value}
-    let a : i32 = 0
-    // Define multiple variables: let ({name} [: {type}], ...) = {value}
-    let (a, b) = test()
-    // If/else-if/else
-    if a == 0 { println("a is 0") }
-    else if a > 0 { println("a > 0") }
-    else { println("a < 0") }
-    // While
-    while a++ < 5 {
-        println("a = %a")
+`Point` has no object identity: assignment creates an independent value copy.
+If it contains a class reference, the reference is copied and both structs
+refer to the same class object.
+
+### Reference types
+
+The following types have reference identity and are assigned by reference:
+
+- `class` values.
+- `Array[T]` and `Slice[T]`.
+- Interface values.
+- Coroutine handles.
+- Non-inline/manual pointers to structs.
+
+Reference values are non-null by default. Use `?T` when `null` is valid.
+
+### Classes
+
+Classes are GC-managed reference types. A class initializer allocates an object
+and evaluates its property initializers before publishing the resulting
+reference.
+
+```valk
+class User {
+    name: String
+    age: uint (0)
+}
+
+let first = User { name: "Ada" }
+let second = first
+second.age = 37 // also observable through first
+```
+
+Class assignment copies the reference, not the object. Deep copying is only
+performed by an explicit clone operation or user-defined clone hook.
+
+### Structs
+
+Structs are inline value types with fields in declaration order. Local structs
+normally live in their containing stack frame, class, array, or aggregate.
+
+```valk
+struct Header packed {
+    kind: u8
+    length: u32
+}
+```
+
+`packed` suppresses normal padding between fields. Pointers to structs and
+manual heap allocation are unsafe facilities; the value type itself is safe.
+A struct may contain GC references, in which case its containing storage is
+walked using the struct's generated GC layout.
+
+A struct cannot contain itself inline, directly or through another inline
+aggregate. Recursive structures must use a class, array, nullable reference,
+or explicit pointer indirection.
+
+### Fixed arrays, arrays, and slices
+
+Valk distinguishes three sequence categories:
+
+| Type | Storage | Copy behavior | Resize |
+| --- | --- | --- | --- |
+| `[T x N]` | Inline elements | Copies all elements | No |
+| `Array[T]` | GC-managed reference | Copies the reference | Yes |
+| `Slice[T]` | GC-managed fixed-length sequence | Copies the reference | No |
+
+Fixed arrays store their elements inline. `Array` and `Slice` are GC reference
+types.
+
+`Array[T]` owns resizable element storage. `Slice[T]` owns fixed-length element
+storage. Creating a slice from another sequence copies its elements into that
+storage; it does not alias a region of the source sequence. Indexing and ranges
+are bounds checked unless an explicitly unsafe operation is used.
+
+```valk
+let fixed: [int x 3] = { 1, 2, 3 }
+let values = Array[int]{ 1, 2, 3 }
+let first_two = values[0 .. 2]
+```
+
+### Functions, function pointers, and closures
+
+Function declarations use an optional return type and optional error type:
+
+```valk
+fn parse(text: String) int !ParseError {
+    // ...
+}
+```
+
+Callable type syntax is:
+
+- `fn(A, B)(R)` for a closure-compatible callable.
+- `fnptr(A, B)(R)` for a raw function pointer.
+- `co(R)` for a coroutine returning `R` when awaited.
+
+Multiple return types appear inside the return parentheses. `()` means no
+return value.
+
+A closure is an inline two-word value:
+
+```text
+{ function: fnptr, environment: ?GcPtr }
+```
+
+Capture-free functions have a null environment and may convert to `fnptr`.
+Captured values live in a GC-managed environment. A raw function pointer does
+not carry an environment and cannot represent a capturing closure.
+
+Coroutines cannot return errors. A coroutine must handle errors before
+suspending or encode failure in its ordinary return type.
+
+### Interfaces
+
+Interfaces describe method and getter requirements. Only classes implement
+interfaces. A class-to-interface conversion is implicit when the class
+implements the complete interface contract.
+
+```valk
+interface Printable {
+    fn text(prefix: String) String;
+}
+
+class User is Printable {
+    name: String
+
+    fn text(prefix: String) String {
+        return prefix + this.name
     }
-    // Each
-    let list = Array[String]{ "a", "b", "c" } 
-    each list as str, i {
-        println("Index %i has value: %str")
-    }
-    // Return an error
-    throw .missing { message: "Not found" }
-    // Return a value
-    return a
-    // Single line scopes
-    if true : println("Yes")
-    else : println("No")
-    while a-- > 0 : println("Looping...")
+}
+```
+
+Valk interface values are reference-sized GC values. The current representation
+is a pointer to an adapter containing:
+
+```text
+{ object: GcPtr, method_0: fnptr, method_1: fnptr, ... }
+```
+
+The object field keeps the concrete class alive. Method slots are assigned in
+interface declaration order. Interface methods cannot be generic, and an
+implementation must match argument types, return types, getter/function form,
+variadic behavior, and error type exactly.
+
+### Tagged unions
+
+A tagged union stores exactly one value from a closed set of alternatives:
+
+```valk
+union Value : String | int | bool {
 }
 
-// Classes (structure which objects are managed by the GC)
-// Syntax: [pub/ns/local] class {name} [is {interface1, ...}] { ... }
-class A {
-    // Properties
-    // Syntax: [pub/ns/local] {name}: {type} [= {default-value}]
-    prop1: i32 = 0
-    prop2: i32
-    // Functions
-    // Syntax: [pub/ns/local] [static] fn {name}({argName}: {argType}, ...) [{return-type}] [!{error-type}] { ... }
-    fn reset() {
-        this.prop1 = 0
-        this.prop2 = 0
-    }
-}
-
-// Struct
-// Syntax: [pub/ns/local] struct {name} [$packed] { ... }
-struct B {
-    // Same syntax as class
-}
-
-// Trait (re-usable code for classes & structs)
-// Syntax [pub/ns/local] trait {name} { ... }
-trait MyTrait {
-    // properties & functions
-}
-// Usage:
-class MyClass {
-    use MyTrait
-}
-
-// Extend (extends a type with properties (if possible) and functions)
-// Syntax: extend [type-identifer] { ... }
-// We can extend properties because there are no late definitions of types in our language and all 'use' statements are processed before reading types
-extend Array[T] {
-    fn print_all() {
-        println("Printing %{ this.length } items of type: %T")
-        each this as item {
-            println(item)
-        }
+fn describe(value: Value) String {
+    return match value : String {
+        String as text => text
+        int as number => "number: %number"
+        bool as enabled => enabled ? "enabled" : "disabled"
     }
 }
+```
 
-// Mode (different name for another named type which allows changing the functions)
-// Syntax: mode {name} for {name} { ... }
+The current tagged-union ABI uses:
+
+```text
+{ tag: u8, padding to byte 8, payload: largest alternative }
+```
+
+- A union may contain at most 256 distinct alternatives.
+- Tags are assigned from `0` through `255` in canonical type-identity order.
+- The payload has enough size and alignment for the largest alternative.
+- The complete union receives the required tail padding.
+- GC walking inspects the active tag.
+- Recursive inline alternatives are rejected.
+- Tagged unions are not allowed directly in `extern` or `export` signatures.
+
+Anonymous union types use `A | B`. A named union may also define methods and
+getters. Nullability is represented separately with `?` rather than by adding
+an implicit union alternative.
+
+### Enums
+
+Enums are named constants over an underlying type. The default underlying type
+is `int`.
+
+```valk
+enum Status {
+    pending       // 0
+    complete (2)  // 2
+    running       // 1
+}
+
+enum Header: String {
+    json ("application/json")
+    text ("text/plain")
+}
+```
+
+An implicit integer value is the smallest non-negative value not already used
+by an earlier implicit item or an explicit integer literal anywhere in the
+enum. Explicit duplicate values are allowed. Non-integer enum items require an
+explicit value.
+
+### Modes
+
+A mode is a distinct named view of an existing named type. It preserves the
+base representation and remains compatible with the base type, while allowing
+methods and operator hooks to be replaced.
+
+```valk
 mode Path for String {
     fn add(part: String) Path {
         // ...
     }
 }
-
-// Interface: define which functions a class must have (only for classes, not other types)
-// Syntax: [pub/ns/local] interface {name} { ... }
-// Interface type values are aggregates { vtable: *void, value: T }
-interface Printable {
-    // Functions
-    fn print();
-    fn to_string() String;
-}
-
-// Union (tagged union)
-// Syntax: [pub/ns/local] union {name} : Type1 | Type2 | ... { ... }
-// Memory layout: { u8, T } where T has the alignment and size of the largest type
-// Max types = 256 (0-255)
-union C : String | int | bool {
-    fn print() {
-        match this {
-            String as val => println("String value: %val")
-            int as val => println("Int value: %val")
-            default => println("Other value")
-        }
-    }
-}
-
-// Enum (default type: int)
-// Syntax: [pub/ns/local] union {name} [: Type1] { {name} [= {value}], ... }
-// Values are required if non-integer type
-enum MyEnum {
-    A // 0
-    B = 2 // 2
-    C // 1
-    D // 3 (The compiler avoids duplicate values when the value is determined by the compiler)
-    E = 2 // 2 (Duplicate values allowed)
-}
-
-// Value creation
-fn example() {
-    // Integer
-    let v = 100
-    let v = 100_000 // Underscores are ignored by the lexer
-    // Float
-    let v = 100_000.0 // {int}.{int} = float
-    let v : f32 = 100.0 // float 32 bit
-    // String
-    let v1 = "123"
-    let v2 = "123 %v1" // 123 123
-    let v3 = "123 %{v1.length + 1}" // 123 4
-    let v4 = "123 " + v1.length + 2 // 123 32
-    let v5 = "123 " + (v1.length + 2) // 123 5
-    let v6 = v1.length + 2 + " 123" // 5 123
-    // Create class object
-    let a = MyClass {
-        myprop: 123
-    }
-    // Create struct object
-    let b = MyStruct {
-        myprop: 123
-    }
-    // Create Array/Slice/Fixed
-    let c = Array[String]{ "a", "b", "c" } // Dynamic array that can grow/shrink in size
-    let d = Slice[String]{ "a", "b", "c" } // Static array with length stored in hidden property
-    // Stack allocation
-    let e : [u8 x 100] = { 0... }
-    let f : MyStruct = { name: "Steve", age: 20 }
-    // Maps
-    let a = Map[u8]{ "a" => 10, "b" => 20 }
-    // Math
-    let v = v1 + v2 // Add
-    let v = v1 - v2 // Subtract
-    let v = v1 / v2 // Divide
-    let v = v1 * v2 // Multiply
-    let v = v1 % v2 // Modulo
-    let v = v1 & v2 // Bitwise AND
-    let v = v1 | v2 // Bitwise OR
-    let v = v1 ^ v2 // Xor
-    let v = v1 << v2 // Shift left
-    let v = v1 >> v2 // Shift rigtht
-    // Comparison
-    if v1 == v2 : println("Equal")
-    if v1 != v2 : println("Not equal")
-    if v1 <= v2 : println("Less or equal")
-    if v1 >= v2 : println("Greater or equal")
-    if v1 < v2 : println("Less than")
-    if v1 > v2 : println("Greater than")
-    // Closures (aggregate { func: *void, data: ?GcPtr })
-    let message = "hello"
-    let myfunc = fn(name: String) { println(message + " " + name) }
-    myfunc("world")
-    // Coroutine
-    let plusone = fn(v: int) int { return v + 1 }
-    let task : co(int) = co plusone(123)
-    let result : int = await task
-}
-
 ```
 
-## Complex parsing logic
+A mode cannot add stored properties. Member lookup checks the mode first and
+then falls through to the base type. Nested modes ultimately use the original
+base representation.
 
-- How the parser handles `{`
--- `{` in a if/while condition grammar context is an AST body
--- `{` after an identifier or `]` is a init body
--- `{` after a `!` is a error handler AST body
--- `{` at the start of a value is an inline init body
--- otherwise build error
+## Nullability
 
-- How the parser handles `!`
--- `!` after a `)` or `]` on the same line is an error handler
--- otherwise it's a not-value (!{value})
--- In a `fn` grammar context it's to define a Error type
+`T` is non-null unless its type inherently represents no value. `?T` permits
+`null`.
 
-- How the parser handles `?`
--- A `?` at the starts it's a nullable-type-expr
--- A trailing `?` is a this-or-that-expr `{expr} ? {expr} : {expr}`
+- Nullable pointer-represented types use a null pointer as the empty state.
+- Nullable closures use a null function pointer as the empty state.
+- Nullable inline values use a presence tag plus the inline payload.
+- Flow checks such as `isset(value)` narrow `?T` to `T` on the proven path.
+- `value ?? fallback` evaluates and returns `fallback` only when `value` is
+  null.
 
+The compiler must not erase nullable state until control-flow analysis proves
+the value non-null.
 
-## Borrow values
+## Borrows and raw pointers
 
-- Can only be assigned to local variables
-- Cannot be captured by other compiler mechanisms
-- Borrow checks on function arguments of known functions are done lazy
--- e.g. passing a `&User` value a `fn myfunc(u: User)` is done lazy by storing info on the Func object
--- If after parsing of `myfunc` the `u` argument abides all borrow rules, then there's no compile error
--- For extern function arguments the borrow rules are ignored
-- If a previous reference is kept that is a non-borrow, that's fine, that reference can still escape
+### Borrows
 
-## Immutable values
+`&T` is a safe, non-owning reference to existing storage. Taking `&value`
+stabilizes the referenced local for the duration of the borrow.
 
-- Any sub property is also immutable
-- If a previous reference is kept that is mutable, that's fine, that reference can still mutate
-- Immutable checks on function arguments of known functions are done lazy
--- For extern function arguments the immutable rules are ignored
+A borrow:
 
-## GC walking
+- May be stored only in local variables and non-escaping parameters.
+- Cannot be stored in a class, array, map, global, interface adapter, or closure.
+- Cannot be returned.
+- Cannot cross a coroutine suspension point.
+- Cannot be converted implicitly to persistent raw-pointer storage.
+- Does not independently keep GC memory alive; the compiler keeps its owner
+  live for every use of the borrow.
 
-- The compiler generates a function for each type that extracts every GC pointer and adds it to a list
-- For union types our compiler generates `match` logic in our walk function (only for types that contain GC data) 
-- borrows and rawpointer are also walked if they point to GC data
+The compiler tracks borrows through tuples, fixed arrays, structs, unions, and
+other inline aggregates. A value containing a borrow follows the same escape
+rules as a direct `&T`.
 
-## Alignment
+### Inferred parameter effects
 
-- Alignment of data is same as the `c` language
-- `struct`s can have `$packed` to make the structure packed
-- bools are 1 byte (and therefore also 1 byte aligned)
+Borrow compatibility and parameter mutation behavior are inferred from
+function bodies rather than requiring developers to repeat effects in every
+signature.
 
-## Allocating memory
+For every parameter, the compiler computes and caches:
 
-- Class initializers use `gc:alloc`
+- `mutates`: the function may modify data reachable through the parameter.
+- `escapes`: the function may return, store, capture, publish, or otherwise
+  retain data reachable through the parameter.
 
-## Inline/stack allocation
+Effects propagate through direct calls. Recursive and mutually recursive
+functions are analyzed as a strongly connected component until their summaries
+stabilize. Generic functions cache effects per specialization. A cached summary
+is invalidated when the function body or a depended-on summary changes.
 
-- Cannot be or contain GC types
-- Cannot be captured or escape a function
+- A borrowed argument is accepted when the target parameter does not escape.
+- Mutation summaries support diagnostics and shared-data validation.
+- For an indirect call, the callable carries the combined effects of its
+  possible targets; an unknown target is treated conservatively.
+- Extern calls have no analyzable body and form an explicit unsafe boundary.
 
-## Access types
+This inference is a semantic pass after identifiers and call targets are
+resolved. It does not affect syntax parsing.
 
-- By default everything can be accessed from the same package
-- Options: pub/ns/local
--- pub: access from everywhere
--- ns: access from same namespace
--- local: access from same file
-- use `@ignoreAccess` to ignore access limitations
+### Raw pointers
+
+Raw pointer types are `ptr`, `*void`, `*T`, and bounded forms such as
+`*[T x N]`. They have no ownership and are not GC roots.
+
+Unsafe pointer-producing or pointer-consuming operations use an `@` token.
+`@ref(value)` creates a raw pointer whose lifetime the programmer must enforce.
+Pointer casts, unchecked arithmetic, and dereferences that cannot be proven
+safe are likewise unsafe operations.
+
+The GC never walks arbitrary raw pointers. Converting a GC reference to a raw
+pointer does not keep the object alive; safe code must retain the owning GC
+reference for as long as the raw pointer is used.
+
+## Shared views
+
+### `shared T`
+
+`shared T` is a transitive view for data published across threads. It cannot be
+converted back to ordinary mutable `T`. Data-race-unsafe properties cannot be
+mutated through a shared view; supported integer operations use atomic access,
+and explicitly synchronized low-level code uses the shared-unsafe mechanisms.
+
+Publishing a GC object as shared publishes its reachable GC graph to the shared
+collector. Ordinary aliases must remain confined to the publishing thread.
+
+## GC and lifetime model
+
+The GC manages classes, arrays, slices, coroutine objects, closure environments,
+interface adapters, and other types explicitly defined as GC objects.
+
+The compiler generates layout-specific GC walking information:
+
+- Direct GC references contribute one root.
+- Structs, tuples, and fixed arrays recursively expose contained roots.
+- Closures expose their environment pointer.
+- Interfaces expose the concrete object stored in their adapter.
+- Tagged unions expose roots only from the active alternative.
+- Nullable inline values expose their payload only when present.
+- Raw pointers and borrows are not independent roots.
+
+Inline aggregates may contain GC references. The compiler must preserve and
+walk those references wherever the aggregate is stored, copied, buffered, or
+returned.
+
+## Layout and ABI
+
+- Layout is target-specific and computed from the target pointer size and
+  alignment rules.
+- Struct and class fields appear in declaration order.
+- Natural padding is inserted before fields and at the end of aggregates.
+- `packed` suppresses normal inter-field padding for a struct.
+- Classes, arrays, slices, coroutines, and interfaces are reference-sized
+  values.
+- Closures are two pointers.
+- Fixed arrays contain `N` consecutive elements.
+- Tuple members use their natural alignment in tuple order.
+- The tagged-union payload begins at byte offset 8 in the current ABI.
+
+Source-level layout compatibility does not by itself guarantee a C ABI.
+Extern/export lowering must validate every argument and return type supported
+by the selected target ABI. Unsupported aggregate or tagged-union signatures
+are compile errors rather than silently using an incorrect calling convention.
+
+## Traits, extensions, and type finalization
+
+Traits reuse declarations inside classes or structs. Generic trait parameters
+are resolved in the receiving type's scope. Conflicting member names are compile
+errors.
+
+Extensions attach methods, getters, hooks, and—unless the type uses
+`$noNewProperties`—stored properties to classes and structs:
+
+```valk
+extend User {
+    fn display_name() String {
+        return this.name
+    }
+}
+```
+
+All declarations and extensions in the build's package graph are discovered
+before type layouts are finalized. Therefore:
+
+- Extension discovery order must not affect the final layout.
+- Duplicate stored property names are errors.
+- Adding an extension property changes the extended type's ABI.
+- A type used as a stable external ABI should use `$noNewProperties`.
+- Precompiled code cannot assume an extended layout unless it was built against
+  the same complete extension set.
+
+Modes, interfaces, unions, arrays, slices, and other representation-sensitive
+built-ins do not accept extension properties.
+
+## Access control
+
+Access markers follow the current compiler contract:
+
+- No marker: accessible throughout the package, private outside it.
+- `-`: private outside the defining source file.
+- `~`: read-only outside the defining source file.
+- `+`: public everywhere.
+- `-~`: read-only in the namespace, private outside it.
+- `-+`: public in the namespace, private outside it.
+- `~+`: public in the namespace, read-only outside it.
+- `-~+`: public in the namespace, read-only in the package, private outside it.
+
+`@ignore_access` is an unsafe file-level escape hatch for compiler and low-level
+library code.
+
+## Errors and control flow
+
+Errors are explicit return channels rather than exceptions.
+
+```valk
+error ParseError (invalid, missing) payload {
+    message: String
+}
+
+fn parse(text: String) int !ParseError {
+    if text.length == 0 {
+        throw .missing { message: "Input is empty" }
+    }
+    return text.to(int) ! throw .invalid { message: "Invalid integer" }
+}
+```
+
+The `!Error` suffix belongs to function declaration/type grammar. Postfix `!`
+forms belong to call error handling. Prefix `!` is boolean negation. These are
+distinguished by grammar context, not by resolving identifiers.
+
+`main` may omit a return type, in which case it returns `void` and the process
+exits successfully. An integer return type supplies the process exit code.
+Other `main` return types are compile errors.
+
+## Context-sensitive punctuation
+
+The parser uses its current grammar context to classify overloaded punctuation:
+
+- `{` starts a declaration/control-flow body when a body is expected.
+- `{` after a type/value constructor starts an initializer.
+- `{` at the start of a value is a type-hinted initializer.
+- `{` after a call error operator starts an error-handler body.
+- `!` in a function declaration or callable type introduces an error type.
+- Postfix `!` after a call introduces error handling.
+- Prefix `!` in a value expression is boolean negation.
+- Prefix `?` in a type context creates a nullable type.
+- In a value context, `condition ? yes : no` is a conditional expression.
+- `??` is nullable fallback and is lexed as one operator.
+- `[` in a type context introduces generics, fixed arrays, or bounded pointer
+  information; in a value context it introduces indexing or a range.
+
+New syntax must preserve the ability to determine these forms from tokens and
+parser context alone.
+
+## Unsafe boundary
+
+Safe code cannot:
+
+- Forge or perform unchecked arithmetic on raw pointers.
+- Return or persist a borrow beyond its owner.
+- Store an untracked GC reference in raw memory.
+- Bypass bounds, access, or shared-data checks.
+- Call an unknown external pointer operation without entering an unsafe path.
+
+Tokens beginning with `@` identify operations that bypass one or more of these
+checks. Raw pointer types may appear in declarations and extern signatures, but
+creating, converting, dereferencing, or persisting them requires an operation
+whose safety is either proven by the compiler or explicitly accepted by the
+programmer.
