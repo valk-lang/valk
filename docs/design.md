@@ -402,6 +402,18 @@ converted back to ordinary mutable `T`. Data-race-unsafe properties cannot be
 mutated through a shared view; supported integer operations use atomic access,
 and explicitly synchronized low-level code uses the shared-unsafe mechanisms.
 
+Language-level atomic reads use acquire ordering, atomic writes use release
+ordering, and atomic read-modify-write operations are sequentially consistent.
+An acquire operation that observes a release operation also observes everything
+sequenced before that release. Mutex unlock and lock form the corresponding
+release/acquire synchronization boundary.
+
+Starting a thread publishes everything sequenced before the start to the new
+thread. Successfully waiting for a thread observes everything sequenced before
+that thread completed. Coroutines are thread-affine and do not migrate between
+threads. Ordinary `global` storage is thread-local; `shared` and `@shared`
+storage is process-wide.
+
 Publishing a GC object as shared publishes its reachable GC graph to the shared
 collector. The compiler tracks uniqueness as internal value provenance; it is
 not part of source-level types. Fresh construction and functions proven to
@@ -445,6 +457,16 @@ The compiler generates layout-specific GC walking information:
 Inline aggregates may contain GC references. The compiler must preserve and
 walk those references wherever the aggregate is stored, copied, buffered, or
 returned.
+
+The local collector invokes `gc_free` for unreachable local objects on the
+thread that owns that local collector. Once an object has been published as
+shared, only the shared collector may invoke its `gc_free`. The call runs on
+whichever thread performs that shared collection, with the object treated as a
+shared value; code must not depend on a particular finalizer thread. A
+particular object receives at most one `gc_free` call, finalization order is
+unspecified, and program shutdown does not guarantee that every remaining
+object is finalized. Deterministic resource release therefore uses an explicit
+operation such as `close`.
 
 ## Layout and ABI
 
