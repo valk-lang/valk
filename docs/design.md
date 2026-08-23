@@ -145,8 +145,16 @@ types.
 
 `Array[T]` owns resizable element storage. `Slice[T]` owns fixed-length element
 storage. Creating a slice from another sequence copies its elements into that
-storage; it does not alias a region of the source sequence. Indexing and ranges
-are bounds checked unless an explicitly unsafe operation is used.
+storage; it does not alias a region of the source sequence.
+
+Array and Slice indexing is compiler-defined rather than implemented through
+`$offset` library hooks. An out-of-range read produces `LookupError.missing`;
+plain `value[index]` handles that error with the element type's default value,
+while `!?` can provide an explicit fallback. For assignment, `Array[length] =
+value` appends, an Array index greater than `length` is ignored, and a Slice
+index at or beyond `length` is ignored. These ignored writes are the result of
+the assignment form's implicit error handler. Fixed arrays use checked inline
+indexing and reject a known invalid index at compile time.
 
 ```valk
 let fixed: [int x 3] = { 1, 2, 3 }
@@ -321,10 +329,20 @@ A borrow:
 - May be stored only in local variables and non-escaping parameters.
 - Cannot be stored in a class, array, map, global, interface adapter, or closure.
 - Cannot be returned.
-- Cannot cross a coroutine suspension point.
 - Cannot be converted implicitly to persistent raw-pointer storage.
-- Does not independently keep GC memory alive; the compiler keeps its owner
-  live for every use of the borrow.
+- May cross a coroutine suspension point when its stabilized storage and owner
+  root are retained in the coroutine frame.
+
+Taking a borrow from an inline local stabilizes that local's address. Taking an
+interior borrow from a GC object creates a hidden root for the exact owner
+allocation, so reassigning the source variable cannot allow the old allocation
+to be collected while the borrow remains live. The current compiler retains
+that root for the remainder of the function or coroutine frame.
+
+Elements of `Array` and `Slice` cannot currently be borrowed through indexing.
+Array backing storage may relocate when it grows, and sequence indexing returns
+a checked value rather than exposing its backing address. Fixed-array elements
+may be borrowed after their containing inline storage is stabilized.
 
 The compiler tracks borrows through tuples, fixed arrays, structs, unions, and
 other inline aggregates. A value containing a borrow follows the same escape

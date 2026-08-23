@@ -426,21 +426,16 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let operand = value_from_exp(operand_exp, scope, ctx.without_suggested_type()) !>
         let op = exp.number.@cast(VALUE_OP)
         if op == VALUE_OP.ref_of {
-            let ref: ?Value = operand
-            while isset(ref) && (ref.type == VAL.ptrv || ref.type == VAL.ptr_of) {
-                ref = ref.value1
-            }
-            let is_var = isset(ref) && (ref.type == VAL.decl || ref.type == VAL.global)
-            if !is_var {
-                exp.error("The '&' operator can only be used on local/global variables")
+            if !operand.assignable() {
+                exp.error("The '&' operator can only be used on assignable storage")
             }
             act_check_assign(operand, exp) !>
             value_check_shared_address(operand, exp) !>
-            if isset(ref) && ref.type == VAL.decl {
-                let decl = ref.decl
-                if isset(decl) : decl.make_stable()
+            let storage = value_prepare_borrow_storage(operand, ctx)
+            if !isset(storage) {
+                exp.error("Cannot borrow from relocatable or unrooted storage")
             }
-            let v = vgen_ptr_of(operand, operand.rett.reference(), exp)
+            let v = vgen_ptr_of(storage, operand.rett.reference(), exp)
             return v
         }
         // Fold constants when possible
@@ -1404,6 +1399,144 @@ fn value_native_sequence_item(on: Value, index: Value, scope: Scope, ctx: Contex
     return value_property_get(vgen_ptrv(data, index, element, at), scope, ctx, at) !>
 }
 
+fn native_sequence_lookup_error(b: Build, at: Exp) ErrorType !Error {
+    let idf = valk_idf(b, "core", "LookupError") !>
+    if idf.type != IDF.error_type : at.bug("core:LookupError is not an error type")
+    let error_type = idf.error_type
+    if !isset(error_type) : at.bug("core:LookupError is missing its error type")
+    parse_error_type(error_type) !>
+    return error_type
+}
+
+fn native_sequence_helper_base(owner: Func, name: String, key: String, on_type: Type, rett: Type, at: Exp) Func !Error {
+    let arg_scope = Scope.new(owner.ns.scope)
+    let func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<sequence." + name + "." + helper:ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: rett
+        is_inline: true
+    }
+    arg_scope.func = func
+    append_func_arg(func, "sequence", on_type)
+    append_func_arg(func, "index", type_from_core(owner.ns.build, "uint") !>)
+    return func
+}
+
+fn native_sequence_helper_finish(func: Func) !Error {
+    let owner_unit = func.unit
+    owner_unit.functions.append(func)
+    func_finish_ast(func) !>
+    if !isset(func.ns.build.options.lsp) : generate_func_ir(func) !>
+}
+
+fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
+    let key = type_identity_key(on_type)
+    ctx.build.cache.sequence_get_funcs.get(key) -> cached : return cached
+
+    let owner = ctx.get_func() !>
+    let element = type_native_sequence_element(on_type)
+    if !isset(element) : at.bug("Sequence type has no element type")
+    let rett = on_type.get_non_nullable().is_shared ? element.shared_storage_type() : element
+    let func = native_sequence_helper_base(owner, "get", key, on_type, rett, at) !>
+    let error_type = native_sequence_lookup_error(ctx.build, at) !>
+    func.can_error = true
+    func.error_type = error_type
+    ctx.build.cache.sequence_get_funcs.set(key, func)
+    bind_func_arg_decls(func) !>
+
+    let body_scope = func.arg_scope.sub_scope()
+    body_scope.func = func
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(func)
+    let sequence_arg = func.args.get(0) ! at.bug("Sequence helper is missing its receiver")
+    let index_arg = func.args.get(1) ! at.bug("Sequence helper is missing its index")
+    let sequence = vgen_decl(sequence_arg.decl)
+    let index = vgen_decl(index_arg.decl)
+    let length = value_native_sequence_length(sequence, on_type, inner_ctx, at) !>
+    if !isset(length) : at.bug("Sequence type has no length")
+    let past_end = vgen_op(index, length, VALUE_OP.gte, type_bool(ctx.build))
+    let missing = value_from_error_code_item(error_type, "missing", at) !>
+    body_scope.append_value(vgen_if(past_end, Array[Value]{ vgen_throw(missing, ctx.build, at) }, null, ctx.build, at))
+    let result = value_native_sequence_item(sequence, index, body_scope, inner_ctx, at) !>
+    result.rett = rett
+    body_scope.append_value(vgen_return(result, ctx.build, at))
+    body_scope.did_return = true
+
+    native_sequence_helper_finish(func) !>
+    return func
+}
+
+fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
+    let key = type_identity_key(on_type)
+    ctx.build.cache.sequence_set_funcs.get(key) -> cached : return cached
+
+    let owner = ctx.get_func() !>
+    let element = type_native_sequence_element(on_type)
+    if !isset(element) : at.bug("Sequence type has no element type")
+    let func = native_sequence_helper_base(owner, "set", key, on_type, type_void(ctx.build), at) !>
+    let error_type = native_sequence_lookup_error(ctx.build, at) !>
+    func.can_error = true
+    func.error_type = error_type
+    func.mutates_receiver = true
+    append_func_arg(func, "value", element)
+    ctx.build.cache.sequence_set_funcs.set(key, func)
+    bind_func_arg_decls(func) !>
+
+    let body_scope = func.arg_scope.sub_scope()
+    body_scope.func = func
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(func)
+    let sequence_arg = func.args.get(0) ! at.bug("Sequence helper is missing its receiver")
+    let index_arg = func.args.get(1) ! at.bug("Sequence helper is missing its index")
+    let value_arg = func.args.get(2) ! at.bug("Sequence helper is missing its value")
+    let sequence = vgen_decl(sequence_arg.decl)
+    let index = vgen_decl(index_arg.decl)
+    let value = vgen_decl(value_arg.decl)
+    let length = value_native_sequence_length(sequence, on_type, inner_ctx, at) !>
+    if !isset(length) : at.bug("Sequence type has no length")
+    let kind = type_native_sequence(on_type).kind
+    let invalid_op = kind == TYPE.array ? VALUE_OP.gt : VALUE_OP.gte
+    let invalid = vgen_op(index, length, invalid_op, type_bool(ctx.build))
+    let range = value_from_error_code_item(error_type, "range", at) !>
+    body_scope.append_value(vgen_if(invalid, Array[Value]{ vgen_throw(range, ctx.build, at) }, null, ctx.build, at))
+
+    if kind == TYPE.array {
+        let class = on_type.get_non_nullable().get_class_or_null()
+        let append_func = isset(class) ? class.get_append_hook() : null
+        if !isset(append_func) : at.bug("Array type has no append function")
+        if !append_func.parsed_types : parse_func_types(append_func) !>
+        let at_end = vgen_op(index, length, VALUE_OP.eq, type_bool(ctx.build))
+        let append_call = vgen_call(
+            inner_ctx,
+            vgen_func(append_func, sequence),
+            Array[Value]{ value, vgen_bool(false, type_bool(ctx.build)) },
+            append_func.get_rett(),
+            body_scope
+        )
+        append_call.exp = at
+        body_scope.append_value(vgen_if(at_end, Array[Value]{ append_call, vgen_return(null, ctx.build, at) }, null, ctx.build, at))
+    }
+
+    let data = value_native_sequence_data(sequence, on_type, inner_ctx, at) !>
+    let prop = vgen_ptrv(data, index, element, at)
+    body_scope.append_value(value_property_update(sequence, prop, value, body_scope, inner_ctx, at) !>)
+    body_scope.append_value(vgen_return(null, ctx.build, at))
+    body_scope.did_return = true
+
+    native_sequence_helper_finish(func) !>
+    return func
+}
+
 fn value_from_offset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let v = value_from_offset_raw_exp(exp, scope, ctx) !>
     if v.can_error : return value_apply_offset_default(v, exp)
@@ -1591,7 +1724,24 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         }
     }
 
-    // Class `$offset` hook, e.g. `Array[T].get(index: uint) T !LookupError`.
+    // Array/Slice indexing is a language operation. The generated helper keeps
+    // the normal error ABI and GC-aware element load while avoiding library hooks.
+    if on_t.kind == TYPE.array || on_t.kind == TYPE.slice {
+        if on.rett.is_nullable_type() {
+            exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+        }
+        let uint_t = type_from_core(b, "uint") !>
+        index = value_try_convert(index, scope, ctx, uint_t)
+        uint_t.compat_check(index.rett, index_exp) !>
+        let get_func = native_sequence_get_func(on.rett, ctx, exp) !>
+        let call = vgen_call(ctx, vgen_func(get_func), Array[Value]{ on, index }, get_func.get_rett(), scope)
+        call.exp = exp
+        call.can_error = true
+        call.set_error_type(get_func.error_type)
+        return call
+    }
+
+    // User-defined class `$offset` hook.
     let on_class = on_t.get_class_or_null()
     if isset(on_class) {
         let get_func = resolve_offset_get_func(on_class)
@@ -1738,6 +1888,30 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
 
     let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
     let on_t = on.rett.get_non_nullable()
+    if on_t.kind == TYPE.array || on_t.kind == TYPE.slice {
+        if on.rett.is_nullable_type() {
+            left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+        }
+        if type_native_sequence(on.rett).is_shared {
+            left_exp.error("Cannot call mutating method 'set' on shared data of type '" + on.rett.compat_display_name() + "'")
+        }
+        let index_exp = access
+        let uint_t = type_from_core(ctx.build, "uint") !>
+        let index = value_from_exp(index_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        index = value_try_convert(index, scope, ctx, uint_t)
+        uint_t.compat_check(index.rett, index_exp) !>
+        let element = type_native_sequence_element(on_t)
+        if !isset(element) : left_exp.bug("Sequence type has no element type")
+        let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
+        right = value_try_convert(right, scope, ctx, element)
+        element.compat_check(right.rett, right_exp) !>
+        let set_func = native_sequence_set_func(on.rett, ctx, left_exp) !>
+        let call = vgen_call(ctx, vgen_func(set_func), Array[Value]{ on, index, right }, set_func.get_rett(), scope)
+        call.exp = at
+        call.can_error = true
+        call.set_error_type(set_func.error_type)
+        return value_apply_error_ignore(call, at, ctx)
+    }
     if on_t.is_fixed_array_type() || on_t.kind == TYPE.ref_of : return null
     let on_class = on_t.kind == TYPE.ptr_of ? on_t.get_direct_class_or_null() : on_t.get_class_or_null()
     if !isset(on_class) : return null
