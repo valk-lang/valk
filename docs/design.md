@@ -5,7 +5,7 @@
 
 - We must be able to parse code/syntax without resolving the identifiers
 - We aim for max parsing/compile speed
-- Unsafe tokens start with `@` (use with caution)
+- Unsafe tokens start with `@`, rawpointers use `*` but should only be achievable through using unsafe tokens
 
 ## Overview
 
@@ -96,7 +96,7 @@ class A {
     }
 }
 
-// Struct (structure which objects are manual memory managed)
+// Struct
 // Syntax: [pub/ns/local] struct {name} [$packed] { ... }
 struct B {
     // Same syntax as class
@@ -124,7 +124,7 @@ extend Array[T] {
     }
 }
 
-// Mode (different name for another class which allows changing the functions)
+// Mode (different name for another named type which allows changing the functions)
 // Syntax: mode {name} for {name} { ... }
 mode Path for String {
     fn add(part: String) Path {
@@ -134,7 +134,7 @@ mode Path for String {
 
 // Interface: define which functions a class must have (only for classes, not other types)
 // Syntax: [pub/ns/local] interface {name} { ... }
-// Using interfaces on a class add a hidden VTABLE property that refers to a table with pointers to the functions for this object
+// Interface type values are aggregates { vtable: *void, value: T }
 interface Printable {
     // Functions
     fn print();
@@ -144,7 +144,7 @@ interface Printable {
 // Union (tagged union)
 // Syntax: [pub/ns/local] union {name} : Type1 | Type2 | ... { ... }
 // Memory layout: { u8, T } where T has the alignment and size of the largest type
-// Max types = max value of u8
+// Max types = 256 (0-255)
 union C : String | int | bool {
     fn print() {
         match this {
@@ -162,8 +162,8 @@ enum MyEnum {
     A // 0
     B = 2 // 2
     C // 1
-    D // 3 (tries to avoid duplicate values)
-    E = 2 // 2 (duplicate values allowed)
+    D // 3 (The compiler avoids duplicate values when the value is determined by the compiler)
+    E = 2 // 2 (Duplicate values allowed)
 }
 
 // Value creation
@@ -215,7 +215,7 @@ fn example() {
     if v1 >= v2 : println("Greater or equal")
     if v1 < v2 : println("Less than")
     if v1 > v2 : println("Greater than")
-    // Closures
+    // Closures (aggregate { func: *void, data: ?GcPtr })
     let message = "hello"
     let myfunc = fn(name: String) { println(message + " " + name) }
     myfunc("world")
@@ -230,7 +230,7 @@ fn example() {
 ## Complex parsing logic
 
 - How the parser handles `{`
--- `{` in a if/while condition is an AST body
+-- `{` in a if/while condition grammar context is an AST body
 -- `{` after an identifier or `]` is a init body
 -- `{` after a `!` is a error handler AST body
 -- `{` at the start of a value is an inline init body
@@ -239,6 +239,7 @@ fn example() {
 - How the parser handles `!`
 -- `!` after a `)` or `]` on the same line is an error handler
 -- otherwise it's a not-value (!{value})
+-- In a `fn` grammar context it's to define a Error type
 
 - How the parser handles `?`
 -- A `?` at the starts it's a nullable-type-expr
@@ -252,22 +253,27 @@ fn example() {
 - Borrow checks on function arguments of known functions are done lazy
 -- e.g. passing a `&User` value a `fn myfunc(u: User)` is done lazy by storing info on the Func object
 -- If after parsing of `myfunc` the `u` argument abides all borrow rules, then there's no compile error
+-- For extern function arguments the borrow rules are ignored
 - If a previous reference is kept that is a non-borrow, that's fine, that reference can still escape
 
 ## Immutable values
 
 - Any sub property is also immutable
 - If a previous reference is kept that is mutable, that's fine, that reference can still mutate
+- Immutable checks on function arguments of known functions are done lazy
+-- For extern function arguments the immutable rules are ignored
 
 ## GC walking
 
 - The compiler generates a function for each type that extracts every GC pointer and adds it to a list
 - For union types our compiler generates `match` logic in our walk function (only for types that contain GC data) 
+- borrows and rawpointer are also walked if they point to GC data
 
 ## Alignment
 
 - Alignment of data is same as the `c` language
 - `struct`s can have `$packed` to make the structure packed
+- bools are 1 byte (and therefore also 1 byte aligned)
 
 ## Allocating memory
 
