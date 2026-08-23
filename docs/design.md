@@ -534,6 +534,9 @@ extend User {
 Extensions from other packages may add only methods and getters. Exported ABI
 types cannot receive extension properties. All declarations and extensions in
 the build's package graph are discovered before type layouts are finalized.
+Exported ABI reachability is transitive through properties, generic arguments,
+sequence elements, union members, callable arguments and returns, and error
+payloads; every reachable type is subject to the same restriction.
 Therefore:
 
 - Extension discovery order must not affect the final layout.
