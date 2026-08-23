@@ -9,10 +9,14 @@ fn parse_func_ast(func: Func) !Error {
     if func.is_clone_hook && !isset(func.clone_at) : return
     if !lsp_should_parse_func_ast(func) : return
 
+    if !func.unique_summary_ready : func_begin_unique_summary(func)
     func.parsed_ast = true
 
     let body = func.body
-    if !isset(body) : return
+    if !isset(body) {
+        func_unique_summary_conservative(func)
+        return
+    }
 
     // Body scope parents arg_scope (args + this already bound as IDF.decl)
     let scope = func.arg_scope.sub_scope()
@@ -41,6 +45,7 @@ fn parse_func_ast(func: Func) !Error {
     if scope.must_return && !scope.did_return && !scope.must_exit && !scope.must_throw {
         body.error("Missing 'return' statement")
     }
+    if func.computing_unique_summary : func_finish_unique_summary(func)
     warn_unused_decls(func)
 
     // The LSP never links, and unreachable CLI bodies need validation only.
@@ -597,7 +602,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                 let explicit = type_from_exp(te, scope) !>
                 if !part.rett.is_void_type() {
                     // Apply int→ptr / number widen / $to before requiring exact compat
-                    part = value_try_convert(part, scope, ctx, explicit, true, true)
+                    part = value_try_convert(part, scope, ctx, explicit, true, true) !>
                     // Prefer RHS value span for errors (not the whole `let` line)
                     let at = part.exp ?? exp
                     explicit.compat_check(part.rett, at) !>
@@ -615,6 +620,16 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             }
             let decl = Decl.new(ctx.get_func() !>, decl_type, false, name)
             decl.exp = exp
+            decl.escape_origins = value_escape_origins(part)
+            let managed = decl_type.has_gc_refs() || decl_type.get_non_nullable().kind == TYPE.closure
+            if managed {
+                decl.unique_graph = value_has_fresh_graph(part)
+                if !decl.unique_graph && value_can_transfer_unique_inputs(part) && value_has_unique_graph(part) {
+                    decl.unique_graph = true
+                    value_transfer_unique_inputs(part, decl)
+                }
+                if !decl.unique_graph : value_invalidate_unique(part)
+            }
             scope.add_decl(decl)
             scope.set_idf(name, Idf.for_decl(decl))
             if part.type != VAL.undefined {
@@ -660,7 +675,19 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
         retv = value_from_exp(value_exp, scope, ctx.with_suggested_type(rett)) !>
         // Skip when returned type is still void (incomplete typing)
         if !retv.rett.is_void_type() {
-            retv = value_try_convert(retv, scope, ctx, rett)
+            retv = value_try_convert(retv, scope, ctx, rett) !>
+            if func.computing_unique_summary {
+                func.unique_summary_saw_return = true
+                let dependencies = Array[uint]{}
+                let summary_unique = value_summary_graph_is_unique(retv, func, dependencies)
+                if !summary_unique {
+                    func.returns_unique_graph = false
+                    func.unique_return_args.clear()
+                } else if func.returns_unique_graph {
+                    each dependencies as index : func.unique_return_args.append(index, true)
+                }
+                value_mark_summary_escape(retv)
+            }
             let at = retv.exp ?? exp
             rett.compat_check(retv.rett, at) !>
             if retv.is_implicit_borrow() {
@@ -828,12 +855,12 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
                     prev.value1 = value_make_nullable(pv)
                 }
             }
-            retv = value_try_convert(retv, scope, ctx, known)
+            retv = value_try_convert(retv, scope, ctx, known) !>
             let at = retv.exp ?? exp
             known.compat_check(retv.rett, at) !>
         }
     } else {
-        retv = value_try_remove_nullable(retv, scope, ctx)
+        retv = value_try_remove_nullable(retv, scope, ctx) !>
         vscope.vscope_rett = retv.rett
     }
     scope.did_return = true
@@ -887,8 +914,8 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     }
 
     if op == ASSIGN_OP.add {
-        let hook_left = value_try_remove_nullable(left, scope, ctx)
-        let hook_right = value_try_remove_nullable(right, scope, ctx)
+        let hook_left = value_try_remove_nullable(left, scope, ctx) !>
+        let hook_right = value_try_remove_nullable(right, scope, ctx) !>
         let hooked = value_try_add_hook(hook_left, hook_right, scope, ctx, exp) !>
         if isset(hooked) {
             right = hooked
@@ -903,7 +930,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
 
     if !left.rett.is_void_type() && !right.rett.is_void_type() {
         if pointer_offset_assign {
-            right = value_try_convert(right, scope, ctx, type_int(b))
+            right = value_try_convert(right, scope, ctx, type_int(b)) !>
             if !right.rett.is_integer_type() {
                 right_exp.error("Pointer offset must be an integer, got: " + right.rett.compat_display_name())
             }
@@ -913,18 +940,59 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             right = vgen_ptr_offset(left, right, exp)
             op = ASSIGN_OP.set
         } else {
-            right = value_try_convert(right, scope, ctx, left.rett, true, left.type == VAL.decl)
+            let allow_shared_unsafe = false
+            if left.type == VAL.global {
+                let global = left.global
+                allow_shared_unsafe = isset(global) && global.allow_unsafe
+            }
+            right = value_try_convert(right, scope, ctx, left.rett, true, left.type == VAL.decl, allow_shared_unsafe) !>
             let at = right.exp ?? exp
             left.rett.compat_check(right.rett, at) !>
         }
     }
 
+    if op == ASSIGN_OP.set {
+        if left.type == VAL.decl {
+            let decl = left.decl
+            if isset(decl) {
+                // Reassignment detaches this variable from the graph it previously named.
+                decl.unique_dependents = .{}
+                decl.escape_origins = value_escape_origins(right)
+                let managed = decl.type.has_gc_refs() || decl.type.get_non_nullable().kind == TYPE.closure
+                if managed {
+                    decl.unique_graph = value_has_fresh_graph(right)
+                    decl.unique_published = false
+                    if !decl.unique_graph && value_can_transfer_unique_inputs(right) && value_has_unique_graph(right) {
+                        decl.unique_graph = true
+                        value_transfer_unique_inputs(right, decl)
+                    }
+                    if !decl.unique_graph : value_invalidate_unique(right)
+                }
+            }
+        } else {
+            value_mark_actual_escape(right)
+            if left.type == VAL.prop || left.type == VAL.ptrv {
+                if !value_has_fresh_graph(right) {
+                    let owner = left.value1
+                    if isset(owner) {
+                        value_mark_summary_unique_invalidation(owner)
+                        value_invalidate_unique(owner)
+                    }
+                }
+            }
+        }
+    }
+
     if op == ASSIGN_OP.set && left.type == VAL.decl && right_is_non_null {
         let decl = left.decl
-        if isset(decl) : scope.mark_not_null(decl)
+        if isset(decl) {
+            scope.mark_not_null(decl)
+        }
     } else if op == ASSIGN_OP.set && left.type == VAL.decl {
         let decl = left.decl
-        if isset(decl) : scope.clear_not_null(decl)
+        if isset(decl) {
+            scope.clear_not_null(decl)
+        }
     }
 
     return vgen_store(left, right, op, ctx, scope, exp) !>
@@ -1036,7 +1104,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     if !isset(on_exp) : exp.bug("each is missing the iterated value")
 
     let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
-    let on_nn = value_try_remove_nullable(on, scope, ctx)
+    let on_nn = value_try_remove_nullable(on, scope, ctx) !>
     if on_nn.rett.is_nullable_type() {
         on_exp.error("Cannot use 'each' on a nullable type: " + on_nn.rett.compat_display_name())
     }
@@ -1100,7 +1168,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         if !skip_v.rett.is_integer_type() {
             skip_exp.error("Expected an integer value for 'skip', not: " + skip_v.rett.compat_display_name())
         }
-        skip_v = value_try_convert(skip_v, scope, ctx, index_type)
+        skip_v = value_try_convert(skip_v, scope, ctx, index_type) !>
         index_type.compat_check(skip_v.rett, skip_exp) !>
         start_value = skip_v
     }

@@ -359,11 +359,15 @@ For every parameter, the compiler computes and caches:
 - `mutates`: the function may modify data reachable through the parameter.
 - `escapes`: the function may return, store, capture, publish, or otherwise
   retain data reachable through the parameter.
+- `invalidates_unique`: the function may insert an external alias into data
+  reachable through the parameter.
 
-Effects propagate through direct calls. Recursive and mutually recursive
-functions are analyzed as a strongly connected component until their summaries
-stabilize. Generic functions cache effects per specialization. A cached summary
-is invalidated when the function body or a depended-on summary changes.
+Return summaries distinguish unconditional fresh graphs from graphs whose
+freshness depends on particular arguments also being fresh temporaries.
+
+Effects propagate through direct calls. Recursive calls whose summary is still
+being computed are treated conservatively. Generic functions cache effects per
+specialization; rebuilding a changed body recomputes its summary.
 
 - A borrowed argument is accepted when the target parameter does not escape.
 - Mutation summaries support diagnostics and shared-data validation.
@@ -398,7 +402,29 @@ mutated through a shared view; supported integer operations use atomic access,
 and explicitly synchronized low-level code uses the shared-unsafe mechanisms.
 
 Publishing a GC object as shared publishes its reachable GC graph to the shared
-collector. Ordinary aliases must remain confined to the publishing thread.
+collector. The compiler tracks uniqueness as internal value provenance; it is
+not part of source-level types. Fresh construction and functions proven to
+return fresh graphs produce unique values. Nonescaping calls preserve
+uniqueness, while aliasing, capture, persistent storage, and calls through
+unknown code remove it.
+
+An ordinary value may become `shared T` only when its complete reachable managed
+graph is still provably unique. Publishing consumes that internal capability;
+using another mutable alias is rejected. Strings and other immutable values are
+always compatible. Function argument escape and fresh-return summaries are
+inferred from bodies and cached, so APIs do not need ownership annotations.
+An ordinary graph may receive a temporary `shared` view for a parameter proven
+not to escape or introduce aliases; this does not publish the graph or consume
+its uniqueness.
+When a fresh local is placed into a fresh aggregate, dependent provenance keeps
+the aggregate unique only while the source local is not read again. Ordinary
+aliasing remains ordinary aliasing; it never silently consumes a value.
+
+Ownership provenance covers managed references; raw pointers retain their
+separate explicit unsafe lifetime and aliasing rules.
+`@shared` globals are the explicit unsafe override when an external protocol
+guarantees synchronization and lifetime safety. Within an expression,
+`value.@cast(shared T)` is the corresponding explicit unsafe conversion.
 
 ## GC and lifetime model
 
