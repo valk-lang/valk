@@ -44,6 +44,22 @@ check_build() {
     fi
 }
 
+check_effects() {
+    local artifact="$1.effects"
+    if [ ! -f "$artifact" ]; then
+        echo "# Effect summary artifact was not created: $artifact"
+        exit 1
+    fi
+    if ! head -n 1 "$artifact" | grep -q '^VALK_EFFECTS|1|'; then
+        echo "# Invalid effect summary header: $artifact"
+        exit 1
+    fi
+    if ! awk -F'|' 'NR > 1 && NF != 10 { bad=1 } END { exit bad || NR < 2 }' "$artifact"; then
+        echo "# Invalid effect summary rows: $artifact"
+        exit 1
+    fi
+}
+
 run_dynamic() {
     case "$(uname -s)" in
         Darwin*) DYLD_LIBRARY_PATH="$workdir${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" "$1" ;;
@@ -81,6 +97,7 @@ if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
         echo "# Dynamic library was not created: $shared"
         exit 1
     fi
+    check_effects "$shared"
 
     echo "> Build dynamic library with static dependencies"
     out=$("$VALK" build "$DIR/library.valk" --lib --static --no-warn -o "$static_shared" 2>&1)
@@ -129,6 +146,7 @@ out=$("$VALK" build "$DIR/dependency.valk" --lib --no-warn -L "$workdir" -o "$sh
 status=$?
 check_build "$out" "dynamic library"
 [ -f "$shared" ] || exit 1
+check_effects "$shared"
 "$cc" "$DIR/consumer.c" "$shared" -L "$workdir" -lanswerdep -Wl,-rpath,"$workdir" -o "$workdir/consumer-dynamic" || exit $?
 run_dynamic "$workdir/consumer-dynamic" || exit $?
 

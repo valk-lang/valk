@@ -370,6 +370,15 @@ Effects propagate through direct calls. Recursive calls whose summary is still
 being computed are treated conservatively. Generic functions cache effects per
 specialization; rebuilding a changed body recomputes its summary.
 
+Available source is always reanalysed. Object caches and precompiled libraries
+store versioned, compiler-generated effect summaries alongside their code. A
+summary records its function signature, body identity, direct callee summary
+hashes, and a transitive dependency hash. The compiler accepts it only when the
+schema, compiler version, signature, checksum, and every available callee
+summary still match. Missing, incompatible, corrupt, or stale metadata receives
+the conservative effects. These summaries are compiler metadata, not source
+annotations or part of the language's API.
+
 - A borrowed argument is accepted when the target parameter does not escape.
 - Mutation summaries support diagnostics and shared-data validation.
 - For an indirect call, the callable carries the combined effects of its
