@@ -438,6 +438,23 @@ Extern/export lowering must validate every argument and return type supported
 by the selected target ABI. Unsupported aggregate or tagged-union signatures
 are compile errors rather than silently using an incorrect calling convention.
 
+Extern signatures cannot contain `&T` or GC-managed references, including
+references nested in inline aggregates. Pointer parameters use raw `*T` or
+`ptr`, and callers must cross that boundary explicitly:
+
+```valk
+extern fn inspect(value: *Value) void
+
+let value = Value {}
+inspect(@ref(value))
+```
+
+`@ref` stabilizes inline stack storage and retains the exact GC owner of an
+interior address for the current function or coroutine frame. It still returns
+an unsafe raw pointer with no lifetime guarantee beyond that frame. An extern
+API that retains a pointer must therefore use a longer-lived explicit
+pinning/rooting protocol.
+
 ## Traits, extensions, and type finalization
 
 Traits reuse declarations inside classes or structs. Generic trait parameters
