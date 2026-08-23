@@ -148,13 +148,14 @@ storage. Creating a slice from another sequence copies its elements into that
 storage; it does not alias a region of the source sequence.
 
 Array and Slice indexing is compiler-defined rather than implemented through
-`$offset` library hooks. An out-of-range read produces `LookupError.missing`;
-plain `value[index]` handles that error with the element type's default value,
-while `!?` can provide an explicit fallback. For assignment, `Array[length] =
-value` appends, an Array index greater than `length` is ignored, and a Slice
-index at or beyond `length` is ignored. These ignored writes are the result of
-the assignment form's implicit error handler. Fixed arrays use checked inline
-indexing and reject a known invalid index at compile time.
+`$offset` library hooks. An out-of-range read produces `LookupError.missing`
+and must use normal error handling or pass the error to the caller. For
+assignment, `Array[length] = value` appends, an Array index greater than
+`length` produces `LookupError.range`, and a Slice index at or beyond `length`
+produces `LookupError.range`. Indexed assignment passes that error to the
+caller; use the corresponding `set` method when another explicit handling
+policy is required. Fixed arrays use checked inline indexing and reject a known
+invalid index at compile time.
 
 ```valk
 let fixed: [int x 3] = { 1, 2, 3 }
