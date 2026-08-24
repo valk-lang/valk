@@ -128,6 +128,9 @@ Coroutine type: `co({return-types})` e.g. `co(i32)` (returns an i32 when using `
 
 Other: `ptr` <- raw pointer (unsafe)
 
+Integers do not convert implicitly to raw pointers; use `value.@cast(ptr)` when
+intentionally forging an address. A raw `ptr` converts implicitly to `uint`.
+
 ---
 
 `int` becomes `i32` or `i64` based on the compile target

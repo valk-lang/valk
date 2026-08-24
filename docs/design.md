@@ -417,10 +417,18 @@ resolved. It does not affect syntax parsing.
 Raw pointer types are `ptr`, `*void`, `*T`, and bounded forms such as
 `*[T x N]`. They have no ownership and are not GC roots.
 
-Unsafe pointer-producing or pointer-consuming operations use an `@` token.
+Raw-pointer operations are unsafe even when expressed with ordinary operators.
 `@ref(value)` creates a raw pointer whose lifetime the programmer must enforce.
-Pointer casts, unchecked arithmetic, and dereferences that cannot be proven
-safe are likewise unsafe operations.
+Integer-to-pointer conversions are never implicit and require
+`value.@cast(ptr)`. A raw `ptr` converts implicitly to pointer-sized `uint`,
+which preserves every address bit; conversions to other integer types remain
+explicit. Dereferences that cannot be proven safe use explicit unsafe
+operations. `pointer.$offset(bytes)` computes an address offset without
+converting the integer offset itself to `ptr`.
+
+Bitwise `ptr & integer`, `ptr | integer`, and `ptr ^ integer` operations retain
+the pointer type. Assigning such a result to `uint` uses the same one-way
+implicit conversion.
 
 The GC never walks arbitrary raw pointers. Converting a GC reference to a raw
 pointer does not keep the object alive; safe code must retain the owning GC
