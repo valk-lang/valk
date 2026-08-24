@@ -1191,11 +1191,13 @@ Although Valk aims to be safe, it still supports low-level operations when neede
 
 - All tokens that start with `@`
 - Raw pointer types such as `ptr`
-- `struct` values whose manually managed allocations are not freed
 
 ## Structs
 
-A `struct` is similar to a `class` without garbage collection. Its allocation lifetime must be managed manually. Struct layouts are compatible with C structs, which makes them useful for integrating with C libraries.
+A `struct` is an inline value type. Assignment, argument passing, and returning
+a struct copy all of its fields by value.
+But you can always use `mem:alloc` and `mem:free` to create struct objects on
+the heap and pass that object by reference.
 
 ```rust
 struct MyStruct {
@@ -1203,18 +1205,18 @@ struct MyStruct {
     b: i32
 }
 
-use valk:mem
-
 fn main() {
-    let ob = MyStruct{
+    let first = MyStruct{
         a: 5
         b: 100
     }
-    mem:free(ob)
+    let second = first
+    second.a = 10
+
+    println(first.a)  // 5
+    println(second.a) // 10
 }
 ```
-
-Valk allocates struct objects through `valk:mem:alloc`; release them with `valk:mem:free`. These functions map to libc's `malloc` and `free`, so memory can cross the Valk/C boundary when both sides agree on ownership.
 
 ## External libraries
 
