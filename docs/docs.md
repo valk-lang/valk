@@ -795,6 +795,8 @@ let response_2 = await request_2 !? http:Response.empty(400)
 ```
 
 Use `co` to start a coroutine and `await` to wait for its result.
+Coroutine error types cannot contain payload fields, including inherited fields.
+Handle payload errors inside the coroutine or encode them in its return type.
 
 ```rust
 fn hi() { println("Hello") }

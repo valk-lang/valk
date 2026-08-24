@@ -224,8 +224,9 @@ Capture-free functions have a null environment and may convert to `fnptr`.
 Captured values live in a GC-managed environment. A raw function pointer does
 not carry an environment and cannot represent a capturing closure.
 
-Coroutines cannot return errors. A coroutine must handle errors before
-suspending or encode failure in its ordinary return type.
+Coroutines may return payload-free errors. Error types with payload fields,
+including inherited fields, must be handled inside the coroutine or encoded in
+its ordinary return type.
 
 ### Interfaces
 
