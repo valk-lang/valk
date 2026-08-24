@@ -1237,6 +1237,14 @@ extern fn malloc(size: uint) ptr;
 extern fn free(adr: ptr);
 ```
 
+C-style variadic declarations use `...` as the final argument. Variadic
+arguments are supported only on `extern` functions; ordinary and exported Valk
+functions cannot declare them.
+
+```rust
+extern fn printf(format: cstring, ...) i32;
+```
+
 ## Linking
 
 To link with your library you have 2 options:

@@ -552,6 +552,9 @@ let value = Value {}
 inspect(@ref(value))
 ```
 
+C-style variadic arguments use a final `...` marker and are restricted to
+extern declarations. Valk-defined and exported functions cannot be variadic.
+
 `@ref` stabilizes inline stack storage and retains the exact GC owner of an
 interior address for the current function or coroutine frame. It still returns
 an unsafe raw pointer with no lifetime guarantee beyond that frame. An extern
