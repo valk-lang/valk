@@ -1,47 +1,41 @@
-
 use ext
 use coro
+use mem
 
 #if OS == "win"
 global cport_instance: ext:HANDLE
 struct OverlapBase {
     sys: ext:OVERLAPPED
-    coro: ?coro:Coro
+    // Raw pointer to the coroutine that owns this overlap. The coroutine is
+    // rooted by 'coro:g_coros' and owns the overlap itself, so it always
+    // outlives it. Keeping it raw makes 'Overlap' free of managed fields.
+    coro: ptr (null.@cast(ptr))
     event: PollEvent
     completed: bool
     cancel_requested: bool
     socket_read: bool
+    // Set while the kernel still owns this overlap, cleared by the coroutine
+    // loop when the completion packet is dequeued. Reusing an overlap is only
+    // safe once that happened.
+    in_use: bool
     fd: FD
 }
-class OverlapData {
+
+// A single overlap type for every operation: a coroutine keeps two of these
+// and hands them out again, so an IO call does not allocate. That only works
+// when one slot fits every use, hence the shared field set.
+// 'buflen' + 'buf' double as the WSABUF given to WSARecv/WSASend, so they must
+// stay adjacent and in this order.
+class Overlap {
     base: OverlapBase
-}
-// AcceptEx
-class OverlapAcceptEx {
-    base: OverlapBase
-    socket: ext:SOCKET
-    addressBuffer: [u8 x 128]
-    bytesReceived: u32
-}
-// ConnectEx
-class OverlapConnectEx {
-    base: OverlapBase
-    sent: u32
-}
-// Recv
-class OverlapRecv {
-    base: OverlapBase
+    // WSABUF
     buflen: uint
     buf: ?ptr
-    rcvd: u32
+    // Recv / Send / ConnectEx result
+    transferred: u32
     flags: u32
-}
-// Send
-class OverlapSend {
-    base: OverlapBase
-    buflen: uint
-    buf: ?ptr
-    sent: u32
+    // AcceptEx
+    addressBuffer: [u8 x 128]
 }
 
 fn iocp() ext:HANDLE {
@@ -60,21 +54,41 @@ fn iocp_close() {
     cport_instance = 0
 }
 
-fn overlap[T]() T {
+fn overlap() Overlap {
     let current = coro:current_coro
     if !isset(current) : panic("Creating IOCP state outside a coroutine")
-    let ov = T {}
-    ov.base.coro = current
+    let ov = current.take_overlap()
+
+    mem:clear(@ref(ov.base.sys), size_of(ext:OVERLAPPED))
+    ov.base.coro = current.@cast(ptr)
+    ov.base.event = 0
+    ov.base.completed = false
+    ov.base.cancel_requested = false
+    ov.base.socket_read = false
+    ov.base.in_use = true
+    ov.base.fd = 0
+    ov.buflen = 0
+    ov.buf = null
+    ov.transferred = 0
+    ov.flags = 0
+
     current.iocp_ready = false
     current.poll_event = 0
     return ov
+}
+
+// Wake a coroutine that is parked on 'port', which may belong to another
+// thread. The coroutine travels as the completion key instead of inside an
+// OVERLAPPED, so waking never allocates.
+fn wake_coro(port: ext:HANDLE, target: ptr) bool {
+    return ext:PostQueuedCompletionStatus(port, 0, target.@cast(uint), null)
 }
 
 fn socket_io_failed() bool {
     return ext:WSAGetLastError() != ext:WSA_IO_PENDING
 }
 
-fn completion_event(ov: OverlapData, result: bool) PollEvent {
+fn completion_event(ov: Overlap, result: bool) PollEvent {
     if !result : return ext:POLLERR
     if !ov.base.socket_read : return ov.base.event
     let available: uint = 0
@@ -87,7 +101,7 @@ fn associate(fd: FD) bool {
 }
 
 fn cancel_overlap(fd: FD, ov: ptr, current: coro:Coro) {
-    let data = ov.@cast(OverlapData)
+    let data = ov.@cast(Overlap)
     if data.base.completed : return
     data.base.cancel_requested = true
     ext:CancelIoEx(fd, data.@cast(ptr))
