@@ -47,6 +47,38 @@ identifier. Semantic stages may resolve identifiers and specialize generics.
 
 Scalar values are copied by value.
 
+### Numeric operations
+
+Integer addition, subtraction, multiplication, negation, increment, and
+decrement wrap modulo the width of their result type. This applies to both
+signed and unsigned integers and does not require runtime overflow checks.
+
+Integer division and remainder truncate toward zero. Their operands must meet
+these unchecked preconditions:
+
+- The divisor is not zero.
+- For a signed type, the minimum value is not divided by `-1` and its remainder
+  is not taken with `-1`.
+
+Violating either precondition at runtime is undefined behavior, and the
+compiler may assume it does not happen. A violation known at compile time is a
+compile error. No implicit runtime check is inserted.
+
+The shift amount must be non-negative and less than the bit width of the left
+operand. A statically invalid shift is a compile error; a dynamically invalid
+shift is undefined behavior and receives no implicit runtime check.
+
+Integer narrowing retains the least-significant bits. Signed and unsigned
+conversions preserve that bit pattern, extending with the source type's sign or
+with zero when the destination is wider.
+
+Floating-point addition, subtraction, multiplication, division, and comparisons
+follow IEEE 754, including its rules for infinities, signed zero, and NaN.
+Floating remainder is `x - trunc(x / y) * y`, so a nonzero result has the sign
+of `x`. Converting a finite, representable float to an integer truncates toward
+zero. Converting NaN, infinity, or a value outside the destination integer's
+range is undefined behavior and receives no implicit runtime check.
+
 ### Value aggregates
 
 The following types have inline storage and are copied by value:
