@@ -397,9 +397,18 @@ For every parameter, the compiler computes and caches:
 Return summaries distinguish unconditional fresh graphs from graphs whose
 freshness depends on particular arguments also being fresh temporaries.
 
-Effects propagate through direct calls. Recursive calls whose summary is still
-being computed are treated conservatively. Generic functions cache effects per
+For an analyzable body, both parameter effects start as false. Direct operations
+may only change them from false to true, and direct calls record dependency edges
+from callee parameters to the corresponding caller parameters. After the bodies
+have been analyzed, effects propagate along those edges until no value changes.
+This computes the least fixed point for recursive call groups and does not depend
+on body-analysis order. Functions without an analyzable body and calls through
+unknown code are conservative. Generic functions cache effects per
 specialization; rebuilding a changed body recomputes its summary.
+
+Return-graph freshness is a separate summary. A return whose freshness depends
+on a recursive return summary that is still being computed is treated as not
+fresh.
 
 All Valk package source is available to the compiler and is reanalysed when
 needed. Effect summaries are compiler-owned in-memory metadata, not source
