@@ -606,6 +606,9 @@ mode LowerCaseString for String {
     fn equals(cmp: LowerCaseString) bool $eq {
         return this.lower() == cmp.lower()
     }
+    fn hash() uint $hash {
+        return this.lower().hash()
+    }
 }
 
 fn main() {
@@ -615,6 +618,8 @@ fn main() {
     println(b == "hello") // True
 }
 ```
+
+`$eq` customizes `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` already honours `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
 
 
 ## Globals
