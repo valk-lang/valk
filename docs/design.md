@@ -532,6 +532,23 @@ unspecified, and program shutdown does not guarantee that every remaining
 object is finalized. Deterministic resource release therefore uses an explicit
 operation such as `close`.
 
+`gc_free` is a restricted instance method:
+
+- Its implicit `this` is a borrow. It cannot escape into persistent storage,
+  be captured, or otherwise resurrect the object.
+- It takes no explicit arguments, returns `void`, and cannot return or throw an
+  error. It may call `panic`, which terminates the process.
+- It cannot allocate GC-managed objects, directly or through known callees, and
+  cannot call code whose allocation effects are unknown. Raw/native resource
+  allocation and release remain permitted.
+- It cannot start a nested local or shared collection.
+- It must not access other GC-managed objects: their finalizers may already
+  have run and finalization order is unspecified.
+- It must not acquire or wait on locks. A shared finalizer can run on an
+  arbitrary collecting thread while collector locks are held; blocking can
+  deadlock collection. Releasing or destroying an unheld native lock is
+  permitted.
+
 ## Layout and ABI
 
 - Layout is target-specific and computed from the target pointer size and

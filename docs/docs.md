@@ -631,6 +631,19 @@ arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`
 cannot be assigned to `Array[String]`, and `HashMap[LowerCaseString, V]` cannot
 be assigned to `HashMap[String, V]`.
 
+## Finalizers
+
+A class may define `gc_free()` to release raw or native resources when the GC
+reclaims it. Its `this` value is borrowed and cannot be stored or captured, so
+the object cannot be resurrected. A finalizer takes no arguments, returns
+`void`, cannot throw errors, allocate GC-managed objects, recursively collect,
+or call code with unknown allocation effects. `panic` remains allowed.
+
+Finalization order is unspecified. A finalizer must not access other
+GC-managed objects or acquire locks, and shared finalizers may run on any
+collecting thread. Use an explicit operation such as `close()` for deterministic
+or ordered cleanup.
+
 
 ## Globals
 
