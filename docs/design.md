@@ -456,18 +456,20 @@ that thread completed. Coroutines are thread-affine and do not migrate between
 threads. Ordinary `global` storage is thread-local; `shared` and `@shared`
 storage is process-wide.
 
-Publishing a GC object as shared publishes its reachable GC graph to the shared
-collector. The compiler tracks uniqueness as internal value provenance; it is
-not part of source-level types. Fresh construction and functions proven to
-return fresh graphs produce unique values. Nonescaping calls preserve
-uniqueness, while aliasing, capture, persistent storage, and calls through
-unknown code remove it.
+Creating a `shared T` view does not by itself move its reachable GC graph to the
+shared collector. GC publication occurs only at an actual cross-thread transfer
+or shared-storage boundary. The compiler tracks uniqueness as internal value
+provenance; it is not part of source-level types. Fresh construction and
+functions proven to return fresh graphs produce unique values. Nonescaping calls
+preserve uniqueness, while aliasing, capture, persistent storage, and calls
+through unknown code remove it.
 
 An ordinary value may become `shared T` only when its complete reachable managed
-graph is still provably unique. Publishing consumes that internal capability;
-using another mutable alias is rejected. Strings and other immutable values are
-always compatible. Function argument escape and fresh-return summaries are
-inferred from bodies and cached, so APIs do not need ownership annotations.
+graph is still provably unique. Creating the view consumes that internal
+capability; using another mutable alias is rejected. Strings and other immutable
+values are always compatible. Function argument escape and fresh-return
+summaries are inferred from bodies and cached, so APIs do not need ownership
+annotations.
 An ordinary graph may receive a temporary `shared` view for a parameter proven
 not to escape or introduce aliases; this does not publish the graph or consume
 its uniqueness.
