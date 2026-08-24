@@ -137,7 +137,7 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-atomic_body=$(sed -n '/^define .*@"atomic_alignment"/,/^}/p' "$atomic_ir")
+atomic_body=$(sed -n '/^define .*__atomic_alignment__/,/^}/p' "$atomic_ir")
 if [[ "$atomic_body" != *"load atomic i8"*"align 1"* ]] \
     || [[ "$atomic_body" != *"load atomic i16"*"align 2"* ]] \
     || [[ "$atomic_body" != *"load atomic i32"*"align 4"* ]]; then
@@ -167,6 +167,24 @@ if [[ "$pointer_left" != *"ptrtoint ptr"* ]] \
     echo "# Pointer/integer comparison was not lowered through pointer-sized integers"
     echo "$pointer_left"
     echo "$pointer_right"
+    exit 1
+fi
+
+echo "> Use 32-bit Win32 BOOL at FFI boundaries"
+
+windows_bool_ir="$workdir/windows-bool.ll"
+out=$("$VALK" build "$DIR/windows-bool.valk" --target win-x64 --ir --no-warn -o "$windows_bool_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build Win32 BOOL IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+if ! grep -q '^declare i32 @"CloseHandle"(i64)' "$windows_bool_ir" \
+    || grep -q '^declare i1 @"CloseHandle"' "$windows_bool_ir"; then
+    echo "# CloseHandle did not use the 32-bit Win32 BOOL ABI"
+    grep 'CloseHandle' "$windows_bool_ir"
     exit 1
 fi
 
@@ -310,5 +328,5 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 10"
+echo "# Test count: 11"
 echo ""

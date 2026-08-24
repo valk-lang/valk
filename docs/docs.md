@@ -1263,8 +1263,8 @@ valk build src/*.valk -l mylib -L "/usr/my-libs" --static
 ## Building native libraries
 
 To make a Valk function callable by a native linker, mark it `export`. Exported
-functions keep their source name as the symbol name and must have a concrete,
-non-generic signature.
+functions must have concrete, non-generic signatures. Arguments and return types
+cannot contain GC-managed data; use an explicit raw-pointer protocol instead.
 
 ```rust
 export fn add(left: int, right: int) int {

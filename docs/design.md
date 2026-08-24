@@ -540,9 +540,10 @@ Extern/export lowering must validate every argument and return type supported
 by the selected target ABI. Unsupported aggregate or tagged-union signatures
 are compile errors rather than silently using an incorrect calling convention.
 
-Extern signatures cannot contain `&T` or GC-managed references, including
-references nested in inline aggregates. Pointer parameters use raw `*T` or
-`ptr`, and callers must cross that boundary explicitly:
+Extern and export signatures cannot contain GC-managed references, including
+references nested in inline aggregates. Extern signatures also cannot contain
+`&T`. Pointer parameters use raw `*T` or `ptr`, and callers must cross an extern
+boundary explicitly:
 
 ```valk
 extern fn inspect(value: *Value) void
