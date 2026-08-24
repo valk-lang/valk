@@ -602,7 +602,9 @@ In other words, `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)` wh
 ## Modes
 
 Use `mode` to wrap an existing class and change its behavior. A mode cannot add
-properties and remains compatible with its base type.
+properties and remains implicitly compatible with its base type in both
+directions. When overloads or operator hooks accept both types, the exact static
+type passed at the call site wins.
 
 ```rust
 mode LowerCaseString for String {
@@ -623,6 +625,11 @@ fn main() {
 ```
 
 `$eq` customizes `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` already honours `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
+
+Generic specializations remain distinct and invariant even when their type
+arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`
+cannot be assigned to `Array[String]`, and `HashMap[LowerCaseString, V]` cannot
+be assigned to `HashMap[String, V]`.
 
 
 ## Globals

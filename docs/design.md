@@ -321,8 +321,8 @@ explicit value.
 ### Modes
 
 A mode is a distinct named view of an existing named type. It preserves the
-base representation and remains compatible with the base type, while allowing
-methods and operator hooks to be replaced.
+base representation and is implicitly compatible with the base type in both
+directions, while allowing methods and operator hooks to be replaced.
 
 ```valk
 mode Path for String {
@@ -335,6 +335,17 @@ mode Path for String {
 A mode cannot add stored properties. Member lookup checks the mode first and
 then falls through to the base type. Nested modes ultimately use the original
 base representation.
+
+Mode identity is preserved during overload and hook selection. An overload
+whose parameter exactly matches the static type passed at the call site wins
+over one that matches only through mode/base compatibility.
+
+Generic arguments are invariant and do not inherit mode compatibility.
+Specializations retain distinct identities because their methods and hooks may
+differ. Consequently, `Array[Mode]` is not compatible with `Array[Base]` in
+either direction, and `HashMap[Mode, V]` is not compatible with
+`HashMap[Base, V]`. Converting a hash map between those types could otherwise
+make entries unreachable when the mode supplies different equality or hashing.
 
 ## Nullability
 
