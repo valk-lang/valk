@@ -126,6 +126,38 @@ if [[ "$fixed_body" != *"alloca [3 x i8]"* ]] \
     exit 1
 fi
 
+echo "> Keep native addresses on stack unless the function may suspend"
+
+address_ir="$workdir/native-stable-address.ll"
+out=$("$VALK" build "$DIR/native-stable-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build native/stable address IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+native_address_body=$(sed -n '/^define .*__native_address_storage__/,/^}/p' "$address_ir")
+stable_address_body=$(sed -n '/^define .*__stable_address_storage__/,/^}/p' "$address_ir")
+microtime_body=$(sed -n '/^define .*__microtime__/,/^}/p' "$address_ir")
+if [[ "$native_address_body" != *"alloca"* ]] \
+    || [[ "$native_address_body" == *"__Pool__get__"* ]]; then
+    echo "# Proven non-suspending address storage did not use the native stack"
+    echo "$native_address_body"
+    exit 1
+fi
+if [[ "$microtime_body" != *"alloca"* ]] \
+    || [[ "$microtime_body" == *"__Pool__get__"* ]]; then
+    echo "# microtime did not keep its address-taken OS structure on the native stack"
+    echo "$microtime_body"
+    exit 1
+fi
+if [[ "$stable_address_body" != *"__Pool__get__"* ]]; then
+    echo "# Transitively suspending address storage was not stable"
+    echo "$stable_address_body"
+    exit 1
+fi
+
 echo "> Use natural alignment for atomic property accesses"
 
 atomic_ir="$workdir/atomic-alignment.ll"
@@ -328,5 +360,5 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 11"
+echo "# Test count: 12"
 echo ""

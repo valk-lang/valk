@@ -397,10 +397,15 @@ A borrow:
 - May cross a coroutine suspension point when its stabilized storage and owner
   root are retained in the coroutine frame.
 
-Taking a borrow from an inline local stabilizes that local's address. Taking an
-interior borrow from a GC object creates a hidden root for the exact owner
-allocation, so reassigning the source variable cannot allow the old allocation
-to be collected while the borrow remains live. The current compiler retains
+Taking a borrow from an inline local makes that local addressable. The compiler
+uses native stack storage when the function is proven not to suspend. If the
+function may suspend directly or through a call, address-taken inline locals use
+stable storage so their addresses remain valid while another coroutine uses the
+execution stack.
+
+Taking an interior borrow from a GC object creates a hidden root for the exact
+owner allocation, so reassigning the source variable cannot allow the old
+allocation to be collected while the borrow remains live. The compiler retains
 that root for the remainder of the function or coroutine frame.
 
 Elements of `Array` and `Slice` cannot currently be borrowed through indexing.
@@ -435,6 +440,11 @@ This computes the least fixed point for recursive call groups and does not depen
 on body-analysis order. Functions without an analyzable body and calls through
 unknown code are conservative. Generic functions cache effects per
 specialization; rebuilding a changed body recomputes its summary.
+
+Suspension is inferred by the same monotone fixed-point process. Direct
+coroutine suspension seeds the effect, direct calls propagate it to callers,
+and indirect or unknown Valk calls are conservative. This effect controls
+whether address-taken inline locals use native or stable storage.
 
 Return-graph freshness is a separate summary. A return whose freshness depends
 on a recursive return summary that is still being computed is treated as not
