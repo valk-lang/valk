@@ -1220,9 +1220,9 @@ Although Valk aims to be safe, it still supports low-level operations when neede
 ## Structs
 
 A `struct` is an inline value type. Assignment, argument passing, and returning
-a struct copy all of its fields by value.
-But you can always use `mem:alloc` and `mem:free` to create struct objects on
-the heap and pass that object by reference.
+a struct copy all of its fields by value. A struct initializer such as `.{}`
+never allocates manual storage. Use `mem:new[T]()` when a struct must live in a
+manual heap allocation, and release it with `mem:free`.
 
 ```rust
 struct MyStruct {
@@ -1240,6 +1240,9 @@ fn main() {
 
     println(first.a)  // 5
     println(second.a) // 10
+
+    let pointer = mem:new[MyStruct](.{ a: 5, b: 100 })
+    defer mem:free(pointer)
 }
 ```
 
