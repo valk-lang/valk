@@ -79,6 +79,10 @@ of `x`. Converting a finite, representable float to an integer truncates toward
 zero. Converting NaN, infinity, or a value outside the destination integer's
 range is undefined behavior and receives no implicit runtime check.
 
+`bool` converts explicitly to numeric types as `0` or `1`. Numeric values do
+not convert to `bool` through `.to(bool)`; code must state the intended
+condition with a comparison. Conversion hooks may still return `bool`.
+
 ### Value aggregates
 
 The following types have inline storage and are copied by value:
@@ -458,6 +462,10 @@ which preserves every address bit; conversions to other integer types remain
 explicit. Dereferences that cannot be proven safe use explicit unsafe
 operations. `pointer.$offset(bytes)` computes an address offset without
 converting the integer offset itself to `ptr`.
+
+Raw pointers may erase to `ptr`, and a bare `ptr` may acquire either a raw `*T`
+element type or a borrowed `&T` type. Converting a typed raw `*T` directly to
+`&T` requires explicit `.@cast(&T)`.
 
 Bitwise `ptr & integer`, `ptr | integer`, and `ptr ^ integer` operations retain
 the pointer type. Assigning such a result to `uint` uses the same one-way
