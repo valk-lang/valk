@@ -318,6 +318,18 @@ by an earlier implicit item or an explicit integer literal anywhere in the
 enum. Explicit duplicate values are allowed. Non-integer enum items require an
 explicit value.
 
+Enum items with the same underlying value are aliases and cannot be
+distinguished at runtime. A match case handles every alias for that value, and
+a later case with the same value is rejected as duplicate and unreachable. A
+`default` case may be omitted when the compiler can prove that the match covers
+every distinct declared value. If any declared value or case cannot be resolved
+at compile time, the match must include `default`. Values created through
+unsafe casts do not affect exhaustiveness.
+
+The underlying type does not implicitly convert to the enum, and `.to(Enum)`
+cannot manufacture an enum value. `.@cast(Enum)` remains the unsafe escape
+hatch. A `$to` or `$auto` conversion hook may return a declared enum value.
+
 ### Modes
 
 A mode is a distinct named view of an existing named type. It preserves the
