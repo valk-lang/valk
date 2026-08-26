@@ -140,17 +140,17 @@ fi
 
 echo "> Keep address-taken locals on native stacks"
 
-address_ir="$workdir/native-stable-address.ll"
-out=$("$VALK" build "$DIR/native-stable-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
+address_ir="$workdir/native-address.ll"
+out=$("$VALK" build "$DIR/native-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
 status=$?
 if [ "$status" -ne 0 ]; then
-    echo "# Failed to build native/stable address IR fixture"
+    echo "# Failed to build native address IR fixture"
     echo "$out"
     exit 1
 fi
 
 native_address_body=$(sed -n '/^define .*__native_address_storage__/,/^}/p' "$address_ir")
-stable_address_body=$(sed -n '/^define .*__stable_address_storage__/,/^}/p' "$address_ir")
+suspending_address_body=$(sed -n '/^define .*__suspending_address_storage__/,/^}/p' "$address_ir")
 microtime_body=$(sed -n '/^define .*__microtime__/,/^}/p' "$address_ir")
 if [[ "$native_address_body" != *"alloca"* ]] \
     || [[ "$native_address_body" == *"__Pool__get__"* ]]; then
@@ -164,10 +164,10 @@ if [[ "$microtime_body" != *"alloca"* ]] \
     echo "$microtime_body"
     exit 1
 fi
-if [[ "$stable_address_body" != *"alloca"* ]] \
-    || [[ "$stable_address_body" == *"__Pool__get__"* ]]; then
+if [[ "$suspending_address_body" != *"alloca"* ]] \
+    || [[ "$suspending_address_body" == *"__Pool__get__"* ]]; then
     echo "# Transitively suspending address storage did not use its private stack"
-    echo "$stable_address_body"
+    echo "$suspending_address_body"
     exit 1
 fi
 
