@@ -50,6 +50,18 @@ if [[ "$marker_body" != *"ptr %frame.values, i64 0"* ]] \
     exit 1
 fi
 
+echo "> Clear managed roots at lexical scope exits"
+
+scope_body=$(sed -n '/^define .*__lexical_scope_roots__/,/^}/p' "$ir")
+scope_collect_line=$(grep -n 'call void .*__collect__' <<< "$scope_body" | head -1 | cut -d: -f1)
+scope_clear_line=$(grep -n 'llvm.memset.inline.*i8 0, i64 8' <<< "$scope_body" | tail -1 | cut -d: -f1)
+if [ -z "$scope_collect_line" ] || [ -z "$scope_clear_line" ] \
+    || [ "$scope_clear_line" -ge "$scope_collect_line" ]; then
+    echo "# Expected the block-local root to be cleared before collection"
+    echo "$scope_body"
+    exit 1
+fi
+
 coro_helper=$(sed -n '/^define internal void @"valk\.coro\./,/^}/p' "$ir")
 if [[ "$coro_helper" != *"alloca { ptr, ptr, [16 x i8] }"* ]] \
     || [[ "$coro_helper" != *"store ptr @\"valk.gc.stack.marker.coro."* ]]; then
@@ -360,5 +372,5 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 12"
+echo "# Test count: 13"
 echo ""
