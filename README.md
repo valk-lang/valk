@@ -74,14 +74,16 @@ make
 
 ## Benchmarks
 
-<div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-bintree.png">
-</p>
-</div>
+| Benchmark | Input | Valk time | Valk memory | Go time | Go memory | Rust time | Rust memory |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| binary-tree | 19 | 0.570 s | 55.7 MiB | 2.070 s | 56.0 MiB | 2.620 s | 66.1 MiB |
+| json-serde | sample, 50000 | 0.655 s | 163.7 MiB | 0.775 s | 108.3 MiB | 0.580 s | 532.6 MiB |
+| lru | 1000, 11000000 | 0.690 s | 2.4 MiB | 0.805 s | 4.6 MiB | 0.450 s | 2.5 MiB |
+| merkletrees | 18 | 0.500 s | 68.6 MiB | 1.560 s | 70.9 MiB | 1.700 s | 66.2 MiB |
+| nsieve | 13 | 0.885 s | 80.4 MiB | 0.920 s | 141.3 MiB | 0.855 s | 80.5 MiB |
+| spectral-norm | 5500 | 1.095 s | 2.3 MiB | 1.130 s | 5.7 MiB | 1.095 s | 2.5 MiB |
 
-The binary object tree test revolves around creating large amount of short-/long-lived objects, iterating over them and doing some calculations.
-
-Code: [Link](examples/bench/binary-tree)
+Code: [Link](examples/bench)
 
 ---
 
@@ -101,21 +103,6 @@ Code: [Link](examples/bench/gc-overhead)
 </p></div>
 
 Code: [Link](examples/bench/http)
-
----
-
-### Object creation statistics
-
-Creating 10 million objects of size 8:
-
-|  | Create short lived | Create long lived | Process memory usage |
-|--|--|--|--|
-| Valk | 31ms | 128ms | 160 MB |
-| Go | 115ms | 216ms | 591 MB |
-| C# | 28ms | 480ms | 253 MB |
-
-Code: [Link](examples/bench/objects)
-
 
 ## Why Valk over Rust, Go, Zig?
 
