@@ -25,6 +25,9 @@ Both single-threaded `spectral-norm` and four-worker `spectral-norm-multi`
 variants are included. The multithreaded variant uses input `8000`, matching
 the programming-language-benchmarks workload.
 
+The `json` benchmark measures dynamic JSON values, while `json-serde` uses the
+larger file-oriented serialization workload.
+
 Requirements are the Valk compiler at the repository root, Go, Rust with
 Cargo, and GNU `/usr/bin/time`.
 

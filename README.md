@@ -77,6 +77,7 @@ make
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
 | binary-tree | 19 | 0.570s (55.8 MB) | 2.060s (56.9 MB) | 2.535s (66.2 MB) |
+| json | 2000000 | 0.700s (2.4 MB) | 2.270s (11.2 MB) | 0.420s (2.6 MB) |
 | json-serde | sample, 50000 | 0.630s (163.8 MB) | 0.755s (108.2 MB) | 0.545s (532.6 MB) |
 | lru | 1000, 11000000 | 0.670s (2.5 MB) | 0.790s (3.7 MB) | 0.445s (2.5 MB) |
 | merkletrees | 18 | 0.480s (67.0 MB) | 1.520s (71.7 MB) | 1.675s (66.3 MB) |
