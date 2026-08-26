@@ -773,6 +773,18 @@ println(json:encode(object, true))
 `json:from_value[T](value)` converts JSON back to a Valk type and returns an
 error when the document does not match that type.
 
+When the target type is known, `json:decode_to[T](text)` parses directly into
+that type without first constructing a dynamic JSON tree:
+
+```rust
+class User {
+    name: String
+    age: int
+}
+
+let user = json:decode_to[User]("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid user")
+```
+
 ## Datetime
 
 API for [valk:time](api.md#time)
