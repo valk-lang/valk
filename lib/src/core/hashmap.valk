@@ -3,14 +3,22 @@ use core
 + class HashMap[K, T] $global {
     _keys: Array[K] (.{})
     - values_: Array[T] (.{})
-    // 0 is empty, -1 is a deleted slot, and positive values are entry indexes + 1.
+    // 0 is empty; positive values are dense entry indexes + 1.
     - buckets: Array[int] (.{})
     - entry_buckets: Array[uint] (.{})
     - bucket_count: uint (16)
-    - tombstones: uint
 
-    + static fn new() SELF $default {
-        return SELF{}
+    + static fn new(capacity: uint(0)) SELF $default {
+        let map = SELF{}
+        if capacity == 0 : return map
+
+        let bucket_count: uint = 16
+        while capacity > bucket_count - bucket_count / 4 {
+            bucket_count *= 2
+            if bucket_count == 0 : panic("HashMap capacity is too large")
+        }
+        map.rebuild_buckets(bucket_count)
+        return map
     }
 
     + fn lock() {
@@ -49,43 +57,44 @@ use core
         #if K.$has_hash
         hash = $hash(key)
         #else
-        hash = key.@cast(uint)
+        hash = key.to(uint)
         #end
 
+        #if K.$is_integer
+        hash ^= hash >> 30
+        hash *= 0xbf58476d1ce4e5b9
+        hash ^= hash >> 27
+        #else
         hash ^= hash >> 33
         hash *= 0xff51afd7ed558ccd
         hash ^= hash >> 33
         hash *= 0xc4ceb9fe1a85ec53
         hash ^= hash >> 33
+        #end
         return hash
     }
 
     fn bucket_value(index: uint) int {
-        return this.buckets.get(index) !? 0
+        return @ptrv(this.buckets.data, int, index)
     }
 
     fn find_bucket(key: K) (uint, bool) {
-        if this.buckets.length == 0 : return (0, false)
+        let bucket_count = this.buckets.length
+        if bucket_count == 0 : return (0, false)
 
-        let index = SELF.key_hash(key) & (this.bucket_count - 1)
-        let first_tombstone = this.bucket_count
+        let index = SELF.key_hash(key) & (bucket_count - 1)
         let checked: uint = 0
-        while checked++ < this.bucket_count {
+        while checked++ < bucket_count {
             let bucket = this.bucket_value(index)
-            if bucket == 0 {
-                return (first_tombstone < this.bucket_count ? first_tombstone : index, false)
-            }
-            if bucket < 0 {
-                if first_tombstone == this.bucket_count : first_tombstone = index
-            } else {
-                let entry_index = (bucket - 1).to(uint)
-                let stored_key = this._keys.get(entry_index) ! panic("HashMap bucket index is out of bounds")
-                if stored_key == key : return (index, true)
-            }
+            if bucket == 0 : return (index, false)
+            if bucket < 0 : panic("HashMap contains a deleted bucket")
+            let entry_index = (bucket - 1).to(uint)
+            let stored_key = @property_get(@ptrv(this._keys.data, K, entry_index))
+            if stored_key == key : return (index, true)
             index++
-            if index == this.bucket_count : index = 0
+            if index == bucket_count : index = 0
         }
-        return (first_tombstone, false)
+        return (bucket_count, false)
     }
 
     fn entry_index(key: K) uint !LookupError {
@@ -98,7 +107,6 @@ use core
 
     fn rebuild_buckets(new_bucket_count: uint) {
         this.bucket_count = new_bucket_count
-        this.tombstones = 0
         this.buckets = Array[int].new(new_bucket_count)
         this.buckets.set_expand(new_bucket_count - 1, 0, 0)
         this.entry_buckets = Array[uint].new(this.length)
@@ -116,13 +124,52 @@ use core
             return true
         }
 
-        if (this.length + this.tombstones + 1) * 4 <= this.bucket_count * 3 : return false
-        if (this.length + 1) * 4 > this.bucket_count * 3 {
-            this.rebuild_buckets(this.bucket_count * 2)
-        } else {
-            this.rebuild_buckets(this.bucket_count)
-        }
+        if (this.length + 1) * 4 <= this.bucket_count * 3 : return false
+        this.rebuild_buckets(this.bucket_count * 2)
         return true
+    }
+
+    // Remove one bucket while preserving every linear-probe search chain.
+    // Returns the dense entry index and the final empty bucket.
+    fn delete_bucket(bucket_index: uint) (uint, uint) !LookupError {
+        let removed = this.bucket_value(bucket_index)
+        if removed <= 0 : throw .missing
+        let removed_index = (removed - 1).to(uint)
+        let mask = this.buckets.length - 1
+        let hole = bucket_index
+        let scan = (hole + 1) & mask
+
+        while true {
+            let candidate = this.bucket_value(scan)
+            if candidate == 0 : break
+            if candidate < 0 : panic("HashMap contains a deleted bucket")
+            let entry_index = (candidate - 1).to(uint)
+            let key = @property_get(@ptrv(this._keys.data, K, entry_index))
+            let home = SELF.key_hash(key) & mask
+            let scan_distance = (scan - home) & mask
+            let hole_distance = (hole - home) & mask
+            if scan_distance > hole_distance {
+                @ptrv(this.buckets.data, int, hole) = candidate
+                @ptrv(this.entry_buckets.data, uint, entry_index) = hole
+                hole = scan
+            }
+            scan = (scan + 1) & mask
+        }
+        @ptrv(this.buckets.data, int, hole) = 0
+        return (removed_index, hole)
+    }
+
+    fn remove_bucket_entry(bucket_index: uint) uint !LookupError {
+        let index, hole = this.delete_bucket(bucket_index) !>
+        let last_index = this.length - 1
+        if index != last_index {
+            let moved_bucket = @ptrv(this.entry_buckets.data, uint, last_index)
+            @ptrv(this.buckets.data, int, moved_bucket) = (index + 1).to(int)
+        }
+        this._keys.swap_remove(index)
+        this.values_.swap_remove(index)
+        this.entry_buckets.swap_remove(index)
+        return hole
     }
 
     // `$set_key`: class-init map form `HashMap`/`Map`{ k => v, ... }
@@ -130,7 +177,7 @@ use core
         let bucket_index, found = this.find_bucket(key)
         if found {
             let index = (this.bucket_value(bucket_index) - 1).to(uint)
-            this.values_.set(index, value) _
+            @property_update(this.values_, @ptrv(this.values_.data, T, index), value)
             return this
         }
 
@@ -144,7 +191,6 @@ use core
         this._keys.append(key)
         this.values_.append(value)
         this.entry_buckets.append(bucket_index)
-        if this.bucket_value(bucket_index) < 0 : this.tombstones--
         this.buckets.set(bucket_index, (entry_index + 1).to(int)) _
         return this
     }
@@ -163,14 +209,41 @@ use core
         this._keys.append(key)
         this.values_.append(value)
         this.entry_buckets.append(bucket_index)
-        if this.bucket_value(bucket_index) < 0 : this.tombstones--
         this.buckets.set(bucket_index, (entry_index + 1).to(int)) _
         return this
     }
 
     + fn get(key: K) T !LookupError $offset {
         let index = this.entry_index(key) !>
-        return this.values_.get(index) !>
+        return @property_get(@ptrv(this.values_.data, T, index))
+    }
+
+    // Look up `key`; when it is absent, replace `remove_key` without probing
+    // `key` a second time. This is useful for fixed-size caches.
+    + fn get_or_replace(key: K, remove_key: K, replacement: T) (T, bool) !LookupError {
+        let bucket_index, found = this.find_bucket(key)
+        if found {
+            let bucket = this.bucket_value(bucket_index)
+            if bucket <= 0 : throw .missing
+            let index = (bucket - 1).to(uint)
+            return (@property_get(@ptrv(this.values_.data, T, index)), true)
+        }
+
+        let remove_bucket_index, remove_found = this.find_bucket(remove_key)
+        if !remove_found : throw .missing
+        let new_hole = this.remove_bucket_entry(remove_bucket_index) !>
+        let mask = this.buckets.length - 1
+        let home = SELF.key_hash(key) & mask
+        if ((new_hole - home) & mask) < ((bucket_index - home) & mask) {
+            bucket_index = new_hole
+        }
+
+        let entry_index = this._keys.length
+        this._keys.append(key)
+        this.values_.append(replacement)
+        this.entry_buckets.append(bucket_index)
+        this.buckets.set(bucket_index, (entry_index + 1).to(int)) _
+        return (replacement, false)
     }
 
     + fn has(key: K) bool {
@@ -198,22 +271,7 @@ use core
         let bucket_index, found = this.find_bucket(key)
         if !found : return this
 
-        let bucket = this.bucket_value(bucket_index)
-        if bucket <= 0 : return this
-        let index = (bucket - 1).to(uint)
-        let last_index = this.length - 1
-
-        this.buckets.set(bucket_index, -1) _
-        this.tombstones++
-
-        if index != last_index {
-            let moved_bucket = this.entry_buckets.get(last_index) ! panic("HashMap reverse bucket index is out of bounds")
-            this.buckets.set(moved_bucket, (index + 1).to(int)) _
-        }
-
-        this._keys.swap_remove(index)
-        this.values_.swap_remove(index)
-        this.entry_buckets.swap_remove(index)
+        this.remove_bucket_entry(bucket_index) ! panic("HashMap bucket index is out of bounds")
         return this
     }
 
@@ -223,7 +281,6 @@ use core
         this._keys.clear()
         this.values_.clear()
         this.bucket_count = 16
-        this.tombstones = 0
         return this
     }
 
