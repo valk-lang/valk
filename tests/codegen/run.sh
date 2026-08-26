@@ -170,6 +170,30 @@ if [[ "$stable_address_body" != *"__Pool__get__"* ]]; then
     exit 1
 fi
 
+echo "> Keep property stores and Array append on their GC fast paths"
+
+fast_path_ir="$workdir/gc-fast-paths.ll"
+out=$("$VALK" build "$DIR/gc-fast-paths.valk" --release --ir --no-warn -o "$fast_path_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build GC fast-path IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+property_fast_body=$(sed -n '/^define .*__property_update__/,/^}/p' "$fast_path_ir")
+if [[ "$property_fast_body" != *"property_update_slow"* ]] \
+    || [[ "$property_fast_body" != *"store ptr"* ]]; then
+    echo "# Managed property update did not contain its guarded fast path"
+    echo "$property_fast_body"
+    exit 1
+fi
+
+if grep -q 'valk\.gc\.stack\.marker\.func\..*__Array__.*__append__' "$fast_path_ir"; then
+    echo "# Array.append installed a GC shadow frame for its non-allocating path"
+    exit 1
+fi
+
 echo "> Use natural alignment for atomic property accesses"
 
 atomic_ir="$workdir/atomic-alignment.ll"
