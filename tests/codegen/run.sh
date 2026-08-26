@@ -138,7 +138,7 @@ if [[ "$fixed_body" != *"alloca [3 x i8]"* ]] \
     exit 1
 fi
 
-echo "> Keep native addresses on stack unless the function may suspend"
+echo "> Keep address-taken locals on native stacks"
 
 address_ir="$workdir/native-stable-address.ll"
 out=$("$VALK" build "$DIR/native-stable-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
@@ -164,8 +164,9 @@ if [[ "$microtime_body" != *"alloca"* ]] \
     echo "$microtime_body"
     exit 1
 fi
-if [[ "$stable_address_body" != *"__Pool__get__"* ]]; then
-    echo "# Transitively suspending address storage was not stable"
+if [[ "$stable_address_body" != *"alloca"* ]] \
+    || [[ "$stable_address_body" == *"__Pool__get__"* ]]; then
+    echo "# Transitively suspending address storage did not use its private stack"
     echo "$stable_address_body"
     exit 1
 fi
