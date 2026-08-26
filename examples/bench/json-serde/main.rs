@@ -1,5 +1,32 @@
-
+use serde::{Deserialize, Serialize};
 use std::fs;
+
+#[derive(Deserialize, Serialize)]
+struct GeoData {
+    #[serde(rename = "type")]
+    kind: String,
+    features: Vec<Feature>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Feature {
+    #[serde(rename = "type")]
+    kind: String,
+    properties: Properties,
+    geometry: Geometry,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Properties {
+    name: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Geometry {
+    #[serde(rename = "type")]
+    kind: String,
+    coordinates: Vec<Vec<Vec<f64>>>,
+}
 
 fn main() -> anyhow::Result<()> {
     let file_name = std::env::args_os()
@@ -12,14 +39,12 @@ fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
     let json_str = fs::read_to_string(format!("{}.json", file_name))?;
-    let json: serde_json::Value = serde_json::from_str(&json_str)?;
-    print_hash(serde_json::to_vec(&json)?);
+    let document: GeoData = serde_json::from_str(&json_str)?;
+    print_hash(serde_json::to_vec(&document)?);
     let mut array = Vec::with_capacity(n);
-    for _i in 0..n {
-        let json: serde_json::Value = serde_json::from_str(&json_str)?;
-        array.push(json);
+    for _ in 0..n {
+        array.push(serde_json::from_str::<GeoData>(&json_str)?);
     }
-    let array = serde_json::json!(array);
     print_hash(serde_json::to_vec(&array)?);
     Ok(())
 }

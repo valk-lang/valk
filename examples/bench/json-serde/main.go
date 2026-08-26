@@ -17,12 +17,13 @@ func main() {
 	if len(os.Args) > 2 {
 		n, _ = strconv.Atoi(os.Args[2])
 	}
-	var data GeoData
 	jsonStr, _ := os.ReadFile(fileName + ".json")
+	var data GeoData
 	json.Unmarshal([]byte(jsonStr), &data)
 	printHash(data.ToJsonString())
 	array := make([]GeoData, 0, n)
 	for i := 0; i < n; i++ {
+		var data GeoData
 		json.Unmarshal([]byte(jsonStr), &data)
 		array = append(array, data)
 	}
@@ -65,6 +66,6 @@ type Properties struct {
 }
 
 type Geometry struct {
-	Type        string         `json:"type"`
-	Coordinates [][][2]float64 `json:"coordinates"`
+	Type        string        `json:"type"`
+	Coordinates [][][]float64 `json:"coordinates"`
 }
