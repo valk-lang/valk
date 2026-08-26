@@ -21,6 +21,10 @@ Use `--list` to print the available benchmarks. The default inputs are chosen
 to take roughly 0.5 to 2 seconds per run on a typical development machine. All
 languages receive exactly the same input.
 
+Both single-threaded `spectral-norm` and four-worker `spectral-norm-multi`
+variants are included. The multithreaded variant uses input `8000`, matching
+the programming-language-benchmarks workload.
+
 Requirements are the Valk compiler at the repository root, Go, Rust with
 Cargo, and GNU `/usr/bin/time`.
 

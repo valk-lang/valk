@@ -14,6 +14,7 @@ all_benchmarks=(
     merkletrees
     nsieve
     spectral-norm
+    spectral-norm-multi
 )
 benchmarks=()
 
@@ -106,6 +107,7 @@ benchmark_args() {
         merkletrees)  args=(18) ;;
         nsieve)       args=(13) ;;
         spectral-norm) args=(5500) ;;
+        spectral-norm-multi) args=(8000 4) ;;
     esac
 }
 
@@ -117,6 +119,7 @@ benchmark_input() {
         merkletrees)   printf '18' ;;
         nsieve)        printf '13' ;;
         spectral-norm) printf '5500' ;;
+        spectral-norm-multi) printf '8000, 4 workers' ;;
     esac
 }
 
