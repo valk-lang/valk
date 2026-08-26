@@ -1,6 +1,6 @@
 # GC bench suite
 
-Side-by-side microbenchmarks for Valk and Go garbage collectors.
+Side-by-side microbenchmarks for Valk, Go, D, and C# garbage collectors.
 
 | Scenario | What it measures |
 |----------|------------------|
@@ -12,11 +12,17 @@ Side-by-side microbenchmarks for Valk and Go garbage collectors.
 | **short-lived churn with large live set** | Nursery/churn tax while a large live set stays rooted |
 | **tree churn** | Allocate/discard trees with internal edges |
 
-Sizes are matched across `main.valk` and `main.go`.
+Sizes are matched across `main.valk`, `main.go`, `main.d`, and `main.cs`.
 
 ## Run
 
 ```bash
+# Build and run all four optimized implementations (from repo root)
+./examples/bench/run-gc.sh
+
+# Run selected implementations
+./examples/bench/run-gc.sh valk go
+
 # Valk (from repo root)
 ./valk run examples/bench/gc/main.valk
 # or
@@ -37,5 +43,6 @@ GOGC=off go run examples/bench/gc/main.go   # only explicit runtime.GC() collect
 
 ## Notes
 
-- `mem_kb` is **not** defined identically: Valk reports thread pool usage (`gc.mem_usage_thread`); Go reports `runtime.MemStats.Alloc`. Use times/rates as the primary comparison.
+- `mem_kb` is **not** defined identically: Valk reports thread pool usage, while the other runtimes report their currently managed/allocated heap. Use times/rates as the primary comparison. The runner additionally reports process peak RSS uniformly through GNU `time`.
+- The D runner accepts LDC, DMD, or GDC. C# is built with the .NET SDK.
 - Existing related benches: `../gc-overhead`, `../objects`, `../binary-tree`.

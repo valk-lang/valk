@@ -85,16 +85,17 @@ make
 
 Code: [Link](examples/bench)
 
----
+### GC benchmarks
 
-<div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-gc.png">
-</p>
-</div>
-
-Because valk only operates on objects that modified their reference path towards the stack, the GC has very little work todo, no matter how many objects you have. This can be crucial in applications where latency is important.
-
-Code: [Link](examples/bench/gc-overhead)
+| Scenario | Valk | Go | D | C# |
+|---|---:|---:|---:|---:|
+| short-lived alloc | 12 ms | 113 ms | 225 ms | 72 ms |
+| stable-heap forced collects | 0 ms | 41541 ms | 15410 ms | 29127 ms |
+| build long-lived chain | 37 ms | 71 ms | 111 ms | 206 ms |
+| free long-lived chain | 17 ms | 52 ms | 2 ms | 14 ms |
+| mutate live links | 10 ms | 8 ms | 8 ms | 13 ms |
+| short-lived churn with large live set | 20 ms | 95 ms | 82 ms | 63 ms |
+| tree churn | 50 ms | 199 ms | 250 ms | 125 ms |
 
 ---
 

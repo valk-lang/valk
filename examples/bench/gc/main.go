@@ -1,4 +1,4 @@
-// GC microbenchmarks — Go counterpart to main.valk in this directory.
+// GC microbenchmarks — Go counterpart to main.valk, main.d, and main.cs.
 // Same scenarios and sizes so results are comparable.
 //
 // Scenarios:
@@ -118,7 +118,6 @@ func collectN(n int) {
 func benchShortLived() {
 	header("short-lived alloc")
 	const amount = 10_000_000
-	sink := &Node{}
 
 	// Local root for verify; separate from package sink used to force heap.
 	root := &Node{}

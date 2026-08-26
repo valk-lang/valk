@@ -23,3 +23,10 @@ languages receive exactly the same input.
 
 Requirements are the Valk compiler at the repository root, Go, Rust with
 Cargo, and GNU `/usr/bin/time`.
+
+The larger seven-scenario garbage-collector comparison has its own runner for
+Valk, Go, D, and C#:
+
+```sh
+./examples/bench/run-gc.sh
+```
