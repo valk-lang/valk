@@ -227,7 +227,7 @@ for benchmark in "${benchmarks[@]}"; do
 done
 
 printf '\nMedian of %s runs after one warm-up; memory is peak RSS.\n\n' "$runs"
-printf '| Benchmark | Input | Valk time | Valk memory | Go time | Go memory | Rust time | Rust memory |\n'
+printf '| Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |\n'
 printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
 for benchmark in "${benchmarks[@]}"; do
     input="$(benchmark_input "$benchmark")"
@@ -237,7 +237,7 @@ for benchmark in "${benchmarks[@]}"; do
     go_memory="$(awk -F '\t' -v b="$benchmark" '$1 == b && $2 == "go" { print $4 }' "$results")"
     rust_time="$(awk -F '\t' -v b="$benchmark" '$1 == b && $2 == "rust" { print $3 }' "$results")"
     rust_memory="$(awk -F '\t' -v b="$benchmark" '$1 == b && $2 == "rust" { print $4 }' "$results")"
-    printf '| %s | %s | %s s | %s MiB | %s s | %s MiB | %s s | %s MiB |\n' \
+    printf '| %s | %s | %ss (%s MB) | %ss (%s MB) | %ss (%s MB) |\n' \
         "$benchmark" "$input" \
         "$valk_time" "$valk_memory" \
         "$go_time" "$go_memory" \

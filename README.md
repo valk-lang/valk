@@ -74,14 +74,14 @@ make
 
 ## Benchmarks
 
-| Benchmark | Input | Valk time | Valk memory | Go time | Go memory | Rust time | Rust memory |
+| Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| binary-tree | 19 | 0.570 s | 55.7 MiB | 2.070 s | 56.0 MiB | 2.620 s | 66.1 MiB |
-| json-serde | sample, 50000 | 0.655 s | 163.7 MiB | 0.775 s | 108.3 MiB | 0.580 s | 532.6 MiB |
-| lru | 1000, 11000000 | 0.690 s | 2.4 MiB | 0.805 s | 4.6 MiB | 0.450 s | 2.5 MiB |
-| merkletrees | 18 | 0.500 s | 68.6 MiB | 1.560 s | 70.9 MiB | 1.700 s | 66.2 MiB |
-| nsieve | 13 | 0.885 s | 80.4 MiB | 0.920 s | 141.3 MiB | 0.855 s | 80.5 MiB |
-| spectral-norm | 5500 | 1.095 s | 2.3 MiB | 1.130 s | 5.7 MiB | 1.095 s | 2.5 MiB |
+| binary-tree | 19 | 0.570s (55.8 MB) | 2.060s (56.9 MB) | 2.535s (66.2 MB) |
+| json-serde | sample, 50000 | 0.630s (163.8 MB) | 0.755s (108.2 MB) | 0.545s (532.6 MB) |
+| lru | 1000, 11000000 | 0.670s (2.5 MB) | 0.790s (3.7 MB) | 0.445s (2.5 MB) |
+| merkletrees | 18 | 0.480s (67.0 MB) | 1.520s (71.7 MB) | 1.675s (66.3 MB) |
+| nsieve | 13 | 0.735s (80.4 MB) | 0.795s (144.1 MB) | 0.810s (80.4 MB) |
+| spectral-norm | 5500 | 1.085s (2.5 MB) | 1.130s (5.8 MB) | 1.100s (2.5 MB) |
 
 Code: [Link](examples/bench)
 
