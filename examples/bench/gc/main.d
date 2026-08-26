@@ -111,7 +111,10 @@ void benchStableCollect() {
     fullGC();
 
     auto start = MonoTime.currTime;
-    for (int i = 0; i < collects; i++) GC.collect();
+    for (int i = 0; i < collects; i++) {
+        heapNode();
+        GC.collect();
+    }
     auto us = microsecondsSince(start);
 
     writeln("live:     ", live);

@@ -135,8 +135,10 @@ static class Program
         FullGC();
 
         var watch = Stopwatch.StartNew();
-        for (int i = 0; i < collects; i++)
+        for (int i = 0; i < collects; i++) {
+            HeapNode();
             FullGC();
+        }
         watch.Stop();
         long us = Microseconds(watch);
 

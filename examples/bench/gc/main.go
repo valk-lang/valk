@@ -138,7 +138,7 @@ func benchShortLived() {
 	fmt.Printf("verify:   %d\n", lenChain(root))
 }
 
-// 2) Large stable live set; force many collections.
+// 2) Large stable live set; allocate one trigger object before each collection.
 func benchStableCollect() {
 	header("stable-heap forced collects")
 	const live = 500_000
@@ -149,6 +149,7 @@ func benchStableCollect() {
 
 	start := time.Now()
 	for c := 0; c < collects; c++ {
+		heapNode()
 		runtime.GC()
 	}
 	us := usSince(start)

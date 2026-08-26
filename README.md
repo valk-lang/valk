@@ -85,17 +85,21 @@ make
 
 Code: [Link](examples/bench)
 
+---
+
 ### GC benchmarks
 
 | Scenario | Valk | Go | D | C# |
 |---|---:|---:|---:|---:|
-| short-lived alloc | 12 ms | 113 ms | 225 ms | 72 ms |
-| stable-heap forced collects | 0 ms | 41541 ms | 15410 ms | 29127 ms |
-| build long-lived chain | 37 ms | 71 ms | 111 ms | 206 ms |
-| free long-lived chain | 17 ms | 52 ms | 2 ms | 14 ms |
-| mutate live links | 10 ms | 8 ms | 8 ms | 13 ms |
-| short-lived churn with large live set | 20 ms | 95 ms | 82 ms | 63 ms |
-| tree churn | 50 ms | 199 ms | 250 ms | 125 ms |
+| short-lived alloc | 13 ms | 111 ms | 210 ms | 76 ms |
+| stable-heap forced collects | 44 ms | 42103 ms | 27000 ms | 29093 ms |
+| build long-lived chain | 43 ms | 71 ms | 185 ms | 209 ms |
+| free long-lived chain | 18 ms | 62 ms | 3 ms | 13 ms |
+| mutate live links | 10 ms | 8 ms | 11 ms | 12 ms |
+| short-lived churn with large live set | 21 ms | 96 ms | 133 ms | 47 ms |
+| tree churn | 51 ms | 194 ms | 277 ms | 121 ms |
+
+Code: [Link](examples/bench/gc)
 
 ---
 
