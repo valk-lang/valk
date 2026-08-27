@@ -4,9 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.4.4
+- Release 0.4.5
 ~ Data race solution (Threads done via shared type, MutexValue not done)
-~ uslice (cstring) / slice (String)
 
 # Next steps
 - Improve standard library
@@ -34,6 +33,13 @@
 ## Done
 
 ```
++ Release 0.4.4
++ Full design doc
++ Stablize the language
++ Benchmarks
++ uslice (cstring) / slice (String)
++ Coroutine growing stack
+
 + Release 0.4.3
 + Recompile for windows
 
