@@ -42,9 +42,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class ByteBuffer {
-    ~ data: GcPtr
+    ~ data: ptr
     ~ length: uint
     ~ size: uint
+    ~ storage: String
 
     + fn clear() void
     + fn clear_next_bytes(amount: uint) void
@@ -56,6 +57,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn get(index: uint) u8
     + fn index_of(byte: u8, start_index: uint (0)) uint !LookupError
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !LookupError
+    + fn into_string() String
     + fn ltrim(filter: fnptr(u8)(bool)) void
     + fn minimum_size(minimum_size: uint) void
     + static fn new(start_size: uint (128)) ByteBuffer
@@ -152,7 +154,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ mode Map[T] {
++ mode Map[T] for HashMap[String, T] {
+    + fn clone() Map[T]
+    + static fn new() Map[T]
 }
 ```
 
@@ -237,6 +241,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn rtrim(part: String, limit: uint (0)) String
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
+    ~ fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
     + fn to_uint() uint !SyntaxError
@@ -593,6 +598,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
 + fn blowfish_init_state(context: BlowfishContext) void
 + fn blowfish_xor_block(data: *[u8], salt: ByteBuffer, saltIndex: *uint) void
++ fn md5_encode(input: String) String
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```
@@ -697,7 +703,7 @@ alias pid_t for i32
 + fn realpath(path: String) String
 + fn resolve(path: String) String
 + fn rmdir(path: String) void !io:IoError
-+ fn size(path: String) uint
++ fn size(path: String) uint !io:IoError
 + fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io:IoError
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync() void
@@ -995,9 +1001,10 @@ alias FD for i32
 
 ```js
 + fn decode(json: ByteBuffer | String) Value !ParseError
++ fn decode_to[T](json: ByteBuffer | String) T !DecodeError
 + fn default_value(kind: int) Value
 + fn encode(data: $T, pretty: bool (false)) String
-+ fn encode_to(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
++ fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 + fn from(data: $T) Value
 + fn from_value[T](data: Value) T !ValueError
 + fn new_array(values: ?Array[Value] (null)) ArrayValue
@@ -1044,7 +1051,7 @@ alias FD for i32
     + fn bool() bool
     + fn bool_or() bool !LookupError
     + fn encode(pretty: bool (false)) String
-    + fn encode_to(output: ByteBuffer, pretty: bool (false)) ByteBuffer
+    + fn encode_into(output: ByteBuffer, pretty: bool (false)) ByteBuffer
     + fn float() float
     + fn float_or() float !LookupError
     + fn get(key: String | uint) Value
@@ -1096,6 +1103,7 @@ alias FD for i32
 + fn find_char(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(adr: ptr) void
 + fn move(from: ptr, to: ptr, length: uint) void
++ fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
 ```
 

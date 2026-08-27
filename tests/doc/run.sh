@@ -34,4 +34,21 @@ if [[ "$doc" != *'"type": "T"'* ]] \
     exit 1
 fi
 
+out=$("$VALK" doc "$DIR/fixture" -o "$workdir/api.md" --markdown 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "$out"
+    exit 1
+fi
+
+markdown=$(<"$workdir/api.md")
+if [[ "$markdown" != *'+ class Box[T]'* ]] \
+    || [[ "$markdown" != *'+ fn get(value: T) T'* ]] \
+    || [[ "$markdown" != *'+ class Ahead'* ]] \
+    || [[ "$markdown" != *'+ fn name() String'* ]]; then
+    echo "# Markdown sorting did not preserve class declarations"
+    echo "$markdown"
+    exit 1
+fi
+
 echo "# 1/1 documentation tests passed"
