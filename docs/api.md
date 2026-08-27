@@ -1006,7 +1006,6 @@ alias FD for i32
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 + fn from(data: $T) Value
-+ fn from_value[T](data: Value) T !LookupError
 + fn new_array(values: ?Array[Value] (null)) ArrayValue
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
@@ -1106,6 +1105,7 @@ alias FD for i32
     + get string: String
     + fn string_or() String !LookupError
     + fn string_value() String !LookupError
+    + fn to_type[T]() T !LookupError
 }
 ```
 

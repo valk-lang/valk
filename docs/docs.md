@@ -767,25 +767,8 @@ let name = list.get_required(0) ! panic("Missing item")
 let name_str = name.string_value() ! panic("Json value must be a string")
 ```
 
-Use strict value methods such as `string_value()`, `int_value()`, and
-`array_value()` when the value itself must have an exact JSON type. They return
-`LookupError.missing` when the type differs.
-
-Use `json:new_object()` and `json:new_array()` to build a document:
-
-```rust
-let object = json:new_object()
-object.set("name", "Alice")
-
-let items = json:new_array()
-items.append(1)
-object.set("items", items)
-
-println(json:encode(object, true))
-```
-
-`json:from(value)` converts classes and other values to JSON.
-`json:from_value[T](value)` converts JSON back to a Valk type and returns an
+`json:from(value)` converts any value to a json:Value.
+`value.to_type[T]()` converts json:Value back to a Valk type and returns an
 error when the document does not match that type.
 
 When the target type is known, `json:decode_to[T](text)` parses directly into
