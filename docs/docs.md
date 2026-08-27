@@ -746,15 +746,31 @@ API for [valk:json](api.md#json)
 use valk:json
 
 let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
-let name = document["name"].string()
-let age = document.get("age").int()
-document = document.set("active", true)
+let name = document.has_string("name") ! panic("Missing name")
+let age = document["age"].int
+document = document.set_bool("active", true)
 println(json:encode(document))
 ```
 
-Both `get()` and bracket access are safe when a path is missing. Use typed
-accessors such as `.string()`, `.int()`, `.float()`, and `.bool()` to read a
-value.
+Both `get()` and bracket access are safe when a path is missing and produce a
+JSON null value. `has()` checks whether an object key or array index exists.
+`get_required()` returns a value or `LookupError.missing`. Typed forms such as
+`has_string()` also verify the value type; every lookup or type failure from
+these strict accessors is `LookupError.missing`.
+
+The `kind`, `is_string`, `is_int`, `is_float`, `is_bool`, `is_array`,
+`is_object`, and `is_null` properties inspect a value. The `string`, `int`,
+`float`, `bool`, `array`, and `object` getters provide convenient values. The
+`string` getter converts scalar values and encodes arrays and objects; the other
+getters return their type's default when the JSON kind differs.
+
+Objects use string keys and arrays use integer indexes. The same operations
+work for either:
+
+```rust
+let first = document["items"][0]
+let first_name = document["items"].has_string(0) ! panic("Missing item")
+```
 
 Use `json:new_object()` and `json:new_array()` to build a document:
 

@@ -43,6 +43,7 @@ fi
 
 markdown=$(<"$workdir/api.md")
 if [[ "$markdown" != *'+ class Box[T]'* ]] \
+    || [[ "$markdown" != *'+ get value_type: T'* ]] \
     || [[ "$markdown" != *'+ fn get(value: T) T'* ]] \
     || [[ "$markdown" != *'+ class Ahead'* ]] \
     || [[ "$markdown" != *'+ fn name() String'* ]]; then

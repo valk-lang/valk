@@ -101,7 +101,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class ByteBufferRef {
     + fn clear() void
-    + fn data() ptr
+    + get data: ptr
     + fn equals(cmp: String) bool
     + static fn new(buffer: ByteBuffer, offset: uint, length: uint) ByteBufferRef
     + fn to_string() String
@@ -205,11 +205,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ data: *[u8]
     ~ length: uint
 
-    + fn bytes() uint
+    + get bytes: uint
     + fn clone() String
     + fn contains(part: String, start_index: uint (0)) bool
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
-    + fn data_cstring() cstring
+    + get data_cstring: cstring
     + fn ends_with(part: String) bool
     + fn escape() String
     + fn get(index: uint) u8
@@ -867,7 +867,7 @@ alias pid_t for i32
     ~+ query_string: ByteBufferRef
     ~+ status: uint
 
-    + fn body() String
+    + get body: String
     + fn data() Map[String]
     + fn data_json() Value
     + fn files() Map[InMemoryFile]
@@ -900,7 +900,7 @@ alias pid_t for i32
     + path: String
     + query_string: String
 
-    + fn body() String
+    + get body: String
     + fn data() Map[String]
     + fn data_json() Value
     + fn files() Map[InMemoryFile]
@@ -987,7 +987,7 @@ alias FD for i32
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
 + fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
-+ fn set_mode(fd: i32, mode: int) void
++ fn set_mode(fd: i32, mode: MODE) void
 + fn set_non_block(fd: i32, value: bool) void
 + fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
 + fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !IoError
@@ -1002,11 +1002,11 @@ alias FD for i32
 ```js
 + fn decode(json: ByteBuffer | String) Value !ParseError
 + fn decode_to[T](json: ByteBuffer | String) T !DecodeError
-+ fn default_value(kind: int) Value
++ fn default_value(kind: Kind) Value
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
 + fn from(data: $T) Value
-+ fn from_value[T](data: Value) T !ValueError
++ fn from_value[T](data: Value) T !LookupError
 + fn new_array(values: ?Array[Value] (null)) ArrayValue
 + fn new_bool(value: bool) Value
 + fn new_float(value: float) Value
@@ -1023,7 +1023,7 @@ alias FD for i32
     + values: Array[Value]
 
     + fn append(value: Value) ArrayValue
-    + fn get(index: uint) Value !ValueError
+    + fn get(index: uint) Value !LookupError
     + fn length() uint
     + fn prepend(value: Value) ArrayValue
     + fn remove(index: uint) ArrayValue
@@ -1034,7 +1034,7 @@ alias FD for i32
 + class ObjectValue {
     + values: Map[Value]
 
-    + fn get(key: String) Value !ValueError
+    + fn get(key: String) Value !LookupError
     + fn get_or(key: String) Value !LookupError
     + fn has(key: String) bool
     + fn length() uint
@@ -1046,35 +1046,53 @@ alias FD for i32
 ```js
 + union Value : String | bool | float | int | ArrayValue | ObjectValue | null {
     + fn append(value: Value) Value
-    + fn array() ArrayValue
+    + fn append_bool(value: bool) Value
+    + fn append_float(value: float) Value
+    + fn append_int(value: int) Value
+    + fn append_null() Value
+    + fn append_string(value: String) Value
+    + get array: ArrayValue
     + fn array_or() ArrayValue !LookupError
-    + fn bool() bool
+    + get bool: bool
     + fn bool_or() bool !LookupError
     + fn encode(pretty: bool (false)) String
     + fn encode_into(output: ByteBuffer, pretty: bool (false)) ByteBuffer
-    + fn float() float
+    + get float: float
     + fn float_or() float !LookupError
     + fn get(key: String | uint) Value
+    + fn get_required(key: String | uint) Value !LookupError
     + fn has(key: String | uint) bool
-    + fn int() int
+    + fn has_array(key: String | uint) ArrayValue !LookupError
+    + fn has_bool(key: String | uint) bool !LookupError
+    + fn has_float(key: String | uint) float !LookupError
+    + fn has_int(key: String | uint) int !LookupError
+    + fn has_object(key: String | uint) ObjectValue !LookupError
+    + fn has_string(key: String | uint) String !LookupError
+    + get int: int
     + fn int_or() int !LookupError
-    + fn is_array() bool
-    + fn is_bool() bool
-    + fn is_float() bool
-    + fn is_int() bool
-    + fn is_null() bool
-    + fn is_number() bool
-    + fn is_object() bool
-    + fn is_string() bool
-    + fn kind() int
+    + get is_array: bool
+    + get is_bool: bool
+    + get is_float: bool
+    + get is_int: bool
+    + fn is_kind(kind: Kind) bool
+    + get is_null: bool
+    + get is_number: bool
+    + get is_object: bool
+    + get is_string: bool
+    + get kind: Kind
     + fn kind_name() String
     + fn length() uint
-    + fn object() ObjectValue
+    + get object: ObjectValue
     + fn object_or() ObjectValue !LookupError
     + fn prepend(value: Value) Value
     + fn remove(key: String | uint) Value
     + fn set(key: String | uint, value: Value) Value
-    + fn string() String
+    + fn set_bool(key: String | uint, value: bool) Value
+    + fn set_float(key: String | uint, value: float) Value
+    + fn set_int(key: String | uint, value: int) Value
+    + fn set_null(key: String | uint) Value
+    + fn set_string(key: String | uint, value: String) Value
+    + get string: String
     + fn string_or() String !LookupError
 }
 ```
@@ -1179,10 +1197,10 @@ alias FD for i32
     ~ host: String
     ~ port: u16
 
-    + static fn client(type: int, host: String, port: u16) Connection !NetError
+    + static fn client(type: SOCKET_TYPE, host: String, port: u16) Connection !NetError
     + fn close() void
     + static fn close_fd(fd: i32) void
-    + static fn server(type: int, host: String, port: u16) shared SocketServer !NetError
+    + static fn server(type: SOCKET_TYPE, host: String, port: u16) shared SocketServer !NetError
 }
 ```
 
