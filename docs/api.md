@@ -720,7 +720,7 @@ alias pid_t for i32
     ~ reading: bool
 
     + fn close() void
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) bool !io:IoError
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
     + fn write(str: String) void !io:IoError
     + fn write_buffer(buffer: ByteBuffer) void !io:IoError
     + fn write_from_ptr(from: ptr, len: uint) void !io:IoError
