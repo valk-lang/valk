@@ -771,8 +771,23 @@ let name_str = name.string_value() ! panic("Json value must be a string")
 `value.to_type[T]()` converts json:Value back to a Valk type and returns an
 error when the document does not match that type.
 
-When the target type is known, `json:decode_to[T](text)` parses directly into
-that type without first constructing a dynamic JSON tree:
+```rust
+class User {
+    name: String
+    age: int
+}
+
+// Json string -> json:Value
+let json_user = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid json")
+// json:Value -> User
+let user = json_user.to_type[User]() ! panic("Incompatible")
+// User -> json:Value
+let json_usr = json:from(user)
+// json:Value -> json string
+let json_string = json_usr.encode()
+```
+
+You can also decode directly to a type using `json:decode_to[T](text)`
 
 ```rust
 class User {
