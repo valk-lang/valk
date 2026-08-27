@@ -435,9 +435,9 @@ check "didOpen publishes diagnostics from the buffer" '"message":"Unknown identi
 mkdir -p "$workdir/pkg-one/src/check" "$workdir/pkg-two/src/check"
 printf '{}\n' > "$workdir/pkg-one/valk.json"
 printf '{}\n' > "$workdir/pkg-two/valk.json"
-printf 'fn package_one() {}\nfn unopened_bad() { missing_unopened_body }\n' > "$workdir/pkg-one/src/main.valk"
+printf 'class PackageValue { value: int (0) }\nfn package_one() {}\nfn inspect_package_value(value: shared PackageValue) int { return value.value }\nfn make_package_value() PackageValue { return PackageValue { value: 1 } }\nfn unopened_bad() { missing_unopened_body }\n' > "$workdir/pkg-one/src/main.valk"
 printf 'fn package_two() {}\n' > "$workdir/pkg-two/src/main.valk"
-printf 'use main\nfn check_one() { main:package_one(); missing_from_one }\n' > "$workdir/pkg-one/src/check/check.valk"
+printf 'use main\nfn check_one() {\n    main:package_one()\n    let value = main:PackageValue { value: 1 }\n    let alias = value\n    assert(main:inspect_package_value(value) == 1)\n    assert(alias.value == 1)\n    let made: shared main:PackageValue = main:make_package_value()\n    assert(made.value == 1)\n    missing_from_one\n}\n' > "$workdir/pkg-one/src/check/check.valk"
 printf 'use main\nfn check_two() { main:package_two(); missing_from_two }\n' > "$workdir/pkg-two/src/check/check.valk"
 count=$((count + 1))
 echo "> diagnostics batch open files from multiple packages"
@@ -454,6 +454,13 @@ esac
 case "$out" in
     *'Unknown identifier: missing_unopened_body'*)
         echo "# Parsed a function body from an unopened file"
+        failed=1
+        ;;
+esac
+case "$out" in
+    *'Only a provably unique value graph'*|*'a mutable alias may remain'*)
+        echo "# An unavailable uniqueness summary caused a false diagnostic"
+        echo "$out" | head -c 2000
         failed=1
         ;;
 esac
