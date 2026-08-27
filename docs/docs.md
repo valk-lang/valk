@@ -746,31 +746,30 @@ API for [valk:json](api.md#json)
 use valk:json
 
 let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
-let name = document.has_string("name") ! panic("Missing name")
+let name = document.get_string("name") ! panic("Missing name")
 let age = document["age"].int
 document = document.set_bool("active", true)
 println(json:encode(document))
 ```
 
-Both `get()` and bracket access are safe when a path is missing and produce a
-JSON null value. `has()` checks whether an object key or array index exists.
-`get_required()` returns a value or `LookupError.missing`. Typed forms such as
-`has_string()` also verify the value type; every lookup or type failure from
-these strict accessors is `LookupError.missing`.
-
-The `kind`, `is_string`, `is_int`, `is_float`, `is_bool`, `is_array`,
-`is_object`, and `is_null` properties inspect a value. The `string`, `int`,
-`float`, `bool`, `array`, and `object` getters provide convenient values. The
-`string` getter converts scalar values and encodes arrays and objects; the other
-getters return their type's default when the JSON kind differs.
-
-Objects use string keys and arrays use integer indexes. The same operations
-work for either:
+Objects use string keys and arrays use integer indexes. The same operations work for either:
 
 ```rust
-let first = document["items"][0]
-let first_name = document["items"].has_string(0) ! panic("Missing item")
+let first_name_str = document["names"][0].string // Fast lookup
+let first_name_str = document.get("names").get(0).string // Same but longer
+// Get offsets and it must exist
+let first_name = document["names"].get_required(0) ! panic("Missing item")
+// Get offsets while also making sure the type matches
+let first_name_str = document["names"].get_string(0) ! panic("Missing item or is not a string")
+// Explicit
+let list = document.get_required("names") ! panic("Missing names list")
+let name = list.get_required(0) ! panic("Missing item")
+let name_str = name.string_value() ! panic("Json value must be a string")
 ```
+
+Use strict value methods such as `string_value()`, `int_value()`, and
+`array_value()` when the value itself must have an exact JSON type. They return
+`LookupError.missing` when the type differs.
 
 Use `json:new_object()` and `json:new_array()` to build a document:
 

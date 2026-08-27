@@ -1053,23 +1053,33 @@ alias FD for i32
     + fn append_string(value: String) Value
     + get array: ArrayValue
     + fn array_or() ArrayValue !LookupError
+    + fn array_value() ArrayValue !LookupError
     + get bool: bool
     + fn bool_or() bool !LookupError
+    + fn bool_value() bool !LookupError
     + fn encode(pretty: bool (false)) String
     + fn encode_into(output: ByteBuffer, pretty: bool (false)) ByteBuffer
     + get float: float
     + fn float_or() float !LookupError
+    + fn float_value() float !LookupError
     + fn get(key: String | uint) Value
+    + fn get_array(key: String | uint) ArrayValue !LookupError
+    + fn get_bool(key: String | uint) bool !LookupError
+    + fn get_float(key: String | uint) float !LookupError
+    + fn get_int(key: String | uint) int !LookupError
+    + fn get_object(key: String | uint) ObjectValue !LookupError
     + fn get_required(key: String | uint) Value !LookupError
+    + fn get_string(key: String | uint) String !LookupError
     + fn has(key: String | uint) bool
-    + fn has_array(key: String | uint) ArrayValue !LookupError
-    + fn has_bool(key: String | uint) bool !LookupError
-    + fn has_float(key: String | uint) float !LookupError
-    + fn has_int(key: String | uint) int !LookupError
-    + fn has_object(key: String | uint) ObjectValue !LookupError
-    + fn has_string(key: String | uint) String !LookupError
+    + fn has_array(key: String | uint) bool
+    + fn has_bool(key: String | uint) bool
+    + fn has_float(key: String | uint) bool
+    + fn has_int(key: String | uint) bool
+    + fn has_object(key: String | uint) bool
+    + fn has_string(key: String | uint) bool
     + get int: int
     + fn int_or() int !LookupError
+    + fn int_value() int !LookupError
     + get is_array: bool
     + get is_bool: bool
     + get is_float: bool
@@ -1084,6 +1094,7 @@ alias FD for i32
     + fn length() uint
     + get object: ObjectValue
     + fn object_or() ObjectValue !LookupError
+    + fn object_value() ObjectValue !LookupError
     + fn prepend(value: Value) Value
     + fn remove(key: String | uint) Value
     + fn set(key: String | uint, value: Value) Value
@@ -1094,6 +1105,7 @@ alias FD for i32
     + fn set_string(key: String | uint, value: String) Value
     + get string: String
     + fn string_or() String !LookupError
+    + fn string_value() String !LookupError
 }
 ```
 
