@@ -13,7 +13,11 @@ global g_coro_count : uint
 global run_coros : Array[Coro] (.new(16))
 global next_run_coros : Array[Coro] (.new(16))
 
+#if OS == "win"
+global main_fiber: ?ptr
+#else
 global main_state : CoroState (@undefined)
+#end
 
 #if OS == "macos"
 global timer_id : uint
@@ -24,21 +28,23 @@ global cport : ?ptr
 global sleep_coros : Array[Coro] (.new(16))
 #end
 
+#if OS != "win"
 struct CoroState {
     rsp: ptr
 }
+#end
 class Coro {
     // Args & results
     args: ptr
     gc_args: Array[gc:GcPtr] (.{})
     // Coro state
+    #if OS == "win"
+    fiber: ?ptr
+    #else
     state: CoroState (@undefined)
-    // Stack info
-    backup_main_stack: ptr (@undefined)
-    backup_main_stack_size: uint (0)
-    backup_main_stack_alloc_size: uint (0)
+    stack_allocation: ptr (@undefined)
+    #end
     backup_gc_sp: ?ptr (null)
-    stack_base: ptr (@undefined)
     //
     start_func: fnptr()()
     handler: fn()()
@@ -67,12 +73,30 @@ class Coro {
 
     static fn new(handler: fn()(), start_func: ptr) SELF {
 
+        #if OS != "win"
+        let stack_allocation = stack_alloc()
+        #end
         let coro = Coro {
             args: mem:alloc(128)
+            #if OS != "win"
+            stack_allocation: stack_allocation
+            #end
             //
             start_func: start_func.@cast(fnptr()())
             handler: handler
         }
+
+        #if OS == "win"
+        ensure_main_fiber()
+        coro.fiber = ext:CreateFiberEx(
+            STACK_INITIAL_SIZE,
+            STACK_SIZE,
+            ext:FIBER_FLAG_FLOAT_SWITCH,
+            win_coro_entry.@cast(ptr),
+            coro.@cast(ptr)
+        )
+        if !isset(coro.fiber) : panic("Failed to allocate coroutine stack")
+        #end
 
         let indexes = g_coro_indexes
         if indexes.count == 0 {
@@ -126,20 +150,23 @@ class Coro {
     fn free_stacks() {
         if this.freed : return
         this.freed = true
-        if this.backup_main_stack_alloc_size > 0 {
-            mem:free(this.backup_main_stack)
+        #if OS == "win"
+        let fiber = this.fiber
+        if isset(fiber) {
+            this.fiber = null
+            ext:DeleteFiber(fiber)
         }
+        #else
+        stack_free(this.stack_allocation)
+        #end
     }
 
+    #if OS != "win"
     fn init_stack(base: ptr) {
 
         #if ARCH == "x64"
         let return_addr_space = 2 * size_of(ptr)
-        #if OS == "win"
-        let regs = 30
-        #else
         let regs = 6
-        #end
         #elif ARCH == "arm64"
         let return_addr_space = size_of(ptr)
         let regs = 19
@@ -152,11 +179,12 @@ class Coro {
         let misalignment: uint = stack_start & 0xF
         stack_start -= misalignment
 
-        mem:clear(stack_start, regs * size_of(ptr)) // Required for windows
+        mem:clear(stack_start, regs * size_of(ptr))
 
         @ptrv(stack_start, ptr, regs) = this.start_func.@cast(ptr)
         this.state.rsp = stack_start
     }
+    #end
 
     //////////////
     // AWAIT
@@ -212,33 +240,45 @@ class Coro {
     //////////////
 
     fn yield() $undefined {
+        #if OS == "win"
+        let fiber = main_fiber
+        if !isset(fiber) : panic("Coroutine thread is not a fiber")
+        SELF.switch_fiber(fiber)
+        #else
         SELF.swap(&this.state, &main_state)
+        #end
     }
 
+    #if OS == "win"
+    static fn switch_fiber(to: ptr) $suspend $undefined {
+        ext:SwitchToFiber(to)
+    }
+    #else
     static fn swap(from: ptr, to: ptr) $suspend $undefined {
         ext:valk_stack_swap(from, to)
     }
+    #end
 
     fn resume() $undefined {
         if this.done : return
 
         current_coro = this
 
-        // Set stack base
-        let sp = @ref(main_stack) + STACK_SIZE - size_of(ptr)
         gc_stack_sp_backup = gc_stack_sp
         this.active = true
 
+        #if OS == "win"
+        if !this.started : this.started = true
+        gc_stack_sp = this.backup_gc_sp
+        let fiber = this.fiber
+        if !isset(fiber) : panic("Coroutine fiber was released before completion")
+        SELF.switch_fiber(fiber)
+        #else
+        let sp = this.stack_allocation + STACK_ALLOC_SIZE - size_of(ptr)
         if this.started {
-            if this.stack_base != sp : panic("Resuming coroutine from another stack position (SP)")
-            // Restore stack
-            if this.backup_main_stack_size > 0 {
-                mem:copy(this.backup_main_stack, this.state.rsp, this.backup_main_stack_size)
-            }
             gc_stack_sp = this.backup_gc_sp
         } else {
             // Init stack
-            this.stack_base = sp
             gc_stack_sp = null
             this.init_stack(sp)
             this.started = true
@@ -246,27 +286,14 @@ class Coro {
 
         // Swap
         SELF.swap(&main_state, &this.state)
+        #end
 
         // Restore backup
         if !this.done {
             this.backup_gc_sp = gc_stack_sp
-
-            // Backup Main stack
-            let size : uint = this.stack_base - this.state.rsp
-            let asize = this.backup_main_stack_alloc_size
-            if size > asize {
-                if asize > 0 : mem:free(this.backup_main_stack)
-                this.backup_main_stack = mem:alloc(size)
-                this.backup_main_stack_alloc_size = size
-            }
-            this.backup_main_stack_size = size
-
-            if size > 0 {
-                mem:copy(this.state.rsp, this.backup_main_stack, this.backup_main_stack_size)
-            }
         }
 
-        // Restore stack base
+        // Restore the scheduler's GC context.
         this.active = false
         gc_stack_sp = gc_stack_sp_backup
         current_coro = null
@@ -440,6 +467,18 @@ class Coro {
 }
 
 #if OS == "win"
+fn ensure_main_fiber() {
+    if isset(main_fiber) : return
+    main_fiber = ext:ConvertThreadToFiberEx(null, ext:FIBER_FLAG_FLOAT_SWITCH)
+    if !isset(main_fiber) : panic("Failed to initialize coroutine thread fiber")
+}
+
+fn win_coro_entry(value: ptr) {
+    let coro = value.@cast(Coro)
+    coro.start_func()
+    panic("Coroutine entry returned without completing")
+}
+
 fn win_wake_sleepers() {
     let now = ext:GetTickCount64()
     let i: uint = 0

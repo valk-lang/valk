@@ -138,19 +138,19 @@ if [[ "$fixed_body" != *"alloca [3 x i8]"* ]] \
     exit 1
 fi
 
-echo "> Keep native addresses on stack unless the function may suspend"
+echo "> Keep address-taken locals on native stacks"
 
-address_ir="$workdir/native-stable-address.ll"
-out=$("$VALK" build "$DIR/native-stable-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
+address_ir="$workdir/native-address.ll"
+out=$("$VALK" build "$DIR/native-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
 status=$?
 if [ "$status" -ne 0 ]; then
-    echo "# Failed to build native/stable address IR fixture"
+    echo "# Failed to build native address IR fixture"
     echo "$out"
     exit 1
 fi
 
 native_address_body=$(sed -n '/^define .*__native_address_storage__/,/^}/p' "$address_ir")
-stable_address_body=$(sed -n '/^define .*__stable_address_storage__/,/^}/p' "$address_ir")
+suspending_address_body=$(sed -n '/^define .*__suspending_address_storage__/,/^}/p' "$address_ir")
 microtime_body=$(sed -n '/^define .*__microtime__/,/^}/p' "$address_ir")
 if [[ "$native_address_body" != *"alloca"* ]] \
     || [[ "$native_address_body" == *"__Pool__get__"* ]]; then
@@ -164,9 +164,28 @@ if [[ "$microtime_body" != *"alloca"* ]] \
     echo "$microtime_body"
     exit 1
 fi
-if [[ "$stable_address_body" != *"__Pool__get__"* ]]; then
-    echo "# Transitively suspending address storage was not stable"
-    echo "$stable_address_body"
+if [[ "$suspending_address_body" != *"alloca"* ]] \
+    || [[ "$suspending_address_body" == *"__Pool__get__"* ]]; then
+    echo "# Transitively suspending address storage did not use its private stack"
+    echo "$suspending_address_body"
+    exit 1
+fi
+
+echo "> Reserve 1 MiB Windows coroutine stacks with a 32 KiB commit"
+
+windows_coro_ir="$workdir/windows-coro-stack.ll"
+out=$("$VALK" build "$DIR/native-address.valk" --target win-x64 --ir --no-warn -o "$windows_coro_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build Windows coroutine stack IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+if ! grep -q 'call ptr @"CreateFiberEx"(i64 32768, i64 1048576, i32 1,' "$windows_coro_ir" \
+    || grep -q 'valk_stack_swap' "$windows_coro_ir"; then
+    echo "# Windows coroutines did not use the expected native fiber stack"
+    grep -E 'CreateFiberEx|valk_stack_swap' "$windows_coro_ir" || true
     exit 1
 fi
 
@@ -396,5 +415,5 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 13"
+echo "# Test count: 14"
 echo ""
