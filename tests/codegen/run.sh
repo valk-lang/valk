@@ -171,6 +171,24 @@ if [[ "$suspending_address_body" != *"alloca"* ]] \
     exit 1
 fi
 
+echo "> Reserve 1 MiB Windows coroutine stacks with a 32 KiB commit"
+
+windows_coro_ir="$workdir/windows-coro-stack.ll"
+out=$("$VALK" build "$DIR/native-address.valk" --target win-x64 --ir --no-warn -o "$windows_coro_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build Windows coroutine stack IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+if ! grep -q 'call ptr @"CreateFiberEx"(i64 32768, i64 1048576, i32 1,' "$windows_coro_ir" \
+    || grep -q 'valk_stack_swap' "$windows_coro_ir"; then
+    echo "# Windows coroutines did not use the expected native fiber stack"
+    grep -E 'CreateFiberEx|valk_stack_swap' "$windows_coro_ir" || true
+    exit 1
+fi
+
 echo "> Keep property stores and Array append on their GC fast paths"
 
 fast_path_ir="$workdir/gc-fast-paths.ll"
@@ -397,5 +415,5 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 13"
+echo "# Test count: 14"
 echo ""
