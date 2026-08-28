@@ -21,6 +21,7 @@ global main_state : CoroState (@undefined)
 
 #if OS == "macos"
 global timer_id : uint
+global io_timeout_coros : Array[Coro] (.new(16))
 #end
 
 #if OS == "win"
@@ -65,7 +66,7 @@ class Coro {
     io_wait_active: bool (false)
     io_wait_timed_out: bool (false)
     io_wait_fd: FD
-    io_wait_timer_id: uint
+    io_deadline_ms: uint (0)
     #elif OS == "win"
     sleep_deadline_ms: u64 (0)
     iocp_ready: bool (false)
@@ -80,13 +81,20 @@ class Coro {
     #end
 
     #if OS == "macos"
-    fn arm_io_timeout(fd: FD, timeout_ms: uint) uint {
+    fn arm_io_timeout(fd: FD, timeout_ms: uint) {
         this.io_wait_active = true
         this.io_wait_timed_out = false
         this.io_wait_fd = fd
-        if timeout_ms == 0 : return 0
-        this.io_wait_timer_id = timer_id++
-        return this.io_wait_timer_id
+        this.io_deadline_ms = 0
+        if timeout_ms == 0 : return
+        this.io_deadline_ms = mac_mstime() + timeout_ms
+        io_timeout_coros.append(this)
+    }
+
+    fn disarm_io_timeout() {
+        if this.io_deadline_ms == 0 : return
+        this.io_deadline_ms = 0
+        io_timeout_coros.remove_value(this)
     }
     #elif OS == "win"
     fn arm_io_timeout(fd: FD, overlap: ptr, timeout_ms: uint) {
@@ -460,6 +468,15 @@ class Coro {
             if run_coros.length > 0 {
                 let t : ext:libc_timespec = {tv_sec: 0, tv_nsec: 0}
                 timeout = @ref(t)
+            } else {
+                let has_timeout, wait_ms = mac_io_timeout()
+                if has_timeout {
+                    let t : ext:libc_timespec = {
+                        tv_sec: (wait_ms / 1000).to(int)
+                        tv_nsec: ((wait_ms % 1000) * 1_000_000).to(int)
+                    }
+                    timeout = @ref(t)
+                }
             }
             let nevents = ext:kevent(kq, null, 0, @ref(events[0]), 64, timeout)
             gc:lock()
@@ -467,38 +484,26 @@ class Coro {
             while nevents-- > 0 {
                 let ev = events[nevents]
                 let coro = ev.udata.@cast(Coro)
-                let is_timeout = ev.filter == io:EVFILT_TIMER && ev.ident == coro.io_wait_timer_id
-                let is_io = ev.ident == coro.io_wait_fd && (ev.filter == io:EVFILT_READ || ev.filter == io:EVFILT_WRITE)
-                if is_timeout || is_io {
-                    if !coro.io_wait_active : continue
+                if ev.filter == io:EVFILT_READ || ev.filter == io:EVFILT_WRITE {
+                    if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
+                    coro.disarm_io_timeout()
                     coro.io_wait_active = false
-                    coro.io_wait_timed_out = is_timeout
-                    if is_timeout {
-                        coro.poll_event = io:POLL_TIMEOUT
-                        coro.completion_res = 0 - ext:ETIMEDOUT
-                    } else if ev.filter == io:EVFILT_READ {
+                    coro.io_wait_timed_out = false
+                    if ev.filter == io:EVFILT_READ {
                         coro.poll_event = ext:POLLIN
                         coro.completion_res = ev.data
                         if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = coro.poll_event | ext:POLLHUP
-                    } else {
+                    } else if ev.filter == io:EVFILT_WRITE {
                         coro.poll_event = ext:POLLOUT
                         coro.completion_res = ev.data
                         if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = coro.poll_event | ext:POLLHUP
                     }
-                    run_coros.append(coro)
-                    continue
-                }
-                if ev.filter == io:EVFILT_READ {
-                    coro.poll_event = ext:POLLIN
-                    coro.completion_res = ev.data
-                    if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = coro.poll_event | ext:POLLHUP
-                } else if ev.filter == io:EVFILT_WRITE {
-                    coro.poll_event = ext:POLLOUT
-                    coro.completion_res = ev.data
-                    if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = coro.poll_event | ext:POLLHUP
+                } else {
+                    if ev.filter != io:EVFILT_TIMER : continue
                 }
                 run_coros.append(coro)
             }
+            mac_wake_io_timeouts()
 
             #elif OS == "win"
             win_wake_sleepers()
@@ -560,6 +565,51 @@ class Coro {
         }
     }
 }
+
+#if OS == "macos"
+fn mac_mstime() uint {
+    let tv : ext:libc_timeval = @undefined
+    if ext:gettimeofday(@ref(tv), null) != 0 : panic("Failed to read system time")
+    return tv.tv_sec.to(uint) * 1000 + tv.tv_usec.to(uint) / 1000
+}
+
+fn mac_io_timeout() (bool, uint) {
+    if io_timeout_coros.length == 0 : return (false, 0)
+    let now = mac_mstime()
+    let nearest : uint = 0
+    each io_timeout_coros as coro {
+        let deadline = coro.io_deadline_ms
+        if deadline == 0 : continue
+        if deadline <= now : return (true, 0)
+        if nearest == 0 || deadline < nearest : nearest = deadline
+    }
+    if nearest == 0 : return (false, 0)
+    return (true, nearest - now)
+}
+
+fn mac_wake_io_timeouts() {
+    let now = mac_mstime()
+    let i : uint = 0
+    while i < io_timeout_coros.length {
+        let coro = io_timeout_coros.get(i) !? null
+        if !isset(coro) || !coro.io_wait_active || coro.io_deadline_ms == 0 {
+            io_timeout_coros.remove(i)
+            continue
+        }
+        if coro.io_deadline_ms > now {
+            i++
+            continue
+        }
+        io_timeout_coros.remove(i)
+        coro.io_deadline_ms = 0
+        coro.io_wait_active = false
+        coro.io_wait_timed_out = true
+        coro.poll_event = io:POLL_TIMEOUT
+        coro.completion_res = 0 - ext:ETIMEDOUT
+        run_coros.append(coro)
+    }
+}
+#end
 
 #if OS == "win"
 fn ensure_main_fiber() {
