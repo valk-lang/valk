@@ -18,6 +18,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Functions for 'core'
 
 ```js
++ fn cleanup_warning(msg: String, file: String, line: uint) void
 + fn clone_value(value: $T) T
 + fn exec(cmd: String, print_output: bool (false)) (i32, String)
 + fn exit(code: i32) void
@@ -182,9 +183,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Process {
-    + fn did_exit() bool
+    + fn did_exit() bool !ExternError
     + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !ExternError
-    + fn stop() void
+    + fn stop() void !ExternError
 }
 ```
 
@@ -678,17 +679,17 @@ alias pid_t for i32
 ```js
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
-+ fn chdir(path: String) void
++ fn chdir(path: String) void !io:IoError
 + fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
-+ fn cwd() String
++ fn cwd() String !io:IoError
 + fn delete(path: String) void !io:IoError
-+ fn delete_recursive(path: String) void
++ fn delete_recursive(path: String) void !io:IoError
 + fn dir_of(path: String) String
-+ fn exe_dir() String
-+ fn exe_path() String
++ fn exe_dir() String !io:IoError
++ fn exe_path() String !io:IoError
 + fn exists(path: String) bool
 + fn ext(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String]
++ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io:IoError
 + fn home_dir() String !ExternError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
@@ -700,8 +701,8 @@ alias pid_t for i32
 + fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io:IoError
 + fn path(path: String) Path
 + fn read(path: String) String !io:IoError
-+ fn realpath(path: String) String
-+ fn resolve(path: String) String
++ fn realpath(path: String) String !io:IoError
++ fn resolve(path: String) String !io:IoError
 + fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint !io:IoError
 + fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io:IoError
@@ -719,7 +720,7 @@ alias pid_t for i32
     + read_offset: uint
     ~ reading: bool
 
-    + fn close() void
+    + fn close() void !io:IoError
     + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
     + fn write(str: String) void !io:IoError
     + fn write_buffer(buffer: ByteBuffer) void !io:IoError
@@ -738,7 +739,7 @@ alias pid_t for i32
     + static fn create_from_file(path: String) InMemoryFile !io:IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn read_all() String
-    + fn save(path: String) void
+    + fn save(path: String) void !io:IoError
 }
 ```
 
@@ -748,7 +749,7 @@ alias pid_t for i32
     + fn dir_of() Path
     + static fn new(path: String) Path
     + fn pop() Path
-    + fn resolve() Path
+    + fn resolve() Path !io:IoError
 }
 ```
 
@@ -812,7 +813,7 @@ alias pid_t for i32
 ```js
 + fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
-+ fn parse_http(input: ByteBuffer, context: Context, is_response: bool) void !HttpParseError
++ fn parse_http(input: ByteBuffer, context: Context, is_response: bool, max_header_size: uint (8192), max_body_size: uint (0)) void !HttpParseError
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
 ```
 
@@ -831,7 +832,7 @@ alias pid_t for i32
     ~ response_received: bool
     ~ sent_percent: uint
 
-    + static fn create(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError
+    + static fn create(method: String, url: String, options: ?Options (null), deadline_ms: uint (0)) ClientRequest !HttpError
     + fn progress() bool !HttpError
     + fn response() ClientResponse !HttpError
 }
@@ -857,6 +858,7 @@ alias pid_t for i32
 
 ```js
 + class Context {
+    ~+ body_expected: uint
     ~+ body_received: uint
     ~+ chunked: bool
     ~+ content_length: uint
@@ -881,11 +883,15 @@ alias pid_t for i32
 + class Options {
     + body: String
     + ca_cert: ?String
+    + connect_timeout_ms: uint
     + follow_redirects: bool
     + headers: ?Map[String]
     + output_to_file: ?String
     + query_data: ?Map[String]
+    + read_timeout_ms: uint
+    + timeout_ms: uint
     + verify_ssl_cert: bool
+    + write_timeout_ms: uint
 
     + fn clear_headers() Options
     + fn get_headers() Map[String]
@@ -956,10 +962,18 @@ alias pid_t for i32
 
 ```js
 + class Server {
+    + body_timeout_ms: uint
     + fast_handler: ?shared fn(Context, ResponseWriter)()
+    + header_timeout_ms: uint
     ~ host: String
+    + idle_timeout_ms: uint
+    + max_connections: uint
+    + max_request_body_size: uint
+    + max_request_header_size: uint
+    + max_server_wide_body_size: uint
     ~ port: u16
     + show_info: bool
+    + write_timeout_ms: uint
 
     + fn add_static_dir(path: String) void !LookupError
     + static fn new(host: String, port: u16, handler: shared fn(Request)(Response)) Server !HttpError
@@ -978,17 +992,17 @@ alias FD for i32
 ## Functions for 'io'
 
 ```js
-+ fn await_fd(fd: i32, read: bool, write: bool) PollEvent
-+ fn await_socket_fd(fd: i32, read: bool, write: bool) PollEvent
-+ fn close(fd: i32) void
++ fn await_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
++ fn await_socket_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
++ fn close(fd: i32) void !IoError
 + fn print(msg: String) void
 + fn print_from_ptr(adr: ptr, len: uint) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
 + fn read_to_ptr(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_to_ptr_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
-+ fn set_mode(fd: i32, mode: MODE) void
-+ fn set_non_block(fd: i32, value: bool) void
++ fn set_mode(fd: i32, mode: MODE) void !IoError
++ fn set_non_block(fd: i32, value: bool) void !IoError
 + fn write(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
 + fn write_from_ptr(fd: i32, buf: ptr, amount: uint) uint !IoError
 + fn write_from_ptr_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
@@ -1142,11 +1156,11 @@ alias FD for i32
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: ByteBuffer, amount: uint) uint !NetError
-+ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint) uint !NetError
-+ fn send(fd: i32, buf: ByteBuffer, amount: uint) uint !NetError
-+ fn send_from_ptr(fd: i32, buf: ptr, amount: uint) uint !NetError
-+ fn send_string(fd: i32, str: String) uint !NetError
++ fn recv(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn recv_to_ptr(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn send(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn send_from_ptr(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn send_string(fd: i32, str: String, timeout_ms: uint (5000)) uint !NetError
 ```
 
 ## Classes for 'net'
@@ -1156,7 +1170,7 @@ alias FD for i32
     ~ data: *libc_gen_addrinfo
 
     + fn addr_len() u32
-    + static fn new(host: String, port: u16) AddrInfo !NetError
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000)) AddrInfo !NetError
     + fn sock_addr() *libc_gen_sockaddr
 }
 ```
@@ -1165,16 +1179,19 @@ alias FD for i32
 + class Connection {
     ~ fd: i32
     ~+ host: String
+    + read_timeout_ms: uint
     ~ ssl: ?SSL
     ~ ssl_enabled: bool
+    + write_timeout_ms: uint
 
-    + fn close() void
-    + static fn new(fd: i32) Connection
+    + fn close() void !NetError
+    + static fn new(fd: i32) Connection !NetError
     + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
     + fn send(data: String) void !NetError
     + fn send_buffer(data: ByteBuffer, skip_bytes: uint, send_all: bool) uint !NetError
     + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
-    + fn ssl_connect(ssl: SSL) void !NetError
+    + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
+    + fn ssl_connect(ssl: SSL, timeout_ms: uint (5000)) void !NetError
 }
 ```
 
@@ -1188,18 +1205,18 @@ alias FD for i32
     ~ fd: i32
     ~ ssl: OSSL
 
-    + fn connect(fd: i32) void !NetError
+    + fn connect(fd: i32, timeout_ms: uint (5000)) void !NetError
     + fn custom_error(msg: String) void !NetError
     + static fn default_ca_cert_paths() Array[String]
     + fn get_error() uint
     + fn get_error_message() String
     + static fn new() SSL
-    + fn recv(buffer: ByteBuffer, max_bytes: uint) uint !NetError
+    + fn recv(buffer: ByteBuffer, max_bytes: uint, timeout_ms: uint (5000)) uint !NetError
     + fn set_ca_cert(path: ?String) void !NetError
     + fn set_ca_cert_dir(dir: ?String) void !NetError
     + fn set_host(host: String) void !NetError
     + fn set_verify(enable: bool) void
-    + fn write(from: ptr, len: uint) uint !NetError
+    + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError
 }
 ```
 
@@ -1209,10 +1226,11 @@ alias FD for i32
     ~ host: String
     ~ port: u16
 
-    + static fn client(type: SOCKET_TYPE, host: String, port: u16) Connection !NetError
-    + fn close() void
-    + static fn close_fd(fd: i32) void
-    + static fn server(type: SOCKET_TYPE, host: String, port: u16) shared SocketServer !NetError
+    + static fn client(type: SOCKET_TYPE, host: String, port: u16, timeout_ms: uint (5000)) Connection !NetError
+    + fn close() void !NetError
+    + static fn close_fd(fd: i32) void !NetError
+    + static fn close_fd_cleanup(fd: i32, file: String, line: uint) void
+    + static fn server(type: SOCKET_TYPE, host: String, port: u16, timeout_ms: uint (5000)) shared SocketServer !NetError
 }
 ```
 
@@ -1221,7 +1239,7 @@ alias FD for i32
     ~+ socket: Socket
 
     + fn accept() Connection !NetError
-    + fn close() void
+    + fn close() void !NetError
 }
 ```
 

@@ -914,6 +914,8 @@ let a = might_error() !? <{
 
 Compile macros select code using compiler definitions or type metadata. Built-in definitions include `OS`, `ARCH`, and `TEST`; additional values can be supplied with `--def`.
 
+Source expressions `__PATH__`, `__FILE__`, `__DIR__`, and `__LINE__` expand to the current source path, the path relative to its package source directory, the current source directory, and the one-based source line. They are also recognized by `is_defined`.
+
 ```rust
 fn main() {
     #if OS == "linux"
