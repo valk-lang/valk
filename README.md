@@ -77,6 +77,7 @@ make
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
 | binary-tree | 19 | 0.570s (55.8 MB) | 2.060s (56.9 MB) | 2.535s (66.2 MB) |
+| binary-tree-multi | 19 | 0.210s (75.0 MB) | 0.600s (87.6 MB) | 0.640s (66.4 MB) |
 | json | 2000000 | 0.700s (2.4 MB) | 2.260s (11.2 MB) | 0.420s (2.6 MB) |
 | json-serde | sample, 50000 | 0.310s (143.1 MB) | 0.810s (154.7 MB) | 0.230s (119.4 MB) |
 | lru | 1000, 11000000 | 0.670s (2.5 MB) | 0.790s (3.7 MB) | 0.445s (2.5 MB) |
@@ -85,6 +86,13 @@ make
 | spectral-norm | 5500 | 1.085s (2.5 MB) | 1.130s (5.8 MB) | 1.100s (2.5 MB) |
 
 Code: [Link](examples/bench)
+
+It's clear that Valk is the best when it comes to managing dynamic memory.
+
+The other benchmarks depend more on algorithms and SIMD. Although we are close
+or equal in performance, we haven't spent much time yet optimizing this. But in
+the end these benchmarks will all relatively perform the same if they get the
+same codegen optimizations and use the same algorithms.
 
 ---
 
@@ -101,6 +109,13 @@ Code: [Link](examples/bench)
 | tree churn | 51 ms | 194 ms | 277 ms | 121 ms |
 
 Code: [Link](examples/bench/gc)
+
+This benchmark runs different kinds of memory structures/lifetimes and 
+looks how it affects the garbage collector.
+
+The force collect benchmark is unrealistic but does reveal a factual difference
+in overhead of the garbage collectors. As valk only needs to process modified
+memory our GC has no problem with this.
 
 ---
 
@@ -128,13 +143,13 @@ When not to use Valk:
 
 ## Language design
 
-- Co routines are semi-stackful. We run the co-routines on the main stack and if it blocks, we copy it to a temporary buffer. This way we can keep memory usage low. And yes, it's fast.
-
-- Each thread manages it's own memory. So we dont need to block other threads. You can share objects with other threads. Each time you do, the shared memory counter increases. At a certain point it will block other threads to free un-used shared objects. But we never block every X seconds like other languages do.
-
-- The local GC has no randomness. Every time you run a program it will use the exact same amount of memory and run at the exact same speed.
+- Our co routines are stackful and use growing stacks
 
 - Co routines are single threaded. A co-routine will always run on the same thread it started on.
+
+- Each thread manages it's own memory. So we dont need to block other threads. You can share objects with other threads. Each time you do, the shared memory counter increases. At a certain point it will block other threads to free un-used shared objects. But we never block every X seconds like many other languages do.
+
+- The local GC has no randomness. Every time you run a program it will use the exact same amount of memory and run at the exact same speed.
 
 - We are a self hosted language with an embedded LLVM 22 backend. Pass `--clang` to compile the emitted textual IR with external clang instead. We depend on libc for system calls. We use the native linux & macos linker. For windows we use lld-link.
 

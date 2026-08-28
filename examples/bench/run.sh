@@ -9,6 +9,7 @@ runs=3
 
 all_benchmarks=(
     binary-tree
+    binary-tree-multi
     json
     json-serde
     lru
@@ -102,7 +103,7 @@ trap 'rm -rf "$measure_dir"' EXIT
 
 benchmark_args() {
     case "$1" in
-        binary-tree)  args=(19) ;;
+        binary-tree|binary-tree-multi) args=(19) ;;
         json)          args=(2000000) ;;
         json-serde)   args=(sample 50000) ;;
         lru)          args=(1000 11000000) ;;
@@ -115,7 +116,8 @@ benchmark_args() {
 
 benchmark_input() {
     case "$1" in
-        binary-tree)   printf '19' ;;
+        binary-tree)       printf '19' ;;
+        binary-tree-multi) printf '19' ;;
         json)           printf '2000000' ;;
         json-serde)    printf 'sample, 50000' ;;
         lru)           printf '1000, 11000000' ;;

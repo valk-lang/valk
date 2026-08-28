@@ -21,9 +21,10 @@ Use `--list` to print the available benchmarks. The default inputs are chosen
 to take roughly 0.5 to 2 seconds per run on a typical development machine. All
 languages receive exactly the same input.
 
-Both single-threaded `spectral-norm` and four-worker `spectral-norm-multi`
-variants are included. The multithreaded variant uses input `8000`, matching
-the programming-language-benchmarks workload.
+Both single-threaded and multithreaded variants of `binary-tree` and
+`spectral-norm` are included. `binary-tree-multi` evaluates each reported tree
+depth on a separate worker. The four-worker `spectral-norm-multi` variant uses
+input `8000`, matching the programming-language-benchmarks workload.
 
 The `json` benchmark measures dynamic JSON values, while `json-serde` uses the
 larger file-oriented serialization workload.
