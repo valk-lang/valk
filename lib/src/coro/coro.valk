@@ -14,7 +14,7 @@ global run_coros : Array[Coro] (.new(16))
 global next_run_coros : Array[Coro] (.new(16))
 
 #if OS == "win"
-global main_fiber: ?ptr
+global main_fiber : ?ptr
 #else
 global main_state : CoroState (@undefined)
 #end
@@ -26,6 +26,7 @@ global timer_id : uint
 #if OS == "win"
 global cport : ?ptr
 global sleep_coros : Array[Coro] (.new(16))
+global io_timeout_coros : Array[Coro] (.new(16))
 #end
 
 #if OS != "win"
@@ -57,6 +58,14 @@ class Coro {
     completion_res: i64 (0)
     #if OS == "linux"
     timeout_ts: io:kernel_timespec (@undefined)
+    timed_io_active: bool (false)
+    timed_io_cancel_pending: bool (false)
+    timed_io_timeout_canceled: bool (false)
+    #elif OS == "macos"
+    io_wait_active: bool (false)
+    io_wait_timed_out: bool (false)
+    io_wait_fd: FD
+    io_wait_timer_id: uint
     #elif OS == "win"
     sleep_deadline_ms: u64 (0)
     iocp_ready: bool (false)
@@ -64,6 +73,38 @@ class Coro {
     // in flight for one coroutine, so two slots cover every path.
     overlap_a: ?io:Overlap (null)
     overlap_b: ?io:Overlap (null)
+    io_deadline_ms: u64 (0)
+    io_timeout_fd: FD
+    io_timeout_overlap: ?ptr
+    io_timed_out: bool (false)
+    #end
+
+    #if OS == "macos"
+    fn arm_io_timeout(fd: FD, timeout_ms: uint) uint {
+        this.io_wait_active = true
+        this.io_wait_timed_out = false
+        this.io_wait_fd = fd
+        if timeout_ms == 0 : return 0
+        this.io_wait_timer_id = timer_id++
+        return this.io_wait_timer_id
+    }
+    #elif OS == "win"
+    fn arm_io_timeout(fd: FD, overlap: ptr, timeout_ms: uint) {
+        this.io_timed_out = false
+        if timeout_ms == 0 : return
+        this.io_timeout_fd = fd
+        this.io_timeout_overlap = overlap
+        this.io_deadline_ms = ext:GetTickCount64() + timeout_ms
+        io_timeout_coros.append(this)
+    }
+
+    fn disarm_io_timeout() {
+        if this.io_deadline_ms != 0 {
+            this.io_deadline_ms = 0
+            io_timeout_coros.remove_value(this)
+        }
+        this.io_timeout_overlap = null
+    }
     #end
     //
     started: bool (false)
@@ -72,7 +113,6 @@ class Coro {
     done: bool (false)
 
     static fn new(handler: fn()(), start_func: ptr) SELF {
-
         #if OS != "win"
         let stack_allocation = stack_alloc()
         #end
@@ -163,7 +203,6 @@ class Coro {
 
     #if OS != "win"
     fn init_stack(base: ptr) {
-
         #if ARCH == "x64"
         let return_addr_space = 2 * size_of(ptr)
         let regs = 6
@@ -176,7 +215,7 @@ class Coro {
 
         let stack_start = base - (regs * size_of(ptr)) - return_addr_space
         // Make sure stack is 16 byte aligned (ptr size)
-        let misalignment: uint = stack_start & 0xF
+        let misalignment : uint = stack_start & 0xF
         stack_start -= misalignment
 
         mem:clear(stack_start, regs * size_of(ptr))
@@ -341,7 +380,6 @@ class Coro {
         #end
 
         while true {
-
             let scheduled_coros = run_coros
             run_coros = next_run_coros
             next_run_coros = scheduled_coros
@@ -375,10 +413,44 @@ class Coro {
                     break
                 }
                 //
-                let coro = cqe.user_data.@cast(Coro)
-                run_coros.append(coro)
-                coro.poll_event = cqe.res.@cast(io:PollEvent)
-                coro.completion_res = cqe.res
+                let user_data = cqe.user_data
+                let timeout_tag = user_data & 3
+                let coro = (user_data - timeout_tag).@cast(Coro)
+                if timeout_tag == 1 {
+                    if !coro.timed_io_active {
+                        io:io_uring_cqe_seen(ring, cqe)
+                        continue
+                    }
+                    if cqe.res == 0 - ext:ETIME {
+                        coro.timed_io_active = false
+                        coro.poll_event = io:POLL_TIMEOUT
+                        coro.completion_res = 0 - ext:ETIMEDOUT
+                        run_coros.append(coro)
+                    } else if cqe.res == 0 - ext:ECANCELED {
+                        if coro.timed_io_cancel_pending {
+                            coro.timed_io_active = false
+                            coro.completion_res = 0 - ext:ECANCELED
+                            run_coros.append(coro)
+                        } else {
+                            coro.timed_io_timeout_canceled = true
+                        }
+                    }
+                } else if timeout_tag == 2 {
+                    if coro.timed_io_active {
+                        if cqe.res == 0 - ext:ECANCELED && !coro.timed_io_timeout_canceled {
+                            coro.timed_io_cancel_pending = true
+                        } else {
+                            coro.timed_io_active = false
+                            coro.poll_event = cqe.res.@cast(io:PollEvent)
+                            coro.completion_res = cqe.res
+                            run_coros.append(coro)
+                        }
+                    }
+                } else {
+                    run_coros.append(coro)
+                    coro.poll_event = cqe.res.@cast(io:PollEvent)
+                    coro.completion_res = cqe.res
+                }
                 io:io_uring_cqe_seen(ring, cqe)
             }
             #elif OS == "macos"
@@ -386,7 +458,7 @@ class Coro {
             gc:unlock()
             let timeout : ?*ext:libc_gen_timespec = null
             if run_coros.length > 0 {
-                let t : ext:libc_timespec = { tv_sec: 0, tv_nsec: 0 }
+                let t : ext:libc_timespec = {tv_sec: 0, tv_nsec: 0}
                 timeout = @ref(t)
             }
             let nevents = ext:kevent(kq, null, 0, @ref(events[0]), 64, timeout)
@@ -394,6 +466,27 @@ class Coro {
             while nevents-- > 0 {
                 let ev = events[nevents]
                 let coro = ev.udata.@cast(Coro)
+                let is_timeout = ev.filter == io:EVFILT_TIMER && ev.ident == coro.io_wait_timer_id
+                let is_io = ev.ident == coro.io_wait_fd && (ev.filter == io:EVFILT_READ || ev.filter == io:EVFILT_WRITE)
+                if is_timeout || is_io {
+                    if !coro.io_wait_active : continue
+                    coro.io_wait_active = false
+                    coro.io_wait_timed_out = is_timeout
+                    if is_timeout {
+                        coro.poll_event = io:POLL_TIMEOUT
+                        coro.completion_res = 0 - ext:ETIMEDOUT
+                    } else if ev.filter == io:EVFILT_READ {
+                        coro.poll_event = ext:POLLIN
+                        coro.completion_res = ev.data
+                        if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = ext:POLLHUP
+                    } else {
+                        coro.poll_event = ext:POLLOUT
+                        coro.completion_res = ev.data
+                        if (ev.flags & io:EV_EOF) == io:EV_EOF : coro.poll_event = ext:POLLHUP
+                    }
+                    run_coros.append(coro)
+                    continue
+                }
                 if ev.filter == io:EVFILT_READ {
                     coro.poll_event = ext:POLLIN
                     coro.completion_res = ev.data
@@ -408,13 +501,14 @@ class Coro {
 
             #elif OS == "win"
             win_wake_sleepers()
+            win_cancel_io_timeouts()
             let first = run_coros.length == 0
-            let wait_ms = first ? win_sleep_timeout() : 0
+            let wait_ms = first ? win_next_timeout() : 0
 
-            let bytes: u32 = 0
-            let key: uint = 0
-            let ov: ?io:Overlap = null
-            let result: ext:BOOL = 0
+            let bytes : u32 = 0
+            let key : uint = 0
+            let ov : ?io:Overlap = null
+            let result : ext:BOOL = 0
             if wait_ms == 0 {
                 result = ext:GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), 0)
             } else {
@@ -481,7 +575,7 @@ fn win_coro_entry(value: ptr) {
 
 fn win_wake_sleepers() {
     let now = ext:GetTickCount64()
-    let i: uint = 0
+    let i : uint = 0
     while i < sleep_coros.length {
         let coro = sleep_coros.get(i) !? null
         if !isset(coro) {
@@ -500,7 +594,7 @@ fn win_wake_sleepers() {
 fn win_sleep_timeout() u32 {
     if sleep_coros.length == 0 : return ext:INFINITE
     let now = ext:GetTickCount64()
-    let nearest: u64 = 0
+    let nearest : u64 = 0
     each sleep_coros as coro {
         if coro.done : continue
         if coro.sleep_deadline_ms <= now : return 0
@@ -510,5 +604,48 @@ fn win_sleep_timeout() u32 {
     let delay = nearest - now
     if delay > 0xffffffff : return 0xffffffff
     return delay.to(u32)
+}
+
+fn win_io_timeout() u32 {
+    if io_timeout_coros.length == 0 : return ext:INFINITE
+    let now = ext:GetTickCount64()
+    let nearest : u64 = 0
+    each io_timeout_coros as coro {
+        let deadline = coro.io_deadline_ms
+        if deadline == 0 : continue
+        if deadline <= now : return 0
+        if nearest == 0 || deadline < nearest : nearest = deadline
+    }
+    if nearest == 0 : return ext:INFINITE
+    let delay = nearest - now
+    if delay > 0xffffffff : return 0xffffffff
+    return delay.to(u32)
+}
+
+fn win_next_timeout() u32 {
+    let sleep_timeout = win_sleep_timeout()
+    let io_timeout = win_io_timeout()
+    return sleep_timeout < io_timeout ? sleep_timeout : io_timeout
+}
+
+fn win_cancel_io_timeouts() {
+    let now = ext:GetTickCount64()
+    let i : uint = 0
+    while i < io_timeout_coros.length {
+        let coro = io_timeout_coros.get(i) !? null
+        if !isset(coro) || coro.done || coro.io_deadline_ms == 0 {
+            io_timeout_coros.remove(i)
+            continue
+        }
+        if coro.io_deadline_ms > now {
+            i++
+            continue
+        }
+        io_timeout_coros.remove(i)
+        coro.io_deadline_ms = 0
+        coro.io_timed_out = true
+        let overlap = coro.io_timeout_overlap
+        if isset(overlap) : ext:CancelIoEx(coro.io_timeout_fd, overlap)
+    }
 }
 #end
