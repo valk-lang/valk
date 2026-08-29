@@ -178,7 +178,7 @@ s.range(start_index, end_index) String // Sub string using end-index
 let middle = s[1 .. 3] // Three characters starting at index 1
 ```
 
-Full `String` API: [valk:type](api.md#core)
+Full `String` API: [valk.type](api.md#core)
 
 ## Arrays
 
@@ -198,7 +198,7 @@ each arr as value {}
 each arr as value, index {}
 ```
 
-Full `Array` API: [valk:type](api.md#core)
+Full `Array` API: [valk.type](api.md#core)
 
 Bracket ranges call an instance method marked `$range`. The hook must accept
 `(start_index: uint, length: uint)` and return one value. This lets custom
@@ -222,7 +222,7 @@ each m as value, key {}
 each m as value, key, index {}
 ```
 
-Full `Map` API: [valk:type](api.md#core)
+Full `Map` API: [valk.type](api.md#core)
 
 If you need non-string keys, use `HashMap`. `HashMap` and `Map` are compatible types.
 
@@ -234,7 +234,7 @@ let b : HashMap[String, uint] = a
 let c : Map[uint] = b
 ```
 
-Full `HashMap` API: [valk:type](api.md#core)
+Full `HashMap` API: [valk.type](api.md#core)
 
 ## Typehints
 
@@ -722,13 +722,13 @@ fn print(msg: ?String) {
 
 ## Files
 
-API for [valk:fs](api.md#fs)
+API for [valk.fs](api.md#fs)
 
-Use `valk:fs` for file-system operations.
+Use `valk.fs` for file-system operations.
 
 ## Paths
 
-Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs:path("path")`
+Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs.path("path")`
 
 ```rust
 fn main() {
@@ -746,16 +746,16 @@ fn main() {
 
 ## JSON
 
-API for [valk:json](api.md#json)
+API for [valk.json](api.md#json)
 
 ```rust
-use valk:json
+use valk.json
 
-let document = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
+let document = json.decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid JSON")
 let name = document.get_string("name") ! panic("Missing name")
 let age = document["age"].int
 document = document.set_bool("active", true)
-println(json:encode(document))
+println(json.encode(document))
 ```
 
 Objects use string keys and arrays use integer indexes. The same operations work for either:
@@ -773,8 +773,8 @@ let name = list.get_required(0) ! panic("Missing item")
 let name_str = name.string_value() ! panic("Json value must be a string")
 ```
 
-`json:from(value)` converts any value to a json:Value.
-`value.to_type[T]()` converts json:Value back to a Valk type and returns an
+`json.from(value)` converts any value to a json.Value.
+`value.to_type[T]()` converts json.Value back to a Valk type and returns an
 error when the document does not match that type.
 
 ```rust
@@ -783,17 +783,17 @@ class User {
     age: int
 }
 
-// Json string -> json:Value
-let json_user = json:decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid json")
-// json:Value -> User
+// Json string -> json.Value
+let json_user = json.decode("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid json")
+// json.Value -> User
 let user = json_user.to_type[User]() ! panic("Incompatible")
-// User -> json:Value
-let json_usr = json:from(user)
-// json:Value -> json string
+// User -> json.Value
+let json_usr = json.from(user)
+// json.Value -> json string
 let json_string = json_usr.encode()
 ```
 
-You can also decode directly to a type using `json:decode_to[T](text)`
+You can also decode directly to a type using `json.decode_to[T](text)`
 
 ```rust
 class User {
@@ -801,23 +801,23 @@ class User {
     age: int
 }
 
-let user = json:decode_to[User]("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid user")
+let user = json.decode_to[User]("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid user")
 ```
 
 ## Datetime
 
-API for [valk:time](api.md#time)
+API for [valk.time](api.md#time)
 
-`time:Datetime` represents UTC dates from year 1 through 9999 with microsecond
+`time.Datetime` represents UTC dates from year 1 through 9999 with microsecond
 precision. Constructor components are optional and default to the current time.
 
 ```rust
-use valk:time
+use valk.time
 
 // Init
-let now = time:Datetime.new()
-let datetime = time:Datetime.new(2026, 8, 8, 19, 7, 6, 123_456)
-let from_str = time:Datetime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
+let now = time.Datetime.new()
+let datetime = time.Datetime.new(2026, 8, 8, 19, 7, 6, 123_456)
+let from_str = time.Datetime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
 
 // Change
 let changed = datetime.add_days(1) // Returns a new Datetime
@@ -839,10 +839,10 @@ println(datetime) // Defaults to to_iso8601 string
 Coroutines let multiple functions make progress on one thread.
 
 ```rust
-let request_1 = co http:request("GET", "http://some-website/api/endpoint1")
-let request_2 = co http:request("GET", "http://some-website/api/endpoint2")
-let response_1 = await request_1 !? http:Response.empty(400)
-let response_2 = await request_2 !? http:Response.empty(400)
+let request_1 = co http.request("GET", "http://some-website/api/endpoint1")
+let request_2 = co http.request("GET", "http://some-website/api/endpoint2")
+let response_1 = await request_1 !? http.Response.empty(400)
+let response_2 = await request_2 !? http.Response.empty(400)
 ```
 
 Use `co` to start a coroutine and `await` to wait for its result.
@@ -999,41 +999,41 @@ valk build ./src ./tests --test --filter "database" --run
 
 ## HTTP
 
-API for [valk:http](api.md#http)
+API for [valk.http](api.md#http)
 
 ### HTTP Client
 
-With `valk:http` you can send HTTP requests or download files from a URL.
+With `valk.http` you can send HTTP requests or download files from a URL.
 
 ```rust
 // Send basic request
-let res = http:request("GET", "http://some-website/api/endpoint") ! panic("Request failed")
+let res = http.request("GET", "http://some-website/api/endpoint") ! panic("Request failed")
 
 // Send GET request with data
 let data = Map[String]{ "key1" => "val1" }
-let res = http:request("GET", "http://some-website/api/endpoint", http:Options{ query_data: data }) ! panic("Request failed")
+let res = http.request("GET", "http://some-website/api/endpoint", http.Options{ query_data: data }) ! panic("Request failed")
 
 // Send POST request with data
-let json_data = json:from(Map[String]{ "key1" => "val1" })
-let res = http:request("POST", "http://some-website/api/endpoint", http:Options{ body: json:encode(json_data) }) ! panic("Request failed")
+let json_data = json.from(Map[String]{ "key1" => "val1" })
+let res = http.request("POST", "http://some-website/api/endpoint", http.Options{ body: json.encode(json_data) }) ! panic("Request failed")
 
 // Download file
-http:download(url, to_path) ! panic("Failed to download file")
+http.download(url, to_path) ! panic("Failed to download file")
 ```
 
 ### HTTP Server
 
 ```rust
-use valk:http
+use valk.http
 
-fn handler(req: http:Request) http:Response {
-    return http:Response.html("Hello world!")
+fn handler(req: http.Request) http.Response {
+    return http.Response.html("Hello world!")
 }
 
 fn main() {
     let host = "127.0.0.1"
     let port : u16 = 9000
-    let s = http:Server.new(host, port, handler) ! {
+    let s = http.Server.new(host, port, handler) ! {
         println("Failed to initialize http server")
         return
     }
@@ -1044,18 +1044,18 @@ fn main() {
 
 ## Sockets
 
-API for [valk:net](api.md#net)
+API for [valk.net](api.md#net)
 
 Create a socket server/client. Currently only supports TCP.
 
 Example
 
 ```rust
-use valk:net
+use valk.net
 
 // Server
 fn server() {
-    let sock = net:Socket.server(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let sock = net.Socket.server(net.SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
     let buffer = ByteBuffer.new()
     while true {
         let con = sock.accept() ! {
@@ -1084,7 +1084,7 @@ fn main() {
     // Start our server in the background
     let s = co server()
     // Open client
-    let con = net:Socket.client(net:SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let con = net.Socket.client(net.SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
     con.send("PING") ! panic("Client failed to send data")
     // Recv
@@ -1097,7 +1097,7 @@ fn main() {
 
 ## Templates
 
-`valk:template` is a small runtime template engine.
+`valk.template` is a small runtime template engine.
 
 Example template:
 
@@ -1120,8 +1120,8 @@ Example template:
 How to render:
 
 ```rust
-use valk:template
-use valk:html
+use valk.template
+use valk.html
 //
 class Article {
     title: String
@@ -1133,11 +1133,11 @@ class PageData {
 }
 //
 fn main() {
-    let options = template:RenderOptions {
-        sanitize: html:sanitize_filter
+    let options = template.RenderOptions {
+        sanitize: html.sanitize_filter
     }
     // Embed templates at compile time and register them by relative path.
-    template:set_content_many(#embed_dir("views"))
+    template.set_content_many(#embed_dir("views"))
     // Template data
     let data = PageData {
         title: "Hello world"
@@ -1149,7 +1149,7 @@ fn main() {
         }
     }
     // Render the template
-    let result = template:render("example.html", data, options) ! panic("Template error: %{E.message}")
+    let result = template.render("example.html", data, options) ! panic("Template error: %{E.message}")
 
     println(result)
 }
@@ -1170,7 +1170,7 @@ Template engine tokens:
 @include("...") // Include another template registered with set_content/set_content_many
 ```
 
-Note: `valk:template` works at runtime and therefore cannot detect incorrect template syntax at compile time.
+Note: `valk.template` works at runtime and therefore cannot detect incorrect template syntax at compile time.
 
 ## Crypto
 
@@ -1179,12 +1179,12 @@ Currently we only support a few algorithms (bcrypt / blake2b)
 Password hashing/verify example:
 
 ```rust
-use valk:crypto
+use valk.crypto
 
 fn main() {
     let password = "test"
-    let hash = crypto:bcrypt_hash(password)
-    if crypto:bcrypt_verify("test", hash) {
+    let hash = crypto.bcrypt_hash(password)
+    if crypto.bcrypt_verify("test", hash) {
         println("👍")
     } else {
         println("❌")
@@ -1234,8 +1234,8 @@ use ns1
 use ns2
 
 fn main() {
-    let a = ns1:MyClass {}
-    let b = ns2:MyOtherClass {}
+    let a = ns1.MyClass {}
+    let b = ns2.MyOtherClass {}
 }
 ```
 
@@ -1254,8 +1254,8 @@ Although Valk aims to be safe, it still supports low-level operations when neede
 
 A `struct` is an inline value type. Assignment, argument passing, and returning
 a struct copy all of its fields by value. A struct initializer such as `.{}`
-never allocates manual storage. Use `mem:new[T]()` when a struct must live in a
-manual heap allocation, and release it with `mem:free`.
+never allocates manual storage. Use `mem.new[T]()` when a struct must live in a
+manual heap allocation, and release it with `mem.free`.
 
 ```rust
 struct MyStruct {
@@ -1274,8 +1274,8 @@ fn main() {
     println(first.a)  // 5
     println(second.a) // 10
 
-    let pointer = mem:new[MyStruct](.{ a: 5, b: 100 })
-    defer mem:free(pointer)
+    let pointer = mem.new[MyStruct](.{ a: 5, b: 100 })
+    defer mem.free(pointer)
 }
 ```
 
@@ -1381,4 +1381,4 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 `shared T` is a read-only view used to pass data across threads. Data-race-unsafe properties cannot be changed through that view, while integer properties use atomic access. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`.
 
-You can use `core:race_lock()` and `core:race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).
+You can use `core.race_lock()` and `core.race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).

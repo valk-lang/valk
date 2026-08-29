@@ -222,7 +222,7 @@ check "member completion after a dot" '"label":"describe"' \
 check "member completion includes properties" '"label":"name"' \
     "$(request textDocument/completion member.valk 9 6)"
 
-# `fs:` likewise, and private members of another package must not be offered
+# `fs.` likewise, and private members of another package must not be offered
 check "namespace completion" '"label":"cwd"' \
     "$(request textDocument/completion namespace.valk 3 7)"
 
@@ -232,7 +232,7 @@ stream="$(frame "$init")$(frame "$(request textDocument/completion namespace.val
 out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
 case "$out" in
     *'"label":"stat"'*)
-        echo "# Private function 'fs:stat' was offered by completion"
+        echo "# Private function 'fs.stat' was offered by completion"
         echo "$out"
         failed=1
         ;;
@@ -261,7 +261,7 @@ fi
 
 check "warns about an unused variable" "\"severity\":2,\"message\":\"Variable 'leftover' was declared but never used\"" \
     "$(notify_save warn.valk)"
-check "warns about an unused import" "\"severity\":2,\"message\":\"Namespace 'valk:mem' is imported but never used\"" \
+check "warns about an unused import" "\"severity\":2,\"message\":\"Namespace 'valk.mem' is imported but never used\"" \
     "$(notify_save warn.valk)"
 
 check "a warning's range ends on its own statement" '"range":{"start":{"line":21,"character":4},"end":{"line":21,"character":21}}' \
@@ -437,8 +437,8 @@ printf '{}\n' > "$workdir/pkg-one/valk.json"
 printf '{}\n' > "$workdir/pkg-two/valk.json"
 printf 'class PackageValue { value: int (0) }\nfn package_one() {}\nfn inspect_package_value(value: shared PackageValue) int { return value.value }\nfn make_package_value() PackageValue { return PackageValue { value: 1 } }\nfn unopened_bad() { missing_unopened_body }\n' > "$workdir/pkg-one/src/main.valk"
 printf 'fn package_two() {}\n' > "$workdir/pkg-two/src/main.valk"
-printf 'use main\nfn check_one() {\n    main:package_one()\n    let value = main:PackageValue { value: 1 }\n    let alias = value\n    assert(main:inspect_package_value(value) == 1)\n    assert(alias.value == 1)\n    let made: shared main:PackageValue = main:make_package_value()\n    assert(made.value == 1)\n    missing_from_one\n}\n' > "$workdir/pkg-one/src/check/check.valk"
-printf 'use main\nfn check_two() { main:package_two(); missing_from_two }\n' > "$workdir/pkg-two/src/check/check.valk"
+printf 'use main\nfn check_one() {\n    main.package_one()\n    let value = main.PackageValue { value: 1 }\n    let alias = value\n    assert(main.inspect_package_value(value) == 1)\n    assert(alias.value == 1)\n    let made: shared main.PackageValue = main.make_package_value()\n    assert(made.value == 1)\n    missing_from_one\n}\n' > "$workdir/pkg-one/src/check/check.valk"
+printf 'use main\nfn check_two() { main.package_two(); missing_from_two }\n' > "$workdir/pkg-two/src/check/check.valk"
 count=$((count + 1))
 echo "> diagnostics batch open files from multiple packages"
 stream="$(frame "$init")$(frame "$(notify_open_path "$workdir/pkg-one/src/check/check.valk")")$(frame "$(notify_open_path "$workdir/pkg-two/src/check/check.valk")")"

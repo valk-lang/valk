@@ -161,7 +161,7 @@ struct Header packed {
 manual heap allocation are unsafe facilities; the value type itself is safe.
 A struct initializer always creates an inline value; an expected pointer type
 does not implicitly change it into a heap allocation. Typed manual allocation
-uses `mem:new[T]()` and must eventually be released with `mem:free`.
+uses `mem.new[T]()` and must eventually be released with `mem.free`.
 A struct may contain GC references, in which case its containing storage is
 walked using the struct's generated GC layout.
 
