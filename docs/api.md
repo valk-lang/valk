@@ -679,37 +679,37 @@ alias pid_t for i32
 ```js
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
-+ fn chdir(path: String) void !io:IoError
-+ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
-+ fn cwd() String !io:IoError
-+ fn delete(path: String) void !io:IoError
-+ fn delete_recursive(path: String) void !io:IoError
++ fn chdir(path: String) void !io.IoError
++ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io.IoError
++ fn cwd() String !io.IoError
++ fn delete(path: String) void !io.IoError
++ fn delete_recursive(path: String) void !io.IoError
 + fn dir_of(path: String) String
-+ fn exe_dir() String !io:IoError
-+ fn exe_path() String !io:IoError
++ fn exe_dir() String !io.IoError
++ fn exe_path() String !io.IoError
 + fn exists(path: String) bool
 + fn ext(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io:IoError
++ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io.IoError
 + fn home_dir() String !ExternError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
 + fn mime(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (0c755)) void !io:IoError
-+ fn modified_time(path: String) uint !io:IoError
-+ fn move(from_path: String, to_path: String) void !io:IoError
-+ fn open(path: String, writable: bool, append_on_write: bool) i32 !io:IoError
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io:IoError
++ fn mkdir(path: String, permissions: u32 (0c755)) void !io.IoError
++ fn modified_time(path: String) uint !io.IoError
++ fn move(from_path: String, to_path: String) void !io.IoError
++ fn open(path: String, writable: bool, append_on_write: bool) i32 !io.IoError
++ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io.IoError
 + fn path(path: String) Path
-+ fn read(path: String) String !io:IoError
-+ fn realpath(path: String) String !io:IoError
-+ fn resolve(path: String) String !io:IoError
-+ fn rmdir(path: String) void !io:IoError
-+ fn size(path: String) uint !io:IoError
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io:IoError
-+ fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
++ fn read(path: String) String !io.IoError
++ fn realpath(path: String) String !io.IoError
++ fn resolve(path: String) String !io.IoError
++ fn rmdir(path: String) void !io.IoError
++ fn size(path: String) uint !io.IoError
++ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io.IoError
++ fn symlink(link: String, target: String, is_directory: bool) void !io.IoError
 + fn sync() void
-+ fn write(path: String, content: String, append: bool (false)) void !io:IoError
-+ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
++ fn write(path: String, content: String, append: bool (false)) void !io.IoError
++ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !io.IoError
 ```
 
 ## Classes for 'fs'
@@ -720,11 +720,11 @@ alias pid_t for i32
     + read_offset: uint
     ~ reading: bool
 
-    + fn close() void !io:IoError
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
-    + fn write(str: String) void !io:IoError
-    + fn write_buffer(buffer: ByteBuffer) void !io:IoError
-    + fn write_from_ptr(from: ptr, len: uint) void !io:IoError
+    + fn close() void !io.IoError
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io.IoError
+    + fn write(str: String) void !io.IoError
+    + fn write_buffer(buffer: ByteBuffer) void !io.IoError
+    + fn write_from_ptr(from: ptr, len: uint) void !io.IoError
 }
 ```
 
@@ -736,10 +736,10 @@ alias pid_t for i32
     ~ size: uint
 
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !io:IoError
+    + static fn create_from_file(path: String) InMemoryFile !io.IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn read_all() String
-    + fn save(path: String) void !io:IoError
+    + fn save(path: String) void !io.IoError
 }
 ```
 
@@ -749,7 +749,7 @@ alias pid_t for i32
     + fn dir_of() Path
     + static fn new(path: String) Path
     + fn pop() Path
-    + fn resolve() Path !io:IoError
+    + fn resolve() Path !io.IoError
 }
 ```
 
