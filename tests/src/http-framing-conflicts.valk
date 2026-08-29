@@ -1,0 +1,135 @@
+use valk.http
+use valk.net
+use valk.time
+
+fn conflict_handler(req: http.Request) http.Response {
+    let marker = req.headers().get("x-marker") !? ""
+    return http.Response.text("marker=" + marker + " body=" + req.body)
+}
+
+fn conflict_server() {
+    let server = http.Server.new("127.0.0.1", 9026, conflict_handler) ! return
+    server.max_request_body_size = 64
+    server.start(1)
+}
+
+fn conflict_connection() net.Connection !net.NetError {
+    return net.Socket.client(net.SOCKET_TYPE.TCP, "127.0.0.1", 9026) !>
+}
+
+fn conflict_request(headers: String, body: String) String {
+    return "POST / HTTP/1.1\r\nHost: localhost\r\n" + headers + "\r\n" + body
+}
+
+fn conflict_round_trip(parts: String, tail: String) String {
+    let connection = conflict_connection() ! return ""
+    connection.send_bytes(parts.data, parts.bytes, true) ! return ""
+    if tail.bytes > 0 {
+        // Gives the server a read boundary to resume across.
+        time.sleep_ms(30)
+        connection.send_bytes(tail.data, tail.bytes, true) ! return ""
+    }
+    let response = ByteBuffer.new(4096)
+    connection.recv(response, 4096) ! return ""
+    let text = response.to_string()
+    connection.close() ! return text
+    return text
+}
+
+fn conflict_send(request: String) String {
+    return conflict_round_trip(request, "")
+}
+
+fn conflict_raw_server(port: u16, response: String) {
+    let server = net.Socket.server(net.SOCKET_TYPE.TCP, "127.0.0.1", port) ! return
+    let connection = server.accept() ! return
+    let buffer = ByteBuffer.new(2048)
+    connection.recv(buffer, 2048) ! return
+    connection.send_bytes(response.data, response.bytes, true) ! return
+    time.sleep_ms(80)
+    connection.close() ! return
+    server.close() ! return
+}
+
+fn conflict_client_body(port: u16, response: String) String {
+    co conflict_raw_server(port, response)
+    time.sleep_ms(60)
+    let res = http.request("GET", "http://127.0.0.1:" + port.to_string() + "/") ! return ""
+    return res.body
+}
+
+test "HTTP: framing headers cannot disagree and trailers are consumed" {
+    co conflict_server()
+
+    // (a) A request carrying both framings is the CL.TE smuggling vector, and
+    // which one wins must not depend on header order.
+    let length_then_chunk = conflict_send(conflict_request(
+        "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n", "hello"))
+    assert(length_then_chunk.contains(" 400 "))
+    assert(!length_then_chunk.contains("body=hello"))
+
+    let chunk_then_length = conflict_send(conflict_request(
+        "Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", "5\r\nhello\r\n0\r\n\r\n"))
+    assert(chunk_then_length.contains(" 400 "))
+
+    // (b) Only the key is case-folded, so a legal value spelling still works.
+    let capitalised = conflict_send(conflict_request(
+        "Transfer-Encoding: Chunked\r\n", "5\r\nhello\r\n0\r\n\r\n"))
+    assert(capitalised.contains(" 200 "))
+    assert(capitalised.contains("body=hello"))
+    assert(!capitalised.contains("400"))
+
+    // (c) The value must be exactly one coding: not a longer word that merely
+    // starts with it, and not a stack of codings.
+    let longer = conflict_send(conflict_request(
+        "Transfer-Encoding: chunkedXX\r\n", "5\r\nhello\r\n0\r\n\r\n"))
+    assert(longer.contains(" 400 "))
+
+    let stacked = conflict_send(conflict_request(
+        "Transfer-Encoding: gzip, chunked\r\n", "5\r\nhello\r\n0\r\n\r\n"))
+    assert(stacked.contains(" 400 "))
+
+    // (d) Conflicting duplicate lengths are rejected. Identical repeats agree
+    // either way, so they stay acceptable.
+    let conflicting = conflict_send(conflict_request(
+        "Content-Length: 5\r\nContent-Length: 12\r\n", "hellohello"))
+    assert(conflicting.contains(" 400 "))
+    assert(!conflicting.contains("body=hellohello"))
+
+    let repeated = conflict_send(conflict_request(
+        "Content-Length: 5\r\nContent-Length: 5\r\n", "hello"))
+    assert(repeated.contains(" 200 "))
+    assert(repeated.contains("body=hello"))
+
+    // (e) Trailers belong to the body: the bytes after the last chunk must not be
+    // reparsed as the next pipelined request.
+    let with_trailers = conflict_send(conflict_request(
+        "Transfer-Encoding: chunked\r\n", "5\r\nhello\r\n0\r\nTrailer-Field: x\r\n\r\n"))
+    assert(with_trailers.contains(" 200 "))
+    assert(with_trailers.contains("body=hello"))
+    assert(!with_trailers.contains("400"))
+
+    // The trailer section can straddle a read boundary, so the parser has to
+    // remember that the body already ended.
+    let split = conflict_round_trip(
+        conflict_request("Transfer-Encoding: chunked\r\n", "5\r\nhello\r\n0\r\n"),
+        "Trailer-Field: x\r\n\r\n")
+    assert(split.contains(" 200 "))
+    assert(split.contains("body=hello"))
+    assert(!split.contains("400"))
+
+    let alive = conflict_send(conflict_request("Content-Length: 5\r\n", "hello"))
+    assert(alive.contains(" 200 "))
+    assert(alive.contains("body=hello"))
+
+    // A *response* with both framings stays tolerated instead of becoming a
+    // client-side outage, but chunked wins in either order so what the client
+    // reads never depends on header arrival order.
+    let response_te_first = conflict_client_body(9035,
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+    assert(response_te_first == "hello")
+
+    let response_cl_first = conflict_client_body(9036,
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+    assert(response_cl_first == "hello")
+}

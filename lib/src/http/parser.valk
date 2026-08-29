@@ -139,21 +139,49 @@ use mem
                 let value_start: uint = value_adr
                 let value_len = input_adr + index - value_start
                 let content_len = mem.bytes_to_uint(value_adr, value_len) ! { throw .invalid }
+                // Two conflicting lengths let a front-end and this server frame the
+                // same connection differently. Identical repeats are harmless.
+                if context.has_content_length && content_len != context.content_length : throw .invalid
+                // A request that is both transfer-coded and length-delimited is the
+                // CL.TE smuggling vector, so reject it rather than pick a winner.
+                if !is_response && context.has_transfer_encoding : throw .invalid
                 if max_body_size > 0 && content_len > max_body_size : throw .http413
-                bdata.length = content_len
-                context.content_length = content_len
-                context.body_expected = content_len
+                context.has_content_length = true
+                // For a response, Transfer-Encoding wins per RFC 9110 §8.4, and that
+                // must not depend on which header arrived first.
+                if !context.chunked {
+                    bdata.length = content_len
+                    context.content_length = content_len
+                    context.body_expected = content_len
+                }
             }
         } else if header_len > h2.bytes && @ptrv(key_adr, u8, h2.bytes) == ':' {
             mem.ascii_bytes_to_lower(key_adr, h2.bytes)
             if mem.equal(key_adr, h2.data, h2.bytes) {
+                if context.has_transfer_encoding : throw .invalid
+                if !is_response && context.has_content_length : throw .invalid
+                context.has_transfer_encoding = true
                 let value_adr = key_adr.$offset(h2.bytes + 1)
                 while @ptrv(value_adr, u8).is_html_spacing() : value_adr = value_adr.$offset(1)
+                let input_adr = input.data.@cast(uint)
+                let value_start: uint = value_adr
+                let value_len = input_adr + index - value_start
                 let v = "chunked"
-                if mem.equal(value_adr, v.data, v.bytes) {
-                    context.chunked = true
-                    bdata.length = 0
-                }
+                while value_len > 0 && @ptrv(value_adr, u8, value_len - 1).is_space_or_tab() : value_len--
+                // Only the key is folded in place, so the value is compared
+                // case-insensitively over the exact remainder of the line: "chu"
+                // must not read 4 bytes of the next line, and "chunkedXX" or a
+                // coding stacked before chunked must not prefix-match. An unknown
+                // transfer coding cannot be framed here at all.
+                if value_len != v.bytes : throw .invalid
+                if !mem.ascii_bytes_equal_ignore_case(value_adr, v.data, v.bytes) : throw .invalid
+                context.chunked = true
+                bdata.length = 0
+                // A Content-Length that arrived earlier must not linger: stage 2
+                // accumulates chunk sizes into body_expected, and the length is
+                // readable through the public context.
+                context.content_length = 0
+                context.body_expected = 0
             }
         } else if header_len > h3.bytes && @ptrv(key_adr, u8, h3.bytes) == ':' {
             mem.ascii_bytes_to_lower(key_adr, h3.bytes)
@@ -175,6 +203,21 @@ use mem
             let chunks = context.chunks
 
             while true {
+                // The last chunk can be followed by trailer headers, which end at
+                // a blank line of their own. They are skipped, not stored.
+                if context.chunk_trailers {
+                    while true {
+                        let t = input.index_of('\r', pos) ! { throw .incomplete }
+                        if t + 1 >= input.length : throw .incomplete
+                        if @ptrv(input.data, u8, t + 1) != '\n' : throw .invalid
+                        let is_last = t == pos
+                        pos = t + 2
+                        context.parsed_index = pos
+                        if max_header_size > 0 && pos - context.request_start > max_header_size : throw .http413
+                        if is_last : break
+                    }
+                    break
+                }
                 // Read length line
                 let chlen = bdata.length
                 if chlen == 0 {
@@ -198,10 +241,12 @@ use mem
                     input_left = length - pos
 
                     if len == 2 {
-                        // Done
-                        pos += 2
-                        context.parsed_index += 2
-                        break
+                        // Last chunk. What follows is not necessarily the blank
+                        // line: trailer fields come first when the client sends
+                        // them, so hand the remainder to the trailer loop rather
+                        // than assuming two bytes.
+                        context.chunk_trailers = true
+                        continue
                     }
 
                     chlen = len
