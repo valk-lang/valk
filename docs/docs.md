@@ -120,6 +120,8 @@ Built-in classes: `String`, `Array`, `Map`, `HashMap`
 
 Nullable types: `?String` allows the value to be `null`
 
+`nonnull(T)` removes one nullable layer from `T`. Same as `T.$nonnull`
+
 Function pointer: `fn({arg-types})({return-types})` e.g. `fn(i32)()`
 
 Raw function pointer: `fnptr({arg-types})({return-types})` e.g. `fnptr(i32)()`
