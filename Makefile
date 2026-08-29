@@ -39,15 +39,6 @@ BENCH_JSON_MEMORY_DOCUMENTS ?= 100
 valk: $(COMPILER_DEPS)
 	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
-valk2: $(COMPILER_DEPS)
-	./valk build . src/*.valk -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS) -vvv
-
-valk3: $(COMPILER_DEPS)
-	./valk2 build . src/*.valk -o ./valk3 -vv $(FLAGS) $(NATIVE_LINK_FLAGS) -vvv
-
-valkvg: $(COMPILER_DEPS)
-	valgrind $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
-
 valkexe: $(COMPILER_DEPS)
 	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static \
 	-L toolchains/libraries/win-llvm-22-x64/lib
