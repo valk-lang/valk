@@ -150,6 +150,10 @@ let text: String = count       // Converted to String automatically
 let parsed = "100".to(u8)
 ```
 
+Unary `-` accepts any integer or floating-point expression, including variables,
+calls, and parenthesized expressions. Applying it to another type is a compile
+error.
+
 ## Strings
 
 ```rust
