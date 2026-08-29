@@ -253,6 +253,22 @@ let ob = A { list: .{ 1, 2, 3 } }
 let is_equal = (ob.list == .{ 3, 2, 1 })
 ```
 
+For a direct variable, property, or global initialization, the leading `.` may
+be omitted. Bare `{ ... }` initializes the known destination storage directly;
+use `.{ ... }` when the initializer is an expression such as a function
+argument, return value, or comparison operand.
+
+```rust
+class User {
+    name: String
+}
+fn save_user(user: User) {}
+
+let bytes: [u8 x 2] = { 1, 2 }
+let user: User = { name: "A" }
+save_user(.{ name: "B" })
+```
+
 ## Tagged unions
 
 A tagged union lets a value be one of several types. Give the union a name when

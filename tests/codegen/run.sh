@@ -414,6 +414,25 @@ if [[ "$native_each_body" != *"icmp ult"* ]] || [[ "$native_each_body" == *"_nex
     exit 1
 fi
 
+echo "> Initialize fixed arrays directly in destination storage"
+
+direct_ir="$workdir/direct-initializer.ll"
+out=$("$VALK" build "$DIR/direct-initializer.valk" --ir --no-warn -o "$direct_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build direct initializer IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+direct_body=$(sed -n '/^define .*__direct_array_initializer__/,/^}/p' "$direct_ir")
+direct_slots=$(grep -c 'alloca \[2 x i8\]' <<< "$direct_body")
+if [ "$direct_slots" -ne 1 ]; then
+    echo "# Expected only the destination slot for fixed-array initialization"
+    echo "$direct_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 14"
+echo "# Test count: 15"
 echo ""
