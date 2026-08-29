@@ -69,6 +69,28 @@ for expected in "$EXPECT_DIR"/*.valk; do
         failed=1
         continue
     fi
+
+    once="$workdir/$name.once"
+    cp "$actual" "$once"
+    set +e
+    out=$("$VALK" build "$actual" --fmt --no-warn 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo "# Second --fmt build failed"
+        echo "- File: $name"
+        echo "- Exit code: $status"
+        echo "- Output:"
+        echo "$out"
+        failed=1
+        continue
+    fi
+    if ! diff -u "$once" "$actual"; then
+        echo "# Formatter is not idempotent"
+        echo "- File: $name"
+        failed=1
+        continue
+    fi
 done
 
 if [ "$count" -eq 0 ]; then
