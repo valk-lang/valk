@@ -214,12 +214,12 @@ fn parse(text: String) int !ParseError {
 
 Callable type syntax is:
 
-- `fn(A, B)(R)` for a closure-compatible callable.
-- `fnptr(A, B)(R)` for a raw function pointer.
-- `co(R)` for a coroutine returning `R` when awaited.
+- `fn(A, B)(R1, R2 !Error)` for a closure-compatible callable.
+- `fnptr(A, B)(R1, R2 !Error)` for a raw function pointer.
+- `co(R1, R2 !Error)` for a coroutine returning values when awaited.
 
-Multiple return types appear inside the return parentheses. `()` means no
-return value.
+Multiple return types and the optional error type appear inside the return
+parentheses. `()` means no return value, and `(!Error)` means error-only.
 
 A closure is an inline two-word value:
 
@@ -706,7 +706,8 @@ The parser uses its current grammar context to classify overloaded punctuation:
 - `{` after a type/value constructor starts an initializer.
 - `{` at the start of a value is a type-hinted initializer.
 - `{` after a call error operator starts an error-handler body.
-- `!` in a function declaration or callable type introduces an error type.
+- `!` in a function declaration or a callable type's result group introduces
+  an error type.
 - Postfix `!` after a call introduces error handling.
 - Prefix `!` in a value expression is boolean negation.
 - Prefix `?` in a type context creates a nullable type.

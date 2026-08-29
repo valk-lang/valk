@@ -122,11 +122,11 @@ Nullable types: `?String` allows the value to be `null`
 
 `nonnull(T)` removes one nullable layer from `T`. Same as `T.$nonnull`
 
-Function pointer: `fn({arg-types})({return-types})` e.g. `fn(i32)()`
+Function pointer: `fn({arg-types})({return-types} !Error)` e.g. `fn(i32)(bool !ParseError)`
 
-Raw function pointer: `fnptr({arg-types})({return-types})` e.g. `fnptr(i32)()`
+Raw function pointer: `fnptr({arg-types})({return-types} !Error)` e.g. `fnptr(i32)(bool !ParseError)`
 
-Coroutine type: `co({return-types})` e.g. `co(i32)` (returns an i32 when using `await`)
+Coroutine type: `co({return-types} !Error)` e.g. `co(i32 !ParseError)`
 
 Other: `ptr` <- raw pointer (unsafe)
 
