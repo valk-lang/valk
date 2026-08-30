@@ -15,17 +15,32 @@ struct ParsedNumber {
     is_float: bool
 }
 
-+ fn decode(json: String | ByteBuffer) Value !ParseError {
+// Nesting limit a caller gets when it does not ask for one. Valk runs every program on
+// a 1 MiB coroutine stack (lib/src/coro/stack.valk), and one level of JSON costs about
+// 450 bytes of it: measured, unclosed-array input dies at depth 2400 and nested objects
+// at 2200. 100 keeps a 20x margin and leaves the rest of the stack to the caller.
+value JSON_MAX_DEPTH (100)
+// The deepest request that is still honoured. RFC 8259 section 9 names 1000 as the depth
+// an interoperable implementation should reach; more than that is not a wider limit but
+// a segfault, so a larger request is clamped to this one instead of being obeyed.
+value JSON_MAX_DEPTH_CEILING (1000)
+
+fn clamp_depth(max_depth: uint) uint {
+    if max_depth > JSON_MAX_DEPTH_CEILING : return JSON_MAX_DEPTH_CEILING
+    return max_depth
+}
+
++ fn decode(json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH)) Value !ParseError {
     match json {
-        String as str => return Parser.parse_string(str) !>
-        ByteBuffer as buf => return Parser.parse_buffer(buf) !>
+        String as str => return Parser.parse_string(str, clamp_depth(max_depth)) !>
+        ByteBuffer as buf => return Parser.parse_buffer(buf, clamp_depth(max_depth)) !>
     }
 }
 
-+ fn decode_to[T](json: String | ByteBuffer) T !DecodeError {
++ fn decode_to[T](json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH)) T !DecodeError {
     match json {
-        String as str => return Parser.parse_to_string[T](str) !>
-        ByteBuffer as buf => return Parser.parse_to_buffer[T](buf) !>
+        String as str => return Parser.parse_to_string[T](str, clamp_depth(max_depth)) !>
+        ByteBuffer as buf => return Parser.parse_to_buffer[T](buf, clamp_depth(max_depth)) !>
     }
 }
 
@@ -33,24 +48,28 @@ struct Parser {
     index: uint (0)
     data: *[u8]
     data_length: uint
+    max_depth: uint (JSON_MAX_DEPTH)
+    depth: uint (0)
     string_owner: ?String (null)
     buffer_owner: ?ByteBuffer (null)
     str_buf: ByteBuffer
 
-    - static fn parse_string(data: String) Value !ParseError {
+    - static fn parse_string(data: String, max_depth: uint) Value !ParseError {
         let parser = Parser {
             data: data.data
             data_length: data.bytes
+            max_depth: max_depth
             string_owner: data
             str_buf: ByteBuffer.new(100)
         }
         return parser.parse_root() !>
     }
 
-    - static fn parse_buffer(data: ByteBuffer) Value !ParseError {
+    - static fn parse_buffer(data: ByteBuffer, max_depth: uint) Value !ParseError {
         let parser = Parser {
             data: data.data
             data_length: data.length
+            max_depth: max_depth
             buffer_owner: data
             str_buf: ByteBuffer.new(100)
         }
@@ -70,20 +89,22 @@ struct Parser {
         return result
     }
 
-    - static fn parse_to_string[T](data: String) T !DecodeError {
+    - static fn parse_to_string[T](data: String, max_depth: uint) T !DecodeError {
         let parser = Parser {
             data: data.data
             data_length: data.bytes
+            max_depth: max_depth
             string_owner: data
             str_buf: ByteBuffer.new(100)
         }
         return parser.parse_typed_root[T]() !>
     }
 
-    - static fn parse_to_buffer[T](data: ByteBuffer) T !DecodeError {
+    - static fn parse_to_buffer[T](data: ByteBuffer, max_depth: uint) T !DecodeError {
         let parser = Parser {
             data: data.data
             data_length: data.length
+            max_depth: max_depth
             buffer_owner: data
             str_buf: ByteBuffer.new(100)
         }
@@ -104,6 +125,21 @@ struct Parser {
     - fn get(index: uint) u8 {
         if index >= this.data_length : return 0
         return this.data[index]
+    }
+
+    // One level of nested container costs about 450 bytes of the 1 MiB coroutine stack
+    // that every Valk program runs on, so nesting without a bound turns a few kilobytes
+    // of input into a segfault. Both the untyped and the typed containers call this.
+    - fn enter_container() !ParseError {
+        if this.depth >= this.max_depth : throw .too_deep {
+            message: "JSON nested deeper than the maximum depth"
+            at_index: this.index
+        }
+        this.depth++
+    }
+
+    - fn leave_container() {
+        this.depth--
     }
 
     - fn parse_typed_type[T]() T !DecodeError {
@@ -208,6 +244,10 @@ struct Parser {
 
     - fn parse_typed_object[T]() T !DecodeError {
         this.expect_typed('{', "Expected JSON object") !>
+        // A recursive type (class Chain { + children: Array[Chain] }) recurses through
+        // here without ever reaching parse_value, so the typed containers are counted
+        // too rather than only the untyped ones.
+        this.enter_container() !>
         let result = T.$zero_value
         let seen: u64 = 0
         let count = 0
@@ -255,6 +295,7 @@ struct Parser {
             #end
         }
         #end
+        this.leave_container()
         return result
     }
 
@@ -299,6 +340,7 @@ struct Parser {
 
     - fn parse_typed_array[T]() Array[T] !DecodeError {
         this.expect_typed('[', "Expected JSON array") !>
+        this.enter_container() !>
         let result = Array[T]{}
         let count = 0
         while true {
@@ -318,6 +360,7 @@ struct Parser {
             count++
             result.append(this.parse_typed_type[T]() !>)
         }
+        this.leave_container()
         return result
     }
 
@@ -356,6 +399,7 @@ struct Parser {
     }
 
     - fn parse_object() Value !ParseError {
+        this.enter_container() !>
         let count = 0
         let values = Map[Value]{}
         while true {
@@ -386,10 +430,12 @@ struct Parser {
                 character: ch
             }
         }
+        this.leave_container()
         return ObjectValue { values: values }
     }
 
     - fn parse_array() Value !ParseError {
+        this.enter_container() !>
         let values = Array[Value]{}
         let count = 0
         while true {
@@ -411,6 +457,7 @@ struct Parser {
             this.index--
             values.append(this.parse_value() !>)
         }
+        this.leave_container()
         return ArrayValue { values: values }
     }
 

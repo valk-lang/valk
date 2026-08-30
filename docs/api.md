@@ -1014,8 +1014,8 @@ alias FD for i32
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: ByteBuffer | String) Value !ParseError
-+ fn decode_to[T](json: ByteBuffer | String) T !DecodeError
++ fn decode(json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH)) Value !ParseError
++ fn decode_to[T](json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH)) T !DecodeError
 + fn default_value(kind: Kind) Value
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
