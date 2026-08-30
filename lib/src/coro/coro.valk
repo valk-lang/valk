@@ -8,6 +8,10 @@ use io
 
 global current_coro: ?Coro
 global g_coros: Array[?Coro] (.new(16))
+// Generations per g_coros slot. Bumped whenever a slot's last kernel event is
+// consumed or the slot is released, so every kernel event id that was handed
+// out for a slot becomes invalid the moment its coroutine may go away.
+global g_coro_gens: Array[uint] (.new(16))
 global g_coro_indexes: core.Pool[uint] (.new(16))
 global g_coro_count: uint
 global run_coros: Array[Coro] (.new(16))
@@ -84,6 +88,10 @@ class Coro {
     #if OS != "win"
     kernel_event_count: u8 (0)
 
+    // Counts kernel events that are armed and whose completion is still owed.
+    // The global root in g_coros is only released once the coroutine is done
+    // AND no event can trigger anymore, so the kernel can never complete an
+    // event for a coroutine that was freed.
     + fn arm_kernel_event() {
         if this.kernel_event_count == 255 : panic("Too many pending kernel events for one coroutine")
         this.kernel_event_count++
@@ -92,7 +100,23 @@ class Coro {
     + fn disarm_kernel_event() {
         if this.kernel_event_count == 0 : return
         this.kernel_event_count--
-        if this.kernel_event_count == 0 && this.done : this.release_global_root()
+        if this.kernel_event_count == 0 {
+            // The last armed event was consumed or cancelled. Events that the
+            // kernel may still deliver for it (deleted/cancelled) are stale:
+            // invalidate their ids so they can never reach this coroutine.
+            let index = this.g_list_index
+            g_coro_gens.set(index, (g_coro_gens.get(index) !? 0) + 1) _
+            if this.done : this.release_global_root()
+        }
+    }
+
+    // Event id handed to the kernel for this coroutine: generation + slot
+    // index + tag. Resolving an id validates the generation, so completions
+    // that arrive after the coroutine disarmed or was released resolve to
+    // null instead of dereferencing a dangling (or recycled) object.
+    + fn event_id() uint {
+        let index = this.g_list_index
+        return (g_coro_gens.get(index) !? 0) << 34 | index << 2
     }
     #end
 
@@ -100,6 +124,8 @@ class Coro {
         if this.g_root_released : return
         this.g_root_released = true
         let index = this.g_list_index
+        // Invalidate ids of events that may still be in flight for this slot
+        g_coro_gens.set(index, (g_coro_gens.get(index) !? 0) + 1) _
         g_coros.set(index, null) _
         g_coro_indexes.add(index)
     }
@@ -174,6 +200,7 @@ class Coro {
         if indexes.count == 0 {
             let index = g_coros.length
             g_coros.append(coro)
+            g_coro_gens.append(0)
             coro.g_list_index = index
         } else {
             let index = indexes.get() !? 0
@@ -287,7 +314,7 @@ class Coro {
         let ms = ns.to(i64) / 1_000_000
         let ev: ext.kEvent = @undefined
         this.arm_kernel_event()
-        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, this.@cast(ptr))
+        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, this.event_id().@cast(ptr))
         let kq = io.kqueue()
         if !io.kqueue_change(kq, &ev) {
             this.disarm_kernel_event()
@@ -453,7 +480,15 @@ class Coro {
                 let user_data = cqe.user_data
                 let timeout_tag = user_data & 3
                 let coro = take_kernel_event(user_data.to(uint))
-                if coro.done {
+                if !isset(coro) {
+                    io.io_uring_cqe_seen(ring, cqe)
+                    continue
+                }
+                // Read `done` before disarming: the last event may release the
+                // global root, and no field is touched after that.
+                let done = coro.done
+                coro.disarm_kernel_event()
+                if done {
                     io.io_uring_cqe_seen(ring, cqe)
                     continue
                 }
@@ -517,7 +552,11 @@ class Coro {
             while nevents-- > 0 {
                 let ev = events[nevents]
                 let coro = take_kernel_event(ev.udata.@cast(uint))
-                if coro.done : continue
+                if !isset(coro) : continue
+                // Read `done` before disarming, see the linux loop
+                let done = coro.done
+                coro.disarm_kernel_event()
+                if done : continue
                 if ev.filter == io.EVFILT_READ || ev.filter == io.EVFILT_WRITE {
                     if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
                     coro.disarm_io_timeout()
@@ -601,9 +640,13 @@ class Coro {
 }
 
 #if OS != "win"
-fn take_kernel_event(tagged_pointer: uint) Coro {
-    let coro = (tagged_pointer & (~3).to(uint)).@cast(Coro)
-    coro.disarm_kernel_event()
+fn take_kernel_event(tagged_id: uint) ?Coro {
+    let index = (tagged_id >> 2) & 0xFFFFFFFF
+    let coro = g_coros.get(index) !? null
+    if !isset(coro) : return null
+    // Generation check: rejects stale ids of a disarmed/released coroutine and
+    // of a new coroutine that reused this slot
+    if coro.event_id() != (tagged_id & (~3).to(uint)) : return null
     return coro
 }
 
@@ -619,17 +662,24 @@ fn take_kernel_event(tagged_pointer: uint) Coro {
     let index = g_coros.length
     completed.g_list_index = index
     g_coros.append(completed)
+    g_coro_gens.append(0)
     completed.arm_kernel_event()
     completed.arm_kernel_event()
 
-    let pointer = completed.@cast(uint)
-    if take_kernel_event(pointer | 1) != completed : return false
+    let first_id = completed.event_id() | 1
+    if take_kernel_event(first_id) != completed : return false
+    completed.disarm_kernel_event()
     if completed.kernel_event_count != 1 : return false
     if !isset(g_coros.get(index) !? null) : return false
 
-    if take_kernel_event(pointer | 2) != completed : return false
+    let second_id = completed.event_id() | 2
+    if take_kernel_event(second_id) != completed : return false
+    completed.disarm_kernel_event()
     if completed.kernel_event_count != 0 : return false
-    return !isset(g_coros.get(index) !? null) && completed.g_root_released
+    // Fully disarmed + done: the root must be released and the ids invalidated
+    if isset(g_coros.get(index) !? null) : return false
+    if !completed.g_root_released : return false
+    return !isset(take_kernel_event(first_id)) && !isset(take_kernel_event(second_id))
 }
 
 fn kernel_event_test_noop() {}
