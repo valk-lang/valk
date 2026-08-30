@@ -899,6 +899,7 @@ alias pid_t for i32
     + connect_timeout_ms: uint
     + follow_redirects: bool
     + headers: ?Map[String]
+    + max_redirects: uint
     + output_to_file: ?String
     + query_data: ?Map[String]
     + read_timeout_ms: uint
