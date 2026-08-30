@@ -805,6 +805,8 @@ alias pid_t for i32
 ```js
 + fn sanitize(code: String, options: ?SanitizeOptions (null)) String
 + fn sanitize_filter(code: String) String
++ fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
++ fn url_is_allowed(target: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) bool
 ```
 
 ## Classes for 'html'

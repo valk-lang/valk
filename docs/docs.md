@@ -1165,7 +1165,7 @@ Template engine tokens:
 @each(... as val, key, index) // With key & index
 
 {{ }}   // Print HTML-escaped (or use the configured sanitizer)
-{! !}  // Print raw content without sanitization
+{! !}   // Print a raw value without sanitization
 
 @include("...") // Include another template registered with set_content/set_content_many
 ```
