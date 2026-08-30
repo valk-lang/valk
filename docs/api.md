@@ -1259,7 +1259,7 @@ alias FD for i32
 
 ```js
 + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
-+ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String
++ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
 + fn set_content(name: String, content: String) void
 + fn set_content_many(content: Map[String]) void
 ```
@@ -1450,4 +1450,3 @@ alias FD for i32
 ```js
 + global default_translations : Map[String]
 ```
-
