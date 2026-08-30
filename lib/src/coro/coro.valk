@@ -25,7 +25,6 @@ global main_state: CoroState (@undefined)
 
 #if OS == "macos"
 global timer_id: uint
-global io_timeout_coros: Array[Coro] (.new(16))
 #end
 
 #if OS == "win"
@@ -64,14 +63,11 @@ class Coro {
     completion_res: i64 (0)
     #if OS == "linux"
     timeout_ts: io.kernel_timespec (@undefined)
-    timed_io_active: bool (false)
-    timed_io_cancel_pending: bool (false)
-    timed_io_timeout_canceled: bool (false)
     #elif OS == "macos"
     io_wait_active: bool (false)
     io_wait_timed_out: bool (false)
     io_wait_fd: FD
-    io_deadline_ms: uint (0)
+    io_timer_ident: uint (0)
     #elif OS == "win"
     sleep_deadline_ms: u64 (0)
     iocp_ready: bool (false)
@@ -130,23 +126,7 @@ class Coro {
         g_coro_indexes.add(index)
     }
 
-    #if OS == "macos"
-    fn arm_io_timeout(fd: FD, timeout_ms: uint) {
-        this.io_wait_active = true
-        this.io_wait_timed_out = false
-        this.io_wait_fd = fd
-        this.io_deadline_ms = 0
-        if timeout_ms == 0 : return
-        this.io_deadline_ms = mac_mstime() + timeout_ms
-        io_timeout_coros.append(this)
-    }
-
-    fn disarm_io_timeout() {
-        if this.io_deadline_ms == 0 : return
-        this.io_deadline_ms = 0
-        io_timeout_coros.remove_value(this)
-    }
-    #elif OS == "win"
+    #if OS == "win"
     fn arm_io_timeout(fd: FD, overlap: ptr, timeout_ms: uint) {
         this.io_timed_out = false
         if timeout_ms == 0 : return
@@ -493,58 +473,47 @@ class Coro {
                     continue
                 }
                 if timeout_tag == 1 {
-                    if !coro.timed_io_active {
-                        io.io_uring_cqe_seen(ring, cqe)
-                        continue
-                    }
+                    // Linked timeout completion. ETIME: the timeout fired and
+                    // the linked operation was cancelled by the kernel, so its
+                    // completion is stale now — resolve both arms (this bumps
+                    // the generation and invalidates the counterpart) and wake
+                    // with a timeout. ECANCELED: the operation completed first
+                    // and cancelled this timeout; the operation's completion
+                    // wakes the coroutine, nothing to do here.
                     if cqe.res == 0 - ext.ETIME {
-                        coro.timed_io_active = false
+                        coro.disarm_kernel_event()
                         coro.poll_event = io.POLL_TIMEOUT
                         coro.completion_res = 0 - ext.ETIMEDOUT
                         run_coros.append(coro)
-                    } else if cqe.res == 0 - ext.ECANCELED {
-                        if coro.timed_io_cancel_pending {
-                            coro.timed_io_active = false
-                            coro.completion_res = 0 - ext.ECANCELED
-                            run_coros.append(coro)
-                        } else {
-                            coro.timed_io_timeout_canceled = true
-                        }
                     }
-                } else if timeout_tag == 2 {
-                    if coro.timed_io_active {
-                        if cqe.res == 0 - ext.ECANCELED && !coro.timed_io_timeout_canceled {
-                            coro.timed_io_cancel_pending = true
-                        } else {
-                            coro.timed_io_active = false
-                            coro.poll_event = cqe.res.@cast(io.PollEvent)
-                            coro.completion_res = cqe.res
-                            run_coros.append(coro)
-                        }
-                    }
-                } else {
+                } else if timeout_tag == 2 && cqe.res == 0 - ext.ECANCELED {
+                    // The operation was cancelled because the linked timeout
+                    // fired — the timeout completion is stale now. Resolve both
+                    // arms and wake with a timeout.
+                    coro.disarm_kernel_event()
+                    coro.poll_event = io.POLL_TIMEOUT
+                    coro.completion_res = 0 - ext.ETIMEDOUT
                     run_coros.append(coro)
+                } else {
+                    // The operation completed; the linked timeout (if any) was
+                    // cancelled by the kernel and its completion is stale after
+                    // the disarm below.
+                    if timeout_tag == 2 : coro.disarm_kernel_event()
                     coro.poll_event = cqe.res.@cast(io.PollEvent)
                     coro.completion_res = cqe.res
+                    run_coros.append(coro)
                 }
                 io.io_uring_cqe_seen(ring, cqe)
             }
             #elif OS == "macos"
             let events: [ext.kEvent x 64] = @undefined
             gc.unlock()
+            // All macos timeouts are kernel-side (EVFILT_TIMER), so the wait
+            // blocks until the kernel reports an event.
             let timeout: ?*ext.libc_gen_timespec = null
             if run_coros.length > 0 {
                 let t: ext.libc_timespec = { tv_sec: 0, tv_nsec: 0 }
                 timeout = @ref(t)
-            } else {
-                let has_timeout, wait_ms = mac_io_timeout()
-                if has_timeout {
-                    let t: ext.libc_timespec = {
-                        tv_sec: (wait_ms / 1000).to(int)
-                        tv_nsec: ((wait_ms % 1000) * 1_000_000).to(int)
-                    }
-                    timeout = @ref(t)
-                }
             }
             let nevents = ext.kevent(kq, null, 0, @ref(events[0]), 64, timeout)
             gc.lock()
@@ -559,9 +528,7 @@ class Coro {
                 if done : continue
                 if ev.filter == io.EVFILT_READ || ev.filter == io.EVFILT_WRITE {
                     if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
-                    coro.disarm_io_timeout()
                     coro.io_wait_active = false
-                    coro.io_wait_timed_out = false
                     if ev.filter == io.EVFILT_READ {
                         coro.poll_event = ext.POLLIN
                         coro.completion_res = ev.data
@@ -571,12 +538,22 @@ class Coro {
                         coro.completion_res = ev.data
                         if (ev.flags & io.EV_EOF) == io.EV_EOF : coro.poll_event = coro.poll_event | ext.POLLHUP
                     }
+                } else if ev.filter == io.EVFILT_TIMER {
+                    if (ev.udata.@cast(uint) & 1) == 1 {
+                        // Timed-out I/O wait; the fd event was deleted by the
+                        // coroutine when it resumes
+                        if !coro.io_wait_active : continue
+                        coro.io_wait_active = false
+                        coro.io_wait_timed_out = true
+                        coro.poll_event = io.POLL_TIMEOUT
+                        coro.completion_res = 0 - ext.ETIMEDOUT
+                    }
+                    // Tag 0 is a plain sleep timer wake
                 } else {
-                    if ev.filter != io.EVFILT_TIMER : continue
+                    continue
                 }
                 run_coros.append(coro)
             }
-            mac_wake_io_timeouts()
 
             #elif OS == "win"
             win_wake_sleepers()
@@ -684,51 +661,6 @@ fn take_kernel_event(tagged_id: uint) ?Coro {
 
 fn kernel_event_test_noop() {}
 #end
-#end
-
-#if OS == "macos"
-fn mac_mstime() uint {
-    let tv: ext.libc_timeval = @undefined
-    if ext.gettimeofday(@ref(tv), null) != 0 : panic("Failed to read system time")
-    return tv.tv_sec.to(uint) * 1000 + tv.tv_usec.to(uint) / 1000
-}
-
-fn mac_io_timeout() (bool, uint) {
-    if io_timeout_coros.length == 0 : return (false, 0)
-    let now = mac_mstime()
-    let nearest: uint = 0
-    each io_timeout_coros as coro {
-        let deadline = coro.io_deadline_ms
-        if deadline == 0 : continue
-        if deadline <= now : return (true, 0)
-        if nearest == 0 || deadline < nearest : nearest = deadline
-    }
-    if nearest == 0 : return (false, 0)
-    return (true, nearest - now)
-}
-
-fn mac_wake_io_timeouts() {
-    let now = mac_mstime()
-    let i: uint = 0
-    while i < io_timeout_coros.length {
-        let coro = io_timeout_coros.get(i) !? null
-        if !isset(coro) || !coro.io_wait_active || coro.io_deadline_ms == 0 {
-            io_timeout_coros.remove(i)
-            continue
-        }
-        if coro.io_deadline_ms > now {
-            i++
-            continue
-        }
-        io_timeout_coros.remove(i)
-        coro.io_deadline_ms = 0
-        coro.io_wait_active = false
-        coro.io_wait_timed_out = true
-        coro.poll_event = io.POLL_TIMEOUT
-        coro.completion_res = 0 - ext.ETIMEDOUT
-        run_coros.append(coro)
-    }
-}
 #end
 
 #if OS == "win"
