@@ -13,6 +13,11 @@ global g_coro_count: uint
 global run_coros: Array[Coro] (.new(16))
 global next_run_coros: Array[Coro] (.new(16))
 
+#if OS != "win"
+global kernel_event_coros: HashMap[uint, Coro] (.new())
+global next_kernel_event_token: uint (4)
+#end
+
 #if OS == "win"
 global main_fiber: ?ptr
 #else
@@ -78,6 +83,33 @@ class Coro {
     io_timeout_fd: FD
     io_timeout_overlap: ?ptr
     io_timed_out: bool (false)
+    #end
+
+    #if OS != "win"
+    kernel_event_token: uint (0)
+    kernel_event_count: u8 (0)
+
+    + fn arm_kernel_event() uint {
+        if this.kernel_event_count == 0 {
+            let token = next_kernel_event_token
+            next_kernel_event_token += 4
+            if next_kernel_event_token == 0 : panic("Coroutine kernel-event token space exhausted")
+            this.kernel_event_token = token
+            kernel_event_coros.set(token, this)
+        }
+        if this.kernel_event_count == 255 : panic("Too many pending kernel events for one coroutine")
+        this.kernel_event_count++
+        return this.kernel_event_token
+    }
+
+    + fn disarm_kernel_event() {
+        if this.kernel_event_count == 0 : return
+        this.kernel_event_count--
+        if this.kernel_event_count == 0 {
+            kernel_event_coros.remove(this.kernel_event_token)
+            this.kernel_event_token = 0
+        }
+    }
     #end
 
     #if OS == "macos"
@@ -262,9 +294,13 @@ class Coro {
         #elif OS == "macos"
         let ms = ns.to(i64) / 1_000_000
         let ev: ext.kEvent = @undefined
-        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, this.@cast(ptr))
+        let token = this.arm_kernel_event()
+        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, token.@cast(ptr))
         let kq = io.kqueue()
-        if !io.kqueue_change(kq, &ev) : panic("Failed to schedule coroutine sleep")
+        if !io.kqueue_change(kq, &ev) {
+            this.disarm_kernel_event()
+            panic("Failed to schedule coroutine sleep")
+        }
 
         #else
         let delay_ms = (ns.to(u64) + 999_999) / 1_000_000
@@ -423,7 +459,11 @@ class Coro {
                 //
                 let user_data = cqe.user_data
                 let timeout_tag = user_data & 3
-                let coro = (user_data - timeout_tag).@cast(Coro)
+                let coro = take_kernel_event(user_data.to(uint))
+                if !isset(coro) || coro.done {
+                    io.io_uring_cqe_seen(ring, cqe)
+                    continue
+                }
                 if timeout_tag == 1 {
                     if !coro.timed_io_active {
                         io.io_uring_cqe_seen(ring, cqe)
@@ -483,7 +523,8 @@ class Coro {
             if nevents < 0 && ext.get_errno() != ext.EINTR : panic("Coroutine event wait failed")
             while nevents-- > 0 {
                 let ev = events[nevents]
-                let coro = ev.udata.@cast(Coro)
+                let coro = take_kernel_event(ev.udata.@cast(uint))
+                if !isset(coro) || coro.done : continue
                 if ev.filter == io.EVFILT_READ || ev.filter == io.EVFILT_WRITE {
                     if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
                     coro.disarm_io_timeout()
@@ -565,6 +606,33 @@ class Coro {
         }
     }
 }
+
+#if OS != "win"
+fn take_kernel_event(tagged_token: uint) ?Coro {
+    let token = tagged_token & (~3).to(uint)
+    let coro = kernel_event_coros.get(token) !? null
+    if !isset(coro) : return null
+    coro.disarm_kernel_event()
+    return coro
+}
+
+#if TEST
++ fn kernel_event_tokens_for_test() bool {
+    let active = current_coro
+    if !isset(active) : return false
+    let first_token = active.arm_kernel_event()
+    if active.arm_kernel_event() != first_token : return false
+    let first = take_kernel_event(first_token | 1)
+    if !isset(first) || first != active : return false
+    let second = take_kernel_event(first_token | 2)
+    if !isset(second) || second != active : return false
+    if isset(take_kernel_event(first_token)) : return false
+    let second_token = active.arm_kernel_event()
+    active.disarm_kernel_event()
+    return second_token != first_token
+}
+#end
+#end
 
 #if OS == "macos"
 fn mac_mstime() uint {
