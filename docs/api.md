@@ -237,6 +237,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn pad_right(char: u8, length: uint) String
     + fn part(start_index: uint, length: uint) String
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
+    + static fn secure_random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String !ExternError
     + fn range(start: uint, end: uint, inclusive: bool (true)) String
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String
@@ -307,6 +308,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i16) void
     + static fn random() i16
+    + static fn secure_random() i16 !ExternError
     + static fn read_big_endian(from: *[u8 x 2]) i16
     + static fn read_little_endian(from: *[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
@@ -326,6 +328,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i32) void
     + static fn random() i32
+    + static fn secure_random() i32 !ExternError
     + static fn read_big_endian(from: *[u8 x 4]) i32
     + static fn read_little_endian(from: *[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
@@ -345,6 +348,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i64) void
     + static fn random() i64
+    + static fn secure_random() i64 !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) i64
     + static fn read_little_endian(from: *[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
@@ -364,6 +368,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i8) void
     + static fn random() i8
+    + static fn secure_random() i8 !ExternError
     + static fn read_big_endian(from: *u8) i8
     + static fn read_little_endian(from: *u8) i8
     + fn round_down(modulo: i8) i8
@@ -383,6 +388,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: int) void
     + static fn random() int
+    + static fn secure_random() int !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) int
     + static fn read_little_endian(from: *[u8 x 8]) int
     + fn round_down(modulo: int) int
@@ -469,6 +475,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: u16) void
     + static fn random() u16
+    + static fn secure_random() u16 !ExternError
     + static fn read_big_endian(from: *[u8 x 2]) u16
     + static fn read_little_endian(from: *[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
@@ -488,6 +495,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: u32) void
     + static fn random() u32
+    + static fn secure_random() u32 !ExternError
     + static fn read_big_endian(from: *[u8 x 4]) u32
     + static fn read_little_endian(from: *[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
@@ -507,6 +515,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: u64) void
     + static fn random() u64
+    + static fn secure_random() u64 !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) u64
     + static fn read_little_endian(from: *[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
@@ -540,6 +549,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_whitespace() bool
     + fn print(base: u8) void
     + static fn random() u8
+    + static fn secure_random() u8 !ExternError
     + static fn read_big_endian(from: *u8) u8
     + static fn read_little_endian(from: *u8) u8
     + fn round_down(modulo: u8) u8
@@ -561,6 +571,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: uint) void
     + static fn random() uint
+    + static fn secure_random() uint !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) uint
     + static fn read_little_endian(from: *[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
@@ -600,6 +611,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn blowfish_init_state(context: BlowfishContext) void
 + fn blowfish_xor_block(data: *[u8], salt: ByteBuffer, saltIndex: *uint) void
 + fn md5_encode(input: String) String
++ fn random_bytes(length: uint) String !CryptoError
++ fn random_uint() uint !CryptoError
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```
