@@ -1131,6 +1131,16 @@ alias FD for i32
 + fn to_html(md: String, options: ?ToHtmlOptions (null)) String
 ```
 
+## Classes for 'markdown'
+
+```js
++ class ToHtmlOptions {
+    + allowed_schemes: Array[String]
+    + code_class: ?String
+    + paragraph_class: ?String
+}
+```
+
 # mem
 
 ## Functions for 'mem'
