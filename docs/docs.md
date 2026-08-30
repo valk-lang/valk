@@ -1183,7 +1183,7 @@ use valk.crypto
 
 fn main() {
     let password = "test"
-    let hash = crypto.bcrypt_hash(password)
+    let hash = crypto.bcrypt_hash(password) ! panic("Failed to hash password")
     if crypto.bcrypt_verify("test", hash) {
         println("👍")
     } else {

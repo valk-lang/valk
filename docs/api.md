@@ -592,8 +592,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void !CryptoError
 + fn base64_encode(str: String) String
 + fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void
-+ fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void
-+ fn bcrypt_hash(password: String, cost: uint (12)) String
++ fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void !CryptoError
++ fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
 + fn bcrypt_verify(password: String, hash: String) bool
 + fn blowfish_encrypt_block(context: BlowfishContext, input: *[u8 x 8], output: *[u8 x 8]) void
 + fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
