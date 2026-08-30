@@ -171,8 +171,8 @@ s.starts_with(x) bool
 s.ends_with(x) bool
 s.is_empty() bool
 s.contains(x) bool
-s.lower() String // Convert to lowercase
-s.upper() String // Convert to uppercase
+s.lower() String // Convert Unicode text to lowercase
+s.upper() String // Convert Unicode text to uppercase
 s.part(start_index, length) String // Sub string
 s.range(start_index, end_index) String // Sub string using end-index
 let middle = s[1 .. 3] // Three characters starting at index 1
