@@ -1111,7 +1111,7 @@ Example template:
 
         @each(articles as art)
         <h2>{{ art.title }}</h2>
-        <p>@{{ art.content }}</p>
+        <p>{! art.content !}</p>
         @end
     </body>
 </html>
@@ -1164,8 +1164,8 @@ Template engine tokens:
 @each(... as val, key) // With key
 @each(... as val, key, index) // With key & index
 
-{{ }} // Print sanitized (if sanitizer isset in the options)
-@{{ }} // Print without sanitization
+{{ }}   // Print HTML-escaped (or use the configured sanitizer)
+{! !}  // Print raw content without sanitization
 
 @include("...") // Include another template registered with set_content/set_content_many
 ```
