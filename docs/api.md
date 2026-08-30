@@ -1379,7 +1379,7 @@ alias FD for i32
 
 ```js
 + fn decode(str: String) String
-+ fn encode(str: String) String
++ fn encode(str: String, component: COMPONENT (COMPONENT.unreserved)) String
 + fn parse(str: String) Url
 ```
 
