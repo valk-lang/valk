@@ -1387,6 +1387,7 @@ alias FD for i32
 
 ```js
 + class Url {
+    + fragment: String
     + host: String
     + path: String
     + query: String
