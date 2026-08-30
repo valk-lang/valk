@@ -207,8 +207,9 @@ check "definition of a local" '"line":5,"character":4' \
 check "definition inside a test body" '"line":0' \
     "$(request textDocument/definition test-body.valk 6 17)"
 
-check "definition of a method inside a test body" '"line":225' \
-    "$(request textDocument/definition ../../tests/src/validate.valk 183 20)"
+# `double` on line 10 is declared on line 15 (0-based line 14)
+check "definition of a method inside a test body" '"line":14' \
+    "$(request textDocument/definition test-body.valk 9 33)"
 
 # Cursor inside helper's argument list: the second argument is active
 check "signature help" '"label":"fn(count: uint, label: String) String"' \
