@@ -13,11 +13,6 @@ global g_coro_count: uint
 global run_coros: Array[Coro] (.new(16))
 global next_run_coros: Array[Coro] (.new(16))
 
-#if OS != "win"
-global kernel_event_coros: HashMap[uint, Coro] (.new())
-global next_kernel_event_token: uint (4)
-#end
-
 #if OS == "win"
 global main_fiber: ?ptr
 #else
@@ -57,6 +52,7 @@ class Coro {
     handler: fn()()
     follow_up: ?Coro
     g_list_index: uint (0)
+    g_root_released: bool (false)
     // Error result
     error_code: u32 (0)
     // async results
@@ -86,31 +82,27 @@ class Coro {
     #end
 
     #if OS != "win"
-    kernel_event_token: uint (0)
     kernel_event_count: u8 (0)
 
-    + fn arm_kernel_event() uint {
-        if this.kernel_event_count == 0 {
-            let token = next_kernel_event_token
-            next_kernel_event_token += 4
-            if next_kernel_event_token == 0 : panic("Coroutine kernel-event token space exhausted")
-            this.kernel_event_token = token
-            kernel_event_coros.set(token, this)
-        }
+    + fn arm_kernel_event() {
         if this.kernel_event_count == 255 : panic("Too many pending kernel events for one coroutine")
         this.kernel_event_count++
-        return this.kernel_event_token
     }
 
     + fn disarm_kernel_event() {
         if this.kernel_event_count == 0 : return
         this.kernel_event_count--
-        if this.kernel_event_count == 0 {
-            kernel_event_coros.remove(this.kernel_event_token)
-            this.kernel_event_token = 0
-        }
+        if this.kernel_event_count == 0 && this.done : this.release_global_root()
     }
     #end
+
+    fn release_global_root() {
+        if this.g_root_released : return
+        this.g_root_released = true
+        let index = this.g_list_index
+        g_coros.set(index, null) _
+        g_coro_indexes.add(index)
+    }
 
     #if OS == "macos"
     fn arm_io_timeout(fd: FD, timeout_ms: uint) {
@@ -294,8 +286,8 @@ class Coro {
         #elif OS == "macos"
         let ms = ns.to(i64) / 1_000_000
         let ev: ext.kEvent = @undefined
-        let token = this.arm_kernel_event()
-        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, token.@cast(ptr))
+        this.arm_kernel_event()
+        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, this.@cast(ptr))
         let kq = io.kqueue()
         if !io.kqueue_change(kq, &ev) {
             this.disarm_kernel_event()
@@ -399,10 +391,11 @@ class Coro {
         this.handler = fn() {}
         current_coro = null
         g_coro_count--
-        let index = this.g_list_index
-
-        g_coros.set(index, null) _
-        g_coro_indexes.add(index)
+        #if OS != "win"
+        if this.kernel_event_count == 0 : this.release_global_root()
+        #else
+        this.release_global_root()
+        #end
 
         this.yield()
     }
@@ -460,7 +453,7 @@ class Coro {
                 let user_data = cqe.user_data
                 let timeout_tag = user_data & 3
                 let coro = take_kernel_event(user_data.to(uint))
-                if !isset(coro) || coro.done {
+                if coro.done {
                     io.io_uring_cqe_seen(ring, cqe)
                     continue
                 }
@@ -524,7 +517,7 @@ class Coro {
             while nevents-- > 0 {
                 let ev = events[nevents]
                 let coro = take_kernel_event(ev.udata.@cast(uint))
-                if !isset(coro) || coro.done : continue
+                if coro.done : continue
                 if ev.filter == io.EVFILT_READ || ev.filter == io.EVFILT_WRITE {
                     if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
                     coro.disarm_io_timeout()
@@ -608,29 +601,38 @@ class Coro {
 }
 
 #if OS != "win"
-fn take_kernel_event(tagged_token: uint) ?Coro {
-    let token = tagged_token & (~3).to(uint)
-    let coro = kernel_event_coros.get(token) !? null
-    if !isset(coro) : return null
+fn take_kernel_event(tagged_pointer: uint) Coro {
+    let coro = (tagged_pointer & (~3).to(uint)).@cast(Coro)
     coro.disarm_kernel_event()
     return coro
 }
 
 #if TEST
-+ fn kernel_event_tokens_for_test() bool {
-    let active = current_coro
-    if !isset(active) : return false
-    let first_token = active.arm_kernel_event()
-    if active.arm_kernel_event() != first_token : return false
-    let first = take_kernel_event(first_token | 1)
-    if !isset(first) || first != active : return false
-    let second = take_kernel_event(first_token | 2)
-    if !isset(second) || second != active : return false
-    if isset(take_kernel_event(first_token)) : return false
-    let second_token = active.arm_kernel_event()
-    active.disarm_kernel_event()
-    return second_token != first_token
++ fn kernel_event_lifetime_for_test() bool {
+    let completed = Coro {
+        args: mem.alloc(0)
+        start_func: kernel_event_test_noop
+        handler: fn() {}
+        freed: true
+        done: true
+    }
+    let index = g_coros.length
+    completed.g_list_index = index
+    g_coros.append(completed)
+    completed.arm_kernel_event()
+    completed.arm_kernel_event()
+
+    let pointer = completed.@cast(uint)
+    if take_kernel_event(pointer | 1) != completed : return false
+    if completed.kernel_event_count != 1 : return false
+    if !isset(g_coros.get(index) !? null) : return false
+
+    if take_kernel_event(pointer | 2) != completed : return false
+    if completed.kernel_event_count != 0 : return false
+    return !isset(g_coros.get(index) !? null) && completed.g_root_released
 }
+
+fn kernel_event_test_noop() {}
 #end
 #end
 
