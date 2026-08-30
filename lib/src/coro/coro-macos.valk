@@ -1,0 +1,85 @@
+// macOS coroutine backend: kqueue. I/O waits and timeouts are both kernel
+// events (EVFILT_READ/WRITE + oneshot EVFILT_TIMER), so the event wait blocks
+// until the kernel reports an event.
+
+#if OS == "macos"
+
+use ext
+use io
+use gc
+use coro
+
+global timer_id: uint
+
+extend Coro {
+    io_wait_active: bool (false)
+    io_wait_timed_out: bool (false)
+    io_wait_fd: FD
+    io_timer_ident: uint (0)
+
+    fn sleep(ns: uint) {
+        let ms = ns.to(i64) / 1_000_000
+        let ev: ext.kEvent = @undefined
+        this.arm_kernel_event()
+        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, this.event_id().@cast(ptr))
+        let kq = io.kqueue()
+        if !io.kqueue_change(kq, &ev) {
+            this.disarm_kernel_event()
+            panic("Failed to schedule coroutine sleep")
+        }
+        this.yield()
+    }
+
+    // Dequeue one batch of kqueue events and wake their coroutines.
+    static fn wait_for_events() {
+        let kq = io.kqueue()
+        let events: [ext.kEvent x 64] = @undefined
+        gc.unlock()
+        let timeout: ?*ext.libc_gen_timespec = null
+        if run_coros.length > 0 {
+            let t: ext.libc_timespec = { tv_sec: 0, tv_nsec: 0 }
+            timeout = @ref(t)
+        }
+        let nevents = ext.kevent(kq, null, 0, @ref(events[0]), 64, timeout)
+        gc.lock()
+        if nevents < 0 && ext.get_errno() != ext.EINTR : panic("Coroutine event wait failed")
+        while nevents-- > 0 {
+            let ev = events[nevents]
+            let coro = take_kernel_event(ev.udata.@cast(uint))
+            if !isset(coro) : continue
+            // Read `done` before disarming, see the linux backend
+            let done = coro.done
+            coro.disarm_kernel_event()
+            if done : continue
+            if ev.filter == io.EVFILT_READ || ev.filter == io.EVFILT_WRITE {
+                if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
+                coro.io_wait_active = false
+                if ev.filter == io.EVFILT_READ {
+                    coro.poll_event = ext.POLLIN
+                    coro.completion_res = ev.data
+                    if (ev.flags & io.EV_EOF) == io.EV_EOF : coro.poll_event = coro.poll_event | ext.POLLHUP
+                } else if ev.filter == io.EVFILT_WRITE {
+                    coro.poll_event = ext.POLLOUT
+                    coro.completion_res = ev.data
+                    if (ev.flags & io.EV_EOF) == io.EV_EOF : coro.poll_event = coro.poll_event | ext.POLLHUP
+                }
+            } else if ev.filter == io.EVFILT_TIMER {
+                if (ev.udata.@cast(uint) & 1) == 1 {
+                    // Timed-out I/O wait; the fd event was deleted by the
+                    // coroutine when it resumes
+                    if !coro.io_wait_active : continue
+                    coro.io_wait_active = false
+                    coro.io_wait_timed_out = true
+                    coro.poll_event = io.POLL_TIMEOUT
+                    coro.completion_res = 0 - ext.ETIMEDOUT
+                }
+                // Tag 0 is a plain sleep timer wake
+            } else {
+                continue
+            }
+            run_coros.append(coro)
+        }
+    }
+}
+
+#end

@@ -1,0 +1,283 @@
+// Windows coroutine backend: fibers + IOCP. Sleeps and I/O timeouts are
+// software deadlines; timed-out I/O is aborted with CancelIoEx.
+
+#if OS == "win"
+
+use ext
+use io
+use gc
+use coro
+use mem
+
+global main_fiber: ?ptr
+global cport: ?ptr
+global sleep_coros: Array[Coro] (.new(16))
+global io_timeout_coros: Array[Coro] (.new(16))
+
+extend Coro {
+    fiber: ?ptr
+    sleep_deadline_ms: u64 (0)
+    iocp_ready: bool (false)
+    // Reusable IOCP state, see io.overlap(). At most two operations are ever
+    // in flight for one coroutine, so two slots cover every path.
+    overlap_a: ?io.Overlap (null)
+    overlap_b: ?io.Overlap (null)
+    io_deadline_ms: u64 (0)
+    io_timeout_fd: FD
+    io_timeout_overlap: ?ptr
+    io_timed_out: bool (false)
+
+    fn arm_io_timeout(fd: FD, overlap: ptr, timeout_ms: uint) {
+        this.io_timed_out = false
+        if timeout_ms == 0 : return
+        this.io_timeout_fd = fd
+        this.io_timeout_overlap = overlap
+        this.io_deadline_ms = ext.GetTickCount64() + timeout_ms
+        io_timeout_coros.append(this)
+    }
+
+    fn disarm_io_timeout() {
+        if this.io_deadline_ms != 0 {
+            this.io_deadline_ms = 0
+            io_timeout_coros.remove_value(this)
+        }
+        this.io_timeout_overlap = null
+    }
+
+    // Hand out an overlap that the kernel is done with. A slot is only free
+    // once its completion packet was dequeued, so an overlap can never be
+    // reused while an operation still points at it; if both slots are busy we
+    // fall back to a fresh one.
+    fn take_overlap() io.Overlap {
+        let a = this.overlap_a
+        if !isset(a) {
+            a = io.Overlap {}
+            this.overlap_a = a
+            return a
+        }
+        if !a.base.in_use : return a
+
+        let b = this.overlap_b
+        if !isset(b) {
+            b = io.Overlap {}
+            this.overlap_b = b
+            return b
+        }
+        if !b.base.in_use : return b
+
+        return io.Overlap {}
+    }
+
+    fn free_stacks() {
+        if this.freed : return
+        this.freed = true
+        let fiber = this.fiber
+        if isset(fiber) {
+            this.fiber = null
+            ext.DeleteFiber(fiber)
+        }
+    }
+
+    fn yield() $undefined {
+        let fiber = main_fiber
+        if !isset(fiber) : panic("Coroutine thread is not a fiber")
+        SELF.switch_fiber(fiber)
+    }
+
+    static fn switch_fiber(to: ptr) $suspend $undefined {
+        ext.SwitchToFiber(to)
+    }
+
+    fn resume() $undefined {
+        if this.done : return
+
+        current_coro = this
+
+        gc_stack_sp_backup = gc_stack_sp
+        this.active = true
+
+        if !this.started : this.started = true
+        gc_stack_sp = this.backup_gc_sp
+        let fiber = this.fiber
+        if !isset(fiber) : panic("Coroutine fiber was released before completion")
+        SELF.switch_fiber(fiber)
+
+        // Restore backup
+        if !this.done {
+            this.backup_gc_sp = gc_stack_sp
+        }
+
+        // Restore the scheduler's GC context.
+        this.active = false
+        gc_stack_sp = gc_stack_sp_backup
+        current_coro = null
+
+        if this.done {
+            // Clean up
+            this.free_stacks()
+
+            // Next
+            let next = this.follow_up
+            if isset(next) {
+                this.follow_up = null
+                run_coros.append(next)
+            }
+        }
+    }
+
+    fn sleep(ns: uint) {
+        let delay_ms = (ns.to(u64) + 999_999) / 1_000_000
+        this.sleep_deadline_ms = ext.GetTickCount64() + delay_ms
+        sleep_coros.append(this)
+        this.yield()
+        this.sleep_deadline_ms = 0
+    }
+
+    // Poll the completion port, waking sleepers and cancelling timed-out I/O.
+    static fn wait_for_events() {
+        let cport = io.iocp()
+        win_wake_sleepers()
+        win_cancel_io_timeouts()
+        let first = run_coros.length == 0
+        let wait_ms = first ? win_next_timeout() : 0
+
+        let bytes: u32 = 0
+        let key: uint = 0
+        let ov: ?io.Overlap = null
+        let result: ext.BOOL = 0
+        if wait_ms == 0 {
+            result = ext.GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), 0)
+        } else {
+            gc.unlock()
+            result = ext.GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), wait_ms)
+            gc.lock()
+        }
+
+        while true {
+            if !isset(ov) {
+                // A packet without an overlap carries the coroutine in its
+                // completion key, see io.wake_coro()
+                if result == 0 || key == 0 {
+                    if result == 0 && ext.GetLastError() != ext.WAIT_TIMEOUT {
+                        panic("GetQueuedCompletionStatus failed")
+                    }
+                    break
+                }
+                let coro = key.@cast(Coro)
+                if !coro.iocp_ready {
+                    coro.iocp_ready = true
+                    run_coros.append(coro)
+                }
+            } else {
+                let coro = ov.base.coro.@cast(Coro)
+                ov.base.completed = true
+                // The kernel is done with it, so the slot can be reused
+                ov.base.in_use = false
+                coro.completion_res = bytes
+                if !ov.base.cancel_requested {
+                    coro.poll_event = coro.poll_event | io.completion_event(ov, result != 0)
+                }
+                if !coro.iocp_ready {
+                    coro.iocp_ready = true
+                    run_coros.append(coro)
+                }
+            }
+
+            bytes = 0
+            key = 0
+            ov = null
+            result = ext.GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), 0)
+        }
+    }
+}
+
+fn ensure_main_fiber() {
+    if isset(main_fiber) : return
+    main_fiber = ext.ConvertThreadToFiberEx(null, ext.FIBER_FLAG_FLOAT_SWITCH)
+    if !isset(main_fiber) : panic("Failed to initialize coroutine thread fiber")
+}
+
+fn win_coro_entry(value: ptr) {
+    let coro = value.@cast(Coro)
+    coro.start_func()
+    panic("Coroutine entry returned without completing")
+}
+
+fn win_wake_sleepers() {
+    let now = ext.GetTickCount64()
+    let i: uint = 0
+    while i < sleep_coros.length {
+        let coro = sleep_coros.get(i) !? null
+        if !isset(coro) {
+            sleep_coros.remove(i)
+            continue
+        }
+        if coro.done || coro.sleep_deadline_ms <= now {
+            sleep_coros.remove(i)
+            if !coro.done : run_coros.append(coro)
+            continue
+        }
+        i++
+    }
+}
+
+fn win_sleep_timeout() u32 {
+    if sleep_coros.length == 0 : return ext.INFINITE
+    let now = ext.GetTickCount64()
+    let nearest: u64 = 0
+    each sleep_coros as coro {
+        if coro.done : continue
+        if coro.sleep_deadline_ms <= now : return 0
+        if nearest == 0 || coro.sleep_deadline_ms < nearest : nearest = coro.sleep_deadline_ms
+    }
+    if nearest == 0 : return ext.INFINITE
+    let delay = nearest - now
+    if delay > 0xffffffff : return 0xffffffff
+    return delay.to(u32)
+}
+
+fn win_io_timeout() u32 {
+    if io_timeout_coros.length == 0 : return ext.INFINITE
+    let now = ext.GetTickCount64()
+    let nearest: u64 = 0
+    each io_timeout_coros as coro {
+        let deadline = coro.io_deadline_ms
+        if deadline == 0 : continue
+        if deadline <= now : return 0
+        if nearest == 0 || deadline < nearest : nearest = deadline
+    }
+    if nearest == 0 : return ext.INFINITE
+    let delay = nearest - now
+    if delay > 0xffffffff : return 0xffffffff
+    return delay.to(u32)
+}
+
+fn win_next_timeout() u32 {
+    let sleep_timeout = win_sleep_timeout()
+    let io_timeout = win_io_timeout()
+    return sleep_timeout < io_timeout ? sleep_timeout : io_timeout
+}
+
+fn win_cancel_io_timeouts() {
+    let now = ext.GetTickCount64()
+    let i: uint = 0
+    while i < io_timeout_coros.length {
+        let coro = io_timeout_coros.get(i) !? null
+        if !isset(coro) || coro.done || coro.io_deadline_ms == 0 {
+            io_timeout_coros.remove(i)
+            continue
+        }
+        if coro.io_deadline_ms > now {
+            i++
+            continue
+        }
+        io_timeout_coros.remove(i)
+        coro.io_deadline_ms = 0
+        coro.io_timed_out = true
+        let overlap = coro.io_timeout_overlap
+        if isset(overlap) && ext.CancelIoEx(coro.io_timeout_fd, overlap) == 0 && ext.GetLastError() != ext.ERROR_NOT_FOUND {
+            panic("Failed to cancel timed out I/O")
+        }
+    }
+}
+#end

@@ -17,35 +17,20 @@ global g_coro_count: uint
 global run_coros: Array[Coro] (.new(16))
 global next_run_coros: Array[Coro] (.new(16))
 
-#if OS == "win"
-global main_fiber: ?ptr
-#else
-global main_state: CoroState (@undefined)
-#end
-
-#if OS == "macos"
-global timer_id: uint
-#end
-
-#if OS == "win"
-global cport: ?ptr
-global sleep_coros: Array[Coro] (.new(16))
-global io_timeout_coros: Array[Coro] (.new(16))
-#end
-
 #if OS != "win"
+global main_state: CoroState (@undefined)
+
 struct CoroState {
     rsp: ptr
 }
 #end
+
 class Coro {
     // Args & results
     args: ptr
     gc_args: Array[gc.GcPtr] (.{})
     // Coro state
-    #if OS == "win"
-    fiber: ?ptr
-    #else
+    #if OS != "win"
     state: CoroState (@undefined)
     stack_allocation: ptr (@undefined)
     #end
@@ -61,89 +46,6 @@ class Coro {
     // async results
     poll_event: io.PollEvent (0)
     completion_res: i64 (0)
-    #if OS == "linux"
-    timeout_ts: io.kernel_timespec (@undefined)
-    #elif OS == "macos"
-    io_wait_active: bool (false)
-    io_wait_timed_out: bool (false)
-    io_wait_fd: FD
-    io_timer_ident: uint (0)
-    #elif OS == "win"
-    sleep_deadline_ms: u64 (0)
-    iocp_ready: bool (false)
-    // Reusable IOCP state, see io.overlap(). At most two operations are ever
-    // in flight for one coroutine, so two slots cover every path.
-    overlap_a: ?io.Overlap (null)
-    overlap_b: ?io.Overlap (null)
-    io_deadline_ms: u64 (0)
-    io_timeout_fd: FD
-    io_timeout_overlap: ?ptr
-    io_timed_out: bool (false)
-    #end
-
-    #if OS != "win"
-    kernel_event_count: u8 (0)
-
-    // Counts kernel events that are armed and whose completion is still owed.
-    // The global root in g_coros is only released once the coroutine is done
-    // AND no event can trigger anymore, so the kernel can never complete an
-    // event for a coroutine that was freed.
-    + fn arm_kernel_event() {
-        if this.kernel_event_count == 255 : panic("Too many pending kernel events for one coroutine")
-        this.kernel_event_count++
-    }
-
-    + fn disarm_kernel_event() {
-        if this.kernel_event_count == 0 : return
-        this.kernel_event_count--
-        if this.kernel_event_count == 0 {
-            // The last armed event was consumed or cancelled. Events that the
-            // kernel may still deliver for it (deleted/cancelled) are stale:
-            // invalidate their ids so they can never reach this coroutine.
-            let index = this.g_list_index
-            g_coro_gens.set(index, (g_coro_gens.get(index) !? 0) + 1) _
-            if this.done : this.release_global_root()
-        }
-    }
-
-    // Event id handed to the kernel for this coroutine: generation + slot
-    // index + tag. Resolving an id validates the generation, so completions
-    // that arrive after the coroutine disarmed or was released resolve to
-    // null instead of dereferencing a dangling (or recycled) object.
-    + fn event_id() uint {
-        let index = this.g_list_index
-        return (g_coro_gens.get(index) !? 0) << 34 | index << 2
-    }
-    #end
-
-    fn release_global_root() {
-        if this.g_root_released : return
-        this.g_root_released = true
-        let index = this.g_list_index
-        // Invalidate ids of events that may still be in flight for this slot
-        g_coro_gens.set(index, (g_coro_gens.get(index) !? 0) + 1) _
-        g_coros.set(index, null) _
-        g_coro_indexes.add(index)
-    }
-
-    #if OS == "win"
-    fn arm_io_timeout(fd: FD, overlap: ptr, timeout_ms: uint) {
-        this.io_timed_out = false
-        if timeout_ms == 0 : return
-        this.io_timeout_fd = fd
-        this.io_timeout_overlap = overlap
-        this.io_deadline_ms = ext.GetTickCount64() + timeout_ms
-        io_timeout_coros.append(this)
-    }
-
-    fn disarm_io_timeout() {
-        if this.io_deadline_ms != 0 {
-            this.io_deadline_ms = 0
-            io_timeout_coros.remove_value(this)
-        }
-        this.io_timeout_overlap = null
-    }
-    #end
     //
     started: bool (false)
     active: bool (false)
@@ -200,47 +102,46 @@ class Coro {
         mem.free(this.args)
     }
 
-    #if OS == "win"
-    // Hand out an overlap that the kernel is done with. A slot is only free
-    // once its completion packet was dequeued, so an overlap can never be
-    // reused while an operation still points at it; if both slots are busy we
-    // fall back to a fresh one.
-    fn take_overlap() io.Overlap {
-        let a = this.overlap_a
-        if !isset(a) {
-            a = io.Overlap {}
-            this.overlap_a = a
-            return a
-        }
-        if !a.base.in_use : return a
+    #if OS != "win"
+    kernel_event_count: u8 (0)
 
-        let b = this.overlap_b
-        if !isset(b) {
-            b = io.Overlap {}
-            this.overlap_b = b
-            return b
-        }
-        if !b.base.in_use : return b
-
-        return io.Overlap {}
+    // Counts kernel events that are armed and whose completion is still owed.
+    // The global root in g_coros is only released once the coroutine is done
+    // AND no event can trigger anymore, so the kernel can never complete an
+    // event for a coroutine that was freed.
+    + fn arm_kernel_event() {
+        if this.kernel_event_count == 255 : panic("Too many pending kernel events for one coroutine")
+        this.kernel_event_count++
     }
-    #end
+
+    + fn disarm_kernel_event() {
+        if this.kernel_event_count == 0 : return
+        this.kernel_event_count--
+        if this.kernel_event_count == 0 {
+            // The last armed event was consumed or cancelled. Events that the
+            // kernel may still deliver for it (deleted/cancelled) are stale:
+            // invalidate their ids so they can never reach this coroutine.
+            let index = this.g_list_index
+            g_coro_gens.set(index, (g_coro_gens.get(index) !? 0) + 1) _
+            if this.done : this.release_global_root()
+        }
+    }
+
+    // Event id handed to the kernel for this coroutine: generation + slot
+    // index + tag. Resolving an id validates the generation, so completions
+    // that arrive after the coroutine disarmed or was released resolve to
+    // null instead of dereferencing a dangling (or recycled) object.
+    + fn event_id() uint {
+        let index = this.g_list_index
+        return (g_coro_gens.get(index) !? 0) << 34 | index << 2
+    }
 
     fn free_stacks() {
         if this.freed : return
         this.freed = true
-        #if OS == "win"
-        let fiber = this.fiber
-        if isset(fiber) {
-            this.fiber = null
-            ext.DeleteFiber(fiber)
-        }
-        #else
         stack_free(this.stack_allocation)
-        #end
     }
 
-    #if OS != "win"
     fn init_stack(base: ptr) {
         #if ARCH == "x64"
         let return_addr_space = 2 * size_of(ptr)
@@ -264,6 +165,16 @@ class Coro {
     }
     #end
 
+    fn release_global_root() {
+        if this.g_root_released : return
+        this.g_root_released = true
+        let index = this.g_list_index
+        // Invalidate ids of events that may still be in flight for this slot
+        g_coro_gens.set(index, (g_coro_gens.get(index) !? 0) + 1) _
+        g_coros.set(index, null) _
+        g_coro_indexes.add(index)
+    }
+
     //////////////
     // AWAIT
     //////////////
@@ -280,38 +191,6 @@ class Coro {
         this.yield()
     }
 
-    fn sleep(ns: uint) {
-        #if OS == "linux"
-        let sqe = io.sqe(this) ! panic("Failed to schedule coroutine sleep")
-        let nsec = ns.to(int)
-        this.timeout_ts = {
-            tv_sec: nsec / 1_000_000_000
-            tv_nsec: (nsec % 1_000_000_000)
-        }
-        io.io_uring_prep_timeout(sqe, &this.timeout_ts, 0, 0)
-
-        #elif OS == "macos"
-        let ms = ns.to(i64) / 1_000_000
-        let ev: ext.kEvent = @undefined
-        this.arm_kernel_event()
-        io.EV_SET(&ev, timer_id++, io.EVFILT_TIMER, io.EV_ADD | io.EV_ENABLE | io.EV_ONESHOT, 0, ms, this.event_id().@cast(ptr))
-        let kq = io.kqueue()
-        if !io.kqueue_change(kq, &ev) {
-            this.disarm_kernel_event()
-            panic("Failed to schedule coroutine sleep")
-        }
-
-        #else
-        let delay_ms = (ns.to(u64) + 999_999) / 1_000_000
-        this.sleep_deadline_ms = ext.GetTickCount64() + delay_ms
-        sleep_coros.append(this)
-        #end
-        this.yield()
-        #if OS == "win"
-        this.sleep_deadline_ms = 0
-        #end
-    }
-
     fn await_last() {
         run_coros.append(this)
         this.yield()
@@ -321,26 +200,17 @@ class Coro {
     // FLOW
     //////////////
 
+    #if OS != "win"
     fn yield() $undefined {
-        #if OS == "win"
-        let fiber = main_fiber
-        if !isset(fiber) : panic("Coroutine thread is not a fiber")
-        SELF.switch_fiber(fiber)
-        #else
         SELF.swap(&this.state, &main_state)
-        #end
     }
 
-    #if OS == "win"
-    static fn switch_fiber(to: ptr) $suspend $undefined {
-        ext.SwitchToFiber(to)
-    }
-    #else
     static fn swap(from: ptr, to: ptr) $suspend $undefined {
         ext.valk_stack_swap(from, to)
     }
     #end
 
+    #if OS != "win"
     fn resume() $undefined {
         if this.done : return
 
@@ -349,13 +219,6 @@ class Coro {
         gc_stack_sp_backup = gc_stack_sp
         this.active = true
 
-        #if OS == "win"
-        if !this.started : this.started = true
-        gc_stack_sp = this.backup_gc_sp
-        let fiber = this.fiber
-        if !isset(fiber) : panic("Coroutine fiber was released before completion")
-        SELF.switch_fiber(fiber)
-        #else
         let sp = this.stack_allocation + STACK_ALLOC_SIZE - size_of(ptr)
         if this.started {
             gc_stack_sp = this.backup_gc_sp
@@ -368,7 +231,6 @@ class Coro {
 
         // Swap
         SELF.swap(&main_state, &this.state)
-        #end
 
         // Restore backup
         if !this.done {
@@ -392,6 +254,7 @@ class Coro {
             }
         }
     }
+    #end
 
     fn complete() {
         this.done = true
@@ -411,17 +274,11 @@ class Coro {
     // LOOP
     //////////////
 
+    // Scheduler loop: run scheduled coroutines, then let the OS backend wait
+    // for completions (wait_for_events) until `until` is done.
     static fn loop(until: ?Coro (null)) {
         // Done check
         if isset(until) && until.done : return
-
-        #if OS == "linux"
-        let ring = io.uring()
-        #elif OS == "macos"
-        let kq = io.kqueue()
-        #elif OS == "win"
-        let cport = io.iocp()
-        #end
 
         while true {
             let scheduled_coros = run_coros
@@ -437,181 +294,8 @@ class Coro {
             // Done check
             if isset(until) && until.done : break
 
-            // Wait for poll coros
-            #if OS == "linux"
-            if io.uring_unsubmitted > 0 : io.uring_submit(ring)
-            #end
-
             gc.collect_if_threshold_almost_reached()
-            #if OS == "linux"
-            while true {
-                let cqe: ?*ext.io_uring_cqe = null
-                if run_coros.length == 0 {
-                    gc.unlock()
-                    io.io_uring_wait_cqe(ring, &cqe)
-                    gc.lock()
-                } else {
-                    io.io_uring_peek_cqe(ring, &cqe)
-                }
-                if !isset(cqe) {
-                    break
-                }
-                //
-                let user_data = cqe.user_data
-                let timeout_tag = user_data & 3
-                let coro = take_kernel_event(user_data.to(uint))
-                if !isset(coro) {
-                    io.io_uring_cqe_seen(ring, cqe)
-                    continue
-                }
-                // Read `done` before disarming: the last event may release the
-                // global root, and no field is touched after that.
-                let done = coro.done
-                coro.disarm_kernel_event()
-                if done {
-                    io.io_uring_cqe_seen(ring, cqe)
-                    continue
-                }
-                if timeout_tag == 1 {
-                    // Linked timeout completion. ETIME: the timeout fired and
-                    // the linked operation was cancelled by the kernel, so its
-                    // completion is stale now — resolve both arms (this bumps
-                    // the generation and invalidates the counterpart) and wake
-                    // with a timeout. ECANCELED: the operation completed first
-                    // and cancelled this timeout; the operation's completion
-                    // wakes the coroutine, nothing to do here.
-                    if cqe.res == 0 - ext.ETIME {
-                        coro.disarm_kernel_event()
-                        coro.poll_event = io.POLL_TIMEOUT
-                        coro.completion_res = 0 - ext.ETIMEDOUT
-                        run_coros.append(coro)
-                    }
-                } else if timeout_tag == 2 && cqe.res == 0 - ext.ECANCELED {
-                    // The operation was cancelled because the linked timeout
-                    // fired — the timeout completion is stale now. Resolve both
-                    // arms and wake with a timeout.
-                    coro.disarm_kernel_event()
-                    coro.poll_event = io.POLL_TIMEOUT
-                    coro.completion_res = 0 - ext.ETIMEDOUT
-                    run_coros.append(coro)
-                } else {
-                    // The operation completed; the linked timeout (if any) was
-                    // cancelled by the kernel and its completion is stale after
-                    // the disarm below.
-                    if timeout_tag == 2 : coro.disarm_kernel_event()
-                    coro.poll_event = cqe.res.@cast(io.PollEvent)
-                    coro.completion_res = cqe.res
-                    run_coros.append(coro)
-                }
-                io.io_uring_cqe_seen(ring, cqe)
-            }
-            #elif OS == "macos"
-            let events: [ext.kEvent x 64] = @undefined
-            gc.unlock()
-            // All macos timeouts are kernel-side (EVFILT_TIMER), so the wait
-            // blocks until the kernel reports an event.
-            let timeout: ?*ext.libc_gen_timespec = null
-            if run_coros.length > 0 {
-                let t: ext.libc_timespec = { tv_sec: 0, tv_nsec: 0 }
-                timeout = @ref(t)
-            }
-            let nevents = ext.kevent(kq, null, 0, @ref(events[0]), 64, timeout)
-            gc.lock()
-            if nevents < 0 && ext.get_errno() != ext.EINTR : panic("Coroutine event wait failed")
-            while nevents-- > 0 {
-                let ev = events[nevents]
-                let coro = take_kernel_event(ev.udata.@cast(uint))
-                if !isset(coro) : continue
-                // Read `done` before disarming, see the linux loop
-                let done = coro.done
-                coro.disarm_kernel_event()
-                if done : continue
-                if ev.filter == io.EVFILT_READ || ev.filter == io.EVFILT_WRITE {
-                    if !coro.io_wait_active || ev.ident != coro.io_wait_fd : continue
-                    coro.io_wait_active = false
-                    if ev.filter == io.EVFILT_READ {
-                        coro.poll_event = ext.POLLIN
-                        coro.completion_res = ev.data
-                        if (ev.flags & io.EV_EOF) == io.EV_EOF : coro.poll_event = coro.poll_event | ext.POLLHUP
-                    } else if ev.filter == io.EVFILT_WRITE {
-                        coro.poll_event = ext.POLLOUT
-                        coro.completion_res = ev.data
-                        if (ev.flags & io.EV_EOF) == io.EV_EOF : coro.poll_event = coro.poll_event | ext.POLLHUP
-                    }
-                } else if ev.filter == io.EVFILT_TIMER {
-                    if (ev.udata.@cast(uint) & 1) == 1 {
-                        // Timed-out I/O wait; the fd event was deleted by the
-                        // coroutine when it resumes
-                        if !coro.io_wait_active : continue
-                        coro.io_wait_active = false
-                        coro.io_wait_timed_out = true
-                        coro.poll_event = io.POLL_TIMEOUT
-                        coro.completion_res = 0 - ext.ETIMEDOUT
-                    }
-                    // Tag 0 is a plain sleep timer wake
-                } else {
-                    continue
-                }
-                run_coros.append(coro)
-            }
-
-            #elif OS == "win"
-            win_wake_sleepers()
-            win_cancel_io_timeouts()
-            let first = run_coros.length == 0
-            let wait_ms = first ? win_next_timeout() : 0
-
-            let bytes: u32 = 0
-            let key: uint = 0
-            let ov: ?io.Overlap = null
-            let result: ext.BOOL = 0
-            if wait_ms == 0 {
-                result = ext.GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), 0)
-            } else {
-                gc.unlock()
-                result = ext.GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), wait_ms)
-                gc.lock()
-            }
-
-            while true {
-                if !isset(ov) {
-                    // A packet without an overlap carries the coroutine in its
-                    // completion key, see io.wake_coro()
-                    if result == 0 || key == 0 {
-                        if result == 0 && ext.GetLastError() != ext.WAIT_TIMEOUT {
-                            panic("GetQueuedCompletionStatus failed")
-                        }
-                        break
-                    }
-                    let coro = key.@cast(Coro)
-                    if !coro.iocp_ready {
-                        coro.iocp_ready = true
-                        run_coros.append(coro)
-                    }
-                } else {
-                    let coro = ov.base.coro.@cast(Coro)
-                    ov.base.completed = true
-                    // The kernel is done with it, so the slot can be reused
-                    ov.base.in_use = false
-                    coro.completion_res = bytes
-                    if !ov.base.cancel_requested {
-                        coro.poll_event = coro.poll_event | io.completion_event(ov, result != 0)
-                    }
-                    if !coro.iocp_ready {
-                        coro.iocp_ready = true
-                        run_coros.append(coro)
-                    }
-                }
-
-                bytes = 0
-                key = 0
-                ov = null
-                result = ext.GetQueuedCompletionStatus(cport.@cast(ptr), @ref(bytes), @ref(key), @ref(ov), 0)
-            }
-
-            #else
-            panic("Unsupported OS for: coroutine loop")
-            #end
+            SELF.wait_for_events()
         }
     }
 }
@@ -661,96 +345,4 @@ fn take_kernel_event(tagged_id: uint) ?Coro {
 
 fn kernel_event_test_noop() {}
 #end
-#end
-
-#if OS == "win"
-fn ensure_main_fiber() {
-    if isset(main_fiber) : return
-    main_fiber = ext.ConvertThreadToFiberEx(null, ext.FIBER_FLAG_FLOAT_SWITCH)
-    if !isset(main_fiber) : panic("Failed to initialize coroutine thread fiber")
-}
-
-fn win_coro_entry(value: ptr) {
-    let coro = value.@cast(Coro)
-    coro.start_func()
-    panic("Coroutine entry returned without completing")
-}
-
-fn win_wake_sleepers() {
-    let now = ext.GetTickCount64()
-    let i: uint = 0
-    while i < sleep_coros.length {
-        let coro = sleep_coros.get(i) !? null
-        if !isset(coro) {
-            sleep_coros.remove(i)
-            continue
-        }
-        if coro.done || coro.sleep_deadline_ms <= now {
-            sleep_coros.remove(i)
-            if !coro.done : run_coros.append(coro)
-            continue
-        }
-        i++
-    }
-}
-
-fn win_sleep_timeout() u32 {
-    if sleep_coros.length == 0 : return ext.INFINITE
-    let now = ext.GetTickCount64()
-    let nearest: u64 = 0
-    each sleep_coros as coro {
-        if coro.done : continue
-        if coro.sleep_deadline_ms <= now : return 0
-        if nearest == 0 || coro.sleep_deadline_ms < nearest : nearest = coro.sleep_deadline_ms
-    }
-    if nearest == 0 : return ext.INFINITE
-    let delay = nearest - now
-    if delay > 0xffffffff : return 0xffffffff
-    return delay.to(u32)
-}
-
-fn win_io_timeout() u32 {
-    if io_timeout_coros.length == 0 : return ext.INFINITE
-    let now = ext.GetTickCount64()
-    let nearest: u64 = 0
-    each io_timeout_coros as coro {
-        let deadline = coro.io_deadline_ms
-        if deadline == 0 : continue
-        if deadline <= now : return 0
-        if nearest == 0 || deadline < nearest : nearest = deadline
-    }
-    if nearest == 0 : return ext.INFINITE
-    let delay = nearest - now
-    if delay > 0xffffffff : return 0xffffffff
-    return delay.to(u32)
-}
-
-fn win_next_timeout() u32 {
-    let sleep_timeout = win_sleep_timeout()
-    let io_timeout = win_io_timeout()
-    return sleep_timeout < io_timeout ? sleep_timeout : io_timeout
-}
-
-fn win_cancel_io_timeouts() {
-    let now = ext.GetTickCount64()
-    let i: uint = 0
-    while i < io_timeout_coros.length {
-        let coro = io_timeout_coros.get(i) !? null
-        if !isset(coro) || coro.done || coro.io_deadline_ms == 0 {
-            io_timeout_coros.remove(i)
-            continue
-        }
-        if coro.io_deadline_ms > now {
-            i++
-            continue
-        }
-        io_timeout_coros.remove(i)
-        coro.io_deadline_ms = 0
-        coro.io_timed_out = true
-        let overlap = coro.io_timeout_overlap
-        if isset(overlap) && ext.CancelIoEx(coro.io_timeout_fd, overlap) == 0 && ext.GetLastError() != ext.ERROR_NOT_FOUND {
-            panic("Failed to cancel timed out I/O")
-        }
-    }
-}
 #end

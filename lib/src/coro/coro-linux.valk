@@ -1,0 +1,92 @@
+// Linux coroutine backend: io_uring.
+
+#if OS == "linux"
+
+use ext
+use io
+use gc
+use coro
+
+extend Coro {
+    timeout_ts: io.kernel_timespec (@undefined)
+
+    fn sleep(ns: uint) {
+        let sqe = io.sqe(this) ! panic("Failed to schedule coroutine sleep")
+        let nsec = ns.to(int)
+        this.timeout_ts = {
+            tv_sec: nsec / 1_000_000_000
+            tv_nsec: (nsec % 1_000_000_000)
+        }
+        io.io_uring_prep_timeout(sqe, &this.timeout_ts, 0, 0)
+        this.yield()
+    }
+
+    // Drain io_uring completions, blocking when no coroutines are runnable.
+    static fn wait_for_events() {
+        let ring = io.uring()
+        if io.uring_unsubmitted > 0 : io.uring_submit(ring)
+        while true {
+            let cqe: ?*ext.io_uring_cqe = null
+            if run_coros.length == 0 {
+                gc.unlock()
+                io.io_uring_wait_cqe(ring, &cqe)
+                gc.lock()
+            } else {
+                io.io_uring_peek_cqe(ring, &cqe)
+            }
+            if !isset(cqe) {
+                break
+            }
+            //
+            let user_data = cqe.user_data
+            let timeout_tag = user_data & 3
+            let coro = take_kernel_event(user_data.to(uint))
+            if !isset(coro) {
+                io.io_uring_cqe_seen(ring, cqe)
+                continue
+            }
+            // Read `done` before disarming: the last event may release the
+            // global root, and no field is touched after that.
+            let done = coro.done
+            coro.disarm_kernel_event()
+            if done {
+                io.io_uring_cqe_seen(ring, cqe)
+                continue
+            }
+            if timeout_tag == 1 {
+                // Linked timeout completion. ETIME: the timeout fired and
+                // the linked operation was cancelled by the kernel, so its
+                // completion is stale now — resolve both arms (this bumps
+                // the generation and invalidates the counterpart) and wake
+                // with a timeout. ECANCELED: the operation completed first
+                // and cancelled this timeout; the operation's completion
+                // wakes the coroutine, nothing to do here.
+                if cqe.res == 0 - ext.ETIME {
+                    coro.disarm_kernel_event()
+                    coro.poll_event = io.POLL_TIMEOUT
+                    coro.completion_res = 0 - ext.ETIMEDOUT
+                    run_coros.append(coro)
+                }
+            } else if timeout_tag == 2 && cqe.res == 0 - ext.ECANCELED {
+                // The operation was cancelled because the linked timeout
+                // fired — the timeout completion is stale now. Resolve both
+                // arms and wake with a timeout.
+                coro.disarm_kernel_event()
+                coro.poll_event = io.POLL_TIMEOUT
+                coro.completion_res = 0 - ext.ETIMEDOUT
+                run_coros.append(coro)
+            } else {
+                // The operation completed; the linked timeout (if any) was
+                // cancelled by the kernel and its completion is stale after
+                // the disarm below.
+                if timeout_tag == 2 : coro.disarm_kernel_event()
+                coro.poll_event = cqe.res.@cast(io.PollEvent)
+                coro.completion_res = cqe.res
+                run_coros.append(coro)
+            }
+            io.io_uring_cqe_seen(ring, cqe)
+        }
+    }
+}
+
+#end
