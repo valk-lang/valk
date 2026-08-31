@@ -3,6 +3,93 @@ use ext
 use gc
 use mem
 
+#if OS != "win"
+struct ProcessReaperEntry {
+    pid: i32
+    next: ?*ProcessReaperEntry
+}
+
+struct ProcessReaper {
+    mutex: ext.pthread_mutex_t
+    head: ?*ProcessReaperEntry
+    started: bool
+
+    static fn new() SELF $default {
+        let reaper = SELF {}
+        if ext.pthread_mutex_init(@ref(reaper.mutex), null) != 0 {
+            panic("Failed to initialize process reaper mutex")
+        }
+        return reaper
+    }
+}
+
+shared process_reaper: ProcessReaper (.new())
+
+fn process_reaper_entry(_: ?ptr) void $entrance {
+    while true {
+        if ext.pthread_mutex_lock(@ref(process_reaper.mutex)) != 0 {
+            return
+        }
+        let entry = process_reaper.head
+        let previous: ?*ProcessReaperEntry = null
+        while isset(entry) {
+            let next = entry.next
+            let status: i32 = 0
+            let result = ext.waitpid(entry.pid, @ref(status), ext.WNOHANG)
+            if result == entry.pid || (result < 0 && ext.get_errno() == ext.ECHILD) {
+                if isset(previous) : previous.next = next
+                else : process_reaper.head = next
+                mem.free(entry)
+            } else {
+                previous = entry
+            }
+            entry = next
+        }
+        if !isset(process_reaper.head) {
+            process_reaper.started = false
+            ext.pthread_mutex_unlock(@ref(process_reaper.mutex))
+            return
+        }
+        if ext.pthread_mutex_unlock(@ref(process_reaper.mutex)) != 0 {
+            return
+        }
+        let delay: ext.libc_timespec = {
+            tv_sec: 0
+            tv_nsec: 100_000_000
+        }
+        ext.nanosleep(@ref(delay), @ref(delay))
+    }
+}
+
+fn process_reaper_add(pid: i32) bool {
+    let entry = mem.new[ProcessReaperEntry](.{ pid: pid })
+    if ext.pthread_mutex_lock(@ref(process_reaper.mutex)) != 0 {
+        mem.free(entry)
+        return false
+    }
+    entry.next = process_reaper.head
+    process_reaper.head = entry
+    if !process_reaper.started {
+        let thread: ext.pthread_t = .{}
+        let error = ext.pthread_create(@ref(thread), null, process_reaper_entry.@cast(ptr), null)
+        if error != 0 {
+            process_reaper.head = entry.next
+            ext.pthread_mutex_unlock(@ref(process_reaper.mutex))
+            mem.free(entry)
+            return false
+        }
+        process_reaper.started = true
+        if ext.pthread_detach(thread.data) != 0 {
+            panic("Failed to detach process reaper thread")
+        }
+    }
+    if ext.pthread_mutex_unlock(@ref(process_reaper.mutex)) != 0 {
+        panic("Failed to unlock process reaper mutex")
+    }
+    return true
+}
+#end
+
 fn windows_quote_process_arg(arg: String) String {
     let initial_size = arg.bytes.checked_add(2) ! panic("Process argument is too large")
     let out = ByteBuffer.new(initial_size)
@@ -169,6 +256,7 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     #end
     - exited: bool (false)
     - stopped: bool (false)
+    - detached: bool (false)
     - status: ?i32 (null)
 
     + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) SELF !ExternError {
@@ -210,6 +298,7 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     #end
 
     + fn did_exit() bool !ExternError {
+        if this.detached : throw .extern
         if this.exited : return true
 
         #if OS == "win"
@@ -236,6 +325,7 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     }
 
     + fn exit_code() i32 !ExternError {
+        if this.detached : throw .extern
         if !this.exited {
             #if OS == "win"
             let res = ext.WaitForSingleObject(this.pid, ext.INFINITE)
@@ -259,6 +349,7 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     }
 
     + fn stop() !ExternError {
+        if this.detached : throw .extern
         if this.stopped : return
         if this.did_exit() !> {
             this.stopped = true
@@ -275,10 +366,50 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
         this.exit_code() !? 0
     }
 
+    + fn detach() !ExternError {
+        if this.detached || this.exited : return
+        #if OS == "win"
+        if ext.CloseHandle(this.pid) == 0 : throw .extern
+        #else
+        if !process_reaper_add(this.pid) : throw .extern
+        #end
+        this.detached = true
+    }
+
+    #if TEST && OS != "win"
+    + fn pid_for_test() i32 {
+        return this.pid
+    }
+
+    + static fn child_is_pending_reap_for_test(pid: i32) bool {
+        if ext.pthread_mutex_lock(@ref(process_reaper.mutex)) != 0 : return false
+        let entry = process_reaper.head
+        while isset(entry) {
+            if entry.pid == pid {
+                ext.pthread_mutex_unlock(@ref(process_reaper.mutex))
+                return true
+            }
+            entry = entry.next
+        }
+        ext.pthread_mutex_unlock(@ref(process_reaper.mutex))
+        return false
+    }
+
+    + static fn child_is_reaped_for_test(pid: i32) bool {
+        let status: i32 = 0
+        let result = ext.waitpid(pid, @ref(status), ext.WNOHANG)
+        return result < 0 && ext.get_errno() == ext.ECHILD
+    }
+    #end
+
     fn gc_free() {
         #if OS == "win"
-        if ext.CloseHandle(this.pid) == 0 {
+        if !this.detached && ext.CloseHandle(this.pid) == 0 {
             cleanup_warning("Failed to close process handle", __FILE__, __LINE__)
+        }
+        #else
+        if !this.detached && !this.exited && !process_reaper_add(this.pid) {
+            cleanup_warning("Failed to detach abandoned process", __FILE__, __LINE__)
         }
         #end
     }
