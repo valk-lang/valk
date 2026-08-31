@@ -45,7 +45,7 @@
 * [Files](#files)
     * [Paths](#paths)
 * [JSON](#json)
-* [Datetime](#datetime)
+* [DateTime](#datetime)
 * [Coroutines](#coroutines)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
@@ -804,23 +804,23 @@ class User {
 let user = json.decode_to[User]("{\"name\":\"Alice\",\"age\":30}") ! panic("Invalid user")
 ```
 
-## Datetime
+## DateTime
 
 API for [valk.time](api.md#time)
 
-`time.Datetime` represents UTC dates from year 1 through 9999 with microsecond
+`time.DateTime` represents UTC dates from year 1 through 9999 with microsecond
 precision. Constructor components are optional and default to the current time.
 
 ```rust
 use valk.time
 
 // Init
-let now = time.Datetime.new()
-let datetime = time.Datetime.new(2026, 8, 8, 19, 7, 6, 123_456)
-let from_str = time.Datetime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
+let now = time.DateTime.new()
+let datetime = time.DateTime.new(2026, 8, 8, 19, 7, 6, 123_456)
+let from_str = time.DateTime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
 
 // Change
-let changed = datetime.add_days(1) // Returns a new Datetime
+let changed = datetime.add_days(1) // Returns a new DateTime
 datetime.modify_add_hours(2)       // Modifies the existing object
 
 // Format to string
@@ -1060,7 +1060,7 @@ use valk.net
 
 // Server
 fn server() {
-    let sock = net.Socket.server(net.SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let sock = net.Socket.server(net.SocketType.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
     let buffer = ByteBuffer.new()
     while true {
         let con = sock.accept() ! {
@@ -1089,7 +1089,7 @@ fn main() {
     // Start our server in the background
     let s = co server()
     // Open client
-    let con = net.Socket.client(net.SOCKET_TYPE.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let con = net.Socket.client(net.SocketType.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
     con.send("PING") ! panic("Client failed to send data")
     // Recv
@@ -1139,7 +1139,7 @@ class PageData {
 //
 fn main() {
     let options = template.RenderOptions {
-        sanitize: html.sanitize_filter
+        sanitize: fn(value: String) String { return html.escape(value) }
     }
     // Embed templates at compile time and register them by relative path.
     template.set_content_many(#embed_dir("views"))
