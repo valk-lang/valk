@@ -1047,6 +1047,11 @@ fn main() {
 }
 ```
 
+The server accepts HTTP/1.1 origin-form requests and `OPTIONS *`. Request
+methods and header names must be HTTP tokens, request targets must use valid
+URI characters and percent escapes, and every request must contain exactly one
+valid `Host` header.
+
 ## Sockets
 
 API for [valk.net](api.md#net)
