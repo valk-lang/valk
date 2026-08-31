@@ -11,6 +11,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn supported() bool
++ fn utf8_supported() bool
 ```
 
 # core
@@ -20,7 +21,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn cleanup_warning(msg: String, file: String, line: uint) void
 + fn clone_value(value: $T) T
-+ fn exec(cmd: String, print_output: bool (false)) (i32, String)
++ fn exec(cmd: String, print_output: bool (false), capture_stderr: bool (true)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
 + fn panic(msg: String) void
@@ -48,6 +49,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ size: uint
     ~ storage: String
 
+    + fn advance(amount: uint) void
     + fn clear() void
     + fn clear_next_bytes(amount: uint) void
     + fn clear_part(index: uint, len: uint) void
@@ -184,6 +186,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Process {
     + fn did_exit() bool !ExternError
+    + fn exit_code() i32 !ExternError
     + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !ExternError
     + fn stop() void !ExternError
 }
@@ -212,6 +215,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
     + get data_cstring: cstring
     + fn ends_with(part: String) bool
+    + fn equal_ignore_ascii_case(other: String) bool
     + fn escape() String
     + fn get(index: uint) u8
     + fn hash() uint
@@ -237,10 +241,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn pad_right(char: u8, length: uint) String
     + fn part(start_index: uint, length: uint) String
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
-    + static fn secure_random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String !ExternError
     + fn range(start: uint, end: uint, inclusive: bool (true)) String
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String
+    + static fn secure_random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String !ExternError
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
     ~ fn take_length(length: uint) String
@@ -263,6 +267,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class bool {
+}
+```
+
+```js
++ mode char for u8 {
+    + fn to_string() String
 }
 ```
 
@@ -308,11 +318,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i16) void
     + static fn random() i16
-    + static fn secure_random() i16 !ExternError
     + static fn read_big_endian(from: *[u8 x 2]) i16
     + static fn read_little_endian(from: *[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
+    + static fn secure_random() i16 !ExternError
     + fn to_base(base: i16) String
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -328,11 +338,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i32) void
     + static fn random() i32
-    + static fn secure_random() i32 !ExternError
     + static fn read_big_endian(from: *[u8 x 4]) i32
     + static fn read_little_endian(from: *[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
+    + static fn secure_random() i32 !ExternError
     + fn to_base(base: i32) String
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -348,11 +358,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i64) void
     + static fn random() i64
-    + static fn secure_random() i64 !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) i64
     + static fn read_little_endian(from: *[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
+    + static fn secure_random() i64 !ExternError
     + fn to_base(base: i64) String
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -368,11 +378,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: i8) void
     + static fn random() i8
-    + static fn secure_random() i8 !ExternError
     + static fn read_big_endian(from: *u8) i8
     + static fn read_little_endian(from: *u8) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
+    + static fn secure_random() i8 !ExternError
     + fn to_base(base: i8) String
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -388,11 +398,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: int) void
     + static fn random() int
-    + static fn secure_random() int !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) int
     + static fn read_little_endian(from: *[u8 x 8]) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
+    + static fn secure_random() int !ExternError
     + fn to_base(base: int) String
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -475,11 +485,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: u16) void
     + static fn random() u16
-    + static fn secure_random() u16 !ExternError
     + static fn read_big_endian(from: *[u8 x 2]) u16
     + static fn read_little_endian(from: *[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
+    + static fn secure_random() u16 !ExternError
     + fn to_base(base: u16) String
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -495,11 +505,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: u32) void
     + static fn random() u32
-    + static fn secure_random() u32 !ExternError
     + static fn read_big_endian(from: *[u8 x 4]) u32
     + static fn read_little_endian(from: *[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
+    + static fn secure_random() u32 !ExternError
     + fn to_base(base: u32) String
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -515,11 +525,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equals_string(str: String) bool
     + fn print(base: u64) void
     + static fn random() u64
-    + static fn secure_random() u64 !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) u64
     + static fn read_little_endian(from: *[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
+    + static fn secure_random() u64 !ExternError
     + fn to_base(base: u64) String
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -549,11 +559,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_whitespace() bool
     + fn print(base: u8) void
     + static fn random() u8
-    + static fn secure_random() u8 !ExternError
     + static fn read_big_endian(from: *u8) u8
     + static fn read_little_endian(from: *u8) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
+    + static fn secure_random() u8 !ExternError
     + fn to_ascii_string() String
     + fn to_base(base: u8) String
     + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
@@ -568,14 +578,16 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class uint {
     + fn character_length(base: uint) uint
+    + fn checked_add(other: uint) uint !LookupError
+    + fn checked_multiply(other: uint) uint !LookupError
     + fn equals_string(str: String) bool
     + fn print(base: uint) void
     + static fn random() uint
-    + static fn secure_random() uint !ExternError
     + static fn read_big_endian(from: *[u8 x 8]) uint
     + static fn read_little_endian(from: *[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
+    + static fn secure_random() uint !ExternError
     + fn to_base(base: uint) String
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -685,6 +697,13 @@ type libc_timezone (libc_gen_timezone)
 alias pid_t for i32
 ```
 
+## Functions for 'ext'
+
+```js
++ fn get_errno() i32
++ fn set_errno(value: i32) void
+```
+
 # fs
 
 ## Functions for 'fs'
@@ -692,37 +711,38 @@ alias pid_t for i32
 ```js
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
-+ fn chdir(path: String) void !io.IoError
-+ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io.IoError
-+ fn cwd() String !io.IoError
-+ fn delete(path: String) void !io.IoError
-+ fn delete_recursive(path: String) void !io.IoError
++ fn chdir(path: String) void !io:IoError
++ fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
++ fn cwd() String !io:IoError
++ fn delete(path: String) void !io:IoError
++ fn delete_recursive(path: String) void !io:IoError
 + fn dir_of(path: String) String
-+ fn exe_dir() String !io.IoError
-+ fn exe_path() String !io.IoError
++ fn exe_dir() String !io:IoError
++ fn exe_path() String !io:IoError
 + fn exists(path: String) bool
 + fn ext(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io.IoError
++ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io:IoError
 + fn home_dir() String !ExternError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
++ fn is_symlink(path: String) bool
 + fn mime(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (0c755)) void !io.IoError
-+ fn modified_time(path: String) uint !io.IoError
-+ fn move(from_path: String, to_path: String) void !io.IoError
-+ fn open(path: String, writable: bool, append_on_write: bool) i32 !io.IoError
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io.IoError
++ fn mkdir(path: String, permissions: u32 (0c755)) void !io:IoError
++ fn modified_time(path: String) uint !io:IoError
++ fn move(from_path: String, to_path: String) void !io:IoError
++ fn open(path: String, writable: bool, append_on_write: bool) i32 !io:IoError
++ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io:IoError
 + fn path(path: String) Path
-+ fn read(path: String) String !io.IoError
-+ fn realpath(path: String) String !io.IoError
-+ fn resolve(path: String) String !io.IoError
-+ fn rmdir(path: String) void !io.IoError
-+ fn size(path: String) uint !io.IoError
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io.IoError
-+ fn symlink(link: String, target: String, is_directory: bool) void !io.IoError
++ fn read(path: String) String !io:IoError
++ fn realpath(path: String) String !io:IoError
++ fn resolve(path: String) String !io:IoError
++ fn rmdir(path: String) void !io:IoError
++ fn size(path: String) uint !io:IoError
++ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io:IoError
++ fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync() void
-+ fn write(path: String, content: String, append: bool (false)) void !io.IoError
-+ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !io.IoError
++ fn write(path: String, content: String, append: bool (false)) void !io:IoError
++ fn write_from_ptr(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -733,11 +753,11 @@ alias pid_t for i32
     + read_offset: uint
     ~ reading: bool
 
-    + fn close() void !io.IoError
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io.IoError
-    + fn write(str: String) void !io.IoError
-    + fn write_buffer(buffer: ByteBuffer) void !io.IoError
-    + fn write_from_ptr(from: ptr, len: uint) void !io.IoError
+    + fn close() void !io:IoError
+    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
+    + fn write(str: String) void !io:IoError
+    + fn write_buffer(buffer: ByteBuffer) void !io:IoError
+    + fn write_from_ptr(from: ptr, len: uint) void !io:IoError
 }
 ```
 
@@ -749,10 +769,10 @@ alias pid_t for i32
     ~ size: uint
 
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !io.IoError
+    + static fn create_from_file(path: String) InMemoryFile !io:IoError
     + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
     + fn read_all() String
-    + fn save(path: String) void !io.IoError
+    + fn save(path: String) void !io:IoError
 }
 ```
 
@@ -762,17 +782,23 @@ alias pid_t for i32
     + fn dir_of() Path
     + static fn new(path: String) Path
     + fn pop() Path
-    + fn resolve() Path !io.IoError
+    + fn resolve() Path !io:IoError
 }
 ```
 
 # gc
 
+## Aliases for 'gc'
+
+```js
+type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
+```
+
 ## Functions for 'gc'
 
 ```js
 + fn alloc(size: uint) GcPtr
-~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo)()) GcPtr
+~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo, fn(ptr, *Lifo)())()) GcPtr
 + fn collect() void
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
@@ -875,9 +901,12 @@ alias pid_t for i32
 + class Context {
     ~+ body_expected: uint
     ~+ body_received: uint
+    ~+ chunk_trailers: bool
     ~+ chunked: bool
     ~+ content_length: uint
+    ~+ has_content_length: bool
     ~+ has_host: bool
+    ~+ has_transfer_encoding: bool
     ~+ method: ByteBufferRef
     ~+ parsed_index: uint
     ~+ path: ByteBufferRef
@@ -1030,8 +1059,8 @@ alias FD for i32
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH)) Value !ParseError
-+ fn decode_to[T](json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH)) T !DecodeError
++ fn decode(json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
++ fn decode_to[T](json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 + fn default_value(kind: Kind) Value
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
@@ -1164,6 +1193,7 @@ alias FD for i32
 ```js
 + fn alloc(size: uint) ptr
 + fn alloc_ob(size: uint) ptr
++ fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
 + fn bytes_to_uint(adr: ptr, len: uint) uint !SyntaxError
 + fn calloc(size: uint) ptr
@@ -1304,9 +1334,6 @@ alias FD for i32
 
 ```js
 + class Task {
-    ~ done: bool
-    ~ started: bool
-
     + fn await() void
 }
 ```
@@ -1337,10 +1364,14 @@ alias FD for i32
 ## Functions for 'time'
 
 ```js
-+ fn microtime() uint
-+ fn mstime() uint
++ fn mono_ms() uint
++ fn mono_ns() uint
++ fn mono_us() uint
 + fn sleep_ms(ms: uint) void
 + fn sleep_ns(ns: uint) void
++ fn unix_ms() uint
++ fn unix_ns() uint
++ fn unix_us() uint
 ```
 
 ## Classes for 'time'
@@ -1457,6 +1488,8 @@ alias FD for i32
     + fn try_cast(data: Value) Value
     + fn upper(val: bool (true)) Field
     + fn username(numbers: bool, underscore: bool) Field
+    + fn utf8_max(val: int) Field
+    + fn utf8_min(val: int) Field
     + fn validate(data: Value, errors: ?Map[String] (null), field_name: ?String (null)) bool
     + fn validate_and_translate(data: Value, errors: Map[String], translations: Map[String] (default_translations)) bool
 }

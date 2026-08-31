@@ -2,6 +2,7 @@
 use ext
 use gc
 use core
+use time
 
 + class ThreadSuspendGate {
     #if OS == "win"
@@ -20,7 +21,16 @@ use core
         ext.InitializeConditionVariable(@ref(sig.var))
         #else
         if ext.pthread_mutex_init(@ref(sig.mutex), null) != 0 : panic("Failed to initialize thread suspend mutex")
-        if ext.pthread_cond_init(@ref(sig.cond)) != 0 : panic("Failed to initialize thread suspend condition")
+        #if OS == "linux"
+        let attr: ext.pthread_condattr_t = {}
+        if ext.pthread_condattr_init(@ref(attr)) != 0 : panic("Failed to initialize thread suspend condition attributes")
+        if ext.pthread_condattr_setclock(@ref(attr), ext.CLOCK_MONOTONIC) != 0 : panic("Failed to set monotonic thread suspend clock")
+        let cond_error = ext.pthread_cond_init(@ref(sig.cond), @ref(attr).@cast(ptr))
+        if ext.pthread_condattr_destroy(@ref(attr)) != 0 : panic("Failed to destroy thread suspend condition attributes")
+        if cond_error != 0 : panic("Failed to initialize thread suspend condition")
+        #else
+        if ext.pthread_cond_init(@ref(sig.cond), null) != 0 : panic("Failed to initialize thread suspend condition")
+        #end
         #end
         return sig
     }
@@ -29,18 +39,27 @@ use core
         let is_timeout = false
         let generation = this.generation
         #if OS == "win"
-        if timeout_ms == 0 : timeout_ms = ext.INFINITE
+        let deadline_ms: u64 = 0
+        if timeout_ms > 0 : deadline_ms = ext.GetTickCount64() + timeout_ms
         while should_wait() {
             gc.unlock()
             ext.EnterCriticalSection(@ref(this.crit))
             if generation == this.generation {
-                let ok = ext.SleepConditionVariableCS(@ref(this.var), @ref(this.crit), timeout_ms.to(u32))
-                if ok == 0 && ext.GetLastError() == ext.ERROR_TIMEOUT && timeout_ms != ext.INFINITE {
-                    is_timeout = true
-                } else if ok == 0 {
-                    ext.LeaveCriticalSection(@ref(this.crit))
-                    gc.lock()
-                    panic("Thread suspend wait failed")
+                let wait_ms: u32 = ext.INFINITE.to(u32)
+                if timeout_ms > 0 {
+                    let now = ext.GetTickCount64()
+                    if now >= deadline_ms : is_timeout = true
+                    else : wait_ms = (deadline_ms - now).to(u32)
+                }
+                if !is_timeout {
+                    let ok = ext.SleepConditionVariableCS(@ref(this.var), @ref(this.crit), wait_ms)
+                    if ok == 0 && ext.GetLastError() == ext.ERROR_TIMEOUT && timeout_ms > 0 {
+                        is_timeout = true
+                    } else if ok == 0 {
+                        ext.LeaveCriticalSection(@ref(this.crit))
+                        gc.lock()
+                        panic("Thread suspend wait failed")
+                    }
                 }
             }
             ext.LeaveCriticalSection(@ref(this.crit))
@@ -49,15 +68,18 @@ use core
             generation = this.generation
         }
         #else
+        #if OS == "linux"
         let until: ext.libc_timespec = @undefined
         if timeout_ms > 0 {
-            let now: ext.libc_timeval = @undefined
-            if ext.gettimeofday(@ref(now), null) != 0 : panic("Failed to read system time")
-            let ns = now.tv_usec * 1000 + (timeout_ms % 1000) * 1_000_000
+            if ext.clock_gettime(ext.CLOCK_MONOTONIC, @ref(until)) != 0 : panic("Failed to read monotonic time")
+            let ns = until.tv_nsec + (timeout_ms % 1000) * 1_000_000
             let extra_s = (ns >= 1_000_000_000).to(int)
-            until.tv_sec = now.tv_sec + (timeout_ms / 1000) + extra_s
+            until.tv_sec += (timeout_ms / 1000) + extra_s
             until.tv_nsec = ns - extra_s * 1_000_000_000
         }
+        #else
+        let deadline_ns = timeout_ms > 0 ? time.mono_ns() + timeout_ms * 1_000_000 : 0
+        #end
         //
         while should_wait() {
             gc.unlock()
@@ -70,7 +92,21 @@ use core
                 if timeout_ms == 0 {
                     wait_error = ext.pthread_cond_wait(@ref(this.cond), @ref(this.mutex))
                 } else {
+                    #if OS == "linux"
                     wait_error = ext.pthread_cond_timedwait(@ref(this.cond), @ref(this.mutex), @ref(until))
+                    #else
+                    let now = time.mono_ns()
+                    if now >= deadline_ns {
+                        is_timeout = true
+                    } else {
+                        let remaining = deadline_ns - now
+                        let interval: ext.libc_timespec = {
+                            tv_sec: (remaining / 1_000_000_000).to(int)
+                            tv_nsec: (remaining % 1_000_000_000).to(int)
+                        }
+                        wait_error = ext.pthread_cond_timedwait_relative_np(@ref(this.cond), @ref(this.mutex), @ref(interval))
+                    }
+                    #end
                     if wait_error == ext.ETIMEDOUT {
                         is_timeout = true
                         wait_error = 0
