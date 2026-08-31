@@ -152,6 +152,9 @@ fi
 native_address_body=$(sed -n '/^define .*__native_address_storage__/,/^}/p' "$address_ir")
 suspending_address_body=$(sed -n '/^define .*__suspending_address_storage__/,/^}/p' "$address_ir")
 clock_time_body=$(sed -n '/^define .*__clock_ns__/,/^}/p' "$address_ir")
+if [[ -z "$clock_time_body" ]]; then
+    clock_time_body=$(sed -n '/^define .*__mono_ns__/,/^}/p' "$address_ir")
+fi
 if [[ "$native_address_body" != *"alloca"* ]] \
     || [[ "$native_address_body" == *"__Pool__get__"* ]]; then
     echo "# Proven non-suspending address storage did not use the native stack"
@@ -160,7 +163,7 @@ if [[ "$native_address_body" != *"alloca"* ]] \
 fi
 if [[ "$clock_time_body" != *"alloca"* ]] \
     || [[ "$clock_time_body" == *"__Pool__get__"* ]]; then
-    echo "# clock_ns did not keep its address-taken OS structure on the native stack"
+    echo "# OS clock helper did not keep its address-taken structure on the native stack"
     echo "$clock_time_body"
     exit 1
 fi
