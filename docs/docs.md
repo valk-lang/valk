@@ -758,11 +758,6 @@ document = document.set_bool("active", true)
 println(json.encode(document))
 ```
 
-`json.decode` and `json.decode_to` reject malformed UTF-8 in string values and
-object keys. Encoding remains infallible: valid UTF-8 is preserved, while each
-malformed input byte is emitted as the Unicode replacement escape `\ufffd`, so
-the result is always valid UTF-8 JSON.
-
 Objects use string keys and arrays use integer indexes. The same operations work for either:
 
 ```rust
