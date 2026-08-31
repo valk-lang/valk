@@ -931,6 +931,8 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + follow_redirects: bool
     + headers: ?Map[String]
     + max_redirects: uint
+    + max_response_body_size: uint
+    + max_response_header_size: uint
     + output_to_file: ?String
     + query_data: ?Map[String]
     + read_timeout_ms: uint
