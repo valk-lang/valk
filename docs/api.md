@@ -1284,6 +1284,7 @@ alias FD for i32
 
 ```js
 + class RenderOptions {
+    + max_depth: uint
     + sanitize: ?fn(String)(String)
 }
 ```
