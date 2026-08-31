@@ -3,6 +3,164 @@ use ext
 use gc
 use mem
 
+fn windows_quote_process_arg(arg: String) String {
+    let initial_size = arg.bytes.checked_add(2) ! panic("Process argument is too large")
+    let out = ByteBuffer.new(initial_size)
+    out.write_byte('"')
+    let slashes: uint = 0
+    each arg as ch {
+        if ch == '\\' {
+            slashes++
+            continue
+        }
+        if ch == '"' {
+            let escaped = slashes.checked_multiply(2) ! panic("Process argument is too large")
+            out.fill('\\', escaped.checked_add(1) ! panic("Process argument is too large"))
+            out.write_byte('"')
+            slashes = 0
+            continue
+        }
+        out.fill('\\', slashes)
+        slashes = 0
+        out.write_byte(ch)
+    }
+    out.fill('\\', slashes.checked_multiply(2) ! panic("Process argument is too large"))
+    out.write_byte('"')
+    return out.into_string()
+}
+
+#if OS == "win"
+fn process_utf16(value: String) Array[u16] !ExternError {
+    if value.bytes > 2147483647 : throw .extern
+    let input_length = value.bytes.to(i32)
+    let wide_length = ext.MultiByteToWideChar(65001, ext.MB_ERR_INVALID_CHARS,
+        value.data, input_length, null, 0)
+    if wide_length <= 0 && value.bytes > 0 : throw .extern
+
+    let result = Array[u16].new(wide_length.to(uint).checked_add(1) ! throw .extern)
+    result.set_expand(wide_length.to(uint), 0, 0)
+    if wide_length > 0 && ext.MultiByteToWideChar(65001, ext.MB_ERR_INVALID_CHARS,
+        value.data, input_length, result.data.@cast(ptr), wide_length) != wide_length : throw .extern
+    return result
+}
+
+fn process_windows_command_line(exe: String, args: ?Array[String]) String {
+    let out = ByteBuffer.new()
+    out.write_string(windows_quote_process_arg(exe))
+    if isset(args) {
+        each args as arg {
+            out.write_byte(' ')
+            out.write_string(windows_quote_process_arg(arg))
+        }
+    }
+    return out.into_string()
+}
+
+fn process_close_windows_handle(handle: ext.HANDLE) {
+    if handle != 0 && handle != ext.INVALID_HANDLE_VALUE && ext.CloseHandle(handle) == 0 {
+        cleanup_warning("Failed to close inherited process handle", __FILE__, __LINE__)
+    }
+}
+
+fn process_inheritable_standard_handle(kind: u32, fallback_access: u32) ext.HANDLE !ExternError {
+    let source = ext.GetStdHandle(kind)
+    if source != 0 && source != ext.INVALID_HANDLE_VALUE {
+        let duplicate: ext.HANDLE = 0
+        let process = ext.GetCurrentProcess()
+        if ext.DuplicateHandle(process, source, process, @ref(duplicate), 0, 1, ext.DUPLICATE_SAME_ACCESS) != 0 {
+            return duplicate
+        }
+    }
+
+    let nul = process_utf16("NUL") !>
+    let attributes = ext.SECURITY_ATTRIBUTES {
+        nLength: size_of(ext.SECURITY_ATTRIBUTES).to(u32)
+        bInheritHandle: 1
+    }
+    let handle = ext.CreateFileW(nul.data.@cast(ptr), fallback_access,
+        ext.FILE_SHARE_READ | ext.FILE_SHARE_WRITE, @ref(attributes), ext.OPEN_EXISTING,
+        ext.FILE_ATTRIBUTE_NORMAL, 0)
+    if handle == ext.INVALID_HANDLE_VALUE : throw .extern
+    return handle
+}
+
+fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ext.HANDLE !ExternError {
+    if exe.bytes == 0 : throw .extern
+    let application = process_utf16(exe) !>
+    let command = process_utf16(process_windows_command_line(exe, args)) !>
+    let pi = ext.PROCESS_INFORMATION {}
+    let created: ext.BOOL = 0
+
+    if print_output {
+        let stdin_handle = process_inheritable_standard_handle(0xfffffff6, ext.GENERIC_READ) !>
+        let stdout_handle = process_inheritable_standard_handle(0xfffffff5, ext.GENERIC_WRITE) ! {
+            process_close_windows_handle(stdin_handle)
+            throw E
+        }
+        let stderr_handle = process_inheritable_standard_handle(0xfffffff4, ext.GENERIC_WRITE) ! {
+            process_close_windows_handle(stdin_handle)
+            process_close_windows_handle(stdout_handle)
+            throw E
+        }
+
+        let attribute_size: uint = 0
+        ext.InitializeProcThreadAttributeList(null, 1, 0, @ref(attribute_size))
+        if attribute_size == 0 {
+            process_close_windows_handle(stdin_handle)
+            process_close_windows_handle(stdout_handle)
+            process_close_windows_handle(stderr_handle)
+            throw .extern
+        }
+        let attributes = mem.alloc(attribute_size)
+        if ext.InitializeProcThreadAttributeList(attributes, 1, 0, @ref(attribute_size)) == 0 {
+            mem.free(attributes)
+            process_close_windows_handle(stdin_handle)
+            process_close_windows_handle(stdout_handle)
+            process_close_windows_handle(stderr_handle)
+            throw .extern
+        }
+
+        let handles: [ext.HANDLE x 3] = { stdin_handle, stdout_handle, stderr_handle }
+        if ext.UpdateProcThreadAttribute(attributes, 0, 0x00020002, @ref(handles),
+            size_of([ext.HANDLE x 3]), null, null) == 0 {
+            ext.DeleteProcThreadAttributeList(attributes)
+            mem.free(attributes)
+            process_close_windows_handle(stdin_handle)
+            process_close_windows_handle(stdout_handle)
+            process_close_windows_handle(stderr_handle)
+            throw .extern
+        }
+
+        let si = ext.STARTUPINFOEXW {}
+        si.StartupInfo.cb = size_of(ext.STARTUPINFOEXW).to(u32)
+        si.StartupInfo.dwFlags = ext.STARTF_USESTDHANDLES
+        si.StartupInfo.hStdInput = stdin_handle
+        si.StartupInfo.hStdOutput = stdout_handle
+        si.StartupInfo.hStdError = stderr_handle
+        si.lpAttributeList = attributes
+        created = ext.CreateProcessW(application.data.@cast(ptr), command.data.@cast(ptr), null, null, 1,
+            ext.EXTENDED_STARTUPINFO_PRESENT, null, null, @ref(si.StartupInfo), @ref(pi))
+
+        ext.DeleteProcThreadAttributeList(attributes)
+        mem.free(attributes)
+        process_close_windows_handle(stdin_handle)
+        process_close_windows_handle(stdout_handle)
+        process_close_windows_handle(stderr_handle)
+    } else {
+        let si = ext.STARTUPINFOW {}
+        si.cb = size_of(ext.STARTUPINFOW).to(u32)
+        created = ext.CreateProcessW(application.data.@cast(ptr), command.data.@cast(ptr), null, null, 0,
+            ext.CREATE_NO_WINDOW, null, null, @ref(si), @ref(pi))
+    }
+
+    if created == 0 : throw .extern
+    if ext.CloseHandle(pi.hThread) == 0 {
+        cleanup_warning("Failed to close process thread handle", __FILE__, __LINE__)
+    }
+    return pi.hProcess
+}
+#end
+
 + class Process {
     #if OS == "win"
     - pid: ext.HANDLE
@@ -15,18 +173,7 @@ use mem
 
     + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) SELF !ExternError {
         #if OS == "win"
-        let cmd = exe + (isset(args) ? " " + args.join(" ") : "")
-        // if !print_output : cmd += " 2>&1"
-        let si: ext.STARTUPINFOA = @undefined
-        let pi: ext.PROCESS_INFORMATION = @undefined
-        if ext.CreateProcessA(null, cmd.data, null, null, print_output ? 1 : 0, 0, null, null, @ref(si), @ref(pi)) == 0 {
-            throw .extern
-        }
-
-        if ext.CloseHandle(pi.hThread) == 0 {
-            cleanup_warning("Failed to close process thread handle", __FILE__, __LINE__)
-        }
-        let pid = pi.hProcess // Process handle
+        let pid = process_run_windows(exe, args, print_output) !>
 
         #else
         let argv_strings = Array[String]{ exe }
@@ -55,6 +202,12 @@ use mem
             pid: pid
         }
     }
+
+    #if TEST
+    + static fn quote_windows_arg_for_test(arg: String) String {
+        return windows_quote_process_arg(arg)
+    }
+    #end
 
     + fn did_exit() bool !ExternError {
         if this.exited : return true
