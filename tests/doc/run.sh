@@ -82,6 +82,7 @@ fi
 echo "> Keep basic documentation examples current"
 
 guide=$(<"$repo/docs/docs.md")
+readme=$(<"$repo/README.md")
 if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" != *'path = path.resolve() ! panic("Failed to resolve path")'* ]] \
     || [[ "$guide" != *'con.send_string("PING")'* ]] \
@@ -92,6 +93,11 @@ if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" == *'Install a package globally'* ]] \
     || [[ "$guide" == *'configured sanitizer'* ]]; then
     echo "# Basic documentation contains stale API examples"
+    exit 1
+fi
+if [[ "$readme" != *'curl -sSL https://valk-lang.dev/install.sh | bash'* ]] \
+    || [[ "$readme" == *'curl -s https://valk-lang.dev/install.sh | bash'* ]]; then
+    echo "# README contains a stale installation command"
     exit 1
 fi
 

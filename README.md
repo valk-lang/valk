@@ -20,7 +20,7 @@ Extensions: [vscode](https://marketplace.visualstudio.com/items?itemName=valk-la
 Linux / MacOS / WSL
 
 ```
-curl -s https://valk-lang.dev/install.sh | bash
+curl -sSL https://valk-lang.dev/install.sh | bash
 ```
 
 Windows (powershell)
@@ -48,7 +48,7 @@ valk build main.valk -o ./main
 
 ## Build from source (Linux / macOS / WSL)
 
-valk/vman: `curl -s https://valk-lang.dev/install.sh | bash`
+valk/vman: `curl -sSL https://valk-lang.dev/install.sh | bash`
 
 The compiler embeds LLVM 22 and uses it to generate object files.
 
