@@ -106,6 +106,17 @@ if [ "$unsafe_dependency_status" -ne 0 ] || [[ "$unsafe_dependency_out" == *"Unn
 fi
 
 count=$((count + 1))
+echo "> generic unsafe use does not warn"
+unsafe_generic_out=$("$VALK" build "$DIR/unsafe-generic-warning.valk" -o "$workdir/unsafe-generic-warning" 2>&1)
+unsafe_generic_status=$?
+if [ "$unsafe_generic_status" -ne 0 ] || [[ "$unsafe_generic_out" == *"Unnecessary '@unsafe'"* ]]; then
+    echo "# Generic unsafe use emitted an unnecessary warning"
+    echo "- Exit code: $unsafe_generic_status"
+    echo "$unsafe_generic_out"
+    failed=1
+fi
+
+count=$((count + 1))
 echo "> failed assertion location"
 assert_bin="$workdir/assert-test$EXE_SUFFIX"
 assert_build=$("$VALK" build "$DIR/assert.valk" --test --no-warn -o "$assert_bin" 2>&1)

@@ -98,6 +98,11 @@ if [[ "$help_out" != *"--ignore-unsafe"* ]]; then
     echo "$help_out"
     exit 1
 fi
+if [[ "$help_out" != *"--lint"* ]]; then
+    echo "# Build help does not list --lint"
+    echo "$help_out"
+    exit 1
+fi
 
 validate_out=$("$VALK" build "$input" --no-warn -v -c 2>&1) || {
     echo "$validate_out"
@@ -109,10 +114,46 @@ if [[ "$validate_out" == *"Cache directory:"* ]]; then
     exit 1
 fi
 
+lint_input="$DIR/lint-no-main.valk"
+lint_out=$("$VALK" build "$lint_input" --lint -v 2>&1) || {
+    echo "# --lint did not accept a source without main"
+    echo "$lint_out"
+    exit 1
+}
+if [[ "$lint_out" != *"Unnecessary '@unsafe'"* ]] || [[ "$lint_out" != *"Lint passed"* ]]; then
+    echo "# --lint did not report lint warnings and success"
+    echo "$lint_out"
+    exit 1
+fi
+if [[ "$lint_out" == *"Cache directory:"* ]] || [[ "$lint_out" == *"Compiled in"* ]]; then
+    echo "# --lint generated build output"
+    echo "$lint_out"
+    exit 1
+fi
+
+lint_package_out=$("$VALK" build "$DIR/lint-package" --lint 2>&1) || {
+    echo "# --lint did not accept a package without main"
+    echo "$lint_package_out"
+    exit 1
+}
+if [[ "$lint_package_out" != *"lint-package/src/hidden/check.valk"* ]] || [[ "$lint_package_out" != *"Unnecessary '@unsafe'"* ]]; then
+    echo "# --lint did not check every package namespace"
+    echo "$lint_package_out"
+    exit 1
+fi
+
+lint_output_out=$("$VALK" build "$lint_input" --lint -o "$output" 2>&1)
+status=$?
+if [ "$status" -eq 0 ] || [[ "$lint_output_out" != *"'--lint' cannot produce, run, or watch an output"* ]]; then
+    echo "# --lint accepted an output path"
+    echo "$lint_output_out"
+    exit 1
+fi
+
 def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o "$output" 2>&1) || {
     echo "$def_out"
     exit 1
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 11"
+echo "# Test count: 15"

@@ -1247,6 +1247,13 @@ fn main() {
 valk build ./src -o ./myprogram
 ```
 
+Use `--lint` to check every source in a package without requiring `main` or
+producing an executable:
+
+```sh
+valk build ./src --lint
+```
+
 ## Unsafe
 
 Although Valk aims to be safe, it still supports low-level operations when needed. Unsafe features include:
