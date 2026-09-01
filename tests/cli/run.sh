@@ -150,10 +150,23 @@ if [ "$status" -eq 0 ] || [[ "$lint_output_out" != *"'--lint' cannot produce, ru
     exit 1
 fi
 
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    lint_target_out=$("$VALK" build "$lint_input" --lint --target "$target" 2>&1) || {
+        echo "# --lint failed for $target"
+        echo "$lint_target_out"
+        exit 1
+    }
+    if [[ "$lint_target_out" != *"Unnecessary '@unsafe'"* ]] || [[ "$lint_target_out" != *"Lint passed"* ]]; then
+        echo "# --lint did not analyze $target"
+        echo "$lint_target_out"
+        exit 1
+    fi
+done
+
 def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o "$output" 2>&1) || {
     echo "$def_out"
     exit 1
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 15"
+echo "# Test count: 16"
