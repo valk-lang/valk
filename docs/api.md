@@ -772,6 +772,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 alias DIR for ptr
 alias FILE for ptr
 type libc_addrinfo (libc_gen_addrinfo)
+alias libc_addrinfo_fix for libc_gen_addrinfo
 type libc_dirent (libc_gen_dirent)
 type libc_epoll_event (libc_gen_epoll_event)
 type libc_jmp_buf (libc_gen___jmp_buf_tag)
@@ -789,6 +790,211 @@ alias pid_t for i32
 ```js
 + fn get_errno() i32
 + fn set_errno(value: i32) void
+```
+
+## Classes for 'ext'
+
+```js
++ struct io_uring {
+    + cq: io_uring_cq
+    + features: u32
+    + flags: u32
+    + pad: [u32 x 3]
+    + ring_fd: i32
+    + sq: io_uring_sq
+}
+```
+
+```js
++ struct io_uring_cq {
+    + cqes: *io_uring_cqe
+    + kflags: *u32
+    + khead: *u32
+    + koverflow: *u32
+    + kring_entries: *u32
+    + kring_mask: *u32
+    + ktail: *u32
+    + pad: [u32 x 4]
+    + ring_ptr: ptr
+    + ring_sz: uint
+}
+```
+
+```js
++ struct io_uring_cqe {
+    + flags: u32
+    + res: i32
+    + user_data: u64
+}
+```
+
+```js
++ struct io_uring_sq {
+    + array: *u32
+    + kdropped: *u32
+    + kflags: *u32
+    + khead: *u32
+    + kring_entries: *u32
+    + kring_mask: *u32
+    + ktail: *u32
+    + pad: [u32 x 4]
+    + ring_ptr: ptr
+    + ring_sz: uint
+    + sqe_head: u32
+    + sqe_tail: u32
+    + sqes: *io_uring_sqe
+}
+```
+
+```js
++ struct io_uring_sqe {
+    + addr: u64
+    + buf_index: u16
+    + fd: i32
+    + file_index: u32
+    + flags: u8
+    + ioprio: u16
+    + len: u32
+    + off: u64
+    + opcode: u8
+    + pad2: [u64 x 2]
+    + personality: u16
+    + rw_flags: u32
+    + user_data: u64
+}
+```
+
+```js
++ struct libc_gen___jmp_buf_tag {
+    + __jmpbuf: [int x 8]
+    + __mask_was_saved: i32
+    + __saved_mask: libc_gen_anon_struct_2
+}
+```
+
+```js
++ struct libc_gen_addrinfo {
+    + ai_addr: *libc_gen_sockaddr
+    + ai_addrlen: u32
+    + ai_canonname: cstring
+    + ai_family: i32
+    + ai_flags: i32
+    + ai_next: *libc_gen_addrinfo
+    + ai_protocol: i32
+    + ai_socktype: i32
+}
+```
+
+```js
++ struct libc_gen_anon_struct_2 {
+    + __val: [uint x 16]
+}
+```
+
+```js
++ struct libc_gen_dirent {
+    + d_ino: uint
+    + d_name: [i8 x 256]
+    + d_off: int
+    + d_reclen: u16
+    + d_type: u8
+}
+```
+
+```js
++ struct libc_gen_epoll_data {
+    + fd: i32
+    + ptr: ptr
+    + u32: u32
+    + u64: uint
+}
+```
+
+```js
++ struct libc_gen_epoll_event {
+    + data: libc_gen_epoll_data
+    + events: u32
+}
+```
+
+```js
++ struct libc_gen_pollfd {
+    + events: i16
+    + fd: i32
+    + revents: i16
+}
+```
+
+```js
++ struct libc_gen_sockaddr {
+    + sa_data: [i8 x 14]
+    + sa_family: u16
+}
+```
+
+```js
++ struct libc_gen_stat {
+    + __glibc_reserved: [int x 3]
+    + __pad0: i32
+    + st_atim: libc_gen_timespec
+    + st_blksize: int
+    + st_blocks: int
+    + st_ctim: libc_gen_timespec
+    + st_dev: uint
+    + st_gid: u32
+    + st_ino: uint
+    + st_mode: u32
+    + st_mtim: libc_gen_timespec
+    + st_nlink: uint
+    + st_rdev: uint
+    + st_size: int
+    + st_uid: u32
+}
+```
+
+```js
++ struct libc_gen_timespec {
+    + tv_nsec: int
+    + tv_sec: int
+}
+```
+
+```js
++ struct libc_gen_timeval {
+    + tv_sec: int
+    + tv_usec: int
+}
+```
+
+```js
++ struct libc_gen_timezone {
+    + tz_dsttime: i32
+    + tz_minuteswest: i32
+}
+```
+
+```js
++ struct pthread_cond_t {
+    + data: [uint x 12]
+}
+```
+
+```js
++ struct pthread_condattr_t {
+    + data: i32
+}
+```
+
+```js
++ struct pthread_mutex_t {
+    + data: [uint x 10]
+}
+```
+
+```js
++ struct pthread_t {
+    + data: uint
+}
 ```
 
 # fs
