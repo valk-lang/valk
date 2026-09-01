@@ -163,10 +163,24 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     fi
 done
 
+conditional_unsafe_input="$DIR/lint-conditional-unsafe.valk"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    conditional_unsafe_out=$("$VALK" build "$conditional_unsafe_input" --lint --target "$target" 2>&1) || {
+        echo "# --lint failed for a target-specific unsafe scope on $target"
+        echo "$conditional_unsafe_out"
+        exit 1
+    }
+    if [[ "$conditional_unsafe_out" == *"Unnecessary '@unsafe'"* ]] || [[ "$conditional_unsafe_out" != *"Lint passed"* ]]; then
+        echo "# --lint mishandled a target-specific unsafe scope on $target"
+        echo "$conditional_unsafe_out"
+        exit 1
+    fi
+done
+
 def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o "$output" 2>&1) || {
     echo "$def_out"
     exit 1
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 16"
+echo "# Test count: 17"
