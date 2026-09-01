@@ -95,6 +95,13 @@ unsafe_call_out=$("$VALK" build "$unsafe_call_input" --ignore-unsafe --no-warn -
     exit 1
 }
 
+inferred_unsafe_input="$DIR/../compile-errors/ce-unsafe-inferred-call-without-directive.valk"
+inferred_unsafe_out=$("$VALK" build "$inferred_unsafe_input" --ignore-unsafe --no-warn -c -o "$output" 2>&1) || {
+    echo "# --ignore-unsafe did not allow an inferred unsafe function call"
+    echo "$inferred_unsafe_out"
+    exit 1
+}
+
 help_out=$("$VALK" build --help 2>&1) || {
     echo "# Build help failed"
     echo "$help_out"
@@ -122,4 +129,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 12"
+echo "# Test count: 13"

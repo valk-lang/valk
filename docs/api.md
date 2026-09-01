@@ -125,7 +125,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_buffer(buf: ByteBuffer, offset: uint (0)) void
     + fn write_buffer_part(buf: ByteBuffer, len: uint, offset: uint (0)) void
     + fn write_byte(v: u8) void
-    + fn write_bytes(data: ptr, length: uint) void $unsafe
+    + fn write_bytes(data: ptr, length: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
     + fn write_f64(v: f64) void
     + fn write_f64_ascii(v: f64, decimals: uint (2), trim_zeros: bool (false)) void
@@ -307,7 +307,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn clone() String
     + fn contains(part: String, start_index: uint (0)) bool
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
-    + static fn copy_from_ptr(data: ptr, length: uint) String $unsafe
+    + static fn copy_from_ptr(data: ptr, length: uint) String
     + get data_cstring: cstring
     + fn ends_with(part: String) bool
     + fn equal_ignore_ascii_case(other: String) bool
@@ -373,7 +373,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class cstring {
-    + fn get(index: uint) u8
+    + fn get(index: uint) u8 $unsafe
     + fn index_of(find: u8) uint !LookupError
     + fn length() uint
     + fn to_string() String
@@ -509,7 +509,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class ptr {
-    + fn clear_bytes(amount: uint) void $unsafe
+    + fn clear_bytes(amount: uint) void
     + fn create_string(length: uint) String
     + fn determine_float_length(max_bytes: uint) uint $unsafe
     + fn determine_hex_int_length(max_bytes: uint) uint $unsafe
@@ -518,59 +518,59 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn determine_octal_int_length(max_bytes: uint) uint $unsafe
     + fn determine_octal_uint_length(max_bytes: uint) uint $unsafe
     + fn determine_uint_length(max_bytes: uint) uint $unsafe
-    + fn equals(data: ptr, len: uint) bool $unsafe
-    + fn equals_string(str: String) bool $unsafe
+    + fn equals(data: ptr, len: uint) bool
+    + fn equals_string(str: String) bool
     + fn fill_bytes(byte: u8, amount: uint) void $unsafe
-    + fn index_of_byte(byte: u8, memory_size: uint) uint !LookupError
-    + fn index_of_byte_inf(byte: u8) uint
-    + fn print_bytes(length: uint, end_with_newline: bool (true)) void
-    + fn read_big_endian(bytes: uint) uint $unsafe
+    + fn index_of_byte(byte: u8, memory_size: uint) uint !LookupError $unsafe
+    + fn index_of_byte_inf(byte: u8) uint $unsafe
+    + fn print_bytes(length: uint, end_with_newline: bool (true)) void $unsafe
+    + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8 $unsafe
-    + fn read_cstring(memory_size: uint) String $unsafe
-    + fn read_cstring_inf() String $unsafe
+    + fn read_cstring(memory_size: uint) String
+    + fn read_cstring_inf() String
     + fn read_float(len: uint) float !SyntaxError $unsafe
-    + fn read_float_dynamic(max_bytes: uint) (float, uint) $unsafe
+    + fn read_float_dynamic(max_bytes: uint) (float, uint)
     + fn read_hex_int(len: uint) int !SyntaxError $unsafe
-    + fn read_hex_int_dynamic(max_bytes: uint) (int, uint) $unsafe
+    + fn read_hex_int_dynamic(max_bytes: uint) (int, uint)
     + fn read_hex_uint(len: uint) uint !SyntaxError $unsafe
-    + fn read_hex_uint_dynamic(max_bytes: uint) (uint, uint) $unsafe
+    + fn read_hex_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_int(len: uint) int !SyntaxError $unsafe
-    + fn read_int_dynamic(max_bytes: uint) (int, uint) $unsafe
-    + fn read_little_endian(bytes: uint) uint $unsafe
+    + fn read_int_dynamic(max_bytes: uint) (int, uint)
+    + fn read_little_endian(bytes: uint) uint
     + fn read_octal_int(len: uint) int !SyntaxError $unsafe
-    + fn read_octal_int_dynamic(max_bytes: uint) (int, uint) $unsafe
+    + fn read_octal_int_dynamic(max_bytes: uint) (int, uint)
     + fn read_octal_uint(len: uint) uint !SyntaxError $unsafe
-    + fn read_octal_uint_dynamic(max_bytes: uint) (uint, uint) $unsafe
-    + fn read_string(len: uint) String $unsafe
-    + fn read_u16_be() u16 $unsafe
-    + fn read_u16_le() u16 $unsafe
-    + fn read_u32_be() u32 $unsafe
-    + fn read_u32_le() u32 $unsafe
-    + fn read_u64_be() u64 $unsafe
-    + fn read_u64_le() u64 $unsafe
+    + fn read_octal_uint_dynamic(max_bytes: uint) (uint, uint)
+    + fn read_string(len: uint) String
+    + fn read_u16_be() u16
+    + fn read_u16_le() u16
+    + fn read_u32_be() u32
+    + fn read_u32_le() u32
+    + fn read_u64_be() u64
+    + fn read_u64_le() u64
     + fn read_uint(len: uint) uint !SyntaxError $unsafe
-    + fn read_uint_be() uint $unsafe
-    + fn read_uint_dynamic(max_bytes: uint) (uint, uint) $unsafe
-    + fn read_uint_le() uint $unsafe
+    + fn read_uint_be() uint
+    + fn read_uint_dynamic(max_bytes: uint) (uint, uint)
+    + fn read_uint_le() uint
     + fn to_hex() String
-    + fn write_big_endian(value: uint, bytes: uint) void $unsafe
-    + fn write_buffer(buf: ByteBuffer, len: uint, offset: uint (0)) void $unsafe
-    + fn write_buffer_all(buf: ByteBuffer, offset: uint (0)) void $unsafe
-    + fn write_bytes(from: ptr, len: uint) void $unsafe
-    + fn write_cstring(str: cstring, include_zero_byte: bool) void $unsafe
-    + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint $unsafe
-    + fn write_little_endian(value: uint, bytes: uint) void $unsafe
-    + fn write_string(str: String) void $unsafe
-    + fn write_u16_be(v: u16) void $unsafe
-    + fn write_u16_le(v: u16) void $unsafe
-    + fn write_u32_be(v: u32) void $unsafe
-    + fn write_u32_le(v: u32) void $unsafe
-    + fn write_u64_be(v: u64) void $unsafe
-    + fn write_u64_le(v: u64) void $unsafe
+    + fn write_big_endian(value: uint, bytes: uint) void
+    + fn write_buffer(buf: ByteBuffer, len: uint, offset: uint (0)) void
+    + fn write_buffer_all(buf: ByteBuffer, offset: uint (0)) void
+    + fn write_bytes(from: ptr, len: uint) void
+    + fn write_cstring(str: cstring, include_zero_byte: bool) void
+    + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint
+    + fn write_little_endian(value: uint, bytes: uint) void
+    + fn write_string(str: String) void
+    + fn write_u16_be(v: u16) void
+    + fn write_u16_le(v: u16) void
+    + fn write_u32_be(v: u32) void
+    + fn write_u32_le(v: u32) void
+    + fn write_u64_be(v: u64) void
+    + fn write_u64_le(v: u64) void
     + fn write_u8(v: u8) void $unsafe
-    + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) uint $unsafe
-    + fn write_uint_be(v: uint) void $unsafe
-    + fn write_uint_le(v: uint) void $unsafe
+    + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) uint
+    + fn write_uint_be(v: uint) void
+    + fn write_uint_le(v: uint) void
 }
 ```
 
@@ -815,7 +815,7 @@ alias pid_t for i32
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync() void
 + fn write(path: String, content: String, append: bool (false)) void !io:IoError
-+ fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError $unsafe
++ fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -831,7 +831,7 @@ alias pid_t for i32
     + fn write[T](data: ByteView[T]) void !io:IoError
     + fn write_buffer(buffer: ByteBuffer) void !io:IoError
     + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) void !io:IoError
-    + fn write_bytes(from: ptr, len: uint) void !io:IoError $unsafe
+    + fn write_bytes(from: ptr, len: uint) void !io:IoError
     + fn write_string(str: String) void !io:IoError
 }
 ```
@@ -843,7 +843,7 @@ alias pid_t for i32
     ~ mime_type: String
     ~ size: uint
 
-    + static fn copy_from_ptr(data: ptr, size: uint) InMemoryFile $unsafe
+    + static fn copy_from_ptr(data: ptr, size: uint) InMemoryFile
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
     + static fn create_from_file(path: String) InMemoryFile !io:IoError
     + static fn create_from_view[T](view: ByteView[T]) InMemoryFile
@@ -1131,7 +1131,7 @@ alias Fd for i32
 + fn await_socket_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn close(fd: i32) void !IoError
 + fn print(msg: String) void
-+ fn print_bytes(adr: ptr, len: uint) void $unsafe
++ fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
 + fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError $unsafe
@@ -1329,7 +1329,7 @@ alias Fd for i32
     + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
     + fn send[T](data: ByteView[T], send_all: bool (true)) uint !NetError
     + fn send_buffer(data: ByteBuffer, skip_bytes: uint (0), send_all: bool (true)) uint !NetError
-    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError $unsafe
+    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
     + fn send_string(data: String, send_all: bool (true)) uint !NetError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
