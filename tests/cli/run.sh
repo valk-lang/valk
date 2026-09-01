@@ -81,6 +81,24 @@ if [ "$status" -eq 0 ] || [[ "$backend_out" != *"Unknown build argument: --valki
     exit 1
 fi
 
+unsafe_input="$DIR/../compile-errors/ce-unsafe-token-without-directive.valk"
+unsafe_out=$("$VALK" build "$unsafe_input" --ignore-unsafe --no-warn -c -o "$output" 2>&1) || {
+    echo "# --ignore-unsafe did not allow an unsafe source"
+    echo "$unsafe_out"
+    exit 1
+}
+
+help_out=$("$VALK" build --help 2>&1) || {
+    echo "# Build help failed"
+    echo "$help_out"
+    exit 1
+}
+if [[ "$help_out" != *"--ignore-unsafe"* ]]; then
+    echo "# Build help does not list --ignore-unsafe"
+    echo "$help_out"
+    exit 1
+fi
+
 validate_out=$("$VALK" build "$input" --no-warn -v -c 2>&1) || {
     echo "$validate_out"
     exit 1
@@ -97,4 +115,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 9"
+echo "# Test count: 11"
