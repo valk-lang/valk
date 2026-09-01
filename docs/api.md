@@ -1294,7 +1294,7 @@ alias Fd for i32
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
 + fn ascii_equal_ignore_case[A, B](a: ByteView[A], b: ByteView[B]) bool
 + fn ascii_to_lower(view: MutableByteView) void
-+ fn bytes_to_uint(adr: ptr, len: uint) uint !SyntaxError
++ fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
 + fn calloc(size: uint) ptr
 + fn clear(view: MutableByteView) void
 + fn clear_bytes(adr: ptr, length: uint) void
@@ -1312,7 +1312,7 @@ alias Fd for i32
 + fn move_value[T](from: *T, to: *T) void
 + fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
-+ fn to_uint[T](view: ByteView[T]) uint !SyntaxError
++ fn to_uint[T](view: ByteView[T], allow_plus: bool (false)) uint !SyntaxError
 ```
 
 # net
