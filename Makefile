@@ -167,6 +167,15 @@ test-cross: valk
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-arm64 -vv $(FLAGS) --target macos-arm64
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-win-x64.exe -vv $(FLAGS) --target win-x64
 
+lint-lib: valk
+	./valk build ./lib --lint
+
+lint-lib-cross: valk
+	@set -e; for target in $(IR_TARGETS); do \
+		echo "# Lint lib ($$target)"; \
+		./valk build ./lib --lint --target $$target; \
+	done
+
 # CI commands
 ci-linux: $(COMPILER_DEPS)
 	valk -h || true
