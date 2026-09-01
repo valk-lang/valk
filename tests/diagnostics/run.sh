@@ -70,6 +70,42 @@ if [ "$warn_status" -ne 0 ] || [[ "$warn_out" != *"unused_value' was declared bu
 fi
 
 count=$((count + 1))
+echo "> unnecessary unsafe warning"
+unsafe_warn_out=$("$VALK" build "$DIR/unsafe-warning.valk" -o "$workdir/unsafe-warning" 2>&1)
+unsafe_warn_status=$?
+unsafe_warn_out=$(printf '%s' "$unsafe_warn_out" | normalize_paths)
+if [ "$unsafe_warn_status" -ne 0 ] || \
+   [[ "$unsafe_warn_out" != *"Unnecessary '@unsafe': this scope contains no unsafe operations @ $DIR/unsafe-warning.valk:2:5"* ]]; then
+    echo "# Wrong unnecessary unsafe warning"
+    echo "- Expected: $DIR/unsafe-warning.valk:2:5"
+    echo "- Exit code: $unsafe_warn_status"
+    echo "$unsafe_warn_out"
+    failed=1
+fi
+
+count=$((count + 1))
+echo "> target-specific unsafe does not warn"
+unsafe_conditional_out=$("$VALK" build "$DIR/unsafe-conditional.valk" -o "$workdir/unsafe-conditional" 2>&1)
+unsafe_conditional_status=$?
+if [ "$unsafe_conditional_status" -ne 0 ] || [[ "$unsafe_conditional_out" == *"Unnecessary '@unsafe'"* ]]; then
+    echo "# Target-specific unsafe emitted an unnecessary warning"
+    echo "- Exit code: $unsafe_conditional_status"
+    echo "$unsafe_conditional_out"
+    failed=1
+fi
+
+count=$((count + 1))
+echo "> dependency unsafe does not warn"
+unsafe_dependency_out=$("$VALK" build "$DIR/unsafe-dependency" -o "$workdir/unsafe-dependency" 2>&1)
+unsafe_dependency_status=$?
+if [ "$unsafe_dependency_status" -ne 0 ] || [[ "$unsafe_dependency_out" == *"Unnecessary '@unsafe'"* ]]; then
+    echo "# Dependency emitted an unnecessary unsafe warning"
+    echo "- Exit code: $unsafe_dependency_status"
+    echo "$unsafe_dependency_out"
+    failed=1
+fi
+
+count=$((count + 1))
 echo "> failed assertion location"
 assert_bin="$workdir/assert-test$EXE_SUFFIX"
 assert_build=$("$VALK" build "$DIR/assert.valk" --test --no-warn -o "$assert_bin" 2>&1)
