@@ -1355,6 +1355,7 @@ alias Fd for i32
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
 + fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
++ fn read_sync(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
 + fn write[T](fd: i32, data: ByteView[T]) uint !IoError

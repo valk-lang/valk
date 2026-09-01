@@ -73,6 +73,34 @@ for case in $cases; do
     fi
 done
 
+count=$((count + 1))
+input="$DIR/stdin-read.valk"
+exe="$workdir/stdin-read$EXE_SUFFIX"
+echo "> Run: pipe input through io.read"
+set +e
+out=$("$VALK" build "$input" --no-warn -o "$exe" 2>&1)
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+    echo "# Build failed"
+    echo "- File: $input"
+    echo "- Exit code: $status"
+    echo "- Output:"
+    echo "$out"
+    failed=1
+else
+    set +e
+    printf 'pingpong' | "$exe" >/dev/null 2>&1
+    got=$?
+    set -e
+    if [ "$got" -ne 0 ]; then
+        echo "# io.read failed to read piped standard input"
+        echo "- File: $input"
+        echo "- Exit code: $got"
+        failed=1
+    fi
+fi
+
 if [ "$count" -eq 0 ]; then
     echo "# No exit-code fixtures found in $DIR"
     exit 1
