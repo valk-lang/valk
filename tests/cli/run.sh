@@ -131,6 +131,17 @@ if [[ "$lint_out" == *"Cache directory:"* ]] || [[ "$lint_out" == *"Compiled in"
     exit 1
 fi
 
+compiler_lint_out=$("$VALK" build "$DIR/../../src" --lint 2>&1) || {
+    echo "# --lint did not accept the compiler source"
+    echo "$compiler_lint_out"
+    exit 1
+}
+if [[ "$compiler_lint_out" != *"Lint passed"* ]]; then
+    echo "# Compiler source lint did not complete"
+    echo "$compiler_lint_out"
+    exit 1
+fi
+
 lint_package_out=$("$VALK" build "$DIR/lint-package" --lint 2>&1) || {
     echo "# --lint did not accept a package without main"
     echo "$lint_package_out"
@@ -183,4 +194,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 17"
+echo "# Test count: 18"

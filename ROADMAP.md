@@ -7,12 +7,6 @@
 - Release 0.5.1
 ~ Data race solution (Threads done via shared type, MutexValue not done)
 
-- Release 0.5.0
-+ Big api overhaul
-+ Full security audit
-+ Replace unsafe code with safe code
-+ Update docs
-
 
 # Next steps
 - Improve standard library
@@ -40,6 +34,12 @@
 ## Done
 
 ```
++ Release 0.5.0
++ Big api overhaul
++ Full security audit
++ Replace unsafe code with safe code
++ Update docs
+
 + Release 0.4.4
 + Full design doc
 + Stablize the language
