@@ -1298,15 +1298,18 @@ alias Fd for i32
 + fn calloc(size: uint) ptr
 + fn clear(view: MutableByteView) void
 + fn clear_bytes(adr: ptr, length: uint) void
++ fn clear_value[T](value: *T) void
 + fn copy[T](from: ByteView[T], to: MutableByteView) uint
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
++ fn copy_value[T](from: *T, to: *T) void
 + fn equal[A, B](a: ByteView[A], b: ByteView[B]) bool
 + fn equal_bytes(a: ptr, b: ptr, length: uint) bool
 + fn find_char[T](view: ByteView[T], ch: u8) uint !LookupError
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
-+ fn free(adr: ptr) void
++ fn free(value: $T) void
 + fn move(from: MutableByteView, to: MutableByteView) uint
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
++ fn move_value[T](from: *T, to: *T) void
 + fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
 + fn to_uint[T](view: ByteView[T]) uint !SyntaxError
