@@ -128,6 +128,17 @@ if [ "$unsafe_generic_status" -ne 0 ] || [[ "$unsafe_generic_out" == *"Unnecessa
 fi
 
 count=$((count + 1))
+echo "> unresolved generic bodies do not cause unused import warnings"
+generic_import_out=$("$VALK" build "$DIR/unused-import-generic.valk" 2>&1)
+generic_import_status=$?
+if [ "$generic_import_status" -ne 0 ] || [[ "$generic_import_out" == *"imported but never used"* ]]; then
+    echo "# Import used by an unresolved generic body emitted a warning"
+    echo "- Exit code: $generic_import_status"
+    echo "$generic_import_out"
+    failed=1
+fi
+
+count=$((count + 1))
 echo "> failed assertion location"
 assert_bin="$workdir/assert-test$EXE_SUFFIX"
 assert_build=$("$VALK" build "$DIR/assert.valk" --test --no-warn -o "$assert_bin" 2>&1)
