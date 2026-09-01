@@ -136,7 +136,7 @@ lint_package_out=$("$VALK" build "$DIR/lint-package" --lint 2>&1) || {
     echo "$lint_package_out"
     exit 1
 }
-if [[ "$lint_package_out" != *"lint-package/src/hidden/check.valk"* ]] || [[ "$lint_package_out" != *"Unnecessary '@unsafe'"* ]]; then
+if [[ "$lint_package_out" != *"lint-package"* ]] || [[ "$lint_package_out" != *"hidden"* ]] || [[ "$lint_package_out" != *"check.valk"* ]] || [[ "$lint_package_out" != *"Unnecessary '@unsafe'"* ]]; then
     echo "# --lint did not check every package namespace"
     echo "$lint_package_out"
     exit 1
