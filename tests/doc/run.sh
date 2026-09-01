@@ -56,7 +56,7 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
 fi
 
 repo=$(cd "$DIR/../.." && pwd)
-out=$("$VALK" doc "$repo/lib" -o "$workdir/stdlib-api.md" --markdown --no-private 2>&1)
+out=$("$VALK" doc "$repo/lib" -o "$workdir/stdlib-api.md" --markdown --no-private --target linux-x64 2>&1)
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "$out"
