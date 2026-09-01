@@ -1253,7 +1253,6 @@ valk build ./src -o ./myprogram
 Although Valk aims to be safe, it still supports low-level operations when needed. Unsafe features include:
 
 - Tokens that start with `@` such as `@ptrv`, `@ref`, ...
-- Calls with raw pointer parameters
 - Offset access on unbounded pointers
 
 Place `@unsafe` at the top of a source file to use these features:
@@ -1265,6 +1264,8 @@ fn address(value: ptr) uint {
     return value.@cast(uint)
 }
 ```
+
+Functions marked with `$unsafe` also require `@unsafe` at their call sites.
 
 Use `valk build --ignore-unsafe` to allow them for an entire build.
 

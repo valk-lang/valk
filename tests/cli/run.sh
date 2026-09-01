@@ -88,6 +88,13 @@ unsafe_out=$("$VALK" build "$unsafe_input" --ignore-unsafe --no-warn -c -o "$out
     exit 1
 }
 
+unsafe_call_input="$DIR/../compile-errors/ce-unsafe-string-copy-from-ptr.valk"
+unsafe_call_out=$("$VALK" build "$unsafe_call_input" --ignore-unsafe --no-warn -c -o "$output" 2>&1) || {
+    echo "# --ignore-unsafe did not allow an unsafe function call"
+    echo "$unsafe_call_out"
+    exit 1
+}
+
 help_out=$("$VALK" build --help 2>&1) || {
     echo "# Build help failed"
     echo "$help_out"
@@ -115,4 +122,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 11"
+echo "# Test count: 12"

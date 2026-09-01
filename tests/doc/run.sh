@@ -70,6 +70,7 @@ fi
 stdlib_markdown=$(<"$workdir/stdlib-api.md")
 if [[ "$stdlib_markdown" != *'+ struct ByteView[T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn new(source: T, offset: uint, length: uint) ByteView[T]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String $unsafe'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \
