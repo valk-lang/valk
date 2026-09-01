@@ -84,7 +84,7 @@ See: [API docs](api.md)
 Install on Linux, macOS, or WSL:
 
 ```sh
-curl -s https://valk-lang.dev/install.sh | bash -s latest
+curl -sSL https://valk-lang.dev/install.sh | bash
 ```
 
 Windows (via PowerShell):
@@ -166,19 +166,21 @@ let msg3 = "Name length x 2: %{ name.length * 2 }!" // Any expression that can b
 let msg4 = "Hello \%name!" // Escape the %
 let msg5 = r"Hello %name!" // Raw string
 // Basics
-s.length // Length of string
+s.length // Length in bytes
 s.starts_with(x) bool
 s.ends_with(x) bool
 s.is_empty() bool
 s.contains(x) bool
 s.lower() String // Convert Unicode text to lowercase
 s.upper() String // Convert Unicode text to uppercase
-s.part(start_index, length) String // Sub string
-s.range(start_index, end_index) String // Sub string using end-index
-let middle = s[1 .. 3] // Three characters starting at index 1
+s.part(start_index, length) String // Sub string using byte offsets
+s.range(start_index, end_index) String // Sub string using inclusive byte offsets
+let middle = s[1 .. 3] // Three bytes starting at byte offset 1
+s.utf8.length // Length in Unicode characters
+s.utf8.part(start_index, length) String // Sub string using character offsets
 ```
 
-Full `String` API: [valk.type](api.md#core)
+Full `String` API: [core](api.md#core)
 
 ## Arrays
 
@@ -198,7 +200,7 @@ each arr as value {}
 each arr as value, index {}
 ```
 
-Full `Array` API: [valk.type](api.md#core)
+Full `Array` API: [core](api.md#core)
 
 Bracket ranges call an instance method marked `$range`. The hook must accept
 `(start_index: uint, length: uint)` and return one value. This lets custom
@@ -222,7 +224,7 @@ each m as value, key {}
 each m as value, key, index {}
 ```
 
-Full `Map` API: [valk.type](api.md#core)
+Full `Map` API: [core](api.md#core)
 
 If you need non-string keys, use `HashMap`. `HashMap` and `Map` are compatible types.
 
@@ -234,7 +236,7 @@ let b : HashMap[String, uint] = a
 let c : Map[uint] = b
 ```
 
-Full `HashMap` API: [valk.type](api.md#core)
+Full `HashMap` API: [core](api.md#core)
 
 ## Typehints
 
@@ -584,7 +586,7 @@ fn main() {
     let v1 = add[String, uint]("5", 10)
     // v1 = "510"
     let v2 = add[uint, uint](5, 10)
-    // v2 = 15
+    // v2 = "15"
 }
 ```
 
@@ -731,11 +733,13 @@ Use `valk.fs` for file-system operations.
 Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs.path("path")`
 
 ```rust
+use valk.fs
+
 fn main() {
-    let path : Path = "."
+    let path : fs.Path = "."
     path = path.add("folder1").add("folder2/").add("/file") // Adding parts to a path without worrying about double slashes
     println(path) // ./folder1/folder2/file
-    path = path.resolve()
+    path = path.resolve() ! panic("Failed to resolve path")
     println(path) // /var/www/folder1/folder2/file
     path = path + ".txt"
     println(path) // /var/www/folder1/folder2/file.txt
@@ -1076,7 +1080,7 @@ fn server() {
                 break
             }
             println("# Server received: " + buffer)
-            con.send("PONG") ! {
+            con.send_string("PONG") ! {
                 println("# Server failed to send data")
                 break
             }
@@ -1091,12 +1095,12 @@ fn main() {
     // Open client
     let con = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
-    con.send("PING") ! panic("Client failed to send data")
+    con.send_string("PING") ! panic("Client failed to send data")
     // Recv
     let buffer = ByteBuffer.new()
     con.recv(buffer, 1000) ! panic("Client failed to read from connection")
     println("# Client received: " + buffer)
-    con.close()
+    con.close() ! panic("Failed to close connection")
 }
 ```
 
@@ -1126,7 +1130,6 @@ How to render:
 
 ```rust
 use valk.template
-use valk.html
 //
 class Article {
     title: String
@@ -1138,9 +1141,6 @@ class PageData {
 }
 //
 fn main() {
-    let options = template.RenderOptions {
-        escape: fn(value: String) String { return html.escape(value) }
-    }
     // Embed templates at compile time and register them by relative path.
     template.set_content_many(#embed_dir("views"))
     // Template data
@@ -1154,7 +1154,7 @@ fn main() {
         }
     }
     // Render the template
-    let result = template.render("example.html", data, options) ! panic("Template error: %{E.message}")
+    let result = template.render("example.html", data) ! panic("Template error: %{E.message}")
 
     println(result)
 }
@@ -1169,8 +1169,8 @@ Template engine tokens:
 @each(... as val, key) // With key
 @each(... as val, key, index) // With key & index
 
-{{ }}   // Print HTML-escaped (or use the configured sanitizer)
-{! !}   // Print a raw value without sanitization
+{{ }}   // Print an HTML-escaped value (or use the configured escape function)
+{! !}   // Print a raw value without escaping
 
 @include("...") // Include another template registered with set_content/set_content_many
 ```
@@ -1179,7 +1179,7 @@ Note: `valk.template` works at runtime and therefore cannot detect incorrect tem
 
 ## Crypto
 
-Currently we only support a few algorithms (bcrypt / blake2b)
+Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256, and secure random values.
 
 Password hashing/verify example:
 
@@ -1376,7 +1376,7 @@ vman use latest # Will install/use the latest version of valk
 vman use # Will install/use the valk version defined in your {cwd}/valk.json config -> { "use": "x.x.x" }
 vman use {version} # Install/use a specific version
 vman install # Install packages defined in valk.json
-vman install {pkg} # Install a package globally
+vman install {pkg} # Install a package in the current project
 vman remove {pkg} # Remove a package
 ```
 

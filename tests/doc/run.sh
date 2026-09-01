@@ -79,4 +79,20 @@ if [[ "$stdlib_markdown" != *'+ struct ByteView[T]'* ]] \
     exit 1
 fi
 
-echo "# 2/2 documentation tests passed"
+echo "> Keep basic documentation examples current"
+
+guide=$(<"$repo/docs/docs.md")
+if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
+    || [[ "$guide" != *'path = path.resolve() ! panic("Failed to resolve path")'* ]] \
+    || [[ "$guide" != *'con.send_string("PING")'* ]] \
+    || [[ "$guide" != *'template.render("example.html", data)'* ]] \
+    || [[ "$guide" == *'con.send("PING")'* ]] \
+    || [[ "$guide" == *'sanitize:'* ]] \
+    || [[ "$guide" == *'[valk.type](api.md#core)'* ]] \
+    || [[ "$guide" == *'Install a package globally'* ]] \
+    || [[ "$guide" == *'configured sanitizer'* ]]; then
+    echo "# Basic documentation contains stale API examples"
+    exit 1
+fi
+
+echo "# 3/3 documentation tests passed"
