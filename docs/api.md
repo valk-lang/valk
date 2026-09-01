@@ -39,6 +39,50 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + array Array[T] {
+    ~ cap: uint
+    ~ data: GcPtr
+    ~ length: uint
+
+    + fn append(item: T, unique: bool (false)) Array[T]
+    + fn append_many(items: Array[T]) Array[T]
+    + fn clear(reduce_size: bool (false)) Array[T]
+    + fn clone() Array[T]
+    + fn contains(value: T) bool
+    + fn copy() Array[T]
+    + fn equal(array: Array[T]) bool
+    + fn equal_ignore_order(array: Array[T]) bool
+    + fn filter(func: ?fn(T)(bool) (null)) Array[T]
+    + fn filter_self(func: ?fn(T)(bool) (null)) Array[T]
+    + fn fit_index(index: uint) void
+    + static fn from_json_value_auto[X](value: X) Array[T] !LookupError
+    + fn get(index: uint) T !LookupError
+    + fn increase_size(new_size: uint) void
+    + fn index_of(item: T) uint !LookupError
+    + fn intersect(with: Array[T]) Array[T]
+    + fn iter() Slice[T]
+    + fn join(divider: String) String
+    + fn lock() void
+    + fn merge(items: Array[T]) Array[T]
+    + fn merge_in_place(items: Array[T]) Array[T]
+    + static fn new(start_size: uint (0)) Array[T]
+    + fn part(start: uint, amount: uint) Array[T]
+    + fn pop_first() T !LookupError
+    + fn pop_last() T !LookupError
+    + fn prepend(item: T, unique: bool (false)) Array[T]
+    + fn prepend_many(items: Array[T]) Array[T]
+    + fn range(start: uint, end: uint, inclusive: bool (true)) Array[T]
+    + fn remove(index: uint) Array[T]
+    + fn remove_value(value: T) Array[T]
+    + fn reverse() Array[T]
+    + fn set(index: uint, value: T) void !LookupError
+    + fn set_all(value: T) void
+    + fn set_expand(index: uint, value: T, filler_value: T) void
+    + fn slice(start: uint, amount: uint) Slice[T]
+    + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
+    + fn swap(index_a: uint, index_b: uint) void
+    + fn swap_remove(index: uint) Array[T]
+    + fn unique() Array[T]
+    + fn unlock() void
 }
 ```
 
@@ -111,11 +155,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_byte() u8
     + fn read_cstring() String
     + fn read_float() float
-    + fn read_hex_int() uint
+    + fn read_hex_int() int
     + fn read_hex_uint() uint
     + fn read_int() int
     + fn read_little_endian(bytes: uint) uint
-    + fn read_octal_int() uint
+    + fn read_octal_int() int
     + fn read_octal_uint() uint
     + fn read_remaining_string() String
     + fn read_string(len: uint) String
@@ -137,34 +181,70 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + struct ByteView[T] {
-    + get bytes: void
+    + get bytes: uint
     + fn clear() void
-    + get data: void
-    + fn equal_at_ignore_ascii_case() void
-    + fn equal_ignore_ascii_case() void
-    + fn equals() void
-    + fn equals_at() void
-    + fn get() void
-    + fn has_ascii_control() void
-    + fn index_of_byte() void
-    + static fn new() void
-    + fn starts_with() void
-    + fn to_ascii_lower_string() void
-    + fn to_float() void
-    + fn to_int() void
-    + fn to_string() void
-    + fn to_uint() void
-    + fn view() void
+    + get data: ptr
+    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
+    + fn equal_ignore_ascii_case(cmp: String) bool
+    + fn equals(cmp: String) bool
+    + fn equals_at(offset: uint, length: uint, cmp: String) bool
+    + fn get(index: uint) u8
+    + fn has_ascii_control(allow_tab: bool (false)) bool
+    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
+    + static fn new(source: T, offset: uint, length: uint) ByteView[T]
+    + fn starts_with(cmp: String) bool
+    + fn to_ascii_lower_string() String
+    + fn to_float() float !SyntaxError
+    + fn to_int() int !SyntaxError
+    + fn to_string() String
+    + fn to_uint() uint !SyntaxError
+    + fn view(offset: uint, length: uint) ByteView[T]
 }
 ```
 
 ```js
 + class FlatMap[K, T] {
+    + fn clear() FlatMap[K, T]
+    + fn clone() FlatMap[K, T]
+    + fn copy() FlatMap[K, T]
+    + fn get(key: K) T !LookupError
+    + fn has(key: K) bool
+    + fn has_value(value: T) bool
+    + fn keys() Array[K]
+    + get length: uint
+    + fn merge(map: FlatMap[K, T]) FlatMap[K, T]
+    + fn merge_in_place(map: FlatMap[K, T]) FlatMap[K, T]
+    + static fn new() FlatMap[K, T]
+    + fn remove(key: K) FlatMap[K, T]
+    + fn set(key: K, value: T) FlatMap[K, T]
+    + fn set_many(map: FlatMap[K, T]) FlatMap[K, T]
+    + fn set_unique(key: K, value: T) FlatMap[K, T] !LookupError
+    + fn sort_keys() FlatMap[K, T]
+    + fn values() Array[T]
 }
 ```
 
 ```js
 + class HashMap[K, T] {
+    + fn clear() HashMap[K, T]
+    + fn clone() HashMap[K, T]
+    + fn copy() HashMap[K, T]
+    + fn get(key: K) T !LookupError
+    + fn get_or_replace(key: K, remove_key: K, replacement: T) (T, bool) !LookupError
+    + fn has(key: K) bool
+    + fn has_value(value: T) bool
+    + fn keys() Array[K]
+    + get length: uint
+    + fn lock() void
+    + fn merge(map: HashMap[K, T]) HashMap[K, T]
+    + fn merge_in_place(map: HashMap[K, T]) HashMap[K, T]
+    + static fn new(capacity: uint (0)) HashMap[K, T]
+    + fn remove(key: K) HashMap[K, T]
+    + fn set(key: K, value: T) HashMap[K, T]
+    + fn set_unique(key: K, value: T) HashMap[K, T] !LookupError
+    + fn sort_keys() HashMap[K, T]
+    + fn unlock() void
+    + fn values() Array[T]
 }
 ```
 
@@ -210,10 +290,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ data: *[T]
     ~ length: uint
 
-    + fn append() void
-    + fn get() void
-    + fn set() void
-    + fn set_all() void
+    + fn append(item: T) Slice[T]
+    + fn get(index: uint) T !LookupError
+    + fn set(index: uint, value: T) void !LookupError
+    + fn set_all(value: T) void
 }
 ```
 
@@ -633,10 +713,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void !CryptoError
 + fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
 + fn bcrypt_verify(password: String, hash: String) bool
-+ fn blowfish_encrypt_block(context: BlowfishContext, input: *[u8 x 8], output: *[u8 x 8]) void
-+ fn blowfish_expand_key(context: BlowfishContext, salt: ?ByteBuffer, key: ByteBuffer) void !CryptoError
-+ fn blowfish_init_state(context: BlowfishContext) void
-+ fn blowfish_xor_block(data: *[u8], salt: ByteBuffer, saltIndex: *uint) void
 + fn md5_encode(input: String) String
 + fn random_bytes(length: uint) String !CryptoError
 + fn random_uint() uint !CryptoError
@@ -652,11 +728,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn hash_string(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
     + fn update(data: *[u8], length: uint) void
-}
-```
-
-```js
-+ class BlowfishContext {
 }
 ```
 
@@ -678,18 +749,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn final() [u8 x 32]
     + fn reset() void
 }
-```
-
-## Globals for 'crypto'
-
-```js
-+ global IV : [u64 x 8]
-+ global SIGMA : [[u8 x 16] x 12]
-+ global parray : [u32 x 18]
-+ global sbox1 : [u32 x 256]
-+ global sbox2 : [u32 x 256]
-+ global sbox3 : [u32 x 256]
-+ global sbox4 : [u32 x 256]
 ```
 
 # ext
@@ -745,15 +804,14 @@ alias pid_t for i32
 + fn mkdir(path: String, permissions: u32 (0c755)) void !io:IoError
 + fn modified_time(path: String) uint !io:IoError
 + fn move(from_path: String, to_path: String) void !io:IoError
-+ fn open(path: String, writable: bool, append_on_write: bool) i32 !io:IoError
-+ fn open_extend(path: String, writable: bool, append_on_write: bool, create_file_if_doesnt_exist: bool (false), create_file_permissions: u32 (0c644)) i32 !io:IoError
++ fn open(path: String, options: ?OpenOptions (null)) i32 !io:IoError
 + fn path(path: String) Path
 + fn read(path: String) String !io:IoError
 + fn realpath(path: String) String !io:IoError
 + fn resolve(path: String) String !io:IoError
 + fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint !io:IoError
-+ fn stream(path: String, read: bool, write: bool, append: bool (false), auto_create: bool (false)) FileStream !io:IoError
++ fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync() void
 + fn write(path: String, content: String, append: bool (false)) void !io:IoError
@@ -785,12 +843,22 @@ alias pid_t for i32
     ~ mime_type: String
     ~ size: uint
 
+    + static fn copy_from_ptr(data: ptr, size: uint) InMemoryFile
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
     + static fn create_from_file(path: String) InMemoryFile !io:IoError
-    + static fn create_from_ptr(data: ptr, size: uint) InMemoryFile
-    + static fn create_from_view[T]() void
+    + static fn create_from_view[T](view: ByteView[T]) InMemoryFile
     + fn read_all() String
     + fn save(path: String) void !io:IoError
+}
+```
+
+```js
++ struct OpenOptions {
+    + append: bool
+    + create: bool
+    + permissions: u32
+    + read: bool
+    + write: bool
 }
 ```
 
@@ -847,7 +915,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ## Functions for 'html'
 
 ```js
-+ fn escape(code: String, options: ?HtmlEscapeOptions (null)) String
++ fn escape(code: String, options: ?EscapeOptions (null)) String
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
 + fn url_is_allowed(target: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) bool
 ```
@@ -855,7 +923,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ## Classes for 'html'
 
 ```js
-+ class HtmlEscapeOptions {
++ class EscapeOptions {
     + escape_ampersand: bool
     + escape_double_quote: bool
     + escape_gt: bool
@@ -943,7 +1011,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ```js
 + class Options {
     + body: String
-    + ca_cert: ?String
+    + ca_cert_path: ?String
     + connect_timeout_ms: uint
     + follow_redirects: bool
     + headers: ?Map[String]
@@ -1013,6 +1081,9 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
 ```js
 + class Route[T] {
+    + handler: T
+
+    + fn params(path: String) Map[String]
 }
 ```
 
@@ -1050,7 +1121,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ## Aliases for 'io'
 
 ```js
-alias FD for i32
+alias Fd for i32
 ```
 
 ## Functions for 'io'
@@ -1060,7 +1131,7 @@ alias FD for i32
 + fn await_socket_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn close(fd: i32) void !IoError
 + fn print(msg: String) void
-+ fn print_from_ptr(adr: ptr, len: uint) void
++ fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
 + fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
@@ -1328,8 +1399,8 @@ alias FD for i32
 
 ```js
 + class RenderOptions {
+    + escape: ?fn(String)(String)
     + max_depth: uint
-    + sanitize: ?fn(String)(String)
 }
 ```
 
@@ -1354,14 +1425,18 @@ alias FD for i32
 
 ```js
 + class Thread[T] {
-    + fn await_result() void
-    + static fn start() void
+    + fn await_result() T
+    + static fn start(func: shared fn()(T)) Thread[T] !InitError
     + fn wait() void
 }
 ```
 
 ```js
 + class ThreadGroup[T] {
+    + fn await_next() (uint, T)
+    + fn has_pending() bool
+    + static fn new() ThreadGroup[T]
+    + fn start(handler: shared fn()(T)) uint !InitError
 }
 ```
 

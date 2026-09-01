@@ -45,6 +45,9 @@ markdown=$(<"$workdir/api.md")
 if [[ "$markdown" != *'+ class Box[T]'* ]] \
     || [[ "$markdown" != *'+ get value_type: T'* ]] \
     || [[ "$markdown" != *'+ fn get(value: T) T'* ]] \
+    || [[ "$markdown" != *'+ struct Pair[T]'* ]] \
+    || [[ "$markdown" != *'+ first: T'* ]] \
+    || [[ "$markdown" != *'+ fn left() T'* ]] \
     || [[ "$markdown" != *'+ class Ahead'* ]] \
     || [[ "$markdown" != *'+ fn name() String'* ]]; then
     echo "# Markdown sorting did not preserve class declarations"
@@ -52,4 +55,28 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
     exit 1
 fi
 
-echo "# 1/1 documentation tests passed"
+repo=$(cd "$DIR/../.." && pwd)
+out=$("$VALK" doc "$repo/lib" -o "$workdir/stdlib-api.md" --markdown --no-private 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "$out"
+    exit 1
+fi
+if ! cmp -s "$workdir/stdlib-api.md" "$repo/docs/api.md"; then
+    echo "# Committed standard-library API documentation is stale"
+    diff -u "$repo/docs/api.md" "$workdir/stdlib-api.md" || true
+    exit 1
+fi
+stdlib_markdown=$(<"$workdir/stdlib-api.md")
+if [[ "$stdlib_markdown" != *'+ struct ByteView[T]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ static fn new(source: T, offset: uint, length: uint) ByteView[T]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
+    || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \
+    || [[ "$stdlib_markdown" == *'+ global parray'* ]] \
+    || [[ "$stdlib_markdown" == *'+ global SIGMA'* ]]; then
+    echo "# Standard-library public API surface is incorrect"
+    exit 1
+fi
+
+echo "# 2/2 documentation tests passed"

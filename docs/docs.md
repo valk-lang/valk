@@ -1060,7 +1060,7 @@ use valk.net
 
 // Server
 fn server() {
-    let sock = net.Socket.server(net.SocketType.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
     let buffer = ByteBuffer.new()
     while true {
         let con = sock.accept() ! {
@@ -1089,7 +1089,7 @@ fn main() {
     // Start our server in the background
     let s = co server()
     // Open client
-    let con = net.Socket.client(net.SocketType.TCP, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let con = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
     con.send("PING") ! panic("Client failed to send data")
     // Recv
@@ -1139,7 +1139,7 @@ class PageData {
 //
 fn main() {
     let options = template.RenderOptions {
-        sanitize: fn(value: String) String { return html.escape(value) }
+        escape: fn(value: String) String { return html.escape(value) }
     }
     // Embed templates at compile time and register them by relative path.
     template.set_content_many(#embed_dir("views"))
