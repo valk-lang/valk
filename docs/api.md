@@ -107,6 +107,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !LookupError
     + fn into_string() String
     + fn ltrim(filter: fnptr(u8)(bool)) void
+    + fn mutable_view(offset: uint, length: uint) MutableByteView
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
     + fn reader() ByteReader
@@ -252,6 +253,18 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + mode Map[T] for HashMap[String, T] {
     + fn clone() Map[T]
     + static fn new() Map[T]
+}
+```
+
+```js
++ struct MutableByteView {
+    + get bytes: uint
+    + get data: ptr
+    + fn get(index: uint) u8
+    + static fn new(source: ByteBuffer, offset: uint, length: uint) MutableByteView
+    + fn read_view() ByteView[ByteBuffer]
+    + fn set(index: uint, value: u8) void
+    + fn view(offset: uint, length: uint) MutableByteView
 }
 ```
 
@@ -1279,16 +1292,24 @@ alias Fd for i32
 + fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
++ fn ascii_equal_ignore_case[A, B](a: ByteView[A], b: ByteView[B]) bool
++ fn ascii_to_lower(view: MutableByteView) void
 + fn bytes_to_uint(adr: ptr, len: uint) uint !SyntaxError
 + fn calloc(size: uint) ptr
-+ fn clear(adr: ptr, length: uint) void
-+ fn copy(from: ptr, to: ptr, length: uint) void
-+ fn equal(a: ptr, b: ptr, length: uint) bool
-+ fn find_char(adr: ptr, ch: u8, length: uint) uint !LookupError
++ fn clear(view: MutableByteView) void
++ fn clear_bytes(adr: ptr, length: uint) void
++ fn copy[T](from: ByteView[T], to: MutableByteView) uint
++ fn copy_bytes(from: ptr, to: ptr, length: uint) void
++ fn equal[A, B](a: ByteView[A], b: ByteView[B]) bool
++ fn equal_bytes(a: ptr, b: ptr, length: uint) bool
++ fn find_char[T](view: ByteView[T], ch: u8) uint !LookupError
++ fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(adr: ptr) void
-+ fn move(from: ptr, to: ptr, length: uint) void
++ fn move(from: MutableByteView, to: MutableByteView) uint
++ fn move_bytes(from: ptr, to: ptr, length: uint) void
 + fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
++ fn to_uint[T](view: ByteView[T]) uint !SyntaxError
 ```
 
 # net
