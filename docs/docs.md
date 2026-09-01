@@ -1264,9 +1264,6 @@ fn address(value: ptr) uint {
 }
 ```
 
-The compiler carries unsafe input through function calls. `$unsafe` explicitly
-marks a low-level function's parameters as unsafe inputs.
-
 Use `valk build --ignore-unsafe` to allow them for an entire build.
 
 ## Structs

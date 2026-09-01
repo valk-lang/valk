@@ -28,11 +28,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn race_lock() void
 + fn race_unlock() void
 + fn raise(code: i32) void
-+ fn read_big_endian(from: *[u8], bytes: uint) uint $unsafe
-+ fn read_little_endian(from: *[u8], bytes: uint) uint $unsafe
++ fn read_big_endian(from: *[u8], bytes: uint) uint
++ fn read_little_endian(from: *[u8], bytes: uint) uint
 + fn signal_ignore(sig: int) void
-+ fn write_big_endian(to: *[u8], v: uint, bytes: uint) void $unsafe
-+ fn write_little_endian(to: *[u8], v: uint, bytes: uint) void $unsafe
++ fn write_big_endian(to: *[u8], v: uint, bytes: uint) void
++ fn write_little_endian(to: *[u8], v: uint, bytes: uint) void
 ```
 
 ## Classes for 'core'
@@ -373,7 +373,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class cstring {
-    + fn get(index: uint) u8 $unsafe
+    + fn get(index: uint) u8
     + fn index_of(find: u8) uint !LookupError
     + fn length() uint
     + fn to_string() String
@@ -383,27 +383,27 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class f32 {
     + fn to_shortest_string() String
-    + fn to_shortest_string_in_ptr(buf: ptr) uint $unsafe
+    + fn to_shortest_string_in_ptr(buf: ptr) uint
     + fn to_string(decimals: uint, trim_zeros: bool (false)) String
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $unsafe
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class f64 {
     + fn to_shortest_string() String
-    + fn to_shortest_string_in_ptr(buf: ptr) uint $unsafe
+    + fn to_shortest_string_in_ptr(buf: ptr) uint
     + fn to_string(decimals: uint, trim_zeros: bool (false)) String
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $unsafe
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class float {
     + fn to_shortest_string() String
-    + fn to_shortest_string_in_ptr(buf: ptr) uint $unsafe
+    + fn to_shortest_string_in_ptr(buf: ptr) uint
     + fn to_string(decimals: uint, trim_zeros: bool (false)) String
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $unsafe
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
@@ -419,7 +419,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: i16) i16
     + static fn secure_random() i16 !ExternError
     + fn to_base(base: i16) String
-    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: i16, to: *[u8 x 2]) void
@@ -439,7 +439,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: i32) i32
     + static fn secure_random() i32 !ExternError
     + fn to_base(base: i32) String
-    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: i32, to: *[u8 x 4]) void
@@ -459,7 +459,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: i64) i64
     + static fn secure_random() i64 !ExternError
     + fn to_base(base: i64) String
-    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: i64, to: *[u8 x 8]) void
@@ -479,7 +479,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: i8) i8
     + static fn secure_random() i8 !ExternError
     + fn to_base(base: i8) String
-    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: i8, to: *u8) void
@@ -499,7 +499,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: int) int
     + static fn secure_random() int !ExternError
     + fn to_base(base: int) String
-    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: int, to: *[u8 x 8]) void
@@ -511,35 +511,35 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + class ptr {
     + fn clear_bytes(amount: uint) void
     + fn create_string(length: uint) String
-    + fn determine_float_length(max_bytes: uint) uint $unsafe
-    + fn determine_hex_int_length(max_bytes: uint) uint $unsafe
-    + fn determine_hex_uint_length(max_bytes: uint) uint $unsafe
-    + fn determine_int_length(max_bytes: uint) uint $unsafe
-    + fn determine_octal_int_length(max_bytes: uint) uint $unsafe
-    + fn determine_octal_uint_length(max_bytes: uint) uint $unsafe
-    + fn determine_uint_length(max_bytes: uint) uint $unsafe
+    + fn determine_float_length(max_bytes: uint) uint
+    + fn determine_hex_int_length(max_bytes: uint) uint
+    + fn determine_hex_uint_length(max_bytes: uint) uint
+    + fn determine_int_length(max_bytes: uint) uint
+    + fn determine_octal_int_length(max_bytes: uint) uint
+    + fn determine_octal_uint_length(max_bytes: uint) uint
+    + fn determine_uint_length(max_bytes: uint) uint
     + fn equals(data: ptr, len: uint) bool
     + fn equals_string(str: String) bool
-    + fn fill_bytes(byte: u8, amount: uint) void $unsafe
-    + fn index_of_byte(byte: u8, memory_size: uint) uint !LookupError $unsafe
-    + fn index_of_byte_inf(byte: u8) uint $unsafe
-    + fn print_bytes(length: uint, end_with_newline: bool (true)) void $unsafe
+    + fn fill_bytes(byte: u8, amount: uint) void
+    + fn index_of_byte(byte: u8, memory_size: uint) uint !LookupError
+    + fn index_of_byte_inf(byte: u8) uint
+    + fn print_bytes(length: uint, end_with_newline: bool (true)) void
     + fn read_big_endian(bytes: uint) uint
-    + fn read_byte() u8 $unsafe
+    + fn read_byte() u8
     + fn read_cstring(memory_size: uint) String
     + fn read_cstring_inf() String
-    + fn read_float(len: uint) float !SyntaxError $unsafe
+    + fn read_float(len: uint) float !SyntaxError
     + fn read_float_dynamic(max_bytes: uint) (float, uint)
-    + fn read_hex_int(len: uint) int !SyntaxError $unsafe
+    + fn read_hex_int(len: uint) int !SyntaxError
     + fn read_hex_int_dynamic(max_bytes: uint) (int, uint)
-    + fn read_hex_uint(len: uint) uint !SyntaxError $unsafe
+    + fn read_hex_uint(len: uint) uint !SyntaxError
     + fn read_hex_uint_dynamic(max_bytes: uint) (uint, uint)
-    + fn read_int(len: uint) int !SyntaxError $unsafe
+    + fn read_int(len: uint) int !SyntaxError
     + fn read_int_dynamic(max_bytes: uint) (int, uint)
     + fn read_little_endian(bytes: uint) uint
-    + fn read_octal_int(len: uint) int !SyntaxError $unsafe
+    + fn read_octal_int(len: uint) int !SyntaxError
     + fn read_octal_int_dynamic(max_bytes: uint) (int, uint)
-    + fn read_octal_uint(len: uint) uint !SyntaxError $unsafe
+    + fn read_octal_uint(len: uint) uint !SyntaxError
     + fn read_octal_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_string(len: uint) String
     + fn read_u16_be() u16
@@ -548,7 +548,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_u32_le() u32
     + fn read_u64_be() u64
     + fn read_u64_le() u64
-    + fn read_uint(len: uint) uint !SyntaxError $unsafe
+    + fn read_uint(len: uint) uint !SyntaxError
     + fn read_uint_be() uint
     + fn read_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_uint_le() uint
@@ -567,7 +567,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_u32_le(v: u32) void
     + fn write_u64_be(v: u64) void
     + fn write_u64_le(v: u64) void
-    + fn write_u8(v: u8) void $unsafe
+    + fn write_u8(v: u8) void
     + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) uint
     + fn write_uint_be(v: uint) void
     + fn write_uint_le(v: uint) void
@@ -586,7 +586,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: u16) u16
     + static fn secure_random() u16 !ExternError
     + fn to_base(base: u16) String
-    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: u16, to: *[u8 x 2]) void
@@ -606,7 +606,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: u32) u32
     + static fn secure_random() u32 !ExternError
     + fn to_base(base: u32) String
-    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: u32, to: *[u8 x 4]) void
@@ -626,7 +626,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: u64) u64
     + static fn secure_random() u64 !ExternError
     + fn to_base(base: u64) String
-    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: u64, to: *[u8 x 8]) void
@@ -661,7 +661,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn secure_random() u8 !ExternError
     + fn to_ascii_string() String
     + fn to_base(base: u8) String
-    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + fn unescape() u8
@@ -684,7 +684,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn round_up(modulo: uint) uint
     + static fn secure_random() uint !ExternError
     + fn to_base(base: uint) String
-    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint $unsafe
+    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
     + fn to_string() String
     + static fn write_big_endian(v: uint, to: *[u8 x 8]) void
@@ -707,9 +707,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + fn base64_decode(str: String) String !CryptoError
-+ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void !CryptoError $unsafe
++ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void !CryptoError
 + fn base64_encode(str: String) String
-+ fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void $unsafe
++ fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void !CryptoError
 + fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
 + fn bcrypt_verify(password: String, hash: String) bool
@@ -724,17 +724,17 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Blake2b {
-    + fn finalize(out: *[u8]) void $unsafe
+    + fn finalize(out: *[u8]) void
     + static fn hash_string(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
-    + fn update(data: *[u8], length: uint) void $unsafe
+    + fn update(data: *[u8], length: uint) void
 }
 ```
 
 ```js
 + class Sha1 {
     + fn add_hash_data(data: *[u8 x 20]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void $unsafe
+    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
     + fn add_string_data(str: String) void
     + fn final() [u8 x 20]
     + fn reset() void
@@ -744,7 +744,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class Sha256 {
     + fn add_hash_data(data: *[u8 x 32]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void $unsafe
+    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
     + fn add_string_data(str: String) void
     + fn final() [u8 x 32]
     + fn reset() void
@@ -1134,14 +1134,14 @@ alias Fd for i32
 + fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
-+ fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError $unsafe
-+ fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError $unsafe
++ fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
++ fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
 + fn write[T](fd: i32, data: ByteView[T]) uint !IoError
 + fn write_buffer(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
-+ fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError $unsafe
-+ fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError $unsafe
++ fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
++ fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
 + fn write_string(fd: i32, str: String) uint !IoError
 ```
 
@@ -1277,18 +1277,18 @@ alias Fd for i32
 ```js
 + fn alloc(size: uint) ptr
 + fn alloc_ob(size: uint) ptr
-+ fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool $unsafe
-+ fn ascii_bytes_to_lower(adr: ptr, len: uint) void $unsafe
-+ fn bytes_to_uint(adr: ptr, len: uint) uint !SyntaxError $unsafe
++ fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
++ fn ascii_bytes_to_lower(adr: ptr, len: uint) void
++ fn bytes_to_uint(adr: ptr, len: uint) uint !SyntaxError
 + fn calloc(size: uint) ptr
-+ fn clear(adr: ptr, length: uint) void $unsafe
-+ fn copy(from: ptr, to: ptr, length: uint) void $unsafe
-+ fn equal(a: ptr, b: ptr, length: uint) bool $unsafe
-+ fn find_char(adr: ptr, ch: u8, length: uint) uint !LookupError $unsafe
-+ fn free(adr: ptr) void $unsafe
-+ fn move(from: ptr, to: ptr, length: uint) void $unsafe
++ fn clear(adr: ptr, length: uint) void
++ fn copy(from: ptr, to: ptr, length: uint) void
++ fn equal(a: ptr, b: ptr, length: uint) bool
++ fn find_char(adr: ptr, ch: u8, length: uint) uint !LookupError
++ fn free(adr: ptr) void
++ fn move(from: ptr, to: ptr, length: uint) void
 + fn new[T](initial: T (T.$default_value)) *T
-+ fn resize(adr: ptr, size: uint, new_size: uint) ptr $unsafe
++ fn resize(adr: ptr, size: uint, new_size: uint) ptr
 ```
 
 # net
@@ -1297,9 +1297,9 @@ alias Fd for i32
 
 ```js
 + fn recv(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError $unsafe
++ fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
 + fn send(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError $unsafe
++ fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
 + fn send_string(fd: i32, str: String, timeout_ms: uint (5000)) uint !NetError
 ```
 
@@ -1380,7 +1380,7 @@ alias Fd for i32
     + fn set_ca_cert_dir(dir: ?String) void !NetError
     + fn set_host(host: String) void !NetError
     + fn set_verify(enable: bool) void
-    + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError $unsafe
+    + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError
 }
 ```
 
