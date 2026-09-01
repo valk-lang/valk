@@ -81,7 +81,7 @@ if [ "$status" -eq 0 ] || [[ "$backend_out" != *"Unknown build argument: --valki
     exit 1
 fi
 
-unsafe_input="$DIR/../compile-errors/ce-unsafe-token-without-directive.valk"
+unsafe_input="$DIR/../compile-errors/ce-unsafe-void-pointer-call.valk"
 unsafe_out=$("$VALK" build "$unsafe_input" --ignore-unsafe --no-warn -c -o "$output" 2>&1) || {
     echo "# --ignore-unsafe did not allow an unsafe source"
     echo "$unsafe_out"

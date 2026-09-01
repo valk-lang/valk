@@ -895,8 +895,7 @@ class Config {
 `-` is source-private rather than class-private: other code in the same file
 can still access the declaration.
 
-Low-level code can place `@unsafe` before `@ignore_access` in a scope to bypass
-access checks.
+Low-level code can place `@ignore_access` in a scope to bypass access checks.
 
 ## Value scopes
 
@@ -1252,15 +1251,18 @@ valk build ./src -o ./myprogram
 
 Although Valk aims to be safe, it still supports low-level operations when needed. Unsafe features include:
 
-- Tokens that start with `@` such as `@ptrv`, `@ref`, ...
+- Calling a function with a `ptr` argument
 - Offset access on unbounded pointers
+
+Tokens that start with `@`, such as `@ptrv`, `@ref`, and `@cast`, do not by
+themselves require an unsafe scope.
 
 Place `@unsafe` in a scope to use these features in that scope and its child scopes:
 
 ```rust
-fn address(value: ptr) uint {
+fn first(data: *[u8]) u8 {
     @unsafe
-    return value.@cast(uint)
+    return data[0]
 }
 ```
 
