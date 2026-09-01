@@ -4,8 +4,15 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.4.5
+- Release 0.5.1
 ~ Data race solution (Threads done via shared type, MutexValue not done)
+
+- Release 0.5.0
++ Big api overhaul
++ Full security audit
++ Replace unsafe code with safe code
++ Update docs
+
 
 # Next steps
 - Improve standard library
