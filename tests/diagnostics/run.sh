@@ -84,13 +84,24 @@ if [ "$unsafe_warn_status" -ne 0 ] || \
 fi
 
 count=$((count + 1))
-echo "> target-specific unsafe does not warn"
+echo "> unsafe outside skipped conditional warns"
 unsafe_conditional_out=$("$VALK" build "$DIR/unsafe-conditional.valk" -o "$workdir/unsafe-conditional" 2>&1)
 unsafe_conditional_status=$?
-if [ "$unsafe_conditional_status" -ne 0 ] || [[ "$unsafe_conditional_out" == *"Unnecessary '@unsafe'"* ]]; then
-    echo "# Target-specific unsafe emitted an unnecessary warning"
+if [ "$unsafe_conditional_status" -ne 0 ] || [[ "$unsafe_conditional_out" != *"Unnecessary '@unsafe'"* ]]; then
+    echo "# Unsafe outside a skipped conditional did not warn"
     echo "- Exit code: $unsafe_conditional_status"
     echo "$unsafe_conditional_out"
+    failed=1
+fi
+
+count=$((count + 1))
+echo "> unsafe inside skipped conditional does not warn"
+unsafe_conditional_scoped_out=$("$VALK" build "$DIR/unsafe-conditional-scoped.valk" -o "$workdir/unsafe-conditional-scoped" 2>&1)
+unsafe_conditional_scoped_status=$?
+if [ "$unsafe_conditional_scoped_status" -ne 0 ] || [[ "$unsafe_conditional_scoped_out" == *"Unnecessary '@unsafe'"* ]]; then
+    echo "# Unsafe inside a skipped conditional emitted a warning"
+    echo "- Exit code: $unsafe_conditional_scoped_status"
+    echo "$unsafe_conditional_scoped_out"
     failed=1
 fi
 
