@@ -456,6 +456,24 @@ if [[ "$interface_body" != *"insertvalue { ptr, ptr }"* ]] \
     exit 1
 fi
 
+echo "> Emit Windows interface vtables in COMDAT sections"
+
+interface_win_ir="$workdir/interface-values-win.ll"
+out=$("$VALK" build "$DIR/interface-values.valk" --ir --no-warn --target win-x64 -o "$interface_win_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build Windows interface value IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+if ! grep -q '^$"valk\.interface\.vtable\..*" = comdat any$' "$interface_win_ir" \
+    || ! grep -q 'comdat($"valk\.interface\.vtable\..*")' "$interface_win_ir"; then
+    echo "# Windows interface vtable did not use a COMDAT section"
+    grep 'valk.interface.vtable' "$interface_win_ir"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 16"
+echo "# Test count: 17"
 echo ""
