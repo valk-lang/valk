@@ -301,6 +301,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
+    + static fn new(length: uint, value: T) Slice[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
 }
