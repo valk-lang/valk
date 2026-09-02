@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -391,35 +391,60 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class f32 {
+    + fn abs() f32
+    + fn clamp(minimum: f32, maximum: f32) f32
+    + fn is_finite() bool
+    + fn is_infinite() bool
+    + fn is_nan() bool
+    + fn max(other: f32) f32
+    + fn min(other: f32) f32
     + fn to_shortest_string() String
     + fn to_shortest_string_in_ptr(buf: ptr) uint
-    + fn to_string(decimals: uint, trim_zeros: bool (false)) String
+    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class f64 {
+    + fn abs() f64
+    + fn clamp(minimum: f64, maximum: f64) f64
+    + fn is_finite() bool
+    + fn is_infinite() bool
+    + fn is_nan() bool
+    + fn max(other: f64) f64
+    + fn min(other: f64) f64
     + fn to_shortest_string() String
     + fn to_shortest_string_in_ptr(buf: ptr) uint
-    + fn to_string(decimals: uint, trim_zeros: bool (false)) String
+    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class float {
+    + fn abs() float
+    + fn clamp(minimum: float, maximum: float) float
+    + fn is_finite() bool
+    + fn is_infinite() bool
+    + fn is_nan() bool
+    + fn max(other: float) float
+    + fn min(other: float) float
     + fn to_shortest_string() String
     + fn to_shortest_string_in_ptr(buf: ptr) uint
-    + fn to_string(decimals: uint, trim_zeros: bool (false)) String
+    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
 }
 ```
 
 ```js
 + class i16 {
+    + fn abs() i16
     + fn character_length(base: i16) uint
+    + fn clamp(minimum: i16, maximum: i16) i16
     + fn equals_string(str: String) bool
+    + fn max(other: i16) i16
+    + fn min(other: i16) i16
     + fn print(base: i16) void
     + static fn random() i16
     + static fn read_big_endian(from: *[u8 x 2]) i16
@@ -438,8 +463,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class i32 {
+    + fn abs() i32
     + fn character_length(base: i32) uint
+    + fn clamp(minimum: i32, maximum: i32) i32
     + fn equals_string(str: String) bool
+    + fn max(other: i32) i32
+    + fn min(other: i32) i32
     + fn print(base: i32) void
     + static fn random() i32
     + static fn read_big_endian(from: *[u8 x 4]) i32
@@ -458,8 +487,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class i64 {
+    + fn abs() i64
     + fn character_length(base: i64) uint
+    + fn clamp(minimum: i64, maximum: i64) i64
     + fn equals_string(str: String) bool
+    + fn max(other: i64) i64
+    + fn min(other: i64) i64
     + fn print(base: i64) void
     + static fn random() i64
     + static fn read_big_endian(from: *[u8 x 8]) i64
@@ -478,8 +511,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class i8 {
+    + fn abs() i8
     + fn character_length(base: i8) uint
+    + fn clamp(minimum: i8, maximum: i8) i8
     + fn equals_string(str: String) bool
+    + fn max(other: i8) i8
+    + fn min(other: i8) i8
     + fn print(base: i8) void
     + static fn random() i8
     + static fn read_big_endian(from: *u8) i8
@@ -498,8 +535,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class int {
+    + fn abs() int
     + fn character_length(base: int) uint
+    + fn clamp(minimum: int, maximum: int) int
     + fn equals_string(str: String) bool
+    + fn max(other: int) int
+    + fn min(other: int) int
     + fn print(base: int) void
     + static fn random() int
     + static fn read_big_endian(from: *[u8 x 8]) int
@@ -585,8 +626,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class u16 {
+    + fn abs() u16
     + fn character_length(base: u16) uint
+    + fn clamp(minimum: u16, maximum: u16) u16
     + fn equals_string(str: String) bool
+    + fn max(other: u16) u16
+    + fn min(other: u16) u16
     + fn print(base: u16) void
     + static fn random() u16
     + static fn read_big_endian(from: *[u8 x 2]) u16
@@ -605,8 +650,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class u32 {
+    + fn abs() u32
     + fn character_length(base: u32) uint
+    + fn clamp(minimum: u32, maximum: u32) u32
     + fn equals_string(str: String) bool
+    + fn max(other: u32) u32
+    + fn min(other: u32) u32
     + fn print(base: u32) void
     + static fn random() u32
     + static fn read_big_endian(from: *[u8 x 4]) u32
@@ -625,8 +674,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class u64 {
+    + fn abs() u64
     + fn character_length(base: u64) uint
+    + fn clamp(minimum: u64, maximum: u64) u64
     + fn equals_string(str: String) bool
+    + fn max(other: u64) u64
+    + fn min(other: u64) u64
     + fn print(base: u64) void
     + static fn random() u64
     + static fn read_big_endian(from: *[u8 x 8]) u64
@@ -645,7 +698,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class u8 {
+    + fn abs() u8
     + fn character_length(base: u8) uint
+    + fn clamp(minimum: u8, maximum: u8) u8
     + fn equals_string(str: String) bool
     + fn hex_byte_to_hex_value() u8
     + fn is_alpha() bool
@@ -661,6 +716,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn is_space_or_tab() bool
     + fn is_upper() bool
     + fn is_whitespace() bool
+    + fn max(other: u8) u8
+    + fn min(other: u8) u8
     + fn print(base: u8) void
     + static fn random() u8
     + static fn read_big_endian(from: *u8) u8
@@ -681,10 +738,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class uint {
+    + fn abs() uint
     + fn character_length(base: uint) uint
     + fn checked_add(other: uint) uint !LookupError
     + fn checked_multiply(other: uint) uint !LookupError
+    + fn clamp(minimum: uint, maximum: uint) uint
     + fn equals_string(str: String) bool
+    + fn max(other: uint) uint
+    + fn min(other: uint) uint
     + fn print(base: uint) void
     + static fn random() uint
     + static fn read_big_endian(from: *[u8 x 8]) uint
@@ -1484,6 +1545,35 @@ alias Fd for i32
     + code_class: ?String
     + paragraph_class: ?String
 }
+```
+
+# math
+
+## Functions for 'math'
+
+```js
++ fn abs(value: float) float
++ fn acos(value: float) float
++ fn asin(value: float) float
++ fn atan(value: float) float
++ fn atan2(y: float, x: float) float
++ fn cbrt(value: float) float
++ fn ceil(value: float) float
++ fn cos(value: float) float
++ fn exp(value: float) float
++ fn exp2(value: float) float
++ fn floor(value: float) float
++ fn hypot(x: float, y: float) float
++ fn log(value: float) float
++ fn log10(value: float) float
++ fn log2(value: float) float
++ fn mod(value: float, divisor: float) float
++ fn pow(base: float, exponent: float) float
++ fn round(value: float) float
++ fn sin(value: float) float
++ fn sqrt(value: float) float
++ fn tan(value: float) float
++ fn trunc(value: float) float
 ```
 
 # mem
