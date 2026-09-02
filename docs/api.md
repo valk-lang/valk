@@ -61,7 +61,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn intersect(with: Array[T]) Array[T]
     + fn iter() Slice[T]
     + fn join(divider: String) String
-    + fn lock() void
     + fn merge(items: Array[T]) Array[T]
     + fn merge_in_place(items: Array[T]) Array[T]
     + static fn new(start_size: uint (0)) Array[T]
@@ -82,7 +81,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
-    + fn unlock() void
 }
 ```
 
@@ -236,7 +234,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn has_value(value: T) bool
     + fn keys() Array[K]
     + get length: uint
-    + fn lock() void
     + fn merge(map: HashMap[K, T]) HashMap[K, T]
     + fn merge_in_place(map: HashMap[K, T]) HashMap[K, T]
     + static fn new(capacity: uint (0)) HashMap[K, T]
@@ -244,7 +241,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set(key: K, value: T) HashMap[K, T]
     + fn set_unique(key: K, value: T) HashMap[K, T] !LookupError
     + fn sort_keys() HashMap[K, T]
-    + fn unlock() void
     + fn values() Array[T]
 }
 ```
