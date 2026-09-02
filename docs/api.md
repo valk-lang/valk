@@ -1063,6 +1063,7 @@ alias pid_t for i32
 + fn add(dir: String, fn: String) String
 + fn basename(path: String) String
 + fn chdir(path: String) void !io:IoError
++ fn chmod(path: String, permissions: u32) void !io:IoError
 + fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
 + fn cwd() String !io:IoError
 + fn delete(path: String) void !io:IoError
@@ -1090,7 +1091,8 @@ alias pid_t for i32
 + fn size(path: String) uint !io:IoError
 + fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
-+ fn sync() void
++ fn sync_all() void
++ fn truncate(path: String, length: uint) void !io:IoError
 + fn write(path: String, content: String, append: bool (false)) void !io:IoError
 + fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
 ```
@@ -1105,6 +1107,8 @@ alias pid_t for i32
 
     + fn close() void !io:IoError
     + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
+    + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
+    + fn sync(data_only: bool (false)) void !io:IoError
     + fn write[T](data: ByteView[T]) void !io:IoError
     + fn write_buffer(buffer: ByteBuffer) void !io:IoError
     + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) void !io:IoError
@@ -1133,6 +1137,7 @@ alias pid_t for i32
 + struct OpenOptions {
     + append: bool
     + create: bool
+    + exclusive: bool
     + permissions: u32
     + read: bool
     + write: bool
@@ -1421,8 +1426,10 @@ alias Fd for i32
 + fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_sync(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
++ fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
++ fn sync(fd: i32, data_only: bool (false)) void !IoError
 + fn write[T](fd: i32, data: ByteView[T]) uint !IoError
 + fn write_buffer(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
 + fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError

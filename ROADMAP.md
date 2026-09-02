@@ -6,13 +6,13 @@
 ```
 - Release 0.5.1
 ~ Data race solution (Threads done via shared type, MutexValue not done)
-- is_a token, union/interface type checker
-- math namespace
++ math namespace
++ more valk lib functions
 - integer .max/.min
 
 
 # Next steps
-- Improve standard library
+- is_a token, union/interface type checker
 
 # Other
 
