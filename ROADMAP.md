@@ -6,6 +6,9 @@
 ```
 - Release 0.5.1
 ~ Data race solution (Threads done via shared type, MutexValue not done)
+- is_a token, union/interface type checker
+- math namespace
+- integer .max/.min
 
 
 # Next steps
