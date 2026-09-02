@@ -1287,18 +1287,24 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
 ```js
 + class Options {
+    + alpn_protocols: ?Array[String]
     + body: String
     + ca_cert_path: ?String
+    + certificate_sha256: ?String
     + connect_timeout_ms: uint
     + follow_redirects: bool
     + headers: ?Map[String]
     + max_redirects: uint
     + max_response_body_size: uint
     + max_response_header_size: uint
+    + max_tls_version: ?TlsVersion
+    + min_tls_version: TlsVersion
     + output_to_file: ?String
     + query_data: ?Map[String]
     + read_timeout_ms: uint
     + timeout_ms: uint
+    + tls_cipher_list: ?String
+    + tls_cipher_suites: ?String
     + verify_ssl_cert: bool
     + write_timeout_ms: uint
 
@@ -1390,6 +1396,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fn add_static_dir(path: String) void !LookupError
     + static fn new(host: String, port: u16, handler: shared fn(Request)(Response)) Server !HttpError
     + fn start(worker_count: i32 (-1)) void
+    + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) Server !HttpError
 }
 ```
 
@@ -1650,6 +1657,7 @@ alias Fd for i32
     + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
     + fn send_string(data: String, send_all: bool (true)) uint !NetError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
+    + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
 }
 ```
@@ -1687,18 +1695,36 @@ alias Fd for i32
     ~ fd: i32
     ~ ssl: OSSL
 
+    + fn accept(fd: i32, timeout_ms: uint (5000)) void !NetError
+    + fn close(timeout_ms: uint (5000)) void !NetError
     + fn connect(fd: i32, timeout_ms: uint (5000)) void !NetError
     + fn custom_error(msg: String) void !NetError
     + static fn default_ca_cert_paths() Array[String]
     + fn get_error() uint
     + fn get_error_message() String
     + static fn new() Ssl
+    + fn peer_certificate_sha256() String !NetError
     + fn recv(buffer: ByteBuffer, max_bytes: uint, timeout_ms: uint (5000)) uint !NetError
+    + fn selected_alpn() String
+    + fn set_alpn(protocols: Array[String]) void !NetError
     + fn set_ca_cert(path: ?String) void !NetError
     + fn set_ca_cert_dir(dir: ?String) void !NetError
+    + fn set_cipher_list(ciphers: String) void !NetError
+    + fn set_cipher_suites(ciphers: String) void !NetError
     + fn set_host(host: String) void !NetError
+    + fn set_max_version(version: TlsVersion) void !NetError
+    + fn set_min_version(version: TlsVersion) void !NetError
     + fn set_verify(enable: bool) void
     + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError
+}
+```
+
+```js
++ class SslServerContext {
+    ~ ctx: SSL_CTX
+
+    + static fn connection(context: shared SslServerContext) Ssl
+    + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) SslServerContext !NetError
 }
 ```
 

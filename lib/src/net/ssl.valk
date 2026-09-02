@@ -1,7 +1,63 @@
 use fs
 use io
+use core
 
 global ca_paths: ?Array[String]
+
++ enum TlsVersion: i32 {
+    tls_1_2 (TLS1_2_VERSION)
+    tls_1_3 (TLS1_3_VERSION)
+}
+
++ class SslServerContext {
+    ~ ctx: SSL_CTX
+
+    + static fn new(
+        certificate_file: String,
+        private_key_file: String,
+        min_version: TlsVersion (TlsVersion.tls_1_2),
+        cipher_list: ?String (null),
+        cipher_suites: ?String (null)
+    ) SELF !NetError {
+        @unsafe
+        let ctx = SSL_CTX_new(TLS_server_method())
+        if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, min_version.to(int), null) != 1 {
+            SSL_CTX_free(ctx)
+            throw .ssl
+        }
+        if SSL_CTX_use_certificate_file(ctx, certificate_file.data, SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_use_PrivateKey_file(ctx, private_key_file.data, SSL_FILETYPE_PEM) != 1
+            || SSL_CTX_check_private_key(ctx) != 1 {
+            SSL_CTX_free(ctx)
+            throw .ssl
+        }
+        if isset(cipher_list) && SSL_CTX_set_cipher_list(ctx, cipher_list.data) != 1 {
+            SSL_CTX_free(ctx)
+            throw .ssl
+        }
+        if isset(cipher_suites) && SSL_CTX_set_ciphersuites(ctx, cipher_suites.data) != 1 {
+            SSL_CTX_free(ctx)
+            throw .ssl
+        }
+        ERR_clear_error()
+        return SELF { ctx: ctx }
+    }
+
+    + static fn connection(context: shared SslServerContext) Ssl {
+        @unsafe
+        return Ssl {
+            ctx: context.ctx
+            ssl: SSL_new(context.ctx)
+            server_context: context
+            owns_context: false
+        }
+    }
+
+    fn gc_free() {
+        @unsafe
+        SSL_CTX_free(this.ctx)
+    }
+}
 
 + class Ssl {
     ~ ctx: SSL_CTX
@@ -13,6 +69,9 @@ global ca_paths: ?Array[String]
     ~ fd: Fd (0)
     - error_changed: bool (false)
     ~ connected: bool (false)
+    - server_context: ?shared SslServerContext
+    - owns_context: bool (true)
+    - closed: bool (false)
 
     + static fn default_ca_cert_paths() Array[String] {
         let paths = ca_paths
@@ -105,6 +164,75 @@ global ca_paths: ?Array[String]
         SSL_set_verify(this.ssl, enable ? SSL_VERIFY_PEER : SSL_VERIFY_NONE, null)
     }
 
+    + fn set_min_version(version: TlsVersion) !NetError {
+        @unsafe
+        if SSL_ctrl(this.ssl, SSL_CTRL_SET_MIN_PROTO_VERSION, version.to(int), null) != 1 : throw .ssl
+    }
+
+    + fn set_max_version(version: TlsVersion) !NetError {
+        @unsafe
+        if SSL_ctrl(this.ssl, SSL_CTRL_SET_MAX_PROTO_VERSION, version.to(int), null) != 1 : throw .ssl
+    }
+
+    + fn set_cipher_list(ciphers: String) !NetError {
+        @unsafe
+        if SSL_set_cipher_list(this.ssl, ciphers.data) != 1 : throw .ssl
+    }
+
+    + fn set_cipher_suites(ciphers: String) !NetError {
+        @unsafe
+        if SSL_set_ciphersuites(this.ssl, ciphers.data) != 1 : throw .ssl
+    }
+
+    + fn set_alpn(protocols: Array[String]) !NetError {
+        @unsafe
+        let encoded = ByteBuffer.new()
+        each protocols as protocol {
+            if protocol.bytes == 0 || protocol.bytes > 255 : throw .ssl
+            encoded.write_byte(protocol.bytes.to(u8))
+            encoded.write_string(protocol)
+        }
+        if encoded.length == 0 || SSL_set_alpn_protos(this.ssl, encoded.data, encoded.length.to(u32)) != 0 : throw .ssl
+    }
+
+    + fn selected_alpn() String {
+        @unsafe
+        let protocol: ptr = @undefined
+        let length: u32 = 0
+        SSL_get0_alpn_selected(this.ssl, @ref(protocol), @ref(length))
+        if length == 0 : return ""
+        return String.copy_from_ptr(protocol, length)
+    }
+
+    + fn peer_certificate_sha256() String !NetError {
+        @unsafe
+        #if OS == "win"
+        let certificate = SSL_get1_peer_certificate(this.ssl)
+        #else
+        let certificate = SSL_get_peer_certificate(this.ssl)
+        #end
+        if !isset(certificate) : throw .ssl
+        defer X509_free(certificate)
+
+        let digest: [u8 x 32] = { 0... }
+        let digest_length: u32 = 0
+        if X509_digest(certificate, EVP_sha256(), @ref(digest).@cast(*u8), @ref(digest_length)) != 1
+            || digest_length != 32 : throw .ssl
+
+        let output: [u8 x 64] = { 0... }
+        let i: uint = 0
+        while i < 32 {
+            let offset = i * 2
+            let length = digest[i].to_base_to_ptr(16, &output[offset], true)
+            if length == 1 {
+                output[offset + 1] = output[offset]
+                output[offset] = '0'
+            }
+            i++
+        }
+        return String.copy_from_ptr(&output, 64)
+    }
+
     #if TEST
     + fn verification_enabled_for_test() bool {
         @unsafe
@@ -113,14 +241,24 @@ global ca_paths: ?Array[String]
     #end
 
     + fn connect(fd: Fd, timeout_ms: uint (5000)) !NetError {
+        this.handshake(fd, timeout_ms, false) !>
+    }
+
+    + fn accept(fd: Fd, timeout_ms: uint (5000)) !NetError {
+        this.handshake(fd, timeout_ms, true) !>
+    }
+
+    fn handshake(fd: Fd, timeout_ms: uint, server: bool) !NetError {
         @unsafe
+        #if OS == "linux"
+        core.signal_ignore(13)
+        #end
         this.fd = fd
         io.set_nonblocking(fd, true) ! throw .os
-        SSL_set_fd(this.ssl, fd.to(i32))
-        if fd == -1 : throw .ssl
+        if fd == -1 || SSL_set_fd(this.ssl, fd.to(i32)) != 1 : throw .ssl
 
         while true {
-            let res = SSL_connect(this.ssl)
+            let res = server ? SSL_accept(this.ssl) : SSL_connect(this.ssl)
             if res != 1 {
                 let err = SSL_get_error(this.ssl, res)
                 if err == ERROR.WANT_READ {
@@ -142,6 +280,26 @@ global ca_paths: ?Array[String]
             break
         }
         this.connected = true
+    }
+
+    + fn close(timeout_ms: uint (5000)) !NetError {
+        @unsafe
+        if this.closed : return
+        this.closed = true
+        if !this.connected : return
+
+        while true {
+            let result = SSL_shutdown(this.ssl)
+            if result >= 0 : break
+            let err = SSL_get_error(this.ssl, result)
+            if err != ERROR.WANT_READ && err != ERROR.WANT_WRITE : throw .ssl
+            let ev = io.await_socket_fd(this.fd, err == ERROR.WANT_READ, err == ERROR.WANT_WRITE, timeout_ms)
+            if ev.is_timeout() : throw .timeout
+            if err == ERROR.WANT_READ {
+                if !ev.is_readable() : throw .closed
+            } else if ev.is_closed() || !ev.is_writable() : throw .closed
+        }
+        this.connected = false
     }
 
     + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError {
@@ -218,6 +376,6 @@ global ca_paths: ?Array[String]
     fn gc_free() {
         @unsafe
         SSL_free(this.ssl)
-        SSL_CTX_free(this.ctx);
+        if this.owns_context : SSL_CTX_free(this.ctx)
     }
 }
