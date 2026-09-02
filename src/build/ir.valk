@@ -41,6 +41,8 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     }
     if unit.string_values.length > 0 : out.write_string("\n")
 
+    ir_write_interface_vtables(out, unit) !>
+
     let declared_externs = Map[bool]{}
     each unit.extern_functions as func {
         // Recorded while lowering any function of this unit, reachable or not.
@@ -729,6 +731,11 @@ fn ir_visit_type_gc_fields(
         return
     }
 
+    if t.kind == TYPE.interface {
+        ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
+        return
+    }
+
     if t.kind == TYPE.union {
         let members = t.get_members()
         if !isset(members) : return
@@ -1165,7 +1172,7 @@ fn ir_type_uncached(type: Type) String !Error {
         out.write_string(" }")
         return out.to_string()
     }
-    if t.kind == TYPE.closure : return "{ ptr, ptr }"
+    if t.kind == TYPE.closure || t.kind == TYPE.interface : return "{ ptr, ptr }"
     if t.kind == TYPE.union {
         let layout = t.union_layout() !>
         let out = ByteBuffer.new()
@@ -1996,6 +2003,12 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if !isset(inner) : value.bug("Shared view is missing its value")
         return ir_emit_value(ir, inner) !>
     }
+    if t == VAL.interface_wrap {
+        return ir_emit_interface_wrap(ir, value) !>
+    }
+    if t == VAL.is_a {
+        return ir_emit_is_a(ir, value) !>
+    }
     if t == VAL.decl || t == VAL.global || t == VAL.ptrv {
         if value_is_shared_storage(value) && value.rett.is_integer_type() {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
@@ -2071,11 +2084,20 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if (op == VALUE_OP.eq || op == VALUE_OP.ne)
             && isset(class) && class.kind == CLASS_KIND.interface
         {
-            if left.rett.is_nullable_type() || right.rett.is_nullable_type() {
-                return ir_emit_nullable_interface_compare(ir, rendered_left, rendered_right, op)
+            if left.rett.is_tagged_nullable() || right.rett.is_tagged_nullable() {
+                return ir_emit_nullable_interface_compare(
+                    ir,
+                    rendered_left,
+                    left.rett,
+                    rendered_right,
+                    right.rett,
+                    op
+                ) !>
             }
             rendered_left = ir_interface_object(ir, rendered_left)
             rendered_right = ir_interface_object(ir, rendered_right)
+            let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
+            return ir_emit_binary_instruction(ir, compare, "ptr", rendered_left, rendered_right)
         }
         return ir_emit_binary(ir, rendered_left, rendered_right, op, left.rett) !>
     }
@@ -2219,13 +2241,6 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         }
         return ir_func_address(func)
     }
-    if t == VAL.interface_method {
-        let func = value.func
-        if !isset(func) : value.bug("Interface adapter entry has no function")
-        ir_use_func(ir, func)
-        return ir_func_address(func)
-    }
-
     value.bug("Value kind reached IR without lowering: " + t)
 }
 
@@ -2416,6 +2431,10 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     if type.kind == TYPE.closure {
         let target = ir_emit_extract(ir, lowered, rendered, 0)
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", target, "null")
+    }
+    if type.kind == TYPE.interface {
+        let object = ir_interface_object(ir, rendered)
+        return ir_emit_binary_instruction(ir, "icmp ne", "ptr", object, "null")
     }
     if type.is_pointer() {
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", rendered, "null")
@@ -2899,42 +2918,162 @@ fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
     }
 }
 
-// Interface objects are stored as tagged GC properties.
-fn ir_interface_object(ir: IRFunc, adapter: String) String {
-    return ir_union_clean_gc_pointer(ir, ir_emit_load(ir, "ptr", adapter))
+fn interface_vtable_name(adapter: Class) String {
+    return "valk.interface.vtable." + adapter.name
 }
 
-fn ir_emit_nullable_interface_compare(ir: IRFunc, left: String, right: String, op: VALUE_OP) String {
-    let left_null = ir_emit_binary_instruction(ir, "icmp eq", "ptr", left, "null")
-    let right_null = ir_emit_binary_instruction(ir, "icmp eq", "ptr", right, "null")
-    let any_null = ir_emit_binary_instruction(ir, "or", "i1", left_null, right_null)
+fn ir_write_interface_vtable(out: ByteBuffer, adapter: Class) !Error {
+    let interface = adapter.interface_for
+    let concrete = adapter.interface_concrete
+    if !isset(interface) || !isset(concrete) : adapter.exp.bug("Interface adapter metadata is incomplete")
+    let count = interface.interface_method_count > 0 ? interface.interface_method_count : 1
+    out.write_string("@\"")
+    out.write_string(interface_vtable_name(adapter))
+    out.write_string("\" = linkonce_odr constant [")
+    out.write_uint_ascii(count)
+    out.write_string(" x ptr] ")
+    if interface.interface_method_count == 0 {
+        out.write_string("zeroinitializer")
+    } else {
+        out.write_string("[")
+        let slot: uint = 0
+        while slot < interface.interface_method_count {
+            let requirement = interface_method_at(interface, slot) ?! adapter.exp.bug("Interface method slot is missing")
+            let implementation = concrete.get_func(requirement.name) ?! adapter.exp.bug("Interface implementation is missing")
+            if slot > 0 : out.write_string(", ")
+            out.write_string("ptr ")
+            out.write_string(ir_func_address(implementation))
+            slot++
+        }
+        out.write_string("]")
+    }
+    out.write_string(", align ")
+    out.write_uint_ascii(adapter.ns.build.options.target.ptr_size.to(uint))
+    out.write_string("\n")
+}
 
-    let null_block = ir.block("interface.compare.null")
+fn ir_write_interface_vtables(out: ByteBuffer, unit: Unit) !Error {
+    let emitted = Map[bool]{}
+    each unit.functions as func {
+        if !func.info_used : continue
+        each func.interface_vtables_used as adapter, name {
+            if emitted.has(name) : continue
+            emitted.set(name, true)
+            ir_write_interface_vtable(out, adapter) !>
+        }
+    }
+    if emitted.length > 0 : out.write_string("\n")
+}
+
+fn ir_use_interface_vtable(ir: IRFunc, adapter: Class) String !Error {
+    let interface = adapter.interface_for
+    let concrete = adapter.interface_concrete
+    if !isset(interface) || !isset(concrete) : adapter.exp.bug("Interface adapter metadata is incomplete")
+
+    let slot: uint = 0
+    while slot < interface.interface_method_count {
+        let requirement = interface_method_at(interface, slot) ?! adapter.exp.bug("Interface method slot is missing")
+        let implementation = concrete.get_func(requirement.name) ?! adapter.exp.bug("Interface implementation is missing")
+        ir_use_func(ir, implementation)
+        slot++
+    }
+
+    let name = interface_vtable_name(adapter)
+    ir.func.interface_vtables_used.set(name, adapter)
+    return ir_symbol_address(name)
+}
+
+fn ir_interface_object(ir: IRFunc, value: String) String {
+    return ir_union_clean_gc_pointer(ir, ir_emit_extract(ir, "{ ptr, ptr }", value, 0))
+}
+
+fn ir_interface_vtable(ir: IRFunc, value: String) String {
+    return ir_emit_extract(ir, "{ ptr, ptr }", value, 1)
+}
+
+fn ir_emit_nullable_interface_compare(
+    ir: IRFunc,
+    left: String,
+    left_type: Type,
+    right: String,
+    right_type: Type,
+    op: VALUE_OP
+) String !Error {
+    let left_present = "true"
+    let left_value = left
+    if left_type.is_tagged_nullable() {
+        left_present = ir_emit_extract(ir, ir_type(left_type) !>, left, 0)
+        left_value = ir_extract_tagged_nullable_value(ir, left, left_type) !>
+    }
+    let right_present = "true"
+    let right_value = right
+    if right_type.is_tagged_nullable() {
+        right_present = ir_emit_extract(ir, ir_type(right_type) !>, right, 0)
+        right_value = ir_extract_tagged_nullable_value(ir, right, right_type) !>
+    }
+
+    let both_present = ir_emit_binary_instruction(ir, "and", "i1", left_present, right_present)
+    let absent_block = ir.block("interface.compare.absent")
     let value_block = ir.block("interface.compare.value")
     let after_block = ir.block("interface.compare.after")
-    ir.cond_jump(any_null, null_block, value_block)
+    ir.cond_jump(both_present, value_block, absent_block)
 
-    ir.label(null_block)
-    let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
-    let null_result = ir_emit_binary_instruction(ir, compare, "i1", left_null, right_null)
-    let null_predecessor = ir.current_block
+    ir.label(absent_block)
+    let presence_compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
+    let absent_result = ir_emit_binary_instruction(ir, presence_compare, "i1", left_present, right_present)
+    let absent_predecessor = ir.current_block
     ir.jump(after_block)
 
     ir.label(value_block)
-    let left_object = ir_interface_object(ir, left)
-    let right_object = ir_interface_object(ir, right)
-    let value_result = ir_emit_binary_instruction(ir, compare, "ptr", left_object, right_object)
+    let value_compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
+    let value_result = ir_emit_binary_instruction(
+        ir,
+        value_compare,
+        "ptr",
+        ir_interface_object(ir, left_value),
+        ir_interface_object(ir, right_value)
+    )
     let value_predecessor = ir.current_block
     ir.jump(after_block)
 
     ir.label(after_block)
-    let out = ir_emit_phi2(ir, "i1", null_result, null_predecessor, value_result, value_predecessor)
-    return out
+    return ir_emit_phi2(ir, "i1", absent_result, absent_predecessor, value_result, value_predecessor)
 }
 
-fn ir_interface_method_target(ir: IRFunc, adapter: String, method: Func) String {
-    let offset = (method.interface_slot + 1) * method.ns.build.options.target.ptr_size.to(uint)
-    return ir_emit_load(ir, "ptr", ir_offset_address(ir, adapter, offset))
+fn ir_emit_interface_wrap(ir: IRFunc, value: Value) String !Error {
+    let on = value.value1
+    let adapter = value.get_class_ref()
+    if !isset(on) || !isset(adapter) : value.bug("Interface conversion is incomplete")
+    let object = ir_emit_value(ir, on) !>
+    let inner = value.rett.get_non_nullable()
+    let lowered = ir_type(inner) !>
+    let result = ir_emit_insert(ir, lowered, "undef", "ptr", object, 0)
+    result = ir_emit_insert(ir, lowered, result, "ptr", ir_use_interface_vtable(ir, adapter) !>, 1)
+    if value.rett.is_tagged_nullable() : return ir_build_tagged_nullable(ir, value.rett, result) !>
+    return result
+}
+
+fn ir_emit_is_a(ir: IRFunc, value: Value) String !Error {
+    let on = value.value1
+    if !isset(on) : value.bug("is_a is missing its interface value")
+    let rendered = ir_emit_value(ir, on) !>
+    let adapter = value.get_class_ref()
+    if !isset(adapter) : return "false"
+    let interface_value = rendered
+    let present = "true"
+    if on.rett.is_tagged_nullable() {
+        present = ir_emit_extract(ir, ir_type(on.rett) !>, rendered, 0)
+        interface_value = ir_extract_tagged_nullable_value(ir, rendered, on.rett) !>
+    }
+    let expected = ir_use_interface_vtable(ir, adapter) !>
+    let matches = ir_emit_binary_instruction(ir, "icmp eq", "ptr", ir_interface_vtable(ir, interface_value), expected)
+    if present == "true" : return matches
+    return ir_emit_binary_instruction(ir, "and", "i1", present, matches)
+}
+
+fn ir_interface_method_target(ir: IRFunc, value: String, method: Func) String {
+    let offset = method.interface_slot * method.ns.build.options.target.ptr_size.to(uint)
+    return ir_emit_load(ir, "ptr", ir_offset_address(ir, ir_interface_vtable(ir, value), offset))
 }
 
 ////////////////////////////
@@ -3008,13 +3147,14 @@ fn ir_write_adapter_signature(ir: IRFunc, func: Func, name: String, closure_data
     ir.label("entry")
 }
 
-fn ir_emit_adapter_call(ir: IRFunc, func: Func, target: String, prefix_type: String, prefix: String, receiver: String) !Error {
+fn ir_emit_adapter_call(ir: IRFunc, func: Func, target: String, prefix_type: String, prefix: String, receiver: String, receiver_type: String ("")) !Error {
     let has_result = !func.get_rett().is_void_type() || func.can_error
     let mark = ir.arg_list.length
     if prefix.length > 0 : ir.write_arg(mark, prefix_type, prefix)
     each func.args as arg, i {
         let value = (i == 0 && receiver.length > 0) ? receiver : ir_arg_name(func.ns.build, i)
-        ir.write_arg(mark, ir_type(arg.type) !>, value)
+        let type = (i == 0 && receiver_type.length > 0) ? receiver_type : ir_type(arg.type) !>
+        ir.write_arg(mark, type, value)
     }
     let rett = ir_func_rett_type(func) !>
     let raw = ir_emit_arg_call(ir, rett, target, mark)
@@ -3055,7 +3195,7 @@ fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Err
         receiver = ir_interface_object(ir, adapter)
         ir_note_unknown_code(parent)
     }
-    ir_emit_adapter_call(ir, func, call_target, "", "", receiver) !>
+    ir_emit_adapter_call(ir, func, call_target, "", "", receiver, func.is_interface ? "ptr" : "") !>
     return name
 }
 
@@ -3425,6 +3565,13 @@ fn ir_coro_append_type_roots(
         ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
         ir.jump(after)
         ir.label(after)
+        return
+    }
+
+    if t.kind == TYPE.interface {
+        let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
+        pointer = ir_union_clean_gc_pointer(ir, pointer)
+        ir_coro_append_gc(ir, value, gc_args, pointer) !>
         return
     }
 

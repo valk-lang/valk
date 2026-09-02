@@ -1100,20 +1100,20 @@ alias pid_t for i32
 ## Classes for 'fs'
 
 ```js
-+ class FileStream {
++ class FileStream is Reader, Writer, Seeker {
     ~ path: String
     + read_offset: uint
     ~ reading: bool
 
     + fn close() void !io:IoError
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
+    + fn read(buffer: ByteBuffer, max_bytes: uint) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
-    + fn write[T](data: ByteView[T]) void !io:IoError
-    + fn write_buffer(buffer: ByteBuffer) void !io:IoError
-    + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) void !io:IoError
-    + fn write_bytes(from: ptr, len: uint) void !io:IoError
-    + fn write_string(str: String) void !io:IoError
+    + fn write[T](data: ByteView[T]) uint !io:IoError
+    + fn write_buffer(buffer: ByteBuffer) uint !io:IoError
+    + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) uint !io:IoError
+    + fn write_bytes(from: ptr, len: uint) uint !io:IoError
+    + fn write_string(str: String) uint !io:IoError
 }
 ```
 
@@ -1437,6 +1437,52 @@ alias Fd for i32
 + fn write_string(fd: i32, str: String) uint !IoError
 ```
 
+## Classes for 'io'
+
+```js
++ class ByteBufferReader is Reader {
+    + offset: uint
+    + source: ByteBuffer
+
+    + fn read(buffer: ByteBuffer, max_bytes: uint) uint !IoError
+}
+```
+
+```js
++ class ByteBufferWriter is Writer {
+    + buffer: ByteBuffer
+
+    + fn write_buffer(source: ByteBuffer) uint !IoError
+}
+```
+
+```js
++ interface Reader {
+    + fn read(buffer: ByteBuffer, max_bytes: uint) uint !IoError
+}
+```
+
+```js
++ interface Seeker {
+    + fn seek(offset: int, from: SeekFrom) uint !IoError
+}
+```
+
+```js
++ class StringReader is Reader {
+    + offset: uint
+    + source: String
+
+    + fn read(buffer: ByteBuffer, max_bytes: uint) uint !IoError
+}
+```
+
+```js
++ interface Writer {
+    + fn write_buffer(buffer: ByteBuffer) uint !IoError
+}
+```
+
 # json
 
 ## Functions for 'json'
@@ -1648,7 +1694,7 @@ alias Fd for i32
 ```
 
 ```js
-+ class Connection {
++ class Connection is Reader, Writer {
     ~ fd: i32
     ~+ host: String
     + read_timeout_ms: uint
@@ -1658,6 +1704,7 @@ alias Fd for i32
 
     + fn close() void !NetError
     + static fn new(fd: i32) Connection !NetError
+    + fn read(buffer: ByteBuffer, max_bytes: uint) uint !io:IoError
     + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
     + fn send[T](data: ByteView[T], send_all: bool (true)) uint !NetError
     + fn send_buffer(data: ByteBuffer, skip_bytes: uint (0), send_all: bool (true)) uint !NetError
@@ -1666,6 +1713,7 @@ alias Fd for i32
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
+    + fn write_buffer(buffer: ByteBuffer) uint !io:IoError
 }
 ```
 
@@ -1693,7 +1741,7 @@ alias Fd for i32
 ```
 
 ```js
-+ class Ssl {
++ class Ssl is Reader, Writer {
     ~ cert_dir: ?String
     ~ cert_file: ?String
     ~ connected: bool
@@ -1711,6 +1759,7 @@ alias Fd for i32
     + fn get_error_message() String
     + static fn new() Ssl
     + fn peer_certificate_sha256() String !NetError
+    + fn read(buffer: ByteBuffer, max_bytes: uint) uint !io:IoError
     + fn recv(buffer: ByteBuffer, max_bytes: uint, timeout_ms: uint (5000)) uint !NetError
     + fn selected_alpn() String
     + fn set_alpn(protocols: Array[String]) void !NetError
@@ -1723,6 +1772,7 @@ alias Fd for i32
     + fn set_min_version(version: TlsVersion) void !NetError
     + fn set_verify(enable: bool) void
     + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError
+    + fn write_buffer(buffer: ByteBuffer) uint !io:IoError
 }
 ```
 

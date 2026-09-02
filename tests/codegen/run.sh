@@ -436,6 +436,26 @@ if [ "$direct_slots" -ne 1 ]; then
     exit 1
 fi
 
+echo "> Store interface values as receiver and static vtable pairs"
+
+interface_ir="$workdir/interface-values.ll"
+out=$("$VALK" build "$DIR/interface-values.valk" --ir --no-warn -o "$interface_ir" 2>&1)
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build interface value IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+interface_body=$(sed -n '/^define .*__interface_fat_value__/,/^}/p' "$interface_ir")
+if [[ "$interface_body" != *"insertvalue { ptr, ptr }"* ]] \
+    || [[ "$interface_body" == *"__Pool__get__"* ]] \
+    || ! grep -q '^@"valk\.interface\.vtable\..*" = linkonce_odr constant \[1 x ptr\]' "$interface_ir"; then
+    echo "# Interface conversion did not use a non-allocating fat value and static vtable"
+    echo "$interface_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 15"
+echo "# Test count: 16"
 echo ""

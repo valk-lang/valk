@@ -255,17 +255,17 @@ class User is Printable {
 }
 ```
 
-Valk interface values are reference-sized GC values. The current representation
-is a pointer to an adapter containing:
+Valk interface values are two-word values containing:
 
 ```text
-{ object: GcPtr, method_0: fnptr, method_1: fnptr, ... }
+{ object: GcPtr, vtable: ptr }
 ```
 
-The object field keeps the concrete class alive. Method slots are assigned in
-interface declaration order. Interface methods cannot be generic, and an
-implementation must match argument types, return types, getter/function form,
-variadic behavior, and error type exactly.
+The object field keeps the concrete class alive. Vtables are static, and method
+slots are assigned in interface declaration order. `value is_a Type` checks
+the concrete class stored in an interface value. Interface methods cannot be
+generic, and an implementation must match argument types, return types,
+getter/function form, variadic behavior, and error type exactly.
 
 ### Tagged unions
 

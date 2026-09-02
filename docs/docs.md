@@ -559,6 +559,14 @@ Only classes can implement interfaces. The compiler verifies that every method
 has the same arguments, return type, getter or function form, and error type as
 the interface declaration.
 
+Use `is_a` to check the concrete class held by an interface value:
+
+```rust
+if printable is_a User {
+    print("user")
+}
+```
+
 ## Generics
 
 With generics you can generate customized versions of a class or function.
