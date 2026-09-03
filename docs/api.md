@@ -1388,9 +1388,9 @@ alias Fd for i32
 + fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
 + fn print(msg: String) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
++ fn read(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
-+ fn read_sync(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
++ fn read_sync(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
