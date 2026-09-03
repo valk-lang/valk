@@ -738,14 +738,14 @@ Use `valk.fs` for file-system operations.
 
 Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
 from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
-reader, writer and closer, `io.SliceReader`
+reader, writer and closer, `ByteReader`
 reads from a `String`, `ByteBuffer` or `Slice[u8]`, and `io.BufferWriter`
 collects writes in a `ByteBuffer`. `io.copy` moves everything from a reader
 into a writer:
 
 ```rust
 let file = fs.stream("out.txt", fs.OpenOptions { read: false, write: true, create: true }) ! panic("open")
-io.copy(io.SliceReader { source: "hello" }, file) ! panic("copy")
+io.copy("hello".reader(), file) ! panic("copy")
 file.close() ! panic("close")
 ```
 

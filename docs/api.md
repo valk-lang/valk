@@ -142,12 +142,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ class ByteReader {
-    + buf: ByteBuffer
++ class ByteReader is Reader, Seeker {
     + pos: uint
+    + source: Slice[u8]
 
     + fn get_pos() uint
-    + static fn new(buf: ByteBuffer) ByteReader
+    + static fn new(source: Slice[u8]) ByteReader
+    + fn read(buf: Slice[u8]) uint !io:IoError
     + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8
     + fn read_cstring() String
@@ -169,8 +170,10 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_uint() uint
     + fn read_uint_be() uint
     + fn read_uint_le() uint
+    + fn remaining() Slice[u8]
     + fn reset() void
     + fn rewind(amount: uint) void
+    + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn set_pos(index: uint) void
     + fn skip(amount: uint) void
 }
@@ -311,6 +314,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn part(start_index: uint, length: uint) String
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
     + fn range(start: uint, end: uint, inclusive: bool (true)) String
+    + fn reader() ByteReader
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String
     + static fn secure_random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String !ExternError
@@ -1423,16 +1427,6 @@ alias Fd for i32
 ```js
 + interface Seeker {
     + fn seek(offset: int, from: SeekFrom) uint !IoError
-}
-```
-
-```js
-+ class SliceReader is Reader, Seeker {
-    + offset: uint
-    + source: Slice[u8]
-
-    + fn read(buf: Slice[u8]) uint !IoError
-    + fn seek(offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 }
 ```
 
