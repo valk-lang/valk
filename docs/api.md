@@ -1676,7 +1676,6 @@ alias Fd for i32
     + fn close() void !NetError
     + static fn new(fd: i32) Connection !NetError
     + fn read(buf: Slice[u8]) uint !io:IoError
-    + fn send_bytes(data: ptr, bytes: uint) uint !io:IoError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
@@ -1726,7 +1725,7 @@ alias Fd for i32
     + fn get_error_message() String
     + static fn new() Ssl
     + fn peer_certificate_sha256() String !NetError
-    + fn recv(buf: Slice[u8]) uint !NetError
+    + fn recv(buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError
     + fn selected_alpn() String
     + fn set_alpn(protocols: Array[String]) void !NetError
     + fn set_ca_cert(path: ?String) void !NetError
@@ -1737,7 +1736,7 @@ alias Fd for i32
     + fn set_max_version(version: TlsVersion) void !NetError
     + fn set_min_version(version: TlsVersion) void !NetError
     + fn set_verify(enable: bool) void
-    + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError
+    + fn write(data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
 }
 ```
 
