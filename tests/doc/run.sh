@@ -68,8 +68,8 @@ if ! cmp -s "$workdir/stdlib-api.md" "$repo/docs/api.md"; then
     exit 1
 fi
 stdlib_markdown=$(<"$workdir/stdlib-api.md")
-if [[ "$stdlib_markdown" != *'+ struct ByteView[T]'* ]] \
-    || [[ "$stdlib_markdown" != *'+ static fn new(source: T, offset: uint, length: uint) ByteView[T]'* ]] \
+if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \

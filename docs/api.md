@@ -105,7 +105,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !LookupError
     + fn into_string() String
     + fn ltrim(filter: fnptr(u8)(bool)) void
-    + fn mutable_view(offset: uint, length: uint) MutableByteView
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
     + fn reader() ByteReader
@@ -119,7 +118,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
-    + fn view(offset: uint, length: uint) ByteView[ByteBuffer]
+    + fn view(offset: uint, length: uint) Slice[u8]
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_buffer(buf: ByteBuffer, offset: uint (0)) void
     + fn write_buffer_part(buf: ByteBuffer, len: uint, offset: uint (0)) void
@@ -179,29 +178,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ struct ByteView[T] {
-    + get bytes: uint
-    + fn clear() void
-    + get data: ptr
-    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
-    + fn equal_ignore_ascii_case(cmp: String) bool
-    + fn equals(cmp: String) bool
-    + fn equals_at(offset: uint, length: uint, cmp: String) bool
-    + fn get(index: uint) u8
-    + fn has_ascii_control(allow_tab: bool (false)) bool
-    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
-    + static fn new(source: T, offset: uint, length: uint) ByteView[T]
-    + fn starts_with(cmp: String) bool
-    + fn to_ascii_lower_string() String
-    + fn to_float() float !SyntaxError
-    + fn to_int() int !SyntaxError
-    + fn to_string() String
-    + fn to_uint() uint !SyntaxError
-    + fn view(offset: uint, length: uint) ByteView[T]
-}
-```
-
-```js
 + class FlatMap[K, T] {
     + fn clear() FlatMap[K, T]
     + fn clone() FlatMap[K, T]
@@ -249,18 +225,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + mode Map[T] for HashMap[String, T] {
     + fn clone() Map[T]
     + static fn new() Map[T]
-}
-```
-
-```js
-+ struct MutableByteView {
-    + get bytes: uint
-    + get data: ptr
-    + fn get(index: uint) u8
-    + static fn new(source: ByteBuffer, offset: uint, length: uint) MutableByteView
-    + fn read_view() ByteView[ByteBuffer]
-    + fn set(index: uint, value: u8) void
-    + fn view(offset: uint, length: uint) MutableByteView
 }
 ```
 
@@ -361,7 +325,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
-    + fn view(start_index: uint, length: uint) ByteView[String]
+    + fn view(start_index: uint, length: uint) Slice[u8]
 }
 ```
 
@@ -1112,7 +1076,7 @@ alias pid_t for i32
     + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
-    + fn write[T](data: ByteView[T]) void !io:IoError
+    + fn write(data: Slice[u8]) void !io:IoError
     + fn write_buffer(buffer: ByteBuffer) void !io:IoError
     + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) void !io:IoError
     + fn write_bytes(from: ptr, len: uint) void !io:IoError
@@ -1130,7 +1094,7 @@ alias pid_t for i32
     + static fn copy_from_ptr(data: ptr, size: uint) InMemoryFile
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
     + static fn create_from_file(path: String) InMemoryFile !io:IoError
-    + static fn create_from_view[T](view: ByteView[T]) InMemoryFile
+    + static fn create_from_view(view: Slice[u8]) InMemoryFile
     + fn read_all() String
     + fn save(path: String) void !io:IoError
 }
@@ -1277,10 +1241,10 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     ~+ has_content_length: bool
     ~+ has_host: bool
     ~+ has_transfer_encoding: bool
-    ~+ method: ByteView[ByteBuffer]
+    ~+ method: Slice[u8]
     ~+ parsed_index: uint
-    ~+ path: ByteView[ByteBuffer]
-    ~+ query_string: ByteView[ByteBuffer]
+    ~+ path: Slice[u8]
+    ~+ query_string: Slice[u8]
     ~+ status: uint
 
     + get body: String
@@ -1433,7 +1397,7 @@ alias Fd for i32
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
-+ fn write[T](fd: i32, data: ByteView[T]) uint !IoError
++ fn write(fd: i32, data: Slice[u8]) uint !IoError
 + fn write_buffer(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
 + fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
 + fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
@@ -1603,27 +1567,27 @@ alias Fd for i32
 + fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
-+ fn ascii_equal_ignore_case[A, B](a: ByteView[A], b: ByteView[B]) bool
-+ fn ascii_to_lower(view: MutableByteView) void
++ fn ascii_equal_ignore_case(a: Slice[u8], b: Slice[u8]) bool
++ fn ascii_to_lower(view: Slice[u8]) void
 + fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
 + fn calloc(size: uint) ptr
-+ fn clear(view: MutableByteView) void
++ fn clear(view: Slice[u8]) void
 + fn clear_bytes(adr: ptr, length: uint) void
 + fn clear_value[T](value: *T) void
-+ fn copy[T](from: ByteView[T], to: MutableByteView) uint
++ fn copy(from: Slice[u8], to: Slice[u8]) uint
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 + fn copy_value[T](from: *T, to: *T) void
-+ fn equal[A, B](a: ByteView[A], b: ByteView[B]) bool
++ fn equal(a: Slice[u8], b: Slice[u8]) bool
 + fn equal_bytes(a: ptr, b: ptr, length: uint) bool
-+ fn find_char[T](view: ByteView[T], ch: u8) uint !LookupError
++ fn find_char(view: Slice[u8], ch: u8) uint !LookupError
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(value: $T) void
-+ fn move(from: MutableByteView, to: MutableByteView) uint
++ fn move(from: Slice[u8], to: Slice[u8]) uint
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
 + fn move_value[T](from: *T, to: *T) void
 + fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
-+ fn to_uint[T](view: ByteView[T], allow_plus: bool (false)) uint !SyntaxError
++ fn to_uint(view: Slice[u8], allow_plus: bool (false)) uint !SyntaxError
 ```
 
 # net
@@ -1662,7 +1626,7 @@ alias Fd for i32
     + fn close() void !NetError
     + static fn new(fd: i32) Connection !NetError
     + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
-    + fn send[T](data: ByteView[T], send_all: bool (true)) uint !NetError
+    + fn send(data: Slice[u8], send_all: bool (true)) uint !NetError
     + fn send_buffer(data: ByteBuffer, skip_bytes: uint (0), send_all: bool (true)) uint !NetError
     + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
     + fn send_string(data: String, send_all: bool (true)) uint !NetError
