@@ -298,12 +298,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice Slice[T] of T {
     ~ data: *[T]
     ~ length: uint
+    ~ offset: uint
 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
     + static fn new(length: uint, value: T) Slice[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
+    + fn view(offset: uint, length: uint) Slice[T]
 }
 ```
 
@@ -311,6 +313,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice String of u8 {
     ~ data: *[u8]
     ~ length: uint
+    ~ offset: uint
 
     + static fn alloc(length: uint) String
     + get bytes: uint
@@ -1442,8 +1445,8 @@ alias Fd for i32
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
-+ fn decode_to[T](json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
++ fn decode(json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
++ fn decode_to[T](json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 + fn default_value(kind: Kind) Value
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer

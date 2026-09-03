@@ -731,6 +731,11 @@ fn ir_visit_type_gc_fields(
         return
     }
 
+    if t.kind == TYPE.slice {
+        ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
+        return
+    }
+
     if t.kind == TYPE.interface {
         ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
         return
@@ -1027,17 +1032,20 @@ fn ir_reuse_adapter(ir: IRFunc, name: String) bool {
     return false
 }
 
-// The String slice object starts after its GC header.
+// String literals use the same backing layout as allocated slices.
 fn ir_emit_string_data(ir: IRFunc, text: String) String {
     let index = ir_use_string(ir, text)
-    let out = ir.var()
+    let storage = ir.var()
     ir.line_start()
-    ir.write(out)
+    ir.write(storage)
     ir.write(" = getelementptr i8, ptr @\"valk.str.")
     ir.write_uint(index)
     ir.write("\", i64 8")
     ir.line_end()
-    return out
+    let type = "{ ptr, i64, i64 }"
+    let out = ir_emit_insert(ir, type, "undef", "ptr", storage, 0)
+    out = ir_emit_insert(ir, type, out, "i64", "0", 1)
+    return ir_emit_insert(ir, type, out, "i64", text.bytes.to_string(), 2)
 }
 
 fn ir_use_string(ir: IRFunc, value: String) uint {
@@ -1173,6 +1181,7 @@ fn ir_type_uncached(type: Type) String !Error {
         return out.to_string()
     }
     if t.kind == TYPE.closure || t.kind == TYPE.interface : return "{ ptr, ptr }"
+    if t.kind == TYPE.slice : return "{ ptr, i64, i64 }"
     if t.kind == TYPE.union {
         let layout = t.union_layout() !>
         let out = ByteBuffer.new()
@@ -1851,6 +1860,27 @@ fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
     return ir_offset_address(ir, on, prop.offset.to(uint))
 }
 
+fn ir_emit_slice_data_address(ir: IRFunc, on: Value, prop: Prop) String !Error {
+    let class = prop.class
+    let storage_prop = class.get_prop_by_name("_storage") !? null
+    let offset_prop = class.get_prop_by_name("offset") !? null
+    let element = class.slice_type
+    if !isset(storage_prop) || !isset(offset_prop) || !isset(element) {
+        prop.exp.bug("Slice descriptor is incomplete")
+    }
+
+    let base = ir_emit_address(ir, on) !>
+    let storage = ir_emit_load(ir, "ptr", ir_prop_address(ir, base, storage_prop))
+    storage = ir_union_clean_gc_pointer(ir, storage)
+    let data = ir_offset_address(ir, storage, (class.slice_data_offset() !>).to(uint))
+    let offset = ir_emit_load(ir, "i64", ir_prop_address(ir, base, offset_prop))
+    let element_size = element.byte_size() !>
+    if element_size != 1 {
+        offset = ir_emit_binary_index(ir, "mul", "i64", offset, element_size.to(uint))
+    }
+    return ir_dynamic_offset_address(ir, data, offset)
+}
+
 fn ir_require_runtime_value(value: Value) !Error {
     let type = value.rett
     if !isset(type.get_cached_ir_type()) && type.has_unresolved_generic() {
@@ -1877,6 +1907,7 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let on = value.value1
         let prop = value.prop
         if !isset(on) || !isset(prop) : value.bug("IR property value is incomplete")
+        if prop.is_slice_data : return ir_emit_slice_data_address(ir, on, prop) !>
         let base = on.rett.is_inline ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
         return ir_prop_address(ir, base, prop)
     }
@@ -2632,7 +2663,10 @@ fn ir_emit_error_panic(ir: IRFunc, value: Value) !Error {
     ir_use_func(ir, panic_func)
     let msg = ir_emit_string_data(ir, "Unhandled error")
     ir_emit_func_cleanup(ir) !>
-    ir_emit_pointer_call(ir, panic_func, msg) !>
+    let arg = panic_func.args.get(0) ! value.bug("core.panic has no message argument")
+    let mark = ir.arg_list.length
+    ir.write_arg(mark, ir_type(arg.type) !>, msg)
+    ir_emit_arg_call(ir, ir_func_rett_type(panic_func) !>, ir_func_address(panic_func), mark)
     ir.line("unreachable")
     ir.terminated = true
 }
@@ -2768,9 +2802,7 @@ fn ir_emit_slice_props(parent: IRFunc, value: Value, class: Class) ?String !Erro
     ir.label("entry")
     let callback = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 0)
     let callback_data = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 1)
-    let length_prop = class.get_prop_by_name("length") !? null
-    if !isset(length_prop) : value.bug("Slice length property is missing")
-    let length = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", length_prop.offset.to(uint)))
+    let length = ir_emit_load(ir, "i64", "\%item")
     let data = ir_offset_address(ir, "\%item", (class.slice_data_offset() !>).to(uint))
     ir_write_sequence_props(ir, props, element.byte_size() !>, length, data, callback, callback_data) !>
     ir.line("ret void")
@@ -2812,7 +2844,38 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     ir.write_arg(mark, "ptr", isset(props) ? ir_symbol_address(props) : "null")
     let slot = ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
     ir_emit_dynamic_zero(ir, slot, total)
+    ir_emit_store(ir, "i64", length, slot)
     return slot
+}
+
+fn ir_emit_slice_init_into(
+    ir: IRFunc,
+    value: Value,
+    class: Class,
+    address: String,
+    fields: ?Array[Value],
+    field_mark: uint
+) !Error {
+    ir_emit_zero(ir, address, (class.compute_body_size() !>).to(uint))
+    if isset(fields) {
+        each fields as field, i {
+            let prop = field.get_init_prop()
+            if !isset(prop) : value.bug("Slice initializer field has no property")
+            let field_value = ir.field_values.get(field_mark + i) !? "undef"
+            ir_emit_store(ir, ir_type(prop.type) !>, field_value, ir_prop_address(ir, address, prop))
+        }
+    }
+
+    let storage = ir_emit_load(ir, "ptr", address)
+    let missing_storage = ir_emit_binary_instruction(ir, "icmp eq", "ptr", storage, "null")
+    let allocate = ir.block("slice.allocate")
+    let ready = ir.block("slice.ready")
+    ir.cond_jump(missing_storage, allocate, ready)
+    ir.label(allocate)
+    let allocated = ir_emit_slice_alloc(ir, value, class, fields, field_mark) !>
+    ir_emit_store(ir, "ptr", allocated, address)
+    ir.jump(ready)
+    ir.label(ready)
 }
 
 fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
@@ -2848,6 +2911,18 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     let result_type = value.rett.is_tagged_nullable() ? value.rett.get_non_nullable() : value.rett
     let lowered = ir_type(result_type) !>
     let size = class.compute_body_size() !>
+    if result_type.kind == TYPE.slice {
+        let slot = ir.var()
+        ir.line3(slot, " = alloca ", lowered)
+        ir_emit_slice_init_into(ir, value, class, slot, fields, field_mark) !>
+        ir.release_field_values(field_mark)
+        let out = ir_emit_load(ir, lowered, slot)
+        if value.rett.is_tagged_nullable() {
+            return ir_build_tagged_nullable(ir, value.rett, out) !>
+        }
+        return out
+    }
+
     if size == 0 && lowered == "ptr" {
         ir.release_field_values(field_mark)
         return "null"
@@ -2903,6 +2978,17 @@ fn ir_collect_inline_init_fields(value: Value, offset: u32, fields: Array[Value]
 fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
     let class = value.get_class_ref()
     if !isset(class) : value.bug("Inline class initializer has no class")
+    if value.rett.get_non_nullable().kind == TYPE.slice {
+        let values = value.values
+        let field_mark = ir.field_values.length
+        if isset(values) {
+            each values as field : ir.field_values.append(ir_emit_value(ir, field) !>)
+        }
+        ir_emit_slice_init_into(ir, value, class, address, values, field_mark) !>
+        ir.release_field_values(field_mark)
+        return
+    }
+
     let fields = Array[Value]{}
     let offsets = Array[u32]{}
     ir_collect_inline_init_fields(value, 0, fields, offsets) !>
@@ -3576,6 +3662,13 @@ fn ir_coro_append_type_roots(
         ir_coro_append_null_roots(ir, value, gc_args, root_count) !>
         ir.jump(after)
         ir.label(after)
+        return
+    }
+
+    if t.kind == TYPE.slice {
+        let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
+        pointer = ir_union_clean_gc_pointer(ir, pointer)
+        ir_coro_append_gc(ir, value, gc_args, pointer) !>
         return
     }
 

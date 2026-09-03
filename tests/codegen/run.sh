@@ -215,6 +215,10 @@ if grep -q 'valk\.gc\.stack\.marker\.func\..*__Array__.*__append__' "$fast_path_
     echo "# Array.append installed a GC shadow frame for its non-allocating path"
     exit 1
 fi
+if ! grep -q 'valk\.gc\.stack\.marker\.func\..*__reassign_slice_argument__' "$fast_path_ir"; then
+    echo "# A reassigned slice argument was not kept in a GC shadow frame"
+    exit 1
+fi
 
 echo "> Use natural alignment for atomic property accesses"
 
@@ -311,14 +315,14 @@ f64_body=$(sed -n '/^define .*__box_f64__/,/^}/p' "$scalar_ir")
 scalar_only_body=$(sed -n '/^define .*__box_scalar_only__/,/^}/p' "$scalar_ir")
 gc_only_body=$(sed -n '/^define .*__box_gc_only__/,/^}/p' "$scalar_ir")
 
-if [[ "$int_body" != *"{ i8, [1 x i64] }"* ]] \
-    || [[ "$i32_body" != *"{ i8, [1 x i64] }"* ]] \
-    || [[ "$u8_body" != *"{ i8, [1 x i64] }"* ]] \
-    || [[ "$bool_body" != *"{ i8, [1 x i64] }"* ]] \
-    || [[ "$f32_body" != *"{ i8, [1 x i64] }"* ]] \
-    || [[ "$f64_body" != *"{ i8, [1 x i64] }"* ]] \
+if [[ "$int_body" != *"{ i8, [3 x i64] }"* ]] \
+    || [[ "$i32_body" != *"{ i8, [3 x i64] }"* ]] \
+    || [[ "$u8_body" != *"{ i8, [3 x i64] }"* ]] \
+    || [[ "$bool_body" != *"{ i8, [3 x i64] }"* ]] \
+    || [[ "$f32_body" != *"{ i8, [3 x i64] }"* ]] \
+    || [[ "$f64_body" != *"{ i8, [3 x i64] }"* ]] \
     || [[ "$scalar_only_body" != *"{ i8, [1 x i64] }"* ]] \
-    || [[ "$gc_only_body" != *"{ i8, [1 x i64] }"* ]]; then
+    || [[ "$gc_only_body" != *"{ i8, [3 x i64] }"* ]]; then
     echo "# Tagged-union aggregate layout did not match tag / shared payload fields"
     exit 1
 fi
