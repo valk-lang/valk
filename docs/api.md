@@ -1071,7 +1071,7 @@ alias pid_t for i32
     ~ reading: bool
 
     + fn close() void !io:IoError
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
+    + fn read(buf: Slice[u8]) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
     + fn write(data: Slice[u8]) void !io:IoError
@@ -1384,10 +1384,10 @@ alias Fd for i32
 + fn print(msg: String) void
 + fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
++ fn read(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
 + fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
-+ fn read_sync(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
++ fn read_sync(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
@@ -1588,7 +1588,7 @@ alias Fd for i32
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError
 + fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
 + fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
 + fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
@@ -1617,7 +1617,7 @@ alias Fd for i32
 
     + fn close() void !NetError
     + static fn new(fd: i32) Connection !NetError
-    + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
+    + fn recv(buf: Slice[u8]) uint !NetError
     + fn send_bytes(data: ptr, bytes: uint) uint !NetError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
@@ -1668,7 +1668,7 @@ alias Fd for i32
     + fn get_error_message() String
     + static fn new() Ssl
     + fn peer_certificate_sha256() String !NetError
-    + fn recv(buffer: ByteBuffer, max_bytes: uint, timeout_ms: uint (5000)) uint !NetError
+    + fn recv(buf: Slice[u8]) uint !NetError
     + fn selected_alpn() String
     + fn set_alpn(protocols: Array[String]) void !NetError
     + fn set_ca_cert(path: ?String) void !NetError

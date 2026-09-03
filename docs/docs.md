@@ -1072,7 +1072,7 @@ use valk.net
 // Server
 fn server() {
     let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
-    let buffer = ByteBuffer.new()
+    let buffer = Slice[u8].new(1000, 0)
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
@@ -1080,13 +1080,12 @@ fn server() {
         }
         // Handle connection (normally you do this on a separate coroutine so you can keep accepting new connections)
         while true {
-            buffer.clear()
-            let bytes = con.recv(buffer, 1000) ! {
+            let bytes = con.recv(buffer) ! {
                 if error_is(E.code, closed) : break // Connection closed
                 println("# Server failed to read from connection")
                 break
             }
-            println("# Server received: " + buffer)
+            println("# Server received: " + buffer.view(0, bytes).to_string())
             con.write("PONG") ! {
                 println("# Server failed to send data")
                 break
@@ -1104,9 +1103,9 @@ fn main() {
     // Send
     con.write("PING") ! panic("Client failed to send data")
     // Recv
-    let buffer = ByteBuffer.new()
-    con.recv(buffer, 1000) ! panic("Client failed to read from connection")
-    println("# Client received: " + buffer)
+    let buffer = Slice[u8].new(1000, 0)
+    let bytes = con.recv(buffer) ! panic("Client failed to read from connection")
+    println("# Client received: " + buffer.view(0, bytes).to_string())
     con.close() ! panic("Failed to close connection")
 }
 ```

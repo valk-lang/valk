@@ -71,8 +71,13 @@ stdlib_markdown=$(<"$workdir/stdlib-api.md")
 if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: Slice[u8], offset: uint) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: Slice[u8], offset: uint) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(buf: Slice[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8]) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn recv(buf: Slice[u8]) uint !NetError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(data: Slice[u8]) uint !NetError'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
@@ -91,6 +96,10 @@ if [[ "$stdlib_markdown" == *'fn write_string(fd:'* ]] \
     || [[ "$stdlib_markdown" == *'fn send_buffer(data:'* ]] \
     || [[ "$stdlib_markdown" == *'fn send(fd: i32, data: Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" == *'fn send(data: Slice[u8]'* ]] \
+    || [[ "$stdlib_markdown" == *'fn read(fd: i32, buf: ByteBuffer'* ]] \
+    || [[ "$stdlib_markdown" == *'fn recv(fd: i32, buf: ByteBuffer'* ]] \
+    || [[ "$stdlib_markdown" == *'fn recv(buffer: ByteBuffer'* ]] \
+    || [[ "$stdlib_markdown" == *'fn read(bytes: uint'* ]] \
     || [[ "$stdlib_markdown" == *'send_all'* ]]; then
     echo "# Standard-library byte I/O still exposes type-specific adapters"
     exit 1
