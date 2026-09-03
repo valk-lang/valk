@@ -769,7 +769,7 @@ fn main() {
     let path : fs.Path = "."
     path = path.add("folder1").add("folder2/").add("/file") // Adding parts to a path without worrying about double slashes
     println(path) // ./folder1/folder2/file
-    path = path.resolve() ! panic("Failed to resolve path")
+    path = path.resolve()
     println(path) // /var/www/folder1/folder2/file
     path = path + ".txt"
     println(path) // /var/www/folder1/folder2/file.txt

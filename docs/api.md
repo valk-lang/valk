@@ -1055,7 +1055,7 @@ alias pid_t for i32
 + fn path(path: String) Path
 + fn read(path: String) String !io:IoError
 + fn realpath(path: String) String !io:IoError
-+ fn resolve(path: String) String !io:IoError
++ fn resolve(path: String) String
 + fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint !io:IoError
 + fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError
@@ -1113,7 +1113,7 @@ alias pid_t for i32
     + fn dir_of() Path
     + static fn new(path: String) Path
     + fn pop() Path
-    + fn resolve() Path !io:IoError
+    + fn resolve() Path
 }
 ```
 

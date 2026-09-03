@@ -110,7 +110,7 @@ echo "> Keep basic documentation examples current"
 guide=$(<"$repo/docs/docs.md")
 readme=$(<"$repo/README.md")
 if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
-    || [[ "$guide" != *'path = path.resolve() ! panic("Failed to resolve path")'* ]] \
+    || [[ "$guide" != *'path = path.resolve()'* ]] \
     || [[ "$guide" != *'con.write("PING")'* ]] \
     || [[ "$guide" != *'template.render("example.html", data)'* ]] \
     || [[ "$guide" == *'con.send("PING")'* ]] \
