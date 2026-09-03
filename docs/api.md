@@ -1064,10 +1064,10 @@ alias pid_t for i32
 ## Classes for 'fs'
 
 ```js
-+ class FileStream is Reader, Writer, Seeker {
++ class FileStream is Reader, Writer, Seeker, Closer {
+    ~ closed: bool
     ~ path: String
-    + read_offset: uint
-    ~ reading: bool
+    ~ position: uint
 
     + fn close() void !io:IoError
     + fn read(buf: Slice[u8]) uint !io:IoError
@@ -1409,6 +1409,12 @@ alias Fd for i32
 ```
 
 ```js
++ interface Closer {
+    + fn close() void !IoError
+}
+```
+
+```js
 + interface Reader {
     + fn read(buf: Slice[u8]) uint !IoError
 }
@@ -1655,7 +1661,7 @@ alias Fd for i32
 ```
 
 ```js
-+ class Connection is Reader, Writer {
++ class Connection is Reader, Writer, Closer {
     ~ fd: i32
     ~+ host: String
     + read_timeout_ms: uint
@@ -1663,7 +1669,7 @@ alias Fd for i32
     ~ ssl_enabled: bool
     + write_timeout_ms: uint
 
-    + fn close() void !NetError
+    + fn close() void !io:IoError
     + static fn new(fd: i32) Connection !NetError
     + fn read(buf: Slice[u8]) uint !io:IoError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection

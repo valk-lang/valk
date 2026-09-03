@@ -736,9 +736,9 @@ API for [valk.fs](api.md#fs)
 
 Use `valk.fs` for file-system operations.
 
-Streams share the `io.Reader`, `io.Writer` and `io.Seeker` interfaces from
-[valk.io](api.md#io). `fs.FileStream` implements all three, `net.Connection` is a
-reader and writer, `io.SliceReader`
+Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
+from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
+reader, writer and closer, `io.SliceReader`
 reads from a `String`, `ByteBuffer` or `Slice[u8]`, and `io.BufferWriter`
 collects writes in a `ByteBuffer`. `io.copy` moves everything from a reader
 into a writer:
