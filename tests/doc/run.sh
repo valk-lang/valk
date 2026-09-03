@@ -72,7 +72,8 @@ if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8]) uint !IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn send(data: Slice[u8], send_all: bool (true)) uint !NetError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(data: Slice[u8]) uint !NetError'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \
@@ -87,7 +88,10 @@ if [[ "$stdlib_markdown" == *'fn write_string(fd:'* ]] \
     || [[ "$stdlib_markdown" == *'fn write_buffer(buffer: ByteBuffer) void !io:IoError'* ]] \
     || [[ "$stdlib_markdown" == *'fn send_string(fd:'* ]] \
     || [[ "$stdlib_markdown" == *'fn send_string(data:'* ]] \
-    || [[ "$stdlib_markdown" == *'fn send_buffer(data:'* ]]; then
+    || [[ "$stdlib_markdown" == *'fn send_buffer(data:'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send(fd: i32, data: Slice[u8]'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send(data: Slice[u8]'* ]] \
+    || [[ "$stdlib_markdown" == *'send_all'* ]]; then
     echo "# Standard-library byte I/O still exposes type-specific adapters"
     exit 1
 fi
@@ -98,9 +102,9 @@ guide=$(<"$repo/docs/docs.md")
 readme=$(<"$repo/README.md")
 if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" != *'path = path.resolve() ! panic("Failed to resolve path")'* ]] \
-    || [[ "$guide" != *'con.send("PING")'* ]] \
+    || [[ "$guide" != *'con.write("PING")'* ]] \
     || [[ "$guide" != *'template.render("example.html", data)'* ]] \
-    || [[ "$guide" == *'con.send_string("PING")'* ]] \
+    || [[ "$guide" == *'con.send("PING")'* ]] \
     || [[ "$guide" == *'sanitize:'* ]] \
     || [[ "$guide" == *'[valk.type](api.md#core)'* ]] \
     || [[ "$guide" == *'Install a package globally'* ]] \

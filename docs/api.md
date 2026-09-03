@@ -1590,8 +1590,8 @@ alias Fd for i32
 ```js
 + fn recv(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
 + fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
 + fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
 ```
 
 ## Classes for 'net'
@@ -1618,11 +1618,11 @@ alias Fd for i32
     + fn close() void !NetError
     + static fn new(fd: i32) Connection !NetError
     + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
-    + fn send(data: Slice[u8], send_all: bool (true)) uint !NetError
-    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
+    + fn send_bytes(data: ptr, bytes: uint) uint !NetError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
+    + fn write(data: Slice[u8]) uint !NetError
 }
 ```
 
