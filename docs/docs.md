@@ -1087,7 +1087,7 @@ fn server() {
                 break
             }
             println("# Server received: " + buffer)
-            con.send_string("PONG") ! {
+            con.send("PONG") ! {
                 println("# Server failed to send data")
                 break
             }
@@ -1102,7 +1102,7 @@ fn main() {
     // Open client
     let con = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
-    con.send_string("PING") ! panic("Client failed to send data")
+    con.send("PING") ! panic("Client failed to send data")
     // Recv
     let buffer = ByteBuffer.new()
     con.recv(buffer, 1000) ! panic("Client failed to read from connection")

@@ -115,13 +115,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn shrink_capacity(size: uint) void
     + fn skip(amount: uint) void
     + fn starts_with(str: String, offset: uint) bool
+    + fn to_slice() Slice[u8]
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
     + fn view(offset: uint, length: uint) Slice[u8]
+    + fn write(data: Slice[u8]) void
     + fn write_big_endian(value: uint, bytes: uint) void
-    + fn write_buffer(buf: ByteBuffer, offset: uint (0)) void
-    + fn write_buffer_part(buf: ByteBuffer, len: uint, offset: uint (0)) void
     + fn write_byte(v: u8) void
     + fn write_bytes(data: ptr, length: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
@@ -131,7 +131,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_f64_le(v: f64) void
     + fn write_int_ascii(v: int, base: u8 (10)) void
     + fn write_little_endian(value: uint, bytes: uint) void
-    + fn write_string(str: String) void
     + fn write_u16_be(v: u16) void
     + fn write_u16_le(v: u16) void
     + fn write_u32_be(v: u32) void
@@ -320,6 +319,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
+    + fn to_slice() Slice[u8]
     + fn to_string() String
     + fn to_uint() uint !SyntaxError
     + fn trim(part: String, limit: uint (0)) String
@@ -571,14 +571,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_uint_le() uint
     + fn to_hex() String
+    + fn write(data: Slice[u8]) void
     + fn write_big_endian(value: uint, bytes: uint) void
-    + fn write_buffer(buf: ByteBuffer, len: uint, offset: uint (0)) void
-    + fn write_buffer_all(buf: ByteBuffer, offset: uint (0)) void
     + fn write_bytes(from: ptr, len: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
     + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint
     + fn write_little_endian(value: uint, bytes: uint) void
-    + fn write_string(str: String) void
     + fn write_u16_be(v: u16) void
     + fn write_u16_le(v: u16) void
     + fn write_u32_be(v: u32) void
@@ -1060,7 +1058,7 @@ alias pid_t for i32
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync_all() void
 + fn truncate(path: String, length: uint) void !io:IoError
-+ fn write(path: String, content: String, append: bool (false)) void !io:IoError
++ fn write(path: String, content: Slice[u8], append: bool (false)) void !io:IoError
 + fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
 ```
 
@@ -1077,10 +1075,7 @@ alias pid_t for i32
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
     + fn write(data: Slice[u8]) void !io:IoError
-    + fn write_buffer(buffer: ByteBuffer) void !io:IoError
-    + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) void !io:IoError
     + fn write_bytes(from: ptr, len: uint) void !io:IoError
-    + fn write_string(str: String) void !io:IoError
 }
 ```
 
@@ -1398,10 +1393,8 @@ alias Fd for i32
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 + fn write(fd: i32, data: Slice[u8]) uint !IoError
-+ fn write_buffer(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
 + fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
 + fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
-+ fn write_string(fd: i32, str: String) uint !IoError
 ```
 
 # json
@@ -1597,9 +1590,8 @@ alias Fd for i32
 ```js
 + fn recv(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
 + fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
++ fn send(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
 + fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send_string(fd: i32, str: String, timeout_ms: uint (5000)) uint !NetError
 ```
 
 ## Classes for 'net'
@@ -1627,9 +1619,7 @@ alias Fd for i32
     + static fn new(fd: i32) Connection !NetError
     + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
     + fn send(data: Slice[u8], send_all: bool (true)) uint !NetError
-    + fn send_buffer(data: ByteBuffer, skip_bytes: uint (0), send_all: bool (true)) uint !NetError
     + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
-    + fn send_string(data: String, send_all: bool (true)) uint !NetError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError

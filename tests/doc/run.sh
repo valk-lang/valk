@@ -71,12 +71,24 @@ stdlib_markdown=$(<"$workdir/stdlib-api.md")
 if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8]) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn send(data: Slice[u8], send_all: bool (true)) uint !NetError'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \
     || [[ "$stdlib_markdown" == *'+ global parray'* ]] \
     || [[ "$stdlib_markdown" == *'+ global SIGMA'* ]]; then
     echo "# Standard-library public API surface is incorrect"
+    exit 1
+fi
+if [[ "$stdlib_markdown" == *'fn write_string(fd:'* ]] \
+    || [[ "$stdlib_markdown" == *'fn write_buffer(fd:'* ]] \
+    || [[ "$stdlib_markdown" == *'fn write_string(str: String) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" == *'fn write_buffer(buffer: ByteBuffer) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send_string(fd:'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send_string(data:'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send_buffer(data:'* ]]; then
+    echo "# Standard-library byte I/O still exposes type-specific adapters"
     exit 1
 fi
 
@@ -86,9 +98,9 @@ guide=$(<"$repo/docs/docs.md")
 readme=$(<"$repo/README.md")
 if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" != *'path = path.resolve() ! panic("Failed to resolve path")'* ]] \
-    || [[ "$guide" != *'con.send_string("PING")'* ]] \
+    || [[ "$guide" != *'con.send("PING")'* ]] \
     || [[ "$guide" != *'template.render("example.html", data)'* ]] \
-    || [[ "$guide" == *'con.send("PING")'* ]] \
+    || [[ "$guide" == *'con.send_string("PING")'* ]] \
     || [[ "$guide" == *'sanitize:'* ]] \
     || [[ "$guide" == *'[valk.type](api.md#core)'* ]] \
     || [[ "$guide" == *'Install a package globally'* ]] \
