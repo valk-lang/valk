@@ -1059,7 +1059,6 @@ alias pid_t for i32
 + fn sync_all() void
 + fn truncate(path: String, length: uint) void !io:IoError
 + fn write(path: String, content: Slice[u8], append: bool (false)) void !io:IoError
-+ fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -1075,7 +1074,6 @@ alias pid_t for i32
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
     + fn write(data: Slice[u8]) uint !io:IoError
-    + fn write_bytes(from: ptr, len: uint) uint !io:IoError
 }
 ```
 
@@ -1086,7 +1084,6 @@ alias pid_t for i32
     ~ mime_type: String
     ~ size: uint
 
-    + static fn copy_from_ptr(data: ptr, size: uint) InMemoryFile
     + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
     + static fn create_from_file(path: String) InMemoryFile !io:IoError
     + static fn create_from_view(view: Slice[u8]) InMemoryFile
@@ -1386,12 +1383,9 @@ alias Fd for i32
 + fn close(fd: i32) void !IoError
 + fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
 + fn print(msg: String) void
-+ fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
-+ fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
-+ fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_sync(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
@@ -1401,8 +1395,6 @@ alias Fd for i32
 + fn stdout() StdStream
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 + fn write(fd: i32, data: Slice[u8]) uint !IoError
-+ fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
-+ fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
 ```
 
 ## Classes for 'io'
@@ -1647,8 +1639,6 @@ alias Fd for i32
 
 ```js
 + fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
-+ fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io:IoError
-+ fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io:IoError
 + fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
 
