@@ -749,6 +749,15 @@ io.copy(io.SliceReader { source: "hello" }, file) ! panic("copy")
 file.close() ! panic("close")
 ```
 
+The process' standard streams are available as `io.stdin()` (a reader),
+`io.stdout()` and `io.stderr()` (writers). Their reads and writes block:
+
+```rust
+// Save everything piped into the program
+io.copy(io.stdin(), file) ! panic("copy")
+io.stderr().write("done\n") ! panic("write")
+```
+
 ## Paths
 
 Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs.path("path")`

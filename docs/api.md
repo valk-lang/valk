@@ -1396,6 +1396,9 @@ alias Fd for i32
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
++ fn stderr() StdStream
++ fn stdin() StdStream
++ fn stdout() StdStream
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 + fn write(fd: i32, data: Slice[u8]) uint !IoError
 + fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
@@ -1432,6 +1435,17 @@ alias Fd for i32
 
     + fn read(buf: Slice[u8]) uint !IoError
     + fn seek(offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
+}
+```
+
+```js
++ class StdStream is Reader, Writer {
+    ~ can_read: bool
+    ~ can_write: bool
+    ~ fd: i32
+
+    + fn read(buf: Slice[u8]) uint !IoError
+    + fn write(data: Slice[u8]) uint !IoError
 }
 ```
 
