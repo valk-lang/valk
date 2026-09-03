@@ -1043,6 +1043,11 @@ let res = http.request("POST", "http://some-website/api/endpoint", http.Options{
 
 // Download file
 http.download(url, to_path) ! panic("Failed to download file")
+
+// Stream the response body into any io.Writer instead of keeping it in memory
+let out = fs.stream(to_path, fs.OpenOptions { read: false, write: true, create: true }) ! panic("Failed to open file")
+http.request("GET", url, http.Options{ output: out }) ! panic("Request failed")
+out.close() ! panic("Failed to close file")
 ```
 
 ### HTTP Server

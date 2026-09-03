@@ -1266,6 +1266,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + max_response_header_size: uint
     + max_tls_version: ?TlsVersion
     + min_tls_version: TlsVersion
+    + output: ?Writer
     + output_to_file: ?String
     + query_data: ?Map[String]
     + read_timeout_ms: uint
@@ -1313,6 +1314,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
     + static fn redirect(location: String, code: u32 (302), headers: ?Map[String] (null)) Response
     + fn set_header(name: String, value: String, extend_existing: bool (false)) void
+    + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Map[String] (null)) Response
 }
 ```
@@ -1326,6 +1328,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fn send_file(path: String, custom_filename: ?String (null)) void
     + fn send_file_stream(stream: FileStream, filename: ?String (null)) void
     + fn send_status(status_code: uint) void
+    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) void
 }
 ```
 
@@ -1386,6 +1389,7 @@ alias Fd for i32
 + fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
++ fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
 + fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
 + fn read_sync(fd: i32, buf: Slice[u8], offset: uint) uint !IoError
