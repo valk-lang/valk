@@ -75,10 +75,10 @@ if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: Slice[u8], offset: uint) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(buf: Slice[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8]) uint !IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn recv(buf: Slice[u8]) uint !NetError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn write(data: Slice[u8]) uint !NetError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(buf: Slice[u8]) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(data: Slice[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \

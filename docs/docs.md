@@ -736,6 +736,19 @@ API for [valk.fs](api.md#fs)
 
 Use `valk.fs` for file-system operations.
 
+Streams share the `io.Reader`, `io.Writer` and `io.Seeker` interfaces from
+[valk.io](api.md#io). `fs.FileStream` implements all three, `net.Connection` is a
+reader and writer, `io.SliceReader`
+reads from a `String`, `ByteBuffer` or `Slice[u8]`, and `io.BufferWriter`
+collects writes in a `ByteBuffer`. `io.copy` moves everything from a reader
+into a writer:
+
+```rust
+let file = fs.stream("out.txt", fs.OpenOptions { read: false, write: true, create: true }) ! panic("open")
+io.copy(io.SliceReader { source: "hello" }, file) ! panic("copy")
+file.close() ! panic("close")
+```
+
 ## Paths
 
 Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs.path("path")`
@@ -1080,7 +1093,7 @@ fn server() {
         }
         // Handle connection (normally you do this on a separate coroutine so you can keep accepting new connections)
         while true {
-            let bytes = con.recv(buffer) ! {
+            let bytes = con.read(buffer) ! {
                 if error_is(E.code, closed) : break // Connection closed
                 println("# Server failed to read from connection")
                 break
@@ -1104,7 +1117,7 @@ fn main() {
     con.write("PING") ! panic("Client failed to send data")
     // Recv
     let buffer = Slice[u8].new(1000, 0)
-    let bytes = con.recv(buffer) ! panic("Client failed to read from connection")
+    let bytes = con.read(buffer) ! panic("Client failed to read from connection")
     println("# Client received: " + buffer.view(0, bytes).to_string())
     con.close() ! panic("Failed to close connection")
 }

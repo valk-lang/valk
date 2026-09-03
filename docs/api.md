@@ -1065,7 +1065,7 @@ alias pid_t for i32
 ## Classes for 'fs'
 
 ```js
-+ class FileStream {
++ class FileStream is Reader, Writer, Seeker {
     ~ path: String
     + read_offset: uint
     ~ reading: bool
@@ -1074,8 +1074,8 @@ alias pid_t for i32
     + fn read(buf: Slice[u8]) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
-    + fn write(data: Slice[u8]) void !io:IoError
-    + fn write_bytes(from: ptr, len: uint) void !io:IoError
+    + fn write(data: Slice[u8]) uint !io:IoError
+    + fn write_bytes(from: ptr, len: uint) uint !io:IoError
 }
 ```
 
@@ -1381,6 +1381,7 @@ alias Fd for i32
 + fn await_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn await_socket_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn close(fd: i32) void !IoError
++ fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
 + fn print(msg: String) void
 + fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
@@ -1395,6 +1396,45 @@ alias Fd for i32
 + fn write(fd: i32, data: Slice[u8]) uint !IoError
 + fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
 + fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
+```
+
+## Classes for 'io'
+
+```js
++ class BufferWriter is Writer {
+    + buffer: ByteBuffer
+
+    + static fn new(buffer: ?ByteBuffer (null)) BufferWriter
+    + fn write(data: Slice[u8]) uint !IoError
+}
+```
+
+```js
++ interface Reader {
+    + fn read(buf: Slice[u8]) uint !IoError
+}
+```
+
+```js
++ interface Seeker {
+    + fn seek(offset: int, from: SeekFrom) uint !IoError
+}
+```
+
+```js
++ class SliceReader is Reader, Seeker {
+    + offset: uint
+    + source: Slice[u8]
+
+    + fn read(buf: Slice[u8]) uint !IoError
+    + fn seek(offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
+}
+```
+
+```js
++ interface Writer {
+    + fn write(data: Slice[u8]) uint !IoError
+}
 ```
 
 # json
@@ -1588,10 +1628,10 @@ alias Fd for i32
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError
-+ fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
++ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io:IoError
++ fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io:IoError
++ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
 
 ## Classes for 'net'
@@ -1607,7 +1647,7 @@ alias Fd for i32
 ```
 
 ```js
-+ class Connection {
++ class Connection is Reader, Writer {
     ~ fd: i32
     ~+ host: String
     + read_timeout_ms: uint
@@ -1617,12 +1657,12 @@ alias Fd for i32
 
     + fn close() void !NetError
     + static fn new(fd: i32) Connection !NetError
-    + fn recv(buf: Slice[u8]) uint !NetError
-    + fn send_bytes(data: ptr, bytes: uint) uint !NetError
+    + fn read(buf: Slice[u8]) uint !io:IoError
+    + fn send_bytes(data: ptr, bytes: uint) uint !io:IoError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
-    + fn write(data: Slice[u8]) uint !NetError
+    + fn write(data: Slice[u8]) uint !io:IoError
 }
 ```
 
