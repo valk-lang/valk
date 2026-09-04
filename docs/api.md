@@ -1196,6 +1196,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
 + fn parse_http(input: ByteBuffer, context: Context, is_response: bool, max_header_size: uint (8192), max_body_size: uint (0)) void !HttpParseError
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
++ fn serve(host: String, port: u16, handler: shared fn(Context, ResponseWriter)(), worker_count: i32 (-1)) void !HttpError
 ```
 
 ## Classes for 'http'
@@ -1364,8 +1365,10 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + write_timeout_ms: uint
 
     + fn add_static_dir(path: String) void !LookupError
-    + static fn new(host: String, port: u16, handler: shared fn(Request)(Response)) Server !HttpError
-    + fn start(worker_count: i32 (-1)) void
+    + fn fast(handler: shared fn(Context, ResponseWriter)()) Server
+    + fn handle(handler: shared fn(Request)(Response)) Server
+    + static fn new(host: String, port: u16, handler: shared fn(Request)(Response) (handler_default)) Server
+    + fn start(worker_count: i32 (-1)) void !HttpError
     + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) Server !HttpError
 }
 ```
