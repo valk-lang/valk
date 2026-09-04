@@ -1083,16 +1083,15 @@ alias pid_t for i32
 
 ```js
 + class InMemoryFile {
-    ~ data: ptr
+    ~ data: Slice[u8]
     ~ filename: String
     ~ mime_type: String
-    ~ size: uint
 
-    + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !io:IoError
-    + static fn create_from_view(view: Slice[u8]) InMemoryFile
-    + fn read_all() String
+    + static fn from_file(path: String) InMemoryFile !io:IoError
+    + static fn new(data: Slice[u8]) InMemoryFile
+    + fn reader() ByteReader
     + fn save(path: String) void !io:IoError
+    + fn to_string() String
 }
 ```
 
