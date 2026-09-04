@@ -1196,7 +1196,8 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
 + fn parse_http(input: ByteBuffer, context: Context, is_response: bool, max_header_size: uint (8192), max_body_size: uint (0)) void !HttpParseError
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
-+ fn serve(host: String, port: u16, handler: shared fn(Context, ResponseWriter)(), worker_count: i32 (-1)) void !HttpError
++ fn serve(host: String, port: u16, handler: shared fn(Request)(Response), worker_count: i32 (-1)) void !HttpError
++ fn serve_fast(host: String, port: u16, handler: shared fn(Context, ResponseWriter)(), worker_count: i32 (-1)) void !HttpError
 ```
 
 ## Classes for 'http'
