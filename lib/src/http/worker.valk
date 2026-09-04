@@ -1,16 +1,35 @@
 
 use core
 use time
+use net
 
-fn worker(server: shared ServerWorkerData) {
-    let sock = server.socket
+// How often an idle acceptor checks whether the server is stopping
+value ACCEPT_POLL_MS (20)
+// Sleep between drain passes over the open connections
+value DRAIN_POLL_MS (10)
 
+fn worker(server: shared ServerWorkerData, index: uint (0)) {
     let worker = Worker {
         server: server
     }
 
-    while true {
-        let netcon = sock.accept() ! {
+    #if OS == "win"
+    if index == 0 {
+        worker.accept_windows()
+    } else {
+        let inbox = server.inboxes.get(index) !!
+        while true {
+            let fd = inbox.pop()
+            if !isset(fd) : break
+            worker.receive_windows(fd)
+        }
+    }
+    #else
+    let sock = server.socket
+    while server.stopping == 0 {
+        let netcon = sock.accept(ACCEPT_POLL_MS) ! {
+            if server.stopping != 0 : break
+            if error_is(E.code, timeout) : continue
             if error_is(E.code, max_connections) {
                 println("[x] Too many connections")
                 time.sleep_ms(100)
@@ -23,46 +42,92 @@ fn worker(server: shared ServerWorkerData) {
             continue
             #end
         }
-        netcon.set_timeouts(server.idle_timeout_ms, server.write_timeout_ms)
+        worker.handle(netcon)
+    }
 
-        let tls_context = server.tls_context
-        if isset(tls_context) {
-            netcon.ssl_accept(tls_context, server.header_timeout_ms) ! {
-                netcon.close() ! core.cleanup_warning("Failed to close rejected TLS connection", __FILE__, __LINE__)
-                continue
-            }
+    if --server.acceptors == 0 {
+        sock.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+    }
+    #end
+    worker.drain()
+    if --server.workers == 0 : server.done.unlock()
+}
+
+class Worker {
+    server: shared ServerWorkerData
+    connections: uint (0)
+    // Doubly linked so that `remove_client` is O(1)
+    clients: ?Connection
+
+    fn handle(netcon: net.Connection) {
+        let server = this.server
+        netcon.set_timeouts(server.idle_timeout_ms, server.write_timeout_ms)
+        if server.stopping != 0 {
+            netcon.interrupt()
+            netcon.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+            return
         }
 
         let connections = ++server.connections
         let too_many_connections = server.max_connections > 0 && connections > server.max_connections
         let body_capacity_full = server.max_server_wide_body_size > 0 && server.active_body_size >= server.max_server_wide_body_size
-        if too_many_connections || body_capacity_full {
-            server.connections--
-            let response = ResponseWriter {}
-            response.send_status(503)
-            response.send_bytes(netcon) ! {}
-            netcon.close() ! core.cleanup_warning("Failed to close rejected HTTP connection", __FILE__, __LINE__)
-            continue
-        }
-
+        let rejected = too_many_connections || body_capacity_full
+        // A rejected connection gives its slot back right away, so the next
+        // accept is judged without it. `finish()` skips the decrement for it.
+        if rejected : server.connections--
         let fd = netcon.fd
         if server.show_info {
             println("[+] New connection: " + fd)
         }
 
         let http_con = Connection {
-            worker: worker,
+            worker: this,
             netcon: netcon,
             fd: fd,
+            rejected: rejected,
         }
+        this.add_client(http_con)
 
-        worker.connections++
-
+        // The TLS handshake happens inside the coroutine, so a slow client
+        // never stalls the acceptor
         co http_con.handle()
     }
-}
 
-class Worker {
-    server: shared ServerWorkerData
-    connections: uint (0)
+    fn add_client(client: Connection) {
+        let head = this.clients
+        client.next = head
+        if isset(head) : head.prev = client
+        this.clients = client
+        this.connections++
+    }
+
+    fn remove_client(client: Connection) {
+        let prev = client.prev
+        let next = client.next
+        if isset(prev) : prev.next = next
+        else if this.clients == client : this.clients = next
+        if isset(next) : next.prev = prev
+        client.prev = null
+        client.next = null
+        this.connections--
+    }
+
+    // Runs once the server is stopping: idle connections are interrupted right
+    // away, in-flight requests may finish until the deadline, after which their
+    // sockets are interrupted too. Returns when every connection is gone.
+    fn drain() {
+        while this.connections > 0 {
+            let now = time.mono_ms()
+            let deadline = this.server.deadline_ms
+            let expired = now >= deadline
+            let connection = this.clients
+            while isset(connection) {
+                if expired || !connection.active : connection.netcon.interrupt()
+                connection = connection.next
+            }
+            let wait_ms: uint = DRAIN_POLL_MS
+            if !expired && deadline - now < wait_ms : wait_ms = deadline - now
+            time.sleep_ms(wait_ms)
+        }
+    }
 }

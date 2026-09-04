@@ -1097,14 +1097,21 @@ fn handler(req: http.Request) http.Response {
 fn main() {
     let s = http.Server.new("127.0.0.1", 9000, handler)
     s.show_info = true
-    s.start() ! println("Failed to start http server")
+    s.start() ! { println("Failed to start http server"); return }
 }
 ```
 
-The server accepts HTTP/1.1 origin-form requests and `OPTIONS *`. Request
-methods and header names must be HTTP tokens, request targets must use valid
-URI characters and percent escapes, and every request must contain exactly one
-valid `Host` header.
+`start` runs until shutdown. Use `co` to keep doing other work:
+
+```rust
+let running = co s.start()
+// Other work...
+s.request_shutdown(5000)
+await running ! { println("HTTP server failed") }
+```
+
+`start` takes a worker thread count and defaults to the number of CPU threads.
+`request_shutdown(5000)` allows up to five seconds for current requests to finish.
 
 ## Sockets
 

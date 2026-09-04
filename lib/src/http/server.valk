@@ -3,6 +3,7 @@ use core
 use net
 use fs
 use thread
+use time
 
 fn handler_default(req: Request) Response {
     return Response.html("Hello world!")
@@ -33,6 +34,67 @@ class ServerWorkerData {
     max_server_wide_body_size: uint
     connections: uint (0)
     active_body_size: uint (0)
+    stopping: u8 (0)
+    deadline_ms: uint (0)
+    workers: uint (0)
+    acceptors: uint (0)
+    #if OS == "win"
+    inboxes: Array[shared WorkerInbox]
+    #end
+    done: shared core.Mutex
+}
+
+class ServerLifecycle {
+    mutex: shared core.SyncMutex (.new())
+    active: bool (false)
+    stopping: bool (false)
+    deadline_ms: uint (0)
+    run: ?shared ServerWorkerData (null)
+
+    fn begin() !HttpError @shared_unsafe {
+        this.mutex.lock()
+        if this.active {
+            this.mutex.unlock()
+            throw .init
+        }
+        this.active = true
+        this.run = null
+        this.mutex.unlock()
+    }
+
+    fn publish(run: shared ServerWorkerData) @shared_unsafe {
+        this.mutex.lock()
+        this.run = run
+        if this.stopping {
+            run.deadline_ms = this.deadline_ms
+            run.stopping = 1
+        }
+        this.mutex.unlock()
+    }
+
+    fn finish() @shared_unsafe {
+        this.mutex.lock()
+        this.active = false
+        this.stopping = false
+        this.mutex.unlock()
+    }
+
+    fn request_shutdown(timeout_ms: uint) @shared_unsafe {
+        let deadline = time.mono_ms().checked_add(timeout_ms) !? (~0).to(uint)
+        this.mutex.lock()
+        let run = this.run
+        if !this.active && isset(run) {
+            this.mutex.unlock()
+            return
+        }
+        if !this.stopping || deadline < this.deadline_ms : this.deadline_ms = deadline
+        this.stopping = true
+        if isset(run) {
+            run.deadline_ms = this.deadline_ms
+            run.stopping = 1
+        }
+        this.mutex.unlock()
+    }
 }
 
 // Shortcut: create a server and start it
@@ -48,6 +110,10 @@ class ServerWorkerData {
 }
 
 + class Server {
+    - lifecycle: shared ServerLifecycle (.{})
+    #if TEST && OS == "win"
+    - fail_worker_start_after: int (-1)
+    #end
     ~ host: String
     ~ port: u16
     - tls_context: ?shared net.SslServerContext
@@ -100,25 +166,55 @@ class ServerWorkerData {
         return this
     }
 
+    // Repeated requests can shorten, but never extend, the shutdown deadline.
+    + fn request_shutdown(timeout_ms: uint (5000)) {
+        this.lifecycle.request_shutdown(timeout_ms)
+    }
+
+    // False means the deadline expired; handler code can still be unwinding.
+    + fn shutdown(timeout_ms: uint (5000)) bool {
+        let lifecycle = this.lifecycle
+        lifecycle.request_shutdown(timeout_ms)
+        while lifecycle.active {
+            let now = time.mono_ms()
+            let deadline = lifecycle.deadline_ms
+            if now >= deadline : return false
+            let remaining = deadline - now
+            time.sleep_ms(remaining < 10 ? remaining : 10)
+        }
+        return true
+    }
+
     + fn start(worker_count: i32 (-1)) void !HttpError {
+        let lifecycle = this.lifecycle
+        lifecycle.begin() !>
+        defer lifecycle.finish()
+        if lifecycle.stopping : return
         let socket = net.Socket.server(net.SocketType.tcp, this.host, this.port) !>
+        let done: shared core.Mutex = .new() ! {
+            socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+            throw .init
+        }
+        done.lock()
 
         // SIGPIPE
         core.signal_ignore(13)
 
-        if worker_count < 0 {
-            worker_count = (core.cpu_thread_count() !? 8).to(i32)
+        // Clamp into a local: `worker_count` is published as shared below
+        let count = worker_count
+        if count < 0 {
+            count = (core.cpu_thread_count() !? 8).to(i32)
         }
-        if worker_count < 1 {
-            worker_count = 1
+        if count < 1 {
+            count = 1
         }
-        if worker_count > 128 {
-            worker_count = 128
+        if count > 128 {
+            count = 128
         }
 
         if this.show_info {
             println("[+] Running http server on port " + this.port)
-            println("[+] Worker count: " + worker_count)
+            println("[+] Worker count: " + count)
         }
 
         let static_dirs: ?shared ServerStaticDir = null
@@ -129,6 +225,11 @@ class ServerWorkerData {
             }
         }
 
+        #if OS == "win"
+        let inboxes = Array[shared WorkerInbox].new()
+        let inbox_count: uint = 0
+        while inbox_count++ < count.to(uint) : inboxes.append(WorkerInbox {})
+        #end
         let server: shared ServerWorkerData = .{
             socket: socket
             tls_context: this.tls_context
@@ -144,20 +245,53 @@ class ServerWorkerData {
             max_request_header_size: this.max_request_header_size
             max_request_body_size: this.max_request_body_size
             max_server_wide_body_size: this.max_server_wide_body_size
+            workers: count.to(uint)
+            acceptors: count.to(uint)
+            done: done
+            #if OS == "win"
+            inboxes: inboxes
+            #end
         }
+        lifecycle.publish(server)
+        #if OS != "win"
         let run: shared fn()() = fn() {
             worker(server)
         }
+        #end
 
-        worker_count--
-        while worker_count > 0 {
-            thread.Thread[void].start(run) ! {
-                println("[+] Failed to start worked number: " + worker_count)
+        let remaining_workers = server.workers - 1
+        while remaining_workers > 0 {
+            #if OS == "win"
+            let index = remaining_workers
+            let run: shared fn()() = fn() { worker(server, index) }
+            #end
+            this.spawn_worker(run) ! {
+                lifecycle.request_shutdown(0)
+                server.workers -= remaining_workers
+                #if OS == "win"
+                each server.inboxes as inbox : inbox.close()
+                server.socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                #else
+                server.acceptors -= remaining_workers
+                if --server.acceptors == 0 : server.socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                #end
+                if --server.workers == 0 : server.done.unlock()
+                server.done.await_unlock()
+                throw .init
             }
-            worker_count--
+            remaining_workers--
         }
 
-        run()
+        worker(server)
+        server.done.await_unlock()
+    }
+
+    fn spawn_worker(handler: shared fn()()) !HttpError {
+        #if TEST && OS == "win"
+        if this.fail_worker_start_after == 0 : throw .init
+        if this.fail_worker_start_after > 0 : this.fail_worker_start_after--
+        #end
+        thread.Thread[void].start(handler) ! throw .init
     }
 
     + fn add_static_dir(path: String) !LookupError {

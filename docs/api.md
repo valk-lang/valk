@@ -1383,6 +1383,8 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fn fast(handler: shared fn(Context, ResponseWriter)()) Server
     + fn handle(handler: shared fn(Request)(Response)) Server
     + static fn new(host: String, port: u16, handler: shared fn(Request)(Response) (handler_default)) Server
+    + fn request_shutdown(timeout_ms: uint (5000)) void
+    + fn shutdown(timeout_ms: uint (5000)) bool
     + fn start(worker_count: i32 (-1)) void !HttpError
     + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) Server !HttpError
 }
@@ -1697,7 +1699,7 @@ alias Fd for i32
 + class SocketServer is Closer {
     ~+ socket: Socket
 
-    + fn accept() Connection !NetError
+    + fn accept(timeout_ms: uint (0)) Connection !NetError
     + fn close() void !io:IoError
 }
 ```
