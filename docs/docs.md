@@ -1034,14 +1034,9 @@ fn handler(req: http.Request) http.Response {
 }
 
 fn main() {
-    let host = "127.0.0.1"
-    let port : u16 = 9000
-    let s = http.Server.new(host, port, handler) ! {
-        println("Failed to initialize http server")
-        return
-    }
-    println("HTTP server - http://%host:%port")
-    s.start()
+    let s = http.Server.new("127.0.0.1", 9000, handler)
+    s.show_info = true
+    s.start() ! println("Failed to start http server")
 }
 ```
 
