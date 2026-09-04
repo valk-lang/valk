@@ -1278,7 +1278,6 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + max_tls_version: ?TlsVersion
     + min_tls_version: TlsVersion
     + output: ?Writer
-    + output_to_file: ?String
     + query_data: ?Map[String]
     + read_timeout_ms: uint
     + timeout_ms: uint
