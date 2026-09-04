@@ -124,8 +124,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
-    + fn write_f64(v: f64) void
-    + fn write_f64_ascii(v: f64, decimals: uint (2), trim_zeros: bool (false)) void
+    + fn write_f64_ascii(v: f64, decimals: uint, trim_zeros: bool (false)) void
+    + fn write_f64_ascii_shortest(v: f64) void
     + fn write_f64_be(v: f64) void
     + fn write_f64_le(v: f64) void
     + fn write_int_ascii(v: int, base: u8 (10)) void

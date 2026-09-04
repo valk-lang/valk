@@ -751,6 +751,18 @@ io.copy("hello".reader(), file) ! panic("copy")
 file.close() ! panic("close")
 ```
 
+For floating-point text, use `write_f64_ascii_shortest` for the shortest
+round-trip representation, or `write_f64_ascii` with an explicit number
+of decimal places. Set `trim_zeros` to `true` to remove trailing fractional
+zeros. `write_f64_le` and `write_f64_be` write binary bytes.
+
+```rust
+let buffer = ByteBuffer.new()
+buffer.write_f64_ascii_shortest(1.5) // 1.5
+buffer.write(" ")
+buffer.write_f64_ascii(1.5, 3) // 1.500
+```
+
 The process' standard streams are available as `io.stdin()` (a reader),
 `io.stdout()` and `io.stderr()` (writers). Their reads and writes block:
 

@@ -26,12 +26,53 @@ build() {
     "$VALK" build "$input" --no-warn -v -c -o "$output" "$@" 2>&1
 }
 
+check_stat() {
+    local text="$1" label="$2" suffix="$3" line value
+    local pattern="^[0-9]+\.[0-9]{2}${suffix}$"
+    local found=0
+    while IFS= read -r line; do
+        if [[ "$line" != *"$label"* ]]; then continue; fi
+        found=1
+        value=${line#*"$label"}
+        value=${value%$'\r'}
+        if [[ ! "$value" =~ $pattern ]]; then
+            echo "# Expected exactly two decimals: $line"
+            exit 1
+        fi
+    done <<< "$text"
+    if [ "$found" -eq 0 ]; then
+        echo "# Missing statistic: $label"
+        echo "$text"
+        exit 1
+    fi
+}
+
+check_stats() {
+    check_stat "$1" "Function AST + IR: " "s"
+    check_stat "$1" "Object generation: " "s"
+    check_stat "$1" "Linking: " "s"
+    check_stat "$1" "Compiler memory usage: " " mb"
+}
+
 echo ""
 echo "# Test build optimization flags"
 
 default_out=$(build) || { echo "$default_out"; exit 1; }
 opt_out=$(build --opt) || { echo "$opt_out"; exit 1; }
 release_out=$(build --release) || { echo "$release_out"; exit 1; }
+
+for stats_out in "$default_out" "$opt_out" "$release_out"; do
+    check_stats "$stats_out"
+    check_stat "$stats_out" "Compiled in " "s"
+done
+
+object_out=$("$VALK" build "$input" --no-warn -vvv --clean -o "$output" 2>&1) || {
+    echo "$object_out"
+    exit 1
+}
+check_stats "$object_out"
+check_stat "$object_out" "Object task: " "ms: .+"
+check_stat "$object_out" "Compiled in " "s"
 
 default_cache=$(cache_dir "$default_out")
 opt_cache=$(cache_dir "$opt_out")
@@ -120,6 +161,12 @@ lint_out=$("$VALK" build "$lint_input" --lint -v 2>&1) || {
     echo "$lint_out"
     exit 1
 }
+check_stats "$lint_out"
+if [[ "$lint_out" != *"Object generation: 0.00s"* ]] || [[ "$lint_out" != *"Linking: 0.00s"* ]]; then
+    echo "# Zero-duration statistics must retain two decimals"
+    echo "$lint_out"
+    exit 1
+fi
 if [[ "$lint_out" != *"Unnecessary '@unsafe'"* ]] || [[ "$lint_out" != *"Lint passed"* ]]; then
     echo "# --lint did not report lint warnings and success"
     echo "$lint_out"
@@ -183,4 +230,4 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
 }
 
 echo "# CLI tests passed"
-echo "# Test count: 17"
+echo "# Test count: 18"
