@@ -129,19 +129,6 @@ memory our GC has no problem with this.
     <img alt="HTTP hello-world benchmark: Valk 6.46M, Rust hyper 5.07M, Go fasthttp 3.44M requests per second" src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-http.svg">
 </picture>
 
-| Server | 4 threads, pinned | All 12 cores, unpinned |
-|---|---:|---:|
-| Valk `http.Server`, fast handler | 6.46M req/s | 7.68M req/s |
-| Rust hyper 1.11 on tokio 1.53 | 5.07M req/s | 7.08M req/s |
-| Go fasthttp 1.73 | 3.44M req/s | 4.90M req/s |
-
-Hello-world responses over loopback, loaded with wrk: 900 keep-alive
-connections, 16 pipelined requests per round trip, median of 3 runs of 5
-seconds after a warm-up. In the pinned column every server gets 4 worker
-threads on 4 dedicated cores and wrk runs on the other 8, so the servers
-never compete with the load generator. In the unpinned column the servers
-use their default thread count and share the 12 cores with wrk.
-
 Code: [Link](examples/bench/http)
 
 ## Why Valk over Rust, Go, Zig?
