@@ -114,7 +114,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set(index: uint, v: u8) void
     + fn shrink_capacity(size: uint) void
     + fn skip(amount: uint) void
-    + fn starts_with(str: String, offset: uint) bool
+    + fn starts_with(str: String, offset: uint (0)) bool
     + fn to_slice() Slice[u8]
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
@@ -123,7 +123,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write(data: Slice[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
-    + fn write_bytes(data: ptr, length: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
     + fn write_f64(v: f64) void
     + fn write_f64_ascii(v: f64, decimals: uint (2), trim_zeros: bool (false)) void
@@ -1325,8 +1324,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
     + static fn code_name(code: uint) String
     + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null), extra_headers: ?Array[String] (null)) void
-    + fn send_file(path: String, custom_filename: ?String (null)) void
-    + fn send_file_stream(stream: FileStream, filename: ?String (null)) void
+    + fn send_file(path: String, filename: ?String (null)) void
     + fn send_status(status_code: uint) void
     + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) void
 }
