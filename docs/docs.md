@@ -384,7 +384,7 @@ Built-in error types:
 
 ```rust
 AnError (error) // Generic error
-ExternError (extern) // For when an extern function returns an error
+SystemError (failed, unsupported) // For when the operating system cannot answer a query, such as the number of CPU cores
 IterError (end) // You can end an 'each' loop with any error or you can use this one
 InitError (init) // Common error
 LookupError (missing, exists, range, empty) // For when a function needs to find or store something
@@ -557,7 +557,17 @@ fn print(value: Printable) {
 
 Only classes can implement interfaces. The compiler verifies that every method
 has the same arguments, return type, getter or function form, and error type as
-the interface declaration.
+the interface declaration. A method that cannot fail may implement an interface
+method that can; callers of the class then never handle an error, while callers
+of the interface do.
+
+Use `is_a` to check the concrete class held by an interface value:
+
+```rust
+if printable is_a User {
+    print("user")
+}
+```
 
 ## Generics
 
@@ -728,6 +738,28 @@ API for [valk.fs](api.md#fs)
 
 Use `valk.fs` for file-system operations.
 
+Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
+from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
+reader, writer and closer, `ByteReader`
+reads from a `String`, `ByteBuffer` or `Slice[u8]`, and a `ByteBuffer` is a
+writer that collects everything written to it. `io.copy` moves everything from a reader
+into a writer:
+
+```rust
+let file = fs.stream("out.txt", fs.OpenOptions { read: false, write: true, create: true }) ! panic("open")
+io.copy("hello".reader(), file) ! panic("copy")
+file.close() ! panic("close")
+```
+
+The process' standard streams are available as `io.stdin()` (a reader),
+`io.stdout()` and `io.stderr()` (writers). Their reads and writes block:
+
+```rust
+// Save everything piped into the program
+io.copy(io.stdin(), file) ! panic("copy")
+io.stderr().write("done\n") ! panic("write")
+```
+
 ## Paths
 
 Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs.path("path")`
@@ -739,7 +771,7 @@ fn main() {
     let path : fs.Path = "."
     path = path.add("folder1").add("folder2/").add("/file") // Adding parts to a path without worrying about double slashes
     println(path) // ./folder1/folder2/file
-    path = path.resolve() ! panic("Failed to resolve path")
+    path = path.resolve()
     println(path) // /var/www/folder1/folder2/file
     path = path + ".txt"
     println(path) // /var/www/folder1/folder2/file.txt
@@ -1022,6 +1054,11 @@ let res = http.request("POST", "http://some-website/api/endpoint", http.Options{
 
 // Download file
 http.download(url, to_path) ! panic("Failed to download file")
+
+// Stream the response body into any io.Writer instead of keeping it in memory
+let out = fs.stream(to_path, fs.OpenOptions { read: false, write: true, create: true }) ! panic("Failed to open file")
+http.request("GET", url, http.Options{ output: out }) ! panic("Request failed")
+out.close() ! panic("Failed to close file")
 ```
 
 ### HTTP Server
@@ -1064,7 +1101,7 @@ use valk.net
 // Server
 fn server() {
     let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
-    let buffer = ByteBuffer.new()
+    let buffer = Slice[u8].new(1000, 0)
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
@@ -1072,14 +1109,13 @@ fn server() {
         }
         // Handle connection (normally you do this on a separate coroutine so you can keep accepting new connections)
         while true {
-            buffer.clear()
-            let bytes = con.recv(buffer, 1000) ! {
+            let bytes = con.read(buffer) ! {
                 if error_is(E.code, closed) : break // Connection closed
                 println("# Server failed to read from connection")
                 break
             }
-            println("# Server received: " + buffer)
-            con.send_string("PONG") ! {
+            println("# Server received: " + buffer.view(0, bytes).to_string())
+            con.write("PONG") ! {
                 println("# Server failed to send data")
                 break
             }
@@ -1094,11 +1130,11 @@ fn main() {
     // Open client
     let con = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
-    con.send_string("PING") ! panic("Client failed to send data")
+    con.write("PING") ! panic("Client failed to send data")
     // Recv
-    let buffer = ByteBuffer.new()
-    con.recv(buffer, 1000) ! panic("Client failed to read from connection")
-    println("# Client received: " + buffer)
+    let buffer = Slice[u8].new(1000, 0)
+    let bytes = con.read(buffer) ! panic("Client failed to read from connection")
+    println("# Client received: " + buffer.view(0, bytes).to_string())
     con.close() ! panic("Failed to close connection")
 }
 ```

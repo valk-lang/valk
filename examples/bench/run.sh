@@ -137,7 +137,10 @@ build_benchmark() {
     printf 'Building %-14s %s\n' "$benchmark" "$language" >&2
     case "$language" in
         valk)
-            "$repo_dir/valk" build "$source_dir/main.valk" --release -o "$output" >/dev/null
+            if ! build_log="$("$repo_dir/valk" build "$source_dir/main.valk" --release -o "$output")"; then
+                printf '%s\n' "$build_log" >&2
+                exit 1
+            fi
             ;;
         go)
             go build -o "$output" "$source_dir/main.go"

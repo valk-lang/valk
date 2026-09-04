@@ -85,7 +85,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ class ByteBuffer {
++ class ByteBuffer is Writer {
     ~ data: ptr
     ~ length: uint
     ~ size: uint
@@ -105,7 +105,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn index_where_byte_is_not(byte: u8, start_index: uint (0)) uint !LookupError
     + fn into_string() String
     + fn ltrim(filter: fnptr(u8)(bool)) void
-    + fn mutable_view(offset: uint, length: uint) MutableByteView
     + static fn new(start_size: uint (128)) ByteBuffer
     + fn part(start_index: uint, length: uint) String
     + fn reader() ByteReader
@@ -115,16 +114,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set(index: uint, v: u8) void
     + fn shrink_capacity(size: uint) void
     + fn skip(amount: uint) void
-    + fn starts_with(str: String, offset: uint) bool
+    + fn starts_with(str: String, offset: uint (0)) bool
+    + fn to_slice() Slice[u8]
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
-    + fn view(offset: uint, length: uint) ByteView[ByteBuffer]
+    + fn view(offset: uint, length: uint) Slice[u8]
+    + fn write(data: Slice[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
-    + fn write_buffer(buf: ByteBuffer, offset: uint (0)) void
-    + fn write_buffer_part(buf: ByteBuffer, len: uint, offset: uint (0)) void
     + fn write_byte(v: u8) void
-    + fn write_bytes(data: ptr, length: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
     + fn write_f64(v: f64) void
     + fn write_f64_ascii(v: f64, decimals: uint (2), trim_zeros: bool (false)) void
@@ -132,7 +130,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn write_f64_le(v: f64) void
     + fn write_int_ascii(v: int, base: u8 (10)) void
     + fn write_little_endian(value: uint, bytes: uint) void
-    + fn write_string(str: String) void
     + fn write_u16_be(v: u16) void
     + fn write_u16_le(v: u16) void
     + fn write_u32_be(v: u32) void
@@ -144,12 +141,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ class ByteReader {
-    + buf: ByteBuffer
++ class ByteReader is Reader, Seeker {
     + pos: uint
+    + source: Slice[u8]
 
     + fn get_pos() uint
-    + static fn new(buf: ByteBuffer) ByteReader
+    + static fn new(source: Slice[u8]) ByteReader
+    + fn read(buf: Slice[u8]) uint !io:IoError
     + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8
     + fn read_cstring() String
@@ -171,33 +169,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_uint() uint
     + fn read_uint_be() uint
     + fn read_uint_le() uint
+    + fn remaining() Slice[u8]
     + fn reset() void
     + fn rewind(amount: uint) void
+    + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn set_pos(index: uint) void
     + fn skip(amount: uint) void
-}
-```
-
-```js
-+ struct ByteView[T] {
-    + get bytes: uint
-    + fn clear() void
-    + get data: ptr
-    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
-    + fn equal_ignore_ascii_case(cmp: String) bool
-    + fn equals(cmp: String) bool
-    + fn equals_at(offset: uint, length: uint, cmp: String) bool
-    + fn get(index: uint) u8
-    + fn has_ascii_control(allow_tab: bool (false)) bool
-    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
-    + static fn new(source: T, offset: uint, length: uint) ByteView[T]
-    + fn starts_with(cmp: String) bool
-    + fn to_ascii_lower_string() String
-    + fn to_float() float !SyntaxError
-    + fn to_int() int !SyntaxError
-    + fn to_string() String
-    + fn to_uint() uint !SyntaxError
-    + fn view(offset: uint, length: uint) ByteView[T]
 }
 ```
 
@@ -246,21 +223,15 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ mode Map[T] for HashMap[String, T] {
-    + fn clone() Map[T]
-    + static fn new() Map[T]
++ extend HashMap[String, T] {
+    + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
 }
 ```
 
 ```js
-+ struct MutableByteView {
-    + get bytes: uint
-    + get data: ptr
-    + fn get(index: uint) u8
-    + static fn new(source: ByteBuffer, offset: uint, length: uint) MutableByteView
-    + fn read_view() ByteView[ByteBuffer]
-    + fn set(index: uint, value: u8) void
-    + fn view(offset: uint, length: uint) MutableByteView
++ mode Map[T] for HashMap[String, T] {
+    + fn clone() Map[T]
+    + static fn new() Map[T]
 }
 ```
 
@@ -286,11 +257,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Process {
-    + fn detach() void !ExternError
-    + fn did_exit() bool !ExternError
-    + fn exit_code() i32 !ExternError
-    + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !ExternError
-    + fn stop() void !ExternError
+    + fn detach() void !io:IoError
+    + fn did_exit() bool !io:IoError
+    + fn exit_code() i32 !io:IoError
+    + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !io:IoError
+    + fn stop() void !io:IoError
 }
 ```
 
@@ -298,12 +269,32 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice Slice[T] of T {
     ~ data: *[T]
     ~ length: uint
+    ~ offset: uint
 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
     + static fn new(length: uint, value: T) Slice[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
+    + fn view(offset: uint, length: uint) Slice[T]
+}
+```
+
+```js
++ extend Slice[u8] {
+    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
+    + fn equal_ignore_ascii_case(cmp: String) bool
+    + fn equals(cmp: String) bool
+    + fn equals_at(offset: uint, length: uint, cmp: String) bool
+    + fn has_ascii_control(allow_tab: bool (false)) bool
+    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
+    + fn reader() ByteReader
+    + fn starts_with(cmp: String) bool
+    + fn to_ascii_lower_string() String
+    + fn to_float() float !SyntaxError
+    + fn to_int() int !SyntaxError
+    + fn to_string() String
+    + fn to_uint() uint !SyntaxError
 }
 ```
 
@@ -311,6 +302,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice String of u8 {
     ~ data: *[u8]
     ~ length: uint
+    ~ offset: uint
 
     + static fn alloc(length: uint) String
     + get bytes: uint
@@ -345,20 +337,21 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn part(start_index: uint, length: uint) String
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
     + fn range(start: uint, end: uint, inclusive: bool (true)) String
+    + fn reader() ByteReader
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String
-    + static fn secure_random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String !ExternError
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
     ~ fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
+    + fn to_slice() Slice[u8]
     + fn to_string() String
     + fn to_uint() uint !SyntaxError
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
-    + fn view(start_index: uint, length: uint) ByteView[String]
+    + fn view(start_index: uint, length: uint) Slice[u8]
 }
 ```
 
@@ -452,7 +445,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
-    + static fn secure_random() i16 !ExternError
     + fn to_base(base: i16) String
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -476,7 +468,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
-    + static fn secure_random() i32 !ExternError
     + fn to_base(base: i32) String
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -500,7 +491,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
-    + static fn secure_random() i64 !ExternError
     + fn to_base(base: i64) String
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -524,7 +514,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *u8) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
-    + static fn secure_random() i8 !ExternError
     + fn to_base(base: i8) String
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -548,7 +537,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
-    + static fn secure_random() int !ExternError
     + fn to_base(base: int) String
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -604,14 +592,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_uint_le() uint
     + fn to_hex() String
+    + fn write(data: Slice[u8]) void
     + fn write_big_endian(value: uint, bytes: uint) void
-    + fn write_buffer(buf: ByteBuffer, len: uint, offset: uint (0)) void
-    + fn write_buffer_all(buf: ByteBuffer, offset: uint (0)) void
     + fn write_bytes(from: ptr, len: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
     + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint
     + fn write_little_endian(value: uint, bytes: uint) void
-    + fn write_string(str: String) void
     + fn write_u16_be(v: u16) void
     + fn write_u16_le(v: u16) void
     + fn write_u32_be(v: u32) void
@@ -639,7 +625,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
-    + static fn secure_random() u16 !ExternError
     + fn to_base(base: u16) String
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -663,7 +648,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
-    + static fn secure_random() u32 !ExternError
     + fn to_base(base: u32) String
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -687,7 +671,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
-    + static fn secure_random() u64 !ExternError
     + fn to_base(base: u64) String
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -725,7 +708,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *u8) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
-    + static fn secure_random() u8 !ExternError
     + fn to_ascii_string() String
     + fn to_base(base: u8) String
     + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
@@ -753,7 +735,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
-    + static fn secure_random() uint !ExternError
     + fn to_base(base: uint) String
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -785,8 +766,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
 + fn bcrypt_verify(password: String, hash: String) bool
 + fn md5_encode(input: String) String
-+ fn random_bytes(length: uint) String !CryptoError
-+ fn random_uint() uint !CryptoError
++ fn random_bytes(length: uint) String
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```
@@ -1073,8 +1053,8 @@ alias pid_t for i32
 + fn exe_path() String !io:IoError
 + fn exists(path: String) bool
 + fn extension(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io:IoError
-+ fn home_dir() String !ExternError
++ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), relative: bool (false)) Array[String] !io:IoError
++ fn home_dir() String !LookupError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
 + fn is_symlink(path: String) bool
@@ -1086,50 +1066,43 @@ alias pid_t for i32
 + fn path(path: String) Path
 + fn read(path: String) String !io:IoError
 + fn realpath(path: String) String !io:IoError
-+ fn resolve(path: String) String !io:IoError
++ fn resolve(path: String) String
 + fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint !io:IoError
 + fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync_all() void
 + fn truncate(path: String, length: uint) void !io:IoError
-+ fn write(path: String, content: String, append: bool (false)) void !io:IoError
-+ fn write_bytes(path: String, data: ptr, size: uint, append: bool (false)) void !io:IoError
++ fn write(path: String, content: Slice[u8], append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
 
 ```js
-+ class FileStream {
++ class FileStream is Reader, Writer, Seeker, Closer {
+    ~ closed: bool
     ~ path: String
-    + read_offset: uint
-    ~ reading: bool
+    ~ position: uint
 
     + fn close() void !io:IoError
-    + fn read(bytes: uint (10240), buffer: ByteBuffer) uint !io:IoError
+    + fn read(buf: Slice[u8]) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
-    + fn write[T](data: ByteView[T]) void !io:IoError
-    + fn write_buffer(buffer: ByteBuffer) void !io:IoError
-    + fn write_buffer_part(buffer: ByteBuffer, length: uint, offset: uint (0)) void !io:IoError
-    + fn write_bytes(from: ptr, len: uint) void !io:IoError
-    + fn write_string(str: String) void !io:IoError
+    + fn write(data: Slice[u8]) uint !io:IoError
 }
 ```
 
 ```js
 + class InMemoryFile {
-    ~ data: ptr
+    ~ data: Slice[u8]
     ~ filename: String
     ~ mime_type: String
-    ~ size: uint
 
-    + static fn copy_from_ptr(data: ptr, size: uint) InMemoryFile
-    + static fn create_from_buffer(buffer: ByteBuffer) InMemoryFile
-    + static fn create_from_file(path: String) InMemoryFile !io:IoError
-    + static fn create_from_view[T](view: ByteView[T]) InMemoryFile
-    + fn read_all() String
+    + static fn from_file(path: String) InMemoryFile !io:IoError
+    + static fn new(data: Slice[u8]) InMemoryFile
+    + fn reader() ByteReader
     + fn save(path: String) void !io:IoError
+    + fn to_string() String
 }
 ```
 
@@ -1150,7 +1123,7 @@ alias pid_t for i32
     + fn dir_of() Path
     + static fn new(path: String) Path
     + fn pop() Path
-    + fn resolve() Path !io:IoError
+    + fn resolve() Path
 }
 ```
 
@@ -1266,18 +1239,9 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
 ```js
 + class Context {
-    ~+ body_expected: uint
-    ~+ body_received: uint
-    ~+ chunk_trailers: bool
-    ~+ chunked: bool
-    ~+ content_length: uint
-    ~+ has_content_length: bool
-    ~+ has_host: bool
-    ~+ has_transfer_encoding: bool
-    ~+ method: ByteView[ByteBuffer]
-    ~+ parsed_index: uint
-    ~+ path: ByteView[ByteBuffer]
-    ~+ query_string: ByteView[ByteBuffer]
+    ~+ method: Slice[u8]
+    ~+ path: Slice[u8]
+    ~+ query_string: Slice[u8]
     ~+ status: uint
 
     + get body: String
@@ -1304,7 +1268,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + max_response_header_size: uint
     + max_tls_version: ?TlsVersion
     + min_tls_version: TlsVersion
-    + output_to_file: ?String
+    + output: ?Writer
     + query_data: ?Map[String]
     + read_timeout_ms: uint
     + timeout_ms: uint
@@ -1351,6 +1315,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
     + static fn redirect(location: String, code: u32 (302), headers: ?Map[String] (null)) Response
     + fn set_header(name: String, value: String, extend_existing: bool (false)) void
+    + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Map[String] (null)) Response
 }
 ```
@@ -1361,9 +1326,9 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
     + static fn code_name(code: uint) String
     + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null), extra_headers: ?Array[String] (null)) void
-    + fn send_file(path: String, custom_filename: ?String (null)) void
-    + fn send_file_stream(stream: FileStream, filename: ?String (null)) void
+    + fn send_file(path: String, filename: ?String (null)) void
     + fn send_status(status_code: uint) void
+    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) void
 }
 ```
 
@@ -1419,22 +1384,57 @@ alias Fd for i32
 + fn await_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn await_socket_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn close(fd: i32) void !IoError
++ fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
 + fn print(msg: String) void
-+ fn print_bytes(adr: ptr, len: uint) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
-+ fn read_bytes(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
-+ fn read_bytes_sync(fd: i32, buf: ptr, amount: uint, offset: uint) uint !IoError
-+ fn read_sync(fd: i32, buf: ByteBuffer, amount: uint, offset: uint) uint !IoError
++ fn read(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError
++ fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
++ fn read_sync(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
++ fn stderr() StdStream
++ fn stdin() StdStream
++ fn stdout() StdStream
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
-+ fn write[T](fd: i32, data: ByteView[T]) uint !IoError
-+ fn write_buffer(fd: i32, buf: ByteBuffer, amount: uint) uint !IoError
-+ fn write_bytes(fd: i32, buf: ptr, amount: uint) uint !IoError
-+ fn write_bytes_sync(fd: i32, buf: ptr, amount: uint) uint !IoError
-+ fn write_string(fd: i32, str: String) uint !IoError
++ fn write(fd: i32, data: Slice[u8]) uint !IoError
+```
+
+## Classes for 'io'
+
+```js
++ interface Closer {
+    + fn close() void !IoError
+}
+```
+
+```js
++ interface Reader {
+    + fn read(buf: Slice[u8]) uint !IoError
+}
+```
+
+```js
++ interface Seeker {
+    + fn seek(offset: int, from: SeekFrom) uint !IoError
+}
+```
+
+```js
++ class StdStream is Reader, Writer {
+    ~ can_read: bool
+    ~ can_write: bool
+    ~ fd: i32
+
+    + fn read(buf: Slice[u8]) uint !IoError
+    + fn write(data: Slice[u8]) uint !IoError
+}
+```
+
+```js
++ interface Writer {
+    + fn write(data: Slice[u8]) uint !IoError
+}
 ```
 
 # json
@@ -1442,8 +1442,8 @@ alias Fd for i32
 ## Functions for 'json'
 
 ```js
-+ fn decode(json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
-+ fn decode_to[T](json: ByteBuffer | String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
++ fn decode(json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
++ fn decode_to[T](json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 + fn default_value(kind: Kind) Value
 + fn encode(data: $T, pretty: bool (false)) String
 + fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
@@ -1465,7 +1465,7 @@ alias Fd for i32
 
     + fn append(value: Value) ArrayValue
     + fn get(index: uint) Value !LookupError
-    + fn length() uint
+    + get length: uint
     + fn prepend(value: Value) ArrayValue
     + fn remove(index: uint) ArrayValue
 }
@@ -1477,7 +1477,7 @@ alias Fd for i32
 
     + fn get(key: String) Value !LookupError
     + fn has(key: String) bool
-    + fn length() uint
+    + get length: uint
     + fn remove(key: String) ObjectValue
     + fn set(key: String, value: Value) ObjectValue
 }
@@ -1527,7 +1527,7 @@ alias Fd for i32
     + get is_string: bool
     + get kind: Kind
     + fn kind_name() String
-    + fn length() uint
+    + get length: uint
     + get object: ObjectValue
     + fn object_value() ObjectValue !LookupError
     + fn prepend(value: Value) Value
@@ -1600,27 +1600,27 @@ alias Fd for i32
 + fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
-+ fn ascii_equal_ignore_case[A, B](a: ByteView[A], b: ByteView[B]) bool
-+ fn ascii_to_lower(view: MutableByteView) void
++ fn ascii_equal_ignore_case(a: Slice[u8], b: Slice[u8]) bool
++ fn ascii_to_lower(view: Slice[u8]) void
 + fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
 + fn calloc(size: uint) ptr
-+ fn clear(view: MutableByteView) void
++ fn clear(view: Slice[u8]) void
 + fn clear_bytes(adr: ptr, length: uint) void
 + fn clear_value[T](value: *T) void
-+ fn copy[T](from: ByteView[T], to: MutableByteView) uint
++ fn copy(from: Slice[u8], to: Slice[u8]) uint
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 + fn copy_value[T](from: *T, to: *T) void
-+ fn equal[A, B](a: ByteView[A], b: ByteView[B]) bool
++ fn equal(a: Slice[u8], b: Slice[u8]) bool
 + fn equal_bytes(a: ptr, b: ptr, length: uint) bool
-+ fn find_char[T](view: ByteView[T], ch: u8) uint !LookupError
++ fn find_char(view: Slice[u8], ch: u8) uint !LookupError
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(value: $T) void
-+ fn move(from: MutableByteView, to: MutableByteView) uint
++ fn move(from: Slice[u8], to: Slice[u8]) uint
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
 + fn move_value[T](from: *T, to: *T) void
 + fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
-+ fn to_uint[T](view: ByteView[T], allow_plus: bool (false)) uint !SyntaxError
++ fn to_uint(view: Slice[u8], allow_plus: bool (false)) uint !SyntaxError
 ```
 
 # net
@@ -1628,11 +1628,8 @@ alias Fd for i32
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn recv_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send(fd: i32, buf: ByteBuffer, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send_bytes(fd: i32, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !NetError
-+ fn send_string(fd: i32, str: String, timeout_ms: uint (5000)) uint !NetError
++ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
 
 ## Classes for 'net'
@@ -1648,7 +1645,7 @@ alias Fd for i32
 ```
 
 ```js
-+ class Connection {
++ class Connection is Reader, Writer, Closer {
     ~ fd: i32
     ~+ host: String
     + read_timeout_ms: uint
@@ -1656,39 +1653,34 @@ alias Fd for i32
     ~ ssl_enabled: bool
     + write_timeout_ms: uint
 
-    + fn close() void !NetError
+    + fn close() void !io:IoError
     + static fn new(fd: i32) Connection !NetError
-    + fn recv(buffer: ByteBuffer, bytes: uint) uint !NetError
-    + fn send[T](data: ByteView[T], send_all: bool (true)) uint !NetError
-    + fn send_buffer(data: ByteBuffer, skip_bytes: uint (0), send_all: bool (true)) uint !NetError
-    + fn send_bytes(data: ptr, bytes: uint, send_all: bool) uint !NetError
-    + fn send_string(data: String, send_all: bool (true)) uint !NetError
+    + fn read(buf: Slice[u8]) uint !io:IoError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
+    + fn write(data: Slice[u8]) uint !io:IoError
 }
 ```
 
 ```js
-+ class Socket {
++ class Socket is Closer {
     ~ fd: i32
     ~ host: String
     ~ port: u16
 
     + static fn client(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) Connection !NetError
-    + fn close() void !NetError
-    + static fn close_fd(fd: i32) void !NetError
-    + static fn close_fd_cleanup(fd: i32, file: String, line: uint) void
+    + fn close() void !io:IoError
     + static fn server(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) shared SocketServer !NetError
 }
 ```
 
 ```js
-+ class SocketServer {
++ class SocketServer is Closer {
     ~+ socket: Socket
 
     + fn accept() Connection !NetError
-    + fn close() void !NetError
+    + fn close() void !io:IoError
 }
 ```
 
@@ -1711,7 +1703,7 @@ alias Fd for i32
     + fn get_error_message() String
     + static fn new() Ssl
     + fn peer_certificate_sha256() String !NetError
-    + fn recv(buffer: ByteBuffer, max_bytes: uint, timeout_ms: uint (5000)) uint !NetError
+    + fn recv(buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError
     + fn selected_alpn() String
     + fn set_alpn(protocols: Array[String]) void !NetError
     + fn set_ca_cert(path: ?String) void !NetError
@@ -1722,7 +1714,7 @@ alias Fd for i32
     + fn set_max_version(version: TlsVersion) void !NetError
     + fn set_min_version(version: TlsVersion) void !NetError
     + fn set_verify(enable: bool) void
-    + fn write(from: ptr, len: uint, timeout_ms: uint (5000)) uint !NetError
+    + fn write(data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
 }
 ```
 
@@ -1776,9 +1768,8 @@ alias Fd for i32
 
 ```js
 + class Thread[T] {
-    + fn await_result() T
+    + fn await() T
     + static fn start(func: shared fn()(T)) Thread[T] !InitError
-    + fn wait() void
 }
 ```
 

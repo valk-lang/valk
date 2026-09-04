@@ -177,14 +177,15 @@ Valk distinguishes three sequence categories:
 | --- | --- | --- | --- |
 | `[T x N]` | Inline elements | Copies all elements | No |
 | `Array[T]` | GC-managed reference | Copies the reference | Yes |
-| `Slice[T]` | GC-managed fixed-length sequence | Copies the reference | No |
+| `Slice[T]` | Bounded view over GC-managed storage | Copies the view | No |
 
-Fixed arrays store their elements inline. `Array` and `Slice` are GC reference
-types.
+Fixed arrays store their elements inline. `Array` is a GC reference type.
+`Slice` is a value descriptor containing its backing storage, offset, and
+visible length. Copying a slice preserves the same backing storage.
 
-`Array[T]` owns resizable element storage. `Slice[T]` owns fixed-length element
-storage. Creating a slice from another sequence copies its elements into that
-storage; it does not alias a region of the source sequence.
+`Array[T]` owns resizable element storage. A newly initialized `Slice[T]` owns
+fixed-length element storage, while `slice.view(offset, length)` creates a
+bounded alias of that storage without allocating or copying elements.
 
 Array and Slice indexing is compiler-defined rather than implemented through
 `$offset` library hooks. An out-of-range read produces `LookupError.missing`
@@ -255,17 +256,17 @@ class User is Printable {
 }
 ```
 
-Valk interface values are reference-sized GC values. The current representation
-is a pointer to an adapter containing:
+Valk interface values are two-word values containing:
 
 ```text
-{ object: GcPtr, method_0: fnptr, method_1: fnptr, ... }
+{ object: GcPtr, vtable: ptr }
 ```
 
-The object field keeps the concrete class alive. Method slots are assigned in
-interface declaration order. Interface methods cannot be generic, and an
-implementation must match argument types, return types, getter/function form,
-variadic behavior, and error type exactly.
+The object field keeps the concrete class alive. Vtables are static, and method
+slots are assigned in interface declaration order. `value is_a Type` checks
+the concrete class stored in an interface value. Interface methods cannot be
+generic, and an implementation must match argument types, return types,
+getter/function form, variadic behavior, and error type exactly.
 
 ### Tagged unions
 
@@ -589,9 +590,9 @@ operation such as `close`.
 - Struct and class fields appear in declaration order.
 - Natural padding is inserted before fields and at the end of aggregates.
 - `packed` suppresses normal inter-field padding for a struct.
-- Classes, arrays, slices, coroutines, and interfaces are reference-sized
-  values.
-- Closures are two pointers.
+- Classes, arrays, and coroutines are reference-sized values.
+- Slices contain a backing reference, element offset, and visible length.
+- Closures and interfaces are two pointers.
 - Fixed arrays contain `N` consecutive elements.
 - Tuple members use their natural alignment in tuple order.
 - The tagged-union payload begins at byte offset 8 in the current ABI.
