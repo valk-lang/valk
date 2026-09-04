@@ -1224,7 +1224,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ```js
 + class ClientResponse {
     + body: String
-    + headers: Map[String]
+    + headers: Headers
     + status: uint
 }
 ```
@@ -1250,9 +1250,24 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fn data() Map[String]
     + fn data_json() Value
     + fn files() Map[InMemoryFile]
-    + fn headers() Map[String]
+    + fn headers() Headers
     + fn params() Map[String]
     + fn params_grouped() Map[Array[String]]
+}
+```
+
+```js
++ class Headers {
+    + fn append(name: String, value: String) Headers
+    + fn clear() Headers
+    + fn copy() Headers
+    + fn get(name: String) String !LookupError
+    + fn get_all(name: String) Array[String]
+    + fn has(name: String) bool
+    + get length: uint
+    + static fn new() Headers
+    + fn remove(name: String) Headers
+    + fn set(name: String, value: String) Headers
 }
 ```
 
@@ -1264,7 +1279,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + certificate_sha256: ?String
     + connect_timeout_ms: uint
     + follow_redirects: bool
-    + headers: ?Map[String]
+    + headers: ?Headers
     + max_redirects: uint
     + max_response_body_size: uint
     + max_response_header_size: uint
@@ -1280,9 +1295,9 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + write_timeout_ms: uint
 
     + fn clear_headers() Options
-    + fn get_headers() Map[String]
+    + fn get_headers() Headers
     + fn set_header(key: String, value: String) Options
-    + fn set_headers(headers: Map[String]) Options
+    + fn set_headers(headers: Headers) Options
 }
 ```
 
@@ -1296,7 +1311,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fn data() Map[String]
     + fn data_json() Value
     + fn files() Map[InMemoryFile]
-    + fn headers() Map[String]
+    + fn headers() Headers
     + fn params() Map[String]
     + fn params_grouped() Map[Array[String]]
 }
@@ -1306,19 +1321,18 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 + class Response {
     + body: String
     + content_type: String
-    + extra_headers: ?Array[String]
-    + headers: ?Map[String]
     + status: u32
 
     + fn add_header(name: String, value: String) void
-    + static fn empty(code: u32 (200), headers: ?Map[String] (null)) Response
+    + static fn empty(code: u32 (200), headers: ?Headers (null)) Response
     + static fn file(path: String, filename: ?String (null)) Response
-    + static fn html(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
-    + static fn json(body: String, code: u32 (200), headers: ?Map[String] (null)) Response
-    + static fn redirect(location: String, code: u32 (302), headers: ?Map[String] (null)) Response
-    + fn set_header(name: String, value: String, extend_existing: bool (false)) void
+    + get headers: Headers
+    + static fn html(body: String, code: u32 (200), headers: ?Headers (null)) Response
+    + static fn json(body: String, code: u32 (200), headers: ?Headers (null)) Response
+    + static fn redirect(location: String, code: u32 (302), headers: ?Headers (null)) Response
+    + fn set_header(name: String, value: String) void
     + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
-    + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Map[String] (null)) Response
+    + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
 }
 ```
 
@@ -1327,10 +1341,10 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     ~ responded: bool
 
     + static fn code_name(code: uint) String
-    + fn respond(code: uint, content_type: String, body: String, headers: ?Map[String] (null), extra_headers: ?Array[String] (null)) void
-    + fn send_file(path: String, filename: ?String (null)) void
+    + fn respond(code: uint, content_type: String, body: String, headers: ?Headers (null)) void
+    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null)) void
     + fn send_status(status_code: uint) void
-    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) void
+    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null)) void
 }
 ```
 

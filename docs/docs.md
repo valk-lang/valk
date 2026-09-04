@@ -1061,6 +1061,18 @@ http.request("GET", url, http.Options{ output: out }) ! panic("Request failed")
 out.close() ! panic("Failed to close file")
 ```
 
+Header names are case-insensitive. `get` returns the first value or a lookup
+error; `get_all` returns all values in order (an empty array when absent).
+`set` replaces all values for a name, while `append` adds a separate field.
+Iteration yields each value and name, including repeated fields.
+
+```rust
+let headers = http.Headers { "Accept" => "application/json" }
+headers.append("X-Tag", "first").append("x-tag", "second")
+let res = http.request("GET", url, http.Options { headers: headers }) ! panic("Request failed")
+let cookies = res.headers.get_all("Set-Cookie")
+```
+
 ### HTTP Server
 
 ```rust
