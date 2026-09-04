@@ -1474,7 +1474,7 @@ alias Fd for i32
 
     + fn append(value: Value) ArrayValue
     + fn get(index: uint) Value !LookupError
-    + fn length() uint
+    + get length: uint
     + fn prepend(value: Value) ArrayValue
     + fn remove(index: uint) ArrayValue
 }
@@ -1486,7 +1486,7 @@ alias Fd for i32
 
     + fn get(key: String) Value !LookupError
     + fn has(key: String) bool
-    + fn length() uint
+    + get length: uint
     + fn remove(key: String) ObjectValue
     + fn set(key: String, value: Value) ObjectValue
 }
@@ -1536,7 +1536,7 @@ alias Fd for i32
     + get is_string: bool
     + get kind: Kind
     + fn kind_name() String
-    + fn length() uint
+    + get length: uint
     + get object: ObjectValue
     + fn object_value() ObjectValue !LookupError
     + fn prepend(value: Value) Value
