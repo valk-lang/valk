@@ -257,11 +257,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class Process {
-    + fn detach() void !ExternError
-    + fn did_exit() bool !ExternError
-    + fn exit_code() i32 !ExternError
-    + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !ExternError
-    + fn stop() void !ExternError
+    + fn detach() void !io:IoError
+    + fn did_exit() bool !io:IoError
+    + fn exit_code() i32 !io:IoError
+    + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !io:IoError
+    + fn stop() void !io:IoError
 }
 ```
 
@@ -340,7 +340,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn reader() ByteReader
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String
-    + static fn secure_random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String !ExternError
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
     ~ fn take_length(length: uint) String
@@ -446,7 +445,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 2]) i16
     + fn round_down(modulo: i16) i16
     + fn round_up(modulo: i16) i16
-    + static fn secure_random() i16 !ExternError
     + fn to_base(base: i16) String
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -470,7 +468,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 4]) i32
     + fn round_down(modulo: i32) i32
     + fn round_up(modulo: i32) i32
-    + static fn secure_random() i32 !ExternError
     + fn to_base(base: i32) String
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -494,7 +491,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) i64
     + fn round_down(modulo: i64) i64
     + fn round_up(modulo: i64) i64
-    + static fn secure_random() i64 !ExternError
     + fn to_base(base: i64) String
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -518,7 +514,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *u8) i8
     + fn round_down(modulo: i8) i8
     + fn round_up(modulo: i8) i8
-    + static fn secure_random() i8 !ExternError
     + fn to_base(base: i8) String
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -542,7 +537,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) int
     + fn round_down(modulo: int) int
     + fn round_up(modulo: int) int
-    + static fn secure_random() int !ExternError
     + fn to_base(base: int) String
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -631,7 +625,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 2]) u16
     + fn round_down(modulo: u16) u16
     + fn round_up(modulo: u16) u16
-    + static fn secure_random() u16 !ExternError
     + fn to_base(base: u16) String
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -655,7 +648,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 4]) u32
     + fn round_down(modulo: u32) u32
     + fn round_up(modulo: u32) u32
-    + static fn secure_random() u32 !ExternError
     + fn to_base(base: u32) String
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -679,7 +671,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) u64
     + fn round_down(modulo: u64) u64
     + fn round_up(modulo: u64) u64
-    + static fn secure_random() u64 !ExternError
     + fn to_base(base: u64) String
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -717,7 +708,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *u8) u8
     + fn round_down(modulo: u8) u8
     + fn round_up(modulo: u8) u8
-    + static fn secure_random() u8 !ExternError
     + fn to_ascii_string() String
     + fn to_base(base: u8) String
     + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
@@ -745,7 +735,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn read_little_endian(from: *[u8 x 8]) uint
     + fn round_down(modulo: uint) uint
     + fn round_up(modulo: uint) uint
-    + static fn secure_random() uint !ExternError
     + fn to_base(base: uint) String
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     + fn to_hex() String
@@ -777,8 +766,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
 + fn bcrypt_verify(password: String, hash: String) bool
 + fn md5_encode(input: String) String
-+ fn random_bytes(length: uint) String !CryptoError
-+ fn random_uint() uint !CryptoError
++ fn random_bytes(length: uint) String
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
 ```

@@ -384,7 +384,7 @@ Built-in error types:
 
 ```rust
 AnError (error) // Generic error
-ExternError (extern) // For when an extern function returns an error
+SystemError (failed, unsupported) // For when the operating system cannot answer a query, such as the number of CPU cores
 IterError (end) // You can end an 'each' loop with any error or you can use this one
 InitError (init) // Common error
 LookupError (missing, exists, range, empty) // For when a function needs to find or store something
