@@ -1042,8 +1042,8 @@ alias pid_t for i32
 + fn exe_path() String !io:IoError
 + fn exists(path: String) bool
 + fn extension(path: String, with_dot: bool (false)) String
-+ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), prefix: ?String (null), result: Array[String] (.{})) Array[String] !io:IoError
-+ fn home_dir() String !ExternError
++ fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), relative: bool (false)) Array[String] !io:IoError
++ fn home_dir() String !LookupError
 + fn is_dir(path: String) bool
 + fn is_file(path: String) bool
 + fn is_symlink(path: String) bool
@@ -1665,25 +1665,23 @@ alias Fd for i32
 ```
 
 ```js
-+ class Socket {
++ class Socket is Closer {
     ~ fd: i32
     ~ host: String
     ~ port: u16
 
     + static fn client(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) Connection !NetError
-    + fn close() void !NetError
-    + static fn close_fd(fd: i32) void !NetError
-    + static fn close_fd_cleanup(fd: i32, file: String, line: uint) void
+    + fn close() void !io:IoError
     + static fn server(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) shared SocketServer !NetError
 }
 ```
 
 ```js
-+ class SocketServer {
++ class SocketServer is Closer {
     ~+ socket: Socket
 
     + fn accept() Connection !NetError
-    + fn close() void !NetError
+    + fn close() void !io:IoError
 }
 ```
 
