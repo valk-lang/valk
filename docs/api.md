@@ -1777,9 +1777,8 @@ alias Fd for i32
 
 ```js
 + class Thread[T] {
-    + fn await_result() T
+    + fn await() T
     + static fn start(func: shared fn()(T)) Thread[T] !InitError
-    + fn wait() void
 }
 ```
 
