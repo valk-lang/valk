@@ -223,6 +223,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
++ extend HashMap[String, T] {
+    + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
+}
+```
+
+```js
 + mode Map[T] for HashMap[String, T] {
     + fn clone() Map[T]
     + static fn new() Map[T]
@@ -271,6 +277,24 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn view(offset: uint, length: uint) Slice[T]
+}
+```
+
+```js
++ extend Slice[u8] {
+    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
+    + fn equal_ignore_ascii_case(cmp: String) bool
+    + fn equals(cmp: String) bool
+    + fn equals_at(offset: uint, length: uint, cmp: String) bool
+    + fn has_ascii_control(allow_tab: bool (false)) bool
+    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
+    + fn reader() ByteReader
+    + fn starts_with(cmp: String) bool
+    + fn to_ascii_lower_string() String
+    + fn to_float() float !SyntaxError
+    + fn to_int() int !SyntaxError
+    + fn to_string() String
+    + fn to_uint() uint !SyntaxError
 }
 ```
 

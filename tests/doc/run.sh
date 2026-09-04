@@ -49,7 +49,10 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
     || [[ "$markdown" != *'+ first: T'* ]] \
     || [[ "$markdown" != *'+ fn left() T'* ]] \
     || [[ "$markdown" != *'+ class Ahead'* ]] \
-    || [[ "$markdown" != *'+ fn name() String'* ]]; then
+    || [[ "$markdown" != *'+ fn name() String'* ]] \
+    || [[ "$markdown" != *'+ extend Box[String] {'* ]] \
+    || [[ "$markdown" != *'+ fn shout() String'* ]] \
+    || [[ "$markdown" == *'+ extend Box[uint]'* ]]; then
     echo "# Markdown sorting did not preserve class declarations"
     echo "$markdown"
     exit 1
@@ -70,6 +73,9 @@ fi
 stdlib_markdown=$(<"$workdir/stdlib-api.md")
 if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ extend Slice[u8] {'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn has_ascii_control(allow_tab: bool (false)) bool'* ]] \
+    || [[ "$stdlib_markdown" != *'+ extend HashMap[String, T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError'* ]] \
