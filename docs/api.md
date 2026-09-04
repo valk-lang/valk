@@ -1239,16 +1239,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
 ```js
 + class Context {
-    ~+ body_expected: uint
-    ~+ body_received: uint
-    ~+ chunk_trailers: bool
-    ~+ chunked: bool
-    ~+ content_length: uint
-    ~+ has_content_length: bool
-    ~+ has_host: bool
-    ~+ has_transfer_encoding: bool
     ~+ method: Slice[u8]
-    ~+ parsed_index: uint
     ~+ path: Slice[u8]
     ~+ query_string: Slice[u8]
     ~+ status: uint
