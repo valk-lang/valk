@@ -85,7 +85,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ class ByteBuffer {
++ class ByteBuffer is Writer {
     ~ data: ptr
     ~ length: uint
     ~ size: uint
@@ -120,7 +120,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
     + fn view(offset: uint, length: uint) Slice[u8]
-    + fn write(data: Slice[u8]) void
+    + fn write(data: Slice[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
     + fn write_bytes(data: ptr, length: uint) void
@@ -1402,15 +1402,6 @@ alias Fd for i32
 ```
 
 ## Classes for 'io'
-
-```js
-+ class BufferWriter is Writer {
-    + buffer: ByteBuffer
-
-    + static fn new(buffer: ?ByteBuffer (null)) BufferWriter
-    + fn write(data: Slice[u8]) uint !IoError
-}
-```
 
 ```js
 + interface Closer {

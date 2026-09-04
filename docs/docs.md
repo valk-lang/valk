@@ -557,7 +557,9 @@ fn print(value: Printable) {
 
 Only classes can implement interfaces. The compiler verifies that every method
 has the same arguments, return type, getter or function form, and error type as
-the interface declaration.
+the interface declaration. A method that cannot fail may implement an interface
+method that can; callers of the class then never handle an error, while callers
+of the interface do.
 
 Use `is_a` to check the concrete class held by an interface value:
 
@@ -739,8 +741,8 @@ Use `valk.fs` for file-system operations.
 Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
 from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
 reader, writer and closer, `ByteReader`
-reads from a `String`, `ByteBuffer` or `Slice[u8]`, and `io.BufferWriter`
-collects writes in a `ByteBuffer`. `io.copy` moves everything from a reader
+reads from a `String`, `ByteBuffer` or `Slice[u8]`, and a `ByteBuffer` is a
+writer that collects everything written to it. `io.copy` moves everything from a reader
 into a writer:
 
 ```rust
