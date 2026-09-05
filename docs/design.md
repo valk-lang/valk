@@ -453,9 +453,13 @@ bounds. `each` iterates it natively. It converts from `&[T x N]`, from a fixed
 array inside an owner, and to and from any `Slice[T]` or `String` value: the
 named slices are `&[T]` with a class, so the conversion is a retype.
 
-Storing an owned borrow makes it an alias into `owner`, so creating one marks
-the owner's graph as no longer uniquely held, exactly as storing a managed
-reference does. Borrowing `shared T` data remains an error.
+An owned borrow is an alias into `owner`, and its owner word is part of the
+borrow value. The owner's graph therefore stops being uniquely held exactly
+when the borrow escapes: stored in an object or global, returned, captured,
+bound to a local, or passed to a parameter the callee keeps. A borrow that
+only lives through a call, such as `read(&owner.payload)` with a callee that
+does not keep it, leaves `owner` publishable as `shared`. Borrowing
+`shared T` data remains an error.
 
 #### Null owner
 
