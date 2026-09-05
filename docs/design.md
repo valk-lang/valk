@@ -178,6 +178,7 @@ Valk distinguishes three sequence categories:
 | `[T x N]` | Inline elements | Copies all elements | No |
 | `Array[T]` | GC-managed reference | Copies the reference | Yes |
 | `Slice[T]` | Bounded view over GC-managed storage | Copies the view | No |
+| `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
 
 Fixed arrays store their elements inline. `Array` is a GC reference type.
 `Slice` is a value descriptor containing its backing storage, offset, and
@@ -386,157 +387,112 @@ the value non-null.
 
 ### Borrows
 
-`&T` is a safe, non-owning reference to existing storage. Taking `&value`
-stabilizes the referenced local for the duration of the borrow.
+Valk has two borrow forms. Both are safe: neither can dangle, and neither
+requires the programmer to track lifetimes.
 
-A borrow:
-
-- May be stored only in local variables and non-escaping parameters.
-- Cannot be stored in a class, array, map, global, interface adapter, or closure.
-- Cannot be returned.
-- Cannot be converted implicitly to persistent raw-pointer storage.
-- May cross a coroutine suspension point when its stabilized storage and owner
-  root are retained in the coroutine frame.
-
-Taking a borrow from an inline local makes that local addressable. The compiler
-uses native stack storage when the function is proven not to suspend. If the
-function may suspend directly or through a call, address-taken inline locals use
-stable storage so their addresses remain valid while another coroutine uses the
-execution stack.
-
-Taking an interior borrow from a GC object creates a hidden root for the exact
-owner allocation, so reassigning the source variable cannot allow the old
-allocation to be collected while the borrow remains live. The compiler retains
-that root for the remainder of the function or coroutine frame.
-
-Elements of `Array` and `Slice` cannot currently be borrowed through indexing.
-Array backing storage may relocate when it grows, and sequence indexing returns
-a checked value rather than exposing its backing address. Fixed-array elements
-may be borrowed after their containing inline storage is stabilized.
-
-The compiler tracks borrows through tuples, fixed arrays, structs, unions, and
-other inline aggregates. A value containing a borrow follows the same escape
-rules as a direct `&T`.
-
-### Proposal: owned borrows and stack borrows
-
-Status: proposal, not implemented. This section describes a planned change to
-the borrow model above.
-
-#### Problem
-
-A borrow of a property inside a GC object, such as `&obj.prop`, is valid only
-for the remainder of the frame that takes it. The compiler keeps the owner
-alive through a hidden root in that frame, and the root dies with the frame.
-That is why a borrow cannot be stored in a class, array, global, or closure,
-and cannot be returned. The restriction is not about the property; it is about
-the borrow having no owner of its own.
-
-#### Types
-
-The proposal splits borrows into two types with different representations.
-
-| Type | Layout | Root | May be stored or returned |
+| Type | Layout | Kept alive by | May be stored or returned |
 | --- | --- | --- | --- |
 | `stack T` | `{ adr: ptr }` | The frame that took it | No |
 | `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
 | `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
 
-`stack T` is the current one-word borrow under a new name. It is what
-`&local` produces for an inline local, and it keeps the current rules: local
-variables and non-escaping parameters only, no persistent storage, no return.
-The name is kept even though address-taken locals in a function that may
-suspend live in stable storage rather than on the native stack.
+#### Stack borrows
 
-`&T` becomes an owned borrow. Taking `&obj.prop` from a GC object produces a
-fat reference whose `owner` is the allocation that contains the storage. The
-GC walks `owner` and ignores `adr`. Because the heap does not move objects,
-`adr` stays valid for as long as `owner` is reachable, so the borrow needs no
-lifetime tracking and may live anywhere a GC reference may live.
+`stack T` is a one-word address of frame storage: an inline local, an
+argument, or a temporary aggregate. `&local` produces it. A stack borrow
+follows the frame rules:
 
-`&[T]` is the sequence form: an owned borrow plus a visible length. It is a
-plain value type without a class. Indexing is checked against `length`.
+- May be stored only in local variables and non-escaping parameters.
+- Cannot be stored in a class, array, map, global, interface adapter, or closure.
+- Cannot be returned.
+- Cannot be converted implicitly to persistent raw-pointer storage.
+- May cross a coroutine suspension point when its stabilized storage is
+  retained in the coroutine frame.
+
+Taking a stack borrow makes the local addressable. The compiler uses native
+stack storage when the function is proven not to suspend. If the function may
+suspend directly or through a call, address-taken inline locals use stable
+storage so their addresses remain valid while another coroutine uses the
+execution stack.
+
+`stack [T x N]` is the bounded form; its length is part of the type and
+indexing is checked against it. Struct method receivers are stack borrows.
+
+#### Owned borrows
+
+`&T` is an owned borrow: a fat reference whose `owner` names the GC allocation
+that contains the storage. The collector walks `owner` and ignores `adr`.
+Because the heap does not move objects, `adr` stays valid for as long as
+`owner` is reachable, so the borrow needs no lifetime tracking and may live
+anywhere a GC reference may live: class properties, arrays, globals, closures,
+return values, and coroutine frames.
+
+`&obj.prop` on a GC object produces `&T` with `owner` set to that object, and
+so does `&ref.prop` through another owned borrow. A property of inline
+aggregate type converts implicitly, as in `let p: &Payload = owner.payload`.
+The members of `&T` are the members of `T`, read through the address.
+
+`&[T]` is the sequence form: an owned borrow plus a visible length, without a
+class. Indexing and ranges are checked against `length` and panic when out of
+bounds. `each` iterates it natively. It converts from `&[T x N]`, from a fixed
+array inside an owner, and from any `Slice[T]` or `String` value, whose
+storage is fixed-size.
+
+Storing an owned borrow makes it an alias into `owner`, so creating one marks
+the owner's graph as no longer uniquely held, exactly as storing a managed
+reference does. Borrowing `shared T` data remains an error.
 
 #### Null owner
 
-`owner` is nullable, but null does not mean "a frame keeps this alive". Null
-means the borrow has no owner at all. Safe code produces a null owner only for
-permanent storage: globals, literals, and other static data. Unsafe code may
-construct an `&T` or `&[T]` with a null owner over memory whose lifetime it
-manages itself, for example a buffer from an extern allocator. That is the
-unsafe boundary and follows the same rules as raw pointers.
-
-A `stack T` never converts to `&T`. The frame is the only thing keeping the
-storage alive, and there is no allocation to name as `owner`. Attempting the
-conversion is a compile-time error, which replaces the current "cannot store a
-borrow" errors with a precise reason.
+`owner` is nullable, and null means the storage has no owner at all. Safe code
+produces a null owner only for permanent storage: globals and other static
+data. Unsafe code may build an `&T` from a raw pointer with `.@cast(&T)`,
+which yields a null owner over memory whose lifetime the programmer manages.
+A null owner never stands in for a frame: a `stack T` does not convert to
+`&T`, because there is no allocation to name, and the compiler reports the
+missing owner instead of the old "cannot be stored" errors.
 
 #### Conversions
 
-- `&T` converts to `stack T` by dropping `owner`. The source expression stays
-  rooted for the duration, using the same hidden root the compiler creates
-  today.
-- `stack T` does not convert to `&T`.
-- `[T x N]`, `&[T x N]`, and `Slice[T]` convert to `&[T]` when the storage has a
-  fixed size (see below).
-- Raw `*T` converts to `&T` only through explicit `.@cast(&T)`, producing a null
-  owner. This is unsafe.
+- `&T` converts to `stack T` by dropping `owner`. A temporary owned borrow
+  is copied into a frame root first so its owner stays alive during the use.
+- `stack T` does not convert to `&T` or `&[T]`.
+- `&[T x N]` converts to `&[T]`; `[T x N]` storage with an owner converts to
+  either.
+- A raw pointer converts to `stack T` implicitly, as before, and to `&T` only
+  through explicit `.@cast(&T)` under `@unsafe`.
+- `&T` and `&[T]` convert to `ptr` and to a matching `*T`; a bounded `*[T x N]`
+  takes exactly its own length.
+- `?&T` uses a null address as its empty state and costs no extra word.
+  Equality on borrows compares addresses.
 
 The convention that follows: a function that only reads takes `stack T`, a
-function that may store takes `&T`, and callers may pass a `&T` to either. The
-escape inference already computes whether a `&T` parameter escapes; the
-compiler may report a `&T` parameter that never escapes and suggest `stack T`.
-It must not silently pass a `stack T` into a `&T` parameter on the strength of
-that summary, because the summary is a fixed point that changes when callee
-bodies change, and because it would give null owner a second meaning.
+function that may store takes `&T`, and callers may pass an owned borrow to
+either.
 
-#### Owners must be fixed-size
+#### Owners are fixed-size
 
-An owned borrow points into its owner's storage. That storage must not
-relocate. Valid owners are class objects, and structs or fixed arrays inlined
-in them. Elements of a growable `Array[T]` cannot be owner-borrowed, because
-the backing store moves when the array grows. The same applies to an `&[T]`
-view over an `Array[T]`. Array elements remain checked, copied values, as
-today. A fixed-capacity array type would lift this restriction for its own
-storage.
+An owned borrow points into its owner's storage, which must not relocate.
+Valid owners are class objects, and structs or fixed arrays inlined in them,
+plus `Slice` and `String` storage. Elements of a growable `Array[T]` cannot be
+borrowed at all: the backing store moves when the array grows, and sequence
+indexing returns a checked value rather than exposing its backing address.
 
-#### Relation to `Slice` and `String`
+#### Stores through borrows
 
-`Slice[T]` and `String` already carry `{ storage, offset, length }`, which is
-the same information as `&[T]`. The `&[T]` layout is preferable: `adr` is an
-untagged address, so indexing loses a mask and an add, and the GC walks a plain
-`owner` field instead of decoding a tag. The intended end state is that
-`Slice[T]` and `String` become method sets over `&[T]` and `&[u8]` with one
-shared representation. That migration is a separate step because it touches
-the runtime, literal globals, and the GC walk.
+A store through `&T` or `&[T]` whose element type holds managed references
+runs the owner's ownership bookkeeping when `owner` is set and a plain store
+when it is null. The same applies to `sequence[i] = value` on a fixed array
+that lives inside a GC object. Reads of managed elements through any borrow
+or fixed array strip the collector's tag bits.
 
-#### Aliasing and uniqueness
-
-A stored `&T` or `&[T]` is an external alias into `owner`. Storing one in
-persistent storage sets `invalidates_unique` on the owner path in the inferred
-parameter effects, so uniqueness summaries stay correct. Borrowing `shared T`
-data remains an error, since a fat reference would bypass the shared view.
-
-`?&T` uses a null `adr` as its nullable sentinel and costs no extra word.
-Equality on borrows compares `adr` only.
-
-#### What simplifies
-
-- The hidden owner root created for interior borrows of GC objects is no longer
-  needed for `&T`; the borrow is its own root. It remains only for `stack T`
-  borrows of inline locals.
-- Borrows crossing a coroutine suspension need no special handling for `&T`.
-  `stack T` keeps the stable-storage rule.
-- The per-frame "borrow cannot escape" checks reduce to one rule: `stack T`
-  cannot escape.
-
-#### Out of scope
+#### Not done here
 
 Allocating class objects in the frame when escape inference proves they do not
-escape is a separate optimization and does not interact with this proposal.
-Promoting a frame-allocated object to the heap at the moment it escapes is
-rejected: raw pointers and existing borrows may already hold the frame
-address, and rewriting them would require a moving collector for frames.
+escape is a separate optimization. Promoting a frame-allocated object to the
+heap at the moment it escapes is rejected: raw pointers and existing borrows
+may already hold the frame address, and rewriting them would require a moving
+collector for frames.
 
 ### Inferred parameter effects
 
@@ -598,8 +554,8 @@ operations. `pointer.$offset(bytes)` computes an address offset without
 converting the integer offset itself to `ptr`.
 
 Raw pointers may erase to `ptr`, and a bare `ptr` may acquire either a raw `*T`
-element type or a borrowed `&T` type. Converting a typed raw `*T` directly to
-`&T` requires explicit `.@cast(&T)`.
+element type or a `stack T` borrow type. Converting any raw pointer to an owned
+`&T` requires explicit `.@cast(&T)` and yields a borrow without an owner.
 
 Bitwise `ptr & integer`, `ptr | integer`, and `ptr ^ integer` operations retain
 the pointer type. Assigning such a result to `uint` uses the same one-way

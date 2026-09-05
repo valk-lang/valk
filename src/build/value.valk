@@ -444,13 +444,7 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             }
             act_check_assign(operand, exp) !>
             value_check_shared_address(operand, exp) !>
-            let storage = value_prepare_borrow_storage(operand, ctx)
-            if !isset(storage) {
-                exp.error("Cannot borrow from relocatable or unrooted storage")
-            }
-            value_clear_borrowed_local_facts(operand, scope)
-            let v = vgen_ptr_of(storage, operand.rett.reference(), exp)
-            return v
+            return value_borrow_of(operand, scope, ctx, exp) !>
         }
         // Fold constants when possible
         if op == VALUE_OP.neg {
@@ -578,6 +572,13 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         // Suggest cast target for the value (`null.@cast(Node)` needs a type for null)
         let cast_ctx = cast_t.get_non_nullable().is_shared ? ctx.without_suggested_type() : ctx.with_suggested_type(cast_t)
         let on = value_from_exp(on_exp, scope, cast_ctx) !>
+        if cast_t.get_non_nullable().is_owned_borrow() || on.rett.get_non_nullable().is_owned_borrow() {
+            let borrowed = value_cast_borrow(on, cast_t, scope, ctx, exp) !>
+            if isset(borrowed) {
+                borrowed.exp = exp
+                return borrowed
+            }
+        }
         let v = vgen_cast(on, cast_t)
         v.exp = exp
         return v
@@ -851,8 +852,8 @@ fn func_prepare_closure(f: Func) !Error {
     if isset(f.capture_class) : return
 
     each f.capture_decls as decl {
-        if decl.type.get_non_nullable().kind == TYPE.ref_of {
-            f.exp.error("You cannot bind references in closures. Type not allowed: " + decl.type.compat_display_name())
+        if decl.type.has_borrowed_refs() {
+            f.exp.error("You cannot bind stack borrows in closures. Type not allowed: " + decl.type.compat_display_name())
         }
     }
 
@@ -1086,11 +1087,12 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
 
     let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    on = value_through_borrow(on, ctx)
     if !on.rett.is_pointer() {
         if !on.rett.is_inline_type() {
             on_exp.error("Expected a pointer value, not: '" + on.rett.compat_display_name() + "'")
         }
-        let pointer_t = on.rett.reference()
+        let pointer_t = on.rett.stack_ref()
         on = value_try_convert(on, scope, ctx, pointer_t, true, true) !>
         pointer_t.compat_check(on.rett, on_exp) !>
     }
@@ -1167,7 +1169,7 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
             return value_clone_method(value, method, ctx, scope, at, check_access) !>
         }
     }
-    if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.ref_of) && !allow_pointer_alias {
+    if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.stack_of || nn.is_owned_borrow()) && !allow_pointer_alias {
         at.error("Cannot clone type '" + nn.compat_display_name() + "' because it aliases memory and has no accessible '$clone' function")
     }
     if nn.is_fixed_array_type() : return value_clone_array(value, ctx, scope, at, check_access, allow_pointer_alias) !>
@@ -1356,7 +1358,7 @@ fn value_from_memcpy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     each arg_exps as arg_exp, i {
         let target = i < 2 ? ptr_t : uint_t
         let value = value_from_exp(arg_exp, scope, ctx.with_suggested_type(target)) !>
-        if i < 2 && value.rett.is_inline_type() : target = value.rett.reference()
+        if i < 2 && value.rett.is_inline_type() : target = value.rett.stack_ref()
         value = value_try_convert(value, scope, ctx, target, true, i < 2) !>
         target.compat_check(value.rett, arg_exp) !>
         values.append(value)
@@ -1419,7 +1421,7 @@ fn parse_offset_access(body: Exp) Exp !Error {
 
 fn type_native_sequence(type: Type) Type {
     let t = type.get_non_nullable()
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of {
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.stack_of {
         let class = t.get_direct_class_or_null()
         if t.is_bounded_pointer() || (t.kind == TYPE.ptr_of && isset(class) && class.kind == CLASS_KIND.unbound) : return t
         let sub = t.get_sub_type()
@@ -1433,7 +1435,7 @@ fn type_native_sequence(type: Type) Type {
 fn type_has_native_sequence_length(type: Type) bool {
     let t = type_native_sequence(type)
     return t.is_fixed_array_type() || t.kind == TYPE.array || t.kind == TYPE.slice
-        || t.is_bounded_pointer()
+        || t.is_bounded_pointer() || t.kind == TYPE.ref_slice
 }
 
 fn type_native_sequence_element(type: Type) ?Type {
@@ -1450,6 +1452,7 @@ fn value_native_sequence_length(on: Value, type: Type, ctx: Context, at: Exp) ?V
     if t.is_fixed_array_type() || t.is_bounded_pointer() {
         return vgen_int(t.length.to(int), uint_t)
     }
+    if t.kind == TYPE.ref_slice : return value_owned_borrow_length(on, ctx) !>
     if t.kind != TYPE.array && t.kind != TYPE.slice : return null
     let class = t.get_class_or_null()
     if isset(class) {
@@ -1480,7 +1483,8 @@ fn value_native_slice_storage(on: Value, type: Type, ctx: Context, at: Exp) Valu
 
 fn value_native_sequence_data(on: Value, type: Type, ctx: Context, at: Exp) Value !Error {
     let t = type_native_sequence(type)
-    if t.is_fixed_array_type() || t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of : return on
+    if t.is_fixed_array_type() || t.kind == TYPE.ptr_of || t.kind == TYPE.stack_of : return on
+    if t.kind == TYPE.ref_slice : return vgen_cast(value_owned_borrow_address(on), type_ptr(ctx.build))
     let class = t.get_class_or_null()
     if isset(class) {
         let prop = class.get_prop_by_name("data") !? null
@@ -1763,6 +1767,10 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context, pass_native_e
     }
 
     let access = parse_offset_access(body) !>
+    if on.rett.get_non_nullable().kind == TYPE.ref_slice {
+        return value_from_ref_slice_offset(on, access, scope, ctx, exp) !>
+    }
+    on = value_through_borrow(on, ctx)
     let on_t = on.rett.get_non_nullable()
     if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
         require_unsafe(exp, scope, "Offset access on an unbounded pointer") !>
@@ -1847,14 +1855,14 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context, pass_native_e
         if on_t.is_shared : sub = sub.shared_storage_type()
         let size = on_t.length
         index = value_check_known_length_index(index, on_t, size, ctx, exp) !>
-        return vgen_ptrv(on, index, sub, exp)
+        return value_sequence_element_read(vgen_ptrv(on, index, sub, exp), scope, ctx, exp) !>
     }
 
     // *T / &T / *[T x N] with known element type
     let direct_class = on_t.get_direct_class_or_null()
     let unbound_class = isset(direct_class) && direct_class.kind == CLASS_KIND.unbound ? direct_class : null
     let unbound_hook = isset(unbound_class) ? resolve_offset_get_func(unbound_class) : null
-    if (on_t.kind == TYPE.ptr_of && !isset(unbound_hook)) || on_t.kind == TYPE.ref_of {
+    if (on_t.kind == TYPE.ptr_of && !isset(unbound_hook)) || on_t.kind == TYPE.stack_of {
         let sub = on_t.get_sub_type()
         if isset(sub) {
             let element = sub
@@ -1869,7 +1877,7 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context, pass_native_e
             } else if on_t.is_bounded_pointer() {
                 index = value_check_known_length_index(index, on_t, on_t.length, ctx, exp) !>
             }
-            return vgen_ptrv(on, index, element, exp)
+            return value_sequence_element_read(vgen_ptrv(on, index, element, exp), scope, ctx, exp) !>
         }
     }
 
@@ -1928,6 +1936,13 @@ fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context, pass_native_e
     }
 
     exp.error("Type: '" + on.rett.compat_display_name() + "' has no '[]' get offset function")
+}
+
+// An element slot inside managed storage carries collector tag bits; a read
+// of a managed element goes through the property read path to strip them.
+fn value_sequence_element_read(slot: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    if !slot.rett.has_gc_refs() : return slot
+    return value_property_get(slot, scope, ctx, at) !>
 }
 
 fn value_check_known_length_index(
@@ -2039,6 +2054,10 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     }
 
     let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
+    if on.rett.get_non_nullable().kind == TYPE.ref_slice {
+        return value_from_ref_slice_offset_assign(on, access, right_exp, scope, ctx, left_exp, at) !>
+    }
+    on = value_through_borrow(on, ctx)
     let on_t = on.rett.get_non_nullable()
     if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
         require_unsafe(left_exp, scope, "Offset access on an unbounded pointer") !>
@@ -2069,7 +2088,9 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
         call.set_error_type(set_func.error_type)
         return value_apply_error_pass(call, scope, ctx, at) !>
     }
-    if on_t.is_fixed_array_type() || on_t.kind == TYPE.ref_of : return null
+    if on_t.is_fixed_array_type() || on_t.kind == TYPE.stack_of {
+        return value_from_managed_element_assign(on, on_t, access, right_exp, scope, ctx, left_exp, at) !>
+    }
     let on_class = on_t.kind == TYPE.ptr_of ? on_t.get_direct_class_or_null() : on_t.get_class_or_null()
     if !isset(on_class) : return null
     if on_t.kind == TYPE.ptr_of && on_class.kind != CLASS_KIND.unbound : return null
@@ -2274,7 +2295,7 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     let suggested = ctx.suggested_type
     if isset(suggested) {
         let suggested_nn = suggested.get_non_nullable()
-        if suggested_nn.kind == TYPE.ref_of {
+        if suggested_nn.kind == TYPE.stack_of {
             exp.error("'.{}' cannot initialize a borrowed reference; initialize an inline value and borrow it with '&'")
         }
         if suggested_nn.is_struct_object() {
@@ -3474,6 +3495,16 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if on_nn.rett.is_nullable_type() && !nullable_union_receiver {
         exp.error("You cannot access properties/functions on a nullable type: " + on_nn.rett.compat_display_name())
     }
+    if on_nn.rett.kind == TYPE.ref_slice {
+        if name == "length" {
+            let length = value_owned_borrow_length(value_root_owned_borrow(on_nn, ctx), ctx) !>
+            length.exp = exp
+            return length
+        }
+        exp.error("Type '" + on_nn.rett.compat_display_name() + "' has no property or method named: '" + name + "'")
+    }
+    // Members of `&T` are the members of T, read through its address.
+    on_nn = value_through_borrow(on_nn, ctx)
 
     if name == "$is_shared" {
         return value_from_is_shared(on_nn, exp, b) !>
@@ -3631,11 +3662,11 @@ fn value_member_class(type: Type) ?Class {
     let t = type.get_non_nullable()
     let direct = t.get_direct_class_or_null()
     if isset(direct) : return direct
-    if t.kind != TYPE.ptr_of && t.kind != TYPE.ref_of : return t.get_class_or_null()
+    if t.kind != TYPE.ptr_of && t.kind != TYPE.stack_of : return t.get_class_or_null()
     let sub = t.get_sub_type()
     // `&T` is a typed borrow, so member lookup remains that of T. Raw `*T`
     // keeps pointer member semantics unless it points at inline storage.
-    if t.kind == TYPE.ref_of && isset(sub) : return sub.get_class_or_null()
+    if t.kind == TYPE.stack_of && isset(sub) : return sub.get_class_or_null()
     if isset(sub) && sub.is_inline : return sub.get_class_or_null()
     return type_ptr(t.build).class
 }
@@ -4367,7 +4398,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             }
             let source_kind = av.rett.get_non_nullable().kind
             let target_kind = param.type.get_non_nullable().kind
-            let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.ref_of)
+            let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.stack_of)
                 && (target_kind == TYPE.ptr_of || param.type.is_raw_pointer())
             if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer {
                 at.error("An implicit pointer borrow cannot be passed to raw pointer storage; use '@ref' explicitly")
