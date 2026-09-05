@@ -90,13 +90,6 @@ Valk 0.5.1, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory i
 
 Code: [Link](examples/bench)
 
-It's clear that Valk is the best when it comes to managing dynamic memory.
-
-The other benchmarks depend more on algorithms and SIMD. Although we are close
-or equal in performance, we haven't spent much time yet optimizing this. But in
-the end these benchmarks will all relatively perform the same if they get the
-same codegen optimizations and use the same algorithms.
-
 ---
 
 ### GC benchmarks
