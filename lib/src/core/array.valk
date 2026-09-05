@@ -1,16 +1,42 @@
 use mem
 use gc
 
+// Elements live in `Slice[T]` storage: a block that traces every slot it
+// holds. The array keeps the block in `storage` and its first element in
+// `data`. A view over the block stays valid after the array reallocates, and
+// a slot that leaves the array is cleared so the block keeps nothing dead.
 + array Array[T] of T $global {
     + static fn new(start_size: uint (0)) SELF $default {
-        let allocation_size = start_size.checked_multiply(size_of(T)) ! panic("Array capacity is too large")
-        let d = gc.alloc(allocation_size)
-
-        let res = SELF {
-            cap: start_size
-            data: d
-        }
+        let res = SELF { cap: 0 }
+        if start_size > 0 : res.allocate_storage(start_size)
         return res
+    }
+
+    - fn allocate_storage(new_cap: uint) {
+        @unsafe
+        let block = Slice[T].init(new_cap)
+        // The block is freshly allocated; it passes through a raw pointer so
+        // the uniqueness analysis keeps treating the array as a fresh graph.
+        this.storage = block.owner.@cast(ptr).@cast(?gc.GcPtr)
+        this.data = block.data
+        this.cap = new_cap
+    }
+
+    // Clear a slot whose element is no longer part of the array.
+    - fn clear_slot(index: uint) {
+        @unsafe
+        @property_clear(this.storage, @ptrv(this.data, T, index))
+        mem.clear_bytes(this.data.@cast(ptr) + index * size_of(T), size_of(T))
+    }
+
+    // A view over the elements, sharing the array's storage. The view keeps
+    // the block alive on its own, so it survives the array growing, and it
+    // observes in-place changes to the elements it covers.
+    + fn view(start: uint (0), amount: uint (0 - 1)) Slice[T] {
+        if start >= this.length : return Slice[T].from_parts(this.storage, this.data, 0)
+        let remain = this.length - start
+        if amount > remain : amount = remain
+        return Slice[T].from_parts(this.storage, @ref(@ptrv(this.data, T, start)), amount)
     }
 
     ////////////////
@@ -26,7 +52,7 @@ use gc
         let length = this.length
         this.fit_index(length)
         // Keep the buffer owned through `this`; a local copy needs its own GC root.
-        @property_init(this, @ptrv(this.data, T, length), item)
+        @property_init(this.storage, @ptrv(this.data, T, length), item)
         this.length = length + 1
         return this
     }
@@ -60,7 +86,7 @@ use gc
             to_pos--
         }
 
-        @property_init(this, @ptrv(data, T, 0), item)
+        @property_init(this.storage, @ptrv(data, T, 0), item)
 
         this.length = length + 1
 
@@ -83,7 +109,7 @@ use gc
 
         let i: uint = 0
         while i < ilen {
-            @property_init(this, @ptrv(data, T, i), @property_get(@ptrv(items_data, T, i)))
+            @property_init(this.storage, @ptrv(data, T, i), @property_get(@ptrv(items_data, T, i)))
             i++
         }
 
@@ -189,15 +215,21 @@ use gc
         if size >= new_size : return
 
         let data = this.data
-        let item_size = size_of(T)
-        let allocation_size = new_size * item_size
-        if item_size > 0 && allocation_size / item_size != new_size : panic("Array capacity is too large")
-        let new_data = gc.alloc(allocation_size)
-        // Nothing to carry over when there was no buffer yet.
-        if size > 0 : mem.copy_bytes(data, new_data, size * size_of(T))
-
-        this.data = new_data
-        this.cap = new_size
+        let length = this.length
+        new_size.checked_multiply(size_of(T)) ! panic("Array capacity is too large")
+        this.allocate_storage(new_size)
+        // The old block stays alive for any view that still covers it, so
+        // managed elements are registered in the new block rather than copied
+        // as bytes: both blocks then hold them until the old one goes.
+        #if T.$has_gc_refs
+        let i: uint = 0
+        while i < length {
+            @property_init(this.storage, @ptrv(this.data, T, i), @property_get(@ptrv(data, T, i)))
+            i++
+        }
+        #else
+        if length > 0 : mem.copy_bytes(data, this.data, length * size_of(T))
+        #end
     }
 
     + fn get(index: uint) T !LookupError {
@@ -214,14 +246,14 @@ use gc
             this.append(value)
             return
         }
-        @property_update(this, @ptrv(this.data, T, index), value)
+        @property_update(this.storage, @ptrv(this.data, T, index), value)
     }
 
     + fn set_all(value: T) {
         let i = this.length
         let data = this.data
         while i-- > 0 {
-            @property_update(this, @ptrv(data, T, i), value)
+            @property_update(this.storage, @ptrv(data, T, i), value)
         }
     }
 
@@ -234,14 +266,14 @@ use gc
         // fill
         let i = len
         while i < index {
-            @property_init(this, @ptrv(data, T, i++), filler_value)
+            @property_init(this.storage, @ptrv(data, T, i++), filler_value)
         }
 
         // Set index
         if index < len {
-            @property_update(this, @ptrv(data, T, index), value)
+            @property_update(this.storage, @ptrv(data, T, index), value)
         } else {
-            @property_init(this, @ptrv(data, T, index), value)
+            @property_init(this.storage, @ptrv(data, T, index), value)
         }
     }
 
@@ -262,13 +294,14 @@ use gc
         let data: ptr = this.data
         let after_count = len - (index + 1)
 
-        @property_clear(this, @ptrv(data, T, index))
+        @property_clear(this.storage, @ptrv(data, T, index))
 
         if after_count > 0 {
             mem.move_bytes(data + (index + 1) * size_of(T), data + index * size_of(T), after_count * size_of(T))
         }
 
         this.length--
+        mem.clear_bytes(data + this.length * size_of(T), size_of(T))
         return this
     }
 
@@ -279,11 +312,12 @@ use gc
 
         let data: ptr = this.data
         let last_index = len - 1
-        @property_clear(this, @ptrv(data, T, index))
+        @property_clear(this.storage, @ptrv(data, T, index))
         if index != last_index {
             mem.copy_bytes(data + last_index * size_of(T), data + index * size_of(T), size_of(T))
         }
         this.length--
+        mem.clear_bytes(data + last_index * size_of(T), size_of(T))
         return this
     }
 
@@ -300,11 +334,8 @@ use gc
         if this.length == 0 : throw .missing
 
         let index = --this.length
-        let data = this.data
-
-        let item = @property_get(@ptrv(data, T, index))
-        @property_clear(this, @ptrv(data, T, index))
-
+        let item = @property_get(@ptrv(this.data, T, index))
+        this.clear_slot(index)
         return item
     }
     + fn pop_first() T !LookupError {
@@ -314,10 +345,11 @@ use gc
         let data: ptr = this.data
 
         let item = @property_get(@ptrv(data, T, 0))
-        @property_clear(this, @ptrv(data, T, 0))
+        @property_clear(this.storage, @ptrv(data, T, 0))
 
         this.length--
         mem.move_bytes(data + size_of(T), data, this.length * size_of(T))
+        mem.clear_bytes(data + this.length * size_of(T), size_of(T))
 
         return item
     }
@@ -350,17 +382,16 @@ use gc
     }
 
     + fn clear(reduce_size: bool (false)) SELF {
-        #if T.$has_gc_refs
+        @unsafe
         let data = this.data
         let i = this.length
-        while i-- > 0 : @property_clear(this, @ptrv(data, T, i))
+        #if T.$has_gc_refs
+        while i-- > 0 : @property_clear(this.storage, @ptrv(data, T, i))
         #end
+        if this.length > 0 : mem.clear_bytes(data, this.length * size_of(T))
 
         this.length = 0
-        if reduce_size {
-            this.data = gc.alloc(2 * size_of(T))
-            this.cap = 2
-        }
+        if reduce_size : this.allocate_storage(2)
         return this
     }
 
@@ -529,12 +560,15 @@ use gc
                     break
                 }
             }
-            if found : @property_clear(this, @ptrv(data, T, i))
+            if found : @property_clear(this.storage, @ptrv(data, T, i))
             else {
                 if insert_i != i : @ptrv(data, T, insert_i) = @ptrv(data, T, i)
                 insert_i++
             }
         }
+        @unsafe
+        let stale = this.length - insert_i
+        if stale > 0 : mem.clear_bytes(data.@cast(ptr) + insert_i * size_of(T), stale * size_of(T))
         this.length = insert_i
         return this
     }

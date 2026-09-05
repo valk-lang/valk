@@ -176,12 +176,24 @@ Valk distinguishes three sequence categories:
 | Type | Storage | Copy behavior | Resize |
 | --- | --- | --- | --- |
 | `[T x N]` | Inline elements | Copies all elements | No |
-| `Array[T]` | GC-managed reference | Copies the reference | Yes |
+| `Array[T]` | GC-managed reference to `Slice[T]` storage | Copies the reference | Yes |
 | `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
 | `Slice[T]`, `String` | `&[T]` with a class attached | Copies the borrow | No |
 
 Fixed arrays store their elements inline. `Array` is a GC reference type that
-owns resizable element storage.
+owns resizable element storage. That storage is a `Slice[T]` block: a header
+with the slot count followed by the elements, traced by the block itself. The
+array holds the block in `storage` and its first element in `data`. Growth
+allocates a new block and registers the elements there as well; the old block
+stays alive only while something else, such as a view, still holds it. Every
+operation that drops an element clears its slot, so the array never keeps a
+removed element reachable.
+
+`array.view(start, length)` returns a `Slice[T]` over the array's block
+without copying. The view shares the elements it covers, observes in-place
+writes through the array, and survives the array growing because it keeps the
+block it was taken from. A view keeps its whole block alive, including slots
+past the elements it covers. `array.iter()` and `array.slice(...)` still copy.
 
 A `slice X of T` class is an `&[T]` with methods: the same three words
 (`owner`, element pointer, `length`), the same GC handling, and the same
@@ -498,9 +510,10 @@ either.
 
 An owned borrow points into its owner's storage, which must not relocate.
 Valid owners are class objects, and structs or fixed arrays inlined in them,
-plus `Slice` and `String` storage. Elements of a growable `Array[T]` cannot be
-borrowed at all: the backing store moves when the array grows, and sequence
-indexing returns a checked value rather than exposing its backing address.
+plus `Slice` and `String` storage. Elements of a growable `Array[T]` are not
+borrowed through the array itself, because the backing store moves when the
+array grows; `array.view(...)` hands out a `Slice[T]` whose owner is the
+storage block, which does not move.
 
 #### Stores through borrows
 

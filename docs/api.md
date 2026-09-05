@@ -40,8 +40,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + array Array[T] {
     ~ cap: uint
-    ~ data: GcPtr
+    ~ data: *[T]
     ~ length: uint
+    ~ storage: ?GcPtr
 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
@@ -81,6 +82,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
+    + fn view(start: uint (0), amount: uint (0 - 1)) Slice[T]
 }
 ```
 
@@ -269,6 +271,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice Slice[T] of T {
     ~ data: *[T]
     ~ length: uint
+    ~ owner: ?GcPtr
 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
@@ -302,6 +305,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice String of u8 {
     ~ data: *[u8]
     ~ length: uint
+    ~ owner: ?GcPtr
 
     + static fn alloc(length: uint) String
     + get bytes: uint
