@@ -418,6 +418,126 @@ The compiler tracks borrows through tuples, fixed arrays, structs, unions, and
 other inline aggregates. A value containing a borrow follows the same escape
 rules as a direct `&T`.
 
+### Proposal: owned borrows and stack borrows
+
+Status: proposal, not implemented. This section describes a planned change to
+the borrow model above.
+
+#### Problem
+
+A borrow of a property inside a GC object, such as `&obj.prop`, is valid only
+for the remainder of the frame that takes it. The compiler keeps the owner
+alive through a hidden root in that frame, and the root dies with the frame.
+That is why a borrow cannot be stored in a class, array, global, or closure,
+and cannot be returned. The restriction is not about the property; it is about
+the borrow having no owner of its own.
+
+#### Types
+
+The proposal splits borrows into two types with different representations.
+
+| Type | Layout | Root | May be stored or returned |
+| --- | --- | --- | --- |
+| `stack T` | `{ adr: ptr }` | The frame that took it | No |
+| `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
+| `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
+
+`stack T` is the current one-word borrow under a new name. It is what
+`&local` produces for an inline local, and it keeps the current rules: local
+variables and non-escaping parameters only, no persistent storage, no return.
+The name is kept even though address-taken locals in a function that may
+suspend live in stable storage rather than on the native stack.
+
+`&T` becomes an owned borrow. Taking `&obj.prop` from a GC object produces a
+fat reference whose `owner` is the allocation that contains the storage. The
+GC walks `owner` and ignores `adr`. Because the heap does not move objects,
+`adr` stays valid for as long as `owner` is reachable, so the borrow needs no
+lifetime tracking and may live anywhere a GC reference may live.
+
+`&[T]` is the sequence form: an owned borrow plus a visible length. It is a
+plain value type without a class. Indexing is checked against `length`.
+
+#### Null owner
+
+`owner` is nullable, but null does not mean "a frame keeps this alive". Null
+means the borrow has no owner at all. Safe code produces a null owner only for
+permanent storage: globals, literals, and other static data. Unsafe code may
+construct an `&T` or `&[T]` with a null owner over memory whose lifetime it
+manages itself, for example a buffer from an extern allocator. That is the
+unsafe boundary and follows the same rules as raw pointers.
+
+A `stack T` never converts to `&T`. The frame is the only thing keeping the
+storage alive, and there is no allocation to name as `owner`. Attempting the
+conversion is a compile-time error, which replaces the current "cannot store a
+borrow" errors with a precise reason.
+
+#### Conversions
+
+- `&T` converts to `stack T` by dropping `owner`. The source expression stays
+  rooted for the duration, using the same hidden root the compiler creates
+  today.
+- `stack T` does not convert to `&T`.
+- `[T x N]`, `&[T x N]`, and `Slice[T]` convert to `&[T]` when the storage has a
+  fixed size (see below).
+- Raw `*T` converts to `&T` only through explicit `.@cast(&T)`, producing a null
+  owner. This is unsafe.
+
+The convention that follows: a function that only reads takes `stack T`, a
+function that may store takes `&T`, and callers may pass a `&T` to either. The
+escape inference already computes whether a `&T` parameter escapes; the
+compiler may report a `&T` parameter that never escapes and suggest `stack T`.
+It must not silently pass a `stack T` into a `&T` parameter on the strength of
+that summary, because the summary is a fixed point that changes when callee
+bodies change, and because it would give null owner a second meaning.
+
+#### Owners must be fixed-size
+
+An owned borrow points into its owner's storage. That storage must not
+relocate. Valid owners are class objects, and structs or fixed arrays inlined
+in them. Elements of a growable `Array[T]` cannot be owner-borrowed, because
+the backing store moves when the array grows. The same applies to an `&[T]`
+view over an `Array[T]`. Array elements remain checked, copied values, as
+today. A fixed-capacity array type would lift this restriction for its own
+storage.
+
+#### Relation to `Slice` and `String`
+
+`Slice[T]` and `String` already carry `{ storage, offset, length }`, which is
+the same information as `&[T]`. The `&[T]` layout is preferable: `adr` is an
+untagged address, so indexing loses a mask and an add, and the GC walks a plain
+`owner` field instead of decoding a tag. The intended end state is that
+`Slice[T]` and `String` become method sets over `&[T]` and `&[u8]` with one
+shared representation. That migration is a separate step because it touches
+the runtime, literal globals, and the GC walk.
+
+#### Aliasing and uniqueness
+
+A stored `&T` or `&[T]` is an external alias into `owner`. Storing one in
+persistent storage sets `invalidates_unique` on the owner path in the inferred
+parameter effects, so uniqueness summaries stay correct. Borrowing `shared T`
+data remains an error, since a fat reference would bypass the shared view.
+
+`?&T` uses a null `adr` as its nullable sentinel and costs no extra word.
+Equality on borrows compares `adr` only.
+
+#### What simplifies
+
+- The hidden owner root created for interior borrows of GC objects is no longer
+  needed for `&T`; the borrow is its own root. It remains only for `stack T`
+  borrows of inline locals.
+- Borrows crossing a coroutine suspension need no special handling for `&T`.
+  `stack T` keeps the stable-storage rule.
+- The per-frame "borrow cannot escape" checks reduce to one rule: `stack T`
+  cannot escape.
+
+#### Out of scope
+
+Allocating class objects in the frame when escape inference proves they do not
+escape is a separate optimization and does not interact with this proposal.
+Promoting a frame-allocated object to the heap at the moment it escapes is
+rejected: raw pointers and existing borrows may already hold the frame
+address, and rewriting them would require a moving collector for frames.
+
 ### Inferred parameter effects
 
 Borrow compatibility and uniqueness preservation are inferred from function
