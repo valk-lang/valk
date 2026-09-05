@@ -32,6 +32,7 @@
 * [Generics](#generics)
 * [Modes](#modes)
 * [Globals](#globals)
+* [Aliases](#aliases)
 * [Tokens](#tokens)
     * [Let](#variables)
     * [If/Else](#if-else)
@@ -203,6 +204,14 @@ each arr as value, index {}
 
 Full `Array` API: [core](api.md#core)
 
+A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
+
+```rust
+let sizes: [int x 3] = { 1, 2, 3 }
+sizes[1] = 20
+println(sizes.length) // 3
+```
+
 Every range in Valk is a start offset and a length, never a start and an end,
 so there is no inclusive or exclusive bound to remember. Bracket ranges call an
 instance method marked `$range`. The hook must accept
@@ -282,7 +291,9 @@ println(describe(value))
 ```
 
 Use `as` to access the value in a `match` case. When every type is handled, a
-`default` case is not needed. Add `null` when the value may be missing.
+`default` case is not needed. Add `null` when the value may be missing. The type
+after `match value :` is the type every case must produce. Leave it out when the
+`match` is a statement rather than a value.
 
 For a union used only once, write it directly as a type, such as
 `String | int`. Named unions can also contain functions and getters.
@@ -416,7 +427,13 @@ my_func() _
 let v = my_func() !!
 ```
 
-You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown.
+You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown. `error_is(E.code, name)` compares against one or more bare code names and is the same as `E.code == E.name`:
+
+```rust
+"x".to_int() ! {
+    if error_is(E.code, syntax) : println("not a number")
+}
+```
 
 ```rust
 fn main() {
@@ -603,7 +620,7 @@ fn main() {
 }
 ```
 
-- Generic type names use the same naming conventions as variable names
+- Generic type names are usually a single upper-case letter such as `T`, but any identifier works
 - Generic types can be modified: e.g. If `T` is `String`, then `?T` will become `?String`
 
 The compiler can also infer a generic type from an argument by prefixing the type parameter with `$`:
@@ -671,6 +688,24 @@ or ordered cleanup.
 ```rust
 global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
+```
+
+## Aliases
+
+Three declarations give an existing thing a new name in the current scope. Add `$global` to make the name available in every namespace without a prefix.
+
+```rust
+use valk.fs
+
+alias Path for fs.Path            // Another name for a class, function or namespace member
+type Handler (fn(String)(bool))   // A name for a type expression
+value MAX_ITEMS (64 * 4)          // A compile-time constant
+
+fn main() {
+    let dir: Path = "."
+    let ok: Handler = fn(s: String) bool { return s.length > 0 }
+    println(MAX_ITEMS) // 256
+}
 ```
 
 ## Tokens
