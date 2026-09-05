@@ -17,6 +17,7 @@ class ServerStaticDir {
     next: ?shared ServerStaticDir
 }
 
+// State shared by the worker threads of one `start()` call
 class ServerWorkerData {
     socket: shared net.SocketServer
     tls_context: ?shared net.SslServerContext
@@ -34,65 +35,27 @@ class ServerWorkerData {
     max_server_wide_body_size: uint
     connections: uint (0)
     active_body_size: uint (0)
+    // Shutdown: `stopping` is polled by the workers, `deadline_ms` says how
+    // long in-flight requests may take. Both are written under `mutex`.
+    mutex: shared core.SyncMutex (.new())
     stopping: u8 (0)
     deadline_ms: uint (0)
+    // Running workers; the last one to exit unlocks `done`
     workers: uint (0)
     acceptors: uint (0)
+    done: shared core.Mutex
     #if OS == "win"
+    // One acceptor hands descriptors to the other workers, see worker-win.valk
     inboxes: Array[shared WorkerInbox]
     #end
-    done: shared core.Mutex
-}
 
-class ServerLifecycle {
-    mutex: shared core.SyncMutex (.new())
-    active: bool (false)
-    stopping: bool (false)
-    deadline_ms: uint (0)
-    run: ?shared ServerWorkerData (null)
-
-    fn begin() !HttpError @shared_unsafe {
-        this.mutex.lock()
-        if this.active {
-            this.mutex.unlock()
-            throw .init
-        }
-        this.active = true
-        this.run = null
-        this.mutex.unlock()
-    }
-
-    fn publish(run: shared ServerWorkerData) @shared_unsafe {
-        this.mutex.lock()
-        this.run = run
-        if this.stopping {
-            run.deadline_ms = this.deadline_ms
-            run.stopping = 1
-        }
-        this.mutex.unlock()
-    }
-
-    fn finish() @shared_unsafe {
-        this.mutex.lock()
-        this.active = false
-        this.stopping = false
-        this.mutex.unlock()
-    }
-
+    // Repeated requests can shorten, but never extend, the deadline
     fn request_shutdown(timeout_ms: uint) @shared_unsafe {
+        // An overflowing timeout saturates: "wait as long as it takes"
         let deadline = time.mono_ms().checked_add(timeout_ms) !? (~0).to(uint)
         this.mutex.lock()
-        let run = this.run
-        if !this.active && isset(run) {
-            this.mutex.unlock()
-            return
-        }
-        if !this.stopping || deadline < this.deadline_ms : this.deadline_ms = deadline
-        this.stopping = true
-        if isset(run) {
-            run.deadline_ms = this.deadline_ms
-            run.stopping = 1
-        }
+        if this.stopping == 0 || deadline < this.deadline_ms : this.deadline_ms = deadline
+        this.stopping = 1
         this.mutex.unlock()
     }
 }
@@ -110,13 +73,14 @@ class ServerLifecycle {
 }
 
 + class Server {
-    - lifecycle: shared ServerLifecycle (.{})
-    #if TEST && OS == "win"
-    - fail_worker_start_after: int (-1)
-    #end
     ~ host: String
     ~ port: u16
     - tls_context: ?shared net.SslServerContext
+    // Set by `start()`; a Server runs once
+    - run: ?shared ServerWorkerData (null)
+    // A shutdown requested before `start()` got going, applied when it does
+    - early_stop: bool (false)
+    - early_stop_timeout_ms: uint (0)
     + max_connections: uint
     handler: shared fn(Request)(Response) (handler_default)
     + fast_handler: ?shared fn(Context, ResponseWriter)()
@@ -166,18 +130,31 @@ class ServerLifecycle {
         return this
     }
 
-    // Repeated requests can shorten, but never extend, the shutdown deadline.
+    // Stops accepting and gives in-flight requests `timeout_ms` to finish.
+    // Does nothing when the server is not running. Safe to call from a handler.
     + fn request_shutdown(timeout_ms: uint (5000)) {
-        this.lifecycle.request_shutdown(timeout_ms)
+        let run = this.run
+        if isset(run) {
+            run.request_shutdown(timeout_ms)
+            return
+        }
+        if !this.early_stop || timeout_ms < this.early_stop_timeout_ms : this.early_stop_timeout_ms = timeout_ms
+        this.early_stop = true
     }
 
-    // False means the deadline expired; handler code can still be unwinding.
+    // `request_shutdown` + wait for the workers. False means the deadline
+    // expired; handler code can still be unwinding and `start()` returns once
+    // it did. Do not call this from a handler: it would wait for itself.
     + fn shutdown(timeout_ms: uint (5000)) bool {
-        let lifecycle = this.lifecycle
-        lifecycle.request_shutdown(timeout_ms)
-        while lifecycle.active {
+        let run = this.run
+        if !isset(run) {
+            this.request_shutdown(timeout_ms)
+            return true
+        }
+        run.request_shutdown(timeout_ms)
+        while run.workers > 0 {
             let now = time.mono_ms()
-            let deadline = lifecycle.deadline_ms
+            let deadline = run.deadline_ms
             if now >= deadline : return false
             let remaining = deadline - now
             time.sleep_ms(remaining < 10 ? remaining : 10)
@@ -185,11 +162,10 @@ class ServerLifecycle {
         return true
     }
 
+    // Serves until `request_shutdown`/`shutdown` and every worker has drained.
+    // One worker runs on the calling thread, so use `co` to keep working.
     + fn start(worker_count: i32 (-1)) void !HttpError {
-        let lifecycle = this.lifecycle
-        lifecycle.begin() !>
-        defer lifecycle.finish()
-        if lifecycle.stopping : return
+        if isset(this.run) : throw .init
         let socket = net.Socket.server(net.SocketType.tcp, this.host, this.port) !>
         let done: shared core.Mutex = .new() ! {
             socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
@@ -252,46 +228,28 @@ class ServerLifecycle {
             inboxes: inboxes
             #end
         }
-        lifecycle.publish(server)
-        #if OS != "win"
-        let run: shared fn()() = fn() {
-            worker(server)
-        }
-        #end
+        this.run = server
+        if this.early_stop : server.request_shutdown(this.early_stop_timeout_ms)
 
-        let remaining_workers = server.workers - 1
-        while remaining_workers > 0 {
-            #if OS == "win"
-            let index = remaining_workers
+        // Worker 0 is this thread; the others get a thread each
+        let failed = false
+        let remaining = server.workers - 1
+        while remaining > 0 && !failed {
+            let index = remaining
             let run: shared fn()() = fn() { worker(server, index) }
-            #end
-            this.spawn_worker(run) ! {
-                lifecycle.request_shutdown(0)
-                server.workers -= remaining_workers
-                #if OS == "win"
-                each server.inboxes as inbox : inbox.close()
-                server.socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
-                #else
-                server.acceptors -= remaining_workers
-                if --server.acceptors == 0 : server.socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
-                #end
-                if --server.workers == 0 : server.done.unlock()
-                server.done.await_unlock()
-                throw .init
-            }
-            remaining_workers--
+            thread.Thread[void].start(run) ! { failed = true }
+            if !failed : remaining--
+        }
+        if failed {
+            // Workers that never started are not waited for; the rest drain
+            server.workers -= remaining
+            server.acceptors -= remaining
+            server.request_shutdown(0)
         }
 
-        worker(server)
+        worker(server, 0)
         server.done.await_unlock()
-    }
-
-    fn spawn_worker(handler: shared fn()()) !HttpError {
-        #if TEST && OS == "win"
-        if this.fail_worker_start_after == 0 : throw .init
-        if this.fail_worker_start_after > 0 : this.fail_worker_start_after--
-        #end
-        thread.Thread[void].start(handler) ! throw .init
+        if failed : throw .init
     }
 
     + fn add_static_dir(path: String) !LookupError {
