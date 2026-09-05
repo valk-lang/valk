@@ -358,6 +358,9 @@ class IRFunc {
     loop_after: ?String (null)
     gc_stack_global: String ("")
     gc_stack_previous: String ("")
+    // GC stack markers: the collector receiver and its argument type
+    mark_receiver: String ("\%gc")
+    mark_receiver_type: String ("ptr")
     cleanup_active: bool (false)
     current_block: String ("")
     vscope_after: ?String (null)
@@ -685,7 +688,9 @@ fn ir_visit_gc_field(
     ir.cond_jump(present, yes, after)
     ir.label(yes)
     ir.line2("call void ", callback_target)
-    ir.write("(ptr ")
+    ir.write("(")
+    ir.write(ir.mark_receiver_type)
+    ir.write(" ")
     ir.write(callback_data)
     ir.write(", ptr ")
     ir.write(pointer)
@@ -731,7 +736,7 @@ fn ir_visit_type_gc_fields(
         return
     }
 
-    if t.kind == TYPE.slice || t.is_owned_borrow() {
+    if t.kind == TYPE.slice || t.is_fat_borrow() {
         ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
         return
     }
@@ -862,12 +867,18 @@ fn ir_gc_stack_collect_func(ir: IRFunc) Func !Error {
     return collect
 }
 
-fn ir_begin_gc_stack_marker(func: Func, name: String, frame_size: uint) IRFunc {
+fn ir_begin_gc_stack_marker(func: Func, name: String, frame_size: uint, collect: Func) IRFunc {
     let ir = IRFunc {func: func}
     ir.code.append_text("define internal void @\"")
     ir.code.append_text(name)
     ir.code.append_text("\"(ptr \%frame, ptr \%gc) {\n")
     ir.label("entry")
+    // The collector is a struct method: its receiver is an ownerless borrow.
+    let this_arg = collect.args.get(0) !? null
+    if isset(this_arg) && this_arg.type.is_stack_borrow() {
+        ir.mark_receiver = ir_frame_borrow(ir, "\%gc")
+        ir.mark_receiver_type = "{ ptr, ptr }"
+    }
     ir_name_field_address(ir, "\%frame.values", ir_gc_stack_frame_type(frame_size), "\%frame", 2, true)
     return ir
 }
@@ -879,11 +890,11 @@ fn ir_finish_gc_stack_marker(out: ByteBuffer, ir: IRFunc) {
 }
 
 fn ir_gc_stack_mark_address(ir: IRFunc, type: Type, address: String, collect: Func) !Error {
-    ir_visit_type_gc_fields(ir, type, address, GC_FIELD_OP.mark, ir_func_address(collect), "\%gc", type.storage_alignment() !>) !>
+    ir_visit_type_gc_fields(ir, type, address, GC_FIELD_OP.mark, ir_func_address(collect), ir.mark_receiver, type.storage_alignment() !>) !>
 }
 
 fn ir_write_func_gc_stack_marker(out: ByteBuffer, func: Func, collect: Func) !Error {
-    let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size)
+    let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size, collect)
 
     // One frame region per rooted declaration, so every offset is distinct.
     each func.all_decls as decl {
@@ -904,7 +915,7 @@ fn ir_write_coro_gc_stack_marker(
     offsets: Array[uint],
     collect: Func
 ) !Error {
-    let ir = ir_begin_gc_stack_marker(func, name, frame_size)
+    let ir = ir_begin_gc_stack_marker(func, name, frame_size, collect)
     each types as type, i {
         let offset = offsets.get(i) ! func.exp.bug("Coroutine GC-frame layout is incomplete")
         let address = ir_offset_address(ir, "\%frame.values", offset)
@@ -1188,7 +1199,7 @@ fn ir_type_uncached(type: Type) String !Error {
         return out.to_string()
     }
     if t.kind == TYPE.closure || t.kind == TYPE.interface : return "{ ptr, ptr }"
-    if t.kind == TYPE.ref_of : return "{ ptr, ptr }"
+    if t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return "{ ptr, ptr }"
     if t.kind == TYPE.ref_slice : return "{ ptr, ptr, i64 }"
     if t.kind == TYPE.slice : return "{ ptr, ptr, i64 }"
     if t.kind == TYPE.union {
@@ -2449,7 +2460,7 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
         let target = ir_emit_extract(ir, lowered, rendered, 0)
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", target, "null")
     }
-    if type.is_owned_borrow() {
+    if type.is_fat_borrow() {
         let adr = ir_emit_extract(ir, lowered, rendered, 1)
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", adr, "null")
     }
@@ -3240,6 +3251,22 @@ fn ir_interface_method_target(ir: IRFunc, value: String, method: Func) String {
 // Allocation
 ////////////////////////////
 
+// A struct method takes `this` as `stack T`: wrap a bare address in an
+// ownerless borrow when the runtime hands us only the address.
+fn ir_frame_borrow(ir: IRFunc, address: String) String {
+    let with_owner = ir_emit_insert(ir, "{ ptr, ptr }", "undef", "ptr", "null", 0)
+    return ir_emit_insert(ir, "{ ptr, ptr }", with_owner, "ptr", address, 1)
+}
+
+fn ir_write_receiver_arg(ir: IRFunc, mark: uint, method: Func, address: String) {
+    let this_arg = method.args.get(0) !? null
+    if isset(this_arg) && this_arg.type.is_stack_borrow() {
+        ir.write_arg(mark, "{ ptr, ptr }", ir_frame_borrow(ir, address))
+        return
+    }
+    ir.write_arg(mark, "ptr", address)
+}
+
 fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String !Error {
     let allocator = value.get_allocator()
     if isset(allocator) {
@@ -3252,7 +3279,7 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
 
         let pool = ir_emit_load(ir, ir_type(pool_type) !>, ir_global_address(global))
         let mark = ir.arg_list.length
-        ir.write_arg(mark, "ptr", pool)
+        ir_write_receiver_arg(ir, mark, pool_get, pool)
         return ir_emit_arg_call(ir, ir_type(pool_get.get_rett()) !>, ir_func_address(pool_get), mark)
     }
 
@@ -3728,7 +3755,7 @@ fn ir_coro_append_type_roots(
         return
     }
 
-    if t.kind == TYPE.slice || t.is_owned_borrow() {
+    if t.kind == TYPE.slice || t.is_fat_borrow() {
         let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
         pointer = ir_union_clean_gc_pointer(ir, pointer)
         ir_coro_append_gc(ir, value, gc_args, pointer) !>

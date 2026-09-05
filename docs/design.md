@@ -388,19 +388,22 @@ the value non-null.
 ### Borrows
 
 Valk has two borrow forms. Both are safe: neither can dangle, and neither
-requires the programmer to track lifetimes.
+requires the programmer to track lifetimes. They share one layout; what
+differs is where the storage may live and whether the borrow may escape.
 
 | Type | Layout | Kept alive by | May be stored or returned |
 | --- | --- | --- | --- |
-| `stack T` | `{ adr: ptr }` | The frame that took it | No |
+| `stack T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
 | `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
 | `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
 
 #### Stack borrows
 
-`stack T` is a one-word address of frame storage: an inline local, an
-argument, or a temporary aggregate. `&local` produces it. A stack borrow
-follows the frame rules:
+`stack T` borrows storage for the rest of the frame: an inline local, an
+argument, a temporary aggregate, or, through another borrow, storage inside a
+GC object. `&local` produces it with a null owner; `&ref.prop` through a
+`stack T` produces it with that borrow's owner word. A stack borrow follows
+the frame rules:
 
 - May be stored only in local variables and non-escaping parameters.
 - Cannot be stored in a class, array, map, global, interface adapter, or closure.
@@ -416,7 +419,13 @@ storage so their addresses remain valid while another coroutine uses the
 execution stack.
 
 `stack [T x N]` is the bounded form; its length is part of the type and
-indexing is checked against it. Struct method receivers are stack borrows.
+indexing is checked against it.
+
+Struct method receivers are stack borrows: `this` is `stack T`. Calling a
+method on a struct that lives inside a GC object hands the method that
+object's owner word, so a store to a managed field through `this` updates the
+owner's bookkeeping. A method called on a frame local or through a raw
+pointer gets a null owner and a plain store.
 
 #### Owned borrows
 
@@ -444,25 +453,26 @@ reference does. Borrowing `shared T` data remains an error.
 
 #### Null owner
 
-`owner` is nullable, and null means the storage has no owner at all. Safe code
-produces a null owner only for permanent storage: globals and other static
-data. Unsafe code may build an `&T` from a raw pointer with `.@cast(&T)`,
-which yields a null owner over memory whose lifetime the programmer manages.
-A null owner never stands in for a frame: a `stack T` does not convert to
-`&T`, because there is no allocation to name, and the compiler reports the
-missing owner instead of the old "cannot be stored" errors.
+`owner` is nullable, and null means nothing owns the storage. For `stack T`
+that includes frame storage. For `&T` safe code produces a null owner only
+for permanent storage: globals and other static data. Unsafe code may build
+an `&T` from a raw pointer with `.@cast(&T)`, which yields a null owner over
+memory whose lifetime the programmer manages. A `stack T` does not convert to
+`&T`, because its null owner may stand for a frame, and the compiler reports
+the missing owner instead of the old "cannot be stored" errors.
 
 #### Conversions
 
-- `&T` converts to `stack T` by dropping `owner`. A temporary owned borrow
-  is copied into a frame root first so its owner stays alive during the use.
+- `&T` converts to `stack T` in place; the layouts are the same and only the
+  escape rule changes.
 - `stack T` does not convert to `&T` or `&[T]`.
 - `&[T x N]` converts to `&[T]`; `[T x N]` storage with an owner converts to
   either.
 - A raw pointer converts to `stack T` implicitly, as before, and to `&T` only
   through explicit `.@cast(&T)` under `@unsafe`.
-- `&T` and `&[T]` convert to `ptr` and to a matching `*T`; a bounded `*[T x N]`
-  takes exactly its own length.
+- Every borrow converts to `ptr` and to a matching `*T`; a bounded `*[T x N]`
+  takes exactly its own length. A raw pointer taken from a `stack T` keeps
+  the frame rules: it may be passed to a pointer parameter but not stored.
 - `?&T` uses a null address as its empty state and costs no extra word.
   Equality on borrows compares addresses.
 
@@ -480,11 +490,17 @@ indexing returns a checked value rather than exposing its backing address.
 
 #### Stores through borrows
 
-A store through `&T` or `&[T]` whose element type holds managed references
-runs the owner's ownership bookkeeping when `owner` is set and a plain store
-when it is null. The same applies to `sequence[i] = value` on a fixed array
-that lives inside a GC object. Reads of managed elements through any borrow
-or fixed array strip the collector's tag bits.
+A store through any borrow whose target holds managed references runs the
+owner's ownership bookkeeping when `owner` is set and a plain store when it
+is null. The check is a runtime test of the owner word, so it holds across
+function boundaries and struct method receivers. The same applies to
+`sequence[i] = value` and `storage.prop = value` on inline storage that lives
+inside a GC object. Reads of managed elements through any borrow or fixed
+array strip the collector's tag bits.
+
+Internally, every read or write through a borrow goes through its address as
+a one-word value that the user cannot name; the fat borrow itself is only
+copied, passed, and stored.
 
 #### Not done here
 
