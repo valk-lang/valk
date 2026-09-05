@@ -1370,6 +1370,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fast_handler: ?shared fn(Context, ResponseWriter)()
     + header_timeout_ms: uint
     ~ host: String
+    + http2: bool
     + idle_timeout_ms: uint
     + max_connections: uint
     + max_request_body_size: uint

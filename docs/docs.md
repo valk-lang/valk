@@ -1113,6 +1113,17 @@ await running ! { println("HTTP server failed") }
 `start` takes a worker thread count and defaults to the number of CPU threads.
 `request_shutdown(5000)` allows up to five seconds for current requests to finish.
 
+HTTP/2 support is experimental and opt-in. Configure TLS before starting:
+
+```rust
+s.tls("certificate.pem", "private-key.pem") !!
+s.http2 = true
+s.start() !!
+```
+
+HTTP/2 uses the same request handlers and responses, with HTTP/1.1 fallback.
+It currently requires TLS and the regular handler API, not `fast` handlers.
+
 ## Sockets
 
 API for [valk.net](api.md#net)

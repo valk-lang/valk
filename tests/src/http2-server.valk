@@ -1,0 +1,116 @@
+@ignore_access
+use valk.http
+use valk.net
+use valk.time
+
+class H2HandlerState {
+    entered: uint (0)
+    finished: uint (0)
+}
+
+test "HTTP2: shutdown deadline interrupts sockets but lets handlers unwind" {
+    let state: shared H2HandlerState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        state.entered++
+        time.sleep_ms(100)
+        state.finished++
+        return http.Response.text(request.body)
+    }
+    let server = http.Server.new("127.0.0.1", 9196, handler)
+    server.http2 = true
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let socket = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9196) !!
+    let ssl = net.Ssl.new()
+    ssl.set_verify(false)
+    ssl.set_alpn(.{ "h2" }) !!
+    socket.ssl_connect(ssl) !!
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    socket.write(h2_request_frame(1, false).encode() !!) !!
+    socket.write(http.H2Frame { kind: 0, flags: 1, stream: 1, payload: "abc" }.encode() !!) !!
+    let deadline = time.mono_ms() + 2000
+    while state.entered == 0 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(state.entered == 1)
+    assert(!server.shutdown(1))
+    await running !!
+    assert(state.finished == 1)
+    let run = server.run
+    if isset(run) : assert(run.active_body_size == 0 && run.connections == 0)
+    socket.close() !!
+}
+
+fn h2_tls_frame(connection: net.Connection, input: ByteBuffer) http.H2Frame {
+    let buffer = Slice[u8].new(16_393, 0)
+    while true {
+        let reader = input.reader()
+        let frame = http.h2_read_frame(reader) ! {
+            if !error_is(E.code, incomplete) : panic("Invalid HTTP/2 test frame")
+            let count = connection.read(buffer) !!
+            if count == 0 : panic("HTTP/2 test connection closed")
+            input.write(buffer.view(0, count))
+            continue
+        }
+        input.clear_until(reader.pos)
+        return frame
+    }
+}
+
+test "HTTP2: TLS negotiation multiplexed responses and shutdown" {
+    let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        if request.path == "/slow" : time.sleep_ms(30)
+        return http.Response.text(request.path + ":" + (request.params().get("x") !? ""))
+    }
+    let server = http.Server.new("127.0.0.1", 9194, handler)
+    server.http2 = true
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let fallback = http.request("GET", "https://127.0.0.1:9194/fallback", http.Options { verify_ssl_cert: false }) !!
+    assert(fallback.body == "/fallback:")
+    let socket = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9194) !!
+    let ssl = net.Ssl.new()
+    ssl.set_verify(false)
+    ssl.set_alpn(.{ "h2", "http/1.1" }) !!
+    socket.ssl_connect(ssl) !!
+    assert(ssl.selected_alpn() == "h2")
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    let input = ByteBuffer.new()
+    let settings = h2_tls_frame(socket, input)
+    assert(settings.kind == 4 && settings.flags == 0)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    let id: u32 = 1
+    while id <= 3 {
+        let fields = Array[http.HpackField] {
+            .{ name: ":method", value: "GET" },
+            .{ name: ":scheme", value: "https" },
+            .{ name: ":path", value: id == 1 ? "/slow?x=one" : "/fast?x=two" },
+            .{ name: ":authority", value: "localhost" }
+        }
+        socket.write(http.H2Frame { kind: 1, flags: 5, stream: id, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+        id += 2
+    }
+    let complete: uint = 0
+    let first_completed: u32 = 0
+    let decoder = http.HpackDecoder {}
+    while complete < 2 {
+        let frame = h2_tls_frame(socket, input)
+        if frame.kind == 1 {
+            let fields = decoder.decode(frame.payload) !!
+            assert((fields.get(0) !!).name == ":status" && (fields.get(0) !!).value == "200")
+        }
+        if frame.kind != 0 : continue
+        if first_completed == 0 : first_completed = frame.stream
+        assert(frame.payload == (frame.stream == 1 ? "/slow:one" : "/fast:two"))
+        if (frame.flags & 1) != 0 : complete++
+    }
+    assert(first_completed == 3)
+    server.request_shutdown(1000)
+    let goaway = h2_tls_frame(socket, input)
+    assert(goaway.kind == 7)
+    assert(ByteReader.new(goaway.payload).read_u32_be() == 3)
+    socket.close() !!
+    await running !!
+}
