@@ -189,8 +189,11 @@ stays alive only while something else, such as a view, still holds it. Every
 operation that drops an element clears its slot, so the array never keeps a
 removed element reachable.
 
-`array.view(start, length)` returns a `Slice[T]` over the array's block
-without copying. The view shares the elements it covers, observes in-place
+`&array[i]` borrows one element as `&T` with the storage block as owner, and
+the same works on `Slice[T]` and `&[T]`; `&view[a..b]` borrows a range of an
+`&[T]` as `&[T]`. A class `$offset` or `$range` hook takes precedence, which
+is why a range of an array goes through `view`. `array.view(start, length)`
+returns a `Slice[T]` over the array's block without copying. The view shares the elements it covers, observes in-place
 writes through the array, and survives the array growing because it keeps the
 block it was taken from. A view keeps its whole block alive, including slots
 past the elements it covers. `array.iter()` and `array.slice(...)` still copy.
@@ -210,7 +213,10 @@ Indexing has one policy for every native sequence. A class hook comes first:
 `$offset`, `$offset_assign`, and `$range` on the class define the operation
 when present, which is how `String[i]` answers 0 past the end. Without a hook
 the compiler emits the native access, which checks the index against the
-length and panics when it is out of bounds. This applies to `Array[T]`,
+length and panics when it is out of bounds. A native read of a non-nullable
+reference element also panics when the slot is empty: storage can be
+zero-filled or cleared by a removal, and the language never hands out an empty
+slot as a valid reference. This applies to `Array[T]`,
 `Slice[T]`, `&[T]`, and named unbound pointers alike. The `get` and `set`
 methods remain the fallible forms that return `LookupError`. For assignment,
 `Array[length] = value` appends. Fixed arrays use checked inline indexing and
@@ -510,10 +516,9 @@ either.
 
 An owned borrow points into its owner's storage, which must not relocate.
 Valid owners are class objects, and structs or fixed arrays inlined in them,
-plus `Slice` and `String` storage. Elements of a growable `Array[T]` are not
-borrowed through the array itself, because the backing store moves when the
-array grows; `array.view(...)` hands out a `Slice[T]` whose owner is the
-storage block, which does not move.
+plus `Slice` and `String` storage, and the storage blocks of arrays. An
+element borrowed out of an `Array[T]` names the block as its owner, so it
+stays valid when the array grows, although it then points into the old block.
 
 #### Stores through borrows
 
