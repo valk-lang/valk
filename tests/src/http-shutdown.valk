@@ -1,0 +1,144 @@
+use valk.http
+use valk.net
+use valk.time
+use valk.io
+
+class ShutdownState {
+    entered: uint (0)
+    release: uint (0)
+}
+
+fn shutdown_wait_entered(state: shared ShutdownState, count: uint) {
+    let deadline = time.mono_ms() + 2000
+    while state.entered < count && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(state.entered == count)
+}
+
+fn shutdown_read(connection: net.Connection) String {
+    let output = ByteBuffer.new()
+    let bytes = Slice[u8].new(1024, 0)
+    while true {
+        let count = connection.read(bytes) ! break
+        if count == 0 : break
+        output.write(bytes.view(0, count))
+    }
+    return output.to_string()
+}
+
+fn shutdown_peer_closed(connection: net.Connection) bool {
+    connection.read_timeout_ms = 200
+    let buf = Slice[u8].new(1, 0)
+    let count = connection.read(buf) ! return !error_is(E.code, timeout)
+    return count == 0
+}
+
+test "HTTP shutdown drains active requests and closes idle connections" {
+    let state: shared ShutdownState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        state.entered++
+        while state.release == 0 : time.sleep_ms(1)
+        return http.Response.text("finished")
+    }
+    let server = http.Server.new("127.0.0.1", 9070, handler)
+    let running = co server.start(2)
+    let first = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9070) !!
+    let second = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9070) !!
+    let idle = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9070) !!
+    first.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /queued HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    second.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    shutdown_wait_entered(state, 2)
+    server.request_shutdown(1000)
+    // The listener closes once the acceptors notice the stop request
+    let refused = false
+    let deadline = time.mono_ms() + 1000
+    while !refused && time.mono_ms() < deadline {
+        let probe = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9070, 100) ! { refused = true; break }
+        probe.close() !!
+        time.sleep_ms(5)
+    }
+    assert(refused)
+    assert(shutdown_peer_closed(idle))
+
+    state.release = 1
+    assert(server.shutdown(1000))
+    let first_response = shutdown_read(first)
+    assert(first_response.ends_with("finished"))
+    assert(first_response.split("HTTP/1.1").length == 2)
+    assert(shutdown_read(second).ends_with("finished"))
+    assert(state.entered == 2)
+    assert(server.shutdown(0))
+    await running !!
+    first.close() !!
+    second.close() !!
+    idle.close() !!
+
+    let rebound = http.Server.new("127.0.0.1", 9070)
+    let rebound_running = co rebound.start(1)
+    assert(rebound.shutdown(1000))
+    await rebound_running !!
+}
+
+test "HTTP shutdown deadline interrupts sockets without killing handlers" {
+    let state: shared ShutdownState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        state.entered++
+        while state.release == 0 : time.sleep_ms(1)
+        return http.Response.text("too late")
+    }
+    let server = http.Server.new("127.0.0.1", 9071, handler)
+    let running = co server.start(1)
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9071) !!
+    connection.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    shutdown_wait_entered(state, 1)
+    server.request_shutdown(1000)
+    let start = time.mono_ms()
+    assert(!server.shutdown(40))
+    assert(time.mono_ms() - start < 500)
+    assert(shutdown_peer_closed(connection))
+    state.release = 1
+    await running !!
+    connection.close() !!
+}
+
+test "HTTP shutdown drains a streaming response" {
+    let state: shared ShutdownState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        return http.Response.stream(ShutdownReader { state: state }, 8)
+    }
+    let server = http.Server.new("127.0.0.1", 9073, handler)
+    let running = co server.start(1)
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9073) !!
+    connection.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    shutdown_wait_entered(state, 1)
+    server.request_shutdown(1000)
+    state.release = 1
+    assert(server.shutdown(1000))
+    await running !!
+    assert(shutdown_read(connection).ends_with("streamed"))
+    connection.close() !!
+}
+
+class ShutdownReader is io.Reader {
+    state: shared ShutdownState
+    source: ByteReader ("streamed".reader())
+
+    + fn read(buf: Slice[u8]) uint !io.IoError {
+        this.state.entered = 1
+        while this.state.release == 0 : time.sleep_ms(1)
+        return this.source.read(buf) !>
+    }
+}
+
+test "HTTP shutdown can shorten its deadline and interrupt a TLS handshake" {
+    let server = http.Server.new("127.0.0.1", 9072)
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(2)
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9072) !!
+    time.sleep_ms(30)
+    server.request_shutdown(1000)
+    let start = time.mono_ms()
+    server.request_shutdown(0)
+    await running !!
+    assert(time.mono_ms() - start < 500)
+    connection.close() !!
+}

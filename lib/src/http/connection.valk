@@ -10,6 +10,10 @@ value READ_SIZE (32000)
     ~+ netcon: net.Connection
     ~+ fd: Fd
     - reserved_body_size: uint (0)
+    active: bool (false)
+    rejected: bool (false)
+    prev: ?Connection
+    next: ?Connection
 
     fn handle() {
         // Settings
@@ -19,11 +23,30 @@ value READ_SIZE (32000)
         let handler = server.handler
         let fast_handler = server.fast_handler
 
+        let tls_context = server.tls_context
+        if isset(tls_context) {
+            this.netcon.ssl_accept(tls_context, server.header_timeout_ms) ! {
+                this.finish()
+                return
+            }
+        }
+
         let input = ByteBuffer.new(2048)
         let context = Context.new(input)
         let res = ResponseWriter {}
 
+        if this.rejected {
+            this.send_error(503, res)
+            this.finish()
+            return
+        }
+
         while true {
+            if server.stopping != 0 && !this.active {
+                this.active = true
+                res.send_bytes(this.netcon) ! {}
+                break
+            }
             parse_http(input, context, false, server.max_request_header_size, server.max_request_body_size) ! {
                 // Check if we need more data
                 if E.code == E.incomplete {
@@ -51,6 +74,9 @@ value READ_SIZE (32000)
             }
 
             // Handle request
+            this.active = true
+            // Draining: this response is the last one on the connection
+            res.close = server.stopping != 0
 
             // Check static dirs
             let is_file = false
@@ -108,22 +134,28 @@ value READ_SIZE (32000)
             }
 
             // Flush output
-            if res.should_send() || reached_end {
+            if res.should_send() || reached_end || server.stopping != 0 {
                 res.send_bytes(this.netcon) ! break
                 res.reset()
             }
             //
             res.allow_new_response()
+            this.active = false
         }
 
         res.reset()
         context.reset()
         input.clear()
 
+        this.finish()
+    }
+
+    fn finish() {
         this.release_body()
         this.close()
-        worker.connections--
-        server.connections--
+        this.worker.remove_client(this)
+        // A rejected connection returned its slot when it was accepted
+        if !this.rejected : this.worker.server.connections--
     }
 
     fn read_more(buffer: ByteBuffer, request: Context) uint !net.NetError {
@@ -138,11 +170,15 @@ value READ_SIZE (32000)
         // Read straight into the spare capacity instead of through a bounce buffer
         buffer.reserve(READ_SIZE)
         let bytes = this.netcon.read(buffer.storage.view(buffer.length, READ_SIZE)) !>
+        if settings.stopping != 0 && !this.active : throw .closed
+        if bytes > 0 : this.active = true
         buffer.advance(bytes)
         return bytes
     }
 
     fn send_error(code: uint, res: ResponseWriter) {
+        // Every error response is followed by closing the connection
+        res.close = true
         res.send_status(code)
         res.send_bytes(this.netcon) ! {
             return

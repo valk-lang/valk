@@ -1,8 +1,256 @@
+@ignore_access
+
 #if OS == "win"
 use valk.coro
 use valk.gc
 use valk.io
 use valk.net
+use valk.thread
+use valk.time
+use valk.http
+
+extern fn GetCurrentThreadId() u32;
+extern fn GetProcessHandleCount(process: uint, count: *u32) i32;
+extern fn GetCurrentProcess() uint;
+
+test "Windows: listener close can race an expired accept timeout" {
+    let listener = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9093) !!
+    let accepting = co listener.accept(2)
+    coro.await_last()
+    listener.close() !!
+    thread.suspend_ms(10)
+    let connection = await accepting !? null
+    assert(!isset(connection))
+}
+
+synctest "Windows: accept events are released after timeout and submission failure" {
+    @unsafe
+    let listener = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9094) !!
+    listener.accept(1) ! {}
+    let before: u32 = 0
+    assert(GetProcessHandleCount(GetCurrentProcess(), @ref(before)) != 0)
+    let index: uint = 0
+    while index++ < 100 {
+        let timed_out = false
+        listener.accept(1) ! { timed_out = error_is(E.code, timeout) }
+        assert(timed_out)
+        let failed = false
+        net.accept((~0).to(Fd), 1) ! { failed = true }
+        assert(failed)
+    }
+    let after: u32 = 0
+    assert(GetProcessHandleCount(GetCurrentProcess(), @ref(after)) != 0)
+    assert(after <= before + 2)
+    listener.close() !!
+}
+
+fn iocp_block_scheduler() {
+    coro.await_last()
+    thread.suspend_ms(50)
+}
+
+test "Windows: successful I/O survives a late timeout check" {
+    let listener = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9076) !!
+    let accepting = co listener.accept()
+    let client = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9076) !!
+    let accepted = await accepting !!
+    accepted.write("r") !!
+    client.read_timeout_ms = 1
+    let blocker = co iocp_block_scheduler()
+    let bytes = Slice[u8].new(1, 0)
+    assert((client.read(bytes) !? 0) == 1)
+    assert(bytes.to_string() == "r")
+    await blocker
+    client.close() !!
+    accepted.close() !!
+    listener.close() !!
+}
+
+class IocpAcceptState {
+    listener: shared net.SocketServer
+    ready: uint (0)
+    timeouts: uint (0)
+    port: uint (0)
+}
+
+fn iocp_accept_worker(state: shared IocpAcceptState) int {
+    let owner = GetCurrentThreadId().to(int)
+    state.port = io.iocp()
+    state.listener.accept(10) ! {
+        if error_is(E.code, timeout) : state.timeouts++
+    }
+    state.ready++
+    let connection = state.listener.accept(2000) ! return 0
+    let bytes = Slice[u8].new(1, 0)
+    if (connection.read(bytes) !? 0) != 1 : return 0
+    gc.collect()
+    connection.write(bytes) ! return 0
+    connection.close() ! return 0
+    return GetCurrentThreadId().to(int) == owner ? owner : 0
+}
+
+test "Windows: concurrent accepts use the calling thread's completion port" {
+    let state: shared IocpAcceptState = .{
+        listener: net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9074) !!
+    }
+    let worker = thread.Thread[int].start(fn() int { return iocp_accept_worker(state) }) !!
+    let deadline = time.mono_ms() + 3000
+    while state.ready == 0 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(state.ready == 1 && state.timeouts == 1)
+    assert(state.port != io.iocp())
+    let timed_out = false
+    state.listener.accept(10) ! {
+        timed_out = error_is(E.code, timeout)
+    }
+    assert(timed_out)
+    let client = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9074) !!
+    client.write("q") !!
+    let bytes = Slice[u8].new(1, 0)
+    assert((client.read(bytes) !? 0) == 1)
+    assert(bytes.to_string() == "q")
+    client.close() !!
+    let owner = worker.await()
+    assert(owner != 0 && owner != GetCurrentThreadId().to(int))
+    state.listener.close() !!
+}
+
+class IocpHttpState {
+    entered: uint (0)
+    gate: shared thread.ThreadSuspendGate (.new())
+}
+
+fn iocp_http_request() String {
+    let response = http.request("GET", "http://127.0.0.1:9075/") ! return "request failed"
+    return response.body
+}
+
+fn iocp_http_clients(state: shared IocpHttpState) Array[String] {
+    let first = co iocp_http_request()
+    let deadline = time.mono_ms() + 3000
+    while state.entered == 0 && time.mono_ms() < deadline : time.sleep_ms(1)
+    // A blocked worker can still have one accept pending.
+    let second = co iocp_http_request()
+    let third = co iocp_http_request()
+    let first_owner = await first
+    let second_owner = await second
+    let third_owner = await third
+    return .{ first_owner, second_owner, third_owner }
+}
+
+test "Windows: HTTP handlers execute on multiple worker threads" {
+    let state: shared IocpHttpState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        state.entered++
+        if state.entered >= 2 : state.gate.signal()
+        state.gate.wait(fn() bool { return state.entered < 2 }, 5000)
+        if state.entered < 2 : return http.Response.text("single worker")
+        return http.Response.text(GetCurrentThreadId().to_string() + "|" + io.iocp().to_string())
+    }
+    let server = http.Server.new("127.0.0.1", 9075, handler)
+    let running = co server.start(2)
+    time.sleep_ms(50)
+    let clients = thread.Thread[Array[String]].start(fn() Array[String] { return iocp_http_clients(state) }) !!
+    let owners = clients.await()
+    let threads = Array[String].new()
+    let ports = Array[String].new()
+    each owners as owner {
+        let parts = owner.split("|")
+        assert(parts.length == 2)
+        if parts.length != 2 : continue
+        threads.append(parts.get(0) !!)
+        ports.append(parts.get(1) !!)
+    }
+    assert(threads.unique().length == 2)
+    assert(ports.unique().length == 2)
+    assert(server.shutdown(1000))
+    await running !!
+}
+
+class IocpSleepState {
+    done: bool (false)
+}
+
+fn iocp_sleep_spinner(state: IocpSleepState) {
+    while !state.done : coro.await_last()
+}
+
+synctest "Windows: busy scheduler does not wake sleepers early" {
+    let state = IocpSleepState {}
+    let spinner = co iocp_sleep_spinner(state)
+    let index: uint = 0
+    while index++ < 16 {
+        let before = time.mono_us()
+        time.sleep_ms(20)
+        assert(time.mono_us() - before >= 19_000)
+    }
+    state.done = true
+    await spinner
+}
+
+class IocpShutdownState {
+    entered: uint (0)
+    release: uint (0)
+}
+
+fn iocp_release_after_delay(state: shared IocpShutdownState) {
+    time.sleep_ms(50)
+    state.release = 1
+}
+
+test "Windows: awaiting HTTP shutdown keeps the caller scheduler running" {
+    let state: shared IocpShutdownState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        state.entered = 1
+        while state.release == 0 : time.sleep_ms(1)
+        return http.Response.text("done")
+    }
+    let server = http.Server.new("127.0.0.1", 9083, handler)
+    let running = co server.start(2)
+    let response = co http.request("GET", "http://127.0.0.1:9083/")
+    let deadline = time.mono_ms() + 2000
+    while state.entered == 0 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(state.entered == 1)
+    let releasing = co iocp_release_after_delay(state)
+    server.request_shutdown(1000)
+    await running !!
+    assert(state.release == 1)
+    await releasing
+    let result = await response !!
+    assert(result.body == "done")
+}
+
+test "Windows: HTTP shutdown closes idle connections while a request drains" {
+    let state: shared IocpShutdownState = .{}
+    let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        state.entered = 1
+        while state.release == 0 : time.sleep_ms(1)
+        return http.Response.text("done")
+    }
+    let server = http.Server.new("127.0.0.1", 9077, handler)
+    let running = co server.start(2)
+    let blocked = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9077) !!
+    blocked.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    let deadline = time.mono_ms() + 2000
+    while state.entered == 0 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(state.entered == 1)
+    let clients = Array[net.Connection].new()
+    let index: uint = 0
+    while index++ < 12 : clients.append(net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9077) !!)
+    let run_state = server.run
+    if !isset(run_state) : panic("Server did not start")
+    deadline = time.mono_ms() + 2000
+    while run_state.connections < 13 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(run_state.connections == 13)
+    assert(!server.shutdown(0))
+    state.release = 1
+    await running !!
+    assert(run_state.connections == 0)
+    each clients as client {
+        assert(shutdown_peer_closed(client))
+        client.close() !!
+    }
+    blocked.close() !!
+}
 
 fn windows_iocp_server() {
     let server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9010) ! {

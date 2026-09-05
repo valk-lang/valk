@@ -1,0 +1,106 @@
+use valk.net
+use valk.thread
+use valk.time
+use valk.coro
+use valk.gc
+
+class SocketAcceptState {
+    listener: shared net.SocketServer
+    ready: uint (0)
+    timeouts: uint (0)
+    finished: uint (0)
+}
+
+fn socket_accept_echo(state: shared SocketAcceptState) bool {
+    let index: uint = 0
+    while index++ < 16 {
+        state.listener.accept(2) ! {
+            if error_is(E.code, timeout) : state.timeouts++
+        }
+    }
+    state.ready++
+    let connection = state.listener.accept(3000) ! return false
+    let bytes = Slice[u8].new(1, 0)
+    let ok = (connection.read(bytes) !? 0) == 1
+    gc.collect()
+    connection.write(bytes) ! { ok = false }
+    connection.close() ! { ok = false }
+    return ok
+}
+
+fn socket_wait_ready(state: shared SocketAcceptState, count: uint) {
+    let deadline = time.mono_ms() + 5000
+    while state.ready < count && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(state.ready == count)
+    if state.ready != count : panic("Socket accept workers did not become ready")
+}
+
+fn socket_accept_until_closed(state: shared SocketAcceptState) bool {
+    let accepting = co state.listener.accept()
+    coro.await_last()
+    state.ready++
+    let connection = await accepting !? null
+    if isset(connection) : connection.close() !!
+    return !isset(connection)
+}
+
+fn socket_accept_batch(state: shared SocketAcceptState, count: uint) bool {
+    if count == 1 : return socket_accept_until_closed(state)
+    let accepting = co socket_accept_until_closed(state)
+    let others = socket_accept_batch(state, count - 1)
+    let closed = await accepting
+    return closed && others
+}
+
+test "SocketServer: accepts survive creator and previous accepting thread exit" {
+    let creator = thread.Thread[shared net.SocketServer].start(fn() shared net.SocketServer {
+        let listener = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9091) !!
+        let timed_out = false
+        listener.accept(2) ! { timed_out = error_is(E.code, timeout) }
+        assert(timed_out)
+        return listener
+    }) !!
+    let state: shared SocketAcceptState = .{ listener: creator.await() }
+    let round: uint = 0
+    while round++ < 3 {
+        state.ready = 0
+        state.timeouts = 0
+        let worker = thread.Thread[bool].start(fn() bool { return socket_accept_echo(state) }) !!
+        socket_wait_ready(state, 1)
+        assert(state.timeouts == 16)
+        let client = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9091) !!
+        client.write("e") !!
+        let bytes = Slice[u8].new(1, 0)
+        assert((client.read(bytes) !? 0) == 1 && bytes.to_string() == "e")
+        client.close() !!
+        assert(worker.await())
+        gc.collect()
+    }
+    state.listener.close() !!
+}
+
+test "SocketServer: close wakes pending accepts on every thread" {
+    let state: shared SocketAcceptState = .{
+        listener: net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9092) !!
+    }
+    let workers = Array[thread.Thread[bool]].new()
+    let index: uint = 0
+    while index++ < 4 {
+        workers.append(thread.Thread[bool].start(fn() bool {
+            let closed = socket_accept_batch(state, 20)
+            state.finished++
+            return closed
+        }) !!)
+    }
+    socket_wait_ready(state, 80)
+    gc.collect()
+    state.listener.close() !!
+    let deadline = time.mono_ms() + 5000
+    while state.finished < 4 && time.mono_ms() < deadline : time.sleep_ms(1)
+    if state.finished != 4 : panic("Closing the listener did not wake every accept worker")
+    each workers as worker : assert(worker.await())
+    let closed = false
+    state.listener.accept(1) ! { closed = error_is(E.code, closed) }
+    assert(closed)
+    state.listener.close() !!
+}

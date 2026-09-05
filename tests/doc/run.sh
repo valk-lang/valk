@@ -119,6 +119,14 @@ if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" != *'path = path.resolve()'* ]] \
     || [[ "$guide" != *'con.write("PING")'* ]] \
     || [[ "$guide" != *'template.render("example.html", data)'* ]] \
+    || [[ "$guide" != *'let running = co s.start()'* ]] \
+    || [[ "$guide" != *'await running'* ]] \
+    || [[ "$guide" != *'s.request_shutdown(5000)'* ]] \
+    || [[ "$guide" == *'server.await()'* ]] \
+    || [[ "$stdlib_markdown" == *'ServerHandle'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn start(worker_count: i32 (-1)) void !HttpError'* ]] \
+    || [[ "$guide" == *'On Windows the server always runs a single worker'* ]] \
+    || [[ "$guide" == *'one completion port, and therefore to one thread'* ]] \
     || [[ "$guide" == *'con.send("PING")'* ]] \
     || [[ "$guide" == *'sanitize:'* ]] \
     || [[ "$guide" == *'[valk.type](api.md#core)'* ]] \

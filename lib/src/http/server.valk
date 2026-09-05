@@ -3,6 +3,7 @@ use core
 use net
 use fs
 use thread
+use time
 
 fn handler_default(req: Request) Response {
     return Response.html("Hello world!")
@@ -16,6 +17,7 @@ class ServerStaticDir {
     next: ?shared ServerStaticDir
 }
 
+// State shared by the worker threads of one `start()` call
 class ServerWorkerData {
     socket: shared net.SocketServer
     tls_context: ?shared net.SslServerContext
@@ -33,6 +35,25 @@ class ServerWorkerData {
     max_server_wide_body_size: uint
     connections: uint (0)
     active_body_size: uint (0)
+    // Shutdown: `stopping` is polled by the workers, `deadline_ms` says how
+    // long in-flight requests may take. Both are written under `mutex`.
+    mutex: shared core.SyncMutex (.new())
+    stopping: u8 (0)
+    deadline_ms: uint (0)
+    // Running workers; the last one to exit unlocks `done`
+    workers: uint (0)
+    acceptors: uint (0)
+    done: shared core.Mutex
+
+    // Repeated requests can shorten, but never extend, the deadline
+    fn request_shutdown(timeout_ms: uint) @shared_unsafe {
+        // An overflowing timeout saturates: "wait as long as it takes"
+        let deadline = time.mono_ms().checked_add(timeout_ms) !? (~0).to(uint)
+        this.mutex.lock()
+        if this.stopping == 0 || deadline < this.deadline_ms : this.deadline_ms = deadline
+        this.stopping = 1
+        this.mutex.unlock()
+    }
 }
 
 // Shortcut: create a server and start it
@@ -51,6 +72,11 @@ class ServerWorkerData {
     ~ host: String
     ~ port: u16
     - tls_context: ?shared net.SslServerContext
+    // Set by `start()`; a Server runs once
+    - run: ?shared ServerWorkerData (null)
+    // A shutdown requested before `start()` got going, applied when it does
+    - early_stop: bool (false)
+    - early_stop_timeout_ms: uint (0)
     + max_connections: uint
     handler: shared fn(Request)(Response) (handler_default)
     + fast_handler: ?shared fn(Context, ResponseWriter)()
@@ -100,25 +126,67 @@ class ServerWorkerData {
         return this
     }
 
+    // Stops accepting and gives in-flight requests `timeout_ms` to finish.
+    // Does nothing when the server is not running. Safe to call from a handler.
+    + fn request_shutdown(timeout_ms: uint (5000)) {
+        let run = this.run
+        if isset(run) {
+            run.request_shutdown(timeout_ms)
+            return
+        }
+        if !this.early_stop || timeout_ms < this.early_stop_timeout_ms : this.early_stop_timeout_ms = timeout_ms
+        this.early_stop = true
+    }
+
+    // `request_shutdown` + wait for the workers. False means the deadline
+    // expired; handler code can still be unwinding and `start()` returns once
+    // it did. Do not call this from a handler: it would wait for itself.
+    + fn shutdown(timeout_ms: uint (5000)) bool {
+        let run = this.run
+        if !isset(run) {
+            this.request_shutdown(timeout_ms)
+            return true
+        }
+        run.request_shutdown(timeout_ms)
+        while run.workers > 0 {
+            let now = time.mono_ms()
+            let deadline = run.deadline_ms
+            if now >= deadline : return false
+            let remaining = deadline - now
+            time.sleep_ms(remaining < 10 ? remaining : 10)
+        }
+        return true
+    }
+
+    // Serves until `request_shutdown`/`shutdown` and every worker has drained.
+    // One worker runs on the calling thread, so use `co` to keep working.
     + fn start(worker_count: i32 (-1)) void !HttpError {
+        if isset(this.run) : throw .init
         let socket = net.Socket.server(net.SocketType.tcp, this.host, this.port) !>
+        let done: shared core.Mutex = .new() ! {
+            socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+            throw .init
+        }
+        done.lock()
 
         // SIGPIPE
         core.signal_ignore(13)
 
-        if worker_count < 0 {
-            worker_count = (core.cpu_thread_count() !? 8).to(i32)
+        // Clamp into a local: `worker_count` is published as shared below
+        let count = worker_count
+        if count < 0 {
+            count = (core.cpu_thread_count() !? 8).to(i32)
         }
-        if worker_count < 1 {
-            worker_count = 1
+        if count < 1 {
+            count = 1
         }
-        if worker_count > 128 {
-            worker_count = 128
+        if count > 128 {
+            count = 128
         }
 
         if this.show_info {
             println("[+] Running http server on port " + this.port)
-            println("[+] Worker count: " + worker_count)
+            println("[+] Worker count: " + count)
         }
 
         let static_dirs: ?shared ServerStaticDir = null
@@ -144,20 +212,31 @@ class ServerWorkerData {
             max_request_header_size: this.max_request_header_size
             max_request_body_size: this.max_request_body_size
             max_server_wide_body_size: this.max_server_wide_body_size
+            workers: count.to(uint)
+            acceptors: count.to(uint)
+            done: done
         }
-        let run: shared fn()() = fn() {
-            worker(server)
+        this.run = server
+        if this.early_stop : server.request_shutdown(this.early_stop_timeout_ms)
+
+        // Worker 0 is this thread; the others get a thread each
+        let failed = false
+        let remaining = server.workers - 1
+        while remaining > 0 && !failed {
+            let run: shared fn()() = fn() { worker(server) }
+            thread.Thread[void].start(run) ! { failed = true }
+            if !failed : remaining--
+        }
+        if failed {
+            // Workers that never started are not waited for; the rest drain
+            server.workers -= remaining
+            server.acceptors -= remaining
+            server.request_shutdown(0)
         }
 
-        worker_count--
-        while worker_count > 0 {
-            thread.Thread[void].start(run) ! {
-                println("[+] Failed to start worked number: " + worker_count)
-            }
-            worker_count--
-        }
-
-        run()
+        worker(server)
+        server.done.await_unlock()
+        if failed : throw .init
     }
 
     + fn add_static_dir(path: String) !LookupError {
