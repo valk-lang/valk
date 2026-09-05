@@ -55,6 +55,16 @@ check_build_error "parser error" parser "4 | Col: 1" "Unexpected token in value 
 check_build_error "type error" type "3 | Col: 13" "Incompatible types"
 check_build_error "interpolated expression error" interpolation "3 | Col: 26" "Unknown identifier: missing_name"
 check_build_error "compile macro error" macro "3 | Col: 5" "Unexpected '#else'"
+check_build_error "generic body error" generic-chain "4 | Col: 16" "Type 'String' has no property or method named: 'twice'"
+
+count=$((count + 1))
+echo "> generic body error shows the instantiation chain"
+chain_out=$("$VALK" build "$DIR/generic-chain.valk" --no-warn -o "$workdir/generic-chain" 2>&1 | normalize_paths)
+if [[ "$chain_out" != *"# Note: while instantiating 'Box[String]' here"* ]] || [[ "$chain_out" != *"# At: $DIR/generic-chain.valk:8:13"* ]]; then
+    echo "# Missing instantiation chain"
+    echo "$chain_out"
+    failed=1
+fi
 
 count=$((count + 1))
 echo "> warning location"

@@ -558,11 +558,48 @@ esac
 
 # Every request must be answered, or the client waits for its timeout
 check "unsupported request gets an error reply" '"code":-32601' \
-    '{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{}}'
+    '{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{}}'
 # Request ids may be strings; they are echoed back rather than coerced
 check "request id is echoed verbatim" '"id":"req-abc"' \
-    '{"jsonrpc":"2.0","id":"req-abc","method":"textDocument/codeAction","params":{}}'
+    '{"jsonrpc":"2.0","id":"req-abc","method":"textDocument/rename","params":{}}'
 
+# Structured diagnostics: codes, related spans and quickfixes
+check "diagnostics carry a stable code" '"code":"unused-import"' \
+    "$(notify_save warn.valk)"
+check "a code action request without a document returns no actions" '"result":[]' \
+    '{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{}}'
+
+count=$((count + 1))
+echo "> quickfixes remove an unused import and an unnecessary unsafe"
+# The diagnostics pass runs once input goes quiet, so the request follows a pause
+code_action_request=$(printf '{"jsonrpc":"2.0","id":3,"method":"textDocument/codeAction","params":{"textDocument":{"uri":"file://%s"},"range":{"start":{"line":0,"character":0},"end":{"line":5,"character":0}},"context":{"diagnostics":[]}}}' "$DIR/quickfix.valk")
+quickfix_out=$({ printf '%s' "$(frame "$init")$(frame "$(notify_open quickfix.valk)")"; sleep 1; printf '%s' "$(frame "$code_action_request")"; } | "$VALK" lsp run 2>&1)
+case "$quickfix_out" in
+    *'"title":"Remove the unused import"'*'"newText":""'*) ;;
+    *)
+        echo "# Missing quickfix for the unused import"
+        echo "$quickfix_out"
+        failed=1
+        ;;
+esac
+case "$quickfix_out" in
+    *'"title":"Remove the directive"'*) ;;
+    *)
+        echo "# Missing quickfix for the unnecessary unsafe"
+        echo "$quickfix_out"
+        failed=1
+        ;;
+esac
+case "$quickfix_out" in
+    *'"kind":"quickfix"'*'"range":{"start":{"line":0,"character":0},"end":{"line":1,"character":0}}'*) ;;
+    *)
+        echo "# The unused import fix should remove the whole line"
+        echo "$quickfix_out"
+        failed=1
+        ;;
+esac
+check "generic errors point at the instantiation" "\"message\":\"while instantiating 'Box[String]' here\"" \
+    "$(notify_open generic-chain.valk)"
 count=$((count + 1))
 echo "> \$/cancelRequest is ignored silently"
 stream="$(frame "$init")$(frame '{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}')"
