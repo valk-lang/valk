@@ -82,7 +82,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
-    + fn view(start: uint (0), amount: uint (0 - 1)) Slice[T]
+    + fn view(start: uint (0), amount: ?uint (null)) Slice[T]
 }
 ```
 
