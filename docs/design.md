@@ -667,7 +667,8 @@ operation such as `close`.
 - Natural padding is inserted before fields and at the end of aggregates.
 - `packed` suppresses normal inter-field padding for a struct.
 - Classes, arrays, and coroutines are reference-sized values.
-- Slices contain a backing reference, element offset, and visible length.
+- Slices contain a backing reference, an element pointer, and a visible
+  length: the same three words as `&[T]`.
 - Closures and interfaces are two pointers.
 - Fixed arrays contain `N` consecutive elements.
 - Tuple members use their natural alignment in tuple order.
