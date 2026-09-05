@@ -1,8 +1,8 @@
 class H2Stream {
     id: u32
     fields: Array[HpackField] (.new())
-    trailers: Array[HpackField] (.new())
-    body: ByteBuffer (.new())
+    trailers: ?Array[HpackField]
+    body: ?ByteBuffer
     send_window: int (65_535)
     receive_window: int (65_535)
     remote_closed: bool (false)
@@ -11,6 +11,11 @@ class H2Stream {
     headers_sent: bool (false)
     expected_length: ?uint
     last_read_ms: uint (0)
+
+    fn body_size() uint {
+        let body = this.body
+        return isset(body) ? body.length : 0
+    }
 }
 
 fn h2_number(value: u32) String {
@@ -23,6 +28,7 @@ fn h2_number(value: u32) String {
 class H2Session {
     peer: H2Settings (.{})
     decoder: HpackDecoder (.{})
+    encoder: HpackEncoder (.{})
     header_block: H2HeaderBlock (.{})
     streams: HashMap[u32, H2Stream] (.new())
     output: Array[H2Frame] (.new())
@@ -62,8 +68,8 @@ class H2Session {
     }
 
     fn release_body(stream: H2Stream) {
-        this.buffered_body -= stream.body.length
-        stream.body.clear()
+        this.buffered_body -= stream.body_size()
+        stream.body = null
     }
 
     fn shutdown() {
@@ -123,6 +129,7 @@ class H2Session {
             let entry = reader.read_string(6)
             let old_window = this.peer.initial_window_size
             this.peer.apply(H2Frame { kind: H2_SETTINGS, payload: entry }) !>
+            this.encoder.set_limit(this.peer.header_table_size)
             let delta = this.peer.initial_window_size.to(int) - old_window.to(int)
             if delta == 0 : continue
             each this.streams as stream {
@@ -213,7 +220,7 @@ class H2Session {
 
     fn end_request(stream: H2Stream) ?H2Stream {
         let expected = stream.expected_length
-        if isset(expected) && expected != stream.body.length {
+        if isset(expected) && expected != stream.body_size() {
             this.reset_stream(stream.id, 1)
             return null
         }
@@ -244,13 +251,21 @@ class H2Session {
             return null
         }
         let data = frame.fragment() !>
-        if stream.body.length > this.max_body_size || this.buffered_body > this.max_buffered_body
-            || data.bytes > this.max_body_size - stream.body.length
+        let body_size = stream.body_size()
+        if body_size > this.max_body_size || this.buffered_body > this.max_buffered_body
+            || data.bytes > this.max_body_size - body_size
             || data.bytes > this.max_buffered_body - this.buffered_body {
             this.reset_stream(frame.stream, 11)
             return null
         }
-        stream.body.write(data)
+        if data.bytes > 0 {
+            let body = stream.body
+            if !isset(body) {
+                body = ByteBuffer.new(data.bytes)
+                stream.body = body
+            }
+            body.write(data)
+        }
         this.buffered_body += data.bytes
         if bytes > 0 : this.output.append(H2Frame { kind: H2_WINDOW_UPDATE, stream: frame.stream, payload: h2_number(bytes.to(u32)) })
         if (frame.flags & 1) != 0 : return this.end_request(stream)
@@ -279,10 +294,7 @@ class H2Session {
         if stream.cancelled || stream.local_closed || stream.headers_sent : throw .protocol
         let limit = this.peer.max_header_list_size.to(uint)
         if limit > 65_536 : limit = 65_536
-        let encoded = ByteBuffer.new()
-        encoded.write_byte(32)
-        encoded.write(hpack_encode(fields, limit) !>)
-        let block = encoded.into_string()
+        let block = this.encoder.encode(fields, limit) !>
         let offset: uint = 0
         let kind: u8 = H2_HEADERS
         while true {
@@ -323,15 +335,33 @@ fn h2_regular_field(field: HpackField) bool {
 }
 
 fn h2_validate_request(stream: H2Stream) !H2Error {
-    let pseudo = Headers.new()
+    let method = ""
+    let scheme = ""
+    let path = ""
+    let authority = ""
+    let seen: u8 = 0
     let regular = false
     let host: ?String = null
     each stream.fields as field {
         if field.name.starts_with(":") {
-            if regular || pseudo.has(field.name) : throw .protocol
-            if field.name != ":method" && field.name != ":scheme" && field.name != ":path" && field.name != ":authority" : throw .protocol
+            if regular : throw .protocol
+            let bit: u8 = 0
+            if field.name == ":method" {
+                bit = 1
+                method = field.value
+            } else if field.name == ":scheme" {
+                bit = 2
+                scheme = field.value
+            } else if field.name == ":path" {
+                bit = 4
+                path = field.value
+            } else if field.name == ":authority" {
+                bit = 8
+                authority = field.value
+            } else : throw .protocol
+            if (seen & bit) != 0 : throw .protocol
+            seen = seen | bit
             if !response_header_value_is_safe(field.value) : throw .protocol
-            pseudo.append(field.name, field.value)
             continue
         }
         regular = true
@@ -353,16 +383,13 @@ fn h2_validate_request(stream: H2Stream) !H2Error {
             stream.expected_length = length
         }
     }
-    let method = pseudo.get(":method") ! throw .protocol
-    if !response_header_name_is_safe(method) : throw .protocol
-    let authority = pseudo.get(":authority") !? ""
+    if (seen & 1) == 0 || !response_header_name_is_safe(method) : throw .protocol
     if isset(host) && authority != "" && host != authority : throw .protocol
     if method == "CONNECT" {
-        if authority == "" || pseudo.has(":scheme") || pseudo.has(":path") : throw .protocol
+        if authority == "" || (seen & 6) != 0 : throw .protocol
     } else {
-        let scheme = pseudo.get(":scheme") ! throw .protocol
+        if (seen & 6) != 6 : throw .protocol
         if scheme != "http" && scheme != "https" : throw .protocol
-        let path = pseudo.get(":path") ! throw .protocol
         if (!path.starts_with("/") && !(method == "OPTIONS" && path == "*")) || path.contains("#") : throw .protocol
         if authority == "" && (!isset(host) || host == "") : throw .protocol
     }
