@@ -177,6 +177,12 @@ check "initialize advertises save notifications" '"save":true'
 check "diagnostics on save" '"message":"Unknown identifier: nope_xyz"' \
     "$(notify_save diag.valk)"
 
+# `#if TEST` code is visible to the editor, so tests calling test-only helpers check clean
+check_absent "test-only helpers resolve in the editor" 'Unknown identifier: guarded_helper' \
+    "$(notify_save test-guard.valk)"
+check "test-only helpers resolve but real errors remain" '"message":"Unknown identifier: nope_guard_xyz"' \
+    "$(notify_save test-guard.valk)"
+
 check_absent "compile-time print stays out of LSP stdout" 'LSP_PRINT_MUST_NOT_ESCAPE' \
     "$(notify_save print.valk)"
 
@@ -474,6 +480,22 @@ case "$out" in
         failed=1
         ;;
 esac
+
+# A sibling file whose imports are only used inside its test blocks: the LSP never
+# parses those bodies, so it cannot claim the import is unused
+printf '@unsafe\nuse main\ntest "uses main" {\n    main.package_one()\n    let p: ptr = null\n    @ptrv(p, u8, 0) = 1\n}\n' > "$workdir/pkg-one/src/check/sibling.valk"
+check_absent "unused-import warning skips files whose bodies were not parsed" 'is imported but never used' \
+    "$(notify_open_path "$workdir/pkg-one/src/check/check.valk")"
+check_absent "unnecessary-unsafe warning skips files whose bodies were not parsed" "Unnecessary '@unsafe'" \
+    "$(notify_open_path "$workdir/pkg-one/src/check/check.valk")"
+# Once the sibling is open too, its tests are checked, and the use inside them counts
+check_absent "tests of every open file are checked" 'is imported but never used' \
+    "$(notify_open_path "$workdir/pkg-one/src/check/sibling.valk")" \
+    "$(notify_open_path "$workdir/pkg-one/src/check/check.valk")"
+printf 'use main\ntest "broken" {\n    main.package_one()\n    missing_in_sibling_test\n}\n' > "$workdir/pkg-one/src/check/sibling.valk"
+check "errors inside tests of another open file are reported" 'Unknown identifier: missing_in_sibling_test' \
+    "$(notify_open_path "$workdir/pkg-one/src/check/sibling.valk")" \
+    "$(notify_open_path "$workdir/pkg-one/src/check/check.valk")"
 
 printf 'fn same_loose_name() { missing_loose_one }\n' > "$workdir/loose-one.valk"
 printf 'fn same_loose_name() { missing_loose_two }\n' > "$workdir/loose-two.valk"
