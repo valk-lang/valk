@@ -496,6 +496,29 @@ case "$out" in
         ;;
 esac
 
+# A buffer whose file was deleted stays open in the editor; it must neither log an error
+# nor keep its old diagnostics
+printf 'fn gone_fn() { missing_gone_xyz }\n' > "$workdir/gone.valk"
+open_gone="$(notify_open_path "$workdir/gone.valk")"
+rm "$workdir/gone.valk"
+count=$((count + 1))
+echo "> diagnostics skip an open buffer whose file was deleted"
+stream="$(frame "$init")$(frame "$open_gone")$(frame "$(notify_open_path "$workdir/loose-one.valk")")"
+out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
+case "$out" in
+    *'File/directory not found'*|*'missing_gone_xyz'*)
+        echo "# A deleted file was still built"
+        echo "$out" | head -c 2000
+        failed=1
+        ;;
+    *"gone.valk\",\"diagnostics\":[]"*) ;;
+    *)
+        echo "# Expected empty diagnostics for the deleted file"
+        echo "$out" | head -c 2000
+        failed=1
+        ;;
+esac
+
 # Every request must be answered, or the client waits for its timeout
 check "unsupported request gets an error reply" '"code":-32601' \
     '{"jsonrpc":"2.0","id":2,"method":"textDocument/codeAction","params":{}}'
