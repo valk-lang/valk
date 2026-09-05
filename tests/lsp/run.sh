@@ -397,6 +397,15 @@ case "$out" in
         ;;
 esac
 
+# range and selectionRange must be distinct objects: the encoder prints a node it already
+# wrote as "(recursion)", and the client then refuses the whole reply
+check_absent "document symbols encode selectionRange as a real range" '(recursion)' \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+check "document symbols carry a selectionRange" '"selectionRange":{"start":' \
+    "$(request_doc textDocument/documentSymbol symbols.valk)"
+check "document symbols reply with an array for an unknown file" '"id":2,"result":[]' \
+    "$(request_doc textDocument/documentSymbol does-not-exist.valk)"
+
 check "document symbols work on a file with errors" '"name":"three"' \
     "$(request_doc textDocument/documentSymbol multi-error.valk)"
 
