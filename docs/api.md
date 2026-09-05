@@ -70,7 +70,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn pop_last() T !LookupError
     + fn prepend(item: T, unique: bool (false)) Array[T]
     + fn prepend_many(items: Array[T]) Array[T]
-    + fn range(start: uint, end: uint, inclusive: bool (true)) Array[T]
     + fn remove(index: uint) Array[T]
     + fn remove_value(value: T) Array[T]
     + fn reverse() Array[T]
@@ -338,7 +337,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn pad_right(char: u8, length: uint) String
     + fn part(start_index: uint, length: uint) String
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
-    + fn range(start: uint, end: uint, inclusive: bool (true)) String
     + fn reader() ByteReader
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String

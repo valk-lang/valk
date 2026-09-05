@@ -176,8 +176,7 @@ s.contains(x) bool
 s.lower() String // Convert Unicode text to lowercase
 s.upper() String // Convert Unicode text to uppercase
 s.part(start_index, length) String // Sub string using byte offsets
-s.range(start_index, end_index) String // Sub string using inclusive byte offsets
-let middle = s[1 .. 3] // Three bytes starting at byte offset 1
+let middle = s[1 .. 3] // Same as s.part(1, 3): three bytes starting at byte offset 1
 s.utf8.length // Length in Unicode characters
 s.utf8.part(start_index, length) String // Sub string using character offsets
 ```
@@ -195,7 +194,7 @@ let arr : Array[int] = .{ 1, 2, 3 } // Using typehint
 arr.append(4)
 arr.prepend(5)
 let v = arr.get(0) ! panic("Empty array")
-let first_three = arr[0 .. 3]
+let first_three = arr[0 .. 3] // Same as arr.part(0, 3)
 arr.clear()
 //
 each arr as value {}
@@ -204,7 +203,9 @@ each arr as value, index {}
 
 Full `Array` API: [core](api.md#core)
 
-Bracket ranges call an instance method marked `$range`. The hook must accept
+Every range in Valk is a start offset and a length, never a start and an end,
+so there is no inclusive or exclusive bound to remember. Bracket ranges call an
+instance method marked `$range`. The hook must accept
 `(start_index: uint, length: uint)` and return one value. This lets custom
 collection types support the same `value[start_index .. length]` syntax.
 
