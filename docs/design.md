@@ -445,7 +445,11 @@ return values, and coroutine frames.
 `&obj.prop` on a GC object produces `&T` with `owner` set to that object, and
 so does `&ref.prop` through another owned borrow. A property of inline
 aggregate type converts implicitly, as in `let p: &Payload = owner.payload`.
-The members of `&T` are the members of `T`, read through the address.
+The members of `&T` are the members of `T`, read through the address. When
+`T` is itself a reference type, such as a class, the borrow names the slot
+that holds the reference: `ref.label` and `ref.method()` read the object out
+of the slot first, while `ref[0]` addresses the slot, so `ref[0] = other` and
+`ref[0] = null` replace what the owner holds with the owner's bookkeeping.
 
 `&[T]` is the sequence form: an owned borrow plus a visible length, without a
 class. Indexing and ranges are checked against `length` and panic when out of
