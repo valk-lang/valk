@@ -176,26 +176,55 @@ Valk distinguishes three sequence categories:
 | Type | Storage | Copy behavior | Resize |
 | --- | --- | --- | --- |
 | `[T x N]` | Inline elements | Copies all elements | No |
-| `Array[T]` | GC-managed reference | Copies the reference | Yes |
-| `Slice[T]` | Bounded view over GC-managed storage | Copies the view | No |
+| `Array[T]` | GC-managed reference to `Slice[T]` storage | Copies the reference | Yes |
+| `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
+| `Slice[T]`, `String` | `&[T]` with a class attached | Copies the borrow | No |
 
-Fixed arrays store their elements inline. `Array` is a GC reference type.
-`Slice` is a value descriptor containing its backing storage, offset, and
-visible length. Copying a slice preserves the same backing storage.
+Fixed arrays store their elements inline. `Array` is a GC reference type that
+owns resizable element storage. That storage is a `Slice[T]` block: a header
+with the slot count followed by the elements, traced by the block itself. The
+array is `{ data, size, length }`: `data` is the block, `size` its slot count,
+and the elements start at the block's storage header offset. Growth
+allocates a new block and registers the elements there as well; the old block
+stays alive only while something else, such as a view, still holds it. Every
+operation that drops an element clears its slot, so the array never keeps a
+removed element reachable.
 
-`Array[T]` owns resizable element storage. A newly initialized `Slice[T]` owns
-fixed-length element storage, while `slice.view(offset, length)` creates a
-bounded alias of that storage without allocating or copying elements.
+`&array[i]` borrows one element as `&T` with the storage block as owner, and
+the same works on `Slice[T]` and `&[T]`; `&view[a..b]` borrows a range of an
+`&[T]` as `&[T]`. A class `$offset` or `$range` hook takes precedence, which
+is why a range of an array goes through `view`. `array.view(start, length)`
+returns a `Slice[T]` over the array's block without copying. The view shares the elements it covers, observes in-place
+writes through the array, and survives the array growing because it keeps the
+block it was taken from. A view keeps its whole block alive, including slots
+past the elements it covers. `array.iter()` and `array.slice(...)` still copy.
 
-Array and Slice indexing is compiler-defined rather than implemented through
-`$offset` library hooks. An out-of-range read produces `LookupError.missing`
-and must use normal error handling or pass the error to the caller. For
-assignment, `Array[length] = value` appends, an Array index greater than
-`length` produces `LookupError.range`, and a Slice index at or beyond `length`
-produces `LookupError.range`. Indexed assignment passes that error to the
-caller; use the corresponding `set` method when another explicit handling
-policy is required. Fixed arrays use checked inline indexing and reject a known
-invalid index at compile time.
+A `slice X of T` class is an `&[T]` with methods: the same three words
+(`owner`, element pointer, `length`), the same GC handling, and the same
+bounds policy. `Slice[T]` and `String` are the two in the core library. A
+value converts implicitly between a named slice and `&[T]` in both directions
+when the element types agree, so a function taking `&[u8]` accepts a `String`
+and a function taking `Slice[T]` accepts any `&[T]`. `String` is the
+exception in one direction: its storage always carries a terminating zero
+byte so `data_cstring` is valid, which an arbitrary `&[u8]` cannot promise,
+so a bare view never becomes a `String` implicitly. Two different named
+slices stay distinct: `String` is not `Slice[u8]`. A newly initialized
+`Slice[T]` owns fixed-length element storage, while `slice.view(offset,
+length)` creates a bounded alias of that storage without allocating or
+copying elements. There is no anonymous `slice[T]` type.
+
+Indexing has one policy for every native sequence. A class hook comes first:
+`$offset`, `$offset_assign`, and `$range` on the class define the operation
+when present, which is how `String[i]` answers 0 past the end. Without a hook
+the compiler emits the native access, which checks the index against the
+length and panics when it is out of bounds. A native read of a non-nullable
+reference element also panics when the slot is empty: storage can be
+zero-filled or cleared by a removal, and the language never hands out an empty
+slot as a valid reference. This applies to `Array[T]`,
+`Slice[T]`, `&[T]`, and named unbound pointers alike. The `get` and `set`
+methods remain the fallible forms that return `LookupError`. For assignment,
+`Array[length] = value` appends. Fixed arrays use checked inline indexing and
+reject a known invalid index at compile time.
 
 ```valk
 let fixed: [int x 3] = { 1, 2, 3 }
@@ -386,37 +415,136 @@ the value non-null.
 
 ### Borrows
 
-`&T` is a safe, non-owning reference to existing storage. Taking `&value`
-stabilizes the referenced local for the duration of the borrow.
+Valk has two borrow forms. Both are safe: neither can dangle, and neither
+requires the programmer to track lifetimes. They share one layout; what
+differs is where the storage may live and whether the borrow may escape.
 
-A borrow:
+| Type | Layout | Kept alive by | May be stored or returned |
+| --- | --- | --- | --- |
+| `stack T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
+| `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
+
+#### Stack borrows
+
+`stack T` borrows storage for the rest of the frame: an inline local, an
+argument, a temporary aggregate, or, through another borrow, storage inside a
+GC object. `&local` produces it with a null owner; `&ref.prop` through a
+`stack T` produces it with that borrow's owner word. A stack borrow follows
+the frame rules:
 
 - May be stored only in local variables and non-escaping parameters.
 - Cannot be stored in a class, array, map, global, interface adapter, or closure.
 - Cannot be returned.
 - Cannot be converted implicitly to persistent raw-pointer storage.
-- May cross a coroutine suspension point when its stabilized storage and owner
-  root are retained in the coroutine frame.
+- May cross a coroutine suspension point when its stabilized storage is
+  retained in the coroutine frame.
 
-Taking a borrow from an inline local makes that local addressable. The compiler
-uses native stack storage when the function is proven not to suspend. If the
-function may suspend directly or through a call, address-taken inline locals use
-stable storage so their addresses remain valid while another coroutine uses the
+Taking a stack borrow makes the local addressable. The compiler uses native
+stack storage when the function is proven not to suspend. If the function may
+suspend directly or through a call, address-taken inline locals use stable
+storage so their addresses remain valid while another coroutine uses the
 execution stack.
 
-Taking an interior borrow from a GC object creates a hidden root for the exact
-owner allocation, so reassigning the source variable cannot allow the old
-allocation to be collected while the borrow remains live. The compiler retains
-that root for the remainder of the function or coroutine frame.
+`stack [T x N]` is the bounded form; its length is part of the type and
+indexing is checked against it.
 
-Elements of `Array` and `Slice` cannot currently be borrowed through indexing.
-Array backing storage may relocate when it grows, and sequence indexing returns
-a checked value rather than exposing its backing address. Fixed-array elements
-may be borrowed after their containing inline storage is stabilized.
+Struct method receivers are stack borrows: `this` is `stack T`. Calling a
+method on a struct that lives inside a GC object hands the method that
+object's owner word, so a store to a managed field through `this` updates the
+owner's bookkeeping. A method called on a frame local or through a raw
+pointer gets a null owner and a plain store.
 
-The compiler tracks borrows through tuples, fixed arrays, structs, unions, and
-other inline aggregates. A value containing a borrow follows the same escape
-rules as a direct `&T`.
+#### Owned borrows
+
+`&T` is an owned borrow: a fat reference whose `owner` names the GC allocation
+that contains the storage. The collector walks `owner` and ignores `adr`.
+Because the heap does not move objects, `adr` stays valid for as long as
+`owner` is reachable, so the borrow needs no lifetime tracking and may live
+anywhere a GC reference may live: class properties, arrays, globals, closures,
+return values, and coroutine frames.
+
+`&obj.prop` on a GC object produces `&T` with `owner` set to that object, and
+so does `&ref.prop` through another owned borrow. A property of inline
+aggregate type converts implicitly, as in `let p: &Payload = owner.payload`.
+The members of `&T` are the members of `T`, read through the address. When
+`T` is itself a reference type, such as a class, the borrow names the slot
+that holds the reference: `ref.label` and `ref.method()` read the object out
+of the slot first, while `ref[0]` addresses the slot, so `ref[0] = other` and
+`ref[0] = null` replace what the owner holds with the owner's bookkeeping.
+
+`&[T]` is the sequence form: an owned borrow plus a visible length, without a
+class. Indexing and ranges are checked against `length` and panic when out of
+bounds. `each` iterates it natively. It converts from `&[T x N]`, from a fixed
+array inside an owner, and to and from any `Slice[T]` or `String` value: the
+named slices are `&[T]` with a class, so the conversion is a retype.
+
+An owned borrow is an alias into `owner`, and its owner word is part of the
+borrow value. The owner's graph therefore stops being uniquely held exactly
+when the borrow escapes: stored in an object or global, returned, captured,
+bound to a local, or passed to a parameter the callee keeps. A borrow that
+only lives through a call, such as `read(&owner.payload)` with a callee that
+does not keep it, leaves `owner` publishable as `shared`. Borrowing
+`shared T` data remains an error.
+
+#### Null owner
+
+`owner` is nullable, and null means nothing owns the storage. For `stack T`
+that includes frame storage. For `&T` safe code produces a null owner only
+for permanent storage: globals and other static data. Unsafe code may build
+an `&T` from a raw pointer with `.@cast(&T)`, which yields a null owner over
+memory whose lifetime the programmer manages. A `stack T` does not convert to
+`&T`, because its null owner may stand for a frame, and the compiler reports
+the missing owner instead of the old "cannot be stored" errors.
+
+#### Conversions
+
+- `&T` converts to `stack T` in place; the layouts are the same and only the
+  escape rule changes.
+- `stack T` does not convert to `&T` or `&[T]`.
+- `&[T x N]` converts to `&[T]`; `[T x N]` storage with an owner converts to
+  either.
+- A raw pointer converts to `stack T` implicitly, as before, and to `&T` only
+  through explicit `.@cast(&T)` under `@unsafe`.
+- Every borrow converts to `ptr` and to a matching `*T`; a bounded `*[T x N]`
+  takes exactly its own length. A raw pointer taken from a `stack T` keeps
+  the frame rules: it may be passed to a pointer parameter but not stored.
+- `?&T` uses a null address as its empty state and costs no extra word.
+  Equality on borrows compares addresses.
+
+The convention that follows: a function that only reads takes `stack T`, a
+function that may store takes `&T`, and callers may pass an owned borrow to
+either.
+
+#### Owners are fixed-size
+
+An owned borrow points into its owner's storage, which must not relocate.
+Valid owners are class objects, and structs or fixed arrays inlined in them,
+plus `Slice` and `String` storage, and the storage blocks of arrays. An
+element borrowed out of an `Array[T]` names the block as its owner, so it
+stays valid when the array grows, although it then points into the old block.
+
+#### Stores through borrows
+
+A store through any borrow whose target holds managed references runs the
+owner's ownership bookkeeping when `owner` is set and a plain store when it
+is null. The check is a runtime test of the owner word, so it holds across
+function boundaries and struct method receivers. The same applies to
+`sequence[i] = value` and `storage.prop = value` on inline storage that lives
+inside a GC object. Reads of managed elements through any borrow or fixed
+array strip the collector's tag bits.
+
+Internally, every read or write through a borrow goes through its address as
+a one-word value that the user cannot name; the fat borrow itself is only
+copied, passed, and stored.
+
+#### Not done here
+
+Allocating class objects in the frame when escape inference proves they do not
+escape is a separate optimization. Promoting a frame-allocated object to the
+heap at the moment it escapes is rejected: raw pointers and existing borrows
+may already hold the frame address, and rewriting them would require a moving
+collector for frames.
 
 ### Inferred parameter effects
 
@@ -478,8 +606,8 @@ operations. `pointer.$offset(bytes)` computes an address offset without
 converting the integer offset itself to `ptr`.
 
 Raw pointers may erase to `ptr`, and a bare `ptr` may acquire either a raw `*T`
-element type or a borrowed `&T` type. Converting a typed raw `*T` directly to
-`&T` requires explicit `.@cast(&T)`.
+element type or a `stack T` borrow type. Converting any raw pointer to an owned
+`&T` requires explicit `.@cast(&T)` and yields a borrow without an owner.
 
 Bitwise `ptr & integer`, `ptr | integer`, and `ptr ^ integer` operations retain
 the pointer type. Assigning such a result to `uint` uses the same one-way
@@ -591,7 +719,8 @@ operation such as `close`.
 - Natural padding is inserted before fields and at the end of aggregates.
 - `packed` suppresses normal inter-field padding for a struct.
 - Classes, arrays, and coroutines are reference-sized values.
-- Slices contain a backing reference, element offset, and visible length.
+- Slices contain a backing reference, an element pointer, and a visible
+  length: the same three words as `&[T]`.
 - Closures and interfaces are two pointers.
 - Fixed arrays contain `N` consecutive elements.
 - Tuple members use their natural alignment in tuple order.

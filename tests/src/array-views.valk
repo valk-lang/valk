@@ -1,0 +1,280 @@
+use valk.gc
+
+// Array elements live in `Slice[T]` storage that traces itself. A view shares
+// that storage, survives the array growing, and never sees an element the
+// array has dropped kept alive on its behalf.
+//
+// Tests run concurrently, so every test that counts finalizers has its own
+// item class and counter.
+
+global av_grow_freed: uint (0)
+global av_drop_freed: uint (0)
+global av_uniq_freed: uint (0)
+global av_view_freed: uint (0)
+
+class AvGrowItem {
+    id: int
+    fn gc_free() { av_grow_freed++ }
+}
+class AvDropItem {
+    id: int
+    fn gc_free() { av_drop_freed++ }
+}
+class AvUniqItem {
+    id: int
+    fn gc_free() { av_uniq_freed++ }
+}
+class AvViewItem {
+    id: int
+    fn gc_free() { av_view_freed++ }
+}
+
+// Elements are created and removed in their own frames so no frame root of
+// the test keeps them alive.
+fn av_fill_grow(values: Array[AvGrowItem], from: int, until: int) {
+    while from < until : values.append(AvGrowItem { id: from++ })
+}
+fn av_fill_drop(values: Array[AvDropItem], from: int, until: int) {
+    while from < until : values.append(AvDropItem { id: from++ })
+}
+fn av_fill_view(values: Array[AvViewItem], from: int, until: int) {
+    while from < until : values.append(AvViewItem { id: from++ })
+}
+
+fn av_fill_repeated(values: Array[AvUniqItem]) {
+    let shared = AvUniqItem { id: 7 }
+    values.append(shared)
+    values.append(shared)
+    values.append(AvUniqItem { id: 8 })
+    values.append(shared)
+}
+
+fn av_drop_last(values: Array[AvUniqItem]) {
+    values.pop_last() _
+}
+
+fn av_drop_four(values: Array[AvDropItem]) {
+    values.pop_last() _
+    values.remove(0)
+    values.swap_remove(0)
+    values.pop_first() _
+}
+
+fn av_sum(values: &[int]) int {
+    let total = 0
+    each values as v : total += v
+    return total
+}
+
+test "Array views: share storage and observe in-place writes" {
+    let values = Array[int]{ 1, 2, 3, 4 }
+    let view = values.view(1, 2)
+    assert(view.length == 2)
+    assert(view[0] == 2)
+    assert(view[1] == 3)
+    values[2] = 30
+    assert(view[1] == 30)
+    view[0] = 20
+    assert(values[1] == 20)
+    let all: &[int] = values.view()
+    assert(all.length == 4)
+    assert(av_sum(all) == 1 + 20 + 30 + 4)
+    assert(av_sum(values.view(2)) == 34)
+    assert(values.view(9).length == 0)
+    assert(values.view(3, 99).length == 1)
+}
+
+test "Array views: survive the array reallocating" {
+    let values = Array[AvGrowItem]{}
+    av_fill_grow(values, 0, 4)
+    let view = values.view()
+    assert(view.length == 4)
+    // Grow past the capacity: the array moves to a new block.
+    av_fill_grow(values, 4, 64)
+    gc.collect()
+    gc.collect()
+    assert(av_grow_freed == 0)
+    assert(view[3].id == 3)
+    assert(values[3].id == 3)
+    assert(values.length == 64)
+}
+
+test "Array views: removed elements are not kept alive by the array" {
+    let values = Array[AvDropItem]{}
+    av_fill_drop(values, 0, 6)
+    av_drop_four(values)
+    assert(values.length == 2)
+    gc.collect()
+    gc.collect()
+    assert(av_drop_freed == 4)
+    values.clear()
+    gc.collect()
+    gc.collect()
+    assert(av_drop_freed == 6)
+}
+
+test "Array views: unique clears the slots it vacates" {
+    let values = Array[AvUniqItem]{}
+    av_fill_repeated(values)
+    values.unique()
+    assert(values.length == 2)
+    av_drop_last(values)
+    gc.collect()
+    gc.collect()
+    assert(av_uniq_freed == 1)
+    assert(values[0].id == 7)
+}
+
+test "Array views: a view keeps its own elements alive after the array drops them" {
+    let values = Array[AvViewItem]{}
+    av_fill_view(values, 0, 3)
+    let view = values.view()
+    // Growth moves the array to a new block; the view still holds the old one.
+    av_fill_view(values, 3, 40)
+    values.clear()
+    gc.collect()
+    gc.collect()
+    assert(view[0].id == 0)
+    assert(view[2].id == 2)
+    // The view's block has capacity 4, so it also holds id 3 until it dies:
+    // a view keeps its whole block, not only the elements it covers.
+    assert(av_view_freed == 36)
+}
+
+class AvLabel {
+    label: String ("a")
+}
+
+fn av_bump(slot: &int) {
+    slot[0] = slot[0] + 100
+}
+
+test "Array views: elements borrow with the storage block as owner" {
+    let values = Array[int]{ 1, 2, 3 }
+    let second = &values[1]
+    assert(second[0] == 2)
+    av_bump(&values[2])
+    assert(values[2] == 103)
+    second[0] = 20
+    assert(values[1] == 20)
+    let head: &[int] = values.view(0, 2)
+    assert(head.length == 2)
+    assert(av_sum(head) == 21)
+    // The borrow keeps its block: growth moves the array, not the borrow.
+    let i = 0
+    while i++ < 40 : values.append(i)
+    assert(second[0] == 20)
+    assert(values[1] == 20)
+
+    let labels = Array[AvLabel]{ AvLabel {}, AvLabel { label: "b" } }
+    let slot = &labels[1]
+    assert(slot.label == "b")
+    slot.label = "c"
+    assert(labels[1].label == "c")
+    slot[0] = AvLabel { label: "d" }
+    gc.collect()
+    assert(labels[1].label == "d")
+}
+
+global av_prepend_freed: uint (0)
+
+class AvPrependItem {
+    id: int
+    fn gc_free() { av_prepend_freed++ }
+}
+
+fn av_prepend_items(values: Array[AvPrependItem]) {
+    values.append(AvPrependItem { id: 1 })
+    values.prepend(AvPrependItem { id: 0 })
+    values.prepend_many(Array[AvPrependItem]{ AvPrependItem { id: -2 }, AvPrependItem { id: -1 } })
+}
+
+// Prepending shifts tagged slot words up before initializing the front slot;
+// the shifted elements must stay owned.
+test "Array views: prepend keeps shifted elements alive" {
+    let values = Array[AvPrependItem]{}
+    av_prepend_items(values)
+    gc.collect()
+    gc.collect()
+    assert(av_prepend_freed == 0)
+    assert(values.length == 4)
+    assert(values[0].id == -2)
+    assert(values[1].id == -1)
+    assert(values[2].id == 0)
+    assert(values[3].id == 1)
+    values.clear()
+    gc.collect()
+    gc.collect()
+    assert(av_prepend_freed == 4)
+}
+
+global av_store_freed: uint (0)
+
+class AvStoreItem {
+    id: int
+    fn gc_free() { av_store_freed++ }
+}
+
+fn av_store_through_view(view: Slice[AvStoreItem]) {
+    view[1] = AvStoreItem { id: 100 }
+}
+
+// A view taken earlier, then a collection, then a store through the view of
+// a fresh object, then another collection: the object is owned by the block
+// the view and the array share.
+test "Array views: an object stored through a view after a collection stays alive" {
+    let values = Array[AvStoreItem]{}
+    let i = 0
+    while i < 3 : values.append(AvStoreItem { id: i++ })
+    let view = values.view()
+    gc.collect()
+    gc.collect()
+    av_store_through_view(view)
+    gc.collect()
+    gc.collect()
+    assert(values[1].id == 100)
+    assert(view[1].id == 100)
+    assert(av_store_freed == 1)
+}
+
+global av_stale_freed: uint (0)
+
+class AvStaleItem {
+    id: int
+    fn gc_free() { av_stale_freed++ }
+}
+
+fn av_fill_stale(values: Array[AvStaleItem], from: int, until: int) {
+    while from < until : values.append(AvStaleItem { id: from++ })
+}
+
+// The view outlives the array's growth, so it holds the old block. A store
+// through it lands in the old block only. Once the view is gone the old block
+// dies and takes the stored object with it: no leak.
+fn av_store_into_stale_view(values: Array[AvStaleItem]) {
+    let view = values.view()
+    gc.collect()
+    av_fill_stale(values, 1, 40)
+    view[0] = AvStaleItem { id: 100 }
+    gc.collect()
+    assert(view[0].id == 100)
+    assert(values[0].id == 0)
+    assert(av_stale_freed == 0)
+}
+
+test "Array views: a store into a stale view is released with the view" {
+    let values = Array[AvStaleItem]{}
+    av_fill_stale(values, 0, 1)
+    av_store_into_stale_view(values)
+    gc.collect()
+    gc.collect()
+    // The old block and the object stored into it are gone; the array still
+    // holds its 40 elements.
+    assert(av_stale_freed == 1)
+    assert(values.length == 40)
+    assert(values[0].id == 0)
+    values.clear()
+    gc.collect()
+    gc.collect()
+    assert(av_stale_freed == 41)
+}

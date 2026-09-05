@@ -9,14 +9,16 @@ enum TYPE : u8 {
     nullable   // ?T
     union      // A | B (inline tagged value)
     array
-    slice
     fixed_array
     struct
     voidptr
     gcptr
     interface
     ptr_of
-    ref_of
+    adr_of     // internal: the one-word address a borrow is used through
+    stack_of   // stack T: frame borrow { owner: ?GcPtr, adr: ptr }, cannot escape
+    ref_of     // &T: owned borrow { owner: ?GcPtr, adr: ptr }
+    ref_slice  // &[T]: owned borrow { owner: ?GcPtr, adr: ptr, length: uint }; a `slice X of T` class attaches methods to it
     co
     closure
     fnptr      // fnptr(...)(...)
@@ -63,12 +65,14 @@ class TypeCache {
     cached_ir_type: ?String (null)
     cached_error_abi_type: ?String (null)
     ptr_of: ?Type (null)
+    adr_of: ?Type (null)
+    stack_of: ?Type (null)
     ref_of: ?Type (null)
+    ref_slice: ?Type (null)
     inline: ?Type (null)
     non_inline: ?Type (null)
     nullable: ?Type (null)
     array: ?Type (null)
-    slice: ?Type (null)
     shared: ?Type (null)
 }
 
@@ -117,7 +121,11 @@ class Type {
 
     fn get_sub_type() ?Type {
         let info = this.get_unary_info()
-        return isset(info) ? info.sub : null
+        if isset(info) : return info.sub
+        // A named slice or array can be typed before its element is parsed.
+        let c = this.class
+        if isset(c) && (this.kind == TYPE.ref_slice || this.kind == TYPE.array) : return c.slice_type
+        return null
     }
 
     fn get_members() ?Array[Type] {
@@ -263,6 +271,8 @@ class Type {
         if t == TYPE.interface : return psz * 2
         if this.is_pointer() : return psz
         if t == TYPE.closure : return psz * 2
+        if t == TYPE.ref_of || t == TYPE.stack_of : return psz * 2
+        if t == TYPE.ref_slice : return psz * 3
 
         if t == TYPE.union {
             let layout = this.union_layout() !>
@@ -278,6 +288,8 @@ class Type {
             if sub.is_pointer() : return psz
             // Closures use a null function pointer as their empty state.
             if sub.kind == TYPE.closure : return sub.byte_size() !>
+            // Owned borrows use a null address as their empty state.
+            if sub.is_fat_borrow() : return sub.byte_size() !>
             let size = psz + (sub.byte_size() !>)
             let alignment = this.ir_alignment() !>
             if alignment > 1 : size = size.round_up(alignment)
@@ -290,7 +302,7 @@ class Type {
             if isset(c) && c.kind == CLASS_KIND.mode {
                 return c.compute_size() !>
             }
-            if isset(c) && (c.kind == CLASS_KIND.struct || c.kind == CLASS_KIND.class || c.kind == CLASS_KIND.array || c.kind == CLASS_KIND.slice) {
+            if isset(c) && (c.kind == CLASS_KIND.struct || c.kind == CLASS_KIND.class || c.kind == CLASS_KIND.array) {
                 return c.compute_body_size() !>
             }
             if t == TYPE.array : return psz * 3
@@ -330,7 +342,6 @@ class Type {
         if t == TYPE.int || t == TYPE.float || t == TYPE.bool {
             return psz
         }
-        if t == TYPE.slice : return psz * 3
         if t == TYPE.gcptr || t == TYPE.struct || t == TYPE.array {
             return psz
         }
@@ -370,8 +381,7 @@ class Type {
         let t = this.get_non_nullable()
         let psz = this.ptr_size()
 
-        if t.kind == TYPE.slice : return psz
-        if t.is_pointer() || t.kind == TYPE.closure : return psz
+        if t.is_pointer() || t.kind == TYPE.closure || t.is_fat_borrow() : return psz
         if t.kind == TYPE.void || t.kind == TYPE.bool || (t.is_inline && isset(t.class) && !t.is_fixed_array_type()) : return 1
         if t.kind == TYPE.error_code : return 4
 
@@ -462,16 +472,42 @@ class Type {
         if !this.is_nullable_type() : return false
         let sub = this.get_sub_type()
         if !isset(sub) : return false
-        return !sub.is_pointer() && sub.kind != TYPE.closure
+        return !sub.is_pointer() && sub.kind != TYPE.closure && !sub.is_fat_borrow()
+    }
+
+    // `&T` or `&[T]`: a borrow that carries its own owner root and may escape.
+    fn is_owned_borrow() bool {
+        let t = this.get_non_nullable()
+        return t.kind == TYPE.ref_of || t.kind == TYPE.ref_slice
+    }
+
+    // `stack T`: an owner-carrying borrow that cannot leave its frame.
+    fn is_stack_borrow() bool {
+        return this.get_non_nullable().kind == TYPE.stack_of
+    }
+
+    // Any `{ owner, adr[, length] }` borrow: layout and GC handling are shared.
+    // This includes the named slices (`Slice[T]`, `String`), which are `&[T]`
+    // with a class attached.
+    fn is_fat_borrow() bool {
+        let t = this.get_non_nullable()
+        return t.kind == TYPE.ref_of || t.kind == TYPE.ref_slice || t.kind == TYPE.stack_of
+    }
+
+    // A borrow written as `stack T`, `&T`, or `&[T]`: no class, so no
+    // initializer, no hooks, and no methods of its own.
+    fn is_bare_borrow() bool {
+        return this.is_fat_borrow() && !isset(this.get_non_nullable().class)
     }
 
     fn is_pointer() bool {
         let t = this.kind
         if t == TYPE.interface : return false
-        if t == TYPE.voidptr || t == TYPE.gcptr || t == TYPE.ptr_of || t == TYPE.ref_of || t == TYPE.fnptr || t == TYPE.co {
+        if t == TYPE.voidptr || t == TYPE.gcptr || t == TYPE.ptr_of || t == TYPE.adr_of || t == TYPE.fnptr || t == TYPE.co {
             return true
         }
-        if (t == TYPE.array || t == TYPE.slice || t == TYPE.struct) && !this.is_inline : return true
+        if t == TYPE.ref_slice : return false
+        if (t == TYPE.array || t == TYPE.struct) && !this.is_inline : return true
         if t == TYPE.nullable {
             let sub = this.get_sub_type()
             if isset(sub) : return sub.is_pointer()
@@ -482,7 +518,7 @@ class Type {
         if !isset(c) : return false
         let kind = c.representation_class().kind
         return kind == CLASS_KIND.class || kind == CLASS_KIND.struct
-            || kind == CLASS_KIND.slice || kind == CLASS_KIND.array || kind == CLASS_KIND.unbound || kind == CLASS_KIND.pointer
+            || kind == CLASS_KIND.array || kind == CLASS_KIND.unbound || kind == CLASS_KIND.pointer
     }
 
     fn has_unresolved_generic() bool {
@@ -526,7 +562,7 @@ class Type {
         let t = this.get_non_nullable()
         let c = t.class
         if isset(c) : return c
-        if t.kind != TYPE.ptr_of && t.kind != TYPE.ref_of : return null
+        if t.kind != TYPE.ptr_of && t.kind != TYPE.adr_of && t.kind != TYPE.ref_of && t.kind != TYPE.stack_of : return null
         let sub = t.get_sub_type()
         return isset(sub) ? sub.get_class_or_null() : null
     }
@@ -550,7 +586,7 @@ class Type {
 
     fn is_bounded_pointer() bool {
         let t = this.get_non_nullable()
-        return (t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of) && t.length > 0
+        return (t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of) && t.length > 0
     }
 
     fn is_inline_type() bool {
@@ -558,7 +594,8 @@ class Type {
         if this.is_inline || t == TYPE.union : return true
         if t == TYPE.int || t == TYPE.float || t == TYPE.bool : return true
         if t == TYPE.closure || t == TYPE.interface : return true
-        if t == TYPE.voidptr || t == TYPE.gcptr || t == TYPE.ptr_of || t == TYPE.ref_of
+        if t == TYPE.ref_of || t == TYPE.ref_slice || t == TYPE.stack_of : return true
+        if t == TYPE.voidptr || t == TYPE.gcptr || t == TYPE.ptr_of || t == TYPE.adr_of
             || t == TYPE.fnptr || t == TYPE.co || t == TYPE.any || t == TYPE.void {
             return false
         }
@@ -631,12 +668,12 @@ class Type {
         if t.kind == TYPE.interface : return false
         if t.is_inline : return false
         if t.kind == TYPE.co : return true
-        if t.kind == TYPE.array || t.kind == TYPE.slice : return !t.is_inline
+        if t.kind == TYPE.array : return !t.is_inline
         if t.kind != TYPE.gcptr && t.kind != TYPE.struct : return false
         let c = t.class
         if !isset(c) : return false
         let kind = c.representation_class().kind
-        if kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.slice || kind == CLASS_KIND.array : return true
+        if kind == CLASS_KIND.class || kind == CLASS_KIND.interface || kind == CLASS_KIND.array : return true
         return false
     }
 
@@ -652,9 +689,9 @@ class Type {
     fn compute_has_gc_refs() bool {
         if this.is_gc_type() : return true
         let t = this.get_non_nullable()
-        if t.kind == TYPE.slice : return true
         if t.kind == TYPE.interface : return true
         if t.kind == TYPE.closure : return true
+        if t.is_fat_borrow() : return true
         if t.kind == TYPE.union || (t.kind == TYPE.struct && t.is_inline && !isset(t.class)) {
             let members = t.get_members()
             if !isset(members) : return false
@@ -688,9 +725,9 @@ class Type {
     fn compute_gc_root_count() uint !Error {
         if this.is_gc_type() : return 1
         let t = this.get_non_nullable()
-        if t.kind == TYPE.slice : return 1
         if t.kind == TYPE.interface : return 1
         if t.kind == TYPE.closure : return 1
+        if t.is_fat_borrow() : return 1
         if t.kind == TYPE.union {
             let members = t.get_members()
             if !isset(members) : return 0
@@ -725,7 +762,7 @@ class Type {
     fn is_raw_pointer() bool {
         let t = this.get_non_nullable()
         if t.kind == TYPE.voidptr : return true
-        if t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of : return false
+        if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of : return false
         let c = t.class
         return isset(c) && c.kind == CLASS_KIND.pointer
     }
@@ -817,6 +854,20 @@ class Type {
         return this.compat_inner(other)
     }
 
+    // `&[T]` and the `slice X of T` classes share one layout. The anonymous
+    // form accepts any named slice of a compatible element and vice versa; two
+    // named slices must be the same class (`String` is not `Slice[u8]`).
+    // `String` is stricter: its storage carries a terminating zero byte for
+    // `data_cstring`, which an arbitrary `&[u8]` cannot promise, so a bare
+    // view never becomes a `String` implicitly. The other direction is fine.
+    fn compat_ref_slice(other: Type) bool {
+        let own_class = this.compat_class()
+        let other_class = other.compat_class()
+        if isset(own_class) && isset(other_class) : return own_class == other_class
+        if isset(own_class) && own_class == type_string(this.build).get_class_or_null() : return false
+        return this.compat_inner(other)
+    }
+
     fn compat_min_length(other: Type) bool {
         return this.length == 0 || (other.length > 0 && this.length <= other.length)
     }
@@ -869,7 +920,7 @@ class Type {
             let theirs = other.single_multi_member() !? null
             if isset(theirs) : return this.compat(theirs)
         }
-        if this.kind == TYPE.ptr_of && other.kind == TYPE.ref_of {
+        if this.kind == TYPE.ptr_of && other.kind == TYPE.adr_of {
             if this.length > 0 && this.length != other.length : return false
             return this.compat_pointer_inner(other)
         }
@@ -883,12 +934,11 @@ class Type {
         if isset(own_enum) && own_enum != other.get_enum() : return false
 
         let t = this.kind
+        if t == TYPE.ref_slice : return this.compat_ref_slice(other)
         if this.is_inline != other.is_inline : return false
-        if t == TYPE.ptr_of || t == TYPE.ref_of : return this.compat_pointer(other)
+        if t == TYPE.ptr_of || t == TYPE.adr_of || t == TYPE.ref_of || t == TYPE.stack_of : return this.compat_pointer(other)
         if t == TYPE.nullable : return this.compat_inner(other)
         if t == TYPE.fixed_array : return this.length == other.length && this.compat_inner(other)
-        if t == TYPE.slice && (this.is_fixed_array_type() || other.is_fixed_array_type()) : return this.compat_array(other)
-        if t == TYPE.slice && !this.compat_min_length(other) : return false
         if t == TYPE.struct && this.is_inline && !isset(this.class) : return this.compat_multi(other)
         if t == TYPE.closure || t == TYPE.fnptr : return this.compat_callable(other)
         if t == TYPE.co : return this.compat_callable(other)
@@ -925,18 +975,23 @@ class Type {
         }
         if typ.kind == TYPE.union : return false
 
-        if base.kind == TYPE.ref_of
+        if base.kind == TYPE.adr_of
             && (typ.kind == TYPE.ptr_of || typ.is_struct_object())
         {
             return false
         }
+        // Borrow kinds convert to each other only through an explicit
+        // conversion step, never by plain compatibility.
+        if base.is_fat_borrow() || typ.is_fat_borrow() {
+            if base.get_non_nullable().kind != typ.get_non_nullable().kind : return false
+        }
 
         if base.is_raw_pointer() {
-            return typ.is_raw_pointer() || typ.kind == TYPE.ptr_of || typ.kind == TYPE.ref_of
+            return typ.is_raw_pointer() || typ.kind == TYPE.ptr_of || typ.kind == TYPE.adr_of
                 || typ.is_struct_object()
         }
         if typ.is_raw_pointer() {
-            return base.kind == TYPE.ptr_of || base.kind == TYPE.ref_of || base.is_struct_object()
+            return base.kind == TYPE.ptr_of || base.kind == TYPE.adr_of || base.is_struct_object()
                 || base.is_uint_type()
         }
         if base.is_number_type() && typ.is_number_type() : return base.compat_numbers(typ)
@@ -985,10 +1040,6 @@ class Type {
             if c.representation_class().kind == CLASS_KIND.struct {
                 return prefix + (this.is_inline ? "" : "*") + c.pretty_name()
             }
-            if this.kind == TYPE.slice && this.length > 0 {
-                let sub = this.get_sub_type()
-                if isset(sub) : return prefix + "slice[" + sub.compat_display_name() + " x " + this.length + "]"
-            }
             if c.kind == CLASS_KIND.unbound && this.length > 0 {
                 return prefix + c.pretty_name() + "[x " + this.length + "]"
             }
@@ -1022,6 +1073,14 @@ class Type {
             }
             return "*"
         }
+        if this.kind == TYPE.adr_of || this.kind == TYPE.stack_of {
+            let sub = this.get_sub_type()
+            if isset(sub) {
+                if this.length == 1 : return "stack " + type_wrapped_display("", sub)
+                return "stack [" + sub.compat_display_name() + " x " + this.length + "]"
+            }
+            return "stack"
+        }
         if this.kind == TYPE.ref_of {
             let sub = this.get_sub_type()
             if isset(sub) {
@@ -1029,6 +1088,10 @@ class Type {
                 return "&[" + sub.compat_display_name() + " x " + this.length + "]"
             }
             return "&"
+        }
+        if this.kind == TYPE.ref_slice {
+            let sub = this.get_sub_type()
+            return isset(sub) ? "&[" + sub.compat_display_name() + "]" : "&[]"
         }
         if this.kind == TYPE.fixed_array {
             let sub = this.get_sub_type()
@@ -1039,15 +1102,6 @@ class Type {
             return isset(sub) ? "array[" + sub.compat_display_name() + "]" : "array[]"
         }
         if this.kind == TYPE.voidptr : return "*"
-        if this.kind == TYPE.slice {
-            let sub = this.get_sub_type()
-            if isset(sub) {
-                let n = this.length
-                if n > 0 : return "slice[" + sub.compat_display_name() + " x " + n + "]"
-                return "slice[" + sub.compat_display_name() + "]"
-            }
-            return "slice[]"
-        }
         if this.kind == TYPE.struct && this.is_inline && !isset(this.class) {
             let subs = this.get_members()
             if isset(subs) {
@@ -1227,7 +1281,46 @@ class Type {
         return t
     }
 
-    // &T — cached on this type
+    // Internal one-word address of a borrow — cached on this type
+    fn adr_ref(length: uint (1)) Type {
+        return this.borrow_type(TYPE.adr_of, length)
+    }
+
+    // stack T — cached on this type
+    fn stack_ref(length: uint (1)) Type {
+        return this.borrow_type(TYPE.stack_of, length)
+    }
+
+    fn borrow_type(kind: TYPE, length: uint) Type {
+        if this.is_fixed_array_type() {
+            let cache = this.get_cache()
+            let cached_array = kind == TYPE.adr_of ? cache.adr_of : cache.stack_of
+            if isset(cached_array) : return cached_array
+            let sub = this.get_sub_type()
+            if isset(sub) {
+                let flat = sub.borrow_type(kind, this.length)
+                if kind == TYPE.adr_of : cache.adr_of = flat
+                else : cache.stack_of = flat
+                return flat
+            }
+        }
+        let cached = this.cache
+        let ref = isset(cached) ? (kind == TYPE.adr_of ? cached.adr_of : cached.stack_of) : null
+        if length == 1 && isset(ref) : return ref
+        let t = Type {
+            build: this.build
+            kind: kind
+            info: UnaryTypeInfo { sub: this }
+            length: length
+        }
+        if length == 1 {
+            if kind == TYPE.adr_of : this.get_cache().adr_of = t
+            else : this.get_cache().stack_of = t
+        }
+        return t
+    }
+
+    // &T — owned borrow, cached on this type
     fn reference(length: uint (1)) Type {
         if this.is_fixed_array_type() {
             let cache = this.get_cache()
@@ -1253,9 +1346,23 @@ class Type {
         return t
     }
 
+    // &[T] — owned borrow with a runtime length, cached on the element type
+    fn ref_slice() Type {
+        let cached = this.cache
+        let ref = isset(cached) ? cached.ref_slice : null
+        if isset(ref) : return ref
+        let t = Type {
+            build: this.build
+            kind: TYPE.ref_slice
+            info: UnaryTypeInfo { sub: this }
+        }
+        this.get_cache().ref_slice = t
+        return t
+    }
+
     // Cached aggregate representation.
     fn inline() Type !Error {
-        if this.kind == TYPE.ptr_of || this.kind == TYPE.ref_of {
+        if this.kind == TYPE.ptr_of || this.kind == TYPE.adr_of || this.kind == TYPE.ref_of || this.kind == TYPE.stack_of {
             if this.length == 0 : this.build.error("Cannot inline a pointer with an unknown length")
             let sub = this.get_sub_type()
             if !isset(sub) : this.build.bug("Pointer type is missing its element type")
@@ -1265,7 +1372,7 @@ class Type {
         let cached = this.cache
         let inline = isset(cached) ? cached.inline : null
         if isset(inline) : return inline
-        if this.kind != TYPE.array && this.kind != TYPE.slice && this.kind != TYPE.struct {
+        if this.kind != TYPE.array && this.kind != TYPE.struct {
             this.build.bug("Type does not have an inline representation")
         }
         let t = Type {
@@ -1315,28 +1422,6 @@ class Type {
         }
         this.get_cache().array = t
         return t
-    }
-
-    fn slice(length: uint (0)) Type {
-        let cached = this.cache
-        let slice = isset(cached) ? cached.slice : null
-        if !isset(slice) {
-            slice = Type {
-                build: this.build
-                kind: TYPE.slice
-                info: UnaryTypeInfo { sub: this }
-                is_inline: true
-            }
-            this.get_cache().slice = slice
-        }
-        if length == 0 : return slice
-        return Type {
-            build: slice.build
-            kind: TYPE.slice
-            info: slice.info
-            length: length
-            is_inline: true
-        }
     }
 
     fn fixed_array(length: uint) Type {
@@ -1406,9 +1491,9 @@ class Type {
 
 fn type_value_has_embedded_pointer(type: Type, include_raw: bool) bool {
     let t = type.get_non_nullable()
-    if t.kind == TYPE.ref_of : return true
-    if include_raw && (t.is_raw_pointer() || t.kind == TYPE.ptr_of) : return true
-    if t.kind == TYPE.slice : return false
+    if t.kind == TYPE.adr_of || t.kind == TYPE.stack_of : return true
+    if include_raw && (t.is_raw_pointer() || t.kind == TYPE.ptr_of || t.is_bare_borrow()) : return true
+    if t.is_owned_borrow() : return false
     if t.is_fixed_array_type() {
         let sub = t.get_sub_type()
         return isset(sub) && type_value_has_embedded_pointer(sub, include_raw)
@@ -1876,7 +1961,7 @@ fn type_validate_struct_gc_storage(type: Type, at: Exp) !Error {
 fn type_has_unpublishable_closure(type: Type, seen: Array[Class]) bool {
     let t = type.get_non_nullable()
     if t.is_shared : return false
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of || t.kind == TYPE.voidptr : return false
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return false
     if t.kind == TYPE.closure : return true
 
     if t.kind == TYPE.union || t.is_tuple_type() {
@@ -1887,7 +1972,7 @@ fn type_has_unpublishable_closure(type: Type, seen: Array[Class]) bool {
         }
         return false
     }
-    if t.kind == TYPE.array || t.kind == TYPE.slice || t.is_fixed_array_type() {
+    if t.kind == TYPE.array || t.kind == TYPE.ref_slice || t.is_fixed_array_type() {
         let sub = t.get_sub_type()
         return isset(sub) && type_has_unpublishable_closure(sub, seen)
     }
@@ -1916,7 +2001,7 @@ fn type_find_unpublishable_closure(type: Type, seen: Array[Class]) ?Prop {
         }
         return null
     }
-    if t.kind == TYPE.array || t.kind == TYPE.slice || t.is_fixed_array_type() {
+    if t.kind == TYPE.array || t.kind == TYPE.ref_slice || t.is_fixed_array_type() {
         let sub = t.get_sub_type()
         return isset(sub) ? type_find_unpublishable_closure(sub, seen) : null
     }
@@ -1932,7 +2017,7 @@ fn type_find_unpublishable_closure(type: Type, seen: Array[Class]) ?Prop {
 
 fn type_find_unsafe_struct_pointer(type: Type) ?Class {
     let t = type.get_non_nullable()
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of || t.kind == TYPE.voidptr : return null
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return null
 
     let class = t.class
     if !t.is_inline && isset(class) && class.kind == CLASS_KIND.struct {
@@ -1948,7 +2033,7 @@ fn type_find_unsafe_struct_pointer(type: Type) ?Class {
         }
         return null
     }
-    if t.kind == TYPE.array || t.kind == TYPE.slice || t.kind == TYPE.fixed_array {
+    if t.kind == TYPE.array || t.kind == TYPE.ref_slice || t.kind == TYPE.fixed_array {
         let sub = t.get_sub_type()
         return isset(sub) ? type_find_unsafe_struct_pointer(sub) : null
     }
@@ -1980,8 +2065,8 @@ fn struct_pointer_has_gc(class: Class) bool {
 
 fn struct_graph_type_has_gc(type: Type, seen: Array[Class]) bool {
     let t = type.get_non_nullable()
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.ref_of || t.kind == TYPE.voidptr : return false
-    if t.is_gc_type() || t.kind == TYPE.closure : return true
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr : return false
+    if t.is_gc_type() || t.kind == TYPE.closure || t.is_fat_borrow() : return true
     if t.kind == TYPE.union || t.is_tuple_type() {
         let members = t.get_members()
         if !isset(members) : return false
@@ -2049,10 +2134,21 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
         if inner.is_inline && inner.kind == TYPE.struct : return inner.non_inline()
         return inner.pointer()
     }
+    if kind == TYPE_KIND.stack {
+        let inner = type_from_inner_exp(exp, scope, "Missing inner type for 'stack'") !>
+        if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
+        if exp.bool2 : return inner.stack_ref(resolve_type_size(exp, scope) !>.to(uint))
+        return inner.stack_ref()
+    }
     if kind == TYPE_KIND.ref {
         let inner = type_from_inner_exp(exp, scope, "Missing inner type for '&'") !>
         if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
-        if exp.bool2 : return inner.reference(resolve_type_size(exp, scope) !>.to(uint))
+        if exp.bool2 {
+            let size_exp = exp.get(TYPE_EXP.size)
+            if isset(size_exp) : return inner.reference(resolve_type_size(exp, scope) !>.to(uint))
+            type_validate_sequence_element(inner, exp) !>
+            return inner.ref_slice()
+        }
         return inner.reference()
     }
 
@@ -2082,12 +2178,6 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
         let sub = type_from_inner_exp(exp, scope, "Missing element type for array") !>
         type_validate_sequence_element(sub, exp) !>
         return sub.array()
-    }
-
-    if kind == TYPE_KIND.slice {
-        let sub = type_from_inner_exp(exp, scope, "Missing element type for slice") !>
-        type_validate_sequence_element(sub, exp) !>
-        return sub.slice(resolve_type_size(exp, scope) !>.to(uint))
     }
 
     if kind == TYPE_KIND.fixed_array {

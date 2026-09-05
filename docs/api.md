@@ -39,9 +39,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + array Array[T] {
-    ~ cap: uint
-    ~ data: GcPtr
+    ~ data: ?GcPtr
     ~ length: uint
+    ~ size: uint
 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
@@ -59,6 +59,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn increase_size(new_size: uint) void
     + fn index_of(item: T) uint !LookupError
     + fn intersect(with: Array[T]) Array[T]
+    + fn items() *[T]
     + fn iter() Slice[T]
     + fn join(divider: String) String
     + fn merge(items: Array[T]) Array[T]
@@ -81,6 +82,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
+    + fn view(start: uint (0), amount: ?uint (null)) Slice[T]
 }
 ```
 
@@ -269,7 +271,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice Slice[T] of T {
     ~ data: *[T]
     ~ length: uint
-    ~ offset: uint
+    ~ owner: ?GcPtr
 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
@@ -302,7 +304,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice String of u8 {
     ~ data: *[u8]
     ~ length: uint
-    ~ offset: uint
+    ~ owner: ?GcPtr
 
     + static fn alloc(length: uint) String
     + get bytes: uint
@@ -1132,6 +1134,7 @@ alias pid_t for i32
 ## Aliases for 'gc'
 
 ```js
+type EnvCloneFn (fnptr(ptr)(ptr))
 type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ```
 
@@ -1140,6 +1143,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ```js
 + fn alloc(size: uint) GcPtr
 ~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo, fn(ptr, *Lifo)())()) GcPtr
++ fn clone_closure_env(env: ?ptr) ?ptr
 + fn collect() void
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void

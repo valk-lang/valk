@@ -135,6 +135,10 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
                     unit.extern_functions.append(props_func, true)
                 }
             }
+            let env_clone = allocator.env_clone
+            if isset(env_clone) && (env_clone.unit != unit || env_clone.is_extern) {
+                unit.extern_functions.append(env_clone, true)
+            }
         }
     }
 }
@@ -213,7 +217,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
         each build.lists.allocators as allocator, i {
             if !allocator.global.is_used : continue
             let props_func = allocator.props_func
-            if allocator.props.length == 0 && allocator.element_props.length == 0 && !isset(props_func) : continue
+            if allocator.props.length == 0 && !isset(props_func) : continue
             let ir = IRFunc {func: owner}
             ir.code.append_text("define internal void @\"valk.allocator.props.")
             ir.code.write_int_ascii(site.value.int_val)
@@ -225,11 +229,6 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             let data = ir_emit_extract(ir, "{ ptr, ptr }", "\%callback", 1)
             each allocator.props as prop {
                 ir_write_allocator_prop(ir, prop, callback, data) !>
-            }
-            if allocator.element_props.length > 0 {
-                let length = ir_emit_load(ir, "i64", ir_offset_address(ir, "\%item", allocator.length_offset.to(uint)))
-                let elements = ir_union_clean_gc_pointer(ir, ir_emit_load(ir, "ptr", ir_offset_address(ir, "\%item", allocator.data_offset.to(uint))))
-                ir_write_sequence_props(ir, allocator.element_props, allocator.element_size, length, elements, callback, data) !>
             }
             if isset(props_func) {
                 let mark = ir.arg_list.length
@@ -263,7 +262,7 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             ir.write("(i64 ")
             ir.write_uint(allocator.size.to(uint))
             ir.write(", ptr ")
-            if allocator.props.length > 0 || allocator.element_props.length > 0 || isset(allocator.props_func) {
+            if allocator.props.length > 0 || isset(allocator.props_func) {
                 ir.write("@\"valk.allocator.props.")
                 ir.write_int(site.value.int_val)
                 ir.write(".")
@@ -275,6 +274,9 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             ir.write(", ptr ")
             let onfree = allocator.onfree
             ir.write(isset(onfree) ? ir_func_address(onfree) : "null")
+            ir.write(", ptr ")
+            let env_clone = allocator.env_clone
+            ir.write(isset(env_clone) ? ir_func_address(env_clone) : "null")
             ir.write(")")
             ir.line_end()
             ir_emit_store(ir, "ptr", pool, ir_global_address(global))
@@ -358,6 +360,9 @@ class IRFunc {
     loop_after: ?String (null)
     gc_stack_global: String ("")
     gc_stack_previous: String ("")
+    // GC stack markers: the collector receiver and its argument type
+    mark_receiver: String ("\%gc")
+    mark_receiver_type: String ("ptr")
     cleanup_active: bool (false)
     current_block: String ("")
     vscope_after: ?String (null)
@@ -685,7 +690,9 @@ fn ir_visit_gc_field(
     ir.cond_jump(present, yes, after)
     ir.label(yes)
     ir.line2("call void ", callback_target)
-    ir.write("(ptr ")
+    ir.write("(")
+    ir.write(ir.mark_receiver_type)
+    ir.write(" ")
     ir.write(callback_data)
     ir.write(", ptr ")
     ir.write(pointer)
@@ -731,7 +738,7 @@ fn ir_visit_type_gc_fields(
         return
     }
 
-    if t.kind == TYPE.slice {
+    if t.is_fat_borrow() {
         ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
         return
     }
@@ -862,12 +869,18 @@ fn ir_gc_stack_collect_func(ir: IRFunc) Func !Error {
     return collect
 }
 
-fn ir_begin_gc_stack_marker(func: Func, name: String, frame_size: uint) IRFunc {
+fn ir_begin_gc_stack_marker(func: Func, name: String, frame_size: uint, collect: Func) IRFunc {
     let ir = IRFunc {func: func}
     ir.code.append_text("define internal void @\"")
     ir.code.append_text(name)
     ir.code.append_text("\"(ptr \%frame, ptr \%gc) {\n")
     ir.label("entry")
+    // The collector is a struct method: its receiver is an ownerless borrow.
+    let this_arg = collect.args.get(0) !? null
+    if isset(this_arg) && this_arg.type.is_stack_borrow() {
+        ir.mark_receiver = ir_frame_borrow(ir, "\%gc")
+        ir.mark_receiver_type = "{ ptr, ptr }"
+    }
     ir_name_field_address(ir, "\%frame.values", ir_gc_stack_frame_type(frame_size), "\%frame", 2, true)
     return ir
 }
@@ -879,11 +892,11 @@ fn ir_finish_gc_stack_marker(out: ByteBuffer, ir: IRFunc) {
 }
 
 fn ir_gc_stack_mark_address(ir: IRFunc, type: Type, address: String, collect: Func) !Error {
-    ir_visit_type_gc_fields(ir, type, address, GC_FIELD_OP.mark, ir_func_address(collect), "\%gc", type.storage_alignment() !>) !>
+    ir_visit_type_gc_fields(ir, type, address, GC_FIELD_OP.mark, ir_func_address(collect), ir.mark_receiver, type.storage_alignment() !>) !>
 }
 
 fn ir_write_func_gc_stack_marker(out: ByteBuffer, func: Func, collect: Func) !Error {
-    let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size)
+    let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size, collect)
 
     // One frame region per rooted declaration, so every offset is distinct.
     each func.all_decls as decl {
@@ -904,7 +917,7 @@ fn ir_write_coro_gc_stack_marker(
     offsets: Array[uint],
     collect: Func
 ) !Error {
-    let ir = ir_begin_gc_stack_marker(func, name, frame_size)
+    let ir = ir_begin_gc_stack_marker(func, name, frame_size, collect)
     each types as type, i {
         let offset = offsets.get(i) ! func.exp.bug("Coroutine GC-frame layout is incomplete")
         let address = ir_offset_address(ir, "\%frame.values", offset)
@@ -1034,17 +1047,20 @@ fn ir_reuse_adapter(ir: IRFunc, name: String) bool {
 
 // String literals use the same backing layout as allocated slices.
 fn ir_emit_string_data(ir: IRFunc, text: String) String {
+    // A literal lives in static storage: nothing owns it, so the owner word
+    // is null and the collector never looks at it.
     let index = ir_use_string(ir, text)
-    let storage = ir.var()
+    let storage = "null"
+    let data = ir.var()
     ir.line_start()
-    ir.write(storage)
+    ir.write(data)
     ir.write(" = getelementptr i8, ptr @\"valk.str.")
     ir.write_uint(index)
-    ir.write("\", i64 8")
+    ir.write("\", i64 16")
     ir.line_end()
-    let type = "{ ptr, i64, i64 }"
+    let type = "{ ptr, ptr, i64 }"
     let out = ir_emit_insert(ir, type, "undef", "ptr", storage, 0)
-    out = ir_emit_insert(ir, type, out, "i64", "0", 1)
+    out = ir_emit_insert(ir, type, out, "ptr", data, 1)
     return ir_emit_insert(ir, type, out, "i64", text.bytes.to_string(), 2)
 }
 
@@ -1181,7 +1197,8 @@ fn ir_type_uncached(type: Type) String !Error {
         return out.to_string()
     }
     if t.kind == TYPE.closure || t.kind == TYPE.interface : return "{ ptr, ptr }"
-    if t.kind == TYPE.slice : return "{ ptr, i64, i64 }"
+    if t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return "{ ptr, ptr }"
+    if t.kind == TYPE.ref_slice : return "{ ptr, ptr, i64 }"
     if t.kind == TYPE.union {
         let layout = t.union_layout() !>
         let out = ByteBuffer.new()
@@ -1409,7 +1426,9 @@ fn ir_emit_user_defers(ir: IRFunc, value: Value) !Error {
     ir.label(body_block)
     let index = ir_emit_binary_instruction(ir, "sub", length_type, length, "1")
 
-    let data = ir_emit_value(ir, vgen_prop(data_prop, stack_value)) !>
+    // `data` is the storage block; the elements follow its header.
+    let block = ir_emit_value(ir, vgen_prop(data_prop, stack_value)) !>
+    let data = ir_offset_address(ir, block, (stack_class.slice_data_offset() !>).to(uint))
     let closure_type = ir_type(pop.get_rett()) !>
     let closure_address = ir_element_address(ir, closure_type, data, "i64", index)
     let closure = ir_emit_load(ir, closure_type, closure_address)
@@ -1860,27 +1879,6 @@ fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
     return ir_offset_address(ir, on, prop.offset.to(uint))
 }
 
-fn ir_emit_slice_data_address(ir: IRFunc, on: Value, prop: Prop) String !Error {
-    let class = prop.class
-    let storage_prop = class.get_prop_by_name("_storage") !? null
-    let offset_prop = class.get_prop_by_name("offset") !? null
-    let element = class.slice_type
-    if !isset(storage_prop) || !isset(offset_prop) || !isset(element) {
-        prop.exp.bug("Slice descriptor is incomplete")
-    }
-
-    let base = ir_emit_address(ir, on) !>
-    let storage = ir_emit_load(ir, "ptr", ir_prop_address(ir, base, storage_prop))
-    storage = ir_union_clean_gc_pointer(ir, storage)
-    let data = ir_offset_address(ir, storage, (class.slice_data_offset() !>).to(uint))
-    let offset = ir_emit_load(ir, "i64", ir_prop_address(ir, base, offset_prop))
-    let element_size = element.byte_size() !>
-    if element_size != 1 {
-        offset = ir_emit_binary_index(ir, "mul", "i64", offset, element_size.to(uint))
-    }
-    return ir_dynamic_offset_address(ir, data, offset)
-}
-
 fn ir_require_runtime_value(value: Value) !Error {
     let type = value.rett
     if !isset(type.get_cached_ir_type()) && type.has_unresolved_generic() {
@@ -1894,7 +1892,7 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let decl = value.decl
         if !isset(decl) : value.bug("IR declaration value is missing its Decl")
         if decl.is_bind : return ir.captured_address(decl) !>
-        if decl.ir_name == "-nameless-" : value.bug("IR declaration has no frame storage")
+        if decl.ir_name == "-nameless-" : value.bug("IR declaration has no frame storage: " + (decl.name ?? "<temp>") + " : " + decl.type.compat_display_name() + " buffer=" + decl.is_buffer + " owner=" + decl.owner.name + " in=" + ir.func.name)
         return decl.ir_name
     }
     if value.type == VAL.global {
@@ -1907,7 +1905,6 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let on = value.value1
         let prop = value.prop
         if !isset(on) || !isset(prop) : value.bug("IR property value is incomplete")
-        if prop.is_slice_data : return ir_emit_slice_data_address(ir, on, prop) !>
         let base = on.rett.is_inline ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
         return ir_prop_address(ir, base, prop)
     }
@@ -2059,7 +2056,6 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if t == VAL.prop {
         let prop = value.prop
         if !isset(prop) : value.bug("IR property value is missing its property")
-        if prop.is_slice_data : return ir_emit_address(ir, value) !>
         if value_is_shared_storage(value) && value.rett.is_integer_type() {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
@@ -2462,6 +2458,10 @@ fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     if type.kind == TYPE.closure {
         let target = ir_emit_extract(ir, lowered, rendered, 0)
         return ir_emit_binary_instruction(ir, "icmp ne", "ptr", target, "null")
+    }
+    if type.is_fat_borrow() {
+        let adr = ir_emit_extract(ir, lowered, rendered, 1)
+        return ir_emit_binary_instruction(ir, "icmp ne", "ptr", adr, "null")
     }
     if type.kind == TYPE.interface {
         let object = ir_interface_object(ir, rendered)
@@ -2875,16 +2875,20 @@ fn ir_emit_slice_init_into(
         }
     }
 
-    let storage = ir_emit_load(ir, "ptr", address)
-    let missing_storage = ir_emit_binary_instruction(ir, "icmp eq", "ptr", storage, "null")
-    let allocate = ir.block("slice.allocate")
-    let ready = ir.block("slice.ready")
-    ir.cond_jump(missing_storage, allocate, ready)
-    ir.label(allocate)
+    // A view names its element storage. Without `data` the descriptor gets
+    // fresh storage of `length` elements and owns it. A null owner with
+    // `data` set is unowned storage, such as a literal.
+    if isset(fields) {
+        each fields as field {
+            let prop = field.get_init_prop()
+            if isset(prop) && prop.name == "data" : return
+        }
+    }
     let allocated = ir_emit_slice_alloc(ir, value, class, fields, field_mark) !>
     ir_emit_store(ir, "ptr", allocated, address)
-    ir.jump(ready)
-    ir.label(ready)
+    let data_prop = class.get_prop_by_name("data") ! value.bug("Slice descriptor has no data property")
+    let data = ir_offset_address(ir, allocated, (class.slice_data_offset() !>).to(uint))
+    ir_emit_store(ir, "ptr", data, ir_prop_address(ir, address, data_prop))
 }
 
 fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
@@ -2920,7 +2924,7 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     let result_type = value.rett.is_tagged_nullable() ? value.rett.get_non_nullable() : value.rett
     let lowered = ir_type(result_type) !>
     let size = class.compute_body_size() !>
-    if result_type.kind == TYPE.slice {
+    if class.kind == CLASS_KIND.slice {
         let slot = ir.var()
         ir.line3(slot, " = alloca ", lowered)
         ir_emit_slice_init_into(ir, value, class, slot, fields, field_mark) !>
@@ -2987,7 +2991,7 @@ fn ir_collect_inline_init_fields(value: Value, offset: u32, fields: Array[Value]
 fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
     let class = value.get_class_ref()
     if !isset(class) : value.bug("Inline class initializer has no class")
-    if value.rett.get_non_nullable().kind == TYPE.slice {
+    if class.kind == CLASS_KIND.slice {
         let values = value.values
         let field_mark = ir.field_values.length
         if isset(values) {
@@ -3246,6 +3250,22 @@ fn ir_interface_method_target(ir: IRFunc, value: String, method: Func) String {
 // Allocation
 ////////////////////////////
 
+// A struct method takes `this` as `stack T`: wrap a bare address in an
+// ownerless borrow when the runtime hands us only the address.
+fn ir_frame_borrow(ir: IRFunc, address: String) String {
+    let with_owner = ir_emit_insert(ir, "{ ptr, ptr }", "undef", "ptr", "null", 0)
+    return ir_emit_insert(ir, "{ ptr, ptr }", with_owner, "ptr", address, 1)
+}
+
+fn ir_write_receiver_arg(ir: IRFunc, mark: uint, method: Func, address: String) {
+    let this_arg = method.args.get(0) !? null
+    if isset(this_arg) && this_arg.type.is_stack_borrow() {
+        ir.write_arg(mark, "{ ptr, ptr }", ir_frame_borrow(ir, address))
+        return
+    }
+    ir.write_arg(mark, "ptr", address)
+}
+
 fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String !Error {
     let allocator = value.get_allocator()
     if isset(allocator) {
@@ -3258,7 +3278,7 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
 
         let pool = ir_emit_load(ir, ir_type(pool_type) !>, ir_global_address(global))
         let mark = ir.arg_list.length
-        ir.write_arg(mark, "ptr", pool)
+        ir_write_receiver_arg(ir, mark, pool_get, pool)
         return ir_emit_arg_call(ir, ir_type(pool_get.get_rett()) !>, ir_func_address(pool_get), mark)
     }
 
@@ -3391,6 +3411,17 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     let allocator = func.capture_allocator
     if !isset(class) : value.bug("Closure data class was not prepared")
 
+    // A bound class method needs no environment: the object is the
+    // environment word and the method's own signature already takes it first.
+    let bound_object = value.value1
+    if isset(bound_object) && isset(func.class) && !func.is_static && !func.is_interface
+        && !func.is_literal && func.capture_decls.length == 0 && bound_object.rett.is_gc_type()
+    {
+        ir_use_func(ir, func)
+        let object = ir_emit_value(ir, bound_object) !>
+        return ir_build_closure_value(ir, value.rett, ir_func_address(func), object) !>
+    }
+
     let target_name = func_ir_name(func)
     if func.is_literal : ir_use_func(ir, func)
     else : target_name = ir_emit_closure_adapter(ir, value, func) !>
@@ -3403,6 +3434,9 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     let ctx = Context.for_func(ir.func)
     let at = value.exp
     if !isset(at) : value.bug("Closure construction is missing its source expression")
+    // The frame layout is fixed by now: no new buffer slots may be created.
+    let buffers_before = ir.func.no_buffers
+    ir.func.no_buffers = true
     let env_type = class.get_type() !>
     let fields = HashMap[Prop, Value]{}
     let capture_base : uint = 0
@@ -3434,6 +3468,7 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     // Keep the prepared allocator (header-aware size) on the init value.
     init.set_allocator(allocator)
     let environment = ir_emit_value(ir, init) !>
+    ir.func.no_buffers = buffers_before
 
     // Protocol header: pointer to the value-AST clone helper.
     let clone_func = func.capture_clone_func
@@ -3658,7 +3693,9 @@ fn ir_coro_get_gc(ir: IRFunc, value: Value, gc_args: String, index: uint) String
     let array_class = gc_args_prop.type.get_class_or_null()
     if !isset(array_class) : value.bug("Coro.gc_args is not an Array")
     let data_prop = array_class.get_prop_by_name("data") ! value.bug("Array has no data property")
-    let data = ir_coro_load_prop(ir, gc_args, data_prop) !>
+    // `data` is the storage block; the elements follow its header.
+    let block = ir_coro_load_prop(ir, gc_args, data_prop) !>
+    let data = ir_offset_address(ir, block, (array_class.slice_data_offset() !>).to(uint))
     let item_address = ir_index_address(ir, "ptr", data, index)
     let item = ir_emit_load(ir, "ptr", item_address)
     let clean = ir_union_clean_gc_pointer(ir, item)
@@ -3734,7 +3771,7 @@ fn ir_coro_append_type_roots(
         return
     }
 
-    if t.kind == TYPE.slice {
+    if t.is_fat_borrow() {
         let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
         pointer = ir_union_clean_gc_pointer(ir, pointer)
         ir_coro_append_gc(ir, value, gc_args, pointer) !>

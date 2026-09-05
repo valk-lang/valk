@@ -1,0 +1,790 @@
+
+// Borrows.
+//
+// `stack T` is `{ owner: ?GcPtr, adr: ptr }` and cannot leave its frame.
+// `&T` has the same layout and may be stored, returned, and captured: its
+// owner names the allocation that contains the storage.
+// `&[T]` adds a runtime length: `{ owner, adr, length }`.
+//
+// A null owner means nothing owns the storage: frame storage for `stack T`,
+// globals, literals, or memory that unsafe code manages itself. For `&T` it
+// never stands in for a frame, which is why `stack T` does not convert to it.
+//
+// Reads and writes through a borrow go through its one-word address, an
+// internal `adr_of` value that is never written by the user.
+
+// Where the storage behind a borrow lives.
+enum BORROW_ORIGIN : u8 {
+    stack      // an inline local or argument: only the frame keeps it alive
+    borrowed   // reached through a `stack T`: `owner` is its runtime owner word
+    managed    // inside a GC allocation: `owner` names it
+    permanent  // a global or other static storage
+    raw        // reached through a raw pointer: unsafe, no owner
+}
+
+class BorrowOrigin {
+    kind: BORROW_ORIGIN
+    owner: ?Value (null)
+}
+
+// Walk the storage chain of an assignable value to find what owns it.
+fn value_borrow_origin(value: Value) BorrowOrigin {
+    let t = value.type
+    if t == VAL.global : return BorrowOrigin { kind: BORROW_ORIGIN.permanent }
+    if t == VAL.decl : return BorrowOrigin { kind: BORROW_ORIGIN.stack }
+    if t == VAL.array_init || t == VAL.class_init {
+        // A temporary aggregate lives in the frame once it is given a home.
+        return BorrowOrigin { kind: BORROW_ORIGIN.stack }
+    }
+    if t == VAL.prop || t == VAL.ptrv {
+        let on = value.value1
+        if !isset(on) : return BorrowOrigin { kind: BORROW_ORIGIN.stack }
+        return value_borrow_origin_through(on)
+    }
+    return BorrowOrigin { kind: BORROW_ORIGIN.stack }
+}
+
+// `on` is the value a property or element was read from.
+fn value_borrow_origin_through(on: Value) BorrowOrigin {
+    let nn = on.rett.get_non_nullable()
+    if on.rett.is_gc_type() {
+        return BorrowOrigin { kind: BORROW_ORIGIN.managed, owner: on }
+    }
+    if nn.is_fat_borrow() : return borrow_origin_of_fat(on)
+    // A narrowed borrow still knows its owner word.
+    let fat = value_narrowed_owned_borrow_source(on)
+    if isset(fat) : return borrow_origin_of_fat(fat)
+    if nn.kind == TYPE.adr_of {
+        return BorrowOrigin { kind: BORROW_ORIGIN.stack }
+    }
+    if nn.kind == TYPE.ptr_of || nn.is_raw_pointer() || nn.is_struct_object() {
+        return BorrowOrigin { kind: BORROW_ORIGIN.raw }
+    }
+    if nn.kind == TYPE.array {
+        // Relocatable storage. Element borrows go through the storage block
+        // (`value_borrow_sequence_element`); anything else reached through an
+        // array is rejected by the caller, so treat it as stack to be safe.
+        return BorrowOrigin { kind: BORROW_ORIGIN.stack }
+    }
+    // Inline aggregate: keep walking to the storage that holds it.
+    return value_borrow_origin(on)
+}
+
+// Storage reached through a fat borrow: an owned borrow proves an owner, a
+// stack borrow carries whatever owner word it was given.
+fn borrow_origin_of_fat(fat: Value) BorrowOrigin {
+    let kind = fat.rett.get_non_nullable().is_owned_borrow() ? BORROW_ORIGIN.managed : BORROW_ORIGIN.borrowed
+    return BorrowOrigin { kind: kind, owner: value_owned_borrow_owner(fat) }
+}
+
+// The source of a `part` extraction that narrowed a fat borrow, if any.
+fn value_narrowed_owned_borrow_source(value: Value) ?Value {
+    if value.type != VAL.multi || value.get_name() != "part" : return null
+    let source = value.value1
+    if !isset(source) : return null
+    if !source.rett.get_non_nullable().is_fat_borrow() : return null
+    return source
+}
+
+fn type_gc_owner(b: Build) Type !Error {
+    return (type_from_valk_namespace(b, "gc", "GcPtr") !>).nullable()
+}
+
+// `owner` field of a fat borrow, as a nullable GC pointer.
+fn value_owned_borrow_owner(value: Value) Value {
+    let owner_t = type_gc_owner(value.rett.build) ! return vgen_null(type_ptr(value.rett.build))
+    return vgen_multi_part(value, 0, owner_t)
+}
+
+// `adr` field of a fat borrow, as the internal one-word address.
+fn value_owned_borrow_address(value: Value) Value {
+    let t = value.rett.get_non_nullable()
+    let sub = t.get_sub_type()
+    let single = t.kind == TYPE.ref_of || t.kind == TYPE.stack_of
+    let adr_t = isset(sub) ? sub.adr_ref(single ? t.length : 1) : type_ptr(value.rett.build)
+    return vgen_multi_part(value, 1, adr_t)
+}
+
+// `length` field of an `&[T]` borrow.
+fn value_owned_borrow_length(value: Value, ctx: Context) Value !Error {
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    return vgen_multi_part(value, 2, uint_t)
+}
+
+// The owner word for an origin: a managed owner as a GC pointer, the carried
+// word of a stack borrow, or null for frame, permanent, and raw storage.
+fn value_borrow_owner_word(origin: BorrowOrigin, ctx: Context, at: Exp) Value !Error {
+    let owner_t = type_gc_owner(ctx.build) !>
+    let owner = origin.owner
+    if isset(owner) && (origin.kind == BORROW_ORIGIN.managed || origin.kind == BORROW_ORIGIN.borrowed) {
+        let word = vgen_cast(owner, owner_t)
+        word.exp = at
+        return word
+    }
+    let none = vgen_null(owner_t)
+    none.exp = at
+    return none
+}
+
+// The owner word to store through, or null when the storage is unowned.
+fn borrow_origin_store_owner(origin: BorrowOrigin, ctx: Context, at: Exp) ?Value !Error {
+    if origin.kind != BORROW_ORIGIN.managed && origin.kind != BORROW_ORIGIN.borrowed : return null
+    if !isset(origin.owner) : return null
+    return value_borrow_owner_word(origin, ctx, at) !>
+}
+
+// Build a fat borrow of assignable `storage` whose origin is already known.
+fn value_make_owned_borrow(storage: Value, origin: BorrowOrigin, rett: Type, ctx: Context, at: Exp) Value !Error {
+    let owner = value_borrow_owner_word(origin, ctx, at) !>
+    let address = vgen_ptr_of(storage, type_ptr(ctx.build), at)
+    // The owner word is a child of the borrow, so the owner loses its
+    // uniqueness only when the borrow escapes: stored, returned, captured, or
+    // handed to a parameter that keeps it. A borrow that only lives through a
+    // call leaves the owner publishable.
+    return vgen_multi(Array[Value]{ owner, address }, rett, at)
+}
+
+// A fat borrow of frame storage: the storage is stabilized first.
+fn value_make_frame_borrow(storage: Value, rett: Type, ctx: Context, at: Exp) Value !Error {
+    let prepared = value_prepare_borrow_storage(storage, ctx)
+    if !isset(prepared) : at.error("Cannot borrow from relocatable or unrooted storage")
+    return value_make_owned_borrow(prepared, BorrowOrigin { kind: BORROW_ORIGIN.stack }, rett, ctx, at) !>
+}
+
+// Build `&[T]` from an owner word, an element address, and a length.
+fn value_make_ref_slice(owner: Value, address: Value, length: Value, rett: Type, at: Exp) Value {
+    let ptr_t = type_ptr(rett.build)
+    let adr = address.rett.is_raw_pointer() ? address : vgen_cast(address, ptr_t)
+    return vgen_multi(Array[Value]{ owner, adr, length }, rett, at)
+}
+
+// Keep a temporary fat borrow rooted while pieces of it are used.
+fn value_root_owned_borrow(value: Value, ctx: Context) Value {
+    if value.type == VAL.decl || value.type == VAL.global : return value
+    if value.type == VAL.prop {
+        let on = value.value1
+        if isset(on) && (on.type == VAL.decl || on.type == VAL.global) : return value
+    }
+    let func = ctx.func
+    if !isset(func) : return value
+    let decl = Decl.new(func, value.rett, false, null)
+    decl.is_mut = true
+    func.all_decls.append(decl)
+    let rooted = vgen_decl(decl)
+    rooted.exp = value.exp
+    rooted.set_pre_value(vgen_assign(vgen_decl(decl), value, ASSIGN_OP.set, ctx.build, value.exp, ctx))
+    return rooted
+}
+
+// Fat borrow -> its one-word address. The owner stays alive through the
+// storage the borrow was read from, or through a frame root when the borrow
+// was a temporary.
+fn value_narrow_owned_borrow(value: Value, ctx: Context) Value {
+    let nn = value.rett.get_non_nullable()
+    if nn.kind != TYPE.ref_of && nn.kind != TYPE.stack_of : return value
+    let rooted = value_root_owned_borrow(value, ctx)
+    let address = value_owned_borrow_address(rooted)
+    address.exp = value.exp
+    if value.rett.is_nullable_type() {
+        address.rett = address.rett.nullable()
+    }
+    return address
+}
+
+// Values that read through a borrow work on its address.
+fn value_through_borrow(value: Value, ctx: Context) Value {
+    return value_narrow_owned_borrow(value, ctx)
+}
+
+fn borrow_stack_to_owned_message(target: Type) String {
+    let sub = target.get_non_nullable().get_sub_type()
+    let stack_name = isset(sub) ? "stack " + sub.compat_display_name() : "a stack borrow"
+    return "Incompatible types: Cannot convert a stack borrow to '" + target.compat_display_name()
+        + "': the storage may only be kept alive by this frame and has no owner to name. Borrow from a class property or a global, or use '" + stack_name + "'"
+}
+
+// `&storage`: a stack borrow for frame storage or storage reached through
+// another stack borrow, an owned borrow otherwise.
+fn value_borrow_of(operand: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let origin = value_borrow_origin(operand)
+    value_clear_borrowed_local_facts(operand, scope)
+    if origin.kind == BORROW_ORIGIN.stack {
+        return value_make_frame_borrow(operand, operand.rett.stack_ref(), ctx, at) !>
+    }
+    if origin.kind == BORROW_ORIGIN.borrowed {
+        return value_make_owned_borrow(operand, origin, operand.rett.stack_ref(), ctx, at) !>
+    }
+    if origin.kind == BORROW_ORIGIN.raw {
+        require_unsafe(at, scope, "Borrowing through a raw pointer") !>
+    }
+    return value_make_owned_borrow(operand, origin, operand.rett.reference(), ctx, at) !>
+}
+
+// Implicit `let x: &T = storage`, `let x: stack T = storage`, and argument
+// passing of inline storage. `target` is the borrow type to produce.
+fn value_owned_borrow_from_storage(value: Value, target: Type, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
+    let origin = value_borrow_origin(value)
+    let target_nn = target.get_non_nullable()
+    if target_nn.is_owned_borrow() {
+        if origin.kind == BORROW_ORIGIN.stack || origin.kind == BORROW_ORIGIN.borrowed {
+            at.error(borrow_stack_to_owned_message(target))
+        }
+        if origin.kind == BORROW_ORIGIN.raw {
+            require_unsafe(at, scope, "Borrowing through a raw pointer") !>
+        }
+    }
+    value_clear_borrowed_local_facts(value, scope)
+    if origin.kind == BORROW_ORIGIN.stack {
+        return value_make_frame_borrow(value, target_nn, ctx, at) !>
+    }
+    return value_make_owned_borrow(value, origin, target_nn, ctx, at) !>
+}
+
+// A struct method receiver: `this` is `stack T`. Inline storage is borrowed
+// with its owner, an existing borrow is retyped, and a raw pointer or struct
+// object gets a null owner. Never fails; an unconvertible receiver is left
+// for the call check to report.
+fn value_struct_receiver(receiver: Value, this_type: Type, ctx: Context) Value {
+    let this_nn = this_type.get_non_nullable()
+    if this_nn.kind != TYPE.stack_of : return receiver
+    let source = receiver.rett.get_non_nullable()
+    let at = receiver.exp
+    if source.kind == TYPE.stack_of : return receiver
+    if !isset(at) : return receiver
+    if source.kind == TYPE.ref_of {
+        let retyped = vgen_cast(receiver, this_nn)
+        retyped.exp = at
+        return retyped
+    }
+    let owner_t = type_gc_owner(ctx.build) ! return receiver
+    if source.kind == TYPE.adr_of || source.kind == TYPE.ptr_of || source.is_raw_pointer() || source.is_struct_object() {
+        let owner = vgen_null(owner_t)
+        let address = vgen_cast(receiver, type_ptr(ctx.build))
+        return vgen_multi(Array[Value]{ owner, address }, this_nn, at)
+    }
+    if !receiver.rett.is_inline_type() : return receiver
+    if !receiver.assignable() && receiver.type != VAL.array_init && receiver.type != VAL.class_init : return receiver
+    let origin = value_borrow_origin(receiver)
+    if origin.kind == BORROW_ORIGIN.stack {
+        return value_make_frame_borrow(receiver, this_nn, ctx, at) ! return receiver
+    }
+    return value_make_owned_borrow(receiver, origin, this_nn, ctx, at) ! return receiver
+}
+
+// `value.@cast(&T)`, `value.@cast(stack T)`, and `borrow.@cast(ptr)`.
+fn value_cast_borrow(on: Value, target: Type, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
+    let source = on.rett.get_non_nullable()
+    let target_nn = target.get_non_nullable()
+    let keep_nullable = on.rett.is_nullable_type() || target.is_nullable_type()
+    let rett = keep_nullable ? target_nn.nullable() : target_nn
+    // `null.@cast(&T)` is the zero borrow: no owner, no address.
+    if target_nn.is_fat_borrow() && on.type == VAL.null {
+        return vgen_null(target)
+    }
+    if target_nn.kind == TYPE.ref_of || target_nn.kind == TYPE.stack_of {
+        if source.kind == TYPE.ref_of || source.kind == TYPE.stack_of {
+            if target_nn.kind == TYPE.ref_of && source.kind == TYPE.stack_of {
+                at.error(borrow_stack_to_owned_message(target))
+            }
+            // Retype the address, keep the owner.
+            let rooted = value_root_owned_borrow(on, ctx)
+            let owner = value_owned_borrow_owner(rooted)
+            let address = vgen_cast(value_owned_borrow_address(rooted), type_ptr(ctx.build))
+            return vgen_multi(Array[Value]{ owner, address }, rett, at)
+        }
+        if source.is_pointer() || source.is_raw_pointer() {
+            if target_nn.kind == TYPE.ref_of {
+                require_unsafe(at, scope, "Casting a raw pointer to an owned borrow") !>
+            }
+            let owner = vgen_null(type_gc_owner(ctx.build) !>)
+            let address = vgen_cast(on, type_ptr(ctx.build))
+            return vgen_multi(Array[Value]{ owner, address }, rett, at)
+        }
+        return null
+    }
+    if target_nn.kind == TYPE.ref_slice {
+        if source.kind == TYPE.ref_slice {
+            let rooted = value_root_owned_borrow(on, ctx)
+            let owner = value_owned_borrow_owner(rooted)
+            let address = vgen_cast(value_owned_borrow_address(rooted), type_ptr(ctx.build))
+            let length = value_owned_borrow_length(rooted, ctx) !>
+            return vgen_multi(Array[Value]{ owner, address, length }, rett, at)
+        }
+        return null
+    }
+    if source.is_fat_borrow() && type_is_raw_address(target_nn) {
+        let rooted = value_root_owned_borrow(on, ctx)
+        let address = value_owned_borrow_address(rooted)
+        return vgen_cast(address, target)
+    }
+    return null
+}
+
+// `ptr`, `*T`, `*Struct`, or the internal address form: one-word pointers.
+fn type_is_raw_address(t: Type) bool {
+    return t.is_raw_pointer() || t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.is_struct_object()
+}
+
+////////////////////////////
+// Conversions
+////////////////////////////
+
+fn value_borrow_compare_operand(value: Value, ctx: Context) Value {
+    let nn = value.rett.get_non_nullable()
+    if nn.kind == TYPE.ref_of || nn.kind == TYPE.stack_of : return value_narrow_owned_borrow(value, ctx)
+    // A named slice compares through its class (`String.$eq`); the anonymous
+    // `&[T]` compares by address.
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) {
+        let address = value_owned_borrow_address(value_root_owned_borrow(value, ctx))
+        address.rett = type_ptr(ctx.build)
+        return address
+    }
+    return value
+}
+
+// Conversions that involve a fat borrow on either side. Returns null when no
+// conversion applies, so the caller can report the type mismatch.
+fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type, allow_inline_borrow: bool) ?Value !Error {
+    let source = result.rett
+    let source_nn = source.get_non_nullable()
+    let target_nn = target.get_non_nullable()
+    let at = result.exp
+    if !isset(at) : return null
+    let source_single = source_nn.kind == TYPE.ref_of || source_nn.kind == TYPE.stack_of
+    let target_single = target_nn.kind == TYPE.ref_of || target_nn.kind == TYPE.stack_of
+
+    // Fat borrow -> internal address (`@ptrv`, `@memcpy`)
+    if source_single && target_nn.kind == TYPE.adr_of {
+        if !target_nn.compat_pointer(source_nn) : return null
+        if source.is_nullable_type() && !target.is_nullable_type() : return null
+        let narrowed = value_narrow_owned_borrow(result, ctx)
+        narrowed.rett = source.is_nullable_type() ? target_nn.nullable() : target_nn
+        return narrowed
+    }
+
+    // &T -> stack T: same layout, the escape rule is what changes
+    if source_nn.kind == TYPE.ref_of && target_nn.kind == TYPE.stack_of {
+        if !target_nn.compat_pointer(source_nn) : return null
+        if source.is_nullable_type() && !target.is_nullable_type() : return null
+        let retyped = vgen_cast(result, source.is_nullable_type() ? target_nn.nullable() : target_nn)
+        retyped.exp = at
+        return retyped
+    }
+
+    // `Slice[T]` / `String` <-> `&[T]`: one layout, so the value is retyped
+    // in place once plain compatibility accepts it.
+    if source_nn.kind == TYPE.ref_slice && target_nn.kind == TYPE.ref_slice {
+        if source_nn.class == target_nn.class : return null
+        if !target_nn.compat_ref_slice(source_nn) : return null
+        if source.is_nullable_type() && !target.is_nullable_type() : return null
+        let view = vgen_cast(result, source.is_nullable_type() ? target_nn.nullable() : target_nn)
+        view.exp = at
+        return view
+    }
+
+    // Same kind: plain compatibility decides
+    if source_nn.kind == target_nn.kind && source_nn.is_fat_borrow() : return null
+
+    // &[T x N] -> &[T]
+    if source_nn.kind == TYPE.ref_of && target_nn.kind == TYPE.ref_slice {
+        let element = target_nn.get_sub_type()
+        let own = source_nn.get_sub_type()
+        if !isset(element) || !isset(own) : return null
+        let source_element = own.is_fixed_array_type() ? own.get_sub_type() : own
+        if !isset(source_element) || !element.compat(source_element) : return null
+        let count = own.is_fixed_array_type() ? own.length : source_nn.length
+        let rooted = value_root_owned_borrow(result, ctx)
+        let uint_t = type_from_core(ctx.build, "uint") !>
+        return value_make_ref_slice(
+            value_owned_borrow_owner(rooted),
+            value_owned_borrow_address(rooted),
+            vgen_int(count.to(int), uint_t),
+            target_nn,
+            at
+        )
+    }
+
+    // stack T -> &T / &[T]: no owner to name
+    if (source_nn.kind == TYPE.stack_of || source_nn.kind == TYPE.adr_of) && target_nn.is_owned_borrow() {
+        at.error(borrow_stack_to_owned_message(target))
+    }
+
+    // raw pointer -> &T: explicit only
+    if (source_nn.is_raw_pointer() || source_nn.kind == TYPE.ptr_of || source_nn.is_struct_object()) && target_nn.is_owned_borrow() {
+        at.error("Incompatible types: Cannot convert a raw pointer to an owned borrow implicitly; use '.@cast(" + target.compat_display_name() + ")' for an unsafe conversion")
+    }
+
+    // Fat borrow -> raw pointer
+    if source_nn.is_fat_borrow() && !source.is_nullable_type()
+        && (target_nn.is_raw_pointer() || target_nn.kind == TYPE.ptr_of || target_nn.is_struct_object())
+    {
+        let rooted = value_root_owned_borrow(result, ctx)
+        let address = value_owned_borrow_address(rooted)
+        if target_nn.is_struct_object() {
+            let own = source_nn.get_sub_type()
+            if !isset(own) || !(target_nn.inline() !>).compat(own) : return null
+        }
+        if target_nn.kind == TYPE.ptr_of {
+            let pointed = target_nn.get_sub_type()
+            let own = source_nn.get_sub_type()
+            if !isset(pointed) || !isset(own) || !pointed.compat(own) : return null
+            // A bounded raw pointer takes exactly its own length; `*[T]` takes any.
+            if source_single && target_nn.length > 0 && target_nn.length != source_nn.length : return null
+            if source_nn.kind == TYPE.ref_slice && target_nn.length > 0 : return null
+        }
+        // A raw pointer taken from a stack borrow keeps the frame rules: it
+        // may be passed on, but not stored or returned. An owned borrow's
+        // address is under the raw-pointer rules only.
+        let raw = vgen_cast(address, target)
+        raw.exp = at
+        if source_nn.kind == TYPE.stack_of : raw.mark_implicit_borrow()
+        return raw
+    }
+
+    // Copy a fixed inline sequence out of a borrow
+    if source_single && target.is_fixed_array_type() && !source.is_nullable_type() {
+        let target_sub = target.get_sub_type()
+        let own = source_nn.get_sub_type()
+        if !isset(target_sub) || !isset(own) : return null
+        let source_sub = own.is_fixed_array_type() ? own.get_sub_type() : own
+        let source_size = own.is_fixed_array_type() ? own.length : source_nn.length
+        if !isset(source_sub) || source_size == 0 || target.length > source_size || !target_sub.compat(source_sub) : return null
+        let address = value_narrow_owned_borrow(result, ctx)
+        let copied = vgen_load(address, target, at)
+        return copied
+    }
+
+    if !target_nn.is_fat_borrow() : return null
+
+    // Bare `ptr` -> stack T, and a raw pointer receiver of a struct method
+    if target_nn.kind == TYPE.stack_of && !source.is_nullable_type() {
+        let raw_source = source_nn.is_raw_pointer()
+        let receiver_source = (source_nn.kind == TYPE.ptr_of || source_nn.is_struct_object())
+            && value_is_method_receiver(result, scope)
+            && (method_receiver_borrow_compatible(source_nn, target_nn) !>)
+        if raw_source || receiver_source {
+            let owner = vgen_null(type_gc_owner(ctx.build) !>)
+            let address = vgen_cast(result, type_ptr(ctx.build))
+            let borrowed = vgen_multi(Array[Value]{ owner, address }, target.is_nullable_type() ? target_nn.nullable() : target_nn, at)
+            return borrowed
+        }
+    }
+
+    // Inline storage -> stack T / &T / &[T]
+    if !allow_inline_borrow : return null
+    if !result.rett.is_inline_type() || result.rett.is_number_type() || result.rett.kind == TYPE.closure : return null
+    if !result.assignable() && result.type != VAL.array_init && result.type != VAL.class_init : return null
+
+    if target_single {
+        if !inline_pointer_compat(result.rett, target_nn) : return null
+        return value_owned_borrow_from_storage(result, target, scope, ctx, at) !>
+    }
+    if target_nn.kind == TYPE.ref_slice && result.rett.is_fixed_array_type() {
+        let element = target_nn.get_sub_type()
+        let own = result.rett.get_sub_type()
+        if !isset(element) || !isset(own) || !element.compat(own) : return null
+        let borrowed = value_owned_borrow_from_storage(result, result.rett.reference(), scope, ctx, at) !>
+        if !isset(borrowed) : return null
+        let rooted = value_root_owned_borrow(borrowed, ctx)
+        let uint_t = type_from_core(ctx.build, "uint") !>
+        return value_make_ref_slice(
+            value_owned_borrow_owner(rooted),
+            value_owned_borrow_address(rooted),
+            vgen_int(result.rett.length.to(int), uint_t),
+            target_nn,
+            at
+        )
+    }
+    return null
+}
+
+////////////////////////////
+// &[T] element access
+////////////////////////////
+
+// A call to `core.panic(message)`; native sequence access uses it for an
+// index or range that is out of bounds at runtime.
+fn value_panic_call(ctx: Context, message: String, at: Exp) Value !Error {
+    let panic = value_get_valk_func(ctx.build, "core", "panic", at) !>
+    if !panic.parsed_types : parse_func_types(panic) !>
+    let origin = message_resolve(at.src, at.i)
+    let path = origin.src.path
+    if isset(path) {
+        let line = message_line_col(origin.src.content, origin.i).line
+        message = message + " at " + path + ":" + line
+    }
+    let call = vgen_call(
+        ctx,
+        vgen_func(panic),
+        Array[Value]{ vgen_string(message, type_string(ctx.build)) },
+        panic.get_rett()
+    )
+    call.exp = at
+    return call
+}
+
+fn value_ref_slice_checked_index(on: Value, index: Value, ctx: Context, at: Exp) Value !Error {
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let func = ctx.get_func() !>
+    let checked = vgen_scratch_value(func, uint_t, at)
+    let decl = checked.decl ?! at.bug("Bounds-check index has no scratch declaration")
+    let length = value_owned_borrow_length(on, ctx) !>
+    let past_end = vgen_op(vgen_decl(decl), length, VALUE_OP.gte, type_bool(ctx.build))
+    past_end.exp = at
+    let panic_call = value_panic_call(ctx, "Index out of bounds", at) !>
+    let result = vgen_decl(decl)
+    result.set_pre_value(vgen_block(Array[Value]{
+        vgen_assign(checked, vgen_cast(index, uint_t), ASSIGN_OP.set, ctx.build, at)
+        vgen_if(past_end, Array[Value]{ panic_call }, null, ctx.build, at)
+    }, ctx.build, at))
+    return result
+}
+
+fn value_ref_slice_element(on: Value, index: Value, ctx: Context, at: Exp) Value !Error {
+    let element = on.rett.get_non_nullable().get_sub_type() ?! at.bug("Slice borrow has no element type")
+    let data = vgen_cast(value_owned_borrow_address(on), type_ptr(ctx.build))
+    return vgen_ptrv(data, index, element, at)
+}
+
+fn value_from_ref_slice_offset(on: Value, access: Exp, scope: Scope, ctx: Context, exp: Exp) Value !Error {
+    let b = ctx.build
+    if on.rett.is_nullable_type() {
+        exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    }
+    let uint_t = type_from_core(b, "uint") !>
+    let rooted = value_root_owned_borrow(on, ctx)
+    let t = on.rett.get_non_nullable()
+    let element = t.get_sub_type() ?! exp.bug("Slice borrow has no element type")
+
+    if access.kind == VALUE_KIND.bracket_range {
+        let start_exp = access.get(VALUE_EXP.left)
+        let length_exp = access.get(VALUE_EXP.right)
+        if !isset(start_exp) || !isset(length_exp) : access.bug("Bracket range is missing an argument")
+        let start = value_from_exp(start_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        let length = value_from_exp(length_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        start = value_try_convert(start, scope, ctx, uint_t) !>
+        length = value_try_convert(length, scope, ctx, uint_t) !>
+        uint_t.compat_check(start.rett, start_exp) !>
+        uint_t.compat_check(length.rett, length_exp) !>
+
+        let func = ctx.get_func() !>
+        let start_slot = vgen_scratch_value(func, uint_t, exp)
+        let length_slot = vgen_scratch_value(func, uint_t, exp)
+        let start_decl = start_slot.decl ?! exp.bug("Range bounds have no scratch declarations")
+        let length_decl = length_slot.decl ?! exp.bug("Range bounds have no scratch declarations")
+        let total = value_owned_borrow_length(rooted, ctx) !>
+        let start_past = vgen_op(vgen_decl(start_decl), total, VALUE_OP.gt, type_bool(b))
+        let remaining = vgen_op(total, vgen_decl(start_decl), VALUE_OP.sub, uint_t)
+        let length_past = vgen_op(vgen_decl(length_decl), remaining, VALUE_OP.gt, type_bool(b))
+        let invalid = vgen_op(start_past, length_past, VALUE_OP.or, type_bool(b))
+        let panic_call = value_panic_call(ctx, "Range out of bounds", exp) !>
+
+        let element_size = element.byte_size() !>
+        let byte_offset = vgen_decl(start_decl)
+        if element_size != 1 {
+            byte_offset = vgen_op(byte_offset, vgen_int(element_size.to(int), uint_t), VALUE_OP.mul, uint_t)
+        }
+        let data = vgen_cast(value_owned_borrow_address(rooted), type_ptr(b))
+        let address = vgen_ptr_offset(data, byte_offset, exp)
+        let view = value_make_ref_slice(value_owned_borrow_owner(rooted), address, vgen_decl(length_decl), t, exp)
+        let body = Array[Value]{
+            vgen_assign(start_slot, start, ASSIGN_OP.set, b, exp)
+            vgen_assign(length_slot, length, ASSIGN_OP.set, b, exp)
+            vgen_if(invalid, Array[Value]{ panic_call }, null, b, exp)
+        }
+        return vgen_scoped_value(body, view, exp)
+    }
+
+    let item = value_ref_slice_index_slot(rooted, access, scope, ctx, exp) !>
+    return value_sequence_element_read(item, scope, ctx, exp) !>
+}
+
+// The bounds-checked element slot for `view[index]`.
+fn value_ref_slice_index_slot(rooted: Value, access: Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let index = value_from_exp(access, scope, ctx.with_suggested_type(uint_t)) !>
+    if !index.rett.is_integer_type() {
+        access.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
+    }
+    let checked = value_ref_slice_checked_index(rooted, index, ctx, at) !>
+    return value_ref_slice_element(rooted, checked, ctx, at) !>
+}
+
+// A non-nullable reference read out of sequence storage must be present.
+fn value_check_present_element(read: Value, ctx: Context, at: Exp) Value !Error {
+    let t = read.rett
+    if t.is_nullable_type() || !t.is_gc_type() : return read
+    let b = ctx.build
+    let func = ctx.get_func() !>
+    let slot = vgen_scratch_value(func, t.nullable(), at)
+    let decl = slot.decl ?! at.bug("Element check has no scratch declaration")
+    let missing = vgen_unary(vgen_isset_val(vgen_decl(decl), type_bool(b)), VALUE_OP.not, type_bool(b))
+    missing.exp = at
+    let panic_call = value_panic_call(ctx, "Empty element: the storage holds no value at this index", at) !>
+    let result = vgen_decl(decl)
+    result.rett = t
+    result.exp = at
+    result.set_pre_value(vgen_block(Array[Value]{
+        vgen_assign(slot, read, ASSIGN_OP.set, b, at)
+        vgen_if(missing, Array[Value]{ panic_call }, null, b, at)
+    }, b, at))
+    return result
+}
+
+// `&[T]` over an array's storage block: the block does not move, so it is a
+// valid owner even after the array grows.
+fn value_array_view(on: Value, ctx: Context, at: Exp) Value !Error {
+    let class = on.rett.get_non_nullable().get_class_or_null() ?! at.bug("Array has no class")
+    let element = class.slice_type ?! at.bug("Array has no element type")
+    let data = class.get_prop_by_name("data") ! at.bug("Array has no data property")
+    let length = class.get_prop_by_name("length") ! at.bug("Array has no length property")
+    let owner = vgen_prop(data, on, ctx)
+    owner.exp = at
+    let address = value_native_sequence_data(on, on.rett, ctx, at) !>
+    let count = vgen_prop(length, on, ctx)
+    count.exp = at
+    return value_make_ref_slice(owner, address, count, element.ref_slice(), at)
+}
+
+// `&on[i]` / `&on[a..b]` where `on` is an array, a named slice, or `&[T]`
+// without an indexing hook. Returns null when the normal path applies.
+fn value_borrow_sequence_element(on: Value, offset_exp: Exp, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
+    if on.rett.is_nullable_type() : return null
+    let body = offset_exp.get(VALUE_EXP.right) ?! return null
+    if body.type != EXP.body : return null
+    let on_t = on.rett.get_non_nullable()
+    if on_t.kind != TYPE.ref_slice && on_t.kind != TYPE.array : return null
+    let access = parse_offset_access(body) !>
+    let is_range = access.kind == VALUE_KIND.bracket_range
+    let class = on_t.class
+    if isset(class) {
+        let hook = is_range ? class.get_range_hook() : resolve_offset_get_func(class)
+        if isset(hook) : return null
+    }
+    value_check_shared_address(on, at) !>
+    let element = on_t.get_sub_type() ?! at.bug("Sequence has no element type")
+    // A temporary sequence is evaluated once. The owner word of the result is
+    // taken from the sequence itself, not from the rooting copy, so the
+    // borrow keeps naming the array or slice it came from for the escape and
+    // uniqueness rules.
+    let base = value_root_owned_borrow(on, ctx)
+    let view = on_t.kind == TYPE.array ? (value_array_view(base, ctx, at) !>) : base
+    let rooted = value_root_owned_borrow(view, ctx)
+    if is_range {
+        let part = value_from_ref_slice_offset(rooted, access, scope, ctx, at) !>
+        let retyped = vgen_cast(part, element.ref_slice())
+        retyped.exp = at
+        return retyped
+    }
+    let item = value_ref_slice_index_slot(rooted, access, scope, ctx, at) !>
+    let origin = BorrowOrigin { kind: BORROW_ORIGIN.managed, owner: value_owned_borrow_owner(view) }
+    return value_make_owned_borrow(item, origin, element.reference(), ctx, at) !>
+}
+
+fn value_from_ref_slice_offset_assign(on: Value, access: Exp, right_exp: Exp, scope: Scope, ctx: Context, left_exp: Exp, at: Exp) Value !Error {
+    let b = ctx.build
+    if on.rett.is_nullable_type() {
+        left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    }
+    let uint_t = type_from_core(b, "uint") !>
+    let rooted = value_root_owned_borrow(on, ctx)
+    let t = on.rett.get_non_nullable()
+    let element = t.get_sub_type() ?! left_exp.bug("Slice borrow has no element type")
+    let index = value_from_exp(access, scope, ctx.with_suggested_type(uint_t)) !>
+    if !index.rett.is_integer_type() {
+        access.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
+    }
+    let checked = value_ref_slice_checked_index(rooted, index, ctx, left_exp) !>
+    let item = value_ref_slice_element(rooted, checked, ctx, left_exp) !>
+    let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
+    right = value_try_convert(right, scope, ctx, element) !>
+    element.compat_check(right.rett, right_exp) !>
+    return value_borrow_store(rooted, item, right, scope, ctx, at) !>
+}
+
+// Store through an owned borrow. Managed element types keep the owner's
+// ownership bookkeeping when there is an owner; ownerless storage is plain.
+fn value_borrow_store(borrow: Value, slot: Value, value: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    return value_owner_store(value_owned_borrow_owner(borrow), slot, value, scope, ctx, at) !>
+}
+
+// Store `value` into `slot`, which lives inside the allocation named by
+// `owner_word` (a nullable GC pointer). With an owner the store runs the
+// collector's ownership bookkeeping; a null owner means unowned storage and
+// gets a plain store.
+// `replace` runs the release walk over what the slot held: false for a slot
+// that is fresh or whose bytes were only copied, as an init must never
+// release an element the copy still holds.
+fn value_owner_store(owner_word: Value, slot: Value, value: Value, scope: Scope, ctx: Context, at: Exp, replace: bool (true)) Value !Error {
+    let b = ctx.build
+    if !slot.rett.has_gc_refs() : return vgen_assign(slot, value, ASSIGN_OP.set, b, at, ctx)
+    let func = ctx.get_func() !>
+    if value.needs_buffer() && !func.no_buffers : value = buffer_value(ctx, func, value)
+    let type = slot.rett
+    // One store; only the collector's bookkeeping around it depends on an
+    // owner being present.
+    let body = Array[Value]{}
+    let target = gc_bind_pointer(ctx, at, vgen_ptr_of(slot, type_ptr(b), at), body) !>
+    let staged = vgen_scratch_value(func, type, at)
+    body.append(vgen_assign(staged, value, ASSIGN_OP.set, b, at))
+    if replace {
+        let release_owner = vgen_isset_val(owner_word, type_bool(b))
+        release_owner.exp = at
+        let released = gc_walk(ctx, scope, at, GC_WALK.remove, target, type, owner_word) !>
+        body.append(vgen_if(release_owner, released, null, b, at))
+    }
+    body.append(vgen_assign(vgen_ptrv(target, vgen_int(0, type_i64(b)), type, at), staged, ASSIGN_OP.set, b, at))
+    let own_owner = vgen_isset_val(owner_word, type_bool(b))
+    own_owner.exp = at
+    let owned = gc_walk(ctx, scope, at, GC_WALK.set, target, type, owner_word) !>
+    body.append(vgen_if(own_owner, owned, null, b, at))
+    return vgen_block(body, b, at)
+}
+
+// `storage.prop = value` where `storage` is not itself a GC object but lives
+// inside one: an inline struct property, or anything reached through a
+// borrow. Returns null when the storage is frame-local.
+fn value_store_into_owned_property(left: Value, right: Value, op: ASSIGN_OP, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
+    let origin = value_borrow_origin(left)
+    let owner_word = borrow_origin_store_owner(origin, ctx, at) !>
+    if !isset(owner_word) : return null
+    if op != ASSIGN_OP.set {
+        at.error("Compound assignment is not valid for a property holding managed references")
+    }
+    return value_owner_store(owner_word, left, right, scope, ctx, at) !>
+}
+
+// `sequence[index] = value` for a fixed array or stack borrow whose element
+// holds managed references and whose storage lives inside a GC object: the
+// store must update the owner's bookkeeping, like a property store does.
+// Returns null when the storage is frame-local so the plain path applies.
+fn value_from_managed_element_assign(on: Value, on_t: Type, access: Exp, right_exp: Exp, scope: Scope, ctx: Context, left_exp: Exp, at: Exp) ?Value !Error {
+    let element = on_t.get_sub_type() ?! return null
+    if !element.has_gc_refs() : return null
+    let origin = on_t.is_fixed_array_type() ? value_borrow_origin(on) : value_borrow_origin_through(on)
+
+    let index = value_from_exp(access, scope, ctx.without_suggested_type()) !>
+    if !index.rett.is_integer_type() {
+        access.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
+    }
+    if on_t.length > 0 : index = value_check_known_length_index(index, on_t, on_t.length, ctx, left_exp) !>
+    let slot = vgen_ptrv(on, index, element, left_exp)
+    act_check_assign(slot, left_exp) !>
+    value_check_shared_store(slot, at) !>
+    let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
+    right = value_try_convert(right, scope, ctx, element) !>
+    element.compat_check(right.rett, right_exp) !>
+    let b = ctx.build
+    // Frame-local storage: a plain store, nothing owns the slot.
+    let owner_word = borrow_origin_store_owner(origin, ctx, at) !>
+    if !isset(owner_word) : return vgen_assign(slot, right, ASSIGN_OP.set, b, at, ctx)
+    return value_owner_store(owner_word, slot, right, scope, ctx, at) !>
+}
+
+// A raw pointer that was taken from a borrow's address; a raw pointer
+// parameter accepts it the way it accepts the borrow itself.
+fn value_is_borrow_address(value: Value) bool {
+    if value.type != VAL.cast : return false
+    let inner = value.value1 ?! return false
+    return inner.rett.get_non_nullable().kind == TYPE.adr_of
+}
