@@ -496,6 +496,21 @@ case "$out" in
         ;;
 esac
 
+# Saving a file in one package must not lose the diagnostics of another open package:
+# its build is skipped and the previous result republished
+count=$((count + 1))
+echo "> diagnostics of an unchanged package survive a save elsewhere"
+stream="$(frame "$init")$(frame "$(notify_open diag.valk)")$(frame "$(notify_open_path "$workdir/loose-one.valk")")"
+later="$(frame "$(printf '{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file://%s"}}}' "$workdir/loose-one.valk")")"
+# The pause makes the save its own diagnostics pass instead of joining the opens
+out=$({ printf '%s' "$stream"; sleep 1; printf '%s' "$later"; } | $TIMEOUT "$VALK" lsp run 2>&1)
+hits=$(printf '%s' "$out" | grep -o 'Unknown identifier: nope_xyz' | wc -l | tr -d ' ')
+if [ "$hits" != "2" ]; then
+    echo "# Expected the cached diagnostics of diag.valk in both passes, got $hits"
+    echo "$out" | head -c 2000
+    failed=1
+fi
+
 # A buffer whose file was deleted stays open in the editor; it must neither log an error
 # nor keep its old diagnostics
 printf 'fn gone_fn() { missing_gone_xyz }\n' > "$workdir/gone.valk"

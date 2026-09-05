@@ -88,6 +88,8 @@ fn lsp_line_col(content: String, offset: u32) LspLineCol {
 }
 
 class Diagnostic {
+    // Identifies the message across builds, to report it once when several groups see it
+    key: String
     severity: int
     msg: String
     line: u32
@@ -113,6 +115,10 @@ class Lsp {
     // Paths that currently have diagnostics published, so they can be cleared
     has_errors: Array[String] (Array[String]{})
     diagnostics_on_change: bool (false)
+    // Last build result per package dir (or loose file path), see build_diagnostics
+    diagnostic_groups: Map[DiagnosticGroup] (Map[DiagnosticGroup]{})
+    // Buffers edited since the last diagnostics pass
+    changed_files: Map[bool] (Map[bool]{})
     //
     file: String ("")
     line: uint (0)
@@ -392,11 +398,17 @@ class Lsp {
     // DIAGNOSTICS
     // ########################################
 
+    // Open files are built per package (a loose file is a package of its own). Each
+    // group's result is kept, and a group is only rebuilt when a file it loaded changed:
+    // in the editor since the last pass, or on disk. An edit in one package then costs
+    // one build instead of one per open package.
     fn build_diagnostics() {
         let per_path = Map[Array[Diagnostic]]{}
         let no_location = Array[String]{}
         let loaded_files = Map[bool]{}
         let seen_messages = Map[bool]{}
+        let changed = this.changed_files
+        this.changed_files = Map[bool]{}
 
         each this.file_content as _, path : per_path.set(path, Array[Diagnostic]{})
         let saved = this.file
@@ -406,39 +418,52 @@ class Lsp {
             this.log(E.msg)
             return
         }
-        let package_files = Map[Array[String]]{}
-        let loose_files = Array[String]{}
+        let groups = Map[Array[String]]{}
         each this.file_content as _, path {
-            lsp_group_diagnostic_file(classifier, package_files, loose_files, path)
+            lsp_group_diagnostic_file(classifier, groups, path)
         }
         if !saved.is_empty() && !this.file_content.has(saved) {
-            lsp_group_diagnostic_file(classifier, package_files, loose_files, saved)
+            lsp_group_diagnostic_file(classifier, groups, saved)
         }
 
-        let groups = Array[Array[String]]{}
-        each package_files as files, _ : groups.append(files)
-        each loose_files as path {
-            let files = Array[String]{}
-            files.append(path)
-            groups.append(files)
+        each groups as files, key {
+            let group = this.diagnostic_groups.get(key) !? null
+            if !isset(group) || lsp_group_is_stale(group, files, changed) {
+                group = this.collect_diagnostic_build(files)
+                this.diagnostic_groups.set(key, group)
+            }
+            each group.loaded as _, path : loaded_files.set(path, true)
+            each group.no_location as msg : no_location.append(msg, true)
+            each group.per_path as diags, path {
+                let list = per_path.get(path) !? <{
+                    let created = Array[Diagnostic]{}
+                    per_path.set(path, created)
+                    return created
+                }
+                each diags as d {
+                    // The same stdlib error surfaces in every group that loads the file
+                    if seen_messages.has(d.key) : continue
+                    seen_messages.set(d.key, true)
+                    list.append(d)
+                }
+            }
         }
-        each groups as files {
-            this.collect_diagnostic_build(files, per_path, no_location, loaded_files, seen_messages)
+
+        // Forget groups whose files were all closed
+        let closed = Array[String]{}
+        each this.diagnostic_groups as _, key {
+            if !groups.has(key) : closed.append(key)
         }
+        each closed as key : this.diagnostic_groups.remove(key)
 
         this.publish_errors(per_path, no_location, loaded_files)
     }
 
-    fn collect_diagnostic_build(
-        args: Array[String],
-        per_path: Map[Array[Diagnostic]],
-        no_location: Array[String],
-        loaded_files: Map[bool],
-        seen_messages: Map[bool]
-    ) {
+    fn collect_diagnostic_build(args: Array[String]) DiagnosticGroup {
+        let group = DiagnosticGroup{}
         let b = build.Build.init_from_args(args) ! {
-            no_location.append(E.msg, true)
-            return
+            group.no_location.append(E.msg, true)
+            return group
         }
         b.options.lsp = this
         b.run() ! {}
@@ -447,32 +472,32 @@ class Lsp {
                 this.document_symbols.set(path, this.symbols_for(b, path))
             }
         }
-        each b.cache.loaded_files as _, path : loaded_files.set(path, true)
+        each b.cache.loaded_files as _, path {
+            group.loaded.set(path, fs.modified_time(path) !? 0)
+        }
 
         each b.messages as m {
             let src = m.src
             if !isset(src) {
-                no_location.append(m.msg, true)
+                group.no_location.append(m.msg, true)
                 continue
             }
             let at = build.message_resolve(src, m.i)
             let path = at.src.path
             if !isset(path) {
-                no_location.append(m.msg, true)
+                group.no_location.append(m.msg, true)
                 continue
             }
-            let key = path + ":" + at.i + ":" + m.len + ":" + m.type.to(int) + ":" + m.msg
-            if seen_messages.has(key) : continue
-            seen_messages.set(key, true)
             let content = at.src.content
             let start = lsp_line_col(content, at.i)
             let end = lsp_line_col(content, at.i + m.len)
-            let list = per_path.get(path) !? <{
+            let list = group.per_path.get(path) !? <{
                 let created = Array[Diagnostic]{}
-                per_path.set(path, created)
+                group.per_path.set(path, created)
                 return created
             }
             list.append(Diagnostic {
+                key: path + ":" + at.i + ":" + m.len + ":" + m.type.to(int) + ":" + m.msg
                 severity: m.type == build.MSG.error ? lsp_msg_type_error : lsp_msg_type_warn
                 msg: m.msg
                 line: start.line
@@ -481,6 +506,7 @@ class Lsp {
                 end_col: end.col
             })
         }
+        return group
     }
 
     fn publish_errors(
@@ -543,29 +569,46 @@ class Lsp {
     }
 }
 
-fn lsp_group_diagnostic_file(
-    classifier: build.Build,
-    package_files: Map[Array[String]],
-    loose_files: Array[String],
-    path: String
-) {
+// Result of building one diagnostics group, kept between passes
+class DiagnosticGroup {
+    // Every file the build read, with its modification time at that moment
+    loaded: Map[uint] (Map[uint]{})
+    per_path: Map[Array[Diagnostic]] (Map[Array[Diagnostic]]{})
+    no_location: Array[String] (Array[String]{})
+}
+
+fn lsp_group_is_stale(group: DiagnosticGroup, files: Array[String], changed: Map[bool]) bool {
+    // A newly opened file the last build never read
+    each files as path {
+        if !group.loaded.has(path) : return true
+    }
+    // An edited buffer, whether or not it was saved
+    each changed as _, path {
+        if group.loaded.has(path) : return true
+    }
+    // A change on disk outside the editor (git checkout, a generator, ...)
+    each group.loaded as mtime, path {
+        if (fs.modified_time(path) !? 0) != mtime : return true
+    }
+    return false
+}
+
+// Groups open files by the package they belong to, keyed by the package dir. A file
+// outside any package forms a group of its own, keyed by its path.
+fn lsp_group_diagnostic_file(classifier: build.Build, groups: Map[Array[String]], path: String) {
     // A buffer whose file was deleted stays open in the editor. Building it can only
     // fail with a position-less error, so leave it out; its (empty) diagnostics entry
     // is still published, which clears whatever was shown before.
     if !fs.exists(path) : return
+    let key = path
     let pkg = classifier.find_pkg_for_path(path)
-    if !isset(pkg) {
-        loose_files.append(path, true)
-        return
+    if isset(pkg) {
+        let dir = pkg.dir
+        if isset(dir) : key = dir
     }
-    let dir = pkg.dir
-    if !isset(dir) {
-        loose_files.append(path, true)
-        return
-    }
-    let files = package_files.get(dir) !? <{
+    let files = groups.get(key) !? <{
         let created = Array[String]{}
-        package_files.set(dir, created)
+        groups.set(key, created)
         return created
     }
     files.append(path, true)
