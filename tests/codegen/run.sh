@@ -478,6 +478,22 @@ if ! grep -q '^$"valk\.interface\.vtable\..*" = comdat any$' "$interface_win_ir"
     exit 1
 fi
 
+echo "> Failed await skips unpublished result storage"
+await_ir="$workdir/await-error.ll"
+if ! "$VALK" build "$DIR/await-error.valk" --ir --no-warn --target macos-arm64 -o "$await_ir"; then
+    exit 1
+fi
+body=$(sed -n '/^define .*__await_failed_result__/,/^}/p' "$await_ir")
+error_body=$(sed -n '/^await.error\./,/^await.success\./p' <<< "$body")
+success_body=$(sed -n '/^await.success\./,/^await.after\./p' <<< "$body")
+if [[ "$error_body" != *"br label %await.after."* ]] \
+    || [[ "$error_body" == *"load ptr"* ]] \
+    || [[ "$success_body" != *"load ptr"* ]]; then
+    echo "# Await must load managed results only on success"
+    echo "$body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 17"
+echo "# Test count: 18"
 echo ""
