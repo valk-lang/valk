@@ -23,6 +23,7 @@ struct OverlapBase {
     // Reuse only after the owning coroutine loop dequeues the completion.
     in_use: bool
     fd: Fd
+    event_port: ext.HANDLE
 }
 
 // A single overlap type for every operation: a coroutine keeps two of these
@@ -109,18 +110,62 @@ fn associate(fd: Fd) bool {
     return ext.CreateIoCompletionPort(fd, iocp(), 0, 0) != 0
 }
 
+// Shared listeners use per-operation events instead of a fixed socket port.
+fn overlap_event_start(ov: Overlap) ext.HANDLE !IoError {
+    @unsafe
+    let event = ext.CreateEventW(null, 1, 0, null)
+    if event == 0 {
+        ov.base.in_use = false
+        throw .os
+    }
+    ov.base.sys.hEvent = event | 1
+    ov.base.event_port = iocp()
+    let wait: ext.HANDLE = 0
+    if ext.RegisterWaitForSingleObject(@ref(wait), event, overlap_event_ready.@cast(ptr), ov.@cast(ptr), ext.INFINITE, ext.WT_EXECUTEONLYONCE) == 0 {
+        ext.CloseHandle(event)
+        ov.base.sys.hEvent = 0
+        ov.base.in_use = false
+        throw .os
+    }
+    return wait
+}
+
+fn overlap_event_stop(ov: Overlap, wait: ext.HANDLE) {
+    if ext.UnregisterWaitEx(wait, ext.INVALID_HANDLE_VALUE) == 0 : panic("Failed to release I/O event wait")
+    if ext.CloseHandle(ov.base.sys.hEvent & ~1) == 0 {
+        core.cleanup_warning("Failed to close I/O event", __FILE__, __LINE__)
+    }
+    ov.base.sys.hEvent = 0
+    ov.base.in_use = false
+}
+
+// No managed state or runtime calls on the Windows wait thread.
+fn overlap_event_ready(value: ptr, timed_out: u8) $entrance {
+    @unsafe
+    let base = value.@cast(*OverlapBase)
+    if ext.PostQueuedCompletionStatus(base.event_port, base.sys.InternalHigh.to(u32), 0, value) == 0 : ext.exit(1)
+}
+
 fn cancel_overlap(fd: Fd, ov: ptr, current: coro.Coro) {
     @unsafe
     let data = ov.@cast(Overlap)
     if data.base.completed : return
     data.base.cancel_requested = true
-    if ext.CancelIoEx(fd, data.@cast(ptr)) == 0 && ext.GetLastError() != ext.ERROR_NOT_FOUND {
+    if !cancel_io(fd, data.@cast(ptr)) {
         panic("Failed to cancel overlapped I/O")
     }
     while !data.base.completed {
         current.iocp_ready = false
         current.yield()
     }
+}
+
+fn cancel_io(fd: Fd, ov: ptr) bool {
+    @unsafe
+    if ext.CancelIoEx(fd, ov) != 0 : return true
+    let error = ext.GetLastError()
+    // Closing a socket also queues completion of its pending operations.
+    return error == ext.ERROR_NOT_FOUND || error == ext.ERROR_INVALID_HANDLE
 }
 
 fn await_overlap(fd: Fd, ov: ptr, current: coro.Coro, timeout_ms: uint) bool {

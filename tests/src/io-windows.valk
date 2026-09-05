@@ -10,6 +10,39 @@ use valk.time
 use valk.http
 
 extern fn GetCurrentThreadId() u32;
+extern fn GetProcessHandleCount(process: uint, count: *u32) i32;
+extern fn GetCurrentProcess() uint;
+
+test "Windows: listener close can race an expired accept timeout" {
+    let listener = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9093) !!
+    let accepting = co listener.accept(2)
+    coro.await_last()
+    listener.close() !!
+    thread.suspend_ms(10)
+    let connection = await accepting !? null
+    assert(!isset(connection))
+}
+
+synctest "Windows: accept events are released after timeout and submission failure" {
+    @unsafe
+    let listener = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9094) !!
+    listener.accept(1) ! {}
+    let before: u32 = 0
+    assert(GetProcessHandleCount(GetCurrentProcess(), @ref(before)) != 0)
+    let index: uint = 0
+    while index++ < 100 {
+        let timed_out = false
+        listener.accept(1) ! { timed_out = error_is(E.code, timeout) }
+        assert(timed_out)
+        let failed = false
+        net.accept((~0).to(Fd), 1) ! { failed = true }
+        assert(failed)
+    }
+    let after: u32 = 0
+    assert(GetProcessHandleCount(GetCurrentProcess(), @ref(after)) != 0)
+    assert(after <= before + 2)
+    listener.close() !!
+}
 
 fn iocp_block_scheduler() {
     coro.await_last()
@@ -56,7 +89,7 @@ fn iocp_accept_worker(state: shared IocpAcceptState) int {
     return GetCurrentThreadId().to(int) == owner ? owner : 0
 }
 
-test "Windows: listener binds to its accepting thread, not its creator" {
+test "Windows: concurrent accepts use the calling thread's completion port" {
     let state: shared IocpAcceptState = .{
         listener: net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9074) !!
     }
@@ -65,11 +98,11 @@ test "Windows: listener binds to its accepting thread, not its creator" {
     while state.ready == 0 && time.mono_ms() < deadline : time.sleep_ms(1)
     assert(state.ready == 1 && state.timeouts == 1)
     assert(state.port != io.iocp())
-    let rejected = false
+    let timed_out = false
     state.listener.accept(10) ! {
-        rejected = error_is(E.code, os)
+        timed_out = error_is(E.code, timeout)
     }
-    assert(rejected)
+    assert(timed_out)
     let client = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9074) !!
     client.write("q") !!
     let bytes = Slice[u8].new(1, 0)
@@ -79,26 +112,6 @@ test "Windows: listener binds to its accepting thread, not its creator" {
     let owner = worker.await()
     assert(owner != 0 && owner != GetCurrentThreadId().to(int))
     state.listener.close() !!
-}
-
-test "Windows: HTTP handoff queues are bounded and drain after closing" {
-    let inbox: shared http.WorkerInbox = .{}
-    let index: uint = 0
-    while index < 128 {
-        assert(inbox.push(index))
-        index++
-    }
-    assert(!inbox.push(128))
-    inbox.close()
-    assert(!inbox.push(129))
-    index = 0
-    while index < 128 {
-        let fd = inbox.pop()
-        assert(isset(fd) && fd == index)
-        index++
-    }
-    assert(!isset(inbox.pop()))
-    inbox.close()
 }
 
 class IocpHttpState {
@@ -137,23 +150,21 @@ test "Windows: HTTP handlers execute on multiple worker threads" {
     await running !!
 }
 
-class IocpQueueState {
+class IocpShutdownState {
     entered: uint (0)
     release: uint (0)
-    gate: shared thread.ThreadSuspendGate (.new())
 }
 
-fn iocp_release_after_delay(state: shared IocpQueueState) {
+fn iocp_release_after_delay(state: shared IocpShutdownState) {
     time.sleep_ms(50)
     state.release = 1
-    state.gate.signal()
 }
 
 test "Windows: awaiting HTTP shutdown keeps the caller scheduler running" {
-    let state: shared IocpQueueState = .{}
+    let state: shared IocpShutdownState = .{}
     let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
         state.entered = 1
-        state.gate.wait(fn() bool { return state.release == 0 }, 5000)
+        while state.release == 0 : time.sleep_ms(1)
         return http.Response.text("done")
     }
     let server = http.Server.new("127.0.0.1", 9083, handler)
@@ -171,11 +182,11 @@ test "Windows: awaiting HTTP shutdown keeps the caller scheduler running" {
     assert(result.body == "done")
 }
 
-test "Windows: HTTP shutdown closes connections still waiting for a worker" {
-    let state: shared IocpQueueState = .{}
+test "Windows: HTTP shutdown closes idle connections while a request drains" {
+    let state: shared IocpShutdownState = .{}
     let handler: shared fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
         state.entered = 1
-        state.gate.wait(fn() bool { return state.release == 0 }, 5000)
+        while state.release == 0 : time.sleep_ms(1)
         return http.Response.text("done")
     }
     let server = http.Server.new("127.0.0.1", 9077, handler)
@@ -190,15 +201,13 @@ test "Windows: HTTP shutdown closes connections still waiting for a worker" {
     while index++ < 12 : clients.append(net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9077) !!)
     let run_state = server.run
     if !isset(run_state) : panic("Server did not start")
-    let inbox = run_state.inboxes.get(1) !!
     deadline = time.mono_ms() + 2000
-    while inbox.sockets.length < 6 && time.mono_ms() < deadline : time.sleep_ms(1)
-    assert(inbox.sockets.length == 6)
+    while run_state.connections < 13 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(run_state.connections == 13)
     assert(!server.shutdown(0))
     state.release = 1
-    state.gate.signal()
     await running !!
-    assert(inbox.sockets.length == 0 && inbox.closed)
+    assert(run_state.connections == 0)
     each clients as client {
         assert(shutdown_peer_closed(client))
         client.close() !!
