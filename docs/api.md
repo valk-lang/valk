@@ -269,11 +269,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice Slice[T] of T {
     ~ data: *[T]
     ~ length: uint
-    ~ offset: uint
 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
     + static fn new(length: uint, value: T) Slice[T]
+    + get offset: uint
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn view(offset: uint, length: uint) Slice[T]
@@ -302,7 +302,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + slice String of u8 {
     ~ data: *[u8]
     ~ length: uint
-    ~ offset: uint
 
     + static fn alloc(length: uint) String
     + get bytes: uint
@@ -332,6 +331,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn ltrim(part: String, limit: uint (0)) String
     + fn octal_to_int() int !SyntaxError
     + fn octal_to_uint() uint !SyntaxError
+    + get offset: uint
     + fn pad_left(char: u8, length: uint) String
     + fn pad_right(char: u8, length: uint) String
     + fn part(start_index: uint, length: uint) String
@@ -1132,6 +1132,7 @@ alias pid_t for i32
 ## Aliases for 'gc'
 
 ```js
+type EnvCloneFn (fnptr(ptr)(ptr))
 type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ```
 
@@ -1140,6 +1141,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 ```js
 + fn alloc(size: uint) GcPtr
 ~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo, fn(ptr, *Lifo)())()) GcPtr
++ fn clone_closure_env(env: ?ptr) ?ptr
 + fn collect() void
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
