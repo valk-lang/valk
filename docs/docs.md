@@ -213,10 +213,20 @@ println(sizes.length) // 3
 ```
 
 Every range in Valk is a start offset and a length, never a start and an end,
-so there is no inclusive or exclusive bound to remember. Bracket ranges call an
-instance method marked `$range`. The hook must accept
-`(start_index: uint, length: uint)` and return one value. This lets custom
-collection types support the same `value[start_index .. length]` syntax.
+so there is no inclusive or exclusive bound to remember. `value[start .. length]`
+returns a copy, while `&value[start .. length]` returns a view that shares the
+elements with `value`:
+
+```rust
+let values = Array[int]{ 1, 2, 3, 4 }
+let copy = values[1 .. 2]  // Array[int], independent of values
+let view = &values[1 .. 2] // Slice[int] over the same elements
+view[0] = 20               // values is now { 1, 20, 3, 4 }
+```
+
+Both forms call an instance method: `$range` for the copy and `$view` for the
+view. The hook must accept `(start_index: uint, length: uint)` and return one
+value. This lets custom collection types support the same syntax.
 
 ## Maps
 

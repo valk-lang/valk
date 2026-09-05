@@ -60,7 +60,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn index_of(item: T) uint !LookupError
     + fn intersect(with: Array[T]) Array[T]
     + fn items() *[T]
-    + fn iter() Slice[T]
     + fn join(divider: String) String
     + fn merge(items: Array[T]) Array[T]
     + fn merge_in_place(items: Array[T]) Array[T]
@@ -81,7 +80,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
-    + fn view(start: uint (0), amount: ?uint (null)) Slice[T]
+    + fn view(start: uint (0), amount: uint (uint.$max)) Slice[T]
 }
 ```
 
@@ -275,6 +274,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn append(item: T) Slice[T]
     + fn get(index: uint) T !LookupError
     + static fn new(length: uint, value: T) Slice[T]
+    + fn part(offset: uint, length: uint) Slice[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn view(offset: uint, length: uint) Slice[T]

@@ -192,12 +192,13 @@ removed element reachable.
 
 `&array[i]` borrows one element as `&T` with the storage block as owner, and
 the same works on `Slice[T]` and `&[T]`; `&view[a..b]` borrows a range of an
-`&[T]` as `&[T]`. A class `$offset` or `$range` hook takes precedence, which
-is why a range of an array goes through `view`. `array.view(start, length)`
+`&[T]` as `&[T]`. A class `$offset` or `$range` hook takes precedence for
+`value[i]` and `value[a..b]`, and a `$view` hook for `&value[a..b]`, which is
+how `&array[a..b]` reaches `array.view(start, length)`: it
 returns a `Slice[T]` over the array's block without copying. The view shares the elements it covers, observes in-place
 writes through the array, and survives the array growing because it keeps the
 block it was taken from. A view keeps its whole block alive, including slots
-past the elements it covers. `array.iter()` and `array.slice(...)` still copy.
+past the elements it covers. `array.slice(...)` still copies.
 
 A `slice X of T` class is an `&[T]` with methods: the same three words
 (`owner`, element pointer, `length`), the same GC handling, and the same
@@ -214,7 +215,7 @@ length)` creates a bounded alias of that storage without allocating or
 copying elements. There is no anonymous `slice[T]` type.
 
 Indexing has one policy for every native sequence. A class hook comes first:
-`$offset`, `$offset_assign`, and `$range` on the class define the operation
+`$offset`, `$offset_assign`, `$range`, and `$view` on the class define the operation
 when present, which is how `String[i]` answers 0 past the end. Without a hook
 the compiler emits the native access, which checks the index against the
 length and panics when it is out of bounds. A native read of a non-nullable
