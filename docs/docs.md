@@ -139,6 +139,8 @@ intentionally forging an address. A raw `ptr` converts implicitly to `uint`.
 
 `uint` becomes `u32` or `u64` based on the compile target
 
+Every integer type exposes its range as `T.$max` and `T.$min`, e.g. `u8.$max` is `255`
+
 `float` becomes `f32` or `f64` based on the compile target
 
 ## Variables
