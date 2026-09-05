@@ -183,7 +183,8 @@ Valk distinguishes three sequence categories:
 Fixed arrays store their elements inline. `Array` is a GC reference type that
 owns resizable element storage. That storage is a `Slice[T]` block: a header
 with the slot count followed by the elements, traced by the block itself. The
-array holds the block in `storage` and its first element in `data`. Growth
+array is `{ data, size, length }`: `data` is the block, `size` its slot count,
+and the elements start at the block's storage header offset. Growth
 allocates a new block and registers the elements there as well; the old block
 stays alive only while something else, such as a view, still holds it. Every
 operation that drops an element clears its slot, so the array never keeps a

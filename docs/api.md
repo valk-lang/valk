@@ -39,10 +39,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + array Array[T] {
-    ~ cap: uint
-    ~ data: *[T]
+    ~ data: ?GcPtr
     ~ length: uint
-    ~ storage: ?GcPtr
+    ~ size: uint
 
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
@@ -60,6 +59,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn increase_size(new_size: uint) void
     + fn index_of(item: T) uint !LookupError
     + fn intersect(with: Array[T]) Array[T]
+    + fn items() *[T]
     + fn iter() Slice[T]
     + fn join(divider: String) String
     + fn merge(items: Array[T]) Array[T]
