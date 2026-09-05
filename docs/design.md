@@ -203,7 +203,10 @@ A `slice X of T` class is an `&[T]` with methods: the same three words
 bounds policy. `Slice[T]` and `String` are the two in the core library. A
 value converts implicitly between a named slice and `&[T]` in both directions
 when the element types agree, so a function taking `&[u8]` accepts a `String`
-and a function taking `String` accepts any `&[u8]`. Two different named
+and a function taking `Slice[T]` accepts any `&[T]`. `String` is the
+exception in one direction: its storage always carries a terminating zero
+byte so `data_cstring` is valid, which an arbitrary `&[u8]` cannot promise,
+so a bare view never becomes a `String` implicitly. Two different named
 slices stay distinct: `String` is not `Slice[u8]`. A newly initialized
 `Slice[T]` owns fixed-length element storage, while `slice.view(offset,
 length)` creates a bounded alias of that storage without allocating or
