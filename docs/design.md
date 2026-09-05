@@ -177,26 +177,32 @@ Valk distinguishes three sequence categories:
 | --- | --- | --- | --- |
 | `[T x N]` | Inline elements | Copies all elements | No |
 | `Array[T]` | GC-managed reference | Copies the reference | Yes |
-| `Slice[T]` | Bounded view over GC-managed storage | Copies the view | No |
 | `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
+| `Slice[T]`, `String` | `&[T]` with a class attached | Copies the borrow | No |
 
-Fixed arrays store their elements inline. `Array` is a GC reference type.
-`Slice` is a value descriptor containing its backing storage, offset, and
-visible length. Copying a slice preserves the same backing storage.
+Fixed arrays store their elements inline. `Array` is a GC reference type that
+owns resizable element storage.
 
-`Array[T]` owns resizable element storage. A newly initialized `Slice[T]` owns
-fixed-length element storage, while `slice.view(offset, length)` creates a
-bounded alias of that storage without allocating or copying elements.
+A `slice X of T` class is an `&[T]` with methods: the same three words
+(`owner`, element pointer, `length`), the same GC handling, and the same
+bounds policy. `Slice[T]` and `String` are the two in the core library. A
+value converts implicitly between a named slice and `&[T]` in both directions
+when the element types agree, so a function taking `&[u8]` accepts a `String`
+and a function taking `String` accepts any `&[u8]`. Two different named
+slices stay distinct: `String` is not `Slice[u8]`. A newly initialized
+`Slice[T]` owns fixed-length element storage, while `slice.view(offset,
+length)` creates a bounded alias of that storage without allocating or
+copying elements. There is no anonymous `slice[T]` type.
 
-Array and Slice indexing is compiler-defined rather than implemented through
-`$offset` library hooks. An out-of-range read produces `LookupError.missing`
-and must use normal error handling or pass the error to the caller. For
-assignment, `Array[length] = value` appends, an Array index greater than
-`length` produces `LookupError.range`, and a Slice index at or beyond `length`
-produces `LookupError.range`. Indexed assignment passes that error to the
-caller; use the corresponding `set` method when another explicit handling
-policy is required. Fixed arrays use checked inline indexing and reject a known
-invalid index at compile time.
+Indexing has one policy for every native sequence. A class hook comes first:
+`$offset`, `$offset_assign`, and `$range` on the class define the operation
+when present, which is how `String[i]` answers 0 past the end. Without a hook
+the compiler emits the native access, which checks the index against the
+length and panics when it is out of bounds. This applies to `Array[T]`,
+`Slice[T]`, `&[T]`, and named unbound pointers alike. The `get` and `set`
+methods remain the fallible forms that return `LookupError`. For assignment,
+`Array[length] = value` appends. Fixed arrays use checked inline indexing and
+reject a known invalid index at compile time.
 
 ```valk
 let fixed: [int x 3] = { 1, 2, 3 }
@@ -444,8 +450,8 @@ The members of `&T` are the members of `T`, read through the address.
 `&[T]` is the sequence form: an owned borrow plus a visible length, without a
 class. Indexing and ranges are checked against `length` and panic when out of
 bounds. `each` iterates it natively. It converts from `&[T x N]`, from a fixed
-array inside an owner, and from any `Slice[T]` or `String` value, whose
-storage is fixed-size.
+array inside an owner, and to and from any `Slice[T]` or `String` value: the
+named slices are `&[T]` with a class, so the conversion is a retype.
 
 Storing an owned borrow makes it an alias into `owner`, so creating one marks
 the owner's graph as no longer uniquely held, exactly as storing a managed
