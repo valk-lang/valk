@@ -1,0 +1,209 @@
+class HpackField {
+    name: String
+    value: String
+    never_index: bool (false)
+
+    fn size() uint { return this.name.bytes + this.value.bytes + 32 }
+}
+
+fn hpack_integer(reader: ByteReader, prefix: uint) uint !H2Error {
+    if prefix == 0 || prefix > 8 || reader.remaining().length == 0 : throw .compression
+    let mask: uint = (1 << prefix) - 1
+    let result = reader.read_byte().to(uint) & mask
+    if result < mask : return result
+    let shift: uint = 0
+    while reader.remaining().length > 0 {
+        let byte = reader.read_byte().to(uint)
+        let part = byte & 127
+        if shift > 56 : throw .compression
+        result = result.checked_add(part << shift) ! throw .compression
+        if byte < 128 : return result
+        shift += 7
+    }
+    throw .compression
+}
+
+fn hpack_write_integer(out: ByteBuffer, number: uint, prefix: uint, flags: u8) {
+    let mask: uint = (1 << prefix) - 1
+    if number < mask {
+        out.write_byte(flags | number.to(u8))
+        return
+    }
+    out.write_byte(flags | mask.to(u8))
+    number -= mask
+    while number >= 128 {
+        out.write_byte((number & 127).to(u8) | 128)
+        number = number >> 7
+    }
+    out.write_byte(number.to(u8))
+}
+
+fn hpack_huffman(bytes: String, limit: uint) String !H2Error {
+    let out = ByteBuffer.new()
+    let node: uint = 0
+    let tail: uint = 0
+    let ones = true
+    each bytes as byte {
+        let bit: uint = 8
+        while bit-- > 0 {
+            let one = (byte.to(uint) & (1 << bit)) != 0
+            let next = one ? hpack_huffman_right[node] : hpack_huffman_left[node]
+            if next < 0 : throw .compression
+            node = next.to(uint)
+            tail++
+            ones = ones && one
+            let symbol = hpack_huffman_symbol[node]
+            if symbol < 0 : continue
+            if symbol == 256 : throw .compression
+            if out.length >= limit : throw .limit
+            out.write_byte(symbol.to(u8))
+            node = 0
+            tail = 0
+            ones = true
+        }
+    }
+    if node != 0 && (tail > 7 || !ones) : throw .compression
+    return out.into_string()
+}
+
+fn hpack_string(reader: ByteReader, limit: uint) String !H2Error {
+    let remaining = reader.remaining()
+    if remaining.length == 0 : throw .compression
+    let huffman = (remaining.byte(0) & 128) != 0
+    let length = hpack_integer(reader, 7) !>
+    if length > reader.remaining().length : throw .compression
+    if !huffman && length > limit : throw .limit
+    let text = reader.read_string(length)
+    if huffman : return hpack_huffman(text, limit) !>
+    return text
+}
+
+class HpackDecoder {
+    entries: Array[HpackField] (.new())
+    size: uint (0)
+    capacity: uint (4096)
+    allowed_capacity: uint (4096)
+    required_capacity: uint (0xffffffff)
+    max_header_size: uint (65_536)
+    max_block_size: uint (65_536)
+    failed: bool (false)
+
+    // Call when a local SETTINGS_HEADER_TABLE_SIZE change is acknowledged.
+    fn set_limit(limit: uint) {
+        this.allowed_capacity = limit
+        if limit < this.capacity && limit < this.required_capacity : this.required_capacity = limit
+    }
+
+    fn lookup(index: uint) HpackField !H2Error {
+        if index == 0 : throw .compression
+        if index <= 61 {
+            return HpackField { name: hpack_names[index - 1], value: hpack_values[index - 1] }
+        }
+        let entry = this.entries.get(index - 62) ! throw .compression
+        return HpackField { name: entry.name, value: entry.value }
+    }
+
+    fn evict(limit: uint) {
+        while this.size > limit {
+            let last = this.entries.get(this.entries.length - 1) !!
+            this.size -= last.size()
+            this.entries.remove(this.entries.length - 1)
+        }
+    }
+
+    fn insert(field: HpackField) {
+        let size = field.size()
+        if size > this.capacity {
+            this.evict(0)
+            return
+        }
+        this.evict(this.capacity - size)
+        this.entries.prepend(HpackField { name: field.name, value: field.value })
+        this.size += size
+    }
+
+    fn decode(block: String) Array[HpackField] !H2Error {
+        if this.failed : throw .compression
+        this.failed = true
+        if block.bytes > this.max_block_size : throw .limit
+        let reader = ByteReader.new(block)
+        let result = Array[HpackField].new()
+        let size: uint = 0
+        let fields_started = false
+        while reader.remaining().length > 0 {
+            let first = reader.remaining().byte(0)
+            if (first & 224) == 32 {
+                if fields_started : throw .compression
+                let capacity = hpack_integer(reader, 5) !>
+                if capacity > this.allowed_capacity || capacity > this.required_capacity : throw .compression
+                this.capacity = capacity
+                this.required_capacity = 0xffffffff
+                this.evict(capacity)
+                continue
+            }
+            if this.capacity > this.required_capacity : throw .compression
+            fields_started = true
+            let field: HpackField = @undefined
+            if (first & 128) != 0 {
+                field = this.lookup(hpack_integer(reader, 7) !>) !>
+            } else {
+                let indexed = (first & 64) != 0
+                let index = hpack_integer(reader, indexed ? 6 : 4) !>
+                let name = index == 0 ? (hpack_string(reader, this.max_header_size) !>) : (this.lookup(index) !>).name
+                let value = hpack_string(reader, this.max_header_size) !>
+                field = HpackField { name: name, value: value, never_index: !indexed && (first & 16) != 0 }
+                if indexed : this.insert(field)
+            }
+            if size > this.max_header_size || field.size() > this.max_header_size - size : throw .limit
+            size += field.size()
+            result.append(field)
+        }
+        if this.capacity > this.required_capacity : throw .compression
+        this.required_capacity = 0xffffffff
+        this.failed = false
+        return result
+    }
+}
+
+global hpack_name_indexes: HashMap[String, uint] (hpack_build_name_indexes())
+
+fn hpack_build_name_indexes() HashMap[String, uint] {
+    let indexes = HashMap[String, uint].new()
+    each hpack_names as name, index {
+        if !indexes.has(name) : indexes.set(name, index + 1)
+    }
+    return indexes
+}
+
+fn hpack_static_indexes(field: HpackField) (uint, uint) {
+    let name_index = hpack_name_indexes.get(field.name) ! return (0, 0)
+    let index = name_index - 1
+    while index < 61 && hpack_names[index] == field.name {
+        if hpack_values[index] == field.value : return (name_index, index + 1)
+        index++
+    }
+    return (name_index, 0)
+}
+
+// Stateless encoding avoids indexing sensitive fields or retaining response values.
+fn hpack_encode(fields: Array[HpackField], max_size: uint (65_536)) String !H2Error {
+    let out = ByteBuffer.new()
+    let size: uint = 0
+    each fields as field {
+        if size > max_size || field.size() > max_size - size : throw .limit
+        size += field.size()
+        let name_index, exact_index = hpack_static_indexes(field)
+        if exact_index != 0 && !field.never_index {
+            hpack_write_integer(out, exact_index, 7, 128)
+            continue
+        }
+        hpack_write_integer(out, name_index, 4, field.never_index ? 16 : 0)
+        if name_index == 0 {
+            hpack_write_integer(out, field.name.bytes, 7, 0)
+            out.write(field.name)
+        }
+        hpack_write_integer(out, field.value.bytes, 7, 0)
+        out.write(field.value)
+    }
+    return out.into_string()
+}

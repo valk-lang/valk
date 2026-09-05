@@ -1,0 +1,168 @@
+@ignore_access
+use valk.http
+
+fn h2_session() http.H2Session {
+    let session = http.H2Session {}
+    session.start()
+    session.receive(http.H2Frame { kind: 4 }) !!
+    assert(session.output.length == 2)
+    session.output.clear()
+    return session
+}
+
+fn h2_request_frame(id: u32, end_stream: bool (true), extra: ?http.HpackField (null)) http.H2Frame {
+    let fields = Array[http.HpackField] {
+        .{ name: ":method", value: "POST" },
+        .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/test?x=1" },
+        .{ name: ":authority", value: "localhost" }
+    }
+    if isset(extra) : fields.append(extra)
+    return http.H2Frame { kind: 1, flags: end_stream ? 5 : 4, stream: id, payload: http.hpack_encode(fields) !! }
+}
+
+test "HTTP2: streams multiplex and responses obey both flow-control windows" {
+    let session = h2_session()
+    let first = session.receive(h2_request_frame(1)) !!
+    if !isset(first) : panic("Missing request")
+    let second = session.receive(h2_request_frame(3)) !!
+    if !isset(second) : panic("Missing request")
+    assert(first.remote_closed && second.remote_closed && session.streams.length == 2)
+    assert(!isset(first.body) && !isset(first.trailers))
+    let headers = Array[http.HpackField] { .{ name: ":status", value: "200" } }
+    session.send_headers(second, headers, false) !!
+    session.send_window = 3
+    second.send_window = 2
+    assert(session.send_data(second, "abcd", true) !! == 2)
+    assert(!second.local_closed && session.send_window == 1)
+    assert(session.send_data(second, "cd", true) !! == 0)
+    session.receive(http.H2Frame { kind: 8, stream: 3, payload: http.h2_number(5) }) !!
+    assert(session.send_data(second, "cd", true) !! == 1)
+    session.receive(http.H2Frame { kind: 8, payload: http.h2_number(5) }) !!
+    assert(session.send_data(second, "d", true) !! == 1)
+    assert(second.local_closed && session.streams.length == 1)
+    session.send_headers(first, headers, true) !!
+    assert(session.streams.length == 0)
+}
+
+test "HTTP2: DATA and trailers complete a bounded request" {
+    let session = h2_session()
+    assert(!isset(session.receive(h2_request_frame(1, false, .{ name: "content-length", value: "3" })) !!))
+    session.receive(http.H2Frame { kind: 0, stream: 1, payload: "abc" }) !!
+    assert(session.buffered_body == 3 && session.output.length == 2)
+    let trailers = Array[http.HpackField] { .{ name: "x-finished", value: "yes" } }
+    let stream = session.receive(http.H2Frame { kind: 1, flags: 5, stream: 1, payload: http.hpack_encode(trailers) !! }) !!
+    assert(isset(stream))
+    if isset(stream) {
+        let body = stream.body
+        let trailers = stream.trailers
+        assert(isset(body) && body == "abc")
+        assert(isset(trailers) && trailers.length == 1)
+    }
+    session.receive(http.H2Frame { kind: 3, stream: 1, payload: http.h2_number(8) }) !!
+    assert(session.buffered_body == 0 && session.streams.length == 0)
+    if isset(stream) : assert(stream.cancelled)
+}
+
+test "HTTP2: empty DATA does not allocate body storage" {
+    let session = h2_session()
+    session.receive(h2_request_frame(1, false, .{ name: "content-length", value: "0" })) !!
+    let stream = session.receive(http.H2Frame { kind: 0, flags: 1, stream: 1 }) !!
+    assert(isset(stream))
+    if isset(stream) {
+        assert(stream.body_size() == 0 && !isset(stream.body))
+        assert(session.buffered_body == 0)
+    }
+}
+
+test "HTTP2: invalid request headers and lengths reset only their stream" {
+    let invalid = Array[http.HpackField] {
+        .{ name: "Connection", value: "close" },
+        .{ name: "connection", value: "close" },
+        .{ name: "te", value: "gzip" },
+        .{ name: "content-length", value: "18446744073709551616" },
+        .{ name: ":method", value: "GET" },
+        .{ name: "content-length", value: "1" }
+    }
+    each invalid as field {
+        let session = h2_session()
+        assert(!isset(session.receive(h2_request_frame(1, true, field)) !!))
+        assert(session.streams.length == 0)
+        assert((session.output.get(0) !!).kind == 3)
+        assert(isset(session.receive(h2_request_frame(3)) !!))
+    }
+}
+
+test "HTTP2: settings reductions permit negative stream windows" {
+    let session = h2_session()
+    let stream = session.receive(h2_request_frame(1)) !!
+    if !isset(stream) : panic("Missing request")
+    stream.send_window = 10
+    let settings = ByteBuffer.new()
+    settings.write_u16_be(4)
+    settings.write_u32_be(0)
+    session.receive(http.H2Frame { kind: 4, payload: settings.into_string() }) !!
+    assert(stream.send_window == -65525)
+    session.receive(http.H2Frame { kind: 8, stream: 1, payload: http.h2_number(65526) }) !!
+    assert(stream.send_window == 1)
+    session.receive(http.H2Frame { kind: 8, stream: 1, payload: http.h2_number(0) }) !!
+    assert(stream.cancelled)
+}
+
+test "HTTP2: pseudo-header validation tracks presence duplicates and order" {
+    let names = Array[String] { ":method", ":scheme", ":path", ":authority" }
+    let values = Array[String] { "GET", "https", "/", "localhost" }
+    each names as name, index {
+        let fields = Array[http.HpackField].new()
+        each names as other, position : fields.append(.{ name: other, value: values.get(position) !! })
+        fields.append(.{ name: name, value: values.get(index) !! })
+        let duplicate = false
+        http.h2_validate_request(http.H2Stream { id: 1, fields: fields }) ! { duplicate = error_is(E.code, protocol) }
+        assert(duplicate)
+        fields.remove(fields.length - 1)
+        fields.remove(index)
+        let missing = false
+        http.h2_validate_request(http.H2Stream { id: 1, fields: fields }) ! { missing = error_is(E.code, protocol) }
+        assert(missing)
+    }
+    let connect = Array[http.HpackField] {
+        .{ name: ":method", value: "CONNECT" },
+        .{ name: ":authority", value: "localhost:443" }
+    }
+    http.h2_validate_request(http.H2Stream { id: 1, fields: connect }) !!
+    connect.append(.{ name: ":path", value: "" })
+    let present_empty = false
+    http.h2_validate_request(http.H2Stream { id: 1, fields: connect }) ! { present_empty = error_is(E.code, protocol) }
+    assert(present_empty)
+    let unordered = Array[http.HpackField] {
+        .{ name: "host", value: "localhost" },
+        .{ name: ":method", value: "GET" }
+    }
+    let rejected = false
+    http.h2_validate_request(http.H2Stream { id: 1, fields: unordered }) ! { rejected = error_is(E.code, protocol) }
+    assert(rejected)
+}
+
+test "HTTP2: shutdown refuses new streams but drains accepted ones" {
+    let session = h2_session()
+    let stream = session.receive(h2_request_frame(1)) !!
+    if !isset(stream) : panic("Missing request")
+    session.shutdown()
+    assert((session.output.get(0) !!).kind == 7)
+    assert(ByteReader.new((session.output.get(0) !!).payload).read_u32_be() == 1)
+    assert(!isset(session.receive(h2_request_frame(3)) !!))
+    assert(session.streams.length == 1)
+    session.send_headers(stream, .{ .{ name: ":status", value: "204" } }, true) !!
+    assert(session.streams.length == 0)
+}
+
+test "HTTP2: request buffering and concurrency limits reject excess streams" {
+    let session = h2_session()
+    session.max_streams = 1
+    session.max_buffered_body = 2
+    session.receive(h2_request_frame(1, false)) !!
+    assert(!isset(session.receive(h2_request_frame(3)) !!))
+    assert(session.streams.length == 1)
+    session.receive(http.H2Frame { kind: 0, flags: 1, stream: 1, payload: "abc" }) !!
+    assert(session.streams.length == 0 && session.buffered_body == 0)
+}

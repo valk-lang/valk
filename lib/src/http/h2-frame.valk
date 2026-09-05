@@ -1,0 +1,169 @@
+// RFC 9113 wire framing. Stream state and SETTINGS effects belong to the connection.
+error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
+
+value H2_DATA (0)
+value H2_HEADERS (1)
+value H2_PRIORITY (2)
+value H2_RST_STREAM (3)
+value H2_SETTINGS (4)
+value H2_PUSH_PROMISE (5)
+value H2_PING (6)
+value H2_GOAWAY (7)
+value H2_WINDOW_UPDATE (8)
+value H2_CONTINUATION (9)
+
+class H2Frame {
+    kind: u8
+    flags: u8 (0)
+    stream: u32 (0)
+    payload: String ("")
+
+    fn encode(max_size: uint (16_384)) String !H2Error {
+        let out = ByteBuffer.new(this.payload.bytes + 9)
+        this.encode_into(out, max_size) !>
+        return out.into_string()
+    }
+
+    fn encode_into(out: ByteBuffer, max_size: uint (16_384)) !H2Error {
+        if this.stream > 0x7fffffff : throw .protocol
+        h2_frame_header(this.kind, this.flags, this.stream, this.payload.bytes, max_size) !>
+        this.validate_payload() !>
+        out.write_byte((this.payload.bytes >> 16).to(u8))
+        out.write_byte((this.payload.bytes >> 8).to(u8))
+        out.write_byte(this.payload.bytes.to(u8))
+        out.write_byte(this.kind)
+        out.write_byte(this.flags)
+        out.write_u32_be(this.stream)
+        out.write(this.payload)
+    }
+
+    fn validate_payload() !H2Error {
+        if this.kind == H2_DATA || this.kind == H2_HEADERS || this.kind == H2_PUSH_PROMISE {
+            this.fragment() !>
+        }
+    }
+
+    // The full payload, including padding, still counts towards DATA flow control.
+    fn fragment() String !H2Error {
+        let start: uint = 0
+        let end = this.payload.bytes
+        if this.kind != H2_DATA && this.kind != H2_HEADERS && this.kind != H2_PUSH_PROMISE : return this.payload
+        if (this.flags & 8) != 0 {
+            if end == 0 : throw .protocol
+            let padding = this.payload[0].to(uint)
+            if padding >= end : throw .protocol
+            start = 1
+            end -= padding
+        }
+        let prefix: uint = 0
+        if this.kind == H2_HEADERS && (this.flags & 32) != 0 : prefix = 5
+        if this.kind == H2_PUSH_PROMISE : prefix = 4
+        if prefix > end - start : throw .frame_size
+        return this.payload.part(start + prefix, end - start - prefix)
+    }
+}
+
+fn h2_frame_header(kind: u8, flags: u8, stream: u32, length: uint, max_size: uint) !H2Error {
+    if max_size < 16_384 || max_size > 0xffffff : throw .limit
+    if length > max_size : throw .frame_size
+    if kind == H2_SETTINGS || kind == H2_PING || kind == H2_GOAWAY {
+        if stream != 0 : throw .protocol
+    } else if kind == H2_DATA || kind == H2_HEADERS || kind == H2_PRIORITY
+        || kind == H2_RST_STREAM || kind == H2_PUSH_PROMISE || kind == H2_CONTINUATION {
+        if stream == 0 : throw .protocol
+    }
+    if kind == H2_PRIORITY && length != 5 : throw .frame_size
+    if (kind == H2_RST_STREAM || kind == H2_WINDOW_UPDATE) && length != 4 : throw .frame_size
+    if kind == H2_PING && length != 8 : throw .frame_size
+    if kind == H2_GOAWAY && length < 8 : throw .frame_size
+    if kind == H2_SETTINGS {
+        if length % 6 != 0 || ((flags & 1) != 0 && length != 0) : throw .frame_size
+    }
+}
+
+// Incomplete input leaves the cursor untouched, including a partial payload.
+fn h2_read_frame(reader: ByteReader, max_size: uint (16_384)) H2Frame !H2Error {
+    let bytes = reader.remaining()
+    if bytes.length < 9 : throw .incomplete
+    let header = ByteReader.new(bytes.view(0, 9))
+    let length = header.read_big_endian(3)
+    let kind = header.read_byte()
+    let flags = header.read_byte()
+    let stream = header.read_u32_be() & 0x7fffffff
+    h2_frame_header(kind, flags, stream, length, max_size) !>
+    if length > bytes.length - 9 : throw .incomplete
+    let frame = H2Frame {
+        kind: kind, flags: flags, stream: stream,
+        payload: bytes.view(9, length).to_string()
+    }
+    frame.validate_payload() !>
+    reader.skip(9 + length)
+    return frame
+}
+
+class H2Settings {
+    header_table_size: u32 (4096)
+    enable_push: bool (true)
+    max_concurrent_streams: u32 (0xffffffff)
+    initial_window_size: u32 (65_535)
+    max_frame_size: u32 (16_384)
+    max_header_list_size: u32 (0xffffffff)
+
+    // Validate the whole frame before publishing any settings.
+    fn apply(frame: H2Frame, from_server: bool (false)) !H2Error {
+        if frame.kind != H2_SETTINGS : throw .protocol
+        h2_frame_header(frame.kind, frame.flags, frame.stream, frame.payload.bytes, 0xffffff) !>
+        if (frame.flags & 1) != 0 : return
+        let reader = ByteReader.new(frame.payload)
+        while reader.remaining().length > 0 {
+            let id = reader.read_u16_be()
+            let value = reader.read_u32_be()
+            if id == 2 && (from_server || value > 1) : throw .protocol
+            if id == 4 && value > 0x7fffffff : throw .flow_control
+            if id == 5 && (value < 16_384 || value > 0xffffff) : throw .protocol
+        }
+        reader.reset()
+        while reader.remaining().length > 0 {
+            let id = reader.read_u16_be()
+            let value = reader.read_u32_be()
+            if id == 1 : this.header_table_size = value
+            else if id == 2 : this.enable_push = value != 0
+            else if id == 3 : this.max_concurrent_streams = value
+            else if id == 4 : this.initial_window_size = value
+            else if id == 5 : this.max_frame_size = value
+            else if id == 6 : this.max_header_list_size = value
+        }
+    }
+}
+
+class H2HeaderBlock {
+    stream: u32 (0)
+    fragments: ByteBuffer (.new())
+    max_size: uint (65_536)
+
+    fn accept(frame: H2Frame) ?String !H2Error {
+        if this.stream != 0 {
+            if frame.kind != H2_CONTINUATION || frame.stream != this.stream : throw .protocol
+        } else {
+            if frame.kind == H2_CONTINUATION : throw .protocol
+            if frame.kind != H2_HEADERS && frame.kind != H2_PUSH_PROMISE : return null
+            if frame.stream == 0 : throw .protocol
+            if (frame.flags & 4) != 0 {
+                let complete = frame.fragment() !>
+                if complete.bytes > this.max_size : throw .limit
+                return complete
+            }
+        }
+        let fragment = frame.fragment() !>
+        if this.fragments.length > this.max_size || fragment.bytes > this.max_size - this.fragments.length : throw .limit
+        this.fragments.write(fragment)
+        if (frame.flags & 4) == 0 {
+            this.stream = frame.stream
+            return null
+        }
+        let block = this.fragments.into_string()
+        this.fragments = ByteBuffer.new()
+        this.stream = 0
+        return block
+    }
+}

@@ -1,0 +1,333 @@
+@ignore_access
+use valk.http
+
+fn hpack_hex(text: String) String {
+    let out = ByteBuffer.new()
+    let index: uint = 0
+    while index < text.bytes {
+        let hi = text[index++]
+        let lo = text[index++]
+        let a = hi <= '9' ? hi - '0' : hi - 'a' + 10
+        let b = lo <= '9' ? lo - '0' : lo - 'a' + 10
+        out.write_byte((a << 4) | b)
+    }
+    return out.into_string()
+}
+
+test "HTTP2: HPACK RFC request vectors share a dynamic table" {
+    let decoder = http.HpackDecoder {}
+    let first = decoder.decode(hpack_hex("828684410f7777772e6578616d706c652e636f6d")) !!
+    assert(first.length == 4)
+    assert((first.get(3) !!).name == ":authority")
+    assert((first.get(3) !!).value == "www.example.com")
+    assert(decoder.size == 57)
+    let second = decoder.decode(hpack_hex("828684be58086e6f2d6361636865")) !!
+    assert(second.length == 5)
+    assert((second.get(4) !!).value == "no-cache")
+    assert(decoder.size == 110)
+    let third = decoder.decode(hpack_hex("828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565")) !!
+    assert(third.length == 5)
+    assert((third.get(2) !!).value == "/index.html")
+    assert((third.get(4) !!).name == "custom-key")
+    assert(decoder.size == 164)
+}
+
+test "HTTP2: HPACK Huffman RFC vectors and padding validation" {
+    let decoder = http.HpackDecoder {}
+    let first = decoder.decode(hpack_hex("828684418cf1e3c2e5f23a6ba0ab90f4ff")) !!
+    assert((first.get(3) !!).value == "www.example.com")
+    let second = decoder.decode(hpack_hex("828684be5886a8eb10649cbf")) !!
+    assert((second.get(4) !!).value == "no-cache")
+    let third = decoder.decode(hpack_hex("828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf")) !!
+    assert((third.get(4) !!).name == "custom-key")
+    assert((third.get(4) !!).value == "custom-value")
+    let malformed = Array[String] { "ffffffff", "ff", "00" }
+    each malformed as hex {
+        let rejected = false
+        http.hpack_huffman(hpack_hex(hex), 1024) ! { rejected = error_is(E.code, compression) }
+        assert(rejected)
+    }
+    let limited = false
+    http.hpack_huffman(hpack_hex("f1e3c2e5f23a6ba0ab90f4ff"), 14) ! { limited = error_is(E.code, limit) }
+    assert(limited)
+}
+
+test "HTTP2: HPACK stateless encoding preserves repeated and sensitive fields" {
+    let fields = Array[http.HpackField] {
+        .{ name: ":status", value: "200" },
+        .{ name: "set-cookie", value: "a=1", never_index: true },
+        .{ name: "set-cookie", value: "b=2", never_index: true },
+        .{ name: "custom", value: "bytes\0here" }
+    }
+    let decoder = http.HpackDecoder {}
+    let result = decoder.decode(http.hpack_encode(fields) !!) !!
+    assert(result.length == fields.length)
+    each result as field, index {
+        let original = fields.get(index) !!
+        assert(field.name == original.name && field.value == original.value)
+        assert(field.never_index == original.never_index)
+    }
+    assert(decoder.size == 0)
+}
+
+test "HTTP2: HPACK rejects invalid indexes integers and late table updates" {
+    let invalid = Array[String] { "80", "be", "ff", "ffffffffffffffffffffffff00", "820020", "8220", "00036162" }
+    each invalid as hex {
+        let decoder = http.HpackDecoder {}
+        let rejected = false
+        decoder.decode(hpack_hex(hex)) ! { rejected = error_is(E.code, compression) }
+        assert(rejected)
+        let poisoned = false
+        decoder.decode("") ! { poisoned = error_is(E.code, compression) }
+        assert(poisoned)
+    }
+    let encoded = ByteBuffer.new()
+    http.hpack_write_integer(encoded, 1337, 5, 0)
+    assert(encoded.to_string() == hpack_hex("1f9a0a"))
+    assert(http.hpack_integer(encoded.reader(), 5) !! == 1337)
+}
+
+test "HTTP2: HPACK table reductions evict entries and enforce acknowledgments" {
+    let decoder = http.HpackDecoder {}
+    decoder.decode(hpack_hex("4001610162")) !!
+    assert(decoder.size == 34)
+    decoder.set_limit(0)
+    let missing = false
+    decoder.decode(hpack_hex("82")) ! { missing = error_is(E.code, compression) }
+    assert(missing)
+    let resized = http.HpackDecoder {}
+    resized.decode(hpack_hex("4001610162")) !!
+    resized.set_limit(0)
+    resized.set_limit(4096)
+    resized.decode(hpack_hex("203fe11f82")) !!
+    assert(resized.size == 0 && resized.capacity == 4096)
+    resized.set_limit(8192)
+    let update = ByteBuffer.new()
+    http.hpack_write_integer(update, 8192, 5, 32)
+    resized.decode(update.to_string()) !!
+    assert(resized.capacity == 8192)
+    let limited = http.HpackDecoder { max_header_size: 41 }
+    let excessive = false
+    limited.decode(hpack_hex("8282")) ! { excessive = error_is(E.code, limit) }
+    assert(excessive)
+}
+
+fn h2_bytes(kind: u8, flags: u8, stream: u32, payload: String) String {
+    let out = ByteBuffer.new()
+    out.write_byte((payload.bytes >> 16).to(u8))
+    out.write_byte((payload.bytes >> 8).to(u8))
+    out.write_byte(payload.bytes.to(u8))
+    out.write_byte(kind)
+    out.write_byte(flags)
+    out.write_u32_be(stream)
+    out.write(payload)
+    return out.into_string()
+}
+
+test "HTTP2: response compression reuses metadata without indexing secrets" {
+    let encoder = http.HpackEncoder {}
+    let decoder = http.HpackDecoder {}
+    let fields = Array[http.HpackField] {
+        .{ name: ":status", value: "200" },
+        .{ name: "content-type", value: "text/html" },
+        .{ name: "content-length", value: "12" }
+    }
+    let first = encoder.encode(fields, 1024) !!
+    decoder.decode(first) !!
+    let second = encoder.encode(fields, 1024) !!
+    assert(second.bytes == 3 && second.bytes < first.bytes)
+    let decoded = decoder.decode(second) !!
+    each decoded as field, index {
+        let expected = fields.get(index) !!
+        assert(field.name == expected.name && field.value == expected.value)
+    }
+    fields.append(.{ name: "content-type", value: "private", never_index: true })
+    let secret = decoder.decode(encoder.encode(fields, 1024) !!) !!
+    assert((secret.get(3) !!).never_index)
+    assert(encoder.entries.length == 2 && decoder.entries.length == 2)
+    let rejected = false
+    encoder.encode(fields, 1) ! { rejected = error_is(E.code, limit) }
+    assert(rejected && encoder.entries.length == 2)
+}
+
+test "HTTP2: response compression synchronizes table reductions and eviction" {
+    let encoder = http.HpackEncoder {}
+    let decoder = http.HpackDecoder {}
+    let fields = Array[http.HpackField] {
+        .{ name: "content-type", value: "text/html" },
+        .{ name: "content-length", value: "12" }
+    }
+    decoder.decode(encoder.encode(fields, 1024) !!) !!
+    encoder.set_limit(0)
+    decoder.set_limit(0)
+    encoder.set_limit(4096)
+    decoder.set_limit(4096)
+    let block = encoder.encode(fields, 1024) !!
+    assert(block[0] == 32)
+    decoder.decode(block) !!
+    assert(decoder.size == encoder.size)
+    encoder.set_limit(50)
+    decoder.set_limit(50)
+    let i = 0
+    while i++ < 3 {
+        let result = decoder.decode(encoder.encode(fields, 1024) !!) !!
+        assert(result.length == 2 && (result.get(1) !!).value == "12")
+        assert(decoder.size == encoder.size && encoder.size <= 50)
+    }
+    encoder.set_limit(0)
+    decoder.set_limit(0)
+    decoder.decode(encoder.encode(fields, 1024) !!) !!
+    assert(encoder.size == 0 && decoder.size == 0)
+}
+
+test "HTTP2: frame batches retain individual wire boundaries" {
+    let first = http.H2Frame { kind: http.H2_HEADERS, flags: 4, stream: 1, payload: "abc" }
+    let second = http.H2Frame { kind: http.H2_DATA, flags: 1, stream: 1, payload: "hello" }
+    let out = ByteBuffer.new()
+    first.encode_into(out) !!
+    second.encode_into(out) !!
+    assert(out.to_string() == (first.encode() !!) + (second.encode() !!))
+    let reader = out.reader()
+    assert((http.h2_read_frame(reader) !!).payload == "abc")
+    assert((http.h2_read_frame(reader) !!).payload == "hello")
+    assert(reader.remaining().length == 0)
+}
+
+test "HTTP2: frame parsing is incremental and preserves boundaries" {
+    let encoded = h2_bytes(0, 1, 1, "hello")
+    let count: uint = 0
+    while count < encoded.bytes {
+        let reader = ByteReader.new(encoded.part(0, count++))
+        let incomplete = false
+        http.h2_read_frame(reader) ! { incomplete = error_is(E.code, incomplete) }
+        assert(incomplete)
+        assert(reader.pos == 0)
+    }
+    let reader = ByteReader.new(encoded + h2_bytes(6, 1, 0, "12345678"))
+    let data = http.h2_read_frame(reader) !!
+    assert(data.kind == 0 && data.stream == 1 && data.flags == 1)
+    assert(data.payload == "hello")
+    assert(data.encode() !! == encoded)
+    let ping = http.h2_read_frame(reader) !!
+    assert(ping.kind == 6 && ping.payload == "12345678")
+    assert(reader.remaining().length == 0)
+}
+
+test "HTTP2: reserved bits and unknown frames remain compatible" {
+    let reader = ByteReader.new(h2_bytes(0xef, 0xff, 0x80000007, "extension"))
+    let frame = http.h2_read_frame(reader) !!
+    assert(frame.kind == 0xef && frame.flags == 0xff && frame.stream == 7)
+    assert(frame.payload == "extension")
+}
+
+fn h2_invalid(bytes: String, size_error: bool) {
+    let reader = ByteReader.new(bytes)
+    let rejected = false
+    http.h2_read_frame(reader) ! {
+        rejected = size_error ? error_is(E.code, frame_size) : error_is(E.code, protocol)
+    }
+    assert(rejected)
+    assert(reader.pos == 0)
+}
+
+test "HTTP2: frame sizes and stream identifiers are validated" {
+    h2_invalid(h2_bytes(0, 0, 0, ""), false)
+    h2_invalid(h2_bytes(1, 4, 0, ""), false)
+    h2_invalid(h2_bytes(2, 0, 1, "1234"), true)
+    h2_invalid(h2_bytes(3, 0, 1, "123"), true)
+    h2_invalid(h2_bytes(4, 0, 1, ""), false)
+    h2_invalid(h2_bytes(4, 0, 0, "12345"), true)
+    h2_invalid(h2_bytes(4, 1, 0, "123456"), true)
+    h2_invalid(h2_bytes(6, 0, 0, "1234567"), true)
+    h2_invalid(h2_bytes(6, 0, 1, "12345678"), false)
+    h2_invalid(h2_bytes(7, 0, 0, "1234567"), true)
+    h2_invalid(h2_bytes(8, 0, 1, "123"), true)
+    h2_invalid(h2_bytes(9, 4, 0, ""), false)
+    let large = ByteBuffer.new()
+    large.skip(16_385)
+    // Reject the advertised length even before its payload arrives.
+    h2_invalid(h2_bytes(0, 0, 1, large.into_string()).part(0, 9), true)
+}
+
+test "HTTP2: padding and optional header fields are bounded" {
+    let payload = ByteBuffer.new()
+    payload.write_byte(2)
+    payload.write_u32_be(0)
+    payload.write_byte(15)
+    payload.write("abc\0\0")
+    let frame = http.H2Frame { kind: 1, flags: 44, stream: 1, payload: payload.into_string() }
+    assert(frame.fragment() !! == "abc")
+    let parsed = http.h2_read_frame(ByteReader.new(frame.encode() !!)) !!
+    assert(parsed.fragment() !! == "abc")
+    h2_invalid(h2_bytes(0, 8, 1, ""), false)
+    h2_invalid(h2_bytes(0, 8, 1, "\x01"), false)
+    h2_invalid(h2_bytes(1, 32, 1, "1234"), true)
+    h2_invalid(h2_bytes(5, 0, 1, "123"), true)
+    let empty = http.H2Frame { kind: 0, flags: 8, stream: 1, payload: "\0" }
+    assert(empty.fragment() !! == "")
+}
+
+test "HTTP2: header continuations cannot interleave and are bounded" {
+    let block = http.H2HeaderBlock { max_size: 5 }
+    let first = block.accept(http.H2Frame { kind: 1, stream: 1, payload: "ab" }) ! panic("HTTP2: first header fragment failed")
+    assert(!isset(first))
+    assert(block.stream == 1 && block.fragments.length == 2)
+    let interleaved = false
+    block.accept(http.H2Frame { kind: 6, payload: "12345678" }) ! { interleaved = error_is(E.code, protocol) }
+    assert(interleaved)
+    let wrong_stream = false
+    block.accept(http.H2Frame { kind: 9, stream: 3 }) ! { wrong_stream = error_is(E.code, protocol) }
+    assert(wrong_stream)
+    let limited = false
+    block.accept(http.H2Frame { kind: 9, stream: 1, payload: "cdef" }) ! { limited = error_is(E.code, limit) }
+    assert(limited)
+    assert(block.stream == 1 && block.fragments.to_string() == "ab")
+    let result = block.accept(http.H2Frame { kind: 9, flags: 4, stream: 1, payload: "cde" }) ! panic("HTTP2: final header continuation failed")
+    assert(result == "abcde")
+    assert(block.stream == 0)
+    let unexpected = false
+    block.accept(http.H2Frame { kind: 9, flags: 4, stream: 1 }) ! { unexpected = error_is(E.code, protocol) }
+    assert(unexpected)
+    let next = block.accept(http.H2Frame { kind: 1, flags: 4, stream: 3, payload: "new" }) ! panic("HTTP2: complete header block after continuation failed")
+    assert(next == "new")
+    assert(block.stream == 0 && block.fragments.length == 0)
+    let oversized = false
+    block.accept(http.H2Frame { kind: 1, flags: 4, stream: 5, payload: "123456" }) ! { oversized = error_is(E.code, limit) }
+    assert(oversized && block.stream == 0 && block.fragments.length == 0)
+}
+
+test "HTTP2: settings validate before applying and ignore unknown ids" {
+    let settings = http.H2Settings {}
+    assert(settings.initial_window_size == 65_535 && settings.max_frame_size == 16_384)
+    let payload = ByteBuffer.new()
+    payload.write_u16_be(1)
+    payload.write_u32_be(1024)
+    payload.write_u16_be(5)
+    payload.write_u32_be(1)
+    let rejected = false
+    settings.apply(http.H2Frame { kind: 4, payload: payload.to_string() }) ! { rejected = error_is(E.code, protocol) }
+    assert(rejected && settings.header_table_size == 4096)
+    payload.clear()
+    payload.write_u16_be(99)
+    payload.write_u32_be(42)
+    payload.write_u16_be(1)
+    payload.write_u32_be(1024)
+    payload.write_u16_be(1)
+    payload.write_u32_be(2048)
+    settings.apply(http.H2Frame { kind: 4, payload: payload.to_string() }) !!
+    assert(settings.header_table_size == 2048)
+    payload.clear()
+    payload.write_u16_be(4)
+    payload.write_u32_be(0x80000000)
+    let flow = false
+    settings.apply(http.H2Frame { kind: 4, payload: payload.to_string() }) ! { flow = error_is(E.code, flow_control) }
+    assert(flow && settings.initial_window_size == 65_535)
+    payload.clear()
+    payload.write_u16_be(2)
+    payload.write_u32_be(0)
+    let push = false
+    settings.apply(http.H2Frame { kind: 4, payload: payload.to_string() }, true) ! { push = error_is(E.code, protocol) }
+    assert(push)
+    settings.apply(http.H2Frame { kind: 4, payload: payload.to_string() }) !!
+    assert(!settings.enable_push)
+}

@@ -28,6 +28,8 @@ trap 'rm -rf "$workdir"' EXIT
 # fixture:expected exit status
 cases="return-3:3 return-0:0 void-main:0 return-int:7 return-non-integer:0 fixed-array-bounds:1 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
 
+cases="$cases unhandled-error:1"
+
 for case in $cases; do
     name="${case%%:*}"
     want="${case##*:}"
@@ -59,9 +61,14 @@ for case in $cases; do
     fi
 
     set +e
-    "$exe" >/dev/null 2>&1
+    output=$("$exe" 2>&1)
     got=$?
     set -e
+
+    if [ "$name" = "unhandled-error" ] && [[ "$output" != *"unhandled-error.valk:8"* ]]; then
+        echo "# Missing unhandled error source location: $output"
+        failed=1
+    fi
 
     if [ "$got" -ne "$want" ]; then
         echo "# Wrong exit status"

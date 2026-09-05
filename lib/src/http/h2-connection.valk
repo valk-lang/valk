@@ -1,0 +1,373 @@
+use net
+use time
+use core
+use fs
+use io
+
+fn h2_close_file(file: ?fs.FileStream) {
+    if isset(file) : file.close() ! {}
+}
+
+fn h2_tls_allowed(ssl: net.Ssl) bool {
+    @unsafe
+    net.SSL_set_options(ssl.ssl, (1 << 17) | (1 << 30))
+    let version: String = net.SSL_get_version(ssl.ssl)
+    if version == "TLSv1.3" : return true
+    if version != "TLSv1.2" : return false
+    let cipher: String = net.SSL_CIPHER_get_name(net.SSL_get_current_cipher(ssl.ssl))
+    return cipher.starts_with("ECDHE-") && (cipher.contains("-GCM-") || cipher.contains("CHACHA20"))
+}
+
+fn h2_alpn_select(ssl: net.OSSL, out: *ptr, length: *u8, input: ptr, size: u32, arg: ?ptr) i32 $entrance {
+    @unsafe
+    let offset: uint = 0
+    let fallback: uint = 0
+    while offset < size {
+        let count = @ptrv(input, u8, offset).to(uint)
+        offset++
+        if count == 0 || count > size - offset : return 2
+        if count == 2 && @ptrv(input, u8, offset) == 'h' && @ptrv(input, u8, offset + 1) == '2' {
+            @ptrv(out, ptr, 0) = input.@offset(offset)
+            @ptrv(length, u8, 0) = 2
+            return 0
+        }
+        if count == 8 && @ptrv(input, u8, offset) == 'h' && @ptrv(input, u8, offset + 1) == 't'
+            && @ptrv(input, u8, offset + 2) == 't' && @ptrv(input, u8, offset + 3) == 'p'
+            && @ptrv(input, u8, offset + 4) == '/' && @ptrv(input, u8, offset + 5) == '1'
+            && @ptrv(input, u8, offset + 6) == '.' && @ptrv(input, u8, offset + 7) == '1' : fallback = offset
+        offset += count
+    }
+    if fallback == 0 : return 2
+    @ptrv(out, ptr, 0) = input.@offset(fallback)
+    @ptrv(length, u8, 0) = 8
+    return 0
+}
+
+class H2Connection {
+    owner: Connection
+    session: H2Session
+    writer: core.Mutex
+    output_buffer: ByteBuffer (.new(16_384))
+    reading_batch: bool (false)
+    closed: bool (false)
+    handlers: uint (0)
+    processing_body: uint (0)
+    reserved_body: uint (0)
+
+    static fn new(owner: Connection) SELF !InitError {
+        let settings = owner.worker.server
+        return SELF {
+            owner: owner,
+            writer: core.Mutex.new() !>,
+            session: H2Session {
+                max_body_size: settings.max_request_body_size,
+                max_buffered_body: settings.max_request_body_size,
+                decoder: HpackDecoder { max_header_size: settings.max_request_header_size },
+                header_block: H2HeaderBlock { max_size: settings.max_request_header_size }
+            }
+        }
+    }
+
+    fn flush() bool {
+        if this.session.output.length == 0 || this.closed : return !this.closed
+        if this.reading_batch && this.session.output.length < 64 : return true
+        this.writer.lock()
+        defer this.writer.unlock()
+        while this.session.output.length > 0 && !this.closed {
+            let out = this.output_buffer
+            out.clear()
+            while this.session.output.length > 0 && out.length < 16_384 {
+                let frame = this.session.output.pop_first() !!
+                frame.encode_into(out, this.session.peer.max_frame_size) ! {
+                    this.closed = true
+                    break
+                }
+            }
+            if this.closed : break
+            this.owner.netcon.write(out) ! {
+                this.closed = true
+                break
+            }
+        }
+        return !this.closed
+    }
+
+    fn request_shutdown() {
+        this.session.shutdown()
+    }
+
+    fn sync_body() bool {
+        let amount = this.session.buffered_body + this.processing_body
+        if amount == this.reserved_body : return true
+        let server = this.owner.worker.server
+        if amount > this.reserved_body {
+            let added = amount - this.reserved_body
+            server.active_body_size += added
+            let active = server.active_body_size
+            if server.max_server_wide_body_size > 0 && active > server.max_server_wide_body_size {
+                server.active_body_size -= added
+                return false
+            }
+        } else {
+            server.active_body_size -= this.reserved_body - amount
+        }
+        this.reserved_body = amount
+        return true
+    }
+
+    fn run() {
+        let socket = this.owner.netcon
+        let settings = this.owner.worker.server
+        socket.read_timeout_ms = 20
+        let input = ByteBuffer.new()
+        let chunk = Slice[u8].new(16_393, 0)
+        let preface = false
+        let last_read = time.mono_ms()
+        let header_started: uint = 0
+        let frame_epoch = last_read
+        let frame_count: uint = 0
+        this.owner.active = true
+        this.session.start()
+        let ssl = socket.ssl
+        if isset(ssl) && !h2_tls_allowed(ssl) {
+            this.fail(12)
+            return
+        }
+        if this.owner.rejected : this.session.shutdown()
+        while !this.closed {
+            let now = time.mono_ms()
+            if header_started != 0 && settings.header_timeout_ms > 0 && now - header_started >= settings.header_timeout_ms {
+                this.fail(1)
+                break
+            }
+            let expired = Array[u32].new()
+            each this.session.streams as stream {
+                if !stream.remote_closed && settings.body_timeout_ms > 0 && now - stream.last_read_ms >= settings.body_timeout_ms : expired.append(stream.id)
+            }
+            each expired as id : this.session.reset_stream(id, 8)
+            this.sync_body()
+            if settings.stopping != 0 : this.request_shutdown()
+            if !this.flush() : break
+            if this.session.draining && this.session.streams.length == 0 && this.handlers == 0 : break
+            let received = socket.read(chunk) ! {
+                if !error_is(E.code, timeout) : break
+                let limit = input.length > 0 || !preface ? settings.header_timeout_ms : settings.idle_timeout_ms
+                if this.handlers == 0 && limit > 0 && time.mono_ms() - last_read >= limit : break
+                continue
+            }
+            if received == 0 : break
+            last_read = time.mono_ms()
+            input.write(chunk.view(0, received))
+            if !preface {
+                let expected = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+                let count = input.length < expected.bytes ? input.length : expected.bytes
+                if input.to_string().part(0, count) != expected.part(0, count) : break
+                if input.length < expected.bytes : continue
+                input.clear_until(expected.bytes)
+                preface = true
+            }
+            let reader = input.reader()
+            this.reading_batch = true
+            while reader.remaining().length > 0 && !this.closed {
+                let frame = h2_read_frame(reader) ! {
+                    if error_is(E.code, incomplete) : break
+                    this.fail(error_is(E.code, frame_size) ? 6 : 1)
+                    break
+                }
+                if time.mono_ms() - frame_epoch >= 1000 {
+                    frame_epoch = time.mono_ms()
+                    frame_count = 0
+                }
+                if ++frame_count > 10_000 {
+                    this.fail(11)
+                    break
+                }
+                this.session.max_buffered_body = this.processing_body >= settings.max_request_body_size ? 0 : settings.max_request_body_size - this.processing_body
+                let ready = this.session.receive(frame) ! {
+                    let code: u32 = 1
+                    if error_is(E.code, compression) : code = 9
+                    if error_is(E.code, flow_control) : code = 3
+                    if error_is(E.code, limit) : code = 11
+                    this.fail(code)
+                    break
+                }
+                if this.session.header_block.stream != 0 {
+                    if header_started == 0 : header_started = time.mono_ms()
+                } else {
+                    header_started = 0
+                }
+                if frame.kind == H2_DATA || frame.kind == H2_HEADERS || frame.kind == H2_CONTINUATION {
+                    this.session.streams.get(frame.stream) -> stream: stream.last_read_ms = time.mono_ms()
+                }
+                if !this.sync_body() {
+                    if frame.stream == 0 {
+                        this.fail(11)
+                        break
+                    }
+                    this.session.reset_stream(frame.stream, 11)
+                    ready = null
+                    this.sync_body()
+                }
+                if isset(ready) {
+                    if this.handlers >= this.session.max_streams {
+                        this.session.reset_stream(ready.id, 7)
+                    } else {
+                        this.handlers++
+                        co this.handle(ready)
+                    }
+                }
+            }
+            this.reading_batch = false
+            if !this.flush() : break
+            input.clear_until(reader.pos)
+        }
+        this.closed = true
+        socket.interrupt()
+        each this.session.streams as stream : stream.cancelled = true
+        while this.handlers > 0 : time.sleep_ms(1)
+        settings.active_body_size -= this.reserved_body
+        this.reserved_body = 0
+    }
+
+    fn fail(code: u32) {
+        this.reading_batch = false
+        let payload = ByteBuffer.new()
+        payload.write_u32_be(this.session.draining ? this.session.goaway_last_stream : this.session.last_stream)
+        payload.write_u32_be(code)
+        this.session.output.append(H2Frame { kind: H2_GOAWAY, payload: payload.into_string() })
+        this.flush()
+        this.closed = true
+    }
+
+    fn handle(stream: H2Stream) {
+        let buffer = stream.body
+        this.session.release_body(stream)
+        let body = isset(buffer) ? buffer.into_string() : ""
+        this.processing_body += body.bytes
+        defer this.handler_finished(body.bytes)
+        let headers = Headers.new()
+        let method = ""
+        let target = ""
+        each stream.fields as field {
+            if field.name == ":method" : method = field.value
+            else if field.name == ":path" : target = field.value
+            else if field.name == ":authority" : headers.set("host", field.value)
+            else if field.name == "cookie" && headers.has("cookie") : headers.set("cookie", (headers.get("cookie") !!) + "; " + field.value)
+            else if !field.name.starts_with(":") : headers.append(field.name, field.value)
+        }
+        let path = target
+        let query = ""
+        target.index_of("?") -> index: {
+            path = target.part(0, index)
+            query = target.part(index + 1, target.bytes - index - 1)
+        }
+        let request = Request { method: method, path: path, query_string: query, body_data: body, header_data: "", header_map: headers }
+        let response: ?Response = null
+        if method != "CONNECT" && !path.contains("..") {
+            let directory = this.owner.worker.server.static_dirs
+            while isset(directory) {
+                let full = fs.resolve(fs.add(directory.path, path))
+                if full.starts_with(directory.path) && fs.is_file(full) {
+                    response = Response.file(full)
+                    break
+                }
+                directory = directory.next
+            }
+        }
+        if !isset(response) : response = method == "CONNECT" ? Response.empty(501) : this.owner.worker.server.handler(request)
+        if !isset(response) : return
+        if stream.cancelled || this.closed : return
+        this.respond(stream, request, response) ! {
+            if !this.closed {
+                this.session.reset_stream(stream.id, 2)
+                this.flush()
+            }
+        }
+    }
+
+    fn handler_finished(bytes: uint) {
+        this.processing_body -= bytes
+        this.handlers--
+        this.sync_body()
+    }
+
+    fn respond(stream: H2Stream, request: Request, response: Response) !H2Error {
+        let source = response.stream_reader
+        let file: ?fs.FileStream = null
+        let size = isset(source) ? response.stream_size : response.body.bytes
+        let content_type = response.content_type
+        let status = response.status
+        let path = response.filepath
+        if isset(path) {
+            file = fs.stream(path) !? null
+            if isset(file) {
+                source = file.to(io.Reader)
+                size = fs.size(path) !? 0
+                content_type = fs.mime_type(fs.extension(path))
+            } else {
+                status = 404
+                size = 0
+            }
+        }
+        defer h2_close_file(file)
+        if status < 200 || status > 599 : status = 500
+        let headers = Array[HpackField] { .{ name: ":status", value: status.to_string() } }
+        let extra = response.header_list
+        if isset(extra) : content_type = extra.get("content-type") !? content_type
+        if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
+        if status != 204 : headers.append(.{ name: "content-length", value: size.to_string() })
+        if isset(extra) {
+            each extra as value, name {
+                if response_header_is_framing(name) : continue
+                let field = HpackField { name: name.lower(), value: value, never_index: true }
+                if h2_regular_field(field) : headers.append(field)
+            }
+        }
+        let filename = response.filename
+        if isset(filename) && response_header_value_is_safe(filename) && (!isset(extra) || !extra.has("content-disposition")) {
+            let disposition = ByteBuffer.new()
+            disposition.write("attachment; filename=\"")
+            write_response_quoted_header_value(disposition, filename)
+            disposition.write("\"")
+            headers.append(.{ name: "content-disposition", value: disposition.into_string() })
+        }
+        let no_body = request.method == "HEAD" || status == 204 || status == 304 || size == 0
+        this.session.send_headers(stream, headers, no_body) !>
+        if no_body {
+            this.flush()
+            return
+        }
+        if isset(source) && !this.flush() : return
+        let offset: uint = 0
+        let data = ""
+        let data_offset: uint = 0
+        let last_write = time.mono_ms()
+        while offset < size && !stream.cancelled && !this.closed {
+            if data_offset == data.bytes {
+                let amount = size - offset
+                if amount > 16_384 : amount = 16_384
+                if isset(source) {
+                    let buffer = Slice[u8].new(amount, 0)
+                    let read = source.read(buffer) ! throw .protocol
+                    if read == 0 || read > amount : throw .protocol
+                    data = buffer.view(0, read).to_string()
+                } else {
+                    data = response.body.part(offset, amount)
+                }
+                data_offset = 0
+            }
+            let count = this.session.send_data(stream, data.part(data_offset, data.bytes - data_offset), offset + data.bytes - data_offset == size) !>
+            if count == 0 {
+                if !this.flush() : return
+                let timeout = this.owner.worker.server.write_timeout_ms
+                if timeout > 0 && time.mono_ms() - last_write >= timeout : throw .limit
+                time.sleep_ms(1)
+                continue
+            }
+            last_write = time.mono_ms()
+            offset += count
+            data_offset += count
+            if !this.flush() : return
+        }
+    }
+}
