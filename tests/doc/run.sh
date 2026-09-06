@@ -58,6 +58,21 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
     exit 1
 fi
 
+echo "> Preserve public value aliases to private functions"
+out=$("$VALK" doc "$DIR/fixture" -o "$workdir/public-api.md" --markdown --no-private 2>&1)
+if [ "$?" -ne 0 ]; then
+    echo "$out"
+    exit 1
+fi
+public_markdown=$(<"$workdir/public-api.md")
+if [[ "$public_markdown" != *'+ value public_callable (hidden_target)'* ]] \
+    || [[ "$public_markdown" == *'value private_callable'* ]] \
+    || [[ "$public_markdown" == *'fn hidden_target'* ]]; then
+    echo "# Value alias visibility is incorrect"
+    echo "$public_markdown"
+    exit 1
+fi
+
 repo=$(cd "$DIR/../.." && pwd)
 out=$("$VALK" doc "$repo/lib" -o "$workdir/stdlib-api.md" --markdown --no-private --target linux-x64 2>&1)
 status=$?
@@ -71,6 +86,11 @@ if ! cmp -s "$workdir/stdlib-api.md" "$repo/docs/api.md"; then
     exit 1
 fi
 stdlib_markdown=$(<"$workdir/stdlib-api.md")
+if [[ "$stdlib_markdown" != *'+ value collect (ext.valk_gc_collect)'* ]] \
+    || [[ "$stdlib_markdown" != *'+ value collect_shared (ext.valk_gc_collect_shared)'* ]]; then
+    echo "# Public collector aliases are missing"
+    exit 1
+fi
 if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend Slice[u8] {'* ]] \
@@ -141,4 +161,4 @@ if [[ "$readme" != *'curl -sSL https://valk-lang.dev/install.sh | bash'* ]] \
     exit 1
 fi
 
-echo "# 3/3 documentation tests passed"
+echo "# 4/4 documentation tests passed"

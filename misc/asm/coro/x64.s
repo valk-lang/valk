@@ -1,4 +1,10 @@
 
+.global _valk_gc_keep_alive
+_valk_gc_keep_alive:
+.global valk_gc_keep_alive
+valk_gc_keep_alive:
+retq
+
 .global _valk_stack_swap
 _valk_stack_swap:
 .global valk_stack_swap
@@ -45,7 +51,7 @@ pushq %r15
 subq $8, %rsp
 
 movq %rdi, %rax
-movq %rsp, %rdi
+leaq 8(%rsp), %rdi
 call *%rax
 
 addq $8, %rsp
@@ -77,7 +83,16 @@ retq
 _valk_gc_collect:
 .global valk_gc_collect
 valk_gc_collect:
+xorl %esi, %esi
+jmp Lvalk_gc_collect
 
+.global _valk_gc_collect_shared
+_valk_gc_collect_shared:
+.global valk_gc_collect_shared
+valk_gc_collect_shared:
+movl $1, %esi
+
+Lvalk_gc_collect:
 pushq %rbp
 pushq %rbx
 pushq %r12
@@ -86,7 +101,8 @@ pushq %r14
 pushq %r15
 subq $8, %rsp
 
-movq %rsp, %rdi
+# Start at the saved registers, above the alignment slot
+leaq 8(%rsp), %rdi
 call *valk_gc_entry(%rip)
 
 addq $8, %rsp

@@ -1,4 +1,10 @@
 
+.global _valk_gc_keep_alive
+_valk_gc_keep_alive:
+.global valk_gc_keep_alive
+valk_gc_keep_alive:
+ret
+
 .global _valk_stack_swap
 _valk_stack_swap:
 .global valk_stack_swap
@@ -102,7 +108,16 @@ ret
 _valk_gc_collect:
 .global valk_gc_collect
 valk_gc_collect:
+mov x1, 0
+b Lvalk_gc_collect
 
+.global _valk_gc_collect_shared
+_valk_gc_collect_shared:
+.global valk_gc_collect_shared
+valk_gc_collect_shared:
+mov x1, 1
+
+Lvalk_gc_collect:
 sub sp, sp, 0xa0
 stp d8,   d9, [sp, 0x00]
 stp d10, d11, [sp, 0x10]

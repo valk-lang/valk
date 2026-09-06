@@ -64,6 +64,10 @@ popq %gs:0x10
 
 retq
 
+.global valk_gc_keep_alive
+valk_gc_keep_alive:
+retq
+
 # valk_gc_scan_stack(callback, ctx): push the callee-saved registers, then
 # call callback(sp, ctx) so a conservative scan from sp sees every register
 .global valk_gc_scan_stack
@@ -92,7 +96,7 @@ movups %xmm15, 0x90(%rsp)
 subq $40, %rsp
 
 movq %rcx, %rax
-movq %rsp, %rcx
+leaq 40(%rsp), %rcx
 call *%rax
 
 addq $40, %rsp
@@ -140,7 +144,14 @@ retq
 # us, and calls the entry with the stack pointer
 .global valk_gc_collect
 valk_gc_collect:
+xorl %edx, %edx
+jmp Lvalk_gc_collect
 
+.global valk_gc_collect_shared
+valk_gc_collect_shared:
+movl $1, %edx
+
+Lvalk_gc_collect:
 movq $0, 0x08(%rsp)
 movq $0, 0x10(%rsp)
 movq $0, 0x18(%rsp)
@@ -167,7 +178,8 @@ movups %xmm14, 0x80(%rsp)
 movups %xmm15, 0x90(%rsp)
 subq $40, %rsp
 
-movq %rsp, %rcx
+# Start at the saved registers, above the callee's shadow space and padding
+leaq 40(%rsp), %rcx
 call *valk_gc_entry(%rip)
 
 addq $40, %rsp

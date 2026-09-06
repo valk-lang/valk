@@ -17,6 +17,36 @@ trap 'rm -rf "$workdir"' EXIT
 
 echo ""
 echo "# Test generated-code optimizations"
+echo "> Call the native GC entry directly on every target"
+
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    collect_ir="$workdir/gc-direct-entry-$target.ll"
+    out=$("$VALK" build "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn -o "$collect_ir" 2>&1)
+    if [ "$?" -ne 0 ]; then
+        echo "# Failed to build direct GC entry fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    collect_body=$(sed -n '/^define .*__explicit_collect__/,/^}/p' "$collect_ir")
+    if [[ "$collect_body" != *'call void @"valk_gc_collect"()'* ]]; then
+        echo "# Explicit collection did not call the assembly entry directly on $target"
+        echo "$collect_body"
+        exit 1
+    fi
+    shared_collect_body=$(sed -n '/^define .*__explicit_collect_shared__/,/^}/p' "$collect_ir")
+    if [[ "$shared_collect_body" != *'call void @"valk_gc_collect_shared"()'* ]]; then
+        echo "# Shared collection did not call the assembly entry directly on $target"
+        echo "$shared_collect_body"
+        exit 1
+    fi
+    accept_body=$(sed -n '/^define .*__SocketServer__accept__/,/^}/p' "$collect_ir")
+    if [ "$(grep -c 'call void @"valk_gc_keep_alive"' <<< "$accept_body")" -lt 2 ]; then
+        echo "# Accept did not retain its socket on success and error exits on $target"
+        echo "$accept_body"
+        exit 1
+    fi
+done
+
 echo "> Keep managed values on the native stack without shadow frames"
 
 ir="$workdir/buffer-roots.ll"
@@ -424,5 +454,5 @@ if [[ "$error_body" != *"br label %await.after."* ]] \
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 18"
+echo "# Test count: 19"
 echo ""
