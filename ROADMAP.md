@@ -11,6 +11,7 @@
 + Fix enum type bug
 + Fix missing gc roots for embedded files
 + Compiler optimizations
++ GC stack & scan rewrite
 
 + Release 0.6.0
 + math namespace
