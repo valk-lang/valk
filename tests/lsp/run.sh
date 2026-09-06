@@ -256,6 +256,16 @@ check "diagnostics report every broken function (2/3)" '"message":"Unknown ident
 check "diagnostics report every broken function (3/3)" "Expected 'uint', got 'String'" \
     "$(notify_save multi-error.valk)"
 
+# One package, two files: errors in one file must not stop the other from being checked
+check "a broken sibling file does not hide the checked file's own error" '"message":"Unknown identifier: keep_going_missing_xyz"' \
+    "$(notify_save keep-going/src/good.valk)"
+check_absent "declarations after a sibling's syntax error still resolve" 'Unknown identifier: Broken' \
+    "$(notify_save keep-going/src/good.valk)"
+check "the broken sibling reports its syntax error" "Invalid identifier name: '{'" \
+    "$(notify_save keep-going/src/good.valk)"
+check "the broken sibling reports the errors after its syntax error" '"message":"Unknown type: NoSuchType"' \
+    "$(notify_save keep-going/src/good.valk)"
+
 count=$((count + 1))
 echo "> CLI prints exactly one error for the same file"
 cli_out=$("$VALK" build "$DIR/multi-error.valk" --no-warn 2>&1)
