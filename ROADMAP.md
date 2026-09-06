@@ -4,8 +4,11 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.6.1
+- Release 0.6.2
 ~ Data race solution (Threads done via shared type, MutexValue not done)
+
+- Release 0.6.1
++ Fix enum type bug
 
 + Release 0.6.0
 + math namespace
