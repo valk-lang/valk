@@ -1,112 +1,127 @@
+@unsafe
 
 use core
 
+class TaskState {
+    tasks: Array[shared Task] (.{})
+    threads_waiting: uint (0)
+    taskrunners: uint (0)
+    #if TEST
+    fail_taskrunner_start: bool (false)
+    #end
+}
+
 shared task_gate: ThreadSuspendGate (.new())
-shared tasks: Array[Task] (.{})
-shared threads_waiting: uint (0)
-shared taskrunners: uint (0)
-#if TEST
-shared fail_taskrunner_start: bool (false)
-#end
+shared task_state: Lock[TaskState] (.new(.{}) !!)
 
 value TASKRUNNER_LIMIT (8)
 
-+ fn task(handler: fn()()) Task !InitError {
++ fn task(handler: shared fn()()) Task !InitError {
     let mutex: shared core.Mutex = .new() ! throw .init
     mutex.lock()
     let task = Task {
         handler: handler
         mutex: mutex
     }
-    core.race_lock()
-    tasks.append(task)
-    start_taskrunner() ! {
-        tasks.pop_last() _
-        core.race_unlock()
+    let failed = false
+    lock task_state as st {
+        // Every field is shared-safe, so the cast is sound
+        st.tasks.append(task.@cast(shared Task))
+        // Queued before the runner exists, so a runner that fails to start
+        // takes its task back out before anyone can consume it.
+        start_taskrunner(st) ! {
+            st.tasks.pop_last() _
+            failed = true
+        }
+    }
+    if failed {
         mutex.unlock()
         throw .init
     }
-    core.race_unlock()
     task_gate.signal()
     return task
 }
 
 + class Task {
-    - handler: fn()()
+    - handler: shared fn()()
     - mutex: shared core.Mutex
     + fn await() {
         this.mutex.await_unlock()
     }
 }
 
-// Called with tasks locked so a new runner cannot consume the published task
-// before its thread has either started or been rolled back.
-fn start_taskrunner() !InitError {
-    let should_start = threads_waiting == 0 && taskrunners < TASKRUNNER_LIMIT
-    if should_start : taskrunners++
+fn start_taskrunner(st: locked TaskState) !InitError {
+    let should_start = st.threads_waiting == 0 && st.taskrunners < TASKRUNNER_LIMIT
+    if should_start : st.taskrunners++
     #if TEST
-    let fail_start = should_start && fail_taskrunner_start
-    if fail_start : fail_taskrunner_start = false
+    let fail_start = should_start && st.fail_taskrunner_start
+    if fail_start : st.fail_taskrunner_start = false
     #end
 
     if should_start {
         #if TEST
         if fail_start {
-            taskrunners--
+            st.taskrunners--
             throw .init
         }
         #end
         start(fn() {
-            while true {
-                core.race_lock()
-                let task = tasks.pop_last() !? null
-                if !isset(task) : threads_waiting++
-                core.race_unlock()
-                if !isset(task) {
-                    let timed_out = task_gate.wait(fn() bool { return tasks.length == 0 }, 5000)
-                    core.race_lock()
-                    threads_waiting--
-                    task = tasks.pop_last() !? null
-                    if !isset(task) {
-                        if timed_out {
-                            taskrunners--
-                            core.race_unlock()
-                            break
-                        }
-                        core.race_unlock()
-                        continue
-                    }
-                    core.race_unlock()
-                }
-                task.handler()
-                task.mutex.unlock()
-            }
+            taskrunner_loop()
         }) ! {
-            taskrunners--
+            st.taskrunners--
             throw .init
         }
     }
 }
 
+fn taskrunner_loop() {
+    while true {
+        let task = taskrunner_next()
+        if !isset(task) : break
+        task.handler()
+        task.mutex.unlock()
+    }
+}
+
+// The next queued task, waiting for one when the queue is empty. Null when
+// nothing arrived within the timeout, which retires this runner.
+fn taskrunner_next() ?shared Task {
+    let task: ?shared Task = null
+    lock task_state as st {
+        task = st.tasks.pop_last() !? null
+        if !isset(task) : st.threads_waiting++
+    }
+    if isset(task) : return task
+
+    while true {
+        let timed_out = task_gate.wait(fn() bool {
+            lock task_state as st : return st.tasks.length == 0
+        }, 5000)
+        let retire = false
+        lock task_state as st {
+            task = st.tasks.pop_last() !? null
+            if isset(task) {
+                st.threads_waiting--
+            } else if timed_out {
+                st.threads_waiting--
+                st.taskrunners--
+                retire = true
+            }
+        }
+        if isset(task) || retire : return task
+    }
+}
+
 #if TEST
 + fn taskrunner_counts_for_test() (uint, uint) {
-    core.race_lock()
-    let active = taskrunners
-    core.race_unlock()
-    return (active, TASKRUNNER_LIMIT)
+    lock task_state as st : return (st.taskrunners, TASKRUNNER_LIMIT)
 }
 
 + fn fail_next_taskrunner_start_for_test() {
-    core.race_lock()
-    fail_taskrunner_start = true
-    core.race_unlock()
+    lock task_state as st : st.fail_taskrunner_start = true
 }
 
 + fn taskrunner_queue_state_for_test() (uint, uint) {
-    core.race_lock()
-    let waiting = threads_waiting
-    let queued = tasks.length
-    core.race_unlock()
-    return (waiting, queued)
+    lock task_state as st : return (st.threads_waiting, st.tasks.length)
 }
 #end

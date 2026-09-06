@@ -1527,8 +1527,6 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 `shared T` is a read-only view used to pass data across threads. Data-race-unsafe properties cannot be changed through that view, while integer properties use atomic access. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`.
 
-You can use `core.race_lock()` and `core.race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).
-
 ### Mutable shared data
 
 `Lock[T]` holds a value that threads may change. The value is only reachable inside a `lock` block, which holds the lock's mutex until the block ends:
