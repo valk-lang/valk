@@ -74,7 +74,7 @@ make
 
 ## Benchmarks
 
-Valk 0.6.0, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
+Valk 0.6.1, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
@@ -96,13 +96,13 @@ Code: [Link](examples/bench)
 
 | Scenario | Valk | Go | D | C# |
 |---|---:|---:|---:|---:|
-| short-lived alloc | 13 ms | 111 ms | 210 ms | 76 ms |
-| stable-heap forced collects | 44 ms | 42103 ms | 27000 ms | 29093 ms |
-| build long-lived chain | 43 ms | 71 ms | 185 ms | 209 ms |
-| free long-lived chain | 18 ms | 62 ms | 3 ms | 13 ms |
-| mutate live links | 10 ms | 8 ms | 11 ms | 12 ms |
-| short-lived churn with large live set | 21 ms | 96 ms | 133 ms | 47 ms |
-| tree churn | 51 ms | 194 ms | 277 ms | 121 ms |
+| short-lived alloc | 9 ms | 74 ms | 125 ms | 84 ms |
+| stable-heap forced collects | 54 ms | 41707 ms | 15506 ms | 28834 ms |
+| build long-lived chain | 45 ms | 58 ms | 132 ms | 205 ms |
+| free long-lived chain | 62 ms | 67 ms | 6 ms | 14 ms |
+| mutate live links | 9 ms | 7 ms | 11 ms | 12 ms |
+| short-lived churn with large live set | 27 ms | 75 ms | 84 ms | 49 ms |
+| tree churn | 68 ms | 123 ms | 245 ms | 123 ms |
 
 Code: [Link](examples/bench/gc)
 
