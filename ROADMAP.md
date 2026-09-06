@@ -9,6 +9,8 @@
 
 - Release 0.6.1
 + Fix enum type bug
++ Fix missing gc roots for embedded files
++ Compiler optimizations
 
 + Release 0.6.0
 + math namespace
