@@ -1,10 +1,4 @@
 
-.global _valk_gc_keep_alive
-_valk_gc_keep_alive:
-.global valk_gc_keep_alive
-valk_gc_keep_alive:
-retq
-
 .global _valk_stack_swap
 _valk_stack_swap:
 .global valk_stack_swap

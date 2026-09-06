@@ -40,8 +40,10 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
         exit 1
     fi
     accept_body=$(sed -n '/^define .*__SocketServer__accept__/,/^}/p' "$collect_ir")
-    if [ "$(grep -c 'call void @"valk_gc_keep_alive"' <<< "$accept_body")" -lt 2 ]; then
-        echo "# Accept did not retain its socket on success and error exits on $target"
+    accept_returns=$(grep -c '^  ret ' <<< "$accept_body")
+    accept_uses=$(grep -c 'call void asm sideeffect "", "r"(ptr' <<< "$accept_body")
+    if [ "$accept_returns" -lt 2 ] || [ "$accept_uses" -lt "$accept_returns" ]; then
+        echo "# Accept did not keep its receiver alive on every exit on $target"
         echo "$accept_body"
         exit 1
     fi

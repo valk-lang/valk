@@ -694,6 +694,11 @@ hold a reference may keep its object alive until the slot is overwritten or
 the frame returns; code that needs a collection to reclaim an object should
 let the frame that referenced it return first.
 
+The one lifetime the compiler still guarantees is for objects with a
+`gc_free` hook, and for interface values that may hold one: such receivers,
+arguments and locals stay alive until the function returns, so a raw handle
+taken from them remains valid while the function waits on it.
+
 The local collector invokes `gc_free` for unreachable local objects on the
 thread that owns that local collector. Once an object has been published as
 shared, only the shared collector may invoke its `gc_free`. The call runs on

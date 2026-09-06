@@ -64,10 +64,6 @@ popq %gs:0x10
 
 retq
 
-.global valk_gc_keep_alive
-valk_gc_keep_alive:
-retq
-
 # valk_gc_scan_stack(callback, ctx): push the callee-saved registers, then
 # call callback(sp, ctx) so a conservative scan from sp sees every register
 .global valk_gc_scan_stack
