@@ -74,7 +74,7 @@ make
 
 ## Benchmarks
 
-Valk 0.5.1, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
+Valk 0.6.0, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|

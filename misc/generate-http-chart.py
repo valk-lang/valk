@@ -64,7 +64,7 @@ def svg(theme):
                    f'<tspan dx="6" font-weight="400" fill="{c["text2"]}">{lib}</tspan></text>')
         out.append(f'<text x="{LEFT + w + 10:.1f}" y="{y + 20 + BAR_H / 2 + 5}" font-size="14" fill="{c["text"]}">{fmt(value)}</text>')
     out.append(f'<text x="{LEFT}" y="{H - 18}" font-size="12" fill="{c["muted"]}">'
-               f'Valk 0.5.1, Rust 1.97.1, Go 1.27.1</text>')
+               f'Valk 0.6.0, Rust 1.97.1, Go 1.27.1</text>')
     out.append('</svg>')
     return "\n".join(out) + "\n"
 
