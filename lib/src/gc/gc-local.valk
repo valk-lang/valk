@@ -4,12 +4,22 @@ use coro
 use core
 use mem
 use time
+use ext
 
 value mem_minimum_trigger (64 * 1024)
 
 // Core
 ~+ global gc: *Gc (@undefined)
+// The gc of this thread; `gc` is switched while collecting shared memory
+global thread_gc: *Gc (@undefined)
 shared gc_nr: uint (@undefined)
+
+// Bytes of pushed registers to keep from the point where the gc lock was released
+value blocked_regs_size (320)
+struct CollectCall {
+    gc: ptr
+    kind: CollectKind
+}
 
 enum GcState {
     disabled
@@ -46,9 +56,20 @@ struct Gc {
     mark_list: *Lifo (Lifo.new())
     props_removed: *Lifo (Lifo.new())
 
+    // Native stacks
+    stack_top: ptr (null_ptr())              // Highest address of the thread stack
+    live_sp: ptr (null_ptr())                // Stack pointer of the running collection
+    blocked_sp: ?ptr (null)                  // Stack pointer when the gc lock was last released
+    blocked_regs: ptr (mem.alloc(blocked_regs_size))
+    scan_min: ptr (null_ptr())
+    scan_max: ptr (null_ptr())
+
     // Refs
-    gc_stack_sp: ptr (@ref(coro.gc_stack_sp))
-    gc_stack_sp_backup: ptr (@ref(coro.gc_stack_sp_backup))
+    #if OS == "win"
+    main_sp: ptr (@ref(coro.main_saved_sp))
+    #else
+    main_sp: ptr (@ref(coro.main_state))
+    #end
     current_coro: ptr (@ref(coro.current_coro))
 
     coros_ptr: *Array[?coro.Coro] (@ref(coro.g_coros))
@@ -80,15 +101,62 @@ struct Gc {
     fn lock() {
         this.mutex.lock()
     }
+    // Releasing our own lock lets other threads collect for us while we
+    // block, so leave them our stack pointer and registers
     fn unlock() {
-        this.mutex.unlock()
+        if this.@cast(ptr) == thread_gc.@cast(ptr) {
+            ext.valk_gc_scan_stack(Gc.release_lock.@cast(ptr), this.@cast(ptr))
+        } else {
+            this.mutex.unlock()
+        }
+    }
+    static fn release_lock(sp: ptr, gcp: ptr) {
+        let g: *Gc = gcp
+        g.blocked_sp = sp
+        // The pushed registers sit just above sp, which may be near the top
+        // of a coroutine stack
+        let current = @ptrv(g.current_coro, ?coro.Coro)
+        let top = isset(current) ? current.stack_top : g.stack_top
+        let size: uint = top - sp
+        if size > blocked_regs_size : size = blocked_regs_size
+        mem.copy_bytes(sp, g.blocked_regs, size)
+        mem.clear_bytes(g.blocked_regs + size, blocked_regs_size - size)
+        g.mutex.unlock()
     }
 
+    // Runs the collection below a helper that pushes the caller's registers,
+    // so the native stack scan sees every live register
     fn collect(kind: CollectKind (CollectKind.local)) {
+        if !this.collect_allowed(kind) : return
+        let call = CollectCall { gc: this.@cast(ptr), kind: kind }
+        ext.valk_gc_scan_stack(Gc.collect_entry.@cast(ptr), @ref(call))
+    }
+
+    static fn collect_entry(sp: ptr, ctx: ptr) {
+        let call = @ptrv(ctx, CollectCall)
+        let g: *Gc = call.gc
+        g.live_sp = sp
+        g.collect_run(call.kind)
+    }
+
+    // The entry behind gc.collect(): valk_gc_collect() pushed the caller's
+    // registers and passes its stack pointer
+    static fn collect_native(sp: ptr) {
+        let g = thread_gc
+        if !g.collect_allowed(CollectKind.local) : return
+        g.live_sp = sp
+        g.collect_run(CollectKind.local)
+    }
+
+    fn collect_allowed(kind: CollectKind) bool {
         if this.dont_stop : panic("Started GC while adding shared memory (bug)")
         if this.state == GcState.collecting : panic("GC is already running (bug)")
-        if this.state == GcState.disabled : return
-        if this.state == GcState.stopping && kind != CollectKind.shutdown : return
+        if this.state == GcState.disabled : return false
+        if this.state == GcState.stopping && kind != CollectKind.shutdown : return false
+        return true
+    }
+
+    fn collect_run(kind: CollectKind) {
         this.state = GcState.collecting
 
         let pause_start = time.mono_us()
@@ -115,6 +183,8 @@ struct Gc {
 
         if reset_pools_needed || this.dis_own_count > 0 {
             this.pools_dirty = reset_pools(this.alc_list_ptr[0])
+        } else {
+            close_alloc_windows(this.alc_list_ptr[0])
         }
 
         // Leak check
@@ -451,27 +521,79 @@ struct Gc {
             c_adr = c_adr.$offset(size_of(ConditionalGlobalRoot))
         }
 
-        // Update GC stack ptr
-        let current = @ptrv(this.current_coro, ?coro.Coro)
-        if isset(current) {
-            // Main stack
-            this.loop_stack(@ptrv(this.gc_stack_sp_backup, ?ptr), 0)
-            // GC stack
-            this.loop_stack(@ptrv(this.gc_stack_sp, ?ptr), 0)
+        // Native stacks
+        if this.@cast(ptr) == thread_gc.@cast(ptr) {
+            this.scan_stacks(this.live_sp)
         } else {
-            // Main stack
-            this.loop_stack(@ptrv(this.gc_stack_sp, ?ptr), 0)
+            let sp = this.blocked_sp
+            if isset(sp) {
+                this.scan_stacks(sp)
+                this.scan_words(this.blocked_regs, this.blocked_regs + blocked_regs_size)
+            }
         }
+    }
 
-        // Coro stacks
-        let coros = this.coros_ptr[0]
-        each coros as coro_item {
-            if isset(coro_item) {
-                if !coro_item.active && !coro_item.done {
-                    this.loop_stack(coro_item.backup_gc_sp, 0)
+    // Every native stack of the thread: the running one from sp, the main
+    // stack while a coroutine runs, and each suspended coroutine
+    fn scan_stacks(sp: ptr) {
+        mark_alloc_limits(this.alc_list_ptr[0])
+        block_lock.lock()
+        let count = block_range_count()
+        if count > 0 {
+            let base = block_ranges.data
+            this.scan_min = @ptrv(base, BlockRange, 0).start
+            this.scan_max = @ptrv(base, BlockRange, count - 1).end
+            let current = @ptrv(this.current_coro, ?coro.Coro)
+            if isset(current) {
+                this.scan_words(sp, current.stack_top)
+                let main_sp = @ptrv(this.main_sp, ?ptr)
+                if isset(main_sp) : this.scan_words(main_sp, this.stack_top)
+            } else {
+                this.scan_words(sp, this.stack_top)
+            }
+            let coros = this.coros_ptr[0]
+            each coros as coro_item {
+                if !isset(coro_item) : continue
+                if coro_item.started && !coro_item.active && !coro_item.done {
+                    this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
                 }
             }
         }
+        block_lock.unlock()
+    }
+
+    fn scan_words(low: ptr, high: ptr) {
+        let min = this.scan_min
+        let max = this.scan_max
+        let adr: ptr = low & (~7).to(uint)
+        while adr < high {
+            let word = @ptrv(adr, ptr)
+            adr += size_of(ptr)
+            if word < min || word >= max : continue
+            let item = this.find_root(word)
+            if isset(item) : this.collect_stack_item(item)
+        }
+    }
+
+    // The item a native stack word may point into. Accepts any allocated
+    // slot of our own blocks and shared items of any block; a stale word
+    // pointing at a free slot is rejected so garbage is never resurrected
+    fn find_root(word: ptr) ?ptr {
+        let range = find_block_range(word) ?! return null
+        let block = range.start
+        let data = block + POOL_DATA_OFFSET
+        if word < data : return null
+        let isize = @ptrv(block, uint, b_isize)
+        let rel: uint = word - data
+        let slot: ptr = data + (rel - rel % isize)
+        let gcd: *GcData = slot
+        let item: ptr = slot + 8
+        if gcd.is_shared() : return item
+        let owner = range.gc ?! return null
+        if owner.@cast(ptr) != this.@cast(ptr) : return null
+        if gcd.is_not_new() : return item
+        if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) : return item
+        return null
     }
 
     fn add_conditional_global(ref: ptr, tag_ref: ptr, tag: uint) {
@@ -482,15 +604,6 @@ struct Gc {
             tag: tag
         }
     }
-    fn loop_stack(base: ?ptr, offset: int) {
-        while isset(base) {
-            let b: ptr = base + offset
-            base = @ptrv(b, ?ptr, 0) // Next frame
-            let marker = @ptrv(b, fnptr(ptr, ptr)(), 1)
-            marker(b, this.@cast(ptr))
-        }
-    }
-
     //////////////////////////
     // Shared
     //////////////////////////
@@ -564,8 +677,10 @@ struct Gc {
             gc.mem_usage_thread -= alloc_size
             if block.slots_used == 0 {
                 atomic(mem_usage_shared - alloc_size)
+                unregister_block(block)
                 mem.free(block)
             } else {
+                release_block_owner(block)
                 add_unused_block(block)
             }
         })
@@ -587,6 +702,7 @@ struct Gc {
         this.shared_items.free()
         this.mark_list.free()
         this.props_removed.free()
+        mem.free(this.blocked_regs)
         mem.free(this)
     }
 }

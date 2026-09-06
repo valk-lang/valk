@@ -1012,6 +1012,12 @@ alias pid_t for i32
 ```
 
 ```js
++ struct pthread_attr_t {
+    + data: [uint x 8]
+}
+```
+
+```js
 + struct pthread_cond_t {
     + data: [uint x 12]
 }

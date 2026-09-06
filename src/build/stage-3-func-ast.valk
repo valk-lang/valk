@@ -64,14 +64,6 @@ fn parse_func_ast(func: Func) !Error {
         return
     }
 
-    if emitted_ir && !func.storage_effects_ready && func_may_drop_gc_stack(func) {
-        let body_exp = func.body
-        func_release_ast(func, exps)
-        func.body = body_exp
-        func.ns.build.pipeline.deferred_gc_funcs.append(func)
-        return
-    }
-
     func_release_ast(func, exps)
 }
 
@@ -84,10 +76,38 @@ fn func_release_ast(func: Func, exps: Array[Exp]) {
     func.user_defer_stack = null
     func.user_defer_pop = null
     func.all_decls = .{}
-    func.define_decls = .{}
     func.buffer_pool = .{}
     func.buffers_used = .{}
     func.test_entry_decl = null
+}
+
+// Forget a lowered body so the function can be parsed again from its AST.
+fn prepare_func_reparse(func: Func) {
+    let args_only = Array[Decl]{}
+    restore_func_generic_scope(func)
+    each func.args as arg {
+        func.arg_scope.set_idf(arg.name, Idf.for_decl(arg.decl))
+        args_only.append(arg.decl, true)
+    }
+    func.all_decls = args_only
+    func.test_entry_decl = null
+    func.user_defer_stack = null
+    func.user_defer_pop = null
+
+    func.functions_used = .{}
+    func.globals_used = .{}
+    func.strings_used = .{}
+    func.interface_vtables_used = null
+
+    let unit = func.unit
+    let dropped = Array[String]{}
+    each unit.closure_adapters as owner, name {
+        if owner == func : dropped.append(name)
+    }
+    each dropped as name : unit.closure_adapters.remove(name)
+    func.set_ir_code("")
+
+    func.parsed_ast = false
 }
 
 fn func_release_exps(func: Func, exps: Array[Exp]) {
@@ -131,55 +151,8 @@ fn func_release_shared_source(func: Func) {
 // Function-local storage
 ////////////////////////////
 
-fn decl_needs_gc_stack_storage(decl: Decl) bool {
-    if decl.skip_gc_field_roots : return false
-    if decl.is_gc {
-        if decl.is_buffer : return true
-        // Immutable managed arguments remain rooted by their caller.
-        return !decl.is_arg || decl.is_mut
-    }
-    // An unwritten borrow argument (`&T`, `&[T]`, `stack T`, and so every
-    // struct method receiver) stays rooted through the caller's copy.
-    if decl.is_arg && !decl.is_written && decl.type.is_fat_borrow() {
-        return false
-    }
-    if decl.type.get_non_nullable().kind == TYPE.closure {
-        return decl.is_arg || decl.closure_holds_captures
-    }
-    return decl.type.has_gc_refs()
-}
-
-fn decl_assign_gc_stack_storage(decl: Decl, offset: uint) uint !Error {
-    let size = (decl.type.byte_size() !>).to(uint)
-    let alignment = decl.type.storage_alignment() !>.to(uint)
-    if alignment > 0 : offset = offset.round_up(alignment)
-    decl.gc_stack_offset = offset
-    return offset + size
-}
-
 fn func_finish_ast(func: Func) !Error {
     let b = func.ns.build
-    let alloca_size: uint = 0
-    let gc_count: uint = 0
-
-    let roots = !func.disable_gc_stack
-
-    each func.all_decls as decl {
-        decl.gc_stack_offset = null
-        if decl.is_bind : continue
-        if roots && decl_needs_gc_stack_storage(decl) {
-            alloca_size = decl_assign_gc_stack_storage(decl, alloca_size) !>
-            gc_count++
-            // Each declaration is visited once, so it is listed at most once.
-            func.define_decls.append(decl)
-            continue
-        }
-        if decl.is_mut : func.define_decls.append(decl)
-    }
-
-    func.alloca_size = alloca_size
-    func.gc_decl_count = gc_count
-
     let alloca_scope = func.alloca_scope
     let defer_scope = func.defer_scope
     let body_scope = func.body_scope
@@ -191,24 +164,6 @@ fn func_finish_ast(func: Func) !Error {
         test_finish_scope(func, defer_scope) !>
     }
 
-    if gc_count > 0 {
-        alloca_scope.append_value(vgen_ir_comment("INCREASE GC STACK", b))
-        alloca_scope.append_value(vgen_gc_stack_init(alloca_size, gc_count, b))
-        if !func.is_entrance {
-            defer_scope.append_value(vgen_ir_comment("REDUCE GC STACK", b))
-            defer_scope.append_value(vgen_gc_stack_defer(b))
-        }
-    }
-    if func.define_decls.length > 0 {
-        alloca_scope.append_value(vgen_ir_comment("INIT LOCAL VARIABLES", b))
-    }
-    each func.define_decls as decl {
-        alloca_scope.append_value(vgen_decl_offset(decl, b))
-    }
-    if func.define_decls.length > 0 {
-        alloca_scope.append_value(vgen_ir_comment("END LOCAL VARIABLES", b))
-    }
-
     if !func.is_entrance {
         body_scope.values.prepend(vgen_allocas(alloca_scope.values, b))
     }
@@ -218,43 +173,9 @@ fn func_finish_ast(func: Func) !Error {
 // Statement temporaries
 ////////////////////////////
 
-fn append_buffer_clears(ctx: Context, values: Array[Value], func: Func, first: uint, at: ?Exp) {
-    let i = first
-    while i < func.buffers_used.length {
-        let decl = func.buffers_used.get(i) ! break
-        i++
-        if !decl.is_gc : continue
-        values.append(vgen_assign(
-            vgen_decl(decl),
-            vgen_null(decl.type),
-            ASSIGN_OP.set,
-            ctx.build,
-            at
-        ))
-    }
-}
-
-fn buffers_need_clear(func: Func, first: uint) bool {
-    let i = first
-    while i < func.buffers_used.length {
-        let decl = func.buffers_used.get(i) ! return false
-        if decl.is_gc : return true
-        i++
-    }
-    return false
-}
-
-fn finish_body_value_buffers(ctx: Context, func: Func, first: uint, at: Exp, value: ?Value) ?Value {
-    if !buffers_need_clear(func, first) {
-        func_release_buffers(func, first)
-        return value
-    }
-
-    let statements = Array[Value]{}
-    if isset(value) : statements.append(value)
-    append_buffer_clears(ctx, statements, func, first, at)
+fn finish_body_value_buffers(func: Func, first: uint, value: ?Value) ?Value {
     func_release_buffers(func, first)
-    return vgen_block(statements, ctx.build, at)
+    return value
 }
 
 ////////////////////////////
@@ -324,8 +245,6 @@ fn append_loop_iteration(ctx: Context, scope: Scope, iter_scope: Scope, exps: Ar
         if isset(output) : output.append(v)
         else : scope.append_value(v)
     }
-    let target = output ?? scope.values
-    append_scope_root_clears(iter_scope, target, ctx.build, loop_exp)
 }
 
 fn append_gc_roots_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint, end: uint, loop_exp: Exp, output: ?Array[Value] (null)) !Error {
@@ -472,7 +391,7 @@ fn body_value_from_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     let func = ctx.get_func() !>
     let first = func.buffers_used.length
     let value = body_value_from_exp_inner(ctx, scope, state, exp) !>
-    return finish_body_value_buffers(ctx, func, first, exp, value)
+    return finish_body_value_buffers(func, first, value)
 }
 
 fn body_value_from_exp_inner(ctx: Context, scope: Scope, state: ParseState, exp: Exp) ?Value !Error {
@@ -508,9 +427,7 @@ fn body_value_from_exp_inner(ctx: Context, scope: Scope, state: ParseState, exp:
         }
         scope.did_return = true
         scope_mark_break(scope, ctx.func)
-        let value = vgen_break(ctx.build, exp)
-        value.values = scope_root_clears_through(scope, loop, ctx.build, exp)
-        return value
+        return vgen_break(ctx.build, exp)
     }
     if exp.type == EXP.continue {
         let loop = scope_find_loop(scope, ctx.func)
@@ -519,9 +436,7 @@ fn body_value_from_exp_inner(ctx: Context, scope: Scope, state: ParseState, exp:
         }
         // Same path-termination semantics as break for flow analysis.
         scope.did_return = true
-        let value = vgen_continue(ctx.build, exp)
-        value.values = scope_root_clears_through(scope, loop, ctx.build, exp)
-        return value
+        return vgen_continue(ctx.build, exp)
     }
     if exp.type == EXP.allocas {
         let func = ctx.get_func() !>
@@ -842,7 +757,6 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Val
         deferred_exp.error("A deferred call must handle its error before the function exits")
     }
     body_scope.append_value(deferred)
-    append_buffer_clears(inner_ctx, body_scope.values, func, first_buffer, deferred_exp)
     func_release_buffers(func, first_buffer)
     func.body_scope = body_scope
     func.alloca_scope = body_scope.sub_scope()
@@ -896,7 +810,6 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
     scope.did_return = true
     // Represent as a return of the value (IR later jumps to vscope after-block)
     let ret = vgen_return(retv, b, exp)
-    ret.values = scope_root_clears_through(scope, vscope, b, exp)
     returns.append(ret)
     return ret
 }
@@ -1315,7 +1228,6 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
     let loop = vgen_while(loop_condition, body_vals, b, exp)
     let values = Array[Value]{ on_init, index_init, loop }
-    append_scope_root_clears(each_scope, values, b, exp)
     return vgen_block(values, b, exp)
 }
 
@@ -1379,29 +1291,6 @@ fn scope_find_loop(scope: Scope, func: ?Func) ?Scope {
     return null
 }
 
-fn decl_needs_scope_root_clear(decl: Decl) bool {
-    if decl.is_bind || decl.skip_gc_field_roots : return false
-    return decl_needs_gc_stack_storage(decl)
-}
-
-fn append_scope_root_clears(scope: Scope, values: Array[Value], b: Build, at: ?Exp (null)) {
-    each scope.decls as decl {
-        if !decl_needs_scope_root_clear(decl) : continue
-        values.append(vgen_gc_root_clear(decl, b, at))
-    }
-}
-
-fn scope_root_clears_through(scope: Scope, through: Scope, b: Build, at: ?Exp (null)) Array[Value] {
-    let values = Array[Value]{}
-    let current: ?Scope = scope
-    while isset(current) {
-        append_scope_root_clears(current, values, b, at)
-        if current == through : return values
-        current = current.parent
-    }
-    panic("Compiler bug: scope cleanup target is not an ancestor")
-}
-
 fn scope_mark_break(scope: Scope, func: ?Func) {
     let current: ?Scope = scope
     while isset(current) {
@@ -1422,7 +1311,6 @@ fn body_values_from_nested(ctx: Context, scope: Scope, state: ParseState, exp: E
     if exp.type == EXP.if {
         let v = body_value_from_exp(ctx, scope, state, exp) !>
         if isset(v) : out.append(v)
-        append_scope_root_clears(scope, out, ctx.build, exp)
         return out
     }
 
@@ -1430,7 +1318,6 @@ fn body_values_from_nested(ctx: Context, scope: Scope, state: ParseState, exp: E
         let members = exp.body_exps
         if isset(members) {
             append_body_exp_range(ctx, scope, state, members, 0, members.length, out) !>
-            append_scope_root_clears(scope, out, ctx.build, exp)
             return out
         }
         let body = exp.get(BLOCK_EXP.body)
@@ -1438,12 +1325,10 @@ fn body_values_from_nested(ctx: Context, scope: Scope, state: ParseState, exp: E
             let exps = read_func_body_exps(body) !>
             append_body_exp_range(ctx, scope, state, exps, 0, exps.length, out) !>
         }
-        append_scope_root_clears(scope, out, ctx.build, exp)
         return out
     }
 
     let v = body_value_from_exp(ctx, scope, state, exp) !>
     if isset(v) : out.append(v)
-    append_scope_root_clears(scope, out, ctx.build, exp)
     return out
 }
