@@ -1,5 +1,4 @@
 
-
 class FmtTok {
     // TOK.*, as returned by Parser.tok.
     type: int
@@ -8,6 +7,33 @@ class FmtTok {
     // Newlines between the previous token and this one.
     new_lines: u32
     spaced: bool
+    // A word that can act as a keyword: not a member name after `.`, not an
+    // enum member. Cleared while rendering when the scope says otherwise.
+    keyword: bool (false)
+}
+
+// What the formatter knows about the statement being written. A statement
+// spans continuation lines and any `(`/`[` opened on it; a `{` starts a new
+// one for its body and the outer statement resumes after the `}`.
+class FmtStmt {
+    first: ?FmtTok (null)
+    // opens.length when the statement started.
+    depth: uint (0)
+    // Indent of the statement's first line.
+    indent: uint (0)
+    // Open `?` operators waiting for their `:`.
+    ternary: uint (0)
+    has_match: bool (false)
+    has_union: bool (false)
+    // A `->` success handler: its `:` body colon is spaced.
+    has_handler: bool (false)
+    // `fn name` seen: the next `(` opens the argument list.
+    fn_wait_args: bool (false)
+    // opens.length while inside a function declaration's argument list.
+    fn_args_depth: uint (0)
+    // The argument list just closed: the next token starts the return type.
+    fn_return_pending: bool (false)
+    is_fn_decl: bool (false)
 }
 
 enum FMT_SCOPE : u8 {
@@ -45,33 +71,63 @@ enum FMT_SCOPE : u8 {
 
 fn format_tokens(src: Source) String !Error {
     let toks = fmt_tokenize(src) !>
-    return format_align_comments(fmt_render(toks))
+    let out = format_align_comments(fmt_render(toks))
+    fmt_verify(src, toks, out) !>
+    return out
 }
 
 fn fmt_tokenize(src: Source) Array[FmtTok] !Error {
     let p = src.start().init_parser()
     let toks = Array[FmtTok]{}
     let prev_end: u32 = 0
+    let prev_text = ""
     while true {
         let t = p.tok(true, true) !>
         if t == TOK.end : break
         let start = p.word_i
         let len = p.word_len
+        let text = src.content.part(start, len)
         toks.append(FmtTok {
             type: t
-            text: src.content.part(start, len)
+            text: text
             new_lines: p.new_lines
             spaced: toks.length > 0 && start > prev_end
+            keyword: (t == TOK.word || t == TOK.at_word) && prev_text != "."
         })
         prev_end = start + len
+        if t != TOK.comment : prev_text = text
     }
     return toks
+}
+
+// The formatter may only move whitespace. Re-tokenize its output and refuse
+// anything that changed a token, so a formatter bug can never damage a file.
+fn fmt_verify(src: Source, toks: Array[FmtTok], out: String) !Error {
+    let check = Source {
+        build: src.build
+        content: out
+        path: src.path
+    }
+    let again = fmt_tokenize(check) ! src.build.error("Formatter produced unreadable output for: " + (src.path ?? "source"))
+    let mismatch = again.length != toks.length
+    if !mismatch {
+        each toks as tok, i {
+            let other = again.get(i) ! break
+            if other.type != tok.type || other.text != tok.text {
+                mismatch = true
+                break
+            }
+        }
+    }
+    if mismatch : src.build.error("Formatter changed the code of: " + (src.path ?? "source") + " (bug, file left untouched)")
 }
 
 fn fmt_render(toks: Array[FmtTok]) String {
     let out = ByteBuffer.new()
     let opens = Array[uint]{}
     let scopes = Array[FMT_SCOPE]{}
+    let stmts = Array[FmtStmt]{}
+    let stmt = FmtStmt {}
     // Indent level of the line being written.
     let indent: uint = 0
     let index: uint = 0
@@ -81,15 +137,6 @@ fn fmt_render(toks: Array[FmtTok]) String {
     let prev_tight_sign = false
     let prev_code: ?FmtTok = null
     let before_prev_code: ?FmtTok = null
-    let line_first: ?FmtTok = null
-    let line_depth: uint = 0
-    // A `?` is open on this line, so the next `:` closes a ternary.
-    let ternary = false
-    let match_on_line = false
-    let union_on_line = false
-    let fn_decl_wait_args = false
-    let fn_decl_args_depth: uint = 0
-    let fn_return_pending = false
     let callable_wait_args: uint = 0
     let callable_wait_results: uint = 0
     let callable_args_depths = Array[uint]{}
@@ -120,7 +167,9 @@ fn fmt_render(toks: Array[FmtTok]) String {
         let infix_sign = false
         let scope = FMT_SCOPE.root
         if scopes.length > 0 : scope = scopes.get(scopes.length - 1) !? FMT_SCOPE.root
-        let return_pending = fn_return_pending || callable_return_pending
+        // Enum members are names, whatever they are called.
+        if scope == FMT_SCOPE.enum && tok.new_lines > 0 : tok.keyword = false
+        let return_pending = stmt.fn_return_pending || callable_return_pending
         let callable_error = tok.text == "!" && callable_result_depths.length > 0
         let macro_word = ""
         if tok.text == "#" && isset(next) && next.new_lines == 0 : macro_word = next.text
@@ -128,15 +177,15 @@ fn fmt_render(toks: Array[FmtTok]) String {
         let macro_closer = macro_word == "end"
         let macro_leading_comment = tok.type == TOK.comment && fmt_next_starts_macro(toks, index)
         if isset(pc) {
-            infix_sign = fmt_is_positional_infix(tok, pc, bpc, return_pending)
+            infix_sign = fmt_is_positional_infix(tok, pc, return_pending)
         }
         let tight_sign = callable_error || fmt_is_tight_sign(tok, pv, infix_sign)
         let access_declaration = fmt_starts_access_declaration(toks, index - 1)
         let tight_left = false
         if isset(pv) {
-            let fn_arg_default = fn_decl_args_depth > 0 && opens.length == fn_decl_args_depth
-            tight_left = fmt_is_tight_left(pv, tok, bpc, line_first, scope, declaration_scope,
-                fn_decl_wait_args, callable_wait_args, callable_wait_results, return_pending, fn_arg_default)
+            let fn_arg_default = stmt.fn_args_depth > 0 && opens.length == stmt.fn_args_depth
+            tight_left = fmt_is_tight_left(pv, tok, stmt, scope, declaration_scope,
+                callable_wait_args, callable_wait_results, return_pending, fn_arg_default)
         }
 
         let nl = tok.new_lines
@@ -156,42 +205,46 @@ fn fmt_render(toks: Array[FmtTok]) String {
             if closer && opens.length > 0 {
                 indent = opens.pop_last() !? 0
                 scopes.pop_last() !? FMT_SCOPE.root
+                if tok.text == "}" && stmts.length > 0 : stmt = stmts.pop_last() !? stmt
             } else {
                 indent = 0
                 if opens.length > 0 : indent = (opens.get(opens.length - 1) !? 0) + 1
-                if isset(pc) && !closer {
-                    if fmt_is_continuation(pc, tok)
-                        || fmt_is_sign_continuation(tok, pc, bpc, scope, ternary, infix_sign, tight_sign, access_declaration) : indent++
+                let continuation = false
+                // Inside `(`/`[` the bracket already indents the line.
+                if isset(pc) && opens.length == stmt.depth {
+                    if fmt_is_continuation(pc, tok, scope)
+                        || fmt_is_sign_continuation(tok, pc, scope, stmt.ternary > 0, infix_sign, tight_sign, access_declaration) : continuation = true
                 }
+                if continuation : indent++
                 if (macro_opener || macro_leading_comment)
                     && isset(pc) && fmt_macro_needs_continuation(pc, bpc) : indent++
                 if macro_indents.length > 0 {
                     let macro_indent = macro_indents.get(macro_indents.length - 1) !? 0
                     if indent < macro_indent : indent = macro_indent
                 }
+                // A code line at the statement's own level starts a new one.
+                // Comment lines and macro lines leave it alone.
+                if !continuation && tok.type != TOK.comment && opens.length <= stmt.depth {
+                    stmt = FmtStmt { first: tok, depth: opens.length, indent: indent }
+                }
             }
             let n = nl
             while n-- > 0 : out.write_byte('\n')
             let d = indent
             while d-- > 0 : out.append_text("    ")
-            line_first = tok
-            line_depth = opens.length
-            ternary = false
-            match_on_line = false
-            union_on_line = false
-            fn_decl_wait_args = false
-            fn_decl_args_depth = 0
-            fn_return_pending = false
         } else {
             if closer && opens.length > 0 {
                 opens.pop_last() !? 0
                 scopes.pop_last() !? FMT_SCOPE.root
+                if tok.text == "}" && stmts.length > 0 : stmt = stmts.pop_last() !? stmt
             }
             if isset(pv) {
-                let own = opens.length == line_depth
-                if fmt_space_between(pv, tok, bpc, line_first, ternary, match_on_line, union_on_line, own, scope, return_pending, callable_error, infix_sign, prev_infix_sign, prev_tight_sign, tight_left) : out.write_byte(' ')
+                let own = opens.length == stmt.depth
+                let fn_arg_default = stmt.fn_args_depth > 0 && opens.length == stmt.fn_args_depth
+                if fmt_space_between(pv, tok, stmt, own, scope, return_pending, callable_error, infix_sign, prev_infix_sign, prev_tight_sign, tight_left, fn_arg_default) : out.write_byte(' ')
             }
         }
+        if !isset(stmt.first) && tok.type != TOK.comment : stmt.first = tok
 
         out.append_text(tok.text)
 
@@ -202,21 +255,25 @@ fn fmt_render(toks: Array[FmtTok]) String {
         }
 
         if fmt_is_opener(tok) {
-            opens.append(indent)
             let opened_scope = FMT_SCOPE.block
+            let pushed = indent
             if tok.text == "(" {
                 opened_scope = fmt_paren_scope(declaration_scope)
                 if declaration_scope != FMT_SCOPE.function : declaration_scope = FMT_SCOPE.root
             } else if tok.text == "[" {
                 opened_scope = FMT_SCOPE.bracket
-            } else if tok.text == "{" {
+            } else {
                 if fmt_scope_has_body(declaration_scope) : opened_scope = declaration_scope
                 declaration_scope = FMT_SCOPE.root
+                // The body of `if a\n && b {` belongs to the `if`, not to the
+                // continuation line that happened to hold the brace.
+                if indent > stmt.indent && fmt_stmt_owns_block(stmt) : pushed = stmt.indent
             }
+            opens.append(pushed)
             scopes.append(opened_scope)
-            if tok.text == "(" && fn_decl_wait_args {
-                fn_decl_args_depth = opens.length
-                fn_decl_wait_args = false
+            if tok.text == "(" && stmt.fn_wait_args {
+                stmt.fn_args_depth = opens.length
+                stmt.fn_wait_args = false
             } else if tok.text == "(" && callable_wait_args > 0 {
                 callable_args_depths.append(opens.length)
                 callable_wait_args--
@@ -224,29 +281,36 @@ fn fmt_render(toks: Array[FmtTok]) String {
                 callable_result_depths.append(opens.length)
                 callable_wait_results--
             }
+            if tok.text != "(" && tok.text != "[" {
+                stmts.append(stmt)
+                stmt = FmtStmt { depth: opens.length, indent: pushed + 1 }
+            }
         }
-        if tok.text == "?" && isset(pc) && fmt_ends_operand(pc) {
-            if infix_sign || tok.spaced : ternary = true
-        } else if tok.text == ":" {
-            ternary = false
+        if tok.text == "?" && isset(pc) && fmt_ends_operand(pc) && !return_pending {
+            if infix_sign || tok.spaced : stmt.ternary++
+        } else if tok.text == ":" && stmt.ternary > 0 {
+            stmt.ternary--
         }
-        if tok.text == "match" : match_on_line = true
-        if tok.text == "union" : union_on_line = true
-        let declared_scope = fmt_declared_scope(tok, pc, line_first, scope)
+        if tok.text == "match" && tok.keyword : stmt.has_match = true
+        if tok.text == "union" && tok.keyword : stmt.has_union = true
+        if tok.text == "->" : stmt.has_handler = true
+        let declared_scope = fmt_declared_scope(tok, stmt, scope)
         if declared_scope != FMT_SCOPE.root : declaration_scope = declared_scope
-        if tok.text == "fn" {
-            if isset(next) && next.type == TOK.word : fn_decl_wait_args = true
-            else if isset(next) && next.text == "(" : callable_wait_args++
+        if tok.text == "fn" && tok.keyword {
+            if isset(next) && next.type == TOK.word {
+                stmt.fn_wait_args = true
+                stmt.is_fn_decl = true
+            } else if isset(next) && next.text == "(" : callable_wait_args++
         }
         if tok.text == "fnptr" && isset(next) && next.text == "(" : callable_wait_args++
         if tok.text == "co" && isset(next) && next.text == "(" : callable_wait_results++
 
         prev_infix_sign = infix_sign
         prev_tight_sign = tight_sign
-        if return_pending : fn_return_pending = false
-        if tok.text == ")" && fn_decl_args_depth > 0 && opens.length < fn_decl_args_depth {
-            fn_decl_args_depth = 0
-            fn_return_pending = true
+        if return_pending : stmt.fn_return_pending = false
+        if tok.text == ")" && stmt.fn_args_depth > 0 && opens.length < stmt.fn_args_depth {
+            stmt.fn_args_depth = 0
+            stmt.fn_return_pending = true
         }
         if tok.text == ")" && callable_result_depths.length > 0 {
             let depth = callable_result_depths.get(callable_result_depths.length - 1) !? 0
@@ -258,7 +322,10 @@ fn fmt_render(toks: Array[FmtTok]) String {
                 callable_wait_results++
             }
         }
-        if tok.text == ";" : declaration_scope = FMT_SCOPE.root
+        if tok.text == ";" {
+            declaration_scope = FMT_SCOPE.root
+            stmt = FmtStmt { depth: stmt.depth, indent: stmt.indent }
+        }
         prev = tok
         if tok.type != TOK.comment {
             before_prev_code = prev_code
@@ -270,14 +337,32 @@ fn fmt_render(toks: Array[FmtTok]) String {
     return out.to_string()
 }
 
-fn fmt_is_continuation(prev_code: FmtTok, tok: FmtTok) bool {
-    if fmt_is_binary(tok.text) && tok.text != "+" : return true
+// Statements whose `{` body is indented from the statement, not from the
+// line that holds the brace.
+fn fmt_stmt_owns_block(stmt: FmtStmt) bool {
+    if stmt.is_fn_decl : return true
+    let first = stmt.first ?! return false
+    let w = first.text
+    if fmt_is_access_sign(w) : return true
+    if w == "static" || w == "extern" || w == "export" || w == "#" : return true
+    if !first.keyword : return false
+    if w == "if" || w == "else" || w == "while" || w == "each" || w == "match" : return true
+    if w == "test" || w == "synctest" : return true
+    return fmt_is_declaration_word(w)
+}
+
+fn fmt_is_continuation(prev_code: FmtTok, tok: FmtTok, scope: FMT_SCOPE) bool {
+    if fmt_is_binary(tok.text) {
+        // A leading `+` at the top level or in a class body declares a public member.
+        if tok.text != "+" : return true
+        if !fmt_scope_has_access(scope) && scope != FMT_SCOPE.root : return true
+    }
     if tok.text == "." : return true
     let w = prev_code.text
     // The single-statement body of `if x :`, written on the line below.
     if w == ":" : return true
     // A condition split off from the keyword it belongs to.
-    if w == "if" || w == "while" || w == "each" : return true
+    if prev_code.keyword && (w == "if" || w == "while" || w == "each") : return true
     return false
 }
 
@@ -285,7 +370,7 @@ fn fmt_macro_needs_continuation(prev_code: FmtTok, before_prev: ?FmtTok) bool {
     if fmt_is_binary(prev_code.text) : return true
     // `return` may be the complete single-statement body of a control clause.
     if prev_code.text == "return" && isset(before_prev) && before_prev.text == ":" : return false
-    return fmt_is_prefix_keyword_context(prev_code, before_prev)
+    return fmt_is_prefix_keyword(prev_code)
 }
 
 fn fmt_next_starts_macro(toks: Array[FmtTok], at: uint) bool {
@@ -304,18 +389,18 @@ fn fmt_next_starts_macro(toks: Array[FmtTok], at: uint) bool {
     return false
 }
 
-fn fmt_is_sign_continuation(tok: FmtTok, prev_code: FmtTok, before_prev: ?FmtTok, scope: FMT_SCOPE, ternary: bool, infix: bool, tight: bool, access_declaration: bool) bool {
+fn fmt_is_sign_continuation(tok: FmtTok, prev_code: FmtTok, scope: FMT_SCOPE, ternary: bool, infix: bool, tight: bool, access_declaration: bool) bool {
     if fmt_scope_has_access(scope) && fmt_is_access_sign(tok.text) : return false
     if tok.text == ":" && ternary : return true
     if access_declaration && scope == FMT_SCOPE.root : return false
     if infix : return true
     if !tight : return false
     if fmt_is_binary(prev_code.text) : return true
-    if fmt_is_prefix_keyword_context(prev_code, before_prev) : return true
+    if fmt_is_prefix_keyword(prev_code) : return true
     return false
 }
 
-fn fmt_space_between(prev: FmtTok, tok: FmtTok, before_prev: ?FmtTok, line_first: ?FmtTok, ternary: bool, match_on_line: bool, union_on_line: bool, own: bool, scope: FMT_SCOPE, fn_return_pending: bool, callable_error: bool, infix_sign: bool, prev_infix_sign: bool, prev_tight_sign: bool, tight_left: bool) bool {
+fn fmt_space_between(prev: FmtTok, tok: FmtTok, stmt: FmtStmt, own: bool, scope: FMT_SCOPE, fn_return_pending: bool, callable_error: bool, infix_sign: bool, prev_infix_sign: bool, prev_tight_sign: bool, tight_left: bool, fn_arg_default: bool) bool {
     let t = tok.text
     let p = prev.text
 
@@ -328,17 +413,19 @@ fn fmt_space_between(prev: FmtTok, tok: FmtTok, before_prev: ?FmtTok, line_first
     if p == "(" || p == "[" : return false
     if p == "{" || p == "<{" : return true
     if tight_left : return false
-    if t == "(" && fmt_paren_prefix_wants_space(p) : return true
+    if t == "(" && fmt_paren_prefix_wants_space(prev) : return true
+    // An argument default: `name: Type (value)`.
+    if t == "(" && fn_arg_default && fmt_ends_operand(prev) && !fmt_is_type_call_word(prev) : return true
 
     if p == "." : return false
     if t == "." {
-        if fmt_is_binary(p) || fmt_is_prefix_keyword_context(prev, before_prev) : return true
+        if fmt_is_binary(p) || fmt_is_prefix_keyword(prev) : return true
         return tok.spaced
     }
 
     if p == "," : return true
 
-    let scope_space = fmt_scope_space_between(scope, prev, tok, line_first)
+    let scope_space = fmt_scope_space_between(scope, prev, tok, stmt.first)
     if isset(scope_space) : return scope_space
 
     if !tok.spaced && (p == "-" || p == "~") && (t == "~" || t == "+") : return false
@@ -349,9 +436,9 @@ fn fmt_space_between(prev: FmtTok, tok: FmtTok, before_prev: ?FmtTok, line_first
     }
 
     if t == ":" {
-        if ternary : return true
+        if stmt.ternary > 0 : return true
         if !own : return false
-        return fmt_colon_wants_space(line_first, ternary, match_on_line, union_on_line)
+        return fmt_colon_wants_space(stmt)
     }
     if p == ":" {
         return true
@@ -365,12 +452,19 @@ fn fmt_space_between(prev: FmtTok, tok: FmtTok, before_prev: ?FmtTok, line_first
 
     if infix_sign : return true
     if prev_infix_sign : return true
-    if fmt_is_prefix_keyword_context(prev, before_prev) && fmt_is_prefix_sign_text(t) : return true
+    if fmt_is_prefix_keyword(prev) && fmt_is_prefix_sign_text(t) : return true
     if t == "++" || t == "--" : return false
     if prev_tight_sign : return false
 
     // A sign the language reads by its spacing. Keep what was written.
     return tok.spaced
+}
+
+// Types written as a call: `nonnull(?T)`, `typeof(x)`, `fn(int)(bool)`.
+fn fmt_is_type_call_word(tok: FmtTok) bool {
+    if !tok.keyword : return false
+    let w = tok.text
+    return w == "nonnull" || w == "typeof" || w == "fn" || w == "fnptr" || w == "co"
 }
 
 fn fmt_starts_return_type(tok: FmtTok) bool {
@@ -379,31 +473,33 @@ fn fmt_starts_return_type(tok: FmtTok) bool {
     return t == "?" || t == "*" || t == "&" || t == "[" || t == "(" || t == "!"
 }
 
-fn fmt_is_tight_left(prev: FmtTok, tok: FmtTok, before_prev: ?FmtTok, line_first: ?FmtTok, scope: FMT_SCOPE, declaration_scope: FMT_SCOPE, fn_decl_wait_args: bool, callable_wait_args: uint, callable_wait_results: uint, fn_return_pending: bool, fn_arg_default: bool) bool {
+fn fmt_is_tight_left(prev: FmtTok, tok: FmtTok, stmt: FmtStmt, scope: FMT_SCOPE, declaration_scope: FMT_SCOPE, callable_wait_args: uint, callable_wait_results: uint, fn_return_pending: bool, fn_arg_default: bool) bool {
     let t = tok.text
     let p = prev.text
 
     if t == ";" || p == "#" : return true
 
-    let first = line_first
+    let first = stmt.first
     if isset(first) && fmt_is_access_sign(first.text)
         && fmt_is_access_sign(p) && fmt_is_access_sign(t) : return true
 
     if t == "." {
-        return fmt_ends_operand(prev) && !fmt_is_prefix_keyword_context(prev, before_prev)
+        return fmt_ends_operand(prev) && !fmt_is_prefix_keyword(prev)
     }
 
     if t == "[" {
         if fn_return_pending : return false
         if p == "array" || p == "slice" : return true
-        return fmt_ends_operand(prev) && !fmt_is_prefix_keyword_context(prev, before_prev)
+        // `stack [T x N]` is a type prefix; `stack[0]` an index. Written spacing decides.
+        if p == "stack" && prev.keyword : return false
+        return fmt_ends_operand(prev) && !fmt_is_prefix_keyword(prev)
     }
 
     if t != "(" : return false
     if fn_return_pending : return false
-    if fn_decl_wait_args || callable_wait_args > 0 || callable_wait_results > 0 : return true
+    if stmt.fn_wait_args || callable_wait_args > 0 || callable_wait_results > 0 : return true
     if fn_arg_default : return false
-    if !fmt_ends_operand(prev) || fmt_paren_prefix_wants_space(p) : return false
+    if !fmt_ends_operand(prev) || fmt_paren_prefix_wants_space(prev) : return false
     if declaration_scope != FMT_SCOPE.root && declaration_scope != FMT_SCOPE.function : return false
     if scope == FMT_SCOPE.enum && isset(first) && first.text == p : return false
     if fmt_scope_has_access(scope) : return false
@@ -437,44 +533,44 @@ fn fmt_is_declaration_word(t: String) bool {
         || t == "use"
 }
 
-fn fmt_paren_prefix_wants_space(t: String) bool {
+fn fmt_paren_prefix_wants_space(prev: FmtTok) bool {
+    if !prev.keyword : return false
+    let t = prev.text
     return t == "if" || t == "while" || t == "each" || t == "match"
         || t == "return" || t == "throw" || t == "await" || t == "co"
         || t == "defer" || t == "else"
 }
 
-fn fmt_colon_wants_space(line_first: ?FmtTok, ternary: bool, match_on_line: bool, union_on_line: bool) bool {
-    if ternary : return true
-    if match_on_line : return true
-    let lf = line_first ?! return false
-    let w = lf.text
+fn fmt_colon_wants_space(stmt: FmtStmt) bool {
+    if stmt.ternary > 0 : return true
+    if stmt.has_match : return true
+    if stmt.has_handler : return true
+    let first = stmt.first ?! return false
+    let w = first.text
+    if w == "}" : return true
+    if !first.keyword : return false
     if w == "match" : return true
     // The single-statement body of a control structure: `if x : return`.
-    if w == "if" || w == "while" || w == "each" || w == "else" || w == "}" : return true
+    if w == "if" || w == "while" || w == "each" || w == "else" : return true
     return false
 }
 
 fn fmt_is_prefix_keyword(t: FmtTok) bool {
+    if !t.keyword : return false
     let w = t.text
     return w == "return" || w == "throw" || w == "await" || w == "co"
-}
-
-fn fmt_is_prefix_keyword_context(t: FmtTok, before: ?FmtTok) bool {
-    if !fmt_is_prefix_keyword(t) : return false
-    if !isset(before) : return true
-    return before.text != "."
 }
 
 fn fmt_is_prefix_sign_text(t: String) bool {
     return t == "-" || t == "!" || t == "~" || t == "?" || t == "&" || t == "*" || t == "<" || t == ">" || t == "++" || t == "--"
 }
 
-fn fmt_is_positional_infix(tok: FmtTok, prev: FmtTok, before_prev: ?FmtTok, fn_return_pending: bool) bool {
+fn fmt_is_positional_infix(tok: FmtTok, prev: FmtTok, fn_return_pending: bool) bool {
     let t = tok.text
     if !fmt_ends_operand(prev) : return false
     // Prefix keywords introduce a new expression, so operators after them
     // are unary prefix (tight), not binary infix (spaced).
-    if fmt_is_prefix_keyword_context(prev, before_prev) : return false
+    if fmt_is_prefix_keyword(prev) : return false
     if fn_return_pending && prev.text == ")" && (t == "?" || t == "&" || t == "*" || t == "<") : return false
     return t == "-" || t == "<" || t == ">" || t == "?" || t == "&" || t == "*"
 }
@@ -491,17 +587,20 @@ fn fmt_is_tight_sign(tok: FmtTok, prev: ?FmtTok, infix: bool) bool {
     return true
 }
 
-fn fmt_declared_scope(tok: FmtTok, prev: ?FmtTok, line_first: ?FmtTok, scope: FMT_SCOPE) FMT_SCOPE {
-    if isset(prev) && prev.text == "." : return FMT_SCOPE.root
+fn fmt_declared_scope(tok: FmtTok, stmt: FmtStmt, scope: FMT_SCOPE) FMT_SCOPE {
+    if !tok.keyword : return FMT_SCOPE.root
     let t = tok.text
     if t == "fn" : return FMT_SCOPE.function
     if t == "get" && fmt_scope_has_access(scope) : return FMT_SCOPE.function
+    // A `group name { ... }` body holds members like the class around it.
+    if t == "group" && fmt_scope_has_access(scope) : return scope
     if t == "payload" : return FMT_SCOPE.error
 
-    let first = line_first ?! return FMT_SCOPE.root
-    if first.text != t {
-        if !fmt_is_access_sign(first.text) : return FMT_SCOPE.root
-        if !isset(prev) || !fmt_is_access_sign(prev.text) : return FMT_SCOPE.root
+    let first = stmt.first ?! return FMT_SCOPE.root
+    if first != tok {
+        // `- class Name {` and `static fn` still declare; `x.type` does not.
+        if !fmt_is_access_sign(first.text) && first.text != "static"
+            && first.text != "extern" && first.text != "export" : return FMT_SCOPE.root
     }
     if t == "test" || t == "synctest" : return FMT_SCOPE.test
     if t == "class" : return FMT_SCOPE.class
@@ -563,14 +662,14 @@ fn fmt_scope_has_access(scope: FMT_SCOPE) bool {
         || scope == FMT_SCOPE.trait || scope == FMT_SCOPE.extend
 }
 
-fn fmt_scope_space_between(scope: FMT_SCOPE, prev: FmtTok, tok: FmtTok, line_first: ?FmtTok) ?bool {
-    if fmt_scope_has_access(scope) : return fmt_member_space_between(prev, tok, line_first)
+fn fmt_scope_space_between(scope: FMT_SCOPE, prev: FmtTok, tok: FmtTok, first: ?FmtTok) ?bool {
+    if fmt_scope_has_access(scope) : return fmt_member_space_between(prev, tok, first)
     return null
 }
 
-fn fmt_member_space_between(prev: FmtTok, tok: FmtTok, line_first: ?FmtTok) ?bool {
-    let first = line_first ?! return null
-    if !fmt_is_access_sign(first.text) : return null
+fn fmt_member_space_between(prev: FmtTok, tok: FmtTok, first: ?FmtTok) ?bool {
+    let f = first ?! return null
+    if !fmt_is_access_sign(f.text) : return null
     if fmt_is_access_sign(tok.text) : return false
     if tok.type == TOK.word && fmt_is_access_sign(prev.text) : return true
     return null
