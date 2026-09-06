@@ -235,6 +235,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
++ class Lock[T] {
+    + static fn new(value: T) Lock[T] !InitError
+}
+```
+
+```js
 + mode Map[T] for HashMap[String, T] {
     + fn clone() Map[T]
     + static fn new() Map[T]

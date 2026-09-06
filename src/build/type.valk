@@ -74,6 +74,9 @@ class TypeCache {
     nullable: ?Type (null)
     array: ?Type (null)
     shared: ?Type (null)
+    locked: ?Type (null)
+    // The ordinary type a shared or locked view was made from
+    plain: ?Type (null)
 }
 
 class Type {
@@ -90,6 +93,8 @@ class Type {
     size_known: bool (false)
     is_inline: bool (false)
     is_shared: bool (false)
+    // Mutable view of shared data, valid only inside a `lock` block
+    is_locked: bool (false)
     error_is_instance: bool (false)
 
     fn get_unary_info() ?UnaryTypeInfo {
@@ -186,22 +191,31 @@ class Type {
     fn set_cached_error_abi_type(value: String) $inline { this.get_cache().cached_error_abi_type = value }
 
     fn shared_type() Type {
+        return this.view_type(false)
+    }
+
+    fn locked_type() Type {
+        return this.view_type(true)
+    }
+
+    fn view_type(locked: bool) Type {
         if this.is_nullable_type() {
-            return this.get_non_nullable().shared_type().nullable()
+            return this.get_non_nullable().view_type(locked).nullable()
         }
-        if this.is_shared : return this
+        if (locked ? this.is_locked : this.is_shared) : return this
         // Inline aggregates (structs, fixed arrays, unions) are copied by
         // value, but the references they carry are not. Reading one out of
         // shared storage has to keep the view, or those references come out
         // plain and fully mutable.
         if !this.is_gc_type() && this.kind != TYPE.closure && !this.has_gc_refs() : return this
         let cached = this.cache
-        let shared = isset(cached) ? cached.shared : null
-        if isset(shared) : return shared
+        let existing = isset(cached) ? (locked ? cached.locked : cached.shared) : null
+        if isset(existing) : return existing
         let result = Type {
             build: this.build
             kind: this.kind
-            is_shared: true
+            is_shared: !locked
+            is_locked: locked
             class: this.class
             enum_info: this.enum_info
             info: this.info
@@ -210,16 +224,37 @@ class Type {
             unsigned: this.unsigned
             is_inline: this.is_inline
         }
-        this.get_cache().shared = result
+        if locked : this.get_cache().locked = result
+        else : this.get_cache().shared = result
+        result.get_cache().plain = this
         return result
     }
 
+    // The ordinary type behind a shared or locked view
+    fn plain_type() Type {
+        if this.is_nullable_type() : return this.get_non_nullable().plain_type().nullable()
+        if !this.is_shared && !this.is_locked : return this
+        let cached = this.cache
+        let plain = isset(cached) ? cached.plain : null
+        return plain ?? this
+    }
+
     fn shared_storage_type() Type {
+        return this.storage_view_type(false)
+    }
+
+    fn locked_storage_type() Type {
+        return this.storage_view_type(true)
+    }
+
+    // What a read out of shared or locked storage hands back: the same view,
+    // except for immutable strings.
+    fn storage_view_type(locked: bool) Type {
         if this.kind == TYPE.struct && this.is_inline && !isset(this.class) {
             let types = Array[Type]{}
             let sub_types = this.get_members()
             if isset(sub_types) {
-                each sub_types as type : types.append(type.shared_storage_type())
+                each sub_types as type : types.append(type.storage_view_type(locked))
             }
             return type_multi(this.build, types, true)
         }
@@ -230,7 +265,15 @@ class Type {
             base = base.mode_for_class
         }
         if isset(string_class) && base == string_class : return this
-        return this.shared_type()
+        return this.view_type(locked)
+    }
+
+    // The view a value read through this storage keeps, if any
+    fn storage_view_of(type: Type) Type {
+        let nn = this.get_non_nullable()
+        if nn.is_locked : return type.locked_storage_type()
+        if nn.is_shared : return type.shared_storage_type()
+        return type
     }
 
     // Target pointer size in bytes
@@ -780,6 +823,7 @@ class Type {
 
     fn is_same_type(other: Type) bool {
         if this.is_shared != other.is_shared : return false
+        if this.is_locked != other.is_locked : return false
         // An enum shares its storage class with its base integer, but it is
         // its own type: `Slice[u8]` helpers must not land on `Slice[E]`.
         if this.get_enum() != other.get_enum() : return false
@@ -971,6 +1015,7 @@ class Type {
         if typ.is_nullable_type() : return false
 
         if base.is_shared != typ.is_shared : return false
+        if base.is_locked != typ.is_locked : return false
 
         if base.kind == TYPE.union {
             if typ.kind == TYPE.union : return base.union_accepts_union(typ)
@@ -1034,7 +1079,7 @@ class Type {
     }
 
     fn compute_compat_display_name() String {
-        let prefix = this.is_shared ? "shared " : ""
+        let prefix = this.is_shared ? "shared " : (this.is_locked ? "locked " : "")
         let enu = this.enum_info
         if isset(enu) : return prefix + enu.name
         // Class-backed types: always prefer pretty name (`Array[String]`, not mangled id)
@@ -1388,6 +1433,7 @@ class Type {
             unsigned: this.unsigned
             is_inline: true
             is_shared: this.is_shared
+            is_locked: this.is_locked
         }
         this.get_cache().inline = t
         t.get_cache().non_inline = this
@@ -1408,6 +1454,7 @@ class Type {
             kind: this.kind
             unsigned: this.unsigned
             is_shared: this.is_shared
+            is_locked: this.is_locked
         }
         this.get_cache().non_inline = t
         t.get_cache().inline = this
@@ -2130,6 +2177,14 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
         return inner.shared_type()
     }
 
+    if kind == TYPE_KIND.locked {
+        let inner = type_from_inner_exp(exp, scope, "Missing inner type for 'locked'") !>
+        if inner.is_nullable_type() {
+            return inner.get_non_nullable().locked_type().nullable()
+        }
+        return inner.locked_type()
+    }
+
     if kind == TYPE_KIND.ptr {
         let inner = type_from_inner_exp(exp, scope, "Missing inner type for '*'") !>
         if inner.is_void_type() : exp.error("Use 'ptr' for an untyped pointer instead of '*void'")
@@ -2348,6 +2403,7 @@ fn type_from_named_exp(exp: Exp, scope: Scope) Type !Error {
             unsigned: base.unsigned
             is_inline: base.is_inline
             is_shared: base.is_shared
+            is_locked: base.is_locked
         }
     }
 

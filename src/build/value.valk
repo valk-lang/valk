@@ -75,6 +75,8 @@ enum VAL : u8 {
     init_allocators
     // Execute the function's runtime stack of deferred closures in LIFO order.
     run_defers
+    // `lock` block: value1 = acquire prelude, value2 = release call, values = body
+    lock_block
     ir_comment
     // Value scope `<{...}`: values = body statements; value1 = phi of return values
     vscope
@@ -954,6 +956,9 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
     if source.owner != parent {
         source = func_capture_decl(parent, source, name, at) !>
     }
+    if source.type.get_non_nullable().is_locked {
+        at.error("A locked view cannot be captured by a closure; it is only valid inside its lock block")
+    }
     source.is_captured = true
     value_mark_actual_escape(vgen_decl(source))
     if source.implicit_borrow {
@@ -1126,7 +1131,7 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let elem = type_from_exp(type_exp, scope) !>
     // Reading through a pointer that came out of shared storage keeps the view,
     // the same as indexing a shared sequence does.
-    if on.rett.get_non_nullable().is_shared : elem = elem.shared_storage_type()
+    elem = on.rett.storage_view_of(elem)
 
     let offset = vgen_int(0, type_int(b))
     if isset(offset_exp) {
@@ -1186,6 +1191,11 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
     let type = value.rett
     let nn = type.get_non_nullable()
     if nn.is_shared : return value
+    // A copy of locked data is a fresh ordinary graph; read the source through
+    // its plain type so the copy comes out plain too
+    if nn.is_locked {
+        return value_clone(value_shared_view(value, type.plain_type()), ctx, scope, at, check_access, allow_pointer_alias) !>
+    }
     if nn.kind == TYPE.closure : return value_fn_clone(value, ctx, scope, at) !>
     let class = nn.get_class_or_null()
     if isset(class) {
@@ -1558,7 +1568,7 @@ fn value_native_sequence_item(on: Value, index: Value, scope: Scope, ctx: Contex
     let element = type_native_sequence_element(t)
     if !isset(element) : at.bug("Sequence type has no element type")
     // An element read out of shared storage keeps the shared view
-    if t.is_shared : element = element.shared_storage_type()
+    element = t.storage_view_of(element)
     let data = value_native_sequence_data(on, t, ctx, at) !>
     return value_sequence_element_read(vgen_ptrv(data, index, element, at), scope, ctx, at) !>
 }
@@ -1597,7 +1607,7 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let owner = ctx.get_func() !>
     let element = type_native_sequence_element(on_type)
     if !isset(element) : at.bug("Sequence type has no element type")
-    let rett = on_type.get_non_nullable().is_shared ? element.shared_storage_type() : element
+    let rett = on_type.storage_view_of(element)
     let func = native_sequence_helper_base(owner, "get", key, on_type, rett, at) !>
     ctx.build.cache.sequence_get_funcs.set(key, func)
     bind_func_arg_decls(func) !>
@@ -1718,7 +1728,16 @@ fn resolve_offset_assign_func(class: Class) ?Func {
 }
 
 fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
-    if !on.rett.get_non_nullable().is_shared || func.is_static || func.shared_unsafe : return func
+    if func.is_static || func.shared_unsafe : return func
+    if on.rett.get_non_nullable().is_locked {
+        if func.is_interface {
+            at.error("Cannot call interface method '" + func.name + "' on locked data of type '"
+                + on.rett.compat_display_name()
+                + "'. The implementation is not known here, so it cannot be checked against the lock rules. Call it through its concrete type instead")
+        }
+        return get_func_locked_receiver(func) !>
+    }
+    if !on.rett.get_non_nullable().is_shared : return func
     if func.mutates_receiver {
         at.error("Cannot call mutating method '" + func.name + "' on shared data of type '" + on.rett.compat_display_name() + "'")
     }
@@ -1879,7 +1898,7 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
             index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
         }
         // An element read out of shared storage keeps the shared view
-        if on_t.is_shared : sub = sub.shared_storage_type()
+        sub = on_t.storage_view_of(sub)
         let size = on_t.length
         index = value_check_known_length_index(index, on_t, size, ctx, exp) !>
         return value_sequence_element_read(vgen_ptrv(on, index, sub, exp), scope, ctx, exp) !>
@@ -2101,6 +2120,9 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
         }
         if type_native_sequence(on.rett).is_shared {
             left_exp.error("Cannot call mutating method 'set' on shared data of type '" + on.rett.compat_display_name() + "'")
+        }
+        if type_native_sequence(on.rett).is_locked {
+            left_exp.error("Cannot assign elements of a locked fixed array; store a whole new array instead")
         }
         let index_exp = access
         let uint_t = type_from_core(ctx.build, "uint") !>
@@ -2864,7 +2886,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if isset(bound_name) && bound_name != "_" {
             let member = bound_type ?! exp.bug("Union match binding is missing its type")
             // A payload pulled out of a shared union keeps the shared view
-            if on.rett.get_non_nullable().is_shared : member = member.shared_storage_type()
+            member = on.rett.storage_view_of(member)
             if case_scope.has_local(bound_name) : exp.error("Name already used: " + bound_name)
             let decl = Decl.new(ctx.get_func() !>, member, false, bound_name)
             decl.exp = exp
@@ -3667,9 +3689,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             act_check(exp, prop.act, prop.exp, false, "property") !>
             lsp_goto(exp, prop.exp) !>
             let v = vgen_prop(prop, on_adr, ctx)
-            if on_adr.rett.get_non_nullable().is_shared {
-                v.rett = prop.type.shared_storage_type()
-            }
+            v.rett = on_adr.rett.storage_view_of(prop.type)
             v.exp = exp
             return v
         }
@@ -4374,6 +4394,37 @@ fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Erro
     }
 }
 
+// A method on locked data may keep what it is handed: anything the callee
+// stores into its receiver (or lets escape) must be a unique graph, since it
+// is published with the locked data and must not keep an ordinary alias.
+fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: Value, ctx: Context) !Error {
+    let nn = av.rett.get_non_nullable()
+    if !av.rett.has_gc_refs() && nn.kind != TYPE.closure : return
+    if nn.is_shared || nn.is_locked : return
+    let string_class = type_string(func.ns.build).get_class_or_null()
+    if isset(string_class) && nn.get_class_or_null() == string_class : return
+    let moves_in = !func.unique_summary_ready
+        || func_arg_may_escape(func, param_i)
+        || func_arg_invalidates_unique(func, param_i)
+    if !moves_in {
+        let receiver_arg = func.args.get(0) !? null
+        let absorbs = isset(receiver_arg) ? receiver_arg.absorbs_args : null
+        moves_in = isset(absorbs) && absorbs.contains(param_i)
+    }
+    if !moves_in : return
+    if !(value_require_unique_graph(av) !>) {
+        // Came in through a parameter of this function: the receiver absorbs
+        // it, and the outer call site proves uniqueness instead.
+        let sources = value_summary_source_args(av, ctx.get_func() !>)
+        if isset(sources) {
+            value_mark_summary_absorbs(receiver, sources)
+            return
+        }
+        av.error("Only a provably unique value graph can be handed to a method on locked data; a mutable alias may remain")
+    }
+    value_publish_unique(av)
+}
+
 fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp) !Error {
     // Ensure signature types are resolved
     if !func.parsed_types {
@@ -4470,6 +4521,9 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let accepts_shared_borrow = !func.unique_summary_ready
                 || (!func_arg_may_escape(func, param_i) && !func_arg_invalidates_unique(func, param_i))
             av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow) !>
+            if isset(receiver) && receiver.rett.get_non_nullable().is_locked {
+                value_check_locked_call_arg(func, param_i, av, receiver, ctx) !>
+            }
             if !func.unique_summary_ready {
                 value_defer_arg_effects(param, av, at, pending_shared_borrow) !>
             } else {

@@ -1528,3 +1528,27 @@ Project: [Link](https://github.com/valk-lang/vman)
 `shared T` is a read-only view used to pass data across threads. Data-race-unsafe properties cannot be changed through that view, while integer properties use atomic access. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`.
 
 You can use `core.race_lock()` and `core.race_unlock()` as a global lock for data races. You are allowed to lock multiple times (e.g. in nested functions) as long as you unlock the same amount of times (it keeps a count).
+
+### Mutable shared data
+
+`Lock[T]` holds a value that threads may change. The value is only reachable inside a `lock` block, which holds the lock's mutex until the block ends:
+
+```rust
+class Stats {
+    count: uint (0)
+    names: Array[String] (.{})
+}
+
+let stats: shared Lock[Stats] = .new(Stats {}) !!
+
+lock stats as s {
+    s.count++
+    s.names.append("x")
+}
+```
+
+Inside the block `s` is a `locked Stats`: a mutable view that is valid until the block ends. Anything read through it, like `s.names`, is a locked view too. The block releases the lock on every exit, including `return`, `throw` and `!>`. `break` and `continue` cannot leave a lock block.
+
+A locked view cannot escape the block: it cannot be returned, captured by a closure, stored in a property or global, or assigned to a variable declared outside the block. Functions can take `locked T` parameters to work on the data while the lock is held. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Data from one lock cannot be stored under another lock. `$clone` and `.clone()` of locked data produce ordinary copies that may leave the block.
+
+`T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again from the same thread deadlocks. Reading the value outside a `lock` block is not possible; every reader takes the lock too.
