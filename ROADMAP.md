@@ -4,11 +4,14 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.5.1
+- Release 0.6.1
 ~ Data race solution (Threads done via shared type, MutexValue not done)
+
++ Release 0.6.0
 + math namespace
 + more valk lib functions
-- integer .max/.min
++ integer .$max/.$min
++ redesign borrows & slices
 
 
 # Next steps
