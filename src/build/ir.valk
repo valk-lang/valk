@@ -360,11 +360,6 @@ class IRFunc {
     terminated: bool (false)
     loop_cond: ?String (null)
     loop_after: ?String (null)
-    gc_stack_global: String ("")
-    gc_stack_previous: String ("")
-    // GC stack markers: the collector receiver and its argument type
-    mark_receiver: String ("\%gc")
-    mark_receiver_type: String ("ptr")
     cleanup_active: bool (false)
     current_block: String ("")
     vscope_after: ?String (null)
@@ -584,20 +579,10 @@ fn generate_func_ir(func: Func) !Error {
     ir.code.append_text(" {\n")
     ir.label("entry")
 
-    if !func.is_entrance : ir_emit_gc_stack_init(ir) !>
-
     each func.all_decls as decl, i {
         if decl.is_bind : continue
         decl.ir_name = ir_decl_name(func.ns.build, i)
-        if ir_decl_uses_gc_stack(func, decl) {
-            if !func.is_entrance {
-                let offset = decl.gc_stack_offset
-                if !isset(offset) : func.exp.bug("GC-backed declaration has no frame offset")
-                ir_name_offset_address(ir, decl.ir_name, "\%valk.gc.stack.values", offset)
-            }
-        } else {
-            ir_name_alloca(ir, decl.ir_name, ir_type(decl.type) !>)
-        }
+        ir_name_alloca(ir, decl.ir_name, ir_type(decl.type) !>)
     }
 
     each func.args as arg, i {
@@ -618,17 +603,8 @@ fn generate_func_ir(func: Func) !Error {
         }
     }
     ir.code.append_text("}\n\n")
-    if func.gc_decl_count > 0 {
-        let collect = ir_gc_stack_collect_func(ir) !>
-        ir_write_func_gc_stack_marker(ir.code, func, collect) !>
-    }
     ir.code.append_buffer(ir.coro_helpers)
     func.set_ir_code(ir.code.to_string())
-}
-
-fn ir_decl_uses_gc_stack(func: Func, decl: Decl) bool {
-    if func.disable_gc_stack : return false
-    return isset(decl.gc_stack_offset)
 }
 
 fn ir_decl_name(build: Build, i: uint) String {
@@ -667,54 +643,17 @@ fn ir_offset_alignment(base_alignment: u32, offset: u32) u32 {
 // Managed field walks
 ////////////////////////////
 
-enum GC_FIELD_OP : u8 {
-    mark  // hand the pointer to the collector
-    clean // strip ownership bits from a loaded copy
-}
-
-fn ir_visit_gc_field(
-    ir: IRFunc,
-    address: String,
-    action: GC_FIELD_OP,
-    callback_target: String,
-    callback_data: String,
-    alignment: u32
-) !Error {
+// Strip the ownership bits from one loaded pointer copy
+fn ir_clean_gc_field(ir: IRFunc, address: String, alignment: u32) {
     let pointer = ir_emit_aligned_load(ir, "ptr", address, alignment)
     pointer = ir_union_clean_gc_pointer(ir, pointer)
-    if action == GC_FIELD_OP.clean {
-        ir_emit_aligned_store(ir, "ptr", pointer, address, alignment)
-        return
-    }
-    let present = ir_emit_binary_instruction(ir, "icmp ne", "ptr", pointer, "null")
-    let yes = ir.block("stack.mark")
-    let after = ir.block("stack.after")
-    ir.cond_jump(present, yes, after)
-    ir.label(yes)
-    ir.line2("call void ", callback_target)
-    ir.write("(")
-    ir.write(ir.mark_receiver_type)
-    ir.write(" ")
-    ir.write(callback_data)
-    ir.write(", ptr ")
-    ir.write(pointer)
-    ir.write(")")
-    ir.line_end()
-    ir.jump(after)
-    ir.label(after)
+    ir_emit_aligned_store(ir, "ptr", pointer, address, alignment)
 }
 
-fn ir_visit_type_gc_fields(
-    ir: IRFunc,
-    type: Type,
-    address: String,
-    action: GC_FIELD_OP,
-    callback_target: String (""),
-    callback_data: String (""),
-    alignment: u32 (1)
-) !Error {
+// Strip the ownership bits from every managed pointer inside a loaded copy
+fn ir_clean_type_gc_fields(ir: IRFunc, type: Type, address: String, alignment: u32 (1)) !Error {
     if type.is_gc_type() {
-        ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
+        ir_clean_gc_field(ir, address, alignment)
         return
     }
 
@@ -722,7 +661,7 @@ fn ir_visit_type_gc_fields(
     if t.kind == TYPE.closure {
         let environment = ir_offset_address(ir, address, t.ptr_size().to(uint))
         let inner_alignment = ir_offset_alignment(alignment, t.ptr_size())
-        ir_visit_gc_field(ir, environment, action, callback_target, callback_data, inner_alignment) !>
+        ir_clean_gc_field(ir, environment, inner_alignment)
         return
     }
 
@@ -734,19 +673,19 @@ fn ir_visit_type_gc_fields(
         ir.label(yes)
         let inner = ir_field_address(ir, ir_type(type) !>, address, 2)
         let inner_alignment = ir_offset_alignment(alignment, type.ptr_size())
-        ir_visit_type_gc_fields(ir, t, inner, action, callback_target, callback_data, inner_alignment) !>
+        ir_clean_type_gc_fields(ir, t, inner, inner_alignment) !>
         ir.jump(after)
         ir.label(after)
         return
     }
 
     if t.is_fat_borrow() {
-        ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
+        ir_clean_gc_field(ir, address, alignment)
         return
     }
 
     if t.kind == TYPE.interface {
-        ir_visit_gc_field(ir, address, action, callback_target, callback_data, alignment) !>
+        ir_clean_gc_field(ir, address, alignment)
         return
     }
 
@@ -767,7 +706,7 @@ fn ir_visit_type_gc_fields(
             ir.label(yes)
             let payload = ir_offset_address(ir, address, layout.payload_offset.to(uint))
             let payload_alignment = ir_offset_alignment(alignment, layout.payload_offset)
-            ir_visit_type_gc_fields(ir, member, payload, action, callback_target, callback_data, payload_alignment) !>
+            ir_clean_type_gc_fields(ir, member, payload, payload_alignment) !>
             ir.jump(after)
             ir.label(next)
         }
@@ -786,7 +725,7 @@ fn ir_visit_type_gc_fields(
             let element_offset = stride * i
             let element = ir_offset_address(ir, address, element_offset.to(uint))
             let element_alignment = ir_offset_alignment(alignment, element_offset)
-            ir_visit_type_gc_fields(ir, sub, element, action, callback_target, callback_data, element_alignment) !>
+            ir_clean_type_gc_fields(ir, sub, element, element_alignment) !>
             i++
         }
         return
@@ -799,7 +738,7 @@ fn ir_visit_type_gc_fields(
             if !prop.type.has_gc_refs() : continue
             let field = ir_prop_address(ir, address, prop)
             let field_alignment = ir_offset_alignment(alignment, prop.offset)
-            ir_visit_type_gc_fields(ir, prop.type, field, action, callback_target, callback_data, field_alignment) !>
+            ir_clean_type_gc_fields(ir, prop.type, field, field_alignment) !>
         }
         return
     }
@@ -813,166 +752,74 @@ fn ir_visit_type_gc_fields(
             if member.has_gc_refs() {
                 let field = ir_offset_address(ir, address, offset.to(uint))
                 let field_alignment = ir_offset_alignment(alignment, offset)
-                ir_visit_type_gc_fields(ir, member, field, action, callback_target, callback_data, field_alignment) !>
+                ir_clean_type_gc_fields(ir, member, field, field_alignment) !>
             }
             offset += member.byte_size() !>
         }
     }
 }
 
-////////////////////////////
-// GC stack frames and markers
-////////////////////////////
-
-fn ir_gc_stack_marker_name(func: Func) String {
-    let buf = ByteBuffer.new(32 + func_ir_name(func).bytes)
-    buf.append_text("valk.gc.stack.marker.func.")
-    buf.append_text(func_ir_name(func))
-    return buf.to_string()
-}
-
-fn ir_gc_stack_coro_marker_name(value: Value) String {
-    let buf = ByteBuffer.new(32 + value.get_name().bytes)
-    buf.append_text("valk.gc.stack.marker.coro.")
-    buf.append_text(value.get_name())
-    return buf.to_string()
-}
-
-fn ir_gc_stack_frame_type(frame_size: uint) String {
-    let buf = ByteBuffer.new(24)
-    buf.append_text("{ ptr, ptr, [")
-    buf.write_uint_ascii(frame_size)
-    buf.append_text(" x i8] }")
-    return buf.to_string()
-}
-
-fn ir_gc_stack_append_type_layout(
-    types: Array[Type],
-    offsets: Array[uint],
-    type: Type,
-    frame_size: uint
-) uint !Error {
-    let size = (type.byte_size() !>).to(uint)
-    let alignment = type.storage_alignment() !>.to(uint)
-    if alignment > 0 : frame_size = frame_size.round_up(alignment)
-    types.append(type)
-    offsets.append(frame_size)
-    return frame_size + size
-}
-
-fn ir_gc_stack_collect_func(ir: IRFunc) Func !Error {
-    let idf = valk_idf(ir.func.ns.build, "gc", "Gc") !>
-    let class = idf.class
-    if !isset(class) : ir.func.exp.bug("gc.Gc is not a class")
-    let collect = class.get_func("collect_stack_item")
-    if !isset(collect) : ir.func.exp.bug("gc.Gc.collect_stack_item is missing")
-    if !collect.parsed_types : parse_func_types(collect) !>
-    ir_use_func(ir, collect)
-    return collect
-}
-
-fn ir_begin_gc_stack_marker(func: Func, name: String, frame_size: uint, collect: Func) IRFunc {
-    let ir = IRFunc {func: func}
-    ir.code.append_text("define internal void @\"")
-    ir.code.append_text(name)
-    ir.code.append_text("\"(ptr \%frame, ptr \%gc) {\n")
-    ir.label("entry")
-    // The collector is a struct method: its receiver is an ownerless borrow.
-    let this_arg = collect.args.get(0) !? null
-    if isset(this_arg) && this_arg.type.is_stack_borrow() {
-        ir.mark_receiver = ir_frame_borrow(ir, "\%gc")
-        ir.mark_receiver_type = "{ ptr, ptr }"
-    }
-    ir_name_field_address(ir, "\%frame.values", ir_gc_stack_frame_type(frame_size), "\%frame", 2, true)
-    return ir
-}
-
-fn ir_finish_gc_stack_marker(out: ByteBuffer, ir: IRFunc) {
-    ir.line("ret void")
-    ir.code.append_text("}\n\n")
-    out.append_buffer(ir.code)
-}
-
-fn ir_gc_stack_mark_address(ir: IRFunc, type: Type, address: String, collect: Func) !Error {
-    ir_visit_type_gc_fields(ir, type, address, GC_FIELD_OP.mark, ir_func_address(collect), ir.mark_receiver, type.storage_alignment() !>) !>
-}
-
-fn ir_write_func_gc_stack_marker(out: ByteBuffer, func: Func, collect: Func) !Error {
-    let ir = ir_begin_gc_stack_marker(func, ir_gc_stack_marker_name(func), func.alloca_size, collect)
-
-    // One frame region per rooted declaration, so every offset is distinct.
-    each func.all_decls as decl {
-        let offset = decl.gc_stack_offset
-        if !isset(offset) : continue
-        let address = ir_offset_address(ir, "\%frame.values", offset)
-        ir_gc_stack_mark_address(ir, decl.type, address, collect) !>
-    }
-    ir_finish_gc_stack_marker(out, ir)
-}
-
-fn ir_write_coro_gc_stack_marker(
-    out: ByteBuffer,
-    func: Func,
-    name: String,
-    frame_size: uint,
-    types: Array[Type],
-    offsets: Array[uint],
-    collect: Func
-) !Error {
-    let ir = ir_begin_gc_stack_marker(func, name, frame_size, collect)
-    each types as type, i {
-        let offset = offsets.get(i) ! func.exp.bug("Coroutine GC-frame layout is incomplete")
-        let address = ir_offset_address(ir, "\%frame.values", offset)
-        ir_gc_stack_mark_address(ir, type, address, collect) !>
-    }
-    ir_finish_gc_stack_marker(out, ir)
-}
-
-fn ir_emit_gc_stack_init(ir: IRFunc) !Error {
-    let func = ir.func
-    if func.gc_decl_count == 0 : return
-
-    let idf = valk_idf(func.ns.build, "coro", "gc_stack_sp") !>
-    let global = idf.global
-    if !isset(global) : func.exp.bug("coro.gc_stack_sp is not a global")
-    ir_use_global(ir, global)
-
-    let global_name = ir_global_address(global)
-    let frame = "\%valk.gc.stack"
-    let frame_type = ir_gc_stack_frame_type(func.alloca_size)
-    ir.gc_stack_global = global_name
-    ir.gc_stack_previous = "\%valk.gc.stack.previous"
-    ir_name_alloca(ir, frame, frame_type)
-    ir.line3(ir.gc_stack_previous, " = load ptr, ptr ", global_name)
-    ir_name_field_address(ir, "\%valk.gc.stack.next", frame_type, frame, 0)
-    ir_emit_store(ir, "ptr", ir.gc_stack_previous, "\%valk.gc.stack.next")
-    ir_name_field_address(ir, "\%valk.gc.stack.marker", frame_type, frame, 1)
-    ir_emit_store(ir, "ptr", ir_symbol_address(ir_gc_stack_marker_name(func)), "\%valk.gc.stack.marker")
-    ir_name_field_address(ir, "\%valk.gc.stack.values", frame_type, frame, 2, true)
-    if func.alloca_size > 0 {
-        ir_emit_zero(ir, "\%valk.gc.stack.values", func.alloca_size)
-    }
-    ir_emit_store(ir, "ptr", frame, global_name)
-}
-
-fn ir_emit_gc_stack_defer(ir: IRFunc) {
-    if ir.gc_stack_global == "" || ir.func.is_entrance : return
-    ir_emit_store(ir, "ptr", ir.gc_stack_previous, ir.gc_stack_global)
-}
-
 fn ir_emit_func_cleanup(ir: IRFunc) !Error {
     if ir.cleanup_active : return
     ir.cleanup_active = true
-    let restored_gc_stack = false
     let scope = ir.func.defer_scope
     if isset(scope) {
-        each scope.values as value {
-            if value.type == VAL.gc_stack_defer : restored_gc_stack = true
-            ir_emit_stmt(ir, value) !>
-        }
+        each scope.values as value : ir_emit_stmt(ir, value) !>
     }
-    if !restored_gc_stack : ir_emit_gc_stack_defer(ir)
+    ir_emit_keep_alive(ir) !>
     ir.cleanup_active = false
+}
+
+// Roots are found on the native stack, so a value would only live until its
+// last use. Objects with a gc_free hook release a resource when collected,
+// so a raw handle taken from one must not outlive it: an opaque use at every
+// exit keeps such receivers, arguments and locals alive for the whole call.
+fn ir_emit_keep_alive(ir: IRFunc) !Error {
+    each ir.func.all_decls as decl {
+        if decl.is_bind || decl.is_shared_capture : continue
+        let type = decl.type
+        if !type_needs_keep_alive(type) : continue
+        let lowered = ir_type(type) !>
+        if type.is_gc_type() {
+            ir_emit_opaque_use(ir, ir_emit_load(ir, lowered, decl.ir_name))
+            continue
+        }
+        // Inline aggregates stay in their stack slot; keeping the slot's
+        // address in use keeps the fields it holds visible to the scan
+        ir_emit_opaque_use(ir, decl.ir_name)
+    }
+}
+
+// Interfaces may hold anything; other types only matter when a finalizer
+// is reachable through their inline layout. Borrows point into their owner,
+// which the scan resolves by itself.
+fn type_needs_keep_alive(type: Type) bool {
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.interface : return true
+    if t.is_fat_borrow() || t.kind == TYPE.closure : return false
+    let class = t.get_class_or_null()
+    if isset(class) && isset(class.get_func("gc_free")) : return true
+    if type.is_gc_type() : return false
+    if !type.has_gc_refs() : return false
+    if t.is_inline && isset(class) {
+        each class.props as prop {
+            if type_needs_keep_alive(prop.type) : return true
+        }
+        return false
+    }
+    let members = t.get_members()
+    if isset(members) {
+        each members as member {
+            if type_needs_keep_alive(member) : return true
+        }
+        return false
+    }
+    let sub = t.get_sub_type()
+    return isset(sub) && type_needs_keep_alive(sub)
+}
+
+fn ir_emit_opaque_use(ir: IRFunc, pointer: String) {
+    ir.line3("call void asm sideeffect \"\", \"r\"(ptr ", pointer, ")")
 }
 
 ////////////////////////////
@@ -1025,10 +872,6 @@ fn ir_use_global(ir: IRFunc, global: Global) {
     if global.unit != ir.func.unit {
         ir.func.unit.extern_globals.append(global, true)
     }
-}
-
-fn ir_note_allocates(ir: IRFunc) {
-    ir.func.info_creates_objects = true
 }
 
 fn ir_note_gc_allocates(ir: IRFunc) {
@@ -1371,35 +1214,6 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
         ir.comment(value.get_string())
         return
     }
-    if t == VAL.gc_stack_init {
-        if ir.func.is_entrance : ir_emit_gc_stack_init(ir) !>
-        return
-    }
-    if t == VAL.decl_offset {
-        if ir.func.is_entrance {
-            let decl = value.decl
-            if !isset(decl) : value.bug("Declaration offset is missing its declaration")
-            if ir_decl_uses_gc_stack(ir.func, decl) {
-                let offset = decl.gc_stack_offset
-                if !isset(offset) : value.bug("GC-backed declaration has no frame offset")
-                ir_name_offset_address(ir, decl.ir_name, "\%valk.gc.stack.values", offset)
-            }
-        }
-        return
-    }
-    if t == VAL.gc_stack_defer {
-        ir_emit_gc_stack_defer(ir)
-        return
-    }
-    if t == VAL.gc_root_clear {
-        let decl = value.decl
-        if !isset(decl) : value.bug("GC-root clear is missing its declaration")
-        let rooted = ir_decl_uses_gc_stack(ir.func, decl)
-        if rooted {
-            ir_emit_zero(ir, decl.ir_name, (decl.type.byte_size() !>).to(uint))
-        }
-        return
-    }
 
     // Expression statement: evaluate for side effects.
     ir_emit_value(ir, value) !>
@@ -1590,7 +1404,7 @@ fn ir_emit_clean_embedded_load(ir: IRFunc, value: Value, type: Type, address: St
 
     let slot = ir_value_slot(ir, value, lowered)
     ir_emit_store(ir, lowered, raw, slot)
-    ir_visit_type_gc_fields(ir, type, slot, GC_FIELD_OP.clean) !>
+    ir_clean_type_gc_fields(ir, type, slot) !>
 
     return ir_emit_load(ir, lowered, slot)
 }
@@ -1842,21 +1656,20 @@ fn ir_index_address(ir: IRFunc, type: String, base: String, index: uint) String 
 
 fn ir_field_address(ir: IRFunc, type: String, base: String, field: uint, element: bool (false)) String {
     let out = ir.var()
-    ir_name_field_address(ir, out, type, base, field, element)
-    return out
-}
-
-fn ir_name_field_address(ir: IRFunc, name: String, type: String, base: String, field: uint, element: bool (false)) {
-    ir_open_element_address(ir, name, type, base)
+    ir_open_element_address(ir, out, type, base)
     ir.write("i32 0, i32 ")
     ir.write_uint(field)
     if element : ir.write(", i32 0")
     ir.line_end()
+    return out
 }
 
 fn ir_offset_address(ir: IRFunc, base: String, offset: uint) String {
     let address = ir.var()
-    ir_name_offset_address(ir, address, base, offset)
+    ir_open_element_address(ir, address, "i8", base)
+    ir.write("i64 ")
+    ir.write_uint(offset)
+    ir.line_end()
     return address
 }
 
@@ -1867,14 +1680,6 @@ fn ir_dynamic_offset_address(ir: IRFunc, base: String, offset: String) String {
     ir.write(offset)
     ir.line_end()
     return address
-}
-
-// Same, for a slot that already has a name of its own.
-fn ir_name_offset_address(ir: IRFunc, name: String, base: String, offset: uint) {
-    ir_open_element_address(ir, name, "i8", base)
-    ir.write("i64 ")
-    ir.write_uint(offset)
-    ir.line_end()
 }
 
 fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
@@ -4001,46 +3806,6 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     if !isset(callee) : value.bug("Coroutine helper call has no callable")
     let closure_handler = call.op.@cast(CALL_KIND) == CALL_KIND.closure
     let result_types = ir_coro_result_types(call.rett)
-    let root_types = Array[Type]{}
-    let root_offsets = Array[uint]{}
-    let root_frame_size : uint = 0
-    each arg_types as type {
-        if type.has_gc_refs() {
-            root_frame_size = ir_gc_stack_append_type_layout(root_types, root_offsets, type, root_frame_size) !>
-        }
-    }
-    each result_types as type {
-        if type.has_gc_refs() {
-            root_frame_size = ir_gc_stack_append_type_layout(root_types, root_offsets, type, root_frame_size) !>
-        }
-    }
-    let has_roots = root_types.length > 0
-    let root_frame_type = has_roots ? ir_gc_stack_frame_type(root_frame_size) : ""
-    let root_marker_name = has_roots ? ir_gc_stack_coro_marker_name(value) : ""
-    let root_collect : ?Func = null
-    if has_roots : root_collect = ir_gc_stack_collect_func(parent) !>
-    let root_global = ""
-    let root_previous = ""
-    let root_values = ""
-    if has_roots {
-        let stack_idf = valk_idf(value.rett.build, "coro", "gc_stack_sp") !>
-        let stack_global = stack_idf.global
-        if !isset(stack_global) : value.bug("coro.gc_stack_sp is not a global")
-        ir_use_global(parent, stack_global)
-        root_global = ir_global_address(stack_global)
-        root_previous = ir.var()
-        root_values = ir.var()
-        let frame = ir.var()
-        let marker_address = ir.var()
-        ir_name_alloca(ir, frame, root_frame_type)
-        ir.line3(root_previous, " = load ptr, ptr ", root_global)
-        ir_emit_store(ir, "ptr", root_previous, frame)
-        ir_name_field_address(ir, marker_address, root_frame_type, frame, 1)
-        ir_emit_store(ir, "ptr", ir_symbol_address(root_marker_name), marker_address)
-        ir_name_field_address(ir, root_values, root_frame_type, frame, 2, true)
-        ir_emit_zero(ir, root_values, root_frame_size)
-        ir_emit_store(ir, "ptr", frame, root_global)
-    }
 
     let coro = ir_emit_load(ir, "ptr", ir_global_address(current_global))
 
@@ -4057,30 +3822,20 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
 
     let rendered_args = Array[String]{}
     let offset : uint = 0
-    let root_index : uint = 0
     each arg_types as type {
         let rendered = ""
         if type.is_gc_type() {
             rendered = ir_coro_pop_gc(ir, value, gc_args) !>
-            let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine argument root has no frame slot")
-            let root_address = ir_offset_address(ir, root_values, root_offset.to(uint))
-            ir_emit_store(ir, "ptr", rendered, root_address)
         } else {
             let alignment = type.storage_alignment() !>.to(uint)
             if alignment > 1 : offset = offset.round_up(alignment)
             let address = ir_offset_address(ir, raw_args, offset)
             rendered = ir_emit_aligned_load(ir, ir_type(type) !>, address, alignment.to(u32))
             let embedded_roots = type.gc_root_count() !>
-            if embedded_roots > 0 {
-                let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine argument root has no frame slot")
-                let root_address = ir_offset_address(ir, root_values, root_offset.to(uint))
-                ir_emit_store(ir, ir_type(type) !>, rendered, root_address)
-                let ri : uint = 0
-                while ri < embedded_roots {
-                    // The complete typed value is now visible to the marker.
-                    ir_coro_pop_gc(ir, value, gc_args) !>
-                    ri++
-                }
+            let ri : uint = 0
+            while ri < embedded_roots {
+                ir_coro_pop_gc(ir, value, gc_args) !>
+                ri++
             }
             offset += type.byte_size() !>
         }
@@ -4104,7 +3859,6 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         let success_block = ir.block("coro.success")
         ir.cond_jump(failed, error_block, success_block)
         ir.label(error_block)
-        if has_roots : ir_emit_store(ir, "ptr", root_previous, root_global)
         ir_emit_coro_complete(ir, value, class, coro) !>
         ir.line("ret void")
         ir.terminated = true
@@ -4119,44 +3873,21 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
             rendered = ir_emit_extract(ir, ir_type(call.rett) !>, success, i)
         }
         if type.is_gc_type() {
-            let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine result root has no frame slot")
-            ir_emit_store(ir, "ptr", rendered, ir_offset_address(ir, root_values, root_offset.to(uint)))
             ir_coro_append_gc(ir, value, gc_args, rendered) !>
         } else {
             let alignment = type.storage_alignment() !>.to(uint)
             if alignment > 1 : result_offset = result_offset.round_up(alignment)
             let address = ir_offset_address(ir, raw_args, result_offset)
-            let embedded_roots = type.gc_root_count() !>
-            let root_address = ""
-            if embedded_roots > 0 {
-                let root_offset = root_offsets.get(root_index++) ! value.bug("Coroutine result root has no frame slot")
-                root_address = ir_offset_address(ir, root_values, root_offset)
-                ir_emit_store(ir, ir_type(type) !>, rendered, root_address)
-            }
             ir_emit_aligned_store(ir, ir_type(type) !>, rendered, address, alignment.to(u32))
-            if embedded_roots > 0 {
-                ir_coro_append_type_roots(ir, value, type, root_address, gc_args, type.storage_alignment() !>) !>
+            if type.gc_root_count() !> > 0 {
+                ir_coro_append_type_roots(ir, value, type, address, gc_args, type.storage_alignment() !>) !>
             }
             result_offset += type.byte_size() !>
         }
     }
-    if has_roots : ir_emit_store(ir, "ptr", root_previous, root_global)
     ir_emit_coro_complete(ir, value, class, coro) !>
     ir.line("ret void")
     ir.code.append_text("}\n\n")
-    if has_roots {
-        let collect = root_collect
-        if !isset(collect) : value.bug("Coroutine GC frame is missing its stack collector")
-        ir_write_coro_gc_stack_marker(
-            ir.code,
-            parent.func,
-            root_marker_name,
-            root_frame_size,
-            root_types,
-            root_offsets,
-            collect
-        ) !>
-    }
 }
 
 fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
@@ -4239,6 +3970,12 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
 fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
     let source = value.value1
     if isset(source) && value.get_name() == "part" {
+        // A rendered aggregate is only reused when the source must not run
+        // twice; a plain load is rendered again where it is needed, as the
+        // first rendering may sit in a branch that does not reach this use
+        if value_renders_freely(source) {
+            return ir_emit_extract(ir, ir_type(source.rett) !>, ir_emit_value(ir, source) !>, value.int_val.to(uint))
+        }
         let aggregate = ir.cached_multi(source)
         if !isset(aggregate) {
             aggregate = ir_emit_value(ir, source) !>
@@ -4256,6 +3993,26 @@ fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
         current = ir_emit_insert(ir, whole, current, ir_type(item.rett) !>, item_value, i)
     }
     return current
+}
+
+// Side-effect free and cheap: safe to render once per use
+fn value_renders_freely(value: Value) bool {
+    let t = value.type
+    if t == VAL.decl || t == VAL.global || t == VAL.ptrv || t == VAL.prop : return !isset(value.get_pre_value())
+    if t == VAL.null || t == VAL.int || t == VAL.bool || t == VAL.float || t == VAL.string : return true
+    if t == VAL.cast {
+        let inner = value.value1
+        return isset(inner) && value_renders_freely(inner)
+    }
+    if t == VAL.multi {
+        let items = value.values
+        if !isset(items) || isset(value.value1) : return false
+        each items as item {
+            if !value_renders_freely(item) : return false
+        }
+        return true
+    }
+    return false
 }
 
 fn ir_emit_short_circuit(ir: IRFunc, left: Value, right: Value, op: VALUE_OP) String !Error {

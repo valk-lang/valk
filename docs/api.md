@@ -16,6 +16,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 # core
 
+## Aliases for 'core'
+
+```js
++ value EXEC_FAILED (-1)
+```
+
 ## Functions for 'core'
 
 ```js
@@ -1012,6 +1018,12 @@ alias pid_t for i32
 ```
 
 ```js
++ struct pthread_attr_t {
+    + data: [uint x 8]
+}
+```
+
+```js
 + struct pthread_cond_t {
     + data: [uint x 12]
 }
@@ -1036,6 +1048,17 @@ alias pid_t for i32
 ```
 
 # fs
+
+## Aliases for 'fs'
+
+```js
++ value PATH_DIV ("/")
++ value PATH_DIV_DOT ("/.")
++ value PATH_DIV_REPLACE ("\\")
++ value PATH_DIV_TWICE ("//")
++ value PATH_DOT_DIV ("./")
++ value PATH_MAX (4096)
+```
 
 ## Functions for 'fs'
 
@@ -1134,6 +1157,8 @@ alias pid_t for i32
 ```js
 type EnvCloneFn (fnptr(ptr)(ptr))
 type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
++ value collect (ext.valk_gc_collect)
++ value collect_shared (ext.valk_gc_collect_shared)
 ```
 
 ## Functions for 'gc'
@@ -1142,10 +1167,8 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 + fn alloc(size: uint) GcPtr
 ~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo, fn(ptr, *Lifo)())()) GcPtr
 + fn clone_closure_env(env: ?ptr) ?ptr
-+ fn collect() void
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
-+ fn collect_shared() void
 + fn collect_shared_if_threshold_reached() void
 + fn lock() void
 + fn mem_usage() uint
@@ -1586,6 +1609,14 @@ alias Fd for i32
 ```
 
 # math
+
+## Aliases for 'math'
+
+```js
++ value E (2.718281828459045)
++ value PI (3.141592653589793)
++ value TAU (6.283185307179586)
+```
 
 ## Functions for 'math'
 

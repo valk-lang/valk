@@ -17,7 +17,39 @@ trap 'rm -rf "$workdir"' EXIT
 
 echo ""
 echo "# Test generated-code optimizations"
-echo "> Coalesce temporary GC roots across statements"
+echo "> Call the native GC entry directly on every target"
+
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    collect_ir="$workdir/gc-direct-entry-$target.ll"
+    out=$("$VALK" build "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn -o "$collect_ir" 2>&1)
+    if [ "$?" -ne 0 ]; then
+        echo "# Failed to build direct GC entry fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    collect_body=$(sed -n '/^define .*__explicit_collect__/,/^}/p' "$collect_ir")
+    if [[ "$collect_body" != *'call void @"valk_gc_collect"()'* ]]; then
+        echo "# Explicit collection did not call the assembly entry directly on $target"
+        echo "$collect_body"
+        exit 1
+    fi
+    shared_collect_body=$(sed -n '/^define .*__explicit_collect_shared__/,/^}/p' "$collect_ir")
+    if [[ "$shared_collect_body" != *'call void @"valk_gc_collect_shared"()'* ]]; then
+        echo "# Shared collection did not call the assembly entry directly on $target"
+        echo "$shared_collect_body"
+        exit 1
+    fi
+    accept_body=$(sed -n '/^define .*__SocketServer__accept__/,/^}/p' "$collect_ir")
+    accept_returns=$(grep -c '^  ret ' <<< "$accept_body")
+    accept_uses=$(grep -c 'call void asm sideeffect "", "r"(ptr' <<< "$accept_body")
+    if [ "$accept_returns" -lt 2 ] || [ "$accept_uses" -lt "$accept_returns" ]; then
+        echo "# Accept did not keep its receiver alive on every exit on $target"
+        echo "$accept_body"
+        exit 1
+    fi
+done
+
+echo "> Keep managed values on the native stack without shadow frames"
 
 ir="$workdir/buffer-roots.ll"
 out=$("$VALK" build "$DIR/buffer-roots.valk" --ir --no-warn -o "$ir" 2>&1)
@@ -33,95 +65,28 @@ if [ -z "$body" ]; then
     echo "# Missing coalesced_roots in generated IR"
     exit 1
 fi
-if [[ "$body" != *"alloca { ptr, ptr, [16 x i8] }"* ]] \
-    || [[ "$body" != *"store ptr @\"valk.gc.stack.marker.func."* ]]; then
-    echo "# Expected one explicit frame wrapper containing two pointer values"
+if grep -q 'valk\.gc\.stack' "$ir" || [[ "$body" == *"alloca { ptr, ptr, ["* ]]; then
+    echo "# Generated code still links a GC shadow frame"
     echo "$body"
     exit 1
 fi
 
-marker_body=$(sed -n '/^define internal void @"valk\.gc\.stack\.marker\.func\..*__coalesced_roots__/,/^}/p' "$ir")
-marker_calls=$(grep -c 'call void .*collect_stack_item' <<< "$marker_body")
-if [[ "$marker_body" != *"ptr %frame.values, i64 0"* ]] \
-    || [[ "$marker_body" != *"ptr %frame.values, i64 8"* ]] \
-    || [ "$marker_calls" -ne 2 ]; then
-    echo "# Expected the generated frame marker to visit exactly two roots"
-    echo "$marker_body"
-    exit 1
-fi
-
-echo "> Clear managed roots at lexical scope exits"
-
-scope_body=$(sed -n '/^define .*__lexical_scope_roots__/,/^}/p' "$ir")
-scope_collect_line=$(grep -n 'call void .*__collect__' <<< "$scope_body" | head -1 | cut -d: -f1)
-scope_clear_line=$(grep -n 'llvm.memset.inline.*i8 0, i64 8' <<< "$scope_body" | tail -1 | cut -d: -f1)
-if [ -z "$scope_collect_line" ] || [ -z "$scope_clear_line" ] \
-    || [ "$scope_clear_line" -ge "$scope_collect_line" ]; then
-    echo "# Expected the block-local root to be cleared before collection"
-    echo "$scope_body"
-    exit 1
-fi
-
 coro_helper=$(sed -n '/^define internal void @"valk\.coro\./,/^}/p' "$ir")
-if [[ "$coro_helper" != *"alloca { ptr, ptr, [16 x i8] }"* ]] \
-    || [[ "$coro_helper" != *"store ptr @\"valk.gc.stack.marker.coro."* ]]; then
-    echo "# Expected one explicit coroutine frame wrapper with typed argument and result values"
+if [ -z "$coro_helper" ] || [[ "$coro_helper" == *"alloca { ptr, ptr, ["* ]]; then
+    echo "# Coroutine helper unexpectedly allocated a GC frame"
     echo "$coro_helper"
-    exit 1
-fi
-
-coro_marker=$(awk '
-    /^define internal void @"valk\.gc\.stack\.marker\.coro\./ {
-        capture = 1
-        body = $0 ORS
-        next
-    }
-    capture {
-        body = body $0 ORS
-        if ($0 == "}") {
-            if (body ~ /\[16 x i8\]/) {
-                printf "%s", body
-                exit
-            }
-            capture = 0
-            body = ""
-        }
-    }
-' "$ir")
-coro_marker_calls=$(grep -c 'call void .*collect_stack_item' <<< "$coro_marker")
-if [[ "$coro_marker" != *"ptr %frame.values, i64 0"* ]] \
-    || [[ "$coro_marker" != *"ptr %frame.values, i64 8"* ]] \
-    || [ "$coro_marker_calls" -ne 2 ]; then
-    echo "# Expected the generated coroutine frame marker to visit exactly two roots"
-    echo "$coro_marker"
     exit 1
 fi
 
 echo "> Keep inline nullable and multi-value GC layouts naturally aligned"
 
 layout_body=$(sed -n '/^define .*__inline_layout_roots__/,/^}/p' "$ir")
-layout_marker=$(sed -n '/^define internal void @"valk\.gc\.stack\.marker\.func\..*__inline_layout_roots__/,/^}/p' "$ir")
 layout_union=$(sed -n '/^define .*__aligned_layout_union__/,/^}/p' "$ir")
-layout_marker_calls=$(grep -c 'call void .*collect_stack_item' <<< "$layout_marker")
-layout_eight_offsets=$(grep -c 'getelementptr i8, ptr .*i64 8' <<< "$layout_marker")
-layout_one_offsets=$(grep -c 'getelementptr i8, ptr .*i64 1$' <<< "$layout_marker")
 
 if [[ "$layout_body" != *"[2 x { i1, [7 x i8], [8 x i8] }]"* ]] \
-    || [[ "$layout_body" != *"alloca { ptr, ptr, [56 x i8] }"* ]] \
     || [[ "$layout_union" != *"insertvalue { i1, ptr }"* ]] \
     || [[ "$layout_union" != *"store { i1, ptr }"* ]]; then
     echo "# Inline nullable or naturally aligned multi-value storage disagreed with its byte layout"
-    exit 1
-fi
-
-if [[ "$layout_marker" != *"i32 0, i32 2"* ]] \
-    || [[ "$layout_marker" != *"ptr %frame.values, i64 32"* ]] \
-    || [ "$layout_eight_offsets" -ne 2 ] \
-    || [ "$layout_one_offsets" -ne 0 ] \
-    || [[ "$layout_marker" != *"load ptr"*"align 8"* ]] \
-    || [ "$layout_marker_calls" -ne 3 ]; then
-    echo "# Generated frame marker did not follow the aligned inline nullable / multi-value layout"
-    echo "$layout_marker"
     exit 1
 fi
 
@@ -211,12 +176,8 @@ if [[ "$property_fast_body" != *"property_update_slow"* ]] \
     exit 1
 fi
 
-if grep -q 'valk\.gc\.stack\.marker\.func\..*__Array__.*__append__' "$fast_path_ir"; then
-    echo "# Array.append installed a GC shadow frame for its non-allocating path"
-    exit 1
-fi
-if ! grep -q 'valk\.gc\.stack\.marker\.func\..*__reassign_slice_argument__' "$fast_path_ir"; then
-    echo "# A reassigned slice argument was not kept in a GC shadow frame"
+if grep -q 'valk\.gc\.stack' "$fast_path_ir"; then
+    echo "# Generated code still links a GC shadow frame"
     exit 1
 fi
 
@@ -495,5 +456,5 @@ if [[ "$error_body" != *"br label %await.after."* ]] \
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 18"
+echo "# Test count: 19"
 echo ""

@@ -679,11 +679,25 @@ The compiler generates layout-specific GC walking information:
 - Interfaces expose the concrete object stored in their adapter.
 - Tagged unions expose roots only from the active alternative.
 - Nullable inline values expose their payload only when present.
-- Raw pointers and borrows are not independent roots.
+- Raw pointers and borrows stored in objects are not independent roots.
 
 Inline aggregates may contain GC references. The compiler must preserve and
 walk those references wherever the aggregate is stored, copied, buffered, or
 returned.
+
+Stack roots are found conservatively. The collector scans the native stacks
+of the thread and of its coroutines, plus the registers saved when a stack
+was suspended, and treats every word that points into a live GC allocation
+(at any interior address) as a root. Functions carry no shadow stack, so
+locals live in registers and ordinary stack slots. A word that only used to
+hold a reference may keep its object alive until the slot is overwritten or
+the frame returns; code that needs a collection to reclaim an object should
+let the frame that referenced it return first.
+
+The one lifetime the compiler still guarantees is for objects with a
+`gc_free` hook, and for interface values that may hold one: such receivers,
+arguments and locals stay alive until the function returns, so a raw handle
+taken from them remains valid while the function waits on it.
 
 The local collector invokes `gc_free` for unreachable local objects on the
 thread that owns that local collector. Once an object has been published as
