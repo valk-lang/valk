@@ -31,8 +31,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
 + fn panic(msg: String) void
-+ fn race_lock() void
-+ fn race_unlock() void
 + fn raise(code: i32) void
 + fn read_big_endian(from: *[u8], bytes: uint) uint
 + fn read_little_endian(from: *[u8], bytes: uint) uint
@@ -231,6 +229,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + extend HashMap[String, T] {
     + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
+}
+```
+
+```js
++ class Lock[T] {
+    + static fn new(value: T) Lock[T] !InitError
 }
 ```
 
@@ -1809,7 +1813,7 @@ alias Fd for i32
 + fn start(func: shared fn()()) Thread[void] !InitError
 + fn suspend_ms(ms: uint) void
 + fn suspend_ns(ns: uint) void
-+ fn task(handler: fn()()) Task !InitError
++ fn task(handler: shared fn()()) Task !InitError
 ```
 
 ## Classes for 'thread'

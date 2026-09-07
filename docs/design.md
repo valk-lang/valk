@@ -662,9 +662,27 @@ aliasing remains ordinary aliasing; it never silently consumes a value.
 
 Ownership provenance covers managed references; raw pointers retain their
 separate explicit unsafe lifetime and aliasing rules.
+A `shared` global reads as `shared T`, so it is governed by the same rules.
 `@shared` globals are the explicit unsafe override when an external protocol
 guarantees synchronization and lifetime safety. Within an expression,
 `value.@cast(shared T)` is the corresponding explicit unsafe conversion.
+
+### `locked T`
+
+`locked T` is the mutable counterpart of `shared T`, produced only by a
+`lock` block over a `shared Lock[T]`. The block holds the lock's mutex
+and releases it on every exit through the function cleanup path. Reads through
+a locked view keep the view; stores through it follow the shared storage
+rules: the stored graph must be provably unique and is published with the
+locked data, and integer fields use atomic access. Methods called on a locked
+receiver get a `__locked` variant whose `this` is locked and whose non-fresh
+results stay locked; unlike the shared variant, mutating methods are allowed,
+and arguments the callee absorbs into its receiver must be unique at the call
+site. A locked view cannot be returned as ordinary data, captured, stored in a
+property, global or generic type argument, assigned to a variable declared
+outside its block, converted to `shared`, or stored under another lock. Escape
+provenance makes the block's binding its own origin, so rearranging data inside
+one locked graph is not an escape.
 
 ## GC and lifetime model
 
