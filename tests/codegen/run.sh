@@ -846,6 +846,218 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     done
 done
 
+echo "> Elide closure environments for local bound-method calls, including loops"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/bound-locals-$target.ll"
+    if ! out=$("$VALK" build "$DIR/bound-locals.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build local bound-method fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in local_binding loop_binding from_factory; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* || "$body" != *'__Counter__add__'* ]]; then
+            echo "# Local binding did not become a direct call on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        if [ "$name" = from_factory ] && [ "$(grep -c 'call .*__Factory__make__' <<< "$body")" -ne 1 ]; then
+            echo "# Bound receiver expression did not execute once on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Evaluate temporary array borrows once without allocating helper storage"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/borrow-evaluation-$target.ll"
+    if ! out=$("$VALK" build "$DIR/borrow-evaluation.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build borrow evaluation fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in borrow_temporary borrow_nested; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        indexes=1
+        if [ "$name" = borrow_nested ]; then indexes=2; fi
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Factory__arrays*__' <<< "$body")" -ne 1 ] \
+            || [ "$(grep -c 'call .*__Factory__index__' <<< "$body")" -ne "$indexes" ]; then
+            echo "# Borrow source or index was repeated, or helper storage allocated, on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Keep slice access bounds and storage together without allocating"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/index-storage-$target.ll"
+    if ! out=$("$VALK" build "$DIR/index-storage.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build slice selection fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in read_selected write_selected borrow_selected range_selected; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Holder__shrink__' <<< "$body")" -ne 1 ]; then
+            echo "# Slice selection repeated its index or allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Evaluate managed-store owners once without allocating helper storage"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/owner-stores-$target.ll"
+    if ! out=$("$VALK" build "$DIR/owner-stores.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build managed-store fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in store_inline store_element store_borrowed_part store_borrowed_item; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Factory__' <<< "$body")" -ne 1 ]; then
+            echo "# Store repeated its owner or allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Borrow managed fixed-array slots without copying their values"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/fixed-element-borrows-$target.ll"
+    if ! out=$("$VALK" build "$DIR/fixed-element-borrows.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build fixed-element borrow fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in borrow_nullable borrow_required; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* || "$body" == *'__property_get__'* ]]; then
+            echo "# Fixed-element borrow copied its value or allocated on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Evaluate fixed-range sources and bounds once without helper allocation"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/fixed-range-evaluation-$target.ll"
+    if ! out=$("$VALK" build "$DIR/fixed-range-evaluation.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build fixed-range fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in copy_property copy_borrowed; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Factory__' <<< "$body")" -ne 2 ] \
+            || [ "$(grep -c 'call .*__Factory__start__' <<< "$body")" -ne 1 ]; then
+            echo "# Fixed range repeated its source or start, or allocated, on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Preserve matrix row strides without allocating borrow adapters"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/matrix-borrows-$target.ll"
+    if ! out=$("$VALK" build "$DIR/matrix-borrows.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build matrix borrow fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in borrow_rows row_view read_row; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Matrix borrow or row access allocated on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        if [ "$name" = read_row ] && [[ "$body" != *'getelementptr [2 x i64]'* ]]; then
+            echo "# Matrix access lost its row stride on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Copy bounded matrix pointers with the full row layout and no heap adapter"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/pointer-array-copies-$target.ll"
+    if ! out=$("$VALK" build "$DIR/pointer-array-copies.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build pointer array-copy fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in copy_rows widen_rows; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* || "$body" != *'load [3 x [2 x i64]]'* ]]; then
+            echo "# Pointer copy lost its row layout or allocated on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Call custom iterators with defaults and no heap adapter"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/iterator-contracts-$target.ll"
+    if ! out=$("$VALK" build "$DIR/iterator-contracts.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build iterator contract fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in default_sum infallible_sum; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Custom iterator allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        default=73
+        if [ "$name" = infallible_sum ]; then default=19; fi
+        if ! grep -q "call .*___next__.*i64 $default)" <<< "$body"; then
+            echo "# Custom iterator did not pass its default argument on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Infer custom iterator calls without allocating an adapter"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/generic-iterators-$target.ll"
+    if ! out=$("$VALK" build "$DIR/generic-iterators.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build iterator contract fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in generic_sum generic_tuple_sum; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Custom iterator allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        default=73
+        if [ "$name" = generic_tuple_sum ]; then default=19; fi
+        if ! grep -q "call .*___next__.*i64 $default)" <<< "$body"; then
+            echo "# Custom iterator did not pass its default argument on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 36"
+echo "# Test count: 46"
 echo ""

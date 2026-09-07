@@ -35,6 +35,10 @@ cases="$cases ternary-panic-return:1 ternary-panic-vscope:1"
 cases="$cases coalesce-panic-typed:1"
 cases="$cases slice-header-overflow:1 string-header-overflow:1"
 cases="$cases enum-view-bounds:1"
+cases="$cases slice-replaced-read:1 slice-replaced-write:1 slice-replaced-borrow:1 slice-replaced-range:1 slice-replaced-local:1"
+cases="$cases fixed-element-borrow-bounds:1"
+cases="$cases fixed-range-copy-bounds:1"
+cases="$cases matrix-borrow-row-bounds:1 matrix-borrow-column-bounds:1"
 
 for case in $cases; do
     name="${case%%:*}"

@@ -327,7 +327,7 @@ for mode in default release; do
     if ! "$VALK" build "$DIR/cleared-views.valk" --no-warn "${cleared_flags[@]}" -o "$cleared_exe"; then
         exit 1
     fi
-    for case in callback callback-get callback-each pointer inline inline-get inline-each nested mode fixed union interface borrow slice string borrowed-field borrowed-method borrowed-bound borrowed-nested borrowed-callback borrowed-interface borrowed-fixed borrowed-union partial-struct partial-fixed enum enum-get enum-each enum-borrowed; do
+    for case in callback callback-get callback-each pointer inline inline-get inline-each nested mode fixed union interface borrow slice string borrowed-field borrowed-method borrowed-bound borrowed-nested borrowed-callback borrowed-interface borrowed-fixed borrowed-union partial-struct partial-nested-field partial-fixed enum enum-get enum-each enum-borrowed; do
         cleared_out=$("$cleared_exe" "$case" 2>&1)
         cleared_status=$?
         if [ "$cleared_status" -ne 1 ] || [[ "$cleared_out" != *"Empty element: the storage holds no value"* ]]; then

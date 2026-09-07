@@ -101,7 +101,7 @@ fn value_owned_borrow_address(value: Value) Value {
     let t = value.rett.get_non_nullable()
     let sub = t.get_sub_type()
     let single = t.kind == TYPE.ref_of || t.kind == TYPE.stack_of
-    let adr_t = isset(sub) ? sub.adr_ref(single ? t.length : 1) : type_ptr(value.rett.build)
+    let adr_t = isset(sub) ? sub.adr_ref(single ? t.length : 1, false) : type_ptr(value.rett.build)
     return vgen_multi_part(value, 1, adr_t)
 }
 
@@ -135,6 +135,20 @@ fn borrow_origin_store_owner(origin: BorrowOrigin, ctx: Context, at: Exp) ?Value
 
 // Build a fat borrow of assignable `storage` whose origin is already known.
 fn value_make_owned_borrow(storage: Value, origin: BorrowOrigin, rett: Type, ctx: Context, at: Exp) Value !Error {
+    let source = origin.owner
+    if isset(source) && (source.type != VAL.decl || isset(source.get_pre_value()))
+        && value_replace_borrow_owner(storage, source, null) {
+        let func = ctx.get_func() !>
+        let saved = Decl.new(func, source.rett, false, null)
+        func.all_decls.append(saved)
+        let rooted = vgen_decl(saved)
+        rooted.set_graph_source(source)
+        value_replace_borrow_owner(storage, source, rooted)
+        let stable_origin = BorrowOrigin { kind: origin.kind, owner: rooted }
+        let result = value_make_owned_borrow(storage, stable_origin, rett, ctx, at) !>
+        let setup = vgen_assign(vgen_decl(saved), source, ASSIGN_OP.set, ctx.build, at)
+        return vgen_scoped_value(Array[Value]{ setup }, result, at)
+    }
     let owner = value_borrow_owner_word(origin, ctx, at) !>
     let address = vgen_ptr_of(storage, type_ptr(ctx.build), at)
     // The owner word is a child of the borrow, so the owner loses its
@@ -142,6 +156,28 @@ fn value_make_owned_borrow(storage: Value, origin: BorrowOrigin, rett: Type, ctx
     // handed to a parameter that keeps it. A borrow that only lives through a
     // call leaves the owner publishable.
     return vgen_multi(Array[Value]{ owner, address }, rett, at)
+}
+
+// The retained owner and interior address must come from the same evaluation.
+fn value_replace_borrow_owner(storage: Value, owner: Value, replacement: ?Value) bool {
+    if storage.type != VAL.prop && storage.type != VAL.ptrv
+        && !isset(value_narrowed_owned_borrow_source(storage)) : return false
+    let on = storage.value1 ?! return false
+    if on == owner {
+        if isset(replacement) : storage.value1 = replacement
+        return true
+    }
+    return value_replace_borrow_owner(on, owner, replacement)
+}
+
+fn value_bind_storage_owner(storage: Value, ctx: Context, at: Exp, body: Array[Value]) BorrowOrigin {
+    let origin = value_borrow_origin(storage)
+    let owner = origin.owner ?! return origin
+    let source = value_narrowed_owned_borrow_source(owner) ?? owner
+    if !value_replace_borrow_owner(storage, source, null) : return origin
+    let rooted = value_bind_once(source, ctx, at, body, true)
+    value_replace_borrow_owner(storage, source, rooted)
+    return value_borrow_origin(storage)
 }
 
 // A fat borrow of frame storage: the storage is stabilized first.
@@ -420,11 +456,9 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
         let element = target_nn.get_sub_type()
         let own = source_nn.get_sub_type()
         if !isset(element) || !isset(own) : return null
-        let flatten = own.is_fixed_array_type() && !isset(own.get_enum())
-        let source_element = flatten ? own.get_sub_type() : own
-        if !isset(source_element) || !element.compat_storage(source_element) : return null
+        if !element.compat_storage(own) : return null
         if !target_nn.compat_ref_slice(element.ref_slice()) : return null
-        let count = flatten ? own.length : source_nn.length
+        let count = source_nn.length
         let rooted = value_root_owned_borrow(result, ctx)
         let uint_t = type_from_core(ctx.build, "uint") !>
         return value_make_ref_slice(
@@ -478,9 +512,9 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
         let target_sub = target.get_sub_type()
         let own = source_nn.get_sub_type()
         if !isset(target_sub) || !isset(own) : return null
-        let source_sub = own.is_fixed_array_type() ? own.get_sub_type() : own
-        let source_size = own.is_fixed_array_type() ? own.length : source_nn.length
-        if !isset(source_sub) || source_size == 0 || target.length > source_size || !target_sub.compat(source_sub) : return null
+        let source_sub = own
+        let source_size = source_nn.length
+        if source_size == 0 || target.length > source_size || !target_sub.compat(source_sub) : return null
         let address = value_narrow_owned_borrow(result, ctx)
         let copied = vgen_load(address, source_sub.fixed_array(target.length), at)
         return value_convert_array_copy(copied, target, scope, ctx) !>
@@ -586,7 +620,8 @@ fn value_from_ref_slice_offset(on: Value, access: Exp, scope: Scope, ctx: Contex
         exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
     }
     let uint_t = type_from_core(b, "uint") !>
-    let rooted = value_root_owned_borrow(on, ctx)
+    let setup = Array[Value]{}
+    let rooted = value_bind_once(on, ctx, exp, setup, true)
     let t = on.rett.get_non_nullable()
     let element = t.get_sub_type() ?! exp.bug("Slice borrow has no element type")
 
@@ -621,15 +656,15 @@ fn value_from_ref_slice_offset(on: Value, access: Exp, scope: Scope, ctx: Contex
         let data = vgen_cast(value_owned_borrow_address(rooted), type_ptr(b))
         let address = vgen_ptr_offset(data, byte_offset, exp)
         let view = value_make_ref_slice(value_owned_borrow_owner(rooted), address, vgen_decl(length_decl), t, exp)
-        let body = Array[Value]{
-            vgen_assign(start_slot, start, ASSIGN_OP.set, b, exp)
-            vgen_assign(length_slot, length, ASSIGN_OP.set, b, exp)
-            vgen_if(invalid, Array[Value]{ panic_call }, null, b, exp)
-        }
+        let body = setup
+        body.append(vgen_assign(start_slot, start, ASSIGN_OP.set, b, exp))
+        body.append(vgen_assign(length_slot, length, ASSIGN_OP.set, b, exp))
+        body.append(vgen_if(invalid, Array[Value]{ panic_call }, null, b, exp))
         return vgen_scoped_value(body, view, exp)
     }
 
     let item = value_ref_slice_index_slot(rooted, access, scope, ctx, exp) !>
+    item.set_pre_value(vgen_block(setup, b, exp))
     return value_sequence_element_read(item, scope, ctx, exp) !>
 }
 
@@ -657,10 +692,31 @@ fn value_storage_can_be_cleared(value: Value) bool {
     return false
 }
 
+fn value_reads_checked_element(value: Value) bool {
+    if value.type == VAL.ptrv : return isset(value.get_checked_read())
+    if value.type != VAL.prop : return false
+    let on = value.value1 ?! return false
+    return on.rett.is_inline && value_reads_checked_element(on)
+}
+
 fn value_check_borrowed_property(value: Value, ctx: Context, at: Exp) Value !Error {
     let receiver = value.value1
-    if !isset(receiver) || !value_storage_can_be_cleared(receiver)
-        || !type_needs_element_presence(value.rett) : return value
+    if !isset(receiver) : return value
+    let read = value
+    let checked_receiver = receiver.get_checked_read()
+    if receiver.rett.is_inline && isset(checked_receiver) && value_reads_checked_element(receiver) {
+        read = Value {
+            type: VAL.prop
+            rett: value.rett
+            prop: value.prop
+            value1: checked_receiver
+            exp: at
+        }
+    }
+    if value_storage_can_be_cleared(receiver) && type_needs_element_presence(value.rett) {
+        read = value_check_present_element(read, ctx, at) !>
+    }
+    if read == value : return value
     // Keep the original address assignable; only reads validate the value.
     let result = Value {
         type: VAL.prop
@@ -669,7 +725,7 @@ fn value_check_borrowed_property(value: Value, ctx: Context, at: Exp) Value !Err
         value1: receiver
         exp: at
     }
-    result.set_checked_read(value_check_present_element(value, ctx, at) !>)
+    result.set_checked_read(read)
     return result
 }
 
@@ -821,22 +877,20 @@ fn value_borrow_sequence_element(on: Value, offset_exp: Exp, scope: Scope, ctx: 
     }
     value_check_shared_address(on, at) !>
     let element = on_t.get_sub_type() ?! at.bug("Sequence has no element type")
-    // A temporary sequence is evaluated once. The owner word of the result is
-    // taken from the sequence itself, not from the rooting copy, so the
-    // borrow keeps naming the array or slice it came from for the escape and
-    // uniqueness rules.
-    let base = value_root_owned_borrow(on, ctx)
+    let setup = Array[Value]{}
+    let base = value_bind_once(on, ctx, at, setup, on_t.kind == TYPE.ref_slice)
     let view = on_t.kind == TYPE.array ? (value_array_view(base, ctx, at) !>) : base
-    let rooted = value_root_owned_borrow(view, ctx)
+    let rooted = value_bind_once(view, ctx, at, setup)
     if is_range {
         let part = value_from_ref_slice_offset(rooted, access, scope, ctx, at) !>
         let retyped = vgen_cast(part, element.ref_slice())
         retyped.exp = at
-        return retyped
+        return vgen_scoped_value(setup, retyped, at)
     }
     let item = value_ref_slice_index_slot(rooted, access, scope, ctx, at) !>
-    let origin = BorrowOrigin { kind: BORROW_ORIGIN.managed, owner: value_owned_borrow_owner(view) }
-    return value_make_owned_borrow(item, origin, element.reference(), ctx, at) !>
+    let origin = BorrowOrigin { kind: BORROW_ORIGIN.managed, owner: value_owned_borrow_owner(rooted) }
+    let result = value_make_owned_borrow(item, origin, element.reference(), ctx, at) !>
+    return vgen_scoped_value(setup, result, at)
 }
 
 fn value_from_ref_slice_offset_assign(on: Value, access: Exp, right_exp: Exp, scope: Scope, ctx: Context, left_exp: Exp, at: Exp) Value !Error {
@@ -845,7 +899,8 @@ fn value_from_ref_slice_offset_assign(on: Value, access: Exp, right_exp: Exp, sc
         left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
     }
     let uint_t = type_from_core(b, "uint") !>
-    let rooted = value_root_owned_borrow(on, ctx)
+    let setup = Array[Value]{}
+    let rooted = value_bind_once(on, ctx, at, setup, true)
     let t = on.rett.get_non_nullable()
     let element = t.get_sub_type() ?! left_exp.bug("Slice borrow has no element type")
     let index = value_from_exp(access, scope, ctx.with_suggested_type(uint_t)) !>
@@ -857,7 +912,8 @@ fn value_from_ref_slice_offset_assign(on: Value, access: Exp, right_exp: Exp, sc
     let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
     right = value_try_convert(right, scope, ctx, element) !>
     element.compat_check(right.rett, right_exp) !>
-    return value_borrow_store(rooted, item, right, scope, ctx, at) !>
+    setup.append(value_borrow_store(rooted, item, right, scope, ctx, at) !>)
+    return vgen_block(setup, b, at)
 }
 
 // Store through an owned borrow. Managed element types keep the owner's
@@ -902,13 +958,15 @@ fn value_owner_store(owner_word: Value, slot: Value, value: Value, scope: Scope,
 // inside one: an inline struct property, or anything reached through a
 // borrow. Returns null when the storage is frame-local.
 fn value_store_into_owned_property(left: Value, right: Value, op: ASSIGN_OP, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
-    let origin = value_borrow_origin(left)
+    let body = Array[Value]{}
+    let origin = value_bind_storage_owner(left, ctx, at, body)
     let owner_word = borrow_origin_store_owner(origin, ctx, at) !>
     if !isset(owner_word) : return null
     if op != ASSIGN_OP.set {
         at.error("Compound assignment is not valid for a property holding managed references")
     }
-    return value_owner_store(owner_word, left, right, scope, ctx, at) !>
+    body.append(value_owner_store(owner_word, left, right, scope, ctx, at) !>)
+    return vgen_block(body, ctx.build, at)
 }
 
 // `sequence[index] = value` for a fixed array or stack borrow whose element
@@ -918,7 +976,6 @@ fn value_store_into_owned_property(left: Value, right: Value, op: ASSIGN_OP, sco
 fn value_from_managed_element_assign(on: Value, on_t: Type, access: Exp, right_exp: Exp, scope: Scope, ctx: Context, left_exp: Exp, at: Exp) ?Value !Error {
     let element = on_t.get_sub_type() ?! return null
     if !element.has_gc_refs() : return null
-    let origin = on_t.is_fixed_array_type() ? value_borrow_origin(on) : value_borrow_origin_through(on)
 
     let index = value_from_exp(access, scope, ctx.without_suggested_type()) !>
     if !index.rett.is_integer_type() {
@@ -928,6 +985,9 @@ fn value_from_managed_element_assign(on: Value, on_t: Type, access: Exp, right_e
     let slot = vgen_ptrv(on, index, element, left_exp)
     act_check_assign(slot, left_exp, scope) !>
     value_check_shared_store(slot, at) !>
+    let destination = publication_copy_destination(slot)
+    let body = Array[Value]{}
+    let origin = value_bind_storage_owner(slot, ctx, at, body)
     let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
     right = value_try_convert(right, scope, ctx, element) !>
     element.compat_check(right.rett, right_exp) !>
@@ -935,7 +995,10 @@ fn value_from_managed_element_assign(on: Value, on_t: Type, access: Exp, right_e
     // Frame-local storage: a plain store, nothing owns the slot.
     let owner_word = borrow_origin_store_owner(origin, ctx, at) !>
     if !isset(owner_word) : return vgen_assign(slot, right, ASSIGN_OP.set, b, at, ctx)
-    return value_owner_store(owner_word, slot, right, scope, ctx, at) !>
+    body.append(value_owner_store(owner_word, slot, right, scope, ctx, at) !>)
+    let result = vgen_block(body, b, at)
+    result.ensure_meta().publication_store = vgen_assign(destination, right, ASSIGN_OP.set, b, at)
+    return result
 }
 
 // A raw pointer that was taken from a borrow's address; a raw pointer

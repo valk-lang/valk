@@ -98,6 +98,9 @@ class ValueMeta {
     checked_read: ?Value (null)
     // Original graph before lowering into temporary storage.
     graph_source: ?Value (null)
+    publishes_graph: bool (false)
+    publication_holds: ?Array[?Decl] (null)
+    publication_store: ?Value (null)
     init_prop: ?Prop (null)
     implicit_borrow: bool (false)
     reads_storage: bool (false)
@@ -1374,8 +1377,8 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     return clone_func
 }
 
-fn value_bind_once(value: Value, ctx: Context, at: Exp, body: Array[Value]) Value {
-    if value.type == VAL.decl : return value
+fn value_bind_once(value: Value, ctx: Context, at: Exp, body: Array[Value], snapshot: bool (false)) Value {
+    if !snapshot && value.type == VAL.decl && !isset(value.get_pre_value()) : return value
     let func = ctx.func ?! return value
     if value.rett.has_gc_refs() {
         let buffered = buffer_value(ctx, func, value)
@@ -1554,7 +1557,7 @@ fn type_native_sequence(type: Type) Type {
         let class = t.get_direct_class_or_null()
         if t.is_bounded_pointer() || (t.kind == TYPE.ptr_of && isset(class) && class.kind == CLASS_KIND.unbound) : return t
         let sub = t.get_sub_type()
-        if isset(sub) && (sub.is_fixed_array_type() || sub.kind == TYPE.array) {
+        if isset(sub) && sub.kind == TYPE.array {
             return sub
         }
     }
@@ -1803,8 +1806,10 @@ fn resolve_offset_assign_func(class: Class) ?Func {
 }
 
 fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
+    parse_func_types(func) !>
+    // Inferred arguments must be concrete before checking the receiver view.
+    if func.has_generic_args : return func
     if !func.is_static && value_is_enum_storage(on) {
-        parse_func_types(func) !>
         let receiver = func.args.get(0) !? null
         if !func.is_generic_base && !func.has_generic_args && isset(receiver)
             && receiver.type.is_stack_borrow() && !isset(receiver.enum_receiver_pos) {
@@ -1980,20 +1985,20 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
             }
             let element = on_t.get_sub_type()
             if !isset(element) : exp.bug("Sequence type has no element type")
+            let setup = Array[Value]{}
+            let data = on_t.is_fixed_array_type() ? vgen_ptr_of(on, type_ptr(b), exp) : on
+            data = value_bind_once(data, ctx, exp, setup, true)
+            let start = value_bind_once(start_index, ctx, exp, setup, true)
+            let viewed_element = on_t.storage_view_of(element)
             let values = Array[Value]{}
             let i: uint = 0
             while i < inline_length {
-                let base_index = start_index
-                if i > 0 && isset(start_index.get_pre_value()) {
-                    let decl = start_index.decl
-                    if !isset(decl) : exp.bug("Checked range start has no declaration")
-                    base_index = vgen_decl(decl)
-                }
-                let index = i == 0 ? base_index : vgen_op(base_index, vgen_int(i.to(int), uint_t), VALUE_OP.add, uint_t)
-                values.append(value_native_sequence_item(on, index, scope, ctx, exp) !>)
+                let index = i == 0 ? start : vgen_op(start, vgen_int(i.to(int), uint_t), VALUE_OP.add, uint_t)
+                let slot = vgen_ptrv(data, index, viewed_element, exp)
+                values.append(value_sequence_element_read(slot, scope, ctx, exp) !>)
                 i++
             }
-            return vgen_array_init(ctx, values, element.fixed_array(inline_length), exp)
+            return vgen_scoped_value(setup, vgen_array_init(ctx, values, viewed_element.fixed_array(inline_length), exp), exp)
         }
         if !isset(range_func) {
             exp.error("Type: '" + on.rett.compat_display_name() + "' has no '$range' function")
@@ -2033,12 +2038,7 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
             if !index.rett.is_integer_type() {
                 index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
             }
-            if sub.is_fixed_array_type() && !isset(sub.get_enum()) {
-                index = value_check_known_length_index(index, sub, sub.length, ctx, exp) !>
-                let fixed_element = sub.get_sub_type()
-                if !isset(fixed_element) : exp.bug("Array type is missing sub_type")
-                element = fixed_element
-            } else if on_t.is_bounded_pointer() {
+            if on_t.is_bounded_pointer() {
                 index = value_check_known_length_index(index, on_t, on_t.length, ctx, exp) !>
             }
             return value_sequence_element_read(vgen_ptrv(on, index, element, exp), scope, ctx, exp) !>
@@ -2112,7 +2112,19 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
 fn value_sequence_element_read(slot: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
     let read = slot
     if slot.rett.has_gc_refs() : read = value_property_get(slot, scope, ctx, at) !>
-    return value_check_present_element(read, ctx, at) !>
+    read = value_check_present_element(read, ctx, at) !>
+    if read == slot : return slot
+    // Reads validate and clean the value; borrows still name the original slot.
+    let result = Value {
+        type: slot.type
+        rett: slot.rett
+        value1: slot.value1
+        value2: slot.value2
+        exp: at
+    }
+    result.set_pre_value(slot.get_pre_value())
+    result.set_checked_read(read)
+    return result
 }
 
 fn value_check_known_length_index(
@@ -4581,7 +4593,7 @@ fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: V
         }
         av.error("Only a provably unique value graph can be handed to a method on locked data; a mutable alias may remain")
     }
-    value_publish_unique(av)
+    value_publish_unique(av, ctx)
 }
 
 fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp, check_pointer_args: bool (true)) !Error {

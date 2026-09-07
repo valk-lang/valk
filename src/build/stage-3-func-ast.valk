@@ -49,6 +49,7 @@ fn parse_func_ast(func: Func) !Error {
         body.error("Missing 'return' statement")
     }
     if func.computing_unique_summary : func_finish_unique_summary(func)
+    if func.has_publications : func_check_publication_flow(func) !>
     warn_unused_decls(func)
 
     // The LSP never links, and unreachable CLI bodies need validation only.
@@ -486,6 +487,23 @@ fn scope_clear_facts_invalidated_by(scope: Scope, body_scope: Scope) {
     }
 }
 
+fn decl_track_value(decl: Decl, value: Value) !Error {
+    decl.escape_origins = value_escape_origins(value)
+    if !decl.type.has_gc_refs() && decl.type.get_non_nullable().kind != TYPE.closure : return
+    value_consume_call_return_sources(value) !>
+    decl.unique_graph = false
+    decl.unique_source = null
+    decl.unique_published = false
+    let deferred = value_can_defer_unique_call(value)
+    if deferred : decl.unique_source = value
+    else : decl.unique_graph = value_has_fresh_graph(value) !>
+    if !deferred && !decl.unique_graph && value_can_transfer_unique_inputs(value) && (value_has_unique_graph(value) !>) {
+        decl.unique_graph = true
+        value_transfer_unique_inputs(value, decl)
+    }
+    if !deferred && !decl.unique_graph : value_invalidate_unique(value)
+}
+
 fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let b = ctx.build
     let names = exp.list
@@ -544,21 +562,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             let decl = Decl.new(ctx.get_func() !>, decl_type, false, name)
             decl.lock_scope = scope_find_lock(scope)
             decl.exp = exp
-            decl.escape_origins = value_escape_origins(part)
-            let managed = decl_type.has_gc_refs() || decl_type.get_non_nullable().kind == TYPE.closure
-            if managed {
-                // Binding a result that aliases an argument consumes that
-                // argument's uniqueness
-                value_consume_call_return_sources(part) !>
-                let deferred = value_can_defer_unique_call(part)
-                if deferred : decl.unique_source = part
-                else : decl.unique_graph = value_has_fresh_graph(part) !>
-                if !deferred && !decl.unique_graph && value_can_transfer_unique_inputs(part) && (value_has_unique_graph(part) !>) {
-                    decl.unique_graph = true
-                    value_transfer_unique_inputs(part, decl)
-                }
-                if !deferred && !decl.unique_graph : value_invalidate_unique(part)
-            }
+            decl_track_value(decl, part) !>
             scope.add_decl(decl)
             scope.set_idf(name, Idf.for_decl(decl))
             if part.type != VAL.undefined {
@@ -950,24 +954,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                 }
                 // Reassignment detaches this variable from the graph it previously named.
                 decl.unique_dependents = null
-                decl.escape_origins = value_escape_origins(right)
-                let managed = decl.type.has_gc_refs() || decl.type.get_non_nullable().kind == TYPE.closure
-                if managed {
-                    // Binding a result that aliases an argument consumes that
-                    // argument's uniqueness
-                    value_consume_call_return_sources(right) !>
-                    decl.unique_graph = false
-                    decl.unique_source = null
-                    let deferred = value_can_defer_unique_call(right)
-                    if deferred : decl.unique_source = right
-                    else : decl.unique_graph = value_has_fresh_graph(right) !>
-                    decl.unique_published = false
-                    if !deferred && !decl.unique_graph && value_can_transfer_unique_inputs(right) && (value_has_unique_graph(right) !>) {
-                        decl.unique_graph = true
-                        value_transfer_unique_inputs(right, decl)
-                    }
-                    if !deferred && !decl.unique_graph : value_invalidate_unique(right)
-                }
+                decl_track_value(decl, right) !>
             }
         } else {
             // Ask before marking the escape: marking consumes the value's
@@ -1004,7 +991,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                     }
                 }
                 // What moves into locked data is published with it
-                if locked_owner && !stays_inside : value_publish_unique(right)
+                if locked_owner && !stays_inside : value_publish_unique(right, ctx)
             }
         }
     }
@@ -1134,6 +1121,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     on_nn = value_through_borrow(on_nn, ctx)
     let native = type_has_native_sequence_length(on_nn.rett)
     let next_func: ?Func = null
+    let next_args: ?Array[Value] = null
     let item_rett = type_void(b)
     let index_type = type_from_core(b, "uint") !>
     if native {
@@ -1151,12 +1139,25 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         if !isset(next_func) {
             on_exp.error("Cannot use 'each' on type '" + on_nn.rett.compat_display_name() + "'. This type does not have a '_next' function")
         }
-        next_func = func_for_receiver(next_func, on_nn, on_exp) !>
+        if !next_func.parsed_types : parse_func_types(next_func) !>
         let next_arg_skip: uint = 0
         if isset(next_func.class) && !next_func.is_static : next_arg_skip = 1
-        let index_arg = next_func.args.get(next_arg_skip) ! exp.bug("'_next' is missing its index parameter")
+        let index_arg = next_func.args.get(next_arg_skip) ! exp.error("'_next' must have an integer index parameter")
+        if next_func.has_generic_args {
+            let inferred_index = index_arg.is_generic ? index_type : index_arg.type
+            let callee = vgen_func(next_func, on_nn)
+            let args = Array[Value]{ vgen_int(0, inferred_index) }
+            value_fill_trailing_defaults(next_func, next_arg_skip, args, scope, ctx, exp) !>
+            next_func = specialize_call_generic_args(next_func, callee, args, exp) !>
+            next_args = args
+        } else : next_func = func_for_receiver(next_func, on_nn, on_exp) !>
+        index_arg = next_func.args.get(next_arg_skip) ! exp.error("'_next' must have an integer index parameter")
         index_type = index_arg.type
+        if !index_type.is_integer_type() || index_type.is_nullable_type() || isset(index_type.get_enum()) {
+            exp.error("The '_next' index must be a non-null integer type without an enum wrapper")
+        }
         item_rett = next_func.get_rett()
+        if item_rett.is_void_type() : exp.error("'_next' must return an iteration value")
     }
 
     let names = exp.list
@@ -1181,7 +1182,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
     let on_decl = Decl.new(ctx.get_func() !>, on_nn.rett, false, null)
     // Items read out of locked data keep tracing back to the lock they belong to
-    if on_nn.rett.get_non_nullable().is_locked : on_decl.escape_origins = value_escape_origins(on_nn)
+    on_decl.escape_origins = value_escape_origins(on_nn)
     each_scope.add_decl(on_decl)
     let on_init = vgen_assign(vgen_decl(on_decl), on_nn, ASSIGN_OP.set, b, exp)
 
@@ -1208,20 +1209,30 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
     let handled = vgen_undefined(item_rett, exp)
     let loop_condition = vgen_bool(true, type_bool(b))
+    let current_on = vgen_decl(on_decl)
+    current_on.exp = on_exp
+    current_on.set_graph_source(on_nn)
     if native {
-        let current_on = vgen_decl(on_decl)
         let length = value_native_sequence_length(current_on, current_on.rett, ctx, exp) !>
         if !isset(length) : exp.bug("Native sequence has no length")
         loop_condition = vgen_op(vgen_decl(index_decl), length, VALUE_OP.lt, type_bool(b))
         handled = value_native_sequence_item(current_on, vgen_decl(index_decl), body_scope, ctx, exp) !>
     } else {
         if !isset(next_func) : exp.bug("Iterator has no '_next' function")
-        let callee = vgen_func(next_func, vgen_decl(on_decl))
-        let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett, body_scope)
+        let callee = vgen_func(next_func, current_on)
+        let args = next_args ?? Array[Value]{}
+        if args.length == 0 : args.append(vgen_decl(index_decl))
+        else : args.set(0, vgen_decl(index_decl)) ! exp.bug("Iterator index argument is missing")
+        value_fill_trailing_defaults(next_func, call_receiver_skip(callee, next_func), args, body_scope, ctx, exp) !>
+        value_check_call_args(next_func, callee, args, body_scope, ctx, exp) !>
+        let next_call = vgen_call(ctx, callee, args, item_rett, body_scope)
         next_call.exp = exp
-        next_call.can_error = true
-        next_call.set_error_type(next_func.error_type)
-        handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+        handled = next_call
+        if next_func.can_error {
+            next_call.can_error = true
+            next_call.set_error_type(next_func.error_type)
+            handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+        }
     }
     let item_parts = handled.unroll()
 
@@ -1234,7 +1245,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         let item_type = item_types.get(i) ! exp.bug("Missing each item type")
         let decl = Decl.new(ctx.get_func() !>, item_type, false, name)
         decl.lock_scope = scope_find_lock(scope)
-        if item_type.get_non_nullable().is_locked : decl.escape_origins = on_decl.escape_origins
+        decl_track_value(decl, part) !>
         decl.exp = exp
         bind_decls.append(decl)
         bind_inits.append(part)
