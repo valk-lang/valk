@@ -179,6 +179,7 @@ Valk distinguishes three sequence categories:
 | `Array[T]` | GC-managed reference to `Slice[T]` storage | Copies the reference | Yes |
 | `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
 | `Slice[T]`, `String` | `&[T]` with a class attached | Copies the borrow | No |
+| `const &[T]`, `const Slice[T]` | The same borrow, read-only | Copies the borrow | No |
 
 Fixed arrays store their elements inline. `Array` is a GC reference type that
 owns resizable element storage. That storage is a `Slice[T]` block: a header
@@ -204,12 +205,22 @@ A `slice X of T` class is an `&[T]` with methods: the same three words
 (`owner`, element pointer, `length`), the same GC handling, and the same
 bounds policy. `Slice[T]` and `String` are the two in the core library. A
 value converts implicitly between a named slice and `&[T]` in both directions
-when the element types agree, so a function taking `&[u8]` accepts a `String`
-and a function taking `Slice[T]` accepts any `&[T]`. `String` is the
-exception in one direction: its storage always carries a terminating zero
-byte so `data_cstring` is valid, which an arbitrary `&[u8]` cannot promise,
-so a bare view never becomes a `String` implicitly. Two different named
-slices stay distinct: `String` is not `Slice[u8]`. A newly initialized
+when the element types agree, so a function taking `Slice[T]` accepts any
+`&[T]`. `String` is the exception in both directions: its storage always
+carries a terminating zero byte so `data_cstring` is valid, which an arbitrary
+`&[u8]` cannot promise, so a bare view never becomes a `String` implicitly;
+and a string is immutable, so it only ever converts to a read-only view.
+Two different named slices stay distinct: `String` is not `Slice[u8]`.
+
+`const` in front of a slice type (`const &[T]`, `const Slice[T]`) is a
+read-only view of the same storage: the same three words, no copy. A writable
+view converts to the `const` form implicitly and never back, except through
+`@cast`. `String` converts to `const &[u8]` and `const Slice[u8]`, and
+`String.view` hands out `const Slice[u8]`. Through a `const` view, element
+assignment, `&element` borrows, and methods that write to their receiver are
+compile errors; a slice of the receiver's own kind returned by a method on a
+`const` view is `const` too. Functions that only read bytes take the `const`
+form, so string literals and shared strings pass to them without a copy. A newly initialized
 `Slice[T]` owns fixed-length element storage, while `slice.view(offset,
 length)` creates a bounded alias of that storage without allocating or
 copying elements. There is no anonymous `slice[T]` type.

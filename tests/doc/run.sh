@@ -92,7 +92,7 @@ if [[ "$stdlib_markdown" != *'+ value collect (ext.valk_gc_collect)'* ]] \
     exit 1
 fi
 if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) Slice[u8]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) const Slice[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend Slice[u8] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn has_ascii_control(allow_tab: bool (false)) bool'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend HashMap[String, T] {'* ]] \
@@ -100,11 +100,11 @@ if [[ "$stdlib_markdown" != *'+ slice Slice[T] of T'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(buf: Slice[u8]) uint !io:IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8]) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: const Slice[u8]) uint !IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: const Slice[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(buf: Slice[u8]) uint !io:IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn write(data: Slice[u8]) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn write(data: const Slice[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \

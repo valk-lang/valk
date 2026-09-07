@@ -218,6 +218,12 @@ method that changes it, is a compile error; write through a view (`arr.view()`,
 `Slice`, `&[T]`), which addresses the element in place, or store the changed
 struct back with `arr.set(i, value)`.
 
+`const &[T]` and `const Slice[T]` are read-only views of the same storage.
+Any writable view converts to them, and a `String` converts only to them,
+so `fn write(data: const Slice[u8])` accepts strings, byte buffers and slices
+without copying. Assigning through a `const` view, borrowing one of its
+elements, or calling a method that changes the view is a compile error.
+
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
 ```rust
