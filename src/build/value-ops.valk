@@ -352,20 +352,187 @@ fn value_mark_summary_absorbs(on: Value, sources: Array[uint]) {
     }
 }
 
-// A callee that only stores values it was handed keeps its receiver unique, as
-// long as every absorbed value is unique here: nothing gains an alias, the
-// values simply move in.
-fn call_absorbs_stay_unique(arg: ?Arg, args: Array[Value], skip: uint) bool !Error {
+// A call whose callee summary was not ready yet: which arguments it moves
+// into which is settled once one of the involved graphs must be unique.
+class PendingAbsorb {
+    func: Func
+    receiver: ?Value
+    args: Array[Value]
+    skip: uint
+    owner: Func
+    resolved: bool (false)
+}
+
+fn value_attach_pending_absorb(value: Value, pending: PendingAbsorb) {
+    let decl = value_root_decl(value)
+    if isset(decl) {
+        let list = decl.pending_absorbs ?? <{
+            let created = Array[PendingAbsorb]{}
+            decl.pending_absorbs = created
+            return created
+        }
+        list.append(pending)
+        return
+    }
+    if value.type != VAL.class_init && value.type != VAL.array_init : return
+    let values = value.values ?! return
+    each values as item : value_attach_pending_absorb(item, pending)
+}
+
+// Nothing can move between the values of a call with fewer than two of them
+fn value_defer_call_absorbs(func: Func, receiver: ?Value, args: Array[Value], skip: uint, owner: Func) {
+    let tracked: uint = 0
+    if isset(receiver) && value_tracks_unique_effects(receiver) : tracked++
+    each args as av {
+        if value_tracks_unique_effects(av) : tracked++
+    }
+    if tracked < 2 : return
+    let pending = PendingAbsorb { func: func, receiver: receiver, args: args, skip: skip, owner: owner }
+    if isset(receiver) : value_attach_pending_absorb(receiver, pending)
+    each args as av {
+        if value_tracks_unique_effects(av) : value_attach_pending_absorb(av, pending)
+    }
+}
+
+fn pending_absorb_param(pending: PendingAbsorb, index: uint) ?Arg {
+    let params = pending.func.args
+    if index < params.length : return params.get(index) !? null
+    if pending.func.infinite_args && params.length > 0 : return params.get(params.length - 1) !? null
+    return null
+}
+
+fn pending_absorb_apply(pending: PendingAbsorb) !Error {
+    let receiver = pending.receiver
+    if isset(receiver) {
+        value_absorb_call_args(pending.func, pending_absorb_param(pending, 0), receiver, pending.args, pending.skip, pending.owner, true) !>
+    }
+    each pending.args as av, i {
+        value_absorb_call_args(pending.func, pending_absorb_param(pending, i + pending.skip), av, pending.args, pending.skip, pending.owner, true) !>
+    }
+}
+
+// A cycle left the callee unknown: nothing handed to it can be relied on
+fn pending_absorb_give_up(pending: PendingAbsorb) {
+    let receiver = pending.receiver
+    if isset(receiver) {
+        value_mark_summary_unique_invalidation(receiver)
+        value_invalidate_unique(receiver)
+    }
+    each pending.args as av {
+        value_mark_summary_unique_invalidation(av)
+        value_invalidate_unique(av)
+    }
+}
+
+// Callee bodies are analyzed on demand from here, like any uniqueness query
+fn decl_resolve_pending_absorbs(decl: Decl) !Error {
+    let list = decl.pending_absorbs ?! return
+    decl.pending_absorbs = null
+    each list as pending {
+        if pending.resolved : continue
+        pending.resolved = true
+        ensure_func_unique_return_summary(pending.func) !>
+        if pending.func.unique_summary_ready : pending_absorb_apply(pending) !>
+        else : pending_absorb_give_up(pending)
+    }
+}
+
+// The callee stores values it was handed into 'target'. A unique value simply
+// moves in and becomes part of the target's graph; anything else leaves an
+// alias behind, unless it came in through a parameter of this function, in
+// which case the outer call site decides. False when what the callee absorbs
+// is not known yet; forced, its own calls are settled first.
+fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Value], skip: uint, owner: Func, force: bool) bool !Error {
     if !isset(arg) : return true
-    let absorbs = arg.absorbs_args
-    if !isset(absorbs) : return true
+    if !func.unique_summary_ready : return false
+    if force : decl_resolve_pending_absorbs(arg.decl) !>
+    else if isset(arg.decl.pending_absorbs) : return false
+    let absorbs = arg.absorbs_args ?! return true
+    let destination = value_root_decl(target)
     each absorbs as index {
-        if index < skip : return false
-        let av = args.get(index - skip) !? null
-        if !isset(av) : return false
-        if !(value_graph_is_unique(av, true) !>) : return false
+        let av = index >= skip ? (args.get(index - skip) !? null) : null
+        if isset(av) && (value_graph_is_unique(av, true) !>) {
+            // Being kept by the callee is what moving in means, not an escape
+            let param = func.args.get(index) !? null
+            if isset(param) : value_drop_pending_effect(av, param)
+            if isset(destination) : value_transfer_unique_inputs(av, destination)
+            else : value_invalidate_unique(av)
+            continue
+        }
+        let sources = isset(av) ? value_summary_source_args(av, owner) : null
+        value_absorb_param_sources(target, sources)
     }
     return true
+}
+
+// Something that was not unique moved into 'target'. When it came in through
+// a parameter the call site decides whether that cost the target its
+// uniqueness; anything else leaves an alias behind.
+fn value_absorb_param_sources(target: Value, sources: ?Array[uint]) {
+    if isset(sources) : value_mark_summary_absorbs(target, sources)
+    else : value_mark_summary_unique_invalidation(target)
+    value_invalidate_unique(target)
+}
+
+// A unique value stored into another graph becomes part of that graph
+fn value_link_stored_graph(value: Value, owner: Value) {
+    let destination = value_root_decl(owner) ?! return
+    value_transfer_unique_inputs(value, destination)
+}
+
+fn value_drop_pending_effect(value: Value, param: Arg) {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_drop_pending_effect(graph_source, param)
+        return
+    }
+    if value.type == VAL.decl {
+        let decl = value.decl ?! return
+        if decl.is_buffer {
+            let pre = value.get_pre_value()
+            if isset(pre) : value_drop_pending_effect(pre, param)
+            return
+        }
+        let args = decl.pending_effect_args ?! return
+        let positions = decl.pending_effect_positions ?! return
+        let i: uint = args.length
+        while i > 0 {
+            i--
+            let arg = args.get(i) ! break
+            if arg != param : continue
+            args.remove(i)
+            positions.remove(i)
+        }
+        return
+    }
+    let inner = value.value1
+    if isset(inner) : value_drop_pending_effect(inner, param)
+    let other = value.value2
+    if isset(other) : value_drop_pending_effect(other, param)
+    let values = value.values
+    if isset(values) {
+        each values as item : value_drop_pending_effect(item, param)
+    }
+}
+
+// The variable whose graph holds this value, when there is one
+fn value_root_decl(value: Value) ?Decl {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) : return value_root_decl(graph_source)
+    if value.type == VAL.decl {
+        let decl = value.decl ?! return null
+        if !decl.is_buffer : return decl
+        let pre = value.get_pre_value()
+        let source = isset(pre) && pre.type == VAL.assign ? pre.value2 : null
+        return isset(source) ? value_root_decl(source) : null
+    }
+    if value.type == VAL.prop || value.type == VAL.wrap || value.type == VAL.cast
+        || value.type == VAL.interface_wrap || value.type == VAL.block
+    {
+        let inner = value.value1 ?! return null
+        return value_root_decl(inner)
+    }
+    return null
 }
 
 // A call that hands back one of its arguments makes the result an alias of that
@@ -441,19 +608,41 @@ fn value_mark_actual_escape(value: Value) {
     value_invalidate_unique(value)
 }
 
-fn value_publish_unique(value: Value, ctx: Context) {
+fn value_publish_unique(value: Value, ctx: Context) !Error {
     if value.rett.get_non_nullable().is_shared : return
     value.ensure_meta().publishes_graph = true
     let func = ctx.func
     if isset(func) : func.has_publications = true
-    value_consume_published_graph(value)
+    value_consume_published_graph(value) !>
 }
 
-fn value_consume_published_graph(value: Value) {
+fn value_consume_published_graph(value: Value) !Error {
     if value.rett.get_non_nullable().is_shared : return
     let graph_source = value.get_graph_source()
     if isset(graph_source) {
-        value_consume_published_graph(graph_source)
+        value_consume_published_graph(graph_source) !>
+        return
+    }
+    // A call that hands back part of an argument publishes that argument too
+    if value.type == VAL.call {
+        let callee = value.value1 ?! return
+        let func = callee.resolve_call_func() ?! return
+        ensure_func_unique_return_summary(func) !>
+        if !func.unique_summary_ready : return
+        each func.unique_return_args as index {
+            let arg = value_call_argument(value, func, index)
+            if isset(arg) : value_consume_published_graph(arg) !>
+        }
+        return
+    }
+    if value.type == VAL.error_handler {
+        let call = value.get_pre_value()
+        if isset(call) : value_consume_published_graph(call) !>
+        return
+    }
+    if value.type == VAL.error_success || value.type == VAL.block {
+        let inner = value.value1
+        if isset(inner) : value_consume_published_graph(inner) !>
         return
     }
     // Only managed, mutable data changes hands when it is published
@@ -467,7 +656,7 @@ fn value_consume_published_graph(value: Value) {
             if decl.is_buffer {
                 let pre = value.get_pre_value()
                 let source = isset(pre) ? pre.value2 : null
-                if isset(source) : value_consume_published_graph(source)
+                if isset(source) : value_consume_published_graph(source) !>
                 return
             }
             decl.unique_graph = false
@@ -480,12 +669,12 @@ fn value_consume_published_graph(value: Value) {
         || value.type == VAL.class_init || value.type == VAL.this_or_that || value.type == VAL.phi
     {
         let inner = value.value1
-        if isset(inner) : value_consume_published_graph(inner)
+        if isset(inner) : value_consume_published_graph(inner) !>
         let other = value.value2
-        if isset(other) : value_consume_published_graph(other)
+        if isset(other) : value_consume_published_graph(other) !>
         let values = value.values
         if isset(values) {
-            each values as item : value_consume_published_graph(item)
+            each values as item : value_consume_published_graph(item) !>
         }
     }
 }
@@ -558,11 +747,14 @@ fn value_transfer_unique_inputs(value: Value, destination: Decl) {
                 if isset(pre) : value_transfer_unique_inputs(pre, destination)
                 return
             }
+            // Stored into its own graph: a rearrangement, not a new input
+            if decl == destination : return
             let type = decl.type.get_non_nullable()
             let string_class = type_string(type.build).get_class_or_null()
             if (!decl.type.has_gc_refs() && type.kind != TYPE.closure)
                 || (isset(string_class) && type.get_class_or_null() == string_class) : return
             decl.unique_graph = false
+            decl.unique_source = null
             let dependents = decl.unique_dependents ?? <{
                 let a = Array[Decl]{}
                 decl.unique_dependents = a
@@ -590,16 +782,13 @@ fn value_transfer_unique_inputs(value: Value, destination: Decl) {
     }
 }
 
-fn decl_invalidate_unique_dependents(decl: Decl, name: String, at: Exp) !Error {
+fn decl_invalidate_unique_dependents(decl: Decl) {
     let dependents = decl.unique_dependents ?! return
     decl.unique_dependents = null
     each dependents as dependent {
-        if dependent.unique_published {
-            at.error("Value '" + name + "' aliases a graph that has already been published as shared")
-        }
         dependent.unique_graph = false
         dependent.unique_source = null
-        decl_invalidate_unique_dependents(dependent, name, at) !>
+        decl_invalidate_unique_dependents(dependent)
     }
 }
 
@@ -663,9 +852,10 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
         let decl = value.decl
         if !isset(decl) : return false
         if !decl.is_buffer {
-            let unique = allow_named && decl.unique_graph && !decl.unique_published
+            if !allow_named : return false
+            let unique = decl.unique_graph && !decl.unique_published
             let source = decl.unique_source
-            if allow_named && !unique && !decl.unique_published && isset(source) {
+            if !unique && !decl.unique_published && isset(source) {
                 if decl.computing_unique_source : return false
                 decl.computing_unique_source = true
                 unique = value_graph_is_unique(source, false, require) !>
@@ -674,6 +864,10 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
                     decl.unique_graph = true
                     decl.unique_source = null
                 }
+            }
+            if unique && isset(decl.pending_absorbs) {
+                decl_resolve_pending_absorbs(decl) !>
+                unique = decl.unique_graph && !decl.unique_published
             }
             if unique && require : decl_require_unique_effects(decl)
             return unique
@@ -703,9 +897,10 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
         ensure_func_unique_return_summary(func) !>
         if func_unique_summary_unavailable_in_lsp(func) : return true
         if !func.unique_summary_ready || !func.returns_unique_graph : return false
+        // Publishing the result consumes the arguments it is built from
         each func.unique_return_args as index {
             let arg = value_call_argument(value, func, index)
-            if !isset(arg) || !(value_graph_is_unique(arg, false, require) !>) : return false
+            if !isset(arg) || !(value_graph_is_unique(arg, allow_named, require) !>) : return false
         }
         return true
     }
@@ -818,9 +1013,15 @@ fn value_summary_graph_is_unique(value: Value, owner: Func, dependencies: Array[
             decl.computing_unique_source = true
             let unique = value_summary_graph_is_unique(source, owner, dependencies) !>
             decl.computing_unique_source = false
+            if unique && isset(decl.pending_absorbs) {
+                decl_resolve_pending_absorbs(decl) !>
+                unique = decl.unique_graph || isset(decl.unique_source)
+            }
             return unique
         }
         if decl.unique_graph && !decl.unique_published {
+            decl_resolve_pending_absorbs(decl) !>
+            if !decl.unique_graph : return false
             return decl_summary_pending_effects_safe(decl) !>
         }
         let found = false
@@ -948,7 +1149,11 @@ fn func_begin_unique_summary(func: Func) {
     func.computing_unique_summary = true
 }
 
-fn func_finish_unique_summary(func: Func) {
+fn func_finish_unique_summary(func: Func) !Error {
+    // Calls to bodies still unknown may yet cost a parameter its uniqueness
+    each func.args as arg {
+        if isset(arg.decl.pending_absorbs) : arg.provisional = true
+    }
     if !func.unique_summary_saw_return : func.returns_unique_graph = false
     // A return that hands back an argument's graph only stays alias-free while
     // the summary says the return is unique. Once it does not, those returns
@@ -1072,6 +1277,12 @@ fn value_defer_arg_effects(param: Arg, value: Value, at: Exp, force: bool (false
 }
 
 fn resolve_deferred_unique_effects(build: Build) !Error {
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if func_unique_summary_unavailable_in_lsp(func) : continue
+            each func.args as arg : decl_resolve_pending_absorbs(arg.decl) !>
+        }
+    }
     let escape = Array[Arg]{}
     let invalidate = Array[Arg]{}
     let writes = Array[Arg]{}
@@ -1140,6 +1351,15 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
                         + "', but one is added through parameter '" + arg.name + "'")
                 }
             }
+        }
+    }
+
+    // Publication flow needs the settled flags; every body is parsed by now
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if !func.has_publications || func_unique_summary_unavailable_in_lsp(func) : continue
+            func_check_publication_flow(func) !>
+            func.body_scope = null
         }
     }
 }
@@ -1222,6 +1442,9 @@ fn value_prepare_borrow_storage(value: Value, ctx: Context) ?Value {
         }
         return value
     }
+    // Any other inline temporary, such as a struct returned by value, gets a
+    // home in the frame like an aggregate literal
+    if value.rett.is_inline_type() && !value.assignable() : return value_permanent_borrow_root(value, ctx)
     return null
 }
 
@@ -1342,7 +1565,7 @@ fn value_try_convert(
                     + " a closure whose captured values were never checked for shared use."
                     + " Declare it as a 'shared fn(...)()' so its captures are checked where the closure is created")
             }
-            value_publish_unique(result, ctx)
+            value_publish_unique(result, ctx) !>
         }
         return value_shared_view(result, target)
     }

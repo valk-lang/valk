@@ -678,6 +678,9 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if isset(operand.rett.get_enum()) {
             exp.error("Cannot increment or decrement an enum; assign a declared enum value")
         }
+        if operand.rett.is_nullable_type() && !value_stores_non_null(operand, scope) {
+            exp.error("Cannot increment or decrement a nullable value; check it with isset first")
+        }
         act_check_assign(operand, exp, scope) !>
         value_mark_mutable(operand)
         value_check_shared_store(operand, exp) !>
@@ -869,6 +872,7 @@ fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let call = value_from_call_raw(call_exp, scope, ctx, true) !>
     let callee = call.value1
     if !isset(callee) : exp.bug("'co' call has no callable")
+    value_check_co_lock_escape(call, callee, exp) !>
     if callee.rett.get_non_nullable().kind == TYPE.closure {
         call.value1 = buffer_value(ctx, enclosing, callee)
         call.op = CALL_KIND.closure
@@ -886,6 +890,20 @@ fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     v.set_name(helper_name)
     return v
+}
+
+fn value_check_co_lock_escape(call: Value, callee: Value, at: Exp) !Error {
+    let receiver = callee.type == VAL.func ? callee.value1 : null
+    if isset(receiver) && receiver.rett.has_locked_refs() {
+        at.error("A locked view cannot be handed to a coroutine; it is only valid inside its lock block")
+    }
+    let args = call.values
+    if !isset(args) : return
+    each args as arg {
+        if arg.rett.has_locked_refs() {
+            at.error("A locked view cannot be handed to a coroutine; it is only valid inside its lock block")
+        }
+    }
 }
 
 fn value_from_error_is_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -1367,7 +1385,7 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     clone_func.unique_summary_saw_return = true
     clone_func.returns_unique_graph = value_summary_graph_is_unique(result, clone_func, clone_func.unique_return_args) !>
     if !clone_func.returns_unique_graph : value_mark_summary_escape(result)
-    func_finish_unique_summary(clone_func)
+    func_finish_unique_summary(clone_func) !>
     body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
 
@@ -1662,7 +1680,7 @@ fn native_sequence_helper_base(owner: Func, name: String, key: String, on_type: 
 }
 
 fn native_sequence_helper_finish(func: Func) !Error {
-    func_finish_unique_summary(func)
+    func_finish_unique_summary(func) !>
     let owner_unit = func.unit
     owner_unit.functions.append(func)
     func_finish_ast(func) !>
@@ -3231,10 +3249,8 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if isset(gens) : exp.error("Unexpected type arguments on variable: " + name)
         let d = idf.decl
         if !isset(d) : exp.bug("Decl idf is missing decl")
-        if !ctx.is_store_target && d.unique_published {
-            exp.error("Value '" + name + "' has already been published as shared")
-        }
-        if !ctx.is_store_target : decl_invalidate_unique_dependents(d, name, exp) !>
+        // Reads after a publish are checked path-sensitively at the end
+        if !ctx.is_store_target : decl_invalidate_unique_dependents(d)
         d.is_used = true
         if !ctx.is_store_target : d.is_read = true
         let current = ctx.func
@@ -4217,9 +4233,12 @@ fn value_from_enum_item(enu: Enum, name: String, at: Exp, scope: Scope, ctx: Con
 
     if item.resolving : at.error("Circular enum member initializer: " + enu.name + "." + name)
     item.resolving = true
-    let result = value_resolve_enum_item(enu, item, at, scope, ctx) !>
+    defer enum_item_resolved(item)
+    return value_resolve_enum_item(enu, item, at, scope, ctx) !>
+}
+
+fn enum_item_resolved(item: EnumItem) {
     item.resolving = false
-    return result
 }
 
 fn value_resolve_enum_item(enu: Enum, item: EnumItem, at: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -4572,6 +4591,8 @@ fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: V
     let nn = av.rett.get_non_nullable()
     if !av.rett.has_gc_refs() && nn.kind != TYPE.closure : return
     if nn.is_shared || nn.is_locked : return
+    // Moved around inside the locked graph it already belongs to
+    if value_stays_inside(av, receiver) : return
     let string_class = type_string(func.ns.build).get_class_or_null()
     if isset(string_class) && nn.get_class_or_null() == string_class : return
     let moves_in = !func.unique_summary_ready
@@ -4579,6 +4600,7 @@ fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: V
         || func_arg_invalidates_unique(func, param_i)
     if !moves_in {
         let receiver_arg = func.args.get(0) !? null
+        if isset(receiver_arg) : decl_resolve_pending_absorbs(receiver_arg.decl) !>
         let absorbs = isset(receiver_arg) ? receiver_arg.absorbs_args : null
         moves_in = isset(absorbs) && absorbs.contains(param_i)
     }
@@ -4593,7 +4615,7 @@ fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: V
         }
         av.error("Only a provably unique value graph can be handed to a method on locked data; a mutable alias may remain")
     }
-    value_publish_unique(av, ctx)
+    value_publish_unique(av, ctx) !>
 }
 
 fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp, check_pointer_args: bool (true)) !Error {
@@ -4614,6 +4636,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     }
 
     let receiver: ?Value = null
+    let absorbs_known = true
     if skip == 1 {
         receiver = callee.value1
         if isset(receiver) {
@@ -4627,18 +4650,13 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 calls.append(func, true)
             }
             let receiver_arg = params.get(0) !? null
-            if !func_arg_summary_settled(func, 0) {
-                if isset(receiver_arg) : value_defer_arg_effects(receiver_arg, receiver, at) !>
-            } else {
-                if func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver)
-                if func_arg_invalidates_unique(func, 0) : value_invalidate_unique(receiver)
-                // The callee stores values it was handed into the receiver. That
-                // only creates an alias when the value passed here already had
-                // one; otherwise it just moves in and the receiver stays unique.
-                else if !(call_absorbs_stay_unique(receiver_arg, args, skip) !>) {
-                    value_mark_summary_unique_invalidation(receiver)
-                    value_invalidate_unique(receiver)
-                }
+            let owner = ctx.get_func() !>
+            // A flag that is already set is final; the rest may still flip
+            if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver)
+            if func.unique_summary_ready && func_arg_invalidates_unique(func, 0) : value_invalidate_unique(receiver)
+            else if !(value_absorb_call_args(func, receiver_arg, receiver, args, skip, owner, false) !>) : absorbs_known = false
+            if !func_arg_summary_settled(func, 0) && isset(receiver_arg) {
+                value_defer_arg_effects(receiver_arg, receiver, at) !>
             }
         }
     }
@@ -4703,28 +4721,32 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let pending_shared_borrow = !settled && accepts_shared_borrow
                 && param.type.get_non_nullable().is_shared
                 && !av.rett.get_non_nullable().is_shared
+            // Part of the locked graph handed back to a method on that graph
+            // is a rearrangement, not a new view
+            if isset(receiver) && receiver.rett.get_non_nullable().is_locked
+                && av.rett.get_non_nullable().is_locked && !param.type.get_non_nullable().is_locked
+                && value_stays_inside(av, receiver)
+            {
+                av = vgen_cast(av, av.rett.plain_type())
+            }
             av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow) !>
             if isset(receiver) && receiver.rett.get_non_nullable().is_locked {
                 value_check_locked_call_arg(func, param_i, av, receiver, ctx) !>
             }
-            if !settled {
-                value_defer_arg_effects(param, av, at, pending_shared_borrow) !>
-            } else {
-                if func_arg_may_escape(func, param_i) : value_mark_actual_escape(av)
-                if func_arg_invalidates_unique(func, param_i) : value_invalidate_unique(av)
-                else if !(call_absorbs_stay_unique(param, args, skip) !>) {
-                    value_mark_summary_unique_invalidation(av)
-                    value_invalidate_unique(av)
-                }
-            }
+            let owner = ctx.get_func() !>
+            if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av)
+            if func.unique_summary_ready && func_arg_invalidates_unique(func, param_i) : value_invalidate_unique(av)
+            else if !(value_absorb_call_args(func, param, av, args, skip, owner, false) !>) : absorbs_known = false
+            if !settled : value_defer_arg_effects(param, av, at, pending_shared_borrow) !>
             let source_kind = av.rett.get_non_nullable().kind
             let target_kind = param.type.get_non_nullable().kind
             let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.adr_of || value_is_borrow_address(av))
                 && (target_kind == TYPE.ptr_of || param.type.is_raw_pointer())
             if av.is_implicit_borrow() && accepts_reference_pointer && !accepts_borrow {
-                if func_arg_summary_settled(func, param_i) {
-                    if param.may_escape : require_unsafe(at, scope, "Passing an implicit pointer borrow to escaping pointer storage") !>
-                } else if !scope.mark_unsafe_used() && !ctx.build.options.ignore_unsafe {
+                // A flag that is already set is final
+                if func.unique_summary_ready && param.may_escape {
+                    require_unsafe(at, scope, "Passing an implicit pointer borrow to escaping pointer storage") !>
+                } else if !func_arg_summary_settled(func, param_i) && !scope.mark_unsafe_used() && !ctx.build.options.ignore_unsafe {
                     if !isset(param.cannot_escape_pos) : param.cannot_escape_pos = Pos { src: at.src, i: at.i }
                 }
             }
@@ -4753,6 +4775,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         }
         i++
     }
+    if !absorbs_known : value_defer_call_absorbs(func, receiver, args, skip, ctx.get_func() !>)
     // Native indexing helpers implement storage access, not a source-level call.
     if check_pointer_args : require_void_pointer_call(func, callee, args, scope, at) !>
 }
