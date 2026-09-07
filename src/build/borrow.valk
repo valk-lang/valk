@@ -196,6 +196,28 @@ fn value_through_borrow(value: Value, ctx: Context) Value {
     return value_narrow_owned_borrow(value, ctx)
 }
 
+fn value_is_nullable_union_receiver(value: Value) bool {
+    if !value.rett.is_nullable_type() : return false
+    let class = value.rett.get_direct_class_or_null() ?! return false
+    return class.kind == CLASS_KIND.union && value.rett == class.type
+}
+
+// Struct methods use the borrowed storage; other receivers use its value.
+fn value_read_borrowed_receiver(value: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    while true {
+        let type = value.rett
+        if (type.kind != TYPE.ref_of && type.kind != TYPE.stack_of) || type.length != 1 : return value
+        let held = type.get_sub_type() ?! return value
+        let class = held.get_direct_class_or_null()
+        if !held.is_nullable_type()
+            && (held.is_fixed_array_type() || (isset(class) && class.representation_class().kind == CLASS_KIND.struct)) : return value
+        let index = vgen_int(0, type_from_core(ctx.build, "uint") !>)
+        let slot = vgen_ptrv(value_through_borrow(value, ctx), index, held, at)
+        value = value_sequence_element_read(slot, scope, ctx, at) !>
+        value.exp = at
+    }
+}
+
 fn borrow_stack_to_owned_message(target: Type) String {
     let sub = target.get_non_nullable().get_sub_type()
     let stack_name = isset(sub) ? "stack " + sub.compat_display_name() : "a stack borrow"
@@ -223,6 +245,7 @@ fn value_borrow_of(operand: Value, scope: Scope, ctx: Context, at: Exp) Value !E
 // Implicit `let x: &T = storage`, `let x: stack T = storage`, and argument
 // passing of inline storage. `target` is the borrow type to produce.
 fn value_owned_borrow_from_storage(value: Value, target: Type, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
+    value_check_enum_part(value, at) !>
     let origin = value_borrow_origin(value)
     let target_nn = target.get_non_nullable()
     if target_nn.is_owned_borrow() {
@@ -263,10 +286,16 @@ fn value_struct_receiver(receiver: Value, this_type: Type, ctx: Context) Value {
         return vgen_multi(Array[Value]{ owner, address }, this_nn, at)
     }
     if !receiver.rett.is_inline_type() : return receiver
-    if !receiver.assignable() && receiver.type != VAL.array_init && receiver.type != VAL.class_init : return receiver
-    let origin = value_borrow_origin(receiver)
+    let storage = receiver
+    if receiver.type == VAL.wrap {
+        let inner = receiver.value1
+        if isset(inner) && inner.rett.is_tagged_nullable() && inner.rett.get_non_nullable() == receiver.rett : storage = inner
+    }
+    if !storage.assignable() && storage.type != VAL.array_init && storage.type != VAL.class_init : return receiver
+    let origin = value_borrow_origin(storage)
     if origin.kind == BORROW_ORIGIN.stack {
-        return value_make_frame_borrow(receiver, this_nn, ctx, at) ! return receiver
+        let prepared = value_prepare_borrow_storage(storage, ctx) ?! return receiver
+        receiver = storage == receiver ? prepared : vgen_wrap(prepared, receiver.rett)
     }
     return value_make_owned_borrow(receiver, origin, this_nn, ctx, at) ! return receiver
 }
@@ -387,19 +416,22 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
 
     // &[T x N] -> &[T]
     if source_nn.kind == TYPE.ref_of && target_nn.kind == TYPE.ref_slice {
+        if source.is_nullable_type() && !target.is_nullable_type() : return null
         let element = target_nn.get_sub_type()
         let own = source_nn.get_sub_type()
         if !isset(element) || !isset(own) : return null
-        let source_element = own.is_fixed_array_type() ? own.get_sub_type() : own
-        if !isset(source_element) || !element.compat(source_element) : return null
-        let count = own.is_fixed_array_type() ? own.length : source_nn.length
+        let flatten = own.is_fixed_array_type() && !isset(own.get_enum())
+        let source_element = flatten ? own.get_sub_type() : own
+        if !isset(source_element) || !element.compat_storage(source_element) : return null
+        if !target_nn.compat_ref_slice(element.ref_slice()) : return null
+        let count = flatten ? own.length : source_nn.length
         let rooted = value_root_owned_borrow(result, ctx)
         let uint_t = type_from_core(ctx.build, "uint") !>
         return value_make_ref_slice(
             value_owned_borrow_owner(rooted),
             value_owned_borrow_address(rooted),
             vgen_int(count.to(int), uint_t),
-            target_nn,
+            source.is_nullable_type() ? target_nn.nullable() : target_nn,
             at
         )
     }
@@ -427,7 +459,7 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
         if target_nn.kind == TYPE.ptr_of {
             let pointed = target_nn.get_sub_type()
             let own = source_nn.get_sub_type()
-            if !isset(pointed) || !isset(own) || !pointed.compat(own) : return null
+            if !isset(pointed) || !isset(own) || !pointed.compat_storage(own) : return null
             // A bounded raw pointer takes exactly its own length; `*[T]` takes any.
             if source_single && target_nn.length > 0 && target_nn.length != source_nn.length : return null
             if source_nn.kind == TYPE.ref_slice && target_nn.length > 0 : return null
@@ -450,8 +482,8 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
         let source_size = own.is_fixed_array_type() ? own.length : source_nn.length
         if !isset(source_sub) || source_size == 0 || target.length > source_size || !target_sub.compat(source_sub) : return null
         let address = value_narrow_owned_borrow(result, ctx)
-        let copied = vgen_load(address, target, at)
-        return copied
+        let copied = vgen_load(address, source_sub.fixed_array(target.length), at)
+        return value_convert_array_copy(copied, target, scope, ctx) !>
     }
 
     if !target_nn.is_fat_borrow() : return null
@@ -481,8 +513,10 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
     }
     if target_nn.kind == TYPE.ref_slice && result.rett.is_fixed_array_type() {
         let element = target_nn.get_sub_type()
-        let own = result.rett.get_sub_type()
-        if !isset(element) || !isset(own) || !element.compat(own) : return null
+        let flatten = !isset(result.rett.get_enum())
+        let own = flatten ? result.rett.get_sub_type() : result.rett
+        if !isset(element) || !isset(own) || !element.compat_storage(own) : return null
+        if !target_nn.compat_ref_slice(element.ref_slice()) : return null
         let borrowed = value_owned_borrow_from_storage(result, result.rett.reference(), scope, ctx, at) !>
         if !isset(borrowed) : return null
         let rooted = value_root_owned_borrow(borrowed, ctx)
@@ -490,7 +524,7 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
         return value_make_ref_slice(
             value_owned_borrow_owner(rooted),
             value_owned_borrow_address(rooted),
-            vgen_int(result.rett.length.to(int), uint_t),
+            vgen_int(flatten ? result.rett.length.to(int) : 1, uint_t),
             target_nn,
             at
         )
@@ -610,15 +644,128 @@ fn value_ref_slice_index_slot(rooted: Value, access: Exp, scope: Scope, ctx: Con
     return value_ref_slice_element(rooted, checked, ctx, at) !>
 }
 
-// A non-nullable reference read out of sequence storage must be present.
+fn value_storage_can_be_cleared(value: Value) bool {
+    let type = value.rett.get_non_nullable()
+    if type.kind == TYPE.ref_of || type.kind == TYPE.stack_of
+        || type.kind == TYPE.adr_of || type.kind == TYPE.ptr_of : return true
+    if !type.is_inline : return false
+    if value.type == VAL.ptrv : return true
+    if value.type == VAL.prop || value.type == VAL.wrap || value.type == VAL.cast {
+        let inner = value.value1
+        return isset(inner) && value_storage_can_be_cleared(inner)
+    }
+    return false
+}
+
+fn value_check_borrowed_property(value: Value, ctx: Context, at: Exp) Value !Error {
+    let receiver = value.value1
+    if !isset(receiver) || !value_storage_can_be_cleared(receiver)
+        || !type_needs_element_presence(value.rett) : return value
+    // Keep the original address assignable; only reads validate the value.
+    let result = Value {
+        type: VAL.prop
+        rett: value.rett
+        prop: value.prop
+        value1: receiver
+        exp: at
+    }
+    result.set_checked_read(value_check_present_element(value, ctx, at) !>)
+    return result
+}
+
+fn type_needs_element_presence(type: Type) bool {
+    if type.is_nullable_type() : return false
+    if isset(type.get_enum()) && type.is_number_type() : return true
+    if type.is_gc_type() || type.is_fat_borrow() || type.kind == TYPE.closure
+        || type.kind == TYPE.fnptr || type.kind == TYPE.interface : return true
+    if type.is_fixed_array_type() {
+        let element = type.get_sub_type()
+        return type.length > 0 && isset(element) && type_needs_element_presence(element)
+    }
+    if type.kind == TYPE.union {
+        let members = type.get_members() ?! return false
+        let first = members.get(0) !? null
+        return isset(first) && type_needs_element_presence(first)
+    }
+    if type.is_inline && type.kind == TYPE.struct {
+        let class = class_from_inline_init_type(type)
+        if isset(class) {
+            each class.representation_class().props as prop {
+                if type_needs_element_presence(prop.type) : return true
+            }
+        } else {
+            let members = type.get_members() ?! return false
+            each members as member {
+                if type_needs_element_presence(member) : return true
+            }
+        }
+    }
+    return false
+}
+
+// A borrow can restore individual fields of a cleared slot.
+// Every mandatory field must be present before copying the aggregate.
+fn value_element_presence(value: Value, ctx: Context, at: Exp) Value !Error {
+    let type = value.rett
+    let bool_t = type_bool(ctx.build)
+    let enu = type.get_enum()
+    if isset(enu) && type.is_number_type() {
+        if enu.allows_zero(ctx, at) !> : return vgen_bool(true, bool_t)
+        return vgen_isset_val(value, bool_t)
+    }
+    if type.is_gc_type() || type.is_fat_borrow() || type.kind == TYPE.closure
+        || type.kind == TYPE.fnptr || type.kind == TYPE.interface
+    {
+        return vgen_isset_val(value, bool_t)
+    }
+    if type.is_fixed_array_type() {
+        let element = type.get_sub_type() ?! at.bug("Fixed array has no element type")
+        let present = vgen_bool(true, bool_t)
+        let i: uint = 0
+        while i < type.length {
+            let check = value_element_presence(vgen_multi_part(value, i, element, at), ctx, at) !>
+            present = vgen_op(present, check, VALUE_OP.and, bool_t)
+            i++
+        }
+        return present
+    }
+    if type.kind == TYPE.union {
+        let members = type.get_members() ?! at.bug("Union has no members")
+        let first = members.get(0) ! at.bug("Union has no first member")
+        let payload = vgen_union_extract(value, first, ctx, at) !>
+        return vgen_this_or_that(vgen_union_is(value, 0, at),
+            value_element_presence(payload, ctx, at) !>, vgen_bool(true, bool_t), bool_t)
+    }
+    let class = class_from_inline_init_type(type)
+    let present = vgen_bool(true, bool_t)
+    if isset(class) {
+        each class.representation_class().props as prop {
+            if type_needs_element_presence(prop.type) {
+                let check = value_element_presence(vgen_prop(prop, value, ctx), ctx, at) !>
+                present = vgen_op(present, check, VALUE_OP.and, bool_t)
+            }
+        }
+    } else {
+        let members = type.get_members() ?! at.bug("Inline value has no members")
+        each members as member, i {
+            if type_needs_element_presence(member) {
+                let check = value_element_presence(vgen_multi_part(value, i, member, at), ctx, at) !>
+                present = vgen_op(present, check, VALUE_OP.and, bool_t)
+            }
+        }
+    }
+    return present
+}
+
 fn value_check_present_element(read: Value, ctx: Context, at: Exp) Value !Error {
     let t = read.rett
-    if t.is_nullable_type() || !t.is_gc_type() : return read
+    if !type_needs_element_presence(t) : return read
     let b = ctx.build
     let func = ctx.get_func() !>
-    let slot = vgen_scratch_value(func, t.nullable(), at)
+    let slot = vgen_scratch_value(func, t, at)
     let decl = slot.decl ?! at.bug("Element check has no scratch declaration")
-    let missing = vgen_unary(vgen_isset_val(vgen_decl(decl), type_bool(b)), VALUE_OP.not, type_bool(b))
+    let present = value_element_presence(vgen_decl(decl), ctx, at) !>
+    let missing = vgen_unary(present, VALUE_OP.not, type_bool(b))
     missing.exp = at
     let panic_call = value_panic_call(ctx, "Empty element: the storage holds no value at this index", at) !>
     let result = vgen_decl(decl)
@@ -650,6 +797,7 @@ fn value_array_view(on: Value, ctx: Context, at: Exp) Value !Error {
 // `on` is an array, a named slice, or `&[T]` without an indexing hook.
 // Returns null when the normal path applies.
 fn value_borrow_sequence_element(on: Value, offset_exp: Exp, scope: Scope, ctx: Context, at: Exp) ?Value !Error {
+    on = value_try_remove_nullable(on, scope, ctx) !>
     if on.rett.is_nullable_type() : return null
     let body = offset_exp.get(VALUE_EXP.right) ?! return null
     if body.type != EXP.body : return null
@@ -778,7 +926,7 @@ fn value_from_managed_element_assign(on: Value, on_t: Type, access: Exp, right_e
     }
     if on_t.length > 0 : index = value_check_known_length_index(index, on_t, on_t.length, ctx, left_exp) !>
     let slot = vgen_ptrv(on, index, element, left_exp)
-    act_check_assign(slot, left_exp) !>
+    act_check_assign(slot, left_exp, scope) !>
     value_check_shared_store(slot, at) !>
     let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
     right = value_try_convert(right, scope, ctx, element) !>

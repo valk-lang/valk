@@ -80,7 +80,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
     + fn slice(start: uint, amount: uint) Slice[T]
-    + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
+    + fn sort(func: fn(T, T)(bool)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]

@@ -29,6 +29,12 @@ trap 'rm -rf "$workdir"' EXIT
 cases="return-3:3 return-0:0 void-main:0 return-int:7 return-non-integer:0 fixed-array-bounds:1 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
 
 cases="$cases unhandled-error:1 array-bounds:1 array-write-bounds:1 slice-bounds:1 slice-write-bounds:1 ref-slice-bounds:1 ref-slice-range-bounds:1 slice-empty-element:1 each-empty-element:1 view-cleared-element:1"
+cases="$cases coalesce-panic:1 ternary-panic-first:1 ternary-panic-second:1 ternary-panic-both:1"
+cases="$cases logical-panic-left:1 logical-panic-right:1 ternary-panic-condition:1"
+cases="$cases ternary-panic-return:1 ternary-panic-vscope:1"
+cases="$cases coalesce-panic-typed:1"
+cases="$cases slice-header-overflow:1 string-header-overflow:1"
+cases="$cases enum-view-bounds:1"
 
 for case in $cases; do
     name="${case%%:*}"
@@ -65,8 +71,18 @@ for case in $cases; do
     got=$?
     set -e
 
+    if [[ "$name" == *-panic* ]] && [[ "$output" != *"Conditional panic reached"* ]]; then
+        echo "# Missing conditional panic message: $output"
+        failed=1
+    fi
+
     if [ "$name" = "unhandled-error" ] && [[ "$output" != *"unhandled-error.valk:8"* ]]; then
         echo "# Missing unhandled error source location: $output"
+        failed=1
+    fi
+
+    if [[ "$name" == *-header-overflow ]] && [[ "$output" != *"Slice length is too large"* ]]; then
+        echo "# Missing sequence allocation overflow message: $output"
         failed=1
     fi
 

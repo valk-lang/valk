@@ -204,6 +204,14 @@ each arr as value, index {}
 
 Full `Array` API: [core](api.md#core)
 
+Use `arr.sort()` for elements that support ordering. Other element types require
+a comparator, such as `rows.sort(fn(a: Slice[int], b: Slice[int]) bool { return a[0] > b[0] })`.
+The comparator returns true when `a` should come after `b`.
+
+Use container methods to allocate storage, resize containers, and create views.
+Writing the raw storage fields of an `array` or `slice`, including their length,
+requires `@unsafe`, even in the source that declares the type.
+
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
 ```rust
@@ -323,6 +331,17 @@ fn main() {
     add()     // Compile error
 }
 ```
+
+Calls evaluate the callable or method receiver first, then arguments from left to right. `co` uses the same order before starting the coroutine.
+
+Append `$inline` to request inlining, or `$noinline` to prevent it:
+
+```rust
+fn add_one(value: int) int $inline { return value + 1 }
+fn add_two(value: int) int $noinline { return value + 2 }
+```
+
+These flags cannot be combined on the same function.
 
 ### Type default values
 
@@ -514,9 +533,24 @@ fn main() {
 
 Closures are anonymous functions that can have variables bound to them from outside their scope.
 
-You can create anonymous functions by using the `fn` keyword. Based on whether you used a variable from outside the scope or not, the return type will either be a raw function pointer `fnptr()()` or a closure type `fn()()`
+You can create anonymous functions using the `fn` keyword. A function literal that captures no outside variables can also be used as a raw function pointer (`fnptr`).
 
-A `fnptr()()` type is always compatible with `fn()()`. But not the other way around. So when you need to specify a type and you want to support both raw function pointers and closures, use `fn` instead of `fnptr`.
+A raw function pointer can convert to a closure with a compatible signature. Use `fn` for callbacks that accept both raw function pointers and closures.
+
+`object.method` binds the object as its receiver and requires a `fn` callback. It cannot convert to `fnptr`. `Type.method` leaves the receiver as the first argument and can be used as either kind of callback. A shared callback can bind a shared receiver.
+
+Callback signatures do not implicitly convert argument or return values. Use a wrapper when a callback needs a value conversion or an added error declaration:
+
+```rust
+fn count() int { return 7 }
+
+fn main() {
+    let optional: fn()(?int) = fn() ?int { return count() }
+    assert(optional() == 7)
+}
+```
+
+The same applies to coroutine results: convert the value inside the coroutine, or after awaiting it.
 
 ```rust
 fn main() {
@@ -678,6 +712,15 @@ Generic specializations remain distinct and invariant even when their type
 arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`
 cannot be assigned to `Array[String]`, and `HashMap[LowerCaseString, V]` cannot
 be assigned to `HashMap[String, V]`.
+
+An enum's generated default is its first declared member. Assign another declared
+member to change an enum value. Arithmetic produces the underlying numeric type;
+increment, decrement, and compound assignment are not supported on enum variables.
+For an enum backed by a fixed array, `&EnumType` borrows one complete enum value;
+use `borrowed[0]` to read or replace that value. Fields and elements of an inline
+enum can be read, but cannot be modified or borrowed separately. Methods must
+leave that storage unchanged and must not expose a writable alias. Copy to the
+underlying type before modifying its fields or calling a mutating method.
 
 ## Finalizers
 

@@ -1,4 +1,129 @@
+use helper
+
 // Closure capture-env helpers built as value-AST (not hand-written IR).
+
+fn value_fnptr_closure(value: Value, scope: Scope, ctx: Context, shared: bool) Value !Error {
+    let owner = ctx.get_func() !>
+    let at = value.exp ?? owner.exp
+    if value.rett.is_nullable_type() {
+        let body = Array[Value]{}
+        let source = value_bind_once(value, ctx, at, body)
+        let converted = value_fnptr_closure(value_force_remove_nullable(source), scope, ctx, shared) !>
+        let nullable = converted.rett.nullable()
+        let result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(converted),
+            vgen_null(nullable),
+            nullable
+        )
+        return vgen_scoped_value(body, result, at)
+    }
+    let inner = value.value1
+    if value.type == VAL.wrap && !isset(value.get_pre_value()) && isset(inner)
+        && inner.type == VAL.func && !isset(inner.get_pre_value())
+    {
+        let func = inner.func
+        if isset(func) && value_is_capture_free_func(inner) {
+            let result = vgen_func(func)
+            result.rett = value_retype_function(value, TYPE.closure).rett
+            if shared : result.rett = result.rett.shared_type()
+            result.exp = at
+            return result
+        }
+    }
+    let factory = ensure_fnptr_closure_factory(value.rett, shared, ctx, at) !>
+    let result = vgen_call(ctx, vgen_func(factory), Array[Value]{ value }, factory.get_rett(), scope)
+    result.exp = at
+    return result
+}
+
+fn ensure_fnptr_closure_factory(type: Type, shared: bool, ctx: Context, at: Exp) Func !Error {
+    let b = ctx.build
+    let key = type_identity_key(type) + ":" + shared
+    b.cache.fnptr_closure_factories.get(key) -> cached : return cached
+    let owner = ctx.get_func() !>
+    let args = type.get_args() ?! at.bug("Function pointer has no arguments")
+    let closure_type = type_callable(b, TYPE.closure, args, type.get_return_type(), type.get_error_type(), shared)
+    let factory = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<fnptr.closure." + helper.ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: Scope.new(owner.ns.scope)
+        parsed_types: true
+        parsed_ast: true
+        rett: closure_type
+    }
+    b.cache.fnptr_closure_factories.set(key, factory)
+    factory.arg_scope.func = factory
+    append_func_arg(factory, "target", type)
+    bind_func_arg_decls(factory) !>
+    let factory_body = factory.arg_scope.sub_scope()
+    factory_body.func = factory
+    factory.body_scope = factory_body
+    factory.alloca_scope = factory_body.sub_scope()
+    factory.defer_scope = factory_body.sub_scope()
+
+    let invoke = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<fnptr.invoke." + helper.ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: factory_body.sub_scope()
+        parsed_types: true
+        parsed_ast: true
+        is_literal: true
+        is_shared: shared
+        rett: type.get_return_type()
+        error_type: type.get_error_type()
+        can_error: isset(type.get_error_type())
+    }
+    invoke.arg_scope.func = invoke
+    each args as arg, i : append_func_arg(invoke, "arg" + i, arg)
+    bind_func_arg_decls(invoke) !>
+    let body = invoke.arg_scope.sub_scope()
+    body.func = invoke
+    invoke.body_scope = body
+    invoke.alloca_scope = body.sub_scope()
+    invoke.defer_scope = body.sub_scope()
+    let target_arg = factory.args.get(0) ! at.bug("Function pointer factory has no target")
+    let target = func_capture_decl(invoke, target_arg.decl, "target", at) !>
+    let call_args = Array[Value]{}
+    each invoke.args as arg : call_args.append(vgen_decl(arg.decl))
+    let inner_ctx = Context.for_func(invoke)
+    let call = vgen_call(inner_ctx, vgen_decl(target), call_args, invoke.get_rett(), body)
+    call.exp = at
+    if invoke.can_error {
+        call.can_error = true
+        call.set_error_type(invoke.error_type)
+        call = value_apply_error_pass(call, body, inner_ctx, at) !>
+    }
+    if invoke.get_rett().is_void_type() {
+        body.append_value(call)
+        body.append_value(vgen_return(null, b, at))
+    } else {
+        body.append_value(vgen_return(call, b, at))
+    }
+    body.did_return = true
+    owner.unit.functions.append(invoke)
+    func_finish_ast(invoke) !>
+    func_prepare_closure(invoke) !>
+    if !isset(b.options.lsp) : generate_func_ir(invoke) !>
+
+    let closure = vgen_func(invoke)
+    closure.exp = at
+    factory_body.append_value(vgen_return(closure, b, at))
+    factory_body.did_return = true
+    factory.note_gc_allocation()
+    factory.returns_unique_graph = true
+    factory.unique_summary_ready = true
+    owner.unit.functions.append(factory)
+    func_finish_ast(factory) !>
+    if !isset(b.options.lsp) : generate_func_ir(factory) !>
+    return factory
+}
 
 fn ensure_closure_clone_func(owner: Func) !Error {
     if isset(owner.capture_clone_func) : return
@@ -47,7 +172,9 @@ fn make_closure_clone_func(owner: Func) Func !Error {
     each class.props as prop {
         let prop_v = vgen_prop(prop, this_v, ctx)
         prop_v.exp = at
-        fields.set(prop, value_clone(prop_v, ctx, body_scope, at, false, true) !>)
+        let cloned = value_clone(prop_v, ctx, body_scope, at, false, true) !>
+        prop.type.compat_check(cloned.rett, at) !>
+        fields.set(prop, cloned)
     }
 
     let init = vgen_class_init(ctx, class, fields, env_type, at) !>
@@ -146,5 +273,7 @@ fn value_fn_clone(f: Value, ctx: Context, scope: Scope, exp: Exp) Value !Error {
     callee.exp = exp
     let new_env = vgen_call(ctx, callee, Array[Value]{ env }, ptr_t, scope)
     new_env.exp = exp
-    return vgen_multi(Array[Value]{ code, new_env }, f.rett, exp)
+    let result = vgen_multi(Array[Value]{ code, new_env }, f.rett, exp)
+    if f.is_implicit_borrow() : result.mark_implicit_borrow()
+    return result
 }

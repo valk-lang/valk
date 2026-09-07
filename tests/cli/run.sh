@@ -229,5 +229,133 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
     exit 1
 }
 
+for filter in clone other; do
+    clone_out=$("$VALK" build "$DIR/clone-summary.valk" --test --filter "$filter" --no-warn -o "$output" 2>&1) || {
+        echo "# Clone freshness changed with test selection: $filter"
+        echo "$clone_out"
+        exit 1
+    }
+    "$output" || exit 1
+done
+
+first_offset=$(grep -bo 'return fn' "$DIR/closure-layouts/first.valk")
+other_offset=$(grep -bo 'return fn' "$DIR/closure-layouts/other.valk")
+if [[ -z "$first_offset" || "$first_offset" != "$other_offset" ]]; then
+    echo "# Closure layout regression must use matching source offsets"
+    exit 1
+fi
+for mode in debug release; do
+    flags=()
+    if [ "$mode" = release ]; then flags+=(--release); fi
+    closure_out=$("$VALK" build "$DIR"/closure-layouts/*.valk "${flags[@]}" --def GC_DEBUG=1 --no-warn -o "$output" 2>&1) || {
+        echo "# Failed to build closures with colliding source offsets: $mode"
+        echo "$closure_out"
+        exit 1
+    }
+    closure_out=$("$output" 2>&1) || {
+        echo "# Closure capture layouts were not independent: $mode"
+        echo "$closure_out"
+        exit 1
+    }
+    if [[ "$closure_out" != *"closure layouts OK"* ]]; then
+        echo "# Closure layout regression did not finish: $mode"
+        echo "$closure_out"
+        exit 1
+    fi
+done
+
+for mode in debug release; do
+    flags=()
+    if [ "$mode" = release ]; then flags+=(--release); fi
+    flags_out=$("$VALK" build "$DIR/optimization-flags.valk" "${flags[@]}" --def GC_DEBUG=1 --no-warn -o "$output" 2>&1) || {
+        echo "# Failed to build optimization flags: $mode"
+        echo "$flags_out"
+        exit 1
+    }
+    flags_out=$("$output" 2>&1) || {
+        echo "# Optimization flags did not preserve behavior: $mode"
+        echo "$flags_out"
+        exit 1
+    }
+    if [[ "$flags_out" != *"optimization flags OK"* ]]; then
+        echo "# Optimization flag regression did not finish: $mode"
+        echo "$flags_out"
+        exit 1
+    fi
+done
+
+echo "> Nonreturning operands stop compound expression evaluation"
+for mode in default release; do
+    termination_flags=()
+    if [ "$mode" = release ]; then termination_flags+=(--release); fi
+    termination_exe="$workdir/nonreturning-expressions$EXE_SUFFIX"
+    if ! "$VALK" build "$DIR/nonreturning-expressions.valk" --no-warn "${termination_flags[@]}" -o "$termination_exe"; then
+        exit 1
+    fi
+    for case in argument conditional-argument closure-argument fnptr-argument binary-left binary-right unary cast field inline array slice if while property index store receiver inline-receiver interface-receiver interface-wrap bound-method multi partial-multi discarded-multi closure fnptr fnptr-wrap isset match match-condition error co co-body await vscope void-argument void-closure-argument void-fnptr-argument void-let void-assign void-return void-vscope void-error-fallback fnptr-callee-argument co-callee-argument; do
+        termination_out=$("$termination_exe" "$case" 2>&1)
+        termination_status=$?
+        if [ "$termination_status" -ne 1 ] || [[ "$termination_out" != *"Nonreturning operand reached"* || "$termination_out" == *"Later operand ran"* ]]; then
+            echo "# Nonreturning operand failed: $mode $case (exit $termination_status)"
+            echo "$termination_out"
+            exit 1
+        fi
+        case "$case" in
+            co-body)
+                if [[ "$termination_out" != *"caller continued"* ]]; then
+                    echo "# Coroutine body exit suppressed its caller: $mode"
+                    echo "$termination_out"
+                    exit 1
+                fi
+                ;;
+            argument|conditional-argument|closure-argument|fnptr-argument|binary-right|inline|array|multi|partial-multi|discarded-multi|co|void-argument|void-closure-argument|void-fnptr-argument)
+                if [ "$(grep -c '^before operand' <<< "$termination_out")" -ne 1 ]; then
+                    echo "# Earlier operand did not run exactly once: $mode $case"
+                    echo "$termination_out"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+done
+
+echo "> Reject cleared callback and inline slots through every read API"
+for mode in default release; do
+    cleared_flags=()
+    if [ "$mode" = release ]; then cleared_flags+=(--release); fi
+    cleared_exe="$workdir/cleared-views$EXE_SUFFIX"
+    if ! "$VALK" build "$DIR/cleared-views.valk" --no-warn "${cleared_flags[@]}" -o "$cleared_exe"; then
+        exit 1
+    fi
+    for case in callback callback-get callback-each pointer inline inline-get inline-each nested mode fixed union interface borrow slice string borrowed-field borrowed-method borrowed-bound borrowed-nested borrowed-callback borrowed-interface borrowed-fixed borrowed-union partial-struct partial-fixed enum enum-get enum-each enum-borrowed; do
+        cleared_out=$("$cleared_exe" "$case" 2>&1)
+        cleared_status=$?
+        if [ "$cleared_status" -ne 1 ] || [[ "$cleared_out" != *"Empty element: the storage holds no value"* ]]; then
+            echo "# Cleared view read failed: $mode $case (exit $cleared_status)"
+            echo "$cleared_out"
+            exit 1
+        fi
+    done
+done
+
+echo "> Reject invalid values in exhaustive enum matches"
+for mode in default release; do
+    enum_flags=()
+    if [ "$mode" = release ]; then enum_flags+=(--release); fi
+    enum_exe="$workdir/enum-matches$EXE_SUFFIX"
+    if ! "$VALK" build "$DIR/enum-matches.valk" --no-warn "${enum_flags[@]}" -o "$enum_exe"; then
+        exit 1
+    fi
+    for case in statement value; do
+        enum_out=$("$enum_exe" "$case" 2>&1)
+        enum_status=$?
+        if [ "$enum_status" -ne 1 ] || [[ "$enum_out" != *"Invalid enum value in exhaustive match"* || "$enum_out" == *"invalid arm ran"* ]]; then
+            echo "# Invalid enum match failed: $mode $case (exit $enum_status)"
+            echo "$enum_out"
+            exit 1
+        fi
+    done
+done
+
 echo "# CLI tests passed"
-echo "# Test count: 18"
+echo "# Test count: 25"
