@@ -662,6 +662,7 @@ aliasing remains ordinary aliasing; it never silently consumes a value.
 
 Ownership provenance covers managed references; raw pointers retain their
 separate explicit unsafe lifetime and aliasing rules.
+A `shared` global reads as `shared T`, so it is governed by the same rules.
 `@shared` globals are the explicit unsafe override when an external protocol
 guarantees synchronization and lifetime safety. Within an expression,
 `value.@cast(shared T)` is the corresponding explicit unsafe conversion.

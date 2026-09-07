@@ -1664,12 +1664,14 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let length = value_native_sequence_length(sequence, on_type, inner_ctx, at) !>
     if !isset(length) : at.bug("Sequence type has no length")
     let kind = type_native_sequence(on_type).kind
-    let invalid_op = kind == TYPE.array ? VALUE_OP.gt : VALUE_OP.gte
+    // Through a view the array cannot grow, so the end is out of bounds
+    let is_view = type_native_sequence(on_type).is_shared || type_native_sequence(on_type).is_locked
+    let invalid_op = kind == TYPE.array && !is_view ? VALUE_OP.gt : VALUE_OP.gte
     let invalid = vgen_op(index, length, invalid_op, type_bool(ctx.build))
     let panic_call = value_panic_call(inner_ctx, "Index out of bounds", at) !>
     body_scope.append_value(vgen_if(invalid, Array[Value]{ panic_call }, null, ctx.build, at))
 
-    if kind == TYPE.array {
+    if kind == TYPE.array && !is_view {
         let class = on_type.get_non_nullable().get_class_or_null()
         let append_func = isset(class) ? class.get_append_hook() : null
         if !isset(append_func) : at.bug("Array type has no append function")
@@ -1690,7 +1692,11 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let prop = vgen_ptrv(data, index, element, at)
     // The element slot lives in the storage block, which is its owner.
     let block_owner = value_native_sequence_owner(sequence, on_type, inner_ctx, at) !>
-    body_scope.append_value(value_owner_store(block_owner, prop, value, body_scope, inner_ctx, at) !>)
+    if type_native_sequence(on_type).is_shared {
+        body_scope.append_value(vgen_atomic_store(prop, value, at))
+    } else {
+        body_scope.append_value(value_owner_store(block_owner, prop, value, body_scope, inner_ctx, at) !>)
+    }
     body_scope.append_value(vgen_return(null, ctx.build, at))
     body_scope.did_return = true
 
@@ -1728,7 +1734,7 @@ fn resolve_offset_assign_func(class: Class) ?Func {
 }
 
 fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
-    if func.is_static || func.shared_unsafe : return func
+    if func.is_static || func.threadsafe : return func
     if on.rett.get_non_nullable().is_locked {
         if func.is_interface {
             at.error("Cannot call interface method '" + func.name + "' on locked data of type '"
@@ -1738,7 +1744,7 @@ fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
         return get_func_locked_receiver(func) !>
     }
     if !on.rett.get_non_nullable().is_shared : return func
-    if func.mutates_receiver {
+    if func_mutates_receiver(func) !> {
         at.error("Cannot call mutating method '" + func.name + "' on shared data of type '" + on.rett.compat_display_name() + "'")
     }
     // A concrete method gets one shared-receiver variant, built on demand and
@@ -1751,6 +1757,48 @@ fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
             + "'. The implementation is not known here, so it cannot be checked against the shared rules. Call it through its concrete type instead")
     }
     return get_func_shared_receiver(func) !>
+}
+
+// Whether a method changes anything reachable from its receiver beyond
+// atomic words: found in its own body, or in a method it calls on that data
+fn func_mutates_receiver(func: Func) bool !Error {
+    if func.threadsafe : return false
+    if func.mutates_receiver : return true
+    if func.checking_mutation : return false
+    ensure_func_unique_return_summary(func) !>
+    if func.mutates_receiver : return true
+    let calls = func.this_calls ?! return false
+    func.checking_mutation = true
+    let found = false
+    each calls as callee {
+        if func_mutates_receiver(callee) !> {
+            found = true
+            break
+        }
+    }
+    func.checking_mutation = false
+    if found : func.mutates_receiver = true
+    return found
+}
+
+// True when 'value' is, or was read out of, the current method's receiver
+fn value_reaches_receiver(value: Value, ctx: Context) bool {
+    let func = ctx.func ?! return false
+    if !isset(func.class) || func.is_static : return false
+    let this_arg = func.args.get(0) !? null
+    if !isset(this_arg) : return false
+    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
+        if origin == this_arg.decl : return true
+    }
+    return false
+}
+
+// A store into 'owner' that is not an atomic word: the enclosing method
+// mutates its receiver when 'owner' comes from it
+fn value_note_receiver_mutation(owner: Value, ctx: Context) {
+    let func = ctx.func ?! return
+    if func.mutates_receiver || func.is_shared_receiver || func.is_locked_receiver : return
+    if value_reaches_receiver(owner, ctx) : func.mutates_receiver = true
 }
 
 fn value_apply_receiver_escape(func: Func, on: Value, at: Exp) !Error {
@@ -2118,19 +2166,22 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
         if on.rett.is_nullable_type() {
             left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
         }
-        if type_native_sequence(on.rett).is_shared {
+        let element = type_native_sequence_element(on_t)
+        if !isset(element) : left_exp.bug("Sequence type has no element type")
+        // A plain element is one word: stored atomically, it is race safe.
+        // Managed references follow the property rules instead.
+        let plain_element = element.is_shared_writable()
+        if type_native_sequence(on.rett).is_shared && !plain_element {
             left_exp.error("Cannot call mutating method 'set' on shared data of type '" + on.rett.compat_display_name() + "'")
         }
-        if type_native_sequence(on.rett).is_locked {
-            left_exp.error("Cannot assign elements of a locked fixed array; store a whole new array instead")
+        if type_native_sequence(on.rett).is_locked && !plain_element {
+            left_exp.error("Cannot assign elements holding managed references through a locked view; use '.set(index, value)'")
         }
         let index_exp = access
         let uint_t = type_from_core(ctx.build, "uint") !>
         let index = value_from_exp(index_exp, scope, ctx.with_suggested_type(uint_t)) !>
         index = value_try_convert(index, scope, ctx, uint_t) !>
         uint_t.compat_check(index.rett, index_exp) !>
-        let element = type_native_sequence_element(on_t)
-        if !isset(element) : left_exp.bug("Sequence type has no element type")
         let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
         right = value_try_convert(right, scope, ctx, element) !>
         element.compat_check(right.rett, right_exp) !>
@@ -4446,6 +4497,15 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     if skip == 1 {
         receiver = callee.value1
         if isset(receiver) {
+            let current = ctx.func
+            if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {
+                let calls = current.this_calls
+                if !isset(calls) {
+                    calls = Array[Func]{}
+                    current.this_calls = calls
+                }
+                calls.append(func, true)
+            }
             let receiver_arg = params.get(0) !? null
             if !func.unique_summary_ready {
                 if isset(receiver_arg) : value_defer_arg_effects(receiver_arg, receiver, at) !>

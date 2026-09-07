@@ -700,6 +700,8 @@ global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
 ```
 
+A `shared` global is read as `shared T`, so it follows the [data race](#data-races) rules: integers are atomic, objects are read-only views, and mutable state goes in a `Lock`. `@shared` is the unsafe form that reads as plain `T` and is not checked.
+
 ## Aliases
 
 Three declarations give an existing thing a new name in the current scope. Add `$global` to make the name available in every namespace without a prefix.
@@ -1525,7 +1527,7 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-`shared T` is a read-only view used to pass data across threads. Data-race-unsafe properties cannot be changed through that view, while integer properties use atomic access. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`.
+`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
 
 ### Mutable shared data
 
