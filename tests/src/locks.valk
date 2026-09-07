@@ -1,4 +1,5 @@
 use valk.thread
+use valk.time
 
 error LockTestError (failed)
 
@@ -101,5 +102,184 @@ test "Locks: released on early return and errors" {
     }
     lock other as s {
         assert(s.count == 1)
+    }
+}
+
+fn lock_identity(s: locked LockStats) locked LockStats { return s }
+
+test "Locks: value scope returns release only locks they leave" {
+    let state: shared Lock[LockStats] = .new(LockStats {}) !!
+    let other: shared Lock[LockStats] = .new(LockStats {}) !!
+    let value = <{
+        lock state as s {
+            lock other as o {
+                s.count++
+                o.count += 2
+                return s.count + o.count
+            }
+        }
+    }
+    assert(value == 3)
+    lock state as s {
+        let view = <{
+            lock other as o {
+                let count = <{ return o.count }
+                assert(count == 2)
+                return lock_identity(s)
+            }
+        }
+        view.count++
+        lock other as o : assert(o.count == 2)
+    }
+    lock state as s : assert(s.count == 2)
+}
+
+class LockProgress {
+    started: uint (0)
+    entered: uint (0)
+}
+
+test "Locks: value scope keeps its enclosing lock held" {
+    let state: shared Lock[LockStats] = .new(LockStats {}) !!
+    let progress: shared LockProgress = .{}
+    let worker: ?thread.Thread[void] = null
+    lock state as s {
+        worker = thread.start(fn() {
+            progress.started = 1
+            lock state as other : progress.entered = 1
+        }) !!
+        while progress.started == 0 : time.sleep_ms(1)
+        let count = <{ return s.count }
+        assert(count == 0)
+        time.sleep_ms(10)
+        assert(progress.entered == 0)
+    }
+    if isset(worker) : worker.await()
+    assert(progress.entered == 1)
+}
+
+fn lock_fail() uint !LockTestError { throw .failed }
+
+fn lock_vscope_error(state: shared Lock[LockStats], other: shared Lock[LockStats]) !LockTestError {
+    lock state as s {
+        let value = <{
+            lock other as o {
+                s.count++
+                o.count++
+                return lock_fail() !>
+            }
+        }
+    }
+}
+
+test "Locks: errors inside value scopes release enclosing locks" {
+    let state: shared Lock[LockStats] = .new(LockStats {}) !!
+    let other: shared Lock[LockStats] = .new(LockStats {}) !!
+    lock_vscope_error(state, other) _
+    lock state as s : assert(s.count == 1)
+    lock other as o : assert(o.count == 1)
+}
+
+class LockCloneAlias {
+    count: uint (0)
+    fn clone() SELF $clone { return this }
+}
+
+class LockCloneFresh {
+    entry: LockEntry (.{ name: "fresh" })
+    fn clone() SELF $clone { return SELF { entry: $clone(this.entry) } }
+}
+
+fn lock_copy_stats(state: shared Lock[LockStats]) LockStats {
+    lock state as s { return $clone(s) }
+}
+
+fn lock_copy_fresh(state: shared Lock[LockCloneFresh]) LockCloneFresh {
+    lock state as s { return s.clone() }
+}
+
+class LockCloneNullable {
+    value: ?LockCloneFresh (null)
+}
+
+fn lock_copy_nullable(state: shared Lock[LockCloneNullable]) ?LockCloneFresh {
+    lock state as s { return $clone(s.value) }
+}
+
+test "Locks: clone hooks preserve aliases inside the block" {
+    let state: shared Lock[LockCloneAlias] = .new(LockCloneAlias {}) !!
+    lock state as s {
+        let alias = $clone(s)
+        let direct = s.clone()
+        alias.count++
+        direct.count++
+        assert(s.count == 2)
+    }
+}
+
+test "Locks: deep copies leave the block as ordinary data" {
+    let state: shared Lock[LockStats] = .new(LockStats {}) !!
+    lock state as s : lock_bump(s, "original")
+    let copy = lock_copy_stats(state)
+    copy.count = 99
+    let first = copy.entries.get(0) !!
+    first.name = "copy"
+    copy.entries.append(LockEntry { name: "new" })
+    let last = copy.last
+    if isset(last) : last.name = "last copy"
+    lock state as s {
+        assert(s.count == 1)
+        assert(s.entries.length == 1)
+        assert((s.entries.get(0) !!).name == "original")
+        let original_last = s.last
+        assert(isset(original_last) && original_last.name == "original!")
+    }
+    let fresh: shared Lock[LockCloneFresh] = .new(LockCloneFresh {}) !!
+    let cloned = lock_copy_fresh(fresh)
+    cloned.entry.name = "copy"
+    lock fresh as s : assert(s.entry.name == "fresh")
+    let nullable: shared Lock[LockCloneNullable] = .new(LockCloneNullable {}) !!
+    assert(!isset(lock_copy_nullable(nullable)))
+    lock nullable as s : s.value = LockCloneFresh {}
+    let nullable_copy = lock_copy_nullable(nullable)
+    assert(isset(nullable_copy))
+    if isset(nullable_copy) : nullable_copy.entry.name = "nullable copy"
+    lock nullable as s {
+        let value = s.value
+        assert(isset(value) && value.entry.name == "fresh")
+    }
+}
+
+union LockCloneItem : LockEntry | uint {}
+class LockCloneAggregate {
+    entries: [LockEntry x 1]
+    item: LockCloneItem
+}
+
+fn lock_copy_aggregate(state: shared Lock[LockCloneAggregate]) LockCloneAggregate {
+    lock state as s { return $clone(s) }
+}
+
+fn lock_make_aggregate() LockCloneAggregate {
+    return LockCloneAggregate {
+        entries: { LockEntry { name: "array" } }
+        item: LockEntry { name: "union" }
+    }
+}
+
+test "Locks: deep copies preserve fixed arrays and union payloads" {
+    let state: shared Lock[LockCloneAggregate] = .new(lock_make_aggregate()) !!
+    let copy = lock_copy_aggregate(state)
+    copy.entries[0].name = "copy"
+    match copy.item {
+        LockEntry as entry => entry.name = "copy"
+        default => assert(false)
+    }
+    lock state as s {
+        assert(s.entries[0].name == "array")
+        match s.item {
+            LockEntry as entry => assert(entry.name == "union")
+            default => assert(false)
+        }
     }
 }
