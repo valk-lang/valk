@@ -99,6 +99,8 @@ class ValueMeta {
     // Original graph before lowering into temporary storage.
     graph_source: ?Value (null)
     publishes_graph: bool (false)
+    // An Array element read out by value: writes into it are lost
+    copied_element: bool (false)
     publication_holds: ?Array[?Decl] (null)
     publication_store: ?Value (null)
     init_prop: ?Prop (null)
@@ -495,7 +497,8 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 return operand
             }
             if operand.type == VAL.float {
-                operand.float_val = 0.0 - operand.float_val
+                // Flip the sign bit: '0 - x' would turn -0.0 into +0.0
+                operand.float_val = operand.float_val * -1.0
                 operand.exp = exp
                 return operand
             }
@@ -680,6 +683,14 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
         if operand.rett.is_nullable_type() && !value_stores_non_null(operand, scope) {
             exp.error("Cannot increment or decrement a nullable value; check it with isset first")
+        }
+        if value_is_copied_element(operand) {
+            exp.error("Cannot change an element copied out of an Array; use a Slice view or store the element back with '.set'")
+        }
+        value_mark_summary_write(operand)
+        if operand.type == VAL.prop || operand.type == VAL.ptrv {
+            let owner = operand.value1
+            if isset(owner) && !operand.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
         }
         act_check_assign(operand, exp, scope) !>
         value_mark_mutable(operand)
@@ -1885,14 +1896,29 @@ fn func_mutates_receiver(func: Func) bool !Error {
     return found
 }
 
+// Whether the method stores into its receiver, atomic words included
+fn func_writes_receiver(func: Func) bool !Error {
+    ensure_func_unique_return_summary(func) !>
+    let receiver = func.args.get(0) ! return false
+    return receiver.may_write
+}
+
 // True when 'value' is, or was read out of, the current method's receiver
 fn value_reaches_receiver(value: Value, ctx: Context) bool {
-    let func = ctx.func ?! return false
+    let func = ctx.func ?? (ctx.get_func() !? null) ?! return false
     if !isset(func.class) || func.is_static : return false
     let this_arg = func.args.get(0) !? null
     if !isset(this_arg) : return false
     each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
         if origin == this_arg.decl : return true
+    }
+    // A struct receiver is a borrow whose storage chain names it directly
+    let current: ?Value = value
+    while isset(current) {
+        if current.type == VAL.decl : return current.decl == this_arg.decl
+        let kind = current.type
+        if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : break
+        current = current.value1
     }
     return false
 }
@@ -1900,7 +1926,7 @@ fn value_reaches_receiver(value: Value, ctx: Context) bool {
 // A store into 'owner' that is not an atomic word: the enclosing method
 // mutates its receiver when 'owner' comes from it
 fn value_note_receiver_mutation(owner: Value, ctx: Context) {
-    let func = ctx.func ?! return
+    let func = ctx.func ?? (ctx.get_func() !? null) ?! return
     if func.mutates_receiver || func.is_shared_receiver || func.is_locked_receiver : return
     if value_reaches_receiver(owner, ctx) : func.mutates_receiver = true
 }
@@ -2080,6 +2106,7 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
         value_check_call_args(get_func, callee, args, scope, ctx, exp, false) !>
         let call = vgen_call(ctx, callee, args, get_func.get_rett(), scope)
         call.exp = exp
+        if call.rett.is_inline_type() : call.ensure_meta().copied_element = true
         return call
     }
 
@@ -2950,6 +2977,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let union_type_before_null: ?Exp = null
     let union_type: ?Type = null
     let enum_type = on.rett.get_non_nullable().get_enum()
+    let subject_nullable = on.rett.is_nullable_type() && !value_stores_non_null(on, scope)
     let covered_enum_values = Array[Value]{}
     let covered_null_case = false
     let on_non_nullable = on.rett.get_non_nullable()
@@ -2997,7 +3025,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             let item = raw_item ?! exp.bug("Union match case is missing its value")
             let is_null_case = item_exp.type == EXP.value && item_exp.kind == VALUE_KIND.null
             if isset(union_type) && is_null_case {
-                if !on.rett.is_nullable_type() {
+                if !subject_nullable {
                     item_exp.error("A non-nullable tagged union cannot match null")
                 }
                 if covered_union_null : item_exp.error("Duplicate tagged-union null case")
@@ -3115,11 +3143,11 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             let union_members = union_type.get_members()
             if isset(union_members) {
                 exhaustive = covered_union_members.length == union_members.length
-                    && (!on.rett.is_nullable_type() || covered_union_null)
+                    && (!subject_nullable || covered_union_null)
             }
         } else if isset(enum_type) {
             exhaustive = (enum_match_is_exhaustive(enum_type, covered_enum_values, ctx, exp) !>)
-                && (!on.rett.is_nullable_type() || covered_null_case)
+                && (!subject_nullable || covered_null_case)
         }
         if !exhaustive {
             exp.error("The match statement must have a 'default' case because it does not cover all values")
@@ -3337,6 +3365,9 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let value_exp = idf.value_exp
         if !isset(value_exp) : exp.bug("Value-expr idf is missing value_exp")
         let value_scope = idf.scope ?? scope
+        if idf.resolving : exp.error("Circular value definition: " + name)
+        idf.resolving = true
+        defer idf_resolved(idf)
         // Keep the suggested type type so e.g. a null alias can inherit the use-site expectation
         let v = value_from_exp(value_exp, value_scope, ctx) !>
         let suggested_type = ctx.suggested_type
@@ -3893,12 +3924,25 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     exp.error("Type '" + on_class.pretty_name() + "' has no property or method named: '" + name + "'")
 }
 
+// Whether this storage lives in an element that was copied out of an Array
+fn value_is_copied_element(value: Value) bool {
+    let meta = value.meta
+    if isset(meta) && meta.copied_element : return true
+    let kind = value.type
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : return false
+    let inner = value.value1 ?! return false
+    if kind == VAL.prop && !inner.rett.is_inline_type() : return false
+    return value_is_copied_element(inner)
+}
+
 fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value {
     let receiver_arg = func.args.get(0) !? null
     let frame_bound = false
     if !func.is_static && isset(receiver) && isset(receiver_arg) && receiver_arg.type.is_stack_borrow() {
         if !func.is_generic_base && !func.has_generic_args {
+            let copied = value_is_copied_element(receiver)
             receiver = value_struct_receiver(receiver, receiver_arg.type, ctx)
+            if copied : receiver.ensure_meta().copied_element = true
         }
         frame_bound = true
     }
@@ -4172,7 +4216,11 @@ fn value_complete_error_payload(value: Value, scope: Scope, ctx: Context, at: Ex
     let values = value.values ?? Array[Value]{}
     value.values = values
     let provided = Map[bool]{}
-    each values as field : provided.set(field.get_name(), true)
+    // A payload travels with the error, beyond anything this body can see
+    each values as field {
+        provided.set(field.get_name(), true)
+        value_mark_actual_escape(field)
+    }
 
     let caught_type: ?ErrorType = null
     let caught_decl: ?Decl = null
@@ -4248,6 +4296,10 @@ fn value_from_enum_item(enu: Enum, name: String, at: Exp, scope: Scope, ctx: Con
     item.resolving = true
     defer enum_item_resolved(item)
     return value_resolve_enum_item(enu, item, at, scope, ctx) !>
+}
+
+fn idf_resolved(idf: Idf) {
+    idf.resolving = false
 }
 
 fn enum_item_resolved(item: EnumItem) {
@@ -4476,6 +4528,18 @@ fn value_try_fold_op(left: Value, right: Value, op: VALUE_OP, b: Build) ?Value {
     }
 
     if op == VALUE_OP.eq || op == VALUE_OP.ne {
+        // A literal number next to a string literal is compared as its text,
+        // a character literal as the character
+        if (left.type == VAL.string) != (right.type == VAL.string) {
+            let number = left.type == VAL.string ? right : left
+            let text = left.type == VAL.string ? left : right
+            if number.type == VAL.int && number.rett == type_char(b) {
+                let buf = ByteBuffer.new()
+                buf.write_byte(number.int_val.to(u8))
+                let eq = text.get_string() == buf.to_string()
+                return vgen_bool(op == VALUE_OP.eq ? eq : !eq, type_bool(b))
+            }
+        }
         // String-ish compare (macro defs, bare words like `win` in `OS == win`)
         let ls = left.fold_string()
         let rs = right.fold_string()
@@ -4592,6 +4656,10 @@ fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Erro
     if !lt.compat(rt) {
         if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte {
             if rt.compat(lt) : return
+            // Shared and plain strings are the same immutable value
+            let string_class = type_string(lt.build).get_class_or_null()
+            if isset(string_class) && lt.get_non_nullable().get_class_or_null() == string_class
+                && rt.get_non_nullable().get_class_or_null() == string_class : return
         }
         lt.compat_check(rt, at) !>
     }
@@ -4631,7 +4699,7 @@ fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: V
     value_publish_unique(av, ctx) !>
 }
 
-fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp, check_pointer_args: bool (true)) !Error {
+fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp, check_pointer_args: bool (true), is_coroutine: bool (false)) !Error {
     // Ensure signature types are resolved
     if !func.parsed_types {
         parse_func_types(func) !>
@@ -4653,6 +4721,12 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     if skip == 1 {
         receiver = callee.value1
         if isset(receiver) {
+            let receiver_param = params.get(0) !? null
+            if isset(receiver_param) && receiver_param.type.is_stack_borrow() && value_is_copied_element(receiver)
+                && (func_writes_receiver(func) !>)
+            {
+                at.error("Cannot call a method that changes its receiver on an element copied out of an Array; use a Slice view or store the element back with '.set'")
+            }
             let current = ctx.func
             if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {
                 let calls = current.this_calls
@@ -4729,8 +4803,10 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 ensure_func_unique_return_summary(func) !>
             }
             let settled = func_arg_summary_settled(func, param_i)
-            let accepts_shared_borrow = !func.unique_summary_ready
-                || (!func_arg_may_escape(func, param_i) && !func_arg_invalidates_unique(func, param_i))
+            // A coroutine keeps its arguments past the call, so a temporary
+            // shared view of ordinary or locked data is not enough
+            let accepts_shared_borrow = !is_coroutine && (!func.unique_summary_ready
+                || (!func_arg_may_escape(func, param_i) && !func_arg_invalidates_unique(func, param_i)))
             // A borrow accepted on unsettled flags is re-checked once they settle
             let pending_shared_borrow = !settled && accepts_shared_borrow
                 && param.type.get_non_nullable().is_shared

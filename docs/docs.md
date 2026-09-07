@@ -212,6 +212,12 @@ Use container methods to allocate storage, resize containers, and create views.
 Writing the raw storage fields of an `array` or `slice`, including their length,
 requires `@unsafe`, even in the source that declares the type.
 
+`arr[i]` on an `Array` of structs hands out a copy of the element, because the
+array's storage can move when it grows. Assigning into that copy, or calling a
+method that changes it, is a compile error; write through a view (`arr.view()`,
+`Slice`, `&[T]`), which addresses the element in place, or store the changed
+struct back with `arr.set(i, value)`.
+
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
 ```rust
@@ -308,7 +314,7 @@ let value: Value = 42
 println(describe(value))
 ```
 
-Use `as` to access the value in a `match` case. When every type is handled, a
+A nullable subject may have a `null` case; an enum match on a nullable enum is exhaustive when `null` and every item are handled. Use `as` to access the value in a `match` case. When every type is handled, a
 `default` case is not needed. Add `null` when the value may be missing. The type
 after `match value :` is the type every case must produce. Leave it out when the
 `match` is a statement rather than a value.
@@ -1570,7 +1576,7 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
+`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique: nothing else may still name any part of it, including values that were moved into it earlier with a store, an initializer or a call such as `append`. Creating the view consumes that uniqueness, and every ordinary variable that named part of the graph is unusable afterwards; the check follows control flow, so a value published on one path stays usable on paths where it was not, and loops are checked for aliases made in an earlier iteration. Publishing the result of a call consumes the arguments it was built from. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
 
 ### Mutable shared data
 
@@ -1592,6 +1598,6 @@ lock stats as s {
 
 Inside the block `s` is a `locked Stats`: a mutable view that is valid until the block ends. Anything read through it, like `s.names`, is a locked view too. The block releases the lock on every exit, including `return`, `throw` and `!>`. `break` and `continue` cannot leave a lock block.
 
-A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, stored in a property or global, or assigned to a variable declared outside the block. Functions can take and return `locked T` views while the originating lock is held. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Data from one lock cannot be stored under another lock. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
+A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Moving data around inside the locked graph, like `s.items.append(s.first)`, is allowed. Functions can take and return `locked T` views while the originating lock is held. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Data from one lock cannot be stored under another lock. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
 
 `T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again from the same thread deadlocks. Reading the value outside a `lock` block is not possible; every reader takes the lock too.

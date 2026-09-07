@@ -85,8 +85,8 @@ fn value_enum_representation(value: Value) Value !Error {
 }
 
 fn value_force_to(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) Value !Error {
-    let target_enum = target.get_enum()
-    if isset(target_enum) && v.rett.get_enum() != target_enum {
+    let target_enum = target.get_enum() ?? target.get_non_nullable().get_enum()
+    if isset(target_enum) && (v.rett.get_enum() ?? v.rett.get_non_nullable().get_enum()) != target_enum {
         let converted = value_try_convert(v, scope, ctx, target, false) !>
         if target.compat(converted.rett) {
             converted.exp = at
@@ -263,7 +263,9 @@ fn value_stays_inside(value: Value, owner: Value) bool {
 fn value_mark_summary_escape(value: Value) {
     each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
         let arg = decl_escape_arg(origin)
-        if isset(arg) : arg.may_escape = true
+        if isset(arg) {
+            arg.may_escape = true
+        }
     }
 }
 
@@ -460,18 +462,52 @@ fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Valu
             continue
         }
         let sources = isset(av) ? value_summary_source_args(av, owner) : null
-        value_absorb_param_sources(target, sources)
+        value_absorb_param_sources(target, sources, owner)
     }
     return true
 }
 
 // Something that was not unique moved into 'target'. When it came in through
 // a parameter the call site decides whether that cost the target its
-// uniqueness; anything else leaves an alias behind.
-fn value_absorb_param_sources(target: Value, sources: ?Array[uint]) {
-    if isset(sources) : value_mark_summary_absorbs(target, sources)
-    else : value_mark_summary_unique_invalidation(target)
+// uniqueness; anything else leaves an alias behind. A local that took in a
+// parameter's graph now has that parameter among its origins.
+fn value_absorb_param_sources(target: Value, sources: ?Array[uint], owner: Func) {
+    if isset(sources) {
+        value_mark_summary_absorbs(target, sources)
+        let destination = value_root_decl(target)
+        if isset(destination) && !isset(func_arg_index(owner, destination)) {
+            let origins = destination.escape_origins ?? <{
+                let created = Array[Decl]{ destination }
+                destination.escape_origins = created
+                return created
+            }
+            each sources as index {
+                let param = owner.args.get(index) ! continue
+                origins.append(param.decl, true)
+            }
+        }
+    } else {
+        value_mark_summary_unique_invalidation(target)
+    }
     value_invalidate_unique(target)
+}
+
+// Whether every input of this graph is the method's receiver or local data
+// built inside the method: a view of the receiver, not a new publication
+fn value_built_from_receiver(value: Value, func: Func) bool !Error {
+    let receiver = func.args.get(0) ! return false
+    // Calls that moved data into this graph settle its origins first
+    let root = value_root_decl(value)
+    if isset(root) : decl_resolve_pending_absorbs(root) !>
+    let origins = value_escape_origins(value)
+    // Nothing flowed in from anywhere the method can name: a local that was
+    // built here counts, a global or a fresh temporary does not
+    if origins.length == 0 : return isset(root) && !isset(func_arg_index(func, root))
+    each origins as origin {
+        let index = func_arg_index(func, origin)
+        if isset(index) && index != 0 : return false
+    }
+    return true
 }
 
 // A unique value stored into another graph becomes part of that graph
@@ -914,14 +950,16 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
     }
     if value.type == VAL.class_init {
         let hook_init = isset(value.value1)
-        if hook_init {
-            let class = value.get_class_ref()
-            if !isset(class) || class.representation_class().kind != CLASS_KIND.array : return false
-        }
         let fields = value.values
         if !isset(fields) : return true
         each fields as field {
             if hook_init && field.type == VAL.call {
+                // A hook that keeps only what it was handed leaves the
+                // fresh object unique
+                let callee = field.value1 ?! return false
+                let func = callee.resolve_call_func() ?! return false
+                ensure_func_unique_return_summary(func) !>
+                if !func.unique_summary_ready || func_arg_may_escape(func, 0) || func_arg_invalidates_unique(func, 0) : return false
                 let args = field.values
                 if !isset(args) : continue
                 each args as arg {
@@ -1539,6 +1577,16 @@ fn value_try_convert(
 
     let target_nn = target.get_non_nullable()
     let source_nn = result.rett.get_non_nullable()
+    // Strings are immutable: a shared view of one is the same value
+    let string_class = type_string(ctx.build).get_class_or_null()
+    if isset(string_class) && !result.rett.is_nullable_type() && !target.is_nullable_type()
+        && source_nn.get_class_or_null() == string_class && target_nn.get_class_or_null() == string_class
+        && source_nn.is_shared != target_nn.is_shared && !source_nn.is_locked && !target_nn.is_locked
+    {
+        let retyped = vgen_cast(result, target)
+        retyped.exp = result.exp
+        return retyped
+    }
     // An ordinary graph becomes a shared or locked view the same way: it
     // must be unique, and it is published from here on.
     let to_view = (target_nn.is_shared && !source_nn.is_shared)
@@ -1597,8 +1645,8 @@ fn value_try_convert(
     }
 
     // Enum values come from their declared items or conversion hooks.
-    let target_enum = target.get_enum()
-    if isset(target_enum) && result.type != VAL.null && result.rett.get_enum() != target_enum {
+    let target_enum = target.get_enum() ?? target.get_non_nullable().get_enum()
+    if isset(target_enum) && result.type != VAL.null && (result.rett.get_enum() ?? result.rett.get_non_nullable().get_enum()) != target_enum {
         result.error("Cannot convert value to enum: '" + target_enum.name + "'")
     }
 
@@ -1659,6 +1707,7 @@ fn value_try_convert(
         if result.rett.is_nullable_type() : return result
         return vgen_wrap(result, result.rett.nullable())
     }
+
 
     if allow_inline_borrow && result.rett.is_inline_type() && !result.rett.is_number_type() && result.rett.kind != TYPE.closure
         && target.get_non_nullable().kind == TYPE.adr_of && inline_pointer_compat(result.rett, target)
@@ -2319,6 +2368,19 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
 
     let nnl = l.rett.is_nullable_type() ? value_force_remove_nullable(l) : l
     let nnr = r.rett.is_nullable_type() ? value_force_remove_nullable(r) : r
+
+    // A string compares with the text of the other side, as `+` joins it,
+    // and a shared string is the same immutable value as a plain one
+    let string_class = type_string(b).get_class_or_null()
+    if isset(string_class) && !nnl.rett.is_nullable_type() && !nnr.rett.is_nullable_type() {
+        let plain_string = type_string(b)
+        if nnl.rett.get_class_or_null() == string_class && nnl.rett.is_shared : nnl = vgen_cast(nnl, plain_string)
+        if nnr.rett.get_class_or_null() == string_class && nnr.rett.is_shared : nnr = vgen_cast(nnr, plain_string)
+        let lsc = nnl.rett.get_class_or_null()
+        let rsc = nnr.rett.get_class_or_null()
+        if lsc == string_class && rsc != string_class && nnr.rett.is_number_type() : nnr = value_try_convert(nnr, scope, ctx, type_string(b)) !>
+        else if rsc == string_class && lsc != string_class && nnl.rett.is_number_type() : nnl = value_try_convert(nnl, scope, ctx, type_string(b)) !>
+    }
 
     let hook: ?Func = null
     let lc = nnl.rett.get_class_or_null()
