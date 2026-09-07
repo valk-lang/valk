@@ -53,16 +53,11 @@ Integer addition, subtraction, multiplication, negation, increment, and
 decrement wrap modulo the width of their result type. This applies to both
 signed and unsigned integers and does not require runtime overflow checks.
 
-Integer division and remainder truncate toward zero. Their operands must meet
-these unchecked preconditions:
-
-- The divisor is not zero.
-- For a signed type, the minimum value is not divided by `-1` and its remainder
-  is not taken with `-1`.
-
-Violating either precondition at runtime is undefined behavior, and the
-compiler may assume it does not happen. A violation known at compile time is a
-compile error. No implicit runtime check is inserted.
+Integer division and remainder truncate toward zero. A zero divisor, and for
+a signed type the minimum value divided by `-1` or its remainder taken with
+`-1`, panics at runtime with a message naming the location; the process does
+not trap. A literal divisor needs no runtime check. A violation known at
+compile time is a compile error.
 
 The shift amount must be non-negative and less than the bit width of the left
 operand. A statically invalid shift is a compile error; a dynamically invalid
@@ -71,6 +66,11 @@ shift is undefined behavior and receives no implicit runtime check.
 Integer narrowing retains the least-significant bits. Signed and unsigned
 conversions preserve that bit pattern, extending with the source type's sign or
 with zero when the destination is wider.
+
+An operation that mixes a signed and an unsigned operand widens both to the
+signed type of twice the wider operand's size, so `u8 255 == i8 -1` is false.
+At the pointer width there is nothing wider: the unsigned operand converts to
+signed and its bit pattern decides, so `uint.$max == -1` is true.
 
 Floating-point addition, subtraction, multiplication, division, and comparisons
 follow IEEE 754, including its rules for infinities, signed zero, and NaN.

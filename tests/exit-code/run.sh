@@ -39,6 +39,7 @@ cases="$cases slice-replaced-read:1 slice-replaced-write:1 slice-replaced-borrow
 cases="$cases fixed-element-borrow-bounds:1"
 cases="$cases fixed-range-copy-bounds:1"
 cases="$cases matrix-borrow-row-bounds:1 matrix-borrow-column-bounds:1"
+cases="$cases division-by-zero:1 division-overflow:1 remainder-by-zero:1"
 
 for case in $cases; do
     name="${case%%:*}"
