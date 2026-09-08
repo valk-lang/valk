@@ -118,7 +118,10 @@ test-extend-access: $(TEST_COMPILER)
 test-doc: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/doc/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc
+test-examples: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) bash ./tests/examples/run.sh
+
+test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples
 
 bench-json: valk
 	mkdir -p ./debug
@@ -285,6 +288,6 @@ clean:
 	asm ci-linux ci-macos ci-win clean dist-all doc install ir \
 	linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
-	test test-all test-compile-errors test-cross test-cross-ir test-diagnostics \
+	test test-all test-examples test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-debug test-gc-shared-stress test-lsp \
 	test-macos-build test-clang test-release test-win test-win-build
