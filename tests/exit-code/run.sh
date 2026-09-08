@@ -79,8 +79,8 @@ run_case() {
         : > "$fail"
     fi
 
-    if [ "$name" = "unhandled-error" ] && [[ "$output" != *"unhandled-error.valk:8"* ]]; then
-        echo "# Missing unhandled error source location: $output" >> "$log"
+    if [ "$name" = "unhandled-error" ] && [[ "$output" != *"Unhandled error 'Failure.failed' at "*"unhandled-error.valk:8"* ]]; then
+        echo "# Missing unhandled error name or source location: $output" >> "$log"
         : > "$fail"
     fi
 
