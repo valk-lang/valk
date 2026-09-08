@@ -36,7 +36,7 @@ check_build_error() {
     echo "> $name"
 
     local out status
-    out=$("$VALK" build "$DIR/$file.valk" --no-warn -o "$workdir/$file" 2>&1)
+    out=$("$VALK" build "$DIR/$file.valk" --no-warn 2>&1)
     status=$?
     out=$(printf '%s' "$out" | normalize_paths)
     if [ "$status" -eq 0 ] || [[ "$out" != *"# File: $DIR/$file.valk"* ]] || \
@@ -59,7 +59,7 @@ check_build_error "generic body error" generic-chain "4 | Col: 16" "Type 'String
 
 count=$((count + 1))
 echo "> generic body error shows the instantiation chain"
-chain_out=$("$VALK" build "$DIR/generic-chain.valk" --no-warn -o "$workdir/generic-chain" 2>&1 | normalize_paths)
+chain_out=$("$VALK" build "$DIR/generic-chain.valk" --no-warn 2>&1 | normalize_paths)
 if [[ "$chain_out" != *"# Note: while instantiating 'Box[String]' here"* ]] || [[ "$chain_out" != *"# At: $DIR/generic-chain.valk:8:13"* ]]; then
     echo "# Missing instantiation chain"
     echo "$chain_out"
@@ -68,7 +68,7 @@ fi
 
 count=$((count + 1))
 echo "> warning location"
-warn_out=$("$VALK" build "$DIR/warning.valk" -o "$workdir/warning" 2>&1)
+warn_out=$("$VALK" build "$DIR/warning.valk" 2>&1)
 warn_status=$?
 warn_out=$(printf '%s' "$warn_out" | normalize_paths)
 if [ "$warn_status" -ne 0 ] || [[ "$warn_out" != *"unused_value' was declared but never used @ $DIR/warning.valk:3:5"* ]]; then
@@ -81,7 +81,7 @@ fi
 
 count=$((count + 1))
 echo "> unnecessary unsafe warning"
-unsafe_warn_out=$("$VALK" build "$DIR/unsafe-warning.valk" -o "$workdir/unsafe-warning" 2>&1)
+unsafe_warn_out=$("$VALK" build "$DIR/unsafe-warning.valk" 2>&1)
 unsafe_warn_status=$?
 unsafe_warn_out=$(printf '%s' "$unsafe_warn_out" | normalize_paths)
 if [ "$unsafe_warn_status" -ne 0 ] || \
@@ -95,7 +95,7 @@ fi
 
 count=$((count + 1))
 echo "> unsafe outside skipped conditional warns"
-unsafe_conditional_out=$("$VALK" build "$DIR/unsafe-conditional.valk" -o "$workdir/unsafe-conditional" 2>&1)
+unsafe_conditional_out=$("$VALK" build "$DIR/unsafe-conditional.valk" 2>&1)
 unsafe_conditional_status=$?
 if [ "$unsafe_conditional_status" -ne 0 ] || [[ "$unsafe_conditional_out" != *"Unnecessary '@unsafe'"* ]]; then
     echo "# Unsafe outside a skipped conditional did not warn"
@@ -106,7 +106,7 @@ fi
 
 count=$((count + 1))
 echo "> unsafe inside skipped conditional does not warn"
-unsafe_conditional_scoped_out=$("$VALK" build "$DIR/unsafe-conditional-scoped.valk" -o "$workdir/unsafe-conditional-scoped" 2>&1)
+unsafe_conditional_scoped_out=$("$VALK" build "$DIR/unsafe-conditional-scoped.valk" 2>&1)
 unsafe_conditional_scoped_status=$?
 if [ "$unsafe_conditional_scoped_status" -ne 0 ] || [[ "$unsafe_conditional_scoped_out" == *"Unnecessary '@unsafe'"* ]]; then
     echo "# Unsafe inside a skipped conditional emitted a warning"
@@ -117,7 +117,7 @@ fi
 
 count=$((count + 1))
 echo "> dependency unsafe does not warn"
-unsafe_dependency_out=$("$VALK" build "$DIR/unsafe-dependency" -o "$workdir/unsafe-dependency" 2>&1)
+unsafe_dependency_out=$("$VALK" build "$DIR/unsafe-dependency" 2>&1)
 unsafe_dependency_status=$?
 if [ "$unsafe_dependency_status" -ne 0 ] || [[ "$unsafe_dependency_out" == *"Unnecessary '@unsafe'"* ]]; then
     echo "# Dependency emitted an unnecessary unsafe warning"
@@ -128,7 +128,7 @@ fi
 
 count=$((count + 1))
 echo "> generic unsafe use does not warn"
-unsafe_generic_out=$("$VALK" build "$DIR/unsafe-generic-warning.valk" -o "$workdir/unsafe-generic-warning" 2>&1)
+unsafe_generic_out=$("$VALK" build "$DIR/unsafe-generic-warning.valk" 2>&1)
 unsafe_generic_status=$?
 if [ "$unsafe_generic_status" -ne 0 ] || [[ "$unsafe_generic_out" == *"Unnecessary '@unsafe'"* ]]; then
     echo "# Generic unsafe use emitted an unnecessary warning"

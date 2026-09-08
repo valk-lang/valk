@@ -40,65 +40,89 @@ cases="$cases fixed-element-borrow-bounds:1"
 cases="$cases fixed-range-copy-bounds:1"
 cases="$cases matrix-borrow-row-bounds:1 matrix-borrow-column-bounds:1"
 cases="$cases division-by-zero:1 division-overflow:1 remainder-by-zero:1"
+cases="$cases panic-in-thread:1"
 
-for case in $cases; do
-    name="${case%%:*}"
-    want="${case##*:}"
-    input="$DIR/$name.valk"
+# Each case builds and runs on its own, so the cases run in parallel and
+# report in list order. A case writes "<index>.out" and "<index>.fail".
+export VALK DIR workdir EXE_SUFFIX
+run_case() {
+    local index="$1" name="$2" want="$3"
+    local input="$DIR/$name.valk" exe="$workdir/$name$EXE_SUFFIX" out status output got
+    local log="$workdir/$index.out" fail="$workdir/$index.fail"
 
     if [ ! -f "$input" ]; then
-        echo "# Missing fixture: $input"
-        failed=1
-        continue
+        echo "# Missing fixture: $input" > "$log"
+        : > "$fail"
+        return
     fi
 
-    count=$((count + 1))
-    exe="$workdir/$name$EXE_SUFFIX"
-    echo "> Run: $VALK build $input -o $exe (expect exit $want)"
-
-    set +e
+    echo "> Run: $VALK build $input -o $exe (expect exit $want)" > "$log"
     out=$("$VALK" build "$input" --no-warn -o "$exe" 2>&1)
     status=$?
-    set -e
-
     if [ "$status" -ne 0 ]; then
-        echo "# Build failed"
-        echo "- File: $input"
-        echo "- Exit code: $status"
-        echo "- Output:"
-        echo "$out"
-        failed=1
-        continue
+        {
+            echo "# Build failed"
+            echo "- File: $input"
+            echo "- Exit code: $status"
+            echo "- Output:"
+            echo "$out"
+        } >> "$log"
+        : > "$fail"
+        return
     fi
 
-    set +e
     output=$("$exe" 2>&1)
     got=$?
-    set -e
 
     if [[ "$name" == *-panic* ]] && [[ "$output" != *"Conditional panic reached"* ]]; then
-        echo "# Missing conditional panic message: $output"
-        failed=1
+        echo "# Missing conditional panic message: $output" >> "$log"
+        : > "$fail"
     fi
 
     if [ "$name" = "unhandled-error" ] && [[ "$output" != *"unhandled-error.valk:8"* ]]; then
-        echo "# Missing unhandled error source location: $output"
-        failed=1
+        echo "# Missing unhandled error source location: $output" >> "$log"
+        : > "$fail"
     fi
 
     if [[ "$name" == *-header-overflow ]] && [[ "$output" != *"Slice length is too large"* ]]; then
-        echo "# Missing sequence allocation overflow message: $output"
-        failed=1
+        echo "# Missing sequence allocation overflow message: $output" >> "$log"
+        : > "$fail"
     fi
 
     if [ "$got" -ne "$want" ]; then
-        echo "# Wrong exit status"
-        echo "- File: $input"
-        echo "- Expected: $want"
-        echo "- Actual: $got"
-        failed=1
-        continue
+        {
+            echo "# Wrong exit status"
+            echo "- File: $input"
+            echo "- Expected: $want"
+            echo "- Actual: $got"
+        } >> "$log"
+        : > "$fail"
     fi
+}
+export -f run_case
+
+for case in $cases; do
+    job="$workdir/job-$count.sh"
+    printf "run_case '%s' '%s' '%s'\n" "$count" "${case%%:*}" "${case##*:}" > "$job"
+    count=$((count + 1))
+done
+
+# Every build spawns a worker per core, and each worker has an io_uring ring
+# that counts against the locked-memory limit of the whole user
+cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+jobs=$((40 / (cores + 1)))
+if [ "$jobs" -lt 1 ]; then jobs=1; fi
+set +e
+ls "$workdir"/job-*.sh | xargs -n 1 -P "$jobs" bash
+set -e
+
+index=0
+while [ "$index" -lt "$count" ]; do
+    cat "$workdir/$index.out"
+    if [ -f "$workdir/$index.fail" ]; then
+        failed=1
+    fi
+    index=$((index + 1))
 done
 
 count=$((count + 1))

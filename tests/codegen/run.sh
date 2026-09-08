@@ -15,13 +15,82 @@ case "$(uname -s)" in
 esac
 trap 'rm -rf "$workdir"' EXIT
 
+# Every IR fixture is built up front, in parallel; the checks below read the
+# saved output and status of their build.
+export VALK DIR workdir
+ir_build() {
+    local path="$1"
+    shift
+    "$VALK" build "$@" -o "$path" > "$path.log" 2>&1
+    echo "$?" > "$path.status"
+}
+export -f ir_build
+job_count=0
+queue_ir() {
+    local job="$workdir/job-$job_count.sh" arg
+    job_count=$((job_count + 1))
+    printf 'ir_build' > "$job"
+    for arg in "$@"; do printf " '%s'" "$arg" >> "$job"; done
+    echo "" >> "$job"
+}
+ir_result() {
+    cat "$1.log"
+    return "$(cat "$1.status")"
+}
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/gc-direct-entry-$target.ll" "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn; done
+queue_ir "$workdir/buffer-roots.ll" "$DIR/buffer-roots.valk" --ir --no-warn
+queue_ir "$workdir/native-address.ll" "$DIR/native-address.valk" --ir --no-warn
+queue_ir "$workdir/windows-coro-stack.ll" "$DIR/native-address.valk" --target win-x64 --ir --no-warn
+queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --no-warn
+queue_ir "$workdir/atomic-alignment.ll" "$DIR/atomic-alignment.valk" --ir --no-warn
+queue_ir "$workdir/pointer-integer-compare.ll" "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn
+queue_ir "$workdir/windows-bool.ll" "$DIR/windows-bool.valk" --target win-x64 --ir --no-warn
+queue_ir "$workdir/tagged-union-scalars.ll" "$DIR/tagged-union-scalars.valk" --ir --no-warn
+queue_ir "$workdir/export.ll" "$DIR/export.valk" --ir --no-warn
+queue_ir "$workdir/shared-pool.ll" "$DIR/shared-pool.valk" --ir --no-warn
+queue_ir "$workdir/fixed-array-bounds.ll" "$DIR/fixed-array-bounds.valk" --ir --no-warn
+queue_ir "$workdir/direct-initializer.ll" "$DIR/direct-initializer.valk" --ir --no-warn
+queue_ir "$workdir/interface-values.ll" "$DIR/interface-values.valk" --ir --no-warn
+queue_ir "$workdir/interface-values-win.ll" "$DIR/interface-values.valk" --ir --no-warn --target win-x64
+queue_ir "$workdir/await-error.ll" "$DIR/await-error.valk" --ir --no-warn --target macos-arm64
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/array-conversions-$target.ll" "$DIR/array-conversions.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/borrow-methods-$target.ll" "$DIR/borrow-methods.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/operator-hooks-$target.ll" "$DIR/operator-hooks.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/clone-borrows-$target.ll" "$DIR/clone-borrows.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/closure-layouts-$target.ll" "$DIR"/../cli/closure-layouts/*.valk --release --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/optimization-flags-$target.ll" "$DIR/../cli/optimization-flags.valk" --release --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/callable-compatibility-$target.ll" "$DIR/callable-compatibility.valk" --release --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/conditional-values-$target.ll" "$DIR/conditional-values.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/nonreturning-expressions-$target.ll" "$DIR/nonreturning-expressions.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/call-evaluation-$target.ll" "$DIR/call-evaluation.valk" --ir --no-warn --target "$target"; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/fnptr-closures-$target.ll" "$DIR/fnptr-closures.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/bound-callables-$target.ll" "$DIR/bound-callables.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/cleared-views-$target.ll" "$DIR/cleared-views.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/array-sorting-$target.ll" "$DIR/array-sorting.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/enum-safety-$target.ll" "$DIR/enum-safety.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/enum-representations-$target.ll" "$DIR/enum-representations.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/enum-storage-$target.ll" "$DIR/enum-storage.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/bound-locals-$target.ll" "$DIR/bound-locals.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/borrow-evaluation-$target.ll" "$DIR/borrow-evaluation.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/index-storage-$target.ll" "$DIR/index-storage.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/owner-stores-$target.ll" "$DIR/owner-stores.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/fixed-element-borrows-$target.ll" "$DIR/fixed-element-borrows.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/fixed-range-evaluation-$target.ll" "$DIR/fixed-range-evaluation.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/matrix-borrows-$target.ll" "$DIR/matrix-borrows.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/pointer-array-copies-$target.ll" "$DIR/pointer-array-copies.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/iterator-contracts-$target.ll" "$DIR/iterator-contracts.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/generic-iterators-$target.ll" "$DIR/generic-iterators.valk" --target "$target" --ir --no-warn; done
+jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+ls "$workdir"/job-*.sh | xargs -n 1 -P "$jobs" bash
+
+
 echo ""
 echo "# Test generated-code optimizations"
 echo "> Call the native GC entry directly on every target"
 
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     collect_ir="$workdir/gc-direct-entry-$target.ll"
-    out=$("$VALK" build "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn -o "$collect_ir" 2>&1)
+    out=$(ir_result "$collect_ir")
     if [ "$?" -ne 0 ]; then
         echo "# Failed to build direct GC entry fixture for $target"
         echo "$out"
@@ -52,7 +121,7 @@ done
 echo "> Keep managed values on the native stack without shadow frames"
 
 ir="$workdir/buffer-roots.ll"
-out=$("$VALK" build "$DIR/buffer-roots.valk" --ir --no-warn -o "$ir" 2>&1)
+out=$(ir_result "$ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build IR fixture"
@@ -106,7 +175,7 @@ fi
 echo "> Keep address-taken locals on native stacks"
 
 address_ir="$workdir/native-address.ll"
-out=$("$VALK" build "$DIR/native-address.valk" --ir --no-warn -o "$address_ir" 2>&1)
+out=$(ir_result "$address_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build native address IR fixture"
@@ -142,7 +211,7 @@ fi
 echo "> Reserve 1 MiB Windows coroutine stacks with a 32 KiB commit"
 
 windows_coro_ir="$workdir/windows-coro-stack.ll"
-out=$("$VALK" build "$DIR/native-address.valk" --target win-x64 --ir --no-warn -o "$windows_coro_ir" 2>&1)
+out=$(ir_result "$windows_coro_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build Windows coroutine stack IR fixture"
@@ -160,7 +229,7 @@ fi
 echo "> Keep property stores and Array append on their GC fast paths"
 
 fast_path_ir="$workdir/gc-fast-paths.ll"
-out=$("$VALK" build "$DIR/gc-fast-paths.valk" --release --ir --no-warn -o "$fast_path_ir" 2>&1)
+out=$(ir_result "$fast_path_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build GC fast-path IR fixture"
@@ -184,7 +253,7 @@ fi
 echo "> Use natural alignment for atomic property accesses"
 
 atomic_ir="$workdir/atomic-alignment.ll"
-out=$("$VALK" build "$DIR/atomic-alignment.valk" --ir --no-warn -o "$atomic_ir" 2>&1)
+out=$(ir_result "$atomic_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build atomic-alignment IR fixture"
@@ -204,7 +273,7 @@ fi
 echo "> Compare pointers with integer sentinels through pointer-sized integers"
 
 pointer_ir="$workdir/pointer-integer-compare.ll"
-out=$("$VALK" build "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn -o "$pointer_ir" 2>&1)
+out=$(ir_result "$pointer_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build pointer-integer comparison IR fixture"
@@ -228,7 +297,7 @@ fi
 echo "> Use 32-bit Win32 BOOL at FFI boundaries"
 
 windows_bool_ir="$workdir/windows-bool.ll"
-out=$("$VALK" build "$DIR/windows-bool.valk" --target win-x64 --ir --no-warn -o "$windows_bool_ir" 2>&1)
+out=$(ir_result "$windows_bool_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build Win32 BOOL IR fixture"
@@ -246,7 +315,7 @@ fi
 echo "> Lower tagged unions to inline value aggregates"
 
 scalar_ir="$workdir/tagged-union-scalars.ll"
-out=$("$VALK" build "$DIR/tagged-union-scalars.valk" --ir --no-warn -o "$scalar_ir" 2>&1)
+out=$(ir_result "$scalar_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build scalar tagged-union IR fixture"
@@ -316,7 +385,7 @@ fi
 echo "> Keep exported symbols unmangled and reachable"
 
 export_ir="$workdir/export.ll"
-out=$("$VALK" build "$DIR/export.valk" --ir --no-warn -o "$export_ir" 2>&1)
+out=$(ir_result "$export_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build exported-symbol IR fixture"
@@ -340,7 +409,7 @@ fi
 echo "> Reuse one allocator pool for local and shared objects"
 
 pool_ir="$workdir/shared-pool.ll"
-out=$("$VALK" build "$DIR/shared-pool.valk" --ir --no-warn -o "$pool_ir" 2>&1)
+out=$(ir_result "$pool_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build shared-pool IR fixture"
@@ -358,7 +427,7 @@ fi
 echo "> Check variable indices for every known-length sequence"
 
 bounds_ir="$workdir/fixed-array-bounds.ll"
-out=$("$VALK" build "$DIR/fixed-array-bounds.valk" --ir --no-warn -o "$bounds_ir" 2>&1)
+out=$(ir_result "$bounds_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build fixed-array bounds IR fixture"
@@ -385,7 +454,7 @@ fi
 echo "> Initialize fixed arrays directly in destination storage"
 
 direct_ir="$workdir/direct-initializer.ll"
-out=$("$VALK" build "$DIR/direct-initializer.valk" --ir --no-warn -o "$direct_ir" 2>&1)
+out=$(ir_result "$direct_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build direct initializer IR fixture"
@@ -404,7 +473,7 @@ fi
 echo "> Store interface values as receiver and static vtable pairs"
 
 interface_ir="$workdir/interface-values.ll"
-out=$("$VALK" build "$DIR/interface-values.valk" --ir --no-warn -o "$interface_ir" 2>&1)
+out=$(ir_result "$interface_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build interface value IR fixture"
@@ -424,7 +493,7 @@ fi
 echo "> Emit Windows interface vtables in COMDAT sections"
 
 interface_win_ir="$workdir/interface-values-win.ll"
-out=$("$VALK" build "$DIR/interface-values.valk" --ir --no-warn --target win-x64 -o "$interface_win_ir" 2>&1)
+out=$(ir_result "$interface_win_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
     echo "# Failed to build Windows interface value IR fixture"
@@ -441,7 +510,7 @@ fi
 
 echo "> Failed await skips unpublished result storage"
 await_ir="$workdir/await-error.ll"
-if ! "$VALK" build "$DIR/await-error.valk" --ir --no-warn --target macos-arm64 -o "$await_ir"; then
+if ! ir_result "$await_ir"; then
     exit 1
 fi
 body=$(sed -n '/^define .*__await_failed_result__/,/^}/p' "$await_ir")
@@ -458,7 +527,7 @@ fi
 echo "> Array conversions read the source layout without heap allocation"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     array_ir="$workdir/array-conversions-$target.ll"
-    if ! "$VALK" build "$DIR/array-conversions.valk" --ir --no-warn --target "$target" -o "$array_ir"; then
+    if ! ir_result "$array_ir"; then
         exit 1
     fi
     widened=$(sed -n '/^define .*__array_widen_elements__/,/^}/p' "$array_ir")
@@ -487,7 +556,7 @@ done
 echo "> Borrowed receivers use their existing storage without heap allocation"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     borrow_ir="$workdir/borrow-methods-$target.ll"
-    if ! "$VALK" build "$DIR/borrow-methods.valk" --ir --no-warn --target "$target" -o "$borrow_ir"; then
+    if ! ir_result "$borrow_ir"; then
         exit 1
     fi
     read_body=$(sed -n '/^define .*__borrow_receiver_read__/,/^}/p' "$borrow_ir")
@@ -505,7 +574,7 @@ done
 echo "> Shared operator hooks use atomic accesses without heap allocation"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     operator_ir="$workdir/operator-hooks-$target.ll"
-    if ! "$VALK" build "$DIR/operator-hooks.valk" --ir --no-warn --target "$target" -o "$operator_ir"; then
+    if ! ir_result "$operator_ir"; then
         exit 1
     fi
     caller=$(sed -n '/^define .*__shared_operator_add__/,/^}/p' "$operator_ir")
@@ -537,7 +606,7 @@ done
 echo "> Borrowed inline clones guard null without heap allocation"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     clone_ir="$workdir/clone-borrows-$target.ll"
-    if ! "$VALK" build "$DIR/clone-borrows.valk" --ir --no-warn --target "$target" -o "$clone_ir"; then
+    if ! ir_result "$clone_ir"; then
         exit 1
     fi
     direct=$(sed -n '/^define .*__clone_borrow_inline__/,/^}/p' "$clone_ir")
@@ -561,7 +630,7 @@ done
 echo "> Same-offset closures in separate files keep distinct allocators"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     closure_ir="$workdir/closure-layouts-$target.ll"
-    if ! "$VALK" build "$DIR"/../cli/closure-layouts/*.valk --release --ir --no-warn --target "$target" -o "$closure_ir"; then
+    if ! ir_result "$closure_ir"; then
         exit 1
     fi
     first=$(sed -n '/^define .*__closure_layout_first__/,/^}/p' "$closure_ir" | grep -o 'ptr @"[^"]*ALC_[^"]*closure_env[^"]*"')
@@ -577,7 +646,7 @@ done
 echo "> Inlining controls survive specialization and receiver variants"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     flags_ir="$workdir/optimization-flags-$target.ll"
-    if ! "$VALK" build "$DIR/../cli/optimization-flags.valk" --release --ir --no-warn --target "$target" -o "$flags_ir"; then
+    if ! ir_result "$flags_ir"; then
         exit 1
     fi
     definitions=$(grep -E '^define .*__(noinline_frame|noinline_generic|NoinlineCounter__(increment|clone))__' "$flags_ir")
@@ -595,7 +664,7 @@ done
 echo "> Compatible callable views do not allocate adapter environments"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     callable_ir="$workdir/callable-compatibility-$target.ll"
-    if ! "$VALK" build "$DIR/callable-compatibility.valk" --release --ir --no-warn --target "$target" -o "$callable_ir"; then
+    if ! ir_result "$callable_ir"; then
         exit 1
     fi
     for view in argument result pointer; do
@@ -611,7 +680,7 @@ done
 echo "> Conditional extraction of inline values does not allocate"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     conditional_ir="$workdir/conditional-values-$target.ll"
-    if ! "$VALK" build "$DIR/conditional-values.valk" --ir --no-warn --target "$target" -o "$conditional_ir"; then
+    if ! ir_result "$conditional_ir"; then
         exit 1
     fi
     for kind in scalar aggregate; do
@@ -628,7 +697,7 @@ done
 echo "> Nonreturning operands terminate their block without new allocations"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     termination_ir="$workdir/nonreturning-expressions-$target.ll"
-    if ! "$VALK" build "$DIR/nonreturning-expressions.valk" --ir --no-warn --target "$target" -o "$termination_ir"; then
+    if ! ir_result "$termination_ir"; then
         exit 1
     fi
     for kind in call array; do
@@ -655,7 +724,7 @@ done
 echo "> Function pointer calls and coroutines do not allocate closure adapters"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     call_ir="$workdir/call-evaluation-$target.ll"
-    if ! "$VALK" build "$DIR/call-evaluation.valk" --ir --no-warn --target "$target" -o "$call_ir"; then
+    if ! ir_result "$call_ir"; then
         exit 1
     fi
     direct=$(sed -n '/^define .*__pointer_call__/,/^}/p' "$call_ir")
@@ -672,7 +741,7 @@ done
 echo "> Adapt function pointers without allocating for known targets"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/fnptr-closures-$target.ll"
-    if ! out=$("$VALK" build "$DIR/fnptr-closures.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build function pointer closure fixture for $target"
         echo "$out"
         exit 1
@@ -699,7 +768,7 @@ done
 echo "> Keep bound and unbound method adapters distinct"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/bound-callables-$target.ll"
-    if ! out=$("$VALK" build "$DIR/bound-callables.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build method adapter fixture for $target"
         echo "$out"
         exit 1
@@ -732,7 +801,7 @@ done
 echo "> Check cleared references without allocating or checking plain numbers"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/cleared-views-$target.ll"
-    if ! out=$("$VALK" build "$DIR/cleared-views.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build cleared-view fixture for $target"
         echo "$out"
         exit 1
@@ -759,7 +828,7 @@ done
 echo "> Sort with default and explicit comparators without allocating"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/array-sorting-$target.ll"
-    if ! out=$("$VALK" build "$DIR/array-sorting.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build array-sorting fixture for $target"
         echo "$out"
         exit 1
@@ -777,7 +846,7 @@ done
 echo "> Check enum storage and exhaustive matches without allocating"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/enum-safety-$target.ll"
-    if ! out=$("$VALK" build "$DIR/enum-safety.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build enum-safety fixture for $target"
         echo "$out"
         exit 1
@@ -813,7 +882,7 @@ done
 echo "> Preserve enum borrows without allocating conversion storage"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/enum-representations-$target.ll"
-    if ! out=$("$VALK" build "$DIR/enum-representations.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build enum representation fixture for $target"
         echo "$out"
         exit 1
@@ -831,7 +900,7 @@ done
 echo "> Read enum storage and mutate independent copies without allocating"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/enum-storage-$target.ll"
-    if ! out=$("$VALK" build "$DIR/enum-storage.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build enum storage fixture for $target"
         echo "$out"
         exit 1
@@ -849,7 +918,7 @@ done
 echo "> Elide closure environments for local bound-method calls, including loops"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/bound-locals-$target.ll"
-    if ! out=$("$VALK" build "$DIR/bound-locals.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build local bound-method fixture for $target"
         echo "$out"
         exit 1
@@ -872,7 +941,7 @@ done
 echo "> Evaluate temporary array borrows once without allocating helper storage"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/borrow-evaluation-$target.ll"
-    if ! out=$("$VALK" build "$DIR/borrow-evaluation.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build borrow evaluation fixture for $target"
         echo "$out"
         exit 1
@@ -894,7 +963,7 @@ done
 echo "> Keep slice access bounds and storage together without allocating"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/index-storage-$target.ll"
-    if ! out=$("$VALK" build "$DIR/index-storage.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build slice selection fixture for $target"
         echo "$out"
         exit 1
@@ -913,7 +982,7 @@ done
 echo "> Evaluate managed-store owners once without allocating helper storage"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/owner-stores-$target.ll"
-    if ! out=$("$VALK" build "$DIR/owner-stores.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build managed-store fixture for $target"
         echo "$out"
         exit 1
@@ -932,7 +1001,7 @@ done
 echo "> Borrow managed fixed-array slots without copying their values"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/fixed-element-borrows-$target.ll"
-    if ! out=$("$VALK" build "$DIR/fixed-element-borrows.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build fixed-element borrow fixture for $target"
         echo "$out"
         exit 1
@@ -950,7 +1019,7 @@ done
 echo "> Evaluate fixed-range sources and bounds once without helper allocation"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/fixed-range-evaluation-$target.ll"
-    if ! out=$("$VALK" build "$DIR/fixed-range-evaluation.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build fixed-range fixture for $target"
         echo "$out"
         exit 1
@@ -970,7 +1039,7 @@ done
 echo "> Preserve matrix row strides without allocating borrow adapters"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/matrix-borrows-$target.ll"
-    if ! out=$("$VALK" build "$DIR/matrix-borrows.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build matrix borrow fixture for $target"
         echo "$out"
         exit 1
@@ -993,7 +1062,7 @@ done
 echo "> Copy bounded matrix pointers with the full row layout and no heap adapter"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/pointer-array-copies-$target.ll"
-    if ! out=$("$VALK" build "$DIR/pointer-array-copies.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build pointer array-copy fixture for $target"
         echo "$out"
         exit 1
@@ -1011,7 +1080,7 @@ done
 echo "> Call custom iterators with defaults and no heap adapter"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/iterator-contracts-$target.ll"
-    if ! out=$("$VALK" build "$DIR/iterator-contracts.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build iterator contract fixture for $target"
         echo "$out"
         exit 1
@@ -1036,7 +1105,7 @@ done
 echo "> Infer custom iterator calls without allocating an adapter"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/generic-iterators-$target.ll"
-    if ! out=$("$VALK" build "$DIR/generic-iterators.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+    if ! out=$(ir_result "$ir"); then
         echo "# Failed to build iterator contract fixture for $target"
         echo "$out"
         exit 1

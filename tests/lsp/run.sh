@@ -286,7 +286,7 @@ check "a warning's range ends on its own statement" '"range":{"start":{"line":21
 
 count=$((count + 1))
 echo "> CLI prints the warnings, and --no-warn suppresses them"
-warn_out=$("$VALK" build "$DIR/warn.valk" -o "$workdir/warn" 2>&1)
+warn_out=$("$VALK" build "$DIR/warn.valk" 2>&1)
 warn_out=$(printf '%s' "$warn_out" | normalize_paths)
 warn_count=$(printf '%s\n' "$warn_out" | grep -c 'never used')
 if [ "$warn_count" -ne 3 ]; then
@@ -303,7 +303,7 @@ case "$warn_out" in
         failed=1
         ;;
 esac
-nowarn_out=$("$VALK" build "$DIR/warn.valk" --no-warn -o "$workdir/warn-nw" 2>&1)
+nowarn_out=$("$VALK" build "$DIR/warn.valk" --no-warn 2>&1)
 case "$nowarn_out" in
     *"never used"*)
         echo "# --no-warn should suppress every warning"
@@ -319,7 +319,7 @@ check "warns about unreachable code" '"severity":2,"message":"Unreachable code: 
 
 count=$((count + 1))
 echo "> flow warnings do not fire on the cases that read their variable"
-flow_out=$("$VALK" build "$DIR/warn-flow.valk" -o "$workdir/warn-flow" 2>&1)
+flow_out=$("$VALK" build "$DIR/warn-flow.valk" 2>&1)
 flow_count=$(printf '%s\n' "$flow_out" | grep -cE 'never read|Unreachable|never used')
 if [ "$flow_count" -ne 2 ]; then
     echo "# warn-flow.valk should report 2 warnings, got $flow_count"
@@ -329,7 +329,7 @@ fi
 
 count=$((count + 1))
 echo "> conditionally compiled code is not reported as unused"
-cond_out=$("$VALK" build "$DIR/warn-conditional.valk" -o "$workdir/warn-cond" 2>&1)
+cond_out=$("$VALK" build "$DIR/warn-conditional.valk" 2>&1)
 case "$cond_out" in
     *"never used"*)
         echo "# A reference inside a compiled-out branch still counts as a reference"
