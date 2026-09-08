@@ -205,26 +205,33 @@ each arr as value, index {}
 Full `Array` API: [core](api.md#core)
 
 Use `arr.sort()` for elements that support ordering. Other element types require
-a comparator, such as `rows.sort(fn(a: Slice[int], b: Slice[int]) bool { return a[0] > b[0] })`.
+a comparator, such as `rows.sort(fn(a: &[int], b: &[int]) bool { return a[0] > b[0] })`.
 The comparator returns true when `a` should come after `b`.
 
-Use container methods to allocate storage, resize containers, and create views.
-Writing the raw storage fields of an `array` or `slice`, including their length,
-requires `@unsafe`, even in the source that declares the type.
+Fresh slice storage is a language form, not a class: `[u8 x n]{ 0 }` allocates
+`n` zero bytes and returns the `&mut [u8]` that owns them, `[int]{ 1, 2, 3 }`
+allocates from a list. `[T x n]{}` skips the fill and is only safe when every
+zero `T` is a valid value; for reference elements it requires `@unsafe`.
+Container methods resize containers and create views. Writing the raw storage
+fields of an `array` or `slice`, including their length, requires `@unsafe`,
+even in the source that declares the type.
 
 `arr[i]` on an `Array` of structs hands out a copy of the element, because the
 array's storage can move when it grows. Assigning into that copy, or calling a
 method that changes it, is a compile error; borrow the element with
-`&mut arr[i]`, write through a writable view (`arr.view()`, `Slice`,
+`&mut arr[i]`, write through a writable view (`arr.view()` returns an
 `&mut [T]`), or store the changed struct back with `arr.set(i, value)`.
 
 A borrow only reads unless it says `mut`: `&[T]` and `&T` are read-only
 views, `&mut [T]` and `&mut T` may be written through. A slice type declared
 with `$immutable`, like `String`, is read-only everywhere outside its own class. Any slice, array or
 string converts to `&[T]`, so `fn write(data: &[u8])` accepts strings, byte
-buffers and slices without copying, while `fn read(buf: Slice[u8])` needs
+buffers and slices without copying, while `fn read(buf: &mut [u8])` needs
 writable storage. Assigning through a read-only borrow, taking `&mut` of one
 of its elements, or calling a method that changes it is a compile error.
+A named slice such as `String` or your own `slice Bytes of u8 {}` converts to
+the bare forms, never the other way around, and two different names never
+convert to each other: a name is a promise only its own class can keep.
 
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
@@ -242,7 +249,7 @@ elements with `value`:
 ```rust
 let values = Array[int]{ 1, 2, 3, 4 }
 let copy = values[1 .. 2]  // Array[int], independent of values
-let view = &values[1 .. 2] // Slice[int] over the same elements
+let view = &values[1 .. 2] // &mut [int] over the same elements
 view[0] = 20               // values is now { 1, 20, 3, 4 }
 ```
 
@@ -848,7 +855,7 @@ Use `valk.fs` for file-system operations.
 Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
 from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
 reader, writer and closer, `ByteReader`
-reads from a `String`, `ByteBuffer` or `Slice[u8]`, and a `ByteBuffer` is a
+reads from a `String`, `ByteBuffer` or `&[u8]`, and a `ByteBuffer` is a
 writer that collects everything written to it. `io.copy` moves everything from a reader
 into a writer:
 
@@ -1245,7 +1252,7 @@ use valk.net
 // Server
 fn server() {
     let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
-    let buffer = Slice[u8].new(1000, 0)
+    let buffer = [u8 x 1000]{ 0 }
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
@@ -1276,7 +1283,7 @@ fn main() {
     // Send
     con.write("PING") ! panic("Client failed to send data")
     // Recv
-    let buffer = Slice[u8].new(1000, 0)
+    let buffer = [u8 x 1000]{ 0 }
     let bytes = con.read(buffer) ! panic("Client failed to read from connection")
     println("# Client received: " + buffer.view(0, bytes).to_string())
     con.close() ! panic("Failed to close connection")

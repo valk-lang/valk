@@ -118,7 +118,7 @@ refer to the same class object.
 The following types have reference identity and are assigned by reference:
 
 - `class` values.
-- `Array[T]` and `Slice[T]`.
+- `Array[T]`.
 - Interface values.
 - Coroutine handles.
 - Non-inline/manual pointers to structs.
@@ -176,13 +176,13 @@ Valk distinguishes three sequence categories:
 | Type | Storage | Copy behavior | Resize |
 | --- | --- | --- | --- |
 | `[T x N]` | Inline elements | Copies all elements | No |
-| `Array[T]` | GC-managed reference to `Slice[T]` storage | Copies the reference | Yes |
+| `Array[T]` | GC-managed reference to `&[T]` storage | Copies the reference | Yes |
 | `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
-| `Slice[T]`, `String` | `&[T]` with a class attached | Copies the borrow | No |
 | `&mut [T]` | The same borrow, writable | Copies the borrow | No |
+| `String`, `slice X of T` | `&[T]` with a class attached | Copies the borrow | No |
 
 Fixed arrays store their elements inline. `Array` is a GC reference type that
-owns resizable element storage. That storage is a `Slice[T]` block: a header
+owns resizable element storage. That storage is an `&[T]` block: a header
 with the slot count followed by the elements, traced by the block itself. The
 array is `{ data, size, length }`: `data` is the block, `size` its slot count,
 and the elements start at the block's storage header offset. Growth
@@ -192,25 +192,37 @@ operation that drops an element clears its slot, so the array never keeps a
 removed element reachable.
 
 `&array[i]` borrows one element as `&T` with the storage block as owner, and
-the same works on `Slice[T]` and `&[T]`; `&view[a..b]` borrows a range of an
+the same works on named slices; `&view[a..b]` borrows a range of an
 `&[T]` as `&[T]`. A class `$offset` or `$range` hook takes precedence for
 `value[i]` and `value[a..b]`, and a `$view` hook for `&value[a..b]`, which is
 how `&array[a..b]` reaches `array.view(start, length)`: it
-returns a `Slice[T]` over the array's block without copying. The view shares the elements it covers, observes in-place
+returns an `&mut [T]` over the array's block without copying. The view shares the elements it covers, observes in-place
 writes through the array, and survives the array growing because it keeps the
 block it was taken from. A view keeps its whole block alive, including slots
 past the elements it covers. `array.slice(...)` still copies.
 
-A `slice X of T` class is an `&[T]` with methods: the same three words
+Fresh slice storage comes from the language itself. `[T x n]{ v }` allocates
+`n` elements filled with `v` and hands back the `&mut [T]` that owns them;
+`n` may be any runtime value. `[T]{ a, b, c }` allocates from a list. Both
+allocate exactly once and never need `@unsafe`. `[T x n]{}` leaves the storage
+zeroed, which is safe when all-zero bytes are a valid `T` (numbers, and
+aggregates of them) and requires `@unsafe` otherwise, because a zero slot of a
+reference type is an empty slot. `[T]{ owner: o, data: p, length: n }`
+describes existing storage and always requires `@unsafe`; it is how the
+library builds views such as `array.view` and `buffer.spare`. The methods of
+`&[T]` live in `extend &[T] { ... }` blocks in the core library, and the
+compiler declares the type they extend; there is no class named `Slice`.
+
+A `slice X of T` class is an `&[T]` with a name attached: the same three words
 (`owner`, element pointer, `length`), the same GC handling, and the same
-bounds policy. `Slice[T]` and `String` are the two in the core library. A
-value converts implicitly between a named slice and `&[T]` in both directions
-when the element types agree, so a function taking `Slice[T]` accepts any
-`&[T]`. `String` is the exception in both directions: its storage always
-carries a terminating zero byte so `data_cstring` is valid, which an arbitrary
-`&[u8]` cannot promise, so a bare view never becomes a `String` implicitly;
-and a string is immutable, so it only ever converts to a read-only view.
-Two different named slices stay distinct: `String` is not `Slice[u8]`.
+bounds policy. `String` is the one in the core library. The name is a
+promise that only the class itself can make, so conversions run one way: a
+named slice converts implicitly to `&[T]`, and a writable one to `&mut [T]`,
+but no bare view ever becomes a named slice, and two different names never
+convert to each other. `@cast` is the only way through. `String` storage
+always carries a terminating zero byte so `data_cstring` is valid, which an
+arbitrary `&[u8]` cannot promise; and a string is immutable, so it only ever
+converts to a read-only view.
 
 A bare borrow only reads. `&T` and `&[T]` are read-only views of their
 storage; `&mut T` and `&mut [T]` are the writable forms, with the same words
@@ -220,20 +232,19 @@ assignment, no `&mut` re-borrows, no `$offset_assign` hook, no conversion to a
 writable view, and methods that write to their receiver are rejected. The
 class's own methods may still write through unsafe pointers to build values.
 `String` is declared that way, which is what makes strings immutable. A writable borrow converts to the read-only one
-implicitly and never back, except through `@cast`; `Slice[T]` converts to
-both, `String` only to `&[u8]`, and `String.view` hands out `&[u8]`. Through a
+implicitly and never back, except through `@cast`; `String` converts only to
+`&[u8]`, and `String.view` hands out `&[u8]`. Through a
 read-only borrow, assignment to the storage or to an inline aggregate inside
 it, `++`, `&mut` re-borrows, and methods that write to their receiver are
 compile errors. A class object reached through a borrow is an ordinary object:
 `ref.field = x` on `&Box` writes the object, not the borrowed slot. A bare
-`&[T]` offers the read-only methods of `Slice[T]`; a borrow handed back by a
+`&[T]` offers only the methods that read; a borrow handed back by a
 method on a read-only borrow is read-only too. `stack T` stays the exclusive
 frame borrow, writable by construction. Functions that only read take `&[u8]`,
 so string literals and shared strings pass to them without a copy; functions
-that fill a buffer take `Slice[u8]` or `&mut [u8]`. A newly initialized
-`Slice[T]` owns fixed-length element storage, while `slice.view(offset,
-length)` creates a bounded alias of that storage without allocating or
-copying elements. There is no anonymous `slice[T]` type.
+that fill a buffer take `&mut [u8]`. `[u8 x n]{ 0 }` owns fresh fixed-length
+storage, while `slice.view(offset, length)` creates a bounded alias of
+existing storage without allocating or copying elements.
 
 Indexing has one policy for every native sequence. A class hook comes first:
 `$offset`, `$offset_assign`, `$range`, and `$view` on the class define the operation
@@ -243,7 +254,7 @@ length and panics when it is out of bounds. A native read of a non-nullable
 reference element also panics when the slot is empty: storage can be
 zero-filled or cleared by a removal, and the language never hands out an empty
 slot as a valid reference. This applies to `Array[T]`,
-`Slice[T]`, `&[T]`, and named unbound pointers alike. The `get` and `set`
+`&[T]`, named slices, and named unbound pointers alike. The `get` and `set`
 methods remain the fallible forms that return `LookupError`. For assignment,
 `Array[length] = value` appends. Fixed arrays use checked inline indexing and
 reject a known invalid index at compile time.
@@ -498,7 +509,7 @@ of the slot first, while `ref[0]` addresses the slot, so `ref[0] = other` and
 `&[T]` is the sequence form: an owned borrow plus a visible length, without a
 class. Indexing and ranges are checked against `length` and panic when out of
 bounds. `each` iterates it natively. It converts from `&[T x N]`, from a fixed
-array inside an owner, and to and from any `Slice[T]` or `String` value: the
+array inside an owner, and from any `String` or other named slice value: the
 named slices are `&[T]` with a class, so the conversion is a retype.
 
 An owned borrow is an alias into `owner`, and its owner word is part of the
@@ -542,7 +553,7 @@ either.
 
 An owned borrow points into its owner's storage, which must not relocate.
 Valid owners are class objects, and structs or fixed arrays inlined in them,
-plus `Slice` and `String` storage, and the storage blocks of arrays. An
+plus slice and `String` storage, and the storage blocks of arrays. An
 element borrowed out of an `Array[T]` names the block as its owner, so it
 stays valid when the array grows, although it then points into the old block.
 
@@ -773,7 +784,7 @@ operation such as `close`.
 - Natural padding is inserted before fields and at the end of aggregates.
 - `packed` suppresses normal inter-field padding for a struct.
 - Classes, arrays, and coroutines are reference-sized values.
-- Slices contain a backing reference, an element pointer, and a visible
+- Named slices contain a backing reference, an element pointer, and a visible
   length: the same three words as `&[T]`.
 - Closures and interfaces are two pointers.
 - Fixed arrays contain `N` consecutive elements.

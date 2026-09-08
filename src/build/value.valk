@@ -742,6 +742,9 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if kind == VALUE_KIND.class_init {
         return value_from_class_init_exp(exp, scope, ctx) !>
     }
+    if kind == VALUE_KIND.slice_init {
+        return value_from_slice_init_exp(exp, scope, ctx) !>
+    }
     if kind == VALUE_KIND.offset {
         return value_from_offset_exp(exp, scope, ctx) !>
     }
@@ -1995,6 +1998,21 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
         let hook: ?Func = null
         if isset(slice_class) {
             hook = access.kind == VALUE_KIND.bracket_range ? slice_class.get_range_hook() : resolve_offset_get_func(slice_class)
+        } else if access.kind == VALUE_KIND.bracket_range {
+            // `view[a..b]` copies like every other `value[a..b]`, after the
+            // native bounds check; `&view[a..b]` is the view itself
+            let element = slice_t.get_sub_type() ?! exp.bug("Slice borrow has no element type")
+            let bare = bare_slice_class(b, element, exp) !>
+            let part = bare.get_range_hook() ?! exp.bug("core '&[T]' has no '$range' method")
+            let checked = value_from_ref_slice_offset(on, access, scope, ctx, exp) !>
+            let setup = Array[Value]{}
+            let rooted = value_bind_once(checked, ctx, exp, setup, true)
+            let uint_t = type_from_core(b, "uint") !>
+            let receiver = vgen_cast(rooted, bare.get_type() !>)
+            receiver.exp = on.exp
+            let length = value_owned_borrow_length(rooted, ctx) !>
+            let copy = value_call_range_hook(receiver, part, vgen_int(0, uint_t), length, scope, ctx, exp) !>
+            return vgen_scoped_value(setup, value_retype_bare_slice(copy, element.ref_slice().mut_type(), exp), exp)
         }
         if !isset(hook) : return value_from_ref_slice_offset(on, access, scope, ctx, exp) !>
     }
@@ -2712,6 +2730,137 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
 
     // List / map init: construct empty, then $append / $set_key
     return value_from_class_init_hooks(target_class, rett, elem_exps, pair_exps, scope, ctx, exp) !>
+}
+
+// The core `slice &[T]` class specialized for one element type: the methods
+// and the storage layout behind every bare `&[T]`.
+fn bare_slice_class(b: Build, element: Type, at: Exp) Class !Error {
+    let idf = valk_idf(b, "core", "&") !>
+    let base = idf.class ?! at.bug("core '&' is not a class")
+    return base.specialize(Array[Type]{ element }, at) !>
+}
+
+// A value typed as the `slice &[T]` class becomes the plain `&mut [T]` it is
+fn value_retype_bare_slice(value: Value, rett: Type, at: Exp) Value {
+    let retyped = vgen_cast(value, value.rett.is_nullable_type() ? rett.nullable() : rett)
+    retyped.exp = at
+    return retyped
+}
+
+// Zero-filled storage of `count` elements, owned by the result.
+fn bare_slice_alloc(class: Class, rett: Type, count: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let fields = HashMap[Prop, Value]{}
+    let length_prop = class.get_prop_by_name("length") ! at.bug("Bare slice class has no 'length'")
+    fields.set(length_prop, count)
+    let init = class_init_construct(class, class.get_type() !>, fields, scope, ctx, at) !>
+    return value_retype_bare_slice(init, rett, at)
+}
+
+// All-zero bytes are a valid value: numbers, and aggregates of them.
+fn type_zero_is_valid(type: Type) bool {
+    let t = type.get_non_nullable()
+    if type.is_nullable_type() : return true
+    return !t.has_gc_refs() && !t.is_pointer() && t.kind != TYPE.interface && t.kind != TYPE.closure
+}
+
+// `[T x n]{ v }` fills n elements with v, `[T]{ a, b }` lists them,
+// `[T x n]{}` leaves the storage zeroed and `[T]{ owner:, data:, length: }`
+// describes existing storage. Every form is a fresh `&mut [T]`.
+fn value_from_slice_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let b = ctx.build
+    let type_exp = exp.get(VALUE_EXP.left) ?! exp.bug("slice_init is missing its element type")
+    let body = exp.get(VALUE_EXP.right) ?! exp.bug("slice_init is missing its body")
+    let count_exp = exp.get(VALUE_EXP.third)
+    let element = type_from_exp(type_exp, scope) !>
+    type_validate_sequence_element(element, type_exp) !>
+    let class = bare_slice_class(b, element, exp) !>
+    let class_type = class.get_type() !>
+    let rett = element.ref_slice().mut_type()
+    let uint_t = type_from_core(b, "uint") !>
+
+    let items_exp = parse_body_as_class_init_fields(body) !>
+    let expanded = ClassInitItems {}
+    append_class_init_item_range(expanded, items_exp, 0, 4294967295, scope, ctx) !>
+    if expanded.pairs.length > 0 : exp.error("A slice has no map entries")
+    let elems = expanded.elems
+    let fields = expanded.fields
+
+    if fields.length > 0 {
+        if elems.length > 0 : exp.error("Cannot mix fields with list entries in a slice initializer")
+        if isset(count_exp) : exp.error("A view over existing storage has no count; drop 'x n'")
+        require_unsafe(exp, scope, "A view over existing storage") !>
+        let fvals = HashMap[Prop, Value]{}
+        each fields as fexp, i {
+            let field_scope = expanded.field_scopes.get(i) ! exp.bug("Missing slice-init field scope")
+            let name = fexp.str1
+            if name != "owner" && name != "data" && name != "length" {
+                fexp.error("A view is described by 'owner', 'data' and 'length', not '" + name + "'")
+            }
+            let prop = class.get_prop_by_name(name) ! fexp.bug("Bare slice class is missing '" + name + "'")
+            if fvals.has(prop) : fexp.error("'" + name + "' is already set in this view")
+            let vexp = fexp.get(VALUE_EXP.left) ?! fexp.bug("slice-init field is missing its value")
+            let fv = value_from_exp(vexp, field_scope, ctx.with_suggested_type(prop.type).for_direct_init()) !>
+            fv = value_try_convert(fv, field_scope, ctx, prop.type) !>
+            prop.type.compat_check(fv.rett, vexp) !>
+            fvals.set(prop, fv)
+        }
+        if fvals.length != 3 : exp.error("A view over existing storage needs 'owner', 'data' and 'length'")
+        let view = vgen_class_init(ctx, class, fvals, class_type, exp) !>
+        return value_retype_bare_slice(view, rett, exp)
+    }
+
+    if isset(count_exp) {
+        let count = value_from_exp(count_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        count = value_try_convert(count, scope, ctx, uint_t) !>
+        uint_t.compat_check(count.rett, count_exp) !>
+        if elems.length > 1 {
+            exp.error("'[T x n]{ ... }' takes one value that fills every element; list the elements without a count instead")
+        }
+        let fill: ?Value = null
+        let elem_exp = elems.get(0) !? null
+        if isset(elem_exp) {
+            let vexp = elem_exp.get(VALUE_EXP.left) ?! elem_exp.bug("element is missing its value")
+            let ev = value_from_exp(vexp, scope, ctx.with_suggested_type(element)) !>
+            ev = value_try_convert(ev, scope, ctx, element) !>
+            element.compat_check(ev.rett, vexp) !>
+            // Fresh storage is already zero
+            let is_zero = (ev.type == VAL.int && ev.int_val == 0) || (ev.type == VAL.float && ev.float_val == 0.0) || ev.type == VAL.null
+            if !is_zero : fill = ev
+        } else if !type_zero_is_valid(element) {
+            require_unsafe(exp, scope, "Zeroed storage of '" + element.compat_display_name() + "' elements") !>
+        }
+        if !isset(fill) : return bare_slice_alloc(class, rett, count, scope, ctx, exp) !>
+        let fill_f = class.get_func("fill") ?! exp.bug("Bare slice class has no 'fill'")
+        if !fill_f.parsed_types : parse_func_types(fill_f) !>
+        let callee = vgen_func(fill_f)
+        let args = Array[Value]{ count, fill }
+        value_check_call_args(fill_f, callee, args, scope, ctx, exp) !>
+        let call = vgen_call(ctx, callee, args, fill_f.get_rett(), scope)
+        call.exp = exp
+        return value_retype_bare_slice(call, rett, exp)
+    }
+
+    let storage = bare_slice_alloc(class, rett, vgen_int(elems.length.to(int), uint_t), scope, ctx, exp) !>
+    if elems.length == 0 : return storage
+    let write_f = class.get_func("write_init") ?! exp.bug("Bare slice class has no 'write_init'")
+    if !write_f.parsed_types : parse_func_types(write_f) !>
+    let setup = Array[Value]{}
+    let rooted = value_bind_once(storage, ctx, exp, setup, true)
+    each elems as eexp, i {
+        let vexp = eexp.get(VALUE_EXP.left) ?! eexp.bug("element is missing its value")
+        let ev = value_from_exp(vexp, scope, ctx.with_suggested_type(element)) !>
+        ev = value_try_convert(ev, scope, ctx, element) !>
+        element.compat_check(ev.rett, vexp) !>
+        let receiver = vgen_cast(rooted, class_type)
+        receiver.exp = exp
+        let callee = vgen_func(write_f, receiver)
+        let args = Array[Value]{ vgen_int(i.to(int), uint_t), ev }
+        value_check_call_args(write_f, callee, args, scope, ctx, eexp) !>
+        let call = vgen_call(ctx, callee, args, write_f.get_rett(), scope)
+        call.exp = eexp
+        setup.append(call)
+    }
+    return vgen_scoped_value(setup, rooted, exp)
 }
 
 // `Array[T]{ a, b }` / `Map[T]{ k => v }` — empty construct + hook calls.
@@ -3775,12 +3924,10 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             length.exp = exp
             return length
         }
-        // Everything else is what `Slice[T]` offers over the same three words;
-        // a read-only borrow keeps the methods that write out of reach
+        // Everything else is declared by core's `slice &[T]` over the same
+        // three words; a read-only borrow keeps the methods that write out of reach
         let element = on_nn.rett.get_sub_type() ?! exp.bug("Slice borrow has no element type")
-        let slice_idf = valk_idf(b, "core", "Slice") !>
-        let slice_base = slice_idf.class ?! exp.bug("Slice is not a class")
-        let slice_class = slice_base.specialize(Array[Type]{ element }, exp) !>
+        let slice_class = bare_slice_class(b, element, exp) !>
         let as_slice = vgen_cast(on_nn, slice_class.get_type() !>)
         as_slice.exp = on_nn.exp
         on_nn = as_slice
