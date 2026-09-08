@@ -9,6 +9,14 @@ case "$(uname -s)" in
     MINGW*|MSYS*) EXE_SUFFIX=".exe" ;;
 esac
 
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT="timeout 120"
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT="gtimeout 120"
+else
+    TIMEOUT=""
+fi
+
 workdir=$(mktemp -d)
 case "$(uname -s)" in
     MINGW*|MSYS*) workdir=$(cygpath -m "$workdir") ;;
@@ -438,7 +446,7 @@ deep_src="$workdir/deep.valk"
 deep_exe="$workdir/deep$EXE_SUFFIX"
 build_deep() {
     local expected="$1"
-    if ! timeout 120 "$VALK" build "$deep_src" --no-warn -o "$deep_exe"; then
+    if ! $TIMEOUT "$VALK" build "$deep_src" --no-warn -o "$deep_exe"; then
         echo "# Generated input failed to compile: $deep_src"
         exit 1
     fi
@@ -468,7 +476,7 @@ for form in paren block call index ternary; do
         index) echo "fn main() { let s = [int x 2]{ 0, 1 } let a = $(repeat 's[' 3000)0$(repeat ']' 3000) println(a) }" > "$deep_src" ;;
         ternary) echo "fn main() { let a = $(repeat 'true ? 1 : ' 3000)2 println(a) }" > "$deep_src" ;;
     esac
-    deep_out=$(timeout 120 "$VALK" build "$deep_src" --no-warn -o "$deep_exe" 2>&1)
+    deep_out=$($TIMEOUT "$VALK" build "$deep_src" --no-warn -o "$deep_exe" 2>&1)
     deep_status=$?
     if [ "$deep_status" -ne 1 ] || [[ "$deep_out" != *"nesting too deep"* ]]; then
         echo "# Deep $form input did not report its nesting (exit $deep_status)"
