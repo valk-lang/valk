@@ -14,6 +14,10 @@ fn parse_func_ast(func: Func) !Error {
     // Errors in a specialized body point back at the instantiation
     let chain = func_push_instantiations(func)
     defer func_pop_instantiations(func, chain)
+    let b = func.ns.build
+    let prev_depth = b.generic_depth
+    b.generic_depth = func_generic_depth(func)
+    defer func_restore_generic_depth(b, prev_depth)
 
     let body = func.body
     if !isset(body) {
@@ -529,6 +533,10 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if names.length > rhs_parts.length {
         exp.error("Right side of '=' does not return enough values for the declared variables")
     }
+    // A call may bind only its leading results; a written tuple binds all of them
+    if rhs.type == VAL.multi && isset(rhs.values) && names.length < rhs_parts.length {
+        exp.error("A tuple of " + rhs_parts.length + " values cannot be bound to " + names.length + " variable(s); declare a name for each value")
+    }
 
     let statements = Array[Value]{}
     let i: uint = 0
@@ -614,6 +622,9 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
         }
         retv = value_from_exp(value_exp, scope, ctx.with_suggested_type(rett)) !>
         retv.require_result() !>
+        // A `$throw` or `$exit` call never hands back a value: the call is
+        // the whole statement and the `return` after it is unreachable
+        if retv.rett.is_void_type() && retv.never_returns : return retv
         // Skip when returned type is still void (incomplete typing)
         if !retv.rett.is_void_type() {
             // A shared-receiver variant only exists because the receiver is
@@ -898,6 +909,10 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
         exp.error("Left side of assignment is not assignable")
     }
     if (left.type == VAL.prop || left.type == VAL.ptrv) && value_is_copied_element(left) {
+        let copy = value_copied_element_decl(left)
+        if isset(copy) {
+            exp.error("Cannot assign into '" + (copy.name ?? "?") + "': 'each' binds a copy of each struct element; write through the index instead, with '&mut arr[i]' or '.set' on an Array")
+        }
         exp.error("Cannot assign into an element copied out of an Array; borrow it with '&mut arr[i]' or store the element back with '.set'")
     }
     if (left.type == VAL.prop || left.type == VAL.ptrv) && value_in_readonly_view(left, ctx) {
@@ -972,41 +987,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                 decl_track_value(decl, right) !>
             }
         } else {
-            // Ask before marking the escape: marking consumes the value's
-            // uniqueness, and a value that was unique adds no alias to the
-            // owner — it simply moves in.
-            let right_unique = value_has_unique_graph(right) !>
-            // Writing a value back into the graph it already came from keeps it
-            // inside that graph, so nothing escapes.
-            let owner_value = left.value1
-            let stays_inside = (left.type == VAL.prop || left.type == VAL.ptrv)
-                && isset(owner_value) && value_stays_inside(right, owner_value)
-            if stays_inside : value_invalidate_unique(right)
-            else : value_mark_actual_escape(right)
-            if left.type == VAL.prop || left.type == VAL.ptrv {
-                let owner = left.value1
-                if isset(owner) && right_unique && !stays_inside : value_link_stored_graph(right, owner)
-                if isset(owner) && !left.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
-                let locked_owner = isset(owner) && owner.rett.get_non_nullable().is_locked
-                if locked_owner && right.rett.get_non_nullable().is_locked && !right_unique && !stays_inside {
-                    exp.error("Data under one lock cannot be stored under another lock")
-                }
-                if !right_unique && !stays_inside {
-                    if isset(owner) {
-                        // When the stored value came in through a parameter,
-                        // whether this costs the owner its uniqueness depends on
-                        // what the caller passed. Record the edge and let the
-                        // call site decide.
-                        let sources = value_summary_source_args(right, ctx.get_func() !>)
-                        if !isset(sources) && locked_owner {
-                            exp.error("Only a provably unique value graph can be stored in locked data of type '" + owner.rett.compat_display_name() + "'; a mutable alias may remain")
-                        }
-                        value_absorb_param_sources(owner, sources, ctx.get_func() !>)
-                    }
-                }
-                // What moves into locked data is published with it
-                if locked_owner && !stays_inside : value_publish_unique(right, ctx) !>
-            }
+            value_track_stored_graph(left, right, ctx, exp) !>
         }
     }
 
@@ -1023,6 +1004,45 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     }
 
     return vgen_store(left, right, op, ctx, scope, exp) !>
+}
+
+// Escape and uniqueness bookkeeping for `storage = right` where storage is a
+// property or an element slot
+fn value_track_stored_graph(left: Value, right: Value, ctx: Context, exp: Exp) !Error {
+    // Ask before marking the escape: marking consumes the value's
+    // uniqueness, and a value that was unique adds no alias to the
+    // owner — it simply moves in.
+    let right_unique = value_has_unique_graph(right) !>
+    // Writing a value back into the graph it already came from keeps it
+    // inside that graph, so nothing escapes.
+    let owner_value = left.value1
+    let stays_inside = (left.type == VAL.prop || left.type == VAL.ptrv)
+        && isset(owner_value) && value_stays_inside(right, owner_value)
+    if stays_inside : value_invalidate_unique(right)
+    else : value_mark_actual_escape(right)
+    if left.type != VAL.prop && left.type != VAL.ptrv : return
+    let owner = left.value1
+    if isset(owner) && right_unique && !stays_inside : value_link_stored_graph(right, owner)
+    if isset(owner) && !left.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
+    let locked_owner = isset(owner) && owner.rett.get_non_nullable().is_locked
+    if locked_owner && right.rett.get_non_nullable().is_locked && !right_unique && !stays_inside {
+        exp.error("Data under one lock cannot be stored under another lock")
+    }
+    if !right_unique && !stays_inside {
+        if isset(owner) {
+            // When the stored value came in through a parameter,
+            // whether this costs the owner its uniqueness depends on
+            // what the caller passed. Record the edge and let the
+            // call site decide.
+            let sources = value_summary_source_args(right, ctx.get_func() !>)
+            if !isset(sources) && locked_owner {
+                exp.error("Only a provably unique value graph can be stored in locked data of type '" + owner.rett.compat_display_name() + "'; a mutable alias may remain")
+            }
+            value_absorb_param_sources(owner, sources, ctx.get_func() !>)
+        }
+    }
+    // What moves into locked data is published with it
+    if locked_owner && !stays_inside : value_publish_unique(right, ctx) !>
 }
 
 fn value_from_stmt_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
@@ -1125,7 +1145,12 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     let on_exp = exp.get(EACH_EXP.on)
     if !isset(on_exp) : exp.bug("each is missing the iterated value")
 
-    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    let on = value_from_exp(on_exp, scope, ctx.for_group_receiver()) !>
+    let on_group = on.get_group()
+    if isset(on_group) {
+        let hint = on_group.name == "utf8" ? " (e.g. each str.utf8.chars() as ch)" : ""
+        on_exp.error("Cannot use 'each' on group '" + on_group.name + "'. Iterate a value returned by one of its functions instead" + hint)
+    }
     let on_nn = value_try_remove_nullable(on, scope, ctx) !>
     if on_nn.rett.is_nullable_type() {
         on_exp.error("Cannot use 'each' on a nullable type: " + on_nn.rett.compat_display_name())
@@ -1259,6 +1284,8 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         let item_type = item_types.get(i) ! exp.bug("Missing each item type")
         let decl = Decl.new(ctx.get_func() !>, item_type, false, name)
         decl.lock_scope = scope_find_lock(scope)
+        // A struct element is read out of the storage by value
+        if native && item_type.is_inline_type() : decl.copied_element = true
         decl_track_value(decl, part) !>
         decl.exp = exp
         bind_decls.append(decl)
@@ -1351,6 +1378,7 @@ fn value_from_lock_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         body = body_values_from_nested(ctx, lock_scope, state, body_exp) !>
     }
     if lock_scope.did_return : scope.did_return = true
+    scope.absorb_removed(lock_scope)
     return vgen_lock_block(vgen_block(prelude, b, exp), body, release, b, exp)
 }
 
@@ -1392,6 +1420,7 @@ fn value_from_block_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp)
     let body = scope.sub_scope()
     let vals = body_values_from_nested(ctx, body, state, exp) !>
     if body.did_return : scope.did_return = true
+    scope.absorb_removed(body)
     return vgen_block(vals, b, exp)
 }
 

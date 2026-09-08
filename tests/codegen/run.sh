@@ -208,7 +208,7 @@ if [[ "$suspending_address_body" != *"alloca"* ]] \
     exit 1
 fi
 
-echo "> Reserve 1 MiB Windows coroutine stacks with a 32 KiB commit"
+echo "> Reserve Windows coroutine stacks with a 32 KiB commit"
 
 windows_coro_ir="$workdir/windows-coro-stack.ll"
 out=$(ir_result "$windows_coro_ir")
@@ -219,7 +219,7 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-if ! grep -q 'call ptr @"CreateFiberEx"(i64 32768, i64 1048576, i32 1,' "$windows_coro_ir" \
+if ! grep -q 'call ptr @"CreateFiberEx"(i64 32768, i64 %' "$windows_coro_ir" \
     || grep -q 'valk_stack_swap' "$windows_coro_ir"; then
     echo "# Windows coroutines did not use the expected native fiber stack"
     grep -E 'CreateFiberEx|valk_stack_swap' "$windows_coro_ir" || true
@@ -652,8 +652,8 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     definitions=$(grep -E '^define .*__(noinline_frame|noinline_generic|NoinlineCounter__(increment|clone))__' "$flags_ir")
     count=$(grep -c '^define ' <<< "$definitions")
     inline_definition=$(grep '^define .*__inline_increment__' "$flags_ir")
-    if [ "$count" -lt 7 ] || grep -qv ' noinline {' <<< "$definitions" \
-        || [[ "$inline_definition" != *' alwaysinline {'* ]]; then
+    if [ "$count" -lt 7 ] || grep -qv ' noinline' <<< "$definitions" \
+        || [[ "$inline_definition" != *' alwaysinline'* ]]; then
         echo "# Inlining controls were lost on $target"
         echo "$definitions"
         echo "$inline_definition"

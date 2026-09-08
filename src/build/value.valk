@@ -373,6 +373,10 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     value.never_returns = value.never_returns || scope.did_return
     scope.did_return = did_return || value.never_returns
+    let group = value.get_group()
+    if isset(group) && !ctx.is_group_receiver {
+        exp.error("'" + group.name + "' is a group of functions, not a value. Use one of its functions instead")
+    }
     return value
 }
 
@@ -911,15 +915,19 @@ fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
 fn value_check_co_lock_escape(call: Value, callee: Value, at: Exp) !Error {
     let receiver = callee.type == VAL.func ? callee.value1 : null
-    if isset(receiver) && receiver.rett.has_locked_refs() {
-        at.error("A locked view cannot be handed to a coroutine; it is only valid inside its lock block")
-    }
+    if isset(receiver) : value_check_co_arg(receiver, at) !>
     let args = call.values
     if !isset(args) : return
-    each args as arg {
-        if arg.rett.has_locked_refs() {
-            at.error("A locked view cannot be handed to a coroutine; it is only valid inside its lock block")
-        }
+    each args as arg : value_check_co_arg(arg, at) !>
+}
+
+fn value_check_co_arg(arg: Value, at: Exp) !Error {
+    if arg.rett.has_locked_refs() {
+        at.error("A locked view cannot be handed to a coroutine; it is only valid inside its lock block")
+    }
+    // The coroutine may outlive the frame that owns the borrowed storage
+    if arg.is_implicit_borrow() {
+        at.error("A stack borrow cannot be handed to a coroutine; it may outlive the frame that owns the storage. Use an owned borrow ('&object.field') or pass a copy")
     }
 }
 
@@ -1100,6 +1108,11 @@ fn value_from_func_lit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     f.info_used = enclosing.info_used
     f.unit.functions.append(f)
     parse_func_types(f) !>
+    if shared {
+        let thread_bound = type_has_coroutine_handle(f.get_rett(), Array[Class]{})
+        each f.args as a : if type_has_coroutine_handle(a.type, Array[Class]{}) : thread_bound = true
+        if thread_bound : exp.error("A shared function cannot take or return a coroutine handle; it is bound to the thread that created it")
+    }
     parse_func_ast(f) !>
     if !f.capture_free : enclosing.note_gc_allocation()
 
@@ -1145,6 +1158,9 @@ fn value_from_vscope_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if state.has_open_if() || state.is_skipping() {
         exp.error("Missing compile macro '#end' in value scope")
     }
+    // The body always falls through into its returned value
+    let removed = sub.not_null_removed
+    if isset(removed) : each removed as decl : scope.clear_not_null(decl)
 
     let rett = sub.vscope_rett
     if !isset(rett) || returns.length == 0 || !sub.did_return {
@@ -3139,6 +3155,8 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let covered_enum_values = Array[Value]{}
     let covered_null_case = false
     let on_non_nullable = on.rett.get_non_nullable()
+    let error_type: ?ErrorType = on_non_nullable.kind == TYPE.error_code && !on_non_nullable.error_is_instance ? on_non_nullable.get_error_type() : null
+    let covered_error_codes = Array[String]{}
     if on_non_nullable.kind == TYPE.union : union_type = on_non_nullable
     let all_cases_return = true
 
@@ -3235,6 +3253,13 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                     }
                     covered_enum_values.append(item)
                 }
+                if isset(error_type) && item.type == VAL.error_value && item.get_string().length > 0 {
+                    let code = item.get_string()
+                    if covered_error_codes.contains(code) {
+                        item_exp.error("Duplicate error code match case: '" + code + "' is already handled")
+                    }
+                    covered_error_codes.append(code)
+                }
                 cond = value_compare_values(subject, item, VALUE_OP.eq, scope, ctx, item_exp) !>
                 if subject != on {
                     let bool_t = type_bool(ctx.build)
@@ -3285,6 +3310,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             if isset(value) : case_prefix.append(value)
             if !case_scope.did_return : all_cases_return = false
         }
+        scope.absorb_removed(case_scope)
         cases.append(casev)
     }
 
@@ -3306,6 +3332,11 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         } else if isset(enum_type) {
             exhaustive = (enum_match_is_exhaustive(enum_type, covered_enum_values, ctx, exp) !>)
                 && (!subject_nullable || covered_null_case)
+        } else if isset(error_type) {
+            exhaustive = !subject_nullable || covered_null_case
+            each error_type.codes as code {
+                if !covered_error_codes.contains(code) : exhaustive = false
+            }
         }
         if !exhaustive {
             exp.error("The match statement must have a 'default' case because it does not cover all values")
@@ -3373,6 +3404,8 @@ fn value_from_int_literal(exp: Exp, b: Build) Value !Error {
         let un = text.to_uint() ! exp.error("Invalid integer: " + exp.str1)
         n = un.to(int)
     }
+    // A literal past the signed range is unsigned
+    if n < 0 && exp.kind == VALUE_KIND.number : return vgen_int(n, type_from_core(b, "uint") !>)
     return vgen_int(n, type_int(b))
 }
 
@@ -3694,7 +3727,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
     }
 
-    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    let on = value_from_exp(on_exp, scope, ctx.for_group_receiver()) !>
     let name = exp.str1
 
     if on.type == VAL.property_meta {
@@ -4099,6 +4132,18 @@ fn value_is_copied_element(value: Value) bool {
     return value_is_copied_element(inner)
 }
 
+// The `each` variable this storage was copied into, if any
+fn value_copied_element_decl(value: Value) ?Decl {
+    let kind = value.type
+    if kind == VAL.decl {
+        let decl = value.decl ?! return null
+        return decl.copied_element ? decl : null
+    }
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : return null
+    let inner = value.value1 ?! return null
+    return value_copied_element_decl(inner)
+}
+
 // A type whose storage may not be written from here: a read-only borrow, or
 // an `$immutable` slice outside the class that declares it
 fn type_is_readonly_here(type: Type, ctx: Context) bool {
@@ -4106,7 +4151,26 @@ fn type_is_readonly_here(type: Type, ctx: Context) bool {
     if !nn.is_readonly_view() : return false
     let c = nn.class ?! return true
     let func = ctx.func ?? (ctx.get_func() !? null)
-    return !isset(func) || func.class != c
+    if !isset(func) : return true
+    // Only the declaring class itself may write; a mode or an extension from
+    // another package is not the class
+    let fc = func.class ?! return true
+    let rep = c.representation_class()
+    if fc.representation_class() != rep : return true
+    let src_ns = func.exp.src.ns ?! return true
+    return src_ns.pkg != rep.ns.pkg
+}
+
+// A property holding inline storage that is read-only from where it is used.
+// An object or raw pointer read out of the property is not the property.
+fn value_is_readonly_property(value: Value) bool {
+    if value.type != VAL.prop : return false
+    let prop = value.prop ?! return false
+    let at = value.exp ?! return false
+    let stored = prop.type.get_non_nullable()
+    if stored.is_gc_type() || stored.kind == TYPE.interface || stored.kind == TYPE.closure
+        || stored.is_raw_pointer() || stored.kind == TYPE.ptr_of || stored.is_struct_object() : return false
+    return act_level(at, prop.act, prop.exp) == ACT.readonly
 }
 
 // Whether this storage sits behind a read-only borrow: an element read out
@@ -4151,6 +4215,10 @@ fn value_readonly_hint(value: Value, ctx: Context) String {
         let nn = current.rett.get_non_nullable()
         let c = nn.class
         if isset(c) && c.immutable && nn.is_readonly_view() : return "'" + c.pretty_name() + "' is an immutable slice type"
+        if value_is_readonly_property(current) {
+            let prop = current.prop
+            return "property '" + (isset(prop) ? (prop.name ?? "?") : "?") + "' is read-only here"
+        }
         let kind = current.type
         if kind == VAL.multi : current = current.value1
         else if kind == VAL.prop || kind == VAL.ptrv || kind == VAL.wrap || kind == VAL.cast || kind == VAL.ptr_of : current = current.value1
@@ -4162,6 +4230,7 @@ fn value_readonly_hint(value: Value, ctx: Context) String {
 // Whether the value itself is a read-only borrow or lives behind one
 fn value_is_readonly_storage(value: Value, ctx: Context) bool {
     if type_is_readonly_here(value.rett, ctx) : return true
+    if value_is_readonly_property(value) : return true
     return value_in_readonly_view(value, ctx)
 }
 
@@ -4171,7 +4240,7 @@ fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value 
     if !func.is_static && isset(receiver) && isset(receiver_arg) && receiver_arg.type.is_stack_borrow() {
         if !func.is_generic_base && !func.has_generic_args {
             let copied = value_is_copied_element(receiver)
-            let readonly = value_in_readonly_view(receiver, ctx)
+            let readonly = value_is_readonly_storage(receiver, ctx)
             receiver = value_struct_receiver(receiver, receiver_arg.type, ctx)
             if copied : receiver.ensure_meta().copied_element = true
             if readonly : receiver.ensure_meta().readonly_element = true
@@ -4707,6 +4776,10 @@ fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Bu
         // Other type optional: unresolved → false (conversion hooks not ready)
         let other = (args.get(0) ! at.bug("Missing $can_convert_to arg")).as_type()
         if !isset(other) : return vgen_bool(false, type_bool(b))
+        // `$to` hooks are registered while parsing method types; the source
+        // class may not have reached that point yet
+        let source_class = t.get_non_nullable().get_class_or_null()
+        if isset(source_class) : class_parse_own_func_types(source_class) !>
         return vgen_bool(t.can_convert_to(other), type_bool(b))
     }
 
@@ -5131,7 +5204,7 @@ fn value_from_string_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let string_type = type_string(ctx.build)
     let inner = strip_quotes(exp.str1)
     if exp.bool1 || !inner.contains("%") {
-        let text = exp.bool1 ? inner : inner.unescape()
+        let text = exp.bool1 ? inner : string_literal_unescape(inner, exp) !>
         let v = vgen_string(text, string_type)
         v.exp = exp
         return v
@@ -5162,14 +5235,8 @@ fn value_from_string_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if inner.get(expr_start) == '{' {
             expr_start++
             expr_end = expr_start
-            let depth: uint = 1
-            while expr_end < inner.length && depth > 0 {
-                let ch = inner.get(expr_end)
-                if ch == '{' : depth++
-                else if ch == '}' : depth--
-                if depth > 0 : expr_end++
-            }
-            if depth != 0 : exp.error("Missing '}' in string interpolation")
+            expr_end = interpolation_end(inner, expr_start)
+            if expr_end >= inner.length : exp.error("Missing '}' in string interpolation")
         } else {
             let ch = inner.get(expr_end)
             if !ch.is_alpha() && ch != '_' {
@@ -5185,7 +5252,7 @@ fn value_from_string_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
 
         if marker > literal_start {
-            let literal = inner.part(literal_start, marker - literal_start).unescape()
+            let literal = string_literal_unescape(inner.part(literal_start, marker - literal_start), exp) !>
             let added = value_try_add_hook(result, vgen_string(literal, string_type), scope, ctx, exp) !>
             if !isset(added) : exp.bug("String does not have a compatible '$add' hook")
             result = added
@@ -5221,13 +5288,106 @@ fn value_from_string_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
 
     if literal_start < inner.length {
-        let literal = inner.part(literal_start, inner.length - literal_start).unescape()
+        let literal = string_literal_unescape(inner.part(literal_start, inner.length - literal_start), exp) !>
         let added = value_try_add_hook(result, vgen_string(literal, string_type), scope, ctx, exp) !>
         if !isset(added) : exp.bug("String does not have a compatible '$add' hook")
         result = added
     }
     result.exp = exp
     return result
+}
+
+// Index of the '}' closing the `%{` whose body starts at `i`, or the length
+// when it is missing. Braces inside nested strings and chars do not count.
+fn interpolation_end(inner: String, i: uint) uint {
+    let len = inner.length
+    let depth: uint = 1
+    while i < len {
+        let ch = inner.get(i)
+        if ch == '"' {
+            i++
+            while i < len {
+                let c = inner.get(i++)
+                if c == '\\' : i++
+                else if c == '"' : break
+            }
+            continue
+        }
+        if ch == '\'' {
+            i += (i + 1 < len && inner.get(i + 1) == '\\') ? 4 : 3
+            continue
+        }
+        if ch == '{' : depth++
+        else if ch == '}' {
+            if --depth == 0 : return i
+        }
+        i++
+    }
+    return len
+}
+
+// Decodes the escapes of a string literal; the tokenizer only skipped them.
+fn string_literal_unescape(text: String, exp: Exp) String !Error {
+    if !text.contains("\\") : return text
+    let buf = ByteBuffer.new()
+    let i: uint = 0
+    while i < text.length {
+        let ch = text.get(i++)
+        if ch != '\\' {
+            buf.write_byte(ch)
+            continue
+        }
+        if i >= text.length : exp.error("Missing escape character after '\\' in string")
+        let e = text.get(i++)
+        if e == 'n' : buf.write_byte('\n')
+        else if e == 'r' : buf.write_byte('\r')
+        else if e == 't' : buf.write_byte('\t')
+        else if e == 'f' : buf.write_byte('\f')
+        else if e == 'b' : buf.write_byte('\b')
+        else if e == 'v' : buf.write_byte('\v')
+        else if e == 'a' : buf.write_byte('\a')
+        else if e == 'e' : buf.write_byte(27)
+        else if e == '0' : buf.write_byte(0)
+        else if e == '\\' || e == '"' || e == '\'' || e == '%' : buf.write_byte(e)
+        else if e == 'x' {
+            let hex = text.part(i, 2)
+            if hex.length != 2 || !hex.get(0).is_hex() || !hex.get(1).is_hex() : exp.error("Escape '\\x' needs two hex digits, like '\\x1f'")
+            buf.write_byte((hex.hex_to_uint() ! exp.bug("Invalid hex escape")).to(u8))
+            i += 2
+        } else if e == 'u' {
+            if i >= text.length || text.get(i) != '{' : exp.error("Escape '\\u' needs a code point in braces, like '\\u{1F600}'")
+            let end = i + 1
+            while end < text.length && text.get(end) != '}' : end++
+            if end >= text.length : exp.error("Missing '}' after '\\u{' in string")
+            let hex = text.part(i + 1, end - i - 1)
+            if hex.length == 0 || hex.length > 6 : exp.error("Escape '\\u{...}' needs 1 to 6 hex digits")
+            let code = hex.hex_to_uint() ! exp.error("Invalid hex digits in '\\u{" + hex + "}'")
+            if code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) : exp.error("Code point '\\u{" + hex + "}' is not a valid unicode scalar value")
+            write_utf8_bytes(buf, code.to(u32))
+            i = end + 1
+        } else {
+            exp.error("Unknown escape sequence '\\" + e.to_ascii_string() + "' in string")
+        }
+    }
+    return buf.to_string()
+}
+
+fn write_utf8_bytes(buf: ByteBuffer, code: u32) {
+    if code < 0x80 {
+        buf.write_byte(code.to(u8))
+    } else if code < 0x800 {
+        buf.write_byte((0xC0 | (code >> 6)).to(u8))
+        buf.write_byte((0x80 | (code & 0x3F)).to(u8))
+    } else if code < 0x10000 {
+        buf.write_byte((0xE0 | (code >> 12)).to(u8))
+        buf.write_byte((0x80 | ((code >> 6) & 0x3F)).to(u8))
+        buf.write_byte((0x80 | (code & 0x3F)).to(u8))
+    } else {
+        buf.write_byte((0xF0 | (code >> 18)).to(u8))
+        buf.write_byte((0x80 | ((code >> 12) & 0x3F)).to(u8))
+        buf.write_byte((0x80 | ((code >> 6) & 0x3F)).to(u8))
+        buf.write_byte((0x80 | (code & 0x3F)).to(u8))
+    }
 }
 
 // Best-effort single-byte value from a char token like 'a' or '\n'.

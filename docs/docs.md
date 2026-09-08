@@ -31,6 +31,7 @@
 * [Interfaces](#interfaces)
 * [Generics](#generics)
 * [Modes](#modes)
+* [Traits](#traits)
 * [Globals](#globals)
 * [Aliases](#aliases)
 * [Tokens](#tokens)
@@ -111,11 +112,19 @@ valk build main.valk -o ./main
 ./main
 ```
 
+`main` can take the command line arguments; the first one is the program path.
+
+```rust
+fn main(args: Array[String]) {
+    each args as arg : println(arg)
+}
+```
+
 ## Types
 
 Integer types: `int`, `uint`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`
 
-Float types: `float`, `f32`, `f64`
+Float types: `float`, `f32`, `f64`. Float literals may use an exponent: `2.5e-3`, `1e10`
 
 Built-in classes: `String`, `Array`, `Map`, `HashMap`
 
@@ -152,7 +161,7 @@ let count = 5                  // Inferred as int
 let unsigned: uint = 5         // Explicit type
 let converted = count.to(uint)
 let text: String = count       // Converted to String automatically
-let parsed = "100".to(u8)
+let parsed = "100".to(u8) !? 0 // Parsing text throws SyntaxError: not a number, or outside the u8 range
 ```
 
 Unary `-` accepts any integer or floating-point expression, including variables,
@@ -180,6 +189,8 @@ s.part(start_index, length) String // Sub string using byte offsets
 let middle = s[1 .. 3] // Same as s.part(1, 3): three bytes starting at byte offset 1
 s.utf8.length // Length in Unicode characters
 s.utf8.part(start_index, length) String // Sub string using character offsets
+each s.utf8.chars() as ch { } // Iterate Unicode characters (each `ch` is a String)
+each s as byte { } // Iterate bytes (u8)
 ```
 
 Full `String` API: [core](api.md#core)
@@ -359,6 +370,14 @@ fn main() {
 ```
 
 Calls evaluate the callable or method receiver first, then arguments from left to right. `co` uses the same order before starting the coroutine.
+
+Command line arguments are passed to `main` when it declares an `Array[String]` argument (the first item is the program path):
+
+```rust
+fn main(args: Array[String]) {
+    each args as arg : println(arg)
+}
+```
 
 Append `$inline` to request inlining, or `$noinline` to prevent it:
 
@@ -748,6 +767,36 @@ enum can be read, but cannot be modified or borrowed separately. Methods must
 leave that storage unchanged and must not expose a writable alias. Copy to the
 underlying type before modifying its fields or calling a mutating method.
 
+## Traits
+
+A trait is a set of methods that classes and structs can copy into their own
+body with `use`. Traits can be generic.
+
+```rust
+trait Greeter {
+    fn greet() String {
+        return "Hello " + this.name
+    }
+}
+trait Wrapper[T] {
+    fn wrap(value: T) Array[T] {
+        return Array[T]{ value }
+    }
+}
+
+class Person {
+    name: String
+    use Greeter
+    use Wrapper[String]
+}
+
+fn main() {
+    let p = Person { name: "Ada" }
+    println(p.greet())          // Hello Ada
+    println(p.wrap("x").length) // 1
+}
+```
+
 ## Finalizers
 
 A class may define `gc_free()` to release raw or native resources when the GC
@@ -942,7 +991,8 @@ let name_str = name.string_value() ! panic("Json value must be a string")
 
 `json.from(value)` converts any value to a json.Value.
 `value.to_type[T]()` converts json.Value back to a Valk type and returns an
-error when the document does not match that type.
+error when the document does not match that type. Every field of `T` must be
+present unless it is nullable or declares an explicit default `(value)`.
 
 ```rust
 class User {
@@ -1023,6 +1073,8 @@ fn main() {
     await task
 }
 ```
+
+Every coroutine runs on its own 1 MB stack; `main` gets 8 MB. Exhausting it, for example with very deep recursion, ends the program with a `Stack overflow` panic; keep large buffers on the heap.
 
 
 ## Access types
@@ -1370,7 +1422,7 @@ Note: `valk.template` works at runtime and therefore cannot detect incorrect tem
 
 ## Crypto
 
-Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256, and secure random values.
+Supported utilities include bcrypt, BLAKE2b (`crypto.Blake2b.hash_string`), Base64, MD5, SHA-1, SHA-256, and secure random values.
 
 Password hashing/verify example:
 
@@ -1491,6 +1543,7 @@ fn main() {
     println(first.a)  // 5
     println(second.a) // 10
 
+    @unsafe // mem.free takes a raw pointer
     let pointer = mem.new[MyStruct](.{ a: 5, b: 100 })
     defer mem.free(pointer)
 }

@@ -98,6 +98,38 @@ if [ "$count" -eq 0 ]; then
     exit 1
 fi
 
+# Input that does not parse must fail and stay untouched
+for input in "$DIR"/invalid/*.valk; do
+    [ -f "$input" ] || continue
+    name=$(basename "$input")
+    count=$((count + 1))
+    actual="$workdir/invalid-$name"
+    cp "$input" "$actual"
+
+    cmd="$VALK build $actual --fmt --no-warn"
+    echo "> Run: $cmd"
+
+    set +e
+    out=$("$VALK" build "$actual" --fmt --no-warn 2>&1)
+    status=$?
+    set -e
+
+    if [ "$status" -eq 0 ]; then
+        echo "# --fmt accepted invalid input"
+        echo "- File: $name"
+        echo "- Output:"
+        echo "$out"
+        failed=1
+        continue
+    fi
+    if ! diff -u "$input" "$actual"; then
+        echo "# --fmt rewrote invalid input"
+        echo "- File: $name"
+        failed=1
+        continue
+    fi
+done
+
 echo ""
 if [ "$failed" -ne 0 ]; then
     echo "# Fmt tests failed"

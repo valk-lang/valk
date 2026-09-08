@@ -354,6 +354,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
+    + fn to_number[T]() T !SyntaxError
     + fn to_slice() &[u8]
     + fn to_string() String
     + fn to_uint() uint !SyntaxError
@@ -361,6 +362,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn unescape() String
     + fn upper() String
     + fn view(start_index: uint, length: uint) &[u8]
+}
+```
+
+```js
++ struct StringChars {
 }
 ```
 
@@ -374,6 +380,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 ```js
 + class bool {
+    + fn to_string() String
 }
 ```
 
@@ -755,11 +762,24 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 
 # coro
 
+## Aliases for 'coro'
+
+```js
++ value MAIN_STACK_SIZE (8 * 1024 * 1024)
+```
+
 ## Functions for 'coro'
 
 ```js
 + fn await_coro(coro: Coro) void
 + fn await_last() void
++ fn stack_guard_init(is_main: bool, stack_low: uint) void
+```
+
+## Globals for 'coro'
+
+```js
++ global next_stack_size : uint
 ```
 
 # crypto
@@ -1047,6 +1067,23 @@ alias pid_t for i32
 ```js
 + struct pthread_t {
     + data: uint
+}
+```
+
+```js
++ struct sigaction_t {
+    + flags: i32
+    + handler: ptr
+    + mask: [u64 x 16]
+    + restorer: ?ptr
+}
+```
+
+```js
++ struct stack_t {
+    + flags: i32
+    + size: uint
+    + sp: ptr
 }
 ```
 
@@ -1671,7 +1708,7 @@ alias Fd for i32
 + fn equal_bytes(a: ptr, b: ptr, length: uint) bool
 + fn find_char(view: &[u8], ch: u8) uint !LookupError
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
-+ fn free(value: $T) void
++ fn free(value: ptr) void
 + fn move(from: &[u8], to: &mut [u8]) uint
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
 + fn move_value[T](from: *T, to: *T) void
@@ -1935,9 +1972,14 @@ alias Fd for i32
 + class Url {
     + fragment: String
     + host: String
+    + password: String
     + path: String
+    + port: ?uint
     + query: String
     + scheme: String
+    + user: String
+
+    + fn host_with_port() String
 }
 ```
 

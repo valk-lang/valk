@@ -61,7 +61,8 @@ compile time is a compile error.
 
 The shift amount must be non-negative and less than the bit width of the left
 operand. A statically invalid shift is a compile error; a dynamically invalid
-shift is undefined behavior and receives no implicit runtime check.
+shift panics at runtime like a zero divisor. A literal amount needs no runtime
+check.
 
 Integer narrowing retains the least-significant bits. Signed and unsigned
 conversions preserve that bit pattern, extending with the source type's sign or
@@ -76,8 +77,9 @@ Floating-point addition, subtraction, multiplication, division, and comparisons
 follow IEEE 754, including its rules for infinities, signed zero, and NaN.
 Floating remainder is `x - trunc(x / y) * y`, so a nonzero result has the sign
 of `x`. Converting a finite, representable float to an integer truncates toward
-zero. Converting NaN, infinity, or a value outside the destination integer's
-range is undefined behavior and receives no implicit runtime check.
+zero. The conversion saturates: NaN becomes `0`, and infinity or a value
+outside the destination integer's range becomes the nearest representable
+bound.
 
 `bool` converts explicitly to numeric types as `0` or `1`. Numeric values do
 not convert to `bool` through `.to(bool)`; code must state the intended
@@ -534,22 +536,25 @@ the missing owner instead of the old "cannot be stored" errors.
 
 #### Conversions
 
-- `&T` converts to `stack T` in place; the layouts are the same and only the
-  escape rule changes.
+- `&mut T` converts to `stack T` in place; the layouts are the same and only
+  the escape rule changes. A read-only `&T` does not: a stack borrow is
+  writable by construction.
 - `stack T` does not convert to `&T` or `&[T]`.
 - `&[T x N]` converts to `&[T]`; `[T x N]` storage with an owner converts to
   either.
 - A raw pointer converts to `stack T` implicitly, as before, and to `&T` only
   through explicit `.@cast(&T)` under `@unsafe`.
-- Every borrow converts to `ptr` and to a matching `*T`; a bounded `*[T x N]`
-  takes exactly its own length. A raw pointer taken from a `stack T` keeps
+- Every writable borrow converts to `ptr` and to a matching `*T`; a bounded
+  `*[T x N]` takes exactly its own length. Read-only storage becomes a raw
+  pointer only under `@unsafe`. A raw pointer taken from a `stack T` keeps
   the frame rules: it may be passed to a pointer parameter but not stored.
 - `?&T` uses a null address as its empty state and costs no extra word.
   Equality on borrows compares addresses.
 
-The convention that follows: a function that only reads takes `stack T`, a
-function that may store takes `&T`, and callers may pass an owned borrow to
-either.
+The convention that follows: a function that only reads takes `&T`, a
+function that writes but does not keep the borrow takes `stack T`, and one
+that may store it takes `&mut T`. Callers may pass a writable owned borrow to
+any of them.
 
 #### Owners are fixed-size
 
@@ -736,6 +741,11 @@ The compiler generates layout-specific GC walking information:
 Inline aggregates may contain GC references. The compiler must preserve and
 walk those references wherever the aggregate is stored, copied, buffered, or
 returned.
+
+Exhausting a native or coroutine stack is reported as a `Stack overflow`
+panic on Linux and macOS: every stack ends in a guard page, large frames probe
+each page so they cannot skip it, and the fault handler runs on an alternate
+signal stack. Any other memory fault keeps its default action.
 
 Stack roots are found conservatively. The collector scans the native stacks
 of the thread and of its coroutines, plus the registers saved when a stack

@@ -3,6 +3,8 @@
 ////////////////////////////
 
 fn value_append_fact(v: Value, decl: Decl, is_set: bool) {
+    // A writable alias may store null between the check and the use
+    if is_set && decl.mut_borrowed : return
     let list = is_set ? v.get_issets() : v.get_not_issets()
     if !isset(list) {
         list = Array[Decl]{}
@@ -101,6 +103,8 @@ fn value_force_to(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) V
         c.exp = at
         return c
     }
+    let parsed = value_string_to_number(v, scope, ctx, target, at) !>
+    if isset(parsed) : return parsed
     let result = value_try_convert(v, scope, ctx, target, false) !>
     if target.compat(result.rett) {
         result.exp = at
@@ -108,6 +112,28 @@ fn value_force_to(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) V
     }
     at.error("Cannot convert value of type '" + result.rett.compat_display_name()
         + "' to: '" + target.compat_display_name() + "'")
+}
+
+// `"100".to(u8)` parses through String.to_number[T], a fallible call: text
+// that is not a number or does not fit the target throws SyntaxError
+fn value_string_to_number(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) ?Value !Error {
+    if !target.is_number_type() || target.is_bool_type() || target.is_nullable_type() : return null
+    if v.rett.is_nullable_type() : return null
+    let class = v.rett.get_class_or_null() ?! return null
+    if class != type_string(ctx.build).get_class_or_null() : return null
+    let base = class.get_func("to_number") ?! at.bug("String.to_number is missing")
+    if !base.parsed_types : parse_func_types(base) !>
+    let func = base.specialize(Array[Type]{ target }, at) !>
+    if !func.parsed_types : parse_func_types(func) !>
+    let receiver = value_read_borrowed_receiver(v, scope, ctx, at) !>
+    let callee = vgen_func(func, receiver)
+    let args = Array[Value]{}
+    value_check_call_args(func, callee, args, scope, ctx, at) !>
+    let call = vgen_call(ctx, callee, args, func.get_rett(), scope)
+    call.exp = at
+    call.can_error = true
+    call.set_error_type(func.error_type)
+    return call
 }
 
 fn value_retype_function(v: Value, kind: TYPE) Value {
@@ -609,8 +635,9 @@ fn value_consume_call_return_sources(value: Value) !Error {
 }
 
 fn func_unique_summary_unavailable_in_lsp(func: Func) bool {
+    let options = func.ns.build.options
     return !func.unique_summary_ready
-        && isset(func.ns.build.options.lsp)
+        && (isset(options.lsp) || options.is_fmt)
         && !lsp_should_parse_func_ast(func)
 }
 
@@ -1552,11 +1579,26 @@ fn value_try_convert(
     if target.is_void_type() : return v
     let result = v
 
+    // Read-only storage may only become a raw pointer under '@unsafe': the
+    // pointer could be written through
+    let raw_target = target.get_non_nullable()
+    let source_nn0 = result.rett.get_non_nullable()
+    if (raw_target.is_raw_pointer() || raw_target.kind == TYPE.ptr_of || raw_target.is_struct_object())
+        && !source_nn0.is_raw_pointer() && source_nn0.kind != TYPE.ptr_of && !source_nn0.is_struct_object()
+        && value_is_readonly_storage(result, ctx)
+    {
+        let at = result.exp
+        if isset(at) : require_unsafe(at, scope, "Converting read-only storage to a raw pointer") !>
+    }
+
     if target.kind == TYPE.closure && target.is_shared && result.rett.kind == TYPE.closure && !result.rett.is_shared {
         let receiver = result.value1
         let shared_receiver = result.type == VAL.func && isset(receiver)
             && receiver.rett.get_non_nullable().is_shared && !result.is_implicit_borrow()
         if value_is_capture_free_func(result) || shared_receiver {
+            if type_has_coroutine_handle(result.rett, Array[Class]{}) {
+                result.error("Cannot use this function as '" + target.compat_display_name() + "': a coroutine handle in its signature is bound to the thread that created it")
+            }
             result.rett = result.rett.shared_type()
         }
     }
@@ -1567,6 +1609,8 @@ fn value_try_convert(
         && isset(source_class) && source_class.kind == CLASS_KIND.class
         && !result.rett.is_nullable_type()
         && !result.rett.get_non_nullable().is_locked
+        // A shared object only becomes a shared interface value
+        && (!result.rett.get_non_nullable().is_shared || target.get_non_nullable().is_shared)
         && class_implements_interface(source_class, target_class)
     {
         let adapter = target_class.interface_adapters.get(interface_adapter_key(source_class)) !? null
@@ -1608,6 +1652,9 @@ fn value_try_convert(
             // it is created. One that only becomes shared because the object
             // holding it was published never got that check, so its captured
             // values could still be mutated from another thread.
+            if type_has_coroutine_handle(source_nn, Array[Class]{}) {
+                result.error("Cannot publish '" + target.compat_display_name() + "' as shared: it reaches a coroutine handle, which is bound to the thread that created it")
+            }
             if type_has_unpublishable_closure(source_nn, Array[Class]{}) {
                 let closure_prop = type_find_unpublishable_closure(source_nn, Array[Class]{})
                 let where = isset(closure_prop)
@@ -1756,6 +1803,12 @@ fn value_try_convert(
             c.exp = result.exp
             return c
         }
+        // A float literal takes the width of its target
+        if result.type == VAL.float && target.is_float_type() {
+            let lit = vgen_float(result.float_val, target)
+            lit.exp = result.exp
+            return lit
+        }
 
         if result.rett.is_integer_type() && target.is_float_type() {
             return vgen_cast(result, target)
@@ -1818,6 +1871,22 @@ fn value_balance_numbers(left: Value, right: Value, b: Build) ValuePair {
     let t2 = right.rett
     if !t1.is_number_type() || !t2.is_number_type() {
         return ValuePair { left: left, right: right }
+    }
+
+    // Two constants of different integer types: an untyped literal adopts the other's type
+    if left.type == VAL.int && right.type == VAL.int && !fold_integer_types_match(left, right) {
+        let left_plain = value_is_untyped_int_literal(left, b)
+        let right_plain = value_is_untyped_int_literal(right, b)
+        if right_plain && !left_plain && type_fits_int_literal(t1, right.int_val) {
+            let lit = vgen_int(right.int_val, t1)
+            lit.exp = right.exp
+            return ValuePair { left: left, right: lit }
+        }
+        if left_plain && !right_plain && type_fits_int_literal(t2, left.int_val) {
+            let lit = vgen_int(left.int_val, t2)
+            lit.exp = left.exp
+            return ValuePair { left: lit, right: right }
+        }
     }
 
     // Int literal soft-fit toward the other side first
@@ -1908,6 +1977,14 @@ fn type_ptr_uint(b: Build) Type {
 }
 
 // Can integer literal `v` be represented in integer type `t`? (old Type.fits_intv)
+// A number written in the source that was typed 'int' only for lack of a better type
+fn value_is_untyped_int_literal(v: Value, b: Build) bool {
+    let t = v.rett
+    if !t.is_integer_type() || !t.is_signed_type() || t.number_byte_size() != b.options.target.ptr_size.to(u32) : return false
+    let exp = v.exp ?! return false
+    return exp.type == EXP.value && (exp.kind == VALUE_KIND.number || exp.kind == VALUE_KIND.hex || exp.kind == VALUE_KIND.octal)
+}
+
 fn type_fits_int_literal(t: Type, v: int) bool {
     if !t.is_integer_type() : return false
     let bits = t.number_byte_size() * 8
@@ -1961,6 +2038,12 @@ fn func_call_arg(func: Func) Arg !LookupError {
 }
 
 fn class_get_add_hook(class: Class, rtype: Type) ?Func {
+    // Exact static type first, like compare hooks: a mode and its
+    // representation type are compatible but pick different hooks.
+    each class.add_hooks as func {
+        let arg = func_call_arg(func) ! continue
+        if type_identity_key(arg.type) == type_identity_key(rtype) : return func
+    }
     each class.add_hooks as func {
         let arg = func_call_arg(func) ! continue
         if arg.type.compat(rtype) : return func
@@ -2079,6 +2162,10 @@ fn value_from_short_circuit_exp(exp: Exp, left_exp: Exp, right_exp: Exp, op: VAL
     sub.apply_issets(facts)
     let right = value_from_exp(right_exp, sub, ctx.without_suggested_type()) !>
     value_check_logical_operand(right, exp) !>
+    // A fact the right side dropped (an assignment inside a value scope) no longer holds
+    let removed = sub.not_null_removed
+    if isset(removed) && isset(facts) : each removed as decl : facts.remove_value(decl)
+    scope.absorb_removed(sub)
 
     let result = value_try_fold_op(left, right, op, b) ?? vgen_op(left, right, op, type_bool(b))
     result.exp = exp
@@ -2546,6 +2633,8 @@ fn value_from_ternary_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if isset(suggested_type) && !else_scope.did_return {
         v2 = value_try_convert(v2, else_scope, ctx, suggested_type) !>
     }
+    scope.absorb_removed(then_scope)
+    scope.absorb_removed(else_scope)
 
     if then_scope.did_return || else_scope.did_return {
         if then_scope.did_return && else_scope.did_return : scope.did_return = true

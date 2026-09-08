@@ -33,7 +33,18 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     out.append_text("\"\n\n")
     out.append_text("declare void @llvm.memset.inline.p0.i64(ptr, i8, i64, i1)\n")
     out.append_text("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n")
-    out.append_text("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n\n")
+    out.append_text("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n")
+    let int_types = Array[String]{ "i8", "i16", "i32", "i64" }
+    let float_types = Array[String]{ "float", "double" }
+    let convs = Array[String]{ "fptosi", "fptoui" }
+    each int_types as int_type {
+        each float_types as float_type {
+            each convs as conv {
+                out.append_text("declare " + int_type + " @llvm." + conv + ".sat." + int_type + "." + float_type + "(" + float_type + ")\n")
+            }
+        }
+    }
+    out.append_text("\n")
 
     each unit.string_values as value, i {
         if !(unit.string_used.get(i) !? false) : continue
@@ -582,6 +593,8 @@ fn generate_func_ir(func: Func) !Error {
     if func.is_inline : ir.code.append_text(" alwaysinline")
     if func.is_noinline : ir.code.append_text(" noinline")
     if func.is_hot : ir.code.append_text(" hot")
+    // Probe every page of a large frame so an overflow always hits the guard page
+    if func.ns.build.options.target.os != "win" : ir.code.append_text(" \"probe-stack\"=\"inline-asm\"")
     ir.code.append_text(" {\n")
     ir.label("entry")
 
@@ -1847,7 +1860,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         return value.int_val
     }
     if t == VAL.float {
-        let rendered = ir_float_constant(value.float_val)
+        let rendered = ir_float_constant(value.float_val, value.rett)
         if value.rett.is_tagged_nullable() {
             return ir_build_tagged_nullable(ir, value.rett, rendered) !>
         }
@@ -2340,7 +2353,10 @@ fn ir_emit_match_case(
 ////////////////////////////
 
 // LLVM reads a double constant from its exact bit pattern, whatever its size
-fn ir_float_constant(f: f64) String {
+fn ir_float_constant(value: f64, type: Type) String {
+    // LLVM wants a 'float' constant as the double that it rounds to exactly
+    let f = value
+    if type.get_non_nullable().number_byte_size() == 4 : f = value.to(f32).to(f64)
     let bits = @ptrv(@ref(f), u64, 0)
     return "0x" + bits.to_hex().pad_left('0', 16)
 }
@@ -4311,14 +4327,15 @@ fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) Stri
 // Integer division by zero, and the signed minimum divided by -1, would trap
 // the process: both panic with a message instead
 fn ir_emit_division_guard(ir: IRFunc, irt: String, left: String, right: String, type: Type) !Error {
-    // A literal divisor was checked at compile time
+    // A literal divisor was checked at compile time, except -1 which still overflows at the minimum
     let first = right.bytes > 0 ? right.get(0) : 0
-    if first.is_number() || first == '-' : return
-    let bad = ir_emit_binary_instruction(ir, "icmp eq", irt, right, "0")
+    let literal = first.is_number() || first == '-'
+    if literal && !(right == "-1" && type.is_signed_type()) : return
+    let bad = literal ? "false" : ir_emit_binary_instruction(ir, "icmp eq", irt, right, "0")
     if type.is_signed_type() {
         let bits = type.number_byte_size() * 8
         let min = bits >= 64 ? "-9223372036854775808" : ("-" + (1.to(u64) << (bits - 1).to(u64)).to_string())
-        let minus_one = ir_emit_binary_instruction(ir, "icmp eq", irt, right, "-1")
+        let minus_one = literal ? "true" : ir_emit_binary_instruction(ir, "icmp eq", irt, right, "-1")
         let at_min = ir_emit_binary_instruction(ir, "icmp eq", irt, left, min)
         let overflow = ir_emit_binary_instruction(ir, "and", "i1", minus_one, at_min)
         bad = ir_emit_binary_instruction(ir, "or", "i1", bad, overflow)
@@ -4328,6 +4345,23 @@ fn ir_emit_division_guard(ir: IRFunc, irt: String, left: String, right: String, 
     ir.cond_jump(bad, failed, valid)
     ir.label(failed)
     let panic_call = value_panic_call(Context.for_func(ir.func), "Integer division by zero or overflow", ir.func.exp) !>
+    ir_emit_stmt(ir, panic_call) !>
+    ir.jump(valid)
+    ir.label(valid)
+}
+
+// A shift count at or past the bit width is poison in LLVM, so it panics like a zero divisor
+fn ir_emit_shift_guard(ir: IRFunc, irt: String, right: String, type: Type) !Error {
+    // A literal count was checked at compile time
+    let first = right.bytes > 0 ? right.get(0) : 0
+    if first.is_number() || first == '-' : return
+    let bits = type.number_byte_size() * 8
+    let bad = ir_emit_binary_instruction(ir, "icmp uge", irt, right, bits.to_string())
+    let failed = ir.block("shift.invalid")
+    let valid = ir.block("shift.valid")
+    ir.cond_jump(bad, failed, valid)
+    ir.label(failed)
+    let panic_call = value_panic_call(Context.for_func(ir.func), "Shift count out of range", ir.func.exp) !>
     ir_emit_stmt(ir, panic_call) !>
     ir.jump(valid)
     ir.label(valid)
@@ -4405,8 +4439,10 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     else if op == VALUE_OP.bit_and || op == VALUE_OP.and : inst = "and"
     else if op == VALUE_OP.bit_or || op == VALUE_OP.or : inst = "or"
     else if op == VALUE_OP.bit_xor : inst = "xor"
-    else if op == VALUE_OP.shl : inst = "shl"
-    else if op == VALUE_OP.shr : inst = type.is_signed_type() ? "ashr" : "lshr"
+    else if op == VALUE_OP.shl || op == VALUE_OP.shr {
+        ir_emit_shift_guard(ir, irt, right, type) !>
+        inst = op == VALUE_OP.shl ? "shl" : (type.is_signed_type() ? "ashr" : "lshr")
+    }
     else : inst = "add"
 
     return ir_emit_binary_instruction(ir, inst, irt, left, right)
@@ -4452,7 +4488,13 @@ fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
     } else if from.is_integer_type() && to.is_float_type() {
         inst = from.is_signed_type() ? "sitofp" : "uitofp"
     } else if from.is_float_type() && to.is_integer_type() {
-        inst = to.is_signed_type() ? "fptosi" : "fptoui"
+        // Saturating: NaN becomes 0 and out-of-range values clamp instead of producing poison
+        let conv = to.is_signed_type() ? "fptosi" : "fptoui"
+        let out = ir.var()
+        ir.line_start()
+        ir.write(out + " = call " + tt + " @llvm." + conv + ".sat." + tt + "." + ft + "(" + ft + " " + value + ")")
+        ir.line_end()
+        return out
     }
 
     return ir_emit_convert(ir, inst, ft, value, tt)
