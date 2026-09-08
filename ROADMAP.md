@@ -5,13 +5,14 @@
 
 ```
 - Release 0.6.2
-~ Data race solution (Threads done via shared type, MutexValue not done)
 
-- Release 0.6.1
++ Release 0.6.1
 + Fix enum type bug
 + Fix missing gc roots for embedded files
 + Compiler optimizations
 + GC stack & scan rewrite
++ Data race solution
++ Improve slice syntax
 
 + Release 0.6.0
 + math namespace

@@ -2,8 +2,8 @@
 .DEFAULT_GOAL := valk
 .DELETE_ON_ERROR:
 
-VALKV := 0.6.0
-VERSION := 0.6.1
+VALKV := 0.6.1
+VERSION := 0.6.2
 
 SRC := $(wildcard src/*.valk src/*/*.valk)
 LIB_SRC := $(wildcard lib/src/*.valk lib/src/*/*.valk lib/src/*/*/*.valk lib/src/*/*/*/*.valk)
