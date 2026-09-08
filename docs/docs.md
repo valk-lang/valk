@@ -214,15 +214,16 @@ requires `@unsafe`, even in the source that declares the type.
 
 `arr[i]` on an `Array` of structs hands out a copy of the element, because the
 array's storage can move when it grows. Assigning into that copy, or calling a
-method that changes it, is a compile error; write through a view (`arr.view()`,
-`Slice`, `&[T]`), which addresses the element in place, or store the changed
-struct back with `arr.set(i, value)`.
+method that changes it, is a compile error; borrow the element with
+`&mut arr[i]`, write through a writable view (`arr.view()`, `Slice`,
+`&mut [T]`), or store the changed struct back with `arr.set(i, value)`.
 
-`const &[T]` and `const Slice[T]` are read-only views of the same storage.
-Any writable view converts to them, and a `String` converts only to them,
-so `fn write(data: const Slice[u8])` accepts strings, byte buffers and slices
-without copying. Assigning through a `const` view, borrowing one of its
-elements, or calling a method that changes the view is a compile error.
+A borrow only reads unless it says `mut`: `&[T]` and `&T` are read-only
+views, `&mut [T]` and `&mut T` may be written through. Any slice, array or
+string converts to `&[T]`, so `fn write(data: &[u8])` accepts strings, byte
+buffers and slices without copying, while `fn read(buf: Slice[u8])` needs
+writable storage. Assigning through a read-only borrow, taking `&mut` of one
+of its elements, or calling a method that changes it is a compile error.
 
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 

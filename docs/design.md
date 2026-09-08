@@ -179,7 +179,7 @@ Valk distinguishes three sequence categories:
 | `Array[T]` | GC-managed reference to `Slice[T]` storage | Copies the reference | Yes |
 | `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
 | `Slice[T]`, `String` | `&[T]` with a class attached | Copies the borrow | No |
-| `const &[T]`, `const Slice[T]` | The same borrow, read-only | Copies the borrow | No |
+| `&mut [T]` | The same borrow, writable | Copies the borrow | No |
 
 Fixed arrays store their elements inline. `Array` is a GC reference type that
 owns resizable element storage. That storage is a `Slice[T]` block: a header
@@ -212,15 +212,20 @@ carries a terminating zero byte so `data_cstring` is valid, which an arbitrary
 and a string is immutable, so it only ever converts to a read-only view.
 Two different named slices stay distinct: `String` is not `Slice[u8]`.
 
-`const` in front of a slice type (`const &[T]`, `const Slice[T]`) is a
-read-only view of the same storage: the same three words, no copy. A writable
-view converts to the `const` form implicitly and never back, except through
-`@cast`. `String` converts to `const &[u8]` and `const Slice[u8]`, and
-`String.view` hands out `const Slice[u8]`. Through a `const` view, element
-assignment, `&element` borrows, and methods that write to their receiver are
-compile errors; a slice of the receiver's own kind returned by a method on a
-`const` view is `const` too. Functions that only read bytes take the `const`
-form, so string literals and shared strings pass to them without a copy. A newly initialized
+A bare borrow only reads. `&T` and `&[T]` are read-only views of their
+storage; `&mut T` and `&mut [T]` are the writable forms, with the same words
+and the same lifetime rules. A writable borrow converts to the read-only one
+implicitly and never back, except through `@cast`; `Slice[T]` converts to
+both, `String` only to `&[u8]`, and `String.view` hands out `&[u8]`. Through a
+read-only borrow, assignment to the storage or to an inline aggregate inside
+it, `++`, `&mut` re-borrows, and methods that write to their receiver are
+compile errors. A class object reached through a borrow is an ordinary object:
+`ref.field = x` on `&Box` writes the object, not the borrowed slot. A bare
+`&[T]` offers the read-only methods of `Slice[T]`; a borrow handed back by a
+method on a read-only borrow is read-only too. `stack T` stays the exclusive
+frame borrow, writable by construction. Functions that only read take `&[u8]`,
+so string literals and shared strings pass to them without a copy; functions
+that fill a buffer take `Slice[u8]` or `&mut [u8]`. A newly initialized
 `Slice[T]` owns fixed-length element storage, while `slice.view(offset,
 length)` creates a bounded alias of that storage without allocating or
 copying elements. There is no anonymous `slice[T]` type.

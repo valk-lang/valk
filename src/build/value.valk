@@ -101,8 +101,8 @@ class ValueMeta {
     publishes_graph: bool (false)
     // An Array element read out by value: writes into it are lost
     copied_element: bool (false)
-    // An element of a const view: its slot is read-only
-    const_element: bool (false)
+    // An element read through a read-only borrow: its slot may not be written
+    readonly_element: bool (false)
     publication_holds: ?Array[?Decl] (null)
     publication_store: ?Value (null)
     init_prop: ?Prop (null)
@@ -473,7 +473,7 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             // a slice, or `&[T]` is borrowed with the storage block as owner.
             let base_exp = operand_exp.get(VALUE_EXP.left) ?! operand_exp.bug("offset is missing base")
             let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
-            let element_borrow = value_borrow_sequence_element(on, operand_exp, scope, ctx, exp) !>
+            let element_borrow = value_borrow_sequence_element(on, operand_exp, scope, ctx, exp, exp.bool1) !>
             if isset(element_borrow) : return element_borrow
             operand = value_from_offset_on(on, operand_exp, scope, ctx) !>
         } else {
@@ -485,7 +485,7 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             }
             act_check_assign(operand, exp, scope) !>
             value_check_shared_address(operand, exp) !>
-            return value_borrow_of(operand, scope, ctx, exp) !>
+            return value_borrow_of(operand, scope, ctx, exp, exp.bool1) !>
         }
         // Fold constants when possible
         operand = value_enum_representation(operand) !>
@@ -687,9 +687,9 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             exp.error("Cannot increment or decrement a nullable value; check it with isset first")
         }
         if value_is_copied_element(operand) {
-            exp.error("Cannot change an element copied out of an Array; use a Slice view or store the element back with '.set'")
+            exp.error("Cannot change an element copied out of an Array; borrow it with '&mut arr[i]' or store the element back with '.set'")
         }
-        if value_in_const_view(operand) : exp.error("Cannot change storage through a const view")
+        if value_in_readonly_view(operand) : exp.error("Cannot change storage through a read-only borrow; it needs '&mut'")
         value_mark_summary_write(operand)
         if operand.type == VAL.prop || operand.type == VAL.ptrv {
             let owner = operand.value1
@@ -2296,6 +2296,7 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     if on_t.is_fixed_array_type() || on_t.kind == TYPE.ptr_of || on_t.kind == TYPE.adr_of {
         if on.rett.is_nullable_type() : left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
     }
+    if value_is_readonly_storage(on) : left_exp.error("Cannot assign through a read-only borrow; it needs '&mut'")
     if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
         require_unsafe(left_exp, scope, "Offset access on an unbounded pointer") !>
     }
@@ -3771,7 +3772,15 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             length.exp = exp
             return length
         }
-        exp.error("Type '" + on_nn.rett.compat_display_name() + "' has no property or method named: '" + name + "'")
+        // Everything else is what `Slice[T]` offers over the same three words;
+        // a read-only borrow keeps the methods that write out of reach
+        let element = on_nn.rett.get_sub_type() ?! exp.bug("Slice borrow has no element type")
+        let slice_idf = valk_idf(b, "core", "Slice") !>
+        let slice_base = slice_idf.class ?! exp.bug("Slice is not a class")
+        let slice_class = slice_base.specialize(Array[Type]{ element }, exp) !>
+        let as_slice = vgen_cast(on_nn, slice_class.get_type() !>)
+        as_slice.exp = on_nn.exp
+        on_nn = as_slice
     }
     // Members of a borrow are the members of T. Properties are read through
     // the address; a method keeps the whole borrow as its receiver so a store
@@ -3938,30 +3947,39 @@ fn value_is_copied_element(value: Value) bool {
     return value_is_copied_element(inner)
 }
 
-// Whether this storage sits inside a read-only (`const`) view: an element
-// read out of one, or something reached through such a view
-fn value_in_const_view(value: Value) bool {
+// Whether this storage sits behind a read-only borrow: an element read out
+// of one, or something reached through one
+fn value_in_readonly_view(value: Value) bool {
     let meta = value.meta
-    if isset(meta) && meta.const_element : return true
+    if isset(meta) && meta.readonly_element : return true
     let kind = value.type
     if kind == VAL.multi {
+        // A borrow split into its words keeps its source in value1
+        let source = value.value1
+        if isset(source) && value_is_readonly_storage(source) : return true
         let parts = value.values ?! return false
         each parts as part {
-            if value_in_const_view(part) : return true
+            if value_in_readonly_view(part) : return true
         }
         return false
     }
-    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : return false
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast && kind != VAL.ptr_of : return false
     let inner = value.value1 ?! return false
-    if kind == VAL.prop && !inner.rett.is_inline_type() && !inner.rett.get_non_nullable().is_const : return false
-    return value_is_const_storage(inner)
+    if kind == VAL.prop {
+        // A class object reached through a borrow is an ordinary object;
+        // only inline storage (structs, fixed arrays) lives inside the borrow
+        let owner_t = inner.rett.get_non_nullable()
+        let stored = (owner_t.kind == TYPE.ref_of || owner_t.kind == TYPE.ref_slice || owner_t.kind == TYPE.stack_of)
+            ? (owner_t.get_sub_type() ?? owner_t) : owner_t
+        if stored.is_gc_type() || stored.kind == TYPE.interface || stored.kind == TYPE.closure : return false
+    }
+    return value_is_readonly_storage(inner)
 }
 
-// Whether the value itself is a const view or lives inside one
-fn value_is_const_storage(value: Value) bool {
-    let nn = value.rett.get_non_nullable()
-    if nn.is_const && nn.kind == TYPE.ref_slice : return true
-    return value_in_const_view(value)
+// Whether the value itself is a read-only borrow or lives behind one
+fn value_is_readonly_storage(value: Value) bool {
+    if value.rett.get_non_nullable().is_readonly_view() : return true
+    return value_in_readonly_view(value)
 }
 
 fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value {
@@ -4754,10 +4772,16 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             if isset(receiver_param) && receiver_param.type.is_stack_borrow() && value_is_copied_element(receiver)
                 && (func_writes_receiver(func) !>)
             {
-                at.error("Cannot call a method that changes its receiver on an element copied out of an Array; use a Slice view or store the element back with '.set'")
+                at.error("Cannot call a method that changes its receiver on an element copied out of an Array; borrow it with '&mut arr[i]' or store the element back with '.set'")
             }
-            if value_is_const_storage(receiver) && !func.is_static && (func_writes_receiver(func) !>) {
-                at.error("Cannot call a method that changes its receiver through a const view")
+            // A struct receiver lives inside the borrow and a slice method
+            // writes the slice's storage; a class or interface method works
+            // on the object the slot refers to
+            let func_class = func.class
+            let storage_receiver = (isset(receiver_param) && receiver_param.type.is_stack_borrow())
+                || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
+            if storage_receiver && value_is_readonly_storage(receiver) && (func_writes_receiver(func) !>) {
+                at.error("Cannot call a method that changes its receiver through a read-only borrow; it needs '&mut'")
             }
             let current = ctx.func
             if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {
