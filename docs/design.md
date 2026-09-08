@@ -201,15 +201,17 @@ writes through the array, and survives the array growing because it keeps the
 block it was taken from. A view keeps its whole block alive, including slots
 past the elements it covers. `array.slice(...)` still copies.
 
-Fresh slice storage comes from the language itself. `[T x n]{ v }` allocates
-`n` elements filled with `v` and hands back the `&mut [T]` that owns them;
-`n` may be any runtime value. `[T]{ a, b, c }` allocates from a list. Both
-allocate exactly once and never need `@unsafe`. `[T x n]{}` leaves the storage
+Fresh slice storage comes from the language itself. `[T]{ a, b, c }`
+allocates from a list and hands back the `&mut [T]` that owns the elements.
+`[T]{ v x n }` repeats `v` `n` times; `n` may be any runtime value. Both
+allocate exactly once and never need `@unsafe`. `[T]{ null x n }` leaves the storage
 zeroed, which is safe when all-zero bytes are a valid `T` (numbers, and
 aggregates of them) and requires `@unsafe` otherwise, because a zero slot of a
 reference type is an empty slot. `[T]{ owner: o, data: p, length: n }`
 describes existing storage and always requires `@unsafe`; it is how the
-library builds views such as `array.view` and `buffer.spare`. The methods of
+library builds views such as `array.view` and `buffer.spare`. The count
+belongs to the value, never to the type: `[T x N]{ a, b }` is a fixed array,
+an inline aggregate whose length `N` is part of its type. The methods of
 `&[T]` live in `extend &[T] { ... }` blocks in the core library, and the
 compiler declares the type they extend; there is no class named `Slice`.
 
@@ -242,7 +244,7 @@ compile errors. A class object reached through a borrow is an ordinary object:
 method on a read-only borrow is read-only too. `stack T` stays the exclusive
 frame borrow, writable by construction. Functions that only read take `&[u8]`,
 so string literals and shared strings pass to them without a copy; functions
-that fill a buffer take `&mut [u8]`. `[u8 x n]{ 0 }` owns fresh fixed-length
+that fill a buffer take `&mut [u8]`. `[u8]{ 0 x n }` owns fresh fixed-length
 storage, while `slice.view(offset, length)` creates a bounded alias of
 existing storage without allocating or copying elements.
 

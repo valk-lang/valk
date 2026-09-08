@@ -208,9 +208,9 @@ Use `arr.sort()` for elements that support ordering. Other element types require
 a comparator, such as `rows.sort(fn(a: &[int], b: &[int]) bool { return a[0] > b[0] })`.
 The comparator returns true when `a` should come after `b`.
 
-Fresh slice storage is a language form, not a class: `[u8 x n]{ 0 }` allocates
-`n` zero bytes and returns the `&mut [u8]` that owns them, `[int]{ 1, 2, 3 }`
-allocates from a list. `[T x n]{}` skips the fill and is only safe when every
+Fresh slice storage is a language form, not a class: `[int]{ 1, 2, 3 }`
+allocates from a list and returns the `&mut [int]` that owns the elements,
+`[u8]{ 0 x n }` repeats a value `n` times. `[T]{ null x n }` skips the fill and is only safe when every
 zero `T` is a valid value; for reference elements it requires `@unsafe`.
 Container methods resize containers and create views. Writing the raw storage
 fields of an `array` or `slice`, including their length, requires `@unsafe`,
@@ -239,7 +239,12 @@ A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, an
 let sizes: [int x 3] = { 1, 2, 3 }
 sizes[1] = 20
 println(sizes.length) // 3
+print_sizes([int x 3]{ 4, 5, 6 })
 ```
+
+`[T x N]{ ... }` writes a fixed array where a value is needed; `{ ... }`
+suffices when the type is already known, and `v...` repeats the last value
+to the end.
 
 Every range in Valk is a start offset and a length, never a start and an end,
 so there is no inclusive or exclusive bound to remember. `value[start .. length]`
@@ -1252,7 +1257,7 @@ use valk.net
 // Server
 fn server() {
     let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
-    let buffer = [u8 x 1000]{ 0 }
+    let buffer = [u8]{ 0 x 1000 }
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
@@ -1283,7 +1288,7 @@ fn main() {
     // Send
     con.write("PING") ! panic("Client failed to send data")
     // Recv
-    let buffer = [u8 x 1000]{ 0 }
+    let buffer = [u8]{ 0 x 1000 }
     let bytes = con.read(buffer) ! panic("Client failed to read from connection")
     println("# Client received: " + buffer.view(0, bytes).to_string())
     con.close() ! panic("Failed to close connection")
