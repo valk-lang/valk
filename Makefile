@@ -131,6 +131,11 @@ test-gc-debug: valk
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-debug --def "GC_DEBUG=1"
 	./debug/test-gc-debug
 
+test-release: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --release --def "GC_DEBUG=1" -o ./debug/test-release$(EXE_SUFFIX)
+	./debug/test-release$(EXE_SUFFIX)
+
 test-gc-shared-stress: valk
 	mkdir -p ./debug
 	./valk build ./tests/src/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress --def "GC_DEBUG=1"
@@ -282,4 +287,4 @@ clean:
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-debug test-gc-shared-stress test-lsp \
-	test-macos-build test-clang test-win test-win-build
+	test-macos-build test-clang test-release test-win test-win-build

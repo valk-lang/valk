@@ -204,13 +204,47 @@ each arr as value, index {}
 
 Full `Array` API: [core](api.md#core)
 
+Use `arr.sort()` for elements that support ordering. Other element types require
+a comparator, such as `rows.sort(fn(a: &[int], b: &[int]) bool { return a[0] > b[0] })`.
+The comparator returns true when `a` should come after `b`.
+
+Fresh slice storage is a language form, not a class: `[int]{ 1, 2, 3 }`
+allocates from a list and returns the `&mut [int]` that owns the elements,
+`[u8]{ 0 x n }` repeats a value `n` times. `[T]{ null x n }` skips the fill and is only safe when every
+zero `T` is a valid value; for reference elements it requires `@unsafe`.
+Container methods resize containers and create views. Writing the raw storage
+fields of an `array` or `slice`, including their length, requires `@unsafe`,
+even in the source that declares the type.
+
+`arr[i]` on an `Array` of structs hands out a copy of the element, because the
+array's storage can move when it grows. Assigning into that copy, or calling a
+method that changes it, is a compile error; borrow the element with
+`&mut arr[i]`, write through a writable view (`arr.view()` returns an
+`&mut [T]`), or store the changed struct back with `arr.set(i, value)`.
+
+A borrow only reads unless it says `mut`: `&[T]` and `&T` are read-only
+views, `&mut [T]` and `&mut T` may be written through. A slice type declared
+with `$immutable`, like `String`, is read-only everywhere outside its own class. Any slice, array or
+string converts to `&[T]`, so `fn write(data: &[u8])` accepts strings, byte
+buffers and slices without copying, while `fn read(buf: &mut [u8])` needs
+writable storage. Assigning through a read-only borrow, taking `&mut` of one
+of its elements, or calling a method that changes it is a compile error.
+A named slice such as `String` or your own `slice Bytes of u8 {}` converts to
+the bare forms, never the other way around, and two different names never
+convert to each other: a name is a promise only its own class can keep.
+
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
 ```rust
 let sizes: [int x 3] = { 1, 2, 3 }
 sizes[1] = 20
 println(sizes.length) // 3
+print_sizes([int x 3]{ 4, 5, 6 })
 ```
+
+`[T x N]{ ... }` writes a fixed array where a value is needed; `{ ... }`
+suffices when the type is already known, and `v...` repeats the last value
+to the end.
 
 Every range in Valk is a start offset and a length, never a start and an end,
 so there is no inclusive or exclusive bound to remember. `value[start .. length]`
@@ -220,7 +254,7 @@ elements with `value`:
 ```rust
 let values = Array[int]{ 1, 2, 3, 4 }
 let copy = values[1 .. 2]  // Array[int], independent of values
-let view = &values[1 .. 2] // Slice[int] over the same elements
+let view = &values[1 .. 2] // &mut [int] over the same elements
 view[0] = 20               // values is now { 1, 20, 3, 4 }
 ```
 
@@ -300,7 +334,7 @@ let value: Value = 42
 println(describe(value))
 ```
 
-Use `as` to access the value in a `match` case. When every type is handled, a
+A nullable subject may have a `null` case; an enum match on a nullable enum is exhaustive when `null` and every item are handled. Use `as` to access the value in a `match` case. When every type is handled, a
 `default` case is not needed. Add `null` when the value may be missing. The type
 after `match value :` is the type every case must produce. Leave it out when the
 `match` is a statement rather than a value.
@@ -323,6 +357,17 @@ fn main() {
     add()     // Compile error
 }
 ```
+
+Calls evaluate the callable or method receiver first, then arguments from left to right. `co` uses the same order before starting the coroutine.
+
+Append `$inline` to request inlining, or `$noinline` to prevent it:
+
+```rust
+fn add_one(value: int) int $inline { return value + 1 }
+fn add_two(value: int) int $noinline { return value + 2 }
+```
+
+These flags cannot be combined on the same function.
 
 ### Type default values
 
@@ -514,9 +559,24 @@ fn main() {
 
 Closures are anonymous functions that can have variables bound to them from outside their scope.
 
-You can create anonymous functions by using the `fn` keyword. Based on whether you used a variable from outside the scope or not, the return type will either be a raw function pointer `fnptr()()` or a closure type `fn()()`
+You can create anonymous functions using the `fn` keyword. A function literal that captures no outside variables can also be used as a raw function pointer (`fnptr`).
 
-A `fnptr()()` type is always compatible with `fn()()`. But not the other way around. So when you need to specify a type and you want to support both raw function pointers and closures, use `fn` instead of `fnptr`.
+A raw function pointer can convert to a closure with a compatible signature. Use `fn` for callbacks that accept both raw function pointers and closures.
+
+`object.method` binds the object as its receiver and requires a `fn` callback. It cannot convert to `fnptr`. `Type.method` leaves the receiver as the first argument and can be used as either kind of callback. A shared callback can bind a shared receiver.
+
+Callback signatures do not implicitly convert argument or return values. Use a wrapper when a callback needs a value conversion or an added error declaration:
+
+```rust
+fn count() int { return 7 }
+
+fn main() {
+    let optional: fn()(?int) = fn() ?int { return count() }
+    assert(optional() == 7)
+}
+```
+
+The same applies to coroutine results: convert the value inside the coroutine, or after awaiting it.
 
 ```rust
 fn main() {
@@ -679,6 +739,15 @@ arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`
 cannot be assigned to `Array[String]`, and `HashMap[LowerCaseString, V]` cannot
 be assigned to `HashMap[String, V]`.
 
+An enum's generated default is its first declared member. Assign another declared
+member to change an enum value. Arithmetic produces the underlying numeric type;
+increment, decrement, and compound assignment are not supported on enum variables.
+For an enum backed by a fixed array, `&EnumType` borrows one complete enum value;
+use `borrowed[0]` to read or replace that value. Fields and elements of an inline
+enum can be read, but cannot be modified or borrowed separately. Methods must
+leave that storage unchanged and must not expose a writable alias. Copy to the
+underlying type before modifying its fields or calling a mutating method.
+
 ## Finalizers
 
 A class may define `gc_free()` to release raw or native resources when the GC
@@ -791,7 +860,7 @@ Use `valk.fs` for file-system operations.
 Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
 from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
 reader, writer and closer, `ByteReader`
-reads from a `String`, `ByteBuffer` or `Slice[u8]`, and a `ByteBuffer` is a
+reads from a `String`, `ByteBuffer` or `&[u8]`, and a `ByteBuffer` is a
 writer that collects everything written to it. `io.copy` moves everything from a reader
 into a writer:
 
@@ -1188,7 +1257,7 @@ use valk.net
 // Server
 fn server() {
     let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
-    let buffer = Slice[u8].new(1000, 0)
+    let buffer = [u8]{ 0 x 1000 }
     while true {
         let con = sock.accept() ! {
             println("# Failed to accept connection")
@@ -1219,7 +1288,7 @@ fn main() {
     // Send
     con.write("PING") ! panic("Client failed to send data")
     // Recv
-    let buffer = Slice[u8].new(1000, 0)
+    let buffer = [u8]{ 0 x 1000 }
     let bytes = con.read(buffer) ! panic("Client failed to read from connection")
     println("# Client received: " + buffer.view(0, bytes).to_string())
     con.close() ! panic("Failed to close connection")
@@ -1527,7 +1596,7 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique. Creating the view consumes that uniqueness and invalidates further use through prior ordinary aliases. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
+`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique: nothing else may still name any part of it, including values that were moved into it earlier with a store, an initializer or a call such as `append`. Creating the view consumes that uniqueness, and every ordinary variable that named part of the graph is unusable afterwards; the check follows control flow, so a value published on one path stays usable on paths where it was not, and loops are checked for aliases made in an earlier iteration. Publishing the result of a call consumes the arguments it was built from. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
 
 ### Mutable shared data
 
@@ -1549,6 +1618,6 @@ lock stats as s {
 
 Inside the block `s` is a `locked Stats`: a mutable view that is valid until the block ends. Anything read through it, like `s.names`, is a locked view too. The block releases the lock on every exit, including `return`, `throw` and `!>`. `break` and `continue` cannot leave a lock block.
 
-A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, stored in a property or global, or assigned to a variable declared outside the block. Functions can take and return `locked T` views while the originating lock is held. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Data from one lock cannot be stored under another lock. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
+A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Moving data around inside the locked graph, like `s.items.append(s.first)`, is allowed. Functions can take and return `locked T` views while the originating lock is held. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Data from one lock cannot be stored under another lock. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
 
 `T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again from the same thread deadlocks. Reading the value outside a `lock` block is not possible; every reader takes the lock too.

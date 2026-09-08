@@ -95,6 +95,8 @@ check_types() {
         t2="${row#* <=> }"
         sed_t1="${t1//&/\\&}"
         sed_t2="${t2//&/\\&}"
+        sed_t1="${sed_t1//|/\\|}"
+        sed_t2="${sed_t2//|/\\|}"
 
         if [ "$compatible" -eq 1 ]; then
             echo "> Must be compatible: $row"

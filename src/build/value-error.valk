@@ -49,7 +49,7 @@ fn value_from_call_intrinsic(exp: Exp, scope: Scope, ctx: Context) ?Value !Error
 }
 
 // Resolve callee and arguments into a call Value. No error handler applied.
-fn value_build_call(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+fn value_build_call(exp: Exp, scope: Scope, ctx: Context, is_coroutine: bool (false)) Value !Error {
     let callee_exp = exp.get(VALUE_EXP.left)
     if !isset(callee_exp) : exp.bug("Missing call callee")
     let callee_ctx = ctx.without_suggested_type()
@@ -87,21 +87,42 @@ fn value_build_call(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             callee.func = call_func
             callee.rett = call_func.get_value_type(isset(callee.value1))
         }
-        value_check_call_args(call_func, callee, args, scope, ctx, exp) !>
-        require_void_pointer_call(call_func, callee, args, scope, exp) !>
-        let v = vgen_call(ctx, callee, args, call_func.get_rett(), scope)
+        value_check_call_args(call_func, callee, args, scope, ctx, exp, true, is_coroutine) !>
+        let v = vgen_call(ctx, callee, args, call_func.get_rett(), is_coroutine ? null : scope)
         v.exp = exp
+        // A borrow handed out by a method on a read-only borrow shares its
+        // storage, so it only reads too
+        let call_receiver = callee.value1
+        let rett_nn = v.rett.get_non_nullable()
+        let rett_class = rett_nn.get_class_or_null()
+        if isset(call_receiver) && !call_func.is_static && value_is_readonly_storage(call_receiver, ctx) {
+            if (rett_nn.kind == TYPE.ref_of || rett_nn.kind == TYPE.ref_slice) && !(isset(rett_class) && rett_class.immutable) {
+                let element = rett_nn.get_sub_type()
+                if !rett_nn.is_readonly_view() && isset(element) {
+                    let readonly = rett_nn.kind == TYPE.ref_of ? element.reference(rett_nn.length, false) : element.ref_slice()
+                    v.rett = v.rett.is_nullable_type() ? readonly.nullable() : readonly
+                }
+            }
+        } else if isset(rett_class) && rett_class.bare_slice {
+            // The core `slice &[T]` class only exists to carry methods
+            let element = rett_nn.get_sub_type()
+            if isset(element) {
+                let bare = element.ref_slice().mut_type()
+                v.rett = v.rett.is_nullable_type() ? bare.nullable() : bare
+            }
+        }
         if call_func.can_error {
             v.can_error = true
             v.set_error_type(call_func.error_type)
         }
         return v
     }
+    value_check_indirect_call_args(callee, args, scope, ctx, exp) !>
     require_void_pointer_indirect_call(callee, args, scope, exp) !>
     let receiver = callee.value1
     if isset(receiver) : value_mark_actual_escape(receiver)
     each args as arg : value_mark_actual_escape(arg)
-    let v = vgen_call(ctx, callee, args, indirect_call_rett(callee, ctx.build), scope)
+    let v = vgen_call(ctx, callee, args, indirect_call_rett(callee, ctx.build), is_coroutine ? null : scope)
     v.exp = exp
     let ierr = indirect_call_error_type(callee)
     if isset(ierr) {
@@ -139,6 +160,37 @@ fn require_void_pointer_indirect_call(callee: Value, args: Array[Value], scope: 
     }
 }
 
+fn value_check_indirect_call_args(callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp) !Error {
+    if callee.rett.kind != TYPE.closure && callee.rett.kind != TYPE.fnptr {
+        at.error("Value is not callable: '" + callee.rett.compat_display_name() + "'")
+    }
+    let params = callee.rett.get_args()
+    if !isset(params) : at.error("Value is not callable: '" + callee.rett.compat_display_name() + "'")
+    if args.length != params.length {
+        at.error("Incorrect argument count (expected " + params.length + ", got " + args.length + ")")
+    }
+    each params as param, i {
+        let arg = args.get(i) ! at.bug("Indirect call argument is missing")
+        arg.require_result() !>
+        if arg.never_returns && arg.rett.is_void_type() : continue
+        let accepts_borrow = param.has_borrowed_refs()
+        arg = value_try_convert(arg, scope, ctx, param, true, accepts_borrow) !>
+        param.compat_check(arg.rett, at) !>
+        if arg.is_implicit_borrow() && !accepts_borrow {
+            let source = arg.rett.get_non_nullable()
+            let target = param.get_non_nullable()
+            let pointer = (source.kind == TYPE.ptr_of || source.kind == TYPE.adr_of || value_is_borrow_address(arg))
+                && (target.kind == TYPE.ptr_of || param.is_raw_pointer())
+            if pointer {
+                require_unsafe(at, scope, "Passing an implicit pointer borrow to escaping pointer storage") !>
+            } else {
+                at.error("An implicit pointer borrow cannot be passed to an indirect call that may retain it")
+            }
+        }
+        args.set(i, arg) ! at.bug("Indirect call argument is missing")
+    }
+}
+
 fn value_from_type_method(callee: Value, args: Array[Value], scope: Scope, ctx: Context, exp: Exp) ?Value !Error {
     let on = callee.value1 ?! return null
     if on.type == VAL.type && callee.get_name().starts_with("$") {
@@ -173,12 +225,7 @@ fn value_from_error_handler_exp(exp: Exp, scope: Scope, ctx: Context) Value !Err
 
     // Evaluate the call without auto-default pass: temporarily parse call kind directly
     let call = value_from_call_raw(call_exp, scope, ctx) !>
-    if !call.can_error {
-        // Soft: still allow if void/unresolved; otherwise error
-        if !call.rett.is_void_type() {
-            exp.error("Error handler on a value that does not return errors")
-        }
-    }
+    if !call.can_error : exp.error("Error handler on a value that does not return errors")
 
     let kind = exp.number.@cast(ERRH_KIND)
     if kind == ERRH_KIND.pass {
@@ -203,7 +250,7 @@ fn value_from_error_handler_exp(exp: Exp, scope: Scope, ctx: Context) Value !Err
 }
 
 // Call evaluation without the default pass-handler (an explicit handler wraps it).
-fn value_from_call_raw(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+fn value_from_call_raw(exp: Exp, scope: Scope, ctx: Context, is_coroutine: bool (false)) Value !Error {
     if exp.type == EXP.value && exp.kind == VALUE_KIND.offset {
         // `arr[i] !? alt` etc. — raw offset access before applying its handler.
         return value_from_offset_raw_exp(exp, scope, ctx) !>
@@ -217,7 +264,7 @@ fn value_from_call_raw(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     }
     let intrinsic = value_from_call_intrinsic(exp, scope, ctx) !>
     if isset(intrinsic) : return intrinsic
-    return value_build_call(exp, scope, ctx) !>
+    return value_build_call(exp, scope, ctx, is_coroutine) !>
 }
 
 fn specialize_call_generic_args(func: Func, callee: Value, args: Array[Value], at: Exp) Func !Error {
@@ -251,6 +298,8 @@ fn specialize_call_generic_args(func: Func, callee: Value, args: Array[Value], a
     }
 
     let specialized = func.specialize_generic_args(names, types, at) !>
+    let receiver = callee.value1
+    if isset(receiver) : specialized = func_for_receiver(specialized, receiver, at) !>
     callee.func = specialized
     callee.set_name(specialized.name)
     callee.rett = specialized.get_value_type(isset(callee.value1))
@@ -391,7 +440,7 @@ fn value_from_atomic_intrinsic_call(exp: Exp, scope: Scope, ctx: Context) ?Value
         if !left.assignable() {
             first_exp.error("Atomic operation: Left value must be an assignable value. e.g. a variable")
         }
-        act_check_assign(left, first_exp) !>
+        act_check_assign(left, first_exp, scope) !>
         value_mark_mutable(left)
         return vgen_atomic_op(left, right, op, exp)
     }
@@ -409,12 +458,13 @@ fn value_from_atomic_intrinsic_call(exp: Exp, scope: Scope, ctx: Context) ?Value
     let right = value_from_exp(second_exp, scope, ctx.with_suggested_type(left.rett)) !>
     right = value_try_convert(right, scope, ctx, left.rett) !>
     left.rett.compat_check(right.rett, second_exp) !>
-    act_check_assign(left, first_exp) !>
+    act_check_assign(left, first_exp, scope) !>
     value_mark_mutable(left)
     return vgen_atomic_store(left, right, exp)
 }
 
 fn value_mark_mutable(value: Value) {
+    value_mark_summary_write(value)
     if value.type != VAL.decl : return
     let decl = value.decl
     if isset(decl) {
@@ -599,13 +649,12 @@ fn value_from_property_intrinsic_call(exp: Exp, scope: Scope, ctx: Context) ?Val
     let stays_inside = value_stays_inside(value, on)
     if stays_inside : value_invalidate_unique(value)
     else : value_mark_actual_escape(value)
+    if value_unique && !stays_inside : value_link_stored_graph(value, on)
     // And the container stops being a unique graph once something that already
     // had another reference goes into it, exactly as for a plain assignment.
     if !value_unique && !stays_inside {
         let sources = value_summary_source_args(value, ctx.get_func() !>)
-        if isset(sources) : value_mark_summary_absorbs(on, sources)
-        else : value_mark_summary_unique_invalidation(on)
-        value_invalidate_unique(on)
+        value_absorb_param_sources(on, sources, ctx.get_func() !>)
     }
     if on.rett.is_gc_type() && value.is_implicit_borrow() {
         exp.error("An implicit pointer borrow cannot be stored in persistent storage; use '@ref' explicitly")
@@ -828,21 +877,15 @@ fn value_apply_error_value(call: Value, exp: Exp, scope: Scope, ctx: Context) Va
     let success_type = call.rett
     let alt_scope = bind_caught_error_scope(scope, call.get_error_type(), ctx.build, ctx.get_func() !>)
     let alt = value_from_exp(alt_exp, alt_scope, ctx.with_suggested_type(success_type)) !>
-    alt = value_try_convert(alt, scope, ctx, success_type) !>
-    if !success_type.is_void_type() && !alt.rett.is_void_type() {
-        // Allow nullable match either way
-        if !success_type.compat(alt.rett) && !alt.rett.compat(success_type) {
-            success_type.compat_check(alt.rett, exp) !>
-        }
-    }
-    let rett = alt.rett
-    if success_type.is_nullable_type() && !rett.is_nullable_type() {
-        // keep alt's type
-    } else if !success_type.is_void_type() {
-        rett = success_type
+    if !success_type.is_void_type() : alt.require_result() !>
+    let rett = success_type
+    if !alt.never_returns {
+        if success_type.is_void_type() : success_type.compat_check(alt.rett, exp) !>
         if alt.rett.is_nullable_type() && !rett.is_nullable_type() {
             rett = rett.nullable()
         }
+        alt = value_try_convert(alt, alt_scope, ctx, rett) !>
+        rett.compat_check(alt.rett, exp) !>
     }
     let v = value_error_result(call, alt, rett, ERRH_KIND.value, exp)
     v.decl = caught_error_decl(alt_scope)

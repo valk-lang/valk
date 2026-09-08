@@ -1,0 +1,536 @@
+class PublicationLink { left: Decl; right: Decl }
+class PublicationState {
+    live: bool (true)
+    published: Array[Decl] (.{})
+    links: Array[PublicationLink] (.{})
+
+    fn copy() PublicationState {
+        return .{ live: this.live, published: this.published.copy(), links: this.links.copy() }
+    }
+    fn link(left: Decl, right: Decl) {
+        if left == right : return
+        each this.links as pair {
+            if (pair.left == left && pair.right == right) || (pair.left == right && pair.right == left) : return
+        }
+        this.links.append(.{ left: left, right: right })
+    }
+    fn related(decl: Decl) Array[Decl] {
+        let found = Array[Decl]{ decl }
+        let index: uint = 0
+        while index < found.length {
+            let current = found[index++]
+            each this.links as pair {
+                if pair.left == current : found.append(pair.right, true)
+                if pair.right == current : found.append(pair.left, true)
+            }
+        }
+        return found
+    }
+    fn assign(decl: Decl, sources: Array[Decl]) {
+        let related = this.related(decl)
+        related.remove_value(decl)
+        let first = related.get(0) !? null
+        if isset(first) {
+            each related as other : this.link(first, other)
+        }
+        let index = this.links.length
+        while index-- > 0 {
+            let pair = this.links[index]
+            if pair.left == decl || pair.right == decl : this.links.remove(index)
+        }
+        this.published.remove_value(decl)
+        each sources as source {
+            if this.published.contains(source) : this.published.append(decl, true)
+            this.link(decl, source)
+        }
+    }
+    fn merge(other: PublicationState) {
+        if !other.live : return
+        if !this.live { this.published.clear(); this.links.clear() }
+        this.live = true
+        each other.published as decl : this.published.append(decl, true)
+        each other.links as pair : this.link(pair.left, pair.right)
+    }
+    fn same(other: PublicationState) bool {
+        if this.live != other.live || this.published.length != other.published.length || this.links.length != other.links.length : return false
+        each this.published as decl {
+            if !other.published.contains(decl) : return false
+        }
+        each this.links as pair {
+            let found = false
+            each other.links as candidate {
+                if (pair.left == candidate.left && pair.right == candidate.right)
+                    || (pair.left == candidate.right && pair.right == candidate.left) { found = true; break }
+            }
+            if !found : return false
+        }
+        return true
+    }
+}
+class PublicationFlow {
+    func: Func
+    // Stands for everything outside the function: a graph linked to it has an
+    // alias the function cannot see
+    world: Decl
+    breaks: ?Array[PublicationState] (null)
+    continues: ?Array[PublicationState] (null)
+    returns: ?Array[PublicationState] (null)
+    match_value: ?Value (null)
+
+    fn nested(breaks: ?Array[PublicationState], continues: ?Array[PublicationState], returns: ?Array[PublicationState], match_value: ?Value) PublicationFlow {
+        return .{ func: this.func, world: this.world, breaks: breaks, continues: continues, returns: returns, match_value: match_value }
+    }
+}
+
+// GC lowering can replace the destination's owner with raw scratch storage.
+fn publication_copy_destination(value: Value) Value {
+    let kind = value.type
+    if kind != VAL.prop && kind != VAL.ptrv && !isset(value_narrowed_owned_borrow_source(value)) : return value
+    let on = value.value1
+    return Value {
+        type: kind
+        rett: value.rett
+        value1: isset(on) ? publication_copy_destination(on) : null
+        value2: value.value2
+        values: value.values
+        prop: value.prop
+        meta: value.meta
+        exp: value.exp
+    }
+}
+
+fn publication_tracks_graph(type: Type) bool {
+    let nn = type.get_non_nullable()
+    if !type.has_gc_refs() && nn.kind != TYPE.closure : return false
+    return !nn.is_shared && !nn.is_locked && nn.get_class_or_null() != type_string(nn.build).get_class_or_null()
+}
+
+// The variables whose graphs this value may be part of. Inputs of a call or
+// read were held when they were evaluated, which may predate a replacement
+// of the variable they came from.
+fn publication_sources(value: ?Value, state: PublicationState, sources: Array[Decl]) {
+    if !isset(value) : return
+    if !publication_tracks_graph(value.rett) : return
+    let meta = value.meta
+    let holds = isset(meta) ? meta.publication_holds : null
+    if isset(holds) && (value.type == VAL.prop || value.type == VAL.ptrv) {
+        publication_held_sources(holds, 0, state, sources)
+        return
+    }
+    if isset(holds) && value.type == VAL.call {
+        let callee = value.value1
+        let func = isset(callee) ? callee.resolve_call_func() : null
+        if isset(callee) && isset(func) && func.unique_summary_ready && func.returns_unique_graph {
+            let offset = 1 - call_receiver_skip(callee, func)
+            each func.unique_return_args as index : publication_held_sources(holds, index + offset, state, sources)
+            return
+        }
+        each holds as held, index : publication_held_sources(holds, index, state, sources)
+        return
+    }
+    if value.type == VAL.decl {
+        let decl = value.decl ?! return
+        if decl.is_buffer {
+            let pre = value.get_pre_value()
+            publication_sources(isset(pre) ? pre.value2 : value.get_graph_source(), state, sources)
+            return
+        }
+        each (state.related(decl)) as source : sources.append(source, true)
+        return
+    }
+    if value.type == VAL.call {
+        let callee = value.value1
+        let func = isset(callee) ? callee.resolve_call_func() : null
+        if isset(func) && func.unique_summary_ready && func.returns_unique_graph {
+            each func.unique_return_args as index : publication_sources(value_call_argument(value, func, index), state, sources)
+            return
+        }
+        // Anything else may hand back part of what it was given
+        if isset(callee) && callee.type == VAL.func : publication_sources(callee.value1, state, sources)
+        else : publication_sources(callee, state, sources)
+        let args = value.values
+        if isset(args) {
+            each args as arg : publication_sources(arg, state, sources)
+        }
+        return
+    }
+    // A raw pointer read is outside what the graph model can see
+    if value.type == VAL.load : return
+    publication_sources(value.get_pre_value(), state, sources)
+    publication_sources(value.value1, state, sources)
+    publication_sources(value.value2, state, sources)
+    let values = value.values
+    if isset(values) {
+        each values as child : publication_sources(child, state, sources)
+    }
+}
+
+fn publication_held_sources(holds: Array[?Decl], index: uint, state: PublicationState, sources: Array[Decl]) {
+    let held = holds.get(index) !? null
+    if !isset(held) : return
+    each (state.related(held)) as source : sources.append(source, true)
+}
+
+fn publication_link_sources(state: PublicationState, sources: Array[Decl], others: Array[Decl]) {
+    each sources as source {
+        each others as other : state.link(source, other)
+    }
+}
+
+// The graph escapes to where the function cannot follow it
+fn publication_escape(value: ?Value, state: PublicationState, flow: PublicationFlow) {
+    if !isset(value) || !state.live : return
+    let sources = Array[Decl]{}
+    publication_sources(value, state, sources)
+    each sources as source : state.link(source, flow.world)
+}
+
+// A local that owns this storage, or null when the storage is not local
+fn publication_storage_root(value: Value) ?Value {
+    let kind = value.type
+    if kind == VAL.decl {
+        let decl = value.decl ?! return null
+        if !decl.is_buffer : return value
+        let pre = value.get_pre_value()
+        let source = isset(pre) && pre.type == VAL.assign ? pre.value2 : value.get_graph_source()
+        return isset(source) ? publication_storage_root(source) : null
+    }
+    if kind == VAL.prop || kind == VAL.ptrv || kind == VAL.wrap || kind == VAL.cast || kind == VAL.interface_wrap || kind == VAL.block {
+        let inner = value.value1 ?! return null
+        return publication_storage_root(inner)
+    }
+    return null
+}
+
+// What a call keeps of its inputs: moved into another input, or gone
+fn publication_call_effects(call: Value, func: ?Func, state: PublicationState, flow: PublicationFlow) !Error {
+    if !state.live : return
+    let callee = call.value1
+    if !isset(func) {
+        publication_escape(isset(callee) && callee.type == VAL.func ? callee.value1 : callee, state, flow)
+        let args = call.values
+        if isset(args) {
+            each args as arg : publication_escape(arg, state, flow)
+        }
+        return
+    }
+    ensure_func_unique_return_summary(func) !>
+    let known = func.unique_summary_ready && !func_unique_summary_unavailable_in_lsp(func)
+    each func.args as param, index {
+        let input = value_call_argument(call, func, index)
+        if !isset(input) || !publication_tracks_graph(input.rett) : continue
+        if !known {
+            publication_escape(input, state, flow)
+            continue
+        }
+        decl_resolve_pending_absorbs(param.decl) !>
+        let sources = Array[Decl]{}
+        publication_sources(input, state, sources)
+        if sources.length == 0 : continue
+        let absorbed = false
+        each func.args as target, target_index {
+            let absorbs = target.absorbs_args ?! continue
+            if !absorbs.contains(index) : continue
+            let holder = value_call_argument(call, func, target_index) ?! continue
+            let others = Array[Decl]{}
+            publication_sources(holder, state, others)
+            publication_link_sources(state, sources, others)
+            absorbed = true
+        }
+        if (param.may_escape && !absorbed) || param.invalidates_unique {
+            each sources as source : state.link(source, flow.world)
+        }
+    }
+}
+
+fn publication_values(values: ?Array[Value], state: PublicationState, flow: PublicationFlow) !Error {
+    if !isset(values) : return
+    each values as value {
+        if !state.live : break
+        publication_value(value, state, flow) !>
+    }
+}
+
+fn publication_branches(value: Value, state: PublicationState, flow: PublicationFlow) !Error {
+    publication_value(value.value1, state, flow) !>
+    if !state.live : return
+    let yes = state.copy()
+    let no = state.copy()
+    if value.type == VAL.if {
+        publication_values(value.values, yes, flow) !>
+        publication_value(value.value2, no, flow) !>
+    } else {
+        publication_value(value.value2, yes, flow) !>
+        publication_values(value.values, no, flow) !>
+    }
+    state.live = false
+    state.published.clear()
+    state.links.clear()
+    state.merge(yes)
+    state.merge(no)
+}
+
+// Check initial entry separately from subsequent iterations.
+fn publication_loop(value: Value, state: PublicationState, flow: PublicationFlow) !Error {
+    let entry = state.copy()
+    let head = entry.copy()
+    let seen = Array[PublicationState]{ head }
+    let exits = PublicationState { live: false }
+    while true {
+        let iteration = head.copy()
+        let breaks = Array[PublicationState]{}
+        let continues = Array[PublicationState]{}
+        let inner = flow.nested(breaks, continues, flow.returns, flow.match_value)
+        publication_value(value.value1, iteration, inner) !>
+        let condition = value.value1
+        if !isset(condition) || condition.type != VAL.bool || !condition.bool_val : exits.merge(iteration)
+        if isset(condition) && condition.type == VAL.bool && !condition.bool_val : iteration.live = false
+        publication_values(value.values, iteration, inner) !>
+        each breaks as stopped : exits.merge(stopped)
+        let next = PublicationState { live: false }
+        next.merge(iteration)
+        each continues as resumed : next.merge(resumed)
+        if !next.live : break
+        let repeated = false
+        each seen as previous {
+            if next.same(previous) { repeated = true; break }
+        }
+        if repeated : break
+        seen.append(next)
+        head = next
+    }
+    state.live = false
+    state.published.clear()
+    state.links.clear()
+    state.merge(exits)
+}
+
+fn publication_hold_input(call: Value, input: ?Value, index: uint, state: PublicationState, flow: PublicationFlow) {
+    if !isset(input) || !state.live || !publication_tracks_graph(input.rett) : return
+    let sources = Array[Decl]{}
+    publication_sources(input, state, sources)
+    if sources.length == 0 : return
+    let meta = call.ensure_meta()
+    let holds = meta.publication_holds ?? <{
+        let created = Array[?Decl]{}
+        meta.publication_holds = created
+        return created
+    }
+    let held = holds.get(index) !? null
+    if !isset(held) {
+        held = Decl.new(flow.func, input.rett, false, null)
+        holds.set_expand(index, held, null)
+    }
+    state.assign(held, sources)
+}
+
+fn publication_clear_holds(value: Value, state: PublicationState) {
+    let previous = value.meta
+    let previous_holds = isset(previous) ? previous.publication_holds : null
+    if isset(previous_holds) {
+        each previous_holds as held {
+            if isset(held) : state.assign(held, Array[Decl]{})
+        }
+    }
+}
+
+fn publication_check_holds(value: Value, state: PublicationState, message: String) !Error {
+    let meta = value.meta
+    let holds = isset(meta) ? meta.publication_holds : null
+    if !isset(holds) || !state.live : return
+    each holds as held {
+        if isset(held) && state.published.contains(held) : value.error(message)
+    }
+}
+
+fn publication_call(value: Value, state: PublicationState, flow: PublicationFlow) !Error {
+    publication_clear_holds(value, state)
+    let callee = value.value1
+    publication_value(callee, state, flow) !>
+    let func = isset(callee) ? callee.resolve_call_func() : null
+    let receiver = isset(callee) && callee.type == VAL.func ? callee.value1 : callee
+    publication_hold_input(value, receiver, 0, state, flow)
+    let args = value.values
+    if isset(args) {
+        each args as arg, index {
+            publication_value(arg, state, flow) !>
+            publication_hold_input(value, arg, index + 1, state, flow)
+        }
+    }
+    publication_check_holds(value, state, "An ordinary call argument or receiver aliases a graph published while evaluating the call") !>
+    publication_call_effects(value, func, state, flow) !>
+    if isset(func) && (func.must_exit || func.will_exit) : state.live = false
+}
+
+// Follow address evaluation, retaining the owner before an index can publish it.
+fn publication_destination(value: Value, assignment: Value, state: PublicationState, flow: PublicationFlow, reading: bool (false)) !Error {
+    let kind = value.type
+    if kind == VAL.decl || kind == VAL.global {
+        publication_value(reading ? value : value.get_pre_value(), state, flow) !>
+        if reading : publication_hold_input(assignment, value, 0, state, flow)
+        return
+    }
+    if kind == VAL.wrap {
+        let inner = value.value1
+        if isset(inner) && inner.rett.is_tagged_nullable() && !value.rett.is_nullable_type() {
+            publication_destination(inner, assignment, state, flow, reading) !>
+            return
+        }
+    }
+    if kind == VAL.prop || kind == VAL.ptrv {
+        publication_value(value.get_pre_value(), state, flow) !>
+        let on = value.value1 ?! return
+        if on.rett.is_inline : publication_destination(on, assignment, state, flow, reading) !>
+        else {
+            publication_value(on, state, flow) !>
+            publication_hold_input(assignment, value_borrow_origin_through(on).owner, 0, state, flow)
+        }
+        publication_value(value.value2, state, flow) !>
+        return
+    }
+    publication_value(value, state, flow) !>
+}
+
+fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFlow) !Error {
+    if !isset(value) || !state.live || value == flow.match_value : return
+    let original = value.meta
+    let store = isset(original) ? original.publication_store : null
+    if isset(store) {
+        publication_value(store, state, flow) !>
+        return
+    }
+    let kind = value.type
+    if kind == VAL.while {
+        publication_loop(value, state, flow) !>
+        return
+    }
+    if kind == VAL.if || kind == VAL.this_or_that {
+        publication_branches(value, state, flow) !>
+    } else if kind == VAL.vscope {
+        let returns = Array[PublicationState]{}
+        let inner = flow.nested(flow.breaks, flow.continues, returns, flow.match_value)
+        publication_values(value.values, state, inner) !>
+        each returns as returned : state.merge(returned)
+    } else if kind == VAL.break || kind == VAL.continue {
+        let destinations = kind == VAL.break ? flow.breaks : flow.continues
+        if isset(destinations) : destinations.append(state.copy())
+        state.live = false
+    } else if kind == VAL.return || kind == VAL.throw {
+        publication_value(value.value1, state, flow) !>
+        publication_values(value.values, state, flow) !>
+        if kind == VAL.return && state.live {
+            let returns = flow.returns
+            if isset(returns) : returns.append(state.copy())
+        }
+        state.live = false
+    } else if kind == VAL.call {
+        publication_call(value, state, flow) !>
+    } else if kind == VAL.assign {
+        let left = value.value1
+        let right = value.value2
+        if !isset(left) : return
+        publication_clear_holds(value, state)
+        publication_destination(left, value, state, flow) !>
+        publication_value(right, state, flow) !>
+        publication_check_holds(value, state, "An ordinary assignment destination aliases a graph published while evaluating the assignment") !>
+        if state.live && left.type == VAL.decl && value.op == ASSIGN_OP.set {
+            let decl = left.decl
+            if isset(decl) && !decl.is_buffer && (decl.type.has_gc_refs() || decl.type.get_non_nullable().kind == TYPE.closure) {
+                let sources = Array[Decl]{}
+                publication_sources(right, state, sources)
+                state.assign(decl, sources)
+            }
+        } else if state.live && left.type != VAL.decl && isset(right) && publication_tracks_graph(right.rett) {
+            // Stored into a local's graph the value joins it; anywhere else
+            // it is out of reach
+            let root = publication_storage_root(left)
+            if isset(root) {
+                let sources = Array[Decl]{}
+                publication_sources(right, state, sources)
+                let others = Array[Decl]{}
+                publication_sources(root, state, others)
+                publication_link_sources(state, sources, others)
+            } else {
+                publication_escape(right, state, flow)
+            }
+        }
+    } else if kind == VAL.prop || kind == VAL.ptrv {
+        publication_clear_holds(value, state)
+        publication_destination(value, value, state, flow, true) !>
+        publication_check_holds(value, state, "An ordinary read aliases a graph published while evaluating its address") !>
+    } else if kind == VAL.lock_block {
+        publication_value(value.value1, state, flow) !>
+        publication_values(value.values, state, flow) !>
+        publication_value(value.value2, state, flow) !>
+    } else if kind == VAL.block || kind == VAL.allocas {
+        publication_values(value.values, state, flow) !>
+        publication_value(value.value1, state, flow) !>
+    } else if kind == VAL.error_handler {
+        publication_value(value.get_pre_value(), state, flow) !>
+        let handled = state.copy()
+        publication_value(value.value2, handled, flow) !>
+        state.merge(handled)
+    } else if kind == VAL.op && (value.op == VALUE_OP.and || value.op == VALUE_OP.or) {
+        publication_value(value.value1, state, flow) !>
+        let right = state.copy()
+        publication_value(value.value2, right, flow) !>
+        state.merge(right)
+    } else if kind == VAL.match {
+        publication_value(value.value1, state, flow) !>
+        let inner = flow.nested(flow.breaks, flow.continues, flow.returns, value.value1)
+        let joined = PublicationState { live: false }
+        let cases = value.values
+        if isset(cases) {
+            each cases as branch {
+                if !state.live : break
+                if !branch.bool_val : publication_value(branch.value1, state, inner) !>
+                let arm = state.copy()
+                publication_values(branch.values, arm, inner) !>
+                publication_value(branch.value2, arm, inner) !>
+                joined.merge(arm)
+                if branch.bool_val : state.live = false
+            }
+        }
+        state.live = false
+        state.published.clear()
+        state.links.clear()
+        state.merge(joined)
+    } else {
+        publication_value(value.get_pre_value(), state, flow) !>
+        if kind == VAL.func && !isset(value.value1) {
+            // A closure keeps what it captured
+            let closure = value.func
+            if isset(closure) {
+                each closure.capture_decls as captured {
+                    if publication_tracks_graph(captured.type) : state.link(captured, flow.world)
+                }
+            }
+        }
+        if kind == VAL.decl {
+            let decl = value.decl
+            let type = value.rett.get_non_nullable()
+            if isset(decl) && !decl.is_buffer && !type.is_shared && !type.is_locked && state.published.contains(decl) {
+                value.error("An ordinary value may be used again after its graph was published as shared")
+            }
+        }
+        publication_value(value.value1, state, flow) !>
+        publication_value(value.value2, state, flow) !>
+        publication_values(value.values, state, flow) !>
+
+    }
+    let meta = value.meta
+    if state.live && isset(meta) && meta.publishes_graph {
+        let sources = Array[Decl]{}
+        publication_sources(value, state, sources)
+        if sources.contains(flow.world) {
+            value.error("Only a provably unique value graph can be published as shared; an alias made on an earlier path may remain")
+        }
+        each sources as source : state.published.append(source, true)
+    }
+}
+
+fn func_check_publication_flow(func: Func) !Error {
+    let body = func.body_scope ?! return
+    let world = Decl.new(func, type_ptr(func.ns.build), false, null)
+    publication_values(body.values, PublicationState {}, PublicationFlow { func: func, world: world }) !>
+}

@@ -75,7 +75,8 @@ class TypeCache {
     array: ?Type (null)
     shared: ?Type (null)
     locked: ?Type (null)
-    // The ordinary type a shared or locked view was made from
+    mut_view: ?Type (null)
+    // The ordinary type a shared, locked or mut view was made from
     plain: ?Type (null)
 }
 
@@ -95,6 +96,9 @@ class Type {
     is_shared: bool (false)
     // Mutable view of shared data, valid only inside a `lock` block
     is_locked: bool (false)
+    // A borrow that may be written through: `&mut T`, `&mut [T]`. Without it
+    // a bare `&T` / `&[T]` only reads; named slices decide by class.
+    is_mut: bool (false)
     error_is_instance: bool (false)
 
     fn get_unary_info() ?UnaryTypeInfo {
@@ -231,10 +235,51 @@ class Type {
         return result
     }
 
-    // The ordinary type behind a shared or locked view
+    // `mut` applies to the anonymous borrows; named slices decide by class
+    fn can_be_mut() bool {
+        return (this.kind == TYPE.ref_of || this.kind == TYPE.ref_slice) && !isset(this.class)
+    }
+
+    // A borrow that only reads: bare `&T` / `&[T]` without `mut`, or a
+    // slice type declared `$immutable`
+    fn is_readonly_view() bool {
+        if this.kind != TYPE.ref_of && this.kind != TYPE.ref_slice : return false
+        let c = this.class
+        // A mode over an immutable slice is as immutable as the slice
+        if isset(c) : return c.immutable || c.representation_class().immutable
+        return !this.is_mut
+    }
+
+    // The writable form of a borrow
+    fn mut_type() Type {
+        if this.is_nullable_type() : return this.get_non_nullable().mut_type().nullable()
+        if this.is_mut || !this.can_be_mut() : return this
+        let cached = this.cache
+        let existing = isset(cached) ? cached.mut_view : null
+        if isset(existing) : return existing
+        let result = Type {
+            build: this.build
+            kind: this.kind
+            is_shared: this.is_shared
+            is_locked: this.is_locked
+            is_mut: true
+            class: this.class
+            enum_info: this.enum_info
+            info: this.info
+            error_is_instance: this.error_is_instance
+            length: this.length
+            unsigned: this.unsigned
+            is_inline: this.is_inline
+        }
+        this.get_cache().mut_view = result
+        result.get_cache().plain = this
+        return result
+    }
+
+    // The ordinary type behind a shared, locked or mut view
     fn plain_type() Type {
         if this.is_nullable_type() : return this.get_non_nullable().plain_type().nullable()
-        if !this.is_shared && !this.is_locked : return this
+        if !this.is_shared && !this.is_locked && !this.is_mut : return this
         let cached = this.cache
         let plain = isset(cached) ? cached.plain : null
         return plain ?? this
@@ -832,6 +877,7 @@ class Type {
     fn is_same_type(other: Type) bool {
         if this.is_shared != other.is_shared : return false
         if this.is_locked != other.is_locked : return false
+        if this.is_mut != other.is_mut : return false
         // An enum shares its storage class with its base integer, but it is
         // its own type: `Slice[u8]` helpers must not land on `Slice[E]`.
         if this.get_enum() != other.get_enum() : return false
@@ -896,7 +942,13 @@ class Type {
     fn compat_pointer_inner(other: Type) bool {
         let own = this.get_sub_type() ?! return false
         let theirs = other.get_sub_type() ?! return false
-        return own.compat(theirs)
+        return own.compat_storage(theirs)
+    }
+
+    // Writable aliases must accept the same values in both directions.
+    fn compat_storage(other: Type) bool {
+        if this.get_enum() != other.get_enum() : return false
+        return this.compat(other) && other.compat(this)
     }
 
     fn compat_pointer(other: Type) bool {
@@ -916,11 +968,19 @@ class Type {
     // `data_cstring`, which an arbitrary `&[u8]` cannot promise, so a bare
     // view never becomes a `String` implicitly. The other direction is fine.
     fn compat_ref_slice(other: Type) bool {
+        // A read-only borrow never becomes writable
+        if other.is_readonly_view() && !this.is_readonly_view() : return false
+        // The core `slice &[T]` class is the bare form with its methods attached
         let own_class = this.compat_class()
+        if isset(own_class) && own_class.bare_slice : own_class = null
         let other_class = other.compat_class()
-        if isset(own_class) && isset(other_class) : return own_class == other_class
-        if isset(own_class) && own_class == type_string(this.build).get_class_or_null() : return false
-        return this.compat_inner(other)
+        if isset(other_class) && other_class.bare_slice : other_class = null
+        if isset(own_class) {
+            // A name promises what its class enforces; only that class makes one
+            if !isset(other_class) : return false
+            return own_class == other_class
+        }
+        return this.compat_pointer_inner(other)
     }
 
     fn compat_min_length(other: Type) bool {
@@ -946,7 +1006,7 @@ class Type {
         if !this.type_arrays_compatible(own_info.returns, their_info.returns) : return false
         let expected_error = own_info.error_type
         let actual_error = their_info.error_type
-        if !isset(actual_error) : return true
+        if !isset(actual_error) : return this.kind == TYPE.co || !isset(expected_error)
         return isset(expected_error) && expected_error.is_compat(actual_error)
     }
 
@@ -954,7 +1014,29 @@ class Type {
         if expected.length != actual.length : return false
         each expected as type, i {
             let other = actual.get(i) ! return false
-            if !type.compat(other) : return false
+            if !type.compat_callable_value(other) : return false
+        }
+        return true
+    }
+
+    // Indirect calls and awaits cannot construct a converted argument/result.
+    fn compat_callable_value(other: Type) bool {
+        if !this.compat(other) : return false
+        if this.is_tagged_nullable() != other.is_tagged_nullable() : return false
+        let own = this.get_non_nullable()
+        let theirs = other.get_non_nullable()
+        if own.kind == TYPE.union || theirs.kind == TYPE.union {
+            return own.kind == theirs.kind
+        }
+        if own.kind == TYPE.fixed_array {
+            let element = own.get_sub_type() ?! return false
+            let other_element = theirs.get_sub_type() ?! return false
+            return element.compat_callable_value(other_element)
+        }
+        if own.is_tuple_type() && theirs.is_tuple_type() {
+            let members = own.get_members() ?! return false
+            let other_members = theirs.get_members() ?! return false
+            return this.type_arrays_compatible(members, other_members)
         }
         return true
     }
@@ -985,9 +1067,6 @@ class Type {
     }
 
     fn compat_same_kind(other: Type) bool {
-        let own_enum = this.get_enum()
-        if isset(own_enum) && own_enum != other.get_enum() : return false
-
         let t = this.kind
         if t == TYPE.ref_slice : return this.compat_ref_slice(other)
         if this.is_inline != other.is_inline : return false
@@ -1015,6 +1094,8 @@ class Type {
 
         let base = this
         let typ = other
+        let own_enum = base.get_enum() ?? base.get_non_nullable().get_enum()
+        if isset(own_enum) && own_enum != (typ.get_enum() ?? typ.get_non_nullable().get_enum()) : return false
         if base.is_nullable_type() && !typ.is_nullable_type() : base = base.get_non_nullable()
         if base.is_nullable_type() {
             if !typ.is_nullable_type() : return false
@@ -1024,6 +1105,11 @@ class Type {
 
         if base.is_shared != typ.is_shared : return false
         if base.is_locked != typ.is_locked : return false
+        // A read-only borrow never becomes writable
+        if typ.is_readonly_view() && !base.is_readonly_view()
+            && (base.kind == TYPE.ref_of || base.kind == TYPE.ref_slice || base.kind == TYPE.stack_of) : return false
+        own_enum = base.get_enum()
+        if isset(own_enum) && own_enum != typ.get_enum() : return false
 
         if base.kind == TYPE.union {
             if typ.kind == TYPE.union : return base.union_accepts_union(typ)
@@ -1138,16 +1224,18 @@ class Type {
             return "stack"
         }
         if this.kind == TYPE.ref_of {
+            let amp = this.is_mut ? "&mut " : "&"
             let sub = this.get_sub_type()
             if isset(sub) {
-                if this.length == 1 : return type_wrapped_display("&", sub)
-                return "&[" + sub.compat_display_name() + " x " + this.length + "]"
+                if this.length == 1 : return type_wrapped_display(amp, sub)
+                return amp + "[" + sub.compat_display_name() + " x " + this.length + "]"
             }
-            return "&"
+            return amp
         }
         if this.kind == TYPE.ref_slice {
+            let amp = this.is_mut ? "&mut " : "&"
             let sub = this.get_sub_type()
-            return isset(sub) ? "&[" + sub.compat_display_name() + "]" : "&[]"
+            return isset(sub) ? amp + "[" + sub.compat_display_name() + "]" : amp + "[]"
         }
         if this.kind == TYPE.fixed_array {
             let sub = this.get_sub_type()
@@ -1327,95 +1415,49 @@ class Type {
         return t
     }
 
-    // *T — cached on this type
-    fn pointer(length: uint (1)) Type {
-        if this.is_fixed_array_type() {
-            let cache = this.get_cache()
-            let pointer = cache.ptr_of
-            if isset(pointer) : return pointer
-            let sub = this.get_sub_type()
-            if isset(sub) {
-                pointer = sub.pointer(this.length)
-                cache.ptr_of = pointer
-                return pointer
-            }
+    // Indirection unwraps only the outer fixed-array dimension.
+    fn indirect_type(kind: TYPE, length: uint, flatten: bool) Type {
+        let array = this.is_fixed_array_type() && !isset(this.get_enum())
+        let cacheable = length == 1 && (!array || flatten)
+        let cache = this.get_cache()
+        let cached = kind == TYPE.ptr_of ? cache.ptr_of
+            : (kind == TYPE.adr_of ? cache.adr_of : (kind == TYPE.stack_of ? cache.stack_of : cache.ref_of))
+        if cacheable && isset(cached) : return cached
+        let sub = this
+        let count = length
+        if array && flatten {
+            sub = this.get_sub_type() ?? this
+            count = this.length
         }
-        let cached = this.cache
-        let pointer = isset(cached) ? cached.ptr_of : null
-        if length == 1 && isset(pointer) : return pointer
-        let t = Type {
-            build: this.build
-            kind: TYPE.ptr_of
-            info: UnaryTypeInfo { sub: this }
-            length: length
-        }
-        if length == 1 : this.get_cache().ptr_of = t
-        return t
-    }
-
-    // Internal one-word address of a borrow — cached on this type
-    fn adr_ref(length: uint (1)) Type {
-        return this.borrow_type(TYPE.adr_of, length)
-    }
-
-    // stack T — cached on this type
-    fn stack_ref(length: uint (1)) Type {
-        return this.borrow_type(TYPE.stack_of, length)
-    }
-
-    fn borrow_type(kind: TYPE, length: uint) Type {
-        if this.is_fixed_array_type() {
-            let cache = this.get_cache()
-            let cached_array = kind == TYPE.adr_of ? cache.adr_of : cache.stack_of
-            if isset(cached_array) : return cached_array
-            let sub = this.get_sub_type()
-            if isset(sub) {
-                let flat = sub.borrow_type(kind, this.length)
-                if kind == TYPE.adr_of : cache.adr_of = flat
-                else : cache.stack_of = flat
-                return flat
-            }
-        }
-        let cached = this.cache
-        let ref = isset(cached) ? (kind == TYPE.adr_of ? cached.adr_of : cached.stack_of) : null
-        if length == 1 && isset(ref) : return ref
         let t = Type {
             build: this.build
             kind: kind
-            info: UnaryTypeInfo { sub: this }
-            length: length
+            info: UnaryTypeInfo { sub: sub }
+            length: count
         }
-        if length == 1 {
-            if kind == TYPE.adr_of : this.get_cache().adr_of = t
-            else : this.get_cache().stack_of = t
+        if cacheable {
+            if kind == TYPE.ptr_of : cache.ptr_of = t
+            else if kind == TYPE.adr_of : cache.adr_of = t
+            else if kind == TYPE.stack_of : cache.stack_of = t
+            else : cache.ref_of = t
         }
         return t
     }
 
-    // &T — owned borrow, cached on this type
-    fn reference(length: uint (1)) Type {
-        if this.is_fixed_array_type() {
-            let cache = this.get_cache()
-            let ref = cache.ref_of
-            if isset(ref) : return ref
-            let sub = this.get_sub_type()
-            if isset(sub) {
-                ref = sub.reference(this.length)
-                cache.ref_of = ref
-                return ref
-            }
-        }
-        let cached = this.cache
-        let ref = isset(cached) ? cached.ref_of : null
-        if length == 1 && isset(ref) : return ref
-        let t = Type {
-            build: this.build
-            kind: TYPE.ref_of
-            info: UnaryTypeInfo { sub: this }
-            length: length
-        }
-        if length == 1 : this.get_cache().ref_of = t
-        return t
+    fn pointer(length: uint (1), flatten: bool (true)) Type {
+        return this.indirect_type(TYPE.ptr_of, length, flatten)
+    }
+
+    fn adr_ref(length: uint (1), flatten: bool (true)) Type {
+        return this.indirect_type(TYPE.adr_of, length, flatten)
+    }
+
+    fn stack_ref(length: uint (1), flatten: bool (true)) Type {
+        return this.indirect_type(TYPE.stack_of, length, flatten)
+    }
+
+    fn reference(length: uint (1), flatten: bool (true)) Type {
+        return this.indirect_type(TYPE.ref_of, length, flatten)
     }
 
     // &[T] — owned borrow with a runtime length, cached on the element type
@@ -2209,13 +2251,14 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
         return inner.locked_type()
     }
 
+
     if kind == TYPE_KIND.ptr {
         let inner = type_from_inner_exp(exp, scope, "Missing inner type for '*'") !>
         if inner.is_void_type() : exp.error("Use 'ptr' for an untyped pointer instead of '*void'")
         if exp.bool2 {
             let size_exp = exp.get(TYPE_EXP.size)
-            if isset(size_exp) : return inner.pointer(resolve_type_size(exp, scope) !>.to(uint))
-            return inner.pointer(0)
+            if isset(size_exp) : return inner.pointer(resolve_type_size(exp, scope) !>.to(uint), false)
+            return inner.pointer(0, false)
         }
         if inner.is_inline && inner.kind == TYPE.struct : return inner.non_inline()
         return inner.pointer()
@@ -2223,19 +2266,22 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
     if kind == TYPE_KIND.stack {
         let inner = type_from_inner_exp(exp, scope, "Missing inner type for 'stack'") !>
         if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
-        if exp.bool2 : return inner.stack_ref(resolve_type_size(exp, scope) !>.to(uint))
+        if exp.bool2 : return inner.stack_ref(resolve_type_size(exp, scope) !>.to(uint), false)
         return inner.stack_ref()
     }
     if kind == TYPE_KIND.ref {
         let inner = type_from_inner_exp(exp, scope, "Missing inner type for '&'") !>
         if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
+        let borrow = inner.reference()
         if exp.bool2 {
             let size_exp = exp.get(TYPE_EXP.size)
-            if isset(size_exp) : return inner.reference(resolve_type_size(exp, scope) !>.to(uint))
-            type_validate_sequence_element(inner, exp) !>
-            return inner.ref_slice()
+            if isset(size_exp) : borrow = inner.reference(resolve_type_size(exp, scope) !>.to(uint), false)
+            else {
+                type_validate_sequence_element(inner, exp) !>
+                borrow = inner.ref_slice()
+            }
         }
-        return inner.reference()
+        return exp.bool1 ? borrow.mut_type() : borrow
     }
 
     if kind == TYPE_KIND.inline {

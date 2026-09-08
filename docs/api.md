@@ -42,6 +42,38 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ## Classes for 'core'
 
 ```js
++ extend &[T] {
+    ~+ data: *[T]
+    ~+ length: uint
+    ~+ owner: ?GcPtr
+
+    + fn get(index: uint) T !LookupError
+    + fn part(offset: uint, length: uint) &mut [T]
+    + fn set(index: uint, value: T) void !LookupError
+    + fn set_all(value: T) void
+    + fn view(offset: uint, length: uint) &mut [T]
+}
+```
+
+```js
++ extend &[u8] {
+    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
+    + fn equal_ignore_ascii_case(cmp: String) bool
+    + fn equals(cmp: String) bool
+    + fn equals_at(offset: uint, length: uint, cmp: String) bool
+    + fn has_ascii_control(allow_tab: bool (false)) bool
+    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
+    + fn reader() ByteReader
+    + fn starts_with(cmp: String) bool
+    + fn to_ascii_lower_string() String
+    + fn to_float() float !SyntaxError
+    + fn to_int() int !SyntaxError
+    + fn to_string() String
+    + fn to_uint() uint !SyntaxError
+}
+```
+
+```js
 + array Array[T] {
     ~ data: ?GcPtr
     ~ length: uint
@@ -79,12 +111,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
-    + fn slice(start: uint, amount: uint) Slice[T]
-    + fn sort(func: ?fn(T, T)(bool) (null)) Array[T]
+    + fn slice(start: uint, amount: uint) &mut [T]
+    + fn sort(func: fn(T, T)(bool)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
-    + fn view(start: uint (0), amount: uint (uint.$max)) Slice[T]
+    + fn view(start: uint (0), amount: uint (uint.$max)) &mut [T]
 }
 ```
 
@@ -118,13 +150,14 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn set(index: uint, v: u8) void
     + fn shrink_capacity(size: uint) void
     + fn skip(amount: uint) void
+    + fn spare(amount: uint) &mut [u8]
     + fn starts_with(str: String, offset: uint (0)) bool
-    + fn to_slice() Slice[u8]
+    + fn to_slice() &mut [u8]
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
-    + fn view(offset: uint, length: uint) Slice[u8]
-    + fn write(data: Slice[u8]) uint
+    + fn view(offset: uint, length: uint) &mut [u8]
+    + fn write(data: &[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
@@ -147,11 +180,11 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + class ByteReader is Reader, Seeker {
     + pos: uint
-    + source: Slice[u8]
+    + source: &[u8]
 
     + fn get_pos() uint
-    + static fn new(source: Slice[u8]) ByteReader
-    + fn read(buf: Slice[u8]) uint !io:IoError
+    + static fn new(source: &[u8]) ByteReader
+    + fn read(buf: &mut [u8]) uint !io:IoError
     + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8
     + fn read_cstring() String
@@ -173,7 +206,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_uint() uint
     + fn read_uint_be() uint
     + fn read_uint_le() uint
-    + fn remaining() Slice[u8]
+    + fn remaining() &[u8]
     + fn reset() void
     + fn rewind(amount: uint) void
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
@@ -276,40 +309,6 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```
 
 ```js
-+ slice Slice[T] of T {
-    ~ data: *[T]
-    ~ length: uint
-    ~ owner: ?GcPtr
-
-    + fn append(item: T) Slice[T]
-    + fn get(index: uint) T !LookupError
-    + static fn new(length: uint, value: T) Slice[T]
-    + fn part(offset: uint, length: uint) Slice[T]
-    + fn set(index: uint, value: T) void !LookupError
-    + fn set_all(value: T) void
-    + fn view(offset: uint, length: uint) Slice[T]
-}
-```
-
-```js
-+ extend Slice[u8] {
-    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
-    + fn equal_ignore_ascii_case(cmp: String) bool
-    + fn equals(cmp: String) bool
-    + fn equals_at(offset: uint, length: uint, cmp: String) bool
-    + fn has_ascii_control(allow_tab: bool (false)) bool
-    + fn index_of_byte(byte: u8, start_index: uint (0)) uint !LookupError
-    + fn reader() ByteReader
-    + fn starts_with(cmp: String) bool
-    + fn to_ascii_lower_string() String
-    + fn to_float() float !SyntaxError
-    + fn to_int() int !SyntaxError
-    + fn to_string() String
-    + fn to_uint() uint !SyntaxError
-}
-```
-
-```js
 + slice String of u8 {
     ~ data: *[u8]
     ~ length: uint
@@ -355,13 +354,13 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
-    + fn to_slice() Slice[u8]
+    + fn to_slice() &[u8]
     + fn to_string() String
     + fn to_uint() uint !SyntaxError
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
-    + fn view(start_index: uint, length: uint) Slice[u8]
+    + fn view(start_index: uint, length: uint) &[u8]
 }
 ```
 
@@ -602,7 +601,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn read_uint_dynamic(max_bytes: uint) (uint, uint)
     + fn read_uint_le() uint
     + fn to_hex() String
-    + fn write(data: Slice[u8]) void
+    + fn write(data: &[u8]) void
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_bytes(from: ptr, len: uint) void
     + fn write_cstring(str: cstring, include_zero_byte: bool) void
@@ -1100,7 +1099,7 @@ alias pid_t for i32
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync_all() void
 + fn truncate(path: String, length: uint) void !io:IoError
-+ fn write(path: String, content: Slice[u8], append: bool (false)) void !io:IoError
++ fn write(path: String, content: &[u8], append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -1112,21 +1111,21 @@ alias pid_t for i32
     ~ position: uint
 
     + fn close() void !io:IoError
-    + fn read(buf: Slice[u8]) uint !io:IoError
+    + fn read(buf: &mut [u8]) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
-    + fn write(data: Slice[u8]) uint !io:IoError
+    + fn write(data: &[u8]) uint !io:IoError
 }
 ```
 
 ```js
 + class InMemoryFile {
-    ~ data: Slice[u8]
+    ~ data: &[u8]
     ~ filename: String
     ~ mime_type: String
 
     + static fn from_file(path: String) InMemoryFile !io:IoError
-    + static fn new(data: Slice[u8]) InMemoryFile
+    + static fn new(data: &[u8]) InMemoryFile
     + fn reader() ByteReader
     + fn save(path: String) void !io:IoError
     + fn to_string() String
@@ -1270,9 +1269,9 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
 ```js
 + class Context {
-    ~+ method: Slice[u8]
-    ~+ path: Slice[u8]
-    ~+ query_string: Slice[u8]
+    ~+ method: &[u8]
+    ~+ path: &[u8]
+    ~+ query_string: &[u8]
     ~+ status: uint
 
     + get body: String
@@ -1437,9 +1436,9 @@ alias Fd for i32
 + fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
 + fn print(msg: String) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError
++ fn read(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
-+ fn read_sync(fd: i32, buf: Slice[u8], offset: uint (0)) uint !IoError
++ fn read_sync(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
@@ -1447,7 +1446,7 @@ alias Fd for i32
 + fn stdin() StdStream
 + fn stdout() StdStream
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
-+ fn write(fd: i32, data: Slice[u8]) uint !IoError
++ fn write(fd: i32, data: &[u8]) uint !IoError
 ```
 
 ## Classes for 'io'
@@ -1460,7 +1459,7 @@ alias Fd for i32
 
 ```js
 + interface Reader {
-    + fn read(buf: Slice[u8]) uint !IoError
+    + fn read(buf: &mut [u8]) uint !IoError
 }
 ```
 
@@ -1476,14 +1475,14 @@ alias Fd for i32
     ~ can_write: bool
     ~ fd: i32
 
-    + fn read(buf: Slice[u8]) uint !IoError
-    + fn write(data: Slice[u8]) uint !IoError
+    + fn read(buf: &mut [u8]) uint !IoError
+    + fn write(data: &[u8]) uint !IoError
 }
 ```
 
 ```js
 + interface Writer {
-    + fn write(data: Slice[u8]) uint !IoError
+    + fn write(data: &[u8]) uint !IoError
 }
 ```
 
@@ -1658,27 +1657,27 @@ alias Fd for i32
 + fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
-+ fn ascii_equal_ignore_case(a: Slice[u8], b: Slice[u8]) bool
-+ fn ascii_to_lower(view: Slice[u8]) void
++ fn ascii_equal_ignore_case(a: &[u8], b: &[u8]) bool
++ fn ascii_to_lower(view: &mut [u8]) void
 + fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
 + fn calloc(size: uint) ptr
-+ fn clear(view: Slice[u8]) void
++ fn clear(view: &mut [u8]) void
 + fn clear_bytes(adr: ptr, length: uint) void
 + fn clear_value[T](value: *T) void
-+ fn copy(from: Slice[u8], to: Slice[u8]) uint
++ fn copy(from: &[u8], to: &mut [u8]) uint
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 + fn copy_value[T](from: *T, to: *T) void
-+ fn equal(a: Slice[u8], b: Slice[u8]) bool
++ fn equal(a: &[u8], b: &[u8]) bool
 + fn equal_bytes(a: ptr, b: ptr, length: uint) bool
-+ fn find_char(view: Slice[u8], ch: u8) uint !LookupError
++ fn find_char(view: &[u8], ch: u8) uint !LookupError
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(value: $T) void
-+ fn move(from: Slice[u8], to: Slice[u8]) uint
++ fn move(from: &[u8], to: &mut [u8]) uint
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
 + fn move_value[T](from: *T, to: *T) void
 + fn new[T](initial: T (T.$default_value)) *T
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
-+ fn to_uint(view: Slice[u8], allow_plus: bool (false)) uint !SyntaxError
++ fn to_uint(view: &[u8], allow_plus: bool (false)) uint !SyntaxError
 ```
 
 # net
@@ -1686,8 +1685,8 @@ alias Fd for i32
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
-+ fn write(fd: i32, data: Slice[u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn recv(fd: i32, buf: &mut [u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn write(fd: i32, data: &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
 
 ## Classes for 'net'
@@ -1713,11 +1712,11 @@ alias Fd for i32
 
     + fn close() void !io:IoError
     + static fn new(fd: i32) Connection !NetError
-    + fn read(buf: Slice[u8]) uint !io:IoError
+    + fn read(buf: &mut [u8]) uint !io:IoError
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
-    + fn write(data: Slice[u8]) uint !io:IoError
+    + fn write(data: &[u8]) uint !io:IoError
 }
 ```
 
@@ -1761,7 +1760,7 @@ alias Fd for i32
     + fn get_error_message() String
     + static fn new() Ssl
     + fn peer_certificate_sha256() String !NetError
-    + fn recv(buf: Slice[u8], timeout_ms: uint (5000)) uint !NetError
+    + fn recv(buf: &mut [u8], timeout_ms: uint (5000)) uint !NetError
     + fn selected_alpn() String
     + fn set_alpn(protocols: Array[String]) void !NetError
     + fn set_ca_cert(path: ?String) void !NetError
@@ -1772,7 +1771,7 @@ alias Fd for i32
     + fn set_max_version(version: TlsVersion) void !NetError
     + fn set_min_version(version: TlsVersion) void !NetError
     + fn set_verify(enable: bool) void
-    + fn write(data: Slice[u8], timeout_ms: uint (5000)) uint !NetError
+    + fn write(data: &[u8], timeout_ms: uint (5000)) uint !NetError
 }
 ```
 

@@ -455,6 +455,609 @@ if [[ "$error_body" != *"br label %await.after."* ]] \
     exit 1
 fi
 
+echo "> Array conversions read the source layout without heap allocation"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    array_ir="$workdir/array-conversions-$target.ll"
+    if ! "$VALK" build "$DIR/array-conversions.valk" --ir --no-warn --target "$target" -o "$array_ir"; then
+        exit 1
+    fi
+    widened=$(sed -n '/^define .*__array_widen_elements__/,/^}/p' "$array_ir")
+    first_load=$(grep -m 1 '= load \[' <<< "$widened")
+    direct=$(sed -n '/^define .*__array_same_layout__/,/^}/p' "$array_ir")
+    if [[ "$first_load" != *'load [2 x i64]'* ]] || [[ "$widened" == *'call '* ]]; then
+        echo "# Widening must read the source layout without allocating on $target"
+        echo "$widened"
+        exit 1
+    fi
+    if [[ "$direct" != *'load [2 x i64]'* ]] || [[ "$direct" == *'insertvalue'* ]] \
+        || [[ "$direct" == *'alloca ['* ]] || [[ "$direct" == *'call '* ]]; then
+        echo "# Matching array layouts should use a direct copy on $target"
+        echo "$direct"
+        exit 1
+    fi
+    presence=$(sed -n '/^define .*__array_add_presence__/,/^}/p' "$array_ir")
+    if [[ "$presence" != *'i1 true, 0'* ]] || [[ "$presence" == *'extractvalue [2 x i64]'* ]] \
+        || [[ "$presence" == *'call '* ]]; then
+        echo "# Adding presence should preserve the existing array on $target"
+        echo "$presence"
+        exit 1
+    fi
+done
+
+echo "> Borrowed receivers use their existing storage without heap allocation"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    borrow_ir="$workdir/borrow-methods-$target.ll"
+    if ! "$VALK" build "$DIR/borrow-methods.valk" --ir --no-warn --target "$target" -o "$borrow_ir"; then
+        exit 1
+    fi
+    read_body=$(sed -n '/^define .*__borrow_receiver_read__/,/^}/p' "$borrow_ir")
+    write_body=$(sed -n '/^define .*__borrow_receiver_write__/,/^}/p' "$borrow_ir")
+    increment_body=$(sed -n '/^define .*__Cell__increment__/,/^}/p' "$borrow_ir")
+    if [[ "$read_body" != *'load i64'* ]] || [[ "$write_body" != *'__Cell__increment__'* ]] \
+        || [[ "$increment_body" != *'store i64'* ]] \
+        || [[ "$read_body$write_body$increment_body" == *'__Pool__get__'* ]]; then
+        echo "# Borrowed receiver access must preserve storage without allocating on $target"
+        echo "$read_body$write_body$increment_body"
+        exit 1
+    fi
+done
+
+echo "> Shared operator hooks use atomic accesses without heap allocation"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    operator_ir="$workdir/operator-hooks-$target.ll"
+    if ! "$VALK" build "$DIR/operator-hooks.valk" --ir --no-warn --target "$target" -o "$operator_ir"; then
+        exit 1
+    fi
+    caller=$(sed -n '/^define .*__shared_operator_add__/,/^}/p' "$operator_ir")
+    hook=$(sed -n '/^define .*__HookCounter__add__shared__/,/^}/p' "$operator_ir")
+    if [[ "$caller" != *'__HookCounter__add__shared__'* ]] \
+        || [[ "$hook" != *'atomicrmw add'* ]] || [[ "$hook" != *'load atomic i64'* ]] \
+        || [[ "$caller$hook" == *'__Pool__get__'* ]]; then
+        echo "# Shared operator calls must select atomic access without allocating on $target"
+        echo "$caller$hook"
+        exit 1
+    fi
+    group_call=$(sed -n '/^define .*__shared_group_increment__/,/^}/p' "$operator_ir")
+    increment=$(sed -n '/^define .*__HookCounter__increment__shared__/,/^}/p' "$operator_ir")
+    group_read=$(sed -n '/^define .*__shared_group_read__/,/^}/p' "$operator_ir")
+    read=$(sed -n '/^define .*__HookCounter__read__shared__/,/^}/p' "$operator_ir")
+    getter=$(sed -n '/^define .*__HookCounter__total__shared__/,/^}/p' "$operator_ir")
+    if [[ "$group_call" != *'__HookCounter__increment__shared__'* ]] \
+        || [[ "$increment" != *'atomicrmw add'* ]] \
+        || [[ "$group_read" != *'__HookCounter__read__shared__'* ]] \
+        || [[ "$read" != *'__HookCounter__total__shared__'* ]] \
+        || [[ "$getter" != *'load atomic i64'* ]] \
+        || [[ "$group_call$increment$group_read$read$getter" == *'__Pool__get__'* ]]; then
+        echo "# Shared group methods and getters must preserve atomic access on $target"
+        echo "$group_call$increment$group_read$read$getter"
+        exit 1
+    fi
+done
+
+echo "> Borrowed inline clones guard null without heap allocation"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    clone_ir="$workdir/clone-borrows-$target.ll"
+    if ! "$VALK" build "$DIR/clone-borrows.valk" --ir --no-warn --target "$target" -o "$clone_ir"; then
+        exit 1
+    fi
+    direct=$(sed -n '/^define .*__clone_borrow_inline__/,/^}/p' "$clone_ir")
+    nullable=$(sed -n '/^define .*__clone_nullable_borrow_inline__/,/^}/p' "$clone_ir")
+    payload=$(sed -n '/^define .*__clone_nullable_inline__/,/^}/p' "$clone_ir")
+    hooks=$(sed -n '/^define .*__CloneCell__clone__/,/^}/p' "$clone_ir")
+    before_guard=$(sed '/^this_or_that.then\./,$d' <<< "$nullable")
+    present=$(sed -n '/^this_or_that.then\./,/^this_or_that.else\./p' <<< "$nullable")
+    absent=$(sed -n '/^this_or_that.else\./,/^this_or_that.after\./p' <<< "$nullable")
+    if [[ "$direct" != *'__CloneCell__clone__'* ]] || [[ "$present" != *'__CloneCell__clone__'* ]] \
+        || [[ "$before_guard$absent" == *'__CloneCell__clone__'* ]] \
+        || [[ "$before_guard" != *'icmp ne ptr'* ]] \
+        || [[ "$payload" != *'getelementptr { i1, [7 x i8], [8 x i8] }'* ]] \
+        || [[ "$direct$nullable$payload$hooks" == *'__Pool__get__'* ]]; then
+        echo "# Borrowed clone hooks must run only for present values without heap allocation on $target"
+        echo "$direct$nullable$payload$hooks"
+        exit 1
+    fi
+done
+
+echo "> Same-offset closures in separate files keep distinct allocators"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    closure_ir="$workdir/closure-layouts-$target.ll"
+    if ! "$VALK" build "$DIR"/../cli/closure-layouts/*.valk --release --ir --no-warn --target "$target" -o "$closure_ir"; then
+        exit 1
+    fi
+    first=$(sed -n '/^define .*__closure_layout_first__/,/^}/p' "$closure_ir" | grep -o 'ptr @"[^"]*ALC_[^"]*closure_env[^"]*"')
+    other=$(sed -n '/^define .*__closure_layout_other__/,/^}/p' "$closure_ir" | grep -o 'ptr @"[^"]*ALC_[^"]*closure_env[^"]*"')
+    if [[ -z "$first" || -z "$other" || "$first" == "$other" ]]; then
+        echo "# Different capture layouts must not share an allocator on $target"
+        echo "$first"
+        echo "$other"
+        exit 1
+    fi
+done
+
+echo "> Inlining controls survive specialization and receiver variants"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    flags_ir="$workdir/optimization-flags-$target.ll"
+    if ! "$VALK" build "$DIR/../cli/optimization-flags.valk" --release --ir --no-warn --target "$target" -o "$flags_ir"; then
+        exit 1
+    fi
+    definitions=$(grep -E '^define .*__(noinline_frame|noinline_generic|NoinlineCounter__(increment|clone))__' "$flags_ir")
+    count=$(grep -c '^define ' <<< "$definitions")
+    inline_definition=$(grep '^define .*__inline_increment__' "$flags_ir")
+    if [ "$count" -lt 7 ] || grep -qv ' noinline {' <<< "$definitions" \
+        || [[ "$inline_definition" != *' alwaysinline {'* ]]; then
+        echo "# Inlining controls were lost on $target"
+        echo "$definitions"
+        echo "$inline_definition"
+        exit 1
+    fi
+done
+
+echo "> Compatible callable views do not allocate adapter environments"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    callable_ir="$workdir/callable-compatibility-$target.ll"
+    if ! "$VALK" build "$DIR/callable-compatibility.valk" --release --ir --no-warn --target "$target" -o "$callable_ir"; then
+        exit 1
+    fi
+    for view in argument result pointer; do
+        body=$(sed -n "/^define .*__callable_${view}_view__/,/^}/p" "$callable_ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'valk.alloc.'* || "$body" == *'call ptr '* ]]; then
+            echo "# Compatible callable view allocated an adapter on $target: $view"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Conditional extraction of inline values does not allocate"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    conditional_ir="$workdir/conditional-values-$target.ll"
+    if ! "$VALK" build "$DIR/conditional-values.valk" --ir --no-warn --target "$target" -o "$conditional_ir"; then
+        exit 1
+    fi
+    for kind in scalar aggregate; do
+        body=$(sed -n "/^define .*__conditional_${kind}__/,/^}/p" "$conditional_ir")
+        if [[ -z "$body" || "$body" != *'br i1 '* || "$body" != *'__panic__'* \
+            || "$body" == *'__ALC_'* || "$body" == *'valk.alloc.'* || "$body" == *'__Pool__get__'* || "$body" == *'call ptr '* ]]; then
+            echo "# Conditional inline extraction allocated or lost its guard on $target: $kind"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Nonreturning operands terminate their block without new allocations"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    termination_ir="$workdir/nonreturning-expressions-$target.ll"
+    if ! "$VALK" build "$DIR/nonreturning-expressions.valk" --ir --no-warn --target "$target" -o "$termination_ir"; then
+        exit 1
+    fi
+    for kind in call array; do
+        body=$(sed -n "/^define .*__interrupted_${kind}__/,/^}/p" "$termination_ir")
+        if [[ -z "$body" || "$body" != *'__exit_number__'* \
+            || ( "$kind" == call && "$body" != *'__combine__'* ) \
+            || "$body" == *'__ALC_'* || "$body" == *'valk.alloc.'* || "$body" == *'__Pool__get__'* ]]; then
+            echo "# Nonreturning operand lost a reachable call or allocated storage on $target: $kind"
+            echo "$body"
+            exit 1
+        fi
+        if ! awk '
+            /^  unreachable$/ { ended = 1; next }
+            /^[^ ;]/ { ended = 0 }
+            /^  [^;]/ && ended { exit 1 }
+        ' <<< "$body"; then
+            echo "# Instructions emitted after unreachable on $target: $kind"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Function pointer calls and coroutines do not allocate closure adapters"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    call_ir="$workdir/call-evaluation-$target.ll"
+    if ! "$VALK" build "$DIR/call-evaluation.valk" --ir --no-warn --target "$target" -o "$call_ir"; then
+        exit 1
+    fi
+    direct=$(sed -n '/^define .*__pointer_call__/,/^}/p' "$call_ir")
+    task=$(sed -n '/^define .*__pointer_task__/,/^}/p' "$call_ir")
+    if [[ -z "$direct" || "$task" != *'__Coro__new__'* \
+        || "$direct$task" == *'__ALC_'* || "$direct$task" == *'valk.alloc.'* \
+        || "$direct$task" == *'__Pool__get__'* || "$direct$task" == *'closure_env'* ]]; then
+        echo "# Function pointer call added closure storage or lost coroutine creation on $target"
+        echo "$direct$task"
+        exit 1
+    fi
+done
+
+echo "> Adapt function pointers without allocating for known targets"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/fnptr-closures-$target.ll"
+    if ! out=$("$VALK" build "$DIR/fnptr-closures.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build function pointer closure fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in known_pointer_closure known_literal_closure; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" != *'ptr null, 1'* \
+            || "$body" == *'__ALC_'* || "$body" == *'valk.alloc.'* \
+            || "$body" == *'closure_env'* || "$body" == *'<fnptr.closure.'* ]]; then
+            echo "# Known function pointer acquired a closure environment on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+    invoke=$(sed -n '/^define .*__<fnptr.invoke\./,/^}/p' "$ir")
+    if [[ "$invoke" != *'(ptr %closure.data, i64 %arg.0)'* ]] \
+        || ! grep -Eq 'call i64 %[^ ]+\(i64 %[^)]+\)' <<< "$invoke"; then
+        echo "# Dynamic closure adapter did not forward the raw pointer signature on $target"
+        echo "$invoke"
+        exit 1
+    fi
+done
+
+echo "> Keep bound and unbound method adapters distinct"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/bound-callables-$target.ll"
+    if ! out=$("$VALK" build "$DIR/bound-callables.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build method adapter fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in unbound_class unbound_struct bound_class; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'call '* || "$body" == *'closure_env'* ]]; then
+            echo "# Method reference unexpectedly allocated or called a helper on $target"
+            echo "$body"
+            exit 1
+        fi
+        if [[ "$name" == unbound_* && "$body" != *'ptr null, 1'* ]]; then
+            echo "# Unbound method retained an environment on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+    class_adapter=$(sed -n '/^define internal .*valk.closure.adapter.*Counter__read__.*\.unbound"/,/^}/p' "$ir")
+    struct_adapter=$(sed -n '/^define internal .*valk.closure.adapter.*Accumulator__add__.*\.unbound"/,/^}/p' "$ir")
+    bound_adapter=$(sed -n '/^define internal .*valk.closure.adapter.*Accumulator__add__[0-9]*"/,/^}/p' "$ir")
+    if [[ "$class_adapter" != *'(ptr %closure.data, ptr %arg.0, i64 %arg.1)'* \
+        || "$struct_adapter" != *'(ptr %closure.data, { ptr, ptr } %arg.0, i64 %arg.1)'* \
+        || "$bound_adapter" != *'(ptr %closure.data, i64 %arg.1)'* ]]; then
+        echo "# Bound and unbound receiver signatures disagree on $target"
+        echo "$class_adapter$struct_adapter$bound_adapter"
+        exit 1
+    fi
+done
+
+echo "> Check cleared references without allocating or checking plain numbers"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/cleared-views-$target.ll"
+    if ! out=$("$VALK" build "$DIR/cleared-views.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build cleared-view fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in read_number read_callback read_pair read_borrowed_pair read_stable_cell; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Checked view read acquired an allocation on $target"
+            echo "$body"
+            exit 1
+        fi
+        presence_count=$(grep -c 'icmp ne ptr' <<< "$body")
+        expected=1
+        if [ "$name" = read_number ] || [ "$name" = read_stable_cell ]; then expected=0; fi
+        if [ "$name" = read_pair ]; then expected=2; fi
+        if [ "$presence_count" -ne "$expected" ]; then
+            echo "# Unexpected presence checks for $name on $target: $presence_count"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Sort with default and explicit comparators without allocating"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/array-sorting-$target.ll"
+    if ! out=$("$VALK" build "$DIR/array-sorting.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build array-sorting fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in sort_numbers sort_slices sort sort_with sort_sift_down sort_after; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Array sorting acquired an allocation on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Check enum storage and exhaustive matches without allocating"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/enum-safety-$target.ll"
+    if ! out=$("$VALK" build "$DIR/enum-safety.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build enum-safety fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in read_enum read_zero_enum choose default_enum arithmetic; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Enum safety acquired an allocation on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        presence_count=$(grep -c 'icmp ne i64' <<< "$body")
+        expected=0
+        if [ "$name" = read_enum ] || [ "$name" = arithmetic ]; then expected=1; fi
+        if [ "$presence_count" -ne "$expected" ]; then
+            echo "# Unexpected enum presence checks for $name on $target: $presence_count"
+            echo "$body"
+            exit 1
+        fi
+        if [ "$name" = choose ] && [ "$(grep -c 'icmp eq i64' <<< "$body")" -ne 2 ]; then
+            echo "# Exhaustive enum match skipped a case check on $target"
+            echo "$body"
+            exit 1
+        fi
+        if [ "$name" = arithmetic ] && [ "$(grep -c 'call .*__index__' <<< "$body")" -ne 1 ]; then
+            echo "# Enum arithmetic evaluated its index more than once on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Preserve enum borrows without allocating conversion storage"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/enum-representations-$target.ll"
+    if ! out=$("$VALK" build "$DIR/enum-representations.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build enum representation fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in read_optional replace_row read_row; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Enum borrow acquired an allocation on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Read enum storage and mutate independent copies without allocating"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/enum-storage-$target.ll"
+    if ! out=$("$VALK" build "$DIR/enum-storage.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build enum storage fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in read_enum read_bound read_generic modify_copy; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Enum storage access acquired an allocation on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Elide closure environments for local bound-method calls, including loops"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/bound-locals-$target.ll"
+    if ! out=$("$VALK" build "$DIR/bound-locals.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build local bound-method fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in local_binding loop_binding from_factory; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* || "$body" != *'__Counter__add__'* ]]; then
+            echo "# Local binding did not become a direct call on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        if [ "$name" = from_factory ] && [ "$(grep -c 'call .*__Factory__make__' <<< "$body")" -ne 1 ]; then
+            echo "# Bound receiver expression did not execute once on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Evaluate temporary array borrows once without allocating helper storage"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/borrow-evaluation-$target.ll"
+    if ! out=$("$VALK" build "$DIR/borrow-evaluation.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build borrow evaluation fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in borrow_temporary borrow_nested; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        indexes=1
+        if [ "$name" = borrow_nested ]; then indexes=2; fi
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Factory__arrays*__' <<< "$body")" -ne 1 ] \
+            || [ "$(grep -c 'call .*__Factory__index__' <<< "$body")" -ne "$indexes" ]; then
+            echo "# Borrow source or index was repeated, or helper storage allocated, on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Keep slice access bounds and storage together without allocating"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/index-storage-$target.ll"
+    if ! out=$("$VALK" build "$DIR/index-storage.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build slice selection fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in read_selected write_selected borrow_selected range_selected; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Holder__shrink__' <<< "$body")" -ne 1 ]; then
+            echo "# Slice selection repeated its index or allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Evaluate managed-store owners once without allocating helper storage"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/owner-stores-$target.ll"
+    if ! out=$("$VALK" build "$DIR/owner-stores.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build managed-store fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in store_inline store_element store_borrowed_part store_borrowed_item; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Factory__' <<< "$body")" -ne 1 ]; then
+            echo "# Store repeated its owner or allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Borrow managed fixed-array slots without copying their values"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/fixed-element-borrows-$target.ll"
+    if ! out=$("$VALK" build "$DIR/fixed-element-borrows.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build fixed-element borrow fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in borrow_nullable borrow_required; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* || "$body" == *'__property_get__'* ]]; then
+            echo "# Fixed-element borrow copied its value or allocated on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Evaluate fixed-range sources and bounds once without helper allocation"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/fixed-range-evaluation-$target.ll"
+    if ! out=$("$VALK" build "$DIR/fixed-range-evaluation.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build fixed-range fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in copy_property copy_borrowed; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]] \
+            || [ "$(grep -c 'call .*__Factory__' <<< "$body")" -ne 2 ] \
+            || [ "$(grep -c 'call .*__Factory__start__' <<< "$body")" -ne 1 ]; then
+            echo "# Fixed range repeated its source or start, or allocated, on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Preserve matrix row strides without allocating borrow adapters"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/matrix-borrows-$target.ll"
+    if ! out=$("$VALK" build "$DIR/matrix-borrows.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build matrix borrow fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in borrow_rows row_view read_row; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Matrix borrow or row access allocated on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        if [ "$name" = read_row ] && [[ "$body" != *'getelementptr [2 x i64]'* ]]; then
+            echo "# Matrix access lost its row stride on $target"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Copy bounded matrix pointers with the full row layout and no heap adapter"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/pointer-array-copies-$target.ll"
+    if ! out=$("$VALK" build "$DIR/pointer-array-copies.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build pointer array-copy fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in copy_rows widen_rows; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* || "$body" != *'load [3 x [2 x i64]]'* ]]; then
+            echo "# Pointer copy lost its row layout or allocated on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Call custom iterators with defaults and no heap adapter"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/iterator-contracts-$target.ll"
+    if ! out=$("$VALK" build "$DIR/iterator-contracts.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build iterator contract fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in default_sum infallible_sum; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Custom iterator allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        default=73
+        if [ "$name" = infallible_sum ]; then default=19; fi
+        if ! grep -q "call .*___next__.*i64 $default)" <<< "$body"; then
+            echo "# Custom iterator did not pass its default argument on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
+echo "> Infer custom iterator calls without allocating an adapter"
+for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+    ir="$workdir/generic-iterators-$target.ll"
+    if ! out=$("$VALK" build "$DIR/generic-iterators.valk" --target "$target" --ir --no-warn -o "$ir" 2>&1); then
+        echo "# Failed to build iterator contract fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for name in generic_sum generic_tuple_sum; do
+        body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
+        if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
+            echo "# Custom iterator allocated helper storage on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+        default=73
+        if [ "$name" = generic_tuple_sum ]; then default=19; fi
+        if ! grep -q "call .*___next__.*i64 $default)" <<< "$body"; then
+            echo "# Custom iterator did not pass its default argument on $target: $name"
+            echo "$body"
+            exit 1
+        fi
+    done
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 19"
+echo "# Test count: 46"
 echo ""

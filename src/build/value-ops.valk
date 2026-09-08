@@ -46,7 +46,6 @@ fn vgen_wrap(on: Value, rett: Type) Value {
     result.set_issets(on.get_issets())
     result.set_not_issets(on.get_not_issets())
     result.set_error_type(on.get_error_type())
-    result.set_pre_value(on.get_pre_value())
     if on.is_implicit_borrow() : result.mark_implicit_borrow()
     return result
 }
@@ -73,9 +72,21 @@ fn value_make_nullable(v: Value) Value {
     return vgen_wrap(v, v.rett.nullable())
 }
 
+fn value_enum_representation(value: Value) Value !Error {
+    let enu = value.rett.get_enum() ?! return value
+    let type = enu.get_item_type() !>
+    let result: Value = value
+    if value.type == VAL.int : result = vgen_int(value.int_val, type)
+    else if value.type == VAL.float : result = vgen_float(value.float_val, type)
+    else if value.type == VAL.bool : result = vgen_bool(value.bool_val, type)
+    else : result = vgen_wrap(value, value.rett.storage_view_of(type))
+    result.exp = value.exp
+    return result
+}
+
 fn value_force_to(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) Value !Error {
-    let target_enum = target.get_enum()
-    if isset(target_enum) && v.rett.get_enum() != target_enum {
+    let target_enum = target.get_enum() ?? target.get_non_nullable().get_enum()
+    if isset(target_enum) && (v.rett.get_enum() ?? v.rett.get_non_nullable().get_enum()) != target_enum {
         let converted = value_try_convert(v, scope, ctx, target, false) !>
         if target.compat(converted.rett) {
             converted.exp = at
@@ -171,6 +182,11 @@ fn decl_escape_arg(decl: Decl) ?Arg {
 }
 
 fn value_collect_escape_origins(value: Value, origins: Array[Decl]) {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_collect_escape_origins(graph_source, origins)
+        return
+    }
     let type = value.rett.get_non_nullable()
     // A raw address taken from a graph still reaches that graph, so the walk
     // continues through it; plain data carries no provenance.
@@ -247,7 +263,9 @@ fn value_stays_inside(value: Value, owner: Value) bool {
 fn value_mark_summary_escape(value: Value) {
     each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
         let arg = decl_escape_arg(origin)
-        if isset(arg) : arg.may_escape = true
+        if isset(arg) {
+            arg.may_escape = true
+        }
     }
 }
 
@@ -255,6 +273,59 @@ fn value_mark_summary_unique_invalidation(value: Value) {
     each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
         let arg = decl_escape_arg(origin)
         if isset(arg) : arg.invalidates_unique = true
+    }
+}
+
+// Writes to inline subobjects reach the storage owner, not a copied scalar.
+fn value_mark_summary_write(value: Value) {
+    if value.type != VAL.prop && value.type != VAL.ptrv : return
+    let owner = value.value1 ?! return
+    if owner.rett.is_inline_type() && !owner.rett.get_non_nullable().is_fat_borrow() {
+        value_mark_summary_write(owner)
+        return
+    }
+    each (value_scratch_escape_origins(owner, owner.rett.build.cache.origins_buf)) as origin {
+        let arg = decl_escape_arg(origin)
+        if isset(arg) : arg.may_write = true
+    }
+}
+
+fn value_note_call_write(value: Value, param: ?Arg) {
+    // A raw pointer handed to a callee is unsafe territory, not a write to
+    // the storage it was read from
+    let nn = value.rett.get_non_nullable()
+    if nn.is_raw_pointer() || nn.kind == TYPE.ptr_of : return
+    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
+        let source = decl_escape_arg(origin) ?! continue
+        if !isset(param) {
+            source.may_write = true
+            continue
+        }
+        let dependents = param.write_dependents ?? <{
+            let created = Array[Arg]{}
+            param.write_dependents = created
+            return created
+        }
+        dependents.append(source, true)
+    }
+}
+
+fn value_note_call_writes(callee: Value, args: Array[Value]) {
+    let func = callee.resolve_call_func()
+    let skip: uint = 0
+    if isset(func) && !func.is_static && isset(func.class) {
+        let receiver = callee.value1
+        if isset(receiver) && receiver.type != VAL.type {
+            skip = 1
+            value_note_call_write(receiver, func.args.get(0) !? null)
+        }
+    }
+    if !isset(func) : value_note_call_write(callee, null)
+    let i: uint = 0
+    each args as arg {
+        let param: ?Arg = isset(func) ? (func.args.get(i + skip) !? null) : null
+        value_note_call_write(arg, param)
+        i++
     }
 }
 
@@ -287,20 +358,221 @@ fn value_mark_summary_absorbs(on: Value, sources: Array[uint]) {
     }
 }
 
-// A callee that only stores values it was handed keeps its receiver unique, as
-// long as every absorbed value is unique here: nothing gains an alias, the
-// values simply move in.
-fn call_absorbs_stay_unique(arg: ?Arg, args: Array[Value], skip: uint) bool !Error {
+// A call whose callee summary was not ready yet: which arguments it moves
+// into which is settled once one of the involved graphs must be unique.
+class PendingAbsorb {
+    func: Func
+    receiver: ?Value
+    args: Array[Value]
+    skip: uint
+    owner: Func
+    resolved: bool (false)
+}
+
+fn value_attach_pending_absorb(value: Value, pending: PendingAbsorb) {
+    let decl = value_root_decl(value)
+    if isset(decl) {
+        let list = decl.pending_absorbs ?? <{
+            let created = Array[PendingAbsorb]{}
+            decl.pending_absorbs = created
+            return created
+        }
+        list.append(pending)
+        return
+    }
+    if value.type != VAL.class_init && value.type != VAL.array_init : return
+    let values = value.values ?! return
+    each values as item : value_attach_pending_absorb(item, pending)
+}
+
+// Nothing can move between the values of a call with fewer than two of them
+fn value_defer_call_absorbs(func: Func, receiver: ?Value, args: Array[Value], skip: uint, owner: Func) {
+    let tracked: uint = 0
+    if isset(receiver) && value_tracks_unique_effects(receiver) : tracked++
+    each args as av {
+        if value_tracks_unique_effects(av) : tracked++
+    }
+    if tracked < 2 : return
+    let pending = PendingAbsorb { func: func, receiver: receiver, args: args, skip: skip, owner: owner }
+    if isset(receiver) : value_attach_pending_absorb(receiver, pending)
+    each args as av {
+        if value_tracks_unique_effects(av) : value_attach_pending_absorb(av, pending)
+    }
+}
+
+fn pending_absorb_param(pending: PendingAbsorb, index: uint) ?Arg {
+    let params = pending.func.args
+    if index < params.length : return params.get(index) !? null
+    if pending.func.infinite_args && params.length > 0 : return params.get(params.length - 1) !? null
+    return null
+}
+
+fn pending_absorb_apply(pending: PendingAbsorb) !Error {
+    let receiver = pending.receiver
+    if isset(receiver) {
+        value_absorb_call_args(pending.func, pending_absorb_param(pending, 0), receiver, pending.args, pending.skip, pending.owner, true) !>
+    }
+    each pending.args as av, i {
+        value_absorb_call_args(pending.func, pending_absorb_param(pending, i + pending.skip), av, pending.args, pending.skip, pending.owner, true) !>
+    }
+}
+
+// A cycle left the callee unknown: nothing handed to it can be relied on
+fn pending_absorb_give_up(pending: PendingAbsorb) {
+    let receiver = pending.receiver
+    if isset(receiver) {
+        value_mark_summary_unique_invalidation(receiver)
+        value_invalidate_unique(receiver)
+    }
+    each pending.args as av {
+        value_mark_summary_unique_invalidation(av)
+        value_invalidate_unique(av)
+    }
+}
+
+// Callee bodies are analyzed on demand from here, like any uniqueness query
+fn decl_resolve_pending_absorbs(decl: Decl) !Error {
+    let list = decl.pending_absorbs ?! return
+    decl.pending_absorbs = null
+    each list as pending {
+        if pending.resolved : continue
+        pending.resolved = true
+        ensure_func_unique_return_summary(pending.func) !>
+        if pending.func.unique_summary_ready : pending_absorb_apply(pending) !>
+        else : pending_absorb_give_up(pending)
+    }
+}
+
+// The callee stores values it was handed into 'target'. A unique value simply
+// moves in and becomes part of the target's graph; anything else leaves an
+// alias behind, unless it came in through a parameter of this function, in
+// which case the outer call site decides. False when what the callee absorbs
+// is not known yet; forced, its own calls are settled first.
+fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Value], skip: uint, owner: Func, force: bool) bool !Error {
     if !isset(arg) : return true
-    let absorbs = arg.absorbs_args
-    if !isset(absorbs) : return true
+    if !func.unique_summary_ready : return false
+    if force : decl_resolve_pending_absorbs(arg.decl) !>
+    else if isset(arg.decl.pending_absorbs) : return false
+    let absorbs = arg.absorbs_args ?! return true
+    let destination = value_root_decl(target)
     each absorbs as index {
-        if index < skip : return false
-        let av = args.get(index - skip) !? null
-        if !isset(av) : return false
-        if !(value_graph_is_unique(av, true) !>) : return false
+        let av = index >= skip ? (args.get(index - skip) !? null) : null
+        if isset(av) && (value_graph_is_unique(av, true) !>) {
+            // Being kept by the callee is what moving in means, not an escape
+            let param = func.args.get(index) !? null
+            if isset(param) : value_drop_pending_effect(av, param)
+            if isset(destination) : value_transfer_unique_inputs(av, destination)
+            else : value_invalidate_unique(av)
+            continue
+        }
+        let sources = isset(av) ? value_summary_source_args(av, owner) : null
+        value_absorb_param_sources(target, sources, owner)
     }
     return true
+}
+
+// Something that was not unique moved into 'target'. When it came in through
+// a parameter the call site decides whether that cost the target its
+// uniqueness; anything else leaves an alias behind. A local that took in a
+// parameter's graph now has that parameter among its origins.
+fn value_absorb_param_sources(target: Value, sources: ?Array[uint], owner: Func) {
+    if isset(sources) {
+        value_mark_summary_absorbs(target, sources)
+        let destination = value_root_decl(target)
+        if isset(destination) && !isset(func_arg_index(owner, destination)) {
+            let origins = destination.escape_origins ?? <{
+                let created = Array[Decl]{ destination }
+                destination.escape_origins = created
+                return created
+            }
+            each sources as index {
+                let param = owner.args.get(index) ! continue
+                origins.append(param.decl, true)
+            }
+        }
+    } else {
+        value_mark_summary_unique_invalidation(target)
+    }
+    value_invalidate_unique(target)
+}
+
+// Whether every input of this graph is the method's receiver or local data
+// built inside the method: a view of the receiver, not a new publication
+fn value_built_from_receiver(value: Value, func: Func) bool !Error {
+    let receiver = func.args.get(0) ! return false
+    // Calls that moved data into this graph settle its origins first
+    let root = value_root_decl(value)
+    if isset(root) : decl_resolve_pending_absorbs(root) !>
+    let origins = value_escape_origins(value)
+    // Nothing flowed in from anywhere the method can name: a local that was
+    // built here counts, a global or a fresh temporary does not
+    if origins.length == 0 : return isset(root) && !isset(func_arg_index(func, root))
+    each origins as origin {
+        let index = func_arg_index(func, origin)
+        if isset(index) && index != 0 : return false
+    }
+    return true
+}
+
+// A unique value stored into another graph becomes part of that graph
+fn value_link_stored_graph(value: Value, owner: Value) {
+    let destination = value_root_decl(owner) ?! return
+    value_transfer_unique_inputs(value, destination)
+}
+
+fn value_drop_pending_effect(value: Value, param: Arg) {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_drop_pending_effect(graph_source, param)
+        return
+    }
+    if value.type == VAL.decl {
+        let decl = value.decl ?! return
+        if decl.is_buffer {
+            let pre = value.get_pre_value()
+            if isset(pre) : value_drop_pending_effect(pre, param)
+            return
+        }
+        let args = decl.pending_effect_args ?! return
+        let positions = decl.pending_effect_positions ?! return
+        let i: uint = args.length
+        while i > 0 {
+            i--
+            let arg = args.get(i) ! break
+            if arg != param : continue
+            args.remove(i)
+            positions.remove(i)
+        }
+        return
+    }
+    let inner = value.value1
+    if isset(inner) : value_drop_pending_effect(inner, param)
+    let other = value.value2
+    if isset(other) : value_drop_pending_effect(other, param)
+    let values = value.values
+    if isset(values) {
+        each values as item : value_drop_pending_effect(item, param)
+    }
+}
+
+// The variable whose graph holds this value, when there is one
+fn value_root_decl(value: Value) ?Decl {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) : return value_root_decl(graph_source)
+    if value.type == VAL.decl {
+        let decl = value.decl ?! return null
+        if !decl.is_buffer : return decl
+        let pre = value.get_pre_value()
+        let source = isset(pre) && pre.type == VAL.assign ? pre.value2 : null
+        return isset(source) ? value_root_decl(source) : null
+    }
+    if value.type == VAL.prop || value.type == VAL.wrap || value.type == VAL.cast
+        || value.type == VAL.interface_wrap || value.type == VAL.block
+    {
+        let inner = value.value1 ?! return null
+        return value_root_decl(inner)
+    }
+    return null
 }
 
 // A call that hands back one of its arguments makes the result an alias of that
@@ -308,7 +580,12 @@ fn call_absorbs_stay_unique(arg: ?Arg, args: Array[Value], skip: uint) bool !Err
 // which is what keeps the return itself from counting as an escape.
 fn value_consume_call_return_sources(value: Value) !Error {
     let v = value
-    while v.type == VAL.wrap || v.type == VAL.cast || v.type == VAL.interface_wrap || v.type == VAL.error_success {
+    let graph_source = v.get_graph_source()
+    if isset(graph_source) {
+        value_consume_call_return_sources(graph_source) !>
+        return
+    }
+    while v.type == VAL.wrap || v.type == VAL.cast || v.type == VAL.interface_wrap || v.type == VAL.error_success || v.type == VAL.block {
         let inner = v.value1
         if !isset(inner) : return
         v = inner
@@ -338,6 +615,11 @@ fn func_unique_summary_unavailable_in_lsp(func: Func) bool {
 }
 
 fn value_invalidate_unique(value: Value) {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_invalidate_unique(graph_source)
+        return
+    }
     if value.type == VAL.decl {
         let decl = value.decl
         if isset(decl) {
@@ -366,7 +648,43 @@ fn value_mark_actual_escape(value: Value) {
     value_invalidate_unique(value)
 }
 
-fn value_publish_unique(value: Value) {
+fn value_publish_unique(value: Value, ctx: Context) !Error {
+    if value.rett.get_non_nullable().is_shared : return
+    value.ensure_meta().publishes_graph = true
+    let func = ctx.func
+    if isset(func) : func.has_publications = true
+    value_consume_published_graph(value) !>
+}
+
+fn value_consume_published_graph(value: Value) !Error {
+    if value.rett.get_non_nullable().is_shared : return
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_consume_published_graph(graph_source) !>
+        return
+    }
+    // A call that hands back part of an argument publishes that argument too
+    if value.type == VAL.call {
+        let callee = value.value1 ?! return
+        let func = callee.resolve_call_func() ?! return
+        ensure_func_unique_return_summary(func) !>
+        if !func.unique_summary_ready : return
+        each func.unique_return_args as index {
+            let arg = value_call_argument(value, func, index)
+            if isset(arg) : value_consume_published_graph(arg) !>
+        }
+        return
+    }
+    if value.type == VAL.error_handler {
+        let call = value.get_pre_value()
+        if isset(call) : value_consume_published_graph(call) !>
+        return
+    }
+    if value.type == VAL.error_success || value.type == VAL.block {
+        let inner = value.value1
+        if isset(inner) : value_consume_published_graph(inner) !>
+        return
+    }
     // Only managed, mutable data changes hands when it is published
     let type = value.rett.get_non_nullable()
     if !value.rett.has_gc_refs() && type.kind != TYPE.closure : return
@@ -378,7 +696,7 @@ fn value_publish_unique(value: Value) {
             if decl.is_buffer {
                 let pre = value.get_pre_value()
                 let source = isset(pre) ? pre.value2 : null
-                if isset(source) : value_publish_unique(source)
+                if isset(source) : value_consume_published_graph(source) !>
                 return
             }
             decl.unique_graph = false
@@ -391,12 +709,12 @@ fn value_publish_unique(value: Value) {
         || value.type == VAL.class_init || value.type == VAL.this_or_that || value.type == VAL.phi
     {
         let inner = value.value1
-        if isset(inner) : value_publish_unique(inner)
+        if isset(inner) : value_consume_published_graph(inner) !>
         let other = value.value2
-        if isset(other) : value_publish_unique(other)
+        if isset(other) : value_consume_published_graph(other) !>
         let values = value.values
         if isset(values) {
-            each values as item : value_publish_unique(item)
+            each values as item : value_consume_published_graph(item) !>
         }
     }
 }
@@ -456,6 +774,11 @@ fn arg_append_dependent(param: Arg, dependent: Arg) {
 }
 
 fn value_transfer_unique_inputs(value: Value, destination: Decl) {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_transfer_unique_inputs(graph_source, destination)
+        return
+    }
     if value.type == VAL.decl {
         let decl = value.decl
         if isset(decl) {
@@ -464,11 +787,14 @@ fn value_transfer_unique_inputs(value: Value, destination: Decl) {
                 if isset(pre) : value_transfer_unique_inputs(pre, destination)
                 return
             }
+            // Stored into its own graph: a rearrangement, not a new input
+            if decl == destination : return
             let type = decl.type.get_non_nullable()
             let string_class = type_string(type.build).get_class_or_null()
             if (!decl.type.has_gc_refs() && type.kind != TYPE.closure)
                 || (isset(string_class) && type.get_class_or_null() == string_class) : return
             decl.unique_graph = false
+            decl.unique_source = null
             let dependents = decl.unique_dependents ?? <{
                 let a = Array[Decl]{}
                 decl.unique_dependents = a
@@ -496,16 +822,13 @@ fn value_transfer_unique_inputs(value: Value, destination: Decl) {
     }
 }
 
-fn decl_invalidate_unique_dependents(decl: Decl, name: String, at: Exp) !Error {
+fn decl_invalidate_unique_dependents(decl: Decl) {
     let dependents = decl.unique_dependents ?! return
     decl.unique_dependents = null
     each dependents as dependent {
-        if dependent.unique_published {
-            at.error("Value '" + name + "' aliases a graph that has already been published as shared")
-        }
         dependent.unique_graph = false
         dependent.unique_source = null
-        decl_invalidate_unique_dependents(dependent, name, at) !>
+        decl_invalidate_unique_dependents(dependent)
     }
 }
 
@@ -545,6 +868,8 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
     // this too. It travels through a raw pointer on the way out, which would
     // otherwise erase its provenance and make it look freshly built.
     if value.reads_storage() : return false
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) : return value_graph_is_unique(graph_source, allow_named, require) !>
     let type = value.rett.get_non_nullable()
     if type.is_shared : return true
     // A view made from a graph that was proven unique when it was converted
@@ -567,9 +892,10 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
         let decl = value.decl
         if !isset(decl) : return false
         if !decl.is_buffer {
-            let unique = allow_named && decl.unique_graph && !decl.unique_published
+            if !allow_named : return false
+            let unique = decl.unique_graph && !decl.unique_published
             let source = decl.unique_source
-            if allow_named && !unique && !decl.unique_published && isset(source) {
+            if !unique && !decl.unique_published && isset(source) {
                 if decl.computing_unique_source : return false
                 decl.computing_unique_source = true
                 unique = value_graph_is_unique(source, false, require) !>
@@ -579,6 +905,10 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
                     decl.unique_source = null
                 }
             }
+            if unique && isset(decl.pending_absorbs) {
+                decl_resolve_pending_absorbs(decl) !>
+                unique = decl.unique_graph && !decl.unique_published
+            }
             if unique && require : decl_require_unique_effects(decl)
             return unique
         }
@@ -587,7 +917,7 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
         let source = pre.value2
         return isset(source) && (value_graph_is_unique(source, allow_named, require) !>)
     }
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap {
+    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.block {
         let inner = value.value1
         return isset(inner) && (value_graph_is_unique(inner, allow_named, require) !>)
     }
@@ -607,13 +937,14 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
         ensure_func_unique_return_summary(func) !>
         if func_unique_summary_unavailable_in_lsp(func) : return true
         if !func.unique_summary_ready || !func.returns_unique_graph : return false
+        // Publishing the result consumes the arguments it is built from
         each func.unique_return_args as index {
             let arg = value_call_argument(value, func, index)
-            if !isset(arg) || !(value_graph_is_unique(arg, false, require) !>) : return false
+            if !isset(arg) || !(value_graph_is_unique(arg, allow_named, require) !>) : return false
         }
         return true
     }
-    if value.type == VAL.array_init {
+    if value.type == VAL.array_init || (value.type == VAL.multi && isset(value.values)) {
         let elements = value.values
         if !isset(elements) : return true
         each elements as element {
@@ -623,14 +954,16 @@ fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false))
     }
     if value.type == VAL.class_init {
         let hook_init = isset(value.value1)
-        if hook_init {
-            let class = value.get_class_ref()
-            if !isset(class) || class.representation_class().kind != CLASS_KIND.array : return false
-        }
         let fields = value.values
         if !isset(fields) : return true
         each fields as field {
             if hook_init && field.type == VAL.call {
+                // A hook that keeps only what it was handed leaves the
+                // fresh object unique
+                let callee = field.value1 ?! return false
+                let func = callee.resolve_call_func() ?! return false
+                ensure_func_unique_return_summary(func) !>
+                if !func.unique_summary_ready || func_arg_may_escape(func, 0) || func_arg_invalidates_unique(func, 0) : return false
                 let args = field.values
                 if !isset(args) : continue
                 each args as arg {
@@ -697,6 +1030,8 @@ fn value_summary_graph_is_unique(value: Value, owner: Func, dependencies: Array[
     // this too. It travels through a raw pointer on the way out, which would
     // otherwise erase its provenance and make it look freshly built.
     if value.reads_storage() : return false
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) : return value_summary_graph_is_unique(graph_source, owner, dependencies) !>
     let type = value.rett.get_non_nullable()
     if type.is_shared || value.type == VAL.null || value.type == VAL.string || value_is_capture_free_func(value) : return true
     let string_class = type_string(type.build).get_class_or_null()
@@ -720,9 +1055,15 @@ fn value_summary_graph_is_unique(value: Value, owner: Func, dependencies: Array[
             decl.computing_unique_source = true
             let unique = value_summary_graph_is_unique(source, owner, dependencies) !>
             decl.computing_unique_source = false
+            if unique && isset(decl.pending_absorbs) {
+                decl_resolve_pending_absorbs(decl) !>
+                unique = decl.unique_graph || isset(decl.unique_source)
+            }
             return unique
         }
         if decl.unique_graph && !decl.unique_published {
+            decl_resolve_pending_absorbs(decl) !>
+            if !decl.unique_graph : return false
             return decl_summary_pending_effects_safe(decl) !>
         }
         let found = false
@@ -738,11 +1079,13 @@ fn value_summary_graph_is_unique(value: Value, owner: Func, dependencies: Array[
         if found : return true
         if decl.is_buffer {
             let pre = value.get_pre_value()
-            if isset(pre) : return value_summary_graph_is_unique(pre, owner, dependencies) !>
+            if !isset(pre) || pre.type != VAL.assign : return false
+            let source = pre.value2
+            return isset(source) && (value_summary_graph_is_unique(source, owner, dependencies) !>)
         }
         return false
     }
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.error_success {
+    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.error_success || value.type == VAL.block {
         let inner = value.value1
         if !isset(inner) : return false
         return value_summary_graph_is_unique(inner, owner, dependencies) !>
@@ -766,7 +1109,8 @@ fn value_summary_graph_is_unique(value: Value, owner: Func, dependencies: Array[
         return true
     }
     if value.type == VAL.class_init && (value_summary_hook_chain_is_unique(value, owner, dependencies) !>) : return true
-    if value.type == VAL.array_init || value.type == VAL.class_init || value.type == VAL.phi {
+    if value.type == VAL.array_init || value.type == VAL.class_init || value.type == VAL.phi
+        || (value.type == VAL.multi && isset(value.values)) {
         let values = value.values
         if !isset(values) : return true
         each values as item {
@@ -824,6 +1168,7 @@ fn func_unique_summary_conservative(func: Func) {
     each func.args as arg {
         arg.may_escape = true
         arg.invalidates_unique = true
+        arg.may_write = true
     }
     func.returns_unique_graph = false
     func.unique_return_args.clear()
@@ -836,6 +1181,7 @@ fn func_begin_unique_summary(func: Func) {
     each func.args as arg {
         arg.may_escape = false
         arg.invalidates_unique = false
+        arg.may_write = false
         arg.absorbs_args = null
     }
     func.pending_return_escapes = .{}
@@ -845,7 +1191,11 @@ fn func_begin_unique_summary(func: Func) {
     func.computing_unique_summary = true
 }
 
-fn func_finish_unique_summary(func: Func) {
+fn func_finish_unique_summary(func: Func) !Error {
+    // Calls to bodies still unknown may yet cost a parameter its uniqueness
+    each func.args as arg {
+        if isset(arg.decl.pending_absorbs) : arg.provisional = true
+    }
     if !func.unique_summary_saw_return : func.returns_unique_graph = false
     // A return that hands back an argument's graph only stays alias-free while
     // the summary says the return is unique. Once it does not, those returns
@@ -907,12 +1257,18 @@ fn func_arg_summary_settled(func: Func, index: uint) bool {
 
 fn value_tracks_unique_effects(value: Value) bool {
     let type = value.rett.get_non_nullable()
-    if !value.rett.has_gc_refs() && type.kind != TYPE.closure : return false
+    let raw_address = type.is_raw_pointer() || type.kind == TYPE.ptr_of || type.kind == TYPE.adr_of
+    if !value.rett.has_gc_refs() && type.kind != TYPE.closure && !raw_address : return false
     let string_class = type_string(type.build).get_class_or_null()
     return !isset(string_class) || type.get_class_or_null() != string_class
 }
 
 fn value_defer_unique_effect(value: Value, param: Arg, pos: Pos, force: bool (false)) {
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_defer_unique_effect(graph_source, param, pos, force)
+        return
+    }
     if value.type == VAL.decl {
         let decl = value.decl
         if !isset(decl) : return
@@ -963,14 +1319,22 @@ fn value_defer_arg_effects(param: Arg, value: Value, at: Exp, force: bool (false
 }
 
 fn resolve_deferred_unique_effects(build: Build) !Error {
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if func_unique_summary_unavailable_in_lsp(func) : continue
+            each func.args as arg : decl_resolve_pending_absorbs(arg.decl) !>
+        }
+    }
     let escape = Array[Arg]{}
     let invalidate = Array[Arg]{}
+    let writes = Array[Arg]{}
     each build.lists.units as unit {
         each unit.functions as func {
             if func_unique_summary_unavailable_in_lsp(func) : continue
             each func.args as arg {
                 if arg.may_escape : escape.append(arg)
                 if arg.invalidates_unique : invalidate.append(arg)
+                if arg.may_write : writes.append(arg)
             }
         }
     }
@@ -996,10 +1360,24 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
         }
     }
 
+    while true {
+        let arg = writes.pop_last() ! break
+        let dependents = arg.write_dependents ?! continue
+        each dependents as dependent {
+            if dependent.may_write : continue
+            dependent.may_write = true
+            writes.append(dependent)
+        }
+    }
+
     each build.lists.units as unit {
         each unit.functions as func {
             if func_unique_summary_unavailable_in_lsp(func) : continue
             each func.args as arg {
+                let enum_pos = arg.enum_receiver_pos
+                if isset(enum_pos) && (arg.may_write || arg.may_escape) {
+                    enum_pos.error("Cannot call a method that modifies or exposes enum storage; copy its underlying value first")
+                }
                 let shared_borrow_pos = arg.cannot_shared_borrow_pos
                 if (arg.may_escape || arg.invalidates_unique) && isset(shared_borrow_pos) {
                     shared_borrow_pos.error("Only a provably unique value graph can be converted to '" + arg.type.compat_display_name() + "'; a mutable alias may remain")
@@ -1017,6 +1395,15 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
             }
         }
     }
+
+    // Publication flow needs the settled flags; every body is parsed by now
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if !func.has_publications || func_unique_summary_unavailable_in_lsp(func) : continue
+            func_check_publication_flow(func) !>
+            func.body_scope = null
+        }
+    }
 }
 
 fn fixed_array_pointer_compat(source: Type, target: Type) bool {
@@ -1027,8 +1414,8 @@ fn fixed_array_pointer_compat(source: Type, target: Type) bool {
     let pointed = target.get_sub_type()
     if !isset(pointed) : return false
     if target.length > source.length : return false
-    if pointed.is_fixed_array_type() : return pointed.compat(source)
-    return pointed.compat(element)
+    if isset(source.get_enum()) : return target.length == 1 && pointed.compat_storage(source)
+    return pointed.compat_storage(element)
 }
 
 fn inline_pointer_compat(source: Type, target: Type) bool {
@@ -1036,7 +1423,7 @@ fn inline_pointer_compat(source: Type, target: Type) bool {
     if target.kind == TYPE.voidptr : return true
     if target.kind == TYPE.ptr_of || target.kind == TYPE.adr_of || target.kind == TYPE.ref_of || target.kind == TYPE.stack_of {
         let pointed = target.get_sub_type()
-        return isset(pointed) && pointed.compat(source)
+        return isset(pointed) && pointed.compat_storage(source)
     }
     return source.kind == TYPE.struct && target.kind == TYPE.struct
         && isset(source.class) && source.class == target.class
@@ -1097,6 +1484,9 @@ fn value_prepare_borrow_storage(value: Value, ctx: Context) ?Value {
         }
         return value
     }
+    // Any other inline temporary, such as a struct returned by value, gets a
+    // home in the frame like an aggregate literal
+    if value.rett.is_inline_type() && !value.assignable() : return value_permanent_borrow_root(value, ctx)
     return null
 }
 
@@ -1119,6 +1509,36 @@ fn method_receiver_borrow_compatible(source: Type, target: Type) bool !Error {
     return false
 }
 
+fn value_convert_array_copy(value: Value, target: Type, scope: Scope, ctx: Context) Value !Error {
+    if value.rett == target : return value
+    if (ir_type(value.rett) !>) == (ir_type(target) !>) : return value
+    let source_type = value.rett.get_non_nullable()
+    let array_type = target.get_non_nullable()
+    if (ir_type(source_type) !>) == (ir_type(array_type) !>) : return vgen_wrap(value, target)
+    let at = value.exp ?? (ctx.get_func() !>).exp
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let source_element = source_type.get_sub_type() ?! at.bug("Array conversion has no source element")
+    let target_element = array_type.get_sub_type() ?! at.bug("Array conversion has no target element")
+    let input = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    let elements = Array[Value]{}
+    let i: uint = 0
+    while i < array_type.length {
+        let element = vgen_multi_part(input, i, source_type.storage_view_of(source_element), at)
+        let converted = value_try_convert(element, scope, ctx, target_element) !>
+        target_element.compat_check(converted.rett, at) !>
+        elements.append(converted)
+        i++
+    }
+    let result = vgen_array_init(ctx, elements, array_type, at)
+    if target.is_nullable_type() : result = value_make_nullable(result)
+    if value.rett.is_nullable_type() {
+        result = vgen_this_or_that(vgen_isset_val(source, type_bool(ctx.build)), result, vgen_null(target), target)
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
 fn value_try_convert(
     v: Value,
     scope: Scope,
@@ -1133,9 +1553,11 @@ fn value_try_convert(
     let result = v
 
     if target.kind == TYPE.closure && target.is_shared && result.rett.kind == TYPE.closure && !result.rett.is_shared {
-        let func = value_resolve_func_ref(result)
-        if isset(func) && func.capture_free {
-            result.rett = target
+        let receiver = result.value1
+        let shared_receiver = result.type == VAL.func && isset(receiver)
+            && receiver.rett.get_non_nullable().is_shared && !result.is_implicit_borrow()
+        if value_is_capture_free_func(result) || shared_receiver {
+            result.rett = result.rett.shared_type()
         }
     }
 
@@ -1159,6 +1581,16 @@ fn value_try_convert(
 
     let target_nn = target.get_non_nullable()
     let source_nn = result.rett.get_non_nullable()
+    // Strings are immutable: a shared view of one is the same value
+    let string_class = type_string(ctx.build).get_class_or_null()
+    if isset(string_class) && !result.rett.is_nullable_type() && !target.is_nullable_type()
+        && source_nn.get_class_or_null() == string_class && target_nn.get_class_or_null() == string_class
+        && source_nn.is_shared != target_nn.is_shared && !source_nn.is_locked && !target_nn.is_locked
+    {
+        let retyped = vgen_cast(result, target)
+        retyped.exp = result.exp
+        return retyped
+    }
     // An ordinary graph becomes a shared or locked view the same way: it
     // must be unique, and it is published from here on.
     let to_view = (target_nn.is_shared && !source_nn.is_shared)
@@ -1185,7 +1617,7 @@ fn value_try_convert(
                     + " a closure whose captured values were never checked for shared use."
                     + " Declare it as a 'shared fn(...)()' so its captures are checked where the closure is created")
             }
-            value_publish_unique(result)
+            value_publish_unique(result, ctx) !>
         }
         return value_shared_view(result, target)
     }
@@ -1194,16 +1626,22 @@ fn value_try_convert(
     if isset(union_value) : return union_value
 
     if !result.rett.is_nullable_type() {
-        let class = result.rett.get_class_or_null()
+        let class = value_member_class(result.rett)
         if isset(class) {
             let hook = class_get_to_hook(class, target, is_auto)
             if isset(hook) {
                 // A conversion hook is an ordinary method call, so a shared
                 // receiver selects the shared variant like anywhere else
                 let at = result.exp ?? hook.exp
-                hook = func_for_receiver(hook, result, at) !>
-                let callee = vgen_func(hook, result)
-                let call = vgen_call(ctx, callee, Array[Value]{}, hook.get_rett(), scope)
+                let receiver = value_read_borrowed_receiver(result, scope, ctx, at) !>
+                if receiver.rett.is_nullable_type() {
+                    at.error("You cannot access properties/functions on a nullable type: " + receiver.rett.compat_display_name())
+                }
+                hook = func_for_receiver(hook, receiver, at) !>
+                let callee = vgen_func(hook, receiver)
+                let args = Array[Value]{}
+                value_check_call_args(hook, callee, args, scope, ctx, at) !>
+                let call = vgen_call(ctx, callee, args, hook.get_rett(), scope)
                 call.exp = result.exp
                 result = call
             }
@@ -1211,8 +1649,8 @@ fn value_try_convert(
     }
 
     // Enum values come from their declared items or conversion hooks.
-    let target_enum = target.get_enum()
-    if isset(target_enum) && result.type != VAL.null && result.rett.get_enum() != target_enum {
+    let target_enum = target.get_enum() ?? target.get_non_nullable().get_enum()
+    if isset(target_enum) && result.type != VAL.null && (result.rett.get_enum() ?? result.rett.get_non_nullable().get_enum()) != target_enum {
         result.error("Cannot convert value to enum: '" + target_enum.name + "'")
     }
 
@@ -1236,7 +1674,7 @@ fn value_try_convert(
 
     if !is_auto && result.rett.kind == TYPE.closure && target.get_non_nullable().kind == TYPE.voidptr {
         let func = value_resolve_func_ref(result)
-        if isset(func) && !func.is_literal {
+        if isset(func) && !func.is_literal && value_is_capture_free_func(result) {
             return value_retype_function(result, TYPE.fnptr)
         }
     }
@@ -1247,18 +1685,24 @@ fn value_try_convert(
         return value_pointer_as_uint(result, target)
     }
 
+    if target_nn.is_fixed_array_type() && result.rett.get_non_nullable().is_fixed_array_type()
+        && target.compat(result.rett) {
+        return value_convert_array_copy(result, target, scope, ctx) !>
+    }
+
     if target.compat(result.rett) && target.is_nullable_type() == result.rett.is_nullable_type() {
         return result
     }
 
     if result.rett.kind == TYPE.closure && target.kind == TYPE.fnptr {
-        let func = value_resolve_func_ref(result)
-        if isset(func) && func.capture_free {
+        if value_is_capture_free_func(result) {
             result = value_retype_function(result, TYPE.fnptr)
         }
     }
-    if result.rett.kind == TYPE.fnptr && target.kind == TYPE.closure {
-        result = value_retype_function(result, TYPE.closure)
+    if result.rett.get_non_nullable().kind == TYPE.fnptr && target_nn.kind == TYPE.closure
+        && (target.is_nullable_type() || !result.rett.is_nullable_type())
+    {
+        result = value_fnptr_closure(result, scope, ctx, target_nn.is_shared) !>
     }
 
     if target.is_nullable_type() {
@@ -1267,6 +1711,7 @@ fn value_try_convert(
         if result.rett.is_nullable_type() : return result
         return vgen_wrap(result, result.rett.nullable())
     }
+
 
     if allow_inline_borrow && result.rett.is_inline_type() && !result.rett.is_number_type() && result.rett.kind != TYPE.closure
         && target.get_non_nullable().kind == TYPE.adr_of && inline_pointer_compat(result.rett, target)
@@ -1288,15 +1733,11 @@ fn value_try_convert(
         let source = result.rett.get_sub_type()
         if isset(target_sub) && isset(source) {
             let source_sub = source
-            let source_size: uint = result.rett.length > 0 ? result.rett.length : 1
-            if source.is_fixed_array_type() {
-                let element = source.get_sub_type()
-                if isset(element) : source_sub = element
-                source_size = source.length
-            }
+            let source_size = result.rett.length
             let enough_values = source_size > 0 && target.length <= source_size
             if enough_values && target_sub.compat(source_sub) {
-                return vgen_load(result, target, result.exp)
+                let copied = vgen_load(result, source_sub.fixed_array(target.length), result.exp)
+                return value_convert_array_copy(copied, target, scope, ctx) !>
             }
         }
     }
@@ -1504,6 +1945,10 @@ fn class_get_to_hook(class: Class, target: Type, is_auto: bool) ?Func {
             let fc = fr.get_class_or_null()
             if tc == fc : return func
             if !isset(tc) && !isset(fc) : return func
+            // A bare `&[T]` view accepts the named slice a hook hands out; a
+            // string result is a value of its own, not a view of the source
+            if !isset(tc) && target.get_non_nullable().kind == TYPE.ref_slice
+                && fc != type_string(target.build).get_class_or_null() : return func
             if target.kind == TYPE.ptr_of && fr.is_raw_pointer() : return func
         }
     }
@@ -1521,7 +1966,7 @@ fn class_get_add_hook(class: Class, rtype: Type) ?Func {
         if arg.type.compat(rtype) : return func
     }
 
-    let rclass = rtype.get_class_or_null()
+    let rclass = value_member_class(rtype)
     if !isset(rclass) : return null
     each class.add_hooks as func {
         let arg = func_call_arg(func) ! continue
@@ -1539,8 +1984,8 @@ fn value_try_add_hook(left: Value, right: Value, scope: Scope, ctx: Context, at:
     let r = right
     let string_class = type_string(b).get_class_or_null()
     if isset(string_class) {
-        let lc = l.rett.get_class_or_null()
-        let rc = r.rett.get_class_or_null()
+        let lc = value_member_class(l.rett)
+        let rc = value_member_class(r.rett)
         if lc == string_class && rc != string_class {
             r = value_try_convert(r, scope, ctx, type_string(b)) !>
         } else if rc == string_class && lc != string_class {
@@ -1548,7 +1993,7 @@ fn value_try_add_hook(left: Value, right: Value, scope: Scope, ctx: Context, at:
         }
     }
 
-    let hook_class = l.rett.get_class_or_null()
+    let hook_class = value_member_class(l.rett)
     if !isset(hook_class) : return null
     let hook = class_get_add_hook(hook_class, r.rett)
     if !isset(hook) {
@@ -1557,15 +2002,24 @@ fn value_try_add_hook(left: Value, right: Value, scope: Scope, ctx: Context, at:
     }
     if !isset(hook) : return null
 
-    let arg = func_call_arg(hook) ! at.bug("'$add' function is missing its argument")
-    let rarg = value_try_convert(r, scope, ctx, arg.type) !>
-    arg.type.compat_check(rarg.rett, at) !>
-
+    l = value_read_borrowed_receiver(l, scope, ctx, at) !>
+    if l.rett.is_nullable_type() {
+        at.error("You cannot access properties/functions on a nullable type: " + l.rett.compat_display_name())
+    }
+    hook = func_for_receiver(hook, l, at) !>
     let callee = vgen_func(hook, l)
-    let args = Array[Value]{ rarg }
+    let args = Array[Value]{ r }
+    value_check_call_args(hook, callee, args, scope, ctx, at) !>
     let call = vgen_call(ctx, callee, args, hook.get_rett(), scope)
     call.exp = at
     return call
+}
+
+fn compare_hook_receiver(type: Type, left_type: Type) Type {
+    if type.kind == TYPE.stack_of && left_type.is_inline {
+        return type.get_sub_type() ?? type
+    }
+    return type
 }
 
 fn hook_select_compare(hooks: Array[Func], left_type: Type, right_type: Type) ?Func {
@@ -1575,7 +2029,7 @@ fn hook_select_compare(hooks: Array[Func], left_type: Type, right_type: Type) ?F
         let args = func.args
         let arg1 = args.get(0) ! continue
         let arg2 = args.get(1) ! continue
-        if type_identity_key(arg1.type) != type_identity_key(left_type) : continue
+        if type_identity_key(compare_hook_receiver(arg1.type, left_type)) != type_identity_key(left_type) : continue
         if type_identity_key(arg2.type) != type_identity_key(right_type) : continue
         return func
     }
@@ -1583,7 +2037,7 @@ fn hook_select_compare(hooks: Array[Func], left_type: Type, right_type: Type) ?F
         let args = func.args
         let arg1 = args.get(0) ! continue
         let arg2 = args.get(1) ! continue
-        if !arg1.type.compat(left_type) : continue
+        if !compare_hook_receiver(arg1.type, left_type).compat(left_type) : continue
         if !arg2.type.compat(right_type) : continue
         return func
     }
@@ -1610,7 +2064,7 @@ fn class_get_compare_hook(class: Class, left_type: Type, right_type: Type, op: V
 ////////////////////////////
 
 fn value_check_logical_operand(v: Value, at: Exp) !Error {
-    if !v.rett.is_void_type() && !v.rett.is_bool_type() {
+    if !v.rett.is_bool_type() && !v.never_returns {
         at.error("Expected a value of type 'bool', not: " + v.rett.compat_display_name())
     }
 }
@@ -1675,10 +2129,17 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     let suggested_type = ctx.suggested_type
     let numeric_target: ?Type = null
-    if isset(suggested_type) && suggested_type.is_number_type() : numeric_target = suggested_type
+    if isset(suggested_type) && suggested_type.is_number_type() {
+        let number = suggested_type.get_non_nullable()
+        let enu = number.get_enum()
+        numeric_target = isset(enu) ? (enu.get_item_type() !>).get_non_nullable() : number
+    }
     let left_ctx = isset(numeric_target) ? ctx.with_suggested_type(numeric_target) : ctx.without_suggested_type()
     let left = value_from_exp(left_exp, scope, left_ctx) !>
+    left.require_result() !>
     left = value_try_remove_nullable(left, scope, ctx) !>
+
+    left = value_enum_representation(left) !>
 
     let left_pointer_kind = left.rett.get_non_nullable().kind
     let left_is_raw_pointer = left.rett.is_pointer()
@@ -1714,7 +2175,10 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     let right_ctx = isset(numeric_target) ? ctx.with_suggested_type(numeric_target) : (left.rett.is_void_type() ? ctx.without_suggested_type() : ctx.with_suggested_type(left.rett))
     let right = value_from_exp(right_exp, scope, right_ctx) !>
+    right.require_result() !>
     right = value_try_remove_nullable(right, scope, ctx) !>
+
+    right = value_enum_representation(right) !>
 
     if op == VALUE_OP.shl || op == VALUE_OP.shr {
         if !left.rett.is_integer_type() {
@@ -1765,6 +2229,26 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 fn value_native_comparable(type: Type) bool {
     let t = type.get_non_nullable()
     return t.is_number_type() || t.is_pointer() || t.kind == TYPE.interface || t.kind == TYPE.error_code
+}
+
+fn type_can_order(type: Type) bool !Error {
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.union || t.kind == TYPE.closure : return false
+    if value_native_comparable(t) : return true
+    let class = t.get_class_or_null() ?! return false
+    let current: ?Class = class
+    while isset(current) {
+        parse_class_properties(current) !>
+        each current.funcs as func {
+            let flags = func.flags
+            if isset(flags) && (flags.contains("$gt") || flags.contains("$lte")) {
+                parse_func_types(func) !>
+            }
+        }
+        current = current.mode_for_class
+    }
+    return isset(class_get_compare_hook(class, t, t, VALUE_OP.gt, false))
+        || isset(class_get_compare_hook(class, t, t, VALUE_OP.gt, true))
 }
 
 fn value_structural_equal_part(result: Value, left: Value, right: Value, offset: u32, type: Type,
@@ -1893,6 +2377,19 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
     let nnl = l.rett.is_nullable_type() ? value_force_remove_nullable(l) : l
     let nnr = r.rett.is_nullable_type() ? value_force_remove_nullable(r) : r
 
+    // A string compares with the text of the other side, as `+` joins it,
+    // and a shared string is the same immutable value as a plain one
+    let string_class = type_string(b).get_class_or_null()
+    if isset(string_class) && !nnl.rett.is_nullable_type() && !nnr.rett.is_nullable_type() {
+        let plain_string = type_string(b)
+        if nnl.rett.get_class_or_null() == string_class && nnl.rett.is_shared : nnl = vgen_cast(nnl, plain_string)
+        if nnr.rett.get_class_or_null() == string_class && nnr.rett.is_shared : nnr = vgen_cast(nnr, plain_string)
+        let lsc = nnl.rett.get_class_or_null()
+        let rsc = nnr.rett.get_class_or_null()
+        if lsc == string_class && rsc != string_class && nnr.rett.is_number_type() : nnr = value_try_convert(nnr, scope, ctx, type_string(b)) !>
+        else if rsc == string_class && lsc != string_class && nnl.rett.is_number_type() : nnl = value_try_convert(nnl, scope, ctx, type_string(b)) !>
+    }
+
     let hook: ?Func = null
     let lc = nnl.rett.get_class_or_null()
     if isset(lc) {
@@ -1917,8 +2414,10 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
 
     let cmp: Value = vgen_op(nnl, nnr, cmp_op, type_bool(b))
     if isset(hook) {
+        hook = func_for_receiver(hook, nnl, exp) !>
         let callee = vgen_func(hook, nnl)
         let args = Array[Value]{ nnr }
+        value_check_call_args(hook, callee, args, scope, ctx, exp) !>
         cmp = vgen_call(ctx, callee, args, type_bool(b), scope)
     } else {
         let pointers = value_balance_pointer_integer(nnl, nnr, b)
@@ -2025,7 +2524,7 @@ fn value_from_ternary_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if !isset(cond_exp) || !isset(then_exp) || !isset(else_exp) : exp.bug("Incomplete ternary")
 
     let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(ctx.build))) !>
-    if !cond.rett.is_void_type() && !cond.rett.is_bool_type() {
+    if !cond.rett.is_bool_type() && !cond.never_returns {
         exp.error("You can only use '?' after values that return a bool. This value has type: " + cond.rett.compat_display_name())
     }
 
@@ -2033,19 +2532,32 @@ fn value_from_ternary_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     then_scope.apply_issets(cond.get_issets())
     let v1 = value_from_exp(then_exp, then_scope, ctx) !>
     let suggested_type = ctx.suggested_type
-    if isset(suggested_type) {
+    if isset(suggested_type) && !then_scope.did_return {
         v1 = value_try_convert(v1, then_scope, ctx, suggested_type) !>
     }
 
     let else_scope = scope.sub_scope()
     else_scope.apply_issets(cond.get_not_issets())
     let else_ctx = ctx
-    if !isset(suggested_type) && !v1.rett.is_void_type() {
+    if !isset(suggested_type) && !then_scope.did_return && !v1.rett.is_void_type() {
         else_ctx = ctx.with_suggested_type(v1.rett)
     }
     let v2 = value_from_exp(else_exp, else_scope, else_ctx) !>
-    if isset(suggested_type) {
+    if isset(suggested_type) && !else_scope.did_return {
         v2 = value_try_convert(v2, else_scope, ctx, suggested_type) !>
+    }
+
+    if then_scope.did_return || else_scope.did_return {
+        if then_scope.did_return && else_scope.did_return : scope.did_return = true
+        if !then_scope.did_return : v1 = value_try_remove_nullable(v1, then_scope, ctx) !>
+        if !else_scope.did_return : v2 = value_try_remove_nullable(v2, else_scope, ctx) !>
+        let rett = then_scope.did_return ? v2.rett : v1.rett
+        let v = vgen_this_or_that(cond, v1, v2, rett)
+        v.exp = exp
+        return v
+    }
+    if v1.rett.is_void_type() || v2.rett.is_void_type() {
+        v1.rett.compat_check(v2.rett, exp) !>
     }
 
     let l = value_try_remove_nullable(v1, then_scope, ctx) !>
@@ -2110,22 +2622,23 @@ fn value_from_null_coalesce_exp(exp: Exp, scope: Scope, ctx: Context) Value !Err
     if !isset(left_exp) || !isset(right_exp) : exp.bug("Incomplete ??")
 
     let on = value_from_exp(left_exp, scope, value_nullable_operand_ctx(ctx)) !>
-    if !on.rett.is_void_type() && !on.rett.is_nullable_type() {
+    if !on.rett.is_nullable_type() && !on.never_returns {
         exp.error("You can only use '??' and '?!' on nullable values. Value type is: '" + on.rett.compat_display_name() + "'")
     }
 
-    let alt = value_from_exp(right_exp, scope, ctx.with_suggested_type(on.rett.is_nullable_type() ? on.rett.get_non_nullable() : on.rett)) !>
+    let alt_scope = scope.sub_scope()
+    let alt = value_from_exp(right_exp, alt_scope, ctx.with_suggested_type(on.rett.is_nullable_type() ? on.rett.get_non_nullable() : on.rett)) !>
     on = value_null_op_operand(on, ctx)
     let iss = vgen_isset_val(on, type_bool(ctx.build))
     let left = value_null_op_operand_read(on)
-    if !alt.rett.is_nullable_type() {
+    if alt_scope.did_return || !alt.rett.is_nullable_type() {
         left = value_force_remove_nullable(left)
     }
-    alt = value_try_convert(alt, scope, ctx, left.rett) !>
-    if !left.rett.is_void_type() && !alt.rett.is_void_type() {
+    if !alt_scope.did_return {
+        alt = value_try_convert(alt, alt_scope, ctx, left.rett) !>
         left.rett.compat_check(alt.rett, exp) !>
     }
-    let v = vgen_this_or_that(iss, left, alt, alt.rett)
+    let v = vgen_this_or_that(iss, left, alt, left.rett)
     v.exp = exp
     return v
 }
@@ -2136,7 +2649,7 @@ fn value_from_null_exit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if !isset(left_exp) || !isset(body_exp) : exp.bug("Incomplete ?!")
 
     let on = value_from_exp(left_exp, scope, value_nullable_operand_ctx(ctx)) !>
-    if !on.rett.is_void_type() && !on.rett.is_nullable_type() {
+    if !on.rett.is_nullable_type() && !on.never_returns {
         exp.error("You can only use '??' and '?!' on nullable values. Value type is: '" + on.rett.compat_display_name() + "'")
     }
 

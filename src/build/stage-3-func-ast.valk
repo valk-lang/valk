@@ -48,7 +48,7 @@ fn parse_func_ast(func: Func) !Error {
     if scope.must_return && !scope.did_return && !scope.must_exit && !scope.must_throw {
         body.error("Missing 'return' statement")
     }
-    if func.computing_unique_summary : func_finish_unique_summary(func)
+    if func.computing_unique_summary : func_finish_unique_summary(func) !>
     warn_unused_decls(func)
 
     // The LSP never links, and unreachable CLI bodies need validation only.
@@ -70,7 +70,8 @@ fn parse_func_ast(func: Func) !Error {
 fn func_release_ast(func: Func, exps: Array[Exp]) {
     func_release_exps(func, exps)
 
-    func.body_scope = null
+    // A body that publishes is checked again once every summary is final
+    if !func.has_publications : func.body_scope = null
     func.alloca_scope = null
     func.defer_scope = null
     func.user_defer_stack = null
@@ -486,6 +487,23 @@ fn scope_clear_facts_invalidated_by(scope: Scope, body_scope: Scope) {
     }
 }
 
+fn decl_track_value(decl: Decl, value: Value) !Error {
+    decl.escape_origins = value_escape_origins(value)
+    if !decl.type.has_gc_refs() && decl.type.get_non_nullable().kind != TYPE.closure : return
+    value_consume_call_return_sources(value) !>
+    decl.unique_graph = false
+    decl.unique_source = null
+    decl.unique_published = false
+    let deferred = value_can_defer_unique_call(value)
+    if deferred : decl.unique_source = value
+    else : decl.unique_graph = value_has_fresh_graph(value) !>
+    if !deferred && !decl.unique_graph && value_can_transfer_unique_inputs(value) && (value_has_unique_graph(value) !>) {
+        decl.unique_graph = true
+        value_transfer_unique_inputs(value, decl)
+    }
+    if !deferred && !decl.unique_graph : value_invalidate_unique(value)
+}
+
 fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let b = ctx.build
     let names = exp.list
@@ -516,6 +534,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let i: uint = 0
     each names as name {
         let part = rhs_parts.get(i) ! exp.error("Missing value for variable '" + name + "'")
+        part.require_result() !>
         let part_is_non_null = value_stores_non_null(part, scope)
         let decl_type = part.rett
         if isset(types_exp) {
@@ -543,21 +562,7 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             let decl = Decl.new(ctx.get_func() !>, decl_type, false, name)
             decl.lock_scope = scope_find_lock(scope)
             decl.exp = exp
-            decl.escape_origins = value_escape_origins(part)
-            let managed = decl_type.has_gc_refs() || decl_type.get_non_nullable().kind == TYPE.closure
-            if managed {
-                // Binding a result that aliases an argument consumes that
-                // argument's uniqueness
-                value_consume_call_return_sources(part) !>
-                let deferred = value_can_defer_unique_call(part)
-                if deferred : decl.unique_source = part
-                else : decl.unique_graph = value_has_fresh_graph(part) !>
-                if !deferred && !decl.unique_graph && value_can_transfer_unique_inputs(part) && (value_has_unique_graph(part) !>) {
-                    decl.unique_graph = true
-                    value_transfer_unique_inputs(part, decl)
-                }
-                if !deferred && !decl.unique_graph : value_invalidate_unique(part)
-            }
+            decl_track_value(decl, part) !>
             scope.add_decl(decl)
             scope.set_idf(name, Idf.for_decl(decl))
             if part.type != VAL.undefined {
@@ -568,6 +573,13 @@ fn value_from_let_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             // `_` still evaluates its RHS, but has no destination storage.
             statements.append(part)
         }
+        i++
+    }
+
+    // Unbound results still evaluate their operands.
+    while i < rhs_parts.length {
+        let part = rhs_parts.get(i) ! exp.bug("Missing unbound result")
+        if part.type != VAL.undefined : statements.append(part)
         i++
     }
 
@@ -601,24 +613,26 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             exp.error("Function must return a value of type matching the signature")
         }
         retv = value_from_exp(value_exp, scope, ctx.with_suggested_type(rett)) !>
+        retv.require_result() !>
         // Skip when returned type is still void (incomplete typing)
         if !retv.rett.is_void_type() {
             // A shared-receiver variant only exists because the receiver is
             // already shared, and its return type was widened to shared for the
             // same reason: what it hands back is reachable from that receiver.
             // That is a view of already-shared data, not a new publication.
-            let shared_view_return = (func.is_shared_receiver
+            let from_receiver = value_built_from_receiver(retv, func) !>
+            let shared_view_return = from_receiver && ((func.is_shared_receiver
                 && rett.get_non_nullable().is_shared
                 && !retv.rett.get_non_nullable().is_shared)
                 || (func.is_locked_receiver
                 && rett.get_non_nullable().is_locked
-                && !retv.rett.get_non_nullable().is_locked)
-            retv = value_try_convert(retv, scope, ctx, rett, true, false, false, shared_view_return) !>
+                && !retv.rett.get_non_nullable().is_locked))
+            retv = value_try_convert(retv, scope, ctx, rett, true, rett.get_non_nullable().is_owned_borrow(), false, shared_view_return) !>
             value_check_lock_escape(retv, func.arg_scope, exp) !>
             if func.computing_unique_summary {
                 func.unique_summary_saw_return = true
-                let dependencies = b.cache.return_deps_buf
-                dependencies.clear()
+                // Nested callee analysis must not clear this return's dependencies.
+                let dependencies = b.cache.return_deps_pool.pop_last() !? Array[uint]{}
                 let summary_unique = value_summary_graph_is_unique(retv, func, dependencies) !>
                 if !summary_unique {
                     func.returns_unique_graph = false
@@ -639,8 +653,13 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                         hands_back_argument = false
                     }
                 }
+                // A raw pointer is outside the ownership model: handing one
+                // out does not let the managed graph escape
+                let raw_result = retv.rett.is_raw_pointer() || retv.rett.get_non_nullable().kind == TYPE.ptr_of
                 if hands_back_argument : func.pending_return_escapes.append(retv)
-                else : value_mark_summary_escape(retv)
+                else if !raw_result : value_mark_summary_escape(retv)
+                dependencies.clear()
+                b.cache.return_deps_pool.append(dependencies)
             }
             let at = retv.exp ?? exp
             rett.compat_check(retv.rett, at) !>
@@ -797,6 +816,7 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
     if isset(known) : ret_ctx = ctx.with_suggested_type(known)
 
     let retv = value_from_exp(value_exp, scope, ret_ctx) !>
+    retv.require_result() !>
     if isset(known) {
         if !retv.rett.is_void_type() && !known.is_void_type() {
             if retv.rett.is_nullable_type() && !known.is_nullable_type() {
@@ -846,6 +866,12 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
         if isset(runtime_property) : left = runtime_property
     }
     value_check_shared_store(left, exp) !>
+    if op != ASSIGN_OP.set && isset(left.rett.get_enum()) {
+        exp.error("Cannot use compound assignment on an enum; assign a declared enum value")
+    }
+    if op != ASSIGN_OP.set && left.rett.is_nullable_type() && !value_stores_non_null(left, scope) {
+        exp.error("Cannot use compound assignment on a nullable value; check it with isset first")
+    }
     let pointer_kind = left.rett.get_non_nullable().kind
     let pointer_offset_assign = left.rett.is_pointer()
         && (pointer_kind == TYPE.voidptr || pointer_kind == TYPE.ptr_of)
@@ -858,10 +884,11 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if pointer_offset_assign : right_ctx = ctx.with_suggested_type(type_int(b))
     else if pointer_bitwise_assign : right_ctx = ctx.with_suggested_type(type_ptr_uint(b))
     else if !left.rett.is_void_type() {
-        right_ctx = ctx.with_suggested_type(left.rett)
+        right_ctx = ctx.with_suggested_type(op == ASSIGN_OP.set ? left.rett : left.rett.get_non_nullable())
         if op == ASSIGN_OP.set : right_ctx = right_ctx.for_direct_init()
     }
     let right = value_from_exp(right_exp, scope, right_ctx) !>
+    right.require_result() !>
     if right.type == VAL.undefined {
         return vgen_block(Array[Value]{}, b, exp)
     }
@@ -870,7 +897,13 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if !left.assignable() {
         exp.error("Left side of assignment is not assignable")
     }
-    act_check_assign(left, exp) !>
+    if (left.type == VAL.prop || left.type == VAL.ptrv) && value_is_copied_element(left) {
+        exp.error("Cannot assign into an element copied out of an Array; borrow it with '&mut arr[i]' or store the element back with '.set'")
+    }
+    if (left.type == VAL.prop || left.type == VAL.ptrv) && value_in_readonly_view(left, ctx) {
+        exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(left, ctx))
+    }
+    act_check_assign(left, exp, scope) !>
     value_mark_mutable(left)
 
     if right.type == VAL.null && left.type == VAL.decl {
@@ -919,9 +952,11 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                 let global = left.global
                 allow_shared_unsafe = isset(global) && global.allow_unsafe
             }
-            right = value_try_convert(right, scope, ctx, left.rett, true, left.type == VAL.decl, allow_shared_unsafe) !>
+            // Arithmetic on a slot proven non-null takes a plain operand
+            let target = op == ASSIGN_OP.set ? left.rett : left.rett.get_non_nullable()
+            right = value_try_convert(right, scope, ctx, target, true, left.type == VAL.decl, allow_shared_unsafe) !>
             let at = right.exp ?? exp
-            left.rett.compat_check(right.rett, at) !>
+            target.compat_check(right.rett, at) !>
         }
     }
 
@@ -934,24 +969,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                 }
                 // Reassignment detaches this variable from the graph it previously named.
                 decl.unique_dependents = null
-                decl.escape_origins = value_escape_origins(right)
-                let managed = decl.type.has_gc_refs() || decl.type.get_non_nullable().kind == TYPE.closure
-                if managed {
-                    // Binding a result that aliases an argument consumes that
-                    // argument's uniqueness
-                    value_consume_call_return_sources(right) !>
-                    decl.unique_graph = false
-                    decl.unique_source = null
-                    let deferred = value_can_defer_unique_call(right)
-                    if deferred : decl.unique_source = right
-                    else : decl.unique_graph = value_has_fresh_graph(right) !>
-                    decl.unique_published = false
-                    if !deferred && !decl.unique_graph && value_can_transfer_unique_inputs(right) && (value_has_unique_graph(right) !>) {
-                        decl.unique_graph = true
-                        value_transfer_unique_inputs(right, decl)
-                    }
-                    if !deferred && !decl.unique_graph : value_invalidate_unique(right)
-                }
+                decl_track_value(decl, right) !>
             }
         } else {
             // Ask before marking the escape: marking consumes the value's
@@ -967,6 +985,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
             else : value_mark_actual_escape(right)
             if left.type == VAL.prop || left.type == VAL.ptrv {
                 let owner = left.value1
+                if isset(owner) && right_unique && !stays_inside : value_link_stored_graph(right, owner)
                 if isset(owner) && !left.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
                 let locked_owner = isset(owner) && owner.rett.get_non_nullable().is_locked
                 if locked_owner && right.rett.get_non_nullable().is_locked && !right_unique && !stays_inside {
@@ -979,16 +998,14 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
                         // what the caller passed. Record the edge and let the
                         // call site decide.
                         let sources = value_summary_source_args(right, ctx.get_func() !>)
-                        if isset(sources) : value_mark_summary_absorbs(owner, sources)
-                        else if locked_owner {
+                        if !isset(sources) && locked_owner {
                             exp.error("Only a provably unique value graph can be stored in locked data of type '" + owner.rett.compat_display_name() + "'; a mutable alias may remain")
                         }
-                        else : value_mark_summary_unique_invalidation(owner)
-                        value_invalidate_unique(owner)
+                        value_absorb_param_sources(owner, sources, ctx.get_func() !>)
                     }
                 }
                 // What moves into locked data is published with it
-                if locked_owner && !stays_inside : value_publish_unique(right)
+                if locked_owner && !stays_inside : value_publish_unique(right, ctx) !>
             }
         }
     }
@@ -1025,7 +1042,7 @@ fn value_from_if_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) Va
     if !isset(cond_exp) : exp.bug("if is missing condition")
     let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
     let cr = cond.rett
-    if !cr.is_void_type() && !cr.is_bool_type() && cr.kind != TYPE.any {
+    if !cond.never_returns && !cr.is_bool_type() && cr.kind != TYPE.any {
         exp.error("The if condition value must be of type bool")
     }
 
@@ -1082,7 +1099,7 @@ fn value_from_while_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp)
     if !isset(cond_exp) : exp.bug("while is missing condition")
     let cond = value_from_exp(cond_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
     let cr = cond.rett
-    if !cr.is_void_type() && !cr.is_bool_type() && cr.kind != TYPE.any {
+    if !cond.never_returns && !cr.is_bool_type() && cr.kind != TYPE.any {
         exp.error("The while condition value must be of type bool")
     }
 
@@ -1118,6 +1135,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     on_nn = value_through_borrow(on_nn, ctx)
     let native = type_has_native_sequence_length(on_nn.rett)
     let next_func: ?Func = null
+    let next_args: ?Array[Value] = null
     let item_rett = type_void(b)
     let index_type = type_from_core(b, "uint") !>
     if native {
@@ -1135,12 +1153,25 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         if !isset(next_func) {
             on_exp.error("Cannot use 'each' on type '" + on_nn.rett.compat_display_name() + "'. This type does not have a '_next' function")
         }
-        next_func = func_for_receiver(next_func, on_nn, on_exp) !>
+        if !next_func.parsed_types : parse_func_types(next_func) !>
         let next_arg_skip: uint = 0
         if isset(next_func.class) && !next_func.is_static : next_arg_skip = 1
-        let index_arg = next_func.args.get(next_arg_skip) ! exp.bug("'_next' is missing its index parameter")
+        let index_arg = next_func.args.get(next_arg_skip) ! exp.error("'_next' must have an integer index parameter")
+        if next_func.has_generic_args {
+            let inferred_index = index_arg.is_generic ? index_type : index_arg.type
+            let callee = vgen_func(next_func, on_nn)
+            let args = Array[Value]{ vgen_int(0, inferred_index) }
+            value_fill_trailing_defaults(next_func, next_arg_skip, args, scope, ctx, exp) !>
+            next_func = specialize_call_generic_args(next_func, callee, args, exp) !>
+            next_args = args
+        } else : next_func = func_for_receiver(next_func, on_nn, on_exp) !>
+        index_arg = next_func.args.get(next_arg_skip) ! exp.error("'_next' must have an integer index parameter")
         index_type = index_arg.type
+        if !index_type.is_integer_type() || index_type.is_nullable_type() || isset(index_type.get_enum()) {
+            exp.error("The '_next' index must be a non-null integer type without an enum wrapper")
+        }
         item_rett = next_func.get_rett()
+        if item_rett.is_void_type() : exp.error("'_next' must return an iteration value")
     }
 
     let names = exp.list
@@ -1165,7 +1196,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
     let on_decl = Decl.new(ctx.get_func() !>, on_nn.rett, false, null)
     // Items read out of locked data keep tracing back to the lock they belong to
-    if on_nn.rett.get_non_nullable().is_locked : on_decl.escape_origins = value_escape_origins(on_nn)
+    on_decl.escape_origins = value_escape_origins(on_nn)
     each_scope.add_decl(on_decl)
     let on_init = vgen_assign(vgen_decl(on_decl), on_nn, ASSIGN_OP.set, b, exp)
 
@@ -1192,20 +1223,30 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
 
     let handled = vgen_undefined(item_rett, exp)
     let loop_condition = vgen_bool(true, type_bool(b))
+    let current_on = vgen_decl(on_decl)
+    current_on.exp = on_exp
+    current_on.set_graph_source(on_nn)
     if native {
-        let current_on = vgen_decl(on_decl)
         let length = value_native_sequence_length(current_on, current_on.rett, ctx, exp) !>
         if !isset(length) : exp.bug("Native sequence has no length")
         loop_condition = vgen_op(vgen_decl(index_decl), length, VALUE_OP.lt, type_bool(b))
         handled = value_native_sequence_item(current_on, vgen_decl(index_decl), body_scope, ctx, exp) !>
     } else {
         if !isset(next_func) : exp.bug("Iterator has no '_next' function")
-        let callee = vgen_func(next_func, vgen_decl(on_decl))
-        let next_call = vgen_call(ctx, callee, Array[Value]{ vgen_decl(index_decl) }, item_rett, body_scope)
+        let callee = vgen_func(next_func, current_on)
+        let args = next_args ?? Array[Value]{}
+        if args.length == 0 : args.append(vgen_decl(index_decl))
+        else : args.set(0, vgen_decl(index_decl)) ! exp.bug("Iterator index argument is missing")
+        value_fill_trailing_defaults(next_func, call_receiver_skip(callee, next_func), args, body_scope, ctx, exp) !>
+        value_check_call_args(next_func, callee, args, body_scope, ctx, exp) !>
+        let next_call = vgen_call(ctx, callee, args, item_rett, body_scope)
         next_call.exp = exp
-        next_call.can_error = true
-        next_call.set_error_type(next_func.error_type)
-        handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+        handled = next_call
+        if next_func.can_error {
+            next_call.can_error = true
+            next_call.set_error_type(next_func.error_type)
+            handled = value_error_result(next_call, vgen_break(b, exp), item_rett, ERRH_KIND.block, exp)
+        }
     }
     let item_parts = handled.unroll()
 
@@ -1218,7 +1259,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
         let item_type = item_types.get(i) ! exp.bug("Missing each item type")
         let decl = Decl.new(ctx.get_func() !>, item_type, false, name)
         decl.lock_scope = scope_find_lock(scope)
-        if item_type.get_non_nullable().is_locked : decl.escape_origins = on_decl.escape_origins
+        decl_track_value(decl, part) !>
         decl.exp = exp
         bind_decls.append(decl)
         bind_inits.append(part)

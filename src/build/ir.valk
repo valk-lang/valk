@@ -548,6 +548,7 @@ class IRFunc {
 }
 
 fn generate_func_ir(func: Func) !Error {
+    func_elide_bound_environments(func)
     let scope = func.body_scope
     if !isset(scope) : return
 
@@ -579,6 +580,7 @@ fn generate_func_ir(func: Func) !Error {
     }
     ir.code.append_text(")")
     if func.is_inline : ir.code.append_text(" alwaysinline")
+    if func.is_noinline : ir.code.append_text(" noinline")
     if func.is_hot : ir.code.append_text(" hot")
     ir.code.append_text(" {\n")
     ir.label("entry")
@@ -769,6 +771,7 @@ fn ir_emit_lock_block(ir: IRFunc, value: Value) !Error {
     let release = value.value2
     if !isset(prelude) || !isset(release) : value.bug("Lock block is incomplete")
     ir_emit_stmt(ir, prelude) !>
+    if ir.terminated : return
     ir.active_locks.append(release)
     ir_emit_values(ir, value.values) !>
     ir.active_locks.pop_last() ! value.bug("Lock block release is missing")
@@ -1182,7 +1185,9 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
             let results = ir.vscope_results
             let blocks = ir.vscope_blocks
             if !isset(results) || !isset(blocks) : value.bug("IR value-scope merge state is missing")
-            results.append(ir_emit_value(ir, retv) !>)
+            let rendered = ir_emit_value(ir, retv) !>
+            if ir.terminated : return
+            results.append(rendered)
             ir_emit_values(ir, value.values) !>
             ir_emit_lock_cleanup(ir, ir.vscope_lock_depth) !>
             blocks.append(ir.current_block)
@@ -1195,6 +1200,7 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
             else : ir.line("ret void")
         } else {
             let rendered = ir_emit_value(ir, retv) !>
+            if ir.terminated : return
             ir_emit_func_cleanup(ir) !>
             if ir.func.can_error : ir_emit_error_return(ir, rendered, ir.func.get_rett(), "0") !>
             else {
@@ -1213,6 +1219,7 @@ fn ir_emit_stmt(ir: IRFunc, value: Value) !Error {
         let thrown = value.value1
         if !isset(thrown) : value.bug("IR throw is missing its error value")
         let code = ir_emit_value(ir, thrown) !>
+        if ir.terminated : return
         ir_emit_func_cleanup(ir) !>
         ir_emit_error_return(ir, "undef", ir.func.get_rett(), code) !>
         ir.terminated = true
@@ -1331,6 +1338,7 @@ fn ir_emit_if(ir: IRFunc, value: Value) !Error {
     let condv = value.value1
     if !isset(condv) : value.bug("IR if is missing its condition")
     let cond = ir_emit_value(ir, condv) !>
+    if ir.terminated : return
     let yes = ir.block("if.then")
     let no = ir.block("if.else")
     let after = ir.block("if.after")
@@ -1338,14 +1346,20 @@ fn ir_emit_if(ir: IRFunc, value: Value) !Error {
 
     ir.label(yes)
     ir_emit_values(ir, value.values) !>
+    let yes_reaches_after = !ir.terminated
     ir.jump(after)
 
     ir.label(no)
     let elsev = value.value2
     if isset(elsev) : ir_emit_stmt(ir, elsev) !>
+    let no_reaches_after = !ir.terminated
     ir.jump(after)
 
     ir.label(after)
+    if !yes_reaches_after && !no_reaches_after {
+        ir.line("unreachable")
+        ir.terminated = true
+    }
 }
 
 fn ir_emit_while(ir: IRFunc, value: Value) !Error {
@@ -1358,6 +1372,7 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     let condv = value.value1
     if !isset(condv) : value.bug("IR while is missing its condition")
     let cond = ir_emit_value(ir, condv) !>
+    if ir.terminated : return
     ir.cond_jump(cond, body_block, after_block)
 
     ir.label(body_block)
@@ -1381,7 +1396,16 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
 fn ir_emit_compound(ir: IRFunc, address: String, result: String, op: ASSIGN_OP, type: Type) String !Error {
     if op == ASSIGN_OP.set : return result
     let old = ir_emit_load(ir, ir_type(type) !>, address)
-    return ir_emit_binary(ir, old, result, assign_value_op(op), type) !>
+    return ir_emit_arith_update(ir, old, result, assign_value_op(op), type) !>
+}
+
+// Arithmetic on a slot proven non-null works on the payload of its tag
+fn ir_emit_arith_update(ir: IRFunc, old: String, operand: String, op: VALUE_OP, type: Type) String !Error {
+    if !type.is_tagged_nullable() : return ir_emit_binary(ir, old, operand, op, type) !>
+    let inner = type.get_non_nullable()
+    let payload = ir_extract_tagged_nullable_value(ir, old, type) !>
+    let next = ir_emit_binary(ir, payload, operand, op, inner) !>
+    return ir_build_tagged_nullable(ir, type, next) !>
 }
 
 fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
@@ -1402,6 +1426,7 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
     }
 
     let address = ir_emit_address(ir, left) !>
+    if ir.terminated : return
     let inline_init = right.type == VAL.class_init
         && right.rett.get_non_nullable().is_inline
         && !isset(right.value1)
@@ -1418,6 +1443,7 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
         return
     }
     let result = ir_emit_value(ir, right) !>
+    if ir.terminated : return
     result = ir_emit_compound(ir, address, result, value.op.@cast(ASSIGN_OP), left.rett) !>
     ir_emit_store(ir, ir_type(left.rett) !>, result, address)
 }
@@ -1726,7 +1752,21 @@ fn ir_require_runtime_value(value: Value) !Error {
 }
 
 fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
+    if ir.terminated : return "undef"
     ir_require_runtime_value(value) !>
+    if value.type == VAL.decl || value.type == VAL.global || value.type == VAL.prop || value.type == VAL.ptrv {
+        let pre = value.get_pre_value()
+        if isset(pre) : ir_emit_stmt(ir, pre) !>
+        if ir.terminated : return "undef"
+    }
+    if value.type == VAL.wrap {
+        let inner = value.value1
+        if isset(inner) && inner.rett.is_tagged_nullable() && !value.rett.is_nullable_type() {
+            let address = ir_emit_address(ir, inner) !>
+            if ir.terminated : return "undef"
+            return ir_field_address(ir, ir_type(inner.rett) !>, address, 2)
+        }
+    }
     if value.type == VAL.decl {
         let decl = value.decl
         if !isset(decl) : value.bug("IR declaration value is missing its Decl")
@@ -1745,6 +1785,7 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let prop = value.prop
         if !isset(on) || !isset(prop) : value.bug("IR property value is incomplete")
         let base = on.rett.is_inline ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
+        if ir.terminated : return "undef"
         return ir_prop_address(ir, base, prop)
     }
     if value.type == VAL.ptrv {
@@ -1752,18 +1793,22 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         let index = value.value2
         if !isset(on) || !isset(index) : value.bug("IR pointer access is incomplete")
         let base = on.rett.is_inline ? (ir_emit_address(ir, on) !>) : (ir_emit_value(ir, on) !>)
+        if ir.terminated : return "undef"
         let off_type, off = ir_emit_gep_index(ir, index) !>
+        if ir.terminated : return "undef"
         return ir_element_address(ir, ir_type(value.rett) !>, base, off_type, off)
     }
     let type = ir_type(value.rett) !>
     let temporary = ir_emit_alloca(ir, type)
     let rendered = ir_emit_value(ir, value) !>
+    if ir.terminated : return "undef"
     ir_emit_store(ir, type, rendered, temporary)
     return temporary
 }
 
 fn ir_emit_gep_index(ir: IRFunc, index: Value) (String, String) !Error {
     let value = ir_emit_value(ir, index) !>
+    if ir.terminated : return ("i64", "undef")
     let from = index.rett
     let from_ir = ir_type(from) !>
     let ptr_bits = ir.func.ns.build.options.target.ptr_size.to(uint) * 8
@@ -1793,6 +1838,9 @@ fn ir_emit_convert(ir: IRFunc, instruction: String, from: String, value: String,
 }
 
 fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
+    if ir.terminated : return "undef"
+    let checked = value.get_checked_read()
+    if isset(checked) : return ir_emit_value(ir, checked) !>
     ir_require_runtime_value(value) !>
     let match_value = ir.match_value
     if isset(match_value) && match_value == value {
@@ -1806,11 +1854,15 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         let call = value.value1
         if !isset(call) : value.bug("IR error-success value has no fallible producer")
         let raw = ir.cached_error_result(call) ?? (ir_emit_value(ir, call) !>)
+        if ir.terminated : return "undef"
         return ir_extract_error_success(ir, raw, call.rett) !>
     }
 
     let pre = value.get_pre_value()
-    if isset(pre) : ir_emit_stmt(ir, pre) !>
+    if isset(pre) && t != VAL.decl && t != VAL.global && t != VAL.prop && t != VAL.ptrv {
+        ir_emit_stmt(ir, pre) !>
+    }
+    if ir.terminated : return "undef"
 
     if t == VAL.int {
         if value.rett.is_tagged_nullable() {
@@ -1822,7 +1874,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         return value.int_val
     }
     if t == VAL.float {
-        let rendered = value.float_val.to_string(17, false)
+        let rendered = ir_float_constant(value.float_val)
         if value.rett.is_tagged_nullable() {
             return ir_build_tagged_nullable(ir, value.rett, rendered) !>
         }
@@ -1842,7 +1894,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if !isset(inner) : value.bug("IR wrapped value is missing its child")
         if value.rett.kind == TYPE.fnptr && inner.type == VAL.func {
             let func = inner.func
-            if isset(func) && func.capture_free {
+            if isset(func) && value_is_capture_free_func(inner) {
                 ir_note_unknown_code(ir)
                 if func.is_literal {
                     return "@\"" + (ir_emit_fnptr_adapter(ir, value, func) !>) + "\""
@@ -1852,15 +1904,17 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             }
         }
         if value.rett.kind == TYPE.closure && inner.rett.kind == TYPE.fnptr {
-            return ir_emit_fnptr_closure(ir, value, inner) !>
+            value.bug("Function pointer conversion is missing its closure adapter")
         }
         if value.rett.is_tagged_nullable() {
             let rendered = ir_emit_value(ir, inner) !>
+            if ir.terminated : return "undef"
             if inner.rett.is_tagged_nullable() : return rendered
             return ir_build_tagged_nullable(ir, value.rett, rendered) !>
         }
         if inner.rett.is_tagged_nullable() && !value.rett.is_nullable_type() {
             let rendered = ir_emit_value(ir, inner) !>
+            if ir.terminated : return "undef"
             return ir_extract_tagged_nullable_value(ir, rendered, inner.rett) !>
         }
         return ir_emit_value(ir, inner) !>
@@ -1881,6 +1935,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
         let address = ir_emit_address(ir, value) !>
+        if ir.terminated : return "undef"
         let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
         // Captures live in taggable closure properties.
         if t == VAL.decl && value.rett.is_gc_type() {
@@ -1899,6 +1954,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
         let address = ir_emit_address(ir, value) !>
+        if ir.terminated : return "undef"
         // Clean aggregate copies without changing heap tags.
         if value.rett.has_gc_refs() && !value.rett.is_gc_type()
             && value.rett.get_non_nullable().kind != TYPE.closure {
@@ -1917,13 +1973,16 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         let offset = value.value2
         if !isset(on) || !isset(offset) : value.bug("IR pointer offset is incomplete")
         let base = ir_emit_value(ir, on) !>
+        if ir.terminated : return "undef"
         let amount_type, amount = ir_emit_gep_index(ir, offset) !>
+        if ir.terminated : return "undef"
         return ir_element_address(ir, "i8", base, amount_type, amount)
     }
     if t == VAL.load {
         let on = value.value1
         if !isset(on) : value.bug("IR load is missing its pointer")
         let address = ir_emit_value(ir, on) !>
+        if ir.terminated : return "undef"
         let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
         return out
     }
@@ -1934,9 +1993,10 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         // ++/-- are represented as an op with no right child.
         if !isset(right) {
             let address = ir_emit_address(ir, left) !>
+            if ir.terminated : return "undef"
             let type = ir_type(left.rett) !>
             let old = ir_emit_load(ir, type, address)
-            let next = ir_emit_binary(ir, old, "1", value.op.@cast(VALUE_OP), left.rett) !>
+            let next = ir_emit_arith_update(ir, old, "1", value.op.@cast(VALUE_OP), left.rett) !>
             ir_emit_store(ir, type, next, address)
             return value.bool_val ? next : old
         }
@@ -1945,7 +2005,9 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             return ir_emit_short_circuit(ir, left, right, op) !>
         }
         let rendered_left = ir_emit_value(ir, left) !>
+        if ir.terminated : return "undef"
         let rendered_right = ir_emit_value(ir, right) !>
+        if ir.terminated : return "undef"
         let class = left.rett.get_non_nullable().get_class_or_null()
         if (op == VALUE_OP.eq || op == VALUE_OP.ne)
             && isset(class) && class.kind == CLASS_KIND.interface
@@ -1971,13 +2033,17 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         let inner = value.value1
         if !isset(inner) : value.bug("IR unary operator is missing its operand")
         let val = ir_emit_value(ir, inner) !>
+        if ir.terminated : return "undef"
         let op = value.op.@cast(VALUE_OP)
         if op == VALUE_OP.not : return ir_emit_binary_instruction(ir, "xor", "i1", val, "true")
         if op == VALUE_OP.neg {
             let type = ir_type(inner.rett) !>
-            let inst = inner.rett.is_float_type() ? "fsub" : "sub"
-            let zero = inner.rett.is_float_type() ? "0.0" : "0"
-            return ir_emit_binary_instruction(ir, inst, type, zero, val)
+            if inner.rett.is_float_type() {
+                let out = ir.var()
+                ir.line4(out, " = fneg ", type, " " + val)
+                return out
+            }
+            return ir_emit_binary_instruction(ir, "sub", type, "0", val)
         }
         return ir_emit_binary_instruction(ir, "xor", ir_type(inner.rett) !>, val, "-1")
     }
@@ -2047,6 +2113,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
                 if !isset(global) : value.bug("Error payload global is missing: " + et.name + "." + field.get_name())
                 ir_use_global(ir, global)
                 let rendered = ir_emit_value(ir, field) !>
+                if ir.terminated : return "undef"
                 ir_emit_store(ir, ir_type(field.rett) !>, rendered, ir_global_address(global))
             }
         }
@@ -2066,8 +2133,11 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             let len = values.get(2) !? null
             if isset(from) && isset(to) && isset(len) {
                 let from_ir = ir_emit_value(ir, from) !>
+                if ir.terminated : return "undef"
                 let to_ir = ir_emit_value(ir, to) !>
+                if ir.terminated : return "undef"
                 let len_ir = ir_emit_value(ir, len) !>
+                if ir.terminated : return "undef"
                 ir.line_start()
                 ir.write("call void @llvm.memcpy.p0.p0.i64(ptr ")
                 ir.write(to_ir)
@@ -2129,7 +2199,9 @@ fn ir_emit_atomic_op(ir: IRFunc, value: Value) String !Error {
     else : value.bug("Unsupported atomic operation")
 
     let address = ir_emit_address(ir, left) !>
+    if ir.terminated : return "undef"
     let rendered = ir_emit_value(ir, right) !>
+    if ir.terminated : return "undef"
     let out = ir.var()
     ir.line_start()
     ir.write(out)
@@ -2153,7 +2225,9 @@ fn ir_emit_atomic_store(ir: IRFunc, value: Value) String !Error {
     if !isset(left) || !isset(right) : value.bug("IR atomic store is missing an operand")
 
     let address = ir_emit_address(ir, left) !>
+    if ir.terminated : return "undef"
     let rendered = ir_emit_value(ir, right) !>
+    if ir.terminated : return "undef"
     ir.line_start()
     ir.write("store atomic ")
     ir.write(ir_type(left.rett) !>)
@@ -2172,6 +2246,7 @@ fn ir_emit_atomic_load(ir: IRFunc, value: Value) String !Error {
     if !isset(left) : value.bug("IR atomic load is missing its value")
 
     let address = ir_emit_address(ir, left) !>
+    if ir.terminated : return "undef"
     let out = ir.var()
     ir.line_start()
     ir.write(out)
@@ -2202,6 +2277,7 @@ fn ir_emit_match(ir: IRFunc, value: Value) String !Error {
     if !isset(on) || !isset(cases) : value.bug("IR match is incomplete")
 
     let rendered_on = ir_emit_value(ir, on) !>
+    if ir.terminated : return "undef"
     let previous_match_value = ir.match_value
     let previous_match_rendered = ir.match_rendered
     ir.match_value = on
@@ -2226,6 +2302,10 @@ fn ir_emit_match(ir: IRFunc, value: Value) String !Error {
             if !isset(cond) : case_value.bug("Non-default match case has no condition")
             let next = ir.block("match.next")
             let rendered_cond = ir_emit_value(ir, cond) !>
+            if ir.terminated {
+                found_default = true
+                break
+            }
             ir.cond_jump(rendered_cond, body_block, next)
             ir.label(body_block)
             ir_emit_match_case(ir, value, case_value, after, results, predecessors) !>
@@ -2286,11 +2366,18 @@ fn ir_emit_match_case(
 // Nullables and unions
 ////////////////////////////
 
+// LLVM reads a double constant from its exact bit pattern, whatever its size
+fn ir_float_constant(f: f64) String {
+    let bits = @ptrv(@ref(f), u64, 0)
+    return "0x" + bits.to_hex().pad_left('0', 16)
+}
+
 fn ir_emit_isset(ir: IRFunc, value: Value) String !Error {
     let on = value.value1
     if !isset(on) : value.bug("IR isset is missing its operand")
 
     let rendered = ir_emit_value(ir, on) !>
+    if ir.terminated : return "undef"
     let type = on.rett.get_non_nullable()
     let lowered = ir_type(on.rett) !>
     if on.rett.is_tagged_nullable() : return ir_emit_extract(ir, lowered, rendered, 0)
@@ -2372,6 +2459,7 @@ fn ir_emit_this_or_that(ir: IRFunc, value: Value) String !Error {
     if !isset(else_value) : value.bug("IR conditional value has no else value")
 
     let rendered_cond = ir_emit_value(ir, cond) !>
+    if ir.terminated : return "undef"
     let then_block = ir.block("this_or_that.then")
     let else_block = ir.block("this_or_that.else")
     let after_block = ir.block("this_or_that.after")
@@ -2379,19 +2467,29 @@ fn ir_emit_this_or_that(ir: IRFunc, value: Value) String !Error {
 
     ir.label(then_block)
     let rendered_then = ir_emit_value(ir, then_value) !>
-    rendered_then = ir_emit_cast(ir, rendered_then, then_value.rett, value.rett) !>
     let then_reaches_after = !ir.terminated
+    if then_reaches_after && !value.rett.is_void_type() {
+        rendered_then = ir_emit_cast(ir, rendered_then, then_value.rett, value.rett) !>
+    }
     let then_predecessor = ir.current_block
     ir.jump(after_block)
 
     ir.label(else_block)
     let rendered_else = ir_emit_value(ir, else_value) !>
-    rendered_else = ir_emit_cast(ir, rendered_else, else_value.rett, value.rett) !>
     let else_reaches_after = !ir.terminated
+    if else_reaches_after && !value.rett.is_void_type() {
+        rendered_else = ir_emit_cast(ir, rendered_else, else_value.rett, value.rett) !>
+    }
     let else_predecessor = ir.current_block
     ir.jump(after_block)
 
     ir.label(after_block)
+    if !then_reaches_after && !else_reaches_after {
+        ir.line("unreachable")
+        ir.terminated = true
+        return "undef"
+    }
+    if value.rett.is_void_type() : return ""
     if then_reaches_after && else_reaches_after {
         return ir_emit_phi2(ir, ir_type(value.rett) !>, rendered_then, then_predecessor, rendered_else, else_predecessor)
     }
@@ -2417,6 +2515,7 @@ fn ir_emit_vscope(ir: IRFunc, value: Value) String !Error {
     ir.vscope_lock_depth = ir.active_locks.length
 
     ir_emit_values(ir, value.values) !>
+    let falls_through = !ir.terminated
     if !ir.terminated : ir.jump(after)
     ir.label(after)
 
@@ -2426,6 +2525,10 @@ fn ir_emit_vscope(ir: IRFunc, value: Value) String !Error {
     ir.vscope_lock_depth = old_lock_depth
 
     if results.length == 0 {
+        if !falls_through {
+            ir.line("unreachable")
+            ir.terminated = true
+        }
         ir.cache_vscope(value, "undef")
         return "undef"
     }
@@ -2493,6 +2596,7 @@ fn ir_default_pass_payloads(ir: IRFunc, value: Value, from: ?ErrorType, to: ?Err
         if !isset(global) : value.bug("Error payload global is missing: " + to.name + "." + field.get_name())
         ir_use_global(ir, global)
         let rendered = ir_emit_value(ir, field) !>
+        if ir.terminated : return
         ir_emit_store(ir, ir_type(field.rett) !>, rendered, ir_global_address(global))
     }
 }
@@ -2526,6 +2630,7 @@ fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
     let call = value.get_pre_value()
     if !isset(call) : value.bug("IR error handler is missing its fallible value")
     let raw = ir.cached_error_result(call) ?? (ir_emit_value(ir, call) !>)
+    if ir.terminated : return "undef"
     ir.cache_error_result(call, raw)
     let call_rett = call.rett
     let code = ir_extract_error_code(ir, raw, call_rett) !>
@@ -2545,9 +2650,11 @@ fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
     ir_store_caught_error(ir, value, code) !>
     if kind == ERRH_KIND.pass {
         ir_default_pass_payloads(ir, value, call.get_error_type(), ir.func.error_type) !>
-        ir_emit_func_cleanup(ir) !>
-        ir_emit_error_return(ir, "undef", ir.func.get_rett(), code) !>
-        ir.terminated = true
+        if !ir.terminated {
+            ir_emit_func_cleanup(ir) !>
+            ir_emit_error_return(ir, "undef", ir.func.get_rett(), code) !>
+            ir.terminated = true
+        }
     } else if kind == ERRH_KIND.panic {
         ir_emit_error_panic(ir, value) !>
     } else if kind == ERRH_KIND.value {
@@ -2583,6 +2690,11 @@ fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
     ir.jump(after_block)
 
     ir.label(after_block)
+    if !error_reaches_after && !success_reaches_after {
+        ir.line("unreachable")
+        ir.terminated = true
+        return "undef"
+    }
     if value.rett.is_void_type() : return ""
     if kind == ERRH_KIND.value && error_reaches_after && success_reaches_after {
         let out = ir_emit_phi2(ir, ir_type(value.rett) !>, error_result, error_predecessor, success_result, success_predecessor)
@@ -2603,6 +2715,7 @@ fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
     let slot = ir_emit_alloca(ir, whole)
     each values as item, i {
         let item_value = ir_emit_value(ir, item) !>
+        if ir.terminated : return "undef"
         let item_type = ir_type(item.rett) !>
         ir_emit_store(ir, item_type, item_value, ir_index_address(ir, item_type, slot, i))
     }
@@ -2620,7 +2733,10 @@ fn ir_emit_array_init_into(ir: IRFunc, value: Value, address: String) !Error {
     // Evaluate every element before touching the destination. This preserves
     // assignments such as `values = { values[1], values[0] }`.
     let rendered = Array[String]{}
-    each values as item : rendered.append(ir_emit_value(ir, item) !>)
+    each values as item {
+        rendered.append(ir_emit_value(ir, item) !>)
+        if ir.terminated : return
+    }
     each values as item, i {
         let item_type = ir_type(item.rett) !>
         ir_emit_store(ir, item_type, rendered.get(i) ! value.bug("IR fixed-array initializer value is missing"), ir_index_address(ir, item_type, address, i))
@@ -2675,12 +2791,25 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     }
     if length == "" : value.bug("Slice initializer is missing length")
 
-    let bytes = length
     let element_size = element.byte_size() !>
+    let header = (class.slice_data_offset() !>).to(uint)
+    if element_size > 0 {
+        let limit = (uint.$max - header) / element_size.to(uint)
+        let invalid = ir_emit_binary_instruction(ir, "icmp ugt", "i64", length, limit)
+        let failed = ir.block("slice.size.invalid")
+        let valid = ir.block("slice.size.valid")
+        ir.cond_jump(invalid, failed, valid)
+        ir.label(failed)
+        let panic_call = value_panic_call(Context.for_func(ir.func), "Slice length is too large", value.exp ?? ir.func.exp) !>
+        ir_emit_stmt(ir, panic_call) !>
+        ir.jump(valid)
+        ir.label(valid)
+    }
+    let bytes = length
     if element_size != 1 {
         bytes = ir_emit_binary_index(ir, "mul", "i64", length, element_size.to(uint))
     }
-    let total = ir_emit_binary_index(ir, "add", "i64", bytes, (class.slice_data_offset() !>).to(uint))
+    let total = ir_emit_binary_index(ir, "add", "i64", bytes, header)
 
     let idf = valk_idf(ir.func.ns.build, "gc", "alloc_typed") !>
     let alloc = idf.func
@@ -2760,6 +2889,10 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     if isset(fields) {
         each fields as field {
             ir.field_values.append(ir_emit_value(ir, field) !>)
+            if ir.terminated {
+                ir.release_field_values(field_mark)
+                return "undef"
+            }
         }
     }
 
@@ -2776,11 +2909,6 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
             return ir_build_tagged_nullable(ir, value.rett, out) !>
         }
         return out
-    }
-
-    if size == 0 && lowered == "ptr" {
-        ir.release_field_values(field_mark)
-        return "null"
     }
 
     let slot = ""
@@ -2837,7 +2965,13 @@ fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
         let values = value.values
         let field_mark = ir.field_values.length
         if isset(values) {
-            each values as field : ir.field_values.append(ir_emit_value(ir, field) !>)
+            each values as field {
+                ir.field_values.append(ir_emit_value(ir, field) !>)
+                if ir.terminated {
+                    ir.release_field_values(field_mark)
+                    return
+                }
+            }
         }
         ir_emit_slice_init_into(ir, value, class, address, values, field_mark) !>
         ir.release_field_values(field_mark)
@@ -2849,7 +2983,10 @@ fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
     ir_collect_inline_init_fields(value, 0, fields, offsets) !>
 
     let rendered = Array[String]{}
-    each fields as field : rendered.append(ir_emit_value(ir, field) !>)
+    each fields as field {
+        rendered.append(ir_emit_value(ir, field) !>)
+        if ir.terminated : return
+    }
     let size = class.compute_body_size() !>
     if size > 0 : ir_emit_zero(ir, address, size.to(uint))
     each fields as field, i {
@@ -3063,6 +3200,7 @@ fn ir_emit_interface_wrap(ir: IRFunc, value: Value) String !Error {
     let adapter = value.get_class_ref()
     if !isset(on) || !isset(adapter) : value.bug("Interface conversion is incomplete")
     let object = ir_emit_value(ir, on) !>
+    if ir.terminated : return "undef"
     let inner = value.rett.get_non_nullable()
     let lowered = ir_type(inner) !>
     let result = ir_emit_insert(ir, lowered, "undef", "ptr", object, 0)
@@ -3075,6 +3213,7 @@ fn ir_emit_is_a(ir: IRFunc, value: Value) String !Error {
     let on = value.value1
     if !isset(on) : value.bug("is_a is missing its interface value")
     let rendered = ir_emit_value(ir, on) !>
+    if ir.terminated : return "undef"
     let adapter = value.get_class_ref()
     if !isset(adapter) : return "false"
     let interface_value = rendered
@@ -3207,11 +3346,12 @@ fn ir_emit_adapter_call(ir: IRFunc, func: Func, target: String, prefix_type: Str
 }
 
 fn ir_emit_closure_adapter(parent: IRFunc, value: Value, func: Func) String !Error {
-    let name = "valk.closure.adapter." + func_ir_name(func)
+    let method = isset(func.class) && !func.is_static
+    let bound = method && isset(value.value1)
+    let name = "valk.closure.adapter." + func_ir_name(func) + (method && !bound ? ".unbound" : "")
     if !func.is_interface : ir_use_func(parent, func)
     if ir_reuse_adapter(parent, name) : return name
     let ir = ir_adapter_ir(parent, name)
-    let bound = isset(func.class) && !func.is_static
     ir_write_adapter_signature(ir, func, name, true, bound) !>
 
     let receiver = ""
@@ -3243,10 +3383,6 @@ fn ir_emit_fnptr_adapter(parent: IRFunc, value: Value, func: Func) String !Error
     return name
 }
 
-fn ir_emit_fnptr_closure(parent: IRFunc, value: Value, inner: Value) String !Error {
-    return ir_build_closure_value(parent, value.rett, ir_emit_value(parent, inner) !>, "null") !>
-}
-
 fn ir_build_closure_value(ir: IRFunc, type: Type, target: String, data: String) String !Error {
     let lowered = ir_type(type) !>
     let code = ir_emit_insert(ir, lowered, "undef", "ptr", target, 0)
@@ -3254,6 +3390,12 @@ fn ir_build_closure_value(ir: IRFunc, type: Type, target: String, data: String) 
 }
 
 fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
+    if value_is_capture_free_func(value) {
+        let target = func_ir_name(func)
+        if func.is_literal : ir_use_func(ir, func)
+        else : target = ir_emit_closure_adapter(ir, value, func) !>
+        return ir_build_closure_value(ir, value.rett, "@\"" + target + "\"", "null") !>
+    }
     func_prepare_closure(func) !>
     let class = func.capture_class
     let allocator = func.capture_allocator
@@ -3267,6 +3409,7 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     {
         ir_use_func(ir, func)
         let object = ir_emit_value(ir, bound_object) !>
+        if ir.terminated : return "undef"
         return ir_build_closure_value(ir, value.rett, ir_func_address(func), object) !>
     }
 
@@ -3317,6 +3460,7 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
     init.set_allocator(allocator)
     let environment = ir_emit_value(ir, init) !>
     ir.func.no_buffers = buffers_before
+    if ir.terminated : return "undef"
 
     // Protocol header: pointer to the value-AST clone helper.
     let clone_func = func.capture_clone_func
@@ -3334,6 +3478,7 @@ fn ir_emit_closure(ir: IRFunc, value: Value, func: Func) String !Error {
 
 // Render one argument — receiver or ordinary — into the list started at `mark`.
 fn ir_write_call_arg(ir: IRFunc, mark: uint, arg: Value, expected: ?Type) !Error {
+    if ir.terminated : return
     if !isset(expected) {
         ir.write_arg(mark, ir_type(arg.rett) !>, ir_emit_value(ir, arg) !>)
         return
@@ -3348,7 +3493,13 @@ fn ir_write_call_arg(ir: IRFunc, mark: uint, arg: Value, expected: ?Type) !Error
         return
     }
     let rendered = ir_emit_value(ir, arg) !>
+    if ir.terminated : return
     ir.write_arg(mark, type, ir_emit_cast(ir, rendered, arg.rett, expected) !>)
+}
+
+fn ir_abandon_call(ir: IRFunc, mark: uint) String {
+    ir.arg_list.clear_part(mark, ir.arg_list.length - mark)
+    return "undef"
 }
 
 fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
@@ -3362,20 +3513,30 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let closure_call = call_kind == CALL_KIND.closure
 
     let target = ""
+    let target_symbol : ?Func = null
     if interface_call {
         let method = direct_func
         if !isset(method) : value.bug("Interface method call has no method")
         let receiver = callee.value1
         if !isset(receiver) : value.bug("Interface method call has no receiver")
         let adapter = ir_emit_value(ir, receiver) !>
+        if ir.terminated : return ir_abandon_call(ir, arg_mark)
         target = ir_interface_method_target(ir, adapter, method)
         ir.write_arg(arg_mark, "ptr", ir_interface_object(ir, adapter))
         ir_note_unknown_code(ir)
     } else if closure_call {
         let closure = ir_emit_value(ir, callee) !>
+        if ir.terminated : return ir_abandon_call(ir, arg_mark)
         let closure_type = ir_type(callee.rett) !>
         target = ir_emit_extract(ir, closure_type, closure, 0)
         ir.write_arg(arg_mark, "ptr", ir_emit_extract(ir, closure_type, closure, 1))
+    } else if isset(direct_func) {
+        ir_use_func(ir, direct_func)
+        target_symbol = direct_func
+    } else {
+        ir_note_unknown_code(ir)
+        target = ir_emit_value(ir, callee) !>
+        if ir.terminated : return ir_abandon_call(ir, arg_mark)
     }
 
     // Bound method receiver is the implicit first argument.
@@ -3389,6 +3550,7 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                 }
             }
             ir_write_call_arg(ir, arg_mark, receiver, expected) !>
+            if ir.terminated : return ir_abandon_call(ir, arg_mark)
         }
     }
     if isset(args) {
@@ -3399,22 +3561,14 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
                 direct_func.args.get(i + receiver_offset) -> func_arg {
                     expected = func_arg.type
                 }
+            } else {
+                expected = indirect_call_arg_type(callee, i)
             }
             ir_write_call_arg(ir, arg_mark, arg, expected) !>
+            if ir.terminated : return ir_abandon_call(ir, arg_mark)
         }
     }
 
-    // A direct call names its symbol instead of computing a value for it.
-    let target_symbol : ?Func = null
-    if !closure_call && !interface_call {
-        if callee.type == VAL.func && isset(direct_func) {
-            ir_use_func(ir, direct_func)
-            target_symbol = direct_func
-        } else {
-            ir_note_unknown_code(ir)
-            target = ir_emit_value(ir, callee) !>
-        }
-    }
     let exits = false
     let call_type = ir_type(value.rett) !>
     if callee.type == VAL.func {
@@ -3470,6 +3624,7 @@ fn ir_emit_raw_function(ir: IRFunc, value: Value) String !Error {
         return ir_func_address(direct)
     }
     let closure = ir_emit_value(ir, value) !>
+    if ir.terminated : return "undef"
     return ir_emit_extract(ir, ir_type(value.rett) !>, closure, 0)
 }
 
@@ -3479,12 +3634,11 @@ fn ir_emit_inline_call_address(ir: IRFunc, value: Value) String !Error {
         if isset(inner) : return ir_emit_inline_call_address(ir, inner) !>
     }
     if value.type == VAL.decl || value.type == VAL.global || value.type == VAL.prop {
-        let pre = value.get_pre_value()
-        if isset(pre) : ir_emit_stmt(ir, pre) !>
         return ir_emit_address(ir, value) !>
     }
 
     let rendered = ir_emit_value(ir, value) !>
+    if ir.terminated : return "undef"
     let type = ir_type(value.rett) !>
     let slot = ir_emit_alloca(ir, type)
     ir_emit_store(ir, type, rendered, slot)
@@ -3757,6 +3911,14 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
     if !isset(current_global) : value.bug("coro.current_coro is not a global")
     ir_use_global(ir, current_global)
 
+    let handler = ir_emit_value(ir, callee) !>
+    if ir.terminated : return "undef"
+    let handler_prop = ir_coro_prop(value, class, "handler") !>
+    let handler_type = ir_type(handler_prop.type) !>
+    if callee.rett.get_non_nullable().kind == TYPE.fnptr {
+        handler = ir_build_closure_value(ir, handler_prop.type, handler, "null") !>
+    }
+
     let arg_types = Array[Type]{}
     let arg_values = Array[String]{}
     if callee.type == VAL.func {
@@ -3764,6 +3926,7 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
         if isset(receiver) {
             arg_types.append(receiver.rett)
             arg_values.append(ir_emit_value(ir, receiver) !>)
+            if ir.terminated : return "undef"
         }
     }
     let args = call.values
@@ -3771,10 +3934,9 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
         each args as arg {
             arg_types.append(arg.rett)
             arg_values.append(ir_emit_value(ir, arg) !>)
+            if ir.terminated : return "undef"
         }
     }
-    let handler = ir_emit_value(ir, callee) !>
-    let handler_type = ir_type(callee.rett) !>
     let arg_size = ir_coro_raw_size(arg_types) !>
     let result_size = ir_coro_raw_size(ir_coro_result_types(call.rett)) !>
     let raw_size = arg_size > result_size ? arg_size : result_size
@@ -3851,7 +4013,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     let raw_args = ir_coro_load_prop(ir, coro, args_prop) !>
     let gc_args = ir_coro_load_prop(ir, coro, gc_args_prop) !>
     let closure = ir_coro_load_prop(ir, coro, handler_prop) !>
-    let closure_type = ir_type(callee.rett) !>
+    let closure_type = ir_type(handler_prop.type) !>
     let handler = ir_emit_extract(ir, closure_type, closure, 0)
     let handler_environment = ir_emit_extract(ir, closure_type, closure, 1)
 
@@ -3930,6 +4092,7 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
     let task_value = value.value1
     if !isset(task_value) : value.bug("IR await has no coroutine value")
     let task = ir_emit_value(ir, task_value) !>
+    if ir.terminated : return "undef"
     let class = ir_coro_class(value) !>
     let current_idf = valk_idf(value.rett.build, "coro", "current_coro") !>
     let current_global = current_idf.global
@@ -4009,11 +4172,14 @@ fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
         // twice; a plain load is rendered again where it is needed, as the
         // first rendering may sit in a branch that does not reach this use
         if value_renders_freely(source) {
-            return ir_emit_extract(ir, ir_type(source.rett) !>, ir_emit_value(ir, source) !>, value.int_val.to(uint))
+            let rendered = ir_emit_value(ir, source) !>
+            if ir.terminated : return "undef"
+            return ir_emit_extract(ir, ir_type(source.rett) !>, rendered, value.int_val.to(uint))
         }
         let aggregate = ir.cached_multi(source)
         if !isset(aggregate) {
             aggregate = ir_emit_value(ir, source) !>
+            if ir.terminated : return "undef"
             ir.cache_multi(source, aggregate)
         }
         return ir_emit_extract(ir, ir_type(source.rett) !>, aggregate, value.int_val.to(uint))
@@ -4025,6 +4191,7 @@ fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
     let whole = ir_type(value.rett) !>
     each values as item, i {
         let item_value = ir_emit_value(ir, item) !>
+        if ir.terminated : return "undef"
         current = ir_emit_insert(ir, whole, current, ir_type(item.rett) !>, item_value, i)
     }
     return current
@@ -4032,6 +4199,7 @@ fn ir_emit_multi(ir: IRFunc, value: Value) String !Error {
 
 // Side-effect free and cheap: safe to render once per use
 fn value_renders_freely(value: Value) bool {
+    if isset(value.get_checked_read()) : return false
     let t = value.type
     if t == VAL.decl || t == VAL.global || t == VAL.ptrv || t == VAL.prop : return !isset(value.get_pre_value())
     if t == VAL.null || t == VAL.int || t == VAL.bool || t == VAL.float || t == VAL.string : return true
@@ -4052,6 +4220,7 @@ fn value_renders_freely(value: Value) bool {
 
 fn ir_emit_short_circuit(ir: IRFunc, left: Value, right: Value, op: VALUE_OP) String !Error {
     let rendered_left = ir_emit_value(ir, left) !>
+    if ir.terminated : return "undef"
     let left_predecessor = ir.current_block
     let right_block = ir.block("logic.right")
     let after_block = ir.block("logic.after")
@@ -4135,6 +4304,31 @@ fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) Stri
     return ir_emit_binary_instruction(ir, "and", "i1", equal, payload_equal)
 }
 
+// Integer division by zero, and the signed minimum divided by -1, would trap
+// the process: both panic with a message instead
+fn ir_emit_division_guard(ir: IRFunc, irt: String, left: String, right: String, type: Type) !Error {
+    // A literal divisor was checked at compile time
+    let first = right.bytes > 0 ? right.get(0) : 0
+    if first.is_number() || first == '-' : return
+    let bad = ir_emit_binary_instruction(ir, "icmp eq", irt, right, "0")
+    if type.is_signed_type() {
+        let bits = type.number_byte_size() * 8
+        let min = bits >= 64 ? "-9223372036854775808" : ("-" + (1.to(u64) << (bits - 1).to(u64)).to_string())
+        let minus_one = ir_emit_binary_instruction(ir, "icmp eq", irt, right, "-1")
+        let at_min = ir_emit_binary_instruction(ir, "icmp eq", irt, left, min)
+        let overflow = ir_emit_binary_instruction(ir, "and", "i1", minus_one, at_min)
+        bad = ir_emit_binary_instruction(ir, "or", "i1", bad, overflow)
+    }
+    let failed = ir.block("div.invalid")
+    let valid = ir.block("div.valid")
+    ir.cond_jump(bad, failed, valid)
+    ir.label(failed)
+    let panic_call = value_panic_call(Context.for_func(ir.func), "Integer division by zero or overflow", ir.func.exp) !>
+    ir_emit_stmt(ir, panic_call) !>
+    ir.jump(valid)
+    ir.label(valid)
+}
+
 fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type) String !Error {
     if type.is_tagged_nullable() && type.get_non_nullable().kind == TYPE.union
         && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
@@ -4197,8 +4391,13 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     } else if op == VALUE_OP.add : inst = type.is_float_type() ? "fadd" : "add"
     else if op == VALUE_OP.sub : inst = type.is_float_type() ? "fsub" : "sub"
     else if op == VALUE_OP.mul : inst = type.is_float_type() ? "fmul" : "mul"
-    else if op == VALUE_OP.div : inst = type.is_float_type() ? "fdiv" : (type.is_signed_type() ? "sdiv" : "udiv")
-    else if op == VALUE_OP.mod : inst = type.is_float_type() ? "frem" : (type.is_signed_type() ? "srem" : "urem")
+    else if op == VALUE_OP.div || op == VALUE_OP.mod {
+        if type.is_float_type() : inst = op == VALUE_OP.div ? "fdiv" : "frem"
+        else {
+            ir_emit_division_guard(ir, irt, left, right, type) !>
+            inst = op == VALUE_OP.div ? (type.is_signed_type() ? "sdiv" : "udiv") : (type.is_signed_type() ? "srem" : "urem")
+        }
+    }
     else if op == VALUE_OP.bit_and || op == VALUE_OP.and : inst = "and"
     else if op == VALUE_OP.bit_or || op == VALUE_OP.or : inst = "or"
     else if op == VALUE_OP.bit_xor : inst = "xor"
@@ -4210,6 +4409,7 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
 }
 
 fn ir_emit_cast(ir: IRFunc, value: String, from: Type, to: Type) String !Error {
+    if ir.terminated : return "undef"
     if from.is_tagged_nullable() {
         let tag = ir_emit_extract(ir, ir_type(from) !>, value, 0)
         let inner_value = ir_extract_tagged_nullable_value(ir, value, from) !>
