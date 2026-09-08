@@ -1505,7 +1505,7 @@ alias Fd for i32
 + fn stdin() StdStream
 + fn stdout() StdStream
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
-+ fn write(fd: i32, data: &[u8]) uint !IoError
++ fn write(fd: i32, data: &[u8], offset: uint (uint.$max)) uint !IoError
 ```
 
 ## Classes for 'io'
