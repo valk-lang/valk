@@ -247,7 +247,7 @@ fi
 for mode in debug release; do
     flags=()
     if [ "$mode" = release ]; then flags+=(--release); fi
-    closure_out=$("$VALK" build "$DIR"/closure-layouts/*.valk "${flags[@]}" --def GC_DEBUG=1 --no-warn -o "$output" 2>&1) || {
+    closure_out=$("$VALK" build "$DIR"/closure-layouts/*.valk ${flags[@]+"${flags[@]}"} --def GC_DEBUG=1 --no-warn -o "$output" 2>&1) || {
         echo "# Failed to build closures with colliding source offsets: $mode"
         echo "$closure_out"
         exit 1
@@ -267,7 +267,7 @@ done
 for mode in debug release; do
     flags=()
     if [ "$mode" = release ]; then flags+=(--release); fi
-    flags_out=$("$VALK" build "$DIR/optimization-flags.valk" "${flags[@]}" --def GC_DEBUG=1 --no-warn -o "$output" 2>&1) || {
+    flags_out=$("$VALK" build "$DIR/optimization-flags.valk" ${flags[@]+"${flags[@]}"} --def GC_DEBUG=1 --no-warn -o "$output" 2>&1) || {
         echo "# Failed to build optimization flags: $mode"
         echo "$flags_out"
         exit 1
@@ -289,7 +289,7 @@ for mode in default release; do
     termination_flags=()
     if [ "$mode" = release ]; then termination_flags+=(--release); fi
     termination_exe="$workdir/nonreturning-expressions$EXE_SUFFIX"
-    if ! "$VALK" build "$DIR/nonreturning-expressions.valk" --no-warn "${termination_flags[@]}" -o "$termination_exe"; then
+    if ! "$VALK" build "$DIR/nonreturning-expressions.valk" --no-warn ${termination_flags[@]+"${termination_flags[@]}"} -o "$termination_exe"; then
         exit 1
     fi
     for case in argument conditional-argument closure-argument fnptr-argument binary-left binary-right unary cast field inline array slice if while property index store receiver inline-receiver interface-receiver interface-wrap bound-method multi partial-multi discarded-multi closure fnptr fnptr-wrap isset match match-condition error co co-body await vscope void-argument void-closure-argument void-fnptr-argument void-let void-assign void-return void-vscope void-error-fallback fnptr-callee-argument co-callee-argument; do
@@ -324,7 +324,7 @@ for mode in default release; do
     cleared_flags=()
     if [ "$mode" = release ]; then cleared_flags+=(--release); fi
     cleared_exe="$workdir/cleared-views$EXE_SUFFIX"
-    if ! "$VALK" build "$DIR/cleared-views.valk" --no-warn "${cleared_flags[@]}" -o "$cleared_exe"; then
+    if ! "$VALK" build "$DIR/cleared-views.valk" --no-warn ${cleared_flags[@]+"${cleared_flags[@]}"} -o "$cleared_exe"; then
         exit 1
     fi
     for case in callback callback-get callback-each pointer inline inline-get inline-each nested mode fixed union interface borrow slice string borrowed-field borrowed-method borrowed-bound borrowed-nested borrowed-callback borrowed-interface borrowed-fixed borrowed-union partial-struct partial-nested-field partial-fixed enum enum-get enum-each enum-borrowed; do
@@ -343,7 +343,7 @@ for mode in default release; do
     enum_flags=()
     if [ "$mode" = release ]; then enum_flags+=(--release); fi
     enum_exe="$workdir/enum-matches$EXE_SUFFIX"
-    if ! "$VALK" build "$DIR/enum-matches.valk" --no-warn "${enum_flags[@]}" -o "$enum_exe"; then
+    if ! "$VALK" build "$DIR/enum-matches.valk" --no-warn ${enum_flags[@]+"${enum_flags[@]}"} -o "$enum_exe"; then
         exit 1
     fi
     for case in statement value; do
