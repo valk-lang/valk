@@ -357,5 +357,125 @@ for mode in default release; do
     done
 done
 
+echo "> Report a missing or invalid main before lowering the entry template"
+no_main_out=$("$VALK" build "$lint_input" --no-warn -o "$output" 2>&1)
+if [ $? -eq 0 ] || [[ "$no_main_out" != *"No 'main' function found in: "*"lint-no-main.valk"* ]] || [[ "$no_main_out" == *"templates"* ]]; then
+    echo "# Missing main was not reported on the input"
+    echo "$no_main_out"
+    exit 1
+fi
+printf 'class main {}\n' > "$workdir/class-main.valk"
+class_main_out=$("$VALK" build "$workdir/class-main.valk" --no-warn -o "$output" 2>&1)
+if [ $? -eq 0 ] || [[ "$class_main_out" != *"'main' must be a function"* ]]; then
+    echo "# A non-function main was not reported"
+    echo "$class_main_out"
+    exit 1
+fi
+
+echo "> Options that take a value reject a missing value"
+for option in -o --target --filter -L --def; do
+    missing_out=$("$VALK" build "$input" --no-warn "$option" 2>&1)
+    if [ $? -eq 0 ] || [[ "$missing_out" != *"Option '$option' expects a value"* ]]; then
+        echo "# Missing value for $option was accepted"
+        echo "$missing_out"
+        exit 1
+    fi
+done
+missing_out=$("$VALK" build "$input" --no-warn -o --run 2>&1)
+if [ $? -eq 0 ] || [[ "$missing_out" != *"Option '-o' expects a value"* ]]; then
+    echo "# A flag was taken as the value of -o"
+    echo "$missing_out"
+    exit 1
+fi
+
+echo "> The target list in --help matches the invalid target message"
+help_targets=$("$VALK" build --help | grep -A1 -- '--target' | tail -n 1 | sed 's/^ *//')
+invalid_targets=$("$VALK" build "$input" --target nope 2>&1 | sed -n 's/^Supported: //p')
+if [ -z "$help_targets" ] || [ "$help_targets" != "$invalid_targets" ]; then
+    echo "# Target lists differ: help '$help_targets' vs error '$invalid_targets'"
+    exit 1
+fi
+
+echo "> valk fmt formats files in place"
+printf 'fn main() {\n  let  x = 1\n}\n' > "$workdir/fmt.valk"
+fmt_out=$("$VALK" fmt "$workdir/fmt.valk" 2>&1) || {
+    echo "# valk fmt failed"
+    echo "$fmt_out"
+    exit 1
+}
+if ! grep -q '^    let x = 1$' "$workdir/fmt.valk"; then
+    echo "# valk fmt did not format the file"
+    cat "$workdir/fmt.valk"
+    exit 1
+fi
+
+echo "> Concurrent builds never fail on the IR cache"
+concurrent_pids=()
+for i in 1 2 3 4 5 6; do
+    printf 'fn main() {\n    println("build %s")\n}\n' "$i" > "$workdir/concurrent-$i.valk"
+    "$VALK" build "$workdir/concurrent-$i.valk" --no-warn -c -o "$workdir/concurrent-$i$EXE_SUFFIX" > "$workdir/concurrent-$i.log" 2>&1 &
+    concurrent_pids+=($!)
+done
+concurrent_failed=0
+for pid in "${concurrent_pids[@]}"; do
+    wait "$pid" || concurrent_failed=1
+done
+if [ "$concurrent_failed" -ne 0 ]; then
+    echo "# A concurrent build failed"
+    cat "$workdir"/concurrent-*.log
+    exit 1
+fi
+for i in 1 2 3 4 5 6; do
+    if [ "$("$workdir/concurrent-$i$EXE_SUFFIX")" != "build $i" ]; then
+        echo "# Concurrent build produced a wrong program: $i"
+        exit 1
+    fi
+done
+
+echo "> Compile generated deep and long inputs"
+repeat() { printf "%.0s$1" $(seq 1 "$2"); }
+deep_src="$workdir/deep.valk"
+deep_exe="$workdir/deep$EXE_SUFFIX"
+build_deep() {
+    local expected="$1"
+    if ! timeout 120 "$VALK" build "$deep_src" --no-warn -o "$deep_exe"; then
+        echo "# Generated input failed to compile: $deep_src"
+        exit 1
+    fi
+    deep_out=$("$deep_exe" 2>&1)
+    if [ "$deep_out" != "$expected" ]; then
+        echo "# Generated input printed '$deep_out', expected '$expected'"
+        exit 1
+    fi
+}
+echo "fn main() { let a = 1$(repeat ' + 1' 5000) println(a) }" > "$deep_src"
+build_deep 5001
+echo "fn main() { let a = 1$(repeat ' + 2 * 3 - 4 / 2' 2000) println(a) }" > "$deep_src"
+build_deep 8001
+echo "fn main() { let a = \"x\"$(repeat ' + "y"' 5000) println(a.length) }" > "$deep_src"
+build_deep 5001
+echo "fn main() { let a = $(repeat '(' 500)1$(repeat ')' 500) println(a) }" > "$deep_src"
+build_deep 1
+echo "fn main() { $(repeat '{ ' 500)println(1)$(repeat ' }' 500) }" > "$deep_src"
+build_deep 1
+echo "struct Big { data: [u8 x 100000] } fn main() { let b = Big{} let a: [u8 x 100000] = { 7... } println(b.data[5] + a[99999]) }" > "$deep_src"
+build_deep 7
+for form in paren block call index ternary; do
+    case "$form" in
+        paren) echo "fn main() { let a = $(repeat '(' 3000)1$(repeat ')' 3000) println(a) }" > "$deep_src" ;;
+        block) echo "fn main() { $(repeat '{ ' 3000)println(1)$(repeat ' }' 3000) }" > "$deep_src" ;;
+        call) echo "fn f(x: int) int { return x } fn main() { let a = $(repeat 'f(' 3000)1$(repeat ')' 3000) println(a) }" > "$deep_src" ;;
+        index) echo "fn main() { let s = [int x 2]{ 0, 1 } let a = $(repeat 's[' 3000)0$(repeat ']' 3000) println(a) }" > "$deep_src" ;;
+        ternary) echo "fn main() { let a = $(repeat 'true ? 1 : ' 3000)2 println(a) }" > "$deep_src" ;;
+    esac
+    deep_out=$(timeout 120 "$VALK" build "$deep_src" --no-warn -o "$deep_exe" 2>&1)
+    deep_status=$?
+    if [ "$deep_status" -ne 1 ] || [[ "$deep_out" != *"nesting too deep"* ]]; then
+        echo "# Deep $form input did not report its nesting (exit $deep_status)"
+        echo "$deep_out" | cut -c1-200
+        exit 1
+    fi
+done
+
 echo "# CLI tests passed"
-echo "# Test count: 25"
+echo "# Test count: 32"

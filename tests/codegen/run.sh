@@ -49,6 +49,7 @@ queue_ir "$workdir/tagged-union-scalars.ll" "$DIR/tagged-union-scalars.valk" --i
 queue_ir "$workdir/export.ll" "$DIR/export.valk" --ir --no-warn
 queue_ir "$workdir/shared-pool.ll" "$DIR/shared-pool.valk" --ir --no-warn
 queue_ir "$workdir/fixed-array-bounds.ll" "$DIR/fixed-array-bounds.valk" --ir --no-warn
+queue_ir "$workdir/fixed-array-fills.ll" "$DIR/fixed-array-fills.valk" --ir --no-warn
 queue_ir "$workdir/direct-initializer.ll" "$DIR/direct-initializer.valk" --ir --no-warn
 queue_ir "$workdir/interface-values.ll" "$DIR/interface-values.valk" --ir --no-warn
 queue_ir "$workdir/interface-values-win.ll" "$DIR/interface-values.valk" --ir --no-warn --target win-x64
@@ -425,6 +426,39 @@ if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
 fi
 
 echo "> Check variable indices for every known-length sequence"
+
+fills_ir="$workdir/fixed-array-fills.ll"
+out=$(ir_result "$fills_ir")
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build fixed-array fills IR fixture"
+    echo "$out"
+    exit 1
+fi
+fills_body=$(sed -n "/^define .*__zero_struct__/,/^}/p" "$fills_ir")
+if [[ "$fills_body" != *"llvm.memset.p0.i64(ptr %"*", i8 0, i64 4096"* ]] || [[ "$fills_body" == *"load [4096 x i8]"* ]] || [[ "$fills_body" == *"i64 4095"* ]]; then
+    echo "# zero_struct did not zero its array field with a single memset"
+    echo "$fills_body"
+    exit 1
+fi
+fills_body=$(sed -n "/^define .*__seven_local__/,/^}/p" "$fills_ir")
+if [[ "$fills_body" != *"llvm.memset.p0.i64(ptr %"*", i8 7, i64 4095"* ]] || [[ "$fills_body" == *"i64 4094"* ]]; then
+    echo "# seven_local did not fill its array with a single memset"
+    echo "$fills_body"
+    exit 1
+fi
+fills_body=$(sed -n "/^define .*__word_fill__/,/^}/p" "$fills_ir")
+if [[ "$fills_body" != *"fill.body"* ]] || [[ "$fills_body" == *"i64 511"* ]]; then
+    echo "# word_fill did not fill its array with a loop"
+    echo "$fills_body"
+    exit 1
+fi
+fills_body=$(sed -n "/^define .*__copy_block__/,/^}/p" "$fills_ir")
+if [[ "$fills_body" != *"llvm.memcpy.p0.p0.i64(ptr %"*", i64 4096"* ]] || [[ "$fills_body" == *"load %"*"Block"* ]]; then
+    echo "# copy_block did not copy its struct with memcpy"
+    echo "$fills_body"
+    exit 1
+fi
 
 bounds_ir="$workdir/fixed-array-bounds.ll"
 out=$(ir_result "$bounds_ir")

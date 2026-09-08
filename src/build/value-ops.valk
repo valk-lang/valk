@@ -96,6 +96,8 @@ fn value_force_to(v: Value, scope: Scope, ctx: Context, target: Type, at: Exp) V
         }
         at.error("Cannot convert value to enum: '" + target_enum.name + "'")
     }
+    // Leaving an enum: convert its storage value
+    if !isset(target_enum) : v = value_enum_representation(v) !>
     if v.rett.is_number_type() && target.is_number_type()
         && (v.rett.is_bool_type() || !target.is_bool_type())
     {
@@ -174,10 +176,26 @@ fn union_numeric_member(target_union: Type, source: Type) ?uint {
 
 fn value_try_union_convert(v: Value, scope: Scope, ctx: Context, target: Type, is_auto: bool) ?Value !Error {
     let target_union = target.get_non_nullable()
-    if target_union.kind != TYPE.union || v.rett.get_non_nullable().kind == TYPE.union {
-        return null
+    if target_union.kind != TYPE.union : return null
+    // A `null` alternative is a real tag: `null` and a missing `?X` select it,
+    // while `?U` keeps its own missing state
+    let null_tag = target_union.union_null_tag()
+    if v.type == VAL.null {
+        if target.is_nullable_type() || !isset(null_tag) : return null
+        return vgen_union_wrap(v, target, null_tag, ctx)
     }
-    if v.rett.is_nullable_type() && !target.is_nullable_type() : return null
+    if v.rett.get_non_nullable().kind == TYPE.union : return null
+    if v.rett.is_nullable_type() && !target.is_nullable_type() {
+        if !isset(null_tag) : return null
+        let at = v.exp ?! return null
+        let body = Array[Value]{}
+        let source = value_bind_once(v, ctx, at, body)
+        let present = value_try_union_convert(value_force_remove_nullable(source), scope, ctx, target, is_auto) !> ?! return null
+        let missing = vgen_union_wrap(vgen_null(target.nullable()), target, null_tag, ctx) ?! return null
+        let result = vgen_this_or_that(vgen_isset_val(source, type_bool(ctx.build)), present, missing, target)
+        if body.length == 0 : return result
+        return vgen_scoped_value(body, result, at)
+    }
     let exact = target_union.union_compatible_member_index(v.rett) !? null
     if isset(exact) : return vgen_union_wrap(v, target, exact, ctx)
     let index = union_numeric_member(target_union, v.rett)
@@ -1617,10 +1635,12 @@ fn value_try_convert(
         if isset(adapter) : return vgen_interface_wrap(result, target, adapter, ctx)
     }
 
-    if result.rett.is_nullable_type() && !target.is_nullable_type()
-        && value_stores_non_null(result, scope)
-    {
-        result = value_force_remove_nullable(result)
+    if result.rett.is_nullable_type() && !target.is_nullable_type() {
+        if target.get_non_nullable().kind == TYPE.union {
+            let union_value = value_try_union_convert(result, scope, ctx, target, is_auto) !>
+            if isset(union_value) : return union_value
+        }
+        if value_stores_non_null(result, scope) : result = value_force_remove_nullable(result)
     }
 
     let target_nn = target.get_non_nullable()
@@ -1639,8 +1659,10 @@ fn value_try_convert(
     // must be unique, and it is published from here on.
     let to_view = (target_nn.is_shared && !source_nn.is_shared)
         || (target_nn.is_locked && !source_nn.is_locked && !source_nn.is_shared)
+    let same_slice = target_nn.kind == TYPE.ref_slice && source_nn.kind == TYPE.ref_slice
+        && target_nn.is_mut == source_nn.is_mut && target_nn.get_sub_type() == source_nn.get_sub_type()
     if to_view
-        && (target_nn.is_gc_type() || target_nn.kind == TYPE.interface)
+        && (target_nn.is_gc_type() || target_nn.kind == TYPE.interface || same_slice)
         && target_nn.get_class_or_null() == source_nn.get_class_or_null()
         && (target.is_nullable_type() || !result.rett.is_nullable_type())
     {
@@ -1737,6 +1759,17 @@ fn value_try_convert(
         return value_convert_array_copy(result, target, scope, ctx) !>
     }
 
+    // An untyped literal adopts a fitting integer target; one that does not fit never converts
+    if result.type == VAL.int && target.is_integer_type() && value_is_untyped_int_literal(result, ctx.build) {
+        if type_fits_int_literal(target, result.int_val, !result.rett.is_signed_type()) {
+            let lit = vgen_int(result.int_val, target)
+            lit.exp = result.exp
+            return lit
+        }
+        if is_auto : result.error("Incompatible types: constant does not fit in '" + target.compat_display_name() + "'")
+        return result
+    }
+
     if target.compat(result.rett) && target.is_nullable_type() == result.rett.is_nullable_type() {
         return result
     }
@@ -1792,7 +1825,7 @@ fn value_try_convert(
     // Number → number (widen / signedness / int→float), same as old try_convert
     if result.rett.is_number_type() && target.is_number_type() {
         if result.type == VAL.int && target.is_integer_type() {
-            if type_fits_int_literal(target, result.int_val) {
+            if type_fits_int_literal(target, result.int_val, !result.rett.is_signed_type()) {
                 let lit = vgen_int(result.int_val, target)
                 lit.exp = result.exp
                 return lit
@@ -1873,16 +1906,17 @@ fn value_balance_numbers(left: Value, right: Value, b: Build) ValuePair {
         return ValuePair { left: left, right: right }
     }
 
-    // Two constants of different integer types: an untyped literal adopts the other's type
+    // Two constants of different integer types: an untyped literal adopts the other's
+    // type; between two literals the one past i64.$max (unsigned) decides
     if left.type == VAL.int && right.type == VAL.int && !fold_integer_types_match(left, right) {
-        let left_plain = value_is_untyped_int_literal(left, b)
-        let right_plain = value_is_untyped_int_literal(right, b)
-        if right_plain && !left_plain && type_fits_int_literal(t1, right.int_val) {
+        let left_plain = value_is_untyped_int_literal(left, b) && t1.is_signed_type()
+        let right_plain = value_is_untyped_int_literal(right, b) && t2.is_signed_type()
+        if right_plain && !left_plain && type_fits_int_literal(t1, right.int_val, false) {
             let lit = vgen_int(right.int_val, t1)
             lit.exp = right.exp
             return ValuePair { left: left, right: lit }
         }
-        if left_plain && !right_plain && type_fits_int_literal(t2, left.int_val) {
+        if left_plain && !right_plain && type_fits_int_literal(t2, left.int_val, false) {
             let lit = vgen_int(left.int_val, t2)
             lit.exp = left.exp
             return ValuePair { left: lit, right: right }
@@ -1891,18 +1925,29 @@ fn value_balance_numbers(left: Value, right: Value, b: Build) ValuePair {
 
     // Int literal soft-fit toward the other side first
     if left.type == VAL.int && right.type != VAL.int && t2.is_integer_type() {
-        if type_fits_int_literal(t2, left.int_val) {
+        if type_fits_int_literal(t2, left.int_val, !t1.is_signed_type()) {
             let lit = vgen_int(left.int_val, t2)
             lit.exp = left.exp
             return ValuePair { left: lit, right: right }
         }
     }
     if right.type == VAL.int && left.type != VAL.int && t1.is_integer_type() {
-        if type_fits_int_literal(t1, right.int_val) {
+        if type_fits_int_literal(t1, right.int_val, !t2.is_signed_type()) {
             let lit = vgen_int(right.int_val, t1)
             lit.exp = right.exp
             return ValuePair { left: left, right: lit }
         }
+    }
+    // An untyped literal next to a float takes that float's width
+    if t2.is_float_type() && right.type != VAL.float && value_is_untyped_number_literal(left, b) {
+        let lit = vgen_float(left.type == VAL.int ? left.int_val.to(f64) : left.float_val, t2)
+        lit.exp = left.exp
+        return ValuePair { left: lit, right: right }
+    }
+    if t1.is_float_type() && left.type != VAL.float && value_is_untyped_number_literal(right, b) {
+        let lit = vgen_float(right.type == VAL.int ? right.int_val.to(f64) : right.float_val, t1)
+        lit.exp = right.exp
+        return ValuePair { left: left, right: lit }
     }
 
     let is_float = t1.is_float_type() || t2.is_float_type()
@@ -1976,37 +2021,55 @@ fn type_ptr_uint(b: Build) Type {
     return type_number_sized(b, b.options.target.ptr_size.to(u32), false, false) ?? type_int(b)
 }
 
-// Can integer literal `v` be represented in integer type `t`? (old Type.fits_intv)
-// A number written in the source that was typed 'int' only for lack of a better type
-fn value_is_untyped_int_literal(v: Value, b: Build) bool {
-    let t = v.rett
-    if !t.is_integer_type() || !t.is_signed_type() || t.number_byte_size() != b.options.target.ptr_size.to(u32) : return false
-    let exp = v.exp ?! return false
-    return exp.type == EXP.value && (exp.kind == VALUE_KIND.number || exp.kind == VALUE_KIND.hex || exp.kind == VALUE_KIND.octal)
+// A number written in the source without a type of its own: a literal, possibly
+// negated, parenthesized, or combined with other such literals
+fn exp_is_untyped_number(exp: Exp) bool {
+    if exp.type != EXP.value : return false
+    let kind = exp.value_kind
+    if kind == VALUE_KIND.number || kind == VALUE_KIND.hex || kind == VALUE_KIND.octal || kind == VALUE_KIND.float : return true
+    if kind == VALUE_KIND.paren || kind == VALUE_KIND.unary {
+        let inner = exp.get(VALUE_EXP.left) ?! return false
+        return exp_is_untyped_number(inner)
+    }
+    if kind == VALUE_KIND.op {
+        let left = exp.get(VALUE_EXP.left) ?! return false
+        let right = exp.get(VALUE_EXP.right) ?! return false
+        return exp_is_untyped_number(left) && exp_is_untyped_number(right)
+    }
+    return false
 }
 
-fn type_fits_int_literal(t: Type, v: int) bool {
+// An untyped literal that was typed 'int' (or 'uint' past i64.$max) only for lack of a better type
+fn value_is_untyped_int_literal(v: Value, b: Build) bool {
+    let t = v.rett
+    if !t.is_integer_type() || t.number_byte_size() != b.options.target.ptr_size.to(u32) : return false
+    let exp = v.exp ?! return false
+    return exp_is_untyped_number(exp)
+}
+
+// An int or float constant written in the source that has not adopted a type yet
+fn value_is_untyped_number_literal(v: Value, b: Build) bool {
+    if v.type == VAL.int : return value_is_untyped_int_literal(v, b)
+    if v.type != VAL.float || v.rett.number_byte_size() != 8 : return false
+    let exp = v.exp ?! return false
+    return exp_is_untyped_number(exp)
+}
+
+// Can the integer constant `v` be represented in integer type `t`? `unsigned`
+// says the constant has an unsigned type, so a negative `v` is a value past i64.$max
+fn type_fits_int_literal(t: Type, v: int, unsigned: bool) bool {
     if !t.is_integer_type() : return false
     let bits = t.number_byte_size() * 8
     if bits == 0 || bits > 64 : return true
+    if unsigned && v < 0 : return bits == 64 && !t.is_signed_type()
     if t.is_signed_type() {
-        if v < 0 {
-            // min = -(1 << (bits-1)); accept v >= min
-            if bits >= 64 : return true
-            let shift = (bits - 1).to(int)
-            let min = 0 - (1 << shift)
-            return v >= min
-        }
-        // non-neg signed: max = (1 << (bits-1)) - 1
         if bits >= 64 : return true
-        let max = (1 << (bits - 1).to(int)) - 1
-        return v <= max
+        if v < 0 : return v >= 0 - (1 << (bits - 1).to(int))
+        return v <= (1 << (bits - 1).to(int)) - 1
     }
-    // unsigned: reject negatives; max = (1 << bits) - 1
     if v < 0 : return false
     if bits >= 64 : return true
-    let umax = (1 << bits.to(int)) - 1
-    return v <= umax
+    return v <= (1 << bits.to(int)) - 1
 }
 
 ////////////////////////////
@@ -2152,10 +2215,10 @@ fn value_check_logical_operand(v: Value, at: Exp) !Error {
     }
 }
 
-fn value_from_short_circuit_exp(exp: Exp, left_exp: Exp, right_exp: Exp, op: VALUE_OP, scope: Scope, ctx: Context) Value !Error {
+// `left` is already lowered, see value_from_op_exp
+fn value_from_short_circuit_exp(exp: Exp, left: Value, right_exp: Exp, op: VALUE_OP, scope: Scope, ctx: Context) Value !Error {
     let b = ctx.build
     let is_and = op == VALUE_OP.and
-    let left = value_from_exp(left_exp, scope, ctx.without_suggested_type()) !>
     value_check_logical_operand(left, exp) !>
     let facts = is_and ? left.get_issets() : left.get_not_issets()
     let sub = scope.sub_scope()
@@ -2199,7 +2262,64 @@ fn value_validate_constant_integer_op(left: Value, right: Value, op: VALUE_OP, a
     }
 }
 
+fn value_op_is_compare(op: VALUE_OP) bool {
+    return op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte
+}
+
+// The number type an operator's operands are steered towards, if any
+fn value_op_numeric_target(ctx: Context) ?Type !Error {
+    let suggested_type = ctx.suggested_type ?! return null
+    if !suggested_type.is_number_type() : return null
+    let number = suggested_type.get_non_nullable()
+    let enu = number.get_enum()
+    return isset(enu) ? (enu.get_item_type() !>).get_non_nullable() : number
+}
+
+fn value_op_left_ctx(op: VALUE_OP, ctx: Context) Context !Error {
+    if op == VALUE_OP.and || op == VALUE_OP.or || value_op_is_compare(op) : return ctx.without_suggested_type()
+    let numeric_target = value_op_numeric_target(ctx) !>
+    return isset(numeric_target) ? ctx.with_suggested_type(numeric_target) : ctx.without_suggested_type()
+}
+
 fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let left_exp = exp.get(VALUE_EXP.left) ?! exp.bug("Missing binary op operands")
+    let op = exp.number.@cast(VALUE_OP)
+    if left_exp.type != EXP.value || left_exp.value_kind != VALUE_KIND.op {
+        let left = value_from_exp(left_exp, scope, value_op_left_ctx(op, ctx) !>) !>
+        return value_from_op_left(exp, left, scope, ctx) !>
+    }
+    // `((a + b) + c) + d` nests on the left: walk the spine and lower it in a
+    // loop, so a long generated chain does not recurse once per operand.
+    let chain = Array[Exp]{ exp }
+    let chain_ctx = Array[Context]{ ctx }
+    let left_ctx = value_op_left_ctx(op, ctx) !>
+    let leaf = left_exp
+    while leaf.type == EXP.value && leaf.value_kind == VALUE_KIND.op {
+        chain.append(leaf)
+        chain_ctx.append(left_ctx)
+        left_ctx = value_op_left_ctx(leaf.number.@cast(VALUE_OP), left_ctx) !>
+        leaf = leaf.get(VALUE_EXP.left) ?! leaf.bug("Missing binary op operands")
+    }
+    let left = value_from_exp(leaf, scope, left_ctx) !>
+    // Operator hooks turn the chain into nested calls, which the IR emits
+    // recursively: bind every CHAIN_BIND_STEP-th call result to a slot first.
+    let body = Array[Value]{}
+    let i = chain.length
+    while i > 0 {
+        i--
+        let node = chain.get(i) ! exp.bug("Missing chain node")
+        let node_ctx = chain_ctx.get(i) ! exp.bug("Missing chain context")
+        left = value_from_op_left(node, left, scope, node_ctx) !>
+        if i > 0 && left.type == VAL.call && (chain.length - i) % CHAIN_BIND_STEP == 0 {
+            left = value_bind_once(left, ctx, exp, body)
+        }
+    }
+    return body.length > 0 ? vgen_scoped_value(body, left, exp) : left
+}
+value CHAIN_BIND_STEP (32)
+
+// Lower `exp` with its left operand already lowered as `left`
+fn value_from_op_left(exp: Exp, left: Value, scope: Scope, ctx: Context) Value !Error {
     let left_exp = exp.get(VALUE_EXP.left)
     let right_exp = exp.get(VALUE_EXP.right)
     if !isset(left_exp) || !isset(right_exp) : exp.bug("Missing binary op operands")
@@ -2207,22 +2327,13 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let b = ctx.build
 
     if op == VALUE_OP.and || op == VALUE_OP.or {
-        return value_from_short_circuit_exp(exp, left_exp, right_exp, op, scope, ctx) !>
+        return value_from_short_circuit_exp(exp, left, right_exp, op, scope, ctx) !>
+    }
+    if value_op_is_compare(op) {
+        return value_from_compare_exp(exp, left, right_exp, op, scope, ctx) !>
     }
 
-    if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte {
-        return value_from_compare_exp(exp, left_exp, right_exp, op, scope, ctx) !>
-    }
-
-    let suggested_type = ctx.suggested_type
-    let numeric_target: ?Type = null
-    if isset(suggested_type) && suggested_type.is_number_type() {
-        let number = suggested_type.get_non_nullable()
-        let enu = number.get_enum()
-        numeric_target = isset(enu) ? (enu.get_item_type() !>).get_non_nullable() : number
-    }
-    let left_ctx = isset(numeric_target) ? ctx.with_suggested_type(numeric_target) : ctx.without_suggested_type()
-    let left = value_from_exp(left_exp, scope, left_ctx) !>
+    let numeric_target = value_op_numeric_target(ctx) !>
     left.require_result() !>
     left = value_try_remove_nullable(left, scope, ctx) !>
 
@@ -2276,14 +2387,41 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         }
     }
 
-    if isset(numeric_target) && left.rett.is_number_type() && right.rett.is_number_type() {
+    if isset(numeric_target) && exp_is_untyped_number(exp) {
         left = value_try_convert(left, scope, ctx, numeric_target) !>
         right = value_try_convert(right, scope, ctx, numeric_target) !>
-        if !numeric_target.compat(left.rett) : left = value_force_to(left, scope, ctx, numeric_target, left_exp) !>
-        if !numeric_target.compat(right.rett) : right = value_force_to(right, scope, ctx, numeric_target, right_exp) !>
+        numeric_target.compat_check(left.rett, left_exp) !>
+        numeric_target.compat_check(right.rett, right_exp) !>
+    } else if isset(numeric_target) && numeric_target.is_integer_type() {
+        // A literal that does not fit the other operand takes the hinted type when it fits
+        if value_is_untyped_int_literal(left, b) && right.rett.is_integer_type() && right.type != VAL.int
+            && !type_fits_int_literal(right.rett, left.int_val, !left.rett.is_signed_type())
+            && type_fits_int_literal(numeric_target, left.int_val, !left.rett.is_signed_type()) {
+            left = vgen_int(left.int_val, numeric_target)
+            left.exp = left_exp
+        }
+        if value_is_untyped_int_literal(right, b) && left.rett.is_integer_type() && left.type != VAL.int
+            && !type_fits_int_literal(left.rett, right.int_val, !right.rett.is_signed_type())
+            && type_fits_int_literal(numeric_target, right.int_val, !right.rett.is_signed_type()) {
+            right = vgen_int(right.int_val, numeric_target)
+            right.exp = right_exp
+        }
     }
 
     value_validate_constant_integer_op(left, right, op, exp) !>
+    // Literal arithmetic must fit its type; typed constants wrap like runtime values
+    if left.type == VAL.int && right.type == VAL.int && exp_is_untyped_number(exp)
+        && fold_integer_overflows(left.int_val, right.int_val, op, left.rett) {
+        exp.error("Incompatible types: constant expression does not fit in '" + left.rett.compat_display_name() + "'")
+    }
+
+    // An enum only compares with itself: its storage value is not its identity
+    let left_enum = left.rett.get_non_nullable().get_enum()
+    let right_enum = right.rett.get_non_nullable().get_enum()
+    if left_enum != right_enum {
+        if isset(left_enum) : left.rett.get_non_nullable().compat_check(right.rett.get_non_nullable(), exp) !>
+        right.rett.get_non_nullable().compat_check(left.rett.get_non_nullable(), exp) !>
+    }
 
     let folded = value_try_fold_op(left, right, op, b)
     if isset(folded) {
@@ -2302,8 +2440,7 @@ fn value_from_op_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     left = balanced.left
     right = balanced.right
     value_check_op_compat(left, right, op, exp) !>
-    let result_type = numeric_target ?? left.rett
-    let v = vgen_op(left, right, op, result_type)
+    let v = vgen_op(left, right, op, left.rett)
     v.exp = exp
     if isset(pointer_result_type) {
         let pointer = vgen_cast(v, pointer_result_type)
@@ -2403,6 +2540,10 @@ fn value_union_equal(left: Value, right: Value, scope: Scope, ctx: Context, at: 
         let left_active = vgen_union_is(left_slot, index, at)
         let right_active = vgen_union_is(right_slot, index, at)
         let active = vgen_op(left_active, right_active, VALUE_OP.bit_and, bool_t)
+        if member.is_null_alt() {
+            result = vgen_this_or_that(active, vgen_bool(true, bool_t), result, bool_t)
+            continue
+        }
         let left_member = vgen_union_extract(left_slot, member, ctx, at) !>
         let right_member = vgen_union_extract(right_slot, member, ctx, at) !>
         let equal = value_compare_values(left_member, right_member, VALUE_OP.eq, scope, ctx, at) !>
@@ -2425,6 +2566,14 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
         let unions = value_balance_union_equal(left, right, scope, ctx) !>
         left = unions.left
         right = unions.right
+    }
+
+    // An enum only compares with itself: its storage value is not its identity
+    let left_enum = left.rett.get_non_nullable().get_enum()
+    let right_enum = right.rett.get_non_nullable().get_enum()
+    if left_enum != right_enum {
+        if isset(left_enum) : left.rett.get_non_nullable().compat_check(right.rett.get_non_nullable(), exp) !>
+        right.rett.get_non_nullable().compat_check(left.rett.get_non_nullable(), exp) !>
     }
 
     let folded = value_try_fold_op(left, right, op, b)
@@ -2559,8 +2708,7 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
     return cmp
 }
 
-fn value_from_compare_exp(exp: Exp, left_exp: Exp, right_exp: Exp, op: VALUE_OP, scope: Scope, ctx: Context) Value !Error {
-    let left = value_from_exp(left_exp, scope, ctx.without_suggested_type()) !>
+fn value_from_compare_exp(exp: Exp, left: Value, right_exp: Exp, op: VALUE_OP, scope: Scope, ctx: Context) Value !Error {
     let right_ctx = left.rett.is_void_type() ? ctx.without_suggested_type() : ctx.with_suggested_type(left.rett)
     let right = value_from_exp(right_exp, scope, right_ctx) !>
     return value_compare_values(left, right, op, scope, ctx, exp) !>

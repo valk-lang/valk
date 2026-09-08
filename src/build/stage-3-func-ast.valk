@@ -43,7 +43,8 @@ fn parse_func_ast(func: Func) !Error {
     if func.is_test {
         test_init_scope(func, scope, ctx) !>
     }
-    let exps = read_func_body_exps(body) !>
+    let init_global = func.global_init
+    let exps = isset(init_global) ? (global_init_body_exps(body) !>) : (read_func_body_exps(body) !>)
     let state = ParseState.new()
     append_body_exp_range(ctx, scope, state, exps, 0, exps.length) !>
     if state.has_open_if() || state.is_skipping() {
@@ -191,7 +192,7 @@ fn append_body_exp_range(ctx: Context, scope: Scope, state: ParseState, exps: Ar
     let i = start
     while i < end {
         let exp = exps.get(i) ! ctx.build.bug("Missing function-body expression")
-        if exp.type == EXP.macro && exp.kind == MACRO_KIND.loop && !state.is_skipping() {
+        if exp.type == EXP.macro && exp.macro_kind == MACRO_KIND.loop && !state.is_skipping() {
             state.saw_macro = true
             let close = find_macro_loop_end(exps, i, end, exp) !>
             let words = exp.list
@@ -327,8 +328,7 @@ fn append_globals_loop(ctx: Context, scope: Scope, exps: Array[Exp], start: uint
         ctx.build.pipeline.globals_loop_funcs.append(owner, true)
     }
 
-    each ctx.build.lists.globals as global {
-        if !global.is_used : continue
+    each (global_init_order(ctx.build) !>) as global {
         let iter_scope = scope.sub_scope()
         iter_scope.set_idf(global_name, Idf.for_global(global))
         iter_scope.set_idf(type_name, Idf.for_type(global.get_type() !>))
@@ -620,7 +620,10 @@ fn value_from_return_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
         if !isset(value_exp) {
             exp.error("Function must return a value of type matching the signature")
         }
-        retv = value_from_exp(value_exp, scope, ctx.with_suggested_type(rett)) !>
+        let retv_ctx = ctx.with_suggested_type(rett)
+        // A global default is written like a store: a bare `{ ... }` is allowed
+        if isset(func.global_init) : retv_ctx = retv_ctx.for_direct_init()
+        retv = value_from_exp(value_exp, scope, retv_ctx) !>
         retv.require_result() !>
         // A `$throw` or `$exit` call never hands back a value: the call is
         // the whole statement and the `return` after it is unreachable
@@ -717,10 +720,10 @@ fn value_from_defer_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
 
 fn defer_exp_is_call(exp: Exp) bool {
     if exp.type != EXP.value : return false
-    if exp.kind == VALUE_KIND.call : return true
-    if exp.kind != VALUE_KIND.error_handler : return false
+    if exp.value_kind == VALUE_KIND.call : return true
+    if exp.value_kind != VALUE_KIND.error_handler : return false
     let call = exp.get(VALUE_EXP.left)
-    return isset(call) && call.type == EXP.value && call.kind == VALUE_KIND.call
+    return isset(call) && call.type == EXP.value && call.value_kind == VALUE_KIND.call
 }
 
 fn ensure_user_defer_stack(func: Func, at: Exp) Decl !Error {
@@ -786,13 +789,13 @@ fn make_defer_closure(owner: Func, scope: Scope, deferred_exp: Exp, at: Exp) Val
     let inner_ctx = Context.for_func(func).without_suggested_type()
     let first_buffer = func.buffers_used.length
     let deferred_value: ?Value = null
-    if deferred_exp.type == EXP.value && deferred_exp.kind == VALUE_KIND.call {
+    if deferred_exp.type == EXP.value && deferred_exp.value_kind == VALUE_KIND.call {
         deferred_value = value_from_call_raw(deferred_exp, body_scope, inner_ctx) !>
     } else {
         deferred_value = value_from_exp(deferred_exp, body_scope, inner_ctx) !>
     }
     let deferred = deferred_value ?! deferred_exp.bug("Deferred call did not produce a value")
-    if deferred.can_error || (deferred.type == VAL.error_handler && deferred.op == ERRH_KIND.pass) {
+    if deferred.can_error || (deferred.type == VAL.error_handler && deferred.errh_kind == ERRH_KIND.pass) {
         deferred_exp.error("A deferred call must handle its error before the function exits")
     }
     body_scope.append_value(deferred)
@@ -861,14 +864,14 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let right_exp = exp.get(ASSIGN_EXP.right)
     if !isset(left_exp) || !isset(right_exp) : exp.bug("assign is missing operands")
 
-    if left_exp.type == EXP.value && left_exp.kind == VALUE_KIND.offset && exp.kind.@cast(ASSIGN_OP) == ASSIGN_OP.set {
+    if left_exp.type == EXP.value && left_exp.value_kind == VALUE_KIND.offset && exp.kind.@cast(ASSIGN_OP) == ASSIGN_OP.set {
         let handled = value_from_offset_assign_exp(ctx, scope, left_exp, right_exp, exp) !>
         if isset(handled) : return handled
     }
 
     let op = exp.kind.@cast(ASSIGN_OP)
     let left_ctx = ctx.without_suggested_type()
-    if op == ASSIGN_OP.set && left_exp.type == EXP.value && left_exp.kind == VALUE_KIND.id {
+    if op == ASSIGN_OP.set && left_exp.type == EXP.value && left_exp.value_kind == VALUE_KIND.id {
         left_ctx = ctx.for_store_target()
     }
     let left = value_from_exp(left_exp, scope, left_ctx) !>
@@ -918,6 +921,7 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if (left.type == VAL.prop || left.type == VAL.ptrv) && value_in_readonly_view(left, ctx) {
         exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(left, ctx))
     }
+    value_check_captured_write(left, exp) !>
     act_check_assign(left, exp, scope) !>
     value_mark_mutable(left)
 
@@ -1008,20 +1012,22 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
 
 // Escape and uniqueness bookkeeping for `storage = right` where storage is a
 // property or an element slot
-fn value_track_stored_graph(left: Value, right: Value, ctx: Context, exp: Exp) !Error {
+// `holder`: the value the slot belongs to when it is not `left.value1`
+// (a slice element slot only names its data address)
+fn value_track_stored_graph(left: Value, right: Value, ctx: Context, exp: Exp, holder: ?Value (null)) !Error {
     // Ask before marking the escape: marking consumes the value's
     // uniqueness, and a value that was unique adds no alias to the
     // owner — it simply moves in.
     let right_unique = value_has_unique_graph(right) !>
     // Writing a value back into the graph it already came from keeps it
     // inside that graph, so nothing escapes.
-    let owner_value = left.value1
+    let owner_value = holder ?? left.value1
     let stays_inside = (left.type == VAL.prop || left.type == VAL.ptrv)
         && isset(owner_value) && value_stays_inside(right, owner_value)
     if stays_inside : value_invalidate_unique(right)
     else : value_mark_actual_escape(right)
     if left.type != VAL.prop && left.type != VAL.ptrv : return
-    let owner = left.value1
+    let owner = owner_value
     if isset(owner) && right_unique && !stays_inside : value_link_stored_graph(right, owner)
     if isset(owner) && !left.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
     let locked_owner = isset(owner) && owner.rett.get_non_nullable().is_locked
@@ -1187,7 +1193,7 @@ fn value_from_each_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
             let callee = vgen_func(next_func, on_nn)
             let args = Array[Value]{ vgen_int(0, inferred_index) }
             value_fill_trailing_defaults(next_func, next_arg_skip, args, scope, ctx, exp) !>
-            next_func = specialize_call_generic_args(next_func, callee, args, exp) !>
+            next_func = specialize_call_generic_args(next_func, callee, args, scope, exp) !>
             next_args = args
         } else : next_func = func_for_receiver(next_func, on_nn, on_exp) !>
         index_arg = next_func.args.get(next_arg_skip) ! exp.error("'_next' must have an integer index parameter")
@@ -1331,6 +1337,7 @@ fn value_from_lock_exp(ctx: Context, scope: Scope, state: ParseState, exp: Exp) 
     let func = ctx.get_func() !>
     let on_exp = exp.get(LOCK_EXP.on) ?! exp.bug("lock is missing its value")
     let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    if on.rett.is_nullable_type() && value_stores_non_null(on, scope) : on = value_force_remove_nullable(on)
     let on_t = on.rett.get_non_nullable()
     let class = on_t.get_class_or_null()
     let lock_base = (valk_idf(b, "core", "Lock") !>).class

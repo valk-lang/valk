@@ -8,9 +8,9 @@ class Arg {
     decl: Decl
     // Default value still raw: EXP.body `(...)` when present
     default: ?Exp (null)
-    // `$G` style generic arg type (inferred from call-site values)
+    // Type expression with `$G` parameters, inferred from the call-site value
     is_generic: bool (false)
-    generic_name: String ("")
+    generic_exp: ?Exp (null)
     // Body-derived effect: data reachable through this argument may outlive the call.
     may_escape: bool (true)
     // The body may introduce an external mutable alias into its reachable graph.
@@ -108,6 +108,8 @@ class Func {
     called_by: Array[Func] (.{})
     pending_exps: ?Array[Exp] (null)
     has_globals_loop: bool (false)
+    // Set on the function that lowers a global's default expression
+    global_init: ?Global (null)
     auto_to: bool (false)     // $auto (also registers as $to)
     no_buffers: bool (false)  // @nobuffers
     threadsafe: bool (false)
@@ -141,6 +143,8 @@ class Func {
     // Variant whose `this` is a locked view: mutation allowed, results stay locked
     is_locked_receiver: bool (false)
     locked_receiver_func: ?Func (null)
+    // The call that first needed a shared/locked receiver variant
+    view_variant_at: ?Exp (null)
     is_clone_hook: bool (false)
     clone_at: ?Exp (null)
     clone_check_access: bool (true)
@@ -310,8 +314,8 @@ fn parse_func_types(func: Func) !Error {
     if isset(owner) && !func.is_static {
         let this_type = owner.get_type() !>
         let is_struct = owner.representation_class().kind == CLASS_KIND.struct
-        if func.is_shared_receiver : this_type = this_type.shared_type()
-        if func.is_locked_receiver : this_type = this_type.locked_type()
+        if func.is_shared_receiver : this_type = this_type.shared_type(is_struct)
+        if func.is_locked_receiver : this_type = this_type.locked_type(is_struct)
         if func.name == "gc_free" {
             // A finalizer observes storage that is already unreachable. The
             // collector hands it a bare address; borrowing it prevents the
@@ -335,17 +339,6 @@ fn parse_func_types(func: Func) !Error {
     }
     if func.is_export && func.has_generic_args {
         func.exp.error("Exported functions cannot declare generic parameters")
-    }
-
-    if func.has_generic_args && !func.generic_args_defined {
-        each func.generic_arg_names as gname {
-            let t = Type {
-                build: func.ns.build
-                kind: TYPE.any
-                custom_name: gname
-            }
-            func.arg_scope.set_idf(gname, Idf.for_type(t))
-        }
     }
 
     if func.name == "main"
@@ -398,6 +391,10 @@ fn parse_func_types(func: Func) !Error {
     } else {
         func.rett = type_from_exp(rett_exp, func.arg_scope) !>
     }
+    let main_rett = func.rett
+    if isset(main_rett) && func.ns.build.main_func == func && !main_rett.is_void_type() && !main_rett.is_integer_type() {
+        func.exp.error("'main' must return nothing or an integer")
+    }
 
     if func.is_extern || func.is_export {
         let linkage = func.is_extern ? "extern" : "export"
@@ -440,6 +437,9 @@ fn parse_func_types(func: Func) !Error {
     }
     // Error payloads are part of the exported function's ABI graph.
     resolve_func_error_type(func) !>
+    if func.ns.build.main_func == func && isset(func.error_type) {
+        func.exp.error("The 'main' function cannot declare an error type; handle errors inside main")
+    }
     if func.is_export {
         each func.args as arg {
             type_validate_export_abi_extensions(arg.type) !>
@@ -503,25 +503,25 @@ fn func_returns_fresh_graph(base: Func) bool {
     return base.unique_return_args.length == 0
 }
 
-fn get_func_shared_receiver(base: Func) Func !Error {
+fn get_func_shared_receiver(base: Func, at: Exp) Func !Error {
     if base.is_shared_receiver : return base
     let cached = base.shared_receiver_func
     if isset(cached) : return cached
-    let func = get_func_view_variant(base, false) !>
+    let func = get_func_view_variant(base, false, at) !>
     base.shared_receiver_func = func
     return func
 }
 
-fn get_func_locked_receiver(base: Func) Func !Error {
+fn get_func_locked_receiver(base: Func, at: Exp) Func !Error {
     if base.is_locked_receiver : return base
     let cached = base.locked_receiver_func
     if isset(cached) : return cached
-    let func = get_func_view_variant(base, true) !>
+    let func = get_func_view_variant(base, true, at) !>
     base.locked_receiver_func = func
     return func
 }
 
-fn get_func_view_variant(base: Func, locked: bool) Func !Error {
+fn get_func_view_variant(base: Func, locked: bool, at: Exp) Func !Error {
     let scope = Scope.new(base.arg_scope.parent)
     // Declaration syntax is read, never rewritten, and a function body is a
     // source span that 'read_func_body_exps' re-reads into fresh statements on
@@ -575,6 +575,7 @@ fn get_func_view_variant(base: Func, locked: bool) Func !Error {
         interface_slot: base.interface_slot
         is_shared_receiver: !locked
         is_locked_receiver: locked
+        view_variant_at: at
         is_clone_hook: base.is_clone_hook
         clone_at: base.clone_at
         clone_check_access: base.clone_check_access
@@ -985,7 +986,7 @@ fn bind_func_arg_decls(func: Func) !Error {
 }
 
 // Append a typed argument (creates Decl). Does not bind into scope yet.
-fn append_func_arg(func: Func, name: String, type: Type, default: ?Exp (null), is_generic: bool (false), generic_name: String ("")) Arg {
+fn append_func_arg(func: Func, name: String, type: Type, default: ?Exp (null), is_generic: bool (false), generic_exp: ?Exp (null)) Arg {
     let decl = Decl.new(func, type, true, name)
     decl.implicit_borrow = type.has_borrowed_refs()
     let arg = Arg {
@@ -994,7 +995,7 @@ fn append_func_arg(func: Func, name: String, type: Type, default: ?Exp (null), i
         decl: decl
         default: default
         is_generic: is_generic
-        generic_name: generic_name
+        generic_exp: generic_exp
     }
     func.args.append(arg)
     return arg
@@ -1075,49 +1076,42 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
 
         p.expect(":", true, true) !>
 
-        // Type: normal type, or `$G` for generic arg type (call-site inference)
+        // Type; `$G` anywhere inside it declares a generic parameter that is
+        // inferred from the call-site value (later `G` refers to the same one)
         let is_generic = false
-        let generic_name = ""
+        let generic_exp: ?Exp = null
         let arg_type = type_any(func.ns.build)
-        t = p.tok(true, true, false) !>
-        if t == TOK.flag {
-            p.tok(true, true) !>
-            let full_name = p.word()
-            let gname = full_name.ltrim("$")
-            if gname.length == 0 : p.error("Empty generic argument name")
-
-            if func.generic_args_defined {
-                // Specialization: look up concrete type for this $G name
-                let gmap = func.generic_type_map
-                if !isset(gmap) : p.error("(Compiler bug) Missing generic_type_map for specialized generic-arg func")
-                let gt = gmap.get(gname) ! p.error("(Compiler bug) Missing argument generic type: " + gname)
-                arg_type = gt
-            } else {
-                // Base: placeholder + track name for later specialization
-                let gnames = func.generic_names
-                if func.generic_arg_names.contains(gname) {
-                    p.error("Duplicate generic name: " + gname)
-                }
-                if isset(gnames) {
-                    each gnames as existing {
-                        if existing == gname : p.error("Duplicate generic name: " + gname)
-                    }
-                }
+        p.tok(true, true, false) !>
+        let type_exp = read_type_exp(p, true, true) !>
+        let gnames = Array[String]{}
+        type_exp_generic_params(type_exp, gnames)
+        if gnames.length > 0 && !func.generic_args_defined {
+            let names = func.generic_names
+            each gnames as gname {
+                if isset(names) && names.contains(gname) : type_exp.error("Duplicate generic name: " + gname)
+                if func.generic_arg_names.contains(gname) : continue
                 func.generic_arg_names.append(gname)
-                is_generic = true
-                generic_name = gname
-                arg_type = Type {
+                let t = Type {
                     build: func.ns.build
                     kind: TYPE.any
-                    custom_name: full_name
+                    custom_name: gname
                 }
-                func.has_generic_args = true
-                func.skip_ast = true
+                scope.set_idf(gname, Idf.for_type(t))
             }
+            // A base is never called as is; the placeholder keeps generic
+            // classes from being instantiated with `any`
+            is_generic = true
+            generic_exp = type_exp
+            arg_type = Type {
+                build: func.ns.build
+                kind: TYPE.any
+                custom_name: type_exp.src.content.part(type_exp.i.to(uint), type_exp.len.to(uint)).trim(" \t\r\n")
+            }
+            func.has_generic_args = true
+            func.skip_ast = true
         } else {
-            let type_exp = read_type_exp(p, true, true) !>
             arg_type = type_from_exp(type_exp, scope) !>
-            if type_exp.kind == TYPE_KIND.void {
+            if type_exp.type_kind == TYPE_KIND.void {
                 type_exp.error("Function arguments cannot be void")
             }
         }
@@ -1132,7 +1126,7 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
 
         // Skip void-typed args (old compiler does the same)
         if arg_type.kind != TYPE.void {
-            append_func_arg(func, name, arg_type, default, is_generic, generic_name)
+            append_func_arg(func, name, arg_type, default, is_generic, generic_exp)
         }
 
         t = p.tok(true, true) !>
@@ -1314,6 +1308,15 @@ fn func_push_instantiations(func: Func) uint {
         b.push_instantiation(at, "while instantiating '" + base.name + generic_types_display(types) + "' here")
         pushed++
     }
+    // A receiver variant is checked with `this` as a shared/locked view;
+    // its errors belong to the call that needed it
+    let view_at = func.view_variant_at
+    if isset(view_at) {
+        let view = func.is_locked_receiver ? "locked" : "shared"
+        let name = func.name.replace("__" + view, "")
+        b.push_instantiation(view_at, "while checking '" + name + "' for a " + view + " receiver, called here")
+        pushed++
+    }
     b.chain_frames += pushed
     return pushed
 }
@@ -1334,4 +1337,80 @@ fn func_generic_depth(func: Func) uint {
 
 fn func_restore_generic_depth(b: Build, depth: uint) {
     b.generic_depth = depth
+}
+
+// Names of the `$G` parameters inside a type expression, in source order
+fn type_exp_generic_params(exp: Exp, out: Array[String]) {
+    if exp.type != EXP.type : return
+    if exp.type_kind == TYPE_KIND.named && exp.bool1 {
+        let id = exp.get(TYPE_EXP.id)
+        if isset(id) : out.append(id.str1, true)
+        return
+    }
+    let i: uint = 0
+    let count = exp.sub_count()
+    while i < count {
+        let sub = exp.get(i++)
+        if isset(sub) : type_exp_generic_params(sub, out)
+    }
+}
+
+// Bind the `$G` parameters in `exp` from the type of the value passed for it
+fn type_exp_infer_generic_params(exp: Exp, actual: Type, bound: Map[Type], scope: Scope, func: Func, at: Exp) !Error {
+    let params = Array[String]{}
+    type_exp_generic_params(exp, params)
+    if params.length == 0 : return
+    let kind = exp.type_kind
+    if kind == TYPE_KIND.named && exp.bool1 {
+        let name = params.get(0) ! exp.bug("Generic parameter is missing its name")
+        if !bound.has(name) : bound.set(name, actual)
+        return
+    }
+    // `?$T` also takes a plain value, as `?T` does
+    if kind == TYPE_KIND.nullable {
+        let inner = exp.get(TYPE_EXP.type) ?! exp.bug("Nullable type is missing its inner type")
+        type_exp_infer_generic_params(inner, actual.get_non_nullable(), bound, scope, func, at) !>
+        return
+    }
+    if actual.is_nullable_type() : generic_infer_error(func, exp, actual, at)
+    if kind == TYPE_KIND.ref || kind == TYPE_KIND.stack || kind == TYPE_KIND.ptr {
+        let wanted = kind == TYPE_KIND.stack ? TYPE.stack_of : kind == TYPE_KIND.ptr ? TYPE.ptr_of : (exp.bool2 ? TYPE.ref_slice : TYPE.ref_of)
+        let sub = actual.get_sub_type()
+        if actual.kind != wanted || !isset(sub) : generic_infer_error(func, exp, actual, at)
+        let inner = exp.get(TYPE_EXP.type) ?! exp.bug("Borrow type is missing its inner type")
+        type_exp_infer_generic_params(inner, sub, bound, scope, func, at) !>
+        return
+    }
+    if kind == TYPE_KIND.named {
+        // `Name[..$G..]`: the value must be a specialization of that class
+        let id = exp.get(TYPE_EXP.id) ?! exp.bug("Named type is missing id")
+        let generics = exp.get(TYPE_EXP.generics) ?! generic_infer_error(func, exp, actual, at)
+        let ns_name = id.str2
+        let idf: ?Idf = null
+        if isset(ns_name) {
+            let ns_idf = scope.get_scope_idf(ns_name) ?! exp.error("Unknown namespace: " + ns_name)
+            let ns_scope = ns_idf.scope ?! exp.bug("Scope idf is missing scope")
+            idf = ns_scope.get_idf(id.str1)
+        } else {
+            idf = scope.get_idf(id.str1)
+        }
+        let base = isset(idf) ? idf.class : null
+        let actual_class = actual.class
+        if !isset(base) || !isset(actual_class) || actual_class.generic_from != base : generic_infer_error(func, exp, actual, at)
+        let actual_types = actual_class.generic_types ?! generic_infer_error(func, exp, actual, at)
+        let i: uint = 0
+        while true {
+            let arg_exp = generics.get(i) ?! break
+            let arg_type = actual_types.get(i) ! generic_infer_error(func, exp, actual, at)
+            type_exp_infer_generic_params(arg_exp, arg_type, bound, scope, func, at) !>
+            i++
+        }
+        return
+    }
+    generic_infer_error(func, exp, actual, at)
+}
+
+fn generic_infer_error(func: Func, exp: Exp, actual: Type, at: Exp) !Error $throw {
+    let shape = exp.src.content.part(exp.i.to(uint), exp.len.to(uint)).trim(" \t\r\n")
+    at.error("Cannot infer generic argument type '" + shape + "' for function '" + func.name + "' from '" + actual.compat_display_name() + "'")
 }

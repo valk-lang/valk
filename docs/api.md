@@ -34,7 +34,9 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 + fn raise(code: i32) void
 + fn read_big_endian(from: *[u8], bytes: uint) uint
 + fn read_little_endian(from: *[u8], bytes: uint) uint
++ fn setenv(var: String, value: String) void !SystemError
 + fn signal_ignore(sig: int) void
++ fn unsetenv(var: String) void !SystemError
 + fn write_big_endian(to: *[u8], v: uint, bytes: uint) void
 + fn write_little_endian(to: *[u8], v: uint, bytes: uint) void
 ```
@@ -79,6 +81,8 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     ~ length: uint
     ~ size: uint
 
+    + fn all(func: fn(T)(bool)) bool
+    + fn any(func: fn(T)(bool)) bool
     + fn append(item: T, unique: bool (false)) Array[T]
     + fn append_many(items: Array[T]) Array[T]
     + fn clear(reduce_size: bool (false)) Array[T]
@@ -89,6 +93,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn equal_ignore_order(array: Array[T]) bool
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn filter_self(func: ?fn(T)(bool) (null)) Array[T]
+    + fn find(func: fn(T)(bool)) T !LookupError
     + fn fit_index(index: uint) void
     + static fn from_json_value_auto[X](value: X) Array[T] !LookupError
     + fn get(index: uint) T !LookupError
@@ -97,6 +102,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn intersect(with: Array[T]) Array[T]
     + fn items() *[T]
     + fn join(divider: String) String
+    + fn map[R](func: fn(T)(R)) Array[R]
     + fn merge(items: Array[T]) Array[T]
     + fn merge_in_place(items: Array[T]) Array[T]
     + static fn new(start_size: uint (0)) Array[T]
@@ -105,18 +111,28 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + fn pop_last() T !LookupError
     + fn prepend(item: T, unique: bool (false)) Array[T]
     + fn prepend_many(items: Array[T]) Array[T]
+    + fn reduce[R](init: R, func: fn(R, T)(R)) R
     + fn remove(index: uint) Array[T]
     + fn remove_value(value: T) Array[T]
     + fn reverse() Array[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
+    + fn shuffle() Array[T]
     + fn slice(start: uint, amount: uint) &mut [T]
     + fn sort(func: fn(T, T)(bool)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
     + fn unique() Array[T]
     + fn view(start: uint (0), amount: uint (uint.$max)) &mut [T]
+}
+```
+
+```js
++ extend Array[uint] {
+    + fn max() uint !LookupError
+    + fn min() uint !LookupError
+    + fn sum() uint
 }
 ```
 
@@ -758,6 +774,12 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
     + static fn write_big_endian(v: uint, to: *[u8 x 8]) void
     + static fn write_little_endian(v: uint, to: *[u8 x 8]) void
 }
+```
+
+## Globals for 'core'
+
+```js
+~+ global held_locks : uint
 ```
 
 # coro
@@ -1495,6 +1517,15 @@ alias Fd for i32
 ```
 
 ```js
++ class LineReader {
+    + fn lines() Array[String] !IoError
+    + static fn new(reader: Reader, chunk_size: uint (65536)) LineReader
+    + fn read_line() ?String !IoError
+    + fn read_until(delimiter: u8) ?String !IoError
+}
+```
+
+```js
 + interface Reader {
     + fn read(buf: &mut [u8]) uint !IoError
 }
@@ -1903,55 +1934,55 @@ alias Fd for i32
 
 ```js
 + class DateTime {
-    + fn add_days(amount: int) DateTime
-    + fn add_hours(amount: int) DateTime
-    + fn add_microseconds(amount: int) DateTime
-    + fn add_minutes(amount: int) DateTime
-    + fn add_months(amount: int) DateTime
-    + fn add_seconds(amount: int) DateTime
-    + fn add_years(amount: int) DateTime
+    + fn add_days(amount: int) DateTime !LookupError
+    + fn add_hours(amount: int) DateTime !LookupError
+    + fn add_microseconds(amount: int) DateTime !LookupError
+    + fn add_minutes(amount: int) DateTime !LookupError
+    + fn add_months(amount: int) DateTime !LookupError
+    + fn add_seconds(amount: int) DateTime !LookupError
+    + fn add_years(amount: int) DateTime !LookupError
     + fn copy() DateTime
     + fn day() uint
     + fn day_of_week() uint
     + fn day_of_year() uint
     + fn format(pattern: String) String
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
-    + static fn from_unix_seconds(timestamp: int) DateTime
-    + static fn from_unix_us(timestamp: int) DateTime
+    + static fn from_unix_seconds(timestamp: int) DateTime !LookupError
+    + static fn from_unix_us(timestamp: int) DateTime !LookupError
     + fn hash() uint
     + fn hour() uint
     + fn is_leap_year() bool
     + fn microsecond() uint
     + fn minute() uint
-    + fn modify_add_days(amount: int) DateTime
-    + fn modify_add_hours(amount: int) DateTime
-    + fn modify_add_microseconds(amount: int) DateTime
-    + fn modify_add_minutes(amount: int) DateTime
-    + fn modify_add_months(amount: int) DateTime
-    + fn modify_add_seconds(amount: int) DateTime
-    + fn modify_add_years(amount: int) DateTime
-    + fn modify_day(day: uint) DateTime
-    + fn modify_hour(hour: uint) DateTime
-    + fn modify_microsecond(microsecond: uint) DateTime
-    + fn modify_minute(minute: uint) DateTime
-    + fn modify_month(month: uint) DateTime
-    + fn modify_second(second: uint) DateTime
-    + fn modify_year(year: int) DateTime
+    + fn modify_add_days(amount: int) DateTime !LookupError
+    + fn modify_add_hours(amount: int) DateTime !LookupError
+    + fn modify_add_microseconds(amount: int) DateTime !LookupError
+    + fn modify_add_minutes(amount: int) DateTime !LookupError
+    + fn modify_add_months(amount: int) DateTime !LookupError
+    + fn modify_add_seconds(amount: int) DateTime !LookupError
+    + fn modify_add_years(amount: int) DateTime !LookupError
+    + fn modify_day(day: uint) DateTime !LookupError
+    + fn modify_hour(hour: uint) DateTime !LookupError
+    + fn modify_microsecond(microsecond: uint) DateTime !LookupError
+    + fn modify_minute(minute: uint) DateTime !LookupError
+    + fn modify_month(month: uint) DateTime !LookupError
+    + fn modify_second(second: uint) DateTime !LookupError
+    + fn modify_year(year: int) DateTime !LookupError
     + fn month() uint
-    + static fn new(year: ?int (null), month: ?uint (null), day: ?uint (null), hour: ?uint (null), minute: ?uint (null), second: ?uint (null), microsecond: ?uint (null)) DateTime
+    + static fn new(year: ?int (null), month: ?uint (null), day: ?uint (null), hour: ?uint (null), minute: ?uint (null), second: ?uint (null), microsecond: ?uint (null)) DateTime !LookupError
     + static fn now() DateTime
     + fn second() uint
     + fn to_iso8601() String
     + fn to_string() String
     + fn unix_seconds() int
     + fn unix_us() int
-    + fn with_day(day: uint) DateTime
-    + fn with_hour(hour: uint) DateTime
-    + fn with_microsecond(microsecond: uint) DateTime
-    + fn with_minute(minute: uint) DateTime
-    + fn with_month(month: uint) DateTime
-    + fn with_second(second: uint) DateTime
-    + fn with_year(year: int) DateTime
+    + fn with_day(day: uint) DateTime !LookupError
+    + fn with_hour(hour: uint) DateTime !LookupError
+    + fn with_microsecond(microsecond: uint) DateTime !LookupError
+    + fn with_minute(minute: uint) DateTime !LookupError
+    + fn with_month(month: uint) DateTime !LookupError
+    + fn with_second(second: uint) DateTime !LookupError
+    + fn with_year(year: int) DateTime !LookupError
     + fn year() int
 }
 ```

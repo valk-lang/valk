@@ -35,6 +35,17 @@ The compiler separates syntax from semantic resolution:
 Syntax parsing may use grammar context, but never the resolved meaning of an
 identifier. Semantic stages may resolve identifiers and specialize generics.
 
+### Limits
+
+Expressions, types and blocks may nest at most 1000 levels deep
+(`MAX_NESTING`): the parser and the lowering recurse once per level on a
+bounded coroutine stack, so deeper input is a compile error, never a crash.
+The frontend also reports "nesting too deep" when its stack is nearly
+exhausted, since the frames differ per construct. Left-associative operator
+chains (`a + b + c + ...`) are lowered and emitted in a loop, and every 32nd
+operator-hook call in a chain is bound to a slot, so their length is not
+limited by nesting.
+
 ## Core type model
 
 ### Scalar values
@@ -52,6 +63,18 @@ Scalar values are copied by value.
 Integer addition, subtraction, multiplication, negation, increment, and
 decrement wrap modulo the width of their result type. This applies to both
 signed and unsigned integers and does not require runtime overflow checks.
+
+An operation's type comes from its operands alone; the type of the variable,
+argument, or return it feeds never widens or narrows the operation, so `i8 +
+i8` wraps to `i8` before it is stored in an `i16`. A number written in the
+source has no type of its own: an integer literal is `int`, or `uint` when it
+exceeds `i64.$max`, and a negative literal is never unsigned. Such a literal
+adopts the type of the other operand when its value fits, else the hinted
+destination type when it fits, else it keeps `int`; a float literal takes the
+width of the other float operand. A literal, or an expression built only from
+literals, that does not fit its type is a compile error rather than a wrapped
+value, while constants that already have a type (`u8.$max + 1`, enum values,
+`255.to(u8) * 3`) wrap exactly like runtime values.
 
 Integer division and remainder truncate toward zero. A zero divisor, and for
 a signed type the minimum value divided by `-1` or its remainder taken with
@@ -213,7 +236,12 @@ reference type is an empty slot. `[T]{ owner: o, data: p, length: n }`
 describes existing storage and always requires `@unsafe`; it is how the
 library builds views such as `array.view` and `buffer.spare`. The count
 belongs to the value, never to the type: `[T x N]{ a, b }` is a fixed array,
-an inline aggregate whose length `N` is part of its type. The methods of
+an inline aggregate whose length `N` is part of its type. In a fixed-array
+initializer `v...` evaluates `v` once and copies it into the remaining slots;
+a constant fill lowers to one `memset`, and `S{}` leaves a zero-filled array
+field to the zeroing of the whole struct. Copies of plain aggregates larger
+than 64 bytes are `memcpy` calls, never first-class LLVM aggregates, whose
+lowering is per element. A fixed array is limited to 1 GB. The methods of
 `&[T]` live in `extend &[T] { ... }` blocks in the core library, and the
 compiler declares the type they extend; there is no class named `Slice`.
 
@@ -298,6 +326,32 @@ Capture-free functions have a null environment and may convert to `fnptr`.
 Captured values live in a GC-managed environment. A raw function pointer does
 not carry an environment and cannot represent a capturing closure.
 
+Capture is by value: creating the closure copies each captured variable into
+the environment, so the closure never observes later assignments to the
+variable and the variable never observes writes made by the closure. Writes to
+a captured variable inside the closure body are therefore rejected: assignment,
+compound assignment, `++`/`--`, and stores into inline storage the capture
+holds, such as a field of a captured struct or an element of a captured fixed
+array. So is anything that would write that storage indirectly: a `&mut` or
+`stack` borrow of it, passing it to a `&mut` or `stack` parameter, and calling
+a method that writes its receiver on it. Read-only borrows and reads remain
+allowed. Writes through a captured reference (`obj.count++`) reach the shared
+object and are allowed. A shared closure cannot capture non-shared managed
+data, so a `shared fn` never carries a private copy of mutable state that
+looks shared.
+
+A capture is a use of the variable. Capturing a variable whose graph was
+already published as `shared` is rejected like any other use after
+publication, and capturing links the variable's graph to the world so it cannot
+be published afterwards.
+
+`object.method` on a struct that lives in the frame binds a stack borrow as
+the receiver, and the callable inherits the frame rules of that borrow: it may
+be called and passed to callees that do not keep it, but not stored, returned,
+or handed to a coroutine. `co` on such a callable is rejected directly, through
+a local, and through a parameter: `co f(...)` inside a function makes `f`
+escape, so passing a frame-bound method for `f` is an error at the call site.
+
 Coroutines may return payload-free errors. Error types with payload fields,
 including inherited fields, must be handled inside the coroutine or encoded in
 its ordinary return type.
@@ -367,7 +421,18 @@ The current tagged-union ABI uses:
 
 Anonymous union types use `A | B`. A named union may also define methods and
 getters. Nullability is represented separately with `?` rather than by adding
-an implicit union alternative.
+an implicit union alternative:
+
+- A declared `null` alternative is an ordinary alternative with an empty
+  payload: it has its own tag, the union is not nullable, and `isset` on it is
+  true. `null` converts to that tag, and a `?X` converts to the union when `X` is
+  an alternative (missing selects the `null` tag).
+- `?U` adds the outer missing state on top; `u ?? fallback` yields the stored
+  union even when it holds the `null` alternative.
+- An alternative cannot itself be nullable (`?int | String` is rejected); the
+  whole union is made nullable with `?` instead.
+- In a `match` on `?U`, the `null` case covers both the missing value and the
+  `null` alternative, so exhaustiveness works without a second null syntax.
 
 ### Enums
 
@@ -675,8 +740,18 @@ release/acquire synchronization boundary.
 Starting a thread publishes everything sequenced before the start to the new
 thread. Successfully waiting for a thread observes everything sequenced before
 that thread completed. Coroutines are thread-affine and do not migrate between
-threads. Ordinary `global` storage is thread-local; `shared` and `@shared`
+threads. A thread ends when its entry function returns; coroutines it leaves
+suspended are abandoned, as when `main` returns, except that the thread keeps
+scheduling while any of its coroutines is inside a `lock` block, so a lock
+never outlives the coroutine holding it. Ordinary `global` storage is thread-local; `shared` and `@shared`
 storage is process-wide.
+
+Global default values run before `main` in dependency order: a default runs
+after every global read by its expression or by any function the expression
+calls, transitively. Literal defaults and globals without a default depend on
+nothing. Defaults that call code the compiler cannot follow (closures,
+interface calls) run after every default with known dependencies. Ties keep the
+declaration order, and a dependency cycle between defaults is a compile error.
 
 Creating a `shared T` view does not by itself move its reachable GC graph to the
 shared collector. GC publication occurs only at an actual cross-thread transfer
@@ -701,6 +776,13 @@ aliasing remains ordinary aliasing; it never silently consumes a value.
 
 Ownership provenance covers managed references; raw pointers retain their
 separate explicit unsafe lifetime and aliasing rules.
+Everything read out of a view keeps it: properties, array and map elements,
+elements of `&[T]` and `&mut [T]` properties, and copies made with a bracket
+range. A struct of plain words reads out as an ordinary copy, but a store
+into it in place (`view.pair.n++`) or a struct method called on it in place
+still hits the view's storage, so it follows the view's rules: integer stores
+are atomic and the method gets the shared or locked receiver variant, with its
+`this` typed as a borrow of the viewed struct.
 A `shared` global reads as `shared T`, so it is governed by the same rules.
 `@shared` globals are the explicit unsafe override when an external protocol
 guarantees synchronization and lifetime safety. Within an expression,
@@ -717,7 +799,11 @@ locked data, and integer fields use atomic access. Methods called on a locked
 receiver get a `__locked` variant whose `this` is locked and whose non-fresh
 results stay locked; unlike the shared variant, mutating methods are allowed,
 and arguments the callee absorbs into its receiver must be unique at the call
-site. A locked view cannot be returned as ordinary data, captured, stored in a
+site. Struct methods get the same variants as class methods. A `&mut [T]`
+property keeps its mutability through the view: the slice can be reassigned
+and its elements stored, each store following the unique-graph rule; the
+elements read back as `locked T`. A locked view cannot be returned as
+ordinary data, captured, stored in a
 property, global or generic type argument, assigned to a variable declared
 outside its block, converted to `shared`, or stored under another lock. Escape
 provenance makes the block's binding its own origin, so rearranging data inside

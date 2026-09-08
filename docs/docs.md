@@ -186,6 +186,7 @@ s.contains(x) bool
 s.lower() String // Convert Unicode text to lowercase
 s.upper() String // Convert Unicode text to uppercase
 s.part(start_index, length) String // Sub string using byte offsets
+s[i] // Byte at index i; an index past the end reads 0
 let middle = s[1 .. 3] // Same as s.part(1, 3): three bytes starting at byte offset 1
 s.utf8.length // Length in Unicode characters
 s.utf8.part(start_index, length) String // Sub string using character offsets
@@ -215,8 +216,21 @@ each arr as value, index {}
 
 Full `Array` API: [core](api.md#core)
 
+Callbacks cover the common searches and transforms: `any`, `all` and `find`
+take a `fn(T)(bool)`, `map[R]` builds a new array from a `fn(T)(R)`, and
+`reduce[R](init, fn(R, T)(R))` folds the elements into one value. Arrays of
+numbers also offer `sum()`, `min()` and `max()`, and `shuffle()` randomizes the order.
+
+```rust
+let nums = Array[int]{ 3, 1, 2 }
+let has_big = nums.any(fn(v: int) bool { return v > 2 })
+let strs = nums.map[String](fn(v: int) String { return v.to(String) })
+let total = nums.reduce[int](0, fn(t: int, v: int) int { return t + v }) // 6, same as nums.sum()
+```
+
 Use `arr.sort()` for elements that support ordering. Other element types require
-a comparator, such as `rows.sort(fn(a: &[int], b: &[int]) bool { return a[0] > b[0] })`.
+a comparator whose parameters have the element type; for an `Array[Array[int]]`:
+`rows.sort(fn(a: Array[int], b: Array[int]) bool { return a[0] > b[0] })`.
 The comparator returns true when `a` should come after `b`.
 
 Fresh slice storage is a language form, not a class: `[int]{ 1, 2, 3 }`
@@ -282,7 +296,7 @@ let m = Map[uint]{ "a" => 1, "b" => 2 } // Create map
 let m : Map[uint] = .{ "a" => 1, "b" => 2 } // Using typehint
 // Basics
 m.set(key, value)
-m.remove(key)
+m.remove(key) // Swap-remove: the last entry takes the removed slot, so iteration order changes
 m.has(key)
 m.clear()
 //
@@ -324,6 +338,10 @@ let ob = A { list: .{ 1, 2, 3 } }
 let is_equal = (ob.list == .{ 3, 2, 1 })
 ```
 
+A typehint on a number only types plain literals: `let x: u8 = 200 + 55` is a `u8`
+constant, while `let y: i16 = a + b` computes `a + b` in the operands' type and
+converts the result.
+
 ## Tagged unions
 
 A tagged union lets a value be one of several types. Give the union a name when
@@ -346,9 +364,16 @@ println(describe(value))
 ```
 
 A nullable subject may have a `null` case; an enum match on a nullable enum is exhaustive when `null` and every item are handled. Use `as` to access the value in a `match` case. When every type is handled, a
-`default` case is not needed. Add `null` when the value may be missing. The type
+`default` case is not needed. The type
 after `match value :` is the type every case must produce. Leave it out when the
-`match` is a statement rather than a value.
+`match` is a statement rather than a value. A case of a value `match` may also
+leave instead of producing a value, with `return`, `throw`, `break`, `continue`
+or `panic`. A `match` on a `bool` is exhaustive when `true` and `false` are handled.
+
+A `null` alternative is a value of its own, like JSON's `null`: a `Value` holding
+it is set, and `?Value` still says whether there is a value at all. An alternative
+itself cannot be nullable; write `?Value` for a union that may be missing. A `null`
+case matches the alternative and, on a nullable subject, a missing value too.
 
 For a union used only once, write it directly as a type, such as
 `String | int`. Named unions can also contain functions and getters.
@@ -491,6 +516,8 @@ my_func() ! { print("error") }
 // If the call's value is needed, the handler must return an alternative value
 // or exit through return, break, continue, throw, panic, or an exit function.
 let v = my_func() ! { print("error"); return }
+// A value scope may also exit instead of returning a value
+let v = my_func() !? <{ log("failed"); throw .failed }
 // ! You can also use a single line
 let v = my_func() ! return
 // !> pass the error to the parent caller
@@ -604,6 +631,20 @@ fn main() {
         println(prefix + ", " + name)
     }
     greet("Sam")
+}
+```
+
+A closure captures the current value of each outer variable when it is created; changing the variable afterwards does not change what the closure sees. Assigning to a captured variable inside the closure is an error. To share state, mutate an object the closure captures instead:
+
+```rust
+class Counter { count: int (0) }
+
+fn main() {
+    let counter = Counter{}
+    let bump = fn() { counter.count++ }
+    bump()
+    bump()
+    println(counter.count) // output: 2
 }
 ```
 
@@ -725,6 +766,17 @@ fn combined_length(v1: $V1, v2: $V2) uint {
 ```
 
 In other words, `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)` when `T` should be inferred from `arg`.
+After `$T` introduces `T`, later parameters and the return type use `T` as usual,
+and `$T` may also sit inside a type: `?$T`, `&$T`, `&[$T]`, `stack $T`, `*$T` and
+class arguments such as `Array[$T]` or `HashMap[$K, $V]` infer `T` through that
+wrapper. A `?$T` parameter also takes a plain value. A nullable variable that was
+just checked with `isset` infers its plain type, as it would pass to a plain parameter.
+
+```rust
+fn pair(a: $T, b: T) T { return a + b }
+fn first(items: Array[$T]) T { return items.get(0) !! }
+fn unwrap(value: ?$T) T { return value ?? panic("missing") }
+```
 
 ## Modes
 
@@ -761,6 +813,8 @@ be assigned to `HashMap[String, V]`.
 An enum's generated default is its first declared member. Assign another declared
 member to change an enum value. Arithmetic produces the underlying numeric type;
 increment, decrement, and compound assignment are not supported on enum variables.
+An enum only compares with values of the same enum: `color == 0` or
+`Color.red == Other.x` is a compile error; convert first with `color.to(int)`.
 For an enum backed by a fixed array, `&EnumType` borrows one complete enum value;
 use `borrowed[0]` to read or replace that value. Fields and elements of an inline
 enum can be read, but cannot be modified or borrowed separately. Methods must
@@ -816,7 +870,10 @@ or ordered cleanup.
 ```rust
 global my_global : uint          // Global (recommended)
 shared my_shared_global : uint   // Global shared over all threads
+global my_counter : uint (my_start + 1)   // Optional default value
 ```
+
+Defaults run before `main`, each after the globals it reads (directly or through the functions it calls), whatever the declaration order; two defaults that read each other are a compile error.
 
 A `shared` global is read as `shared T`, so it follows the [data race](#data-races) rules: integers are atomic, objects are read-only views, and mutable state goes in a `Lock`. `@shared` is the unsafe form that reads as plain `T` and is not checked.
 
@@ -940,6 +997,22 @@ io.copy(io.stdin(), file) ! panic("copy")
 io.stderr().write("done\n") ! panic("write")
 ```
 
+`io.LineReader` reads any reader line by line. `read_line()` returns the next
+line without its `\n` or `\r\n` and null once the input is exhausted,
+`read_until(delimiter)` splits on any byte, and `lines()` collects what remains:
+
+```rust
+let input = io.LineReader.new(io.stdin())
+while true {
+    let line = input.read_line() ! panic("read")
+    if !isset(line) : break
+    println(line)
+}
+```
+
+Environment variables are read with `core.getenv(name)`, and changed for the
+process and its children with `core.setenv(name, value)` and `core.unsetenv(name)`.
+
 ## Paths
 
 Valk offers a `Path` mode for `String` which can be initialized by either `type hints` or using `fs.path("path")`
@@ -1027,18 +1100,20 @@ API for [valk.time](api.md#time)
 
 `time.DateTime` represents UTC dates from year 1 through 9999 with microsecond
 precision. Constructor components are optional and default to the current time.
+Constructors and changes throw a `LookupError` (`.range`) when the result is not
+a valid date or falls outside the supported range.
 
 ```rust
 use valk.time
 
 // Init
-let now = time.DateTime.new()
-let datetime = time.DateTime.new(2026, 8, 8, 19, 7, 6, 123_456)
+let now = time.DateTime.now()
+let datetime = time.DateTime.new(2026, 8, 8, 19, 7, 6, 123_456) ! panic("Invalid date")
 let from_str = time.DateTime.from_format("Y-m-d H:i:s.u", text) ! panic("Invalid date")
 
 // Change
-let changed = datetime.add_days(1) // Returns a new DateTime
-datetime.modify_add_hours(2)       // Modifies the existing object
+let changed = datetime.add_days(1) !? datetime // Returns a new DateTime
+datetime.modify_add_hours(2) _                 // Modifies the existing object
 
 // Format to string
 let text = datetime.format("Y-m-d H:i:s.u")
@@ -1065,6 +1140,8 @@ let response_2 = await request_2 !? http.Response.empty(400)
 Use `co` to start a coroutine and `await` to wait for its result.
 Coroutine error types cannot contain payload fields, including inherited fields.
 Handle payload errors inside the coroutine or encode them in its return type.
+An error thrown by a coroutine reaches the `await`; a coroutine that is never
+awaited drops its error silently.
 
 ```rust
 fn hi() { println("Hello") }
@@ -1161,7 +1238,7 @@ fn main() {
 
 ## Atomics
 
-We can do atomic operations on integers by placing our operation inside an `atomic()` token.
+We can do atomic operations on integers and floats by placing our operation inside an `atomic()` token. This also works on number properties of `shared` data.
 
 ```rust
 // {value-before-updating} = atomic( {variable} {op} {value} )
@@ -1422,7 +1499,13 @@ Note: `valk.template` works at runtime and therefore cannot detect incorrect tem
 
 ## Crypto
 
-Supported utilities include bcrypt, BLAKE2b (`crypto.Blake2b.hash_string`), Base64, MD5, SHA-1, SHA-256, and secure random values.
+Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256, and secure random values.
+
+```rust
+use valk.crypto
+
+let hash = crypto.Blake2b.hash_string("test") ! panic("Failed to hash")
+```
 
 Password hashing/verify example:
 
@@ -1569,7 +1652,17 @@ functions cannot declare them.
 
 ```rust
 extern fn printf(format: cstring, ...) i32;
+
+fn main() {
+    @unsafe
+    let count: i32 = 7
+    printf("\%d \%f\n".data_cstring, count, 1.5)
+}
 ```
+
+Variadic arguments keep their own type and follow the C promotion rules
+(`f32` becomes `double`, small integers become `i32`); only integers, floats
+and raw pointers can be passed.
 
 ## Linking
 
@@ -1649,7 +1742,7 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique: nothing else may still name any part of it, including values that were moved into it earlier with a store, an initializer or a call such as `append`. Creating the view consumes that uniqueness, and every ordinary variable that named part of the graph is unusable afterwards; the check follows control flow, so a value published on one path stays usable on paths where it was not, and loops are checked for aliases made in an earlier iteration. Publishing the result of a call consumes the arguments it was built from. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
+`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. The view carries over to everything read through it, including struct properties, their methods, and the elements of slice properties. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique: nothing else may still name any part of it, including values that were moved into it earlier with a store, an initializer or a call such as `append`. Creating the view consumes that uniqueness, and every ordinary variable that named part of the graph is unusable afterwards; the check follows control flow, so a value published on one path stays usable on paths where it was not, and loops are checked for aliases made in an earlier iteration. Publishing the result of a call consumes the arguments it was built from. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch.
 
 ### Mutable shared data
 
@@ -1673,4 +1766,6 @@ Inside the block `s` is a `locked Stats`: a mutable view that is valid until the
 
 A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Moving data around inside the locked graph, like `s.items.append(s.first)`, is allowed. Functions can take and return `locked T` views while the originating lock is held. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Data from one lock cannot be stored under another lock. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
 
-`T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again from the same thread deadlocks. Reading the value outside a `lock` block is not possible; every reader takes the lock too.
+Methods that hand elements to a callback or return a view of the elements, like `sort(comparator)`, `filter` and `view()` on a locked array, cannot be called on locked data: the callback or view could keep an element past the block. The error points at the call with a note that the method was checked for a locked receiver. Sort or filter a copy instead, or loop over the elements inside the block.
+
+`T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again from the same thread deadlocks. Reading the value outside a `lock` block is not possible; every reader takes the lock too. A thread whose entry function returns while one of its coroutines is still inside a `lock` block keeps running its coroutines until that block ends.

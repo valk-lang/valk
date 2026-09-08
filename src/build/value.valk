@@ -32,6 +32,7 @@ enum VAL : u8 {
     multi    // argument list only (values array); not a runtime value alone
     class_init
     // Fixed-array construction: { v0, v1, ... } — values = elements; rett = array type
+    // bool_val: the last element repeats to fill the length (`v...`)
     array_init
     match
     error_value
@@ -108,6 +109,8 @@ class ValueMeta {
     init_prop: ?Prop (null)
     implicit_borrow: bool (false)
     reads_storage: bool (false)
+    // A struct receiver borrowed out of a closure's captured copy
+    captured_receiver: ?Decl (null)
 }
 
 class Value {
@@ -120,6 +123,11 @@ class Value {
     value2: ?Value (null)
     values: ?Array[Value] (null)
     op: u8 (0)
+    // Typed views of `op`, one per VAL family
+    get value_op: VALUE_OP $inline { return this.op.@cast(VALUE_OP) }
+    get assign_op: ASSIGN_OP $inline { return this.op.@cast(ASSIGN_OP) }
+    get call_kind: CALL_KIND $inline { return this.op.@cast(CALL_KIND) }
+    get errh_kind: ERRH_KIND $inline { return this.op.@cast(ERRH_KIND) }
     // Literal payloads
     int_val: int (0)
     float_val: f64 (0)
@@ -365,12 +373,20 @@ class Value {
 ////////////////////////////
 
 fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let b = ctx.build
+    if b.nest_depth >= MAX_NESTING {
+        exp.error("Expression nesting too deep (limit " + MAX_NESTING + ")")
+    }
+    if b.stack_exhausted() : exp.error("Expression nesting too deep")
+    b.nest_depth++
     let did_return = scope.did_return
     scope.did_return = false
     let value = value_from_exp_inner(exp, scope, ctx) ! {
+        b.nest_depth--
         scope.did_return = did_return
         throw E
     }
+    b.nest_depth--
     value.never_returns = value.never_returns || scope.did_return
     scope.did_return = did_return || value.never_returns
     let group = value.get_group()
@@ -382,7 +398,7 @@ fn value_from_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
 fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if exp.type != EXP.value : exp.bug("Expected EXP.value")
-    let kind = exp.kind
+    let kind = exp.value_kind
     let b = ctx.build
 
     if kind == VALUE_KIND.paren {
@@ -472,7 +488,7 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if !isset(operand_exp) : exp.bug("Missing unary operand")
         let op = exp.number.@cast(VALUE_OP)
         let operand = vgen_undefined(type_void(b), exp)
-        if op == VALUE_OP.ref_of && operand_exp.type == EXP.value && operand_exp.kind == VALUE_KIND.offset {
+        if op == VALUE_OP.ref_of && operand_exp.type == EXP.value && operand_exp.value_kind == VALUE_KIND.offset {
             // `&sequence[i]` and `&sequence[a..b]`: an element of an array,
             // a slice, or `&[T]` is borrowed with the storage block as owner.
             let base_exp = operand_exp.get(VALUE_EXP.left) ?! operand_exp.bug("offset is missing base")
@@ -498,6 +514,13 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 exp.error("Expected an integer or float after unary '-', the value type we found was: " + operand.rett.compat_display_name())
             }
             if operand.type == VAL.int {
+                // A negative literal is never unsigned: only the signed minimum survives negation
+                if !operand.rett.is_signed_type() && exp_is_untyped_number(operand_exp) {
+                    if operand.int_val != (-9223372036854775807 - 1) : exp.error("Integer literal is out of range")
+                    let v = vgen_int(operand.int_val, type_int(b))
+                    v.exp = exp
+                    return v
+                }
                 operand.int_val = fold_integer_to_width(0 - operand.int_val, operand.rett)
                 operand.exp = exp
                 return operand
@@ -694,6 +717,7 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             exp.error("Cannot change an element copied out of an Array; borrow it with '&mut arr[i]' or store the element back with '.set'")
         }
         if value_in_readonly_view(operand, ctx) : exp.error("Cannot change storage through a read-only borrow; " + value_readonly_hint(operand, ctx))
+        value_check_captured_write(operand, exp) !>
         value_mark_summary_write(operand)
         if operand.type == VAL.prop || operand.type == VAL.ptrv {
             let owner = operand.value1
@@ -887,7 +911,7 @@ fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     enclosing.note_suspend()
     let call_exp = exp.get(VALUE_EXP.left)
     if !isset(call_exp) : exp.bug("'co' is missing a call expression")
-    if call_exp.type != EXP.value || call_exp.kind != VALUE_KIND.call {
+    if call_exp.type != EXP.value || call_exp.value_kind != VALUE_KIND.call {
         call_exp.error("'co' can only be used on a function call")
     }
     let call = value_from_call_raw(call_exp, scope, ctx, true) !>
@@ -916,6 +940,12 @@ fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 fn value_check_co_lock_escape(call: Value, callee: Value, at: Exp) !Error {
     let receiver = callee.type == VAL.func ? callee.value1 : null
     if isset(receiver) : value_check_co_arg(receiver, at) !>
+    if callee.type != VAL.func {
+        // A bound stack method reached through a variable or a parameter
+        value_check_co_arg(callee, at) !>
+        // The coroutine keeps the callable past the call
+        value_mark_actual_escape(callee)
+    }
     let args = call.values
     if !isset(args) : return
     each args as arg : value_check_co_arg(arg, at) !>
@@ -1163,6 +1193,12 @@ fn value_from_vscope_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if isset(removed) : each removed as decl : scope.clear_not_null(decl)
 
     let rett = sub.vscope_rett
+    if returns.length == 0 && sub.did_return {
+        // The body always exits (throw/panic/return/...): no value is needed
+        scope.did_return = true
+        let phi = vgen_phi(Array[Value]{}, rett ?? type_void(ctx.build), exp)
+        return vgen_vscope(stmts, phi, exp)
+    }
     if !isset(rett) || returns.length == 0 || !sub.did_return {
         exp.error("Value scope did not return a value")
     }
@@ -1486,6 +1522,11 @@ fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
     let i = members.length
     while i-- > 0 {
         let member = members.get(i) ! at.bug("Tagged-union clone alternative is missing")
+        if member.is_null_alt() {
+            let wrapped = vgen_union_wrap(source, type, i, ctx) ?! at.bug("Failed to rebuild cloned tagged union")
+            result = vgen_this_or_that(vgen_union_is(source, i, at), wrapped, result, type)
+            continue
+        }
         let extracted = vgen_union_extract(source, member, ctx, at) !>
         extracted.rett = value.rett.storage_view_of(member)
         let cloned = value_clone(extracted, ctx, scope, at, check_access, allow_pointer_alias) !>
@@ -1868,19 +1909,26 @@ fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
         }
     }
     if func.is_static || func.threadsafe : return func
-    if func.is_clone_hook && !isset(func.clone_at)
-        && (on.rett.get_non_nullable().is_shared || on.rett.get_non_nullable().is_locked) {
+    // A struct of plain words reads out of a view as an ordinary struct;
+    // its method still stores into the view's storage
+    let view = on.rett.storage_view_type_of()
+    let view_class = view.get_direct_class_or_null()
+    let in_storage = view == on.rett.get_non_nullable() && view.is_inline
+        && isset(view_class) && view_class.representation_class().kind == CLASS_KIND.struct
+    let locked = view.is_locked || (in_storage && value_is_locked_storage(on))
+    let shared = view.is_shared || (in_storage && !locked && value_is_shared_storage(on))
+    if func.is_clone_hook && !isset(func.clone_at) && (shared || locked) {
         func = get_func_clone_variant(func, at, true) !>
     }
-    if on.rett.get_non_nullable().is_locked {
+    if locked {
         if func.is_interface {
             at.error("Cannot call interface method '" + func.name + "' on locked data of type '"
                 + on.rett.compat_display_name()
                 + "'. The implementation is not known here, so it cannot be checked against the lock rules. Call it through its concrete type instead")
         }
-        return get_func_locked_receiver(func) !>
+        return get_func_locked_receiver(func, at) !>
     }
-    if !on.rett.get_non_nullable().is_shared : return func
+    if !shared : return func
     if func_mutates_receiver(func) !> {
         at.error("Cannot call mutating method '" + func.name + "' on shared data of type '" + on.rett.compat_display_name() + "'")
     }
@@ -1893,7 +1941,7 @@ fn func_for_receiver(func: Func, on: Value, at: Exp) Func !Error {
             + on.rett.compat_display_name()
             + "'. The implementation is not known here, so it cannot be checked against the shared rules. Call it through its concrete type instead")
     }
-    return get_func_shared_receiver(func) !>
+    return get_func_shared_receiver(func, at) !>
 }
 
 // Whether a method changes anything reachable from its receiver beyond
@@ -2013,8 +2061,8 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
         let slice_class = slice_t.class
         let hook: ?Func = null
         if isset(slice_class) {
-            hook = access.kind == VALUE_KIND.bracket_range ? slice_class.get_range_hook() : resolve_offset_get_func(slice_class)
-        } else if access.kind == VALUE_KIND.bracket_range {
+            hook = access.value_kind == VALUE_KIND.bracket_range ? slice_class.get_range_hook() : resolve_offset_get_func(slice_class)
+        } else if access.value_kind == VALUE_KIND.bracket_range {
             // `view[a..b]` copies like every other `value[a..b]`, after the
             // native bounds check; `&view[a..b]` is the view itself
             let element = slice_t.get_sub_type() ?! exp.bug("Slice borrow has no element type")
@@ -2028,7 +2076,8 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
             receiver.exp = on.exp
             let length = value_owned_borrow_length(rooted, ctx) !>
             let copy = value_call_range_hook(receiver, part, vgen_int(0, uint_t), length, scope, ctx, exp) !>
-            return vgen_scoped_value(setup, value_retype_bare_slice(copy, element.ref_slice().mut_type(), exp), exp)
+            // Copied out of a view, the elements keep it
+            return vgen_scoped_value(setup, value_retype_bare_slice(copy, slice_t.storage_view_of(element.ref_slice().mut_type()), exp), exp)
         }
         if !isset(hook) : return value_from_ref_slice_offset(on, access, scope, ctx, exp) !>
     }
@@ -2040,7 +2089,7 @@ fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !
     if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
         require_unsafe(exp, scope, "Offset access on an unbounded pointer") !>
     }
-    if access.kind == VALUE_KIND.bracket_range {
+    if access.value_kind == VALUE_KIND.bracket_range {
         let start_exp = access.get(VALUE_EXP.left)
         let length_exp = access.get(VALUE_EXP.right)
         if !isset(start_exp) || !isset(length_exp) : access.bug("Bracket range is missing an argument")
@@ -2316,7 +2365,7 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     if body.type != EXP.body : left_exp.bug("offset body must be EXP.body")
 
     let access = parse_offset_access(body) !>
-    if access.kind == VALUE_KIND.bracket_range {
+    if access.value_kind == VALUE_KIND.bracket_range {
         left_exp.error("Cannot assign to a bracket range")
     }
 
@@ -2334,6 +2383,7 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
         if on.rett.is_nullable_type() : left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
     }
     if value_is_readonly_storage(on, ctx) : left_exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(on, ctx))
+    if on_t.is_fixed_array_type() : value_check_captured_write(on, left_exp) !>
     if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
         require_unsafe(left_exp, scope, "Offset access on an unbounded pointer") !>
     }
@@ -2607,7 +2657,7 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     }
 
     // `.code { field: value, ... }` — error payload construction, not a class/struct init.
-    if isset(left_exp) && left_exp.type == EXP.value && left_exp.kind == VALUE_KIND.error_code {
+    if isset(left_exp) && left_exp.type == EXP.value && left_exp.value_kind == VALUE_KIND.error_code {
         return value_from_error_payload_init_exp(exp, scope, ctx, left_exp) !>
     }
 
@@ -2834,7 +2884,7 @@ fn value_from_slice_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         let elem_exp = elems.get(0) ! exp.bug("slice count without a value")
         let vexp = elem_exp.get(VALUE_EXP.left) ?! elem_exp.bug("element is missing its value")
         let fill: ?Value = null
-        if vexp.type == EXP.value && vexp.kind == VALUE_KIND.null && !element.is_nullable_type() {
+        if vexp.type == EXP.value && vexp.value_kind == VALUE_KIND.null && !element.is_nullable_type() {
             // Zeroed storage: valid only when a zero slot is a valid element
             if !type_zero_is_valid(element) {
                 require_unsafe(exp, scope, "Zeroed storage of '" + element.compat_display_name() + "' elements") !>
@@ -3034,12 +3084,19 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
     let values = Array[Value]{}
     let last_start: uint = 0
     let last_len: uint = 0
+    // `v...`: a single value fills the rest without being repeated per element
+    let fill = false
     let i: uint = 0
     while true {
         let eexp = elems_exp.get(i)
         if !isset(eexp) : break
-        if eexp.type == EXP.value && eexp.kind == VALUE_KIND.repeat {
+        if eexp.type == EXP.value && eexp.value_kind == VALUE_KIND.repeat {
             if last_len == 0 : eexp.error("No value to repeat")
+            if last_len == 1 {
+                fill = values.length < size
+                i++
+                continue
+            }
             while values.length < size {
                 let k = last_start
                 while k < last_start + last_len {
@@ -3051,7 +3108,7 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
             i++
             continue
         }
-        if values.length >= size {
+        if fill || values.length >= size {
             eexp.error("Too many values")
         }
         let ev = value_from_exp(eexp, scope, ctx.with_suggested_type(sub).for_direct_init()) !>
@@ -3074,11 +3131,11 @@ fn value_from_array_init_body(exp: Exp, body: Exp, suggested_type: Type, scope: 
         last_len = appended
         i++
     }
-    if values.length < size {
+    if !fill && values.length < size {
         exp.error("Missing array values. Expected amount '" + size + "', but found '" + values.length + "'")
     }
 
-    return vgen_array_init(ctx, values, suggested_type, exp)
+    return vgen_array_init(ctx, values, suggested_type, exp, fill)
 }
 
 ////////////////////////////
@@ -3099,6 +3156,7 @@ fn enum_match_values_equal(left: Value, right: Value) int {
         let left_values = left.values
         let right_values = right.values
         if !isset(left_values) || !isset(right_values) : return -1
+        if left.bool_val != right.bool_val : return -1
         if left_values.length != right_values.length : return 0
         each left_values as left_value, i {
             let right_value = right_values.get(i) !? null
@@ -3157,6 +3215,8 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let on_non_nullable = on.rett.get_non_nullable()
     let error_type: ?ErrorType = on_non_nullable.kind == TYPE.error_code && !on_non_nullable.error_is_instance ? on_non_nullable.get_error_type() : null
     let covered_error_codes = Array[String]{}
+    let covered_true = false
+    let covered_false = false
     if on_non_nullable.kind == TYPE.union : union_type = on_non_nullable
     let all_cases_return = true
 
@@ -3192,21 +3252,34 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 raw_item.exp = type_exp
             } else {
                 let value_exp = read_value_exp(p, true, false) !>
-                let is_null_case = value_exp.type == EXP.value && value_exp.kind == VALUE_KIND.null
+                let is_null_case = value_exp.type == EXP.value && value_exp.value_kind == VALUE_KIND.null
                 let item_ctx = isset(union_type) && !is_null_case ? ctx.without_suggested_type() : ctx.with_suggested_type(on.rett)
                 raw_item_exp = value_exp
                 raw_item = value_from_exp(value_exp, scope, item_ctx) !>
             }
             let item_exp = raw_item_exp ?! exp.bug("Union match case is missing its expression")
             let item = raw_item ?! exp.bug("Union match case is missing its value")
-            let is_null_case = item_exp.type == EXP.value && item_exp.kind == VALUE_KIND.null
+            let is_null_case = item_exp.type == EXP.value && item_exp.value_kind == VALUE_KIND.null
             if isset(union_type) && is_null_case {
-                if !subject_nullable {
-                    item_exp.error("A non-nullable tagged union cannot match null")
+                // Covers the union's `null` alternative and, for a nullable subject, the missing value
+                let null_tag = union_type.union_null_tag()
+                if !subject_nullable && !isset(null_tag) {
+                    item_exp.error("This tagged union has no 'null' alternative and cannot be null")
                 }
                 if covered_union_null : item_exp.error("Duplicate tagged-union null case")
                 covered_union_null = true
-                cond = vgen_op(on, item, VALUE_OP.eq, type_bool(ctx.build))
+                let bool_t = type_bool(ctx.build)
+                if isset(null_tag) {
+                    let members = union_type.get_members() ?! exp.bug("Tagged union is missing alternatives")
+                    covered_union_members.append(members.get(null_tag) ! exp.bug("Tagged union null alternative is missing"))
+                    cond = vgen_union_is(on, null_tag, item_exp)
+                    if subject_nullable {
+                        let missing = vgen_unary(vgen_isset_val(on, bool_t), VALUE_OP.not, bool_t)
+                        cond = vgen_op(missing, cond, VALUE_OP.or, bool_t)
+                    }
+                } else {
+                    cond = vgen_op(on, item, VALUE_OP.eq, bool_t)
+                }
                 cond.exp = item_exp
             } else if isset(union_type) && item.type == VAL.type {
                 if on.rett.is_nullable_type() && !covered_union_null && !isset(union_type_before_null) {
@@ -3244,6 +3317,10 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 let subject = on.rett.is_nullable_type() ? value_force_remove_nullable(on) : on
                 item = value_try_convert(item, scope, ctx, subject.rett) !>
                 subject.rett.compat_check(item.rett, item_exp) !>
+                if subject.rett.is_bool_type() && item.type == VAL.bool {
+                    if item.bool_val : covered_true = true
+                    else : covered_false = true
+                }
                 if isset(enum_type) {
                     each covered_enum_values as covered {
                         let equal = enum_match_values_equal(covered, item)
@@ -3295,14 +3372,21 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             values: case_prefix
         }
 
-        if isset(result_type) {
-            // A match used as a value produces one; it does not end the path.
-            all_cases_return = false
+        let arm_tok = p.tok(true, true, false) !>
+        let arm_exits = arm_tok == TOK.word && (p.word_is("throw") || p.word_is("return") || p.word_is("break") || p.word_is("continue"))
+        if isset(result_type) && !arm_exits {
             let value_exp = read_value_exp(p, true, true) !>
             let value = value_from_exp(value_exp, case_scope, ctx.with_suggested_type(result_type)) !>
-            value = value_try_convert(value, case_scope, ctx, result_type) !>
-            result_type.compat_check(value.rett, value_exp) !>
-            casev.value2 = value
+            if case_scope.did_return {
+                // An arm that never yields, like `panic(...)`
+                case_prefix.append(value)
+            } else {
+                // A match used as a value produces one; it does not end the path.
+                all_cases_return = false
+                value = value_try_convert(value, case_scope, ctx, result_type) !>
+                result_type.compat_check(value.rett, value_exp) !>
+                casev.value2 = value
+            }
         } else {
             let stmt_exp = read_func_stmt_exp(p) !>
             let state = ParseState.new()
@@ -3337,6 +3421,8 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             each error_type.codes as code {
                 if !covered_error_codes.contains(code) : exhaustive = false
             }
+        } else if on_non_nullable.is_bool_type() {
+            exhaustive = covered_true && covered_false && (!subject_nullable || covered_null_case)
         }
         if !exhaustive {
             exp.error("The match statement must have a 'default' case because it does not cover all values")
@@ -3389,10 +3475,10 @@ fn class_from_inline_init_type(t: Type) ?Class {
 fn value_from_int_literal(exp: Exp, b: Build) Value !Error {
     let text = exp.str1.replace("_", "")
     let n: int = 0
-    if exp.kind == VALUE_KIND.hex {
+    if exp.value_kind == VALUE_KIND.hex {
         let un = text.hex_to_uint() ! exp.error("Invalid hex integer: " + exp.str1)
         n = un.to(int)
-    } else if exp.kind == VALUE_KIND.octal {
+    } else if exp.value_kind == VALUE_KIND.octal {
         // Source form is 0c… — strip leading 0c/0C if present for octal_to_int
         let body = text
         if body.starts_with("0c") || body.starts_with("0C") {
@@ -3404,8 +3490,8 @@ fn value_from_int_literal(exp: Exp, b: Build) Value !Error {
         let un = text.to_uint() ! exp.error("Invalid integer: " + exp.str1)
         n = un.to(int)
     }
-    // A literal past the signed range is unsigned
-    if n < 0 && exp.kind == VALUE_KIND.number : return vgen_int(n, type_from_core(b, "uint") !>)
+    // A literal past the signed range is unsigned, whatever its radix
+    if n < 0 : return vgen_int(n, type_from_core(b, "uint") !>)
     return vgen_int(n, type_int(b))
 }
 
@@ -3504,6 +3590,9 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if !isset(g) : exp.bug("Global idf is missing global")
         // Stores are checked at the assignment site, where is_assign is known
         act_check(exp, g.act, g.exp, false, "global") !>
+        // Known before IR generation: global defaults are ordered by these reads
+        let reader = ctx.func
+        if isset(reader) : reader.globals_used.append(g, true)
         let v = vgen_global(g) !>
         v.exp = exp
         return v
@@ -3700,7 +3789,7 @@ fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
     // A scope imported with `use` uses the same dot syntax as member access.
     // Resolve that case before evaluating the left side as a runtime value.
-    if on_exp.type == EXP.value && on_exp.kind == VALUE_KIND.id {
+    if on_exp.type == EXP.value && on_exp.value_kind == VALUE_KIND.id {
         let base_id = on_exp.get(VALUE_EXP.left)
         let base_idf = isset(base_id) && !isset(base_id.str2) ? scope.get_idf(base_id.str1) : null
         let namespace_idf = isset(base_id) && !isset(base_id.str2) ? scope.find_scope_idf(base_id.str1) : null
@@ -4144,6 +4233,32 @@ fn value_copied_element_decl(value: Value) ?Decl {
     return value_copied_element_decl(inner)
 }
 
+// The captured variable whose private copy this storage is, if any: the
+// variable itself or inline storage (struct, fixed array) inside it. An
+// object read out of a captured reference is not the capture.
+fn value_captured_decl(value: Value) ?Decl {
+    let kind = value.type
+    if kind == VAL.decl {
+        let decl = value.decl ?! return null
+        return decl.is_bind ? decl : null
+    }
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast && kind != VAL.ptr_of : return null
+    let inner = value.value1 ?! return null
+    if !inner.rett.is_inline_type() || inner.rett.is_fat_borrow() : return null
+    return value_captured_decl(inner)
+}
+
+fn value_check_captured_write(value: Value, at: Exp, what: String ("assign to")) !Error {
+    let captured = value_captured_decl(value) ?! return
+    at.error("Cannot " + what + " captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead")
+}
+
+// A writable borrow of a capture's inline storage would write the private copy
+fn value_check_captured_borrow(value: Value, at: Exp) !Error {
+    if value.rett.is_fat_borrow() : return
+    value_check_captured_write(value, at, "take a writable borrow of") !>
+}
+
 // A type whose storage may not be written from here: a read-only borrow, or
 // an `$immutable` slice outside the class that declares it
 fn type_is_readonly_here(type: Type, ctx: Context) bool {
@@ -4241,9 +4356,11 @@ fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value 
         if !func.is_generic_base && !func.has_generic_args {
             let copied = value_is_copied_element(receiver)
             let readonly = value_is_readonly_storage(receiver, ctx)
+            let captured = receiver.rett.is_fat_borrow() ? null[?Decl] : value_captured_decl(receiver)
             receiver = value_struct_receiver(receiver, receiver_arg.type, ctx)
             if copied : receiver.ensure_meta().copied_element = true
             if readonly : receiver.ensure_meta().readonly_element = true
+            if isset(captured) : receiver.ensure_meta().captured_receiver = captured
         }
         frame_bound = true
     }
@@ -4281,6 +4398,13 @@ fn value_from_default_value(on: Value, scope: Scope, ctx: Context, at: Exp) Valu
     if on.type == VAL.global {
         let global = on.global
         if !isset(global) : at.bug("VAL.global is missing its Global")
+        let init = global.init_func
+        if isset(init) {
+            if !init.parsed_types : parse_func_types(init) !>
+            let call = vgen_call(ctx, vgen_func(init), Array[Value]{}, init.get_rett(), scope)
+            call.exp = at
+            return call
+        }
         let default_body = global.default_exp
         if isset(default_body) {
             let default_exp = parse_body_as_value_exp(default_body) !>
@@ -4329,13 +4453,8 @@ fn value_generate_default(target: Type, scope: Scope, ctx: Context, at: Exp) Val
     } else if target.is_fixed_array_type() {
         let sub = target.get_sub_type()
         if !isset(sub) : at.bug("Array type is missing sub_type")
-        let values = Array[Value]{}
-        let i: u32 = 0
-        while i < target.length {
-            values.append(value_generate_default(sub, scope, ctx, at) !>)
-            i++
-        }
-        value = vgen_array_init(ctx, values, target, at)
+        let values = Array[Value]{ value_generate_default(sub, scope, ctx, at) !> }
+        value = vgen_array_init(ctx, values, target, at, target.length > 1)
     } else if isset(target_hook) {
         let hook = target_hook
         if !hook.parsed_types : parse_func_types(hook) !>
@@ -4703,6 +4822,7 @@ fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
     if name == "$is_void" : return vgen_bool(t.is_void_type(), type_bool(b))
     if name == "$is_integer" : return vgen_bool(t.is_integer_type(), type_bool(b))
     if name == "$is_float" : return vgen_bool(t.is_float_type(), type_bool(b))
+    if name == "$is_enum" : return vgen_bool(isset(t.get_non_nullable().get_enum()), type_bool(b))
     if name == "$is_bool" : return vgen_bool(t.is_bool_type(), type_bool(b))
     if name == "$is_signed" : return vgen_bool(t.is_signed_type(), type_bool(b))
     if name == "$is_structural" : return vgen_bool(t.is_structural_type(), type_bool(b))
@@ -4929,6 +5049,34 @@ fn fold_integer_types_match(left: Value, right: Value) bool {
         && left.rett.number_byte_size() == right.rett.number_byte_size()
 }
 
+// Does `l op r` leave the range of `type`? Used to reject untyped literal
+// arithmetic that would wrap in its destination type.
+fn fold_integer_overflows(l: int, r: int, op: VALUE_OP, type: Type) bool {
+    if op != VALUE_OP.add && op != VALUE_OP.sub && op != VALUE_OP.mul && op != VALUE_OP.shl : return false
+    let bits = type.number_byte_size() * 8
+    let signed = type.is_signed_type()
+    if bits < 64 {
+        let result: int = 0
+        if op == VALUE_OP.add : result = l + r
+        else if op == VALUE_OP.sub : result = l - r
+        else if op == VALUE_OP.mul : result = l * r
+        else : result = l << r
+        return fold_integer_to_width(result, type) != result
+    }
+    if signed {
+        if op == VALUE_OP.add : return ((l ^ (l + r)) & (r ^ (l + r))) < 0
+        if op == VALUE_OP.sub : return ((l ^ r) & (l ^ (l - r))) < 0
+        if op == VALUE_OP.mul : return l != 0 && ((l * r) / l != r || (l == -1 && r == (-9223372036854775807 - 1)))
+        return ((l << r) >> r) != l
+    }
+    let ul = l.to(u64)
+    let ur = r.to(u64)
+    if op == VALUE_OP.add : return ul + ur < ul
+    if op == VALUE_OP.sub : return ul < ur
+    if op == VALUE_OP.mul : return ul != 0 && (ul * ur) / ul != ur
+    return ((ul << ur) >> ur) != ul
+}
+
 fn fold_integer_to_width(value: int, type: Type) int {
     let bits = type.number_byte_size() * 8
     if bits == 0 || bits >= 64 : return value
@@ -5041,6 +5189,11 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             if storage_receiver && value_is_readonly_storage(receiver, ctx) && (func_writes_receiver(func) !>) {
                 at.error("Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx))
             }
+            let receiver_meta = receiver.meta
+            let captured = isset(receiver_meta) ? receiver_meta.captured_receiver : null
+            if isset(captured) && storage_receiver && (func_writes_receiver(func) !>) {
+                at.error("Cannot call a method that changes captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead")
+            }
             let current = ctx.func
             if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {
                 let calls = current.this_calls
@@ -5083,15 +5236,16 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     while i < args.length {
         let param_i = skip + i
         let param: ?Arg = null
-        if param_i < params.length {
-            param = params.get(param_i) !? null
-        } else if func.infinite_args && params.length > 0 {
-            param = params.get(params.length - 1) !? null
-        }
-        if !isset(param) : break
+        if param_i < params.length : param = params.get(param_i) !? null
 
         let av = args.get(i) ! break
         av.require_result() !>
+        if !isset(param) {
+            if !func.infinite_args : break
+            args.set(i, value_variadic_extern_arg(av, ctx, at) !>) _
+            i++
+            continue
+        }
         if !param.is_generic {
             if func.is_extern {
                 let target = param.type.get_non_nullable()
@@ -5160,6 +5314,13 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             if frame_closure && !func.unique_summary_ready : ensure_func_unique_return_summary(func) !>
             let accepts_frame_closure = frame_closure
                 && func.unique_summary_ready && !func_arg_may_escape(func, param_i)
+            if frame_closure && !accepts_frame_closure {
+                at.error("A method bound to a stack receiver cannot be passed to '" + func.name + "'; it is kept beyond the call through parameter '" + param.name + "'")
+            }
+            // A provisional flag may still flip; re-checked once it settles
+            if frame_closure && !func_arg_summary_settled(func, param_i) && !isset(param.cannot_escape_pos) {
+                param.cannot_escape_pos = Pos { src: at.src, i: at.i }
+            }
             if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !accepts_frame_closure {
                 at.error("An implicit pointer borrow cannot be passed to raw pointer storage; use '@ref' explicitly")
             }
@@ -5182,6 +5343,21 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     if !absorbs_known : value_defer_call_absorbs(func, receiver, args, skip, ctx.get_func() !>)
     // Native indexing helpers implement storage access, not a source-level call.
     if check_pointer_args : require_void_pointer_call(func, callee, args, scope, at) !>
+}
+
+// A `...` argument keeps its own type; C default promotions apply.
+fn value_variadic_extern_arg(av: Value, ctx: Context, at: Exp) Value !Error {
+    let t = av.rett.get_non_nullable()
+    if t.kind == TYPE.ptr_of || t.is_raw_pointer() : return av
+    if t.is_float_type() {
+        if t.number_byte_size() < 8 : return vgen_cast(av, type_from_core(ctx.build, "f64") !>)
+        return av
+    }
+    if t.is_integer_type() || t.is_bool_type() {
+        if t.number_byte_size() < 4 : return vgen_cast(av, type_from_core(ctx.build, "i32") !>)
+        return av
+    }
+    at.error("Variadic extern arguments must be integers, floats or raw pointers; got '" + av.rett.compat_display_name() + "'")
 }
 
 ////////////////////////////

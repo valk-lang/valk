@@ -1114,6 +1114,8 @@ fn ir_type_uncached(type: Type) String !Error {
     if t.is_fixed_array_type() {
         let sub = t.get_sub_type()
         if !isset(sub) : type.build.bug("Array type is missing its element type during IR generation")
+        // Enforces MAX_FIXED_ARRAY_BYTES for arrays nothing else sized
+        t.byte_size() !>
         let out = ByteBuffer.new()
         out.append_text("[")
         out.write_uint_ascii(t.length.to(uint))
@@ -1387,18 +1389,18 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
 ////////////////////////////
 
 // `x OP= v`: fold the stored value into the result. Plain `=` keeps it as is.
-fn ir_emit_compound(ir: IRFunc, address: String, result: String, op: ASSIGN_OP, type: Type) String !Error {
+fn ir_emit_compound(ir: IRFunc, address: String, result: String, op: ASSIGN_OP, type: Type, at: Exp) String !Error {
     if op == ASSIGN_OP.set : return result
     let old = ir_emit_load(ir, ir_type(type) !>, address)
-    return ir_emit_arith_update(ir, old, result, assign_value_op(op), type) !>
+    return ir_emit_arith_update(ir, old, result, assign_value_op(op), type, at) !>
 }
 
 // Arithmetic on a slot proven non-null works on the payload of its tag
-fn ir_emit_arith_update(ir: IRFunc, old: String, operand: String, op: VALUE_OP, type: Type) String !Error {
-    if !type.is_tagged_nullable() : return ir_emit_binary(ir, old, operand, op, type) !>
+fn ir_emit_arith_update(ir: IRFunc, old: String, operand: String, op: VALUE_OP, type: Type, at: Exp) String !Error {
+    if !type.is_tagged_nullable() : return ir_emit_binary(ir, old, operand, op, type, at) !>
     let inner = type.get_non_nullable()
     let payload = ir_extract_tagged_nullable_value(ir, old, type) !>
-    let next = ir_emit_binary(ir, payload, operand, op, inner) !>
+    let next = ir_emit_binary(ir, payload, operand, op, inner, at) !>
     return ir_build_tagged_nullable(ir, type, next) !>
 }
 
@@ -1436,10 +1438,32 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
         ir_emit_array_init_into(ir, right, address) !>
         return
     }
+    if value.op.@cast(ASSIGN_OP) == ASSIGN_OP.set && (ir_copies_by_memcpy(right) !>) {
+        let from = ir_emit_address(ir, right) !>
+        if ir.terminated : return
+        ir_emit_memcpy(ir, address, from, (right.rett.byte_size() !>).to(uint))
+        return
+    }
     let result = ir_emit_value(ir, right) !>
     if ir.terminated : return
-    result = ir_emit_compound(ir, address, result, value.op.@cast(ASSIGN_OP), left.rett) !>
+    result = ir_emit_compound(ir, address, result, value.op.@cast(ASSIGN_OP), left.rett, value.exp ?? ir.func.exp) !>
     ir_emit_store(ir, ir_type(left.rett) !>, result, address)
+}
+
+// A first-class load/store of an aggregate expands per element; storage
+// reads of large plain aggregates copy with memcpy instead.
+value MEMCPY_MIN_BYTES (65)
+
+fn ir_copies_by_memcpy(value: Value) bool !Error {
+    let t = value.type
+    if t != VAL.decl && t != VAL.global && t != VAL.prop && t != VAL.ptrv : return false
+    if isset(value.get_checked_read()) : return false
+    let type = value.rett
+    if type.is_nullable_type() || type.has_gc_refs() || value_is_shared_storage(value) : return false
+    let class = type.get_class_or_null()
+    let struct = isset(class) && class.kind == CLASS_KIND.struct && type.is_inline
+    if !struct && !type.is_fixed_array_type() : return false
+    return (type.byte_size() !>).to(uint) >= MEMCPY_MIN_BYTES
 }
 
 // Reuse lowering-reserved aggregate scratch.
@@ -1647,11 +1671,32 @@ fn ir_emit_pointer_call(ir: IRFunc, func: Func, first: String, second: String ("
 }
 
 fn ir_emit_zero(ir: IRFunc, address: String, size: uint) {
+    ir_emit_memset(ir, address, 0, size)
+}
+
+// Expanding the fill inline only pays off for small blocks
+value MEMSET_INLINE_MAX (256)
+
+fn ir_emit_memset(ir: IRFunc, address: String, byte: uint, size: uint) {
     ir.line_start()
-    ir.write("call void @llvm.memset.inline.p0.i64(ptr ")
+    ir.write(size <= MEMSET_INLINE_MAX ? "call void @llvm.memset.inline.p0.i64(ptr " : "call void @llvm.memset.p0.i64(ptr ")
     ir.write(address)
-    ir.write(", i8 0, i64 ")
+    ir.write(", i8 ")
+    ir.write_uint(byte)
+    ir.write(", i64 ")
     ir.write_uint(size)
+    ir.write(", i1 false)")
+    ir.line_end()
+}
+
+fn ir_emit_memcpy(ir: IRFunc, to: String, from: String, size: String) {
+    ir.line_start()
+    ir.write("call void @llvm.memcpy.p0.p0.i64(ptr ")
+    ir.write(to)
+    ir.write(", ptr ")
+    ir.write(from)
+    ir.write(", i64 ")
+    ir.write(size)
     ir.write(", i1 false)")
     ir.line_end()
 }
@@ -1825,6 +1870,7 @@ fn ir_emit_convert(ir: IRFunc, instruction: String, from: String, value: String,
 
 fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
     if ir.terminated : return "undef"
+    if value.rett.build.stack_exhausted() : value.error("Expression nesting too deep")
     let checked = value.get_checked_read()
     if isset(checked) : return ir_emit_value(ir, checked) !>
     ir_require_runtime_value(value) !>
@@ -1922,16 +1968,23 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         }
         let address = ir_emit_address(ir, value) !>
         if ir.terminated : return "undef"
-        let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
         // Captures live in taggable closure properties.
-        if t == VAL.decl && value.rett.is_gc_type() {
+        if t == VAL.decl {
             let decl = value.decl
-            if isset(decl) && decl.is_bind {
-                let clean = ir_union_clean_gc_pointer(ir, out)
-                return clean
+            if isset(decl) && decl.is_bind && value.rett.has_gc_refs() {
+                if value.rett.is_gc_type() || value.rett.get_non_nullable().kind == TYPE.closure {
+                    let out = ir_emit_load(ir, ir_type(value.rett) !>, address)
+                    return ir_clean_property_value(ir, value.rett, out)
+                }
+                let lowered = ir_type(value.rett) !>
+                let raw = ir_emit_load(ir, lowered, address)
+                let slot = ir_emit_alloca(ir, lowered)
+                ir_emit_store(ir, lowered, raw, slot)
+                ir_clean_type_gc_fields(ir, value.rett, slot) !>
+                return ir_emit_load(ir, lowered, slot)
             }
         }
-        return out
+        return ir_emit_load(ir, ir_type(value.rett) !>, address)
     }
     if t == VAL.prop {
         let prop = value.prop
@@ -1982,7 +2035,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
             if ir.terminated : return "undef"
             let type = ir_type(left.rett) !>
             let old = ir_emit_load(ir, type, address)
-            let next = ir_emit_arith_update(ir, old, "1", value.op.@cast(VALUE_OP), left.rett) !>
+            let next = ir_emit_arith_update(ir, old, "1", value.op.@cast(VALUE_OP), left.rett, value.exp ?? ir.func.exp) !>
             ir_emit_store(ir, type, next, address)
             return value.bool_val ? next : old
         }
@@ -1990,30 +2043,28 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
         if op == VALUE_OP.and || op == VALUE_OP.or {
             return ir_emit_short_circuit(ir, left, right, op) !>
         }
-        let rendered_left = ir_emit_value(ir, left) !>
-        if ir.terminated : return "undef"
-        let rendered_right = ir_emit_value(ir, right) !>
-        if ir.terminated : return "undef"
-        let class = left.rett.get_non_nullable().get_class_or_null()
-        if (op == VALUE_OP.eq || op == VALUE_OP.ne)
-            && isset(class) && class.kind == CLASS_KIND.interface
-        {
-            if left.rett.is_tagged_nullable() || right.rett.is_tagged_nullable() {
-                return ir_emit_nullable_interface_compare(
-                    ir,
-                    rendered_left,
-                    left.rett,
-                    rendered_right,
-                    right.rett,
-                    op
-                ) !>
-            }
-            rendered_left = ir_interface_object(ir, rendered_left)
-            rendered_right = ir_interface_object(ir, rendered_right)
-            let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
-            return ir_emit_binary_instruction(ir, compare, "ptr", rendered_left, rendered_right)
+        if !ir_op_chains(ir, left) {
+            let rendered_left = ir_emit_value(ir, left) !>
+            if ir.terminated : return "undef"
+            return ir_emit_binary_op(ir, value, rendered_left) !>
         }
-        return ir_emit_binary(ir, rendered_left, rendered_right, op, left.rett) !>
+        // `((a + b) + c) + d` nests on the left: emit the spine in a loop so a
+        // long generated chain does not recurse once per operand.
+        let chain = Array[Value]{ value }
+        let leaf = left
+        while ir_op_chains(ir, leaf) {
+            chain.append(leaf)
+            leaf = leaf.value1 ?! leaf.bug("IR operator is missing its left operand")
+        }
+        let rendered = ir_emit_value(ir, leaf) !>
+        let i = chain.length
+        while i > 0 {
+            if ir.terminated : return "undef"
+            i--
+            let node = chain.get(i) ! value.bug("IR operator chain node is missing")
+            rendered = ir_emit_binary_op(ir, node, rendered) !>
+        }
+        return rendered
     }
     if t == VAL.unary {
         let inner = value.value1
@@ -2124,15 +2175,7 @@ fn ir_emit_value(ir: IRFunc, value: Value) String !Error {
                 if ir.terminated : return "undef"
                 let len_ir = ir_emit_value(ir, len) !>
                 if ir.terminated : return "undef"
-                ir.line_start()
-                ir.write("call void @llvm.memcpy.p0.p0.i64(ptr ")
-                ir.write(to_ir)
-                ir.write(", ptr ")
-                ir.write(from_ir)
-                ir.write(", i64 ")
-                ir.write(len_ir)
-                ir.write(", i1 false)")
-                ir.line_end()
+                ir_emit_memcpy(ir, to_ir, from_ir, len_ir)
             }
         }
         return "undef"
@@ -2336,13 +2379,17 @@ fn ir_emit_match_case(
         if !ir.terminated : predecessors.append(ir.current_block)
     } else {
         ir_emit_values(ir, case_value.values) !>
+        // An arm without a result never yields (throw/return/panic)
         let result = case_value.value2
-        if !isset(result) : case_value.bug("Value-returning match case has no result")
-        let rendered = ir_emit_value(ir, result) !>
-        rendered = ir_emit_cast(ir, rendered, result.rett, match_value.rett) !>
-        if !ir.terminated {
-            results.append(rendered)
-            predecessors.append(ir.current_block)
+        if isset(result) {
+            let rendered = ir_emit_value(ir, result) !>
+            rendered = ir_emit_cast(ir, rendered, result.rett, match_value.rett) !>
+            if !ir.terminated {
+                results.append(rendered)
+                predecessors.append(ir.current_block)
+            }
+        } else if !ir.terminated {
+            case_value.bug("Value-returning match case has no result")
         }
     }
     ir.jump(after)
@@ -2728,17 +2775,13 @@ fn ir_emit_error_handler(ir: IRFunc, value: Value) String !Error {
 ////////////////////////////
 
 fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
-    let values = value.values
-    if !isset(values) : value.bug("IR fixed-array initializer has no elements")
     let aggregate_type = value.rett.is_tagged_nullable() ? value.rett.get_non_nullable() : value.rett
     let whole = ir_type(aggregate_type) !>
     let slot = ir_emit_alloca(ir, whole)
-    each values as item, i {
-        let item_value = ir_emit_value(ir, item) !>
-        if ir.terminated : return "undef"
-        let item_type = ir_type(item.rett) !>
-        ir_emit_store(ir, item_type, item_value, ir_index_address(ir, item_type, slot, i))
-    }
+    let rendered = Array[String]{}
+    ir_emit_array_elements(ir, value, rendered) !>
+    if ir.terminated : return "undef"
+    ir_emit_array_store(ir, value, rendered, 0, slot, false) !>
     let aggregate = ir_emit_load(ir, whole, slot)
     if value.rett.is_tagged_nullable() {
         return ir_build_tagged_nullable(ir, value.rett, aggregate) !>
@@ -2747,20 +2790,129 @@ fn ir_emit_array_init(ir: IRFunc, value: Value) String !Error {
 }
 
 fn ir_emit_array_init_into(ir: IRFunc, value: Value, address: String) !Error {
-    let values = value.values
-    if !isset(values) : value.bug("IR fixed-array initializer has no elements")
-
     // Evaluate every element before touching the destination. This preserves
     // assignments such as `values = { values[1], values[0] }`.
     let rendered = Array[String]{}
+    ir_emit_array_elements(ir, value, rendered) !>
+    if ir.terminated : return
+    ir_emit_array_store(ir, value, rendered, 0, address, false) !>
+}
+
+// Evaluate the elements of a fixed-array initializer, in order, into `out`.
+// A large pure aggregate is built in place later, see ir_inits_in_place.
+fn ir_emit_array_elements(ir: IRFunc, value: Value, out: Array[String]) !Error {
+    let values = value.values
+    if !isset(values) : value.bug("IR fixed-array initializer has no elements")
     each values as item {
-        rendered.append(ir_emit_value(ir, item) !>)
+        out.append(ir_inits_in_place(item) ? "" : (ir_emit_value(ir, item) !>))
         if ir.terminated : return
     }
+}
+
+// Build an aggregate initializer at `address`: the first-class form of a
+// large aggregate lowers per element in LLVM.
+fn ir_emit_aggregate_into(ir: IRFunc, value: Value, address: String) !Error {
+    if value.type == VAL.array_init : ir_emit_array_init_into(ir, value, address) !>
+    else : ir_emit_inline_class_init(ir, value, address) !>
+}
+
+// A large aggregate initializer without side effects: building it at its
+// destination instead of up front cannot reorder anything observable.
+fn ir_inits_in_place(value: Value) bool {
+    if !ir_is_plain_aggregate_init(value) : return false
+    let size = value.rett.byte_size() !? 0
+    return size.to(uint) >= MEMCPY_MIN_BYTES && ir_value_is_pure(value)
+}
+
+fn ir_is_plain_aggregate_init(value: Value) bool {
+    if value.rett.is_tagged_nullable() : return false
+    if value.type == VAL.array_init : return true
+    return value.type == VAL.class_init && value.rett.get_non_nullable().is_inline && !isset(value.value1)
+}
+
+fn ir_value_is_pure(value: Value) bool {
+    let t = value.type
+    if t == VAL.int || t == VAL.float || t == VAL.bool || t == VAL.null || t == VAL.string || t == VAL.undefined : return true
+    if !ir_is_plain_aggregate_init(value) : return false
+    let values = value.values ?! return true
+    each values as item {
+        if !ir_value_is_pure(item) : return false
+    }
+    return true
+}
+
+// Store the elements rendered from `base` on in `rendered`; a `v...` tail is
+// one memset or a loop. `zeroed` storage skips a zero tail.
+fn ir_emit_array_store(ir: IRFunc, value: Value, rendered: Array[String], base: uint, address: String, zeroed: bool) !Error {
+    let values = value.values
+    if !isset(values) : value.bug("IR fixed-array initializer has no elements")
     each values as item, i {
         let item_type = ir_type(item.rett) !>
-        ir_emit_store(ir, item_type, rendered.get(i) ! value.bug("IR fixed-array initializer value is missing"), ir_index_address(ir, item_type, address, i))
+        let stored = rendered.get(base + i) ! value.bug("IR fixed-array initializer value is missing")
+        let slot = ir_index_address(ir, item_type, address, i)
+        if stored == "" : ir_emit_aggregate_into(ir, item, slot) !>
+        else : ir_emit_store(ir, item_type, stored, slot)
     }
+    if !value.bool_val : return
+    let count = values.length
+    let length = value.rett.get_non_nullable().length
+    if count >= length : return
+    let last = values.get(count - 1) ! value.bug("IR fixed-array fill value is missing")
+    let stored = rendered.get(base + count - 1) ! value.bug("IR fixed-array fill value is missing")
+    let element_type = ir_type(last.rett) !>
+    let element_size = (last.rett.byte_size() !>).to(uint)
+    let tail_address = ir_index_address(ir, element_type, address, count)
+    let byte = ir_fill_byte(last)
+    if isset(byte) {
+        if byte == 0 && zeroed : return
+        ir_emit_memset(ir, tail_address, byte, (length - count) * element_size)
+        return
+    }
+    // for (i = count; i < length; i++) address[i] = last
+    let cond_block = ir.block("fill.cond")
+    let body_block = ir.block("fill.body")
+    let after_block = ir.block("fill.after")
+    let entry = ir.current_block
+    let next = ir.var()
+    ir.jump(cond_block)
+    ir.label(cond_block)
+    let index = ir_emit_phi2(ir, "i64", count.to_string(), entry, next, body_block)
+    let done = ir_emit_binary_instruction(ir, "icmp uge", "i64", index, length.to_string())
+    ir.cond_jump(done, after_block, body_block)
+    ir.label(body_block)
+    let slot = ir_element_address(ir, element_type, address, "i64", index)
+    // An element built in place is copied from the slot before the tail
+    if stored == "" : ir_emit_memcpy(ir, slot, ir_index_address(ir, element_type, address, count - 1), element_size.to_string())
+    else : ir_emit_store(ir, element_type, stored, slot)
+    ir.line4(next, " = add i64 ", index, ", 1")
+    ir.jump(cond_block)
+    ir.label(after_block)
+}
+
+// The byte a memset can fill an element with, if any
+fn ir_fill_byte(value: Value) ?uint {
+    if ir_value_is_zero(value) : return 0
+    if value.type != VAL.int || !value.rett.is_integer_type() : return null
+    let size = value.rett.byte_size() !? 0
+    if size != 1 : return null
+    return (value.int_val & 0xff).to(uint)
+}
+
+// Constant whose storage is all zero bytes
+fn ir_value_is_zero(value: Value) bool {
+    let t = value.type
+    if value.rett.is_tagged_nullable() : return false
+    if t == VAL.int : return value.int_val == 0
+    if t == VAL.bool : return !value.bool_val
+    if t == VAL.null : return true
+    let aggregate = t == VAL.array_init
+        || (t == VAL.class_init && value.rett.get_non_nullable().is_inline && !isset(value.value1))
+    if !aggregate : return false
+    let values = value.values ?! return t == VAL.class_init
+    each values as item {
+        if !ir_value_is_zero(item) : return false
+    }
+    return true
 }
 
 fn ir_emit_dynamic_zero(ir: IRFunc, address: String, size: String) {
@@ -2903,12 +3055,18 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
     let class = value.get_class_ref() ?? storage_type.get_class_or_null()
     if !isset(class) : value.bug("Aggregate class initializer has no class")
 
-    // Evaluate fields before allocating their owner.
+    // Evaluate fields before allocating their owner. Fixed-array fields of a
+    // plain class render element-wise, see ir_emit_array_store.
     let fields = value.values
     let field_mark = ir.field_values.length
+    let starts = Array[uint]{}
+    let element_wise = class.kind != CLASS_KIND.slice
     if isset(fields) {
         each fields as field {
-            ir.field_values.append(ir_emit_value(ir, field) !>)
+            starts.append(ir.field_values.length)
+            if element_wise && field.type == VAL.array_init && ir_field_inits_in_place(field) : ir_emit_array_elements(ir, field, ir.field_values) !>
+            else if element_wise && ir_field_inits_in_place(field) : ir.field_values.append("")
+            else : ir.field_values.append(ir_emit_value(ir, field) !>)
             if ir.terminated {
                 ir.release_field_values(field_mark)
                 return "undef"
@@ -2948,9 +3106,15 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         each fields as field, i {
             let prop = field.get_init_prop()
             if !isset(prop) : value.bug("Aggregate initializer field has no property")
-            let field_value = ir.field_values.get(field_mark + i) !? "undef"
+            let start = starts.get(i) !? field_mark + i
             let address = ir_prop_address(ir, slot, prop)
-            ir_emit_store(ir, ir_type(prop.type) !>, field_value, address)
+            if field.type == VAL.array_init && ir_field_inits_in_place(field) {
+                ir_emit_array_store(ir, field, ir.field_values, start, address, size > 0) !>
+                continue
+            }
+            let field_value = ir.field_values.get(start) !? "undef"
+            if field_value == "" : ir_emit_aggregate_into(ir, field, address) !>
+            else : ir_emit_store(ir, ir_type(prop.type) !>, field_value, address)
         }
     }
     ir.release_field_values(field_mark)
@@ -3002,18 +3166,36 @@ fn ir_emit_inline_class_init(ir: IRFunc, value: Value, address: String) !Error {
     let offsets = Array[u32]{}
     ir_collect_inline_init_fields(value, 0, fields, offsets) !>
 
+    // Fixed-array fields render element-wise, see ir_emit_array_store
     let rendered = Array[String]{}
+    let starts = Array[uint]{}
     each fields as field {
-        rendered.append(ir_emit_value(ir, field) !>)
+        starts.append(rendered.length)
+        if field.type == VAL.array_init && ir_field_inits_in_place(field) : ir_emit_array_elements(ir, field, rendered) !>
+        else if ir_field_inits_in_place(field) : rendered.append("")
+        else : rendered.append(ir_emit_value(ir, field) !>)
         if ir.terminated : return
     }
     let size = class.compute_body_size() !>
     if size > 0 : ir_emit_zero(ir, address, size.to(uint))
     each fields as field, i {
-        let stored = rendered.get(i) ! value.bug("Inline initializer value is missing")
+        let start = starts.get(i) ! value.bug("Inline initializer value is missing")
         let offset = offsets.get(i) ! value.bug("Inline initializer offset is missing")
-        ir_emit_store(ir, ir_type(field.rett) !>, stored, ir_offset_address(ir, address, offset))
+        let field_address = ir_offset_address(ir, address, offset)
+        if field.type == VAL.array_init && ir_field_inits_in_place(field) {
+            ir_emit_array_store(ir, field, rendered, start, field_address, size > 0) !>
+            continue
+        }
+        let stored = rendered.get(start) ! value.bug("Inline initializer value is missing")
+        if stored == "" : ir_emit_aggregate_into(ir, field, field_address) !>
+        else : ir_emit_store(ir, ir_type(field.rett) !>, stored, field_address)
     }
+}
+
+// Fields built at their address instead of stored as a rendered value
+fn ir_field_inits_in_place(field: Value) bool {
+    if field.type == VAL.array_init : return !field.rett.is_tagged_nullable()
+    return ir_inits_in_place(field)
 }
 
 fn interface_vtable_name(adapter: Class) String {
@@ -4270,6 +4452,46 @@ fn ir_emit_short_circuit(ir: IRFunc, left: Value, right: Value, op: VALUE_OP) St
 // Operators and casts
 ////////////////////////////
 
+// A plain binary operator that needs none of ir_emit_value's own handling
+fn ir_op_chains(ir: IRFunc, value: Value) bool {
+    if value.type != VAL.op || !isset(value.value2) : return false
+    let op = value.op.@cast(VALUE_OP)
+    if op == VALUE_OP.and || op == VALUE_OP.or : return false
+    if isset(value.get_checked_read()) || isset(value.get_pre_value()) : return false
+    let match_value = ir.match_value
+    return !isset(match_value) || match_value != value
+}
+
+// Binary operator with its left operand already rendered
+fn ir_emit_binary_op(ir: IRFunc, value: Value, rendered_left: String) String !Error {
+    let left = value.value1
+    let right = value.value2
+    if !isset(left) || !isset(right) : value.bug("IR operator is missing an operand")
+    let op = value.op.@cast(VALUE_OP)
+    let rendered_right = ir_emit_value(ir, right) !>
+    if ir.terminated : return "undef"
+    let class = left.rett.get_non_nullable().get_class_or_null()
+    if (op == VALUE_OP.eq || op == VALUE_OP.ne)
+        && isset(class) && class.kind == CLASS_KIND.interface
+    {
+        if left.rett.is_tagged_nullable() || right.rett.is_tagged_nullable() {
+            return ir_emit_nullable_interface_compare(
+                ir,
+                rendered_left,
+                left.rett,
+                rendered_right,
+                right.rett,
+                op
+            ) !>
+        }
+        rendered_left = ir_interface_object(ir, rendered_left)
+        rendered_right = ir_interface_object(ir, rendered_right)
+        let compare = op == VALUE_OP.eq ? "icmp eq" : "icmp ne"
+        return ir_emit_binary_instruction(ir, compare, "ptr", rendered_left, rendered_right)
+    }
+    return ir_emit_binary(ir, rendered_left, rendered_right, op, left.rett, value.exp ?? ir.func.exp) !>
+}
+
 fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) String !Error {
     let lowered = ir_type(type) !>
     let layout = type.union_layout() !>
@@ -4326,7 +4548,7 @@ fn ir_emit_union_equal(ir: IRFunc, left: String, right: String, type: Type) Stri
 
 // Integer division by zero, and the signed minimum divided by -1, would trap
 // the process: both panic with a message instead
-fn ir_emit_division_guard(ir: IRFunc, irt: String, left: String, right: String, type: Type) !Error {
+fn ir_emit_division_guard(ir: IRFunc, irt: String, left: String, right: String, type: Type, at: Exp) !Error {
     // A literal divisor was checked at compile time, except -1 which still overflows at the minimum
     let first = right.bytes > 0 ? right.get(0) : 0
     let literal = first.is_number() || first == '-'
@@ -4344,14 +4566,14 @@ fn ir_emit_division_guard(ir: IRFunc, irt: String, left: String, right: String, 
     let valid = ir.block("div.valid")
     ir.cond_jump(bad, failed, valid)
     ir.label(failed)
-    let panic_call = value_panic_call(Context.for_func(ir.func), "Integer division by zero or overflow", ir.func.exp) !>
+    let panic_call = value_panic_call(Context.for_func(ir.func), "Integer division by zero or overflow", at) !>
     ir_emit_stmt(ir, panic_call) !>
     ir.jump(valid)
     ir.label(valid)
 }
 
 // A shift count at or past the bit width is poison in LLVM, so it panics like a zero divisor
-fn ir_emit_shift_guard(ir: IRFunc, irt: String, right: String, type: Type) !Error {
+fn ir_emit_shift_guard(ir: IRFunc, irt: String, right: String, type: Type, at: Exp) !Error {
     // A literal count was checked at compile time
     let first = right.bytes > 0 ? right.get(0) : 0
     if first.is_number() || first == '-' : return
@@ -4361,13 +4583,13 @@ fn ir_emit_shift_guard(ir: IRFunc, irt: String, right: String, type: Type) !Erro
     let valid = ir.block("shift.valid")
     ir.cond_jump(bad, failed, valid)
     ir.label(failed)
-    let panic_call = value_panic_call(Context.for_func(ir.func), "Shift count out of range", ir.func.exp) !>
+    let panic_call = value_panic_call(Context.for_func(ir.func), "Shift count out of range", at) !>
     ir_emit_stmt(ir, panic_call) !>
     ir.jump(valid)
     ir.label(valid)
 }
 
-fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type) String !Error {
+fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: Type, at: Exp) String !Error {
     if type.is_tagged_nullable() && type.get_non_nullable().kind == TYPE.union
         && (op == VALUE_OP.eq || op == VALUE_OP.ne) {
             if right == "zeroinitializer" || left == "zeroinitializer" {
@@ -4432,7 +4654,7 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     else if op == VALUE_OP.div || op == VALUE_OP.mod {
         if type.is_float_type() : inst = op == VALUE_OP.div ? "fdiv" : "frem"
         else {
-            ir_emit_division_guard(ir, irt, left, right, type) !>
+            ir_emit_division_guard(ir, irt, left, right, type, at) !>
             inst = op == VALUE_OP.div ? (type.is_signed_type() ? "sdiv" : "udiv") : (type.is_signed_type() ? "srem" : "urem")
         }
     }
@@ -4440,7 +4662,7 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     else if op == VALUE_OP.bit_or || op == VALUE_OP.or : inst = "or"
     else if op == VALUE_OP.bit_xor : inst = "xor"
     else if op == VALUE_OP.shl || op == VALUE_OP.shr {
-        ir_emit_shift_guard(ir, irt, right, type) !>
+        ir_emit_shift_guard(ir, irt, right, type, at) !>
         inst = op == VALUE_OP.shl ? "shl" : (type.is_signed_type() ? "ashr" : "lshr")
     }
     else : inst = "add"

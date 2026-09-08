@@ -67,6 +67,15 @@ if [[ "$chain_out" != *"# Note: while instantiating 'Box[String]' here"* ]] || [
 fi
 
 count=$((count + 1))
+echo "> locked receiver error shows the call that needed it"
+locked_out=$("$VALK" build "$DIR/locked-chain.valk" --no-warn 2>&1 | normalize_paths)
+if [[ "$locked_out" != *"# Note: while checking 'sort' for a locked receiver, called here"* ]] || [[ "$locked_out" != *"# At: $DIR/locked-chain.valk:6:9"* ]]; then
+    echo "# Missing locked receiver chain"
+    echo "$locked_out"
+    failed=1
+fi
+
+count=$((count + 1))
 echo "> warning location"
 warn_out=$("$VALK" build "$DIR/warning.valk" 2>&1)
 warn_status=$?

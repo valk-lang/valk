@@ -265,6 +265,7 @@ fn borrow_stack_to_owned_message(target: Type) String {
 // another stack borrow, an owned borrow otherwise.
 fn value_borrow_of(operand: Value, scope: Scope, ctx: Context, at: Exp, mutable: bool) Value !Error {
     if mutable && value_in_readonly_view(operand, ctx) : at.error("Cannot take a '&mut' borrow of storage behind a read-only borrow")
+    if mutable : value_check_captured_borrow(operand, at) !>
     let origin = value_borrow_origin(operand)
     value_clear_borrowed_local_facts(operand, scope)
     if mutable : value_note_mut_borrowed_local(operand)
@@ -290,6 +291,7 @@ fn value_owned_borrow_from_storage(value: Value, target: Type, scope: Scope, ctx
     if (target_nn.is_mut || target_nn.kind == TYPE.stack_of) && value_is_readonly_storage(value, ctx) {
         at.error("Cannot borrow read-only storage as '" + target.compat_display_name() + "'; " + value_readonly_hint(value, ctx))
     }
+    if target_nn.is_mut || target_nn.kind == TYPE.stack_of : value_check_captured_borrow(value, at) !>
     if target_nn.is_owned_borrow() {
         if origin.kind == BORROW_ORIGIN.stack || origin.kind == BORROW_ORIGIN.borrowed {
             at.error(borrow_stack_to_owned_message(target))
@@ -574,6 +576,7 @@ fn value_convert_borrow(result: Value, scope: Scope, ctx: Context, target: Type,
         if target_nn.is_mut && value_is_readonly_storage(result, ctx) {
             at.error("Cannot borrow read-only storage as '" + target.compat_display_name() + "'; " + value_readonly_hint(result, ctx))
         }
+        if target_nn.is_mut : value_check_captured_borrow(result, at) !>
         let borrowed = value_owned_borrow_from_storage(result, result.rett.reference(), scope, ctx, at) !>
         if !isset(borrowed) : return null
         let rooted = value_root_owned_borrow(borrowed, ctx)
@@ -634,7 +637,8 @@ fn value_ref_slice_checked_index(on: Value, index: Value, ctx: Context, at: Exp)
 fn value_ref_slice_element(on: Value, index: Value, ctx: Context, at: Exp) Value !Error {
     let element = on.rett.get_non_nullable().get_sub_type() ?! at.bug("Slice borrow has no element type")
     let data = vgen_cast(value_owned_borrow_address(on), type_ptr(ctx.build))
-    return vgen_ptrv(data, index, element, at)
+    // An element read out of a shared or locked slice keeps the view
+    return vgen_ptrv(data, index, on.rett.storage_view_of(element), at)
 }
 
 fn value_from_ref_slice_offset(on: Value, access: Exp, scope: Scope, ctx: Context, exp: Exp) Value !Error {
@@ -648,7 +652,7 @@ fn value_from_ref_slice_offset(on: Value, access: Exp, scope: Scope, ctx: Contex
     let t = on.rett.get_non_nullable()
     let element = t.get_sub_type() ?! exp.bug("Slice borrow has no element type")
 
-    if access.kind == VALUE_KIND.bracket_range {
+    if access.value_kind == VALUE_KIND.bracket_range {
         let start_exp = access.get(VALUE_EXP.left)
         let length_exp = access.get(VALUE_EXP.right)
         if !isset(start_exp) || !isset(length_exp) : access.bug("Bracket range is missing an argument")
@@ -892,10 +896,11 @@ fn value_borrow_sequence_element(on: Value, offset_exp: Exp, scope: Scope, ctx: 
     on = value_try_remove_nullable(on, scope, ctx) !>
     if on.rett.is_nullable_type() : return null
     if mutable && value_is_readonly_storage(on, ctx) : at.error("Cannot take a '&mut' borrow of storage behind a read-only borrow")
+    if mutable : value_check_captured_borrow(on, at) !>
     let body = offset_exp.get(VALUE_EXP.right) ?! return null
     if body.type != EXP.body : return null
     let access = parse_offset_access(body) !>
-    let is_range = access.kind == VALUE_KIND.bracket_range
+    let is_range = access.value_kind == VALUE_KIND.bracket_range
     if is_range {
         let hook_class = on.rett.get_non_nullable().get_class_or_null()
         let view_hook = isset(hook_class) ? hook_class.get_view_hook() : null
@@ -913,6 +918,8 @@ fn value_borrow_sequence_element(on: Value, offset_exp: Exp, scope: Scope, ctx: 
         if isset(hook) : return null
     }
     value_check_shared_address(on, at) !>
+    if on_t.is_shared : at.error("Cannot take a reference to shared data")
+    if on_t.is_locked : at.error("Cannot take a reference to locked data")
     let element = on_t.get_sub_type() ?! at.bug("Sequence has no element type")
     let setup = Array[Value]{}
     let base = value_bind_once(on, ctx, at, setup, on_t.kind == TYPE.ref_slice)
@@ -947,10 +954,20 @@ fn value_from_ref_slice_offset_assign(on: Value, access: Exp, right_exp: Exp, sc
     }
     let checked = value_ref_slice_checked_index(rooted, index, ctx, left_exp) !>
     let item = value_ref_slice_element(rooted, checked, ctx, left_exp) !>
-    let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>
-    right = value_try_convert(right, scope, ctx, element) !>
-    element.compat_check(right.rett, right_exp) !>
-    setup.append(value_borrow_store(rooted, item, right, scope, ctx, at) !>)
+    // A plain element is one word: stored atomically, it is race safe.
+    // Managed references follow the property rules instead.
+    let plain_element = element.is_shared_writable()
+    if t.is_shared && !plain_element {
+        left_exp.error("Cannot modify shared data of type '" + element.compat_display_name() + "'")
+    }
+    // Through a lock the stored graph must be unique; the view conversion checks it
+    let target = t.is_locked && !plain_element ? item.rett : element
+    let right = value_from_exp(right_exp, scope, ctx.with_suggested_type(target)) !>
+    right = value_try_convert(right, scope, ctx, target) !>
+    target.compat_check(right.rett, right_exp) !>
+    if t.is_locked && !plain_element : value_track_stored_graph(item, right, ctx, at, rooted) !>
+    if t.is_shared && element.is_integer_type() : setup.append(vgen_atomic_store(item, right, at))
+    else : setup.append(value_borrow_store(rooted, item, right, scope, ctx, at) !>)
     return vgen_block(setup, b, at)
 }
 

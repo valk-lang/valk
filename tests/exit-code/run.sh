@@ -25,8 +25,8 @@ if [ -n "$EXE_SUFFIX" ]; then
 fi
 trap 'rm -rf "$workdir"' EXIT
 
-# fixture:expected exit status
-cases="return-3:3 return-0:0 void-main:0 return-int:7 return-non-integer:0 fixed-array-bounds:1 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
+# fixture:expected exit status[:expected output substring]
+cases="return-3:3 return-0:0 void-main:0 return-int:7 fixed-array-bounds:1 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
 
 cases="$cases unhandled-error:1 array-bounds:1 array-write-bounds:1 slice-bounds:1 slice-write-bounds:1 ref-slice-bounds:1 ref-slice-range-bounds:1 slice-empty-element:1 each-empty-element:1 view-cleared-element:1"
 cases="$cases coalesce-panic:1 ternary-panic-first:1 ternary-panic-second:1 ternary-panic-both:1"
@@ -41,6 +41,8 @@ cases="$cases fixed-range-copy-bounds:1"
 cases="$cases matrix-borrow-row-bounds:1 matrix-borrow-column-bounds:1"
 cases="$cases division-by-zero:1 division-overflow:1 remainder-by-zero:1 shift-count-overflow:1 shift-count-negative:1 division-literal-minus-one:1"
 cases="$cases panic-in-thread:1"
+cases="$cases global-init-print:0 global-init-abort:1 global-init-error:1"
+cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-line:1:shift-count-line.valk:3"
 # Windows delivers the overflow exception only when it can still push a frame
 if [ -z "$EXE_SUFFIX" ]; then
     cases="$cases stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"
@@ -50,7 +52,7 @@ fi
 # report in list order. A case writes "<index>.out" and "<index>.fail".
 export VALK DIR workdir EXE_SUFFIX
 run_case() {
-    local index="$1" name="$2" want="$3"
+    local index="$1" name="$2" want="$3" text="${4:-}"
     local input="$DIR/$name.valk" exe="$workdir/$name$EXE_SUFFIX" out status output got
     local log="$workdir/$index.out" fail="$workdir/$index.fail"
 
@@ -93,6 +95,11 @@ run_case() {
         : > "$fail"
     fi
 
+    if [ -n "$text" ] && [[ "$output" != *"$text"* ]]; then
+        echo "# Missing expected output '$text': $output" >> "$log"
+        : > "$fail"
+    fi
+
     if [ "$got" -ne "$want" ]; then
         {
             echo "# Wrong exit status"
@@ -107,7 +114,12 @@ export -f run_case
 
 for case in $cases; do
     job="$workdir/job-$count.sh"
-    printf "run_case '%s' '%s' '%s'\n" "$count" "${case%%:*}" "${case##*:}" > "$job"
+    name="${case%%:*}"
+    rest="${case#*:}"
+    want="${rest%%:*}"
+    text=""
+    if [ "$rest" != "$want" ]; then text="${rest#*:}"; fi
+    printf "run_case '%s' '%s' '%s' '%s'\n" "$count" "$name" "$want" "$text" > "$job"
     count=$((count + 1))
 done
 

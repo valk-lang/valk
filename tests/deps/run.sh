@@ -173,6 +173,10 @@ elif [[ "$out" != *"vendor/github-acme-widget/2.0.0"* ]]; then
     failed=1
 fi
 
+# A malformed valk.json is a build error naming the file.
+check_fail "config-bad-json" "Invalid JSON in '$DIR/config-bad-json/valk.json'"
+check_fail "config-wrong-type" "Invalid config '$DIR/config-wrong-type/valk.json': 'dependencies.widget' must be a JSON object, got string"
+
 if [ "$failed" -ne 0 ]; then
     echo "# GitHub dependency path tests failed"
     exit 1
