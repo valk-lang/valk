@@ -30,25 +30,38 @@ cp -r src "$workdir/first/src"
 mkdir -p "$workdir/first/lib"
 cp -r lib/src "$workdir/first/lib/src"
 
-while IFS= read -r file; do
-    count=$((count + 1))
-    set +e
-    out=$("$VALK" build "$file" --fmt --no-warn 2>&1)
-    status=$?
-    set -e
-    if [ "$status" -ne 0 ]; then
-        echo "# --fmt failed"
-        echo "- File: ${file#$workdir/first/}"
+# Bounded batches avoid process startup per file and Windows command-line limits.
+run_batch() {
+    local tree="$1" out
+    shift
+    if ! out=$("$VALK" build "$@" --fmt --no-warn 2>&1); then
+        echo "# --fmt failed in $tree"
         echo "$out"
         failed=1
     fi
-done < <(find "$workdir/first" -name '*.valk' | sort)
+}
+
+format_tree() {
+    local tree="$1" file
+    local batch=()
+    while IFS= read -r file; do
+        batch+=("$file")
+        if [ "${#batch[@]}" -eq 16 ]; then
+            run_batch "$tree" "${batch[@]}"
+            batch=()
+        fi
+    done < <(find "$tree" -name '*.valk' | sort)
+    if [ "${#batch[@]}" -gt 0 ]; then
+        run_batch "$tree" "${batch[@]}"
+    fi
+}
+
+count=$(( $(find "$workdir/first" -name '*.valk' | wc -l) ))
+format_tree "$workdir/first"
 
 cp -r "$workdir/first/." "$workdir/second/"
 
-while IFS= read -r file; do
-    "$VALK" build "$file" --fmt --no-warn >/dev/null 2>&1 || true
-done < <(find "$workdir/second" -name '*.valk' | sort)
+format_tree "$workdir/second"
 
 if ! diff -ru "$workdir/first" "$workdir/second"; then
     echo "# Formatter is not idempotent on the corpus"

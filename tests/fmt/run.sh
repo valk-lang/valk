@@ -130,6 +130,21 @@ for input in "$DIR"/invalid/*.valk; do
     fi
 done
 
+count=$((count + 1))
+echo "> Format multiple explicit files, including preloaded siblings"
+batch="$workdir/batch inputs/src"
+mkdir -p "$batch"
+printf '{}\n' > "$batch/../valk.json"
+cp "$DIR/types.valk" "$batch/a.valk"
+cp "$DIR/comments.valk" "$batch/b.valk"
+cp "$DIR/exprs.valk" "$batch/untouched.valk"
+if ! "$VALK" build "$batch/a.valk" "$batch/b.valk" "$batch/b.valk" --fmt --no-warn; then
+    failed=1
+fi
+diff -u "$EXPECT_DIR/types.valk" "$batch/a.valk" || failed=1
+diff -u "$EXPECT_DIR/comments.valk" "$batch/b.valk" || failed=1
+diff -u "$DIR/exprs.valk" "$batch/untouched.valk" || failed=1
+
 echo ""
 if [ "$failed" -ne 0 ]; then
     echo "# Fmt tests failed"
