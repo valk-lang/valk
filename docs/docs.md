@@ -219,7 +219,8 @@ method that changes it, is a compile error; borrow the element with
 `&mut [T]`), or store the changed struct back with `arr.set(i, value)`.
 
 A borrow only reads unless it says `mut`: `&[T]` and `&T` are read-only
-views, `&mut [T]` and `&mut T` may be written through. Any slice, array or
+views, `&mut [T]` and `&mut T` may be written through. A slice type declared
+with `$immutable`, like `String`, is read-only everywhere outside its own class. Any slice, array or
 string converts to `&[T]`, so `fn write(data: &[u8])` accepts strings, byte
 buffers and slices without copying, while `fn read(buf: Slice[u8])` needs
 writable storage. Assigning through a read-only borrow, taking `&mut` of one

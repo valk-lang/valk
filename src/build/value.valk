@@ -689,7 +689,7 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if value_is_copied_element(operand) {
             exp.error("Cannot change an element copied out of an Array; borrow it with '&mut arr[i]' or store the element back with '.set'")
         }
-        if value_in_readonly_view(operand) : exp.error("Cannot change storage through a read-only borrow; it needs '&mut'")
+        if value_in_readonly_view(operand, ctx) : exp.error("Cannot change storage through a read-only borrow; " + value_readonly_hint(operand, ctx))
         value_mark_summary_write(operand)
         if operand.type == VAL.prop || operand.type == VAL.ptrv {
             let owner = operand.value1
@@ -1902,6 +1902,9 @@ fn func_mutates_receiver(func: Func) bool !Error {
 // Whether the method stores into its receiver, atomic words included
 fn func_writes_receiver(func: Func) bool !Error {
     ensure_func_unique_return_summary(func) !>
+    // A body the LSP did not load, or one still being analyzed, is not
+    // known to write; only a settled summary reports
+    if !func.unique_summary_ready || func_unique_summary_unavailable_in_lsp(func) : return false
     let receiver = func.args.get(0) ! return false
     return receiver.may_write
 }
@@ -2296,7 +2299,7 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     if on_t.is_fixed_array_type() || on_t.kind == TYPE.ptr_of || on_t.kind == TYPE.adr_of {
         if on.rett.is_nullable_type() : left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
     }
-    if value_is_readonly_storage(on) : left_exp.error("Cannot assign through a read-only borrow; it needs '&mut'")
+    if value_is_readonly_storage(on, ctx) : left_exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(on, ctx))
     if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
         require_unsafe(left_exp, scope, "Offset access on an unbounded pointer") !>
     }
@@ -3947,24 +3950,40 @@ fn value_is_copied_element(value: Value) bool {
     return value_is_copied_element(inner)
 }
 
+// A type whose storage may not be written from here: a read-only borrow, or
+// an `$immutable` slice outside the class that declares it
+fn type_is_readonly_here(type: Type, ctx: Context) bool {
+    let nn = type.get_non_nullable()
+    if !nn.is_readonly_view() : return false
+    let c = nn.class ?! return true
+    let func = ctx.func ?? (ctx.get_func() !? null)
+    return !isset(func) || func.class != c
+}
+
 // Whether this storage sits behind a read-only borrow: an element read out
 // of one, or something reached through one
-fn value_in_readonly_view(value: Value) bool {
+fn value_in_readonly_view(value: Value, ctx: Context) bool {
     let meta = value.meta
     if isset(meta) && meta.readonly_element : return true
+    // A raw pointer read out of anything is unsafe territory, not a borrow
+    let own_nn = value.rett.get_non_nullable()
+    if own_nn.is_raw_pointer() || own_nn.kind == TYPE.ptr_of : return false
     let kind = value.type
     if kind == VAL.multi {
         // A borrow split into its words keeps its source in value1
         let source = value.value1
-        if isset(source) && value_is_readonly_storage(source) : return true
+        if isset(source) && value_is_readonly_storage(source, ctx) : return true
         let parts = value.values ?! return false
         each parts as part {
-            if value_in_readonly_view(part) : return true
+            if value_in_readonly_view(part, ctx) : return true
         }
         return false
     }
     if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast && kind != VAL.ptr_of : return false
     let inner = value.value1 ?! return false
+    // Through a raw pointer the unsafe rules apply instead
+    let inner_nn = inner.rett.get_non_nullable()
+    if inner_nn.is_raw_pointer() || inner_nn.kind == TYPE.ptr_of : return false
     if kind == VAL.prop {
         // A class object reached through a borrow is an ordinary object;
         // only inline storage (structs, fixed arrays) lives inside the borrow
@@ -3973,13 +3992,28 @@ fn value_in_readonly_view(value: Value) bool {
             ? (owner_t.get_sub_type() ?? owner_t) : owner_t
         if stored.is_gc_type() || stored.kind == TYPE.interface || stored.kind == TYPE.closure : return false
     }
-    return value_is_readonly_storage(inner)
+    return value_is_readonly_storage(inner, ctx)
+}
+
+// What to tell the writer: a borrow wants `&mut`, an immutable type never changes
+fn value_readonly_hint(value: Value, ctx: Context) String {
+    let current: ?Value = value
+    while isset(current) {
+        let nn = current.rett.get_non_nullable()
+        let c = nn.class
+        if isset(c) && c.immutable && nn.is_readonly_view() : return "'" + c.pretty_name() + "' is an immutable slice type"
+        let kind = current.type
+        if kind == VAL.multi : current = current.value1
+        else if kind == VAL.prop || kind == VAL.ptrv || kind == VAL.wrap || kind == VAL.cast || kind == VAL.ptr_of : current = current.value1
+        else : break
+    }
+    return "it needs '&mut'"
 }
 
 // Whether the value itself is a read-only borrow or lives behind one
-fn value_is_readonly_storage(value: Value) bool {
-    if value.rett.get_non_nullable().is_readonly_view() : return true
-    return value_in_readonly_view(value)
+fn value_is_readonly_storage(value: Value, ctx: Context) bool {
+    if type_is_readonly_here(value.rett, ctx) : return true
+    return value_in_readonly_view(value, ctx)
 }
 
 fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value {
@@ -3988,8 +4022,10 @@ fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value 
     if !func.is_static && isset(receiver) && isset(receiver_arg) && receiver_arg.type.is_stack_borrow() {
         if !func.is_generic_base && !func.has_generic_args {
             let copied = value_is_copied_element(receiver)
+            let readonly = value_in_readonly_view(receiver, ctx)
             receiver = value_struct_receiver(receiver, receiver_arg.type, ctx)
             if copied : receiver.ensure_meta().copied_element = true
+            if readonly : receiver.ensure_meta().readonly_element = true
         }
         frame_bound = true
     }
@@ -4780,8 +4816,8 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let func_class = func.class
             let storage_receiver = (isset(receiver_param) && receiver_param.type.is_stack_borrow())
                 || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
-            if storage_receiver && value_is_readonly_storage(receiver) && (func_writes_receiver(func) !>) {
-                at.error("Cannot call a method that changes its receiver through a read-only borrow; it needs '&mut'")
+            if storage_receiver && value_is_readonly_storage(receiver, ctx) && (func_writes_receiver(func) !>) {
+                at.error("Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx))
             }
             let current = ctx.func
             if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {

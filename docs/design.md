@@ -214,7 +214,12 @@ Two different named slices stay distinct: `String` is not `Slice[u8]`.
 
 A bare borrow only reads. `&T` and `&[T]` are read-only views of their
 storage; `&mut T` and `&mut [T]` are the writable forms, with the same words
-and the same lifetime rules. A writable borrow converts to the read-only one
+and the same lifetime rules. A named slice declared `slice X of T $immutable`
+is read-only in the same way everywhere outside its own class: no element
+assignment, no `&mut` re-borrows, no `$offset_assign` hook, no conversion to a
+writable view, and methods that write to their receiver are rejected. The
+class's own methods may still write through unsafe pointers to build values.
+`String` is declared that way, which is what makes strings immutable. A writable borrow converts to the read-only one
 implicitly and never back, except through `@cast`; `Slice[T]` converts to
 both, `String` only to `&[u8]`, and `String.view` hands out `&[u8]`. Through a
 read-only borrow, assignment to the storage or to an inline aggregate inside
