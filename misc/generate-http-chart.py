@@ -2,8 +2,11 @@
 """Generate misc/valk-http.svg and misc/valk-http-dark.svg for the README.
 
 Usage: python3 misc/generate-http-chart.py misc
-Edit DATA with the new medians from examples/bench/http and rerun."""
+Edit DATA with the new medians from examples/bench/http and rerun.
+"""
 import sys
+from html import escape
+from pathlib import Path
 
 # Median of 3 runs, 4 worker threads pinned to 4 cores, wrk on 8 other cores.
 DATA = [
@@ -12,19 +15,23 @@ DATA = [
     ("Go", "fasthttp 1.73", 3_443_542),
 ]
 
+# Dark colors follow https://valk-lang.dev/assets/site.css; light adapts the same palette.
 THEMES = {
-    "light": dict(surface="#fcfcfb", text="#0b0b0b", text2="#52514e", muted="#898781",
-                  grid="#e1e0d9", accent="#2a78d6", other="#c3c2b7"),
-    "dark": dict(surface="#1a1a19", text="#ffffff", text2="#c3c2b7", muted="#898781",
-                 grid="#2c2c2a", accent="#3987e5", other="#4a4a47"),
+    "light": dict(surface="#ffffff", text="#101121", muted="#52617a",
+                  border="#dce3ee", track="#edf1f8", accent="#1268ff", other="#42618c",
+                  value="#34445f"),
+    "dark": dict(surface="#04060b", text="#f1f1f7", muted="#b2b4c6",
+                 border="#202c45", track="#101726", accent="#1268ff", other="#42618c",
+                 value="#c1c5d4"),
 }
 
 W, H = 900, 400
-LEFT, RIGHT, TOP = 40, 40, 116
-BAR_H, BAND = 24, 72
+LEFT, RIGHT, TOP = 32, 32, 140
+BAR_H, BAND = 12, 60
 MAXV = 7_000_000
 PLOT_W = W - LEFT - RIGHT
-FONT = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+FONT = "Arial, Helvetica, sans-serif"
+MONO = "ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace"
 
 
 def fmt(v):
@@ -33,44 +40,52 @@ def fmt(v):
 
 def svg(theme):
     c = THEMES[theme]
-    out = []
-    out.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
-               f'font-family="{FONT}" role="img" aria-label="HTTP hello-world benchmark: requests per second" xml:space="preserve">')
-    out.append(f'<rect width="{W}" height="{H}" rx="12" fill="{c["surface"]}"/>')
-    # Title
-    out.append(f'<text x="{LEFT}" y="44" font-size="22" font-weight="600" fill="{c["text"]}">HTTP benchmarks - plain text</text>')
-    out.append(f'<text x="{LEFT}" y="70" font-size="14" fill="{c["text2"]}">'
-               f'Requests per second, higher is better. 4 worker threads each, pinned to 4 cores; '
-               f'wrk on 8 other cores</text>')
-    out.append(f'<text x="{LEFT}" y="90" font-size="14" fill="{c["text2"]}">'
-               f'900 keep-alive connections, 16 pipelined requests, median of 3 x 5 s runs</text>')
-    # Gridlines every 1M
-    base_y = TOP + len(DATA) * BAND
-    for m in range(0, MAXV + 1, 1_000_000):
-        x = LEFT + PLOT_W * m / MAXV
-        out.append(f'<line x1="{x:.1f}" y1="{TOP - 8}" x2="{x:.1f}" y2="{base_y}" stroke="{c["grid"]}" stroke-width="1"/>')
-        label = "0" if m == 0 else f"{m // 1_000_000}M"
-        anchor = "start" if m == 0 else "middle"
-        out.append(f'<text x="{x:.1f}" y="{base_y + 18}" font-size="12" fill="{c["muted"]}" text-anchor="{anchor}">{label}</text>')
-    # Bars
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+           f'viewBox="0 0 {W} {H}" font-family="{FONT}" role="img" '
+           'aria-labelledby="title description">',
+           '<title id="title">HTTP hello-world benchmark</title>',
+           '<desc id="description">' + escape('; '.join(
+               f'{name} {lib}: {value:,} requests per second' for name, lib, value in DATA
+           )) + '. Higher is better.</desc>',
+           f'<rect x="0.5" y="0.5" width="{W - 1}" height="{H - 1}" rx="7" '
+           f'fill="{c["surface"]}" stroke="{c["border"]}"/>']
+
+    def text(x, y, content, color, size=14, font=FONT, anchor="start", weight=400):
+        out.append(f'<text x="{x}" y="{y}" font-size="{size}" font-family="{font}" '
+                   f'font-weight="{weight}" fill="{color}" text-anchor="{anchor}">'
+                   f'{escape(content)}</text>')
+
+    def divider(y):
+        out.append(f'<path d="M 1 {y} H {W - 1}" stroke="{c["border"]}"/>')
+
+    text(LEFT, 39, "HTTP benchmarks", c["text"], size=18, weight=500)
+    text(W - RIGHT, 38, "Valk 0.6.0", c["muted"], font=MONO, anchor="end")
+    divider(64)
+    text(LEFT, 98, "HTTP hello world · req/s", c["muted"], font=MONO)
+    text(W - RIGHT, 98, "Higher is better", c["muted"], font=MONO, anchor="end")
+
     for i, (name, lib, value) in enumerate(DATA):
         y = TOP + i * BAND
-        w = PLOT_W * value / MAXV
+        text(LEFT, y, name, c["text"], size=15, weight=600)
+        text(LEFT + 56, y, lib, c["muted"], size=13)
+        text(W - RIGHT, y, fmt(value), c["value"], font=MONO, anchor="end")
+        out.append(f'<rect x="{LEFT}" y="{y + 14}" width="{PLOT_W}" height="{BAR_H}" '
+                   f'rx="2" fill="{c["track"]}"/>')
         fill = c["accent"] if name == "Valk" else c["other"]
-        # Rounded data end, square at the baseline: draw a rect then square off the left edge
-        out.append(f'<rect x="{LEFT}" y="{y + 20}" width="{w:.1f}" height="{BAR_H}" rx="4" fill="{fill}"/>')
-        out.append(f'<rect x="{LEFT}" y="{y + 20}" width="4" height="{BAR_H}" fill="{fill}"/>')
-        out.append(f'<text x="{LEFT}" y="{y + 12}" font-size="15" font-weight="600" fill="{c["text"]}">{name} '
-                   f'<tspan dx="6" font-weight="400" fill="{c["text2"]}">{lib}</tspan></text>')
-        out.append(f'<text x="{LEFT + w + 10:.1f}" y="{y + 20 + BAR_H / 2 + 5}" font-size="14" fill="{c["text"]}">{fmt(value)}</text>')
-    out.append(f'<text x="{LEFT}" y="{H - 18}" font-size="12" fill="{c["muted"]}">'
-               f'Valk 0.6.0, Rust 1.97.1, Go 1.27.1</text>')
+        out.append(f'<rect x="{LEFT}" y="{y + 14}" width="{PLOT_W * value / MAXV:.1f}" '
+                   f'height="{BAR_H}" rx="2" fill="{fill}"/>')
+
+    divider(312)
+    text(LEFT, 338, "4 workers pinned to 4 cores; wrk on 8 other cores.", c["muted"], size=13)
+    text(LEFT, 360, "900 keep-alive connections · 16 pipelined requests · Median of three 5-second runs.",
+         c["muted"], size=13)
+    text(LEFT, 382, "Valk 0.6.0 · Rust 1.97.1 · Go 1.27.1", c["muted"], size=12, font=MONO)
     out.append('</svg>')
     return "\n".join(out) + "\n"
 
 
 if __name__ == "__main__":
-    outdir = sys.argv[1]
-    open(f"{outdir}/valk-http.svg", "w").write(svg("light"))
-    open(f"{outdir}/valk-http-dark.svg", "w").write(svg("dark"))
+    outdir = Path(sys.argv[1])
+    for theme, suffix in (("light", ""), ("dark", "-dark")):
+        (outdir / f"valk-http{suffix}.svg").write_text(svg(theme), encoding="utf-8")
     print("written")
