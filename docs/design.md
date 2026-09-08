@@ -745,7 +745,9 @@ returned.
 Exhausting a native or coroutine stack is reported as a `Stack overflow`
 panic on Linux and macOS: every stack ends in a guard page, large frames probe
 each page so they cannot skip it, and the fault handler runs on an alternate
-signal stack. Any other memory fault keeps its default action.
+signal stack. Any other memory fault keeps its default action. Windows reports
+it through a vectored exception handler when the system can still deliver the
+exception; otherwise the process ends with the system's stack overflow status.
 
 Stack roots are found conservatively. The collector scans the native stacks
 of the thread and of its coroutines, plus the registers saved when a stack

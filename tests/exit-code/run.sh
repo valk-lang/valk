@@ -40,7 +40,11 @@ cases="$cases fixed-element-borrow-bounds:1"
 cases="$cases fixed-range-copy-bounds:1"
 cases="$cases matrix-borrow-row-bounds:1 matrix-borrow-column-bounds:1"
 cases="$cases division-by-zero:1 division-overflow:1 remainder-by-zero:1 shift-count-overflow:1 shift-count-negative:1 division-literal-minus-one:1"
-cases="$cases panic-in-thread:1 stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"
+cases="$cases panic-in-thread:1"
+# Windows delivers the overflow exception only when it can still push a frame
+if [ -z "$EXE_SUFFIX" ]; then
+    cases="$cases stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"
+fi
 
 # Each case builds and runs on its own, so the cases run in parallel and
 # report in list order. A case writes "<index>.out" and "<index>.fail".
