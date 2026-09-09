@@ -1361,6 +1361,9 @@ Declarations without a marker are available throughout their package and
 private outside it. Use `-` to keep a declaration in its source file, `~` to
 make it read-only outside that source, and `+` to make it public everywhere.
 
+Markers containing `~` are only allowed on properties and globals. Other
+declarations use no marker, `-`, `-+`, or `+`.
+
 Combined markers widen as code gets closer to the declaration. They use `-`,
 `~`, `+` in that order:
 

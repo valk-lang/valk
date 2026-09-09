@@ -965,6 +965,9 @@ Access markers follow the current compiler contract:
 - `~+`: public in the namespace, read-only outside it.
 - `-~+`: public in the namespace, read-only in the package, private outside it.
 
+Markers containing `~` are only allowed on properties and globals, including
+`shared` and `@shared` globals.
+
 `@ignore_access` is an unsafe file-level escape hatch for compiler and low-level
 library code.
 
