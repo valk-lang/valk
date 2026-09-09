@@ -232,14 +232,16 @@ check "member completion includes properties" '"label":"name"' \
 # `fs.` likewise, and private members of another package must not be offered
 check "namespace completion" '"label":"cwd"' \
     "$(request textDocument/completion namespace.valk 3 7)"
+check "namespace completion includes public file metadata" '"label":"stat"' \
+    "$(request textDocument/completion namespace.valk 3 7)"
 
 count=$((count + 1))
 echo "> namespace completion hides private members"
 stream="$(frame "$init")$(frame "$(request textDocument/completion namespace.valk 3 7)")"
 out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
 case "$out" in
-    *'"label":"stat"'*)
-        echo "# Private function 'fs.stat' was offered by completion"
+    *'"label":"write_all"'*)
+        echo "# Private function 'fs.write_all' was offered by completion"
         echo "$out"
         failed=1
         ;;
