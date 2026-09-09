@@ -111,6 +111,19 @@ if [ "$opt_cache" != "$release_cache" ]; then
     exit 1
 fi
 
+echo "> Reopening the object-cache lock preserves its contents"
+lock_file="$default_cache/cache.lock"
+if [ ! -f "$lock_file" ]; then
+    echo "# Build did not create its cache lock"
+    exit 1
+fi
+printf '%s' 'preserve-cache-lock' > "$lock_file"
+lock_out=$(build) || { echo "$lock_out"; exit 1; }
+if [ "$(cat "$lock_file")" != 'preserve-cache-lock' ]; then
+    echo "# Reopening the cache lock truncated its contents"
+    exit 1
+fi
+
 no_opt_out=$(build --no-opt)
 status=$?
 if [ "$status" -eq 0 ] || [[ "$no_opt_out" != *"Unknown build argument: --no-opt"* ]]; then
@@ -562,4 +575,4 @@ if [ "$(loc_value "$loc_out" File)" -ne "$(( $(loc_value "$loc_base" File) + 1 )
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 33"
+echo "# Test count: 34"
