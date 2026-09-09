@@ -4,7 +4,29 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.6.2
+- Release 0.6.3
+- /
+```
+
+## Maybe
+
+```
+- Complete libc integration
+- vman templates -> vman template http-server-router ./src
+- Built-in cookie functions
+- on exit thread/process { ... }
+- WASM support
+- Allow @undefined for entire struct. E.g. let user = User { @undefined }
+- @stack(StructName) -> stackalloc StructName { ... }
+-- This is the same as `let x : <StructName> = { ... }`
+-- but stackalloc can be used as a value, e.g. in function arguments
+```
+
+## Done
+
+```
++ Release 0.6.2
++ Language audit + fixes
 
 + Release 0.6.1
 + Fix enum type bug
@@ -20,33 +42,6 @@
 + integer .$max/.$min
 + redesign borrows & slices
 
-
-# Next steps
-- is_a token, union/interface type checker
-
-# Other
-
-- Complete libc integration
-- Provide a `IR` build so people can build valk with `clang` instead of `valk`
-- vman templates -> vman template http-server-router ./src
-- Allow all types of 128 bit and lower as function arguments
-- Full HTTP 1.1 protocol + Cookies
-```
-
-## Maybe
-
-```
-- on exit thread/process { ... }
-- WASM support
-- Allow @undefined for entire struct. E.g. let user = User { @undefined }
-- @stack(StructName) -> stackalloc StructName { ... }
--- This is the same as `let x : <StructName> = { ... }`
--- but stackalloc can be used as a value, e.g. in function arguments
-```
-
-## Done
-
-```
 + Release 0.5.0
 + Big api overhaul
 + Full security audit
