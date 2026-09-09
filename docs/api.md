@@ -71,7 +71,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + fn exec(cmd: String, print_output: bool (false), capture_stderr: bool (true)) (i32, String)
 + fn exit(code: i32) void
 + fn getenv(var: String) String !LookupError
-+ fn panic(msg: String) void
++ fn panic(msg: String, location: String ("")) void
 + fn raise(code: i32) void
 + fn read_big_endian(from: *[u8], bytes: uint) uint
 + fn read_little_endian(from: *[u8], bytes: uint) uint

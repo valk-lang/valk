@@ -675,6 +675,14 @@ fn parse() !ParseError {
 
 Calling a function that's flagged with `$exit` tells the compiler that the function will exit the program. E.g. the `panic` function. This mechanic is used for certain null-checking or error-handling features.
 
+`panic(msg)` prints the message followed by the file and line it was called from, relative to the root of the package, then exits the process with status 1. Runtime checks report the same way: an index out of bounds, a division by zero, or an error left unhandled by `!!` names the line in your code where it happened.
+
+```
+Empty array at src/main.valk:12
+Unhandled error 'LookupError.missing' at src/main.valk:20
+Index out of bounds at src/core/ByteBuffer.valk:98 in package valk
+```
+
 ```rust
 fn myexit() $exit {
     println("I QUIT")

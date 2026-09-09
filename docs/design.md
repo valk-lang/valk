@@ -989,6 +989,13 @@ The `!Error` suffix belongs to function declaration/type grammar. Postfix `!`
 forms belong to call error handling. Prefix `!` is boolean negation. These are
 distinguished by grammar context, not by resolving identifiers.
 
+`!!` on a failed call, a failed runtime check (bounds, division, shift), and a
+direct `panic(msg)` call all end in `core.panic(msg, location)`. The compiler
+fills `location` with the source position of the failing expression, as
+`path:line` relative to the root of its package; a position inside a dependency
+adds ` in package <name>`. `panic` writes the message, the location, and a
+newline, then leaves through `_exit` without running C exit handlers.
+
 `main` may omit a return type, in which case it returns `void` and the process
 exits successfully. An integer return type supplies the process exit code.
 Other `main` return types are compile errors.

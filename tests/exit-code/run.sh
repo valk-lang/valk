@@ -26,7 +26,7 @@ fi
 trap 'rm -rf "$workdir"' EXIT
 
 # fixture:expected exit status[:expected output substring]
-cases="return-3:3 return-0:0 void-main:0 return-int:7 fixed-array-bounds:1 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
+cases="return-3:3 return-0:0 void-main:0 return-int:7 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
 
 cases="$cases unhandled-error:1 array-bounds:1 array-write-bounds:1 slice-bounds:1 slice-write-bounds:1 ref-slice-bounds:1 ref-slice-range-bounds:1 slice-empty-element:1 each-empty-element:1 view-cleared-element:1"
 cases="$cases coalesce-panic:1 ternary-panic-first:1 ternary-panic-second:1 ternary-panic-both:1"
@@ -43,6 +43,10 @@ cases="$cases division-by-zero:1 division-overflow:1 remainder-by-zero:1 shift-c
 cases="$cases panic-in-thread:1"
 cases="$cases global-init-print:0 global-init-abort:1 global-init-error:1"
 cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-line:1:shift-count-line.valk:3"
+# Panic locations are relative to the package root, or the working directory
+# for loose files; a dependency names its package
+cases="$cases panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:1:tests/exit-code/fixed-array-bounds.valk:4"
+cases="$cases panic-in-library:1:ByteBuffer.valk:98"
 # Windows delivers the overflow exception only when it can still push a frame
 if [ -z "$EXE_SUFFIX" ]; then
     cases="$cases stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"
@@ -85,8 +89,18 @@ run_case() {
         : > "$fail"
     fi
 
-    if [ "$name" = "unhandled-error" ] && [[ "$output" != *"Unhandled error 'Failure.failed' at "*"unhandled-error.valk:8"* ]]; then
+    if [ "$name" = "unhandled-error" ] && [[ "$output" != *"Unhandled error 'Failure.failed' at tests/exit-code/unhandled-error.valk:8"* ]]; then
         echo "# Missing unhandled error name or source location: $output" >> "$log"
+        : > "$fail"
+    fi
+
+    if [ "$name" = "panic-line" ] && [[ "$output" != *"Explicit panic at tests/exit-code/panic-line.valk:2"* ]]; then
+        echo "# Missing panic message or source location: $output" >> "$log"
+        : > "$fail"
+    fi
+
+    if [ "$name" = "panic-in-library" ] && [[ "$output" != *"Index out of bounds at src/core/ByteBuffer.valk:98 in package valk"* ]]; then
+        echo "# Missing library panic location or package name: $output" >> "$log"
         : > "$fail"
     fi
 
