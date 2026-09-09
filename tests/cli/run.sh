@@ -481,6 +481,18 @@ echo "fn main() { $(repeat '{ ' 500)println(1)$(repeat ' }' 500) }" > "$deep_src
 build_deep 1
 echo "struct Big { data: [u8 x 100000] } fn main() { let b = Big{} let a: [u8 x 100000] = { 7... } println(b.data[5] + a[99999]) }" > "$deep_src"
 build_deep 7
+cat > "$deep_src" <<'EOF'
+class FlagTest {
+    value: int (0)
+}
+fn flag_inline(value: int) int $inline { return value + 1 }
+fn flag_plain(value: int) int { return value + 2 }
+fn main() {
+    let item = FlagTest { value: 12 }
+    println(flag_inline(flag_plain(item.value)))
+}
+EOF
+build_deep 15
 for form in paren block call index ternary; do
     case "$form" in
         paren) echo "fn main() { let a = $(repeat '(' 3000)1$(repeat ')' 3000) println(a) }" > "$deep_src" ;;
