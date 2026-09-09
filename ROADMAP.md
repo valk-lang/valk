@@ -4,8 +4,12 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.6.4
+- Release 0.6.5
 - /
+
+- Release 0.6.4
++ Fix isset on union containing null
++ HTTP/1.0 support
 ```
 
 ## Maybe
