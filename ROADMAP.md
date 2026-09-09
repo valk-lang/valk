@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.6.3
+- Release 0.6.4
 - /
 ```
 
@@ -25,6 +25,10 @@
 ## Done
 
 ```
++ Release 0.6.3
++ Optimize GC (transfer refs)
++ Remove void pointers from the escape analysis
+
 + Release 0.6.2
 + Language audit + fixes
 
