@@ -299,6 +299,15 @@ A named slice such as `String` or your own `slice Bytes of u8 {}` converts to
 the bare forms, never the other way around, and two different names never
 convert to each other: a name is a promise only its own class can keep.
 
+A fixed array on the stack, such as `let key: [u8 x 4] = { 1, 2, 3, 4 }`,
+also converts to `&[T]` or `&T` when passed to a function, as long as that
+function provably keeps nothing: it may read and pass the borrow on, but a
+callee that stores it in an object, returns it, or hands it to a coroutine
+gets "Cannot convert a stack borrow" at the call, because the storage dies
+with the caller's frame. The same applies to a `stack T` borrow. Storage
+that must be kept belongs in a class property, a global, or a heap slice
+such as `[u8]{ 0 x 4 }`.
+
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
 ```rust
