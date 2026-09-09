@@ -1379,8 +1379,11 @@ It currently requires TLS and the regular handler API, not `fast` handlers.
 HTTP/1.0 clients are served as well: a `Host` header is not required, the
 connection closes after the response unless the request says
 `Connection: keep-alive`, and responses always carry a `Content-Length`. A
-`Connection: close` on an HTTP/1.1 request ends the connection after that
-response.
+1.0 request with a `Transfer-Encoding` header is rejected with 400, since
+transfer codings do not exist in that version. Higher `HTTP/1.x` minor
+versions are handled as 1.1. A `Connection: close` on an HTTP/1.1 request
+ends the connection after that response; anything pipelined behind it is
+not served.
 
 ## Sockets
 
