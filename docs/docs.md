@@ -1184,6 +1184,60 @@ fn main() {
 Every coroutine runs on its own 1 MB stack; `main` gets 8 MB. Exhausting it, for example with very deep recursion, ends the program with a `Stack overflow` panic; keep large buffers on the heap.
 
 
+## Channels and cancellation
+
+API for [valk.sync](api.md#sync)
+
+A `Channel` moves values between coroutines, on one thread or across threads.
+`send` waits while a bounded channel is full, `recv` waits for a value, and
+both take an optional timeout and cancellation token. Closing a channel lets
+receivers drain what is queued and then fail with `closed`; `each` receives
+until then. Class values must be `shared` to travel: a literal passed to
+`send` is published on the spot, a named value has to be converted first.
+
+```rust
+use valk.sync
+use valk.thread
+
+class Job {
+    id: uint
+}
+
+fn main() {
+    let jobs: shared sync.Channel[shared Job] = sync.Channel[shared Job].new(16) ! panic("init")
+    let results: shared sync.Channel[uint] = sync.Channel[uint].new() ! panic("init")
+
+    let worker = thread.start(fn() {
+        each jobs as job {
+            results.send(job.id * 2) ! break
+        }
+    }) ! panic("thread")
+
+    jobs.send(Job { id: 1 }) ! panic("closed")
+    jobs.send(Job { id: 2 }) ! panic("closed")
+    jobs.close()
+    let total = (results.recv(1000) !? 0) + (results.recv(1000) !? 0)
+    worker.await()
+    println(total) // 6
+}
+```
+
+`try_send` and `try_recv` never wait and fail with `full` or `empty`.
+
+A `CancelToken` is a shared flag with waiters. `cancel()` wakes every
+`wait()`, cancels every token made with `child()`, and runs the callbacks
+given to `on_cancel`. `cancel_after(ms)` cancels from a timer on the calling
+thread. A blocked `send` or `recv` given the token ends with `cancelled`:
+
+```rust
+let stop: shared sync.CancelToken = sync.CancelToken.new() ! panic("init")
+stop.cancel_after(500)
+let value = queue.recv(0, stop) ! {
+    if error_is(E.code, cancelled) : println("gave up")
+    return
+}
+```
+
 ## Access types
 
 Declarations without a marker are available throughout their package and

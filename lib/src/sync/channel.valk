@@ -1,0 +1,226 @@
+use core
+use time
+
+class ChannelState[T] {
+    items: Deque[T] (.{})
+    closed: bool (false)
+    // Slots handed to senders that have not stored their value yet
+    reserved: uint (0)
+    readers: Array[shared Waker] (.{})
+    writers: Array[shared Waker] (.{})
+}
+
+// A queue of values between coroutines, on one thread or across threads.
+// With a capacity, `send` waits while the channel is full; without one it
+// never waits. Values that are class objects must be `shared` to travel:
+// `Channel[shared Message]`. Closing a channel ends waiting receivers once
+// the remaining values are drained, and fails later sends
++ class Channel[T] {
+    - state: shared core.Lock[ChannelState[T]]
+    - capacity: uint
+
+    // `capacity` 0 is unbounded
+    + static fn new(capacity: uint (0)) SELF !SyncError {
+        return SELF {
+            state: core.Lock[ChannelState[T]].new(ChannelState[T] {}) ! throw .init
+            capacity: capacity
+        }
+    }
+
+    + get length: uint {
+        lock this.state as s : return s.items.length
+    }
+
+    + fn is_closed() bool @threadsafe {
+        lock this.state as s : return s.closed
+    }
+
+    // Sends `value`, waiting while the channel is full
+    + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) !SyncError @threadsafe {
+        this.reserve_slot(timeout_ms, cancel) !>
+        this.push_reserved(value) !>
+    }
+
+    // Sends without waiting; `full` when the channel is full
+    + fn try_send(value: T) !SyncError @threadsafe {
+        let reserved = false
+        lock this.state as s {
+            if s.closed : throw .closed
+            if this.capacity == 0 || s.items.length + s.reserved < this.capacity {
+                s.reserved++
+                reserved = true
+            }
+        }
+        if !reserved : throw .full
+        this.push_reserved(value) !>
+    }
+
+    // Waits until a slot is reserved for the caller's value
+    fn reserve_slot(timeout_ms: uint, cancel: ?shared CancelToken) !SyncError @threadsafe {
+        let waker: ?shared Waker = null
+        let deadline = timeout_ms > 0 ? time.mono_ms() + timeout_ms : 0
+        let reserved = false
+        while !reserved {
+            lock this.state as s {
+                if s.closed {
+                    if isset(waker) : release_waker(waker)
+                    throw .closed
+                }
+                if this.capacity == 0 || s.items.length + s.reserved < this.capacity {
+                    s.reserved++
+                    reserved = true
+                } else if isset(waker) {
+                    s.writers.append(waker)
+                }
+            }
+            if reserved : break
+            if !isset(waker) {
+                waker = take_waker() !>
+                continue
+            }
+            let remaining: uint = 0
+            if deadline > 0 {
+                let now = time.mono_ms()
+                if now >= deadline {
+                    this.forget(waker, false)
+                    release_waker(waker)
+                    throw .timeout
+                }
+                remaining = deadline - now
+            }
+            if isset(cancel) && cancel.register(waker) {
+                this.forget(waker, false)
+                release_waker(waker)
+                throw .cancelled
+            }
+            waker.wait(remaining)
+            this.forget(waker, false)
+            if isset(cancel) {
+                cancel.forget(waker)
+                if cancel.is_cancelled() {
+                    release_waker(waker)
+                    throw .cancelled
+                }
+            }
+        }
+        if isset(waker) : release_waker(waker)
+    }
+
+    // Stores a value into its reserved slot and wakes one receiver
+    fn push_reserved(value: T) !SyncError @threadsafe {
+        let reader: ?shared Waker = null
+        lock this.state as s {
+            s.reserved--
+            if s.closed : throw .closed
+            s.items.push_back(value)
+            reader = s.readers.pop_first() !? null
+        }
+        if isset(reader) : reader.wake()
+    }
+
+    // Receives the next value, waiting for one. `closed` once the channel is
+    // closed and empty
+    + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError @threadsafe {
+        let waker: ?shared Waker = null
+        let deadline = timeout_ms > 0 ? time.mono_ms() + timeout_ms : 0
+        while true {
+            let value = this.try_recv_locked(waker) ! {
+                if !error_is(E.code, empty) {
+                    if isset(waker) : release_waker(waker)
+                    throw E
+                }
+                if !isset(waker) {
+                    waker = take_waker() !>
+                    continue
+                }
+                let remaining: uint = 0
+                if deadline > 0 {
+                    let now = time.mono_ms()
+                    if now >= deadline {
+                        this.forget(waker, true)
+                        release_waker(waker)
+                        throw .timeout
+                    }
+                    remaining = deadline - now
+                }
+                if isset(cancel) && cancel.register(waker) {
+                    this.forget(waker, true)
+                    release_waker(waker)
+                    throw .cancelled
+                }
+                waker.wait(remaining)
+                this.forget(waker, true)
+                if isset(cancel) {
+                    cancel.forget(waker)
+                    if cancel.is_cancelled() {
+                        release_waker(waker)
+                        throw .cancelled
+                    }
+                }
+                continue
+            }
+            if isset(waker) : release_waker(waker)
+            return value
+        }
+        throw .closed
+    }
+
+    // Receives without waiting; `empty` when nothing is queued
+    + fn try_recv() T !SyncError @threadsafe {
+        return this.try_recv_locked(null) !>
+    }
+
+    fn try_recv_locked(waker: ?shared Waker) T !SyncError @threadsafe {
+        let writer: ?shared Waker = null
+        let closed = false
+        let result: ?T = null
+        lock this.state as s {
+            let item = s.items.pop_front() !? null
+            if isset(item) {
+                result = item
+                writer = s.writers.pop_first() !? null
+            } else if s.closed {
+                closed = true
+            } else if isset(waker) {
+                s.readers.append(waker)
+            }
+        }
+        if isset(writer) : writer.wake()
+        if closed : throw .closed
+        let value = result ?! throw .empty
+        return value
+    }
+
+    // Closes the channel: later sends fail, receives drain what is queued
+    + fn close() @threadsafe {
+        let readers: ?Array[shared Waker] = null
+        let writers: ?Array[shared Waker] = null
+        lock this.state as s {
+            if s.closed : return
+            s.closed = true
+            readers = s.readers.copy()
+            writers = s.writers.copy()
+            s.readers.clear()
+            s.writers.clear()
+        }
+        if isset(readers) {
+            each readers as waker : waker.wake()
+        }
+        if isset(writers) {
+            each writers as waker : waker.wake()
+        }
+    }
+
+    fn forget(waker: shared Waker, reader: bool) @threadsafe {
+        lock this.state as s {
+            if reader : s.readers.remove_value(waker)
+            else : s.writers.remove_value(waker)
+        }
+    }
+
+    // `each channel as value` receives until the channel is closed
+    fn _next(index: uint) (T, uint) !IterError {
+        let value = this.recv() ! throw .end
+        return (value, index)
+    }
+}

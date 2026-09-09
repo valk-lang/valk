@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -1986,6 +1986,43 @@ alias Fd for i32
     + static fn open(ipv6: bool (false)) UdpSocket !NetError
     + fn recv_from(buf: &mut [u8]) (uint, SocketAddress) !io:IoError
     + fn send_to(data: &[u8], to: SocketAddress) uint !io:IoError
+}
+```
+
+# sync
+
+## Classes for 'sync'
+
+```js
++ class CancelToken {
+    + fn cancel() void
+    + fn cancel_after(ms: uint) void
+    + fn child() CancelToken !SyncError
+    + fn is_cancelled() bool
+    + static fn new() CancelToken !SyncError
+    + fn on_cancel(callback: shared fn()()) void
+    + fn wait(timeout_ms: uint (0)) bool
+}
+```
+
+```js
++ class Channel[T] {
+    + fn close() void
+    + fn is_closed() bool
+    + get length: uint
+    + static fn new(capacity: uint (0)) Channel[T] !SyncError
+    + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
+    + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
+    + fn try_recv() T !SyncError
+    + fn try_send(value: T) void !SyncError
+}
+```
+
+```js
++ class Waker {
+    + static fn new() Waker !SyncError
+    + fn wait(timeout_ms: uint (0)) bool
+    + fn wake() void
 }
 ```
 

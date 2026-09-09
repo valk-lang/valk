@@ -1,0 +1,183 @@
+use valk.sync
+use valk.thread
+use valk.time
+use valk.coro
+
+test "Channel: send and receive on one thread" {
+    let ch = sync.Channel[String].new() !!
+    ch.send("a") !!
+    ch.send("b") !!
+    assert(ch.length == 2)
+    assert((ch.recv() !!) == "a")
+    assert((ch.try_recv() !!) == "b")
+    let empty = false
+    ch.try_recv() ! { empty = error_is(E.code, empty) }
+    assert(empty)
+    let timed_out = false
+    ch.recv(20) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+
+    // A coroutine blocked in recv wakes when a value arrives
+    let receiver = co ch.recv()
+    coro.await_last()
+    ch.send("late") !!
+    assert((await receiver !? "") == "late")
+
+    ch.close()
+    let closed = false
+    ch.send("x") ! { closed = error_is(E.code, closed) }
+    assert(closed)
+    closed = false
+    ch.recv() ! { closed = error_is(E.code, closed) }
+    assert(closed)
+    assert(ch.is_closed())
+}
+
+test "Channel: bounded sends block until there is room" {
+    let ch = sync.Channel[uint].new(2) !!
+    ch.send(1) !!
+    ch.send(2) !!
+    let full = false
+    ch.try_send(3) ! { full = error_is(E.code, full) }
+    assert(full)
+    let timed_out = false
+    ch.send(3, 20) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+
+    let sender = co ch.send(3)
+    coro.await_last()
+    assert(ch.length == 2)
+    assert((ch.recv() !!) == 1)
+    await sender !!
+    assert((ch.recv() !!) == 2)
+    assert((ch.recv() !!) == 3)
+}
+
+class Message {
+    id: uint
+    text: String
+}
+
+test "Channel: values cross threads and each drains until close" {
+    let ch: shared sync.Channel[shared Message] = sync.Channel[shared Message].new(4) !!
+    let producers = Array[thread.Thread[void]]{}
+    let p: uint = 0
+    while p < 3 {
+        let base = p * 100
+        let t = thread.start(fn() {
+            let i: uint = 0
+            while i < 50 {
+                ch.send(Message { id: base + i, text: "m" + (base + i) }) !!
+                i++
+            }
+        }) !!
+        producers.append(t)
+        p++
+    }
+    let closer = thread.start(fn() {
+        // Close once every producer is done
+        time.sleep_ms(50)
+        while ch.length > 0 : time.sleep_ms(1)
+        time.sleep_ms(50)
+        ch.close()
+    }) !!
+
+    let sum: uint = 0
+    let count: uint = 0
+    each ch as message {
+        assert(message.text == "m" + message.id)
+        sum += message.id
+        count++
+    }
+    each producers as t : t.await()
+    closer.await()
+    assert(count == 150)
+    // 3 * (0..49 sum) + (0 + 100 + 200) * 50
+    assert(sum == 3 * 1225 + 300 * 50)
+}
+
+test "Channel: worker pool with results" {
+    let jobs: shared sync.Channel[uint] = sync.Channel[uint].new() !!
+    let results: shared sync.Channel[uint] = sync.Channel[uint].new() !!
+    let workers = Array[thread.Thread[void]]{}
+    let w: uint = 0
+    while w < 4 {
+        workers.append(thread.start(fn() {
+            each jobs as job {
+                results.send(job * job) !!
+            }
+        }) !!)
+        w++
+    }
+    let i: uint = 1
+    while i <= 100 {
+        jobs.send(i) !!
+        i++
+    }
+    jobs.close()
+    let total: uint = 0
+    i = 0
+    while i < 100 {
+        total += results.recv(5000) !!
+        i++
+    }
+    assert(total == 338350)
+    each workers as t : t.await()
+}
+
+test "CancelToken: cancellation wakes waiters, children and callbacks" {
+    let token: shared sync.CancelToken = sync.CancelToken.new() !!
+    let child = token.child() !!
+    assert(!token.is_cancelled() && !child.is_cancelled())
+    assert(!token.wait(20))
+
+    let calls: shared sync.Channel[String] = sync.Channel[String].new() !!
+    token.on_cancel(fn() { calls.try_send("parent") !! })
+    child.on_cancel(fn() { calls.try_send("child") !! })
+
+    let waiter = thread.start(fn() {
+        token.wait()
+        calls.try_send("waiter") !!
+    }) !!
+    time.sleep_ms(20)
+
+    token.cancel()
+    token.cancel()
+    assert(token.is_cancelled() && child.is_cancelled())
+    waiter.await()
+    let seen = Array[String]{}
+    let n: uint = 0
+    while n < 3 {
+        seen.append(calls.recv(2000) !!)
+        n++
+    }
+    assert(seen.contains("parent") && seen.contains("child") && seen.contains("waiter"))
+    assert(token.wait())
+    // A child of a cancelled token starts cancelled and runs callbacks at once
+    let late = token.child() !!
+    assert(late.is_cancelled())
+    late.on_cancel(fn() { calls.try_send("late") !! })
+    assert((calls.recv(2000) !!) == "late")
+}
+
+test "CancelToken: cancels a blocked receive and a timed cancel" {
+    let ch = sync.Channel[uint].new() !!
+    let token: shared sync.CancelToken = sync.CancelToken.new() !!
+    token.cancel_after(30)
+    let cancelled = false
+    let started = time.mono_ms()
+    ch.recv(5000, token) ! { cancelled = error_is(E.code, cancelled) }
+    assert(cancelled)
+    assert(time.mono_ms() - started < 2000)
+
+    let full = sync.Channel[uint].new(1) !!
+    full.send(1) !!
+    let stop: shared sync.CancelToken = sync.CancelToken.new() !!
+    let blocked = co full.send(2, 0, stop)
+    coro.await_last()
+    stop.cancel()
+    let send_cancelled = false
+    await blocked ! { send_cancelled = error_is(E.code, cancelled) }
+    assert(send_cancelled)
+    assert(full.length == 1)
+}

@@ -1,0 +1,206 @@
+@unsafe
+
+use ext
+use io
+use coro
+use core
+use gc
+use time
+
+// A one-shot wakeup for the coroutine that waits on it. `wake` may be
+// called from any thread; `wait` parks the current coroutine (or blocks a
+// native thread) until a wake arrives or the timeout runs out. Wakes are
+// counted loosely: a wait may return early after an earlier, unconsumed
+// wake, so callers re-check their condition in a loop
++ class Waker {
+    #if OS == "win"
+    - mutex: core.SyncMutex (.new())
+    - signaled: bool (false)
+    - waiting: bool (false)
+    - coro: ptr (null.@cast(ptr))
+    - iocp: ext.HANDLE (0)
+    #else
+    - pipe: [i32 x 2] ({ -1... })
+    #end
+
+    + static fn new() SELF !SyncError {
+        let w = SELF {}
+        #if OS != "win"
+        if ext.pipe(@ref(w.pipe)) != 0 : throw .init
+        io.set_nonblocking(w.pipe[0], true) ! {
+            w.close_pipe()
+            throw .init
+        }
+        io.set_nonblocking(w.pipe[1], true) ! {
+            w.close_pipe()
+            throw .init
+        }
+        #end
+        return w
+    }
+
+    // Wakes the waiter; safe from any thread, and harmless without a waiter
+    + fn wake() @threadsafe {
+        #if OS == "win"
+        this.mutex.lock()
+        this.signaled = true
+        if this.waiting {
+            this.waiting = false
+            if !io.wake_coro(this.iocp, this.coro) {
+                this.mutex.unlock()
+                panic("PostQueuedCompletionStatus failed")
+            }
+        }
+        this.mutex.unlock()
+        #else
+        let token: u8 = 1
+        while true {
+            let written = ext.write(this.pipe[1], @ref(token), 1)
+            if written == 1 : return
+            let error = ext.get_errno()
+            if error == ext.EINTR : continue
+            // A full pipe already holds plenty of wakes
+            return
+        }
+        #end
+    }
+
+    // Waits for a wake; false when `timeout_ms` (0 = forever) ran out first
+    + fn wait(timeout_ms: uint (0)) bool @threadsafe {
+        #if OS == "win"
+        let current = coro.current_coro
+        if !isset(current) : return this.wait_native(timeout_ms)
+        this.mutex.lock()
+        if this.signaled {
+            this.signaled = false
+            this.mutex.unlock()
+            return true
+        }
+        this.coro = current.@cast(ptr)
+        this.iocp = io.iocp()
+        this.waiting = true
+        current.iocp_ready = false
+        this.mutex.unlock()
+
+        if timeout_ms > 0 {
+            current.sleep_deadline_ms = time.mono_ms().to(u64) + timeout_ms
+            coro.sleep_coros.append(current)
+        }
+        current.yield()
+        if timeout_ms > 0 {
+            current.sleep_deadline_ms = 0
+            coro.sleep_coros.remove_value(current)
+        }
+
+        this.mutex.lock()
+        let woke = this.signaled
+        this.signaled = false
+        this.waiting = false
+        this.mutex.unlock()
+        // The deadline resumed us while a wake packet is still queued:
+        // absorb it so it cannot resume a later wait
+        if woke && !current.iocp_ready {
+            current.yield()
+        }
+        return woke
+        #else
+        if this.drain() : return true
+        let current = coro.current_coro
+        if !isset(current) : return this.wait_native(timeout_ms)
+        while true {
+            let ev = io.await_fd(this.pipe[0], true, false, timeout_ms)
+            if ev.is_timeout() : return false
+            if this.drain() : return true
+            if !ev.is_readable() && !ev.is_closed() : return false
+        }
+        return false
+        #end
+    }
+
+    #if OS == "win"
+    fn wait_native(timeout_ms: uint) bool @threadsafe {
+        let deadline = timeout_ms > 0 ? time.mono_ms() + timeout_ms : 0
+        while true {
+            this.mutex.lock()
+            let woke = this.signaled
+            this.signaled = false
+            this.mutex.unlock()
+            if woke : return true
+            if deadline > 0 && time.mono_ms() >= deadline : return false
+            gc.unlock()
+            ext.Sleep(1)
+            gc.lock()
+        }
+        return false
+    }
+    #else
+    // Consumes every queued wake; true when there was one
+    fn drain() bool @threadsafe {
+        let buffer = [u8 x 64]{ 0... }
+        let woke = false
+        while true {
+            let count = ext.read(this.pipe[0], @ref(buffer).@cast(ptr), 64)
+            if count > 0 {
+                woke = true
+                if count < 64 : return true
+                continue
+            }
+            if count < 0 && ext.get_errno() == ext.EINTR : continue
+            return woke
+        }
+        return woke
+    }
+
+    fn wait_native(timeout_ms: uint) bool @threadsafe {
+        let wait = ext.libc_pollfd { fd: this.pipe[0], events: ext.POLLIN, revents: 0 }
+        let deadline = timeout_ms > 0 ? time.mono_ms() + timeout_ms : 0
+        while true {
+            let remaining: i32 = -1
+            if deadline > 0 {
+                let now = time.mono_ms()
+                if now >= deadline : return false
+                remaining = (deadline - now).to(i32)
+            }
+            gc.unlock()
+            let ready = ext.poll(@ref(wait), 1, remaining)
+            gc.lock()
+            if ready < 0 {
+                if ext.get_errno() == ext.EINTR : continue
+                return false
+            }
+            if ready == 0 : return false
+            if this.drain() : return true
+        }
+        return false
+    }
+
+    fn close_pipe() {
+        if this.pipe[0] >= 0 && ext.close(this.pipe[0]) != 0 {
+            core.cleanup_warning("Failed to close waker read descriptor", __FILE__, __LINE__)
+        }
+        if this.pipe[1] >= 0 && ext.close(this.pipe[1]) != 0 {
+            core.cleanup_warning("Failed to close waker write descriptor", __FILE__, __LINE__)
+        }
+        this.pipe = { -1... }
+    }
+    #end
+
+    fn gc_free() @threadsafe {
+        #if OS != "win"
+        this.close_pipe()
+        #end
+    }
+}
+
+// Wakers are reused per thread: a wait takes one, a finished wait puts it back
+global waker_cache: Array[shared Waker] (.{})
+
+fn take_waker() shared Waker !SyncError {
+    let cached = waker_cache.pop_last() !? null
+    if isset(cached) : return cached
+    return Waker.new() !>
+}
+
+fn release_waker(waker: shared Waker) {
+    if waker_cache.length < 64 : waker_cache.append(waker)
+}
