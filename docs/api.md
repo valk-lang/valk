@@ -1764,9 +1764,12 @@ alias Fd for i32
 ```js
 + class AddrInfo {
     ~ data: *libc_gen_addrinfo
+    ~+ family: i32
 
     + fn addr_len() u32
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000)) AddrInfo !NetError
+    + fn address() SocketAddress !NetError
+    + fn is_ipv6() bool
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), datagram: bool (false), numeric_only: bool (false)) AddrInfo !NetError
     + fn sock_addr() *libc_gen_sockaddr
 }
 ```
@@ -1794,11 +1797,27 @@ alias Fd for i32
 + class Socket is Closer {
     ~ fd: i32
     ~ host: String
+    ~+ ipv6: bool
     ~ port: u16
 
     + static fn client(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) Connection !NetError
     + fn close() void !io:IoError
     + static fn server(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) shared SocketServer !NetError
+}
+```
+
+```js
++ struct SocketAddress {
+    + ipv6: bool
+    + port: u16
+    + scope_id: u32
+
+    + fn equals(other: SocketAddress) bool
+    + fn ip() String
+    + static fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16 (0)) SocketAddress
+    + static fn parse(host: String, port: u16 (0)) SocketAddress !NetError
+    + static fn resolve(host: String, port: u16, timeout_ms: uint (5000)) SocketAddress !NetError
+    + fn to_string() String
 }
 ```
 
@@ -1851,6 +1870,22 @@ alias Fd for i32
 
     + static fn connection(context: shared SslServerContext) Ssl
     + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) SslServerContext !NetError
+}
+```
+
+```js
++ class UdpSocket is Closer {
+    ~ fd: i32
+    ~+ ipv6: bool
+    + read_timeout_ms: uint
+    + write_timeout_ms: uint
+
+    + static fn bind(host: String, port: u16, timeout_ms: uint (5000)) UdpSocket !NetError
+    + fn close() void !io:IoError
+    + fn local_address() SocketAddress !NetError
+    + static fn open(ipv6: bool (false)) UdpSocket !NetError
+    + fn recv_from(buf: &mut [u8]) (uint, SocketAddress) !io:IoError
+    + fn send_to(data: &[u8], to: SocketAddress) uint !io:IoError
 }
 ```
 
