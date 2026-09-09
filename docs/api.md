@@ -1236,7 +1236,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 + fn mem_usage() uint
 + fn reset_pause_durations() void
 + fn reset_shared_pause_durations() void
-~+ fn transfer_refs(from_adr: uint, to_adr: uint) void
+~+ fn transfer_refs(from: ptr, to: ptr) void
 + fn unlock() void
 ```
 

@@ -225,13 +225,34 @@ fn decl_escape_arg(decl: Decl) ?Arg {
     return null
 }
 
-fn value_collect_escape_origins(value: Value, origins: Array[Decl]) {
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) {
-        value_collect_escape_origins(graph_source, origins)
+// A bare raw pointer, as opposed to a typed '*T' or '@ref' address
+fn type_is_bare_raw_pointer(type: Type) bool {
+    return type.is_raw_pointer() && type.kind != TYPE.ptr_of && type.kind != TYPE.adr_of
+}
+
+// A call argument that is a bare raw pointer taken from managed data: what
+// the callee keeps or aliases through it is the unsafe writer's concern
+fn value_is_raw_pointer_arg(value: Value) bool {
+    return value.type != VAL.decl && type_is_bare_raw_pointer(value.rett.get_non_nullable())
+}
+
+// With 'into_managed' false the walk does not step from a bare raw pointer
+// into the managed graph it was taken from: keeping such a pointer is unsafe
+// territory for its writer, not an escape of that graph. Frame addresses and
+// raw parameters behind it are still reported.
+fn value_collect_escape_origins(value: Value, origins: Array[Decl], into_managed: bool (true)) {
+    let type = value.rett.get_non_nullable()
+    // Checked before the graph source: a raw pointer read from an object
+    // still names that object as its source
+    if !into_managed && type_is_bare_raw_pointer(type) {
+        value_collect_raw_pointer_origins(value, origins)
         return
     }
-    let type = value.rett.get_non_nullable()
+    let graph_source = value.get_graph_source()
+    if isset(graph_source) {
+        value_collect_escape_origins(graph_source, origins, into_managed)
+        return
+    }
     // A raw address taken from a graph still reaches that graph, so the walk
     // continues through it; plain data carries no provenance.
     let raw_address = type.is_raw_pointer() || type.kind == TYPE.ptr_of || type.kind == TYPE.adr_of
@@ -260,19 +281,48 @@ fn value_collect_escape_origins(value: Value, origins: Array[Decl]) {
     if value.type == VAL.call && value.rett.has_locked_refs() {
         let callee = value.value1
         let receiver = isset(callee) ? callee.value1 : null
-        if isset(receiver) : value_collect_escape_origins(receiver, origins)
+        if isset(receiver) : value_collect_escape_origins(receiver, origins, into_managed)
     }
     if value.type == VAL.error_handler {
         let call = value.get_pre_value()
-        if isset(call) : value_collect_escape_origins(call, origins)
+        if isset(call) : value_collect_escape_origins(call, origins, into_managed)
     }
     let inner = value.value1
-    if isset(inner) : value_collect_escape_origins(inner, origins)
+    if isset(inner) : value_collect_escape_origins(inner, origins, into_managed)
     let other = value.value2
-    if isset(other) : value_collect_escape_origins(other, origins)
+    if isset(other) : value_collect_escape_origins(other, origins, into_managed)
     let values = value.values
     if isset(values) {
-        each values as item : value_collect_escape_origins(item, origins)
+        each values as item : value_collect_escape_origins(item, origins, into_managed)
+    }
+}
+
+// The origins of a bare raw pointer that matter when it is kept: the raw
+// parameter or frame address it was made from, never a managed object
+fn value_collect_raw_pointer_origins(value: Value, origins: Array[Decl]) {
+    if value.type == VAL.decl {
+        let decl = value.decl
+        if !isset(decl) : return
+        if decl.is_buffer {
+            let pre = value.get_pre_value()
+            let source = isset(pre) ? pre.value2 : null
+            if isset(source) : value_collect_escape_origins(source, origins, false)
+            return
+        }
+        let arg = decl_escape_arg(decl)
+        if isset(arg) : origins.append(decl, true)
+        return
+    }
+    if value.type == VAL.global || value.type == VAL.string || value.type == VAL.null : return
+    let inner = value.value1
+    if isset(inner) && !inner.rett.has_gc_refs() : value_collect_escape_origins(inner, origins, false)
+    let other = value.value2
+    if isset(other) && !other.rett.has_gc_refs() : value_collect_escape_origins(other, origins, false)
+    let values = value.values
+    if isset(values) {
+        each values as item {
+            if !item.rett.has_gc_refs() : value_collect_escape_origins(item, origins, false)
+        }
     }
 }
 
@@ -305,7 +355,10 @@ fn value_stays_inside(value: Value, owner: Value) bool {
 }
 
 fn value_mark_summary_escape(value: Value) {
-    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
+    let origins = value.rett.build.cache.origins_buf
+    origins.clear()
+    value_collect_escape_origins(value, origins, false)
+    each origins as origin {
         let arg = decl_escape_arg(origin)
         if isset(arg) {
             arg.may_escape = true
@@ -501,6 +554,9 @@ fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Valu
     let destination = value_root_decl(target)
     each absorbs as index {
         let av = index >= skip ? (args.get(index - skip) !? null) : null
+        // A bare raw pointer moves no graph in: what it points at is the
+        // unsafe writer's concern
+        if isset(av) && value_is_raw_pointer_arg(av) : continue
         if isset(av) && (value_graph_is_unique(av, true) !>) {
             // Being kept by the callee is what moving in means, not an escape
             let param = func.args.get(index) !? null
@@ -1309,6 +1365,13 @@ fn value_tracks_unique_effects(value: Value) bool {
 }
 
 fn value_defer_unique_effect(value: Value, param: Arg, pos: Pos, force: bool (false)) {
+    // What a callee keeps of a bare raw pointer is the unsafe writer's concern,
+    // not an effect on the managed graph it was taken from
+    if value_is_raw_pointer_arg(value) {
+        let inner = value.value1
+        if isset(inner) && !inner.rett.has_gc_refs() : value_defer_unique_effect(inner, param, pos, force)
+        return
+    }
     let graph_source = value.get_graph_source()
     if isset(graph_source) {
         value_defer_unique_effect(graph_source, param, pos, force)
@@ -1349,7 +1412,12 @@ fn value_defer_arg_effects(param: Arg, value: Value, at: Exp, force: bool (false
     }
     if force && value_is_capture_free_func(unwrapped) : force = false
 
-    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
+    // Same boundary as value_mark_summary_escape: a kept raw pointer does
+    // not make the graph it was read from depend on the callee
+    let origins = value.rett.build.cache.origins_buf
+    origins.clear()
+    value_collect_escape_origins(value, origins, false)
+    each origins as origin {
         let source = decl_escape_arg(origin)
         if !isset(source) : continue
         arg_append_dependent(param, source)
