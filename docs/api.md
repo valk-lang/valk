@@ -1298,8 +1298,12 @@ alias pid_t for i32
 + fn chdir(path: String) void !io:IoError
 + fn chmod(path: String, permissions: u32) void !io:IoError
 + fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
++ fn create_dir(path: String, permissions: u32 (0c755)) void !io:IoError
 + fn cwd() String !io:IoError
 + fn delete(path: String) void !io:IoError
++ fn delete_all(path: String) void !io:IoError
++ fn delete_dir(path: String) void !io:IoError
++ fn delete_file(path: String) void !io:IoError
 + fn delete_recursive(path: String) void !io:IoError
 + fn dir_of(path: String) String
 + fn exe_dir() String !io:IoError
