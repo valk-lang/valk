@@ -1254,6 +1254,39 @@ let bytes = con.read(buffer) ! {
 }
 ```
 
+## Signals
+
+API for [valk.signal](api.md#signal)
+
+`valk.signal` delivers SIGINT, SIGTERM and the other process signals without
+running anything in signal context: the handler writes the number to a pipe
+and a dispatcher thread does the work. A signal can cancel tokens, run
+callbacks, or wake a coroutine waiting for it. `cancel_on_shutdown` watches
+the signals a service gets when it is asked to stop, which together with
+`Server.shutdown` gives a graceful stop on Ctrl-C or `kill`:
+
+```rust
+use valk.signal
+use valk.sync
+use valk.http
+
+fn main() {
+    let stop: shared sync.CancelToken = sync.CancelToken.new() ! panic("init")
+    signal.cancel_on_shutdown(stop) ! panic("signals")
+
+    let server = http.Server.new("127.0.0.1", 8080, handler)
+    let running = co server.start()
+    stop.wait()
+    server.shutdown()
+    await running ! panic("server failed")
+}
+```
+
+`wait(sig, timeout_ms)` blocks the current coroutine until the signal
+arrives, `ignore` and `restore` set the OS disposition, and `raise` sends a
+signal to the process itself. `hangup`, `quit`, `user1` and `user2` throw
+`unsupported` on Windows, where only `interrupt` and `terminate` exist.
+
 ## Access types
 
 Declarations without a marker are available throughout their package and

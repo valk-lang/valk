@@ -1,0 +1,261 @@
+// Process signals: SIGINT, SIGTERM and friends delivered to cancel tokens,
+// callbacks and waiting coroutines. The OS handler only writes the signal
+// number to a pipe; a dispatcher thread reads it and does the actual work,
+// so nothing runs in signal context
+
+use ext
+use core
+use sync
+use thread
+use coro
+use gc
+
++ enum Signal {
+    // Ctrl-C (SIGINT)
+    interrupt
+    // SIGTERM, what `kill`, systemd and Docker send
+    terminate
+    // SIGHUP; not on Windows
+    hangup
+    // SIGQUIT; not on Windows
+    quit
+    // SIGUSR1; not on Windows
+    user1
+    // SIGUSR2; not on Windows
+    user2
+}
+
+// The OS number of `sig`; `unsupported` on this platform
++ fn number(sig: Signal) i32 !SignalError {
+    if sig == Signal.interrupt : return 2
+    if sig == Signal.terminate : return 15
+    #if OS == "win"
+    throw .unsupported
+    #else
+    if sig == Signal.hangup : return 1
+    if sig == Signal.quit : return 3
+    #if OS == "macos"
+    if sig == Signal.user1 : return 30
+    return 31
+    #else
+    if sig == Signal.user1 : return 10
+    return 12
+    #end
+    #end
+}
+
+class Registration {
+    signal: Signal
+    installed: bool (false)
+    tokens: Array[shared sync.CancelToken] (.{})
+    callbacks: Array[shared fn()()] (.{})
+    waiters: Array[shared sync.Waker] (.{})
+}
+
+class SignalState {
+    entries: Array[Registration] (.{})
+    started: bool (false)
+
+    static fn new() SELF {
+        let s = SELF {}
+        s.entries.append(Registration { signal: Signal.interrupt })
+        s.entries.append(Registration { signal: Signal.terminate })
+        s.entries.append(Registration { signal: Signal.hangup })
+        s.entries.append(Registration { signal: Signal.quit })
+        s.entries.append(Registration { signal: Signal.user1 })
+        s.entries.append(Registration { signal: Signal.user2 })
+        return s
+    }
+
+    fn entry(sig: Signal) Registration {
+        each this.entries as e {
+            if e.signal == sig : return e
+        }
+        panic("Unknown signal")
+    }
+}
+
+shared state: core.Lock[SignalState] (.new(SignalState.new()) !!)
+// The self-pipe; read by the dispatcher, written by the handler
+shared pipe_read: i32 (-1)
+shared pipe_write: i32 (-1)
+
+// Cancels `token` when `sig` arrives. Several tokens may watch one signal
++ fn cancel_on(sig: Signal, token: shared sync.CancelToken) !SignalError {
+    let number = number(sig) !>
+    lock state as s {
+        ensure_started(s) !>
+        let e = s.entry(sig)
+        install(e, number) !>
+        e.tokens.append(token)
+    }
+}
+
+// Cancels `token` on SIGINT or SIGTERM (and SIGHUP where it exists): the
+// signals a service receives when it is asked to stop
++ fn cancel_on_shutdown(token: shared sync.CancelToken) !SignalError {
+    cancel_on(Signal.interrupt, token) !>
+    cancel_on(Signal.terminate, token) !>
+    #if OS != "win"
+    cancel_on(Signal.hangup, token) !>
+    #end
+}
+
+// Runs `callback` on the dispatcher thread each time `sig` arrives
++ fn on(sig: Signal, callback: shared fn()()) !SignalError {
+    let number = number(sig) !>
+    lock state as s {
+        ensure_started(s) !>
+        let e = s.entry(sig)
+        install(e, number) !>
+        e.callbacks.append(callback)
+    }
+}
+
+// Waits until `sig` arrives; false when `timeout_ms` (0 = forever) ran out
++ fn wait(sig: Signal, timeout_ms: uint (0)) bool !SignalError {
+    let number = number(sig) !>
+    let waker = sync.take_waker() ! throw .init
+    lock state as s {
+        ensure_started(s) !>
+        let e = s.entry(sig)
+        install(e, number) !>
+        e.waiters.append(waker)
+    }
+    let woke = waker.wait(timeout_ms)
+    lock state as s : s.entry(sig).waiters.remove_value(waker)
+    sync.release_waker(waker)
+    return woke
+}
+
+// Makes the process ignore `sig`, dropping what was registered for it
++ fn ignore(sig: Signal) !SignalError {
+    let number = number(sig) !>
+    lock state as s {
+        clear(s.entry(sig))
+        set_disposition(number, 1)
+    }
+}
+
+// Restores the default action of `sig`, dropping what was registered for it
++ fn restore(sig: Signal) !SignalError {
+    let number = number(sig) !>
+    lock state as s {
+        clear(s.entry(sig))
+        set_disposition(number, 0)
+    }
+}
+
+// Sends `sig` to this process
++ fn raise(sig: Signal) !SignalError {
+    let number = number(sig) !>
+    ext.raise(number)
+}
+
+fn clear(e: locked Registration) {
+    e.installed = false
+    e.tokens.clear()
+    e.callbacks.clear()
+    e.waiters.clear()
+}
+
+fn ensure_started(s: locked SignalState) !SignalError {
+    @unsafe
+    if s.started : return
+    let fds: [i32 x 2] = { -1, -1 }
+    #if OS == "win"
+    if ext._pipe(@ref(fds), 4096, ext.O_BINARY) != 0 : throw .init
+    #else
+    if ext.pipe(@ref(fds)) != 0 : throw .init
+    #end
+    pipe_read = fds[0]
+    pipe_write = fds[1]
+    thread.start(fn() { dispatch_loop() }) ! throw .init
+    s.started = true
+}
+
+fn install(e: locked Registration, number: i32) !SignalError {
+    @unsafe
+    if e.installed : return
+    #if OS == "win"
+    ext.signal(number, handler.@cast(ptr))
+    #else
+    let action = ext.sigaction_t { handler: handler.@cast(ptr) }
+    #if OS == "macos"
+    action.flags = ext.SA_RESTART
+    #else
+    action.flags = 0x10000000 // SA_RESTART
+    #end
+    if ext.sigaction(number, @ref(action), null) != 0 : throw .init
+    #end
+    e.installed = true
+}
+
+// 0 = default action, 1 = ignore
+fn set_disposition(number: i32, disposition: uint) {
+    @unsafe
+    #if OS == "win"
+    ext.signal(number, disposition.@cast(ptr))
+    #else
+    let action = ext.sigaction_t { handler: disposition.@cast(ptr) }
+    ext.sigaction(number, @ref(action), null)
+    #end
+}
+
+// Runs in signal context: only the write is allowed here
+fn handler(number: i32) {
+    @unsafe
+    let byte: u8 = number.to(u8)
+    #if OS == "win"
+    ext._write(pipe_write, @ref(byte), 1)
+    // The C runtime resets the disposition before calling the handler
+    ext.signal(number, handler.@cast(ptr))
+    #else
+    ext.write(pipe_write, @ref(byte), 1)
+    #end
+}
+
+fn dispatch_loop() {
+    @unsafe
+    let buffer: [u8 x 64] = { 0... }
+    while true {
+        gc.unlock()
+        #if OS == "win"
+        let count = ext._read(pipe_read, @ref(buffer), 64)
+        #else
+        let count = ext.read(pipe_read, @ref(buffer), 64)
+        #end
+        gc.lock()
+        if count <= 0 : continue
+        let i: uint = 0
+        while i < count.to(uint) {
+            dispatch(buffer[i].to(i32))
+            i++
+        }
+    }
+}
+
+fn dispatch(arrived: i32) {
+    let tokens: ?Array[shared sync.CancelToken] = null
+    let callbacks: ?Array[shared fn()()] = null
+    let waiters: ?Array[shared sync.Waker] = null
+    lock state as s {
+        each s.entries as e {
+            let n = number(e.signal) ! continue
+            if n != arrived : continue
+            tokens = e.tokens.copy()
+            callbacks = e.callbacks.copy()
+            waiters = e.waiters.copy()
+            e.waiters.clear()
+        }
+    }
+    if isset(tokens) {
+        each tokens as token : token.cancel()
+    }
+    if isset(waiters) {
+        each waiters as waker : waker.wake()
+    }
+    if isset(callbacks) {
+        each callbacks as callback : callback()
+    }
+}

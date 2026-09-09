@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -2055,6 +2055,21 @@ alias Fd for i32
     + fn recv_from(buf: &mut [u8]) (uint, SocketAddress) !io:IoError
     + fn send_to(data: &[u8], to: SocketAddress) uint !io:IoError
 }
+```
+
+# signal
+
+## Functions for 'signal'
+
+```js
++ fn cancel_on(sig: Signal, token: shared CancelToken) void !SignalError
++ fn cancel_on_shutdown(token: shared CancelToken) void !SignalError
++ fn ignore(sig: Signal) void !SignalError
++ fn number(sig: Signal) i32 !SignalError
++ fn on(sig: Signal, callback: shared fn()()) void !SignalError
++ fn raise(sig: Signal) void !SignalError
++ fn restore(sig: Signal) void !SignalError
++ fn wait(sig: Signal, timeout_ms: uint (0)) bool !SignalError
 ```
 
 # sync
