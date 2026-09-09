@@ -74,14 +74,14 @@ make
 
 ## Benchmarks
 
-Valk 0.6.1, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
+Valk 0.6.4, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
 | binary-tree | 19 | 0.450s (51.2 MB) | 1.300s (58.6 MB) | 2.570s (66.1 MB) |
 | binary-tree-multi | 19 | 0.220s (70.8 MB) | 0.500s (87.1 MB) | 0.670s (66.4 MB) |
-| json | 2000000 | 0.700s (2.3 MB) | 2.600s (11.4 MB) | 0.430s (2.5 MB) |
-| json-serde | sample, 50000 | 0.330s (150.4 MB) | 0.400s (227.9 MB) | 0.230s (119.2 MB) |
+| json | 2000000 | 0.700s (2.8 MB) | 2.110s (11.4 MB) | 0.430s (2.5 MB) |
+| json-serde | sample, 50000 | 0.320s (153.2 MB) | 0.360s (230.1 MB) | 0.230s (119.3 MB) |
 | lru | 1000, 11000000 | 0.640s (2.4 MB) | 0.760s (3.5 MB) | 0.450s (2.6 MB) |
 | merkletrees | 18 | 0.510s (90.9 MB) | 1.170s (70.4 MB) | 1.670s (66.3 MB) |
 | nsieve | 13 | 0.770s (80.1 MB) | 0.820s (141.7 MB) | 0.790s (80.5 MB) |

@@ -2,7 +2,7 @@ package main
 
 import (
 	"crypto/md5"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"strconv"

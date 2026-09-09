@@ -27,9 +27,10 @@ depth on a separate worker. The four-worker `spectral-norm-multi` variant uses
 input `8000`, matching the programming-language-benchmarks workload.
 
 The `json` benchmark measures dynamic JSON values, while `json-serde` uses the
-larger file-oriented serialization workload.
+larger file-oriented serialization workload. Both Go implementations use
+`encoding/json/v2` with its default options.
 
-Requirements are the Valk compiler at the repository root, Go, Rust with
+Requirements are the Valk compiler at the repository root, Go 1.27+, Rust with
 Cargo, and GNU `/usr/bin/time`.
 
 The larger seven-scenario garbage-collector comparison has its own runner for

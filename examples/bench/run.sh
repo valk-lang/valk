@@ -205,6 +205,11 @@ measure_benchmark() {
     for ((run = 1; run <= runs; run++)); do
         (cd "$source_dir" && /usr/bin/time -f '%e %M' -o "$timing" \
             "$binary" "${args[@]}") >"$output"
+        if ! cmp -s "$output" "$measure_dir/$benchmark-$language-reference"; then
+            printf 'Unstable benchmark output: %s (%s), run %s\n' \
+                "$benchmark" "$language" "$run" >&2
+            exit 1
+        fi
         read -r elapsed rss <"$timing"
         printf '%s\n' "$elapsed" >>"$times"
         printf '%s\n' "$rss" >>"$memories"
