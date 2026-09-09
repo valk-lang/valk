@@ -1635,12 +1635,52 @@ Note: `valk.template` works at runtime and therefore cannot detect incorrect tem
 
 ## Crypto
 
-Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256, and secure random values.
+Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256,
+SHA-384, SHA-512, HMAC, PBKDF2, HKDF, and secure random values.
 
 ```rust
 use valk.crypto
 
 let hash = crypto.Blake2b.hash_string("test") ! panic("Failed to hash")
+let hex = crypto.sha512_encode("test")
+```
+
+The hash functions share the `Hasher` interface: `update` feeds input in
+pieces and `finish` writes the digest. `crypto.hash` and `crypto.hash_hex`
+take a `HashAlgorithm` and do it in one call; `hex_encode` and `hex_decode`
+convert raw digests:
+
+```rust
+use valk.crypto
+
+let sha = crypto.hasher(crypto.HashAlgorithm.sha256)
+sha.update("ab")
+sha.update("c")
+let digest = [u8]{ 0 x sha.digest_size() }
+sha.finish(digest)
+println(crypto.hex_encode(digest)) // same as crypto.sha256_encode("abc")
+```
+
+`Hmac` signs and verifies messages with any of those hashes. Compare MACs
+and tokens with `verify` or `constant_time_equals`, never with `==`:
+
+```rust
+use valk.crypto
+
+let signature = crypto.Hmac.sign_hex(crypto.HashAlgorithm.sha256, "secret", payload)
+if !crypto.Hmac.verify(crypto.HashAlgorithm.sha256, "secret", payload, received) {
+    println("bad signature")
+}
+```
+
+`pbkdf2` turns a password into a key of any length, and `hkdf` derives keys
+from material that already has entropy, such as a shared secret:
+
+```rust
+use valk.crypto
+
+let key = crypto.pbkdf2(crypto.HashAlgorithm.sha256, password, salt, 600000, 32) ! panic("bad input")
+let session = crypto.hkdf(crypto.HashAlgorithm.sha256, secret, "", "session v1", 32) ! panic("bad input")
 ```
 
 Password hashing/verify example:

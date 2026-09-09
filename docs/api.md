@@ -917,10 +917,23 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void !CryptoError
 + fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
 + fn bcrypt_verify(password: String, hash: String) bool
++ fn constant_time_equals(a: &[u8], b: &[u8]) bool
++ fn digest_size(algorithm: HashAlgorithm) uint
++ fn hash(algorithm: HashAlgorithm, data: &[u8]) String
++ fn hash_hex(algorithm: HashAlgorithm, data: &[u8]) String
++ fn hasher(algorithm: HashAlgorithm) Hasher
++ fn hex_decode(text: &[u8]) String !CryptoError
++ fn hex_encode(data: &[u8]) String
++ fn hkdf(algorithm: HashAlgorithm, ikm: &[u8], salt: &[u8], info: &[u8], length: uint) String !CryptoError
++ fn hkdf_expand(algorithm: HashAlgorithm, prk: &[u8], info: &[u8], length: uint) String !CryptoError
++ fn hkdf_extract(algorithm: HashAlgorithm, salt: &[u8], ikm: &[u8]) String
 + fn md5_encode(input: String) String
++ fn pbkdf2(algorithm: HashAlgorithm, password: &[u8], salt: &[u8], iterations: uint, length: uint) String !CryptoError
 + fn random_bytes(length: uint) String
 + fn sha1_encode(str: String) String
 + fn sha256_encode(str: String) String
++ fn sha384_encode(str: String) String
++ fn sha512_encode(str: String) String
 ```
 
 ## Classes for 'crypto'
@@ -935,22 +948,75 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```
 
 ```js
-+ class Sha1 {
-    + fn add_hash_data(data: *[u8 x 20]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
-    + fn add_string_data(str: String) void
-    + fn final() [u8 x 20]
++ interface Hasher {
+    + fn block_size() uint
+    + fn digest_size() uint
+    + fn finish(out: &mut [u8]) uint
     + fn reset() void
+    + fn update(data: &[u8]) void
 }
 ```
 
 ```js
-+ class Sha256 {
++ class Hmac is Hasher {
+    + fn block_size() uint
+    + fn digest_size() uint
+    + fn finish(out: &mut [u8]) uint
+    + static fn new(algorithm: HashAlgorithm, key: &[u8]) Hmac
+    + fn reset() void
+    + static fn sign(algorithm: HashAlgorithm, key: &[u8], data: &[u8]) String
+    + static fn sign_hex(algorithm: HashAlgorithm, key: &[u8], data: &[u8]) String
+    + fn update(data: &[u8]) void
+    + static fn verify(algorithm: HashAlgorithm, key: &[u8], data: &[u8], mac: &[u8]) bool
+}
+```
+
+```js
++ class Md5 is Hasher {
+    + fn block_size() uint
+    + fn digest_size() uint
+    + fn finish(out: &mut [u8]) uint
+    + fn reset() void
+    + fn update(data: &[u8]) void
+}
+```
+
+```js
++ class Sha1 is Hasher {
+    + fn add_hash_data(data: *[u8 x 20]) void
+    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
+    + fn add_string_data(str: String) void
+    + fn block_size() uint
+    + fn digest_size() uint
+    + fn final() [u8 x 20]
+    + fn finish(out: &mut [u8]) uint
+    + fn reset() void
+    + fn update(data: &[u8]) void
+}
+```
+
+```js
++ class Sha256 is Hasher {
     + fn add_hash_data(data: *[u8 x 32]) void
     + fn add_raw_data_unsafe(data: *[u8], len: uint) void
     + fn add_string_data(str: String) void
+    + fn block_size() uint
+    + fn digest_size() uint
     + fn final() [u8 x 32]
+    + fn finish(out: &mut [u8]) uint
     + fn reset() void
+    + fn update(data: &[u8]) void
+}
+```
+
+```js
++ class Sha512 is Hasher {
+    + fn block_size() uint
+    + fn digest_size() uint
+    + fn finish(out: &mut [u8]) uint
+    + fn reset() void
+    + static fn sha384() Sha512
+    + fn update(data: &[u8]) void
 }
 ```
 
