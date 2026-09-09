@@ -795,6 +795,7 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn await_coro(coro: Coro) void
 + fn await_last() void
++ fn stack_cache_release() void
 + fn stack_guard_init(is_main: bool, stack_low: uint) void
 ```
 
