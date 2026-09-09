@@ -56,10 +56,23 @@ check_stat() {
 }
 
 check_stats() {
+    local file_loc parse_loc
+    file_loc=$(loc_value "$1" File)
+    parse_loc=$(loc_value "$1" Parse)
+    if [[ ! "$file_loc" =~ ^[0-9]+$ || ! "$parse_loc" =~ ^[0-9]+$ ]] \
+        || [ "$file_loc" -eq 0 ] || [ "$parse_loc" -lt "$file_loc" ]; then
+        echo "# Invalid File LOC / Parse LOC statistics"
+        echo "$1"
+        exit 1
+    fi
     check_stat "$1" "Function AST + IR: " "s"
     check_stat "$1" "Object generation: " "s"
     check_stat "$1" "Linking: " "s"
     check_stat "$1" "Compiler memory usage: " " mb"
+}
+
+loc_value() {
+    printf '%s\n' "$1" | sed -n "s/^.*$2 LOC: \([0-9][0-9]*\).*$/\1/p"
 }
 
 echo ""
@@ -485,5 +498,56 @@ for form in paren block call index ternary; do
     fi
 done
 
+echo "> File LOC and Parse LOC count generic instances and function reparses"
+loc_dir="$workdir/loc"
+mkdir -p "$loc_dir"
+loc_base=$("$VALK" build "$DIR/loc-generics.valk" --lint --no-warn -v 2>&1) || { echo "$loc_base"; exit 1; }
+check_stats "$loc_base"
+for ending in crlf no-final-newline; do
+    case "$ending" in
+        crlf) awk '{ printf "%s\r\n", $0 }' "$DIR/loc-generics.valk" > "$loc_dir/$ending.valk" ;;
+        no-final-newline) printf '%s' "$(cat "$DIR/loc-generics.valk")" > "$loc_dir/$ending.valk" ;;
+    esac
+    loc_out=$("$VALK" build "$loc_dir/$ending.valk" --lint --no-warn -v 2>&1) || { echo "$loc_out"; exit 1; }
+    check_stats "$loc_out"
+    if [ "$(loc_value "$loc_out" File)" -ne "$(loc_value "$loc_base" File)" ] \
+        || [ "$(loc_value "$loc_out" Parse)" -ne "$(loc_value "$loc_base" Parse)" ]; then
+        echo "# Line endings changed LOC counts: $ending"
+        echo "$loc_base"
+        echo "$loc_out"
+        exit 1
+    fi
+done
+for kind in class function ordinary; do
+    case "$kind" in
+        class) pattern='    value: T'; extra=3 ;;
+        function) pattern='    return value'; extra=3 ;;
+        ordinary) pattern='    let a'; extra=1 ;;
+    esac
+    awk -v pattern="$pattern" 'index($0, pattern) == 1 { print "" } { print }' "$DIR/loc-generics.valk" > "$loc_dir/$kind.valk"
+    loc_out=$("$VALK" build "$loc_dir/$kind.valk" --lint --no-warn -v 2>&1) || { echo "$loc_out"; exit 1; }
+    check_stats "$loc_out"
+    if [ "$(loc_value "$loc_out" File)" -ne "$(( $(loc_value "$loc_base" File) + 1 ))" ] \
+        || [ "$(loc_value "$loc_out" Parse)" -ne "$(( $(loc_value "$loc_base" Parse) + extra ))" ]; then
+        echo "# Incorrect LOC delta for $kind"
+        echo "$loc_base"
+        echo "$loc_out"
+        exit 1
+    fi
+done
+
+loc_base=$("$VALK" build "$DIR/loc-reparse.valk" --no-warn -v -o "$loc_dir/reparse$EXE_SUFFIX" 2>&1) || { echo "$loc_base"; exit 1; }
+awk '/^    return Item/ { print "" } { print }' "$DIR/loc-reparse.valk" > "$loc_dir/reparse.valk"
+loc_out=$("$VALK" build "$loc_dir/reparse.valk" --no-warn -v -o "$loc_dir/reparse$EXE_SUFFIX" 2>&1) || { echo "$loc_out"; exit 1; }
+check_stats "$loc_base"
+check_stats "$loc_out"
+if [ "$(loc_value "$loc_out" File)" -ne "$(( $(loc_value "$loc_base" File) + 1 ))" ] \
+    || [ "$(loc_value "$loc_out" Parse)" -ne "$(( $(loc_value "$loc_base" Parse) + 2 ))" ]; then
+    echo "# Function reparses must add their declaration LOC again"
+    echo "$loc_base"
+    echo "$loc_out"
+    exit 1
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 32"
+echo "# Test count: 33"

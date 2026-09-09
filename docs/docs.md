@@ -112,6 +112,10 @@ valk build main.valk -o ./main
 ./main
 ```
 
+Add `-v` to see build statistics. `File LOC` counts physical lines in loaded
+source files. `Parse LOC` also includes the base declaration's lines for each
+new generic instance and the function's lines each time it is parsed again.
+
 `main` can take the command line arguments; the first one is the program path.
 
 ```rust
