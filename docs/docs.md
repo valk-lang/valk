@@ -319,6 +319,36 @@ let c : Map[uint] = b
 
 Full `HashMap` API: [core](api.md#core)
 
+## Sets, deques and heaps
+
+`HashSet` holds unique values, hashed like `HashMap` keys. `Deque` is a
+double-ended queue with amortized constant-time pushes and pops at both ends
+and indexed access from the front. `Heap` is a binary heap that pops the
+smallest item first, or the item a comparator puts first.
+
+```rust
+let seen = HashSet[String]{ "a", "b" }
+seen.add("c")                 // chainable; insert() tells whether the value was new
+seen.has("a")                 // true
+seen.remove("b")              // true when it was present
+let both = seen.intersection(HashSet[String]{ "a", "z" })
+let all = seen + HashSet[String]{ "z" }   // union
+each seen as value {}
+
+let queue = Deque[uint]{ 2, 3 }
+queue.push_front(1)
+queue.push_back(4)
+let first = queue.pop_front() ! panic("empty")   // 1
+let last = queue.pop_back() ! panic("empty")     // 4
+queue[0]                      // indexed from the front
+
+let heap = Heap[int]{ 5, 1, 4 }
+let smallest = heap.pop() ! panic("empty")       // 1
+let by_length = Heap[String].new(fn(a: String, b: String) bool { return a.bytes < b.bytes })
+```
+
+Full API: [core](api.md#core)
+
 ## Typehints
 
 Variables, properties, globals, and function arguments can have explicit type hints. When the expected type is known, `.` can construct a value of that type without repeating its name.
@@ -803,7 +833,7 @@ fn main() {
 }
 ```
 
-`$eq` customizes `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` already honours `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
+`$add` and `$sub` customize `+` and `-` (and `+=`, `-=`) for a class; the method takes the right-hand value and returns the result. `$eq` customizes `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` already honours `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
 
 Generic specializations remain distinct and invariant even when their type
 arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`

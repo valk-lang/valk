@@ -273,6 +273,27 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```
 
 ```js
++ class Deque[T] {
+    + fn clear() Deque[T]
+    + fn clone() Deque[T]
+    + fn contains(value: T) bool
+    + fn copy() Deque[T]
+    + fn get(index: uint) T !LookupError
+    + fn is_empty() bool
+    + get length: uint
+    + static fn new(capacity: uint (0)) Deque[T]
+    + fn peek_back() T !LookupError
+    + fn peek_front() T !LookupError
+    + fn pop_back() T !LookupError
+    + fn pop_front() T !LookupError
+    + fn push_back(item: T) Deque[T]
+    + fn push_front(item: T) Deque[T]
+    + fn set(index: uint, value: T) void
+    + fn to_array() Array[T]
+}
+```
+
+```js
 + class FlatMap[K, T] {
     + fn clear() FlatMap[K, T]
     + fn clone() FlatMap[K, T]
@@ -319,6 +340,44 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 + extend HashMap[String, T] {
     + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
+}
+```
+
+```js
++ class HashSet[T] {
+    + fn add(value: T) HashSet[T]
+    + fn add_all(values: Array[T]) HashSet[T]
+    + fn clear() HashSet[T]
+    + fn clone() HashSet[T]
+    + fn copy() HashSet[T]
+    + fn difference(other: HashSet[T]) HashSet[T]
+    + fn equals(other: HashSet[T]) bool
+    + fn has(value: T) bool
+    + fn insert(value: T) bool
+    + fn intersection(other: HashSet[T]) HashSet[T]
+    + fn is_disjoint(other: HashSet[T]) bool
+    + fn is_subset_of(other: HashSet[T]) bool
+    + fn items() Array[T]
+    + get length: uint
+    + static fn new(capacity: uint (0)) HashSet[T]
+    + fn remove(value: T) bool
+    + fn union(other: HashSet[T]) HashSet[T]
+}
+```
+
+```js
++ class Heap[T] {
+    + fn clear() Heap[T]
+    + fn copy() Heap[T]
+    + fn drain() Array[T]
+    + fn is_empty() bool
+    + get length: uint
+    + static fn new(before: fn(T, T)(bool)) Heap[T]
+    + fn peek() T !LookupError
+    + fn pop() T !LookupError
+    + fn push(item: T) Heap[T]
+    + fn replace(item: T) T !LookupError
+    + fn to_array() Array[T]
 }
 ```
 
