@@ -244,6 +244,7 @@ Prefer `append` over `prepend` when possible; appending is significantly faster.
 ```rust
 let arr = Array[int]{ 1, 2, 3 } // Create array
 let arr : Array[int] = .{ 1, 2, 3 } // Using typehint
+let zeros = Array[int]{ 0 x 10 }  // Ten copies of one value (Array.fill)
 // Basics
 arr.append(4)
 arr.prepend(5)
@@ -391,6 +392,7 @@ queue.push_back(4)
 let first = queue.pop_front() ! panic("empty")   // 1
 let last = queue.pop_back() ! panic("empty")     // 4
 queue[0]                      // indexed from the front
+queue[0] = 9 !!               // assignment throws `missing` out of range
 
 let heap = Heap[int]{ 5, 1, 4 }
 let smallest = heap.pop() ! panic("empty")       // 1
@@ -398,6 +400,14 @@ let by_length = Heap[String].new(fn(a: String, b: String) bool { return a.bytes 
 ```
 
 Full API: [core](api.md#core)
+
+An indexed assignment goes through the type's `$offset_assign` hook, and
+that hook may throw. The handler then follows the assignment: `deque[i] = v
+!!`, `deque[i] = v ! { ... }` or `deque[i] = v !? _`, and without one the
+error passes to the caller like any other. When the right-hand side itself
+throws, the handler belongs to that value; parenthesize it to give the
+assignment its own: `deque[i] = (compute() !? 0) !!`. `Type{ v x n }` builds
+any class with a `static fn fill(count, value)`, as `Array` has.
 
 ## Typehints
 

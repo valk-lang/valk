@@ -132,6 +132,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
     + fn equal_ignore_order(array: Array[T]) bool
+    + static fn fill(count: uint, value: T) Array[T]
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     + fn filter_self(func: ?fn(T)(bool) (null)) Array[T]
     + fn find(func: fn(T)(bool)) T !LookupError
@@ -288,7 +289,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn pop_front() T !LookupError
     + fn push_back(item: T) Deque[T]
     + fn push_front(item: T) Deque[T]
-    + fn set(index: uint, value: T) void
+    + fn set(index: uint, value: T) void !LookupError
     + fn to_array() Array[T]
 }
 ```
