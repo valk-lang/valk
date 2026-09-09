@@ -1,0 +1,487 @@
+use core
+
+// Recursive-descent parser for the pattern syntax (see docs: Regular
+// expressions). Works on code points; positions in errors are byte offsets
+
+class Parser {
+    pattern: String
+    pos: uint (0)
+    flags: uint (0)
+    groups: uint (0)
+    names: Array[String] (.{})
+
+    static fn parse(pattern: String, flags: uint) (Node, uint, Array[String]) !RegexError {
+        let p = Parser { pattern: pattern, flags: flags }
+        let node = p.parse_alternation() !>
+        if p.pos < pattern.bytes {
+            if p.peek() == ')' : p.fail("Unmatched ')'") !>
+            p.fail("Unexpected character") !>
+        }
+        return (node, p.groups, p.names)
+    }
+
+    fn fail(message: String) !RegexError {
+        throw .syntax { message: message, position: this.pos }
+    }
+
+    fn at_end() bool { return this.pos >= this.pattern.bytes }
+
+    // Current code point without consuming it; 0 at the end
+    fn peek() u32 {
+        if this.at_end() : return 0
+        return core.unicode_read(this.pattern, this.pos).code
+    }
+
+    fn peek_byte_at(offset: uint) u8 {
+        if this.pos + offset >= this.pattern.bytes : return 0
+        return this.pattern[this.pos + offset]
+    }
+
+    fn next() u32 {
+        let ch = core.unicode_read(this.pattern, this.pos)
+        this.pos += ch.count
+        return ch.code
+    }
+
+    fn parse_alternation() Node !RegexError {
+        let saved_flags = this.flags
+        let first = this.parse_concat() !>
+        if this.at_end() || this.peek() != '|' {
+            this.flags = saved_flags
+            return first
+        }
+        let alt = Node { kind: NODE_ALT }
+        alt.children.append(first)
+        while !this.at_end() && this.peek() == '|' {
+            this.next()
+            alt.children.append(this.parse_concat() !>)
+        }
+        this.flags = saved_flags
+        return alt
+    }
+
+    fn parse_concat() Node !RegexError {
+        let concat = Node { kind: NODE_CONCAT }
+        while !this.at_end() {
+            let c = this.peek()
+            if c == '|' || c == ')' : break
+            let atom = this.parse_repeat() !>
+            if isset(atom) : concat.children.append(atom)
+        }
+        if concat.children.length == 1 : return concat.children[0]
+        if concat.children.length == 0 : return Node { kind: NODE_EMPTY }
+        return concat
+    }
+
+    // An atom with its quantifier; null for a flag group like `(?i)`
+    fn parse_repeat() ?Node !RegexError {
+        let start = this.pos
+        let atom = this.parse_atom() !>
+        if !isset(atom) : return null
+        while !this.at_end() {
+            let c = this.peek()
+            let min: uint = 0
+            let max: uint = 0
+            if c == '*' {
+                this.next()
+                max = REPEAT_UNBOUNDED
+            } else if c == '+' {
+                this.next()
+                min = 1
+                max = REPEAT_UNBOUNDED
+            } else if c == '?' {
+                this.next()
+                max = 1
+            } else if c == '{' {
+                let bounds = this.parse_bounds() !>
+                if !isset(bounds) : break
+                min = bounds[0]
+                max = bounds[1]
+            } else {
+                break
+            }
+            if atom.kind == NODE_EMPTY || atom.kind == NODE_ASSERT {
+                this.pos = start
+                this.fail("Nothing to repeat") !>
+            }
+            let greedy = true
+            if !this.at_end() && this.peek() == '?' {
+                this.next()
+                greedy = false
+            }
+            let repeat = Node { kind: NODE_REPEAT, min: min, max: max, greedy: greedy }
+            repeat.children.append(atom)
+            atom = repeat
+        }
+        return atom
+    }
+
+    // `{n}`, `{n,}`, `{n,m}`; null (and no consumption) when `{` is literal
+    fn parse_bounds() ?Array[uint] !RegexError {
+        let start = this.pos
+        this.next() // {
+        let parsed_min = this.parse_number()
+        if !isset(parsed_min) {
+            this.pos = start
+            return null
+        }
+        let min: uint = parsed_min
+        let max: uint = min
+        if !this.at_end() && this.peek() == ',' {
+            this.next()
+            if !this.at_end() && this.peek() == '}' {
+                max = REPEAT_UNBOUNDED
+            } else {
+                let m = this.parse_number()
+                if !isset(m) {
+                    this.pos = start
+                    return null
+                }
+                let parsed_max: uint = m
+                max = parsed_max
+            }
+        }
+        if this.at_end() || this.peek() != '}' {
+            this.pos = start
+            return null
+        }
+        this.next()
+        if max != REPEAT_UNBOUNDED && max < min : this.fail("Repetition bounds out of order") !>
+        if min > REPEAT_LIMIT || (max != REPEAT_UNBOUNDED && max > REPEAT_LIMIT) : this.fail("Repetition count too large") !>
+        return Array[uint]{ min, max }
+    }
+
+    fn parse_number() ?uint {
+        let value: uint = 0
+        let digits: uint = 0
+        while !this.at_end() {
+            let c = this.peek()
+            if c < '0' || c > '9' : break
+            value = value * 10 + (c - '0').to(uint)
+            if value > 100000 : value = 100000
+            digits++
+            this.next()
+        }
+        if digits == 0 : return null
+        return value
+    }
+
+    fn parse_atom() ?Node !RegexError {
+        let c = this.next()
+        if c == '(' : return this.parse_group() !>
+        if c == '[' : return this.parse_class() !>
+        if c == '.' {
+            return Node { kind: NODE_ANY, flags: this.flags }
+        }
+        if c == '^' {
+            return Node { kind: NODE_ASSERT, assert: (this.flags & FLAG_MULTILINE) != 0 ? ASSERT_LINE_START : ASSERT_TEXT_START }
+        }
+        if c == '$' {
+            return Node { kind: NODE_ASSERT, assert: (this.flags & FLAG_MULTILINE) != 0 ? ASSERT_LINE_END : ASSERT_TEXT_END }
+        }
+        if c == '\\' : return this.parse_escape(false) !>
+        if c == '*' || c == '+' || c == '?' {
+            this.pos--
+            this.fail("Nothing to repeat") !>
+        }
+        return Node { kind: NODE_CHAR, code: c, flags: this.flags }
+    }
+
+    fn parse_group() ?Node !RegexError {
+        let capture = true
+        let name: ?String = null
+        if !this.at_end() && this.peek() == '?' {
+            this.next()
+            let c = this.peek()
+            if c == ':' {
+                this.next()
+                capture = false
+            } else if c == 'P' && this.peek_byte_at(1) == '<' {
+                this.next()
+                this.next()
+                name = this.parse_name() !>
+            } else if c == '<' && this.peek_byte_at(1) != '=' && this.peek_byte_at(1) != '!' {
+                this.next()
+                name = this.parse_name() !>
+            } else if c == '=' || c == '!' || c == '<' {
+                this.pos--
+                throw .unsupported { message: "Lookaround is not supported", position: this.pos }
+            } else {
+                // Inline flags: (?i) or (?i:...)
+                let on = true
+                let flags = this.flags
+                while !this.at_end() {
+                    let f = this.next()
+                    if f == ')' {
+                        this.flags = flags
+                        return null
+                    }
+                    if f == ':' {
+                        let saved = this.flags
+                        this.flags = flags
+                        let inner = this.parse_alternation() !>
+                        this.expect_close() !>
+                        this.flags = saved
+                        let group = Node { kind: NODE_GROUP }
+                        group.children.append(inner)
+                        return group
+                    }
+                    if f == '-' : on = false
+                    else if f == 'i' : flags = on ? flags | FLAG_CASELESS : flags & ~FLAG_CASELESS
+                    else if f == 'm' : flags = on ? flags | FLAG_MULTILINE : flags & ~FLAG_MULTILINE
+                    else if f == 's' : flags = on ? flags | FLAG_DOTALL : flags & ~FLAG_DOTALL
+                    else {
+                        this.pos--
+                        this.fail("Unknown group flag") !>
+                    }
+                }
+                this.fail("Unterminated group") !>
+            }
+        }
+        let index: uint = 0
+        if capture {
+            this.groups++
+            index = this.groups
+            this.names.append(isset(name) ? name : "")
+        }
+        let saved = this.flags
+        let inner = this.parse_alternation() !>
+        this.expect_close() !>
+        this.flags = saved
+        let group = Node { kind: NODE_GROUP, group: index }
+        group.children.append(inner)
+        return group
+    }
+
+    fn expect_close() !RegexError {
+        if this.at_end() || this.peek() != ')' : this.fail("Missing ')'") !>
+        this.next()
+    }
+
+    fn parse_name() String !RegexError {
+        let start = this.pos
+        while !this.at_end() {
+            let c = this.peek()
+            if c == '>' : break
+            let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+            if !ok : this.fail("Invalid group name") !>
+            this.next()
+        }
+        if this.at_end() : this.fail("Unterminated group name") !>
+        let name = this.pattern.part(start, this.pos - start)
+        if name.bytes == 0 : this.fail("Empty group name") !>
+        this.next()
+        each this.names as existing {
+            if existing == name : this.fail("Duplicate group name") !>
+        }
+        return name
+    }
+
+    // After a backslash. `in_class` limits what is allowed
+    fn parse_escape(in_class: bool) Node !RegexError {
+        if this.at_end() : this.fail("Trailing backslash") !>
+        let c = this.next()
+        if c == 'd' || c == 'D' || c == 'w' || c == 'W' || c == 's' || c == 'S' {
+            let set = CharSet {}
+            add_class_escape(set, c)
+            set.finish()
+            return Node { kind: NODE_SET, set: set, flags: this.flags }
+        }
+        if !in_class {
+            if c == 'b' : return Node { kind: NODE_ASSERT, assert: ASSERT_WORD }
+            if c == 'B' : return Node { kind: NODE_ASSERT, assert: ASSERT_NOT_WORD }
+            if c == 'A' : return Node { kind: NODE_ASSERT, assert: ASSERT_TEXT_START }
+            if c == 'z' : return Node { kind: NODE_ASSERT, assert: ASSERT_TEXT_END }
+            if c >= '1' && c <= '9' {
+                this.pos--
+                throw .unsupported { message: "Backreferences are not supported", position: this.pos }
+            }
+        }
+        if c == 'p' || c == 'P' {
+            this.pos--
+            throw .unsupported { message: "Unicode property classes are not supported", position: this.pos }
+        }
+        let code = this.escape_code(c) !>
+        return Node { kind: NODE_CHAR, code: code, flags: this.flags }
+    }
+
+    // The code point of a simple escape; `c` is the character after `\`
+    fn escape_code(c: u32) u32 !RegexError {
+        if c == 'n' : return 10
+        if c == 't' : return 9
+        if c == 'r' : return 13
+        if c == 'f' : return 12
+        if c == 'v' : return 11
+        if c == 'a' : return 7
+        if c == 'e' : return 27
+        if c == '0' : return 0
+        if c == 'x' {
+            if !this.at_end() && this.peek() == '{' {
+                this.next()
+                let value = this.parse_hex(8) !>
+                if this.at_end() || this.peek() != '}' : this.fail("Missing '}' in \\x{...}") !>
+                this.next()
+                return value
+            }
+            return this.parse_hex(2) !>
+        }
+        if c == 'u' : return this.parse_hex(4) !>
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+            this.pos--
+            this.fail("Unknown escape") !>
+        }
+        return c
+    }
+
+    fn parse_hex(max_digits: uint) u32 !RegexError {
+        let value: u32 = 0
+        let digits: uint = 0
+        while digits < max_digits && !this.at_end() {
+            let c = this.peek()
+            let d: u32 = 0
+            if c >= '0' && c <= '9' : d = c - '0'
+            else if c >= 'a' && c <= 'f' : d = c - 'a' + 10
+            else if c >= 'A' && c <= 'F' : d = c - 'A' + 10
+            else : break
+            value = value * 16 + d
+            digits++
+            this.next()
+        }
+        if digits == 0 : this.fail("Expected hex digits") !>
+        if value > 0x10ffff : this.fail("Code point out of range") !>
+        return value
+    }
+
+    fn parse_class() Node !RegexError {
+        let set = CharSet {}
+        if !this.at_end() && this.peek() == '^' {
+            this.next()
+            set.negated = true
+        }
+        let first = true
+        while true {
+            if this.at_end() : this.fail("Missing ']'") !>
+            let c = this.next()
+            if c == ']' && !first : break
+            first = false
+            let low: u32 = c
+            let is_range_start = true
+            if c == '[' && !this.at_end() && this.peek() == ':' {
+                let posix = this.parse_posix_class() !>
+                if isset(posix) {
+                    set.add_set(posix)
+                    continue
+                }
+            }
+            if c == '\\' {
+                let escaped = this.parse_escape(true) !>
+                if escaped.kind == NODE_SET {
+                    let inner = escaped.set
+                    if isset(inner) {
+                        if inner.negated : set.add_set(invert(inner))
+                        else : set.add_set(inner)
+                    }
+                    continue
+                }
+                low = escaped.code
+            }
+            // A range?
+            if !this.at_end() && this.peek() == '-' && this.peek_byte_at(1) != ']' && this.pos + 1 < this.pattern.bytes {
+                this.next()
+                let h = this.next()
+                let high = h
+                if h == '\\' {
+                    let escaped = this.parse_escape(true) !>
+                    if escaped.kind == NODE_SET : this.fail("Invalid range end") !>
+                    high = escaped.code
+                } else if h == '[' && !this.at_end() && this.peek() == ':' {
+                    this.fail("Invalid range end") !>
+                }
+                if high < low : this.fail("Range out of order") !>
+                set.add(low, high)
+            } else {
+                set.add(low, low)
+            }
+        }
+        set.finish()
+        return Node { kind: NODE_SET, set: set, flags: this.flags }
+    }
+
+    // `[:name:]` inside a class, after the `[`; null (nothing consumed) when
+    // it is not one
+    fn parse_posix_class() ?CharSet !RegexError {
+        let start = this.pos
+        this.next() // :
+        let negate = false
+        if !this.at_end() && this.peek() == '^' {
+            this.next()
+            negate = true
+        }
+        let name_start = this.pos
+        while !this.at_end() && this.peek() >= 'a' && this.peek() <= 'z' : this.next()
+        let name = this.pattern.part(name_start, this.pos - name_start)
+        if this.peek() != ':' || this.peek_byte_at(1) != ']' {
+            this.pos = start
+            return null
+        }
+        this.next()
+        this.next()
+        let set = CharSet {}
+        if name == "alpha" { set.add('a', 'z'); set.add('A', 'Z') }
+        else if name == "digit" { set.add('0', '9') }
+        else if name == "alnum" { set.add('a', 'z'); set.add('A', 'Z'); set.add('0', '9') }
+        else if name == "upper" { set.add('A', 'Z') }
+        else if name == "lower" { set.add('a', 'z') }
+        else if name == "space" { set.add(9, 13); set.add(' ', ' ') }
+        else if name == "blank" { set.add(9, 9); set.add(' ', ' ') }
+        else if name == "punct" { set.add('!', '/'); set.add(':', '@'); set.add('[', '`'); set.add('{', '~') }
+        else if name == "xdigit" { set.add('0', '9'); set.add('a', 'f'); set.add('A', 'F') }
+        else if name == "word" { set.add('a', 'z'); set.add('A', 'Z'); set.add('0', '9'); set.add('_', '_') }
+        else if name == "cntrl" { set.add(0, 31); set.add(127, 127) }
+        else if name == "print" { set.add(32, 126) }
+        else if name == "graph" { set.add(33, 126) }
+        else {
+            this.pos = start
+            this.fail("Unknown POSIX class") !>
+        }
+        set.finish()
+        if negate : return invert(set)
+        return set
+    }
+}
+
+// \d \w \s and their negations, ASCII-only
+fn add_class_escape(set: CharSet, c: u32) {
+    let base = CharSet {}
+    if c == 'd' || c == 'D' {
+        base.add('0', '9')
+    } else if c == 'w' || c == 'W' {
+        base.add('a', 'z')
+        base.add('A', 'Z')
+        base.add('0', '9')
+        base.add('_', '_')
+    } else {
+        base.add(9, 13)
+        base.add(' ', ' ')
+    }
+    base.finish()
+    if c == 'D' || c == 'W' || c == 'S' : set.add_set(invert(base))
+    else : set.add_set(base)
+}
+
+// The complement of a finished, non-negated set as explicit ranges
+fn invert(set: CharSet) CharSet {
+    let out = CharSet {}
+    let next: u32 = 0
+    let i: uint = 0
+    while i < set.ranges.length {
+        let low = set.ranges[i]
+        let high = set.ranges[i + 1]
+        if low > next : out.add(next, low - 1)
+        next = high + 1
+        i += 2
+    }
+    if next <= 0x10ffff : out.add(next, 0x10ffff)
+    out.finish()
+    return out
+}

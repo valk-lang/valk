@@ -1,0 +1,332 @@
+use core
+
+// Pike VM: runs every thread of the NFA in lock step over the input, so the
+// time is bounded by (input length × program length) whatever the pattern.
+// Threads are ordered by priority, which gives leftmost-first (Perl-style)
+// match selection
+
+value SLOT_UNSET (uint.$max)
+
+class ThreadList {
+    // Program counters of the live threads, in priority order
+    pcs: Array[uint]
+    threads: uint (0)
+    // Capture slots of every thread, `slots` values per thread
+    caps: Array[uint]
+    // Sparse set of program counters visited in this step
+    dense: Array[uint]
+    sparse: Array[uint]
+    count: uint (0)
+
+    static fn new(program_length: uint, slots: uint) SELF {
+        return SELF {
+            pcs: filled(program_length, 0)
+            caps: filled(program_length * slots, SLOT_UNSET)
+            dense: filled(program_length, 0)
+            sparse: filled(program_length, 0)
+        }
+    }
+
+    fn clear() $inline {
+        this.count = 0
+        this.threads = 0
+    }
+
+    fn contains(pc: uint) bool $inline {
+        let i = this.sparse[pc]
+        return i < this.count && this.dense[i] == pc
+    }
+
+    fn add(pc: uint) $inline {
+        this.sparse[pc] = this.count
+        this.dense[this.count] = pc
+        this.count++
+    }
+}
+
+// Closure stack entries: a program counter, or `RESTORE_BIT | slot`
+// preceded by the value to put back
+value RESTORE_BIT (1 << 62)
+
+class Vm {
+    program: Array[Inst]
+    slots: uint
+    text: String
+    multiline: bool
+    current: ThreadList
+    next: ThreadList
+    scratch: Array[uint]
+    stack: Array[uint]
+    matched: bool (false)
+    result: Array[uint]
+    // Bytes that can begin a match; empty when every byte can
+    first: Array[u8]
+
+    static fn new(program: Array[Inst], slots: uint) SELF {
+        return SELF {
+            program: program
+            slots: slots
+            text: ""
+            multiline: false
+            current: ThreadList.new(program.length, slots)
+            next: ThreadList.new(program.length, slots)
+            stack: filled(program.length * 3 + 8, 0)
+            scratch: filled(slots, SLOT_UNSET)
+            result: filled(slots, SLOT_UNSET)
+            first: first_bytes(program)
+        }
+    }
+
+    // Searches `text` from `start`; `anchored` only allows a match at
+    // `start`; `prefix` (when set) must begin every match. Returns the
+    // capture slots or null
+    fn exec(text: String, start: uint, anchored: bool, prefix: ?String) ?Array[uint] {
+        this.text = text
+        this.matched = false
+        this.current.clear()
+        this.next.clear()
+        let length = text.bytes
+        let pos = start
+        if isset(prefix) && !anchored {
+            pos = text.index_of(prefix, pos) ! return null
+        }
+        while true {
+            // No thread survived: the visited set is stale, reset it
+            if this.current.threads == 0 : this.current.clear()
+            if !this.matched && (!anchored || pos == start) {
+                if this.current.threads == 0 && !anchored && pos > start {
+                    // Nothing alive: jump to the next possible start
+                    if isset(prefix) {
+                        let found = text.index_of(prefix, pos) ! return null
+                        pos = found
+                    } else if this.first.length > 0 {
+                        let first = this.first
+                        while pos < length && first[text[pos].to(uint)] == 0 : pos++
+                    }
+                }
+                let i: uint = 0
+                while i < this.slots {
+                    this.scratch[i] = SLOT_UNSET
+                    i++
+                }
+                this.add_thread(this.current, 0, pos)
+            }
+            if this.current.threads == 0 {
+                if this.matched || anchored || pos >= length : break
+                pos++
+                continue
+            }
+            let code: u32 = 0
+            let width: uint = 0
+            let at_end = pos >= length
+            if !at_end {
+                let byte = text[pos]
+                if byte < 0x80 {
+                    code = byte.to(u32)
+                    width = 1
+                } else {
+                    let ch = core.unicode_read(text, pos)
+                    code = ch.code
+                    width = ch.count
+                }
+            }
+            this.step(pos, at_end, code, width)
+            let swap = this.current
+            this.current = this.next
+            this.next = swap
+            this.next.clear()
+            if at_end : break
+            pos += width
+        }
+        if !this.matched : return null
+        return this.result.copy()
+    }
+
+    fn step(pos: uint, at_end: bool, code: u32, width: uint) {
+        let list = this.current
+        let program = this.program
+        let slots = this.slots
+        let count = list.threads
+        let t: uint = 0
+        while t < count {
+            let pc = list.pcs[t]
+            let inst = program[pc]
+            let op = inst.op
+            if op == OP_MATCH {
+                // Lower-priority threads are cut
+                let i: uint = 0
+                let base = t * slots
+                while i < slots {
+                    this.result[i] = list.caps[base + i]
+                    i++
+                }
+                this.matched = true
+                break
+            }
+            if at_end {
+                t++
+                continue
+            }
+            let ok = false
+            if op == OP_CHAR : ok = code == inst.code
+            else if op == OP_SET {
+                let set = inst.set
+                if isset(set) : ok = set.has(code)
+            } else if op == OP_ANY : ok = code != 10
+            else if op == OP_ANY_NL : ok = true
+            if ok {
+                let i: uint = 0
+                let base = t * slots
+                while i < slots {
+                    this.scratch[i] = list.caps[base + i]
+                    i++
+                }
+                this.add_thread(this.next, pc + 1, pos + width)
+            }
+            t++
+        }
+    }
+
+    // Follows the epsilon closure from `pc` at `pos`, appending consuming
+    // instructions to `list` with the captures in `scratch`
+    fn add_thread(list: ThreadList, start_pc: uint, pos: uint) {
+        let program = this.program
+        let slots = this.slots
+        // Fast path: a consuming instruction with nothing to follow
+        let first = program[start_pc]
+        if first.op < OP_SPLIT {
+            if list.contains(start_pc) : return
+            list.add(start_pc)
+            this.push_thread(list, start_pc)
+            return
+        }
+        let stack = this.stack
+        let top: uint = 0
+        stack[top++] = start_pc
+        while top > 0 {
+            let entry = stack[--top]
+            if (entry & RESTORE_BIT) != 0 {
+                this.scratch[entry & ~RESTORE_BIT] = stack[--top]
+                continue
+            }
+            let pc = entry
+            if list.contains(pc) : continue
+            list.add(pc)
+            let inst = program[pc]
+            let op = inst.op
+            if op == OP_JMP {
+                stack[top++] = inst.x
+            } else if op == OP_SPLIT {
+                stack[top++] = inst.y
+                stack[top++] = inst.x
+            } else if op == OP_SAVE {
+                stack[top++] = this.scratch[inst.x]
+                stack[top++] = RESTORE_BIT | inst.x
+                this.scratch[inst.x] = pos
+                stack[top++] = pc + 1
+            } else if op == OP_ASSERT {
+                if this.check_assert(inst.x, pos) : stack[top++] = pc + 1
+            } else {
+                this.push_thread(list, pc)
+            }
+        }
+    }
+
+    fn push_thread(list: ThreadList, pc: uint) $inline {
+        let index = list.threads
+        list.pcs[index] = pc
+        let base = index * this.slots
+        let i: uint = 0
+        while i < this.slots {
+            list.caps[base + i] = this.scratch[i]
+            i++
+        }
+        list.threads = index + 1
+    }
+
+    fn check_assert(kind: uint, pos: uint) bool {
+        let text = this.text
+        let length = text.bytes
+        if kind == ASSERT_TEXT_START : return pos == 0
+        if kind == ASSERT_TEXT_END : return pos == length
+        if kind == ASSERT_LINE_START : return pos == 0 || text[pos - 1] == 10
+        if kind == ASSERT_LINE_END : return pos == length || text[pos] == 10
+        let before = pos > 0 && is_word_byte(text[pos - 1])
+        let after = pos < length && is_word_byte(text[pos])
+        let boundary = before != after
+        if kind == ASSERT_WORD : return boundary
+        return !boundary
+    }
+}
+
+fn is_word_byte(b: u8) bool $inline {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+fn filled(count: uint, value: uint) Array[uint] {
+    let out = Array[uint].new(count)
+    let i: uint = 0
+    while i < count {
+        out.append(value)
+        i++
+    }
+    return out
+}
+
+// The table of bytes that can start a match, or an empty array when the
+// pattern can match the empty string or start with any character
+fn first_bytes(program: Array[Inst]) Array[u8] {
+    let table = filled_u8(256, 0)
+    let visited = filled_u8(program.length, 0)
+    let stack = Array[uint]{ 0 }
+    while stack.length > 0 {
+        let pc = stack.pop_last() ! break
+        if visited[pc] == 1 : continue
+        visited[pc] = 1
+        let inst = program[pc]
+        let op = inst.op
+        if op == OP_JMP {
+            stack.append(inst.x)
+        } else if op == OP_SPLIT {
+            stack.append(inst.x)
+            stack.append(inst.y)
+        } else if op == OP_SAVE || op == OP_ASSERT {
+            stack.append(pc + 1)
+        } else if op == OP_CHAR {
+            if inst.code < 128 : table[inst.code.to(uint)] = 1
+            else : mark_high(table)
+        } else if op == OP_SET {
+            let set = inst.set
+            if !isset(set) : return Array[u8]{}
+            let b: uint = 0
+            while b < 128 {
+                if set.ascii[b] == 1 : table[b] = 1
+                b++
+            }
+            // Anything non-ASCII may be in the set; be conservative
+            if set.negated || set.ranges.length == 0 || set.ranges[set.ranges.length - 1] >= 128 : mark_high(table)
+        } else {
+            // ANY, ANY_NL or MATCH: no skipping possible
+            return Array[u8]{}
+        }
+    }
+    return table
+}
+
+fn mark_high(table: Array[u8]) {
+    let b: uint = 128
+    while b < 256 {
+        table[b] = 1
+        b++
+    }
+}
+
+fn filled_u8(count: uint, value: u8) Array[u8] {
+    let out = Array[u8].new(count)
+    let i: uint = 0
+    while i < count {
+        out.append(value)
+        i++
+    }
+    return out
+}

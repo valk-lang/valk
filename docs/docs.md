@@ -196,6 +196,47 @@ each s as byte { } // Iterate bytes (u8)
 
 Full `String` API: [core](api.md#core)
 
+## Regular expressions
+
+API for [valk.regex](api.md#regex)
+
+`Regex.new(pattern, flags)` compiles a pattern once; the flags are `i` for
+case-insensitive, `m` for `^` and `$` at line boundaries, and `s` for `.`
+matching newlines. Matching never backtracks: every pattern runs in time
+proportional to the text length times the pattern size, so untrusted
+patterns cannot hang a program. Offsets are byte offsets into the text.
+
+```rust
+use valk.regex
+
+let re = regex.Regex.new("(?P<user>\\w+)@(?P<host>[\\w.]+)") ! panic("bad pattern")
+let m = re.find("mail me@example.com today") ?! return
+println(m.str())                       // me@example.com
+println(m.named("host") ?? "")         // example.com
+println(m.get(1) ?? "")                // me
+println(m.start)                       // 5
+
+each re.find_all("a@b.c x@y.z") as found : println(found.str())
+re.is_match("nothing here")           // false
+re.replace("me@home you@work", "${host}:${user}")   // home:me work:you
+re.replace_with(text, fn(m: regex.Match) String { return m.str().upper() })
+regex.Regex.new("\\s*,\\s*").!.split("a , b,c")     // ["a", "b", "c"]
+regex.escape("1+1=2")                  // 1\+1=2
+```
+
+Supported syntax: literals and escapes (`\n \t \xHH \x{HHHH}`), `.`,
+classes `[a-z]`, `[^...]`, `\d \w \s` and their negations (ASCII), POSIX
+classes `[[:alpha:]]`, anchors `^ $ \A \z`, word boundaries `\b \B`, groups
+`(...)`, `(?:...)`, `(?P<name>...)`, `(?<name>...)`, inline flags `(?i)` and
+`(?i:...)`, quantifiers `* + ? {n} {n,} {n,m}` with a `?` suffix for lazy
+matching, and alternation `|`. Alternation is leftmost-first like Perl and
+RE2: `a|ab` on `ab` matches `a`. Backreferences, lookaround and `\p{...}`
+classes are not supported and fail with `unsupported`; malformed patterns
+fail with `syntax` and carry a `message` and byte `position`. Case folding
+covers ASCII and simple one-to-one Unicode mappings. Patterns match code
+points, and a byte that is not valid UTF-8 matches as the code point of its
+value.
+
 ## Arrays
 
 Prefer `append` over `prepend` when possible; appending is significantly faster.

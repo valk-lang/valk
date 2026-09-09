@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [regex](#regex) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -2054,6 +2054,50 @@ alias Fd for i32
     + static fn open(ipv6: bool (false)) UdpSocket !NetError
     + fn recv_from(buf: &mut [u8]) (uint, SocketAddress) !io:IoError
     + fn send_to(data: &[u8], to: SocketAddress) uint !io:IoError
+}
+```
+
+# regex
+
+## Functions for 'regex'
+
+```js
++ fn escape(text: String) String
++ fn is_match(pattern: String, text: String) bool !RegexError
+```
+
+## Classes for 'regex'
+
+```js
++ class Match {
+    + text: String
+
+    + fn count() uint
+    + get end: uint
+    + fn expand(template: String) String
+    + fn get(index: uint) ?String
+    + fn named(name: String) ?String
+    + fn range(index: uint) (uint, uint) !LookupError
+    + get start: uint
+    + fn str() String
+}
+```
+
+```js
++ class Regex {
+    + pattern: String
+
+    + fn find(text: String, start: uint (0)) ?Match
+    + fn find_all(text: String, limit: uint (0)) Array[Match]
+    + fn group_count() uint
+    + fn group_index(name: String) uint !LookupError
+    + fn group_names() Array[String]
+    + fn is_match(text: String) bool
+    + fn match_at(text: String, start: uint (0)) ?Match
+    + static fn new(pattern: String, flags: String ("")) Regex !RegexError
+    + fn replace(text: String, replacement: String, limit: uint (0)) String
+    + fn replace_with(text: String, func: fn(Match)(String), limit: uint (0)) String
+    + fn split(text: String, limit: uint (0)) Array[String]
 }
 ```
 
