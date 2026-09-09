@@ -1219,7 +1219,6 @@ alias pid_t for i32
 
 ```js
 type EnvCloneFn (fnptr(ptr)(ptr))
-type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 + value collect (ext.valk_gc_collect)
 + value collect_shared (ext.valk_gc_collect_shared)
 ```
@@ -1228,7 +1227,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
 
 ```js
 + fn alloc(size: uint) GcPtr
-~+ fn alloc_typed(size: uint, props: ?fnptr(ptr, *Lifo, fn(ptr, *Lifo)())()) GcPtr
+~+ fn alloc_typed(size: uint, layout: ?ptr) GcPtr
 + fn clone_closure_env(env: ?ptr) ?ptr
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
