@@ -1,6 +1,7 @@
 use io
 use core
 use ext
+use sync
 
 + class Connection is io.Reader, io.Writer, io.Closer {
     ~ fd: Fd
@@ -12,6 +13,7 @@ use ext
     - closed: bool (false)
     - socket_closed: bool (false)
     - interrupted: bool (false)
+    - cancel: ?shared sync.CancelToken (null)
 
     + static fn new(fd: Fd) Connection !NetError {
         #if OS == "linux" || OS == "macos"
@@ -40,7 +42,31 @@ use ext
             ssl.close(this.write_timeout_ms) ! {}
         }
         this.socket_closed = true
+        this.unwatch()
         Socket.close_fd(this.fd) ! throw .os
+    }
+
+    // Interrupts pending and later reads and writes when `token` is
+    // cancelled: they throw `cancelled`. The registration lasts until
+    // `close()`
+    + fn set_cancel(token: shared sync.CancelToken) SELF {
+        this.unwatch()
+        this.cancel = token
+        if token.watch_fd(this.fd) : this.interrupt()
+        return this
+    }
+
+    fn unwatch() {
+        let cancel = this.cancel
+        if isset(cancel) {
+            cancel.unwatch_fd(this.fd)
+            this.cancel = null
+        }
+    }
+
+    fn is_cancelled() bool {
+        let cancel = this.cancel
+        return isset(cancel) && cancel.is_cancelled()
     }
 
     // Wake pending I/O and make later I/O fail, without releasing the
@@ -48,13 +74,7 @@ use ext
     fn interrupt() {
         if this.socket_closed || this.interrupted : return
         this.interrupted = true
-        ext.shutdown(this.fd, 2)
-        #if OS == "win"
-        // Winsock's shutdown() does not complete a pending overlapped receive;
-        // cancelling the descriptor's I/O does (see io.cancel_overlap)
-        @unsafe
-        ext.CancelIoEx(this.fd, null)
-        #end
+        io.interrupt_fd(this.fd)
     }
 
     fn gc_free() {
@@ -87,6 +107,7 @@ use ext
     // Sends all of `data`; returns the number of bytes written
     + fn write(data: &[u8]) uint !io.IoError {
         if this.closed : throw .closed
+        if this.is_cancelled() : throw .cancelled
 
         let ssl = this.ssl
         let remaining = data
@@ -94,14 +115,21 @@ use ext
             let sent: uint = 0
             if isset(ssl) {
                 sent = ssl.write(remaining, this.write_timeout_ms) ! {
+                    if this.is_cancelled() : throw .cancelled
                     if error_is(E.code, timeout) : throw .timeout
                     if error_is(E.code, closed) : throw .closed
                     throw .write
                 }
             } else {
-                sent = write(this.fd, remaining, this.write_timeout_ms) !>
+                sent = write(this.fd, remaining, this.write_timeout_ms) ! {
+                    if this.is_cancelled() : throw .cancelled
+                    throw E
+                }
             }
-            if sent == 0 || sent > remaining.length : throw .write
+            if sent == 0 || sent > remaining.length {
+                if this.is_cancelled() : throw .cancelled
+                throw .write
+            }
             remaining = remaining.view(sent, remaining.length - sent)
         }
         return data.length
@@ -110,18 +138,26 @@ use ext
     // Throws `closed` when the peer closed its end
     + fn read(buf: &mut [u8]) uint !io.IoError {
         if this.closed : throw .closed
+        if this.is_cancelled() : throw .cancelled
         let ssl = this.ssl
         let bytes: uint = 0
         if isset(ssl) {
             bytes = ssl.recv(buf, this.read_timeout_ms) ! {
+                if this.is_cancelled() : throw .cancelled
                 if error_is(E.code, timeout) : throw .timeout
                 if error_is(E.code, closed) : throw .closed
                 throw .read
             }
         } else {
-            bytes = recv(this.fd, buf, this.read_timeout_ms) !>
+            bytes = recv(this.fd, buf, this.read_timeout_ms) ! {
+                if this.is_cancelled() : throw .cancelled
+                throw E
+            }
         }
-        if bytes == 0 && buf.length > 0 : throw .closed
+        if bytes == 0 && buf.length > 0 {
+            if this.is_cancelled() : throw .cancelled
+            throw .closed
+        }
         return bytes
     }
 

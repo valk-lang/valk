@@ -1595,6 +1595,7 @@ alias Fd for i32
 + fn await_socket_fd(fd: i32, read: bool, write: bool, timeout_ms: uint (0)) PollEvent
 + fn close(fd: i32) void !IoError
 + fn copy(reader: Reader, writer: Writer, chunk_size: uint (65536)) uint !IoError
++ fn interrupt_fd(fd: i32) void
 + fn print(msg: String) void
 + fn println(msg: String) void
 + fn read(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError
@@ -1886,6 +1887,7 @@ alias Fd for i32
     + fn close() void !io:IoError
     + static fn new(fd: i32) Connection !NetError
     + fn read(buf: &mut [u8]) uint !io:IoError
+    + fn set_cancel(token: shared CancelToken) Connection
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError

@@ -1238,6 +1238,22 @@ let value = queue.recv(0, stop) ! {
 }
 ```
 
+A token also reaches socket I/O. `Connection.set_cancel(token)` interrupts a
+read or write that is blocked when the token is cancelled, and every later
+one; they throw the `cancelled` I/O error. The registration is dropped by
+`close()`, so close the connection before the token outlives it:
+
+```rust
+let con = listener.accept(3000) ! return
+con.set_cancel(stop)
+let buffer = [u8]{ 0 x 1024 }
+let bytes = con.read(buffer) ! {
+    if error_is(E.code, cancelled) : println("cancelled")
+    con.close() ! {}
+    return
+}
+```
+
 ## Access types
 
 Declarations without a marker are available throughout their package and
