@@ -1559,6 +1559,50 @@ fn main() {
 }
 ```
 
+## Compression
+
+API for [valk.compress](api.md#compress)
+
+DEFLATE, zlib and gzip compression, plus the CRC-32 and Adler-32 checksums.
+zlib is DEFLATE with a small header and an Adler-32 trailer (what HTTP calls
+`deflate`); gzip adds a header and a CRC-32 trailer (`.gz` files, HTTP `gzip`).
+
+```rust
+use valk.compress
+
+fn main() {
+    let text = "hello hello hello hello"
+    let packed = compress.gzip(text)          // also: deflate(), zlib()
+    let unpacked = compress.gunzip(packed) ! panic("Corrupt data") // inflate(), unzlib()
+    println(unpacked == text)
+
+    let crc = compress.crc32("123456789")      // 0xcbf43926
+    let adler = compress.adler32("Wikipedia")  // 0x11e60398
+}
+```
+
+Levels run from 0 (store only) to 9; the default is 6. Decompression takes an
+optional `max_size` to bound the output of untrusted data. Streams of any size
+go through `Compressor` (an `io.Writer`) and `Decompressor` (an `io.Reader`):
+
+```rust
+use valk.compress
+use valk.fs
+use valk.io
+
+fn main() {
+    let file = fs.stream("log.txt.gz", fs.OpenOptions { read: false, write: true, create: true }) ! panic("Cannot open")
+    let writer = compress.Compressor.new(file, compress.Format.gzip)
+    writer.write("first line\n") ! panic("Write failed")
+    writer.close() ! panic("Write failed") // writes the last block and the trailer
+    file.close() ! panic("Close failed")
+
+    let input = fs.stream("log.txt.gz") ! panic("Cannot open")
+    let reader = compress.Decompressor.new(input, compress.Format.gzip)
+    let text = io.read_all(reader) ! panic("Corrupt data")
+}
+```
+
 ## Embed
 
 With `#embed` & `#embed_dir` you can embed files/assets into your code as strings at compile time. All paths are relative to your `valk.json` config.

@@ -1,0 +1,618 @@
+use io
+use mem
+
+// DEFLATE encoding (RFC 1951): LZ77 matching over a 32 KiB window with
+// hash chains, then one Huffman block per 64K symbols using whichever of
+// stored, fixed or dynamic codes is smallest
+
+value deflate_window (32768)
+value deflate_hash_bits (15)
+value deflate_hash_size (32768)
+value deflate_min_match (3)
+value deflate_max_match (258)
+value deflate_block_symbols (65000)
+value deflate_end_of_block (256)
+
+// Per-level search effort: how many chain entries are tried, and the match
+// length at which searching stops early
+global deflate_max_chain: [u16 x 10] ({ 0, 4, 8, 16, 32, 64, 128, 256, 512, 1024 })
+global deflate_nice_length: [u16 x 10] ({ 0, 16, 32, 32, 64, 128, 258, 258, 258, 258 })
+
+// The default compression level
++ value COMPRESS_DEFAULT_LEVEL (6)
+
+// Writes bits least significant first into a ByteBuffer
+struct BitWriter {
+    out: ByteBuffer
+    bit_buf: uint (0)
+    bit_count: uint (0)
+
+    fn put_bits(value: uint, count: uint) {
+        @unsafe
+        this.bit_buf = this.bit_buf | (value << this.bit_count)
+        this.bit_count += count
+        while this.bit_count >= 8 {
+            this.out.write_byte((this.bit_buf & 0xff).to(u8))
+            this.bit_buf = this.bit_buf >> 8
+            this.bit_count -= 8
+        }
+    }
+
+    // Huffman codes are stored most significant bit first
+    fn put_code(code: uint, length: uint) {
+        @unsafe
+        this.put_bits(reverse_bits(code, length), length)
+    }
+
+    fn flush() {
+        @unsafe
+        if this.bit_count > 0 {
+            this.out.write_byte((this.bit_buf & 0xff).to(u8))
+        }
+        this.bit_buf = 0
+        this.bit_count = 0
+    }
+}
+
+// Code lengths and codes for one alphabet
+struct Codes {
+    lengths: [u8 x 288] ({ 0... })
+    codes: [u16 x 288] ({ 0... })
+
+    // Length-limited Huffman code lengths from symbol frequencies
+    fn assign_lengths(freq: ptr, n: uint, max_length: uint) {
+        @unsafe
+        let i: uint = 0
+        while i < 288 {
+            this.lengths[i] = 0
+            i++
+        }
+        // Used symbols sorted by frequency (insertion sort: n <= 288)
+        let order = [u16 x 288]{ 0... }
+        let used: uint = 0
+        i = 0
+        while i < n {
+            let f = @ptrv(freq, u32, i)
+            if f != 0 {
+                let k = used
+                while k > 0 && @ptrv(freq, u32, order[k - 1].to(uint)) > f {
+                    order[k] = order[k - 1]
+                    k--
+                }
+                order[k] = i.to(u16)
+                used++
+            }
+            i++
+        }
+        if used == 0 : return
+        if used == 1 {
+            this.lengths[order[0].to(uint)] = 1
+            return
+        }
+        // Huffman tree: leaves are items 0..used, internal nodes follow.
+        // Both the sorted leaves and the created nodes form queues in
+        // increasing weight, so the two lightest items are at the fronts
+        let weights = [uint x 576]{ 0... }
+        let parent = [u16 x 576]{ 0... }
+        let has_parent = [u8 x 576]{ 0... }
+        i = 0
+        while i < used {
+            weights[i] = @ptrv(freq, u32, order[i].to(uint)).to(uint)
+            i++
+        }
+        let queue = [u16 x 288]{ 0... }
+        let queue_head: uint = 0
+        let queue_len: uint = 0
+        let leaf: uint = 0
+        let next_node = used
+        while (used - leaf) + (queue_len - queue_head) >= 2 {
+            let picked = [uint x 2]{ 0... }
+            let p: uint = 0
+            while p < 2 {
+                let take_leaf = leaf < used
+                if take_leaf && queue_head < queue_len {
+                    take_leaf = weights[leaf] <= weights[queue[queue_head].to(uint)]
+                }
+                if take_leaf {
+                    picked[p] = leaf
+                    leaf++
+                } else {
+                    picked[p] = queue[queue_head].to(uint)
+                    queue_head++
+                }
+                p++
+            }
+            let node = next_node
+            next_node++
+            weights[node] = weights[picked[0]] + weights[picked[1]]
+            parent[picked[0]] = node.to(u16)
+            parent[picked[1]] = node.to(u16)
+            has_parent[picked[0]] = 1
+            has_parent[picked[1]] = 1
+            queue[queue_len] = node.to(u16)
+            queue_len++
+        }
+        // Depth of every leaf, capped at max_length
+        let count = [uint x 16]{ 0... }
+        i = 0
+        while i < used {
+            let depth: uint = 0
+            let item = i
+            while has_parent[item] != 0 {
+                item = parent[item].to(uint)
+                depth++
+            }
+            if depth > max_length : depth = max_length
+            count[depth] = count[depth] + 1
+            i++
+        }
+        // Restore the Kraft equality after capping (miniz's method)
+        let total: uint = 0
+        let l: uint = 1
+        while l <= max_length {
+            total += count[l] << (max_length - l)
+            l++
+        }
+        while total != (1 << max_length) {
+            count[max_length] = count[max_length] - 1
+            l = max_length - 1
+            while l > 0 {
+                if count[l] > 0 {
+                    count[l] = count[l] - 1
+                    count[l + 1] = count[l + 1] + 2
+                    break
+                }
+                l--
+            }
+            total--
+        }
+        // Rarest symbols get the longest lengths
+        let length: uint = max_length
+        let remaining = count[length]
+        i = 0
+        while i < used {
+            while remaining == 0 {
+                length--
+                remaining = count[length]
+            }
+            this.lengths[order[i].to(uint)] = length.to(u8)
+            remaining--
+            i++
+        }
+    }
+
+    // Canonical codes from the lengths
+    fn assign_codes(n: uint) {
+        @unsafe
+        let count = [uint x 16]{ 0... }
+        let i: uint = 0
+        while i < n {
+            let l = this.lengths[i].to(uint)
+            count[l] = count[l] + 1
+            i++
+        }
+        count[0] = 0
+        let next = [uint x 16]{ 0... }
+        let code: uint = 0
+        let len: uint = 1
+        while len < 16 {
+            code = (code + count[len - 1]) << 1
+            next[len] = code
+            len++
+        }
+        i = 0
+        while i < n {
+            let l = this.lengths[i].to(uint)
+            if l != 0 {
+                this.codes[i] = next[l].to(u16)
+                next[l] = next[l] + 1
+            }
+            i++
+        }
+    }
+}
+
+// Length and distance symbols with their extra bits
+fn length_symbol(length: uint) uint {
+    @unsafe
+    let i: uint = 28
+    while length_base[i].to(uint) > length : i--
+    return i
+}
+
+fn dist_symbol(distance: uint) uint {
+    @unsafe
+    let i: uint = 29
+    while dist_base[i].to(uint) > distance : i--
+    return i
+}
+
+// Compresses a buffer whose first `history` bytes were already emitted (they
+// only serve as match sources)
+class Deflater {
+    level: uint
+    // Hash chains: head per hash, previous position per window slot (both
+    // store position + 1; 0 is empty)
+    head: ptr (mem.calloc(deflate_hash_size * 4))
+    prev: ptr (mem.calloc(deflate_window * 4))
+    // Block symbols: literal < 256, or (1 << 31) | (length << 16) | distance
+    symbols: ptr (mem.calloc(deflate_block_symbols * 4))
+    symbol_count: uint (0)
+    lit_freq: ptr (mem.calloc(288 * 4))
+    dist_freq: ptr (mem.calloc(32 * 4))
+    lit_codes: Codes (Codes {})
+    dist_codes: Codes (Codes {})
+    writer: BitWriter
+
+    static fn new(out: ByteBuffer, level: uint) Deflater {
+        @unsafe
+        if level > 9 : level = 9
+        return Deflater {
+            level: level
+            writer: BitWriter { out: out }
+        }
+    }
+
+    fn gc_free() {
+        @unsafe
+        mem.free(this.head)
+        mem.free(this.prev)
+        mem.free(this.symbols)
+        mem.free(this.lit_freq)
+        mem.free(this.dist_freq)
+    }
+
+    fn reset_chains() {
+        @unsafe
+        mem.clear_bytes(this.head, deflate_hash_size * 4)
+        mem.clear_bytes(this.prev, deflate_window * 4)
+    }
+
+    fn hash(data: ptr, pos: uint) uint {
+        @unsafe
+        let v = (@ptrv(data, u8, pos).to(uint) << 16) | (@ptrv(data, u8, pos + 1).to(uint) << 8) | @ptrv(data, u8, pos + 2).to(uint)
+        return ((v * 2654435761) >> (32 - deflate_hash_bits)) & (deflate_hash_size - 1)
+    }
+
+    fn insert(data: ptr, pos: uint) {
+        @unsafe
+        let h = this.hash(data, pos)
+        @ptrv(this.prev, u32, pos & (deflate_window - 1)) = @ptrv(this.head, u32, h)
+        @ptrv(this.head, u32, h) = (pos + 1).to(u32)
+    }
+
+    // Compresses data[start..length) with data[0..start) as history. The
+    // last block is marked final when `final` is set
+    fn compress(data: ptr, length: uint, start: uint, final: bool) {
+        @unsafe
+        if this.level == 0 {
+            this.write_stored_blocks(data, start, length, final)
+            return
+        }
+        this.reset_chains()
+        let max_chain = deflate_max_chain[this.level].to(uint)
+        let nice = deflate_nice_length[this.level].to(uint)
+
+        // History positions take part in matching
+        let pos: uint = 0
+        while pos + deflate_min_match <= start {
+            this.insert(data, pos)
+            pos++
+        }
+        pos = start
+        let block_start = start
+        while pos < length {
+            let best_length: uint = 0
+            let best_distance: uint = 0
+            if pos + deflate_min_match <= length {
+                let h = this.hash(data, pos)
+                let cur = @ptrv(this.head, u32, h).to(uint)
+                let limit = length - pos
+                if limit > deflate_max_match : limit = deflate_max_match
+                let chain = max_chain
+                while cur != 0 && chain > 0 {
+                    let candidate = cur - 1
+                    let distance = pos - candidate
+                    if distance > deflate_window || distance == 0 : break
+                    // Compare from the end of the best match first: a
+                    // mismatch there rules the candidate out cheaply
+                    if @ptrv(data, u8, candidate + best_length) == @ptrv(data, u8, pos + best_length) {
+                        let n: uint = 0
+                        while n < limit && @ptrv(data, u8, candidate + n) == @ptrv(data, u8, pos + n) : n++
+                        if n > best_length {
+                            best_length = n
+                            best_distance = distance
+                            if n >= nice : break
+                        }
+                    }
+                    cur = @ptrv(this.prev, u32, candidate & (deflate_window - 1)).to(uint)
+                    chain--
+                }
+            }
+            if best_length >= deflate_min_match {
+                this.add_match(best_length, best_distance)
+                let end = pos + best_length
+                while pos < end {
+                    if pos + deflate_min_match <= length : this.insert(data, pos)
+                    pos++
+                }
+            } else {
+                this.add_literal(@ptrv(data, u8, pos))
+                if pos + deflate_min_match <= length : this.insert(data, pos)
+                pos++
+            }
+            if this.symbol_count >= deflate_block_symbols {
+                this.write_block(data, block_start, pos, false)
+                block_start = pos
+            }
+        }
+        this.write_block(data, block_start, pos, final)
+    }
+
+    fn add_literal(byte: u8) {
+        @unsafe
+        @ptrv(this.symbols, u32, this.symbol_count++) = byte.to(u32)
+        let slot = this.lit_freq.@offset(byte.to(uint) * 4)
+        @ptrv(slot, u32) = @ptrv(slot, u32) + 1
+    }
+
+    fn add_match(length: uint, distance: uint) {
+        @unsafe
+        @ptrv(this.symbols, u32, this.symbol_count++) = ((1 << 31) | (length << 16) | distance).to(u32)
+        let ls = this.lit_freq.@offset((257 + length_symbol(length)) * 4)
+        @ptrv(ls, u32) = @ptrv(ls, u32) + 1
+        let ds = this.dist_freq.@offset(dist_symbol(distance) * 4)
+        @ptrv(ds, u32) = @ptrv(ds, u32) + 1
+    }
+
+    fn write_stored_blocks(data: ptr, start: uint, end: uint, final: bool) {
+        @unsafe
+        let pos = start
+        while true {
+            let count = end - pos
+            if count > 65535 : count = 65535
+            let last = final && pos + count == end
+            this.writer.put_bits(last ? 1 : 0, 1)
+            this.writer.put_bits(0, 2)
+            this.writer.flush()
+            let out = this.writer.out
+            out.write_u16_le(count.to(u16))
+            out.write_u16_le((count ^ 0xffff).to(u16))
+            out.reserve(count)
+            mem.copy_bytes(data.@offset(pos), out.spare(count).data, count)
+            out.advance(count)
+            pos += count
+            if pos >= end : break
+        }
+    }
+
+    // Emits the buffered symbols as the smallest of a stored, fixed or
+    // dynamic block; data[start..end) are the bytes they encode
+    fn write_block(data: ptr, start: uint, end: uint, final: bool) {
+        @unsafe
+        let lit_end = this.lit_freq.@offset(deflate_end_of_block * 4)
+        @ptrv(lit_end, u32) = 1
+
+        // Dynamic code lengths and their cost
+        this.lit_codes.assign_lengths(this.lit_freq, 286, 15)
+        this.dist_codes.assign_lengths(this.dist_freq, 30, 15)
+        let dynamic_bits = this.dynamic_header_bits() + this.symbol_bits(false)
+        let fixed_bits = 3 + this.symbol_bits(true)
+        let stored_bits = (end - start) * 8 + 40 * ((end - start) / 65535 + 1)
+
+        if stored_bits <= dynamic_bits && stored_bits <= fixed_bits {
+            this.write_stored_blocks(data, start, end, final)
+        } else if fixed_bits <= dynamic_bits {
+            this.set_fixed_codes()
+            this.writer.put_bits(final ? 1 : 0, 1)
+            this.writer.put_bits(1, 2)
+            this.write_symbols()
+        } else {
+            this.writer.put_bits(final ? 1 : 0, 1)
+            this.writer.put_bits(2, 2)
+            this.write_dynamic_header()
+            this.write_symbols()
+        }
+        if final : this.writer.flush()
+
+        this.symbol_count = 0
+        mem.clear_bytes(this.lit_freq, 288 * 4)
+        mem.clear_bytes(this.dist_freq, 32 * 4)
+    }
+
+    fn set_fixed_codes() {
+        @unsafe
+        let i: uint = 0
+        while i < 144 : this.lit_codes.lengths[i++] = 8
+        while i < 256 : this.lit_codes.lengths[i++] = 9
+        while i < 280 : this.lit_codes.lengths[i++] = 7
+        while i < 288 : this.lit_codes.lengths[i++] = 8
+        this.lit_codes.assign_codes(288)
+        i = 0
+        while i < 30 : this.dist_codes.lengths[i++] = 5
+        this.dist_codes.assign_codes(30)
+    }
+
+    // Bits the symbols take under the current (or the fixed) lengths
+    fn symbol_bits(fixed: bool) uint {
+        @unsafe
+        let bits: uint = 0
+        let i: uint = 0
+        while i < 286 {
+            let f = @ptrv(this.lit_freq, u32, i).to(uint)
+            if f != 0 {
+                let l: uint = fixed ? (i < 144 ? 8 : (i < 256 ? 9 : (i < 280 ? 7 : 8))) : this.lit_codes.lengths[i].to(uint)
+                bits += f * l
+                if i >= 257 : bits += f * length_extra[i - 257].to(uint)
+            }
+            i++
+        }
+        i = 0
+        while i < 30 {
+            let f = @ptrv(this.dist_freq, u32, i).to(uint)
+            if f != 0 {
+                let l: uint = fixed ? 5 : this.dist_codes.lengths[i].to(uint)
+                bits += f * (l + dist_extra[i].to(uint))
+            }
+            i++
+        }
+        return bits
+    }
+
+    fn write_symbols() {
+        @unsafe
+        let count = this.symbol_count
+        let i: uint = 0
+        while i < count {
+            let s = @ptrv(this.symbols, u32, i).to(uint)
+            if s < 256 {
+                this.writer.put_code(this.lit_codes.codes[s].to(uint), this.lit_codes.lengths[s].to(uint))
+            } else {
+                let length = (s >> 16) & 0x1ff
+                let distance = s & 0xffff
+                let ls = length_symbol(length)
+                let sym = 257 + ls
+                this.writer.put_code(this.lit_codes.codes[sym].to(uint), this.lit_codes.lengths[sym].to(uint))
+                this.writer.put_bits(length - length_base[ls].to(uint), length_extra[ls].to(uint))
+                let ds = dist_symbol(distance)
+                this.writer.put_code(this.dist_codes.codes[ds].to(uint), this.dist_codes.lengths[ds].to(uint))
+                this.writer.put_bits(distance - dist_base[ds].to(uint), dist_extra[ds].to(uint))
+            }
+            i++
+        }
+        this.writer.put_code(this.lit_codes.codes[deflate_end_of_block].to(uint), this.lit_codes.lengths[deflate_end_of_block].to(uint))
+    }
+
+    // The run-length encoded code lengths of both alphabets: symbols 0-15
+    // are lengths, 16 repeats the previous length, 17 and 18 repeat zero
+    fn code_length_symbols(out: ptr, extra: ptr) uint {
+        @unsafe
+        let hlit = this.hlit()
+        let hdist = this.hdist()
+        let total = hlit + hdist
+        let n: uint = 0
+        let i: uint = 0
+        while i < total {
+            let l = i < hlit ? this.lit_codes.lengths[i].to(uint) : this.dist_codes.lengths[i - hlit].to(uint)
+            let run: uint = 1
+            while i + run < total {
+                let next = i + run < hlit ? this.lit_codes.lengths[i + run].to(uint) : this.dist_codes.lengths[i + run - hlit].to(uint)
+                if next != l : break
+                run++
+            }
+            if l == 0 && run >= 3 {
+                if run > 138 : run = 138
+                if run <= 10 {
+                    @ptrv(out, u8, n) = 17
+                    @ptrv(extra, u8, n) = (run - 3).to(u8)
+                } else {
+                    @ptrv(out, u8, n) = 18
+                    @ptrv(extra, u8, n) = (run - 11).to(u8)
+                }
+                n++
+                i += run
+                continue
+            }
+            if l != 0 && run >= 4 {
+                @ptrv(out, u8, n) = l.to(u8)
+                @ptrv(extra, u8, n) = 0
+                n++
+                run--
+                if run > 6 : run = 6
+                @ptrv(out, u8, n) = 16
+                @ptrv(extra, u8, n) = (run - 3).to(u8)
+                n++
+                i += run + 1
+                continue
+            }
+            @ptrv(out, u8, n) = l.to(u8)
+            @ptrv(extra, u8, n) = 0
+            n++
+            i++
+        }
+        return n
+    }
+
+    fn hlit() uint {
+        @unsafe
+        let n: uint = 286
+        while n > 257 && this.lit_codes.lengths[n - 1] == 0 : n--
+        return n
+    }
+
+    fn hdist() uint {
+        @unsafe
+        let n: uint = 30
+        while n > 1 && this.dist_codes.lengths[n - 1] == 0 : n--
+        return n
+    }
+
+    fn dynamic_header_bits() uint {
+        @unsafe
+        let symbols = [u8 x 320]{ 0... }
+        let extra = [u8 x 320]{ 0... }
+        let count = this.code_length_symbols(@ref(symbols).@cast(ptr), @ref(extra).@cast(ptr))
+        let freq = [u32 x 19]{ 0... }
+        let i: uint = 0
+        while i < count {
+            let s = symbols[i].to(uint)
+            freq[s] = freq[s] + 1
+            i++
+        }
+        let codes: Codes = Codes {}
+        codes.assign_lengths(@ref(freq).@cast(ptr), 19, 7)
+        let bits: uint = 3 + 5 + 5 + 4 + 19 * 3
+        i = 0
+        while i < count {
+            let s = symbols[i].to(uint)
+            bits += codes.lengths[s].to(uint)
+            if s == 16 : bits += 2
+            else if s == 17 : bits += 3
+            else if s == 18 : bits += 7
+            i++
+        }
+        return bits
+    }
+
+    fn write_dynamic_header() {
+        @unsafe
+        let symbols = [u8 x 320]{ 0... }
+        let extra = [u8 x 320]{ 0... }
+        let count = this.code_length_symbols(@ref(symbols).@cast(ptr), @ref(extra).@cast(ptr))
+        let freq = [u32 x 19]{ 0... }
+        let i: uint = 0
+        while i < count {
+            let s = symbols[i].to(uint)
+            freq[s] = freq[s] + 1
+            i++
+        }
+        let codes: Codes = Codes {}
+        codes.assign_lengths(@ref(freq).@cast(ptr), 19, 7)
+        codes.assign_codes(19)
+        let hclen: uint = 19
+        while hclen > 4 && codes.lengths[code_length_order[hclen - 1].to(uint)] == 0 : hclen--
+
+        let hlit = this.hlit()
+        let hdist = this.hdist()
+        this.lit_codes.assign_codes(hlit)
+        this.dist_codes.assign_codes(hdist)
+
+        this.writer.put_bits(hlit - 257, 5)
+        this.writer.put_bits(hdist - 1, 5)
+        this.writer.put_bits(hclen - 4, 4)
+        i = 0
+        while i < hclen {
+            this.writer.put_bits(codes.lengths[code_length_order[i].to(uint)].to(uint), 3)
+            i++
+        }
+        i = 0
+        while i < count {
+            let s = symbols[i].to(uint)
+            this.writer.put_code(codes.codes[s].to(uint), codes.lengths[s].to(uint))
+            if s == 16 : this.writer.put_bits(extra[i].to(uint), 2)
+            else if s == 17 : this.writer.put_bits(extra[i].to(uint), 3)
+            else if s == 18 : this.writer.put_bits(extra[i].to(uint), 7)
+            i++
+        }
+    }
+}
