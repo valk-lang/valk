@@ -1061,6 +1061,35 @@ API for [valk.fs](api.md#fs)
 
 Use `valk.fs` for file-system operations.
 
+`fs.stat(path)` returns a `FileInfo` with `size` in bytes, `kind` (`file`,
+`directory`, or `other`), `permissions`, and `modified_time` in Unix nanoseconds.
+It follows symlinks and reports an error if the target cannot be read.
+Permissions use Unix mode bits; on Windows they reflect the read-only attribute
+(`0c444` or `0c666`, plus `0c111` for directories), not ACL permissions.
+
+`fs.read_dir(path)` reads one entry name at a time, without collecting the entire
+directory. It skips `.` and `..`, does not recurse, and returns names in no
+guaranteed order. `next()` returns null at the end and propagates read errors.
+The iterator closes automatically at the end; close it when stopping early:
+
+```rust
+let entries = fs.read_dir("assets") ! panic("open directory")
+defer entries.close() ! panic("close directory")
+while true {
+    let name = entries.next() ! panic("read directory")
+    if !isset(name) : break
+    println(name)
+}
+```
+
+Use `fs.files_in()` when you want an array of paths or recursive listing.
+
+`OpenOptions.write` defaults to null, which disables writing. Choose
+`fs.WriteMode.preserve` to overwrite bytes without clearing the file,
+`fs.WriteMode.truncate` to clear it on open, or `fs.WriteMode.append` to write at
+the end even after seeking. `read` defaults to true; `create` allows creating a
+missing file, and `exclusive` with `create` rejects an existing file.
+
 Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
 from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
 reader, writer and closer, `ByteReader`
@@ -1069,7 +1098,7 @@ writer that collects everything written to it. `io.copy` moves everything from a
 into a writer:
 
 ```rust
-let file = fs.stream("out.txt", fs.OpenOptions { read: false, write: true, create: true }) ! panic("open")
+let file = fs.stream("out.txt", fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true }) ! panic("open")
 io.copy("hello".reader(), file) ! panic("copy")
 file.close() ! panic("close")
 ```
@@ -1520,7 +1549,7 @@ let res = http.request("POST", "http://some-website/api/endpoint", http.Options{
 http.download(url, to_path) ! panic("Failed to download file")
 
 // Stream the response body into any io.Writer instead of keeping it in memory
-let out = fs.stream(to_path, fs.OpenOptions { read: false, write: true, create: true }) ! panic("Failed to open file")
+let out = fs.stream(to_path, fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true }) ! panic("Failed to open file")
 http.request("GET", url, http.Options{ output: out }) ! panic("Request failed")
 out.close() ! panic("Failed to close file")
 ```
@@ -1835,7 +1864,7 @@ use valk.fs
 use valk.io
 
 fn main() {
-    let file = fs.stream("log.txt.gz", fs.OpenOptions { read: false, write: true, create: true }) ! panic("Cannot open")
+    let file = fs.stream("log.txt.gz", fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true }) ! panic("Cannot open")
     let writer = compress.Compressor.new(file, compress.Format.gzip)
     writer.write("first line\n") ! panic("Write failed")
     writer.close() ! panic("Write failed") // writes the last block and the trailer

@@ -468,7 +468,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn rtrim(part: String, limit: uint (0)) String
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
-    ~ fn take_length(length: uint) String
+    + fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
     + fn to_number[T]() T !SyntaxError
@@ -1318,10 +1318,12 @@ alias pid_t for i32
 + fn open(path: String, options: ?OpenOptions (null)) i32 !io:IoError
 + fn path(path: String) Path
 + fn read(path: String) String !io:IoError
++ fn read_dir(path: String) DirIterator !io:IoError
 + fn realpath(path: String) String !io:IoError
 + fn resolve(path: String) String
 + fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint !io:IoError
++ fn stat(path: String) FileInfo !io:IoError
 + fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError
 + fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
 + fn sync_all() void
@@ -1330,6 +1332,24 @@ alias pid_t for i32
 ```
 
 ## Classes for 'fs'
+
+```js
++ class DirIterator is Closer {
+    ~ closed: bool
+
+    + fn close() void !io:IoError
+    + fn next() ?String !io:IoError
+}
+```
+
+```js
++ struct FileInfo {
+    + kind: FileKind
+    + modified_time: uint
+    + permissions: u32
+    + size: uint
+}
+```
 
 ```js
 + class FileStream is Reader, Writer, Seeker, Closer {
@@ -1361,12 +1381,11 @@ alias pid_t for i32
 
 ```js
 + struct OpenOptions {
-    + append: bool
     + create: bool
     + exclusive: bool
     + permissions: u32
     + read: bool
-    + write: bool
+    + write: ?WriteMode
 }
 ```
 
@@ -1394,7 +1413,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
 ```js
 + fn alloc(size: uint) GcPtr
-~+ fn alloc_typed(size: uint, layout: ?ptr) GcPtr
++ fn alloc_typed(size: uint, layout: ?ptr) GcPtr
 + fn clone_closure_env(env: ?ptr) ?ptr
 + fn collect_if_threshold_almost_reached() void
 + fn collect_if_threshold_reached() void
@@ -1403,7 +1422,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn mem_usage() uint
 + fn reset_pause_durations() void
 + fn reset_shared_pause_durations() void
-~+ fn transfer_refs(from: ptr, to: ptr) void
++ fn transfer_refs(from: ptr, to: ptr) void
 + fn unlock() void
 ```
 
