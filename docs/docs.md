@@ -1892,7 +1892,10 @@ Although Valk aims to be safe, it still supports low-level operations when neede
 - Offset access on unbounded pointers
 
 Tokens that start with `@`, such as `@ptrv`, `@ref`, and `@cast`, do not by
-themselves require an unsafe scope.
+themselves require an unsafe scope. `@ref(x)` is the address of `x` as a
+raw `ptr`, except when `x` is a struct held inline (a local or a struct
+property): then it is the typed `*Struct` pointer, so the struct's methods
+are reachable through it, and it still converts to `ptr` and `*[Struct]`.
 
 Place `@unsafe` in a scope to use these features in that scope and its child scopes:
 
