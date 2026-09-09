@@ -1,0 +1,329 @@
+use io
+
+// Compression formats: raw DEFLATE (RFC 1951), zlib (RFC 1950: a two byte
+// header and an Adler-32 trailer, what HTTP calls "deflate") and gzip
+// (RFC 1952: a ten byte header and a CRC-32 + length trailer, the .gz
+// file format and HTTP "gzip")
++ enum Format {
+    deflate
+    zlib
+    gzip
+}
+
+// One-shot compression of `data` at `level` (0 stores, 1 fastest, 9 best)
++ fn compress(data: &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String {
+    let out = ByteBuffer.new(data.length / 2 + 64)
+    let writer = Compressor.new(out, format, level)
+    writer.write(data) ! panic("Compression into memory cannot fail")
+    writer.close() ! panic("Compression into memory cannot fail")
+    return out.to_string()
+}
+
+// One-shot decompression. `max_size` (0 = unlimited) bounds the output
++ fn decompress(data: &[u8], format: Format, max_size: uint (0)) String !CompressError {
+    let reader = Decompressor.new(ByteReader.new(data), format)
+    let out = ByteBuffer.new(data.length * 3 + 64)
+    let chunk = [u8]{ 0 x 65536 }
+    while true {
+        let count = reader.read_inner(chunk) !>
+        if count == 0 : break
+        if max_size > 0 && out.length + count > max_size : throw .too_large
+        out.write(chunk.view(0, count))
+    }
+    return out.to_string()
+}
+
++ fn deflate(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String {
+    return compress(data, Format.deflate, level)
+}
++ fn inflate(data: &[u8], max_size: uint (0)) String !CompressError {
+    return decompress(data, Format.deflate, max_size) !>
+}
++ fn gzip(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String {
+    return compress(data, Format.gzip, level)
+}
++ fn gunzip(data: &[u8], max_size: uint (0)) String !CompressError {
+    return decompress(data, Format.gzip, max_size) !>
+}
++ fn zlib(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String {
+    return compress(data, Format.zlib, level)
+}
++ fn unzlib(data: &[u8], max_size: uint (0)) String !CompressError {
+    return decompress(data, Format.zlib, max_size) !>
+}
+
+// Streaming compression: an io.Writer that compresses what it is given
+// into `out`. Input is compressed in 64 KiB pieces; `close` writes the last
+// block and the format's trailer
++ class Compressor is io.Writer, io.Closer {
+    - out: io.Writer
+    - format: Format
+    - level: uint
+    - deflater: Deflater
+    - block: ByteBuffer (ByteBuffer.new(131072))
+    // Input bytes before `pending_start` were already compressed (history)
+    - history: uint (0)
+    - crc: u32 (0)
+    - adler: u32 (1)
+    - total: uint (0)
+    - started: bool (false)
+    - closed: bool (false)
+
+    + static fn new(out: io.Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) Compressor {
+        if level > 9 : level = 9
+        return Compressor {
+            out: out
+            format: format
+            level: level
+            deflater: Deflater.new(ByteBuffer.new(65536), level)
+        }
+    }
+
+    + fn write(data: &[u8]) uint !io.IoError {
+        if this.closed : throw .closed
+        this.start() !>
+        if this.format == Format.gzip : this.crc = crc32(data, this.crc)
+        if this.format == Format.zlib : this.adler = adler32(data, this.adler)
+        this.total += data.length
+        // One 64 KiB piece at a time keeps the input buffer small
+        let block = this.block
+        let offset: uint = 0
+        while offset < data.length {
+            let room = 65536 - (block.length - this.history)
+            let take = data.length - offset
+            if take > room : take = room
+            block.write(data.view(offset, take))
+            offset += take
+            if block.length - this.history >= 65536 : this.compress_pending(false) !>
+        }
+        return data.length
+    }
+
+    + fn close() !io.IoError {
+        if this.closed : return
+        this.start() !>
+        this.compress_pending(true) !>
+        let out = this.deflater.writer.out
+        if this.format == Format.gzip {
+            out.write_u32_le(this.crc)
+            out.write_u32_le((this.total & 0xffffffff).to(u32))
+        } else if this.format == Format.zlib {
+            out.write_u32_be(this.adler)
+        }
+        this.flush_out() !>
+        this.closed = true
+    }
+
+    fn start() !io.IoError {
+        if this.started : return
+        this.started = true
+        let out = this.deflater.writer.out
+        if this.format == Format.gzip {
+            // ID, CM = deflate, no flags, no mtime, XFL, OS = unknown
+            out.write_byte(0x1f)
+            out.write_byte(0x8b)
+            out.write_byte(8)
+            out.write_byte(0)
+            out.write_u32_le(0)
+            out.write_byte(this.level >= 9 ? 2 : (this.level <= 1 ? 4 : 0))
+            out.write_byte(255)
+        } else if this.format == Format.zlib {
+            // CMF: deflate with a 32K window; FLG: level hint, check bits
+            let flevel: uint = this.level <= 1 ? 0 : (this.level <= 5 ? 1 : (this.level == 6 ? 2 : 3))
+            let cmf: uint = 0x78
+            let flg: uint = flevel << 6
+            flg = flg | (31 - ((cmf << 8) | flg) % 31)
+            out.write_byte(cmf.to(u8))
+            out.write_byte(flg.to(u8))
+        }
+        this.flush_out() !>
+    }
+
+    // Compresses the input after the history; keeps the last 32 KiB as
+    // history for the next piece
+    fn compress_pending(final: bool) !io.IoError {
+        @unsafe
+        let block = this.block
+        let view = block.view(0, block.length)
+        let start = this.history
+        let end = block.length
+        if !final {
+            // Up to one piece at a time, so a block never exceeds the
+            // symbol limit by much
+            end = start + 65536
+            if end > block.length : end = block.length
+        }
+        this.deflater.compress(view.data, end, start, final)
+        this.flush_out() !>
+        if end > deflate_window {
+            block.clear_until(end - deflate_window)
+            this.history = deflate_window
+        } else {
+            this.history = end
+        }
+    }
+
+    fn flush_out() !io.IoError {
+        let buffer = this.deflater.writer.out
+        let view = buffer.view(0, buffer.length)
+        while view.length > 0 {
+            let written = this.out.write(view) !>
+            if written == 0 || written > view.length : throw .write
+            view = view.view(written, view.length - written)
+        }
+        buffer.clear()
+    }
+}
+
+// Streaming decompression: an io.Reader over a compressed source. Concatenated
+// gzip members are read as one stream. A malformed stream reads as an
+// io.IoError `read`, a truncated one as `closed`
++ class Decompressor is io.Reader {
+    - source: io.Reader
+    - format: Format
+    - inflater: Inflater
+    - header_done: bool (false)
+    - finished: bool (false)
+    - crc: u32 (0)
+    - adler: u32 (1)
+    - total: uint (0)
+
+    + static fn new(source: io.Reader, format: Format) Decompressor {
+        return Decompressor {
+            source: source
+            format: format
+            inflater: Inflater.new(source)
+        }
+    }
+
+    // Total compressed bytes consumed so far
+    + fn consumed() uint {
+        return this.inflater.consumed - this.inflater.unread_count()
+    }
+
+    + fn read(buf: &mut [u8]) uint !io.IoError {
+        if buf.length == 0 : return 0
+        let count = this.read_inner(buf) ! {
+            if error_is(E.code, truncated) : throw .closed
+            throw .read
+        }
+        return count
+    }
+
+    fn read_inner(buf: &mut [u8]) uint !CompressError {
+        while true {
+            if this.finished : return 0
+            if !this.header_done {
+                this.read_header() !>
+                this.header_done = true
+            }
+            let inflater = this.inflater
+            if inflater.pending() == 0 && !inflater.finished() {
+                inflater.produce(inflater.out_pos + buf.length) !>
+            }
+            let available = inflater.pending()
+            if available > 0 {
+                let count = available > buf.length ? buf.length : available
+                let view = inflater.out.view(inflater.out_pos, count)
+                mem_copy(view, buf)
+                inflater.out_pos += count
+                inflater.compact()
+                if this.format == Format.gzip : this.crc = crc32(view, this.crc)
+                if this.format == Format.zlib : this.adler = adler32(view, this.adler)
+                this.total += count
+                return count
+            }
+            // The stream ended: check the trailer
+            this.read_trailer() !>
+            if this.format == Format.gzip && this.inflater.has_more() {
+                // Another gzip member follows
+                this.inflater.restart()
+                this.header_done = false
+                this.crc = 0
+                this.total = 0
+                continue
+            }
+            this.finished = true
+        }
+        return 0
+    }
+
+    fn read_header() !CompressError {
+        let inflater = this.inflater
+        if this.format == Format.zlib {
+            let cmf = inflater.next_byte() !>
+            let flg = inflater.next_byte() !>
+            if (cmf & 0x0f) != 8 || (cmf >> 4) > 7 : throw .invalid_input
+            if ((cmf << 8) | flg) % 31 != 0 : throw .invalid_input
+            if (flg & 0x20) != 0 : throw .invalid_input // preset dictionaries are not supported
+            return
+        }
+        if this.format == Format.gzip {
+            if (inflater.next_byte() !>) != 0x1f || (inflater.next_byte() !>) != 0x8b : throw .invalid_input
+            if (inflater.next_byte() !>) != 8 : throw .invalid_input
+            let flags = inflater.next_byte() !>
+            let i: uint = 0
+            while i < 6 {
+                inflater.next_byte() !>
+                i++
+            }
+            if (flags & 4) != 0 {
+                let e0 = inflater.next_byte() !>
+                let e1 = inflater.next_byte() !>
+                let extra = e0 | (e1 << 8)
+                while extra > 0 {
+                    inflater.next_byte() !>
+                    extra--
+                }
+            }
+            if (flags & 8) != 0 {
+                while (inflater.next_byte() !>) != 0 {}
+            }
+            if (flags & 16) != 0 {
+                while (inflater.next_byte() !>) != 0 {}
+            }
+            if (flags & 2) != 0 {
+                inflater.next_byte() !>
+                inflater.next_byte() !>
+            }
+        }
+    }
+
+    fn read_le32() uint !CompressError {
+        let inflater = this.inflater
+        let b0 = inflater.next_byte() !>
+        let b1 = inflater.next_byte() !>
+        let b2 = inflater.next_byte() !>
+        let b3 = inflater.next_byte() !>
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+
+    fn read_trailer() !CompressError {
+        let inflater = this.inflater
+        inflater.align()
+        if this.format == Format.gzip {
+            let crc = this.read_le32() !>
+            let size = this.read_le32() !>
+            if crc != this.crc.to(uint) || size != (this.total & 0xffffffff) : throw .checksum
+            return
+        }
+        if this.format == Format.zlib {
+            let b0 = inflater.next_byte() !>
+            let b1 = inflater.next_byte() !>
+            let b2 = inflater.next_byte() !>
+            let b3 = inflater.next_byte() !>
+            let adler = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+            if adler != this.adler.to(uint) : throw .checksum
+        }
+    }
+}
+
+fn mem_copy(from: &[u8], to: &mut [u8]) {
+    @unsafe
+    let i: uint = 0
+    let count = from.length
+    while i < count {
+        to[i] = from[i]
+        i++
+    }
+}

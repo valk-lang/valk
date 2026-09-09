@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -12,6 +12,47 @@ Namespaces: [ansi](#ansi) | [core](#core) | [coro](#coro) | [crypto](#crypto) | 
 ```js
 + fn supported() bool
 + fn utf8_supported() bool
+```
+
+# compress
+
+## Aliases for 'compress'
+
+```js
++ value COMPRESS_DEFAULT_LEVEL (6)
+```
+
+## Functions for 'compress'
+
+```js
++ fn adler32(data: &[u8], adler: u32 (1)) u32
++ fn compress(data: &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn crc32(data: &[u8], crc: u32 (0)) u32
++ fn decompress(data: &[u8], format: Format, max_size: uint (0)) String !CompressError
++ fn deflate(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn gunzip(data: &[u8], max_size: uint (0)) String !CompressError
++ fn gzip(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn inflate(data: &[u8], max_size: uint (0)) String !CompressError
++ fn unzlib(data: &[u8], max_size: uint (0)) String !CompressError
++ fn zlib(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
+```
+
+## Classes for 'compress'
+
+```js
++ class Compressor is Writer, Closer {
+    + fn close() void !io:IoError
+    + static fn new(out: Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) Compressor
+    + fn write(data: &[u8]) uint !io:IoError
+}
+```
+
+```js
++ class Decompressor is Reader {
+    + fn consumed() uint
+    + static fn new(source: Reader, format: Format) Decompressor
+    + fn read(buf: &mut [u8]) uint !io:IoError
+}
 ```
 
 # core
