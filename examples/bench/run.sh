@@ -233,6 +233,10 @@ for benchmark in "${benchmarks[@]}"; do
         if [[ -z "$reference_output" ]]; then
             reference_output="$output"
         elif ! cmp -s "$reference_output" "$output"; then
+            if [[ "$benchmark" == merkletrees ]]; then
+                printf 'Merkle-tree output differs between Valk and %s\n' "$language" >&2
+                exit 1
+            fi
             printf 'Warning: %s output differs between Valk and %s\n' \
                 "$benchmark" "$language" >&2
         fi

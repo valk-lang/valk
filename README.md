@@ -83,7 +83,7 @@ Valk 0.6.4, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory i
 | json | 2000000 | 0.700s (2.8 MB) | 2.110s (11.4 MB) | 0.430s (2.5 MB) |
 | json-serde | sample, 50000 | 0.320s (153.2 MB) | 0.360s (230.1 MB) | 0.230s (119.3 MB) |
 | lru | 1000, 11000000 | 0.640s (2.4 MB) | 0.760s (3.5 MB) | 0.450s (2.6 MB) |
-| merkletrees | 18 | 0.510s (90.9 MB) | 1.170s (70.4 MB) | 1.670s (66.3 MB) |
+| merkletrees | 18 | 0.400s (71.1 MB) | 1.130s (72.6 MB) | 1.640s (66.3 MB) |
 | nsieve | 13 | 0.770s (80.1 MB) | 0.820s (141.7 MB) | 0.790s (80.5 MB) |
 | spectral-norm | 5500 | 1.080s (2.5 MB) | 1.130s (7.6 MB) | 1.080s (2.5 MB) |
 | spectral-norm-multi | 8000, 4 workers | 0.620s (3.6 MB) | 0.620s (9.6 MB) | 0.630s (2.9 MB) |
