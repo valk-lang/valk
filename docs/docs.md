@@ -1385,7 +1385,10 @@ not served.
 
 API for [valk.net](api.md#net)
 
-Create a socket server/client. Currently only supports TCP.
+TCP servers and clients, and UDP sockets. Hosts can be names, IPv4
+addresses or IPv6 addresses (`"::1"`, or `"[::1]"` as written in a URL);
+a name that resolves to both uses IPv4. A server bound to `"::"` also
+accepts IPv4 clients where the system allows it.
 
 Example
 
@@ -1432,6 +1435,30 @@ fn main() {
     con.close() ! panic("Failed to close connection")
 }
 ```
+
+UDP example
+
+```rust
+use valk.net
+
+fn main() {
+    let server = net.UdpSocket.bind("127.0.0.1", 8001) ! panic("Failed to bind")
+    let client = net.UdpSocket.open() ! panic("Failed to open socket")
+
+    let to = net.SocketAddress.parse("127.0.0.1", 8001) ! panic("Invalid address")
+    client.send_to("PING", to) ! panic("Failed to send")
+
+    let buffer = [u8]{ 0 x 1500 }
+    let bytes, from = server.recv_from(buffer) ! panic("Failed to receive")
+    println("# Server received " + buffer.view(0, bytes).to_string() + " from " + from.to_string())
+    server.send_to("PONG", from) ! panic("Failed to send")
+}
+```
+
+`recv_from` and `send_to` time out after `read_timeout_ms` / `write_timeout_ms`
+(5000 by default). `bind` with port 0 lets the system pick a port;
+`local_address()` returns it. `SocketAddress.resolve(host, port)` looks a
+name up; `parse` only accepts numeric addresses.
 
 ## Templates
 
