@@ -1339,6 +1339,7 @@ type PropsFn (fnptr(ptr, *Lifo, fn(ptr, *Lifo)())())
     + fn data_json() Value
     + fn files() Map[InMemoryFile]
     + fn headers() Headers
+    + get keep_alive: bool
     + fn params() Map[String]
     + fn params_grouped() Map[Array[String]]
 }

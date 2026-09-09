@@ -1376,6 +1376,12 @@ s.start() !!
 HTTP/2 uses the same request handlers and responses, with HTTP/1.1 fallback.
 It currently requires TLS and the regular handler API, not `fast` handlers.
 
+HTTP/1.0 clients are served as well: a `Host` header is not required, the
+connection closes after the response unless the request says
+`Connection: keep-alive`, and responses always carry a `Content-Length`. A
+`Connection: close` on an HTTP/1.1 request ends the connection after that
+response.
+
 ## Sockets
 
 API for [valk.net](api.md#net)
