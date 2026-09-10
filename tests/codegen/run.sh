@@ -215,7 +215,7 @@ windows_coro_ir="$workdir/windows-coro-stack.ll"
 out=$(ir_result "$windows_coro_ir")
 status=$?
 if [ "$status" -ne 0 ]; then
-    echo "# Failed to build Windows coroutine temp IR fixture"
+    echo "# Failed to build Windows coroutine stack IR fixture"
     echo "$out"
     exit 1
 fi
