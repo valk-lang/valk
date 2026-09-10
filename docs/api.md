@@ -210,12 +210,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn set(index: uint, v: u8) void
     + fn shrink_capacity(size: uint) void
     + fn skip(amount: uint) void
-    + fn spare(amount: uint) &mut [u8]
     + fn starts_with(str: String, offset: uint (0)) bool
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
     + fn view(offset: uint (0), length: uint (uint.$max)) &mut [u8]
+    + fn view_spare(amount: uint) &mut [u8]
     + fn write(data: &[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
@@ -469,7 +469,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn rtrim(part: String, limit: uint (0)) String
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
-    + fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
     + fn to_number[T]() T !SyntaxError
