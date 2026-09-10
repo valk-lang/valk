@@ -260,8 +260,11 @@ Full `Array` API: [core](api.md#core)
 
 Callbacks cover the common searches and transforms: `any`, `all` and `find`
 take a `fn(T)(bool)`, `map[R]` builds a new array from a `fn(T)(R)`, and
-`reduce[R](init, fn(R, T)(R))` folds the elements into one value. Arrays of
-numbers also offer `sum()`, `min()` and `max()`, and `shuffle()` randomizes the order.
+`reduce[R](init, fn(R, T)(R))` folds the elements into one value. `filter`
+copies matching items into a new array. `remove_where` removes matching items
+from the original. `extract` takes matching items out of the original and
+returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`, and
+`shuffle()` randomizes the order.
 
 ```rust
 let nums = Array[int]{ 3, 1, 2 }

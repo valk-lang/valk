@@ -92,7 +92,7 @@ if [[ "$stdlib_markdown" != *'+ value collect (ext.valk_gc_collect)'* ]] \
     exit 1
 fi
 if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint, length: uint) &[u8]'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend &[u8] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn has_ascii_control(allow_tab: bool (false)) bool'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend HashMap[String, T] {'* ]] \
@@ -117,7 +117,9 @@ if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \
     || [[ "$stdlib_markdown" == *'+ global parray'* ]] \
-    || [[ "$stdlib_markdown" == *'+ global SIGMA'* ]]; then
+    || [[ "$stdlib_markdown" == *'+ global SIGMA'* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn to_slice()'* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn clear_part('* ]]; then
     echo "# Standard-library public API surface is incorrect"
     exit 1
 fi

@@ -132,9 +132,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn copy() Array[T]
     + fn equal(array: Array[T]) bool
     + fn equal_ignore_order(array: Array[T]) bool
+    + fn extract(func: ?fn(T)(bool) (null)) Array[T]
     + static fn fill(count: uint, value: T) Array[T]
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
-    + fn filter_self(func: ?fn(T)(bool) (null)) Array[T]
     + fn find(func: fn(T)(bool)) T !LookupError
     + fn fit_index(index: uint) void
     + static fn from_json_value_auto[X](value: X) Array[T] !LookupError
@@ -156,6 +156,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn reduce[R](init: R, func: fn(R, T)(R)) R
     + fn remove(index: uint) Array[T]
     + fn remove_value(value: T) Array[T]
+    + fn remove_where(func: ?fn(T)(bool) (null)) void
     + fn reverse() Array[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
@@ -187,7 +188,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn advance(amount: uint) void
     + fn clear() void
     + fn clear_next_bytes(amount: uint) void
-    + fn clear_part(index: uint, len: uint) void
+    + fn clear_range(index: uint, len: uint) void
     + fn clear_until(index: uint) void
     + fn clone() ByteBuffer
     + fn ensure_capacity(minimum_capacity: uint) void
@@ -209,11 +210,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn skip(amount: uint) void
     + fn spare(amount: uint) &mut [u8]
     + fn starts_with(str: String, offset: uint (0)) bool
-    + fn to_slice() &mut [u8]
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
-    + fn view(offset: uint, length: uint) &mut [u8]
+    + fn view(offset: uint (0), length: uint (uint.$max)) &mut [u8]
     + fn write(data: &[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
@@ -471,13 +471,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
     + fn to_number[T]() T !SyntaxError
-    + fn to_slice() &[u8]
     + fn to_string() String
     + fn to_uint() uint !SyntaxError
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
-    + fn view(start_index: uint, length: uint) &[u8]
+    + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
 }
 ```
 
