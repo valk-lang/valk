@@ -185,7 +185,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     ~ size: uint
     ~ storage: String
 
-    + fn advance(amount: uint) void
     + fn clear() void
     + fn clear_next_bytes(amount: uint) void
     + fn clear_range(index: uint, len: uint) void

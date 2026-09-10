@@ -119,7 +119,8 @@ if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
     || [[ "$stdlib_markdown" == *'+ global parray'* ]] \
     || [[ "$stdlib_markdown" == *'+ global SIGMA'* ]] \
     || [[ "$stdlib_markdown" == *'+ fn to_slice()'* ]] \
-    || [[ "$stdlib_markdown" == *'+ fn clear_part('* ]]; then
+    || [[ "$stdlib_markdown" == *'+ fn clear_part('* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn advance(amount: uint) void'* ]]; then
     echo "# Standard-library public API surface is incorrect"
     exit 1
 fi
