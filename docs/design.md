@@ -224,7 +224,7 @@ how `&array[a..b]` reaches `array.view(start, length)`: it
 returns an `&mut [T]` over the array's block without copying. The view shares the elements it covers, observes in-place
 writes through the array, and survives the array growing because it keeps the
 block it was taken from. A view keeps its whole block alive, including slots
-past the elements it covers. `array.slice(...)` still copies.
+past the elements it covers. `array.range(...)` copies into a new array.
 
 Fresh slice storage comes from the language itself. `[T]{ a, b, c }`
 allocates from a list and hands back the `&mut [T]` that owns the elements.

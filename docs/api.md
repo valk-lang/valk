@@ -91,7 +91,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     ~+ owner: ?GcPtr
 
     + fn get(index: uint) T !LookupError
-    + fn part(offset: uint, length: uint) &mut [T]
+    + fn range(offset: uint, length: uint) &mut [T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn view(offset: uint, length: uint) &mut [T]
@@ -148,11 +148,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn merge(items: Array[T]) Array[T]
     + fn merge_in_place(items: Array[T]) Array[T]
     + static fn new(start_size: uint (0)) Array[T]
-    + fn part(start: uint, amount: uint) Array[T]
     + fn pop_first() T !LookupError
     + fn pop_last() T !LookupError
     + fn prepend(item: T, unique: bool (false)) Array[T]
     + fn prepend_many(items: Array[T]) Array[T]
+    + fn range(start: uint, amount: uint) Array[T]
     + fn reduce[R](init: R, func: fn(R, T)(R)) R
     + fn remove(index: uint) Array[T]
     + fn remove_value(value: T) Array[T]
@@ -161,7 +161,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
     + fn shuffle() Array[T]
-    + fn slice(start: uint, amount: uint) &mut [T]
     + fn sort(func: fn(T, T)(bool)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) Array[T]
@@ -200,7 +199,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn into_string() String
     + fn ltrim(filter: fnptr(u8)(bool)) void
     + static fn new(start_size: uint (128)) ByteBuffer
-    + fn part(start_index: uint, length: uint) String
+    + fn range(start_index: uint, length: uint) String
     + fn reader() ByteReader
     + fn reserve(length: uint) void
     + fn resize(length: uint) void
@@ -461,8 +460,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn octal_to_uint() uint !SyntaxError
     + fn pad_left(char: u8, length: uint) String
     + fn pad_right(char: u8, length: uint) String
-    + fn part(start_index: uint, length: uint) String
     + static fn random(len: uint, characters: String ("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) String
+    + fn range(start_index: uint, length: uint) String
     + fn reader() ByteReader
     + fn replace(part: String, with: String) String
     + fn rtrim(part: String, limit: uint (0)) String

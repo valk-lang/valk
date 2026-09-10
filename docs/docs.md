@@ -185,11 +185,11 @@ s.is_empty() bool
 s.contains(x) bool
 s.lower() String // Convert Unicode text to lowercase
 s.upper() String // Convert Unicode text to uppercase
-s.part(start_index, length) String // Sub string using byte offsets
+s.range(start_index, length) String // Sub string using byte offsets
 s[i] // Byte at index i; an index past the end reads 0
-let middle = s[1 .. 3] // Same as s.part(1, 3): three bytes starting at byte offset 1
+let middle = s[1 .. 3] // Same as s.range(1, 3): three bytes starting at byte offset 1
 s.utf8.length // Length in Unicode characters
-s.utf8.part(start_index, length) String // Sub string using character offsets
+s.utf8.range(start_index, length) String // Sub string using character offsets
 each s.utf8.chars() as ch { } // Iterate Unicode characters (each `ch` is a String)
 each s as byte { } // Iterate bytes (u8)
 ```
@@ -249,7 +249,7 @@ let zeros = Array[int]{ 0 x 10 }  // Ten copies of one value (Array.fill)
 arr.append(4)
 arr.prepend(5)
 let v = arr.get(0) ! panic("Empty array")
-let first_three = arr[0 .. 3] // Same as arr.part(0, 3)
+let first_three = arr[0 .. 3] // Same as arr.range(0, 3)
 arr.clear()
 //
 each arr as value {}
@@ -324,8 +324,8 @@ to the end.
 
 Every range in Valk is a start offset and a length, never a start and an end,
 so there is no inclusive or exclusive bound to remember. `value[start .. length]`
-returns a copy, while `&value[start .. length]` returns a view that shares the
-elements with `value`:
+and `value.range(start, length)` return a copy. `&value[start .. length]` and
+`value.view(start, length)` return a view that shares the elements with `value`:
 
 ```rust
 let values = Array[int]{ 1, 2, 3, 4 }
