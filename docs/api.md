@@ -910,30 +910,40 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ## Functions for 'crypto'
 
 ```js
-+ fn base64_decode(str: String) String !CryptoError
-+ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void !CryptoError
-+ fn base64_encode(str: String) String
-+ fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void
-+ fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void !CryptoError
-+ fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
-+ fn bcrypt_verify(password: String, hash: String) bool
++ fn base64_decode(data: &[u8]) String !CryptoError
++ fn base64_encode(data: &[u8]) String
++ fn base64_write_decode(data: &[u8], out: Writer) uint !CryptoError
++ fn base64_write_encode(data: &[u8], out: Writer) uint !io:IoError
++ fn bcrypt(cost: uint, salt: &[u8], password: &[u8], output: ByteBuffer) void !CryptoError
++ fn bcrypt_hash(password: &[u8], cost: uint (12)) String !CryptoError
++ fn bcrypt_verify(password: &[u8], hash: &[u8]) bool
 + fn constant_time_equals(a: &[u8], b: &[u8]) bool
 + fn digest_size(algorithm: HashAlgorithm) uint
 + fn hash(algorithm: HashAlgorithm, data: &[u8]) String
 + fn hash_hex(algorithm: HashAlgorithm, data: &[u8]) String
++ fn hash_write(algorithm: HashAlgorithm, data: &[u8], out: Writer) uint !io:IoError
++ fn hash_write_hex(algorithm: HashAlgorithm, data: &[u8], out: Writer) uint !io:IoError
 + fn hasher(algorithm: HashAlgorithm) Hasher
 + fn hex_decode(text: &[u8]) String !CryptoError
 + fn hex_encode(data: &[u8]) String
++ fn hex_write_decode(text: &[u8], out: Writer) uint !CryptoError
++ fn hex_write_encode(data: &[u8], out: Writer) uint !io:IoError
 + fn hkdf(algorithm: HashAlgorithm, ikm: &[u8], salt: &[u8], info: &[u8], length: uint) String !CryptoError
 + fn hkdf_expand(algorithm: HashAlgorithm, prk: &[u8], info: &[u8], length: uint) String !CryptoError
 + fn hkdf_extract(algorithm: HashAlgorithm, salt: &[u8], ikm: &[u8]) String
-+ fn md5_encode(input: String) String
++ fn md5_hex(data: &[u8]) String
++ fn md5_write_hex(data: &[u8], out: Writer) uint !io:IoError
 + fn pbkdf2(algorithm: HashAlgorithm, password: &[u8], salt: &[u8], iterations: uint, length: uint) String !CryptoError
 + fn random_bytes(length: uint) String
-+ fn sha1_encode(str: String) String
-+ fn sha256_encode(str: String) String
-+ fn sha384_encode(str: String) String
-+ fn sha512_encode(str: String) String
++ fn random_write_bytes(length: uint, out: Writer) uint !io:IoError
++ fn sha1_hex(data: &[u8]) String
++ fn sha1_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha256_hex(data: &[u8]) String
++ fn sha256_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha384_hex(data: &[u8]) String
++ fn sha384_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha512_hex(data: &[u8]) String
++ fn sha512_write_hex(data: &[u8], out: Writer) uint !io:IoError
 ```
 
 ## Classes for 'crypto'
@@ -941,9 +951,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 + class Blake2b {
     + fn finalize(out: *[u8]) void
-    + static fn hash_string(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
+    + static fn hash_string(input: &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
-    + fn update(data: *[u8], length: uint) void
+    + fn update(input: &[u8]) void
 }
 ```
 
@@ -983,12 +993,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class Sha1 is Hasher {
-    + fn add_hash_data(data: *[u8 x 20]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
-    + fn add_string_data(str: String) void
     + fn block_size() uint
     + fn digest_size() uint
-    + fn final() [u8 x 20]
     + fn finish(out: &mut [u8]) uint
     + fn reset() void
     + fn update(data: &[u8]) void
@@ -997,12 +1003,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class Sha256 is Hasher {
-    + fn add_hash_data(data: *[u8 x 32]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
-    + fn add_string_data(str: String) void
     + fn block_size() uint
     + fn digest_size() uint
-    + fn final() [u8 x 32]
     + fn finish(out: &mut [u8]) uint
     + fn reset() void
     + fn update(data: &[u8]) void

@@ -1,5 +1,9 @@
 
 use valk.crypto
+use valk.core
+use valk.thread
+use valk.coro
+use valk.io
 
 fn base64_test(input: String, cmp: String) bool {
     // Encode
@@ -40,4 +44,153 @@ test "Base64" {
     assert(base64_invalid("AA=A"))
     assert(base64_invalid("AA$="))
     assert(base64_invalid("AB=="))
+}
+
+test "Base64 streamed into a writer" {
+    // Longer than one block, so the streaming path wraps around
+    let long = ByteBuffer.new(4096)
+    let i: uint = 0
+    while i++ < 2000 : long.write_byte(('a' + (i % 26)).to(u8))
+    let source = long.into_string()
+
+    let encoded = ByteBuffer.new(64)
+    let written = crypto.base64_write_encode(source, encoded) !!
+    let expect = crypto.base64_encode(source)
+    assert(encoded.to_string() == expect)
+    assert(written == expect.bytes)
+
+    let decoded = ByteBuffer.new(64)
+    let back = crypto.base64_write_decode(expect, decoded) !!
+    assert(decoded.to_string() == source)
+    assert(back == source.bytes)
+
+    // Empty input writes nothing
+    let none = ByteBuffer.new(8)
+    assert((crypto.base64_write_encode("", none) !!) == 0)
+    assert(none.length == 0)
+
+    // Malformed input still throws
+    let bad = ByteBuffer.new(8)
+    let threw = false
+    crypto.base64_write_decode("AA$=", bad) ! threw = true
+    assert(threw)
+}
+
+test "Hex and digests streamed into a writer" {
+    let data = "The quick brown fox jumps over the lazy dog"
+
+    let hex = ByteBuffer.new(16)
+    let n = crypto.hex_write_encode(data, hex) !!
+    assert(hex.to_string() == crypto.hex_encode(data))
+    assert(n == data.bytes * 2)
+
+    let raw = ByteBuffer.new(16)
+    crypto.hex_write_decode(crypto.hex_encode(data), raw) !!
+    assert(raw.to_string() == data)
+
+    let digest = ByteBuffer.new(8)
+    crypto.hash_write(crypto.HashAlgorithm.sha256, data, digest) !!
+    assert(crypto.hex_encode(digest.to_string()) == crypto.sha256_hex(data))
+
+    let digest_hex = ByteBuffer.new(8)
+    let hn = crypto.hash_write_hex(crypto.HashAlgorithm.sha512, data, digest_hex) !!
+    assert(digest_hex.to_string() == crypto.sha512_hex(data))
+    assert(hn == 128)
+
+    // The per-algorithm shorthands agree with the generic form
+    let shorthand = ByteBuffer.new(8)
+    crypto.sha256_write_hex(data, shorthand) !!
+    assert(shorthand.to_string() == crypto.sha256_hex(data))
+    let md5_out = ByteBuffer.new(8)
+    crypto.md5_write_hex(data, md5_out) !!
+    assert(md5_out.to_string() == crypto.md5_hex(data))
+
+    // Random bytes stream out at the requested length
+    let rnd = ByteBuffer.new(8)
+    assert((crypto.random_write_bytes(1500, rnd) !!) == 1500)
+    assert(rnd.length == 1500)
+
+    // Longer than one chunk, so the hex streaming path wraps around
+    let big = ByteBuffer.new(2048)
+    let i: uint = 0
+    while i++ < 1000 : big.write_byte((i % 256).to(u8))
+    let bytes = big.into_string()
+    let out = ByteBuffer.new(16)
+    crypto.hex_write_encode(bytes, out) !!
+    assert(out.to_string() == crypto.hex_encode(bytes))
+}
+
+test "Crypto writers work on a spawned thread" {
+    // The streaming functions must not depend on anything the main thread set up
+    let data = "payload for the worker thread"
+    let expect = crypto.sha256_hex(data)
+
+    let worker = thread.Thread[String].start(fn() String {
+        let out = ByteBuffer.new(8)
+        crypto.sha256_write_hex("payload for the worker thread", out) !!
+        crypto.base64_write_encode("abc", out) !!
+        crypto.hex_write_encode("\x01", out) !!
+        crypto.random_write_bytes(600, out) !!
+        return out.to_string()
+    }) !!
+    let result = worker.await()
+
+    assert(result.starts_with(expect))
+    assert(result.range(expect.bytes, 4) == "YWJj")
+    assert(result.range(expect.bytes + 4, 2) == "01")
+    assert(result.bytes == expect.bytes + 4 + 2 + 600)
+}
+
+test "Digest and hex buffers do not collide" {
+    // 'hash_write_hex' holds a digest while hex encoding it, so the digest and
+    // the hex chunk must be separate storage
+    let data = "the quick brown fox"
+    let out = ByteBuffer.new(8)
+    crypto.hash_write_hex(crypto.HashAlgorithm.sha512, data, out) !!
+    assert(out.to_string() == crypto.sha512_hex(data))
+
+    // Back to back calls must not carry state over
+    let again = ByteBuffer.new(8)
+    crypto.hash_write_hex(crypto.HashAlgorithm.md5, data, again) !!
+    crypto.hash_write_hex(crypto.HashAlgorithm.md5, data, again) !!
+    assert(again.to_string() == crypto.md5_hex(data) + crypto.md5_hex(data))
+}
+
+// A writer that suspends its coroutine on every write, the way a socket does
+// when it has to wait for the kernel. Anything the encoder still needs after
+// the write must therefore survive another coroutine running in between.
+class YieldingWriter is io.Writer {
+    sink: ByteBuffer (.new(64))
+    + fn write(data: &[u8]) uint !io.IoError {
+        coro.await_last()
+        return this.sink.write(data)
+    }
+}
+
+fn hex_through_yields(source: String, out: YieldingWriter) {
+    crypto.hex_write_encode(source, out) !!
+}
+
+test "Interleaved coroutines do not share encoder state" {
+    // Long enough that each encode spans several writes, so the two coroutines
+    // are guaranteed to interleave inside the encoding loop
+    let first = ByteBuffer.new(2048)
+    let second = ByteBuffer.new(2048)
+    let i: uint = 0
+    while i++ < 700 {
+        first.write_byte('a')
+        second.write_byte('b')
+    }
+    let a = first.into_string()
+    let b = second.into_string()
+
+    let out_a = YieldingWriter {}
+    let out_b = YieldingWriter {}
+    let ca = co hex_through_yields(a, out_a)
+    let cb = co hex_through_yields(b, out_b)
+    await ca
+    await cb
+
+    assert(out_a.sink.to_string() == crypto.hex_encode(a))
+    assert(out_b.sink.to_string() == crypto.hex_encode(b))
 }
