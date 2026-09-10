@@ -540,6 +540,8 @@ differs is where the storage may live and whether the borrow may escape. The
 | Type | Layout | Kept alive by | May be stored or returned |
 | --- | --- | --- | --- |
 | `local &T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `local &[T x N]` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `local &[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | The frame, or `owner` when set | No |
 | `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
 | `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
 
