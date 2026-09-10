@@ -97,13 +97,13 @@ if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn has_ascii_control(allow_tab: bool (false)) bool'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend HashMap[String, T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ static fn copy_from_ptr(data: ptr, length: uint) String'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn read(buf: &mut [u8]) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(fd: i32, buf: mut &[u8], offset: uint (0)) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read_sync(fd: i32, buf: mut &[u8], offset: uint (0)) uint !IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(buf: mut &[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: &[u8], offset: uint (uint.$max)) uint !IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: &mut [u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn recv(fd: i32, buf: mut &[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: &[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn read(buf: &mut [u8]) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn read(buf: mut &[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(data: &[u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn create_dir(path: String, permissions: u32 (0c755)) void !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn delete_all(path: String) void !io:IoError'* ]] \
@@ -131,8 +131,8 @@ if [[ "$stdlib_markdown" == *'fn write_string(fd:'* ]] \
     || [[ "$stdlib_markdown" == *'fn send_string(fd:'* ]] \
     || [[ "$stdlib_markdown" == *'fn send_string(data:'* ]] \
     || [[ "$stdlib_markdown" == *'fn send_buffer(data:'* ]] \
-    || [[ "$stdlib_markdown" == *'fn send(fd: i32, data: &mut [u8]'* ]] \
-    || [[ "$stdlib_markdown" == *'fn send(data: &mut [u8]'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send(fd: i32, data: mut &[u8]'* ]] \
+    || [[ "$stdlib_markdown" == *'fn send(data: mut &[u8]'* ]] \
     || [[ "$stdlib_markdown" == *'fn read(fd: i32, buf: ByteBuffer'* ]] \
     || [[ "$stdlib_markdown" == *'fn recv(fd: i32, buf: ByteBuffer'* ]] \
     || [[ "$stdlib_markdown" == *'fn recv(buffer: ByteBuffer'* ]] \

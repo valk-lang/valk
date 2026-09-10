@@ -16,9 +16,8 @@ enum TYPE : u8 {
     interface
     ptr_of
     adr_of     // internal: the one-word address a borrow is used through
-    stack_of   // stack T: frame borrow { owner: ?GcPtr, adr: ptr }, cannot escape
-    ref_of     // &T: owned borrow { owner: ?GcPtr, adr: ptr }
-    ref_slice  // &[T]: owned borrow { owner: ?GcPtr, adr: ptr, length: uint }; a `slice X of T` class attaches methods to it
+    ref_of     // &T / local &T: borrow { owner: ?GcPtr, adr: ptr }; length > 1 is a bounded `&[T x N]`
+    ref_slice  // &[T] / local &[T]: borrow { owner: ?GcPtr, adr: ptr, length: uint }; a `slice X of T` class attaches methods to it
     co
     closure
     fnptr      // fnptr(...)(...)
@@ -66,9 +65,10 @@ class TypeCache {
     cached_error_abi_type: ?String (null)
     ptr_of: ?Type (null)
     adr_of: ?Type (null)
-    stack_of: ?Type (null)
     ref_of: ?Type (null)
+    local_ref_of: ?Type (null)
     ref_slice: ?Type (null)
+    local_ref_slice: ?Type (null)
     inline: ?Type (null)
     non_inline: ?Type (null)
     nullable: ?Type (null)
@@ -96,9 +96,12 @@ class Type {
     is_shared: bool (false)
     // Mutable view of shared data, valid only inside a `lock` block
     is_locked: bool (false)
-    // A borrow that may be written through: `&mut T`, `&mut [T]`. Without it
+    // A borrow that may be written through: `mut &T`, `mut &[T]`. Without it
     // a bare `&T` / `&[T]` only reads; named slices decide by class.
     is_mut: bool (false)
+    // A borrow that cannot escape its frame: `local &T`, `local &[T]`. Same
+    // runtime layout as the owned form; the flag only gates conversions.
+    is_local: bool (false)
     error_is_instance: bool (false)
 
     fn get_unary_info() ?UnaryTypeInfo {
@@ -243,8 +246,8 @@ class Type {
         return (this.kind == TYPE.ref_of || this.kind == TYPE.ref_slice) && !isset(this.class)
     }
 
-    // A borrow that only reads: bare `&T` / `&[T]` without `mut`, or a
-    // slice type declared `$immutable`
+    // A borrow that only reads: bare `&T` / `&[T]` / `local &T` without `mut`,
+    // or a slice type declared `$immutable`
     fn is_readonly_view() bool {
         if this.kind != TYPE.ref_of && this.kind != TYPE.ref_slice : return false
         let c = this.class
@@ -265,6 +268,7 @@ class Type {
             kind: this.kind
             is_shared: this.is_shared
             is_locked: this.is_locked
+            is_local: this.is_local
             is_mut: true
             class: this.class
             enum_info: this.enum_info
@@ -321,7 +325,7 @@ class Type {
     // or address of one element hands the question to what it points at
     fn storage_view_type_of() Type {
         let nn = this.get_non_nullable()
-        if (nn.kind == TYPE.ref_of || nn.kind == TYPE.stack_of || nn.kind == TYPE.adr_of) && nn.length == 1 {
+        if (nn.kind == TYPE.ref_of || nn.kind == TYPE.adr_of) && nn.length == 1 {
             let sub = nn.get_sub_type()
             if isset(sub) : return sub.get_non_nullable()
         }
@@ -374,7 +378,7 @@ class Type {
         if t == TYPE.interface : return psz * 2
         if this.is_pointer() : return psz
         if t == TYPE.closure : return psz * 2
-        if t == TYPE.ref_of || t == TYPE.stack_of : return psz * 2
+        if t == TYPE.ref_of : return psz * 2
         if t == TYPE.ref_slice : return psz * 3
 
         if t == TYPE.union {
@@ -584,9 +588,10 @@ class Type {
         return t.kind == TYPE.ref_of || t.kind == TYPE.ref_slice
     }
 
-    // `stack T`: an owner-carrying borrow that cannot leave its frame.
+    // A borrow that cannot leave its frame: `local &T`, `local &[T]`.
     fn is_stack_borrow() bool {
-        return this.get_non_nullable().kind == TYPE.stack_of
+        let t = this.get_non_nullable()
+        return t.is_local && (t.kind == TYPE.ref_of || t.kind == TYPE.ref_slice)
     }
 
     // Any `{ owner, adr[, length] }` borrow: layout and GC handling are shared.
@@ -594,7 +599,7 @@ class Type {
     // with a class attached.
     fn is_fat_borrow() bool {
         let t = this.get_non_nullable()
-        return t.kind == TYPE.ref_of || t.kind == TYPE.ref_slice || t.kind == TYPE.stack_of
+        return t.kind == TYPE.ref_of || t.kind == TYPE.ref_slice
     }
 
     // A borrow written as `stack T`, `&T`, or `&[T]`: no class, so no
@@ -669,7 +674,7 @@ class Type {
         let t = this.get_non_nullable()
         let c = t.class
         if isset(c) : return c
-        if t.kind != TYPE.ptr_of && t.kind != TYPE.adr_of && t.kind != TYPE.ref_of && t.kind != TYPE.stack_of : return null
+        if t.kind != TYPE.ptr_of && t.kind != TYPE.adr_of && t.kind != TYPE.ref_of : return null
         let sub = t.get_sub_type()
         return isset(sub) ? sub.get_class_or_null() : null
     }
@@ -701,7 +706,7 @@ class Type {
         if this.is_inline || t == TYPE.union : return true
         if t == TYPE.int || t == TYPE.float || t == TYPE.bool : return true
         if t == TYPE.closure || t == TYPE.interface : return true
-        if t == TYPE.ref_of || t == TYPE.ref_slice || t == TYPE.stack_of : return true
+        if t == TYPE.ref_of || t == TYPE.ref_slice : return true
         if t == TYPE.voidptr || t == TYPE.gcptr || t == TYPE.ptr_of || t == TYPE.adr_of
             || t == TYPE.fnptr || t == TYPE.co || t == TYPE.any || t == TYPE.void {
             return false
@@ -911,6 +916,7 @@ class Type {
         if this.is_shared != other.is_shared : return false
         if this.is_locked != other.is_locked : return false
         if this.is_mut != other.is_mut : return false
+        if this.is_local != other.is_local : return false
         // An enum shares its storage class with its base integer, but it is
         // its own type: `Slice[u8]` helpers must not land on `Slice[E]`.
         if this.get_enum() != other.get_enum() : return false
@@ -1103,7 +1109,7 @@ class Type {
         let t = this.kind
         if t == TYPE.ref_slice : return this.compat_ref_slice(other)
         if this.is_inline != other.is_inline : return false
-        if t == TYPE.ptr_of || t == TYPE.adr_of || t == TYPE.ref_of || t == TYPE.stack_of : return this.compat_pointer(other)
+        if t == TYPE.ptr_of || t == TYPE.adr_of || t == TYPE.ref_of : return this.compat_pointer(other)
         if t == TYPE.nullable : return this.compat_inner(other)
         if t == TYPE.fixed_array : return this.length == other.length && this.compat_inner(other)
         if t == TYPE.struct && this.is_inline && !isset(this.class) : return this.compat_multi(other)
@@ -1140,7 +1146,7 @@ class Type {
         if base.is_locked != typ.is_locked : return false
         // A read-only borrow never becomes writable
         if typ.is_readonly_view() && !base.is_readonly_view()
-            && (base.kind == TYPE.ref_of || base.kind == TYPE.ref_slice || base.kind == TYPE.stack_of) : return false
+            && (base.kind == TYPE.ref_of || base.kind == TYPE.ref_slice) : return false
         own_enum = base.get_enum()
         if isset(own_enum) && own_enum != typ.get_enum() : return false
 
@@ -1254,16 +1260,17 @@ class Type {
             }
             return "*"
         }
-        if this.kind == TYPE.adr_of || this.kind == TYPE.stack_of {
+        if this.kind == TYPE.adr_of {
             let sub = this.get_sub_type()
+            let prefix = this.is_mut ? "local mut &" : "local &"
             if isset(sub) {
-                if this.length == 1 : return "local " + type_wrapped_display("", sub)
-                return "local [" + sub.compat_display_name() + " x " + this.length + "]"
+                if this.length == 1 : return type_wrapped_display(prefix, sub)
+                return prefix + "[" + sub.compat_display_name() + " x " + this.length + "]"
             }
-            return "local"
+            return this.is_mut ? "local mut &" : "local &"
         }
         if this.kind == TYPE.ref_of {
-            let amp = this.is_mut ? "&mut " : "&"
+            let amp = this.is_local ? (this.is_mut ? "local mut &" : "local &") : (this.is_mut ? "mut &" : "&")
             let sub = this.get_sub_type()
             if isset(sub) {
                 if this.length == 1 : return type_wrapped_display(amp, sub)
@@ -1272,7 +1279,7 @@ class Type {
             return amp
         }
         if this.kind == TYPE.ref_slice {
-            let amp = this.is_mut ? "&mut " : "&"
+            let amp = this.is_local ? (this.is_mut ? "local mut &" : "local &") : (this.is_mut ? "mut &" : "&")
             let sub = this.get_sub_type()
             return isset(sub) ? amp + "[" + sub.compat_display_name() + "]" : amp + "[]"
         }
@@ -1460,12 +1467,12 @@ class Type {
     }
 
     // Indirection unwraps only the outer fixed-array dimension.
-    fn indirect_type(kind: TYPE, length: uint, flatten: bool) Type {
+    fn indirect_type(kind: TYPE, length: uint, flatten: bool, local: bool (false)) Type {
         let array = this.is_fixed_array_type() && !isset(this.get_enum())
         let cacheable = length == 1 && (!array || flatten)
         let cache = this.get_cache()
         let cached = kind == TYPE.ptr_of ? cache.ptr_of
-            : (kind == TYPE.adr_of ? cache.adr_of : (kind == TYPE.stack_of ? cache.stack_of : cache.ref_of))
+            : (kind == TYPE.adr_of ? cache.adr_of : (local ? cache.local_ref_of : cache.ref_of))
         if cacheable && isset(cached) : return cached
         let sub = this
         let count = length
@@ -1476,13 +1483,14 @@ class Type {
         let t = Type {
             build: this.build
             kind: kind
+            is_local: local
             info: UnaryTypeInfo { sub: sub }
             length: count
         }
         if cacheable {
             if kind == TYPE.ptr_of : cache.ptr_of = t
             else if kind == TYPE.adr_of : cache.adr_of = t
-            else if kind == TYPE.stack_of : cache.stack_of = t
+            else if local : cache.local_ref_of = t
             else : cache.ref_of = t
         }
         return t
@@ -1496,15 +1504,16 @@ class Type {
         return this.indirect_type(TYPE.adr_of, length, flatten)
     }
 
-    fn stack_ref(length: uint (1), flatten: bool (true)) Type {
-        return this.indirect_type(TYPE.stack_of, length, flatten)
+    // local &T / local &[T x N] — frame borrow, same layout as `&T`
+    fn local_ref(length: uint (1), flatten: bool (true)) Type {
+        return this.indirect_type(TYPE.ref_of, length, flatten, true)
     }
 
     fn reference(length: uint (1), flatten: bool (true)) Type {
         return this.indirect_type(TYPE.ref_of, length, flatten)
     }
 
-    // &[T] — owned borrow with a runtime length, cached on the element type
+    // &[T] — borrow with a runtime length, cached on the element type
     fn ref_slice() Type {
         let cached = this.cache
         let ref = isset(cached) ? cached.ref_slice : null
@@ -1518,9 +1527,24 @@ class Type {
         return t
     }
 
+    // local &[T] — frame borrow of unbounded storage, same layout as `&[T]`
+    fn local_ref_slice() Type {
+        let cached = this.cache
+        let ref = isset(cached) ? cached.local_ref_slice : null
+        if isset(ref) : return ref
+        let t = Type {
+            build: this.build
+            kind: TYPE.ref_slice
+            is_local: true
+            info: UnaryTypeInfo { sub: this }
+        }
+        this.get_cache().local_ref_slice = t
+        return t
+    }
+
     // Cached aggregate representation.
     fn inline() Type !Error {
-        if this.kind == TYPE.ptr_of || this.kind == TYPE.adr_of || this.kind == TYPE.ref_of || this.kind == TYPE.stack_of {
+        if this.kind == TYPE.ptr_of || this.kind == TYPE.adr_of || this.kind == TYPE.ref_of {
             if this.length == 0 : this.build.error("Cannot inline a pointer with an unknown length")
             let sub = this.get_sub_type()
             if !isset(sub) : this.build.bug("Pointer type is missing its element type")
@@ -1651,7 +1675,8 @@ class Type {
 
 fn type_value_has_embedded_pointer(type: Type, include_raw: bool) bool {
     let t = type.get_non_nullable()
-    if t.kind == TYPE.adr_of || t.kind == TYPE.stack_of : return true
+    if t.kind == TYPE.adr_of : return true
+    if t.is_local && t.is_fat_borrow() : return true
     if include_raw && (t.is_raw_pointer() || t.kind == TYPE.ptr_of || t.is_bare_borrow()) : return true
     if t.is_owned_borrow() : return false
     if t.is_fixed_array_type() {
@@ -2128,7 +2153,7 @@ fn type_validate_struct_gc_storage(type: Type, at: Exp) !Error {
 fn type_has_unpublishable_closure(type: Type, seen: Array[Class]) bool {
     let t = type.get_non_nullable()
     if t.is_shared : return false
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return false
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of : return false
     if t.kind == TYPE.closure : return true
 
     if t.kind == TYPE.union || t.is_tuple_type() {
@@ -2159,7 +2184,7 @@ fn type_has_unpublishable_closure(type: Type, seen: Array[Class]) bool {
 fn type_has_coroutine_handle(type: Type, seen: Array[Class]) bool {
     let t = type.get_non_nullable()
     if t.kind == TYPE.co : return true
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return false
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of : return false
     if t.kind == TYPE.closure || t.kind == TYPE.fnptr {
         if type_has_coroutine_handle(t.get_return_type(), seen) : return true
         let args = t.get_args()
@@ -2223,7 +2248,7 @@ fn type_find_unpublishable_closure(type: Type, seen: Array[Class]) ?Prop {
 // forever: the size error for it is reported elsewhere.
 fn type_find_unsafe_struct_pointer(type: Type, seen: Array[Class]) ?Class {
     let t = type.get_non_nullable()
-    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of || t.kind == TYPE.stack_of : return null
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.voidptr || t.kind == TYPE.ref_of : return null
 
     let class = t.class
     if !t.is_inline && isset(class) && class.kind == CLASS_KIND.struct {
@@ -2351,15 +2376,24 @@ fn type_from_exp_unchecked(exp: Exp, scope: Scope, suggested_type: ?Type (null))
         if inner.is_inline && inner.kind == TYPE.struct : return inner.non_inline()
         return inner.pointer()
     }
-    if kind == TYPE_KIND.stack {
-        let inner = type_from_inner_exp(exp, scope, "Missing inner type for 'local'") !>
-        if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
-        if exp.bool2 : return inner.stack_ref(resolve_type_size(exp, scope) !>.to(uint), false)
-        return inner.stack_ref()
-    }
     if kind == TYPE_KIND.ref {
         let inner = type_from_inner_exp(exp, scope, "Missing inner type for '&'") !>
         if inner.is_void_type() : exp.error("You cannot reference a value of type 'void'")
+        if exp.bool3 {
+            // `local &T`, `local &[T]` / `local &[T x N]`: a frame borrow that cannot escape
+            if exp.bool2 {
+                let size_exp = exp.get(TYPE_EXP.size)
+                if isset(size_exp) {
+                    let bounded = inner.local_ref(resolve_type_size(exp, scope) !>.to(uint), false)
+                    return exp.bool1 ? bounded.mut_type() : bounded
+                }
+                type_validate_sequence_element(inner, exp) !>
+                let borrow = inner.local_ref_slice()
+                return exp.bool1 ? borrow.mut_type() : borrow
+            }
+            let borrow = inner.local_ref()
+            return exp.bool1 ? borrow.mut_type() : borrow
+        }
         let borrow = inner.reference()
         if exp.bool2 {
             let size_exp = exp.get(TYPE_EXP.size)

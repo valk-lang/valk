@@ -281,7 +281,7 @@ element type; for an `Array[Array[int]]`:
 The comparator returns true when `a` should come after `b`.
 
 Fresh slice storage is a language form, not a class: `[int]{ 1, 2, 3 }`
-allocates from a list and returns the `&mut [int]` that owns the elements,
+allocates from a list and returns the `mut &[int]` that owns the elements,
 `[u8]{ 0 x n }` repeats a value `n` times. `[T]{ null x n }` skips the fill and is only safe when every
 zero `T` is a valid value; for reference elements it requires `@unsafe`.
 Container methods resize containers and create views. Writing the raw storage
@@ -291,16 +291,18 @@ even in the source that declares the type.
 `arr[i]` on an `Array` of structs hands out a copy of the element, because the
 array's storage can move when it grows. Assigning into that copy, or calling a
 method that changes it, is a compile error; borrow the element with
-`&mut arr[i]`, write through a writable view (`arr.view()` returns an
-`&mut [T]`), or store the changed struct back with `arr.set(i, value)`.
+`&arr[i]`, write through a writable view (`arr.view()` returns a
+`mut &[T]`), or store the changed struct back with `arr.set(i, value)`.
 
 A borrow only reads unless it says `mut`: `&[T]` and `&T` are read-only
-views, `&mut [T]` and `&mut T` may be written through. A slice type declared
+views, `mut &[T]` and `mut &T` may be written through. The `&` operator is
+the only borrow form: `&storage` borrows as writable as the storage allows,
+so there is no `&mut`. A slice type declared
 with `$immutable`, like `String`, is read-only everywhere outside its own class. Any slice, array or
 string converts to `&[T]`, so `fn write(data: &[u8])` accepts strings, byte
-buffers and slices without copying, while `fn read(buf: &mut [u8])` needs
-writable storage. Assigning through a read-only borrow, taking `&mut` of one
-of its elements, or calling a method that changes it is a compile error.
+buffers and slices without copying, while `fn read(buf: mut &[u8])` needs
+writable storage. Assigning through a read-only borrow, or calling a method
+that changes it is a compile error.
 A named slice such as `String` or your own `slice Bytes of u8 {}` converts to
 the bare forms, never the other way around, and two different names never
 convert to each other: a name is a promise only its own class can keep.
@@ -310,7 +312,7 @@ also converts to `&[T]` or `&T` when passed to a function, as long as that
 function provably keeps nothing: it may read and pass the borrow on, but a
 callee that stores it in an object, returns it, or hands it to a coroutine
 gets "Cannot convert a stack borrow" at the call, because the storage dies
-with the caller's frame. The same applies to a `local T` borrow. Storage
+with the caller's frame. The same applies to a `local &T` borrow. Storage
 that must be kept belongs in a class property, a global, or a heap slice
 such as `[u8]{ 0 x 4 }`.
 
@@ -335,7 +337,7 @@ and `value.range(start, length)` return a copy. `&value[start .. length]` and
 ```rust
 let values = Array[int]{ 1, 2, 3, 4 }
 let copy = values[1 .. 2]  // Array[int], independent of values
-let view = &values[1 .. 2] // &mut [int] over the same elements
+let view = &values[1 .. 2] // mut &[int] over the same elements
 view[0] = 20               // values is now { 1, 20, 3, 4 }
 ```
 
@@ -870,7 +872,7 @@ fn combined_length(v1: $V1, v2: $V2) uint {
 
 In other words, `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)` when `T` should be inferred from `arg`.
 After `$T` introduces `T`, later parameters and the return type use `T` as usual,
-and `$T` may also sit inside a type: `?$T`, `&$T`, `&[$T]`, `local $T`, `*$T` and
+and `$T` may also sit inside a type: `?$T`, `&$T`, `&[$T]`, `local &$T`, `*$T` and
 class arguments such as `Array[$T]` or `HashMap[$K, $V]` infer `T` through that
 wrapper. A `?$T` parameter also takes a plain value. A nullable variable that was
 just checked with `isset` infers its plain type, as it would pass to a plain parameter.
