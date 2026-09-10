@@ -130,7 +130,7 @@ static class Program
     {
         Header("stable-heap forced collects");
         const int live = 500_000;
-        const int collects = 5_000;
+        const int collects = 500;
         var list = Chain(live);
         FullGC();
 

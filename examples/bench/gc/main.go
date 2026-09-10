@@ -142,7 +142,7 @@ func benchShortLived() {
 func benchStableCollect() {
 	header("stable-heap forced collects")
 	const live = 500_000
-	const collects = 5_000
+	const collects = 500
 	list := chain(live)
 
 	fullGC()

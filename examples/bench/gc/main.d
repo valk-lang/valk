@@ -106,7 +106,7 @@ void benchShortLived() {
 void benchStableCollect() {
     header("stable-heap forced collects");
     enum live = 500_000;
-    enum collects = 5_000;
+    enum collects = 500;
     auto list = chain(live);
     fullGC();
 
