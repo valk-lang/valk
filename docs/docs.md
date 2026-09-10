@@ -263,8 +263,9 @@ take a `fn(T)(bool)`, `map[R]` builds a new array from a `fn(T)(R)`, and
 `reduce[R](init, fn(R, T)(R))` folds the elements into one value. `filter`
 copies matching items into a new array. `remove_where` removes matching items
 from the original. `extract` takes matching items out of the original and
-returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`, and
-`shuffle()` randomizes the order.
+returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`.
+`sort`, `reverse`, `shuffle` and `remove_duplicates` update the array in place;
+`sorted`, `reversed`, `shuffled` and `unique` return a new array.
 
 ```rust
 let nums = Array[int]{ 3, 1, 2 }
@@ -273,8 +274,9 @@ let strs = nums.map[String](fn(v: int) String { return v.to(String) })
 let total = nums.reduce[int](0, fn(t: int, v: int) int { return t + v }) // 6, same as nums.sum()
 ```
 
-Use `arr.sort()` for elements that support ordering. Other element types require
-a comparator whose parameters have the element type; for an `Array[Array[int]]`:
+Use `arr.sort()` for elements that support ordering, or `arr.sorted()` for a
+copy. Other element types require a comparator whose parameters have the
+element type; for an `Array[Array[int]]`:
 `rows.sort(fn(a: Array[int], b: Array[int]) bool { return a[0] > b[0] })`.
 The comparator returns true when `a` should come after `b`.
 
@@ -904,7 +906,7 @@ fn main() {
 }
 ```
 
-`$add` and `$sub` customize `+` and `-` (and `+=`, `-=`) for a class; the method takes the right-hand value and returns the result. `$eq` customizes `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` already honours `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
+`$add` and `$sub` customize `+` and `-` (and `+=`, `-=`) for a class; the method takes the right-hand value and returns the result. `$eq` customizes `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` / `Array.remove_duplicates()` already honour `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
 
 Generic specializations remain distinct and invariant even when their type
 arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`

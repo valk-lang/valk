@@ -154,17 +154,21 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn range(start: uint, amount: uint) Array[T]
     + fn reduce[R](init: R, func: fn(R, T)(R)) R
     + fn remove(index: uint) void
+    + fn remove_duplicates() void
     + fn remove_value(value: T) void
     + fn remove_where(func: ?fn(T)(bool) (null)) void
     + fn reverse() void
+    + fn reversed() Array[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
     + fn shuffle() void
+    + fn shuffled() Array[T]
     + fn sort(func: fn(T, T)(bool)) void
+    + fn sorted(func: fn(T, T)(bool)) Array[T]
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) void
-    + fn unique() void
+    + fn unique() Array[T]
     + fn view(start: uint (0), amount: uint (uint.$max)) &mut [T]
 }
 ```
