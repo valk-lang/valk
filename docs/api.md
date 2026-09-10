@@ -1300,11 +1300,9 @@ alias pid_t for i32
 + fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
 + fn create_dir(path: String, permissions: u32 (0c755)) void !io:IoError
 + fn cwd() String !io:IoError
-+ fn delete(path: String) void !io:IoError
 + fn delete_all(path: String) void !io:IoError
 + fn delete_dir(path: String) void !io:IoError
 + fn delete_file(path: String) void !io:IoError
-+ fn delete_recursive(path: String) void !io:IoError
 + fn dir_of(path: String) String
 + fn exe_dir() String !io:IoError
 + fn exe_path() String !io:IoError
@@ -1316,7 +1314,6 @@ alias pid_t for i32
 + fn is_file(path: String) bool
 + fn is_symlink(path: String) bool
 + fn mime_type(ext_without_dot: String) String
-+ fn mkdir(path: String, permissions: u32 (0c755)) void !io:IoError
 + fn modified_time(path: String) uint !io:IoError
 + fn move(from_path: String, to_path: String) void !io:IoError
 + fn open(path: String, options: ?OpenOptions (null)) i32 !io:IoError
@@ -1325,7 +1322,6 @@ alias pid_t for i32
 + fn read_dir(path: String) DirIterator !io:IoError
 + fn realpath(path: String) String !io:IoError
 + fn resolve(path: String) String
-+ fn rmdir(path: String) void !io:IoError
 + fn size(path: String) uint !io:IoError
 + fn stat(path: String) FileInfo !io:IoError
 + fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError

@@ -105,6 +105,14 @@ if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(fd: i32, data: &[u8], timeout_ms: uint (5000)) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn read(buf: &mut [u8]) uint !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn write(data: &[u8]) uint !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn create_dir(path: String, permissions: u32 (0c755)) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn delete_all(path: String) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn delete_dir(path: String) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn delete_file(path: String) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn delete(path: String) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn delete_recursive(path: String) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn mkdir(path: String, permissions: u32 (0c755)) void !io:IoError'* ]] \
+    || [[ "$stdlib_markdown" == *'+ fn rmdir(path: String) void !io:IoError'* ]] \
     || [[ "$stdlib_markdown" != *'+ class HashMap[K, T]'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn get(key: K) T !LookupError'* ]] \
     || [[ "$stdlib_markdown" == *'+ class BlowfishContext'* ]] \
