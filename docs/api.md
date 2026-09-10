@@ -124,9 +124,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
     + fn all(func: fn(T)(bool)) bool
     + fn any(func: fn(T)(bool)) bool
-    + fn append(item: T, unique: bool (false)) Array[T]
-    + fn append_many(items: Array[T]) Array[T]
-    + fn clear(reduce_size: bool (false)) Array[T]
+    + fn append(item: T, unique: bool (false)) void
+    + fn append_many(items: Array[T], unique: bool (false)) void
+    + fn clear(reduce_size: bool (false)) void
     + fn clone() Array[T]
     + fn contains(value: T) bool
     + fn copy() Array[T]
@@ -146,26 +146,25 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn join(divider: String) String
     + fn map[R](func: fn(T)(R)) Array[R]
     + fn merge(items: Array[T]) Array[T]
-    + fn merge_in_place(items: Array[T]) Array[T]
     + static fn new(start_size: uint (0)) Array[T]
     + fn pop_first() T !LookupError
     + fn pop_last() T !LookupError
-    + fn prepend(item: T, unique: bool (false)) Array[T]
-    + fn prepend_many(items: Array[T]) Array[T]
+    + fn prepend(item: T, unique: bool (false)) void
+    + fn prepend_many(items: Array[T], unique: bool (false)) void
     + fn range(start: uint, amount: uint) Array[T]
     + fn reduce[R](init: R, func: fn(R, T)(R)) R
-    + fn remove(index: uint) Array[T]
-    + fn remove_value(value: T) Array[T]
+    + fn remove(index: uint) void
+    + fn remove_value(value: T) void
     + fn remove_where(func: ?fn(T)(bool) (null)) void
-    + fn reverse() Array[T]
+    + fn reverse() void
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
     + fn set_expand(index: uint, value: T, filler_value: T) void
-    + fn shuffle() Array[T]
-    + fn sort(func: fn(T, T)(bool)) Array[T]
+    + fn shuffle() void
+    + fn sort(func: fn(T, T)(bool)) void
     + fn swap(index_a: uint, index_b: uint) void
-    + fn swap_remove(index: uint) Array[T]
-    + fn unique() Array[T]
+    + fn swap_remove(index: uint) void
+    + fn unique() void
     + fn view(start: uint (0), amount: uint (uint.$max)) &mut [T]
 }
 ```
@@ -273,7 +272,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class Deque[T] {
-    + fn clear() Deque[T]
+    + fn clear() void
     + fn clone() Deque[T]
     + fn contains(value: T) bool
     + fn copy() Deque[T]
@@ -285,8 +284,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn peek_front() T !LookupError
     + fn pop_back() T !LookupError
     + fn pop_front() T !LookupError
-    + fn push_back(item: T) Deque[T]
-    + fn push_front(item: T) Deque[T]
+    + fn push_back(item: T) void
+    + fn push_front(item: T) void
     + fn set(index: uint, value: T) void !LookupError
     + fn to_array() Array[T]
 }
@@ -294,7 +293,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class FlatMap[K, T] {
-    + fn clear() FlatMap[K, T]
+    + fn clear() void
     + fn clone() FlatMap[K, T]
     + fn copy() FlatMap[K, T]
     + fn get(key: K) T !LookupError
@@ -303,20 +302,20 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn keys() Array[K]
     + get length: uint
     + fn merge(map: FlatMap[K, T]) FlatMap[K, T]
-    + fn merge_in_place(map: FlatMap[K, T]) FlatMap[K, T]
+    + fn merge_in_place(map: FlatMap[K, T]) void
     + static fn new() FlatMap[K, T]
-    + fn remove(key: K) FlatMap[K, T]
-    + fn set(key: K, value: T) FlatMap[K, T]
-    + fn set_many(map: FlatMap[K, T]) FlatMap[K, T]
-    + fn set_unique(key: K, value: T) FlatMap[K, T] !LookupError
-    + fn sort_keys() FlatMap[K, T]
+    + fn remove(key: K) void
+    + fn set(key: K, value: T) void
+    + fn set_many(map: FlatMap[K, T]) void
+    + fn set_unique(key: K, value: T) void !LookupError
+    + fn sort_keys() void
     + fn values() Array[T]
 }
 ```
 
 ```js
 + class HashMap[K, T] {
-    + fn clear() HashMap[K, T]
+    + fn clear() void
     + fn clone() HashMap[K, T]
     + fn copy() HashMap[K, T]
     + fn get(key: K) T !LookupError
@@ -326,12 +325,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn keys() Array[K]
     + get length: uint
     + fn merge(map: HashMap[K, T]) HashMap[K, T]
-    + fn merge_in_place(map: HashMap[K, T]) HashMap[K, T]
+    + fn merge_in_place(map: HashMap[K, T]) void
     + static fn new(capacity: uint (0)) HashMap[K, T]
-    + fn remove(key: K) HashMap[K, T]
-    + fn set(key: K, value: T) HashMap[K, T]
-    + fn set_unique(key: K, value: T) HashMap[K, T] !LookupError
-    + fn sort_keys() HashMap[K, T]
+    + fn remove(key: K) void
+    + fn set(key: K, value: T) void
+    + fn set_unique(key: K, value: T) void !LookupError
+    + fn sort_keys() void
     + fn values() Array[T]
 }
 ```
@@ -344,9 +343,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class HashSet[T] {
-    + fn add(value: T) HashSet[T]
-    + fn add_all(values: Array[T]) HashSet[T]
-    + fn clear() HashSet[T]
+    + fn add(value: T) void
+    + fn add_all(values: Array[T]) void
+    + fn clear() void
     + fn clone() HashSet[T]
     + fn copy() HashSet[T]
     + fn difference(other: HashSet[T]) HashSet[T]
@@ -366,7 +365,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class Heap[T] {
-    + fn clear() Heap[T]
+    + fn clear() void
     + fn copy() Heap[T]
     + fn drain() Array[T]
     + fn is_empty() bool
@@ -374,7 +373,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn new(before: fn(T, T)(bool)) Heap[T]
     + fn peek() T !LookupError
     + fn pop() T !LookupError
-    + fn push(item: T) Heap[T]
+    + fn push(item: T) void
     + fn replace(item: T) T !LookupError
     + fn to_array() Array[T]
 }
@@ -1530,16 +1529,16 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
 ```js
 + class Headers {
-    + fn append(name: String, value: String) Headers
-    + fn clear() Headers
+    + fn append(name: String, value: String) void
+    + fn clear() void
     + fn copy() Headers
     + fn get(name: String) String !LookupError
     + fn get_all(name: String) Array[String]
     + fn has(name: String) bool
     + get length: uint
     + static fn new() Headers
-    + fn remove(name: String) Headers
-    + fn set(name: String, value: String) Headers
+    + fn remove(name: String) void
+    + fn set(name: String, value: String) void
 }
 ```
 
@@ -1566,10 +1565,10 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + verify_ssl_cert: bool
     + write_timeout_ms: uint
 
-    + fn clear_headers() Options
+    + fn clear_headers() void
     + fn get_headers() Headers
-    + fn set_header(key: String, value: String) Options
-    + fn set_headers(headers: Headers) Options
+    + fn set_header(key: String, value: String) void
+    + fn set_headers(headers: Headers) void
 }
 ```
 
@@ -1653,13 +1652,13 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + write_timeout_ms: uint
 
     + fn add_static_dir(path: String) void !LookupError
-    + fn fast(handler: shared fn(Context, ResponseWriter)()) Server
-    + fn handle(handler: shared fn(Request)(Response)) Server
+    + fn fast(handler: shared fn(Context, ResponseWriter)()) void
+    + fn handle(handler: shared fn(Request)(Response)) void
     + static fn new(host: String, port: u16, handler: shared fn(Request)(Response) (handler_default)) Server
     + fn request_shutdown(timeout_ms: uint (5000)) void
     + fn shutdown(timeout_ms: uint (5000)) bool
     + fn start(worker_count: i32 (-1)) void !HttpError
-    + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) Server !HttpError
+    + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) void !HttpError
 }
 ```
 
@@ -1766,11 +1765,11 @@ alias Fd for i32
 + class ArrayValue {
     + values: Array[Value]
 
-    + fn append(value: Value) ArrayValue
+    + fn append(value: Value) void
     + fn get(index: uint) Value !LookupError
     + get length: uint
-    + fn prepend(value: Value) ArrayValue
-    + fn remove(index: uint) ArrayValue
+    + fn prepend(value: Value) void
+    + fn remove(index: uint) void
 }
 ```
 
@@ -1781,8 +1780,8 @@ alias Fd for i32
     + fn get(key: String) Value !LookupError
     + fn has(key: String) bool
     + get length: uint
-    + fn remove(key: String) ObjectValue
-    + fn set(key: String, value: Value) ObjectValue
+    + fn remove(key: String) void
+    + fn set(key: String, value: Value) void
 }
 ```
 
@@ -1970,8 +1969,8 @@ alias Fd for i32
     + fn close() void !io:IoError
     + static fn new(fd: i32) Connection !NetError
     + fn read(buf: &mut [u8]) uint !io:IoError
-    + fn set_cancel(token: shared CancelToken) Connection
-    + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) Connection
+    + fn set_cancel(token: shared CancelToken) void
+    + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
     + fn write(data: &[u8]) uint !io:IoError
@@ -2272,20 +2271,20 @@ alias Fd for i32
     + fn is_leap_year() bool
     + fn microsecond() uint
     + fn minute() uint
-    + fn modify_add_days(amount: int) DateTime !LookupError
-    + fn modify_add_hours(amount: int) DateTime !LookupError
-    + fn modify_add_microseconds(amount: int) DateTime !LookupError
-    + fn modify_add_minutes(amount: int) DateTime !LookupError
-    + fn modify_add_months(amount: int) DateTime !LookupError
-    + fn modify_add_seconds(amount: int) DateTime !LookupError
-    + fn modify_add_years(amount: int) DateTime !LookupError
-    + fn modify_day(day: uint) DateTime !LookupError
-    + fn modify_hour(hour: uint) DateTime !LookupError
-    + fn modify_microsecond(microsecond: uint) DateTime !LookupError
-    + fn modify_minute(minute: uint) DateTime !LookupError
-    + fn modify_month(month: uint) DateTime !LookupError
-    + fn modify_second(second: uint) DateTime !LookupError
-    + fn modify_year(year: int) DateTime !LookupError
+    + fn modify_add_days(amount: int) void !LookupError
+    + fn modify_add_hours(amount: int) void !LookupError
+    + fn modify_add_microseconds(amount: int) void !LookupError
+    + fn modify_add_minutes(amount: int) void !LookupError
+    + fn modify_add_months(amount: int) void !LookupError
+    + fn modify_add_seconds(amount: int) void !LookupError
+    + fn modify_add_years(amount: int) void !LookupError
+    + fn modify_day(day: uint) void !LookupError
+    + fn modify_hour(hour: uint) void !LookupError
+    + fn modify_microsecond(microsecond: uint) void !LookupError
+    + fn modify_minute(minute: uint) void !LookupError
+    + fn modify_month(month: uint) void !LookupError
+    + fn modify_second(second: uint) void !LookupError
+    + fn modify_year(year: int) void !LookupError
     + fn month() uint
     + static fn new(year: ?int (null), month: ?uint (null), day: ?uint (null), hour: ?uint (null), minute: ?uint (null), second: ?uint (null), microsecond: ?uint (null)) DateTime !LookupError
     + static fn now() DateTime

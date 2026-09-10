@@ -683,7 +683,7 @@ Calling a function that's flagged with `$exit` tells the compiler that the funct
 ```
 Empty array at src/main.valk:12
 Unhandled error 'LookupError.missing' at src/main.valk:20
-Index out of bounds at src/core/ByteBuffer.valk:98 in package valk
+Index out of bounds at src/core/ByteBuffer.valk:85 in package valk
 ```
 
 ```rust
@@ -1564,7 +1564,8 @@ Iteration yields each value and name, including repeated fields.
 
 ```rust
 let headers = http.Headers { "Accept" => "application/json" }
-headers.append("X-Tag", "first").append("x-tag", "second")
+headers.append("X-Tag", "first")
+headers.append("x-tag", "second")
 let res = http.request("GET", url, http.Options { headers: headers }) ! panic("Request failed")
 let cookies = res.headers.get_all("Set-Cookie")
 ```
