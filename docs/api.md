@@ -1911,7 +1911,6 @@ alias Fd for i32
 
 ```js
 + fn alloc(size: uint) ptr
-+ fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
 + fn ascii_equal_ignore_case(a: &[u8], b: &[u8]) bool
