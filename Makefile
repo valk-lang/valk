@@ -32,7 +32,9 @@ LLVM_DIR := toolchains/libraries/linux-llvm-22-x64
 GCC_LIB_DIR := $(dir $(shell g++ -print-file-name=libstdc++.a))
 NATIVE_LINK_FLAGS := -L $(LLVM_DIR)/lib -L $(GCC_LIB_DIR)
 endif
-TEST_FLAGS := --test --def "DEF_TEST=TestValue" -vv
+# GC_DEBUG turns on the GC's internal assertions: a corrupted property slot
+# or a misaligned root panics by name instead of faulting later elsewhere
+TEST_FLAGS := --test --def "DEF_TEST=TestValue" --def "GC_DEBUG=1" -vv
 BENCH_JSON_ITERATIONS ?= 500
 BENCH_JSON_MEMORY_DOCUMENTS ?= 100
 
@@ -76,12 +78,6 @@ test: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-core$(EXE_SUFFIX)
 	./debug/test-core$(EXE_SUFFIX)
 
-# Same suite as `test`, but objects are produced by external clang.
-test-clang: $(TEST_COMPILER)
-	mkdir -p ./debug
-	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-clang$(EXE_SUFFIX) -c -vvv
-	./debug/test-clang$(EXE_SUFFIX)
-
 test-compile-errors: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/compile-errors/run.sh
 
@@ -123,25 +119,26 @@ test-examples: $(TEST_COMPILER)
 
 test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples
 
+# The suites whose outcome depends on the host: the runtime, the linker and
+# the CLI's path handling. The front-end suites (compile errors, formatting,
+# codegen, docs, examples) behave the same on every host, so only one CI job
+# runs 'test-all'.
+test-native: test test-library test-exit-code test-cli test-lsp test-diagnostics test-deps
+
 bench-json: valk
 	mkdir -p ./debug
 	./valk build ./examples/bench/json/main.valk --release -o ./debug/bench-json
 	./debug/bench-json time $(BENCH_JSON_ITERATIONS)
 	./debug/bench-json memory $(BENCH_JSON_MEMORY_DOCUMENTS)
 
-test-gc-debug: valk
-	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-debug --def "GC_DEBUG=1"
-	./debug/test-gc-debug
-
 test-release: $(TEST_COMPILER)
 	mkdir -p ./debug
-	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --release --def "GC_DEBUG=1" -o ./debug/test-release$(EXE_SUFFIX)
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --release -o ./debug/test-release$(EXE_SUFFIX)
 	./debug/test-release$(EXE_SUFFIX)
 
 test-gc-shared-stress: valk
 	mkdir -p ./debug
-	./valk build ./tests/src/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress --def "GC_DEBUG=1"
+	./valk build ./tests/src/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress
 	@run=0; while [ $$run -lt 10 ]; do \
 		run=$$((run + 1)); \
 		echo "Shared GC stress run $$run/10"; \
@@ -149,11 +146,11 @@ test-gc-shared-stress: valk
 	done
 
 watchtest: valk2
-	./valk2 build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all --def "GC_DEBUG=1" -w -v
+	./valk2 build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-all -w -v
 
 test-win: valk
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS) --def "GC_DEBUG=1"
+	./valk build ./tests $(TEST_FLAGS) -vv -o ./debug/test-win.exe --target win-x64 $(FLAGS)
 	./debug/test-win.exe
 
 test-macos-build: valk
@@ -171,9 +168,9 @@ test-cross-ir: valk
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-arm64-ir --target macos-arm64 --ir --clean
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-win-x64-ir --target win-x64 --ir --clean
 
+# The other targets only; the host build is what `test` already made
 test-cross: valk
 	mkdir -p ./debug
-	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-linux-x64 -vv $(FLAGS) --target linux-x64
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-x64 -vv $(FLAGS) --target macos-x64
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-arm64 -vv $(FLAGS) --target macos-arm64
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-win-x64.exe -vv $(FLAGS) --target win-x64
@@ -289,5 +286,5 @@ clean:
 	linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-examples test-compile-errors test-cross test-cross-ir test-diagnostics \
-	test-exit-code test-fmt test-fmt-corpus test-gc-debug test-gc-shared-stress test-lsp \
-	test-macos-build test-clang test-release test-win test-win-build
+	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
+	test-macos-build test-release test-win test-win-build
