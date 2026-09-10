@@ -271,7 +271,7 @@ it, `++`, `&mut` re-borrows, and methods that write to their receiver are
 compile errors. A class object reached through a borrow is an ordinary object:
 `ref.field = x` on `&Box` writes the object, not the borrowed slot. A bare
 `&[T]` offers only the methods that read; a borrow handed back by a
-method on a read-only borrow is read-only too. `stack T` stays the exclusive
+method on a read-only borrow is read-only too. `temp T` stays the exclusive
 frame borrow, writable by construction. Functions that only read take `&[u8]`,
 so string literals and shared strings pass to them without a copy; functions
 that fill a buffer take `&mut [u8]`. `[u8]{ 0 x n }` owns fresh fixed-length
@@ -333,7 +333,7 @@ a captured variable inside the closure body are therefore rejected: assignment,
 compound assignment, `++`/`--`, and stores into inline storage the capture
 holds, such as a field of a captured struct or an element of a captured fixed
 array. So is anything that would write that storage indirectly: a `&mut` or
-`stack` borrow of it, passing it to a `&mut` or `stack` parameter, and calling
+`temp` borrow of it, passing it to a `&mut` or `temp` parameter, and calling
 a method that writes its receiver on it. Read-only borrows and reads remain
 allowed. Writes through a captured reference (`obj.count++`) reach the shared
 object and are allowed. A shared closure cannot capture non-shared managed
@@ -523,16 +523,16 @@ differs is where the storage may live and whether the borrow may escape.
 
 | Type | Layout | Kept alive by | May be stored or returned |
 | --- | --- | --- | --- |
-| `stack T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `temp T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
 | `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
 | `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
 
 #### Stack borrows
 
-`stack T` borrows storage for the rest of the frame: an inline local, an
+`temp T` borrows storage for the rest of the frame: an inline local, an
 argument, a temporary aggregate, or, through another borrow, storage inside a
 GC object. `&local` produces it with a null owner; `&ref.prop` through a
-`stack T` produces it with that borrow's owner word. A stack borrow follows
+`temp T` produces it with that borrow's owner word. A stack borrow follows
 the frame rules:
 
 - May be stored only in local variables and non-escaping parameters.
@@ -548,10 +548,10 @@ suspend directly or through a call, address-taken inline locals use stable
 storage so their addresses remain valid while another coroutine uses the
 execution stack.
 
-`stack [T x N]` is the bounded form; its length is part of the type and
+`temp [T x N]` is the bounded form; its length is part of the type and
 indexing is checked against it.
 
-Struct method receivers are stack borrows: `this` is `stack T`. Calling a
+Struct method receivers are stack borrows: `this` is `temp T`. Calling a
 method on a struct that lives inside a GC object hands the method that
 object's owner word, so a store to a managed field through `this` updates the
 owner's bookkeeping. A method called on a frame local or through a raw
@@ -591,33 +591,33 @@ does not keep it, leaves `owner` publishable as `shared`. Borrowing
 
 #### Null owner
 
-`owner` is nullable, and null means nothing owns the storage. For `stack T`
+`owner` is nullable, and null means nothing owns the storage. For `temp T`
 that includes frame storage. For `&T` safe code produces a null owner only
 for permanent storage: globals and other static data. Unsafe code may build
 an `&T` from a raw pointer with `.@cast(&T)`, which yields a null owner over
-memory whose lifetime the programmer manages. A `stack T` does not convert to
+memory whose lifetime the programmer manages. A `temp T` does not convert to
 `&T`, because its null owner may stand for a frame, and the compiler reports
 the missing owner instead of the old "cannot be stored" errors.
 
 #### Conversions
 
-- `&mut T` converts to `stack T` in place; the layouts are the same and only
+- `&mut T` converts to `temp T` in place; the layouts are the same and only
   the escape rule changes. A read-only `&T` does not: a stack borrow is
   writable by construction.
-- `stack T` does not convert to `&T` or `&[T]`.
+- `temp T` does not convert to `&T` or `&[T]`.
 - `&[T x N]` converts to `&[T]`; `[T x N]` storage with an owner converts to
   either.
-- A raw pointer converts to `stack T` implicitly, as before, and to `&T` only
+- A raw pointer converts to `temp T` implicitly, as before, and to `&T` only
   through explicit `.@cast(&T)` under `@unsafe`.
 - Every writable borrow converts to `ptr` and to a matching `*T`; a bounded
   `*[T x N]` takes exactly its own length. Read-only storage becomes a raw
-  pointer only under `@unsafe`. A raw pointer taken from a `stack T` keeps
+  pointer only under `@unsafe`. A raw pointer taken from a `temp T` keeps
   the frame rules: it may be passed to a pointer parameter but not stored.
 - `?&T` uses a null address as its empty state and costs no extra word.
   Equality on borrows compares addresses.
 
 The convention that follows: a function that only reads takes `&T`, a
-function that writes but does not keep the borrow takes `stack T`, and one
+function that writes but does not keep the borrow takes `temp T`, and one
 that may store it takes `&mut T`. Callers may pass a writable owned borrow to
 any of them.
 
@@ -711,7 +711,7 @@ operations. `pointer.$offset(bytes)` computes an address offset without
 converting the integer offset itself to `ptr`.
 
 Raw pointers may erase to `ptr`, and a bare `ptr` may acquire either a raw `*T`
-element type or a `stack T` borrow type. Converting any raw pointer to an owned
+element type or a `temp T` borrow type. Converting any raw pointer to an owned
 `&T` requires explicit `.@cast(&T)` and yields a borrow without an owner.
 
 Bitwise `ptr & integer`, `ptr | integer`, and `ptr ^ integer` operations retain

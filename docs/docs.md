@@ -310,7 +310,7 @@ also converts to `&[T]` or `&T` when passed to a function, as long as that
 function provably keeps nothing: it may read and pass the borrow on, but a
 callee that stores it in an object, returns it, or hands it to a coroutine
 gets "Cannot convert a stack borrow" at the call, because the storage dies
-with the caller's frame. The same applies to a `stack T` borrow. Storage
+with the caller's frame. The same applies to a `temp T` borrow. Storage
 that must be kept belongs in a class property, a global, or a heap slice
 such as `[u8]{ 0 x 4 }`.
 
@@ -870,7 +870,7 @@ fn combined_length(v1: $V1, v2: $V2) uint {
 
 In other words, `fn myfunc[T](arg: T)` can be written as `fn myfunc(arg: $T)` when `T` should be inferred from `arg`.
 After `$T` introduces `T`, later parameters and the return type use `T` as usual,
-and `$T` may also sit inside a type: `?$T`, `&$T`, `&[$T]`, `stack $T`, `*$T` and
+and `$T` may also sit inside a type: `?$T`, `&$T`, `&[$T]`, `temp $T`, `*$T` and
 class arguments such as `Array[$T]` or `HashMap[$K, $V]` infer `T` through that
 wrapper. A `?$T` parameter also takes a plain value. A nullable variable that was
 just checked with `isset` infers its plain type, as it would pass to a plain parameter.
