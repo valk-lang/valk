@@ -1033,6 +1033,11 @@ An interface implementation has to be at least as accessible as the requirement
 it satisfies; a call through the interface only checks the requirement's access,
 so a narrower implementation would be reachable through it.
 
+A declaration that reaches beyond its source file must not name a file-private
+type in its signature, including through the types it contains; the callers
+would hold values of a type they cannot name. The implicit `this` receiver is
+exempt, so a private class can implement a wider interface.
+
 `@ignore_access` is an unsafe file-level escape hatch for compiler and low-level
 library code.
 

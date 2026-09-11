@@ -1445,6 +1445,12 @@ An interface implementation must be at least as accessible as the requirement
 it satisfies: a `- fn` cannot implement a `fn` requirement, because calls
 through the interface would reach it anyway.
 
+A declaration that reaches outside its source file cannot name a file-private
+type in its signature, because callers would receive a value whose type they
+cannot name. A `- class` may still sit behind a wider declaration: a private
+class implementing a public interface is fine, its methods are called through
+the interface.
+
 Low-level code can place `@ignore_access` in a scope to bypass access checks.
 
 ## Value scopes
