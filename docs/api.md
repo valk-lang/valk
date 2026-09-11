@@ -165,7 +165,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn to_int() int !SyntaxError
     // Returns a new `String` holding a copy of the bytes.
     + fn to_string() String
-    // Parses the bytes as a decimal unsigned integer.
+    // Parses the bytes as a decimal unsigned integer, with an optional leading `+`.
     + fn to_uint() uint !SyntaxError
 }
 ```
@@ -417,17 +417,17 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn read_cstring() String
     // Parses a decimal float and advances past it.
     + fn read_float() float
-    // Parses a hexadecimal integer with an optional `-` sign and `0x` prefix, advancing past it.
+    // Parses a hexadecimal integer with an optional `-` or `+` sign and `0x`/`0X` prefix, advancing past it.
     + fn read_hex_int() int
-    // Parses an unsigned hexadecimal integer with an optional `0x` prefix, advancing past it.
+    // Parses an unsigned hexadecimal integer with an optional `+` sign and `0x`/`0X` prefix, advancing past it.
     + fn read_hex_uint() uint
     // Parses a decimal integer with an optional `-` or `+` sign and advances past it.
     + fn read_int() int
     // Reads `bytes` bytes as an unsigned little-endian integer (meant for 1 to 8 bytes).
     + fn read_little_endian(bytes: uint) uint
-    // Parses an octal integer with an optional `-` sign and `0c` prefix and advances past it.
+    // Parses an octal integer with an optional `-` or `+` sign and `0c` prefix and advances past it.
     + fn read_octal_int() int
-    // Parses an unsigned octal integer with an optional `0c` prefix and advances past it.
+    // Parses an unsigned octal integer with an optional `+` sign and `0c` prefix and advances past it.
     + fn read_octal_uint() uint
     // Reads all remaining bytes into a new `String`.
     + fn read_remaining_string() String
@@ -547,7 +547,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // A hash table from keys of type `K` to values of type `T`.
 + class HashMap[K, T] {
-    // Removes every entry and shrinks the bucket table back to its initial 16 buckets.
+    // Removes every entry.
     + fn clear() void
     // Returns a deep copy: every key and value is cloned with `$clone`.
     + fn clone() HashMap[K, T]
@@ -782,9 +782,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn gte(cmp: String) bool
     // Returns a hash of the bytes; the `$hash` hook that `HashMap` and `HashSet` keys use.
     + fn hash() uint
-    // Parses the string as a hexadecimal signed integer: optional `-`, optional `0x`, digits.
+    // Parses the string as a hexadecimal signed integer: optional `-` or `+`, optional `0x`, digits.
     + fn hex_to_int() int !SyntaxError
-    // Parses the string as a hexadecimal unsigned integer, with an optional `0x` prefix.
+    // Parses the string as a hexadecimal unsigned integer: optional `+`, optional `0x`, digits.
     + fn hex_to_uint() uint !SyntaxError
     // Returns the byte offset of the first occurrence of `part` at or after `start_index`.
     + fn index_of(part: String, start_index: uint (0)) uint !LookupError
@@ -800,7 +800,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn is_integer() bool
     // Returns whether no character in the string has a lower-case mapping.
     + fn is_lower() bool
-    // Returns whether the string is non-empty and holds only digits `0`-`9` and at most one `.`.
+    // Returns whether the string holds only digits `0`-`9` and at most one `.`, with at least one digit.
     + fn is_number() bool
     // Returns whether every byte is allowed by `mask`, or with `mask_is_exclude`, whether none is.
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) bool
@@ -814,9 +814,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn lte(cmp: String) bool
     // Removes repeated copies of `part` from the start of the string.
     + fn ltrim(part: String, limit: uint (0)) String
-    // Parses the string as an octal signed integer: optional `-`, optional `0c`, digits.
+    // Parses the string as an octal signed integer: optional `-` or `+`, optional `0c`, digits.
     + fn octal_to_int() int !SyntaxError
-    // Parses the string as an octal unsigned integer, with an optional `0c` prefix.
+    // Parses the string as an octal unsigned integer: optional `+`, optional `0c`, digits.
     + fn octal_to_uint() uint !SyntaxError
     // Returns the string prefixed with the byte `char` until it is `length` bytes long.
     + fn pad_left(char: u8, length: uint) String
@@ -1032,9 +1032,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 2]) i16
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 2]) i16
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i16) i16
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i16) i16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i16) String
@@ -1074,9 +1074,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 4]) i32
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 4]) i32
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i32) i32
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i32) i32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i32) String
@@ -1116,9 +1116,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 8]) i64
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 8]) i64
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i64) i64
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i64) i64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i64) String
@@ -1158,9 +1158,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *u8) i8
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *u8) i8
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i8) i8
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i8) i8
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i8) String
@@ -1200,9 +1200,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 8]) int
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 8]) int
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: int) int
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: int) int
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: int) String
@@ -1228,15 +1228,15 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn create_string(length: uint) String
     // Returns the length of the float text at this address, up to `max_bytes`.
     + fn determine_float_length(max_bytes: uint) uint
-    // Returns the length of an optional `-`, `0x` prefix and hex digits, up to `max_bytes`.
+    // Returns the length of an optional `-` or `+` sign, `0x`/`0X` prefix and hex digits, up to `max_bytes`.
     + fn determine_hex_int_length(max_bytes: uint) uint
-    // Returns the length of an optional `0x` prefix and hex digits, up to `max_bytes`.
+    // Returns the length of an optional `+` sign, `0x`/`0X` prefix and hex digits, up to `max_bytes`.
     + fn determine_hex_uint_length(max_bytes: uint) uint
-    // Returns the length of an optional sign and decimal digits, up to `max_bytes`.
+    // Returns the length of an optional `-` or `+` sign and decimal digits, up to `max_bytes`.
     + fn determine_int_length(max_bytes: uint) uint
-    // Returns the length of an optional `-`, `0c` prefix and octal digits, up to `max_bytes`.
+    // Returns the length of an optional `-` or `+` sign, `0c` prefix and octal digits, up to `max_bytes`.
     + fn determine_octal_int_length(max_bytes: uint) uint
-    // Returns the length of an optional `0c` prefix and octal digits, up to `max_bytes`.
+    // Returns the length of an optional `+` sign, `0c` prefix and octal digits, up to `max_bytes`.
     + fn determine_octal_uint_length(max_bytes: uint) uint
     // Returns the length of an optional `+` and decimal digits, up to `max_bytes`.
     + fn determine_uint_length(max_bytes: uint) uint
@@ -1250,7 +1250,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn index_of_byte(byte: u8, memory_size: uint) uint !LookupError
     // Returns the offset of the first `byte`, scanning without any length limit.
     + fn index_of_byte_inf(byte: u8) uint
-    // Prints the first `length` bytes to stdout as a comma-separated list like `0x1,0xAB`.
+    // Prints the first `length` bytes to stdout as a comma-separated list like `0x01,0xAB`.
     + fn print_bytes(length: uint, end_with_newline: bool (true)) void
     // Reads a `bytes`-long big-endian unsigned integer from this address.
     + fn read_big_endian(bytes: uint) uint
@@ -1264,11 +1264,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn read_float(len: uint) float !SyntaxError
     // Parses a float like `read_float`, stopping at the first byte not part of it.
     + fn read_float_dynamic(max_bytes: uint) (float, uint)
-    // Parses the first `len` bytes as a hexadecimal `int` with an optional `-` and `0x` prefix.
+    // Parses the first `len` bytes as a hexadecimal `int`: an optional `-` or `+` sign, an optional `0x` or `0X` prefix, then hex digits.
     + fn read_hex_int(len: uint) int !SyntaxError
     // Parses a hex `int` like `read_hex_int`, stopping at the first byte not part of it.
     + fn read_hex_int_dynamic(max_bytes: uint) (int, uint)
-    // Parses the first `len` bytes as a hexadecimal `uint` with an optional `0x` prefix.
+    // Parses the first `len` bytes as a hexadecimal `uint`: an optional `+` sign, an optional `0x` or `0X` prefix, then hex digits.
     + fn read_hex_uint(len: uint) uint !SyntaxError
     // Parses a hex `uint` like `read_hex_uint`, stopping at the first byte not part of it.
     + fn read_hex_uint_dynamic(max_bytes: uint) (uint, uint)
@@ -1278,11 +1278,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn read_int_dynamic(max_bytes: uint) (int, uint)
     // Reads a `bytes`-long little-endian unsigned integer from this address.
     + fn read_little_endian(bytes: uint) uint
-    // Parses the first `len` bytes as an octal `int` with an optional `-` and `0c` prefix.
+    // Parses the first `len` bytes as an octal `int`: an optional `-` or `+` sign, an optional `0c` prefix, then octal digits.
     + fn read_octal_int(len: uint) int !SyntaxError
     // Parses an octal `int` like `read_octal_int`, stopping at the first byte not part of it.
     + fn read_octal_int_dynamic(max_bytes: uint) (int, uint)
-    // Parses the first `len` bytes as an octal `uint` with an optional `0c` prefix.
+    // Parses the first `len` bytes as an octal `uint`: an optional `+` sign, an optional `0c` prefix, then octal digits.
     + fn read_octal_uint(len: uint) uint !SyntaxError
     // Parses an octal `uint` like `read_octal_uint`, stopping at the first byte not part of it.
     + fn read_octal_uint_dynamic(max_bytes: uint) (uint, uint)
@@ -1368,9 +1368,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 2]) u16
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 2]) u16
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u16) u16
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u16) u16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u16) String
@@ -1410,9 +1410,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 4]) u32
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 4]) u32
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u32) u32
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u32) u32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u32) String
@@ -1452,9 +1452,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 8]) u64
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 8]) u64
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u64) u64
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u64) u64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u64) String
@@ -1522,9 +1522,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *u8) u8
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *u8) u8
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u8) u8
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u8) u8
     // Returns a one-byte `String` holding this byte.
     + fn to_ascii_string() String
@@ -1572,9 +1572,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn read_big_endian(from: *[u8 x 8]) uint
     // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
     + static fn read_little_endian(from: *[u8 x 8]) uint
-    // Rounds down to a multiple of `modulo` by dropping the remainder.
+    // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: uint) uint
-    // Rounds up to the next multiple of `modulo`; multiples are returned unchanged.
+    // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: uint) uint
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: uint) String
@@ -1707,7 +1707,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // A streaming BLAKE2b hash with a digest of 1 to 64 bytes and an optional key.
 + class Blake2b {
-    // Writes the `hash_size`-byte digest to `out`.
+    // Writes the `hash_size`-byte digest to the start of `out`.
     + fn finalize(out: *[u8]) void
     // Returns the 64-byte BLAKE2b digest of `input` as 128 hex characters.
     + static fn hash_string(input: &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
@@ -2221,7 +2221,7 @@ alias pid_t for i32
 + value PATH_DIV ("/")
 // `PATH_DIV` followed by `.`.
 + value PATH_DIV_DOT ("/.")
-// The other platform's separator, which `resolve` converts to `PATH_DIV`.
+// The other platform's separator: `\` outside Windows, where it is an ordinary name byte.
 + value PATH_DIV_REPLACE ("\\")
 // Two path separators, as at the start of a UNC path.
 + value PATH_DIV_TWICE ("//")
@@ -2340,7 +2340,7 @@ alias pid_t for i32
 ```js
 // An open file that reads and writes at a tracked position.
 + class FileStream is Reader, Writer, Seeker, Closer {
-    // Whether the stream is closed, by `close` or by reading to the end.
+    // Whether the stream is closed, by `close` or by reading a read-only stream to the end.
     ~ closed: bool
     // The path the stream was opened with.
     ~ path: String
@@ -2536,7 +2536,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     ~ bytes_received: uint
     // The number of request bytes written so far.
     ~ bytes_sent: uint
-    // Unused; always 0.
+    // The size of the complete raw response (head and body) in bytes, like `bytes_received` counts it.
     ~ bytes_to_recv: uint
     // The size of the complete request (head and body) in bytes.
     ~ bytes_to_send: uint
@@ -2544,7 +2544,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     ~ con: Connection
     // The buffer that collects the raw response bytes.
     ~ recv_buffer: ByteBuffer
-    // An estimate of the share of the response received, from 0 to 100.
+    // The share of the response received so far, from 0 to 100.
     ~ recv_percent: uint
     // Whether the request has been written completely, or the request ended in an error.
     ~ request_sent: bool
@@ -2735,7 +2735,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + body: String
     // The `Content-Type` header value; a value with control characters is not sent.
     + content_type: String
-    // The HTTP status code; ignored for `file` and `stream` responses over HTTP/1.1, which are always sent as 200.
+    // The HTTP status code, also for `file` and `stream` responses.
     + status: u32
 
     // Adds a header field, keeping earlier fields with the same name.
@@ -2771,11 +2771,11 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + static fn code_name(code: uint) String
     // Responds with status `code`, `content_type` and `body`.
     + fn respond(code: uint, content_type: String, body: String, headers: ?Headers (null)) void
-    // Responds 200 with the file at `path`; responds 404 when it cannot be opened.
+    // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null)) void
     // Responds with `status_code` and an empty `text/plain` body.
     + fn send_status(status_code: uint) void
-    // Responds 200 with a body streamed from `reader`.
+    // Responds with status `code` and a body streamed from `reader`.
     + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null)) void
 }
 ```
@@ -3066,9 +3066,9 @@ alias Fd for i32
     + fn encode(pretty: bool (false)) String
     // Writes the value encoded as JSON to `output` and returns `output`; see `json.encode`.
     + fn encode_into(output: ByteBuffer, pretty: bool (false)) ByteBuffer
-    // Returns the float held, or `0.0` when the value is not a float.
+    // Returns the number held as a float, or `0.0` when the value is not a number.
     + get float: float
-    // Returns the float held.
+    // Returns the number held as a float; an integer is converted.
     + fn float_value() float !LookupError
     // Returns the object member named `key` or the array item at index `key`.
     + fn get(key: String | uint) Value
@@ -3076,7 +3076,7 @@ alias Fd for i32
     + fn get_array(key: String | uint) ArrayValue !LookupError
     // Returns the bool at `key`.
     + fn get_bool(key: String | uint) bool !LookupError
-    // Returns the float at `key`.
+    // Returns the number at `key` as a float; an integer is converted.
     + fn get_float(key: String | uint) float !LookupError
     // Returns the integer at `key`.
     + fn get_int(key: String | uint) int !LookupError
@@ -3092,7 +3092,7 @@ alias Fd for i32
     + fn has_array(key: String | uint) bool
     // Returns whether the value at `key` exists and is a bool.
     + fn has_bool(key: String | uint) bool
-    // Returns whether the value at `key` exists and is a float.
+    // Returns whether the value at `key` exists and is a number, i.e. whether `get_float` succeeds; an integer counts.
     + fn has_float(key: String | uint) bool
     // Returns whether the value at `key` exists and is an integer.
     + fn has_int(key: String | uint) bool
@@ -3467,9 +3467,9 @@ alias Fd for i32
     + fn selected_alpn() String
     // Sets the ALPN protocols to offer (such as `"h2"`, `"http/1.1"`), most preferred first.
     + fn set_alpn(protocols: Array[String]) void !NetError
-    // Loads the trusted CA certificates in the PEM file `path`, adding to those already loaded.
+    // Trusts the CA certificates in the PEM file `path` and stores it as `cert_file`.
     + fn set_ca_cert(path: ?String) void !NetError
-    // Adds `dir`, a directory of hashed CA certificates (OpenSSL `c_rehash` layout), as trusted.
+    // Trusts the CA directory `dir` (OpenSSL `c_rehash` layout) and stores it as `cert_dir`.
     + fn set_ca_cert_dir(dir: ?String) void !NetError
     // Sets the TLS 1.2 and older ciphers as an OpenSSL cipher string.
     + fn set_cipher_list(ciphers: String) void !NetError
@@ -3779,7 +3779,7 @@ alias Fd for i32
 + fn mono_us() uint
 // Pauses the caller for at least `ms` milliseconds; see `sleep_ns`.
 + fn sleep_ms(ms: uint) void
-// Pauses the caller for `ns` nanoseconds.
+// Pauses the caller for at least `ns` nanoseconds.
 + fn sleep_ns(ns: uint) void
 // Returns the wall-clock time in milliseconds since the Unix epoch (UTC).
 + fn unix_ms() uint
@@ -3969,7 +3969,7 @@ alias Fd for i32
     + fn email() Field
     // Sets a string the value must equal; `null` removes the check.
     + fn equals_string(str: ?String) Field
-    // Returns a rule that requires a float.
+    // Returns a rule that requires a number; an integer such as `1` is accepted as a float.
     + static fn float() Field
     // Sets a float maximum for a float rule, checked in addition to `max`.
     + fn fmax(val: float) Field
