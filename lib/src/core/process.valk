@@ -154,27 +154,70 @@ fn process_close_windows_handle(handle: ext.HANDLE) {
     }
 }
 
-fn process_inheritable_standard_handle(kind: u32, fallback_access: u32) ext.HANDLE !io.IoError {
+fn process_open_null_handle(access: u32) ext.HANDLE !io.IoError {
     @unsafe
-    let source = ext.GetStdHandle(kind)
-    if source != 0 && source != ext.INVALID_HANDLE_VALUE {
-        let duplicate: ext.HANDLE = 0
-        let process = ext.GetCurrentProcess()
-        if ext.DuplicateHandle(process, source, process, @ref(duplicate), 0, 1, ext.DUPLICATE_SAME_ACCESS) != 0 {
-            return duplicate
-        }
-    }
-
     let nul = process_utf16("NUL") !>
     let attributes = ext.SECURITY_ATTRIBUTES {
         nLength: size_of(ext.SECURITY_ATTRIBUTES).to(u32)
         bInheritHandle: 1
     }
-    let handle = ext.CreateFileW(nul.items().@cast(ptr), fallback_access,
+    let handle = ext.CreateFileW(nul.items().@cast(ptr), access,
         ext.FILE_SHARE_READ | ext.FILE_SHARE_WRITE, @ref(attributes), ext.OPEN_EXISTING,
         ext.FILE_ATTRIBUTE_NORMAL, 0)
     if handle == ext.INVALID_HANDLE_VALUE : throw .os
     return handle
+}
+
+/// An inheritable standard handle for a child: a duplicate of this process's `kind` handle,
+/// or NUL when the parent has none. `discard` forces NUL so the child's output is thrown away.
+fn process_standard_handle(kind: u32, access: u32, discard: bool) ext.HANDLE !io.IoError {
+    @unsafe
+    if !discard {
+        let source = ext.GetStdHandle(kind)
+        if source != 0 && source != ext.INVALID_HANDLE_VALUE {
+            let duplicate: ext.HANDLE = 0
+            let process = ext.GetCurrentProcess()
+            if ext.DuplicateHandle(process, source, process, @ref(duplicate), 0, 1, ext.DUPLICATE_SAME_ACCESS) != 0 {
+                return duplicate
+            }
+        }
+    }
+    return process_open_null_handle(access)
+}
+
+fn process_create_windows(command: Array[u16], stdin_handle: ext.HANDLE, stdout_handle: ext.HANDLE,
+    stderr_handle: ext.HANDLE, flags: u32) ext.PROCESS_INFORMATION !io.IoError {
+    @unsafe
+    let attribute_size: uint = 0
+    ext.InitializeProcThreadAttributeList(null, 1, 0, @ref(attribute_size))
+    if attribute_size == 0 : throw .os
+    let attributes = mem.alloc(attribute_size)
+    if ext.InitializeProcThreadAttributeList(attributes, 1, 0, @ref(attribute_size)) == 0 {
+        mem.free(attributes)
+        throw .os
+    }
+    let handles: [ext.HANDLE x 3] = { stdin_handle, stdout_handle, stderr_handle }
+    if ext.UpdateProcThreadAttribute(attributes, 0, 0x00020002, @ref(handles),
+        size_of([ext.HANDLE x 3]), null, null) == 0 {
+        ext.DeleteProcThreadAttributeList(attributes)
+        mem.free(attributes)
+        throw .os
+    }
+
+    let si = ext.STARTUPINFOEXW {}
+    si.StartupInfo.cb = size_of(ext.STARTUPINFOEXW).to(u32)
+    si.StartupInfo.dwFlags = ext.STARTF_USESTDHANDLES
+    si.StartupInfo.hStdInput = stdin_handle
+    si.StartupInfo.hStdOutput = stdout_handle
+    si.StartupInfo.hStdError = stderr_handle
+    si.lpAttributeList = attributes
+    let pi = ext.PROCESS_INFORMATION {}
+    let created = ext.CreateProcessW(null, command.items().@cast(ptr), null, null, 1,
+        flags, null, null, @ref(si.StartupInfo), @ref(pi))
+    ext.DeleteProcThreadAttributeList(attributes)
+    mem.free(attributes)
+    if created == 0 : throw .os
+    return pi
 }
 
 fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ext.HANDLE !io.IoError {
@@ -183,72 +226,31 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     // No application name: CreateProcessW then takes the program from the
     // command line's first (quoted) token and searches PATH for it
     let command = process_utf16(process_windows_command_line(exe, args)) !>
-    let pi = ext.PROCESS_INFORMATION {}
-    let created: ext.BOOL = 0
 
-    if print_output {
-        let stdin_handle = process_inheritable_standard_handle(0xfffffff6, ext.GENERIC_READ) !>
-        let stdout_handle = process_inheritable_standard_handle(0xfffffff5, ext.GENERIC_WRITE) ! {
-            process_close_windows_handle(stdin_handle)
-            throw E
-        }
-        let stderr_handle = process_inheritable_standard_handle(0xfffffff4, ext.GENERIC_WRITE) ! {
-            process_close_windows_handle(stdin_handle)
-            process_close_windows_handle(stdout_handle)
-            throw E
-        }
+    // A child with no standard handles makes console programs such as cmd fail, so stdout and
+    // stderr always get NUL when the output is not forwarded, and stdin this process's own.
+    let stdin_handle = process_standard_handle(0xfffffff6, ext.GENERIC_READ, false) !>
+    let stdout_handle = process_standard_handle(0xfffffff5, ext.GENERIC_WRITE, !print_output) ! {
+        process_close_windows_handle(stdin_handle)
+        throw E
+    }
+    let stderr_handle = process_standard_handle(0xfffffff4, ext.GENERIC_WRITE, !print_output) ! {
+        process_close_windows_handle(stdin_handle)
+        process_close_windows_handle(stdout_handle)
+        throw E
+    }
 
-        let attribute_size: uint = 0
-        ext.InitializeProcThreadAttributeList(null, 1, 0, @ref(attribute_size))
-        if attribute_size == 0 {
-            process_close_windows_handle(stdin_handle)
-            process_close_windows_handle(stdout_handle)
-            process_close_windows_handle(stderr_handle)
-            throw .os
-        }
-        let attributes = mem.alloc(attribute_size)
-        if ext.InitializeProcThreadAttributeList(attributes, 1, 0, @ref(attribute_size)) == 0 {
-            mem.free(attributes)
-            process_close_windows_handle(stdin_handle)
-            process_close_windows_handle(stdout_handle)
-            process_close_windows_handle(stderr_handle)
-            throw .os
-        }
-
-        let handles: [ext.HANDLE x 3] = { stdin_handle, stdout_handle, stderr_handle }
-        if ext.UpdateProcThreadAttribute(attributes, 0, 0x00020002, @ref(handles),
-            size_of([ext.HANDLE x 3]), null, null) == 0 {
-            ext.DeleteProcThreadAttributeList(attributes)
-            mem.free(attributes)
-            process_close_windows_handle(stdin_handle)
-            process_close_windows_handle(stdout_handle)
-            process_close_windows_handle(stderr_handle)
-            throw .os
-        }
-
-        let si = ext.STARTUPINFOEXW {}
-        si.StartupInfo.cb = size_of(ext.STARTUPINFOEXW).to(u32)
-        si.StartupInfo.dwFlags = ext.STARTF_USESTDHANDLES
-        si.StartupInfo.hStdInput = stdin_handle
-        si.StartupInfo.hStdOutput = stdout_handle
-        si.StartupInfo.hStdError = stderr_handle
-        si.lpAttributeList = attributes
-        created = ext.CreateProcessW(null, command.items().@cast(ptr), null, null, 1,
-            ext.EXTENDED_STARTUPINFO_PRESENT, null, null, @ref(si.StartupInfo), @ref(pi))
-
-        ext.DeleteProcThreadAttributeList(attributes)
-        mem.free(attributes)
+    let flags: u32 = print_output ? ext.EXTENDED_STARTUPINFO_PRESENT : ext.EXTENDED_STARTUPINFO_PRESENT | ext.CREATE_NO_WINDOW
+    let pi = process_create_windows(command, stdin_handle, stdout_handle, stderr_handle, flags) ! {
         process_close_windows_handle(stdin_handle)
         process_close_windows_handle(stdout_handle)
         process_close_windows_handle(stderr_handle)
-    } else {
-        let si = ext.STARTUPINFOW {}
-        si.cb = size_of(ext.STARTUPINFOW).to(u32)
-        created = ext.CreateProcessW(null, command.items().@cast(ptr), null, null, 0,
-            ext.CREATE_NO_WINDOW, null, null, @ref(si), @ref(pi))
+        throw E
     }
+    process_close_windows_handle(stdin_handle)
+    process_close_windows_handle(stdout_handle)
+    process_close_windows_handle(stderr_handle)
 
-    if created == 0 : throw .os
     if ext.CloseHandle(pi.hThread) == 0 {
         cleanup_warning("Failed to close process thread handle", __FILE__, __LINE__)
     }
