@@ -1077,6 +1077,11 @@ newline, then leaves through `_exit` without running C exit handlers.
 exits successfully. An integer return type supplies the process exit code.
 Other `main` return types are compile errors.
 
+Divergence analysis looks at the statements that can run: a statement after a
+`return` is reported as unreachable and cannot change whether a `while true`
+body diverges, so a dead `break` does not turn a diverging loop into one that
+falls through to a required `return`.
+
 ## Context-sensitive punctuation
 
 The parser uses its current grammar context to classify overloaded punctuation:
