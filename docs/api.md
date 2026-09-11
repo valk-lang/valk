@@ -537,8 +537,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn set_many(map: FlatMap[K, T]) void
     // Adds a new entry for `key` at the end.
     + fn set_unique(key: K, value: T) void !LookupError
-    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-    + fn sort_keys() void
     // Returns a new array of the values, in entry order.
     + fn values() Array[T]
 }
@@ -577,8 +575,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn set(key: K, value: T) void
     // Adds a new entry for `key`.
     + fn set_unique(key: K, value: T) void !LookupError
-    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-    + fn sort_keys() void
     // Returns a new array of the values, in entry order.
     + fn values() Array[T]
 }
@@ -588,6 +584,15 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + extend HashMap[String, T] {
     // Builds a map from a JSON object, converting each member with `to_type`.
     + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
+    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+    + fn sort_keys() void
+}
+```
+
+```js
++ extend HashMap[u32, H2Stream] {
+    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+    + fn sort_keys() void
 }
 ```
 
@@ -1708,7 +1713,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // A streaming BLAKE2b hash with a digest of 1 to 64 bytes and an optional key.
 + class Blake2b {
     // Writes the `hash_size`-byte digest to the start of `out`.
-    + fn finalize(out: *[u8]) void
+    + fn finalize(out: mut &[u8]) void
     // Returns the 64-byte BLAKE2b digest of `input` as 128 hex characters.
     + static fn hash_string(input: &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
     // Returns a BLAKE2b hasher producing `hash_size` bytes, keyed with `key` when given.
@@ -1834,7 +1839,6 @@ alias FILE for ptr
 type libc_addrinfo (libc_gen_addrinfo)
 alias libc_addrinfo_fix for libc_gen_addrinfo
 type libc_dirent (libc_gen_dirent)
-type libc_epoll_event (libc_gen_epoll_event)
 type libc_jmp_buf (libc_gen___jmp_buf_tag)
 type libc_pollfd (libc_gen_pollfd)
 type libc_sockaddr (libc_gen_sockaddr)
@@ -1996,13 +2000,13 @@ alias pid_t for i32
     // Length of `ai_addr` in bytes.
     + ai_addrlen: u32
     // Canonical host name (only with `AI_CANONNAME`), otherwise null.
-    + ai_canonname: cstring
+    + ai_canonname: ?cstring
     // Address family (`AF_*`).
     + ai_family: i32
     // `AI_*` flags.
     + ai_flags: i32
     // Next result in the list, null on the last one.
-    + ai_next: *libc_gen_addrinfo
+    + ai_next: ?*libc_gen_addrinfo
     // Protocol (`IPPROTO_*`), 0 for any.
     + ai_protocol: i32
     // Socket type (`SOCK_*`).
@@ -2031,30 +2035,6 @@ alias pid_t for i32
     + d_reclen: u16
     // File type (`DT_*`), or `DT_UNKNOWN` when the file system does not say.
     + d_type: u8
-}
-```
-
-```js
-// Stands in for the C `epoll_data_t` union, but as a struct.
-+ struct libc_gen_epoll_data {
-    // File descriptor member.
-    + fd: i32
-    // Pointer member.
-    + ptr: ptr
-    // 32-bit integer member.
-    + u32: u32
-    // 64-bit integer member.
-    + u64: uint
-}
-```
-
-```js
-// Stands in for `struct epoll_event`; aliased as `libc_epoll_event`.
-+ struct libc_gen_epoll_event {
-    // User data returned with the event.
-    + data: libc_gen_epoll_data
-    // `EPOLL*` event bits.
-    + events: u32
 }
 ```
 
@@ -2772,11 +2752,11 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // Responds with status `code`, `content_type` and `body`.
     + fn respond(code: uint, content_type: String, body: String, headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
-    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null)) void
+    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: uint (200)) void
     // Responds with `status_code` and an empty `text/plain` body.
     + fn send_status(status_code: uint) void
     // Responds with status `code` and a body streamed from `reader`.
-    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null)) void
+    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: uint (200)) void
 }
 ```
 
@@ -2878,11 +2858,11 @@ alias Fd for i32
 // Writes `msg` and a newline to standard output.
 + fn println(msg: String) void
 // Reads up to `buf.length` bytes from `fd` into `buf` and returns the number read.
-+ fn read(fd: i32, buf: mut &[u8], offset: uint (0)) uint !IoError
++ fn read(fd: i32, buf: mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Reads `reader` until it is exhausted and returns everything read.
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
 // Reads like `read`, but always blocks the thread, even inside a coroutine.
-+ fn read_sync(fd: i32, buf: mut &[u8], offset: uint (0)) uint !IoError
++ fn read_sync(fd: i32, buf: mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Moves the position of `fd` to `offset` bytes from `from` and returns the new position.
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 // Sets the newline translation mode of a C runtime descriptor such as 0, 1 or 2.
@@ -3428,9 +3408,9 @@ alias Fd for i32
 ```js
 // One TLS session over one socket, either client or server side.
 + class Ssl {
-    // Unused: never assigned, always `null`.
+    // The CA directory last given to `set_ca_cert_dir`; `null` when none is set.
     ~ cert_dir: ?String
-    // Unused: never assigned, always `null`.
+    // The CA file last given to `set_ca_cert`; `null` when none is set.
     ~ cert_file: ?String
     // True from a successful handshake until `close`.
     ~ connected: bool
@@ -3698,7 +3678,7 @@ alias Fd for i32
 ```js
 // Options for `render` and `render_content`.
 + class RenderOptions {
-    // Function applied to every `{{ }}` output; `null` uses HTML escaping.
+    // Function applied to every `{{ }}` output; HTML escaping by default, `null` for none.
     + escape: ?fn(String)(String)
     // Maximum nesting of `@include`/`@extend` templates.
     + max_depth: uint
@@ -3744,7 +3724,7 @@ alias Fd for i32
 // Runs handlers on threads of their own and collects their results in completion order.
 + class ThreadGroup[T] {
     // Blocks until the next handler finishes and returns its start index and result.
-    + fn await_next() (uint, T)
+    + fn await_next() (uint, T) !LookupError
     // Returns true while some started handler was not yet returned by `await_next`.
     + fn has_pending() bool
     // Returns an empty group. Tagged `$default`, so it also supplies the group's default value.

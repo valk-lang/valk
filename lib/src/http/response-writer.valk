@@ -50,13 +50,19 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     // Emits `Connection: keep-alive`: an HTTP/1.0 client only keeps the
     // connection open when the response says so
     -+ keep_alive: bool (false)
+    // Answers a `HEAD` request: the head is sent without the body; set by the server
+    // for every request
+    -+ head: bool (false)
     - output_pos: uint (0)
+    // The number of bytes still to copy from `body_reader`
+    - body_left: uint (0)
 
     -+ fn reset() {
         this.output.clear()
         this.output.shrink_capacity(2048)
         this.output_pos = 0
         this.body_reader = null
+        this.body_left = 0
 
         let file = this.file_response
         if isset(file) {
@@ -74,12 +80,12 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
 
         let filepath = resp.filepath
         if isset(filepath) {
-            this.send_file(filepath, resp.filename, resp.header_list)
+            this.send_file(filepath, resp.filename, resp.header_list, resp.status)
             return
         }
         let reader = resp.stream_reader
         if isset(reader) {
-            this.send_stream(reader, resp.stream_size, resp.content_type, resp.filename, resp.header_list)
+            this.send_stream(reader, resp.stream_size, resp.content_type, resp.filename, resp.header_list, resp.status)
             return
         }
 
@@ -96,8 +102,8 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     ///
     /// The content type follows from the file extension, unless `headers` has a
     /// `Content-Type`. With a `filename` the file is offered as a download under that
-    /// name.
-    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null)) {
+    /// name. The body is left out like `respond` leaves it out.
+    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: uint (200)) {
         if this.responded : return
 
         let stream = fs.stream(path) ! {
@@ -111,28 +117,34 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         }
 
         this.file_response = stream
-        this.send_stream(stream, fsize, fs.mime_type(fs.extension(path)), filename, headers)
+        this.send_stream(stream, fsize, fs.mime_type(fs.extension(path)), filename, headers, code)
     }
 
     /// Responds with status `code` and a body streamed from `reader`.
     ///
-    /// `size` becomes the `Content-Length`; the reader is copied until it ends, so it must
-    /// yield exactly `size` bytes. A `Content-Type` in `headers` replaces `content_type`.
-    /// With a `filename` the body is offered as a download under that name.
-    + fn send_stream(reader: io.Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null)) {
+    /// `size` becomes the `Content-Length` and exactly `size` bytes are copied from the
+    /// reader; a reader that ends early fails the response and closes the connection. A
+    /// `Content-Type` in `headers` replaces `content_type`. With a `filename` the body is
+    /// offered as a download under that name. The body is left out like `respond` leaves
+    /// it out, and then the reader is not read.
+    + fn send_stream(reader: io.Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: uint (200)) {
         if this.responded : return
         this.responded = true
 
         let out = this.output
-        this.body_reader = reader
+        let with_body = ResponseWriter.status_has_body(code) && !this.head
+        if with_body && size > 0 {
+            this.body_reader = reader
+            this.body_left = size
+        }
 
         if isset(headers) : content_type = headers.get("content-type") !? content_type
 
-        out.write("HTTP/1.1 200 OK\r\nContent-Type: ")
+        this.write_status_line(code)
+        out.write("Content-Type: ")
         out.write(response_header_value_is_safe(content_type) ? content_type : "application/octet-stream")
-        out.write("\r\nContent-Length: ")
-        out.write_uint_ascii(size)
         out.write("\r\n")
+        this.write_content_length(code, size)
         this.write_connection_header()
 
         let has_disposition = isset(headers) && headers.has("content-disposition")
@@ -183,24 +195,44 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
 
         if isset(headers) : content_type = headers.get("content-type") !? content_type
 
-        if code == 200 {
-            buf.write("HTTP/1.1 200 OK\r\nContent-Type: ")
-        } else {
-            buf.write("HTTP/1.1 ")
-            buf.write_uint_ascii(code)
-            buf.write(" ")
-            buf.write(ResponseWriter.code_name(code))
-            buf.write("\r\nContent-Type: ")
-        }
+        this.write_status_line(code)
+        buf.write("Content-Type: ")
         buf.write(response_header_value_is_safe(content_type) ? content_type : "text/plain")
-        buf.write("\r\nContent-Length: ")
-        buf.write_uint_ascii(body.bytes)
         buf.write("\r\n")
+        this.write_content_length(code, body.bytes)
         this.write_connection_header()
 
         this.write_headers(headers)
         buf.write("\r\n")
-        buf.write(body)
+        if ResponseWriter.status_has_body(code) && !this.head : buf.write(body)
+    }
+
+    // 1xx, 204 and 304 responses never carry a body (RFC 9110 §6.4.1)
+    - static fn status_has_body(code: uint) bool {
+        return code >= 200 && code != 204 && code != 304
+    }
+
+    - fn write_status_line(code: uint) {
+        let buf = this.output
+        if code == 200 {
+            buf.write("HTTP/1.1 200 OK\r\n")
+            return
+        }
+        buf.write("HTTP/1.1 ")
+        buf.write_uint_ascii(code)
+        buf.write(" ")
+        buf.write(ResponseWriter.code_name(code))
+        buf.write("\r\n")
+    }
+
+    // A HEAD or 304 response states the length the body would have had; 1xx and 204
+    // responses must not send the field at all (RFC 9110 §8.6)
+    - fn write_content_length(code: uint, size: uint) {
+        if code < 200 || code == 204 : return
+        let buf = this.output
+        buf.write("Content-Length: ")
+        buf.write_uint_ascii(size)
+        buf.write("\r\n")
     }
 
     - fn write_connection_header() {
@@ -236,6 +268,27 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         return this.count_bytes_to_send() > (128 * 1024) || this.body_reader != null
     }
 
+    // Copies exactly `body_left` bytes: the Content-Length promised that many, so a
+    // longer reader is cut off and a shorter one fails the response
+    - fn copy_body(reader: io.Reader, writer: io.Writer) !HttpError {
+        let left = this.body_left
+        let chunk: uint = left < 65536 ? left : 65536
+        let buf = [u8]{ 0 x chunk }
+        while left > 0 {
+            let amount = left < chunk ? left : chunk
+            let count = reader.read(buf.view(0, amount)) !>
+            if count == 0 || count > amount : throw .write
+            let view = buf.view(0, count)
+            while view.length > 0 {
+                let written = writer.write(view) !>
+                if written == 0 || written > view.length : throw .write
+                view = view.view(written, view.length - written)
+            }
+            left -= count
+            this.body_left = left
+        }
+    }
+
     -+ fn send_bytes(writer: io.Writer) !HttpError {
         let out = this.output
         let reader = this.body_reader
@@ -244,9 +297,8 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             // Headers are flushed before the streamed body
             if isset(reader) {
                 if this.count_bytes_to_send() == 0 {
-                    io.copy(reader, writer) !>
+                    this.copy_body(reader, writer) !>
                     this.body_reader = null
-                    this.file_response = null
                     reader = null
                 }
             }

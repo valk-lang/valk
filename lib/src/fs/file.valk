@@ -4,6 +4,13 @@ use core
 
 value default_read_size (32 * 1024)
 
+#if OS == "win"
+value append_access (ext.FILE_APPEND_DATA | ext.FILE_WRITE_ATTRIBUTES | ext.FILE_WRITE_EA | ext.READ_CONTROL | ext.SYNCHRONIZE)
+value FSCTL_GET_REPARSE_POINT (0x000900A8)
+value REPARSE_TAG_SYMLINK (0xA000000C)
+value REPARSE_TAG_MOUNT_POINT (0xA0000003)
+#end
+
 /// How `open` treats the contents of a file it opens for writing.
 + enum WriteMode {
     /// Keeps the existing contents.
@@ -50,7 +57,8 @@ value default_read_size (32 * 1024)
     #if OS == "win"
     let access: u32 = 0
     if opts.read : access = access | ext.GENERIC_READ
-    if writable : access = access | ext.GENERIC_WRITE
+    // Append-only access (no FILE_WRITE_DATA) makes every write go to the end, like O_APPEND
+    if writable : access = access | (opts.write == WriteMode.append ? append_access : ext.GENERIC_WRITE)
     // Shade mode
     let share_mode: u32 = ext.FILE_SHARE_READ
     // dwCreationDisposition
@@ -98,7 +106,27 @@ value default_read_size (32 * 1024)
 /// On Windows it calls `FlushFileBuffers` on each fixed and removable volume, which needs
 /// administrator rights; volumes that cannot be opened are skipped.
 + fn sync_all() {
+    #if OS == "win"
+    @unsafe
+    let drives = ext.GetLogicalDrives()
+    let letter: uint = 0
+    while letter < 26 {
+        let index = letter++
+        if (drives & (1.to(u32) << index.to(u32))) == 0 : continue
+        let name = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".range(index, 1)
+        let root = windows_path(name + ":\\") ! continue
+        let kind = ext.GetDriveTypeW(root.items().@cast(ptr))
+        if kind != ext.DRIVE_FIXED && kind != ext.DRIVE_REMOVABLE : continue
+        let volume = windows_path("\\\\.\\" + name + ":") ! continue
+        let handle = ext.CreateFileW(volume.items().@cast(ptr), ext.GENERIC_READ | ext.GENERIC_WRITE,
+            ext.FILE_SHARE_READ | ext.FILE_SHARE_WRITE, null, ext.OPEN_EXISTING, 0, 0)
+        if handle == ext.INVALID_HANDLE_VALUE : continue
+        ext.FlushFileBuffers(handle)
+        ext.CloseHandle(handle)
+    }
+    #else
     ext.sync()
+    #end
 }
 
 /// Sets the permission bits of the file at `path`, such as `0c644`.
@@ -142,15 +170,14 @@ value default_read_size (32 * 1024)
 /// and files that grow meanwhile are read completely. Throws `.open` or `.read`.
 + fn read(path: String) String !io.IoError {
     let fd = open(path) ! throw .open
-    let size: uint = size(path) ! {
-        io.close_cleanup(fd, __FILE__, __LINE__)
-        throw .read
-    }
+    // Only a capacity hint: the file can grow meanwhile, and /proc files report 0
+    let size: uint = size(path) !? 0
     let offset: uint = 0
     let buffer = ByteBuffer.new(size + 1)
 
-    while offset < size {
-        let readcount = io.read(fd, buffer.view_spare(size - offset), offset) ! {
+    while true {
+        buffer.reserve(1)
+        let readcount = io.read(fd, buffer.view_spare(1024 * 1024 * 1024), offset) ! {
             io.close_cleanup(fd, __FILE__, __LINE__)
             throw .read
         }
@@ -222,7 +249,7 @@ value default_read_size (32 * 1024)
     let data: ext.libc_WIN32_FIND_DATAW = @undefined
     let hFind = ext.FindFirstFileW(wide_path.items().@cast(ptr), @ref(data))
     if hFind == ext.INVALID_HANDLE_VALUE : return false
-    let result = (data.dwFileAttributes & ext.FILE_ATTRIBUTE_REPARSE_POINT) != 0 && data.dwReserved0 == ext.IO_REPARSE_TAG_SYMLINK.to(u32)
+    let result = (data.dwFileAttributes & ext.FILE_ATTRIBUTE_REPARSE_POINT) != 0 && data.dwReserved0 == REPARSE_TAG_SYMLINK
     ext.FindClose(hFind)
     return result
     #else
@@ -311,11 +338,16 @@ value default_read_size (32 * 1024)
     if isdir {
         if !exists(to_path) : create_dir(to_path) ! throw .access
         else if !is_dir(to_path) : throw .open
-        // Copy files
-        let files = files_in(from_path, false, true, recursive, true) !>
+        // Copy files, links and (when recursive) subdirectories
+        let files = files_in(from_path, false, true, true, true) !>
         each files as fn {
             let from = add(from_path, fn)
             let to = add(to_path, fn)
+            if is_traversal_link(from) {
+                copy_link(from, to) ! throw .write
+                continue
+            }
+            if !recursive && is_dir(from) : continue
             copy(from, to, recursive) ! throw .write
         }
     } else {
@@ -369,12 +401,62 @@ value default_read_size (32 * 1024)
                 throw .write
             }
             offset += rcount
-            if rcount < 32000 {
-                close_pair(in, out) !>
-                break
-            }
         }
     }
+}
+
+// Recreates the symlink `from` at `to` with the same target
+fn copy_link(from: String, to: String) !io.IoError {
+    let target = read_link(from) !>
+    #if OS == "win"
+    @unsafe
+    let wide_path = windows_path(from) ! throw .read
+    let attributes = ext.GetFileAttributesW(wide_path.items().@cast(ptr))
+    let directory = attributes != ext.INVALID_FILE_ATTRIBUTES_fix && (attributes & ext.FILE_ATTRIBUTE_DIRECTORY) != 0
+    #else
+    let directory = false
+    #end
+    if is_traversal_link(to) : delete_traversal_link(to) !>
+    symlink(to, target, directory) !>
+}
+
+// Returns the target a symlink (or on Windows a junction) points to, as stored
+fn read_link(path: String) String !io.IoError {
+    @unsafe
+    #if OS == "win"
+    let wide_path = windows_path(path) ! throw .read
+    let handle = ext.CreateFileW(wide_path.items().@cast(ptr), 0,
+        ext.FILE_SHARE_READ | ext.FILE_SHARE_WRITE | ext.FILE_SHARE_DELETE, null,
+        ext.OPEN_EXISTING, ext.FILE_FLAG_OPEN_REPARSE_POINT | ext.FILE_FLAG_BACKUP_SEMANTICS, 0)
+    if handle == ext.INVALID_HANDLE_VALUE : throw .read
+    let buf: [u8 x 16384] = @undefined
+    let data: ptr = @ref(buf)
+    let returned: u32 = 0
+    let ok = ext.DeviceIoControl(handle, FSCTL_GET_REPARSE_POINT, null, 0, data, 16384, @ref(returned), null)
+    ext.CloseHandle(handle)
+    if ok == 0 || returned < 16 : throw .read
+    // REPARSE_DATA_BUFFER: tag, data length, reserved, then the name offsets and lengths
+    let tag = @ptrv(data, u32, 0)
+    let path_buffer: uint = 16
+    if tag == REPARSE_TAG_SYMLINK : path_buffer = 20
+    else if tag != REPARSE_TAG_MOUNT_POINT : throw .read
+    let name_offset = @ptrv(data, u16, 6).to(uint)
+    let name_length = @ptrv(data, u16, 7).to(uint)
+    if name_length == 0 {
+        name_offset = @ptrv(data, u16, 4).to(uint)
+        name_length = @ptrv(data, u16, 5).to(uint)
+    }
+    let start = path_buffer + name_offset
+    if start + name_length > returned.to(uint) : throw .read
+    let target = windows_string(data + start, name_length / 2) ! throw .read
+    if target.starts_with("\\??\\") : target = target.range(4, target.bytes - 4)
+    return target
+    #else
+    let buf: [u8 x 4096] = @undefined
+    let length = ext.readlink(path.data_cstring, @ref(buf), PATH_MAX)
+    if length < 0 || length.to(uint) >= PATH_MAX : throw .read
+    return String.copy_from_ptr(&buf, length.to(u64))
+    #end
 }
 
 - fn close_pair(first: Fd, second: Fd) !io.IoError {
@@ -392,9 +474,13 @@ value default_read_size (32 * 1024)
     #if OS == "win"
     @unsafe
     let wide_path = windows_path(path) ! throw .access
-    if ext.CreateDirectoryW(wide_path.items().@cast(ptr), null) == 0 : throw .access
+    if ext.CreateDirectoryW(wide_path.items().@cast(ptr), null) == 0 {
+        if ext.GetLastError() == ext.ERROR_ALREADY_EXISTS : throw .exists
+        throw .access
+    }
     #else
     if ext.mkdir(path.data_cstring, permissions) == -1 {
+        if ext.get_errno() == ext.EEXIST : throw .exists
         throw .access
     }
     #end

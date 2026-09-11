@@ -9,6 +9,7 @@ use sync
 use thread
 use coro
 use gc
+use time
 
 /// A process signal that can be handled, waited for or raised.
 ///
@@ -54,6 +55,8 @@ class Registration {
     tokens: Array[shared sync.CancelToken] (.{})
     callbacks: Array[shared fn()()] (.{})
     waiters: Array[shared sync.Waker] (.{})
+    // Counts deliveries, so a woken `wait` can tell an arrival from `ignore` / `restore`
+    arrivals: uint (0)
 }
 
 class SignalState {
@@ -134,16 +137,36 @@ shared pipe_write: i32 (-1)
 + fn wait(sig: Signal, timeout_ms: uint (0)) bool !SignalError {
     let number = number(sig) !>
     let waker = sync.take_waker() ! throw .init
+    let seen: uint = 0
     lock state as s {
         ensure_started(s) !>
         let e = s.entry(sig)
         install(e, number) !>
+        seen = e.arrivals
         e.waiters.append(waker)
     }
-    let woke = waker.wait(timeout_ms)
-    lock state as s : s.entry(sig).waiters.remove_value(waker)
+    let deadline = timeout_ms > 0 ? time.mono_ms() + timeout_ms : 0
+    let arrived = false
+    while true {
+        let remaining: uint = 0
+        if deadline > 0 {
+            let now = time.mono_ms()
+            remaining = now < deadline ? deadline - now : 1
+        }
+        let woke = waker.wait(remaining)
+        let done = !woke
+        lock state as s {
+            let e = s.entry(sig)
+            arrived = e.arrivals != seen
+            // Still registered after a wake without an arrival: the wake was
+            // spurious, so keep waiting. A dispatch or `ignore` unregisters us.
+            if !e.waiters.contains(waker) || arrived : done = true
+            if done : e.waiters.remove_value(waker)
+        }
+        if done : break
+    }
     sync.release_waker(waker)
-    return woke
+    return arrived
 }
 
 /// Makes the process ignore `sig` and drops the tokens, callbacks and waiters registered for it.
@@ -178,6 +201,8 @@ fn clear(e: locked Registration) {
     e.installed = false
     e.tokens.clear()
     e.callbacks.clear()
+    // Woken without an arrival, so their `wait` returns false
+    each e.waiters as waker : waker.wake()
     e.waiters.clear()
 }
 
@@ -260,22 +285,21 @@ fn dispatch_loop() {
 fn dispatch(arrived: i32) {
     let tokens: ?Array[shared sync.CancelToken] = null
     let callbacks: ?Array[shared fn()()] = null
-    let waiters: ?Array[shared sync.Waker] = null
     lock state as s {
         each s.entries as e {
             let n = number(e.signal) ! continue
             if n != arrived : continue
             tokens = e.tokens.copy()
             callbacks = e.callbacks.copy()
-            waiters = e.waiters.copy()
+            e.arrivals++
+            // Woken under the lock: once `wait` has unregistered a waker and
+            // put it back in the cache, no late wake can reach it
+            each e.waiters as waker : waker.wake()
             e.waiters.clear()
         }
     }
     if isset(tokens) {
         each tokens as token : token.cancel()
-    }
-    if isset(waiters) {
-        each waiters as waker : waker.wake()
     }
     if isset(callbacks) {
         each callbacks as callback : callback()

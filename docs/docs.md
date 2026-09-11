@@ -1270,8 +1270,9 @@ let user = json.decode_to[User]("{\"name\":\"Alice\",\"age\":30}") ! panic("Inva
 API for [valk.time](api.md#time)
 
 `time.DateTime` represents UTC dates from year 1 through 9999 with microsecond
-precision. Constructor components are optional and default to the current time.
-Constructors and changes throw a `LookupError` (`.range`) when the result is not
+precision. Constructor components are optional: those before the first given one
+default to the current time, those after it to their minimum, so
+`DateTime.new(2024, 1, 1)` is midnight and `DateTime.new()` is now. Constructors and changes throw a `LookupError` (`.range`) when the result is not
 a valid date or falls outside the supported range.
 
 ```rust
@@ -2199,4 +2200,4 @@ A locked view cannot escape the block: it cannot be returned past the block, cap
 
 Methods that hand elements to a callback or return a view of the elements, like `sort(comparator)`, `filter` and `view()` on a locked array, cannot be called on locked data: the callback or view could keep an element past the block. The error points at the call with a note that the method was checked for a locked receiver. Sort or filter a copy instead, or loop over the elements inside the block.
 
-`T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again from the same thread deadlocks. Reading the value outside a `lock` block is not possible; every reader takes the lock too. A thread whose entry function returns while one of its coroutines is still inside a `lock` block keeps running its coroutines until that block ends.
+`T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. The lock is not reentrant: locking the same `Lock` again inside its own `lock` block deadlocks. Another coroutine on the same thread that locks it just waits until the block ends, as a coroutine on another thread would. Reading the value outside a `lock` block is not possible; every reader takes the lock too. A thread whose entry function returns while one of its coroutines is still inside a `lock` block keeps running its coroutines until that block ends.

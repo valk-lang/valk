@@ -1,0 +1,291 @@
+use valk.fs
+use valk.io
+use valk.net
+use valk.time
+use valk.coro
+
+#if OS == "win"
+extern fn send(s: uint, buf: ptr, len: i32, flags: i32) i32;
+#else
+extern fn dup(old_fd: i32) i32;
+extern fn dup2(old_fd: i32, new_fd: i32) i32;
+#end
+
+fn fix_fs_io_path(name: String) String {
+    return fs.add(fs.exe_dir() !? ".", name)
+}
+
+test "fix fs-io: basename of a path without a separator is the whole path" {
+    assert(fs.basename("nginx.conf") == "nginx.conf")
+    assert(fs.basename("etc/nginx.conf") == "nginx.conf")
+    assert(fs.basename("nginx/") == "nginx")
+    assert(fs.basename("/") == "")
+}
+
+#if OS != "win"
+test "fix fs-io: stdin redirected from a regular file reads sequentially" {
+    @unsafe
+    let path = fix_fs_io_path("fix-fs-io-stdin.txt")
+    fs.write(path, "one\ntwo\nthree") ! assert(false)
+    let fd = fs.open(path) ! { assert(false); return }
+    let saved = dup(0)
+    assert(saved >= 0)
+    assert(dup2(fd, 0) == 0)
+    // A small chunk forces several reads; each must continue where the last stopped
+    let lines = io.LineReader.new(io.stdin(), 4).lines() !? .{}
+    assert(dup2(saved, 0) == 0)
+    io.close(saved) ! assert(false)
+    io.close(fd) ! assert(false)
+    fs.delete_file(path) ! assert(false)
+    assert(lines.length == 3)
+    assert((lines.get(0) !? "") == "one")
+    assert((lines.get(2) !? "") == "three")
+}
+#end
+
+test "fix fs-io: io.read defaults to the current position" {
+    let path = fix_fs_io_path("fix-fs-io-read.txt")
+    fs.write(path, "abcdef") ! assert(false)
+    let fd = fs.open(path) ! { assert(false); return }
+    let chunk = [u8]{ 0 x 2 }
+    assert((io.read(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "ab")
+    assert((io.read(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "cd")
+    // An explicit offset neither uses nor moves the position
+    assert((io.read(fd, chunk, 0) !? 99) == 2)
+    assert(chunk.to_string() == "ab")
+    assert((io.read_sync(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "ef")
+    assert((io.read(fd, chunk) !? 99) == 0)
+    // seek moves the position the default offset reads from
+    assert((io.seek(fd, 1) !? 99) == 1)
+    assert((io.read(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "bc")
+    io.close(fd) ! assert(false)
+    fs.delete_file(path) ! assert(false)
+}
+
+test "fix fs-io: io.write defaults to the current position" {
+    let path = fix_fs_io_path("fix-fs-io-write.txt")
+    fs.write(path, "abcdef") ! assert(false)
+    let fd = fs.open(path, fs.OpenOptions { write: fs.WriteMode.preserve }) ! { assert(false); return }
+    assert((io.seek(fd, 2) !? 99) == 2)
+    assert((io.write(fd, "XY") !? 99) == 2)
+    assert((io.write(fd, "Z") !? 99) == 1)
+    assert((io.seek(fd, 0, io.SeekFrom.current) !? 99) == 5)
+    io.close(fd) ! assert(false)
+    assert((fs.read(path) !? "") == "abXYZf")
+
+    // Append mode still writes at the end, wherever the position is
+    let appender = fs.open(path, fs.OpenOptions { write: fs.WriteMode.append }) ! { assert(false); return }
+    assert((io.write(appender, "1") !? 99) == 1)
+    assert((io.seek(appender, 0) !? 99) == 0)
+    assert((io.write(appender, "2") !? 99) == 1)
+    io.close(appender) ! assert(false)
+    fs.write(path, "3", true) ! assert(false)
+    assert((fs.read(path) !? "") == "abXYZf123")
+    fs.delete_file(path) ! assert(false)
+}
+
+test "fix fs-io: mime types are single and case-insensitive" {
+    assert(fs.mime_type("mid") == "audio/midi")
+    assert(fs.mime_type("midi") == "audio/midi")
+    assert(fs.mime_type("PNG") == "image/png")
+    assert(fs.mime_type("Html") == "text/html")
+    assert(fs.mime_type("nope") == "application/octet-stream")
+}
+
+test "fix fs-io: sync_all flushes without failing" {
+    let path = fix_fs_io_path("fix-fs-io-sync.txt")
+    fs.write(path, "synced") ! assert(false)
+    fs.sync_all()
+    assert((fs.read(path) !? "") == "synced")
+    fs.delete_file(path) ! assert(false)
+}
+
+#if OS == "linux"
+test "fix fs-io: fs.read reads files that report size 0" {
+    assert((fs.size("/proc/self/status") !? 1) == 0)
+    let status = fs.read("/proc/self/status") !? ""
+    assert(status.contains("Name:"))
+    assert(status.contains("VmRSS:"))
+}
+
+test "fix fs-io: copy continues past short reads" {
+    // /proc files hand out at most a page per read
+    let path = fix_fs_io_path("fix-fs-io-smaps.txt")
+    fs.copy("/proc/self/smaps", path) ! assert(false)
+    let copied = fs.read(path) !? ""
+    fs.delete_file(path) ! assert(false)
+    assert(copied.bytes > 16384)
+    assert(copied.ends_with("\n"))
+}
+#end
+
+test "fix fs-io: copy recreates symlinks inside a directory" {
+    let dir = fix_fs_io_path("fix-fs-io-links")
+    let copy_dir = fix_fs_io_path("fix-fs-io-links-copy")
+    if fs.exists(dir) : fs.delete_all(dir) ! assert(false)
+    if fs.is_dir(copy_dir) : fs.delete_all(copy_dir) ! assert(false)
+    fs.create_dir(dir) ! assert(false)
+    fs.write(fs.add(dir, "file.txt"), "data") ! assert(false)
+    let linked = true
+    fs.symlink(fs.add(dir, "relative"), "file.txt", false) ! { linked = false }
+    #if OS == "win"
+    // Creating symlinks needs Developer Mode or elevation on Windows
+    if !linked {
+        fs.delete_all(dir) ! assert(false)
+        return
+    }
+    #end
+    assert(linked)
+    fs.symlink(fs.add(dir, "dangling"), "missing.txt", false) ! assert(false)
+    fs.create_dir(fs.add(dir, "sub")) ! assert(false)
+    fs.symlink(fs.add(dir, "sub-link"), "sub", true) ! assert(false)
+
+    fs.copy(dir, copy_dir) ! assert(false)
+    let relative = fs.add(copy_dir, "relative")
+    assert(fs.is_symlink(relative))
+    assert((fs.read(relative) !? "") == "data")
+    assert(fs.is_symlink(fs.add(copy_dir, "dangling")))
+    assert(fs.is_symlink(fs.add(copy_dir, "sub-link")))
+    // Without `recursive` real subdirectories are still skipped
+    assert(!fs.exists(fs.add(copy_dir, "sub")))
+
+    // Copying again replaces the links
+    fs.copy(dir, copy_dir) ! assert(false)
+    assert(fs.is_symlink(relative))
+    assert((fs.read(relative) !? "") == "data")
+
+    fs.delete_all(dir) ! assert(false)
+    fs.delete_all(copy_dir) ! assert(false)
+}
+
+test "fix fs-io: file stream seeks from the end of the open file and stays writable" {
+    let path = fix_fs_io_path("fix-fs-io-stream.txt")
+    fs.write(path, "abcdef") ! assert(false)
+    let stream = fs.stream(path, fs.OpenOptions { write: fs.WriteMode.preserve }) ! { assert(false); return }
+    let chunk = [u8]{ 0 x 8 }
+    assert((stream.read(chunk) !? 99) == 6)
+    assert((stream.read(chunk) !? 99) == 0)
+    assert(!stream.closed)
+    assert((stream.write("gh") !? 99) == 2)
+    assert((stream.seek(-1, io.SeekFrom.end) !? 99) == 7)
+    stream.close() ! assert(false)
+    assert((fs.read(path) !? "") == "abcdefgh")
+
+    // A read-only stream still closes itself at the end
+    let reader = fs.stream(path) ! { assert(false); return }
+    assert((reader.read(chunk) !? 99) == 8)
+    assert((reader.read(chunk) !? 99) == 0)
+    assert(reader.closed)
+
+    #if OS != "win"
+    // The size comes from the descriptor, not from whatever the path names now
+    let other = fix_fs_io_path("fix-fs-io-stream-other.txt")
+    let held = fs.stream(path) ! { assert(false); return }
+    fs.write(other, "xy") ! assert(false)
+    fs.move(other, path) ! assert(false)
+    assert((held.seek(0, io.SeekFrom.end) !? 99) == 8)
+    held.close() ! assert(false)
+    #end
+    fs.delete_file(path) ! assert(false)
+}
+
+test "fix fs-io: resolve keeps drive roots and platform separators" {
+    #if OS == "win"
+    assert(fs.resolve("C:\\") == "C:\\")
+    assert(fs.resolve("C:") == "C:\\")
+    assert(fs.resolve("C:/a/..") == "C:\\")
+    assert(fs.resolve("c:/a/b") == "c:\\a\\b")
+    #else
+    let cwd = fs.cwd() ! { assert(false); return }
+    assert(fs.resolve("/a\\b/c") == "/a\\b/c")
+    assert(fs.resolve("C:/x") == fs.add(cwd, "C:/x"))
+    assert(fs.resolve("a:b") == fs.add(cwd, "a:b"))
+    #end
+}
+
+#if OS != "win"
+test "fix fs-io: realpath keeps a backslash as part of a name" {
+    let path = fix_fs_io_path("fix-fs-io-back\\slash.txt")
+    fs.write(path, "x") ! assert(false)
+    let real = fs.realpath(path) ! { assert(false); return }
+    fs.delete_file(path) ! assert(false)
+    assert(real.ends_with("fix-fs-io-back\\slash.txt"))
+    let missing = fs.realpath("missing\\name") !? ""
+    assert(missing == "missing\\name")
+}
+#end
+
+test "fix fs-io: add with an empty directory keeps the name relative" {
+    assert(fs.add("", "x") == "x")
+    assert(fs.add("", "a/b") == "a/b")
+    assert(fs.add("dir", "x") == "dir" + fs.PATH_DIV + "x")
+}
+
+test "fix fs-io: dir_of a bare name is the current directory" {
+    assert(fs.dir_of("etc") == ".")
+    assert(fs.dir_of("etc/") == ".")
+    assert(fs.dir_of("a/b") == "a")
+    assert(fs.dir_of("/etc") == "/")
+    assert(fs.dir_of("/") == "/")
+    assert(fs.dir_of("") == "")
+    #if OS == "win"
+    assert(fs.dir_of("C:\\etc") == "C:\\")
+    assert(fs.dir_of("C:\\") == "C:\\")
+    assert(fs.dir_of("C:") == "C:")
+    #end
+}
+
+test "fix fs-io: create_dir on an existing path throws exists" {
+    let dir = fix_fs_io_path("fix-fs-io-exists")
+    if fs.exists(dir) : fs.delete_all(dir) ! assert(false)
+    fs.create_dir(dir) ! assert(false)
+    let exists = false
+    fs.create_dir(dir) ! { exists = error_is(E.code, exists) }
+    assert(exists)
+    let access = false
+    fs.create_dir(fs.add(dir, "missing/child")) ! { access = error_is(E.code, access) }
+    assert(access)
+    fs.delete_dir(dir) ! assert(false)
+}
+
+#if OS == "win"
+class FixFsIoFlag {
+    done: bool (false)
+}
+
+fn fix_fs_io_hold_server(flag: FixFsIoFlag) {
+    let server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 9281) ! { assert(false); return }
+    let con = server.accept() ! { assert(false); return }
+    // Never read, so the client's send buffer stays full
+    while !flag.done : time.sleep_ms(5)
+    con.close() _
+}
+
+test "fix fs-io: Windows socket wait for both directions honors the timeout" {
+    @unsafe
+    let flag = FixFsIoFlag{}
+    let server = co fix_fs_io_hold_server(flag)
+    coro.await_last()
+    let con = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 9281) ! { assert(false); return }
+    io.set_nonblocking(con.fd, true) ! assert(false)
+    let chunk = [u8]{ 7 x 65536 }
+    let rounds = 0
+    while rounds < 4096 {
+        if send(con.fd, chunk.data, 65536, 0) <= 0 : break
+        rounds++
+    }
+    let start = time.mono_ms()
+    let event = io.await_socket_fd(con.fd, true, true, 100)
+    let elapsed = time.mono_ms() - start
+    flag.done = true
+    await server
+    con.close() _
+    assert(event.is_timeout() || event.is_writable())
+    assert(!event.is_readable())
+    assert(elapsed < 5000)
+}
+#end

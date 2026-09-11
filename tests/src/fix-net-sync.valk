@@ -1,0 +1,321 @@
+use valk.core
+use valk.gc
+use valk.net
+use valk.signal
+use valk.sync
+use valk.thread
+use valk.time
+
+// Raw OpenSSL calls to make a TLS client present a certificate, which the
+// standard library has no API for
+extern fn SSL_use_certificate_file(ssl: ptr, path: cstring, file_type: i32) i32;
+extern fn SSL_use_PrivateKey_file(ssl: ptr, path: cstring, file_type: i32) i32;
+extern fn SSL_CTX_load_verify_locations(ctx: ptr, ca_file: ?cstring, ca_path: ?cstring) i32;
+extern fn SSL_CTX_set_verify(ctx: ptr, mode: i32, cb: ?ptr) void;
+
+fn fix_net_sync_cert() String {
+    return __DIR__ + "/../assets/tls-cert.pem"
+}
+
+fn fix_net_sync_key() String {
+    return __DIR__ + "/../assets/tls-key.pem"
+}
+
+// The SHA-256 fingerprint of tests/assets/tls-cert.pem
+fn fix_net_sync_cert_sha256() String {
+    return "e63cdb9e606bce316e137c12ed84f847272fa277c29a327024d86d6da2eda627"
+}
+
+fn fix_net_sync_v6_echo(server: shared net.SocketServer) bool {
+    let connection = server.accept(3000) ! return false
+    let buffer = [u8]{ 0 x 8 }
+    let bytes = connection.read(buffer) ! return false
+    connection.write(buffer.view(0, bytes)) ! return false
+    connection.close() ! return false
+    return true
+}
+
+test "Fix net-sync: an IPv6 listener accepts connections" {
+    let server = net.Socket.server(net.SocketType.tcp, "::1", 19480) !!
+    assert(server.socket.ipv6)
+    let echo = co fix_net_sync_v6_echo(server)
+    let connection = net.Socket.client(net.SocketType.tcp, "::1", 19480) !!
+    connection.write("v6") !!
+    let buffer = [u8]{ 0 x 8 }
+    let bytes = connection.read(buffer) !!
+    assert(buffer.view(0, bytes).to_string() == "v6")
+    connection.close() !!
+    assert(await echo)
+    server.close() !!
+}
+
+test "Fix net-sync: CA file and directory are stored and combined" {
+    let ssl = net.Ssl.new()
+    assert(!isset(ssl.cert_file) && !isset(ssl.cert_dir))
+    ssl.set_ca_cert(fix_net_sync_cert()) !!
+    assert(ssl.cert_file == fix_net_sync_cert())
+    ssl.set_ca_cert_dir(__DIR__) !!
+    assert(ssl.cert_dir == __DIR__)
+    assert(ssl.cert_file == fix_net_sync_cert())
+
+    // A missing file is rejected and a later call still loads the directory
+    let rejected = false
+    ssl.set_ca_cert(__DIR__ + "/missing-ca.pem") ! { rejected = true }
+    assert(rejected)
+    ssl.set_ca_cert(null) !!
+    assert(!isset(ssl.cert_file))
+    assert(ssl.cert_dir == __DIR__)
+    ssl.set_ca_cert_dir(null) !!
+    assert(!isset(ssl.cert_dir))
+}
+
+fn fix_net_sync_tls_server(server: shared net.SocketServer, context: shared net.SslServerContext) String {
+    let connection = server.accept(3000) ! return "accept failed"
+    connection.ssl_accept(context, 3000) ! return "handshake failed"
+    let ssl = connection.ssl ?! return "no session"
+    let fingerprint = ssl.peer_certificate_sha256() ! return "no peer certificate"
+    let buffer = [u8]{ 0 x 8 }
+    connection.read(buffer) ! return "read failed"
+    connection.close() _
+    return fingerprint
+}
+
+test "Fix net-sync: a server hashes the client certificate" {
+    @unsafe
+    let context: shared net.SslServerContext = net.SslServerContext.new(fix_net_sync_cert(), fix_net_sync_key()) !!
+    // Ask for a client certificate and trust the test certificate
+    assert(SSL_CTX_load_verify_locations(context.ctx.@cast(ptr), fix_net_sync_cert().data, null) == 1)
+    SSL_CTX_set_verify(context.ctx.@cast(ptr), 1, null)
+
+    let server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 19481) !!
+    let running = co fix_net_sync_tls_server(server, context)
+
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 19481) !!
+    let ssl = net.Ssl.new()
+    assert(SSL_use_certificate_file(ssl.ssl.@cast(ptr), fix_net_sync_cert().data, 1) == 1)
+    assert(SSL_use_PrivateKey_file(ssl.ssl.@cast(ptr), fix_net_sync_key().data, 1) == 1)
+    ssl.set_ca_cert(fix_net_sync_cert()) !!
+    connection.ssl_connect(ssl, 3000) !!
+    assert((ssl.peer_certificate_sha256() !!) == fix_net_sync_cert_sha256())
+    connection.write("done") !!
+
+    assert((await running) == fix_net_sync_cert_sha256())
+    connection.close() !!
+    server.close() !!
+}
+
+test "Fix net-sync: bind failures report their reason" {
+    let first = net.UdpSocket.bind("127.0.0.1", 19482) !!
+    let in_use = false
+    net.UdpSocket.bind("127.0.0.1", 19482) ! { in_use = error_is(E.code, port_in_use) }
+    assert(in_use)
+    first.close() !!
+
+    // 192.0.2.1 (TEST-NET-1) is not an address of this machine
+    let udp_os = false
+    net.UdpSocket.bind("192.0.2.1", 19483) ! { udp_os = error_is(E.code, os) }
+    assert(udp_os)
+    let tcp_os = false
+    net.Socket.server(net.SocketType.tcp, "192.0.2.1", 19483) ! { tcp_os = error_is(E.code, os) }
+    assert(tcp_os)
+
+    // A privileged port, where the system has them
+    let privileged = net.UdpSocket.bind("127.0.0.1", 1) ! {
+        assert(error_is(E.code, access))
+        return
+    }
+    privileged.close() !!
+}
+
+test "Fix net-sync: an oversized datagram is truncated" {
+    let server = net.UdpSocket.bind("127.0.0.1", 19484) !!
+    let client = net.UdpSocket.open() !!
+    let to = net.SocketAddress.parse("127.0.0.1", 19484) !!
+    assert((client.send_to("abcdefghij", to) !!) == 10)
+    let buffer = [u8]{ 0 x 4 }
+    let bytes, from = server.recv_from(buffer) !!
+    assert(bytes == 4)
+    assert(buffer.to_string() == "abcd")
+    assert(from.port == (client.local_address() !!).port)
+
+    // The socket keeps working after a truncated datagram
+    client.send_to("xy", to) !!
+    let next, _ = server.recv_from(buffer) !!
+    assert(next == 2)
+    assert(buffer.view(0, 2).to_string() == "xy")
+    client.close() !!
+    server.close() !!
+}
+
+fn fix_net_sync_tls_client(port: u16) String {
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", port) ! return "connect failed"
+    let context: shared net.SslServerContext = net.SslServerContext.new(fix_net_sync_cert(), fix_net_sync_key()) ! return "context failed"
+    // The connecting side takes the server role here
+    connection.ssl_accept(context, 3000) ! return "handshake failed"
+    let buffer = [u8]{ 0 x 8 }
+    let bytes = connection.read(buffer) ! return "read failed"
+    connection.close() _
+    return buffer.view(0, bytes).to_string()
+}
+
+test "Fix net-sync: TLS client handshake without a host, and with an IP host" {
+    // An accepted connection has no host: no server name is sent
+    let server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 19485) !!
+    let peer = co fix_net_sync_tls_client(19485)
+    let accepted = server.accept(3000) !!
+    assert(accepted.host == "")
+    let ssl = net.Ssl.new()
+    ssl.set_ca_cert(fix_net_sync_cert()) !!
+    accepted.ssl_connect(ssl, 3000) !!
+    accepted.write("hello") !!
+    assert((await peer) == "hello")
+    accepted.close() !!
+    server.close() !!
+
+    // An IP host is checked against the certificate's IP address
+    let context: shared net.SslServerContext = net.SslServerContext.new(fix_net_sync_cert(), fix_net_sync_key()) !!
+    let tls_server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 19486) !!
+    let running = co fix_net_sync_tls_server(tls_server, context)
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 19486) !!
+    let verified = net.Ssl.new()
+    verified.set_ca_cert(fix_net_sync_cert()) !!
+    connection.ssl_connect(verified, 3000) !!
+    connection.write("done") !!
+    await running
+    connection.close() !!
+    tls_server.close() !!
+}
+
+test "Fix net-sync: default CA paths are a copy" {
+    let paths = net.Ssl.default_ca_cert_paths()
+    let count = paths.length
+    paths.append("/nowhere/cacert.pem")
+    paths.clear()
+    assert(net.Ssl.default_ca_cert_paths().length == count)
+}
+
+#if OS != "win"
+test "Fix net-sync: a stale wake does not end a signal wait" {
+    sync.leave_stale_wake_for_test() !!
+    let start = time.mono_ms()
+    assert(!(signal.wait(signal.Signal.quit, 50) !!))
+    assert(time.mono_ms() - start >= 40)
+    signal.restore(signal.Signal.quit) !!
+}
+
+fn fix_net_sync_wait_hangup() bool {
+    return signal.wait(signal.Signal.hangup, 5000) ! return true
+}
+
+test "Fix net-sync: ignore wakes pending signal waits" {
+    let waiting = co fix_net_sync_wait_hangup()
+    time.sleep_ms(30)
+    let start = time.mono_ms()
+    signal.ignore(signal.Signal.hangup) !!
+    assert(!(await waiting))
+    assert(time.mono_ms() - start < 2000)
+    signal.restore(signal.Signal.hangup) !!
+}
+#end
+
+class FixNetSyncOrder {
+    order: uint (0)
+    started: uint (0)
+}
+
+// Sequential: the task runner pool is shared by the whole process
+synctest "Fix net-sync: queued tasks run first-in first-out" {
+    let first_release: shared core.Mutex = .new() !!
+    first_release.lock()
+    let release: shared core.Mutex = .new() !!
+    release.lock()
+    let state: shared FixNetSyncOrder = .{}
+    let blockers = Array[thread.Task]{}
+
+    // Occupy all 8 runners
+    let i: uint = 0
+    while i < 8 {
+        let first = i == 0
+        blockers.append(thread.task(fn() {
+            atomic(state.started + 1)
+            if first : first_release.await_unlock()
+            else : release.await_unlock()
+        }) !!)
+        i++
+        while state.started < i : time.sleep_ns(10)
+    }
+    let active, limit = thread.taskrunner_counts_for_test()
+    assert(active == limit)
+
+    let queued = Array[thread.Task]{}
+    queued.append(thread.task(fn() { state.order = state.order * 10 + 1 }) !!)
+    queued.append(thread.task(fn() { state.order = state.order * 10 + 2 }) !!)
+    queued.append(thread.task(fn() { state.order = state.order * 10 + 3 }) !!)
+
+    // One runner frees up and works through the queue alone
+    first_release.unlock()
+    each queued as task : task.await()
+    assert(state.order == 123)
+
+    release.unlock()
+    each blockers as task : task.await()
+}
+
+class FixNetSyncSleeper {
+    sleeping: bool (false)
+}
+
+// Sequential: the shared collection waits for every thread's GC lock
+synctest "Fix net-sync: thread suspend releases the GC lock" {
+    let state: shared FixNetSyncSleeper = .{}
+    let sleeper = thread.Thread[void].start(fn() {
+        state.sleeping = true
+        thread.suspend_ms(800)
+    }) !!
+    while !state.sleeping : time.sleep_ms(1)
+    time.sleep_ms(20)
+    let start = time.mono_ms()
+    gc.collect_shared()
+    assert(time.mono_ms() - start < 500)
+    sleeper.await()
+}
+
+class FixNetSyncGate {
+    gate: shared thread.ThreadSuspendGate (.new())
+    open: bool (false)
+}
+
+test "Fix net-sync: suspend gate returns true when signalled" {
+    let state: shared FixNetSyncGate = .{}
+    assert(!state.gate.wait(fn() bool { return !state.open }, 20))
+    state.open = true
+    assert(state.gate.wait(fn() bool { return !state.open }, 20))
+
+    state.open = false
+    let opener = thread.Thread[void].start(fn() {
+        time.sleep_ms(20)
+        state.open = true
+        state.gate.signal()
+    }) !!
+    assert(state.gate.wait(fn() bool { return !state.open }, 5000))
+    opener.await()
+}
+
+test "Fix net-sync: thread group with nothing pending throws" {
+    let group = thread.ThreadGroup[int].new()
+    let empty = false
+    group.await_next() ! { empty = error_is(E.code, empty) }
+    assert(empty)
+
+    group.start(fn() int { return 7 }) !!
+    let index, result = group.await_next() !!
+    assert(index == 0 && result == 7)
+    let drained = false
+    group.await_next() ! { drained = true }
+    assert(drained)
+
+    let void_group = thread.ThreadGroup[void].new()
+    let void_empty = false
+    void_group.await_next() ! { void_empty = true }
+    assert(void_empty)
+}
