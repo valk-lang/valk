@@ -369,7 +369,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Appends `v` in fixed notation with `decimals` digits after the point.
     + fn write_f64_ascii(v: f64, decimals: uint, trim_zeros: bool (false)) void
     // Appends `v` with the fewest digits that parse back to the same value.
-    + fn write_f64_ascii_shortest(v: f64) void
+    + fn write_f64_ascii_shortest(v: f64, force_exponent: bool (false)) void
     // Appends the IEEE 754 bits of `v` as 8 bytes, most significant first.
     + fn write_f64_be(v: f64) void
     // Appends the IEEE 754 bits of `v` as 8 bytes, least significant first.
@@ -946,7 +946,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
     // Writes the value like `to_string` to `buf` and returns the byte count.
@@ -976,7 +976,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
     // Writes the value like `to_string` to `buf` and returns the byte count.
@@ -1006,7 +1006,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
     // Writes the value like `to_string` to `buf` and returns the byte count.

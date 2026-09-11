@@ -1150,7 +1150,10 @@ file.close() ! panic("close")
 For floating-point text, use `write_f64_ascii_shortest` for the shortest
 round-trip representation, or `write_f64_ascii` with an explicit number
 of decimal places. Set `trim_zeros` to `true` to remove trailing fractional
-zeros. `write_f64_le` and `write_f64_be` write binary bytes.
+zeros, and pass `force_exponent` as `true` to always use the exponent form
+(`1e19` instead of `10000000000000000000`), which keeps whole values that are
+too large for an integer readable as floats. `write_f64_le` and `write_f64_be`
+write binary bytes.
 
 ```rust
 let buffer = ByteBuffer.new()
