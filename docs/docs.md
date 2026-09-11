@@ -1521,7 +1521,7 @@ println(v) // 7
 
 ## Testing
 
-To test a project, pass `--test` with the build command. Test declarations are omitted from ordinary builds; in a test build, the generated entry point runs them instead of `main`. Use `assert` inside a test to record its results.
+To test a project, pass `--test` with the build command. Test declarations are omitted from ordinary builds; in a test build, the generated entry point runs them instead of `main`. Use `assert` inside a test to record its results. Every executed `assert` counts towards the test summary, so keep them out of long loops: accumulate the result in a variable and assert once after the loop.
 
 ```rust
 test "My test" {
