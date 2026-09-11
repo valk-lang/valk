@@ -1003,6 +1003,12 @@ extend User {
 }
 ```
 
+The bracket of an `extend` header declares, positionally, the parameter names
+the body uses (`extend HashMap[MAP_KEY, MAP_VALUE] { ... }`). A name that is
+already a type is rejected: writing a concrete type there would bind that name
+as a parameter and silently extend every instantiation instead of one
+specialization.
+
 Extensions from other packages may add only methods and getters. Exported ABI
 types cannot receive extension properties. All declarations and extensions in
 the build's package graph are discovered before type layouts are finalized.
