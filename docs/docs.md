@@ -463,7 +463,9 @@ println(describe(value))
 A case names an alternative by type; a tuple alternative is named with its
 parenthesized type, `(String, int) as pair`.
 
-A nullable subject may have a `null` case; an enum match on a nullable enum is exhaustive when `null` and every item are handled. Use `as` to access the value in a `match` case. When every type is handled, a
+A nullable subject may have a `null` case; the arms after it see the subject as
+non-null, so `default => x.v` needs no check of its own. An enum match on a
+nullable enum is exhaustive when `null` and every item are handled. Use `as` to access the value in a `match` case. When every type is handled, a
 `default` case is not needed. The type
 after `match value :` is the type every case must produce. Leave it out when the
 `match` is a statement rather than a value. A case of a value `match` may also

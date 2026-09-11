@@ -473,6 +473,8 @@ an implicit union alternative:
   whole union is made nullable with `?` instead.
 - In a `match` on `?U`, the `null` case covers both the missing value and the
   `null` alternative, so exhaustiveness works without a second null syntax.
+- After a `null` case, the remaining arms see the subject as non-null, the same
+  way an `isset` check narrows a declaration.
 
 ### Enums
 
