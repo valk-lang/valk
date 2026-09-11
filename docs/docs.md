@@ -1030,7 +1030,10 @@ Documentation reaches both readers and tools:
 ```sh
 valk doc lib/ -o docs/api.md --markdown --no-private
 valk doc lib/ -o api.json          # JSON, with a "description" per declaration
+valk doc lib/ -o docs/api.md --markdown --full   # Whole blocks, not just summaries
 ```
+
+In markdown the first paragraph of each block is shown as a comment above the signature, so the signature list stays readable; `--full` also prints the whole block under it.
 
 Editors show the same text on hover, under the signature.
 

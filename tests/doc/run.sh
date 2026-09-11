@@ -86,6 +86,36 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
 fi
 
 for expect in \
+    '// A box holding one value of `T`.' \
+    '    // The type of the stored value.' \
+    '// Two values of the same type.' \
+    '    // The first half.' \
+    '    // Returns `first`.' \
+    '// Picks `value` for the caller.' \
+    '// Number of boxes alive in tests.' \
+    '// Public alias for a private function.' \
+    '    // Shouts the value.'; do
+    if ! grep -Fq "$expect" "$workdir/api.md"; then
+        echo "# Markdown is missing a documentation summary: $expect"
+        cat "$workdir/api.md"
+        exit 1
+    fi
+done
+if grep -Fq '// Generic documentation is kept' "$workdir/api.md" \
+    || grep -Eq '^#+ (Box|choose|box_count|value_type|first)$' "$workdir/api.md"; then
+    echo "# Full documentation sections and later paragraphs need --full"
+    cat "$workdir/api.md"
+    exit 1
+fi
+
+echo "> Include full documentation with --full"
+out=$("$VALK" doc "$DIR/fixture" -o "$workdir/full.md" --markdown --full 2>&1)
+if [ "$?" -ne 0 ]; then
+    echo "$out"
+    exit 1
+fi
+for expect in \
+    '// A box holding one value of `T`.' \
     '### Box' \
     '#### value_type' \
     'The type of the stored value.' \
@@ -94,11 +124,13 @@ for expect in \
     '### box_count' \
     '### documented_alias' \
     'Public alias for a private function.' \
+    'Picks `value` for the caller.' \
+    'Generic documentation is kept on every instantiation.' \
     '#### Box[String].shout' \
     'Shouts the value.'; do
-    if ! grep -Fq "$expect" "$workdir/api.md"; then
-        echo "# Markdown is missing documentation comment: $expect"
-        cat "$workdir/api.md"
+    if ! grep -Fq "$expect" "$workdir/full.md"; then
+        echo "# Markdown is missing full documentation: $expect"
+        cat "$workdir/full.md"
         exit 1
     fi
 done

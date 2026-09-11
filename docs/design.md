@@ -1148,6 +1148,9 @@ stage that does not ask for documentation.
   of the declaration they came from.
 - The text is sliced from the source when `valk doc` or an editor hover asks for
   it, so ordinary builds store no documentation and pay no parse cost.
+- Markdown keeps a reference compact: the first paragraph of the block is shown
+  as a comment above the signature. `valk doc --full` adds the whole block as a
+  section under the signatures.
 
 ## Unsafe boundary
 
