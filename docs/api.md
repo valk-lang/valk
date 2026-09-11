@@ -434,6 +434,14 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
     + fn add(add: String) String
     + static fn alloc(length: uint) String
+    + fn ansi.black(bold: bool (false)) String
+    + fn ansi.blue(bold: bool (false)) String
+    + fn ansi.cyan(bold: bool (false)) String
+    + fn ansi.green(bold: bool (false)) String
+    + fn ansi.purple(bold: bool (false)) String
+    + fn ansi.red(bold: bool (false)) String
+    + fn ansi.white(bold: bool (false)) String
+    + fn ansi.yellow(bold: bool (false)) String
     + get bytes: uint
     + fn clone() String
     + fn contains(part: String, start_index: uint (0)) bool
@@ -483,6 +491,13 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn trim(part: String, limit: uint (0)) String
     + fn unescape() String
     + fn upper() String
+    + fn utf8.chars() StringChars
+    + fn utf8.contains(part: String) bool
+    + fn utf8.get(index: uint) String
+    + fn utf8.index_of(part: String, start_index: uint (0)) uint !LookupError
+    + get utf8.length: uint
+    + fn utf8.range(start_index: uint, length: uint) String
+    + fn utf8.split(on: String) Array[String]
     + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
 }
 ```
