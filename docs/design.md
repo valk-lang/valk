@@ -1025,6 +1025,10 @@ dispatch happens inside the generic library code, a hook called by a generic
 container has to be reachable from the library's package, which in practice
 means `+`.
 
+`alias`, `type`, `value` and `group` carry their own marker, which is checked
+where the name is used; their unmarked form stays reachable from other packages
+because the generated `ext` bindings are shared that way.
+
 An interface implementation has to be at least as accessible as the requirement
 it satisfies; a call through the interface only checks the requirement's access,
 so a narrower implementation would be reachable through it.

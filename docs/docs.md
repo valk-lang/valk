@@ -1433,6 +1433,12 @@ as regular functions when they are called: `x + y` and
 Generic library code performs those calls from its own package, so a hook that
 a generic container uses must be reachable from it — mark such hooks `+`.
 
+`alias`, `type`, `value` and `group` declarations honor their marker, so a
+`- value` or `- group` stays inside its source file and a `- type` alias cannot
+be named from another file. Unlike the other declarations, their unmarked form
+is reachable from every package; the generated `ext` enum bindings rely on
+that.
+
 An interface implementation must be at least as accessible as the requirement
 it satisfies: a `- fn` cannot implement a `fn` requirement, because calls
 through the interface would reach it anyway.
