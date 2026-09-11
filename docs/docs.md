@@ -327,7 +327,10 @@ print_sizes([int x 3]{ 4, 5, 6 })
 
 `[T x N]{ ... }` writes a fixed array where a value is needed; `{ ... }`
 suffices when the type is already known, and `v...` repeats the last value
-to the end.
+to the end. An entry that already has the element type counts as one element,
+so a tuple element is written as it is (`[(u8, u64) x 1] = { pair() }`); an
+entry that does not match the element type spreads over the following
+elements, so `[u8 x 2] = { two_bytes() }` fills both slots.
 
 Every range in Valk is a start offset and a length, never a start and an end,
 so there is no inclusive or exclusive bound to remember. `value[start .. length]`
