@@ -139,6 +139,9 @@ check_ok "github-fallback-order" "nested-first"
 # different packages: their interface adapters and allocators stay separate.
 check_ok "duplicate-alias" "12"
 
+# A dependency alias that hides a local namespace of the same name.
+check_fail "shadowed-namespace" "is shadowed by the dependency"
+
 # One C symbol declared with two different prototypes in one build.
 check_fail "extern-signature-conflict" "one C symbol needs one prototype"
 

@@ -1966,7 +1966,9 @@ valk build ./src -o ./myprogram
 
 A dependency alias names a directory. Two dependencies that share an alias but
 resolve to different directories are different packages: their types, interface
-adapters and allocator pools stay separate.
+adapters and allocator pools stay separate. A dependency alias that also names
+a local namespace is rejected, because `use` would refer to the dependency and
+leave the local namespace unreachable; rename one of them.
 
 Use `--lint` to check every source in a package without requiring `main` or
 producing an executable:
