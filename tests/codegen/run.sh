@@ -153,7 +153,7 @@ echo "> Keep inline nullable and multi-value GC layouts naturally aligned"
 layout_body=$(sed -n '/^define .*__inline_layout_roots__/,/^}/p' "$ir")
 layout_union=$(sed -n '/^define .*__aligned_layout_union__/,/^}/p' "$ir")
 
-if [[ "$layout_body" != *"[2 x { i1, [7 x i8], [8 x i8] }]"* ]] \
+if [[ "$layout_body" != *"[2 x { i1, [7 x i8], [1 x i64] }]"* ]] \
     || [[ "$layout_union" != *"insertvalue { i1, ptr }"* ]] \
     || [[ "$layout_union" != *"store { i1, ptr }"* ]]; then
     echo "# Inline nullable or naturally aligned multi-value storage disagreed with its byte layout"
@@ -653,7 +653,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     if [[ "$direct" != *'__CloneCell__clone__'* ]] || [[ "$present" != *'__CloneCell__clone__'* ]] \
         || [[ "$before_guard$absent" == *'__CloneCell__clone__'* ]] \
         || [[ "$before_guard" != *'icmp ne ptr'* ]] \
-        || [[ "$payload" != *'getelementptr { i1, [7 x i8], [8 x i8] }'* ]] \
+        || [[ "$payload" != *'getelementptr { i1, [7 x i8], [1 x i64] }'* ]] \
         || [[ "$direct$nullable$payload$hooks" == *'__Pool__get__'* ]]; then
         echo "# Borrowed clone hooks must run only for present values without heap allocation on $target"
         echo "$direct$nullable$payload$hooks"
