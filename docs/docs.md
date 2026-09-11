@@ -1007,6 +1007,33 @@ fn main() {
 }
 ```
 
+## Documentation comments
+
+A `///` block directly above a declaration documents it. The text is markdown, and the blank line below shows that the block ends where the declaration begins.
+
+```rust
+/// Splits `text` at each occurrence of `sep`.
+///
+/// Empty fields are kept:
+///
+/// ```valk
+/// "a,,b".split(",") == .{ "a", "", "b" }
+/// ```
++ fn split(text: String, sep: String) Array[String] { ... }
+
+/// How many requests the server handled so far.
++ global requests: uint (0)
+```
+
+Documentation reaches both readers and tools:
+
+```sh
+valk doc lib/ -o docs/api.md --markdown --no-private
+valk doc lib/ -o api.json          # JSON, with a "description" per declaration
+```
+
+Editors show the same text on hover, under the signature.
+
 ## Tokens
 
 ### If Else

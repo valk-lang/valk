@@ -41,6 +41,33 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
+for expect in \
+    '"description": "A box holding one value of `T`.\n\n```valk\nBox[uint]{ 3 }.get() == 3\n```"' \
+    '"description": "The type of the stored value."' \
+    '"description": "Two values of the same type."' \
+    '"description": "The first half."' \
+    '"description": "Returns `first`."' \
+    'Generic documentation is kept on every instantiation."' \
+    '"description": "Number of boxes alive in tests."' \
+    '"description": "Public alias for a private function."' \
+    '"description": "Shouts the value."'; do
+    if ! grep -Fq "$expect" "$workdir/api.json"; then
+        echo "# Documentation comment is missing from the API JSON: $expect"
+        cat "$workdir/api.json"
+        exit 1
+    fi
+done
+for absent in \
+    '"description": "A plain comment' \
+    '"description": "A separator line' \
+    '"description": "Detached by'; do
+    if grep -Fq "$absent" "$workdir/api.json"; then
+        echo "# Undocumented declaration reported a description: $absent"
+        cat "$workdir/api.json"
+        exit 1
+    fi
+done
+
 markdown=$(<"$workdir/api.md")
 if [[ "$markdown" != *'+ class Box[T]'* ]] \
     || [[ "$markdown" != *'+ get value_type: T'* ]] \
@@ -57,6 +84,24 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
     echo "$markdown"
     exit 1
 fi
+
+for expect in \
+    '### Box' \
+    '#### value_type' \
+    'The type of the stored value.' \
+    '#### first' \
+    '### choose' \
+    '### box_count' \
+    '### documented_alias' \
+    'Public alias for a private function.' \
+    '#### Box[String].shout' \
+    'Shouts the value.'; do
+    if ! grep -Fq "$expect" "$workdir/api.md"; then
+        echo "# Markdown is missing documentation comment: $expect"
+        cat "$workdir/api.md"
+        exit 1
+    fi
+done
 
 echo "> Preserve public value aliases to private functions"
 out=$("$VALK" doc "$DIR/fixture" -o "$workdir/public-api.md" --markdown --no-private 2>&1)

@@ -1128,6 +1128,27 @@ The parser uses its current grammar context to classify overloaded punctuation:
 New syntax must preserve the ability to determine these forms from tokens and
 parser context alone.
 
+## Documentation comments
+
+A `///` block directly above a declaration is that declaration's documentation.
+The block is positional and needs no new grammar: `///` is a comment to every
+stage that does not ask for documentation.
+
+- The block is contiguous and ends at the first line that is not `///`, so a
+  blank line or any other line detaches it.
+- `///` and one following space are removed; the rest is markdown and is kept
+  verbatim, including indented code blocks.
+- `////` and anything longer is an ordinary comment, so ruler lines in the
+  sources stay comments.
+- Lines starting with `@` between the block and the declaration are attributes
+  of that declaration and are skipped, not documented.
+- Functions (including methods, getters, externs and generic bases), classes,
+  structs, unions, interfaces, modes, class properties, globals and `value`
+  aliases carry documentation. Generic instantiations report the documentation
+  of the declaration they came from.
+- The text is sliced from the source when `valk doc` or an editor hover asks for
+  it, so ordinary builds store no documentation and pay no parse cost.
+
 ## Unsafe boundary
 
 Safe code cannot:

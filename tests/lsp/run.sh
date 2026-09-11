@@ -354,6 +354,15 @@ check "hover on a function" '"value":"```valk\nfn helper(count: uint, label: Str
 check "hover on an inferred local" '"value":"```valk\nString\n```"' \
     "$(request textDocument/hover nav.valk 7 28)"
 
+check "hover shows the documentation comment" '"value":"```valk\nfn total(numbers: Array[uint]) uint\n```\n\nSums the values in `numbers`.\n\nReturns `0` for an empty array."' \
+    "$(request textDocument/hover nav.valk 22 14)"
+
+check "hover on a class shows its documentation" '"value":"```valk\nCounter\n```\n\nA counter that records how often it was bumped."' \
+    "$(request textDocument/hover nav.valk 38 19)"
+
+check "hover on a method shows its documentation" '"value":"```valk\nfn bump()\n```\n\nAdds one to `count`."' \
+    "$(request textDocument/hover nav.valk 39 12)"
+
 check "hover ranges use UTF-16 columns" '"start":{"line":3,"character":20}' \
     "$(request textDocument/hover unicode.valk 3 21)"
 
