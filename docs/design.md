@@ -437,12 +437,15 @@ Anonymous union types use `A | B`. A named union may also define methods and
 getters. Nullability is represented separately with `?` rather than by adding
 an implicit union alternative:
 
-- A declared `null` alternative is an ordinary alternative with an empty
-  payload: it has its own tag, the union is not nullable, and `isset` on it is
-  true. `null` converts to that tag, and a `?X` converts to the union when `X` is
-  an alternative (missing selects the `null` tag).
-- `?U` adds the outer missing state on top; `u ?? fallback` yields the stored
-  union even when it holds the `null` alternative.
+- A declared `null` alternative is a real alternative with an empty payload: it
+  has its own tag and the union itself is not nullable. `isset` on the union is
+  false while that alternative is active, and true otherwise. `null` converts
+  to that tag, and a `?X` converts to the union when `X` is an alternative
+  (missing selects the `null` tag).
+- `?U` adds the outer missing state on top, so `isset` on a `?U` tests only the
+  outer state: it stays true when the stored union holds the `null` alternative.
+  `u ?? fallback` yields the stored union even when it holds the `null`
+  alternative.
 - An alternative cannot itself be nullable (`?int | String` is rejected); the
   whole union is made nullable with `?` instead.
 - In a `match` on `?U`, the `null` case covers both the missing value and the
