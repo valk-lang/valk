@@ -812,7 +812,9 @@ preserve uniqueness, while aliasing, capture, persistent storage, and calls
 through unknown code remove it.
 
 An ordinary value may become `shared T` only when its complete reachable managed
-graph is still provably unique. Creating the view consumes that internal
+graph is still provably unique. Inline aggregates follow the same rule: a
+struct, tuple or fixed array that carries managed references is published by
+copying the aggregate and taking the view over those references. Creating the view consumes that internal
 capability; using another mutable alias is rejected. Strings and other immutable
 values are always compatible. Function argument escape and fresh-return
 summaries are inferred from bodies and cached, so APIs do not need ownership
