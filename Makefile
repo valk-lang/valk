@@ -116,7 +116,12 @@ test-doc: $(TEST_COMPILER)
 test-examples: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./tests/examples/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples
+# Requires a curl built with HTTP/2 (nghttp2). It runs as part of test-all,
+# which CI only executes in the linux-x64 job.
+test-http2: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) bash ./tests/http2/run.sh
+
+test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2
 
 # The suites whose outcome depends on the host: the runtime, the linker and
 # the CLI's path handling. The front-end suites (compile errors, formatting,
@@ -283,6 +288,6 @@ clean:
 	asm ci-linux ci-macos ci-win clean dist-all doc install ir \
 	linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
-	test test-all test-examples test-compile-errors test-cross test-cross-ir test-diagnostics \
+	test test-all test-examples test-http2 test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
 	test-macos-build test-release test-win test-win-build
