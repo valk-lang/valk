@@ -35,8 +35,7 @@ endif
 # GC_DEBUG turns on the GC's internal assertions: a corrupted property slot
 # or a misaligned root panics by name instead of faulting later elsewhere
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" --def "GC_DEBUG=1" -vv
-BENCH_JSON_ITERATIONS ?= 500
-BENCH_JSON_MEMORY_DOCUMENTS ?= 100
+BENCH_JSON_ITERATIONS ?= 2000000
 
 valk: $(COMPILER_DEPS)
 	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
@@ -128,8 +127,7 @@ test-native: test test-library test-exit-code test-cli test-lsp test-diagnostics
 bench-json: valk
 	mkdir -p ./debug
 	./valk build ./examples/bench/json/main.valk --release -o ./debug/bench-json
-	./debug/bench-json time $(BENCH_JSON_ITERATIONS)
-	./debug/bench-json memory $(BENCH_JSON_MEMORY_DOCUMENTS)
+	./debug/bench-json $(BENCH_JSON_ITERATIONS)
 
 test-release: $(TEST_COMPILER)
 	mkdir -p ./debug
