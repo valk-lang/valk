@@ -329,6 +329,19 @@ Callable type syntax is:
 Multiple return types and the optional error type appear inside the return
 parentheses. `()` means no return value, and `(!Error)` means error-only.
 
+A tuple value is a single value: one name holds it whole, and it may be passed,
+returned, compared, and stored, including as an array element or a property.
+Naming several variables for a tuple destructures it into its members in order,
+and `_` discards a member:
+
+```valk
+fn pair() (String, int) { return ("a", 1) }
+
+let whole = pair()          // the tuple value
+let text, number = whole    // destructures it
+let first, _ = pair()       // only the first member
+```
+
 A closure is an inline two-word value:
 
 ```text
