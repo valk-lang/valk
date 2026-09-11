@@ -1,6 +1,14 @@
 
 use valk.fs
 use valk.io
+#if OS != "win"
+extern fn dup(old_fd: i32) i32;
+extern fn dup2(old_fd: i32, new_fd: i32) i32;
+#end
+
+fn temp_path(name: String) String {
+    return fs.add(fs.exe_dir() !? ".", name)
+}
 
 fn stream_read_append(stream: fs.FileStream, output: ByteBuffer, buf: mut &[u8]) uint {
     let read = stream.read(buf) ! {
@@ -466,4 +474,182 @@ test "fs: chmod and truncate files" {
     fs.truncate(path, 3) ! assert(false)
     assert((fs.read(path) !? "") == "abc")
     fs.delete_file(path) ! assert(false)
+}
+
+test "fs: a stream seeks from the end of the open file and stays writable" {
+    let path = temp_path("fs-stream-seek.txt")
+    fs.write(path, "abcdef") ! assert(false)
+    let stream = fs.stream(path, fs.OpenOptions { write: fs.WriteMode.preserve }) ! { assert(false); return }
+    let chunk = [u8]{ 0 x 8 }
+    assert((stream.read(chunk) !? 99) == 6)
+    assert((stream.read(chunk) !? 99) == 0)
+    assert(!stream.closed)
+    assert((stream.write("gh") !? 99) == 2)
+    assert((stream.seek(-1, io.SeekFrom.end) !? 99) == 7)
+    stream.close() ! assert(false)
+    assert((fs.read(path) !? "") == "abcdefgh")
+
+    // A read-only stream still closes itself at the end
+    let reader = fs.stream(path) ! { assert(false); return }
+    assert((reader.read(chunk) !? 99) == 8)
+    assert((reader.read(chunk) !? 99) == 0)
+    assert(reader.closed)
+
+    #if OS != "win"
+    // The size comes from the descriptor, not from whatever the path names now
+    let other = temp_path("fs-stream-other.txt")
+    let held = fs.stream(path) ! { assert(false); return }
+    fs.write(other, "xy") ! assert(false)
+    fs.move(other, path) ! assert(false)
+    assert((held.seek(0, io.SeekFrom.end) !? 99) == 8)
+    held.close() ! assert(false)
+    #end
+    fs.delete_file(path) ! assert(false)
+}
+
+test "fs: copy continues past short reads" {
+    // /proc files hand out at most a page per read
+    let path = temp_path("fs-copy-proc.txt")
+    fs.copy("/proc/self/smaps", path) ! assert(false)
+    let copied = fs.read(path) !? ""
+    fs.delete_file(path) ! assert(false)
+    assert(copied.bytes > 16384)
+    assert(copied.ends_with("\n"))
+}
+
+test "fs: copy recreates symlinks inside a directory" {
+    let dir = temp_path("fs-symlink-src")
+    let copy_dir = temp_path("fs-symlink-copy")
+    if fs.exists(dir) : fs.delete_all(dir) ! assert(false)
+    if fs.is_dir(copy_dir) : fs.delete_all(copy_dir) ! assert(false)
+    fs.create_dir(dir) ! assert(false)
+    fs.write(fs.add(dir, "file.txt"), "data") ! assert(false)
+    let linked = true
+    fs.symlink(fs.add(dir, "relative"), "file.txt", false) ! { linked = false }
+    #if OS == "win"
+    // Creating symlinks needs Developer Mode or elevation on Windows
+    if !linked {
+        fs.delete_all(dir) ! assert(false)
+        return
+    }
+    #end
+    assert(linked)
+    fs.symlink(fs.add(dir, "dangling"), "missing.txt", false) ! assert(false)
+    fs.create_dir(fs.add(dir, "sub")) ! assert(false)
+    fs.symlink(fs.add(dir, "sub-link"), "sub", true) ! assert(false)
+
+    fs.copy(dir, copy_dir) ! assert(false)
+    let relative = fs.add(copy_dir, "relative")
+    assert(fs.is_symlink(relative))
+    assert((fs.read(relative) !? "") == "data")
+    assert(fs.is_symlink(fs.add(copy_dir, "dangling")))
+    assert(fs.is_symlink(fs.add(copy_dir, "sub-link")))
+    // Without `recursive` real subdirectories are still skipped
+    assert(!fs.exists(fs.add(copy_dir, "sub")))
+
+    // Copying again replaces the links
+    fs.copy(dir, copy_dir) ! assert(false)
+    assert(fs.is_symlink(relative))
+    assert((fs.read(relative) !? "") == "data")
+
+    fs.delete_all(dir) ! assert(false)
+    fs.delete_all(copy_dir) ! assert(false)
+}
+
+test "fs: create_dir on an existing path throws exists" {
+    let dir = temp_path("fs-create-exists")
+    if fs.exists(dir) : fs.delete_all(dir) ! assert(false)
+    fs.create_dir(dir) ! assert(false)
+    let exists = false
+    fs.create_dir(dir) ! { exists = error_is(E.code, exists) }
+    assert(exists)
+    let access = false
+    fs.create_dir(fs.add(dir, "missing/child")) ! { access = error_is(E.code, access) }
+    assert(access)
+    fs.delete_dir(dir) ! assert(false)
+}
+
+test "fs: mime types are single and case-insensitive" {
+    assert(fs.mime_type("mid") == "audio/midi")
+    assert(fs.mime_type("midi") == "audio/midi")
+    assert(fs.mime_type("PNG") == "image/png")
+    assert(fs.mime_type("Html") == "text/html")
+    assert(fs.mime_type("nope") == "application/octet-stream")
+}
+
+test "fs: read reads files that report size 0" {
+    assert((fs.size("/proc/self/status") !? 1) == 0)
+    let status = fs.read("/proc/self/status") !? ""
+    assert(status.contains("Name:"))
+    assert(status.contains("VmRSS:"))
+}
+
+test "fs: stdin redirected from a regular file reads sequentially" {
+    @unsafe
+    let path = temp_path("fs-stdin-redirect.txt")
+    fs.write(path, "one\ntwo\nthree") ! assert(false)
+    let fd = fs.open(path) ! { assert(false); return }
+    let saved = dup(0)
+    assert(saved >= 0)
+    assert(dup2(fd, 0) == 0)
+    // A small chunk forces several reads; each must continue where the last stopped
+    let lines = io.LineReader.new(io.stdin(), 4).lines() !? .{}
+    assert(dup2(saved, 0) == 0)
+    io.close(saved) ! assert(false)
+    io.close(fd) ! assert(false)
+    fs.delete_file(path) ! assert(false)
+    assert(lines.length == 3)
+    assert((lines.get(0) !? "") == "one")
+    assert((lines.get(2) !? "") == "three")
+}
+
+test "fs: sync_all flushes without failing" {
+    let path = temp_path("fs-sync-all.txt")
+    fs.write(path, "synced") ! assert(false)
+    fs.sync_all()
+    assert((fs.read(path) !? "") == "synced")
+    fs.delete_file(path) ! assert(false)
+}
+
+test "io: read and write default to the current position" {
+    let path = temp_path("fs-io-read-pos.txt")
+    fs.write(path, "abcdef") ! assert(false)
+    let fd = fs.open(path) ! { assert(false); return }
+    let chunk = [u8]{ 0 x 2 }
+    assert((io.read(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "ab")
+    assert((io.read(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "cd")
+    // An explicit offset neither uses nor moves the position
+    assert((io.read(fd, chunk, 0) !? 99) == 2)
+    assert(chunk.to_string() == "ab")
+    assert((io.read_sync(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "ef")
+    assert((io.read(fd, chunk) !? 99) == 0)
+    // seek moves the position the default offset reads from
+    assert((io.seek(fd, 1) !? 99) == 1)
+    assert((io.read(fd, chunk) !? 99) == 2)
+    assert(chunk.to_string() == "bc")
+    io.close(fd) ! assert(false)
+    fs.delete_file(path) ! assert(false)
+
+    let write_path = temp_path("fs-io-write-pos.txt")
+    fs.write(write_path, "abcdef") ! assert(false)
+    let wfd = fs.open(write_path, fs.OpenOptions { write: fs.WriteMode.preserve }) ! { assert(false); return }
+    assert((io.seek(wfd, 2) !? 99) == 2)
+    assert((io.write(wfd, "XY") !? 99) == 2)
+    assert((io.write(wfd, "Z") !? 99) == 1)
+    assert((io.seek(wfd, 0, io.SeekFrom.current) !? 99) == 5)
+    io.close(wfd) ! assert(false)
+    assert((fs.read(write_path) !? "") == "abXYZf")
+
+    // Append mode still writes at the end, wherever the position is
+    let appender = fs.open(write_path, fs.OpenOptions { write: fs.WriteMode.append }) ! { assert(false); return }
+    assert((io.write(appender, "1") !? 99) == 1)
+    assert((io.seek(appender, 0) !? 99) == 0)
+    assert((io.write(appender, "2") !? 99) == 1)
+    io.close(appender) ! assert(false)
+    fs.write(write_path, "3", true) ! assert(false)
+    assert((fs.read(write_path) !? "") == "abXYZf123")
+    fs.delete_file(write_path) ! assert(false)
 }

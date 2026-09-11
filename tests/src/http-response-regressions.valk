@@ -1,6 +1,62 @@
+use valk.fs
 use valk.http
 use valk.net
 use valk.time
+// Reads until the server closes the connection
+fn raw_http_read_all(connection: net.Connection) String {
+    connection.read_timeout_ms = 2000
+    let output = ByteBuffer.new()
+    let bytes = [u8]{ 0 x 1024 }
+    while true {
+        let count = connection.read(bytes) ! break
+        if count == 0 : break
+        output.write(bytes.view(0, count))
+    }
+    return output.to_string()
+}
+
+fn raw_http_exchange(port: u16, request: String) String {
+    let connection = net.Socket.client(net.SocketType.tcp, "127.0.0.1", port) ! return ""
+    connection.write(request) ! return ""
+    let response = raw_http_read_all(connection)
+    connection.close() ! assert(false)
+    return response
+}
+
+fn raw_http_handler(req: http.Request) http.Response {
+    if req.path == "/nocontent" : return http.Response.text("hello", 204)
+    if req.path == "/notmodified" : return http.Response.text("hello", 304)
+    if req.path == "/stream" {
+        let response = http.Response.stream(ByteReader.new("hello world"), 5)
+        response.status = 201
+        return response
+    }
+    if req.path == "/file" {
+        let response = http.Response.file(__DIR__ + "/../assets/valk-logo.png")
+        response.status = 203
+        return response
+    }
+    if req.path == "/params" {
+        let grouped = req.params_grouped().get("a b") !? Array[String]{}
+        return http.Response.text((req.params().get("a b") !? "-") + "|" + grouped.join(","))
+    }
+    if req.path == "/data" {
+        let data = req.data()
+        return http.Response.text((data.get("a b") !? "-") + "|" + (data.get("c") !? "-"))
+    }
+    return http.Response.text("hello")
+}
+
+global regression_request: String ("")
+
+fn audit_raw_server(server: shared net.SocketServer, response: String) {
+    let connection = server.accept(2000) ! { assert(false); return }
+    let buffer = [u8]{ 0 x 4096 }
+    let count = connection.read(buffer) ! { assert(false); return }
+    regression_request = buffer.view(0, count).to_string()
+    connection.write(response) ! assert(false)
+    connection.close() ! assert(false)
+}
 
 fn audit_response_server(server: shared net.SocketServer, response: String, split: uint) {
     let connection = server.accept(2000) ! { assert(false); return }
@@ -92,4 +148,123 @@ test "audit: ordinary final responses still work" {
     if !isset(response) : return
     assert(response.status == 200)
     assert(response.body == "ok")
+}
+
+test "Http: ClientRequest.bytes_to_recv is the response size" {
+    let response = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    let server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 19463) ! { assert(false); return }
+    let running = co audit_raw_server(server, response)
+    let req = http.create_request("GET", "http://127.0.0.1:19463/") ! { assert(false); return }
+    while (req.progress() !? false) {}
+    await running
+    server.close() ! assert(false)
+    assert(req.bytes_to_recv == response.bytes)
+    assert(req.bytes_received == response.bytes)
+    assert(req.recv_percent == 100)
+    let res = req.response() ! { assert(false); return }
+    assert(res.body == "hello")
+}
+
+test "Http: HTTP/1.1 omits the body for HEAD, 204 and 304" {
+    let server = http.Server.new("127.0.0.1", 19461, raw_http_handler)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+
+    let head = raw_http_exchange(19461, "HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(head.starts_with("HTTP/1.1 200 OK\r\n"))
+    assert(head.contains("\r\nContent-Length: 5\r\n"))
+    assert(head.ends_with("\r\n\r\n"))
+
+    let get = raw_http_exchange(19461, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(get.ends_with("\r\n\r\nhello"))
+
+    let no_content = raw_http_exchange(19461, "GET /nocontent HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(no_content.starts_with("HTTP/1.1 204 "))
+    assert(!no_content.contains("Content-Length"))
+    assert(no_content.ends_with("\r\n\r\n"))
+
+    let not_modified = raw_http_exchange(19461, "GET /notmodified HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(not_modified.starts_with("HTTP/1.1 304 "))
+    assert(not_modified.ends_with("\r\n\r\n"))
+
+    let head_stream = raw_http_exchange(19461, "HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(head_stream.contains("\r\nContent-Length: 5\r\n"))
+    assert(head_stream.ends_with("\r\n\r\n"))
+}
+
+test "Http: Route.params counts parts like Router.find" {
+    let router = http.Router[String].new()
+    router.add("GET", "/users//@id/posts/@post", "posts")
+    let path = "//users/12//posts/34/"
+    let route = router.find("GET", path) ! { assert(false); return }
+    assert(route.handler == "posts")
+    let params = route.params(path)
+    assert((params.get("id") !? "") == "12")
+    assert((params.get("post") !? "") == "34")
+    assert((route.params("users/12/posts/34").get("id") !? "") == "12")
+}
+
+test "Http: data() accepts media type parameters and quoted boundaries" {
+    let server = http.Server.new("127.0.0.1", 19464, raw_http_handler)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+
+    let json_options = http.Options { body: "{\"c\":\"json\"}" }
+    json_options.set_header("Content-Type", "Application/JSON; charset=utf-8")
+    let json = http.request("POST", "http://127.0.0.1:19464/data", json_options) ! { assert(false); return }
+    assert(json.body == "-|json")
+
+    let form_options = http.Options { body: "c=form" }
+    form_options.set_header("Content-Type", "application/x-www-form-urlencoded ; charset=utf-8")
+    let form = http.request("POST", "http://127.0.0.1:19464/data", form_options) ! { assert(false); return }
+    assert(form.body == "-|form")
+
+    let multipart_body = "--a;b\r\nContent-Disposition: form-data; name=\"c\"\r\n\r\nmultipart\r\n--a;b--\r\n"
+    let multipart_options = http.Options { body: multipart_body }
+    multipart_options.set_header("Content-Type", "multipart/form-data; charset=utf-8; BOUNDARY=\"a;b\"")
+    let multipart = http.request("POST", "http://127.0.0.1:19464/data", multipart_options) ! { assert(false); return }
+    assert(multipart.body == "-|multipart")
+}
+
+test "Http: download leaves the caller's options unchanged" {
+    let path = fs.add(fs.exe_dir() !? "", "http-download.tmp")
+    let server = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 19466) ! { assert(false); return }
+    let running = co audit_raw_server(server, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    let options = http.Options { timeout_ms: 2000 }
+    http.download("http://127.0.0.1:19466/", path, "GET", options) ! assert(false)
+    await running
+    server.close() ! assert(false)
+    assert(!isset(options.output))
+    assert((fs.read(path) !? "") == "ok")
+    fs.delete_file(path) ! assert(false)
+}
+
+test "Http: file and stream responses use the status and the size" {
+    let server = http.Server.new("127.0.0.1", 19462, raw_http_handler)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+
+    let stream = raw_http_exchange(19462, "GET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(stream.starts_with("HTTP/1.1 201 "))
+    assert(stream.contains("\r\nContent-Length: 5\r\n"))
+    assert(stream.ends_with("\r\n\r\nhello"))
+
+    let file = http.request("GET", "http://127.0.0.1:19462/file") ! { assert(false); return }
+    assert(file.status == 203)
+    let size = fs.size(__DIR__ + "/../assets/valk-logo.png") ! { assert(false); return }
+    assert(file.body.bytes == size)
+}
+
+test "Http: params() and data() decode keys" {
+    let server = http.Server.new("127.0.0.1", 19465, raw_http_handler)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+
+    let params = http.request("GET", "http://127.0.0.1:19465/params?a%20b=1&a+b=2") ! { assert(false); return }
+    assert(params.body == "2|1,2")
+
+    let options = http.Options { body: "a%20b=x%21&c=y" }
+    options.set_header("Content-Type", "application/x-www-form-urlencoded")
+    let data = http.request("POST", "http://127.0.0.1:19465/data", options) ! { assert(false); return }
+    assert(data.body == "x!|y")
 }
