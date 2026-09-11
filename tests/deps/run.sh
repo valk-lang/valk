@@ -139,6 +139,9 @@ check_ok "github-fallback-order" "nested-first"
 # different packages: their interface adapters and allocators stay separate.
 check_ok "duplicate-alias" "12"
 
+# One C symbol declared with two different prototypes in one build.
+check_fail "extern-signature-conflict" "one C symbol needs one prototype"
+
 # Missing vendor dir reports the new assoc path (not github.com.user.repo).
 check_fail "github-missing" "vendor/github-acme-widget/9.9.9"
 

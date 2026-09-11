@@ -971,6 +971,10 @@ inspect(@ref(value))
 C-style variadic arguments use a final `...` marker and are restricted to
 extern declarations. Valk-defined and exported functions cannot be variadic.
 
+One C symbol has one prototype: extern declarations that share a name are
+checked against each other, and a differing signature is a compile error, since
+one module would otherwise emit a declaration that disagrees with a call site.
+
 `@ref` stabilizes inline stack storage and retains the exact GC owner of an
 interior address for the current function or coroutine frame. It still returns
 an unsafe raw pointer with no lifetime guarantee beyond that frame. An extern
