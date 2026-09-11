@@ -1964,6 +1964,10 @@ fn main() {
 valk build ./src -o ./myprogram
 ```
 
+A dependency alias names a directory. Two dependencies that share an alias but
+resolve to different directories are different packages: their types, interface
+adapters and allocator pools stay separate.
+
 Use `--lint` to check every source in a package without requiring `main` or
 producing an executable:
 

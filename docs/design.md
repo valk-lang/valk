@@ -735,6 +735,12 @@ Return-graph freshness is a separate summary. A return whose freshness depends
 on a recursive return summary that is still being computed is treated as not
 fresh.
 
+A package is identified by its directory, not by the alias that refers to it.
+Two dependencies that share an alias but resolve to different directories are
+separate packages with separate types, interface adapters and allocator pools;
+a package under the main package is keyed by its path relative to it, which
+keeps the emitted IR independent of where the project is checked out.
+
 All Valk package source is available to the compiler and is reanalysed when
 needed. Effect summaries are compiler-owned in-memory metadata, not source
 annotations or library artifacts.

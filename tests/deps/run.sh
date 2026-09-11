@@ -135,6 +135,10 @@ check_ok "github-dotted-prefers-new" "dashed-new"
 # Among the fallbacks, nested is tried first.
 check_ok "github-fallback-order" "nested-first"
 
+# Two dependencies that share an alias but live in different directories are
+# different packages: their interface adapters and allocators stay separate.
+check_ok "duplicate-alias" "12"
+
 # Missing vendor dir reports the new assoc path (not github.com.user.repo).
 check_fail "github-missing" "vendor/github-acme-widget/9.9.9"
 
