@@ -203,7 +203,7 @@ Valk distinguishes three sequence categories:
 | `[T x N]` | Inline elements | Copies all elements | No |
 | `Array[T]` | GC-managed reference to `&[T]` storage | Copies the reference | Yes |
 | `&[T]` | Owned borrow of fixed-size storage | Copies the borrow | No |
-| `&mut [T]` | The same borrow, writable | Copies the borrow | No |
+| `mut &[T]` | The same borrow, writable | Copies the borrow | No |
 | `String`, `slice X of T` | `&[T]` with a class attached | Copies the borrow | No |
 
 Fixed arrays store their elements inline. `Array` is a GC reference type that
@@ -221,13 +221,13 @@ the same works on named slices; `&view[a..b]` borrows a range of an
 `&[T]` as `&[T]`. A class `$offset` or `$range` hook takes precedence for
 `value[i]` and `value[a..b]`, and a `$view` hook for `&value[a..b]`, which is
 how `&array[a..b]` reaches `array.view(start, length)`: it
-returns an `&mut [T]` over the array's block without copying. The view shares the elements it covers, observes in-place
+returns an `mut &[T]` over the array's block without copying. The view shares the elements it covers, observes in-place
 writes through the array, and survives the array growing because it keeps the
 block it was taken from. A view keeps its whole block alive, including slots
 past the elements it covers. `array.range(...)` copies into a new array.
 
 Fresh slice storage comes from the language itself. `[T]{ a, b, c }`
-allocates from a list and hands back the `&mut [T]` that owns the elements.
+allocates from a list and hands back the `mut &[T]` that owns the elements.
 `[T]{ v x n }` repeats `v` `n` times; `n` may be any runtime value. Both
 allocate exactly once and never need `@unsafe`. `[T]{ null x n }` leaves the storage
 zeroed, which is safe when all-zero bytes are a valid `T` (numbers, and
@@ -249,7 +249,7 @@ A `slice X of T` class is an `&[T]` with a name attached: the same three words
 (`owner`, element pointer, `length`), the same GC handling, and the same
 bounds policy. `String` is the one in the core library. The name is a
 promise that only the class itself can make, so conversions run one way: a
-named slice converts implicitly to `&[T]`, and a writable one to `&mut [T]`,
+named slice converts implicitly to `&[T]`, and a writable one to `mut &[T]`,
 but no bare view ever becomes a named slice, and two different names never
 convert to each other. `@cast` is the only way through. `String` storage
 always carries a terminating zero byte so `data_cstring` is valid, which an
@@ -257,24 +257,37 @@ arbitrary `&[u8]` cannot promise; and a string is immutable, so it only ever
 converts to a read-only view.
 
 A bare borrow only reads. `&T` and `&[T]` are read-only views of their
-storage; `&mut T` and `&mut [T]` are the writable forms, with the same words
-and the same lifetime rules. A named slice declared `slice X of T $immutable`
+storage; `mut &T` and `mut &[T]` are the writable forms, with the same words
+and the same lifetime rules. `mut` and `local` are modifiers written before
+the ampersand, and they compose: `mut` allows writes, `local` marks a frame
+borrow that cannot escape, so `local mut &T` is the writable non-escaping
+form and `local &T` the read-only one.
+
+The `&` operator is the only borrow form: `&storage` borrows the storage as
+writable as the storage allows, so a writable local yields `local mut &T`.
+Behind a read-only view, on a capture, or on an `$immutable` slice, `&`
+yields the read-only form instead; there is no `&mut` operator. Read-only-ness
+then only widens at use sites, since a writable borrow converts to a read-only
+one implicitly and never back.
+A named slice declared `slice X of T $immutable`
 is read-only in the same way everywhere outside its own class: no element
-assignment, no `&mut` re-borrows, no `$offset_assign` hook, no conversion to a
+assignment, no writable re-borrow, no `$offset_assign` hook, no conversion to a
 writable view, and methods that write to their receiver are rejected. The
 class's own methods may still write through unsafe pointers to build values.
 `String` is declared that way, which is what makes strings immutable. A writable borrow converts to the read-only one
 implicitly and never back, except through `@cast`; `String` converts only to
 `&[u8]`, and `String.view` hands out `&[u8]`. Through a
 read-only borrow, assignment to the storage or to an inline aggregate inside
-it, `++`, `&mut` re-borrows, and methods that write to their receiver are
+it, `++`, writable re-borrows (`&` behind a read-only view stays read-only),
+and methods that write to their receiver are
 compile errors. A class object reached through a borrow is an ordinary object:
 `ref.field = x` on `&Box` writes the object, not the borrowed slot. A bare
 `&[T]` offers only the methods that read; a borrow handed back by a
-method on a read-only borrow is read-only too. `stack T` stays the exclusive
-frame borrow, writable by construction. Functions that only read take `&[u8]`,
+method on a read-only borrow is read-only too. `local &T` and `local mut &T`
+stay the exclusive frame borrows: a writable one is written `local mut &T`.
+Functions that only read take `&[u8]`,
 so string literals and shared strings pass to them without a copy; functions
-that fill a buffer take `&mut [u8]`. `[u8]{ 0 x n }` owns fresh fixed-length
+that fill a buffer take `mut &[u8]`. `[u8]{ 0 x n }` owns fresh fixed-length
 storage, while `slice.view(offset, length)` creates a bounded alias of
 existing storage without allocating or copying elements.
 
@@ -332,8 +345,9 @@ variable and the variable never observes writes made by the closure. Writes to
 a captured variable inside the closure body are therefore rejected: assignment,
 compound assignment, `++`/`--`, and stores into inline storage the capture
 holds, such as a field of a captured struct or an element of a captured fixed
-array. So is anything that would write that storage indirectly: a `&mut` or
-`stack` borrow of it, passing it to a `&mut` or `stack` parameter, and calling
+array. So is anything that would write that storage indirectly: a writable
+borrow of it (`&` yields a read-only borrow of a capture), passing it to a
+`mut &` or `local mut &` parameter, and calling
 a method that writes its receiver on it. Read-only borrows and reads remain
 allowed. Writes through a captured reference (`obj.count++`) reach the shared
 object and are allowed. A shared closure cannot capture non-shared managed
@@ -519,20 +533,24 @@ the value non-null.
 
 Valk has two borrow forms. Both are safe: neither can dangle, and neither
 requires the programmer to track lifetimes. They share one layout; what
-differs is where the storage may live and whether the borrow may escape.
+differs is where the storage may live and whether the borrow may escape. The
+`mut` and `local` modifiers are written before the ampersand and compose:
+`mut` allows writes, `local` keeps the borrow inside its frame.
 
 | Type | Layout | Kept alive by | May be stored or returned |
 | --- | --- | --- | --- |
-| `stack T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `local &T` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `local &[T x N]` | `{ owner: ?GcPtr, adr: ptr }` | The frame, or `owner` when set | No |
+| `local &[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | The frame, or `owner` when set | No |
 | `&T` | `{ owner: ?GcPtr, adr: ptr }` | Its own `owner` field | Yes |
 | `&[T]` | `{ owner: ?GcPtr, adr: ptr, length: uint }` | Its own `owner` field | Yes |
 
 #### Stack borrows
 
-`stack T` borrows storage for the rest of the frame: an inline local, an
+`local &T` borrows storage for the rest of the frame: an inline local, an
 argument, a temporary aggregate, or, through another borrow, storage inside a
 GC object. `&local` produces it with a null owner; `&ref.prop` through a
-`stack T` produces it with that borrow's owner word. A stack borrow follows
+`local &T` produces it with that borrow's owner word. A stack borrow follows
 the frame rules:
 
 - May be stored only in local variables and non-escaping parameters.
@@ -542,16 +560,21 @@ the frame rules:
 - May cross a coroutine suspension point when its stabilized storage is
   retained in the coroutine frame.
 
+A stack borrow is read-only unless declared `local mut &T`: without `mut` it
+only reads, with `mut` it may be written through.
+
 Taking a stack borrow makes the local addressable. The compiler uses native
 stack storage when the function is proven not to suspend. If the function may
 suspend directly or through a call, address-taken inline locals use stable
 storage so their addresses remain valid while another coroutine uses the
 execution stack.
 
-`stack [T x N]` is the bounded form; its length is part of the type and
-indexing is checked against it.
+`local &[T x N]` is the bounded form; its length is part of the type and
+indexing is checked against it, so it keeps the two-word layout.
+`local &[T]` is the unbounded form: the same three-word layout as `&[T]`
+(`{ owner, adr, length }`), only the escape rule differs.
 
-Struct method receivers are stack borrows: `this` is `stack T`. Calling a
+Struct method receivers are stack borrows: `this` is `local mut &T`. Calling a
 method on a struct that lives inside a GC object hands the method that
 object's owner word, so a store to a managed field through `this` updates the
 owner's bookkeeping. A method called on a frame local or through a raw
@@ -591,34 +614,34 @@ does not keep it, leaves `owner` publishable as `shared`. Borrowing
 
 #### Null owner
 
-`owner` is nullable, and null means nothing owns the storage. For `stack T`
+`owner` is nullable, and null means nothing owns the storage. For `local &T`
 that includes frame storage. For `&T` safe code produces a null owner only
 for permanent storage: globals and other static data. Unsafe code may build
 an `&T` from a raw pointer with `.@cast(&T)`, which yields a null owner over
-memory whose lifetime the programmer manages. A `stack T` does not convert to
+memory whose lifetime the programmer manages. A `local &T` does not convert to
 `&T`, because its null owner may stand for a frame, and the compiler reports
 the missing owner instead of the old "cannot be stored" errors.
 
 #### Conversions
 
-- `&mut T` converts to `stack T` in place; the layouts are the same and only
-  the escape rule changes. A read-only `&T` does not: a stack borrow is
-  writable by construction.
-- `stack T` does not convert to `&T` or `&[T]`.
+- `mut &T` converts to `local mut &T` in place; the layouts are the same and
+  only the escape rule changes. The same holds for the read-only pair: `&T`
+  converts to `local &T` in place.
+- `local &T` does not convert to `&T` or `&[T]`.
 - `&[T x N]` converts to `&[T]`; `[T x N]` storage with an owner converts to
   either.
-- A raw pointer converts to `stack T` implicitly, as before, and to `&T` only
+- A raw pointer converts to `local &T` implicitly, as before, and to `&T` only
   through explicit `.@cast(&T)` under `@unsafe`.
 - Every writable borrow converts to `ptr` and to a matching `*T`; a bounded
   `*[T x N]` takes exactly its own length. Read-only storage becomes a raw
-  pointer only under `@unsafe`. A raw pointer taken from a `stack T` keeps
+  pointer only under `@unsafe`. A raw pointer taken from a `local &T` keeps
   the frame rules: it may be passed to a pointer parameter but not stored.
 - `?&T` uses a null address as its empty state and costs no extra word.
   Equality on borrows compares addresses.
 
 The convention that follows: a function that only reads takes `&T`, a
-function that writes but does not keep the borrow takes `stack T`, and one
-that may store it takes `&mut T`. Callers may pass a writable owned borrow to
+function that writes but does not keep the borrow takes `local mut &T`, and one
+that may store it takes `mut &T`. Callers may pass a writable owned borrow to
 any of them.
 
 #### Owners are fixed-size
@@ -711,7 +734,7 @@ operations. `pointer.$offset(bytes)` computes an address offset without
 converting the integer offset itself to `ptr`.
 
 Raw pointers may erase to `ptr`, and a bare `ptr` may acquire either a raw `*T`
-element type or a `stack T` borrow type. Converting any raw pointer to an owned
+element type or a `local &T` borrow type. Converting any raw pointer to an owned
 `&T` requires explicit `.@cast(&T)` and yields a borrow without an owner.
 
 Bitwise `ptr & integer`, `ptr | integer`, and `ptr ^ integer` operations retain
@@ -777,7 +800,7 @@ aliasing remains ordinary aliasing; it never silently consumes a value.
 Ownership provenance covers managed references; raw pointers retain their
 separate explicit unsafe lifetime and aliasing rules.
 Everything read out of a view keeps it: properties, array and map elements,
-elements of `&[T]` and `&mut [T]` properties, and copies made with a bracket
+elements of `&[T]` and `mut &[T]` properties, and copies made with a bracket
 range. A struct of plain words reads out as an ordinary copy, but a store
 into it in place (`view.pair.n++`) or a struct method called on it in place
 still hits the view's storage, so it follows the view's rules: integer stores
@@ -799,7 +822,7 @@ locked data, and integer fields use atomic access. Methods called on a locked
 receiver get a `__locked` variant whose `this` is locked and whose non-fresh
 results stay locked; unlike the shared variant, mutating methods are allowed,
 and arguments the callee absorbs into its receiver must be unique at the call
-site. Struct methods get the same variants as class methods. A `&mut [T]`
+site. Struct methods get the same variants as class methods. A `mut &[T]`
 property keeps its mutability through the view: the slice can be reassigned
 and its elements stored, each store following the unique-graph rule; the
 elements read back as `locked T`. A locked view cannot be returned as

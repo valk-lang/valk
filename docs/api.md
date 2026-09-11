@@ -51,7 +51,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class Decompressor is Reader {
     + fn consumed() uint
     + static fn new(source: Reader, format: Format) Decompressor
-    + fn read(buf: &mut [u8]) uint !io:IoError
+    + fn read(buf: mut &[u8]) uint !io:IoError
 }
 ```
 
@@ -91,10 +91,10 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     ~+ owner: ?GcPtr
 
     + fn get(index: uint) T !LookupError
-    + fn range(offset: uint, length: uint) &mut [T]
+    + fn range(offset: uint, length: uint) mut &[T]
     + fn set(index: uint, value: T) void !LookupError
     + fn set_all(value: T) void
-    + fn view(offset: uint, length: uint) &mut [T]
+    + fn view(offset: uint, length: uint) mut &[T]
 }
 ```
 
@@ -169,7 +169,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn swap(index_a: uint, index_b: uint) void
     + fn swap_remove(index: uint) void
     + fn unique() Array[T]
-    + fn view(start: uint (0), amount: uint (uint.$max)) &mut [T]
+    + fn view(start: uint (0), amount: uint (uint.$max)) mut &[T]
 }
 ```
 
@@ -210,12 +210,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn set(index: uint, v: u8) void
     + fn shrink_capacity(size: uint) void
     + fn skip(amount: uint) void
-    + fn spare(amount: uint) &mut [u8]
     + fn starts_with(str: String, offset: uint (0)) bool
     + fn to_string() String
     + fn trim(filter: fnptr(u8)(bool)) void
     + fn truncate(length: uint) void
-    + fn view(offset: uint (0), length: uint (uint.$max)) &mut [u8]
+    + fn view(offset: uint (0), length: uint (uint.$max)) mut &[u8]
+    + fn view_spare(amount: uint) mut &[u8]
     + fn write(data: &[u8]) uint
     + fn write_big_endian(value: uint, bytes: uint) void
     + fn write_byte(v: u8) void
@@ -243,7 +243,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
     + fn get_pos() uint
     + static fn new(source: &[u8]) ByteReader
-    + fn read(buf: &mut [u8]) uint !io:IoError
+    + fn read(buf: mut &[u8]) uint !io:IoError
     + fn read_big_endian(bytes: uint) uint
     + fn read_byte() u8
     + fn read_cstring() String
@@ -469,7 +469,6 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn rtrim(part: String, limit: uint (0)) String
     + fn split(on: String) Array[String]
     + fn starts_with(part: String) bool
-    + fn take_length(length: uint) String
     + fn to_float() f64 !SyntaxError
     + fn to_int() int !SyntaxError
     + fn to_number[T]() T !SyntaxError
@@ -911,30 +910,40 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ## Functions for 'crypto'
 
 ```js
-+ fn base64_decode(str: String) String !CryptoError
-+ fn base64_decode_ptr(data: ptr, len: uint, out: ByteBuffer) void !CryptoError
-+ fn base64_encode(str: String) String
-+ fn base64_encode_ptr(data: ptr, len: uint, out: ByteBuffer) void
-+ fn bcrypt(cost: uint, salt: String, password: String, output: ByteBuffer) void !CryptoError
-+ fn bcrypt_hash(password: String, cost: uint (12)) String !CryptoError
-+ fn bcrypt_verify(password: String, hash: String) bool
++ fn base64_decode(data: &[u8]) String !CryptoError
++ fn base64_encode(data: &[u8]) String
++ fn base64_write_decode(data: &[u8], out: Writer) uint !CryptoError
++ fn base64_write_encode(data: &[u8], out: Writer) uint !io:IoError
++ fn bcrypt(cost: uint, salt: &[u8], password: &[u8], output: ByteBuffer) void !CryptoError
++ fn bcrypt_hash(password: &[u8], cost: uint (12)) String !CryptoError
++ fn bcrypt_verify(password: &[u8], hash: &[u8]) bool
 + fn constant_time_equals(a: &[u8], b: &[u8]) bool
 + fn digest_size(algorithm: HashAlgorithm) uint
 + fn hash(algorithm: HashAlgorithm, data: &[u8]) String
 + fn hash_hex(algorithm: HashAlgorithm, data: &[u8]) String
++ fn hash_write(algorithm: HashAlgorithm, data: &[u8], out: Writer) uint !io:IoError
++ fn hash_write_hex(algorithm: HashAlgorithm, data: &[u8], out: Writer) uint !io:IoError
 + fn hasher(algorithm: HashAlgorithm) Hasher
 + fn hex_decode(text: &[u8]) String !CryptoError
 + fn hex_encode(data: &[u8]) String
++ fn hex_write_decode(text: &[u8], out: Writer) uint !CryptoError
++ fn hex_write_encode(data: &[u8], out: Writer) uint !io:IoError
 + fn hkdf(algorithm: HashAlgorithm, ikm: &[u8], salt: &[u8], info: &[u8], length: uint) String !CryptoError
 + fn hkdf_expand(algorithm: HashAlgorithm, prk: &[u8], info: &[u8], length: uint) String !CryptoError
 + fn hkdf_extract(algorithm: HashAlgorithm, salt: &[u8], ikm: &[u8]) String
-+ fn md5_encode(input: String) String
++ fn md5_hex(data: &[u8]) String
++ fn md5_write_hex(data: &[u8], out: Writer) uint !io:IoError
 + fn pbkdf2(algorithm: HashAlgorithm, password: &[u8], salt: &[u8], iterations: uint, length: uint) String !CryptoError
 + fn random_bytes(length: uint) String
-+ fn sha1_encode(str: String) String
-+ fn sha256_encode(str: String) String
-+ fn sha384_encode(str: String) String
-+ fn sha512_encode(str: String) String
++ fn random_write_bytes(length: uint, out: Writer) uint !io:IoError
++ fn sha1_hex(data: &[u8]) String
++ fn sha1_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha256_hex(data: &[u8]) String
++ fn sha256_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha384_hex(data: &[u8]) String
++ fn sha384_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha512_hex(data: &[u8]) String
++ fn sha512_write_hex(data: &[u8], out: Writer) uint !io:IoError
 ```
 
 ## Classes for 'crypto'
@@ -942,9 +951,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 + class Blake2b {
     + fn finalize(out: *[u8]) void
-    + static fn hash_string(input: String, key: ?String (null), lowercase: bool (true)) String !CryptoError
+    + static fn hash_string(input: &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
-    + fn update(data: *[u8], length: uint) void
+    + fn update(input: &[u8]) void
 }
 ```
 
@@ -952,7 +961,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + interface Hasher {
     + fn block_size() uint
     + fn digest_size() uint
-    + fn finish(out: &mut [u8]) uint
+    + fn finish(out: mut &[u8]) uint
     + fn reset() void
     + fn update(data: &[u8]) void
 }
@@ -962,7 +971,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class Hmac is Hasher {
     + fn block_size() uint
     + fn digest_size() uint
-    + fn finish(out: &mut [u8]) uint
+    + fn finish(out: mut &[u8]) uint
     + static fn new(algorithm: HashAlgorithm, key: &[u8]) Hmac
     + fn reset() void
     + static fn sign(algorithm: HashAlgorithm, key: &[u8], data: &[u8]) String
@@ -976,7 +985,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class Md5 is Hasher {
     + fn block_size() uint
     + fn digest_size() uint
-    + fn finish(out: &mut [u8]) uint
+    + fn finish(out: mut &[u8]) uint
     + fn reset() void
     + fn update(data: &[u8]) void
 }
@@ -984,13 +993,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class Sha1 is Hasher {
-    + fn add_hash_data(data: *[u8 x 20]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
-    + fn add_string_data(str: String) void
     + fn block_size() uint
     + fn digest_size() uint
-    + fn final() [u8 x 20]
-    + fn finish(out: &mut [u8]) uint
+    + fn finish(out: mut &[u8]) uint
     + fn reset() void
     + fn update(data: &[u8]) void
 }
@@ -998,13 +1003,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + class Sha256 is Hasher {
-    + fn add_hash_data(data: *[u8 x 32]) void
-    + fn add_raw_data_unsafe(data: *[u8], len: uint) void
-    + fn add_string_data(str: String) void
     + fn block_size() uint
     + fn digest_size() uint
-    + fn final() [u8 x 32]
-    + fn finish(out: &mut [u8]) uint
+    + fn finish(out: mut &[u8]) uint
     + fn reset() void
     + fn update(data: &[u8]) void
 }
@@ -1014,7 +1015,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class Sha512 is Hasher {
     + fn block_size() uint
     + fn digest_size() uint
-    + fn finish(out: &mut [u8]) uint
+    + fn finish(out: mut &[u8]) uint
     + fn reset() void
     + static fn sha384() Sha512
     + fn update(data: &[u8]) void
@@ -1358,7 +1359,7 @@ alias pid_t for i32
     ~ position: uint
 
     + fn close() void !io:IoError
-    + fn read(buf: &mut [u8]) uint !io:IoError
+    + fn read(buf: mut &[u8]) uint !io:IoError
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     + fn sync(data_only: bool (false)) void !io:IoError
     + fn write(data: &[u8]) uint !io:IoError
@@ -1684,9 +1685,9 @@ alias Fd for i32
 + fn interrupt_fd(fd: i32) void
 + fn print(msg: String) void
 + fn println(msg: String) void
-+ fn read(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError
++ fn read(fd: i32, buf: mut &[u8], offset: uint (0)) uint !IoError
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
-+ fn read_sync(fd: i32, buf: &mut [u8], offset: uint (0)) uint !IoError
++ fn read_sync(fd: i32, buf: mut &[u8], offset: uint (0)) uint !IoError
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 + fn set_nonblocking(fd: i32, value: bool) void !IoError
@@ -1716,7 +1717,7 @@ alias Fd for i32
 
 ```js
 + interface Reader {
-    + fn read(buf: &mut [u8]) uint !IoError
+    + fn read(buf: mut &[u8]) uint !IoError
 }
 ```
 
@@ -1732,7 +1733,7 @@ alias Fd for i32
     ~ can_write: bool
     ~ fd: i32
 
-    + fn read(buf: &mut [u8]) uint !IoError
+    + fn read(buf: mut &[u8]) uint !IoError
     + fn write(data: &[u8]) uint !IoError
 }
 ```
@@ -1911,17 +1912,16 @@ alias Fd for i32
 
 ```js
 + fn alloc(size: uint) ptr
-+ fn alloc_ob(size: uint) ptr
 + fn ascii_bytes_equal_ignore_case(a: ptr, b: ptr, len: uint) bool
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
 + fn ascii_equal_ignore_case(a: &[u8], b: &[u8]) bool
-+ fn ascii_to_lower(view: &mut [u8]) void
++ fn ascii_to_lower(view: mut &[u8]) void
 + fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
 + fn calloc(size: uint) ptr
-+ fn clear(view: &mut [u8]) void
++ fn clear(view: mut &[u8]) void
 + fn clear_bytes(adr: ptr, length: uint) void
 + fn clear_value[T](value: *T) void
-+ fn copy(from: &[u8], to: &mut [u8]) uint
++ fn copy(from: &[u8], to: mut &[u8]) uint
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 + fn copy_value[T](from: *T, to: *T) void
 + fn equal(a: &[u8], b: &[u8]) bool
@@ -1929,7 +1929,7 @@ alias Fd for i32
 + fn find_char(view: &[u8], ch: u8) uint !LookupError
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 + fn free(value: ptr) void
-+ fn move(from: &[u8], to: &mut [u8]) uint
++ fn move(from: &[u8], to: mut &[u8]) uint
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
 + fn move_value[T](from: *T, to: *T) void
 + fn new[T](initial: T (T.$default_value)) *T
@@ -1942,7 +1942,7 @@ alias Fd for i32
 ## Functions for 'net'
 
 ```js
-+ fn recv(fd: i32, buf: &mut [u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn recv(fd: i32, buf: mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
 + fn write(fd: i32, data: &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
 
@@ -1972,7 +1972,7 @@ alias Fd for i32
 
     + fn close() void !io:IoError
     + static fn new(fd: i32) Connection !NetError
-    + fn read(buf: &mut [u8]) uint !io:IoError
+    + fn read(buf: mut &[u8]) uint !io:IoError
     + fn set_cancel(token: shared CancelToken) void
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
@@ -2037,7 +2037,7 @@ alias Fd for i32
     + fn get_error_message() String
     + static fn new() Ssl
     + fn peer_certificate_sha256() String !NetError
-    + fn recv(buf: &mut [u8], timeout_ms: uint (5000)) uint !NetError
+    + fn recv(buf: mut &[u8], timeout_ms: uint (5000)) uint !NetError
     + fn selected_alpn() String
     + fn set_alpn(protocols: Array[String]) void !NetError
     + fn set_ca_cert(path: ?String) void !NetError
@@ -2072,7 +2072,7 @@ alias Fd for i32
     + fn close() void !io:IoError
     + fn local_address() SocketAddress !NetError
     + static fn open(ipv6: bool (false)) UdpSocket !NetError
-    + fn recv_from(buf: &mut [u8]) (uint, SocketAddress) !io:IoError
+    + fn recv_from(buf: mut &[u8]) (uint, SocketAddress) !io:IoError
     + fn send_to(data: &[u8], to: SocketAddress) uint !io:IoError
 }
 ```
