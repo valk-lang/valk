@@ -237,11 +237,11 @@ describes existing storage and always requires `@unsafe`; it is how the
 library builds views such as `array.view` and `buffer.spare`. The count
 belongs to the value, never to the type: `[T x N]{ a, b }` is a fixed array,
 an inline aggregate whose length `N` is part of its type. In a fixed-array
-initializer an entry is taken as one element when its value already has the
-element type, so a whole tuple fills one slot (`[(u8, u64) x 1]{ pair() }`);
-otherwise it spreads over the following elements, which is how a `(u8, u8)`
-result fills both slots of `[u8 x 2]`. `v...` evaluates `v` once and copies it
-into the remaining slots;
+initializer one entry is one element, exactly as in the initializer of a
+dynamic array: a value of the element type fills one slot, so a whole tuple
+element is written as it is (`[(u8, u64) x 1]{ pair() }`) and a tuple never
+spreads over several slots. `v...` evaluates `v` once and copies it into the
+remaining slots;
 a constant fill lowers to one `memset`, and `S{}` leaves a zero-filled array
 field to the zeroing of the whole struct. Copies of plain aggregates larger
 than 64 bytes are `memcpy` calls, never first-class LLVM aggregates, whose
