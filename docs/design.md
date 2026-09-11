@@ -742,7 +742,8 @@ fresh.
 A package is identified by its directory, not by the alias that refers to it.
 Two dependencies that share an alias but resolve to different directories are
 separate packages with separate types, interface adapters and allocator pools;
-a package under the main package is keyed by its path relative to it, which
+a package under the main package is keyed by its path relative to it and a
+package outside it by the chain of dependency names that reached it, which
 keeps the emitted IR independent of where the project is checked out.
 
 A dependency alias that shares its name with a namespace of the using package

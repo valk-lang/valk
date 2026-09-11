@@ -139,6 +139,10 @@ check_ok "github-fallback-order" "nested-first"
 # different packages: their interface adapters and allocators stay separate.
 check_ok "duplicate-alias" "12"
 
+# The same holds when both directories are outside the main package directory,
+# where the alias chain is what tells them apart.
+check_ok "duplicate-alias-outside" "12"
+
 # A dependency alias that hides a local namespace of the same name.
 check_fail "shadowed-namespace" "is shadowed by the dependency"
 
