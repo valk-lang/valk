@@ -1025,6 +1025,10 @@ dispatch happens inside the generic library code, a hook called by a generic
 container has to be reachable from the library's package, which in practice
 means `+`.
 
+An interface implementation has to be at least as accessible as the requirement
+it satisfies; a call through the interface only checks the requirement's access,
+so a narrower implementation would be reachable through it.
+
 `@ignore_access` is an unsafe file-level escape hatch for compiler and low-level
 library code.
 

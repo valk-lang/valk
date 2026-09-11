@@ -1433,6 +1433,10 @@ as regular functions when they are called: `x + y` and
 Generic library code performs those calls from its own package, so a hook that
 a generic container uses must be reachable from it — mark such hooks `+`.
 
+An interface implementation must be at least as accessible as the requirement
+it satisfies: a `- fn` cannot implement a `fn` requirement, because calls
+through the interface would reach it anyway.
+
 Low-level code can place `@ignore_access` in a scope to bypass access checks.
 
 ## Value scopes
