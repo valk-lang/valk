@@ -752,8 +752,9 @@ reference for as long as the raw pointer is used.
 
 ### `shared T`
 
-`shared T` is a transitive view for data published across threads. It cannot be
-converted back to ordinary mutable `T`. Data-race-unsafe properties cannot be
+`shared T` is a transitive view for data published across threads. No safe
+conversion turns it back into ordinary mutable `T`; `value.@cast(T)` is the
+explicit unsafe way back. Data-race-unsafe properties cannot be
 mutated through a shared view; supported integer operations use atomic access,
 and explicitly synchronized low-level code uses the shared-unsafe mechanisms.
 
