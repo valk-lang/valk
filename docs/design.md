@@ -1018,6 +1018,13 @@ Access markers follow the current compiler contract:
 Markers containing `~` are only allowed on properties and globals, including
 `shared` and `@shared` globals.
 
+Operator and collection hooks (`$add`, `$eq`, `$hash`, `$to`, `$offset`,
+`$append`, ...) are subject to the same markers when they are dispatched:
+`x + y` and generic container operations check the hook they call. Since that
+dispatch happens inside the generic library code, a hook called by a generic
+container has to be reachable from the library's package, which in practice
+means `+`.
+
 `@ignore_access` is an unsafe file-level escape hatch for compiler and low-level
 library code.
 

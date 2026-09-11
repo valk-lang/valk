@@ -1427,6 +1427,12 @@ class Config {
 `-` is source-private rather than class-private: other code in the same file
 can still access the declaration.
 
+Hooks (`$add`, `$eq`, `$hash`, `$to`, `$offset`, ...) follow the same markers
+as regular functions when they are called: `x + y` and
+`HashMap[K, V]{}.set(k, v)` check the access of `$add` and `$hash`/`$eq`.
+Generic library code performs those calls from its own package, so a hook that
+a generic container uses must be reachable from it — mark such hooks `+`.
+
 Low-level code can place `@ignore_access` in a scope to bypass access checks.
 
 ## Value scopes

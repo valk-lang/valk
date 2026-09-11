@@ -432,6 +432,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     ~ length: uint
     ~ owner: ?GcPtr
 
+    + fn add(add: String) String
     + static fn alloc(length: uint) String
     + get bytes: uint
     + fn clone() String
@@ -440,9 +441,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + static fn copy_from_ptr(data: ptr, length: uint) String
     + get data_cstring: cstring
     + fn ends_with(part: String) bool
+    + fn equal(cmp: String) bool
     + fn equal_ignore_ascii_case(other: String) bool
     + fn escape() String
     + fn get(index: uint) u8
+    + fn gt(cmp: String) bool
+    + fn gte(cmp: String) bool
     + fn hash() uint
     + fn hex_to_int() int !SyntaxError
     + fn hex_to_uint() uint !SyntaxError
@@ -457,6 +461,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) bool
     + fn is_upper() bool
     + fn lower() String
+    + fn lt(cmp: String) bool
+    + fn lte(cmp: String) bool
     + fn ltrim(part: String, limit: uint (0)) String
     + fn octal_to_int() int !SyntaxError
     + fn octal_to_uint() uint !SyntaxError
@@ -519,6 +525,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class f32 {
     + fn abs() f32
     + fn clamp(minimum: f32, maximum: f32) f32
+    + fn equals_string(str: String) bool
     + fn is_finite() bool
     + fn is_infinite() bool
     + fn is_nan() bool
@@ -535,6 +542,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class f64 {
     + fn abs() f64
     + fn clamp(minimum: f64, maximum: f64) f64
+    + fn equals_string(str: String) bool
     + fn is_finite() bool
     + fn is_infinite() bool
     + fn is_nan() bool
@@ -551,6 +559,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + class float {
     + fn abs() float
     + fn clamp(minimum: float, maximum: float) float
+    + fn equals_string(str: String) bool
     + fn is_finite() bool
     + fn is_infinite() bool
     + fn is_nan() bool
@@ -2266,13 +2275,16 @@ alias Fd for i32
     + fn day() uint
     + fn day_of_week() uint
     + fn day_of_year() uint
+    + fn equal(other: DateTime) bool
     + fn format(pattern: String) String
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
     + static fn from_unix_seconds(timestamp: int) DateTime !LookupError
     + static fn from_unix_us(timestamp: int) DateTime !LookupError
+    + fn greater_than(other: DateTime) bool
     + fn hash() uint
     + fn hour() uint
     + fn is_leap_year() bool
+    + fn less_than(other: DateTime) bool
     + fn microsecond() uint
     + fn minute() uint
     + fn modify_add_days(amount: int) void !LookupError
