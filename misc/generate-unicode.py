@@ -102,6 +102,26 @@ def is_cased(char):
     return char.islower() or char.isupper() or char.istitle()
 
 
+def caseless_pairs():
+    # Every code point grouped by its full case fold: the members of one group are the
+    # caseless equivalents of each other. This is symmetric where the simple upper and
+    # lower mappings are not: sharp s has no simple uppercase, but both s and U+1E9E
+    # fold to "ss", and KELVIN SIGN folds to "k" while 'k' maps to 'K' (U+004B).
+    groups = {}
+    for code in range(sys.maxunicode + 1):
+        groups.setdefault(chr(code).casefold(), []).append(code)
+    pairs = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        for code in members:
+            for other in members:
+                if other != code:
+                    pairs.append((code, other))
+    pairs.sort()
+    return pairs
+
+
 def is_case_ignorable(code):
     char = chr(code)
     # Python applies Unicode's Final_Sigma rule. A character that is skipped by
@@ -135,6 +155,7 @@ def main():
         emit_table("unicode_alnum_ranges", flatten(alnum)),
         emit_table("unicode_cased_ranges", flatten(cased)),
         emit_table("unicode_case_ignorable_ranges", flatten(ignorable)),
+        emit_table("unicode_caseless_pairs", flatten(caseless_pairs())),
         emit_mapping("lower", "lower"),
         emit_mapping("upper", "upper"),
     )) + "\n"

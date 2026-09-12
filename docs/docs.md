@@ -233,7 +233,8 @@ matching, and alternation `|`. Alternation is leftmost-first like Perl and
 RE2: `a|ab` on `ab` matches `a`. Backreferences, lookaround and `\p{...}`
 classes are not supported and fail with `unsupported`; malformed patterns
 fail with `syntax` and carry a `message` and byte `position`. Case folding
-covers ASCII and simple one-to-one Unicode mappings. Patterns match code
+covers the Unicode simple case-folding equivalents of a code point, so `(?i)ß`
+also matches `ẞ` and `(?i)k` also matches KELVIN SIGN. Patterns match code
 points, and a byte that is not valid UTF-8 matches as the code point of its
 value.
 
