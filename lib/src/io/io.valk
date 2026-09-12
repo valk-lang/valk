@@ -2,6 +2,7 @@ use ext
 use coro
 use core
 use mem
+use time
 
 /// Newline translation mode of a descriptor, for `set_mode`.
 + enum Mode {
@@ -430,9 +431,11 @@ fn cancel_kqueue_wait_events(kq: i32, current: coro.Coro) {
     }
 
     if timeout_ms > 0 {
+        // A longer span is armed again by the wait loop below for the time left
+        let budget: uint = timeout_ms > MAX_TIMER_MS ? MAX_TIMER_MS : timeout_ms
         coro.io_timer_ident = coro.timer_id++
         coro.arm_kernel_event()
-        EV_SET(&ev, coro.io_timer_ident, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, timeout_ms.to(i64), (coro.event_id() | 1).@cast(ptr))
+        EV_SET(&ev, coro.io_timer_ident, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, budget.to(i64), (coro.event_id() | 1).@cast(ptr))
         if !kqueue_change(kq, &ev) {
             coro.disarm_kernel_event()
             coro.io_wait_active = false
@@ -477,15 +480,45 @@ fn cancel_kqueue_wait_events(kq: i32, current: coro.Coro) {
 
     #if OS == "win"
     if await_overlap(fd, ov.@cast(ptr), coro, timeout_ms) : return POLL_TIMEOUT
+    #elif OS == "macos"
+    // A timer that ran out before the deadline only means the span did not fit in the
+    // one the kernel takes; arm the rest and keep waiting for the descriptor
+    let deadline = time.deadline_ms(timeout_ms)
+    while true {
+        coro.yield()
+        if !coro.io_wait_timed_out : break
+        // An event loop can record readiness while the timer is out, and that readiness
+        // is the event this wait was after even though it woke nobody by itself
+        if coro.poll_event.is_readable() || coro.poll_event.is_writable() || coro.poll_event.is_closed() {
+            coro.poll_event = coro.poll_event & ~POLL_TIMEOUT
+            coro.io_wait_timed_out = false
+            break
+        }
+        if deadline == 0 : break
+        let now = time.mono_ms()
+        if now >= deadline : break
+        let left = deadline - now
+        if left > MAX_TIMER_MS : left = MAX_TIMER_MS
+        coro.io_wait_active = true
+        coro.io_wait_timed_out = false
+        coro.io_timer_ident = coro.timer_id++
+        coro.arm_kernel_event()
+        EV_SET(&ev, coro.io_timer_ident, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, left.to(i64), (coro.event_id() | 1).@cast(ptr))
+        if !kqueue_change(kq, &ev) {
+            coro.disarm_kernel_event()
+            coro.io_wait_active = false
+            cancel_kqueue_wait_events(kq, coro)
+            return ext.POLLERR
+        }
+        coro.io_wait_timer_armed = true
+    }
+    coro.io_wait_active = false
+    cancel_kqueue_wait_events(kq, coro)
+    if coro.io_wait_timed_out : return POLL_TIMEOUT
     #else
     coro.yield()
     #end
 
-    #if OS == "macos"
-    coro.io_wait_active = false
-    cancel_kqueue_wait_events(kq, coro)
-    if coro.io_wait_timed_out : return POLL_TIMEOUT
-    #end
     return coro.poll_event
 }
 
