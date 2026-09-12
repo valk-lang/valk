@@ -4,8 +4,12 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.6.5
-- /
+- Release 0.7.1
+
+- Release 0.7.0
++ Audit API & language syntax
++ Bug fixes standard library
++ Documentation feature using `///`
 
 + Release 0.6.4
 + Fix isset on union containing null
