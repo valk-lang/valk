@@ -114,3 +114,115 @@ test "HTTP2: TLS negotiation multiplexed responses and shutdown" {
     socket.close() !!
     await running !!
 }
+
+fn h2_advertised_setting(frame: http.H2Frame, id: u16) uint {
+    let reader = ByteReader.new(frame.payload)
+    while reader.remaining().length >= 6 {
+        let entry = reader.read_u16_be()
+        let value = reader.read_u32_be()
+        if entry == id : return value
+    }
+    return 0
+}
+
+fn h2_open(port: u16) net.Connection {
+    let socket = net.Socket.client(net.SocketType.tcp, "127.0.0.1", port) !!
+    let ssl = net.Ssl.new()
+    ssl.set_verify(false)
+    ssl.set_alpn(.{ "h2" }) !!
+    socket.ssl_connect(ssl) !!
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    return socket
+}
+
+// Reads frames until the response of `stream` ends, rejecting any reset or shutdown.
+fn h2_response(socket: net.Connection, input: ByteBuffer, stream: u32) (String, String) {
+    let decoder = http.HpackDecoder {}
+    let body = ""
+    let status = ""
+    while true {
+        let frame = h2_tls_frame(socket, input)
+        if frame.kind == 3 || frame.kind == 7 : panic("HTTP/2 server refused the request")
+        if frame.stream != stream : continue
+        if frame.kind == 1 {
+            let fields = decoder.decode(frame.payload) !!
+            each fields as field {
+                if field.name == ":status" : status = field.value
+            }
+        }
+        if frame.kind == 0 {
+            body += frame.payload
+            if (frame.flags & 1) != 0 : break
+        }
+    }
+    return (status, body)
+}
+
+test "HTTP2: request size limits of zero mean no limit" {
+    let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        return http.Response.text(request.body)
+    }
+    let server = http.Server.new("127.0.0.1", 9192, handler)
+    server.http2 = true
+    server.max_request_header_size = 0
+    server.max_request_body_size = 0
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let socket = h2_open(9192)
+    let input = ByteBuffer.new()
+    let settings = h2_tls_frame(socket, input)
+    assert(settings.kind == 4)
+    // An unlimited header limit is advertised as the protocol's largest value
+    assert(h2_advertised_setting(settings, 6) == 0xffffffff)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    let fields = Array[http.HpackField] {
+        .{ name: ":method", value: "POST" },
+        .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/" },
+        .{ name: ":authority", value: "localhost" }
+    }
+    socket.write(http.H2Frame { kind: 1, flags: 4, stream: 1, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+    socket.write(http.H2Frame { kind: 0, flags: 1, stream: 1, payload: "payload" }.encode() !!) !!
+    let status, body = h2_response(socket, input, 1)
+    assert(status == "200")
+    assert(body == "payload")
+    socket.close() !!
+    server.request_shutdown(1000)
+    await running !!
+}
+
+test "HTTP2: a non-zero request size limit still rejects oversized requests" {
+    let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        return http.Response.text(request.body)
+    }
+    let server = http.Server.new("127.0.0.1", 9191, handler)
+    server.http2 = true
+    server.max_request_body_size = 2
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let socket = h2_open(9191)
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    let fields = Array[http.HpackField] {
+        .{ name: ":method", value: "POST" },
+        .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/" },
+        .{ name: ":authority", value: "localhost" }
+    }
+    socket.write(http.H2Frame { kind: 1, flags: 4, stream: 1, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+    socket.write(http.H2Frame { kind: 0, flags: 1, stream: 1, payload: "abc" }.encode() !!) !!
+    let reset = false
+    while true {
+        let frame = h2_tls_frame(socket, input)
+        if frame.kind == 3 && (ByteReader.new(frame.payload).read_u32_be() == 11) : reset = true
+        if reset : break
+    }
+    assert(reset)
+    socket.close() !!
+    server.request_shutdown(1000)
+    await running !!
+}

@@ -3114,7 +3114,7 @@ alias Fd for i32
     + fn object_value() ObjectValue !LookupError
     // Inserts `value` at the start of the array and returns it.
     + fn prepend(value: Value) Value
-    // Removes the object member named `key` or the array item at index `key`, and returns the value.
+    // Removes the object member named `key` or the array item at index `key`, and returns the container.
     + fn remove(key: String | uint) Value
     // Sets the member named `key` or the array item at index `key`, and returns the container.
     + fn set(key: String | uint, value: Value) Value
