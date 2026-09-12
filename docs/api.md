@@ -72,7 +72,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns a decompressor reading `format` data from `source`.
     + static fn new(source: Reader, format: Format) Decompressor
     // Fills `buf` with decompressed bytes and returns how many were written; 0 means the end.
-    + fn read(buf: mut &[u8]) uint !io:IoError
+    + fn read(buf: local mut &[u8]) uint !io:IoError
 }
 ```
 
@@ -408,7 +408,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Creates a reader at position 0 over `source`.
     + static fn new(source: &[u8]) ByteReader
     // Copies up to `buf.length` unread bytes into `buf` and advances past them.
-    + fn read(buf: mut &[u8]) uint !io:IoError
+    + fn read(buf: local mut &[u8]) uint !io:IoError
     // Reads `bytes` bytes as an unsigned big-endian integer (meant for 1 to 8 bytes).
     + fn read_big_endian(bytes: uint) uint
     // Reads one byte, or returns 0 without advancing at the end.
@@ -2330,7 +2330,7 @@ alias pid_t for i32
     // Closes the stream; calling it again does nothing.
     + fn close() void !io:IoError
     // Reads up to `buf.length` bytes at `position` and advances past them.
-    + fn read(buf: mut &[u8]) uint !io:IoError
+    + fn read(buf: local mut &[u8]) uint !io:IoError
     // Moves `position` to `offset` bytes from `from` and returns the new position.
     + fn seek(offset: int, from: SeekFrom (io.SeekFrom.start)) uint !io:IoError
     // Flushes the written data to disk.
@@ -2858,11 +2858,11 @@ alias Fd for i32
 // Writes `msg` and a newline to standard output.
 + fn println(msg: String) void
 // Reads up to `buf.length` bytes from `fd` into `buf` and returns the number read.
-+ fn read(fd: i32, buf: mut &[u8], offset: uint (uint.$max)) uint !IoError
++ fn read(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Reads `reader` until it is exhausted and returns everything read.
 + fn read_all(reader: Reader, chunk_size: uint (65536)) ByteBuffer !IoError
 // Reads like `read`, but always blocks the thread, even inside a coroutine.
-+ fn read_sync(fd: i32, buf: mut &[u8], offset: uint (uint.$max)) uint !IoError
++ fn read_sync(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Moves the position of `fd` to `offset` bytes from `from` and returns the new position.
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
 // Sets the newline translation mode of a C runtime descriptor such as 0, 1 or 2.
@@ -2909,7 +2909,7 @@ alias Fd for i32
 // A source of bytes that is read one buffer at a time.
 + interface Reader {
     // Reads up to `buf.length` bytes into `buf` and returns the count; 0 means the end of input.
-    + fn read(buf: mut &[u8]) uint !IoError
+    + fn read(buf: local mut &[u8]) uint !IoError
 }
 ```
 
@@ -2932,7 +2932,7 @@ alias Fd for i32
     ~ fd: i32
 
     // Reads up to `buf.length` bytes into `buf` and returns the count; 0 at the end of input.
-    + fn read(buf: mut &[u8]) uint !IoError
+    + fn read(buf: local mut &[u8]) uint !IoError
     // Writes all of `data` and returns its length.
     + fn write(data: local &[u8]) uint !IoError
 }
@@ -3283,7 +3283,7 @@ alias Fd for i32
 
 ```js
 // Receives once from the socket `fd` into `buf` and returns the number of bytes read.
-+ fn recv(fd: i32, buf: mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn recv(fd: i32, buf: local mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
 // Sends once from `data` on the socket `fd` and returns the number of bytes sent.
 + fn write(fd: i32, data: local &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
@@ -3332,7 +3332,7 @@ alias Fd for i32
     // Wraps an already connected socket descriptor and takes ownership of it.
     + static fn new(fd: i32) Connection !NetError
     // Reads up to `buf.length` bytes into `buf` and returns the count.
-    + fn read(buf: mut &[u8]) uint !io:IoError
+    + fn read(buf: local mut &[u8]) uint !io:IoError
     // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
     + fn set_cancel(token: shared CancelToken) void
     // Sets `read_timeout_ms` and `write_timeout_ms`; 0 waits forever.
@@ -3442,7 +3442,7 @@ alias Fd for i32
     // Returns the SHA-256 fingerprint of the peer certificate as 64 lowercase hex characters.
     + fn peer_certificate_sha256() String !NetError
     // Reads up to `buf.length` decrypted bytes into `buf` and returns the count.
-    + fn recv(buf: mut &[u8], timeout_ms: uint (5000)) uint !NetError
+    + fn recv(buf: local mut &[u8], timeout_ms: uint (5000)) uint !NetError
     // Returns the ALPN protocol agreed in the handshake, or `""` when none was.
     + fn selected_alpn() String
     // Sets the ALPN protocols to offer (such as `"h2"`, `"http/1.1"`), most preferred first.
