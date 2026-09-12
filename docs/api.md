@@ -60,7 +60,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns a compressor writing `format` data to `out` at `level` (0 stores, 9 is smallest).
     + static fn new(out: Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) Compressor
     // Compresses `data` and returns its length, the number of input bytes accepted.
-    + fn write(data: &[u8]) uint !io:IoError
+    + fn write(data: local &[u8]) uint !io:IoError
 }
 ```
 
@@ -359,7 +359,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns a writable view of up to `amount` bytes of unused capacity after the contents.
     + fn view_spare(amount: uint) mut &[u8]
     // Appends the bytes of `data` and returns how many were written (`data.length`).
-    + fn write(data: &[u8]) uint
+    + fn write(data: local &[u8]) uint
     // Appends the low `bytes` bytes of `value`, most significant first.
     + fn write_big_endian(value: uint, bytes: uint) void
     // Appends one byte.
@@ -1316,7 +1316,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the address as uppercase hexadecimal digits, without a `0x` prefix.
     + fn to_hex() String
     // Copies the bytes of `data` to this address.
-    + fn write(data: &[u8]) void
+    + fn write(data: local &[u8]) void
     // Writes the low `bytes` bytes of `value` to this address, most significant first.
     + fn write_big_endian(value: uint, bytes: uint) void
     // Copies `len` bytes from `from` to this address.
@@ -2336,7 +2336,7 @@ alias pid_t for i32
     // Flushes the written data to disk.
     + fn sync(data_only: bool (false)) void !io:IoError
     // Writes all of `data` at `position`, advances past it and returns `data.length`.
-    + fn write(data: &[u8]) uint !io:IoError
+    + fn write(data: local &[u8]) uint !io:IoError
 }
 ```
 
@@ -2878,7 +2878,7 @@ alias Fd for i32
 // Flushes the data written to `fd` to disk.
 + fn sync(fd: i32, data_only: bool (false)) void !IoError
 // Writes up to `data.length` bytes of `data` to `fd` and returns the number written.
-+ fn write(fd: i32, data: &[u8], offset: uint (uint.$max)) uint !IoError
++ fn write(fd: i32, data: local &[u8], offset: uint (uint.$max)) uint !IoError
 ```
 
 ## Classes for 'io'
@@ -2934,7 +2934,7 @@ alias Fd for i32
     // Reads up to `buf.length` bytes into `buf` and returns the count; 0 at the end of input.
     + fn read(buf: mut &[u8]) uint !IoError
     // Writes all of `data` and returns its length.
-    + fn write(data: &[u8]) uint !IoError
+    + fn write(data: local &[u8]) uint !IoError
 }
 ```
 
@@ -2942,7 +2942,7 @@ alias Fd for i32
 // A destination for bytes.
 + interface Writer {
     // Writes bytes from `data` and returns the count, which may be less than `data.length`.
-    + fn write(data: &[u8]) uint !IoError
+    + fn write(data: local &[u8]) uint !IoError
 }
 ```
 
@@ -3285,7 +3285,7 @@ alias Fd for i32
 // Receives once from the socket `fd` into `buf` and returns the number of bytes read.
 + fn recv(fd: i32, buf: mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
 // Sends once from `data` on the socket `fd` and returns the number of bytes sent.
-+ fn write(fd: i32, data: &[u8], timeout_ms: uint (5000)) uint !io:IoError
++ fn write(fd: i32, data: local &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
 
 ## Classes for 'net'
@@ -3342,7 +3342,7 @@ alias Fd for i32
     // Runs the TLS client handshake over this connection with `ssl`.
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
     // Sends all of `data` and returns its length.
-    + fn write(data: &[u8]) uint !io:IoError
+    + fn write(data: local &[u8]) uint !io:IoError
 }
 ```
 
@@ -3464,7 +3464,7 @@ alias Fd for i32
     // Turns verification of the peer certificate on or off for this session.
     + fn set_verify(enable: bool) void
     // Encrypts and sends all of `data`; returns the number of bytes written.
-    + fn write(data: &[u8], timeout_ms: uint (5000)) uint !NetError
+    + fn write(data: local &[u8], timeout_ms: uint (5000)) uint !NetError
 }
 ```
 
