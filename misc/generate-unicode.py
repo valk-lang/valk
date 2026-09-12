@@ -104,11 +104,13 @@ def is_cased(char):
 
 def is_case_ignorable(code):
     char = chr(code)
-    if is_cased(char):
-        return False
-    # Python applies Unicode's Final_Sigma rule. If this character does not
-    # interrupt the preceding-cased scan, it has Case_Ignorable=True.
-    return ("A" + char + "Σ").lower().endswith("ς")
+    # Python applies Unicode's Final_Sigma rule. A character that is skipped by
+    # both context scans has Case_Ignorable=True; one that ends either scan has
+    # it False. A cased character is skipped too — the probes disagree about the
+    # ones that are cased but not ignorable, so do not test `is_cased` first.
+    before = ("A" + char + "\u03a3").lower().endswith("\u03c2")
+    after = ("A\u03a3" + char).lower()[1] == "\u03c2"
+    return before == after
 
 
 def main():
