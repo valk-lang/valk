@@ -8142,10 +8142,20 @@ Replaces `'` with `&#39;`.
 ```js
 // Connects and prepares a request without sending it; drive it with `progress`.
 + fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError
+// Sends a DELETE request; see `request`.
++ fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and writes the response body to the file at `to_path`.
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
-// Parses one HTTP/1.x request or response from `input` into `context`, incrementally.
-+ fn parse_http(input: ByteBuffer, context: Context, is_response: bool, max_header_size: uint (8192), max_body_size: uint (0)) void !HttpParseError
+// Sends a GET request; see `request`.
++ fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a HEAD request; see `request`.
++ fn head(url: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a PATCH request with `body`; see `post`.
++ fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a POST request with `body`; see `request`.
++ fn post(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a PUT request with `body`; see `post`.
++ fn put(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and returns the final response, following redirects.
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
 // Creates a `Server` with default settings for `handler` and runs it; see `Server.start`.
@@ -8163,6 +8173,10 @@ with credentials or an out-of-range port, with `invalid_request` for an invalid
 method, path or header, and with the connection/TLS errors of `ClientRequest.create`.
 Redirects are not followed.
 
+### delete
+
+Sends a DELETE request; see `request`.
+
 ### download
 
 Sends a request and writes the response body to the file at `to_path`.
@@ -8173,17 +8187,27 @@ in it. The body is written whatever the status code is. The request uses a copy 
 `options` the timeout is 30 seconds instead of the usual 10. Failing to close the
 file throws `write`.
 
-### parse_http
+### get
 
-Parses one HTTP/1.x request or response from `input` into `context`, incrementally.
+Sends a GET request; see `request`.
 
-Parsing resumes at `context.parsed_index`; call it again after appending more data.
-Returns once the message is complete (`context.done`), and immediately when it
-already was. Throws `incomplete` when more data is needed, `http413` when the head
-exceeds `max_header_size` or the body `max_body_size` bytes (0 disables either),
-`missing_host_header` for an HTTP/1.1 request without `Host`, `not_implemented` for
-an unsupported transfer coding and `invalid` for malformed input. Errors from
-writing the body to `context.output` are passed on.
+### head
+
+Sends a HEAD request; see `request`.
+
+### patch
+
+Sends a PATCH request with `body`; see `post`.
+
+### post
+
+Sends a POST request with `body`; see `request`.
+
+`body` is stored in `options.body`, so a passed `Options` object is modified.
+
+### put
+
+Sends a PUT request with `body`; see `post`.
 
 ### request
 
@@ -8236,7 +8260,7 @@ benchmarks.
     ~ sent_percent: uint
 
     // Validates the request, connects to the server and builds the request bytes.
-    + static fn create(method: String, url: String, options: ?Options (null), deadline_ms: uint (0)) ClientRequest !HttpError
+    + static fn new(method: String, url: String, options: ?Options (null), deadline_ms: uint (0)) ClientRequest !HttpError
     // Writes or reads the next chunk; returns `true` while there is more to do.
     + fn progress() bool !HttpError
     // Returns the response once `progress` has returned `false`.
@@ -8307,7 +8331,7 @@ Whether the request has finished, with a response or with an error.
 
 The share of the request written so far, from 0 to 100.
 
-#### create
+#### new
 
 Validates the request, connects to the server and builds the request bytes.
 
@@ -8363,49 +8387,14 @@ The response headers; names are stored lowercased.
 The HTTP status code, such as `200` or `404`.
 
 ```js
-// One accepted client connection of a `Server`, served on its own coroutine.
-+ class Connection {
-    // The socket's file descriptor.
-    ~+ fd: i32
-    // The underlying socket connection.
-    ~+ netcon: TcpConnection
-    // The server worker that accepted the connection.
-    ~+ worker: Worker
-
-    // Closes the socket; a failure to close only prints a warning.
-    + fn close() void
-}
-```
-
-### Connection
-
-One accepted client connection of a `Server`, served on its own coroutine.
-
-The server creates and manages these; handlers never receive one.
-
-#### fd
-
-The socket's file descriptor.
-
-#### netcon
-
-The underlying socket connection.
-
-#### worker
-
-The server worker that accepted the connection.
-
-#### close
-
-Closes the socket; a failure to close only prints a warning.
-
-```js
 // The parse state of one HTTP/1.x message; `fast` handlers receive it as the request.
 + class Context {
     // The request method as sent, such as `GET`.
     ~+ method: &[u8]
     // The path of the request target without the query string, not percent-decoded.
     ~+ path: &[u8]
+    // The client's address; unset (port 0) for a context that was not accepted by a server.
+    ~+ peer_address: SocketAddress
     // The query string without the leading `?`, not decoded; empty when absent.
     ~+ query_string: &[u8]
     // The status code of a parsed response; 0 for a request.
@@ -8413,20 +8402,20 @@ Closes the socket; a failure to close only prints a warning.
 
     // The message body, with chunked encoding removed; empty until the message is complete.
     + get body: String
-    // Returns the form fields of the request body.
-    + fn data() Map[String]
-    // Returns the request body as JSON.
-    + fn data_json() Value
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
+    // Returns the form fields of the request body.
+    + fn form() Map[String]
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
+    // Returns the request body as JSON.
+    + fn json() Value
     // Whether the client expects the connection to stay open after the response.
     + get keep_alive: bool
     // Returns the query string parameters.
-    + fn params() Map[String]
+    + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
-    + fn params_grouped() Map[Array[String]]
+    + fn query_grouped() Map[Array[String]]
 }
 ```
 
@@ -8436,7 +8425,7 @@ The parse state of one HTTP/1.x message; `fast` handlers receive it as the reque
 
 `method`, `path` and `query_string` are views into the connection's input buffer and
 are only valid during the handler call; copy them with `to_string()` to keep them.
-`headers()`, `params()`, `data()`, `data_json()` and `files()` parse on first use and
+`headers()`, `query()`, `form()`, `json()` and `files()` parse on first use and
 cache the result.
 
 #### method
@@ -8446,6 +8435,10 @@ The request method as sent, such as `GET`.
 #### path
 
 The path of the request target without the query string, not percent-decoded.
+
+#### peer_address
+
+The client's address; unset (port 0) for a context that was not accepted by a server.
 
 #### query_string
 
@@ -8460,7 +8453,13 @@ The status code of a parsed response; 0 for a request.
 The message body, with chunked encoding removed; empty until the message is
 complete.
 
-#### data
+#### files
+
+Returns the uploaded files of a `multipart/form-data` body, by field name.
+
+A file part without its own `Content-Type` header is skipped.
+
+#### form
 
 Returns the form fields of the request body.
 
@@ -8472,25 +8471,19 @@ and without its parameters, so `application/json; charset=utf-8` is read as JSON
 the multipart `boundary` parameter may be quoted. Any other body gives an empty
 map.
 
-#### data_json
+#### headers
+
+Returns the request headers, with names lowercased.
+
+Leading spaces of values are removed; trailing whitespace is kept.
+
+#### json
 
 Returns the request body as JSON.
 
 Form bodies are turned into an object of string values, see `data()`. Any other
 body is decoded as JSON regardless of its content type; a body that is not valid
 JSON gives an empty object.
-
-#### files
-
-Returns the uploaded files of a `multipart/form-data` body, by field name.
-
-A file part without its own `Content-Type` header is skipped.
-
-#### headers
-
-Returns the request headers, with names lowercased.
-
-Leading spaces of values are removed; trailing whitespace is kept.
 
 #### keep_alive
 
@@ -8499,14 +8492,14 @@ Whether the client expects the connection to stay open after the response.
 HTTP/1.1 keeps it unless `Connection: close` was sent; HTTP/1.0 only when
 `Connection: keep-alive` was sent.
 
-#### params
+#### query
 
 Returns the query string parameters.
 
 Keys and values are decoded with `url.decode`. A part without `=` is skipped, and
 for a repeated key the last value wins; see `params_grouped`.
 
-#### params_grouped
+#### query_grouped
 
 Returns every value of each query string parameter, in order.
 
@@ -8638,7 +8631,7 @@ the `Headers{ name => value }` literal.
     // The OpenSSL cipher suites for TLS 1.3.
     + tls_cipher_suites: ?String
     // Whether the server's TLS certificate is verified.
-    + verify_ssl_cert: bool
+    + verify_tls_cert: bool
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
@@ -8754,7 +8747,7 @@ The OpenSSL cipher list for TLS 1.2 and older.
 
 The OpenSSL cipher suites for TLS 1.3.
 
-#### verify_ssl_cert
+#### verify_tls_cert
 
 Whether the server's TLS certificate is verified.
 
@@ -8788,23 +8781,25 @@ in `headers` are all kept. Names not in `headers` stay untouched.
     + method: String
     // The path of the request target without the query string, not percent-decoded.
     + path: String
+    // The client's address.
+    + peer_address: SocketAddress
     // The query string without the leading `?`, not decoded; empty when absent.
     + query_string: String
 
     // The request body; empty when there is none.
     + get body: String
-    // Returns the form fields of the request body.
-    + fn data() Map[String]
-    // Returns the request body as JSON.
-    + fn data_json() Value
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
+    // Returns the form fields of the request body.
+    + fn form() Map[String]
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
+    // Returns the request body as JSON.
+    + fn json() Value
     // Returns the query string parameters.
-    + fn params() Map[String]
+    + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
-    + fn params_grouped() Map[Array[String]]
+    + fn query_grouped() Map[Array[String]]
 }
 ```
 
@@ -8812,8 +8807,8 @@ in `headers` are all kept. Names not in `headers` stay untouched.
 
 A request passed to a server handler.
 
-`headers()`, `params()`, `data()`, `data_json()` and `files()` parse the request on
-first use and cache the result.
+`headers()`, `query()`, `form()`, `json()` and `files()` parse the request on first
+use and cache the result.
 
 #### method
 
@@ -8823,6 +8818,10 @@ The request method as sent, such as `GET`.
 
 The path of the request target without the query string, not percent-decoded.
 
+#### peer_address
+
+The client's address.
+
 #### query_string
 
 The query string without the leading `?`, not decoded; empty when absent.
@@ -8831,7 +8830,13 @@ The query string without the leading `?`, not decoded; empty when absent.
 
 The request body; empty when there is none.
 
-#### data
+#### files
+
+Returns the uploaded files of a `multipart/form-data` body, by field name.
+
+A file part without its own `Content-Type` header is skipped.
+
+#### form
 
 Returns the form fields of the request body.
 
@@ -8843,7 +8848,13 @@ and without its parameters, so `application/json; charset=utf-8` is read as JSON
 the multipart `boundary` parameter may be quoted. Any other body gives an empty
 map.
 
-#### data_json
+#### headers
+
+Returns the request headers, with names lowercased.
+
+Leading spaces of values are removed; trailing whitespace is kept.
+
+#### json
 
 Returns the request body as JSON.
 
@@ -8851,26 +8862,14 @@ Form bodies are turned into an object of string values, see `data()`. Any other
 body is decoded as JSON regardless of its content type; a body that is not valid
 JSON gives an empty object.
 
-#### files
-
-Returns the uploaded files of a `multipart/form-data` body, by field name.
-
-A file part without its own `Content-Type` header is skipped.
-
-#### headers
-
-Returns the request headers, with names lowercased.
-
-Leading spaces of values are removed; trailing whitespace is kept.
-
-#### params
+#### query
 
 Returns the query string parameters.
 
 Keys and values are decoded with `url.decode`. A part without `=` is skipped, and
 for a repeated key the last value wins; see `params_grouped`.
 
-#### params_grouped
+#### query_grouped
 
 Returns every value of each query string parameter, in order.
 
@@ -8898,14 +8897,18 @@ Decoded like `params`.
     + static fn html(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Creates an `application/json` response; `body` must already be encoded JSON.
     + static fn json(body: String, code: u16 (200), headers: ?Headers (null)) Response
+    // Creates an `application/json` response from any value, encoded with `json.encode`.
+    + static fn json_of(data: $T, code: u16 (200), headers: ?Headers (null)) Response
+    // Creates a response with `body`, `code` and `content_type`; the general form the other constructors are shortcuts for.
+    + static fn new(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
     // Creates a redirect to `location` with an empty body.
     + static fn redirect(location: String, code: u16 (302), headers: ?Headers (null)) Response
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
     + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
-    // Creates a response with the given `content_type`, `text/plain` by default.
-    + static fn text(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
+    // Creates a `text/plain` response.
+    + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
 }
 ```
 
@@ -8962,6 +8965,15 @@ Creates a `text/html` response.
 
 Creates an `application/json` response; `body` must already be encoded JSON.
 
+#### json_of
+
+Creates an `application/json` response from any value, encoded with `json.encode`.
+
+#### new
+
+Creates a response with `body`, `code` and `content_type`; the general form the
+other constructors are shortcuts for.
+
 #### redirect
 
 Creates a redirect to `location` with an empty body.
@@ -8982,7 +8994,7 @@ as a download under that name. The reader is not closed.
 
 #### text
 
-Creates a response with the given `content_type`, `text/plain` by default.
+Creates a `text/plain` response.
 
 ```js
 // Writes the HTTP/1.1 response for one request; passed to `fast` handlers.
@@ -8993,7 +9005,7 @@ Creates a response with the given `content_type`, `text/plain` by default.
     // Returns the reason phrase for `code`, such as `Bad Request`.
     + static fn code_name(code: u16) String
     // Responds with status `code`, `content_type` and `body`.
-    + fn respond(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) void
+    + fn send(body: local &[u8], code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Responds with `status_code` and an empty `text/plain` body.
@@ -9023,7 +9035,7 @@ Returns the reason phrase for `code`, such as `Bad Request`.
 Only 200, 301, 302, 303, 307, 308, 400, 413, 501 and 503 have a phrase; every
 other code, 404 included, returns an empty string.
 
-#### respond
+#### send
 
 Responds with status `code`, `content_type` and `body`.
 
@@ -9135,8 +9147,6 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
 + class Server {
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
-    // A handler that replaces the regular one, see `fast`.
-    + fast_handler: ?shared fn(Context, ResponseWriter)()
     // How long each read of a request head, and the TLS handshake, may take, in milliseconds.
     + header_timeout_ms: uint
     // The address the server listens on.
@@ -9161,7 +9171,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + write_timeout_ms: uint
 
     // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String) void !LookupError
+    + fn add_static_dir(path: String) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: shared fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.
@@ -9194,10 +9204,6 @@ s.start() ! { println("Failed to start http server"); return }
 #### body_timeout_ms
 
 How long each read of a request body may take, in milliseconds.
-
-#### fast_handler
-
-A handler that replaces the regular one, see `fast`.
 
 #### header_timeout_ms
 
@@ -9261,7 +9267,7 @@ How long each socket write may take, in milliseconds.
 
 Serves files from the directory `path` before a request reaches the handler.
 
-Throws `missing` when `path` is not a directory. A request whose path names a file
+Throws `open` when `path` is not a directory. A request whose path names a file
 inside the directory gets that file whatever the method (over HTTP/2: except
 `CONNECT`); paths containing `..` are never served. The directory added last is
 searched first.

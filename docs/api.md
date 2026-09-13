@@ -2500,10 +2500,20 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```js
 // Connects and prepares a request without sending it; drive it with `progress`.
 + fn create_request(method: String, url: String, options: ?Options (null)) ClientRequest !HttpError
+// Sends a DELETE request; see `request`.
++ fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and writes the response body to the file at `to_path`.
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
-// Parses one HTTP/1.x request or response from `input` into `context`, incrementally.
-+ fn parse_http(input: ByteBuffer, context: Context, is_response: bool, max_header_size: uint (8192), max_body_size: uint (0)) void !HttpParseError
+// Sends a GET request; see `request`.
++ fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a HEAD request; see `request`.
++ fn head(url: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a PATCH request with `body`; see `post`.
++ fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a POST request with `body`; see `request`.
++ fn post(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+// Sends a PUT request with `body`; see `post`.
++ fn put(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and returns the final response, following redirects.
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
 // Creates a `Server` with default settings for `handler` and runs it; see `Server.start`.
@@ -2539,7 +2549,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     ~ sent_percent: uint
 
     // Validates the request, connects to the server and builds the request bytes.
-    + static fn create(method: String, url: String, options: ?Options (null), deadline_ms: uint (0)) ClientRequest !HttpError
+    + static fn new(method: String, url: String, options: ?Options (null), deadline_ms: uint (0)) ClientRequest !HttpError
     // Writes or reads the next chunk; returns `true` while there is more to do.
     + fn progress() bool !HttpError
     // Returns the response once `progress` has returned `false`.
@@ -2560,27 +2570,14 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```
 
 ```js
-// One accepted client connection of a `Server`, served on its own coroutine.
-+ class Connection {
-    // The socket's file descriptor.
-    ~+ fd: i32
-    // The underlying socket connection.
-    ~+ netcon: TcpConnection
-    // The server worker that accepted the connection.
-    ~+ worker: Worker
-
-    // Closes the socket; a failure to close only prints a warning.
-    + fn close() void
-}
-```
-
-```js
 // The parse state of one HTTP/1.x message; `fast` handlers receive it as the request.
 + class Context {
     // The request method as sent, such as `GET`.
     ~+ method: &[u8]
     // The path of the request target without the query string, not percent-decoded.
     ~+ path: &[u8]
+    // The client's address; unset (port 0) for a context that was not accepted by a server.
+    ~+ peer_address: SocketAddress
     // The query string without the leading `?`, not decoded; empty when absent.
     ~+ query_string: &[u8]
     // The status code of a parsed response; 0 for a request.
@@ -2588,20 +2585,20 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
     // The message body, with chunked encoding removed; empty until the message is complete.
     + get body: String
-    // Returns the form fields of the request body.
-    + fn data() Map[String]
-    // Returns the request body as JSON.
-    + fn data_json() Value
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
+    // Returns the form fields of the request body.
+    + fn form() Map[String]
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
+    // Returns the request body as JSON.
+    + fn json() Value
     // Whether the client expects the connection to stay open after the response.
     + get keep_alive: bool
     // Returns the query string parameters.
-    + fn params() Map[String]
+    + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
-    + fn params_grouped() Map[Array[String]]
+    + fn query_grouped() Map[Array[String]]
 }
 ```
 
@@ -2671,7 +2668,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The OpenSSL cipher suites for TLS 1.3.
     + tls_cipher_suites: ?String
     // Whether the server's TLS certificate is verified.
-    + verify_ssl_cert: bool
+    + verify_tls_cert: bool
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
@@ -2693,23 +2690,25 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + method: String
     // The path of the request target without the query string, not percent-decoded.
     + path: String
+    // The client's address.
+    + peer_address: SocketAddress
     // The query string without the leading `?`, not decoded; empty when absent.
     + query_string: String
 
     // The request body; empty when there is none.
     + get body: String
-    // Returns the form fields of the request body.
-    + fn data() Map[String]
-    // Returns the request body as JSON.
-    + fn data_json() Value
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
+    // Returns the form fields of the request body.
+    + fn form() Map[String]
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
+    // Returns the request body as JSON.
+    + fn json() Value
     // Returns the query string parameters.
-    + fn params() Map[String]
+    + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
-    + fn params_grouped() Map[Array[String]]
+    + fn query_grouped() Map[Array[String]]
 }
 ```
 
@@ -2735,14 +2734,18 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + static fn html(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Creates an `application/json` response; `body` must already be encoded JSON.
     + static fn json(body: String, code: u16 (200), headers: ?Headers (null)) Response
+    // Creates an `application/json` response from any value, encoded with `json.encode`.
+    + static fn json_of(data: $T, code: u16 (200), headers: ?Headers (null)) Response
+    // Creates a response with `body`, `code` and `content_type`; the general form the other constructors are shortcuts for.
+    + static fn new(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
     // Creates a redirect to `location` with an empty body.
     + static fn redirect(location: String, code: u16 (302), headers: ?Headers (null)) Response
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
     + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
-    // Creates a response with the given `content_type`, `text/plain` by default.
-    + static fn text(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
+    // Creates a `text/plain` response.
+    + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
 }
 ```
 
@@ -2755,7 +2758,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // Returns the reason phrase for `code`, such as `Bad Request`.
     + static fn code_name(code: u16) String
     // Responds with status `code`, `content_type` and `body`.
-    + fn respond(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) void
+    + fn send(body: local &[u8], code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Responds with `status_code` and an empty `text/plain` body.
@@ -2793,8 +2796,6 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + class Server {
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
-    // A handler that replaces the regular one, see `fast`.
-    + fast_handler: ?shared fn(Context, ResponseWriter)()
     // How long each read of a request head, and the TLS handshake, may take, in milliseconds.
     + header_timeout_ms: uint
     // The address the server listens on.
@@ -2819,7 +2820,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     + write_timeout_ms: uint
 
     // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String) void !LookupError
+    + fn add_static_dir(path: String) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: shared fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.

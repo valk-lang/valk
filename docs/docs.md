@@ -1638,7 +1638,11 @@ API for [valk.http](api.md#http)
 With `valk.http` you can send HTTP requests or download files from a URL.
 
 ```rust
-// Send basic request
+// The common methods have their own functions
+let res = http.get("http://some-website/api/endpoint") ! panic("Request failed")
+let created = http.post("http://some-website/api/items", json.encode(item)) ! panic("Request failed")
+
+// Any method through `request`
 let res = http.request("GET", "http://some-website/api/endpoint") ! panic("Request failed")
 
 // Send GET request with data
@@ -1686,6 +1690,12 @@ fn main() {
     s.start() ! { println("Failed to start http server"); return }
 }
 ```
+
+A handler gets the parsed request: `method`, `path`, `query_string` and
+`peer_address` as fields, and `headers()`, `query()`, `form()`, `json()` and
+`files()` which parse on first use. Responses come from `Response.text`,
+`html`, `json`, `json_of` (encodes any value), `redirect`, `file`, `stream`,
+`empty` and the general `Response.new(body, code, content_type)`.
 
 `start` runs until shutdown. Use `co` to keep doing other work:
 
