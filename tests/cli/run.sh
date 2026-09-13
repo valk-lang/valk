@@ -586,5 +586,16 @@ if [[ "$deprecated_out" != *"'equal_bytes' is deprecated: old name of \`equals_b
     exit 1
 fi
 
+quiet_deprecated_out=$("$VALK" build "$DIR/deprecated.valk" --lint --no-warn-deprecated 2>&1) || {
+    echo "# --no-warn-deprecated rejected the build"
+    echo "$quiet_deprecated_out"
+    exit 1
+}
+if [[ "$quiet_deprecated_out" == *"is deprecated"* ]] || [[ "$quiet_deprecated_out" != *"Variable 'unused' was declared but never used"* ]] || [[ "$quiet_deprecated_out" != *"Lint passed"* ]]; then
+    echo "# --no-warn-deprecated must drop only the deprecation warnings"
+    echo "$quiet_deprecated_out"
+    exit 1
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 35"
+echo "# Test count: 36"

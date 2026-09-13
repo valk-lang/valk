@@ -545,7 +545,9 @@ These flags cannot be combined on the same function.
 `$deprecated` keeps a function callable but warns at every call from another
 package. The warning quotes the sentence of the `///` block that starts with
 "Deprecated", so say what to use instead; `valk doc` shows the flag and editors
-strike the name through in completions:
+strike the name through in completions. `valk build --no-warn-deprecated`
+silences these warnings alone, for a build that has to keep using an old
+dependency while every other warning stays visible:
 
 ```rust
 /// Deprecated: use `equals_bytes`.
