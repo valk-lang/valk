@@ -3508,6 +3508,8 @@ Writes the value like `to_string` to `buf` and returns the byte count.
     + fn round_up(modulo: i16) i16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i16) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -3605,6 +3607,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -3665,6 +3675,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: i32) i32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i32) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -3762,6 +3774,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -3822,6 +3842,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: i64) i64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i64) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -3919,6 +3941,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -3979,6 +4009,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: i8) i8
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i8) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -4076,6 +4108,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -4136,6 +4176,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: int) int
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: int) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -4232,6 +4274,14 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
 
 #### to_base_to_ptr
 
@@ -4755,6 +4805,8 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     + fn round_up(modulo: u16) u16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u16) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -4852,6 +4904,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -4912,6 +4972,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: u32) u32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u32) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5009,6 +5071,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -5069,6 +5139,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: u64) u64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u64) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5166,6 +5238,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -5256,6 +5336,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_ascii_string() String
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u8) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5420,6 +5502,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
+
 #### to_base_to_ptr
 
 Writes the value as text in `base` to `result` and returns the byte count.
@@ -5491,6 +5581,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: uint) uint
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: uint) String
+    // Writes the value as text in `base` to `out` and returns the bytes written.
+    + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
     + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
@@ -5595,6 +5687,14 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+
+#### to_base_into
+
+Writes the value as text in `base` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Digits above 9 are lowercase
+when `lowercase` is true, uppercase otherwise; `base` is clamped as in `to_base`.
+Throws when `out` fails.
 
 #### to_base_to_ptr
 
