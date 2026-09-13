@@ -29,25 +29,25 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 // Returns the Adler-32 checksum (as in zlib) of `data`.
-+ fn adler32(data: &[u8], adler: u32 (1)) u32
++ fn adler32(data: local &[u8], adler: u32 (1)) u32
 // Returns `data` compressed into `format` at `level` (0 stores, 1 is fastest, 9 is smallest).
-+ fn compress(data: &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn compress(data: local &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String
 // Returns the CRC-32 (IEEE 802.3, as in gzip, zip and PNG) of `data`.
-+ fn crc32(data: &[u8], crc: u32 (0)) u32
++ fn crc32(data: local &[u8], crc: u32 (0)) u32
 // Returns the decompressed contents of `data`, which must be in `format`.
 + fn decompress(data: &[u8], format: Format, max_size: uint (0)) String !CompressError
 // Returns `data` compressed as raw DEFLATE; see `compress`.
-+ fn deflate(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn deflate(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
 // Returns the decompressed contents of gzip `data`.
 + fn gunzip(data: &[u8], max_size: uint (0)) String !CompressError
 // Returns `data` compressed in the gzip format; see `compress`.
-+ fn gzip(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn gzip(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
 // Returns the decompressed contents of raw DEFLATE `data`.
 + fn inflate(data: &[u8], max_size: uint (0)) String !CompressError
 // Returns the decompressed contents of zlib `data`.
 + fn unzlib(data: &[u8], max_size: uint (0)) String !CompressError
 // Returns `data` compressed in the zlib format; see `compress`.
-+ fn zlib(data: &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
++ fn zlib(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
 ```
 
 ## Classes for 'compress'
@@ -141,14 +141,14 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + extend &[u8] {
-    // Returns whether the `length` bytes at `offset` equal `cmp`, ignoring ASCII case.
-    + fn equal_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
-    // Returns whether the bytes equal `cmp` when ASCII letters are compared case-insensitively.
-    + fn equal_ignore_ascii_case(cmp: String) bool
     // Returns whether the bytes are exactly the bytes of `cmp`.
     + fn equals(cmp: String) bool
     // Returns whether the `length` bytes at `offset` are exactly the bytes of `cmp`.
     + fn equals_at(offset: uint, length: uint, cmp: String) bool
+    // Returns whether the `length` bytes at `offset` equal `cmp`, ignoring ASCII case.
+    + fn equals_at_ignore_ascii_case(offset: uint, length: uint, cmp: String) bool
+    // Returns whether the bytes equal `cmp` when ASCII letters are compared case-insensitively.
+    + fn equals_ignore_ascii_case(cmp: String) bool
     // Returns whether any byte is an ASCII control character (below 32, or 127 DEL).
     + fn has_ascii_control(allow_tab: bool (false)) bool
     // Returns the index of the first `byte` at or after `start_index`.
@@ -197,9 +197,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns a shallow copy: a new array holding the same elements.
     + fn copy() Array[T]
     // Returns whether both arrays have the same length and equal elements at each index.
-    + fn equal(array: Array[T]) bool
+    + fn equals(array: Array[T]) bool
     // Returns whether both arrays hold the same elements the same number of times, in any order.
-    + fn equal_ignore_order(array: Array[T]) bool
+    + fn equals_ignore_order(array: Array[T]) bool
     // Removes the elements for which `func` returns true and returns them in their original order.
     + fn extract(func: ?fn(T)(bool) (null)) Array[T]
     // Creates an array holding `count` copies of `value`; backs `Array[T]{ value x count }`.
@@ -365,7 +365,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Appends one byte.
     + fn write_byte(v: u8) void
     // Appends the bytes of the C string `str`, plus its zero terminator when `include_zero_byte`.
-    + fn write_cstring(str: cstring, include_zero_byte: bool) void
+    + fn write_cstring(str: cstring, include_zero_byte: bool (true)) void
     // Appends `v` in fixed notation with `decimals` digits after the point.
     + fn write_f64_ascii(v: f64, decimals: uint, trim_zeros: bool (false)) void
     // Appends `v` with the fewest digits that parse back to the same value.
@@ -375,7 +375,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Appends the IEEE 754 bits of `v` as 8 bytes, least significant first.
     + fn write_f64_le(v: f64) void
     // Appends `v` as text in `base`, with a leading `-` when negative.
-    + fn write_int_ascii(v: int, base: u8 (10)) void
+    + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) void
     // Appends the low `bytes` bytes of `value`, least significant first.
     + fn write_little_endian(value: uint, bytes: uint) void
     // Appends `v` as 2 bytes, most significant first.
@@ -391,7 +391,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Appends `v` as 8 bytes, least significant first.
     + fn write_u64_le(v: u64) void
     // Appends `v` as text in `base`, using uppercase digits above 9.
-    + fn write_uint_ascii(v: uint, base: u8 (10)) void
+    + fn write_uint_ascii(v: uint, base: u8 (10), lowercase: bool (false)) void
 }
 ```
 
@@ -723,7 +723,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Waits for the child to exit and returns its exit code.
     + fn exit_code() i32 !io:IoError
     // Starts `exe` with `args` and returns without waiting for it.
-    + static fn run(exe: String, args: ?Array[String], print_output: bool (false)) Process !io:IoError
+    + static fn run(exe: String, args: ?Array[String] (null), print_output: bool (false)) Process !io:IoError
     // Kills the child and waits for it to exit.
     + fn stop() void !io:IoError
 }
@@ -774,9 +774,9 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
     + fn ends_with(part: String) bool
     // Returns whether both strings hold the same bytes; backs `==`.
-    + fn equal(cmp: String) bool
+    + fn equals(cmp: String) bool
     // Returns whether both strings are equal when ASCII letters are compared case-insensitively.
-    + fn equal_ignore_ascii_case(other: String) bool
+    + fn equals_ignore_ascii_case(other: String) bool
     // Returns a copy with special characters written as backslash escapes, as in a string literal.
     + fn escape() String
     // Returns the byte at byte offset `index`; backs `str[i]`.
@@ -1322,7 +1322,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Copies `len` bytes from `from` to this address.
     + fn write_bytes(from: ptr, len: uint) void
     // Copies the bytes of `str` here, plus its zero byte when `include_zero_byte` is true.
-    + fn write_cstring(str: cstring, include_zero_byte: bool) void
+    + fn write_cstring(str: cstring, include_zero_byte: bool (true)) void
     // Writes `v` as text in `base` (2 to 16) to this address and returns the byte count.
     + fn write_int_ascii(v: int, base: u8 (10), lowercase: bool (false)) uint
     // Writes the low `bytes` bytes of `value` to this address, least significant first.
@@ -1638,73 +1638,73 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
-+ fn base64_decode(data: &[u8]) String !CryptoError
++ fn base64_decode(data: local &[u8]) String !CryptoError
 // Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
-+ fn base64_encode(data: &[u8]) String
++ fn base64_encode(data: local &[u8]) String
 // Decodes standard base64 into `out` and returns the bytes written.
-+ fn base64_write_decode(data: &[u8], out: Writer) uint !CryptoError
++ fn base64_write_decode(data: local &[u8], out: Writer) uint !CryptoError
 // Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
-+ fn base64_write_encode(data: &[u8], out: Writer) uint !io:IoError
++ fn base64_write_encode(data: local &[u8], out: Writer) uint !io:IoError
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
-+ fn bcrypt(cost: uint, salt: &[u8], password: &[u8], output: ByteBuffer) void !CryptoError
++ fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
-+ fn bcrypt_hash(password: &[u8], cost: uint (12)) String !CryptoError
++ fn bcrypt_hash(password: local &[u8], cost: uint (12)) String !CryptoError
 // Returns whether `password` matches the bcrypt `hash` string.
-+ fn bcrypt_verify(password: &[u8], hash: &[u8]) bool
++ fn bcrypt_verify(password: local &[u8], hash: local &[u8]) bool
 // Returns whether `a` and `b` hold the same bytes, in time that depends only on their length.
-+ fn constant_time_equals(a: &[u8], b: &[u8]) bool
++ fn constant_time_equals(a: local &[u8], b: local &[u8]) bool
 // Returns the digest size in bytes of `algorithm`.
 + fn digest_size(algorithm: HashAlgorithm) uint
 // Returns the raw digest of `data` as binary bytes (not text).
-+ fn hash(algorithm: HashAlgorithm, data: &[u8]) String
++ fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
 // Returns the digest of `data` as lowercase hex.
-+ fn hash_hex(algorithm: HashAlgorithm, data: &[u8]) String
++ fn hash_hex(algorithm: HashAlgorithm, data: local &[u8]) String
 // Writes the raw digest of `data` to `out` and returns the bytes written.
-+ fn hash_write(algorithm: HashAlgorithm, data: &[u8], out: Writer) uint !io:IoError
++ fn hash_write(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hash_write_hex(algorithm: HashAlgorithm, data: &[u8], out: Writer) uint !io:IoError
++ fn hash_write_hex(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Returns a fresh `Hasher` for `algorithm`.
 + fn hasher(algorithm: HashAlgorithm) Hasher
 // Decodes hex text (either case) into the raw bytes it represents.
-+ fn hex_decode(text: &[u8]) String !CryptoError
++ fn hex_decode(text: local &[u8]) String !CryptoError
 // Returns `data` encoded as lowercase hex, two characters per byte.
-+ fn hex_encode(data: &[u8]) String
++ fn hex_encode(data: local &[u8]) String
 // Decodes hex text (either case) into `out` and returns the bytes written.
-+ fn hex_write_decode(text: &[u8], out: Writer) uint !CryptoError
++ fn hex_write_decode(text: local &[u8], out: Writer) uint !CryptoError
 // Writes `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hex_write_encode(data: &[u8], out: Writer) uint !io:IoError
++ fn hex_write_encode(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `ikm` with HKDF (RFC 5869): extract with `salt`, expand with `info`.
-+ fn hkdf(algorithm: HashAlgorithm, ikm: &[u8], salt: &[u8], info: &[u8], length: uint) String !CryptoError
++ fn hkdf(algorithm: HashAlgorithm, ikm: local &[u8], salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom key `prk`.
-+ fn hkdf_expand(algorithm: HashAlgorithm, prk: &[u8], info: &[u8], length: uint) String !CryptoError
++ fn hkdf_expand(algorithm: HashAlgorithm, prk: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns the HKDF-Extract (RFC 5869) pseudorandom key of `ikm` under `salt`.
-+ fn hkdf_extract(algorithm: HashAlgorithm, salt: &[u8], ikm: &[u8]) String
++ fn hkdf_extract(algorithm: HashAlgorithm, salt: local &[u8], ikm: local &[u8]) String
 // Returns the MD5 digest of `data` as lowercase hex.
-+ fn md5_hex(data: &[u8]) String
++ fn md5_hex(data: local &[u8]) String
 // Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn md5_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn md5_write_hex(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
-+ fn pbkdf2(algorithm: HashAlgorithm, password: &[u8], salt: &[u8], iterations: uint, length: uint) String !CryptoError
++ fn pbkdf2(algorithm: HashAlgorithm, password: local &[u8], salt: local &[u8], iterations: uint, length: uint) String !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
 + fn random_write_bytes(length: uint, out: Writer) uint !io:IoError
 // Returns the SHA-1 digest of `data` as lowercase hex.
-+ fn sha1_hex(data: &[u8]) String
++ fn sha1_hex(data: local &[u8]) String
 // Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha1_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha1_write_hex(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-256 digest of `data` as lowercase hex.
-+ fn sha256_hex(data: &[u8]) String
++ fn sha256_hex(data: local &[u8]) String
 // Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha256_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha256_write_hex(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-384 digest of `data` as lowercase hex.
-+ fn sha384_hex(data: &[u8]) String
++ fn sha384_hex(data: local &[u8]) String
 // Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha384_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha384_write_hex(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
-+ fn sha512_hex(data: &[u8]) String
++ fn sha512_hex(data: local &[u8]) String
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha512_write_hex(data: &[u8], out: Writer) uint !io:IoError
++ fn sha512_write_hex(data: local &[u8], out: Writer) uint !io:IoError
 ```
 
 ## Classes for 'crypto'
@@ -1713,13 +1713,13 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // A streaming BLAKE2b hash with a digest of 1 to 64 bytes and an optional key.
 + class Blake2b {
     // Writes the `hash_size`-byte digest to the start of `out`.
-    + fn finalize(out: mut &[u8]) void
+    + fn finalize(out: local mut &[u8]) void
     // Returns the 64-byte BLAKE2b digest of `input` as 128 hex characters.
-    + static fn hash_string(input: &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
+    + static fn hash_string(input: local &[u8], key: ?String (null), lowercase: bool (true)) String !CryptoError
     // Returns a BLAKE2b hasher producing `hash_size` bytes, keyed with `key` when given.
     + static fn new(hash_size: uint, key: ?String (null)) Blake2b !CryptoError
     // Feeds more input into the hash.
-    + fn update(input: &[u8]) void
+    + fn update(input: local &[u8]) void
 }
 ```
 
@@ -1731,11 +1731,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the digest size in bytes.
     + fn digest_size() uint
     // Writes the digest into `out` and returns its size in bytes.
-    + fn finish(out: mut &[u8]) uint
+    + fn finish(out: local mut &[u8]) uint
     // Returns the hasher to its initial state, discarding all input fed so far.
     + fn reset() void
     // Feeds more input into the hash.
-    + fn update(data: &[u8]) void
+    + fn update(data: local &[u8]) void
 }
 ```
 
@@ -1747,19 +1747,19 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the MAC size in bytes, the digest size of the underlying hash.
     + fn digest_size() uint
     // Writes the MAC into `out` and returns its size in bytes.
-    + fn finish(out: mut &[u8]) uint
+    + fn finish(out: local mut &[u8]) uint
     // Returns an HMAC ready for input, keyed with `key`.
-    + static fn new(algorithm: HashAlgorithm, key: &[u8]) Hmac
+    + static fn new(algorithm: HashAlgorithm, key: local &[u8]) Hmac
     // Discards all input and starts a new MAC with the same key.
     + fn reset() void
     // Returns the raw MAC of `data` under `key` as binary bytes (not text).
-    + static fn sign(algorithm: HashAlgorithm, key: &[u8], data: &[u8]) String
+    + static fn sign(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8]) String
     // Returns the MAC of `data` under `key` as lowercase hex.
-    + static fn sign_hex(algorithm: HashAlgorithm, key: &[u8], data: &[u8]) String
+    + static fn sign_hex(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8]) String
     // Feeds more input into the MAC.
-    + fn update(data: &[u8]) void
+    + fn update(data: local &[u8]) void
     // Returns whether `mac` is the raw MAC of `data` under `key`, compared in constant time.
-    + static fn verify(algorithm: HashAlgorithm, key: &[u8], data: &[u8], mac: &[u8]) bool
+    + static fn verify(algorithm: HashAlgorithm, key: local &[u8], data: local &[u8], mac: local &[u8]) bool
 }
 ```
 
@@ -1771,11 +1771,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns 16, the MD5 digest size in bytes.
     + fn digest_size() uint
     // Writes the 16-byte digest into `out` and returns 16.
-    + fn finish(out: mut &[u8]) uint
+    + fn finish(out: local mut &[u8]) uint
     // Returns the hasher to its initial state, discarding all input fed so far.
     + fn reset() void
     // Feeds more input into the hash.
-    + fn update(data: &[u8]) void
+    + fn update(data: local &[u8]) void
 }
 ```
 
@@ -1787,11 +1787,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns 20, the SHA-1 digest size in bytes.
     + fn digest_size() uint
     // Writes the 20-byte digest into `out` and returns 20.
-    + fn finish(out: mut &[u8]) uint
+    + fn finish(out: local mut &[u8]) uint
     // Returns the hasher to its initial state, discarding all input fed so far.
     + fn reset() void
     // Feeds more input into the hash.
-    + fn update(data: &[u8]) void
+    + fn update(data: local &[u8]) void
 }
 ```
 
@@ -1803,11 +1803,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns 32, the SHA-256 digest size in bytes.
     + fn digest_size() uint
     // Writes the 32-byte digest into `out` and returns 32.
-    + fn finish(out: mut &[u8]) uint
+    + fn finish(out: local mut &[u8]) uint
     // Returns the hasher to its initial state, discarding all input fed so far.
     + fn reset() void
     // Feeds more input into the hash.
-    + fn update(data: &[u8]) void
+    + fn update(data: local &[u8]) void
 }
 ```
 
@@ -1819,13 +1819,13 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
     // Returns the digest size in bytes: 64 for SHA-512, 48 for SHA-384.
     + fn digest_size() uint
     // Writes the digest into `out` and returns its size in bytes.
-    + fn finish(out: mut &[u8]) uint
+    + fn finish(out: local mut &[u8]) uint
     // Returns the hasher to its initial state for its variant, discarding all input fed so far.
     + fn reset() void
     // Returns a hasher that computes SHA-384.
     + static fn sha384() Sha512
     // Feeds more input into the hash.
-    + fn update(data: &[u8]) void
+    + fn update(data: local &[u8]) void
 }
 ```
 
@@ -2279,13 +2279,13 @@ alias pid_t for i32
 // Opens the file at `path` as a `FileStream`, read-only by default.
 + fn stream(path: String, options: ?OpenOptions (null)) FileStream !io:IoError
 // Creates a symbolic link at `link` that points to `target`.
-+ fn symlink(link: String, target: String, is_directory: bool) void !io:IoError
++ fn symlink(link: String, target: String, is_directory: bool (false)) void !io:IoError
 // Asks the OS to flush all file system buffers to disk (`sync(2)`).
 + fn sync_all() void
 // Resizes the file at `path` to `length` bytes, cutting it off or padding it with zeros.
 + fn truncate(path: String, length: uint) void !io:IoError
 // Writes `content` to the file at `path`, creating the file when it is missing.
-+ fn write(path: String, content: &[u8], append: bool (false)) void !io:IoError
++ fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -2353,7 +2353,7 @@ alias pid_t for i32
     // Reads the whole file at `path` into memory.
     + static fn from_file(path: String) InMemoryFile !io:IoError
     // Creates a file that holds a private copy of `data`.
-    + static fn new(data: &[u8]) InMemoryFile
+    + static fn new(data: local &[u8]) InMemoryFile
     // Returns a `ByteReader` over the bytes, without copying them.
     + fn reader() ByteReader
     // Writes the bytes to `path`, creating the file or replacing its contents.
@@ -2502,9 +2502,9 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 // Sends a request and returns the final response, following redirects.
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
 // Creates a `Server` with default settings for `handler` and runs it; see `Server.start`.
-+ fn serve(host: String, port: u16, handler: shared fn(Request)(Response), worker_count: i32 (-1)) void !HttpError
++ fn serve(host: String, port: u16, handler: shared fn(Request)(Response), worker_count: uint (0)) void !HttpError
 // Like `serve`, with a fast handler that writes straight to a `ResponseWriter`.
-+ fn serve_fast(host: String, port: u16, handler: shared fn(Context, ResponseWriter)(), worker_count: i32 (-1)) void !HttpError
++ fn serve_fast(host: String, port: u16, handler: shared fn(Context, ResponseWriter)(), worker_count: uint (0)) void !HttpError
 ```
 
 ## Classes for 'http'
@@ -2550,7 +2550,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The response headers; names are stored lowercased.
     + headers: Headers
     // The HTTP status code, such as `200` or `404`.
-    + status: uint
+    + status: u16
 }
 ```
 
@@ -2579,7 +2579,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The query string without the leading `?`, not decoded; empty when absent.
     ~+ query_string: &[u8]
     // The status code of a parsed response; 0 for a request.
-    ~+ status: uint
+    ~+ status: u16
 
     // The message body, with chunked encoding removed; empty until the message is complete.
     + get body: String
@@ -2716,28 +2716,28 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The `Content-Type` header value; a value with control characters is not sent.
     + content_type: String
     // The HTTP status code, also for `file` and `stream` responses.
-    + status: u32
+    + status: u16
 
     // Adds a header field, keeping earlier fields with the same name.
     + fn add_header(name: String, value: String) void
     // Creates a response with an empty body; also backs default construction.
-    + static fn empty(code: u32 (200), headers: ?Headers (null)) Response
+    + static fn empty(code: u16 (200), headers: ?Headers (null)) Response
     // Creates a response that sends the file at `path`.
     + static fn file(path: String, filename: ?String (null)) Response
     // The extra response headers, created empty on first access.
     + get headers: Headers
     // Creates a `text/html` response.
-    + static fn html(body: String, code: u32 (200), headers: ?Headers (null)) Response
+    + static fn html(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Creates an `application/json` response; `body` must already be encoded JSON.
-    + static fn json(body: String, code: u32 (200), headers: ?Headers (null)) Response
+    + static fn json(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Creates a redirect to `location` with an empty body.
-    + static fn redirect(location: String, code: u32 (302), headers: ?Headers (null)) Response
+    + static fn redirect(location: String, code: u16 (302), headers: ?Headers (null)) Response
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
     + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     // Creates a response with the given `content_type`, `text/plain` by default.
-    + static fn text(body: String, code: u32 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
+    + static fn text(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
 }
 ```
 
@@ -2748,15 +2748,15 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     ~ responded: bool
 
     // Returns the reason phrase for `code`, such as `Bad Request`.
-    + static fn code_name(code: uint) String
+    + static fn code_name(code: u16) String
     // Responds with status `code`, `content_type` and `body`.
-    + fn respond(code: uint, content_type: String, body: String, headers: ?Headers (null)) void
+    + fn respond(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
-    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: uint (200)) void
+    + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Responds with `status_code` and an empty `text/plain` body.
-    + fn send_status(status_code: uint) void
+    + fn send_status(status_code: u16) void
     // Responds with status `code` and a body streamed from `reader`.
-    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: uint (200)) void
+    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
 }
 ```
 
@@ -2826,7 +2826,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // Calls `request_shutdown` and waits for the workers to finish.
     + fn shutdown(timeout_ms: uint (5000)) bool
     // Serves until `request_shutdown`/`shutdown` and every worker has drained.
-    + fn start(worker_count: i32 (-1)) void !HttpError
+    + fn start(worker_count: uint (0)) void !HttpError
     // Serves over TLS with the given PEM certificate and private key files.
     + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) void !HttpError
 }
@@ -3234,37 +3234,38 @@ alias Fd for i32
 // Converts the ASCII letters `A`-`Z` in the `len` bytes at `adr` to lower case, in place.
 + fn ascii_bytes_to_lower(adr: ptr, len: uint) void
 // Returns whether `a` and `b` have the same length and bytes, ignoring ASCII letter case.
-+ fn ascii_equal_ignore_case(a: &[u8], b: &[u8]) bool
++ fn ascii_equal_ignore_case(a: local &[u8], b: local &[u8]) bool
 // Converts the ASCII letters `A`-`Z` in `view` to lower case, in place.
-+ fn ascii_to_lower(view: mut &[u8]) void
++ fn ascii_to_lower(view: local mut &[u8]) void
 // Parses the `len` bytes at `adr` as a decimal unsigned integer.
 + fn bytes_to_uint(adr: ptr, len: uint, allow_plus: bool (false)) uint !SyntaxError
 // Allocates `size` bytes of unmanaged memory set to zero; release it with `free`.
 + fn calloc(size: uint) ptr
 // Sets every byte of `view` to zero.
-+ fn clear(view: mut &[u8]) void
++ fn clear(view: local mut &[u8]) void
 // Sets `length` bytes at `adr` to zero.
 + fn clear_bytes(adr: ptr, length: uint) void
 // Sets the `T` at `value` to all zero bytes.
 + fn clear_value[T](value: *T) void
 // Copies the bytes of `from` to the start of `to` and returns the number copied.
-+ fn copy(from: &[u8], to: mut &[u8]) uint
++ fn copy(from: local &[u8], to: local mut &[u8]) uint
 // Copies `length` bytes from `from` to `to`; the two ranges must not overlap.
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
-// Returns whether `a` and `b` have the same length and bytes.
-+ fn equal(a: &[u8], b: &[u8]) bool
-// Returns whether the `length` bytes at `a` and `b` are identical.
 + fn equal_bytes(a: ptr, b: ptr, length: uint) bool
+// Returns whether `a` and `b` have the same length and bytes.
++ fn equals(a: local &[u8], b: local &[u8]) bool
+// Returns whether the `length` bytes at `a` and `b` are identical.
++ fn equals_bytes(a: ptr, b: ptr, length: uint) bool
 // Returns the byte index of the first `ch` in `view`.
-+ fn find_char(view: &[u8], ch: u8) uint !LookupError
++ fn find_char(view: local &[u8], ch: u8) uint !LookupError
 // Returns the byte index of the first `ch` in the `length` bytes at `adr`.
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 // Releases memory obtained from `alloc`, `calloc`, `new` or `resize`.
 + fn free(value: ptr) void
 // Copies the bytes of `from` to the start of `to` and returns the number copied.
-+ fn move(from: &[u8], to: mut &[u8]) uint
++ fn move(from: local &[u8], to: local mut &[u8]) uint
 // Copies `length` bytes from `from` to `to`; the two ranges may overlap.
 + fn move_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two may overlap.
@@ -3274,7 +3275,7 @@ alias Fd for i32
 // Moves the memory at `adr` into a new allocation of `new_size` bytes and frees the old one.
 + fn resize(adr: ptr, size: uint, new_size: uint) ptr
 // Parses `view` as a decimal unsigned integer.
-+ fn to_uint(view: &[u8], allow_plus: bool (false)) uint !SyntaxError
++ fn to_uint(view: local &[u8], allow_plus: bool (false)) uint !SyntaxError
 ```
 
 # net
@@ -3867,7 +3868,7 @@ alias Fd for i32
     // Returns the day of the year, 1 to 366.
     + fn day_of_year() uint
     // Returns whether both values name the same instant; backs the `==` operator (`$eq`).
-    + fn equal(other: DateTime) bool
+    + fn equals(other: DateTime) bool
     // Returns the value as text laid out by `pattern`.
     + fn format(pattern: String) String
     // Parses `value` laid out by `pattern`, using the tokens of `format`.

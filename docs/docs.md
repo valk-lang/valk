@@ -317,6 +317,14 @@ with the caller's frame. The same applies to a `local &T` borrow. Storage
 that must be kept belongs in a class property, a global, or a heap slice
 such as `[u8]{ 0 x 4 }`.
 
+A parameter declared `local &[T]` or `local mut &[T]` says up front that the
+callee keeps nothing, so it takes any of these without a proof, and a
+`.{ 1, 2, 3 }` literal passed to it fills an inline array that the frame lends
+for the call: `crypto.hex_encode(.{ 0xab, 0xcd })`. The standard library
+declares its byte inputs that way (`io.Writer.write`, hashing, encoding,
+compression), while a function that stores its input, such as
+`ByteReader.new`, keeps the plain `&[u8]`.
+
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
 ```rust

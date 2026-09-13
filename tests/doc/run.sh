@@ -235,7 +235,7 @@ if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" != *'s.request_shutdown(5000)'* ]] \
     || [[ "$guide" == *'server.await()'* ]] \
     || [[ "$stdlib_markdown" == *'ServerHandle'* ]] \
-    || [[ "$stdlib_markdown" != *'+ fn start(worker_count: i32 (-1)) void !HttpError'* ]] \
+    || [[ "$stdlib_markdown" != *'+ fn start(worker_count: uint (0)) void !HttpError'* ]] \
     || [[ "$guide" == *'On Windows the server always runs a single worker'* ]] \
     || [[ "$guide" == *'one completion port, and therefore to one thread'* ]] \
     || [[ "$guide" == *'con.send("PING")'* ]] \

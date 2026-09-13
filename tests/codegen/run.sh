@@ -377,7 +377,7 @@ for name in union_equal_member member_equal_union; do
 done
 
 string_compare_body=$(sed -n '/^define .*__union_equal_string__/,/^}/p' "$scalar_ir")
-if [[ "$string_compare_body" != *"__String__equal__"* ]]; then
+if [[ "$string_compare_body" != *"__String__equals__"* ]]; then
     echo "# Tagged-union equality did not use the active member comparison hook"
     echo "$string_compare_body"
     exit 1
