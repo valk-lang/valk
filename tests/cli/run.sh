@@ -574,5 +574,17 @@ if [ "$(loc_value "$loc_out" File)" -ne "$(( $(loc_value "$loc_base" File) + 1 )
     exit 1
 fi
 
+deprecated_out=$("$VALK" build "$DIR/deprecated.valk" --lint 2>&1) || {
+    echo "# --lint rejected a call to a deprecated function"
+    echo "$deprecated_out"
+    exit 1
+}
+if [[ "$deprecated_out" != *"'equal_bytes' is deprecated: old name of \`equals_bytes\`, kept because 0.7.0 shipped it."* ]] \
+    || [[ "$deprecated_out" == *"'stale' is deprecated"* ]]; then
+    echo "# A deprecated function must warn from another package and stay quiet in its own"
+    echo "$deprecated_out"
+    exit 1
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 34"
+echo "# Test count: 35"

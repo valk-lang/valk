@@ -225,9 +225,11 @@ check "signature help active parameter" '"activeParameter":1' \
 
 # `t.` is not valid syntax; completion is expected to answer anyway
 check "member completion after a dot" '"label":"describe"' \
-    "$(request textDocument/completion member.valk 9 6)"
+    "$(request textDocument/completion member.valk 13 6)"
 check "member completion includes properties" '"label":"name"' \
-    "$(request textDocument/completion member.valk 9 6)"
+    "$(request textDocument/completion member.valk 13 6)"
+check "member completion tags a deprecated method" '"label":"legacy","tags":[1]' \
+    "$(request textDocument/completion member.valk 13 6)"
 
 # `fs.` likewise, and private members of another package must not be offered
 check "namespace completion" '"label":"cwd"' \
@@ -353,6 +355,8 @@ check "hover on a function" '"value":"```valk\nfn helper(count: uint, label: Str
     "$(request textDocument/hover nav.valk 7 14)"
 check "hover on an inferred local" '"value":"```valk\nString\n```"' \
     "$(request textDocument/hover nav.valk 7 28)"
+check "hover shows the deprecated flag and note" '"value":"```valk\nfn legacy(count: uint) String $deprecated\n```\n\nDeprecated: use `helper`."' \
+    "$(request textDocument/hover nav.valk 49 14)"
 
 check "hover shows the documentation comment" '"value":"```valk\nfn total(numbers: Array[uint]) uint\n```\n\nSums the values in `numbers`.\n\nReturns `0` for an empty array."' \
     "$(request textDocument/hover nav.valk 22 14)"

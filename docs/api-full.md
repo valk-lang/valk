@@ -3356,7 +3356,7 @@ Returns a new `String` holding a copy of the bytes before the zero terminator.
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
@@ -3364,7 +3364,7 @@ Returns a new `String` holding a copy of the bytes before the zero terminator.
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -3527,7 +3527,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
@@ -3535,7 +3535,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -3698,7 +3698,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
@@ -3706,7 +3706,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -3873,7 +3873,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -3991,8 +3991,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4051,7 +4051,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -4169,8 +4169,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4229,7 +4229,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -4347,8 +4347,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4407,7 +4407,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -4525,8 +4525,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4585,7 +4585,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -4703,8 +4703,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5226,7 +5226,7 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5344,8 +5344,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5404,7 +5404,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5522,8 +5522,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5582,7 +5582,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5700,8 +5700,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5790,7 +5790,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -5975,8 +5975,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -6046,7 +6046,7 @@ u32.write_little_endian(0x01020304, &buf)
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -6172,8 +6172,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
-bounds-checked slice, or `to_base_into`.
+binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
+takes a bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -11831,8 +11831,8 @@ Returns `value` with its fractional part removed, rounding toward zero.
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
-// Old name of `equals_bytes`, kept because 0.7.0 shipped it.
-+ fn equal_bytes(a: ptr, b: ptr, length: uint) bool
+// Deprecated: old name of `equals_bytes`, kept because 0.7.0 shipped it.
++ fn equal_bytes(a: ptr, b: ptr, length: uint) bool $deprecated
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.
@@ -11928,7 +11928,7 @@ Copies the `T` at `from` to `to`; the two must not overlap.
 
 ### equal_bytes
 
-Old name of `equals_bytes`, kept because 0.7.0 shipped it.
+Deprecated: old name of `equals_bytes`, kept because 0.7.0 shipped it.
 
 ### equals
 

@@ -1010,7 +1010,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
@@ -1018,7 +1018,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -1054,7 +1054,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
@@ -1062,7 +1062,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -1098,7 +1098,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
     + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
-    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
@@ -1106,7 +1106,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value like `to_string` into `buf` and returns the byte count.
     + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
-    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
     + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
@@ -1146,7 +1146,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1192,7 +1192,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1238,7 +1238,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1284,7 +1284,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: i8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1330,7 +1330,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: int, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1502,7 +1502,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u16, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1548,7 +1548,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u32, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1594,7 +1594,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u64, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1670,7 +1670,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: u8, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -1722,7 +1722,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
-    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint
+    + fn to_base_to_ptr(base: uint, result: ptr, lowercase: bool (false)) uint $deprecated
     // Returns the value in uppercase hexadecimal without a `0x` prefix, e.g. `FF` or `-FF`.
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
@@ -3598,8 +3598,8 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
-// Old name of `equals_bytes`, kept because 0.7.0 shipped it.
-+ fn equal_bytes(a: ptr, b: ptr, length: uint) bool
+// Deprecated: old name of `equals_bytes`, kept because 0.7.0 shipped it.
++ fn equal_bytes(a: ptr, b: ptr, length: uint) bool $deprecated
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.

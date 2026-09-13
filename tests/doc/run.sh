@@ -68,6 +68,18 @@ for absent in \
     fi
 done
 
+echo "> Document deprecated functions"
+if ! grep -Fq '"deprecated": true' "$workdir/api.json"; then
+    echo "# The deprecated flag is missing from the API JSON"
+    cat "$workdir/api.json"
+    exit 1
+fi
+if ! grep -Fq '+ fn pick() uint $deprecated' "$workdir/api.md"; then
+    echo "# The deprecated flag is missing from the markdown signature"
+    cat "$workdir/api.md"
+    exit 1
+fi
+
 echo "> Document error types and enums"
 for expect in \
     '"description": "Failures of the box store."' \

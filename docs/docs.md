@@ -542,6 +542,18 @@ fn add_two(value: int) int $noinline { return value + 2 }
 
 These flags cannot be combined on the same function.
 
+`$deprecated` keeps a function callable but warns at every call from another
+package. The warning quotes the sentence of the `///` block that starts with
+"Deprecated", so say what to use instead; `valk doc` shows the flag and editors
+strike the name through in completions:
+
+```rust
+/// Deprecated: use `equals_bytes`.
++ fn equal_bytes(a: ptr, b: ptr, length: uint) bool $deprecated {
+    return equals_bytes(a, b, length)
+}
+```
+
 ### Type default values
 
 A class, struct, or other named type can provide the value returned by
