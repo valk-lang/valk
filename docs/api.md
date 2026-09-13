@@ -2521,7 +2521,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The size of the complete request (head and body) in bytes.
     ~ bytes_to_send: uint
     // The connection the request is sent on; closed once the request has finished.
-    ~ con: Connection
+    ~ con: TcpConnection
     // The buffer that collects the raw response bytes.
     ~ recv_buffer: ByteBuffer
     // The share of the response received so far, from 0 to 100.
@@ -2560,7 +2560,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
     // The socket's file descriptor.
     ~+ fd: i32
     // The underlying socket connection.
-    ~+ netcon: Connection
+    ~+ netcon: TcpConnection
     // The server worker that accepted the connection.
     ~+ worker: Worker
 
@@ -3284,6 +3284,14 @@ alias Fd for i32
 ```js
 // Receives once from the socket `fd` into `buf` and returns the number of bytes read.
 + fn recv(fd: i32, buf: local mut &[u8], timeout_ms: uint (5000)) uint !io:IoError
+// Connects to a TCP server; the same as `TcpConnection.new`.
++ fn tcp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) TcpConnection !NetError
+// Opens a listening TCP socket; the same as `TcpServer.new`.
++ fn tcp_server(host: String, port: u16, timeout_ms: uint (5000)) shared TcpServer !NetError
+// Opens a UDP socket that talks to one server; the same as `UdpClient.new`.
++ fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
+// Binds a UDP socket to your own address; the same as `UdpServer.new`.
++ fn udp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
 // Sends once from `data` on the socket `fd` and returns the number of bytes sent.
 + fn write(fd: i32, data: local &[u8], timeout_ms: uint (5000)) uint !io:IoError
 ```
@@ -3312,62 +3320,6 @@ alias Fd for i32
 ```
 
 ```js
-// A connected TCP stream, optionally with TLS, read and written from a coroutine.
-+ class Connection is Reader, Writer, Closer {
-    // The OS socket descriptor.
-    ~ fd: i32
-    // The host the connection was made to; empty for accepted connections and `new`.
-    ~+ host: String
-    // Milliseconds a single `read` may wait for data; 0 waits forever.
-    + read_timeout_ms: uint
-    // The TLS session, once `ssl_connect` or `ssl_accept` succeeded.
-    ~ ssl: ?Ssl
-    // True once a TLS handshake succeeded; reads and writes then go through TLS.
-    ~ ssl_enabled: bool
-    // Milliseconds each send inside `write` may wait; 0 waits forever.
-    + write_timeout_ms: uint
-
-    // Closes the connection; does nothing when already closed.
-    + fn close() void !io:IoError
-    // Wraps an already connected socket descriptor and takes ownership of it.
-    + static fn new(fd: i32) Connection !NetError
-    // Reads up to `buf.length` bytes into `buf` and returns the count.
-    + fn read(buf: local mut &[u8]) uint !io:IoError
-    // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
-    + fn set_cancel(token: shared CancelToken) void
-    // Sets `read_timeout_ms` and `write_timeout_ms`; 0 waits forever.
-    + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
-    // Runs the TLS server handshake over this connection with a session from `context`.
-    + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
-    // Runs the TLS client handshake over this connection with `ssl`.
-    + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
-    // Sends all of `data` and returns its length.
-    + fn write(data: local &[u8]) uint !io:IoError
-}
-```
-
-```js
-// A stream socket before it is connected or listening; see `server` and `client`.
-+ class Socket is Closer {
-    // The OS socket descriptor.
-    ~ fd: i32
-    // The host name or address the socket was created for.
-    ~ host: String
-    // True when the host resolved to an IPv6 address.
-    ~+ ipv6: bool
-    // The port the socket was created for.
-    ~ port: u16
-
-    // Resolves `host`, connects to it and `port`, and returns the connection.
-    + static fn client(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) Connection !NetError
-    // Closes the descriptor; does nothing when already closed.
-    + fn close() void !io:IoError
-    // Resolves `host`, binds to it and `port`, and starts listening.
-    + static fn server(type: SocketType, host: String, port: u16, timeout_ms: uint (5000)) shared SocketServer !NetError
-}
-```
-
-```js
 // An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
@@ -3389,19 +3341,6 @@ alias Fd for i32
     + static fn resolve(host: String, port: u16, timeout_ms: uint (5000)) SocketAddress !NetError
     // Returns the address with its port, as `"127.0.0.1:80"` or `"[::1]:80"`.
     + fn to_string() String
-}
-```
-
-```js
-// A listening TCP socket, made by `Socket.server`; `accept` hands out connections.
-+ class SocketServer is Closer {
-    // The underlying listening socket.
-    ~+ socket: Socket
-
-    // Waits for the next incoming connection and returns it.
-    + fn accept(timeout_ms: uint (0)) Connection !NetError
-    // Closes the listening socket; connections already accepted stay open.
-    + fn close() void !io:IoError
 }
 ```
 
@@ -3482,29 +3421,160 @@ alias Fd for i32
 ```
 
 ```js
-// A UDP datagram socket, bound with `bind` or opened unbound with `open`.
-+ class UdpSocket is Closer {
+// A connected TCP stream, optionally with TLS, read and written from a coroutine.
++ class TcpConnection is Reader, Writer, Closer {
     // The OS socket descriptor.
     ~ fd: i32
-    // True for an IPv6 socket; it can only send to addresses of the same family.
-    ~+ ipv6: bool
+    // The host the connection was made to; empty for accepted connections and `new`.
+    ~+ host: String
+    // Milliseconds a single `read` may wait for data; 0 waits forever.
+    + read_timeout_ms: uint
+    // The TLS session, once `ssl_connect` or `ssl_accept` succeeded.
+    ~ ssl: ?Ssl
+    // True once a TLS handshake succeeded; reads and writes then go through TLS.
+    ~ ssl_enabled: bool
+    // Milliseconds each send inside `write` may wait; 0 waits forever.
+    + write_timeout_ms: uint
+
+    // Closes the connection; does nothing when already closed.
+    + fn close() void !io:IoError
+    // Returns the address of this end of the connection.
+    + fn local_address() SocketAddress !NetError
+    // Resolves `host` and connects to it and `port` over TCP; also `net.tcp_client`.
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) TcpConnection !NetError
+    // Returns the address of the peer.
+    + fn peer_address() SocketAddress !NetError
+    // Reads up to `buf.length` bytes into `buf` and returns the count.
+    + fn read(buf: local mut &[u8]) uint !io:IoError
+    // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
+    + fn set_cancel(token: shared CancelToken) void
+    // Asks the system for a receive buffer of `bytes`; it may round or cap the size.
+    + fn set_receive_buffer(bytes: uint) void !NetError
+    // Asks the system for a send buffer of `bytes`; it may round or cap the size.
+    + fn set_send_buffer(bytes: uint) void !NetError
+    // Sets `read_timeout_ms` and `write_timeout_ms`; 0 waits forever.
+    + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
+    // Runs the TLS server handshake over this connection with a session from `context`.
+    + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
+    // Runs the TLS client handshake over this connection with `ssl`.
+    + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
+    // Wraps an already connected socket descriptor and takes ownership of it.
+    + static fn wrap(fd: i32) TcpConnection !NetError
+    // Sends all of `data` and returns its length.
+    + fn write(data: local &[u8]) uint !io:IoError
+}
+```
+
+```js
+// A listening TCP socket, made by `new` or `net.tcp_server`; `accept` hands out connections.
++ class TcpServer is Closer {
+    // The OS socket descriptor.
+    ~ fd: i32
+    // The host name or address the server was created for.
+    ~ host: String
+    // The port the server was created for.
+    ~ port: u16
+
+    // Waits for the next incoming connection and returns it.
+    + fn accept(timeout_ms: uint (0)) TcpConnection !NetError
+    // Closes the listening socket; connections already accepted stay open. Does nothing when already closed. Throws `os` when closing fails.
+    + fn close() void !io:IoError
+    // Returns the address the server listens on.
+    + fn local_address() SocketAddress !NetError
+    // Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000)) shared TcpServer !NetError
+}
+```
+
+```js
+// A UDP socket that talks to one server, made by `new` or `net.udp_client`.
++ class UdpClient is Reader, Writer, Closer {
+    // The OS socket descriptor.
+    ~ fd: i32
+    // Milliseconds `read` may wait for a datagram; 0 waits forever.
+    + read_timeout_ms: uint
+    // Milliseconds `write` may wait; 0 waits forever.
+    + write_timeout_ms: uint
+
+    // Closes the socket; does nothing when already closed. Throws `os` when closing fails.
+    + fn close() void !io:IoError
+    // Returns the local address the system bound this socket to.
+    + fn local_address() SocketAddress !NetError
+    // Opens a socket to the server at `host` and `port`; also `net.udp_client`.
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
+    // Returns the server's address.
+    + fn peer_address() SocketAddress !NetError
+    // Receives one datagram from the server into `buf` and returns its byte count.
+    + fn read(buf: local mut &[u8]) uint !io:IoError
+    // Allows sending to a broadcast address such as `255.255.255.255`.
+    + fn set_broadcast(enabled: bool) void !NetError
+    // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
+    + fn set_cancel(token: shared CancelToken) void
+    // Sends multicast datagrams through the interface with the IPv4 address `interface_ip` (IPv4 sockets) instead of the default route.
+    + fn set_multicast_interface_v4(interface_ip: String) void !NetError
+    // Sends multicast datagrams through interface `interface_index` (IPv6 sockets); 0 is the default route.
+    + fn set_multicast_interface_v6(interface_index: u32) void !NetError
+    // Whether multicast datagrams this socket sends are also delivered to receivers on this machine; on by default.
+    + fn set_multicast_loopback(enabled: bool) void !NetError
+    // Sets the hop limit (TTL) used when the server is a multicast group; 1 (the system default) stays on the local network.
+    + fn set_multicast_ttl(hops: u8) void !NetError
+    // Asks the system for a receive buffer of `bytes`; it may round or cap the size.
+    + fn set_receive_buffer(bytes: uint) void !NetError
+    // Asks the system for a send buffer of `bytes`; it may round or cap the size.
+    + fn set_send_buffer(bytes: uint) void !NetError
+    // Sets the hop limit (TTL) of the datagrams sent.
+    + fn set_ttl(hops: u8) void !NetError
+    // Sends `data` to the server as one datagram and returns its length.
+    + fn write(data: local &[u8]) uint !io:IoError
+}
+```
+
+```js
+// A UDP socket bound to your own address, made by `new` or `net.udp_server`.
++ class UdpServer is Closer {
+    // The OS socket descriptor.
+    ~ fd: i32
     // Milliseconds `recv_from` may wait for a datagram; 0 waits forever.
     + read_timeout_ms: uint
     // Milliseconds `send_to` may wait; 0 waits forever.
     + write_timeout_ms: uint
 
-    // Binds a socket to `host` (a name or a numeric IPv4 / IPv6 address) and `port`.
-    + static fn bind(host: String, port: u16, timeout_ms: uint (5000)) UdpSocket !NetError
     // Closes the socket; does nothing when already closed. Throws `os` when closing fails.
     + fn close() void !io:IoError
+    // Starts receiving datagrams sent to the IPv4 multicast `group` (`224.0.0.0/4`) on the interface with address `interface_ip`; `"0.0.0.0"` (the default) lets the system pick.
+    + fn join_multicast_v4(group: String, interface_ip: String ("0.0.0.0")) void !NetError
+    // Starts receiving datagrams sent to the IPv6 multicast `group` (`ff00::/8`) on interface `interface_index`; 0 (the default) lets the system pick.
+    + fn join_multicast_v6(group: String, interface_index: u32 (0)) void !NetError
+    // Stops receiving the IPv4 multicast `group` joined on `interface_ip`.
+    + fn leave_multicast_v4(group: String, interface_ip: String ("0.0.0.0")) void !NetError
+    // Stops receiving the IPv6 multicast `group` joined on `interface_index`.
+    + fn leave_multicast_v6(group: String, interface_index: u32 (0)) void !NetError
     // Returns the address this socket is bound to.
     + fn local_address() SocketAddress !NetError
-    // Opens an unbound IPv4 socket (IPv6 when `ipv6` is set), for a client.
-    + static fn open(ipv6: bool (false)) UdpSocket !NetError
+    // Binds a socket to your own `host` and `port`; also `net.udp_server`.
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError
     // Receives one datagram into `buf` and returns its byte count and its sender.
-    + fn recv_from(buf: mut &[u8]) (uint, SocketAddress) !io:IoError
+    + fn recv_from(buf: local mut &[u8]) (uint, SocketAddress) !io:IoError
     // Sends `data` as one datagram to `to` and returns the number of bytes sent.
-    + fn send_to(data: &[u8], to: SocketAddress) uint !io:IoError
+    + fn send_to(data: local &[u8], to: SocketAddress) uint !io:IoError
+    // Allows sending to a broadcast address such as `255.255.255.255`.
+    + fn set_broadcast(enabled: bool) void !NetError
+    // Makes pending and later `recv_from` and `send_to` calls throw `cancelled` once `token` is cancelled.
+    + fn set_cancel(token: shared CancelToken) void
+    // Sends multicast datagrams through the interface with the IPv4 address `interface_ip` (IPv4 sockets) instead of the default route.
+    + fn set_multicast_interface_v4(interface_ip: String) void !NetError
+    // Sends multicast datagrams through interface `interface_index` (IPv6 sockets); 0 is the default route.
+    + fn set_multicast_interface_v6(interface_index: u32) void !NetError
+    // Whether multicast datagrams this socket sends are also delivered to receivers on this machine; on by default.
+    + fn set_multicast_loopback(enabled: bool) void !NetError
+    // Sets the hop limit (TTL) of datagrams sent to a multicast group; 1 (the system default) stays on the local network.
+    + fn set_multicast_ttl(hops: u8) void !NetError
+    // Asks the system for a receive buffer of `bytes`; it may round or cap the size.
+    + fn set_receive_buffer(bytes: uint) void !NetError
+    // Asks the system for a send buffer of `bytes`; it may round or cap the size.
+    + fn set_send_buffer(bytes: uint) void !NetError
+    // Sets the hop limit (TTL) of datagrams sent to a single address.
+    + fn set_ttl(hops: u8) void !NetError
 }
 ```
 

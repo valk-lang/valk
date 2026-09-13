@@ -1136,7 +1136,7 @@ the end even after seeking. `read` defaults to true; `create` allows creating a
 missing file, and `exclusive` with `create` rejects an existing file.
 
 Streams share the `io.Reader`, `io.Writer`, `io.Seeker` and `io.Closer` interfaces
-from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.Connection` is a
+from [valk.io](api.md#io). `fs.FileStream` implements all four, `net.TcpConnection` is a
 reader, writer and closer, `ByteReader`
 reads from a `String`, `ByteBuffer` or `&[u8]`, and a `ByteBuffer` is a
 writer that collects everything written to it. `io.copy` moves everything from a reader
@@ -1386,7 +1386,7 @@ let value = queue.recv(0, stop) ! {
 }
 ```
 
-A token also reaches socket I/O. `Connection.set_cancel(token)` interrupts a
+A token also reaches socket I/O. `TcpConnection.set_cancel(token)` interrupts a
 read or write that is blocked when the token is cancelled, and every later
 one; they throw the `cancelled` I/O error. The registration is dropped by
 `close()`, so close the connection before the token outlives it:
@@ -1704,7 +1704,7 @@ use valk.net
 
 // Server
 fn server() {
-    let sock = net.Socket.server(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let sock = net.tcp_server("127.0.0.1", 8000) ! panic("Failed to open socket")
     let buffer = [u8]{ 0 x 1000 }
     while true {
         let con = sock.accept() ! {
@@ -1732,7 +1732,7 @@ fn main() {
     // Start our server in the background
     let s = co server()
     // Open client
-    let con = net.Socket.client(net.SocketType.tcp, "127.0.0.1", 8000) ! panic("Failed to open socket")
+    let con = net.tcp_client("127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
     con.write("PING") ! panic("Client failed to send data")
     // Recv
@@ -1749,23 +1749,52 @@ UDP example
 use valk.net
 
 fn main() {
-    let server = net.UdpSocket.bind("127.0.0.1", 8001) ! panic("Failed to bind")
-    let client = net.UdpSocket.open() ! panic("Failed to open socket")
+    let server = net.udp_server("127.0.0.1", 8001) ! panic("Failed to bind")
+    let client = net.udp_client("127.0.0.1", 8001) ! panic("Failed to open socket")
 
-    let to = net.SocketAddress.parse("127.0.0.1", 8001) ! panic("Invalid address")
-    client.send_to("PING", to) ! panic("Failed to send")
+    client.write("PING") ! panic("Failed to send")
 
     let buffer = [u8]{ 0 x 1500 }
     let bytes, from = server.recv_from(buffer) ! panic("Failed to receive")
     println("# Server received " + buffer.view(0, bytes).to_string() + " from " + from.to_string())
     server.send_to("PONG", from) ! panic("Failed to send")
+
+    let reply = client.read(buffer) ! panic("Failed to receive")
+    println("# Client received " + buffer.view(0, reply).to_string())
 }
 ```
 
-`recv_from` and `send_to` time out after `read_timeout_ms` / `write_timeout_ms`
-(5000 by default). `bind` with port 0 lets the system pick a port;
-`local_address()` returns it. `SocketAddress.resolve(host, port)` looks a
-name up; `parse` only accepts numeric addresses.
+A `UdpServer` has no connections to accept: each `recv_from` returns one
+datagram and its sender, and `send_to` replies to that sender. A `UdpClient`
+talks to one server, so it has plain `write` and `read` instead and serves as
+an `io.Reader` / `io.Writer`. Both time out after `read_timeout_ms` /
+`write_timeout_ms` (5000 by default), report `closed` when closed from another
+coroutine, and take a `sync.CancelToken` through `set_cancel`. Port 0 lets the
+system pick a port; `local_address()` returns it. `SocketAddress.resolve(host,
+port)` looks a name up; `parse` only accepts numeric addresses.
+
+The constructors take the same arguments as their TCP twins, plus:
+
+- `udp_client(host, port, timeout_ms, local_port, local_host)` and
+  `tcp_client(...)` bind their own end when a protocol needs a fixed source
+  port or a specific interface; 0 and `""` let the system choose.
+- `udp_server(host, port, timeout_ms, reuse_address)` lets several sockets
+  bind one port, which multicast receivers and per-thread servers need.
+
+Socket options are methods: `set_broadcast`, `set_ttl`, `set_receive_buffer`
+and `set_send_buffer` on every UDP socket and (the buffers) on a
+`TcpConnection`; `set_multicast_ttl`, `set_multicast_loopback` and
+`set_multicast_interface_v4` / `_v6` on both UDP sockets; and
+`join_multicast_v4` / `_v6` with their `leave_` twins on a `UdpServer`:
+
+```rust
+let group = net.udp_server("0.0.0.0", 5353, 5000, true) ! panic("bind")
+group.join_multicast_v4("224.0.0.251") ! panic("join")
+
+let sender = net.udp_client("224.0.0.251", 5353) ! panic("open")
+sender.set_multicast_ttl(1) ! panic("ttl")
+sender.write("hello group") ! panic("send")
+```
 
 ## Templates
 

@@ -1,0 +1,226 @@
+use ext
+use io
+use core
+use sync
+
+/// A UDP socket that talks to one server, made by `new` or `net.udp_client`.
+///
+/// `write` sends the server one datagram and `read` receives one from it, so the socket
+/// serves as an `io.Reader` and `io.Writer`. Datagrams from anyone else are dropped. To
+/// receive from many peers use `UdpServer`. The descriptor is closed by `close` or when
+/// the object is collected.
++ class UdpClient is io.Reader, io.Writer, io.Closer {
+    /// The OS socket descriptor.
+    ~ fd: Fd
+    /// Milliseconds `read` may wait for a datagram; 0 waits forever.
+    + read_timeout_ms: uint (5000)
+    /// Milliseconds `write` may wait; 0 waits forever.
+    + write_timeout_ms: uint (5000)
+    - ipv6: bool (false)
+    - closed: bool (false)
+    - interrupted: bool (false)
+    - cancel: ?shared sync.CancelToken (null)
+
+    /// Opens a socket to the server at `host` and `port`; also `net.udp_client`.
+    ///
+    /// `local_port` and `local_host` bind the socket's own end; 0 and `""` (the defaults)
+    /// let the system choose (see `local_address`). Nothing is sent yet: the first `write`
+    /// shows whether anyone listens, and even that only when the network reports it. Throws
+    /// `invalid_host` or `timeout` when resolving fails, `init` when the socket cannot be
+    /// made, `port_in_use` or `access` when the local end cannot be bound, `os` when binding
+    /// fails for another reason, and `connect` when the system refuses the peer.
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError {
+        @unsafe
+        let addrinfo = resolve_host(host, port, timeout_ms, true) !>
+        let fd = create_socket(true, true, addrinfo.is_ipv6()) !>
+        // Overlapped sends on Windows need a bound socket; elsewhere the connect binds
+        // unless a local end was chosen
+        #if OS == "win"
+        let bind_first = true
+        #else
+        let bind_first = local_port != 0 || local_host.length > 0
+        #end
+        if bind_first {
+            bind_local(fd, addrinfo.is_ipv6(), local_host, local_port) ! {
+                close_fd_cleanup(fd, __FILE__, __LINE__)
+                throw E
+            }
+        }
+        // A datagram socket only records the peer: nothing is sent, so the connect never
+        // waits and the stream helper `connect` (ConnectEx, io_uring) is not needed. On
+        // Windows it would even fail, since ConnectEx accepts stream sockets only.
+        if ext.connect(fd, addrinfo.sock_addr(), addrinfo.addr_len()) != 0 {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw .connect
+        }
+        return UdpClient {
+            fd: fd
+            ipv6: addrinfo.is_ipv6()
+        }
+    }
+
+    /// Receives one datagram from the server into `buf` and returns its byte count.
+    ///
+    /// A datagram larger than `buf` is cut to `buf.length` and the rest is lost. An empty
+    /// datagram returns 0, which stream helpers such as `io.copy` take as the end of input.
+    /// Throws `timeout` after `read_timeout_ms`, `closed`, and `read` when the receive fails.
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if this.closed : throw .closed
+        if this.is_cancelled() : throw .cancelled
+        let bytes = recv(this.fd, buf, this.read_timeout_ms) ! {
+            if this.is_cancelled() : throw .cancelled
+            if error_is(E.code, timeout) : throw .timeout
+            // A close from another coroutine aborts the receive
+            if error_is(E.code, closed) || this.closed : throw .closed
+            throw .read
+        }
+        // A close or cancellation while waiting ends the receive with 0 bytes on Linux,
+        // which is otherwise a legitimate empty datagram
+        if this.closed : throw .closed
+        if this.is_cancelled() : throw .cancelled
+        return bytes
+    }
+
+    /// Sends `data` to the server as one datagram and returns its length.
+    ///
+    /// Throws `write` when the send fails (such as a datagram too large for the network),
+    /// `timeout` after `write_timeout_ms`, and `closed`.
+    + fn write(data: local &[u8]) uint !io.IoError {
+        if this.closed : throw .closed
+        if this.is_cancelled() : throw .cancelled
+        return write(this.fd, data, this.write_timeout_ms) ! {
+            if this.is_cancelled() : throw .cancelled
+            if error_is(E.code, timeout) : throw .timeout
+            if error_is(E.code, closed) || this.closed : throw .closed
+            throw .write
+        }
+    }
+
+    /// Returns the local address the system bound this socket to.
+    ///
+    /// Throws `closed` after `close` and `os` when the system cannot report it.
+    + fn local_address() SocketAddress !NetError {
+        if this.closed : throw .closed
+        return local_address_of(this.fd) !>
+    }
+
+    /// Returns the server's address.
+    ///
+    /// Throws `closed` after `close` and `os` when the system cannot report it.
+    + fn peer_address() SocketAddress !NetError {
+        if this.closed : throw .closed
+        return peer_address_of(this.fd) !>
+    }
+
+    /// Allows sending to a broadcast address such as `255.255.255.255`.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_broadcast(enabled: bool) !NetError {
+        if this.closed : throw .closed
+        set_broadcast_fd(this.fd, enabled) !>
+    }
+
+    /// Sets the hop limit (TTL) of the datagrams sent.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_ttl(hops: u8) !NetError {
+        if this.closed : throw .closed
+        set_ttl_fd(this.fd, this.ipv6, hops) !>
+    }
+
+    /// Sets the hop limit (TTL) used when the server is a multicast group; 1 (the system
+    /// default) stays on the local network.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_multicast_ttl(hops: u8) !NetError {
+        if this.closed : throw .closed
+        set_multicast_ttl_fd(this.fd, this.ipv6, hops) !>
+    }
+
+    /// Whether multicast datagrams this socket sends are also delivered to receivers on
+    /// this machine; on by default.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_multicast_loopback(enabled: bool) !NetError {
+        if this.closed : throw .closed
+        set_multicast_loopback_fd(this.fd, this.ipv6, enabled) !>
+    }
+
+    /// Sends multicast datagrams through the interface with the IPv4 address
+    /// `interface_ip` (IPv4 sockets) instead of the default route.
+    ///
+    /// Throws `closed` after `close`, `invalid_host` when the address is not IPv4, and `os`.
+    + fn set_multicast_interface_v4(interface_ip: String) !NetError {
+        if this.closed : throw .closed
+        set_multicast_interface_v4_fd(this.fd, interface_ip) !>
+    }
+
+    /// Sends multicast datagrams through interface `interface_index` (IPv6 sockets); 0 is
+    /// the default route.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_multicast_interface_v6(interface_index: u32) !NetError {
+        if this.closed : throw .closed
+        set_multicast_interface_v6_fd(this.fd, interface_index) !>
+    }
+
+    /// Asks the system for a receive buffer of `bytes`; it may round or cap the size.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_receive_buffer(bytes: uint) !NetError {
+        if this.closed : throw .closed
+        set_receive_buffer_fd(this.fd, bytes) !>
+    }
+
+    /// Asks the system for a send buffer of `bytes`; it may round or cap the size.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_send_buffer(bytes: uint) !NetError {
+        if this.closed : throw .closed
+        set_send_buffer_fd(this.fd, bytes) !>
+    }
+
+    /// Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
+    ///
+    /// The registration replaces any earlier token and lasts until `close`. When `token` is
+    /// already cancelled the socket is interrupted right away.
+    + fn set_cancel(token: shared sync.CancelToken) {
+        this.unwatch()
+        this.cancel = token
+        if token.watch_fd(this.fd) : this.interrupt()
+    }
+
+    fn unwatch() {
+        let cancel = this.cancel
+        if isset(cancel) {
+            cancel.unwatch_fd(this.fd)
+            this.cancel = null
+        }
+    }
+
+    fn is_cancelled() bool {
+        let cancel = this.cancel
+        return isset(cancel) && cancel.is_cancelled()
+    }
+
+    // Wakes pending I/O and makes later I/O fail, without releasing the descriptor
+    fn interrupt() {
+        if this.closed || this.interrupted : return
+        this.interrupted = true
+        io.interrupt_fd(this.fd)
+    }
+
+    /// Closes the socket; does nothing when already closed. Throws `os` when closing fails.
+    + fn close() !io.IoError {
+        if this.closed : return
+        this.closed = true
+        this.unwatch()
+        close_fd(this.fd) ! throw .os
+    }
+
+    fn gc_free() {
+        if this.closed : return
+        this.closed = true
+        close_fd_cleanup(this.fd, __FILE__, __LINE__)
+    }
+}

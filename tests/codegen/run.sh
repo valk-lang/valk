@@ -109,7 +109,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
         echo "$shared_collect_body"
         exit 1
     fi
-    accept_body=$(sed -n '/^define .*__SocketServer__accept__/,/^}/p' "$collect_ir")
+    accept_body=$(sed -n '/^define .*__TcpServer__accept__/,/^}/p' "$collect_ir")
     accept_returns=$(grep -c '^  ret ' <<< "$accept_body")
     accept_uses=$(grep -c 'call void asm sideeffect "", "r"(ptr' <<< "$accept_body")
     if [ "$accept_returns" -lt 2 ] || [ "$accept_uses" -lt "$accept_returns" ]; then

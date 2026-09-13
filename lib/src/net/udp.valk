@@ -3,93 +3,45 @@ use io
 use coro
 use core
 use time
+use sync
 
-/// A UDP datagram socket, bound with `bind` or opened unbound with `open`.
+/// A UDP socket bound to your own address, made by `new` or `net.udp_server`.
 ///
-/// The descriptor is closed by `close` or when the object is collected.
-+ class UdpSocket is io.Closer {
+/// It has no connections to accept: `recv_from` returns each datagram with its sender,
+/// and `send_to` replies to that sender. To talk to one server use `UdpClient`. Multicast
+/// groups are joined with `join_multicast_v4` / `join_multicast_v6`. The descriptor is
+/// closed by `close` or when the object is collected.
++ class UdpServer is io.Closer {
     /// The OS socket descriptor.
     ~ fd: Fd
-    /// True for an IPv6 socket; it can only send to addresses of the same family.
-    ~+ ipv6: bool
     /// Milliseconds `recv_from` may wait for a datagram; 0 waits forever.
     + read_timeout_ms: uint (5000)
     /// Milliseconds `send_to` may wait; 0 waits forever.
     + write_timeout_ms: uint (5000)
+    - ipv6: bool (false)
     - closed: bool (false)
+    - interrupted: bool (false)
+    - cancel: ?shared sync.CancelToken (null)
 
-    /// Binds a socket to `host` (a name or a numeric IPv4 / IPv6 address) and `port`.
+    /// Binds a socket to your own `host` and `port`; also `net.udp_server`.
     ///
-    /// Port 0 lets the system pick one (see `local_address`). An IPv6 host such as `"::"` also
-    /// receives from IPv4 peers where the system allows it. Throws `invalid_host` or
-    /// `timeout` when resolving fails, `init` when the socket cannot be made, `port_in_use`
-    /// when the address is already in use, `access` when the system refuses it (such as a
-    /// privileged port), and `os` when binding fails for another reason.
-    + static fn bind(host: String, port: u16, timeout_ms: uint (5000)) UdpSocket !NetError {
-        let info = AddrInfo.new(host, port, timeout_ms, true) ! {
-            if error_is(E.code, timeout) : throw .timeout
-            throw .invalid_host
+    /// Port 0 lets the system pick one (see `local_address`). An IPv6 host such as `"::"`
+    /// also receives from IPv4 peers where the system allows it. `reuse_address` lets
+    /// several sockets bind the same port, which multicast receivers need. Throws
+    /// `invalid_host` or `timeout` when resolving fails, `init` when the socket cannot be
+    /// made, `port_in_use` when the address is already in use, `access` when the system
+    /// refuses it (such as a privileged port), and `os` when binding fails for another
+    /// reason.
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_address: bool (false)) UdpServer !NetError {
+        let addrinfo = resolve_host(host, port, timeout_ms, true) !>
+        let fd = create_socket(true, true, addrinfo.is_ipv6()) !>
+        bind_fd(fd, addrinfo, reuse_address, false, true) ! {
+            close_fd_cleanup(fd, __FILE__, __LINE__)
+            throw E
         }
-        let socket = SELF.create(info.is_ipv6()) !>
-        @unsafe
-        if socket.ipv6 {
-            // Accept IPv4 peers on "::" as well, where the system allows it
-            let no: i32 = 0
-            ext.setsockopt(socket.fd, ext.IPPROTO_IPV6, ext.IPV6_V6ONLY, @ref(no), size_of(i32))
-        }
-        if ext.bind(socket.fd, info.sock_addr(), info.addr_len()) != 0 {
-            // Reads the reason before closing can overwrite it
-            bind_failed() ! {
-                socket.close() ! core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
-                throw E
-            }
-        }
-        return socket
-    }
-
-    /// Opens an unbound IPv4 socket (IPv6 when `ipv6` is set), for a client.
-    ///
-    /// The system binds it to a free port on the first send (on Windows right away, to any
-    /// address). Throws `init` or `os` when the socket cannot be made.
-    + static fn open(ipv6: bool (false)) UdpSocket !NetError {
-        let socket = SELF.create(ipv6) !>
-        #if OS == "win"
-        // Overlapped operations need a bound socket
-        if !bind_any(socket.fd, ipv6) {
-            socket.close() ! core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
-            throw .init
-        }
-        #end
-        return socket
-    }
-
-    static fn create(ipv6: bool) UdpSocket !NetError {
-        let family: i32 = ipv6 ? ext.AF_INET6 : ext.AF_INET
-        #if OS == "win"
-        @unsafe
-        WSA.init()
-        let fd = ext.WSASocketA(family, ext.SOCK_DGRAM, ext.IPPROTO_UDP, null, 0, ext.WSA_FLAG_OVERLAPPED)
-        if fd == ext.INVALID_SOCKET : throw .init
-        if !io.associate(fd) {
-            if ext.closesocket(fd) != 0 : core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
-            throw .init
-        }
-        #else
-        let fd = ext.socket(family, ext.SOCK_DGRAM, 0)
-        if fd == -1 : throw .init
-        io.set_nonblocking(fd, true) ! {
-            if ext.close(fd) != 0 : core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
-            throw .os
-        }
-        #end
-        #if OS == "macos"
-        @unsafe
-        let nosigv: i32 = 1
-        ext.setsockopt(fd, ext.SOL_SOCKET, ext.SO_NOSIGPIPE, @ref(nosigv), size_of(i32))
-        #end
-        return UdpSocket {
+        return UdpServer {
             fd: fd
-            ipv6: ipv6
+            ipv6: addrinfo.is_ipv6()
         }
     }
 
@@ -103,12 +55,13 @@ use time
 
     /// Sends `data` as one datagram to `to` and returns the number of bytes sent.
     ///
-    /// Throws `write` when `to` is of the other address family or the send fails, `timeout`
-    /// after `write_timeout_ms`, and `closed`.
-    + fn send_to(data: &[u8], to: SocketAddress) uint !io.IoError {
+    /// The socket can only send to addresses of its own family (see `local_address`).
+    /// Throws `write` when `to` is of the other family or the send fails, `timeout` after
+    /// `write_timeout_ms`, and `closed`.
+    + fn send_to(data: local &[u8], to: SocketAddress) uint !io.IoError {
         @unsafe
         if this.closed : throw .closed
-        if to.ipv6 != this.ipv6 : throw .write
+        if this.is_cancelled() : throw .cancelled
         let current = coro.current_coro.@cast(coro.Coro)
 
         #if OS == "win"
@@ -120,6 +73,8 @@ use time
         let res = ext.WSASendTo(this.fd, @ref(ov.buflen), 1, null, 0, address, length.to(i32), ov.@cast(ptr), null)
         if res == ext.SOCKET_ERROR && io.socket_io_failed() : throw .write
         if io.await_overlap(this.fd, ov.@cast(ptr), current, this.write_timeout_ms) : throw .timeout
+        if this.is_cancelled() : throw .cancelled
+        if this.closed : throw .closed
         let flags: u32 = 0
         let ok = ext.WSAGetOverlappedResult(this.fd, ov.@cast(ptr), @ref(ov.transferred), 1, @ref(flags))
         if ok == 0 || ov.base.sys.Internal != 0 : throw .write
@@ -131,13 +86,16 @@ use time
         let deadline = time_deadline(this.write_timeout_ms)
         while true {
             let sent = ext.sendto(this.fd, data.data, data.length, 0, address.@cast(*ext.libc_sockaddr), length)
+            let error = sent < 0 ? ext.get_errno() : 0
+            if this.is_cancelled() : throw .cancelled
             if sent >= 0 : return sent.to(uint)
-            let error = ext.get_errno()
             if error == ext.EINTR : continue
             if error != ext.EAGAIN && error != ext.EWOULDBLOCK : throw .write
             let ev = io.await_fd(this.fd, false, true, time_remaining(deadline) !>)
             if ev.is_timeout() : throw .timeout
-            if ev.is_closed() : throw .closed
+            // An interrupt shows as a hang-up, so cancellation is checked first
+            if this.is_cancelled() : throw .cancelled
+            if ev.is_closed() || this.closed : throw .closed
         }
         throw .write
         #end
@@ -147,9 +105,10 @@ use time
     ///
     /// A datagram larger than `buf` is cut to `buf.length` and the rest is lost. Throws
     /// `timeout` after `read_timeout_ms`, `closed`, and `read` when the receive fails.
-    + fn recv_from(buf: mut &[u8]) (uint, SocketAddress) !io.IoError {
+    + fn recv_from(buf: local mut &[u8]) (uint, SocketAddress) !io.IoError {
         @unsafe
         if this.closed : throw .closed
+        if this.is_cancelled() : throw .cancelled
         let current = coro.current_coro.@cast(coro.Coro)
 
         #if OS == "win"
@@ -166,6 +125,9 @@ use time
         // so its completion is still queued) and fills the buffer
         if res == ext.SOCKET_ERROR && io.socket_io_failed() && ext.WSAGetLastError() != ext.WSAEMSGSIZE : throw .read
         if io.await_overlap(this.fd, ov.@cast(ptr), current, this.read_timeout_ms) : throw .timeout
+        // A close or cancellation from another coroutine aborts the receive
+        if this.is_cancelled() : throw .cancelled
+        if this.closed : throw .closed
         let ok = ext.WSAGetOverlappedResult(this.fd, ov.@cast(ptr), @ref(ov.transferred), 1, @ref(ov.flags))
         let truncated = ok == 0 && ext.WSAGetLastError() == ext.WSAEMSGSIZE
         if !truncated && (ok == 0 || ov.base.sys.Internal != 0) : throw .read
@@ -179,40 +141,174 @@ use time
         while true {
             let length: u32 = 128
             let received = ext.recvfrom(this.fd, buf.data, buf.length, 0, address.@cast(*ext.libc_sockaddr), @ref(length))
+            // errno is read before anything else runs: the cancellation check below
+            // takes a lock, which may clobber it
+            let error = received < 0 ? ext.get_errno() : 0
+            // An interrupt (cancel) ends the wait with an empty read
+            if this.is_cancelled() : throw .cancelled
             if received >= 0 {
                 let from = SocketAddress.from_sockaddr(address, length.to(uint)) ! throw .read
                 return (received.to(uint), from)
             }
-            let error = ext.get_errno()
             if error == ext.EINTR : continue
             if error != ext.EAGAIN && error != ext.EWOULDBLOCK : throw .read
             let ev = io.await_fd(this.fd, true, false, time_remaining(deadline) !>)
             if ev.is_timeout() : throw .timeout
-            if ev.is_closed() : throw .closed
+            // An interrupt shows as a hang-up, so cancellation is checked first
+            if this.is_cancelled() : throw .cancelled
+            if ev.is_closed() || this.closed : throw .closed
         }
         throw .read
         #end
+    }
+
+    /// Allows sending to a broadcast address such as `255.255.255.255`.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_broadcast(enabled: bool) !NetError {
+        if this.closed : throw .closed
+        set_broadcast_fd(this.fd, enabled) !>
+    }
+
+    /// Sets the hop limit (TTL) of datagrams sent to a single address.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_ttl(hops: u8) !NetError {
+        if this.closed : throw .closed
+        set_ttl_fd(this.fd, this.ipv6, hops) !>
+    }
+
+    /// Sets the hop limit (TTL) of datagrams sent to a multicast group; 1 (the system
+    /// default) stays on the local network.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_multicast_ttl(hops: u8) !NetError {
+        if this.closed : throw .closed
+        set_multicast_ttl_fd(this.fd, this.ipv6, hops) !>
+    }
+
+    /// Whether multicast datagrams this socket sends are also delivered to receivers on
+    /// this machine; on by default.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_multicast_loopback(enabled: bool) !NetError {
+        if this.closed : throw .closed
+        set_multicast_loopback_fd(this.fd, this.ipv6, enabled) !>
+    }
+
+    /// Sends multicast datagrams through the interface with the IPv4 address
+    /// `interface_ip` (IPv4 sockets) instead of the default route.
+    ///
+    /// Throws `closed` after `close`, `invalid_host` when the address is not IPv4, and `os`.
+    + fn set_multicast_interface_v4(interface_ip: String) !NetError {
+        if this.closed : throw .closed
+        set_multicast_interface_v4_fd(this.fd, interface_ip) !>
+    }
+
+    /// Sends multicast datagrams through interface `interface_index` (IPv6 sockets); 0 is
+    /// the default route.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_multicast_interface_v6(interface_index: u32) !NetError {
+        if this.closed : throw .closed
+        set_multicast_interface_v6_fd(this.fd, interface_index) !>
+    }
+
+    /// Starts receiving datagrams sent to the IPv4 multicast `group` (`224.0.0.0/4`) on the
+    /// interface with address `interface_ip`; `"0.0.0.0"` (the default) lets the system pick.
+    ///
+    /// Bind the socket to the group's port, usually with `reuse_address`. Throws `closed`
+    /// after `close`, `invalid_host` when an address is not IPv4, and `os` when the system
+    /// refuses.
+    + fn join_multicast_v4(group: String, interface_ip: String ("0.0.0.0")) !NetError {
+        if this.closed : throw .closed
+        multicast_membership_v4(this.fd, group, interface_ip, true) !>
+    }
+
+    /// Stops receiving the IPv4 multicast `group` joined on `interface_ip`.
+    ///
+    /// Throws `closed` after `close`, `invalid_host` and `os`.
+    + fn leave_multicast_v4(group: String, interface_ip: String ("0.0.0.0")) !NetError {
+        if this.closed : throw .closed
+        multicast_membership_v4(this.fd, group, interface_ip, false) !>
+    }
+
+    /// Starts receiving datagrams sent to the IPv6 multicast `group` (`ff00::/8`) on
+    /// interface `interface_index`; 0 (the default) lets the system pick.
+    ///
+    /// Throws `closed` after `close`, `invalid_host` when `group` is not IPv6, and `os`.
+    + fn join_multicast_v6(group: String, interface_index: u32 (0)) !NetError {
+        if this.closed : throw .closed
+        multicast_membership_v6(this.fd, group, interface_index, true) !>
+    }
+
+    /// Stops receiving the IPv6 multicast `group` joined on `interface_index`.
+    ///
+    /// Throws `closed` after `close`, `invalid_host` and `os`.
+    + fn leave_multicast_v6(group: String, interface_index: u32 (0)) !NetError {
+        if this.closed : throw .closed
+        multicast_membership_v6(this.fd, group, interface_index, false) !>
+    }
+
+    /// Asks the system for a receive buffer of `bytes`; it may round or cap the size.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_receive_buffer(bytes: uint) !NetError {
+        if this.closed : throw .closed
+        set_receive_buffer_fd(this.fd, bytes) !>
+    }
+
+    /// Asks the system for a send buffer of `bytes`; it may round or cap the size.
+    ///
+    /// Throws `closed` after `close` and `os` when the system refuses.
+    + fn set_send_buffer(bytes: uint) !NetError {
+        if this.closed : throw .closed
+        set_send_buffer_fd(this.fd, bytes) !>
+    }
+
+    /// Makes pending and later `recv_from` and `send_to` calls throw `cancelled` once
+    /// `token` is cancelled.
+    ///
+    /// The registration replaces any earlier token and lasts until `close`. When `token` is
+    /// already cancelled the socket is interrupted right away.
+    + fn set_cancel(token: shared sync.CancelToken) {
+        this.unwatch()
+        this.cancel = token
+        if token.watch_fd(this.fd) : this.interrupt()
+    }
+
+    fn unwatch() {
+        let cancel = this.cancel
+        if isset(cancel) {
+            cancel.unwatch_fd(this.fd)
+            this.cancel = null
+        }
+    }
+
+    fn is_cancelled() bool {
+        let cancel = this.cancel
+        return isset(cancel) && cancel.is_cancelled()
+    }
+
+    // Wakes pending I/O and makes later I/O fail, without releasing the descriptor
+    fn interrupt() {
+        if this.closed || this.interrupted : return
+        this.interrupted = true
+        io.interrupt_fd(this.fd)
     }
 
     /// Closes the socket; does nothing when already closed. Throws `os` when closing fails.
     + fn close() !io.IoError {
         if this.closed : return
         this.closed = true
-        #if OS == "win"
-        if ext.closesocket(this.fd) != 0 : throw .os
-        #else
-        if ext.close(this.fd) != 0 : throw .os
-        #end
+        this.unwatch()
+        close_fd(this.fd) ! throw .os
     }
 
     fn gc_free() {
         if this.closed : return
         this.closed = true
-        #if OS == "win"
-        if ext.closesocket(this.fd) != 0 : core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
-        #else
-        if ext.close(this.fd) != 0 : core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
-        #end
+        close_fd_cleanup(this.fd, __FILE__, __LINE__)
     }
 }
 
