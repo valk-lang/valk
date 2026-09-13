@@ -79,7 +79,7 @@
 
 ## Standard library API
 
-See: [API docs](api.md)
+See: [API docs](api.md), or [api-full.md](api-full.md) with every description in full
 
 ## Getting started
 

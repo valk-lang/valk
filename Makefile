@@ -46,6 +46,7 @@ valkexe: $(COMPILER_DEPS)
 
 doc: valk
 	./valk doc lib/ -o docs/api.md --markdown --no-private --target linux-x64
+	./valk doc lib/ -o docs/api-full.md --markdown --no-private --full --target linux-x64
 
 valk-profile: $(COMPILER_DEPS)
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
