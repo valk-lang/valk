@@ -122,8 +122,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 + extend &[T] {
+    // The address of the first element.
     ~+ data: *[T]
+    // The number of elements.
     ~+ length: uint
+    // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~+ owner: ?GcPtr
 
     // Returns the element at `index`.
@@ -173,11 +176,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // A growable array of `T` stored in one contiguous block.
 + array Array[T] {
-    // A growable array of `T` stored in one contiguous block.
+    // The storage block holding the elements; null until the first element is stored.
     ~ data: ?GcPtr
-    // A growable array of `T` stored in one contiguous block.
+    // The number of elements.
     ~ length: uint
-    // A growable array of `T` stored in one contiguous block.
+    // The number of element slots the storage block holds; `length` of them are in use.
     ~ size: uint
 
     // Returns whether `func` returns true for every element; true when empty.
@@ -732,11 +735,11 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
 + slice String of u8 {
-    // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+    // The address of the first element.
     ~ data: *[u8]
-    // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+    // The number of elements.
     ~ length: uint
-    // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+    // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~ owner: ?GcPtr
 
     // Returns a new string with the bytes of `add` after this one; backs the `+` operator.

@@ -359,8 +359,11 @@ Higher bytes of `v` are dropped. No bounds are checked.
 
 ```js
 + extend &[T] {
+    // The address of the first element.
     ~+ data: *[T]
+    // The number of elements.
     ~+ length: uint
+    // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~+ owner: ?GcPtr
 
     // Returns the element at `index`.
@@ -375,6 +378,18 @@ Higher bytes of `v` are dropped. No bounds are checked.
     + fn view(offset: uint, length: uint) mut &[T]
 }
 ```
+
+#### data
+
+The address of the first element.
+
+#### length
+
+The number of elements.
+
+#### owner
+
+The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
 
 #### get
 
@@ -519,11 +534,11 @@ the sign, or a value that does not fit.
 ```js
 // A growable array of `T` stored in one contiguous block.
 + array Array[T] {
-    // A growable array of `T` stored in one contiguous block.
+    // The storage block holding the elements; null until the first element is stored.
     ~ data: ?GcPtr
-    // A growable array of `T` stored in one contiguous block.
+    // The number of elements.
     ~ length: uint
-    // A growable array of `T` stored in one contiguous block.
+    // The number of element slots the storage block holds; `length` of them are in use.
     ~ size: uint
 
     // Returns whether `func` returns true for every element; true when empty.
@@ -634,24 +649,15 @@ Build one with `Array[T]{ a, b }` (see `append`) or `Array[T]{ value x count }` 
 
 #### data
 
-A growable array of `T` stored in one contiguous block.
-
-Build one with `Array[T]{ a, b }` (see `append`) or `Array[T]{ value x count }` (see
-`fill`), and iterate with `each arr as value, index`.
+The storage block holding the elements; null until the first element is stored.
 
 #### length
 
-A growable array of `T` stored in one contiguous block.
-
-Build one with `Array[T]{ a, b }` (see `append`) or `Array[T]{ value x count }` (see
-`fill`), and iterate with `each arr as value, index`.
+The number of elements.
 
 #### size
 
-A growable array of `T` stored in one contiguous block.
-
-Build one with `Array[T]{ a, b }` (see `append`) or `Array[T]{ value x count }` (see
-`fill`), and iterate with `each arr as value, index`.
+The number of element slots the storage block holds; `length` of them are in use.
 
 #### all
 
@@ -2458,11 +2464,11 @@ after `detach`, and `os` when the kill fails.
 ```js
 // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
 + slice String of u8 {
-    // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+    // The address of the first element.
     ~ data: *[u8]
-    // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+    // The number of elements.
     ~ length: uint
-    // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+    // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~ owner: ?GcPtr
 
     // Returns a new string with the bytes of `add` after this one; backs the `+` operator.
@@ -2613,30 +2619,15 @@ class.
 
 #### data
 
-An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
-
-Indexes, lengths and ranges count bytes; the `utf8` group works in characters. The
-content is not validated as UTF-8 and may contain zero bytes. `$global` makes the name
-available in every namespace, and `$immutable` makes the bytes read-only outside this
-class.
+The address of the first element.
 
 #### length
 
-An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
-
-Indexes, lengths and ranges count bytes; the `utf8` group works in characters. The
-content is not validated as UTF-8 and may contain zero bytes. `$global` makes the name
-available in every namespace, and `$immutable` makes the bytes read-only outside this
-class.
+The number of elements.
 
 #### owner
 
-An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
-
-Indexes, lengths and ranges count bytes; the `utf8` group works in characters. The
-content is not validated as UTF-8 and may contain zero bytes. `$global` makes the name
-available in every namespace, and `$immutable` makes the bytes read-only outside this
-class.
+The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
 
 #### add
 
