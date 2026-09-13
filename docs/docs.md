@@ -1084,6 +1084,16 @@ valk doc lib/ -o docs/api.md --markdown --full   # Whole blocks, not just summar
 
 In markdown the first paragraph of each block is shown as a comment above the signature, so the signature list stays readable; `--full` also prints the whole block under it.
 
+The JSON lists every namespace's aliases, classes, functions, globals, error
+types and enums, so tools can compare two versions of an API. The repository
+does exactly that: `make test-api-compat` checks that the standard library is
+still a superset of the last stable release recorded in
+`tests/api-compat/baseline.json`, and reports every removed or changed
+declaration. Only additions are allowed between stable releases; an intentional
+exception is listed in `tests/api-compat/allowed-changes.txt`. After a stable
+release, `make api-baseline STABLE=x.y.z` records the installed version as the
+new baseline.
+
 Editors show the same text on hover, under the signature.
 
 ## Tokens

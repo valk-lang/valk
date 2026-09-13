@@ -44,6 +44,37 @@ always true.
 
 The compression level used when none is given, a balance of speed and size.
 
+## Errors for 'compress'
+
+```js
+// Thrown when decompressing DEFLATE, zlib or gzip data fails.
+error CompressError (invalid_input, checksum, truncated, too_large, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+```
+
+### CompressError
+
+Thrown when decompressing DEFLATE, zlib or gzip data fails.
+
+- `invalid_input`: the data is not a valid stream (bad header, block type, Huffman
+  code or distance; zlib preset dictionaries are not supported).
+- `checksum`: the gzip CRC-32 and length trailer or the zlib Adler-32 trailer does not
+  match the output.
+- `truncated`: the stream ends early.
+- `too_large`: the output would exceed the caller's `max_size`.
+
+Also carries every `io.IoError` code.
+
+## Enums for 'compress'
+
+```js
+// A compressed data format; all three carry the same DEFLATE data.
++ enum Format { deflate, zlib, gzip }
+```
+
+### Format
+
+A compressed data format; all three carry the same DEFLATE data.
+
 ## Functions for 'compress'
 
 ```js
@@ -279,6 +310,49 @@ Fills `buf` with decompressed bytes and returns how many were written; 0 means t
 ### EXEC_FAILED
 
 The exit code `exec` returns when it cannot run the shell or collect its status.
+
+## Errors for 'core'
+
+```js
+// A general-purpose error with the single code `error`.
++ error AnError (error)
+// A resource could not be created or set up (`init`).
++ error InitError (init)
+// Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
++ error IterError (end)
+// A lookup failed: `missing` (no such key or item), `exists` (already present), `range` (index out of range) or `empty` (the container is empty).
++ error LookupError (missing, exists, range, empty)
+// Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
++ error SyntaxError (syntax)
+// An operating-system call failed (`failed`) or is not available on this platform (`unsupported`).
++ error SystemError (failed, unsupported)
+```
+
+### AnError
+
+A general-purpose error with the single code `error`.
+
+### InitError
+
+A resource could not be created or set up (`init`).
+
+### IterError
+
+Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
+
+### LookupError
+
+A lookup failed: `missing` (no such key or item), `exists` (already present), `range`
+(index out of range) or `empty` (the container is empty).
+
+### SyntaxError
+
+Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
+
+### SystemError
+
+An operating-system call failed (`failed`) or is not available on this platform
+(`unsupported`).
 
 ## Functions for 'core'
 
@@ -5862,6 +5936,33 @@ The default is 1 MiB. Creating a coroutine resets it to 0.
 
 # crypto
 
+## Errors for 'crypto'
+
+```js
+// Thrown by the decoders, password hashes and key derivation functions of `crypto`.
+error CryptoError (invalid_input, write)
+```
+
+### CryptoError
+
+Thrown by the decoders, password hashes and key derivation functions of `crypto`.
+
+- `invalid_input`: malformed base64, radix-64 or hex input, or a parameter out of range
+  (bcrypt cost or salt length, a zero or too large pbkdf2/hkdf output length, a BLAKE2b
+  hash size or key over 64 bytes, an empty blowfish key).
+- `write`: the `io.Writer` given to `base64_decode_into` or `hex_decode_into` failed.
+
+## Enums for 'crypto'
+
+```js
+// The hash functions available through `hasher`, `hash` and `Hmac`.
++ enum HashAlgorithm { md5, sha1, sha256, sha384, sha512 }
+```
+
+### HashAlgorithm
+
+The hash functions available through `hasher`, `hash` and `Hmac`.
+
 ## Functions for 'crypto'
 
 ```js
@@ -7383,6 +7484,23 @@ Buffer length used when asking the OS for a path; longer paths fail with `.os`.
 
 Counted in bytes, or in UTF-16 units on Windows.
 
+## Enums for 'fs'
+
+```js
+// The kind of file system entry reported by `stat`.
++ enum FileKind { file, directory, other }
+// How `open` treats the contents of a file it opens for writing.
++ enum WriteMode { preserve, truncate, append }
+```
+
+### FileKind
+
+The kind of file system entry reported by `stat`.
+
+### WriteMode
+
+How `open` treats the contents of a file it opens for writing.
+
 ## Functions for 'fs'
 
 ```js
@@ -8405,6 +8523,104 @@ Replaces `<` with `&lt;`.
 Replaces `'` with `&#39;`.
 
 # http
+
+## Errors for 'http'
+
+```js
+// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
+error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
+// Thrown by the HTTP client and by starting an HTTP server.
+error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled, invalid, http413, incomplete, missing_host_header, not_implemented) extends (net:NetError, io:IoError, HttpParseError)
+// Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
+error HttpParseError (invalid, http413, incomplete, missing_host_header, not_implemented, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+// A router error.
+error RouteError (invalid)
+// Thrown by `WebSocket` methods.
+error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_request, init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (net:NetError, io:IoError)
+```
+
+### H2Error
+
+An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
+
+No public function throws it; the server answers with a connection error instead.
+
+- `incomplete`: fewer bytes than a whole frame are buffered.
+- `protocol`: a frame breaks RFC 9113 rules (wrong stream id, unexpected frame kind,
+  bad padding, invalid SETTINGS value, a zero window increment).
+- `frame_size`: a frame is longer than allowed or has the wrong length for its kind.
+- `flow_control`: a window would exceed 2^31-1 or received data exceeds the window.
+- `compression`: an HPACK header block cannot be decoded.
+- `limit`: a header block or header list exceeds the configured size, or a response
+  stalls longer than the server's `write_timeout_ms`.
+
+### HttpError
+
+Thrown by the HTTP client and by starting an HTTP server.
+
+- `invalid_url`: the URL is not `http`/`https`, contains credentials, or has an
+  unsafe host or an invalid port.
+- `invalid_response`: the response could not be parsed, or `ClientRequest.response`
+  was called on a request that failed.
+- `in_progress`: `ClientRequest.response` was called before the response arrived.
+- `too_many_redirects`: a response still redirects after `max_redirects` were followed.
+- `invalid_request`: the method, path, query or a header is unsafe to send, or a
+  header is one the client sets itself.
+- `response_too_large`: the response exceeds `max_response_header_size` or
+  `max_response_body_size`.
+
+Also carries every `net.NetError` and `HttpParseError` code; the client uses `timeout`,
+`read`, `write` and `ssl`; `Server.start` throws `init` when it was started before, when
+`http2` is set without TLS or with a fast handler, or when a worker cannot start.
+
+### HttpParseError
+
+Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
+
+- `invalid`: the start line, a header, `Content-Length` or chunked framing is malformed
+  or contradictory.
+- `http413`: the header section exceeds `max_header_size` or the body exceeds
+  `max_body_size`.
+- `incomplete`: more input is needed; call again once more bytes arrived.
+- `missing_host_header`: an HTTP/1.1 request has no `Host` header.
+- `not_implemented`: `Transfer-Encoding` names a coding other than a final `chunked`.
+
+Also carries every `io.IoError` code.
+
+### RouteError
+
+A router error.
+
+- `invalid`: not raised by the standard library.
+
+### WebSocketError
+
+Thrown by `WebSocket` methods.
+
+- `protocol`: the peer sent a frame that breaks RFC 6455 (bad opcode, a fragmented or
+  oversized control frame, a text message that is not UTF-8, a missing or unexpected
+  mask). The connection is closed with code 1002 or 1007.
+- `too_large`: a message exceeds `max_message_size`; closed with code 1009.
+- `handshake`: the server did not accept the upgrade, or its answer is not a valid
+  WebSocket handshake.
+- `invalid_url`: `connect` was given a URL that is not `ws://` or `wss://`.
+- `invalid_request`: an extra header given to `connect` is unsafe to send or one the
+  client sets itself.
+
+Also carries every `net.NetError` and `io.IoError` code: `closed` once the connection is
+closed, from either side, `ssl` for a failed `wss://` handshake, and `timeout`,
+`cancelled`, `read` and `write` from the socket.
+
+## Enums for 'http'
+
+```js
+// The kind of a WebSocket message.
++ enum WebSocketMessageType { text, binary }
+```
+
+### WebSocketMessageType
+
+The kind of a WebSocket message.
 
 ## Functions for 'http'
 
@@ -9790,6 +10006,50 @@ Whether this is a text message.
 alias Fd for i32
 ```
 
+## Errors for 'io'
+
+```js
+// Thrown by file, stream, process and socket I/O.
+error IoError (open, access, read, write, exists, os, closed, timeout, range, cancelled)
+```
+
+### IoError
+
+Thrown by file, stream, process and socket I/O.
+
+- `open`: a file or directory cannot be opened or its metadata read (for example it
+  does not exist, or the open options allow neither reading nor writing).
+- `access`: creating, deleting, moving, copying, linking or changing the permissions of
+  a path failed.
+- `read`: reading from a file, stream, pipe or socket failed.
+- `write`: writing to a file, stream, pipe or socket failed or accepted no bytes.
+- `exists`: `symlink` or `create_dir` found that the path already exists.
+- `os`: another operating-system call failed (process spawning, path lookup, event
+  loop setup).
+- `closed`: the stream, connection, directory iterator, socket or compressor is closed,
+  the peer closed it, or the process was detached.
+- `timeout`: a socket read, write or wait ran past its timeout.
+- `range`: a seek target lies before the start, past the end of a `ByteReader`, or
+  beyond the largest file offset.
+- `cancelled`: the connection's cancellation token fired.
+
+## Enums for 'io'
+
+```js
+// Newline translation mode of a descriptor, for `set_mode`.
++ enum Mode { text, binary }
+// The reference point of a seek offset.
++ enum SeekFrom { start, current, end }
+```
+
+### Mode
+
+Newline translation mode of a descriptor, for `set_mode`.
+
+### SeekFrom
+
+The reference point of a seek offset.
+
 ## Functions for 'io'
 
 ```js
@@ -10133,6 +10393,44 @@ A destination for bytes.
 Writes bytes from `data` and returns the count, which may be less than `data.length`.
 
 # json
+
+## Errors for 'json'
+
+```js
+// Thrown by typed decoding when the input does not fit the target type.
++ error DecodeError (wrong_type, missing, invalid, too_deep, too_large) extends (ParseError) payload { at_index: uint, message: String, character: u8 (0) }
+// Thrown when JSON input cannot be parsed.
++ error ParseError (invalid, too_deep, too_large) payload { at_index: uint, message: String, character: u8 (0) }
+```
+
+### DecodeError
+
+Thrown by typed decoding when the input does not fit the target type.
+
+Adds `.wrong_type` (a value has the wrong JSON type or is out of range for the
+target number type) and `.missing` (a required field is absent) to the `ParseError`
+values, with the same payload.
+
+### ParseError
+
+Thrown when JSON input cannot be parsed.
+
+`.invalid` is a syntax error (including invalid UTF-8 and out-of-range numbers),
+`.too_deep` means nesting exceeded `max_depth`, and `.too_large` means the input
+exceeded `max_bytes` or `max_entries`. The payload carries a `message`, the byte
+offset `at_index` where parsing stopped, and the offending byte in `character`
+(`0` when there is none).
+
+## Enums for 'json'
+
+```js
+// The type of a JSON value, as reported by `Value.kind`.
++ enum Kind { null, string, bool, int, float, array, object }
+```
+
+### Kind
+
+The type of a JSON value, as reported by `Value.kind`.
 
 ## Functions for 'json'
 
@@ -11093,6 +11391,8 @@ Returns `value` with its fractional part removed, rounding toward zero.
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
+// Old name of `equals_bytes`, kept because 0.7.0 shipped it.
++ fn equal_bytes(a: ptr, b: ptr, length: uint) bool
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.
@@ -11186,6 +11486,10 @@ Copies the `T` at `from` to `to`; the two must not overlap.
 
 `T` must be an inline value type without GC references; anything else is a compile error.
 
+### equal_bytes
+
+Old name of `equals_bytes`, kept because 0.7.0 shipped it.
+
 ### equals
 
 Returns whether `a` and `b` have the same length and bytes.
@@ -11253,6 +11557,42 @@ fine. Throws `SyntaxError` for an empty view, any other byte or a value above th
 maximum.
 
 # net
+
+## Errors for 'net'
+
+```js
+// Thrown by address resolution, sockets, connections and TLS.
+error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+```
+
+### NetError
+
+Thrown by address resolution, sockets, connections and TLS.
+
+- `init`: a socket could not be created or configured, `accept` failed, or the
+  resolver thread could not start.
+- `connect`: connecting to the remote address failed.
+- `disconnected`: not raised by the standard library.
+- `invalid_host`: the host could not be resolved, is not numeric where a numeric
+  address is required, or has an unsupported address family.
+- `ssl`: TLS setup failed (certificate, key, CA file, version, ciphers, ALPN, SNI) or
+  the TLS handshake failed.
+- `port_in_use`: binding or listening failed because the address is already in use;
+  other bind failures throw `access` or `os`.
+- `max_connections`: `accept` hit the process or system file descriptor limit.
+
+Also carries every `io.IoError` code.
+
+## Enums for 'net'
+
+```js
+// A TLS protocol version, for the minimum and maximum version settings.
++ enum TlsVersion : : i32 { tls_1_2 (TLS1_2_VERSION), tls_1_3 (TLS1_3_VERSION) }
+```
+
+### TlsVersion
+
+A TLS protocol version, for the minimum and maximum version settings.
 
 ## Functions for 'net'
 
@@ -12314,6 +12654,25 @@ Throws `closed` after `close` and `os` when the system refuses.
 
 # regex
 
+## Errors for 'regex'
+
+```js
+// Thrown when a regular expression pattern cannot be compiled.
+error RegexError (syntax, unsupported, too_large) payload { message: String, position: uint (0) }
+```
+
+### RegexError
+
+Thrown when a regular expression pattern cannot be compiled.
+
+- `syntax`: the pattern is malformed, or a flag is unknown.
+- `unsupported`: the pattern uses a feature this engine does not have (lookaround,
+  backreferences, `\p` classes).
+- `too_large`: the compiled program exceeds the instruction limit.
+
+The payload holds a `message` and the byte `position` in the pattern (0 for an unknown
+flag or a too large program).
+
 ## Functions for 'regex'
 
 ```js
@@ -12533,6 +12892,36 @@ characters, never at either end of the text or right after the previous split.
 
 # signal
 
+## Errors for 'signal'
+
+```js
+// Thrown by the `signal` functions.
+error SignalError (unsupported, init)
+```
+
+### SignalError
+
+Thrown by the `signal` functions.
+
+- `unsupported`: the signal does not exist on this platform (on Windows, everything
+  but `interrupt` and `terminate`).
+- `init`: the dispatcher (its pipe, waker or thread) could not be started, or the OS
+  handler could not be installed.
+
+## Enums for 'signal'
+
+```js
+// A process signal that can be handled, waited for or raised.
++ enum Signal { interrupt, terminate, hangup, quit, user1, user2 }
+```
+
+### Signal
+
+A process signal that can be handled, waited for or raised.
+
+`hangup`, `quit`, `user1` and `user2` do not exist on Windows: every function here
+throws `unsupported` for them there.
+
 ## Functions for 'signal'
 
 ```js
@@ -12606,6 +12995,22 @@ away when `ignore` or `restore` is called for `sig` meanwhile. Throws `unsupport
 `init`.
 
 # sync
+
+## Errors for 'sync'
+
+```js
+// Errors of channels, wakers and cancellation tokens.
++ error SyncError (closed, timeout, cancelled, empty, full, init)
+```
+
+### SyncError
+
+Errors of channels, wakers and cancellation tokens.
+
+`closed`: the channel is closed (and, for a receive, drained). `timeout`: the wait ran
+out. `cancelled`: the cancellation token fired. `empty` / `full`: a `try_recv` /
+`try_send` that could not proceed. `init`: an OS resource (pipe, lock) could not be
+created.
 
 ## Classes for 'sync'
 
@@ -12791,6 +13196,36 @@ Returns true right away when an earlier wake is still pending, consuming it.
 Wakes the waiter; safe from any thread, and kept for the next `wait` when nobody waits.
 
 # template
+
+## Errors for 'template'
+
+```js
+// The base error of `template`; functions throw it as `ParseError`.
+error Error (template_not_found) payload { template_name: String, message: String }
+// Thrown by `render` and `render_content` when a template cannot be rendered.
+error ParseError (parse, missing, write, template_not_found) extends (Error) payload { template_name: String, message: String, index: uint (0), line: uint (0) }
+```
+
+### Error
+
+The base error of `template`; functions throw it as `ParseError`.
+
+- `template_not_found`: `render` was given a name that no template was registered
+  under.
+
+The payload holds the `template_name` involved and a `message`.
+
+### ParseError
+
+Thrown by `render` and `render_content` when a template cannot be rendered.
+
+- `parse`: a syntax error, an unknown variable or property, an unknown template in
+  `@include`/`@extend`, a cycle or too deep nesting; `message` says what and where.
+- `missing`: used inside `@isset`/`@len`; it never leaves `render`.
+- `write`: `render_into` / `render_content_into` could not write to the writer.
+
+Also carries `Error.template_not_found`. The payload adds the `line` and byte `index`
+in the template where the error was found.
 
 ## Functions for 'template'
 
@@ -13534,6 +13969,25 @@ when `year` is outside 1 to 9999.
 Returns the year, 1 to 9999.
 
 # url
+
+## Enums for 'url'
+
+```js
+// Selects which characters `url.encode` may leave unescaped, per URL component.
++ enum Component { unreserved, path, query, fragment }
+```
+
+### Component
+
+Selects which characters `url.encode` may leave unescaped, per URL component.
+
+`unreserved` escapes everything RFC 3986 does not list as unreserved, so it is the
+only choice that cannot change the meaning of a URL; it is the default. The others
+additionally keep punctuation that is legal inside that one component.
+
+`%` and `+` are escaped in every component: `%` introduces an escape sequence, so
+passing it through would make `decode(encode(x)) != x`, and `decode` reads `+` as a
+space.
 
 ## Functions for 'url'
 

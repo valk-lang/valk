@@ -25,6 +25,20 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + value COMPRESS_DEFAULT_LEVEL (6)
 ```
 
+## Errors for 'compress'
+
+```js
+// Thrown when decompressing DEFLATE, zlib or gzip data fails.
+error CompressError (invalid_input, checksum, truncated, too_large, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+```
+
+## Enums for 'compress'
+
+```js
+// A compressed data format; all three carry the same DEFLATE data.
++ enum Format { deflate, zlib, gzip }
+```
+
 ## Functions for 'compress'
 
 ```js
@@ -99,6 +113,23 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // The exit code `exec` returns when it cannot run the shell or collect its status.
 + value EXEC_FAILED (-1)
+```
+
+## Errors for 'core'
+
+```js
+// A general-purpose error with the single code `error`.
++ error AnError (error)
+// A resource could not be created or set up (`init`).
++ error InitError (init)
+// Ends an iteration: an iterator's `_next` method throws `end` when no items are left.
++ error IterError (end)
+// A lookup failed: `missing` (no such key or item), `exists` (already present), `range` (index out of range) or `empty` (the container is empty).
++ error LookupError (missing, exists, range, empty)
+// Text could not be parsed (`syntax`), as thrown by the number parsers such as `to_int`.
++ error SyntaxError (syntax)
+// An operating-system call failed (`failed`) or is not available on this platform (`unsupported`).
++ error SystemError (failed, unsupported)
 ```
 
 ## Functions for 'core'
@@ -1673,6 +1704,20 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 # crypto
 
+## Errors for 'crypto'
+
+```js
+// Thrown by the decoders, password hashes and key derivation functions of `crypto`.
+error CryptoError (invalid_input, write)
+```
+
+## Enums for 'crypto'
+
+```js
+// The hash functions available through `hasher`, `hash` and `Hmac`.
++ enum HashAlgorithm { md5, sha1, sha256, sha384, sha512 }
+```
+
 ## Functions for 'crypto'
 
 ```js
@@ -2250,6 +2295,15 @@ alias pid_t for i32
 + value PATH_MAX (4096)
 ```
 
+## Enums for 'fs'
+
+```js
+// The kind of file system entry reported by `stat`.
++ enum FileKind { file, directory, other }
+// How `open` treats the contents of a file it opens for writing.
++ enum WriteMode { preserve, truncate, append }
+```
+
 ## Functions for 'fs'
 
 ```js
@@ -2563,6 +2617,28 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```
 
 # http
+
+## Errors for 'http'
+
+```js
+// An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
+error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
+// Thrown by the HTTP client and by starting an HTTP server.
+error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled, invalid, http413, incomplete, missing_host_header, not_implemented) extends (net:NetError, io:IoError, HttpParseError)
+// Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
+error HttpParseError (invalid, http413, incomplete, missing_host_header, not_implemented, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+// A router error.
+error RouteError (invalid)
+// Thrown by `WebSocket` methods.
+error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_request, init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (net:NetError, io:IoError)
+```
+
+## Enums for 'http'
+
+```js
+// The kind of a WebSocket message.
++ enum WebSocketMessageType { text, binary }
+```
 
 ## Functions for 'http'
 
@@ -2967,6 +3043,22 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 alias Fd for i32
 ```
 
+## Errors for 'io'
+
+```js
+// Thrown by file, stream, process and socket I/O.
+error IoError (open, access, read, write, exists, os, closed, timeout, range, cancelled)
+```
+
+## Enums for 'io'
+
+```js
+// Newline translation mode of a descriptor, for `set_mode`.
++ enum Mode { text, binary }
+// The reference point of a seek offset.
++ enum SeekFrom { start, current, end }
+```
+
 ## Functions for 'io'
 
 ```js
@@ -3078,6 +3170,22 @@ alias Fd for i32
 ```
 
 # json
+
+## Errors for 'json'
+
+```js
+// Thrown by typed decoding when the input does not fit the target type.
++ error DecodeError (wrong_type, missing, invalid, too_deep, too_large) extends (ParseError) payload { at_index: uint, message: String, character: u8 (0) }
+// Thrown when JSON input cannot be parsed.
++ error ParseError (invalid, too_deep, too_large) payload { at_index: uint, message: String, character: u8 (0) }
+```
+
+## Enums for 'json'
+
+```js
+// The type of a JSON value, as reported by `Value.kind`.
++ enum Kind { null, string, bool, int, float, array, object }
+```
 
 ## Functions for 'json'
 
@@ -3394,6 +3502,8 @@ alias Fd for i32
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
+// Old name of `equals_bytes`, kept because 0.7.0 shipped it.
++ fn equal_bytes(a: ptr, b: ptr, length: uint) bool
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.
@@ -3419,6 +3529,20 @@ alias Fd for i32
 ```
 
 # net
+
+## Errors for 'net'
+
+```js
+// Thrown by address resolution, sockets, connections and TLS.
+error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+```
+
+## Enums for 'net'
+
+```js
+// A TLS protocol version, for the minimum and maximum version settings.
++ enum TlsVersion : : i32 { tls_1_2 (TLS1_2_VERSION), tls_1_3 (TLS1_3_VERSION) }
+```
 
 ## Functions for 'net'
 
@@ -3721,6 +3845,13 @@ alias Fd for i32
 
 # regex
 
+## Errors for 'regex'
+
+```js
+// Thrown when a regular expression pattern cannot be compiled.
+error RegexError (syntax, unsupported, too_large) payload { message: String, position: uint (0) }
+```
+
 ## Functions for 'regex'
 
 ```js
@@ -3790,6 +3921,20 @@ alias Fd for i32
 
 # signal
 
+## Errors for 'signal'
+
+```js
+// Thrown by the `signal` functions.
+error SignalError (unsupported, init)
+```
+
+## Enums for 'signal'
+
+```js
+// A process signal that can be handled, waited for or raised.
++ enum Signal { interrupt, terminate, hangup, quit, user1, user2 }
+```
+
 ## Functions for 'signal'
 
 ```js
@@ -3812,6 +3957,13 @@ alias Fd for i32
 ```
 
 # sync
+
+## Errors for 'sync'
+
+```js
+// Errors of channels, wakers and cancellation tokens.
++ error SyncError (closed, timeout, cancelled, empty, full, init)
+```
 
 ## Classes for 'sync'
 
@@ -3870,6 +4022,15 @@ alias Fd for i32
 ```
 
 # template
+
+## Errors for 'template'
+
+```js
+// The base error of `template`; functions throw it as `ParseError`.
+error Error (template_not_found) payload { template_name: String, message: String }
+// Thrown by `render` and `render_content` when a template cannot be rendered.
+error ParseError (parse, missing, write, template_not_found) extends (Error) payload { template_name: String, message: String, index: uint (0), line: uint (0) }
+```
 
 ## Functions for 'template'
 
@@ -4103,6 +4264,13 @@ alias Fd for i32
 ```
 
 # url
+
+## Enums for 'url'
+
+```js
+// Selects which characters `url.encode` may leave unescaped, per URL component.
++ enum Component { unreserved, path, query, fragment }
+```
 
 ## Functions for 'url'
 
