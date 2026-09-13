@@ -55,6 +55,7 @@
 * [JSON](#json)
 * [DateTime](#datetime)
 * [Coroutines](#coroutines)
+* [Threads](#threads)
 * [Channels and cancellation](#channels-and-cancellation)
 * [Signals](#signals)
 * [Access Types](#access-types)
@@ -1409,6 +1410,36 @@ fn main() {
 
 Every coroutine runs on its own 1 MB stack; `main` gets 8 MB. Exhausting it, for example with very deep recursion, ends the program with a `Stack overflow` panic; keep large buffers on the heap.
 
+
+## Threads
+
+API for [valk.thread](api.md#thread)
+
+`thread.start(fn)` runs a closure on a new OS thread and returns a `Thread` to
+`await`; `Thread[T].start` does the same for a closure that returns a value. A
+`ThreadGroup[T]` starts several workers and returns their results as each one
+finishes:
+
+```rust
+use valk.thread
+
+let numbers = Array[int]{ 1, 2, 3 }
+let group = thread.ThreadGroup[int].new()
+each numbers as number {
+    group.start(fn() int { return number * number }) ! panic("Could not start a worker")
+}
+let total = 0
+while group.has_pending() {
+    let index, result = group.await_next() ! break
+    total += result
+}
+println(total) // 14
+```
+
+A closure that runs on another thread is a `shared fn`: it may capture numbers
+and `shared` values, so an object or string it needs is published first, as in
+`let name: shared String = "Ada" + "!"`. See [Data races](#data-races) for the
+rules and `Lock[T]` for mutable state.
 
 ## Channels and cancellation
 
