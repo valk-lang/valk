@@ -1,0 +1,358 @@
+use valk.http
+use valk.net
+use valk.time
+use valk.sync
+
+global ws_last_close_code: u16 (0)
+global ws_last_close_reason: String ("")
+global ws_server_saw_close: bool (false)
+global ws_raw_close_code: u16 (0)
+global ws_idle_saw_close: bool (false)
+
+// Records the close code in its own global: tests run concurrently
+fn ws_record_handler(req: http.Request) http.Response {
+    return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+        while true {
+            let msg = ws.read() ! {
+                ws_raw_close_code = ws.close_code
+                break
+            }
+            ws.write(msg.data) ! break
+        }
+    })
+}
+
+fn ws_idle_handler(req: http.Request) http.Response {
+    return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+        ws.read() ! {
+            ws_idle_saw_close = true
+        }
+    })
+}
+
+fn ws_echo_handler(req: http.Request) http.Response {
+    if req.path == "/echo" {
+        return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+            while true {
+                let msg = ws.read() ! {
+                    ws_last_close_code = ws.close_code
+                    ws_last_close_reason = ws.close_reason
+                    ws_server_saw_close = true
+                    break
+                }
+                if msg.is_text : ws.write(msg.data) ! break
+                else : ws.write_binary(msg.data) ! break
+            }
+        })
+    }
+    if req.path == "/small" {
+        return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+            ws.max_message_size = 100
+            while true {
+                ws.read() ! break
+            }
+        })
+    }
+    if req.path == "/push" {
+        return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+            // Push from a second coroutine while this one waits for the client's reply
+            let pusher = co fn() {
+                ws.write("one") ! return
+                ws.write("two") ! return
+                ws.write("three") ! return
+            }()
+            let reply = ws.read() ! { await pusher; return }
+            await pusher
+            if reply.data == "got them" : ws.close(1000, "bye") ! {}
+        })
+    }
+    return http.Response.text("plain " + req.path)
+}
+
+fn ws_frame(opcode: u8, payload: String, mask: bool, fin: bool (true)) String {
+    let out = ByteBuffer.new(payload.bytes + 8)
+    out.write_byte((fin ? 0x80 : 0) | opcode)
+    let mask_bit: u8 = mask ? 0x80 : 0
+    if payload.bytes < 126 {
+        out.write_byte(mask_bit | payload.bytes.to(u8))
+    } else {
+        out.write_byte(mask_bit | 126)
+        out.write_u16_be(payload.bytes.to(u16))
+    }
+    if mask {
+        // A fixed key keeps the expected bytes easy to compute
+        out.write("\x01\x02\x03\x04")
+        each payload as byte, i {
+            out.write_byte(byte ^ (i % 4 + 1).to(u8))
+        }
+    } else {
+        out.write(payload)
+    }
+    return out.to_string()
+}
+
+// Opens a raw socket, completes the handshake by hand and returns the connection
+fn ws_raw_client(port: u16, path: String) net.TcpConnection {
+    let con = net.tcp_client("127.0.0.1", port) !!
+    con.write("GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n") !!
+    let buf = [u8]{ 0 x 4096 }
+    let response = ""
+    while !response.contains("\r\n\r\n") {
+        let bytes = con.read(buf) !!
+        response += buf.view(0, bytes).to_string()
+    }
+    assert(response.starts_with("HTTP/1.1 101 "))
+    assert(response.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"))
+    assert(!response.contains("Content-Type"))
+    return con
+}
+
+// Reads one close frame from the server and returns its code
+fn ws_read_close_code(con: net.TcpConnection) u16 {
+    let buf = [u8]{ 0 x 256 }
+    let got: uint = 0
+    while got < 4 {
+        got += con.read(buf.view(got, 256 - got)) !!
+    }
+    assert(buf[0] == 0x88)
+    return (buf[2].to(u16) << 8) | buf[3].to(u16)
+}
+
+test "WebSocket: echo text and binary, ping, fragments, large frames and close handshake" {
+    let server = http.Server.new("127.0.0.1", 19495, ws_echo_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    // Plain requests still work next to the upgrade path
+    let plain = http.get("http://127.0.0.1:19495/other") !!
+    assert(plain.body == "plain /other")
+    let not_upgrade = http.get("http://127.0.0.1:19495/echo") !!
+    assert(not_upgrade.status == 400)
+
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19495/echo") !!
+    assert(!ws.is_closed)
+    ws.write("hello") !!
+    let reply = ws.read() !!
+    assert(reply.is_text && reply.data == "hello")
+
+    ws.write_binary("\x00\x01\xff") !!
+    let binary = ws.read() !!
+    assert(!binary.is_text && binary.data == "\x00\x01\xff")
+
+    // 16-bit and 64-bit length frames, with a 200 KB message
+    let medium = "".pad_right('m', 70000)
+    ws.write(medium) !!
+    assert((ws.read() !!).data == medium)
+    let big = ByteBuffer.new(200_000)
+    let i: uint = 0
+    while i < 200_000 {
+        big.write_byte((i % 251).to(u8))
+        i++
+    }
+    ws.write_binary(big) !!
+    let out = ByteBuffer.new(200_000)
+    let type = ws.read_into(out) !!
+    assert(type == http.WebSocketMessageType.binary)
+    assert(out.length == 200_000 && out.to_string() == big.to_string())
+
+    // A ping is answered without disturbing the next message
+    ws.ping("p") !!
+    ws.write("after ping") !!
+    assert((ws.read() !!).data == "after ping")
+
+    // Unicode text survives the UTF-8 check
+    ws.write("héllo 🎉") !!
+    assert((ws.read() !!).data == "héllo 🎉")
+
+    ws.close(1000, "done") !!
+    assert(ws.is_closed)
+    assert(ws.close_code == 1000 && ws.close_reason == "done")
+    ws.write("late") ! {
+        assert(error_is(E.code, closed))
+    }
+    time.sleep_ms(20)
+    assert(ws_server_saw_close)
+    assert(ws_last_close_code == 1000 && ws_last_close_reason == "done")
+
+    // A message over the server's limit closes with 1009
+    let small = http.WebSocket.connect("ws://127.0.0.1:19495/small") !!
+    small.write("".pad_right('x', 101)) !!
+    small.read() ! {
+        assert(error_is(E.code, closed))
+    }
+    assert(small.close_code == 1009)
+
+    // Two coroutines on one socket: the server pushes while waiting for a reply
+    let push = http.WebSocket.connect("ws://127.0.0.1:19495/push") !!
+    let received = Array[String].new()
+    while received.length < 3 {
+        received.append((push.read() !!).data)
+    }
+    assert(received.join(",") == "one,two,three")
+    push.write("got them") !!
+    push.read() ! {
+        assert(error_is(E.code, closed))
+    }
+    assert(push.close_code == 1000 && push.close_reason == "bye")
+
+    server.request_shutdown(1000)
+    await running !!
+}
+
+test "WebSocket: raw frames, masking rules, fragmentation and protocol errors" {
+    let server = http.Server.new("127.0.0.1", 19496, ws_record_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    // A fragmented text message is echoed as one frame
+    let con = ws_raw_client(19496, "/echo")
+    con.write(ws_frame(1, "ab", true, false)) !!
+    con.write(ws_frame(0, "cd", true, false)) !!
+    con.write(ws_frame(0, "ef", true)) !!
+    let buf = [u8]{ 0 x 64 }
+    let bytes = con.read(buf) !!
+    assert(bytes == 8)
+    assert(buf[0] == 0x81 && buf[1] == 6)
+    assert(buf.view(2, 6).to_string() == "abcdef")
+
+    // A ping gets a pong with the same payload; the server does not mask
+    con.write(ws_frame(9, "hi", true)) !!
+    bytes = con.read(buf) !!
+    assert(bytes == 4 && buf[0] == 0x8a && buf[1] == 2 && buf.view(2, 2).to_string() == "hi")
+
+    // A close frame is answered with a close frame carrying the same code
+    con.write(ws_frame(8, "\x03\xe9", true)) !!
+    assert(ws_read_close_code(con) == 1001)
+    con.close() !!
+    time.sleep_ms(20)
+    assert(ws_raw_close_code == 1001)
+
+    // An unmasked client frame is a protocol error
+    con = ws_raw_client(19496, "/echo")
+    con.write(ws_frame(1, "unmasked", false)) !!
+    assert(ws_read_close_code(con) == 1002)
+    con.close() !!
+
+    // A continuation without a start is a protocol error
+    con = ws_raw_client(19496, "/echo")
+    con.write(ws_frame(0, "x", true)) !!
+    assert(ws_read_close_code(con) == 1002)
+    con.close() !!
+
+    // Invalid UTF-8 in a text message closes with 1007
+    con = ws_raw_client(19496, "/echo")
+    con.write(ws_frame(1, "\xff\xfe", true)) !!
+    assert(ws_read_close_code(con) == 1007)
+    con.close() !!
+
+    // A fragmented control frame is a protocol error
+    con = ws_raw_client(19496, "/echo")
+    con.write(ws_frame(9, "p", true, false)) !!
+    assert(ws_read_close_code(con) == 1002)
+    con.close() !!
+
+    server.request_shutdown(1000)
+    await running !!
+}
+
+fn ws_fast_handler(ctx: http.Context, res: http.ResponseWriter) {
+    if ctx.path.equals("/ws") {
+        res.send_websocket(ctx, fn(ws: http.WebSocket) {
+            let msg = ws.read() ! return
+            ws.write("fast:" + msg.data) ! return
+            ws.close() ! {}
+        })
+        return
+    }
+    res.send("fast plain", 200)
+}
+
+test "WebSocket: fast handler upgrade, handshake failures and shutdown interrupts a read" {
+    let server = http.Server.new("127.0.0.1", 19497)
+    server.fast(ws_fast_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19497/ws") !!
+    ws.write("x") !!
+    assert((ws.read() !!).data == "fast:x")
+    ws.read() ! {
+        assert(error_is(E.code, closed))
+    }
+    assert(ws.close_code == 1000)
+
+    // Not an upgrade: the fast handler answers 400
+    let bad = http.get("http://127.0.0.1:19497/ws") !!
+    assert(bad.status == 400)
+
+    // A server that answers with a normal response fails the handshake
+    http.WebSocket.connect("ws://127.0.0.1:19497/plain") ! {
+        assert(error_is(E.code, handshake))
+    }
+    http.WebSocket.connect("http://127.0.0.1:19497/ws") ! {
+        assert(error_is(E.code, invalid_url))
+    }
+    let reserved = http.Options { headers: http.Headers { "Upgrade" => "h2c" } }
+    http.WebSocket.connect("ws://127.0.0.1:19497/ws", reserved) ! {
+        assert(error_is(E.code, invalid_request))
+    }
+    http.WebSocket.connect("ws://127.0.0.1:1/ws", http.Options { connect_timeout_ms: 500 }) ! {
+        assert(!error_is(E.code, handshake))
+    }
+
+    server.request_shutdown(1000)
+    await running !!
+
+    // A handler blocked in `read` is interrupted by the shutdown
+    let idle = http.Server.new("127.0.0.1", 19498, ws_idle_handler)
+    let idle_running = co idle.start(1)
+    time.sleep_ms(20)
+    let waiting = http.WebSocket.connect("ws://127.0.0.1:19498/echo") !!
+    let start = time.mono_ms()
+    idle.request_shutdown(2000)
+    await idle_running !!
+    assert(time.mono_ms() - start < 1500)
+    assert(ws_idle_saw_close)
+    waiting.read() ! {
+        assert(error_is(E.code, closed))
+    }
+}
+
+test "WebSocket: a cancel token interrupts a pending read" {
+    let server = http.Server.new("127.0.0.1", 19499, ws_echo_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19499/echo") !!
+    let stop: shared sync.CancelToken = sync.CancelToken.new() !!
+    ws.set_cancel(stop)
+    stop.cancel_after(50)
+    ws.read() ! {
+        assert(error_is(E.code, cancelled))
+    }
+    ws.close() ! {}
+
+    server.request_shutdown(1000)
+    await running !!
+}
+
+test "WebSocket: wss:// over the server's TLS certificate" {
+    let server = http.Server.new("127.0.0.1", 19500, ws_echo_handler)
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let ws = http.WebSocket.connect("wss://127.0.0.1:19500/echo", http.Options { verify_tls_cert: false }) !!
+    ws.write("secure") !!
+    assert((ws.read() !!).data == "secure")
+    ws.close() !!
+    assert(ws.close_code == 1000)
+
+    // Verification stays on by default, so the self-signed certificate is refused
+    http.WebSocket.connect("wss://127.0.0.1:19500/echo") ! {
+        assert(error_is(E.code, ssl))
+    }
+
+    server.request_shutdown(1000)
+    await running !!
+}

@@ -65,6 +65,7 @@
 * [Testing](#testing)
 * [HTTP Client](#http-client)
 * [HTTP Server](#http-server)
+    * [WebSockets](#websockets)
 * [Sockets](#sockets)
 * [Templates](#templates)
 * [Crypto](#crypto)
@@ -1806,6 +1807,53 @@ transfer codings do not exist in that version. Higher `HTTP/1.x` minor
 versions are handled as 1.1. A `Connection: close` on an HTTP/1.1 request
 ends the connection after that response; anything pipelined behind it is
 not served.
+
+### WebSockets
+
+A handler turns a request into a WebSocket connection with
+`WebSocket.upgrade(req, handler)`: the server sends the `101` response and then
+runs the handler on the connection, which closes when the handler returns. A
+request that is not a WebSocket upgrade gets a `400` instead. Fast handlers use
+`res.send_websocket(ctx, handler)`. `read` returns whole text or binary messages
+and answers pings by itself; `write` sends a text message, `write_binary` a
+binary one, and `close` runs the closing handshake:
+
+```rust
+use valk.http
+
+fn handler(req: http.Request) http.Response {
+    if req.path == "/chat" {
+        return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+            while true {
+                let msg = ws.read() ! break // `closed` once the client is gone
+                ws.write("echo: " + msg.data) ! break
+            }
+        })
+    }
+    return http.Response.html("<script>new WebSocket('ws://' + location.host + '/chat')</script>")
+}
+```
+
+`WebSocket.connect(url, options)` is the client side, for `ws://` and `wss://`
+URLs; the `http.Options` supply extra headers, the TLS settings and the
+timeouts:
+
+```rust
+let ws = http.WebSocket.connect("ws://127.0.0.1:9000/chat") ! panic("Could not connect")
+ws.write("hello") ! panic("Send failed")
+let reply = ws.read() ! panic("Read failed")
+println(reply.data)
+ws.close() ! {}
+```
+
+A `read` and a `write` may run on different coroutines, so one coroutine can
+wait for messages while another pushes. After a close from either side `read`
+and `write` throw `closed` and `close_code` / `close_reason` say why; a
+dropped connection reports 1006. `max_message_size` (16 MB by default) bounds a
+message, and `set_timeouts` / `set_cancel` work as on a `TcpConnection`.
+Protocol violations by the peer close the connection with 1002 or 1007 and
+throw `protocol`. `Server.request_shutdown` interrupts open WebSockets. Not
+available over HTTP/2.
 
 ## Sockets
 

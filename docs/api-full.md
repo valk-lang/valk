@@ -9281,6 +9281,8 @@ Creates a `text/plain` response.
     + fn send_status(status_code: u16) void
     // Responds with status `code` and a body streamed from `reader`.
     + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
+    // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
+    + fn send_websocket(context: Context, handler: fn(WebSocket)()) void
 }
 ```
 
@@ -9336,6 +9338,14 @@ reader; a reader that ends early fails the response and closes the connection. A
 `Content-Type` in `headers` replaces `content_type`. With a `filename` the body is
 offered as a download under that name. The body is left out like `respond` leaves
 it out, and then the reader is not read.
+
+#### send_websocket
+
+Answers with the WebSocket upgrade and runs `handler` on the connection once the
+response is sent; the fast-handler form of `WebSocket.upgrade`.
+
+A request that is not a valid WebSocket upgrade gets a `400` response and the
+handler never runs.
 
 ```js
 // A route found by `Router.find`: the handler plus the positions of its `@name` parts.
@@ -9594,6 +9604,183 @@ Serves over TLS with the given PEM certificate and private key files.
 
 `cipher_list` applies to TLS 1.2 and older, `cipher_suites` to TLS 1.3. Throws when
 the files or settings cannot be loaded.
+
+```js
+// A WebSocket connection (RFC 6455), on the server or the client side.
++ class WebSocket {
+    // The close code received from the peer, or the one sent when this side closed first; 0 while open, 1006 when the connection dropped without a close frame.
+    ~ close_code: u16
+    // The close reason that came with `close_code`.
+    ~ close_reason: String
+    // The largest message accepted, in bytes; a larger one closes the connection with code 1009. Defaults to 16 MB.
+    + max_message_size: uint
+
+    // Performs the closing handshake and closes the socket.
+    + fn close(code: u16 (1000), reason: String (""), timeout_ms: uint (1000)) void !WebSocketError
+    // Connects to a `ws://` or `wss://` server and completes the opening handshake.
+    + static fn connect(url: String, options: ?Options (null)) WebSocket !WebSocketError
+    // Whether the connection is closed, from either side.
+    + get is_closed: bool
+    // The address of the peer.
+    + fn peer_address() SocketAddress !net:NetError
+    // Sends a ping; the peer answers with a pong that `read` consumes.
+    + fn ping(data: String ("")) void !WebSocketError
+    // Waits for the next text or binary message.
+    + fn read() WebSocketMessage !WebSocketError
+    // Like `read`, but writes the payload to `out` and returns the message type.
+    + fn read_into(out: Writer) WebSocketMessageType !WebSocketError
+    // Makes a blocked `read` or `write` fail with `cancelled` when `token` is cancelled.
+    + fn set_cancel(token: shared CancelToken) void
+    // Sets the socket timeouts in milliseconds; 0 waits forever.
+    + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
+    // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
+    + static fn upgrade(req: Request, handler: fn(WebSocket)()) Response
+    // Sends `text` as one text message; the bytes must be UTF-8.
+    + fn write(text: local &[u8]) void !WebSocketError
+    // Sends `data` as one binary message.
+    + fn write_binary(data: local &[u8]) void !WebSocketError
+}
+```
+
+### WebSocket
+
+A WebSocket connection (RFC 6455), on the server or the client side.
+
+A server gets one from `WebSocket.upgrade`, a client from `WebSocket.connect`. `read`
+returns whole messages and answers pings by itself; `write` and `write_binary` send
+one message each. Reads and writes may run on different coroutines, so one coroutine
+can wait for messages while another sends. `close` performs the closing handshake.
+
+```valk
+fn handler(req: http.Request) http.Response {
+    return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+        while true {
+            let msg = ws.read() ! break
+            ws.write(msg.data) ! break
+        }
+    })
+}
+```
+
+#### close_code
+
+The close code received from the peer, or the one sent when this side closed
+first; 0 while open, 1006 when the connection dropped without a close frame.
+
+#### close_reason
+
+The close reason that came with `close_code`.
+
+#### max_message_size
+
+The largest message accepted, in bytes; a larger one closes the connection
+with code 1009. Defaults to 16 MB.
+
+#### close
+
+Performs the closing handshake and closes the socket.
+
+Sends a close frame with `code` and `reason` (at most 123 bytes), waits up to
+`timeout_ms` for the peer's close frame, and closes the socket either way. Does
+nothing when the connection is closed already. Throws when sending fails.
+
+#### connect
+
+Connects to a `ws://` or `wss://` server and completes the opening handshake.
+
+`options` supplies extra request headers (for example `Origin` or a cookie), the
+TLS settings for `wss://` and the timeouts: `connect_timeout_ms` bounds the
+connection, `timeout_ms` the whole handshake, and `read_timeout_ms` /
+`write_timeout_ms` become the socket timeouts afterwards. Throws `invalid_url`,
+`handshake` when the server answers anything but a matching `101`, and the
+socket's `timeout`, `closed`, `read` and `write`.
+
+#### is_closed
+
+Whether the connection is closed, from either side.
+
+#### peer_address
+
+The address of the peer.
+
+#### ping
+
+Sends a ping; the peer answers with a pong that `read` consumes.
+
+`data` is at most 125 bytes.
+
+#### read
+
+Waits for the next text or binary message.
+
+Pings are answered and pongs skipped on the way. Throws `closed` after the
+closing handshake (see `close_code`) or when the connection dropped, `timeout`
+after the read timeout, `cancelled`, `protocol` and `too_large`.
+
+#### read_into
+
+Like `read`, but writes the payload to `out` and returns the message type.
+
+Throws the writer's error as `write`.
+
+#### set_cancel
+
+Makes a blocked `read` or `write` fail with `cancelled` when `token` is cancelled.
+
+#### set_timeouts
+
+Sets the socket timeouts in milliseconds; 0 waits forever.
+
+A server socket starts with no read timeout and a 5 second write timeout; a client
+socket starts with the timeouts of the `Options` it was connected with.
+
+#### upgrade
+
+Answers a server request with the WebSocket upgrade, then runs `handler` on the
+connection.
+
+The handler runs on the connection's coroutine after the `101` response is sent;
+the connection is closed when it returns. A request that is not a valid WebSocket
+upgrade (RFC 6455 §4.2.1) gets a `400` response instead and the handler never
+runs. `Server.request_shutdown` interrupts the socket, so a blocked `read` then
+fails with `closed`. Not available over HTTP/2.
+
+#### write
+
+Sends `text` as one text message; the bytes must be UTF-8.
+
+#### write_binary
+
+Sends `data` as one binary message.
+
+```js
+// One complete message received over a `WebSocket`.
++ class WebSocketMessage {
+    // The message payload; valid UTF-8 for a text message.
+    + data: String
+    // Whether the message is text or binary.
+    + type: WebSocketMessageType
+
+    // Whether this is a text message.
+    + get is_text: bool
+}
+```
+
+### WebSocketMessage
+
+One complete message received over a `WebSocket`.
+
+#### data
+
+The message payload; valid UTF-8 for a text message.
+
+#### type
+
+Whether the message is text or binary.
+
+#### is_text
+
+Whether this is a text message.
 
 # io
 
