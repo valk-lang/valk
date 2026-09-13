@@ -10100,8 +10100,14 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + max_server_wide_body_size: uint
     // The port the server listens on.
     ~ port: u16
+    // Lets several processes listen on the same port at once (`SO_REUSEPORT`; not on Windows). Start the new process, then stop the old one, for a restart without refused connections.
+    + reuse_port: bool
     // Whether the server prints startup, connection and error messages.
     + show_info: bool
+    // Stops the server when `SIGINT` or `SIGTERM` arrives (and `SIGHUP` where it exists): the listener closes, in-flight requests get `stop_on_signal_timeout_ms` to finish, and `start` returns. Combine with `reuse_port` for restarts without refused connections.
+    + stop_on_signal: bool
+    // How long in-flight requests may take after a stop signal, in milliseconds.
+    + stop_on_signal_timeout_ms: uint
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
 
@@ -10190,9 +10196,26 @@ reached new connections are answered with 503 as well.
 
 The port the server listens on.
 
+#### reuse_port
+
+Lets several processes listen on the same port at once (`SO_REUSEPORT`; not on
+Windows). Start the new process, then stop the old one, for a restart without
+refused connections.
+
 #### show_info
 
 Whether the server prints startup, connection and error messages.
+
+#### stop_on_signal
+
+Stops the server when `SIGINT` or `SIGTERM` arrives (and `SIGHUP` where it exists):
+the listener closes, in-flight requests get `stop_on_signal_timeout_ms` to finish,
+and `start` returns. Combine with `reuse_port` for restarts without refused
+connections.
+
+#### stop_on_signal_timeout_ms
+
+How long in-flight requests may take after a stop signal, in milliseconds.
 
 #### write_timeout_ms
 
@@ -12055,7 +12078,7 @@ A TLS protocol version, for the minimum and maximum version settings.
 // Connects to a TCP server; the same as `TcpConnection.new`.
 + fn tcp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) TcpConnection !NetError
 // Opens a listening TCP socket; the same as `TcpServer.new`.
-+ fn tcp_server(host: String, port: u16, timeout_ms: uint (5000)) shared TcpServer !NetError
++ fn tcp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) shared TcpServer !NetError
 // Opens a UDP socket that talks to one server; the same as `UdpClient.new`.
 + fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
 // Binds a UDP socket to your own address; the same as `UdpServer.new`.
@@ -12705,7 +12728,7 @@ Sends all of `data` and returns its length.
     // Returns the address the server listens on.
     + fn local_address() SocketAddress !NetError
     // Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000)) shared TcpServer !NetError
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) shared TcpServer !NetError
 }
 ```
 
@@ -12750,7 +12773,9 @@ Throws `closed` after `close` and `os` when the system cannot report it.
 
 Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
 
-Sets `SO_REUSEADDR`; an IPv6 host such as `"::"` also accepts IPv4 clients where the
+Sets `SO_REUSEADDR`, and `SO_REUSEPORT` when `reuse_port` is set so that several
+processes may listen on the same port at once (not on Windows; used for zero-downtime
+restarts). An IPv6 host such as `"::"` also accepts IPv4 clients where the
 system allows it. Throws `invalid_host` or `timeout` when resolving fails, `init` when
 the socket cannot be made, `port_in_use` when the address is already in use, `access`
 when the system refuses it (such as a privileged port), and `os` when binding or
