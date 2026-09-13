@@ -115,6 +115,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + value EXEC_FAILED (-1)
 // The buffer size the `_in` float formatters require: the longest text any of them writes is 40 bytes, so 64 leaves room to spare.
 + value FLOAT_TEXT_SIZE (64)
+// Methods shared by every integer type. The buffer size `to_base_in` requires: a sign plus 64 binary digits.
++ value INT_TEXT_SIZE (65)
 ```
 
 ## Errors for 'core'
@@ -1139,6 +1141,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: i16) i16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i16) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1183,6 +1187,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: i32) i32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i32) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1227,6 +1233,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: i64) i64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i64) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1271,6 +1279,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: i8) i8
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i8) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1315,6 +1325,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: int) int
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: int) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1485,6 +1497,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: u16) u16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u16) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1529,6 +1543,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: u32) u32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u32) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1573,6 +1589,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: u64) u64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u64) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1647,6 +1665,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_ascii_string() String
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u8) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1697,6 +1717,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: uint) uint
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: uint) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -1770,11 +1792,19 @@ error CryptoError (invalid_input, write)
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
 + fn base64_decode(data: local &[u8]) String !CryptoError
 // Decodes standard base64 into `out` and returns the bytes written.
++ fn base64_decode_in(data: local &[u8], out: local mut &[u8]) uint !CryptoError
+// Decodes standard base64 into `out` and returns the bytes written.
 + fn base64_decode_into(data: local &[u8], out: Writer) uint !CryptoError
+// Returns the most bytes that `length` base64 characters can decode to.
++ fn base64_decoded_size(length: uint) uint
 // Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
 + fn base64_encode(data: local &[u8]) String
+// Writes `data` encoded as standard padded base64 into `out` and returns the bytes written.
++ fn base64_encode_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
 + fn base64_encode_into(data: local &[u8], out: Writer) uint !io:IoError
+// Returns the number of base64 characters that encode `length` bytes, padding included.
++ fn base64_encoded_size(length: uint) uint
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
 + fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
@@ -1789,8 +1819,12 @@ error CryptoError (invalid_input, write)
 + fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
 // Returns the digest of `data` as lowercase hex.
 + fn hash_hex(algorithm: HashAlgorithm, data: local &[u8]) String
+// Writes the digest of `data` as lowercase hex into `out` and returns the bytes written.
++ fn hash_hex_in(algorithm: HashAlgorithm, data: local &[u8], out: local mut &[u8]) uint
 // Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
 + fn hash_hex_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw digest of `data` into `out` and returns the bytes written.
++ fn hash_in(algorithm: HashAlgorithm, data: local &[u8], out: local mut &[u8]) uint
 // Writes the raw digest of `data` to `out` and returns the bytes written.
 + fn hash_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Returns a fresh `Hasher` for `algorithm`.
@@ -1798,9 +1832,13 @@ error CryptoError (invalid_input, write)
 // Decodes hex text (either case) into the raw bytes it represents.
 + fn hex_decode(text: local &[u8]) String !CryptoError
 // Decodes hex text (either case) into `out` and returns the bytes written.
++ fn hex_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
+// Decodes hex text (either case) into `out` and returns the bytes written.
 + fn hex_decode_into(text: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as lowercase hex, two characters per byte.
 + fn hex_encode(data: local &[u8]) String
+// Writes `data` as lowercase hex into `out` and returns the bytes written.
++ fn hex_encode_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes `data` as lowercase hex to `out` and returns the bytes written.
 + fn hex_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `ikm` with HKDF (RFC 5869): extract with `salt`, expand with `info`.
@@ -1811,28 +1849,40 @@ error CryptoError (invalid_input, write)
 + fn hkdf_extract(algorithm: HashAlgorithm, salt: local &[u8], ikm: local &[u8]) String
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
+// Writes the MD5 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn md5_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 + fn pbkdf2(algorithm: HashAlgorithm, password: local &[u8], salt: local &[u8], iterations: uint, length: uint) String !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
+// Fills all of `out` with cryptographically secure random bytes and returns its length.
++ fn random_bytes_in(out: local mut &[u8]) uint
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
 + fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
 // Returns the SHA-1 digest of `data` as lowercase hex.
 + fn sha1_hex(data: local &[u8]) String
+// Writes the SHA-1 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha1_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha1_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-256 digest of `data` as lowercase hex.
 + fn sha256_hex(data: local &[u8]) String
+// Writes the SHA-256 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha256_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha256_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-384 digest of `data` as lowercase hex.
 + fn sha384_hex(data: local &[u8]) String
+// Writes the SHA-384 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha384_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha384_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
+// Writes the SHA-512 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha512_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 ```
@@ -3576,6 +3626,13 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 
 # net
 
+## Aliases for 'net'
+
+```js
+// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint. The buffer size `SocketAddress.ip_in` and `to_string_in` require.
++ value ADDRESS_TEXT_SIZE (64)
+```
+
 ## Errors for 'net'
 
 ```js
@@ -3631,7 +3688,6 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
 ```
 
 ```js
-// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
@@ -3644,6 +3700,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn equals(other: SocketAddress) bool
     // Returns the address without the port, as `"127.0.0.1"` or `"::1"`.
     + fn ip() String
+    // Writes `ip()` into `buf` and returns the byte count.
+    + fn ip_in(buf: local mut &[u8]) uint
     // Returns the IPv4 address `a.b.c.d` with `port`.
     + static fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16 (0)) SocketAddress
     // Parses a numeric host such as `"127.0.0.1"`, `"::1"` or `"[::1]"`; never does a DNS lookup.
@@ -3652,6 +3710,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + static fn resolve(host: String, port: u16, timeout_ms: uint (5000)) SocketAddress !NetError
     // Returns the address with its port, as `"127.0.0.1:80"` or `"[::1]:80"`.
     + fn to_string() String
+    // Writes `to_string()` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8]) uint
 }
 ```
 
@@ -4170,6 +4230,13 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 
 # time
 
+## Aliases for 'time'
+
+```js
+// A UTC date and time with microsecond precision, for the years 1 to 9999.
++ value ISO8601_TEXT_SIZE (27)
+```
+
 ## Functions for 'time'
 
 ```js
@@ -4194,7 +4261,6 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ## Classes for 'time'
 
 ```js
-// A UTC date and time with microsecond precision, for the years 1 to 9999.
 + class DateTime {
     // Returns a copy moved by `amount` days of exactly 24 hours, which may be negative.
     + fn add_days(amount: int) DateTime !LookupError
@@ -4222,8 +4288,12 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn equals(other: DateTime) bool
     // Returns the value as text laid out by `pattern`.
     + fn format(pattern: String) String
+    // Writes `format(pattern)` into `buf` and returns the byte count.
+    + fn format_in(pattern: String, buf: local mut &[u8]) uint
     // Writes `format(pattern)` to `out` and returns the bytes written.
     + fn format_into(pattern: String, out: Writer) uint !io:IoError
+    // Returns the number of bytes `format(pattern)` writes for any date.
+    + static fn format_size(pattern: String) uint
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
     // Creates a date and time from whole seconds since the Unix epoch.
@@ -4282,6 +4352,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn second() uint
     // Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
     + fn to_iso8601() String
+    // Writes `to_iso8601()` into `buf` and returns the byte count.
+    + fn to_iso8601_in(buf: local mut &[u8]) uint
     // Writes `to_iso8601()` to `out` and returns the bytes written.
     + fn to_iso8601_into(out: Writer) uint !io:IoError
     // Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.

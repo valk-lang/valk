@@ -880,6 +880,16 @@ compression `gzip_into` / `gunzip_into` family and the crypto `hash_into` /
 `ByteBuffer`, and hand any other writer the finished bytes. Each returns the
 bytes written and throws when the writer fails; the plain form returns a `String`.
 
+Where the output size is known up front there is also an `_in(buf)` form that
+writes into a caller's `local mut &[u8]`, usually a stack array, and returns the
+byte count: the float and integer text writers (`to_string_in`,
+`to_scientific_string_in`, `to_base_in`), `crypto.hex_encode_in`,
+`base64_encode_in`, `hash_in` and `sha256_hex_in`, `random_bytes_in`,
+`DateTime.to_iso8601_in` and `format_in`, and `SocketAddress.to_string_in`.
+The required size is a constant such as `FLOAT_TEXT_SIZE`, or a function of
+the input such as `base64_encoded_size(n)`; a smaller buffer panics like an
+index out of bounds, so the size is checked instead of trusted.
+
 ## Generics
 
 With generics you can generate customized versions of a class or function.

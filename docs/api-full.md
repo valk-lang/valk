@@ -307,6 +307,8 @@ Fills `buf` with decompressed bytes and returns how many were written; 0 means t
 + value EXEC_FAILED (-1)
 // The buffer size the `_in` float formatters require: the longest text any of them writes is 40 bytes, so 64 leaves room to spare.
 + value FLOAT_TEXT_SIZE (64)
+// Methods shared by every integer type. The buffer size `to_base_in` requires: a sign plus 64 binary digits.
++ value INT_TEXT_SIZE (65)
 ```
 
 ### EXEC_FAILED
@@ -317,6 +319,11 @@ The exit code `exec` returns when it cannot run the shell or collect its status.
 
 The buffer size the `_in` float formatters require: the longest text any of them writes
 is 40 bytes, so 64 leaves room to spare.
+
+### INT_TEXT_SIZE
+
+Methods shared by every integer type.
+The buffer size `to_base_in` requires: a sign plus 64 binary digits.
 
 ## Errors for 'core'
 
@@ -3861,6 +3868,8 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn round_up(modulo: i16) i16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i16) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -3960,6 +3969,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -3974,7 +3991,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4028,6 +4046,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: i32) i32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i32) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -4127,6 +4147,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -4141,7 +4169,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4195,6 +4224,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: i64) i64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i64) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -4294,6 +4325,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -4308,7 +4347,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4362,6 +4402,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: i8) i8
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: i8) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: i8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -4461,6 +4503,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -4475,7 +4525,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -4529,6 +4580,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: int) int
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: int) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: int, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -4628,6 +4681,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -4642,7 +4703,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5159,6 +5221,8 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     + fn round_up(modulo: u16) u16
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u16) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u16, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -5258,6 +5322,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -5272,7 +5344,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5326,6 +5399,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: u32) u32
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u32) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u32, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -5425,6 +5500,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -5439,7 +5522,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5493,6 +5577,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: u64) u64
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u64) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u64, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -5592,6 +5678,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -5606,7 +5700,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5690,6 +5785,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_ascii_string() String
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: u8) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: u8, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -5856,6 +5953,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -5870,7 +5975,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -5935,6 +6041,8 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: uint) uint
     // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
     + fn to_base(base: uint) String
+    // Writes the value as text in `base` into `buf` and returns the byte count.
+    + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
     // Writes the value as text in `base` to `out` and returns the bytes written.
     + fn to_base_into(base: uint, out: Writer, lowercase: bool (false)) uint !io:IoError
     // Writes the value as text in `base` to `result` and returns the byte count.
@@ -6042,6 +6150,14 @@ Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
 
 Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
 
+#### to_base_in
+
+Writes the value as text in `base` into `buf` and returns the byte count.
+
+`buf` must hold at least `INT_TEXT_SIZE` (65) bytes; a shorter buffer panics. Nothing is
+allocated. Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise;
+`base` is clamped as in `to_base`. No terminating zero is written.
+
 #### to_base_into
 
 Writes the value as text in `base` to `out` and returns the bytes written.
@@ -6056,7 +6172,8 @@ Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
 above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
-binary digits) and no terminating zero.
+binary digits) and no terminating zero. Unchecked: prefer `to_base_in`, which takes a
+bounds-checked slice, or `to_base_into`.
 
 #### to_hex
 
@@ -6194,11 +6311,19 @@ The hash functions available through `hasher`, `hash` and `Hmac`.
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
 + fn base64_decode(data: local &[u8]) String !CryptoError
 // Decodes standard base64 into `out` and returns the bytes written.
++ fn base64_decode_in(data: local &[u8], out: local mut &[u8]) uint !CryptoError
+// Decodes standard base64 into `out` and returns the bytes written.
 + fn base64_decode_into(data: local &[u8], out: Writer) uint !CryptoError
+// Returns the most bytes that `length` base64 characters can decode to.
++ fn base64_decoded_size(length: uint) uint
 // Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
 + fn base64_encode(data: local &[u8]) String
+// Writes `data` encoded as standard padded base64 into `out` and returns the bytes written.
++ fn base64_encode_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
 + fn base64_encode_into(data: local &[u8], out: Writer) uint !io:IoError
+// Returns the number of base64 characters that encode `length` bytes, padding included.
++ fn base64_encoded_size(length: uint) uint
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
 + fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
@@ -6213,8 +6338,12 @@ The hash functions available through `hasher`, `hash` and `Hmac`.
 + fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
 // Returns the digest of `data` as lowercase hex.
 + fn hash_hex(algorithm: HashAlgorithm, data: local &[u8]) String
+// Writes the digest of `data` as lowercase hex into `out` and returns the bytes written.
++ fn hash_hex_in(algorithm: HashAlgorithm, data: local &[u8], out: local mut &[u8]) uint
 // Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
 + fn hash_hex_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw digest of `data` into `out` and returns the bytes written.
++ fn hash_in(algorithm: HashAlgorithm, data: local &[u8], out: local mut &[u8]) uint
 // Writes the raw digest of `data` to `out` and returns the bytes written.
 + fn hash_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Returns a fresh `Hasher` for `algorithm`.
@@ -6222,9 +6351,13 @@ The hash functions available through `hasher`, `hash` and `Hmac`.
 // Decodes hex text (either case) into the raw bytes it represents.
 + fn hex_decode(text: local &[u8]) String !CryptoError
 // Decodes hex text (either case) into `out` and returns the bytes written.
++ fn hex_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
+// Decodes hex text (either case) into `out` and returns the bytes written.
 + fn hex_decode_into(text: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as lowercase hex, two characters per byte.
 + fn hex_encode(data: local &[u8]) String
+// Writes `data` as lowercase hex into `out` and returns the bytes written.
++ fn hex_encode_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes `data` as lowercase hex to `out` and returns the bytes written.
 + fn hex_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `ikm` with HKDF (RFC 5869): extract with `salt`, expand with `info`.
@@ -6235,28 +6368,40 @@ The hash functions available through `hasher`, `hash` and `Hmac`.
 + fn hkdf_extract(algorithm: HashAlgorithm, salt: local &[u8], ikm: local &[u8]) String
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
+// Writes the MD5 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn md5_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 + fn pbkdf2(algorithm: HashAlgorithm, password: local &[u8], salt: local &[u8], iterations: uint, length: uint) String !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
+// Fills all of `out` with cryptographically secure random bytes and returns its length.
++ fn random_bytes_in(out: local mut &[u8]) uint
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
 + fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
 // Returns the SHA-1 digest of `data` as lowercase hex.
 + fn sha1_hex(data: local &[u8]) String
+// Writes the SHA-1 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha1_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha1_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-256 digest of `data` as lowercase hex.
 + fn sha256_hex(data: local &[u8]) String
+// Writes the SHA-256 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha256_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha256_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-384 digest of `data` as lowercase hex.
 + fn sha384_hex(data: local &[u8]) String
+// Writes the SHA-384 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha384_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha384_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
+// Writes the SHA-512 digest of `data` as hex into `out`; see `hash_hex_in`.
++ fn sha512_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 ```
@@ -6269,6 +6414,13 @@ The `=` padding is optional. Throws `invalid_input` on any other character (incl
 whitespace and line breaks, and the URL-safe `-` and `_`), on an impossible length, or
 when the unused bits of the last character are not zero.
 
+### base64_decode_in
+
+Decodes standard base64 into `out` and returns the bytes written.
+
+`out` must hold at least `base64_decoded_size(data.length)` bytes; a shorter buffer
+panics. Accepts the same input as `base64_decode` and throws `invalid_input` the same way.
+
 ### base64_decode_into
 
 Decodes standard base64 into `out` and returns the bytes written.
@@ -6277,15 +6429,29 @@ Accepts the same input as `base64_decode`, decoded in blocks of 504 characters. 
 `invalid_input` on malformed input and `write` when `out` fails; blocks decoded before
 the error have already been written.
 
+### base64_decoded_size
+
+Returns the most bytes that `length` base64 characters can decode to.
+
 ### base64_encode
 
 Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
+
+### base64_encode_in
+
+Writes `data` encoded as standard padded base64 into `out` and returns the bytes written.
+
+`out` must hold at least `base64_encoded_size(data.length)` bytes; a shorter buffer panics.
 
 ### base64_encode_into
 
 Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
 
 The input is encoded in blocks of 504 bytes, so memory use does not grow with `data`.
+
+### base64_encoded_size
+
+Returns the number of base64 characters that encode `length` bytes, padding included.
 
 ### bcrypt
 
@@ -6330,9 +6496,21 @@ Returns the raw digest of `data` as binary bytes (not text).
 
 Returns the digest of `data` as lowercase hex.
 
+### hash_hex_in
+
+Writes the digest of `data` as lowercase hex into `out` and returns the bytes written.
+
+`out` must hold at least `2 * digest_size(algorithm)` bytes; a shorter buffer panics.
+
 ### hash_hex_into
 
 Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
+
+### hash_in
+
+Writes the raw digest of `data` into `out` and returns the bytes written.
+
+`out` must hold at least `digest_size(algorithm)` bytes; a shorter buffer panics.
 
 ### hash_into
 
@@ -6348,6 +6526,13 @@ Decodes hex text (either case) into the raw bytes it represents.
 
 Throws `invalid_input` on an odd length or a non-hex character.
 
+### hex_decode_in
+
+Decodes hex text (either case) into `out` and returns the bytes written.
+
+`out` must hold at least `text.length / 2` bytes; a shorter buffer panics. Throws
+`invalid_input` on an odd length or a non-hex character.
+
 ### hex_decode_into
 
 Decodes hex text (either case) into `out` and returns the bytes written.
@@ -6359,6 +6544,12 @@ already been written.
 ### hex_encode
 
 Returns `data` encoded as lowercase hex, two characters per byte.
+
+### hex_encode_in
+
+Writes `data` as lowercase hex into `out` and returns the bytes written.
+
+`out` must hold at least `2 * data.length` bytes; a shorter buffer panics.
 
 ### hex_encode_into
 
@@ -6388,6 +6579,10 @@ An empty `salt` is allowed. The result is raw bytes, one digest long.
 
 Returns the MD5 digest of `data` as lowercase hex.
 
+### md5_hex_in
+
+Writes the MD5 digest of `data` as hex into `out`; see `hash_hex_in`.
+
 ### md5_hex_into
 
 Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
@@ -6406,6 +6601,10 @@ Returns a string of `length` cryptographically secure random bytes.
 The bytes are raw binary, not valid UTF-8 text; encode them (e.g. with `hex_encode` or
 `base64_encode`) before printing.
 
+### random_bytes_in
+
+Fills all of `out` with cryptographically secure random bytes and returns its length.
+
 ### random_bytes_into
 
 Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
@@ -6417,6 +6616,10 @@ The bytes are generated and written in chunks of 512, so memory use does not gro
 
 Returns the SHA-1 digest of `data` as lowercase hex.
 
+### sha1_hex_in
+
+Writes the SHA-1 digest of `data` as hex into `out`; see `hash_hex_in`.
+
 ### sha1_hex_into
 
 Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
@@ -6424,6 +6627,10 @@ Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes w
 ### sha256_hex
 
 Returns the SHA-256 digest of `data` as lowercase hex.
+
+### sha256_hex_in
+
+Writes the SHA-256 digest of `data` as hex into `out`; see `hash_hex_in`.
 
 ### sha256_hex_into
 
@@ -6433,6 +6640,10 @@ Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes
 
 Returns the SHA-384 digest of `data` as lowercase hex.
 
+### sha384_hex_in
+
+Writes the SHA-384 digest of `data` as hex into `out`; see `hash_hex_in`.
+
 ### sha384_hex_into
 
 Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
@@ -6440,6 +6651,10 @@ Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes
 ### sha512_hex
 
 Returns the SHA-512 digest of `data` as lowercase hex.
+
+### sha512_hex_in
+
+Writes the SHA-512 digest of `data` as hex into `out`; see `hash_hex_in`.
 
 ### sha512_hex_into
 
@@ -11783,6 +11998,18 @@ maximum.
 
 # net
 
+## Aliases for 'net'
+
+```js
+// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint. The buffer size `SocketAddress.ip_in` and `to_string_in` require.
++ value ADDRESS_TEXT_SIZE (64)
+```
+
+### ADDRESS_TEXT_SIZE
+
+An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
+The buffer size `SocketAddress.ip_in` and `to_string_in` require.
+
 ## Errors for 'net'
 
 ```js
@@ -11934,7 +12161,6 @@ and `init` when the background task cannot start.
 Returns a pointer to the C `sockaddr` of the chosen entry; valid while this object lives.
 
 ```js
-// An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 + struct SocketAddress {
     // True for an IPv6 address, false for IPv4.
     + ipv6: bool
@@ -11947,6 +12173,8 @@ Returns a pointer to the C `sockaddr` of the chosen entry; valid while this obje
     + fn equals(other: SocketAddress) bool
     // Returns the address without the port, as `"127.0.0.1"` or `"::1"`.
     + fn ip() String
+    // Writes `ip()` into `buf` and returns the byte count.
+    + fn ip_in(buf: local mut &[u8]) uint
     // Returns the IPv4 address `a.b.c.d` with `port`.
     + static fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16 (0)) SocketAddress
     // Parses a numeric host such as `"127.0.0.1"`, `"::1"` or `"[::1]"`; never does a DNS lookup.
@@ -11955,12 +12183,10 @@ Returns a pointer to the C `sockaddr` of the chosen entry; valid while this obje
     + static fn resolve(host: String, port: u16, timeout_ms: uint (5000)) SocketAddress !NetError
     // Returns the address with its port, as `"127.0.0.1:80"` or `"[::1]:80"`.
     + fn to_string() String
+    // Writes `to_string()` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8]) uint
 }
 ```
-
-### SocketAddress
-
-An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint.
 
 #### ipv6
 
@@ -11985,6 +12211,12 @@ Returns the address without the port, as `"127.0.0.1"` or `"::1"`.
 IPv6 is written in the RFC 5952 short form (lowercase hex, the longest run of two or
 more zero groups as `::`), followed by `%scope_id` when the scope id is not 0.
 
+#### ip_in
+
+Writes `ip()` into `buf` and returns the byte count.
+
+`buf` must hold at least `ADDRESS_TEXT_SIZE` (64) bytes; a shorter buffer panics.
+
 #### ipv4
 
 Returns the IPv4 address `a.b.c.d` with `port`.
@@ -12006,6 +12238,12 @@ that timed out keeps running on a background thread until the system returns.
 #### to_string
 
 Returns the address with its port, as `"127.0.0.1:80"` or `"[::1]:80"`.
+
+#### to_string_in
+
+Writes `to_string()` into `buf` and returns the byte count.
+
+`buf` must hold at least `ADDRESS_TEXT_SIZE` (64) bytes; a shorter buffer panics.
 
 ```js
 // One TLS session over one socket, either client or server side.
@@ -13731,6 +13969,23 @@ sleeps is not lost. Panics when the OS wait fails.
 
 # time
 
+## Aliases for 'time'
+
+```js
+// A UTC date and time with microsecond precision, for the years 1 to 9999.
++ value ISO8601_TEXT_SIZE (27)
+```
+
+### ISO8601_TEXT_SIZE
+
+A UTC date and time with microsecond precision, for the years 1 to 9999.
+
+There are no time zones or leap seconds. The `with_*` and `add_*` methods return a new
+value; the `modify_*` methods change this one in place and leave it unchanged when they
+throw. Every operation that would leave the year range, or build an invalid date, throws
+`LookupError`.
+The buffer size `DateTime.to_iso8601_in` requires: `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`.
+
 ## Functions for 'time'
 
 ```js
@@ -13796,7 +14051,6 @@ Returns the wall-clock time in microseconds since the Unix epoch (UTC).
 ## Classes for 'time'
 
 ```js
-// A UTC date and time with microsecond precision, for the years 1 to 9999.
 + class DateTime {
     // Returns a copy moved by `amount` days of exactly 24 hours, which may be negative.
     + fn add_days(amount: int) DateTime !LookupError
@@ -13824,8 +14078,12 @@ Returns the wall-clock time in microseconds since the Unix epoch (UTC).
     + fn equals(other: DateTime) bool
     // Returns the value as text laid out by `pattern`.
     + fn format(pattern: String) String
+    // Writes `format(pattern)` into `buf` and returns the byte count.
+    + fn format_in(pattern: String, buf: local mut &[u8]) uint
     // Writes `format(pattern)` to `out` and returns the bytes written.
     + fn format_into(pattern: String, out: Writer) uint !io:IoError
+    // Returns the number of bytes `format(pattern)` writes for any date.
+    + static fn format_size(pattern: String) uint
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
     // Creates a date and time from whole seconds since the Unix epoch.
@@ -13884,6 +14142,8 @@ Returns the wall-clock time in microseconds since the Unix epoch (UTC).
     + fn second() uint
     // Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
     + fn to_iso8601() String
+    // Writes `to_iso8601()` into `buf` and returns the byte count.
+    + fn to_iso8601_in(buf: local mut &[u8]) uint
     // Writes `to_iso8601()` to `out` and returns the bytes written.
     + fn to_iso8601_into(out: Writer) uint !io:IoError
     // Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.
@@ -13910,15 +14170,6 @@ Returns the wall-clock time in microseconds since the Unix epoch (UTC).
     + fn year() int
 }
 ```
-
-### DateTime
-
-A UTC date and time with microsecond precision, for the years 1 to 9999.
-
-There are no time zones or leap seconds. The `with_*` and `add_*` methods return a new
-value; the `modify_*` methods change this one in place and leave it unchanged when they
-throw. Every operation that would leave the year range, or build an invalid date, throws
-`LookupError`.
 
 #### add_days
 
@@ -13986,12 +14237,23 @@ the pattern ends with a backslash.
 dt.format("Y-m-d H:i:s") // 2024-03-05 14:07:09
 ```
 
+#### format_in
+
+Writes `format(pattern)` into `buf` and returns the byte count.
+
+`buf` must hold at least `format_size(pattern)` bytes; a shorter buffer panics, as does a
+pattern ending with a backslash.
+
 #### format_into
 
 Writes `format(pattern)` to `out` and returns the bytes written.
 
 A `ByteBuffer` is written directly; any other writer receives the text in one write.
 Throws when `out` fails.
+
+#### format_size
+
+Returns the number of bytes `format(pattern)` writes for any date.
 
 #### from_format
 
@@ -14133,6 +14395,12 @@ Returns the second, 0 to 59.
 Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
 
 A non-zero microsecond part adds six fraction digits: `2024-03-05T14:07:09.250000Z`.
+
+#### to_iso8601_in
+
+Writes `to_iso8601()` into `buf` and returns the byte count.
+
+`buf` must hold at least `ISO8601_TEXT_SIZE` (27) bytes; a shorter buffer panics.
 
 #### to_iso8601_into
 
