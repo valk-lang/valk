@@ -11543,8 +11543,9 @@ Sets `key` to a string; see `set` for how the container is chosen and returned.
 Returns the value as text; any kind converts.
 
 A string is returned as is (without quotes), numbers and bools are formatted, `null`
-gives `"null"`, and arrays and objects give their compact JSON encoding. Use
-`string_value` to require a string.
+gives an empty string (like a missing member, which `get` also reports as `null`), and
+arrays and objects give their compact JSON encoding. Use `string_value` to require a
+string.
 
 #### string_value
 
