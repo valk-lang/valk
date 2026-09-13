@@ -9626,8 +9626,12 @@ Releases the resource.
     + static fn new(reader: Reader, chunk_size: uint (65536)) LineReader
     // Returns the next line without its `\n` or `\r\n`, or `null` once the input is exhausted.
     + fn read_line() ?String !IoError
+    // Writes the next line to `out` as `read_line` returns it and returns the bytes written, or `null` once the input is exhausted.
+    + fn read_line_into(out: Writer) ?uint !IoError
     // Returns the bytes up to, not including, the next `delimiter`, or `null` at the end.
     + fn read_until(delimiter: u8) ?String !IoError
+    // Writes the bytes up to, not including, the next `delimiter` to `out` and returns the bytes written, or `null` at the end of the input.
+    + fn read_until_into(delimiter: u8, out: Writer) ?uint !IoError
 }
 ```
 
@@ -9653,12 +9657,28 @@ A final line without a newline is returned as well; a newline at the very end do
 produce an extra empty line. The `\r` of a `\r\n` is only dropped when the `\n` was
 there: without it the line keeps its last byte, as `read_until` promises.
 
+#### read_line_into
+
+Writes the next line to `out` as `read_line` returns it and returns the bytes written,
+or `null` once the input is exhausted.
+
+An empty line writes nothing and returns 0. Throws when the reader or `out` fails;
+bytes written to `out` before a failure stay written.
+
 #### read_until
 
 Returns the bytes up to, not including, the next `delimiter`, or `null` at the end.
 
 The input's final bytes are returned as-is when no delimiter follows them. A `.closed`
 error from the reader counts as the end of input.
+
+#### read_until_into
+
+Writes the bytes up to, not including, the next `delimiter` to `out` and returns the
+bytes written, or `null` at the end of the input.
+
+The bytes reach `out` as the reader delivers them, so a long line never sits in memory
+as a whole. Throws when the reader or `out` fails.
 
 ```js
 // A source of bytes that is read one buffer at a time.

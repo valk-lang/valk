@@ -2926,8 +2926,12 @@ alias Fd for i32
     + static fn new(reader: Reader, chunk_size: uint (65536)) LineReader
     // Returns the next line without its `\n` or `\r\n`, or `null` once the input is exhausted.
     + fn read_line() ?String !IoError
+    // Writes the next line to `out` as `read_line` returns it and returns the bytes written, or `null` once the input is exhausted.
+    + fn read_line_into(out: Writer) ?uint !IoError
     // Returns the bytes up to, not including, the next `delimiter`, or `null` at the end.
     + fn read_until(delimiter: u8) ?String !IoError
+    // Writes the bytes up to, not including, the next `delimiter` to `out` and returns the bytes written, or `null` at the end of the input.
+    + fn read_until_into(delimiter: u8, out: Writer) ?uint !IoError
 }
 ```
 
