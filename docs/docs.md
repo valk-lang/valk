@@ -1717,7 +1717,7 @@ Iteration yields each value and name, including repeated fields.
 ```rust
 let headers = http.Headers { "Accept" => "application/json" }
 headers.append("X-Tag", "first")
-headers.append("x-tag", "second")
+headers.append("X-Tag", "second")
 let res = http.request("GET", url, http.Options { headers: headers }) ! panic("Request failed")
 let cookies = res.headers.get_all("Set-Cookie")
 ```

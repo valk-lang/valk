@@ -248,7 +248,7 @@ done
 
 printf '\nMedian of %s runs after one warm-up; memory is peak RSS.\n\n' "$runs"
 printf '| Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |\n'
-printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
+printf '|---|---:|---:|---:|---:|\n'
 for benchmark in "${benchmarks[@]}"; do
     input="$(benchmark_input "$benchmark")"
     valk_time="$(awk -F '\t' -v b="$benchmark" '$1 == b && $2 == "valk" { print $3 }' "$results")"
