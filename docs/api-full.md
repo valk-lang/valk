@@ -10906,7 +10906,6 @@ Returns `value` with its fractional part removed, rounding toward zero.
 + fn copy_bytes(from: ptr, to: ptr, length: uint) void
 // Copies the `T` at `from` to `to`; the two must not overlap.
 + fn copy_value[T](from: *T, to: *T) void
-+ fn equal_bytes(a: ptr, b: ptr, length: uint) bool
 // Returns whether `a` and `b` have the same length and bytes.
 + fn equals(a: local &[u8], b: local &[u8]) bool
 // Returns whether the `length` bytes at `a` and `b` are identical.
