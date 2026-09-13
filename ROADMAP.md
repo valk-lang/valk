@@ -8,6 +8,10 @@
 + Api change guard
 + Enum/error output in `valk doc`
 + fmt correction
++ Selective parsing options
++ Doc generate improvements
++ Websockets
++ Deprecation flagging
 
 - Release 0.7.0
 + Audit API & language syntax
