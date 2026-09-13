@@ -2291,6 +2291,8 @@ alias pid_t for i32
 + fn read(path: String) String !io:IoError
 // Opens the directory `path` for iterating over its entries.
 + fn read_dir(path: String) DirIterator !io:IoError
+// Writes the whole file at `path` to `out` in chunks of `chunk_size` bytes and returns the bytes written; the file is never held in memory as a whole.
++ fn read_into(path: String, out: Writer, chunk_size: uint (65536)) uint !io:IoError
 // Returns the absolute path of `path` with symlinks resolved.
 + fn realpath(path: String) String !io:IoError
 // Makes `path` absolute and folds `.`, `..` and repeated separators.
@@ -2309,6 +2311,8 @@ alias pid_t for i32
 + fn truncate(path: String, length: uint) void !io:IoError
 // Writes `content` to the file at `path`, creating the file when it is missing.
 + fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
+// Writes everything `source` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
++ fn write_from(path: String, source: Reader, append: bool (false), chunk_size: uint (65536)) uint !io:IoError
 ```
 
 ## Classes for 'fs'
@@ -2323,6 +2327,8 @@ alias pid_t for i32
     + fn close() void !io:IoError
     // Returns the next entry name, or `null` once all entries are read.
     + fn next() ?String !io:IoError
+    // Writes the next entry name to `out` and returns the bytes written, or `null` once all entries are read; the names are the ones `next` returns.
+    + fn next_into(out: Writer) ?uint !io:IoError
 }
 ```
 
@@ -2383,6 +2389,8 @@ alias pid_t for i32
     + fn save(path: String) void !io:IoError
     // Returns a copy of the bytes as a `String`.
     + fn to_string() String
+    // Writes the bytes to `out` and returns the count, without copying them first.
+    + fn write_into(out: Writer) uint !io:IoError
 }
 ```
 

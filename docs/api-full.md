@@ -7385,6 +7385,8 @@ Counted in bytes, or in UTF-16 units on Windows.
 + fn read(path: String) String !io:IoError
 // Opens the directory `path` for iterating over its entries.
 + fn read_dir(path: String) DirIterator !io:IoError
+// Writes the whole file at `path` to `out` in chunks of `chunk_size` bytes and returns the bytes written; the file is never held in memory as a whole.
++ fn read_into(path: String, out: Writer, chunk_size: uint (65536)) uint !io:IoError
 // Returns the absolute path of `path` with symlinks resolved.
 + fn realpath(path: String) String !io:IoError
 // Makes `path` absolute and folds `.`, `..` and repeated separators.
@@ -7403,6 +7405,8 @@ Counted in bytes, or in UTF-16 units on Windows.
 + fn truncate(path: String, length: uint) void !io:IoError
 // Writes `content` to the file at `path`, creating the file when it is missing.
 + fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
+// Writes everything `source` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
++ fn write_from(path: String, source: Reader, append: bool (false), chunk_size: uint (65536)) uint !io:IoError
 ```
 
 ### add
@@ -7595,6 +7599,14 @@ Opens the directory `path` for iterating over its entries.
 Throws `.open` when it cannot be opened. The iterator closes itself at the end or when it
 is garbage-collected; call `close` to release it earlier.
 
+### read_into
+
+Writes the whole file at `path` to `out` in chunks of `chunk_size` bytes and returns the
+bytes written; the file is never held in memory as a whole.
+
+Throws `.open` when the file cannot be opened, `.read` when reading fails and the
+writer's error when `out` fails; bytes written before a failure stay written.
+
 ### realpath
 
 Returns the absolute path of `path` with symlinks resolved.
@@ -7661,6 +7673,15 @@ Writes `content` to the file at `path`, creating the file when it is missing.
 Replaces the existing contents, or adds to the end when `append` is set. A new file gets
 permissions `0c644`. Throws `.open` or `.write`.
 
+### write_from
+
+Writes everything `source` yields to the file at `path`, in chunks of `chunk_size`
+bytes, and returns the bytes written; the file is created when it is missing and
+replaced unless `append` is set.
+
+Throws `.open` when the file cannot be opened, `.write` when writing fails and the
+reader's error when `source` fails; a partly written file is left in place.
+
 ## Classes for 'fs'
 
 ```js
@@ -7673,6 +7694,8 @@ permissions `0c644`. Throws `.open` or `.write`.
     + fn close() void !io:IoError
     // Returns the next entry name, or `null` once all entries are read.
     + fn next() ?String !io:IoError
+    // Writes the next entry name to `out` and returns the bytes written, or `null` once all entries are read; the names are the ones `next` returns.
+    + fn next_into(out: Writer) ?uint !io:IoError
 }
 ```
 
@@ -7697,6 +7720,15 @@ Returns the next entry name, or `null` once all entries are read.
 Names are bare, not paths, in file system order; `.` and `..` are skipped. Reaching the end
 closes the iterator, and later calls keep returning `null`. Throws `.closed` after an
 explicit `close` and `.read` when reading fails.
+
+#### next_into
+
+Writes the next entry name to `out` and returns the bytes written, or `null` once all
+entries are read; the names are the ones `next` returns.
+
+On Linux and macOS the name is copied from the OS entry straight to `out` through a
+stack buffer; on Windows it is converted from UTF-16 first. Throws as `next` does,
+and the writer's error when `out` fails.
 
 ```js
 // Metadata of a file system entry, as returned by `stat`.
@@ -7833,6 +7865,8 @@ stream was not opened for writing or the OS fails, and `.closed` when it is clos
     + fn save(path: String) void !io:IoError
     // Returns a copy of the bytes as a `String`.
     + fn to_string() String
+    // Writes the bytes to `out` and returns the count, without copying them first.
+    + fn write_into(out: Writer) uint !io:IoError
 }
 ```
 
@@ -7877,6 +7911,10 @@ Throws `.open` or `.write`.
 #### to_string
 
 Returns a copy of the bytes as a `String`.
+
+#### write_into
+
+Writes the bytes to `out` and returns the count, without copying them first.
 
 ```js
 // Options for `open` and `stream`; the defaults open an existing file read-only.
