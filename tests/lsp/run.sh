@@ -502,6 +502,12 @@ case "$out" in
         ;;
 esac
 
+# A decision that needs a callee's summary parses that body even from an unopened
+# file: lending a stack array to `ByteReader.new` (core is never open) is accepted
+printf 'fn lend_check() uint {\n    let bytes: [u8 x 2] = { 1, 2 }\n    let reader = ByteReader.new(bytes)\n    return reader.read_byte().to(uint)\n}\n' > "$workdir/pkg-one/src/check/lend.valk"
+check_absent "a summary needed for a decision is parsed from an unopened file" 'Cannot convert a local borrow' \
+    "$(notify_open_path "$workdir/pkg-one/src/check/lend.valk")"
+
 # A sibling file whose imports are only used inside its test blocks: the LSP never
 # parses those bodies, so it cannot claim the import is unused
 printf '@unsafe\nuse main\ntest "uses main" {\n    main.package_one()\n    let p: ptr = null\n    @ptrv(p, u8, 0) = 1\n}\n' > "$workdir/pkg-one/src/check/sibling.valk"
