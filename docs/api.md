@@ -1639,12 +1639,12 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ```js
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
 + fn base64_decode(data: local &[u8]) String !CryptoError
+// Decodes standard base64 into `out` and returns the bytes written.
++ fn base64_decode_into(data: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
 + fn base64_encode(data: local &[u8]) String
-// Decodes standard base64 into `out` and returns the bytes written.
-+ fn base64_write_decode(data: local &[u8], out: Writer) uint !CryptoError
 // Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
-+ fn base64_write_encode(data: local &[u8], out: Writer) uint !io:IoError
++ fn base64_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
 + fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
@@ -1659,20 +1659,20 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 + fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
 // Returns the digest of `data` as lowercase hex.
 + fn hash_hex(algorithm: HashAlgorithm, data: local &[u8]) String
-// Writes the raw digest of `data` to `out` and returns the bytes written.
-+ fn hash_write(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hash_write_hex(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
++ fn hash_hex_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw digest of `data` to `out` and returns the bytes written.
++ fn hash_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Returns a fresh `Hasher` for `algorithm`.
 + fn hasher(algorithm: HashAlgorithm) Hasher
 // Decodes hex text (either case) into the raw bytes it represents.
 + fn hex_decode(text: local &[u8]) String !CryptoError
+// Decodes hex text (either case) into `out` and returns the bytes written.
++ fn hex_decode_into(text: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as lowercase hex, two characters per byte.
 + fn hex_encode(data: local &[u8]) String
-// Decodes hex text (either case) into `out` and returns the bytes written.
-+ fn hex_write_decode(text: local &[u8], out: Writer) uint !CryptoError
 // Writes `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hex_write_encode(data: local &[u8], out: Writer) uint !io:IoError
++ fn hex_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `ikm` with HKDF (RFC 5869): extract with `salt`, expand with `info`.
 + fn hkdf(algorithm: HashAlgorithm, ikm: local &[u8], salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom key `prk`.
@@ -1682,29 +1682,29 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
 // Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn md5_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 + fn pbkdf2(algorithm: HashAlgorithm, password: local &[u8], salt: local &[u8], iterations: uint, length: uint) String !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
-+ fn random_write_bytes(length: uint, out: Writer) uint !io:IoError
++ fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
 // Returns the SHA-1 digest of `data` as lowercase hex.
 + fn sha1_hex(data: local &[u8]) String
 // Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha1_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha1_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-256 digest of `data` as lowercase hex.
 + fn sha256_hex(data: local &[u8]) String
 // Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha256_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha256_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-384 digest of `data` as lowercase hex.
 + fn sha384_hex(data: local &[u8]) String
 // Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha384_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha384_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha512_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 ```
 
 ## Classes for 'crypto'
@@ -2464,6 +2464,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ```js
 // Returns `code` with the HTML special characters `<`, `>`, `"`, `'` and `&` as entities.
 + fn escape(code: String, options: ?EscapeOptions (null)) String
+// Writes `code` escaped as `escape` does to `out` and returns the bytes written.
++ fn escape_into(code: String, out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
@@ -2959,8 +2961,8 @@ alias Fd for i32
 + fn default_value(kind: Kind) Value
 // Returns `data` encoded as JSON text; `pretty` adds newlines and four-space indentation.
 + fn encode(data: $T, pretty: bool (false)) String
-// Appends `data` encoded as JSON to `output` and returns `output`; see `encode`.
-+ fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
+// Writes `data` encoded as JSON to `out` and returns the bytes written; see `encode`.
++ fn encode_into(data: $T, out: Writer, pretty: bool (false)) uint !io:IoError
 // Converts `data` to a JSON value.
 + fn from(data: $T) Value
 // Returns a JSON array holding `values`, or an empty array when `values` is `null`.
@@ -3044,8 +3046,8 @@ alias Fd for i32
     + fn bool_value() bool !LookupError
     // Returns the value encoded as JSON text; see `json.encode`.
     + fn encode(pretty: bool (false)) String
-    // Writes the value encoded as JSON to `output` and returns `output`; see `json.encode`.
-    + fn encode_into(output: ByteBuffer, pretty: bool (false)) ByteBuffer
+    // Writes the value encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the number held as a float, or `0.0` when the value is not a number.
     + get float: float
     // Returns the number held as a float; an integer is converted.
@@ -3144,6 +3146,8 @@ alias Fd for i32
 ```js
 // Converts the markdown text `md` to an HTML fragment.
 + fn to_html(md: String, options: ?ToHtmlOptions (null)) String
+// Writes `to_html(md)` to `out` and returns the bytes written.
++ fn to_html_into(md: String, out: Writer, options: ?ToHtmlOptions (null)) uint !io:IoError
 ```
 
 ## Classes for 'markdown'
@@ -3738,6 +3742,10 @@ alias Fd for i32
 + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
 // Renders the template text `content` with `data` and returns the output.
 + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
+// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
++ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
+// Writes `render(name, data, options)` to `out` and returns the bytes written.
++ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
 // Registers `content` as the template named `name`, replacing any earlier one.
 + fn set_content(name: String, content: String) void
 // Registers every entry of `content` as a template, keyed by name; see `set_content`.
@@ -3871,6 +3879,8 @@ alias Fd for i32
     + fn equals(other: DateTime) bool
     // Returns the value as text laid out by `pattern`.
     + fn format(pattern: String) String
+    // Writes `format(pattern)` to `out` and returns the bytes written.
+    + fn format_into(pattern: String, out: Writer) uint !io:IoError
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
     // Creates a date and time from whole seconds since the Unix epoch.
@@ -3929,6 +3939,8 @@ alias Fd for i32
     + fn second() uint
     // Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
     + fn to_iso8601() String
+    // Writes `to_iso8601()` to `out` and returns the bytes written.
+    + fn to_iso8601_into(out: Writer) uint !io:IoError
     // Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.
     + fn to_string() String
     // Returns the whole seconds since the Unix epoch, rounded down (towards the past).
@@ -3961,8 +3973,12 @@ alias Fd for i32
 ```js
 // Decodes `%XX` escapes and turns every `+` into a space.
 + fn decode(str: String) String
+// Writes `str` decoded as `decode` does to `out` and returns the bytes written.
++ fn decode_into(str: String, out: Writer) uint !io:IoError
 // Percent-encodes `str` for use in the given URL `component`.
 + fn encode(str: String, component: Component (Component.unreserved)) String
+// Writes `str` percent-encoded as `encode` does to `out` and returns the bytes written.
++ fn encode_into(str: String, out: Writer, component: Component (Component.unreserved)) uint !io:IoError
 // Splits `str` into a `Url`; it never fails.
 + fn parse(str: String) Url
 ```

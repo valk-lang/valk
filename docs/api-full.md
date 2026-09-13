@@ -5721,12 +5721,12 @@ The default is 1 MiB. Creating a coroutine resets it to 0.
 ```js
 // Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
 + fn base64_decode(data: local &[u8]) String !CryptoError
+// Decodes standard base64 into `out` and returns the bytes written.
++ fn base64_decode_into(data: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
 + fn base64_encode(data: local &[u8]) String
-// Decodes standard base64 into `out` and returns the bytes written.
-+ fn base64_write_decode(data: local &[u8], out: Writer) uint !CryptoError
 // Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
-+ fn base64_write_encode(data: local &[u8], out: Writer) uint !io:IoError
++ fn base64_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
 + fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
@@ -5741,20 +5741,20 @@ The default is 1 MiB. Creating a coroutine resets it to 0.
 + fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
 // Returns the digest of `data` as lowercase hex.
 + fn hash_hex(algorithm: HashAlgorithm, data: local &[u8]) String
-// Writes the raw digest of `data` to `out` and returns the bytes written.
-+ fn hash_write(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hash_write_hex(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
++ fn hash_hex_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
+// Writes the raw digest of `data` to `out` and returns the bytes written.
++ fn hash_into(algorithm: HashAlgorithm, data: local &[u8], out: Writer) uint !io:IoError
 // Returns a fresh `Hasher` for `algorithm`.
 + fn hasher(algorithm: HashAlgorithm) Hasher
 // Decodes hex text (either case) into the raw bytes it represents.
 + fn hex_decode(text: local &[u8]) String !CryptoError
+// Decodes hex text (either case) into `out` and returns the bytes written.
++ fn hex_decode_into(text: local &[u8], out: Writer) uint !CryptoError
 // Returns `data` encoded as lowercase hex, two characters per byte.
 + fn hex_encode(data: local &[u8]) String
-// Decodes hex text (either case) into `out` and returns the bytes written.
-+ fn hex_write_decode(text: local &[u8], out: Writer) uint !CryptoError
 // Writes `data` as lowercase hex to `out` and returns the bytes written.
-+ fn hex_write_encode(data: local &[u8], out: Writer) uint !io:IoError
++ fn hex_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `ikm` with HKDF (RFC 5869): extract with `salt`, expand with `info`.
 + fn hkdf(algorithm: HashAlgorithm, ikm: local &[u8], salt: local &[u8], info: local &[u8], length: uint) String !CryptoError
 // Returns `length` bytes of HKDF-Expand (RFC 5869) output from the pseudorandom key `prk`.
@@ -5764,29 +5764,29 @@ The default is 1 MiB. Creating a coroutine resets it to 0.
 // Returns the MD5 digest of `data` as lowercase hex.
 + fn md5_hex(data: local &[u8]) String
 // Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn md5_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn md5_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Derives `length` bytes from `password` and `salt` with PBKDF2-HMAC (RFC 8018).
 + fn pbkdf2(algorithm: HashAlgorithm, password: local &[u8], salt: local &[u8], iterations: uint, length: uint) String !CryptoError
 // Returns a string of `length` cryptographically secure random bytes.
 + fn random_bytes(length: uint) String
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
-+ fn random_write_bytes(length: uint, out: Writer) uint !io:IoError
++ fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
 // Returns the SHA-1 digest of `data` as lowercase hex.
 + fn sha1_hex(data: local &[u8]) String
 // Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha1_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha1_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-256 digest of `data` as lowercase hex.
 + fn sha256_hex(data: local &[u8]) String
 // Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha256_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha256_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-384 digest of `data` as lowercase hex.
 + fn sha384_hex(data: local &[u8]) String
 // Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha384_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha384_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the SHA-512 digest of `data` as lowercase hex.
 + fn sha512_hex(data: local &[u8]) String
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
-+ fn sha512_write_hex(data: local &[u8], out: Writer) uint !io:IoError
++ fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
 ```
 
 ### base64_decode
@@ -5797,11 +5797,7 @@ The `=` padding is optional. Throws `invalid_input` on any other character (incl
 whitespace and line breaks, and the URL-safe `-` and `_`), on an impossible length, or
 when the unused bits of the last character are not zero.
 
-### base64_encode
-
-Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
-
-### base64_write_decode
+### base64_decode_into
 
 Decodes standard base64 into `out` and returns the bytes written.
 
@@ -5809,7 +5805,11 @@ Accepts the same input as `base64_decode`, decoded in blocks of 504 characters. 
 `invalid_input` on malformed input and `write` when `out` fails; blocks decoded before
 the error have already been written.
 
-### base64_write_encode
+### base64_encode
+
+Returns `data` encoded as standard base64 (`+` and `/`), `=` padded, without line breaks.
+
+### base64_encode_into
 
 Writes `data` encoded as standard padded base64 to `out` and returns the bytes written.
 
@@ -5858,13 +5858,13 @@ Returns the raw digest of `data` as binary bytes (not text).
 
 Returns the digest of `data` as lowercase hex.
 
-### hash_write
-
-Writes the raw digest of `data` to `out` and returns the bytes written.
-
-### hash_write_hex
+### hash_hex_into
 
 Writes the digest of `data` as lowercase hex to `out` and returns the bytes written.
+
+### hash_into
+
+Writes the raw digest of `data` to `out` and returns the bytes written.
 
 ### hasher
 
@@ -5876,11 +5876,7 @@ Decodes hex text (either case) into the raw bytes it represents.
 
 Throws `invalid_input` on an odd length or a non-hex character.
 
-### hex_encode
-
-Returns `data` encoded as lowercase hex, two characters per byte.
-
-### hex_write_decode
+### hex_decode_into
 
 Decodes hex text (either case) into `out` and returns the bytes written.
 
@@ -5888,7 +5884,11 @@ Output is buffered in 512-byte chunks. Throws `invalid_input` on an odd length o
 non-hex character, and `write` when `out` fails; chunks decoded before the error have
 already been written.
 
-### hex_write_encode
+### hex_encode
+
+Returns `data` encoded as lowercase hex, two characters per byte.
+
+### hex_encode_into
 
 Writes `data` as lowercase hex to `out` and returns the bytes written.
 
@@ -5916,7 +5916,7 @@ An empty `salt` is allowed. The result is raw bytes, one digest long.
 
 Returns the MD5 digest of `data` as lowercase hex.
 
-### md5_write_hex
+### md5_hex_into
 
 Writes the MD5 digest of `data` as lowercase hex to `out`; returns the bytes written.
 
@@ -5934,7 +5934,7 @@ Returns a string of `length` cryptographically secure random bytes.
 The bytes are raw binary, not valid UTF-8 text; encode them (e.g. with `hex_encode` or
 `base64_encode`) before printing.
 
-### random_write_bytes
+### random_bytes_into
 
 Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
 
@@ -5945,7 +5945,7 @@ The bytes are generated and written in chunks of 512, so memory use does not gro
 
 Returns the SHA-1 digest of `data` as lowercase hex.
 
-### sha1_write_hex
+### sha1_hex_into
 
 Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes written.
 
@@ -5953,7 +5953,7 @@ Writes the SHA-1 digest of `data` as lowercase hex to `out`; returns the bytes w
 
 Returns the SHA-256 digest of `data` as lowercase hex.
 
-### sha256_write_hex
+### sha256_hex_into
 
 Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes written.
 
@@ -5961,7 +5961,7 @@ Writes the SHA-256 digest of `data` as lowercase hex to `out`; returns the bytes
 
 Returns the SHA-384 digest of `data` as lowercase hex.
 
-### sha384_write_hex
+### sha384_hex_into
 
 Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes written.
 
@@ -5969,7 +5969,7 @@ Writes the SHA-384 digest of `data` as lowercase hex to `out`; returns the bytes
 
 Returns the SHA-512 digest of `data` as lowercase hex.
 
-### sha512_write_hex
+### sha512_hex_into
 
 Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
 
@@ -8058,6 +8058,8 @@ Set at startup: `true` in `GC_DEBUG` builds (such as `make test`), `false` other
 ```js
 // Returns `code` with the HTML special characters `<`, `>`, `"`, `'` and `&` as entities.
 + fn escape(code: String, options: ?EscapeOptions (null)) String
+// Writes `code` escaped as `escape` does to `out` and returns the bytes written.
++ fn escape_into(code: String, out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
@@ -8070,6 +8072,13 @@ Returns `code` with the HTML special characters `<`, `>`, `"`, `'` and `&` as en
 
 The result is safe as element text and inside quoted attribute values. Pass `options` to
 leave some of the characters as they are.
+
+### escape_into
+
+Writes `code` escaped as `escape` does to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the escaped text in one
+write. Throws when `out` fails.
 
 ### sanitize_url_attributes
 
@@ -9663,8 +9672,8 @@ Writes bytes from `data` and returns the count, which may be less than `data.len
 + fn default_value(kind: Kind) Value
 // Returns `data` encoded as JSON text; `pretty` adds newlines and four-space indentation.
 + fn encode(data: $T, pretty: bool (false)) String
-// Appends `data` encoded as JSON to `output` and returns `output`; see `encode`.
-+ fn encode_into(data: $T, output: ByteBuffer, pretty: bool (false)) ByteBuffer
+// Writes `data` encoded as JSON to `out` and returns the bytes written; see `encode`.
++ fn encode_into(data: $T, out: Writer, pretty: bool (false)) uint !io:IoError
 // Converts `data` to a JSON value.
 + fn from(data: $T) Value
 // Returns a JSON array holding `values`, or an empty array when `values` is `null`.
@@ -9724,7 +9733,10 @@ without a cycle, such as one array held by two members, is written in full each 
 
 ### encode_into
 
-Appends `data` encoded as JSON to `output` and returns `output`; see `encode`.
+Writes `data` encoded as JSON to `out` and returns the bytes written; see `encode`.
+
+A `ByteBuffer` is written directly; any other writer receives the document in one
+write. Throws when `out` fails.
 
 ### from
 
@@ -9900,8 +9912,8 @@ Sets the member `key` to `value`; an existing member keeps its position.
     + fn bool_value() bool !LookupError
     // Returns the value encoded as JSON text; see `json.encode`.
     + fn encode(pretty: bool (false)) String
-    // Writes the value encoded as JSON to `output` and returns `output`; see `json.encode`.
-    + fn encode_into(output: ByteBuffer, pretty: bool (false)) ByteBuffer
+    // Writes the value encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the number held as a float, or `0.0` when the value is not a number.
     + get float: float
     // Returns the number held as a float; an integer is converted.
@@ -10062,7 +10074,8 @@ Returns the value encoded as JSON text; see `json.encode`.
 
 #### encode_into
 
-Writes the value encoded as JSON to `output` and returns `output`; see `json.encode`.
+Writes the value encoded as JSON to `out` and returns the bytes written; see
+`json.encode_into`.
 
 #### float
 
@@ -10322,6 +10335,8 @@ members are ignored.
 ```js
 // Converts the markdown text `md` to an HTML fragment.
 + fn to_html(md: String, options: ?ToHtmlOptions (null)) String
+// Writes `to_html(md)` to `out` and returns the bytes written.
++ fn to_html_into(md: String, out: Writer, options: ?ToHtmlOptions (null)) uint !io:IoError
 ```
 
 ### to_html
@@ -10334,6 +10349,13 @@ lists, fenced code blocks, `---` rules, inline code, `*` emphasis, `**`/`__` bol
 `'` and `&` in the input is escaped, so the output is safe to embed. Lines of one
 paragraph are joined with `<br>`, headings get no inline formatting, and an ordered list
 must start at `1.`. Quotes and lists nest at most 64 levels deep; deeper markers stay text.
+
+### to_html_into
+
+Writes `to_html(md)` to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the HTML in one write.
+Throws when `out` fails.
 
 ## Classes for 'markdown'
 
@@ -12279,6 +12301,10 @@ Wakes the waiter; safe from any thread, and kept for the next `wait` when nobody
 + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
 // Renders the template text `content` with `data` and returns the output.
 + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
+// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
++ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
+// Writes `render(name, data, options)` to `out` and returns the bytes written.
++ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
 // Registers `content` as the template named `name`, replacing any earlier one.
 + fn set_content(name: String, content: String) void
 // Registers every entry of `content` as a template, keyed by name; see `set_content`.
@@ -12306,6 +12332,20 @@ Renders the template text `content` with `data` and returns the output.
 
 Works like `render` without looking up a name first; `@include` and `@extend` still
 resolve against the registered templates. Throws `.parse` as `render` does.
+
+### render_content_into
+
+Writes `render_content(content, data, options)` to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the page in one write.
+Throws `ParseError` as `render_content` does, and `.write` when `out` fails.
+
+### render_into
+
+Writes `render(name, data, options)` to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the page in one write.
+Throws `ParseError` as `render` does, and `.write` when `out` fails.
 
 ### set_content
 
@@ -12626,6 +12666,8 @@ Returns the wall-clock time in microseconds since the Unix epoch (UTC).
     + fn equals(other: DateTime) bool
     // Returns the value as text laid out by `pattern`.
     + fn format(pattern: String) String
+    // Writes `format(pattern)` to `out` and returns the bytes written.
+    + fn format_into(pattern: String, out: Writer) uint !io:IoError
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
     // Creates a date and time from whole seconds since the Unix epoch.
@@ -12684,6 +12726,8 @@ Returns the wall-clock time in microseconds since the Unix epoch (UTC).
     + fn second() uint
     // Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
     + fn to_iso8601() String
+    // Writes `to_iso8601()` to `out` and returns the bytes written.
+    + fn to_iso8601_into(out: Writer) uint !io:IoError
     // Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.
     + fn to_string() String
     // Returns the whole seconds since the Unix epoch, rounded down (towards the past).
@@ -12783,6 +12827,13 @@ the pattern ends with a backslash.
 ```valk
 dt.format("Y-m-d H:i:s") // 2024-03-05 14:07:09
 ```
+
+#### format_into
+
+Writes `format(pattern)` to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the text in one write.
+Throws when `out` fails.
 
 #### from_format
 
@@ -12925,6 +12976,13 @@ Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
 
 A non-zero microsecond part adds six fraction digits: `2024-03-05T14:07:09.250000Z`.
 
+#### to_iso8601_into
+
+Writes `to_iso8601()` to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the text in one write.
+Throws when `out` fails.
+
 #### to_string
 
 Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.
@@ -12984,8 +13042,12 @@ Returns the year, 1 to 9999.
 ```js
 // Decodes `%XX` escapes and turns every `+` into a space.
 + fn decode(str: String) String
+// Writes `str` decoded as `decode` does to `out` and returns the bytes written.
++ fn decode_into(str: String, out: Writer) uint !io:IoError
 // Percent-encodes `str` for use in the given URL `component`.
 + fn encode(str: String, component: Component (Component.unreserved)) String
+// Writes `str` percent-encoded as `encode` does to `out` and returns the bytes written.
++ fn encode_into(str: String, out: Writer, component: Component (Component.unreserved)) uint !io:IoError
 // Splits `str` into a `Url`; it never fails.
 + fn parse(str: String) Url
 ```
@@ -12997,12 +13059,26 @@ Decodes `%XX` escapes and turns every `+` into a space.
 A `%` that is not followed by two hex digits is kept as is. `+` is decoded as a space
 in every position, including paths. The result is not checked for valid UTF-8.
 
+### decode_into
+
+Writes `str` decoded as `decode` does to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the text in one write.
+Throws when `out` fails.
+
 ### encode
 
 Percent-encodes `str` for use in the given URL `component`.
 
 Works on bytes: every byte that is not a literal for `component` becomes `%XX` with
 uppercase hex digits, so multi-byte UTF-8 characters become one escape per byte.
+
+### encode_into
+
+Writes `str` percent-encoded as `encode` does to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the text in one write.
+Throws when `out` fails.
 
 ### parse
 

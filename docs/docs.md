@@ -840,6 +840,29 @@ if printable is_a User {
 }
 ```
 
+`match` does the same and also hands you the object as its own class. An
+interface can be implemented by classes the match does not know, so a
+`default` case is required:
+
+```rust
+fn write_fast(out: io.Writer, text: String) uint !io.IoError {
+    match out {
+        ByteBuffer as buf => {
+            buf.write(text)    // no interface call, no error to handle
+            return text.length
+        }
+        default => return out.write(text) !>
+    }
+}
+```
+
+That is how the standard library's `_into` functions work: `html.escape_into`,
+`url.encode_into`, `json.encode_into`, `DateTime.format_into`,
+`markdown.to_html_into`, `template.render_into` and the crypto `hash_into` /
+`hex_encode_into` family take an `io.Writer`, write straight into a
+`ByteBuffer`, and hand any other writer the finished bytes. Each returns the
+bytes written and throws when the writer fails; the plain form returns a `String`.
+
 ## Generics
 
 With generics you can generate customized versions of a class or function.
