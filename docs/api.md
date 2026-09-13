@@ -2957,10 +2957,10 @@ alias Fd for i32
 ## Functions for 'json'
 
 ```js
-// Parses JSON text into a `Value`.
-+ fn decode(json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
+// Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
++ fn decode(json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
 // Parses JSON text directly into `T`, without building an intermediate `Value`.
-+ fn decode_to[T](json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
++ fn decode_to[T](json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 // Returns the empty value of a kind: `null`, `""`, `false`, `0`, `0.0`, `[]` or `{}`.
 + fn default_value(kind: Kind) Value
 // Returns `data` encoded as JSON text; `pretty` adds newlines and four-space indentation.
@@ -2995,6 +2995,10 @@ alias Fd for i32
 
     // Appends `value` to the end.
     + fn append(value: Value) void
+    // Returns the array encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String
+    // Writes the array encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the item at `index`.
     + fn get(index: uint) Value !LookupError
     // Returns the number of items.
@@ -3012,6 +3016,10 @@ alias Fd for i32
     // The members. Changes to this map change the JSON object.
     + values: Map[Value]
 
+    // Returns the object encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String
+    // Writes the object encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the member named `key`.
     + fn get(key: String) Value !LookupError
     // Returns whether a member named `key` exists.

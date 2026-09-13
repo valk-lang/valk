@@ -9661,10 +9661,10 @@ Writes bytes from `data` and returns the count, which may be less than `data.len
 ## Functions for 'json'
 
 ```js
-// Parses JSON text into a `Value`.
-+ fn decode(json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
+// Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
++ fn decode(json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
 // Parses JSON text directly into `T`, without building an intermediate `Value`.
-+ fn decode_to[T](json: String | ByteBuffer, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
++ fn decode_to[T](json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 // Returns the empty value of a kind: `null`, `""`, `false`, `0`, `0.0`, `[]` or `{}`.
 + fn default_value(kind: Kind) Value
 // Returns `data` encoded as JSON text; `pretty` adds newlines and four-space indentation.
@@ -9691,7 +9691,7 @@ Writes bytes from `data` and returns the count, which may be less than `data.len
 
 ### decode
 
-Parses JSON text into a `Value`.
+Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
 
 Throws `.invalid` on a syntax error, invalid UTF-8 in a string, trailing non-whitespace
 or a number outside the range of `int`/`float`; `.too_deep` when containers nest deeper
@@ -9791,6 +9791,10 @@ Returns `value` as a JSON string.
 
     // Appends `value` to the end.
     + fn append(value: Value) void
+    // Returns the array encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String
+    // Writes the array encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the item at `index`.
     + fn get(index: uint) Value !LookupError
     // Returns the number of items.
@@ -9813,6 +9817,15 @@ The items, in order. Changes to this array change the JSON array.
 #### append
 
 Appends `value` to the end.
+
+#### encode
+
+Returns the array encoded as JSON text; see `json.encode`.
+
+#### encode_into
+
+Writes the array encoded as JSON to `out` and returns the bytes written; see
+`json.encode_into`.
 
 #### get
 
@@ -9838,6 +9851,10 @@ Removes the item at `index`, moving later items down; does nothing when out of r
     // The members. Changes to this map change the JSON object.
     + values: Map[Value]
 
+    // Returns the object encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String
+    // Writes the object encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
+    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
     // Returns the member named `key`.
     + fn get(key: String) Value !LookupError
     // Returns whether a member named `key` exists.
@@ -9858,6 +9875,15 @@ A JSON object: `Value` members keyed by string, kept in insertion order.
 #### values
 
 The members. Changes to this map change the JSON object.
+
+#### encode
+
+Returns the object encoded as JSON text; see `json.encode`.
+
+#### encode_into
+
+Writes the object encoded as JSON to `out` and returns the bytes written; see
+`json.encode_into`.
 
 #### get
 
