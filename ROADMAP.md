@@ -12,6 +12,8 @@
 + Doc generate improvements
 + Websockets
 + Deprecation flagging
++ Reuse address option
++ HTTP server shutdown signal
 
 - Release 0.7.0
 + Audit API & language syntax
