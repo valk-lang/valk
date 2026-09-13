@@ -638,9 +638,10 @@ Bytes outside ASCII are copied unchanged.
 Parses the bytes as a decimal floating-point number, with the rules of `String.to_float`.
 
 Accepts an optional `-` or `+` sign, digits with at most one `.` (at least one digit is
-required), and an optional `e`/`E` exponent with its own sign. Throws `SyntaxError` for
-other bytes, input without mantissa digits such as `"."` or `"e5"`, more than 768 bytes,
-an exponent above 400, or a value that overflows to infinity.
+required), and an optional `e`/`E` exponent with its own sign, or `nan`, `inf` and
+`infinity` in any letter case after the sign. Throws `SyntaxError` for other bytes, input
+without mantissa digits such as `"."` or `"e5"`, more than 768 bytes, an exponent above
+400, or a numeric value that overflows to infinity.
 
 #### &[u8].to_int
 
@@ -3065,9 +3066,11 @@ Returns whether the string begins with the bytes of `part`; an empty `part` alwa
 Parses the string as a decimal floating-point number.
 
 Accepts an optional `-` or `+` sign, digits with at most one `.` (at least one digit is
-required), and an optional `e`/`E` exponent with its own sign. Throws `SyntaxError` for
-other bytes, input without mantissa digits such as `"."` or `"e5"`, more than 768 bytes,
-an exponent above 400, or a value that overflows to infinity.
+required), and an optional `e`/`E` exponent with its own sign. The special values `nan`,
+`inf` and `infinity` are accepted in any letter case, with an optional sign, as C's
+`strtod` and Postgres spell them. Throws `SyntaxError` for other bytes, input without
+mantissa digits such as `"."` or `"e5"`, more than 768 bytes, an exponent above 400, or
+a numeric value that overflows to infinity.
 
 #### to_int
 
@@ -4681,7 +4684,8 @@ Scans without a length limit, so the memory must contain a zero byte.
 Parses the first `len` bytes as a decimal floating-point number, e.g. `-12.5e-3`.
 
 Accepts an optional `-` or `+` sign, digits with at most one `.` (at least one digit is
-required), and an optional `e`/`E` exponent with its own sign. The result is the nearest
+required), and an optional `e`/`E` exponent with its own sign, or the special values
+`nan`, `inf` and `infinity` in any letter case after the sign. The result is the nearest
 `float` to the decimal value. Throws `syntax` on any other byte, on input without
 mantissa digits (`""`, `"-"`, `"."`, `"e5"`), on an exponent without digits, on an
 exponent above 400, on a value that overflows to infinity, and when `len` exceeds 768.
