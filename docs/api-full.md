@@ -51,22 +51,38 @@ The compression level used when none is given, a balance of speed and size.
 + fn adler32(data: local &[u8], adler: u32 (1)) u32
 // Returns `data` compressed into `format` at `level` (0 stores, 1 is fastest, 9 is smallest).
 + fn compress(data: local &[u8], format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) String
+// Writes `data` compressed into `format` at `level` to `out` and returns the bytes written.
++ fn compress_into(data: local &[u8], out: Writer, format: Format, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
 // Returns the CRC-32 (IEEE 802.3, as in gzip, zip and PNG) of `data`.
 + fn crc32(data: local &[u8], crc: u32 (0)) u32
 // Returns the decompressed contents of `data`, which must be in `format`.
 + fn decompress(data: &[u8], format: Format, max_size: uint (0)) String !CompressError
+// Writes the decompressed contents of `data` to `out` and returns the bytes written.
++ fn decompress_into(data: &[u8], out: Writer, format: Format, max_size: uint (0)) uint !CompressError
 // Returns `data` compressed as raw DEFLATE; see `compress`.
 + fn deflate(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
+// Writes `data` compressed as raw DEFLATE to `out`; see `compress_into`.
++ fn deflate_into(data: local &[u8], out: Writer, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
 // Returns the decompressed contents of gzip `data`.
 + fn gunzip(data: &[u8], max_size: uint (0)) String !CompressError
+// Writes the decompressed contents of gzip `data` to `out`; see `decompress_into`.
++ fn gunzip_into(data: &[u8], out: Writer, max_size: uint (0)) uint !CompressError
 // Returns `data` compressed in the gzip format; see `compress`.
 + fn gzip(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
+// Writes `data` compressed in the gzip format to `out`; see `compress_into`.
++ fn gzip_into(data: local &[u8], out: Writer, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
 // Returns the decompressed contents of raw DEFLATE `data`.
 + fn inflate(data: &[u8], max_size: uint (0)) String !CompressError
+// Writes the decompressed contents of raw DEFLATE `data` to `out`; see `decompress_into`.
++ fn inflate_into(data: &[u8], out: Writer, max_size: uint (0)) uint !CompressError
 // Returns the decompressed contents of zlib `data`.
 + fn unzlib(data: &[u8], max_size: uint (0)) String !CompressError
+// Writes the decompressed contents of zlib `data` to `out`; see `decompress_into`.
++ fn unzlib_into(data: &[u8], out: Writer, max_size: uint (0)) uint !CompressError
 // Returns `data` compressed in the zlib format; see `compress`.
 + fn zlib(data: local &[u8], level: uint (COMPRESS_DEFAULT_LEVEL)) String
+// Writes `data` compressed in the zlib format to `out`; see `compress_into`.
++ fn zlib_into(data: local &[u8], out: Writer, level: uint (COMPRESS_DEFAULT_LEVEL)) uint !io:IoError
 ```
 
 ### adler32
@@ -81,6 +97,14 @@ new checksum.
 Returns `data` compressed into `format` at `level` (0 stores, 1 is fastest, 9 is smallest).
 
 Levels above 9 act as 9.
+
+### compress_into
+
+Writes `data` compressed into `format` at `level` to `out` and returns the bytes written.
+
+The compressed bytes reach `out` in pieces as they are produced, so only the 64 KiB
+input window and the current block are held in memory. Throws when `out` fails; bytes
+written before a failure stay written.
 
 ### crc32
 
@@ -104,9 +128,20 @@ when the output would exceed `max_size`. Concatenated gzip members decode as one
 so bytes after a gzip member must form another member. For `deflate` and `zlib`, bytes
 after the end of the stream are ignored.
 
+### decompress_into
+
+Writes the decompressed contents of `data` to `out` and returns the bytes written.
+
+Takes the same `max_size` and throws the same errors as `decompress`, plus the writer's
+error when `out` fails; output written before a failure stays written.
+
 ### deflate
 
 Returns `data` compressed as raw DEFLATE; see `compress`.
+
+### deflate_into
+
+Writes `data` compressed as raw DEFLATE to `out`; see `compress_into`.
 
 ### gunzip
 
@@ -114,9 +149,17 @@ Returns the decompressed contents of gzip `data`.
 
 See `decompress` for `max_size` and the errors thrown.
 
+### gunzip_into
+
+Writes the decompressed contents of gzip `data` to `out`; see `decompress_into`.
+
 ### gzip
 
 Returns `data` compressed in the gzip format; see `compress`.
+
+### gzip_into
+
+Writes `data` compressed in the gzip format to `out`; see `compress_into`.
 
 ### inflate
 
@@ -124,15 +167,27 @@ Returns the decompressed contents of raw DEFLATE `data`.
 
 See `decompress` for `max_size` and the errors thrown.
 
+### inflate_into
+
+Writes the decompressed contents of raw DEFLATE `data` to `out`; see `decompress_into`.
+
 ### unzlib
 
 Returns the decompressed contents of zlib `data`.
 
 See `decompress` for `max_size` and the errors thrown.
 
+### unzlib_into
+
+Writes the decompressed contents of zlib `data` to `out`; see `decompress_into`.
+
 ### zlib
 
 Returns `data` compressed in the zlib format; see `compress`.
+
+### zlib_into
+
+Writes `data` compressed in the zlib format to `out`; see `compress_into`.
 
 ## Classes for 'compress'
 
