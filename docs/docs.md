@@ -1219,8 +1219,14 @@ file.close() ! panic("close")
 ```
 
 For floating-point text, use `write_f64_ascii_shortest` for the shortest
-round-trip representation, or `write_f64_ascii` with an explicit number
-of decimal places. Set `trim_zeros` to `true` to remove trailing fractional
+round-trip representation, `write_f64_ascii` with an explicit number
+of decimal places, or `write_f64_ascii_scientific` for the exponent form
+with a fixed number of mantissa digits (`1.234567e6`). The `String`
+counterparts are `to_shortest_string`, `to_string(decimals)` and
+`to_scientific_string(decimals)`, each with an `_into(writer)` form that
+builds the text on the stack and an `_in(buf)` form that writes into a
+caller's `local mut &[u8]` of at least `FLOAT_TEXT_SIZE` bytes and returns
+the count. Set `trim_zeros` to `true` to remove trailing fractional
 zeros, and pass `force_exponent` as `true` to always use the exponent form
 (`1e19` instead of `10000000000000000000`), which keeps whole values that are
 too large for an integer readable as floats. `write_f64_le` and `write_f64_be`

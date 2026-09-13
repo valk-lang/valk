@@ -305,11 +305,18 @@ Fills `buf` with decompressed bytes and returns how many were written; 0 means t
 ```js
 // The exit code `exec` returns when it cannot run the shell or collect its status.
 + value EXEC_FAILED (-1)
+// The buffer size the `_in` float formatters require: the longest text any of them writes is 40 bytes, so 64 leaves room to spare.
++ value FLOAT_TEXT_SIZE (64)
 ```
 
 ### EXEC_FAILED
 
 The exit code `exec` returns when it cannot run the shell or collect its status.
+
+### FLOAT_TEXT_SIZE
+
+The buffer size the `_in` float formatters require: the longest text any of them writes
+is 40 bytes, so 64 leaves room to spare.
 
 ## Errors for 'core'
 
@@ -1180,6 +1187,8 @@ Available on arrays of non-nullable integers and floats.
     + fn write_cstring(str: cstring, include_zero_byte: bool (true)) void
     // Appends `v` in fixed notation with `decimals` digits after the point.
     + fn write_f64_ascii(v: f64, decimals: uint, trim_zeros: bool (false)) void
+    // Appends `v` in exponent form with `decimals` digits after the point, e.g. `1.234567e6`.
+    + fn write_f64_ascii_scientific(v: f64, decimals: uint (6), trim_zeros: bool (false)) void
     // Appends `v` with the fewest digits that parse back to the same value.
     + fn write_f64_ascii_shortest(v: f64, force_exponent: bool (false)) void
     // Appends the IEEE 754 bits of `v` as 8 bytes, most significant first.
@@ -1429,6 +1438,14 @@ Appends `v` in fixed notation with `decimals` digits after the point.
 `decimals` is clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the point
 too when the fraction is zero. NaN, infinities and values beyond the 64-bit integer range
 are written as by `write_f64_ascii_shortest`.
+
+#### write_f64_ascii_scientific
+
+Appends `v` in exponent form with `decimals` digits after the point, e.g. `1.234567e6`.
+
+`decimals` is clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the point
+too when the fraction is zero. NaN and infinities are written by name; see
+`float.to_scientific_string`.
 
 #### write_f64_ascii_shortest
 
@@ -3321,14 +3338,28 @@ Returns a new `String` holding a copy of the bytes before the zero terminator.
     + fn max(other: f32) f32
     // Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
     + fn min(other: f32) f32
+    // Returns the value in exponent form with `decimals` digits after the dot, e.g. `1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+    + fn to_scientific_string(decimals: uint (6), trim_zeros: bool (false)) String
+    // Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+    + fn to_scientific_string_in(buf: local mut &[u8], decimals: uint (6), trim_zeros: bool (false)) uint
+    // Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+    + fn to_scientific_string_into(out: Writer, decimals: uint (6), trim_zeros: bool (false)) uint !io:IoError
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
+    // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+    + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+    + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Writes the value like `to_string` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    // Writes the value like `to_string` to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -3374,6 +3405,30 @@ Returns the larger of `this` and `other`; when one of them is NaN, returns the o
 
 Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
 
+#### to_scientific_string
+
+Returns the value in exponent form with `decimals` digits after the dot, e.g.
+`1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+
+The mantissa has one digit before the dot; the exponent is written as `to_shortest_string`
+writes it, without a sign for positive values or padding. At most 19 decimals are written;
+larger values are clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the
+dot too when nothing remains after it. Rounding follows `to_string`: halfway cases round
+toward zero. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
+
+#### to_scientific_string_in
+
+Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. No
+terminating zero is written.
+
+#### to_scientific_string_into
+
+Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Throws when `out` fails.
+
 #### to_shortest_string
 
 Returns the shortest decimal text that parses back to the same value.
@@ -3383,12 +3438,27 @@ Values with a decimal exponent from -6 to 20 are written plainly (`100`, `0.1`,
 `-inf` and `-0`. Tagged `$auto`, so a float converts to `String` implicitly wherever one
 is expected.
 
+#### to_shortest_string_in
+
+Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. With
+`force_exponent` the exponent form is always used. No terminating zero is written.
+
 #### to_shortest_string_in_ptr
 
 Writes the value like `to_shortest_string` to `buf` and returns the byte count.
 
-`buf` needs room for 32 bytes. No terminating zero is written. With `force_exponent`
-the exponent form is always used.
+`buf` needs room for 32 bytes, unchecked. Deprecated: use `to_shortest_string_in`, which
+takes a bounds-checked slice, or `to_shortest_string_into`. No terminating zero is
+written. With `force_exponent` the exponent form is always used.
+
+#### to_shortest_string_into
+
+Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. With `force_exponent` the
+exponent form is always used. Throws when `out` fails.
 
 #### to_string
 
@@ -3399,11 +3469,26 @@ trailing zeros are dropped, and the dot too when nothing remains after it. Halfw
 round toward zero: `(2.5).to_string(0)` is `2`. NaN, infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
+#### to_string_in
+
+Writes the value like `to_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. Nothing
+is allocated, so a stack array works: `let text: [u8 x 64] = @undefined` and
+`value.to_string_in(&text, 3)`. No terminating zero is written.
+
 #### to_string_in_ptr
 
 Writes the value like `to_string` to `buf` and returns the byte count.
 
-`buf` needs room for 64 bytes. No terminating zero is written.
+`buf` needs room for 64 bytes, unchecked. Deprecated: use `to_string_in`, which takes a
+bounds-checked slice, or `to_string_into`. No terminating zero is written.
+
+#### to_string_into
+
+Writes the value like `to_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Throws when `out` fails.
 
 ```js
 // A 64-bit IEEE 754 floating-point number.
@@ -3424,14 +3509,28 @@ Writes the value like `to_string` to `buf` and returns the byte count.
     + fn max(other: f64) f64
     // Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
     + fn min(other: f64) f64
+    // Returns the value in exponent form with `decimals` digits after the dot, e.g. `1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+    + fn to_scientific_string(decimals: uint (6), trim_zeros: bool (false)) String
+    // Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+    + fn to_scientific_string_in(buf: local mut &[u8], decimals: uint (6), trim_zeros: bool (false)) uint
+    // Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+    + fn to_scientific_string_into(out: Writer, decimals: uint (6), trim_zeros: bool (false)) uint !io:IoError
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
+    // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+    + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+    + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Writes the value like `to_string` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    // Writes the value like `to_string` to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -3477,6 +3576,30 @@ Returns the larger of `this` and `other`; when one of them is NaN, returns the o
 
 Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
 
+#### to_scientific_string
+
+Returns the value in exponent form with `decimals` digits after the dot, e.g.
+`1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+
+The mantissa has one digit before the dot; the exponent is written as `to_shortest_string`
+writes it, without a sign for positive values or padding. At most 19 decimals are written;
+larger values are clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the
+dot too when nothing remains after it. Rounding follows `to_string`: halfway cases round
+toward zero. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
+
+#### to_scientific_string_in
+
+Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. No
+terminating zero is written.
+
+#### to_scientific_string_into
+
+Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Throws when `out` fails.
+
 #### to_shortest_string
 
 Returns the shortest decimal text that parses back to the same value.
@@ -3486,12 +3609,27 @@ Values with a decimal exponent from -6 to 20 are written plainly (`100`, `0.1`,
 `-inf` and `-0`. Tagged `$auto`, so a float converts to `String` implicitly wherever one
 is expected.
 
+#### to_shortest_string_in
+
+Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. With
+`force_exponent` the exponent form is always used. No terminating zero is written.
+
 #### to_shortest_string_in_ptr
 
 Writes the value like `to_shortest_string` to `buf` and returns the byte count.
 
-`buf` needs room for 32 bytes. No terminating zero is written. With `force_exponent`
-the exponent form is always used.
+`buf` needs room for 32 bytes, unchecked. Deprecated: use `to_shortest_string_in`, which
+takes a bounds-checked slice, or `to_shortest_string_into`. No terminating zero is
+written. With `force_exponent` the exponent form is always used.
+
+#### to_shortest_string_into
+
+Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. With `force_exponent` the
+exponent form is always used. Throws when `out` fails.
 
 #### to_string
 
@@ -3502,11 +3640,26 @@ trailing zeros are dropped, and the dot too when nothing remains after it. Halfw
 round toward zero: `(2.5).to_string(0)` is `2`. NaN, infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
+#### to_string_in
+
+Writes the value like `to_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. Nothing
+is allocated, so a stack array works: `let text: [u8 x 64] = @undefined` and
+`value.to_string_in(&text, 3)`. No terminating zero is written.
+
 #### to_string_in_ptr
 
 Writes the value like `to_string` to `buf` and returns the byte count.
 
-`buf` needs room for 64 bytes. No terminating zero is written.
+`buf` needs room for 64 bytes, unchecked. Deprecated: use `to_string_in`, which takes a
+bounds-checked slice, or `to_string_into`. No terminating zero is written.
+
+#### to_string_into
+
+Writes the value like `to_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Throws when `out` fails.
 
 ```js
 // A float as wide as a pointer: `f64` on 64-bit targets, `f32` on 32-bit ones.
@@ -3527,14 +3680,28 @@ Writes the value like `to_string` to `buf` and returns the byte count.
     + fn max(other: float) float
     // Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
     + fn min(other: float) float
+    // Returns the value in exponent form with `decimals` digits after the dot, e.g. `1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+    + fn to_scientific_string(decimals: uint (6), trim_zeros: bool (false)) String
+    // Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+    + fn to_scientific_string_in(buf: local mut &[u8], decimals: uint (6), trim_zeros: bool (false)) uint
+    // Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+    + fn to_scientific_string_into(out: Writer, decimals: uint (6), trim_zeros: bool (false)) uint !io:IoError
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
+    // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+    + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+    + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Writes the value like `to_string` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    // Writes the value like `to_string` to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -3580,6 +3747,30 @@ Returns the larger of `this` and `other`; when one of them is NaN, returns the o
 
 Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
 
+#### to_scientific_string
+
+Returns the value in exponent form with `decimals` digits after the dot, e.g.
+`1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+
+The mantissa has one digit before the dot; the exponent is written as `to_shortest_string`
+writes it, without a sign for positive values or padding. At most 19 decimals are written;
+larger values are clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the
+dot too when nothing remains after it. Rounding follows `to_string`: halfway cases round
+toward zero. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
+
+#### to_scientific_string_in
+
+Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. No
+terminating zero is written.
+
+#### to_scientific_string_into
+
+Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Throws when `out` fails.
+
 #### to_shortest_string
 
 Returns the shortest decimal text that parses back to the same value.
@@ -3589,12 +3780,27 @@ Values with a decimal exponent from -6 to 20 are written plainly (`100`, `0.1`,
 `-inf` and `-0`. Tagged `$auto`, so a float converts to `String` implicitly wherever one
 is expected.
 
+#### to_shortest_string_in
+
+Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. With
+`force_exponent` the exponent form is always used. No terminating zero is written.
+
 #### to_shortest_string_in_ptr
 
 Writes the value like `to_shortest_string` to `buf` and returns the byte count.
 
-`buf` needs room for 32 bytes. No terminating zero is written. With `force_exponent`
-the exponent form is always used.
+`buf` needs room for 32 bytes, unchecked. Deprecated: use `to_shortest_string_in`, which
+takes a bounds-checked slice, or `to_shortest_string_into`. No terminating zero is
+written. With `force_exponent` the exponent form is always used.
+
+#### to_shortest_string_into
+
+Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. With `force_exponent` the
+exponent form is always used. Throws when `out` fails.
 
 #### to_string
 
@@ -3605,11 +3811,26 @@ trailing zeros are dropped, and the dot too when nothing remains after it. Halfw
 round toward zero: `(2.5).to_string(0)` is `2`. NaN, infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
+#### to_string_in
+
+Writes the value like `to_string` into `buf` and returns the byte count.
+
+`buf` must hold at least `FLOAT_TEXT_SIZE` (64) bytes; a shorter buffer panics. Nothing
+is allocated, so a stack array works: `let text: [u8 x 64] = @undefined` and
+`value.to_string_in(&text, 3)`. No terminating zero is written.
+
 #### to_string_in_ptr
 
 Writes the value like `to_string` to `buf` and returns the byte count.
 
-`buf` needs room for 64 bytes. No terminating zero is written.
+`buf` needs room for 64 bytes, unchecked. Deprecated: use `to_string_in`, which takes a
+bounds-checked slice, or `to_string_into`. No terminating zero is written.
+
+#### to_string_into
+
+Writes the value like `to_string` to `out` and returns the bytes written.
+
+The text is built on the stack, so nothing is allocated. Throws when `out` fails.
 
 ```js
 // A 16-bit signed integer.

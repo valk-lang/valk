@@ -113,6 +113,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // The exit code `exec` returns when it cannot run the shell or collect its status.
 + value EXEC_FAILED (-1)
+// The buffer size the `_in` float formatters require: the longest text any of them writes is 40 bytes, so 64 leaves room to spare.
++ value FLOAT_TEXT_SIZE (64)
 ```
 
 ## Errors for 'core'
@@ -418,6 +420,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn write_cstring(str: cstring, include_zero_byte: bool (true)) void
     // Appends `v` in fixed notation with `decimals` digits after the point.
     + fn write_f64_ascii(v: f64, decimals: uint, trim_zeros: bool (false)) void
+    // Appends `v` in exponent form with `decimals` digits after the point, e.g. `1.234567e6`.
+    + fn write_f64_ascii_scientific(v: f64, decimals: uint (6), trim_zeros: bool (false)) void
     // Appends `v` with the fewest digits that parse back to the same value.
     + fn write_f64_ascii_shortest(v: f64, force_exponent: bool (false)) void
     // Appends the IEEE 754 bits of `v` as 8 bytes, most significant first.
@@ -993,14 +997,28 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn max(other: f32) f32
     // Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
     + fn min(other: f32) f32
+    // Returns the value in exponent form with `decimals` digits after the dot, e.g. `1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+    + fn to_scientific_string(decimals: uint (6), trim_zeros: bool (false)) String
+    // Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+    + fn to_scientific_string_in(buf: local mut &[u8], decimals: uint (6), trim_zeros: bool (false)) uint
+    // Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+    + fn to_scientific_string_into(out: Writer, decimals: uint (6), trim_zeros: bool (false)) uint !io:IoError
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
+    // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+    + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+    + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Writes the value like `to_string` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    // Writes the value like `to_string` to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -1023,14 +1041,28 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn max(other: f64) f64
     // Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
     + fn min(other: f64) f64
+    // Returns the value in exponent form with `decimals` digits after the dot, e.g. `1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+    + fn to_scientific_string(decimals: uint (6), trim_zeros: bool (false)) String
+    // Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+    + fn to_scientific_string_in(buf: local mut &[u8], decimals: uint (6), trim_zeros: bool (false)) uint
+    // Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+    + fn to_scientific_string_into(out: Writer, decimals: uint (6), trim_zeros: bool (false)) uint !io:IoError
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
+    // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+    + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+    + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Writes the value like `to_string` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    // Writes the value like `to_string` to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -1053,14 +1085,28 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn max(other: float) float
     // Returns the smaller of `this` and `other`; when one of them is NaN, returns the other.
     + fn min(other: float) float
+    // Returns the value in exponent form with `decimals` digits after the dot, e.g. `1.234567e6` for `1234567.0` and `1.234e-5` for `0.00001234`.
+    + fn to_scientific_string(decimals: uint (6), trim_zeros: bool (false)) String
+    // Writes the value like `to_scientific_string` into `buf` and returns the byte count.
+    + fn to_scientific_string_in(buf: local mut &[u8], decimals: uint (6), trim_zeros: bool (false)) uint
+    // Writes the value like `to_scientific_string` to `out` and returns the bytes written.
+    + fn to_scientific_string_into(out: Writer, decimals: uint (6), trim_zeros: bool (false)) uint !io:IoError
     // Returns the shortest decimal text that parses back to the same value.
     + fn to_shortest_string() String
+    // Writes the value like `to_shortest_string` into `buf` and returns the byte count.
+    + fn to_shortest_string_in(buf: local mut &[u8], force_exponent: bool (false)) uint
     // Writes the value like `to_shortest_string` to `buf` and returns the byte count.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint
+    // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
+    + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
     // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
     + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Writes the value like `to_string` into `buf` and returns the byte count.
+    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint
+    // Writes the value like `to_string` to `out` and returns the bytes written.
+    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
