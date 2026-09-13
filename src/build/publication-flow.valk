@@ -3,9 +3,13 @@ class PublicationState {
     live: bool (true)
     published: Array[Decl] (.{})
     links: Array[PublicationLink] (.{})
+    // `world`: everything that escaped is linked to it, but two graphs that
+    // both escaped are not thereby each other's aliases, so `related` never
+    // travels through it (it still lists it)
+    barrier: ?Decl (null)
 
     fn copy() PublicationState {
-        return .{ live: this.live, published: this.published.copy(), links: this.links.copy() }
+        return .{ live: this.live, published: this.published.copy(), links: this.links.copy(), barrier: this.barrier }
     }
     fn link(left: Decl, right: Decl) {
         if left == right : return
@@ -19,6 +23,7 @@ class PublicationState {
         let index: uint = 0
         while index < found.length {
             let current = found[index++]
+            if current == this.barrier : continue
             each this.links as pair {
                 if pair.left == current : found.append(pair.right, true)
                 if pair.right == current : found.append(pair.left, true)
@@ -72,13 +77,16 @@ class PublicationFlow {
     // Stands for everything outside the function: a graph linked to it has an
     // alias the function cannot see
     world: Decl
+    // Stands for frame storage lent to a call: a graph linked to it holds
+    // storage that dies with this frame, so it may never reach `world`
+    lent: Decl
     breaks: ?Array[PublicationState] (null)
     continues: ?Array[PublicationState] (null)
     returns: ?Array[PublicationState] (null)
     match_value: ?Value (null)
 
     fn nested(breaks: ?Array[PublicationState], continues: ?Array[PublicationState], returns: ?Array[PublicationState], match_value: ?Value) PublicationFlow {
-        return .{ func: this.func, world: this.world, breaks: breaks, continues: continues, returns: returns, match_value: match_value }
+        return .{ func: this.func, world: this.world, lent: this.lent, breaks: breaks, continues: continues, returns: returns, match_value: match_value }
     }
 }
 
@@ -177,12 +185,33 @@ fn publication_link_sources(state: PublicationState, sources: Array[Decl], other
     }
 }
 
+// The graph of `source` leaves the frame through `what`; storage lent to a call
+// must not be part of it
+fn publication_link_world(source: Decl, state: PublicationState, flow: PublicationFlow, at: ?Value, what: String, retains: bool (true)) !Error {
+    if retains && isset(at) && source != flow.world && state.related(source).contains(flow.lent) {
+        at.error("Frame storage lent to a call must not leave this function, but " + what
+            + " keeps an object holding it; copy the storage into the heap first")
+    }
+    state.link(source, flow.world)
+}
+
 // The graph escapes to where the function cannot follow it
-fn publication_escape(value: ?Value, state: PublicationState, flow: PublicationFlow) {
+fn publication_escape(value: ?Value, state: PublicationState, flow: PublicationFlow, what: String ("this call")) !Error {
     if !isset(value) || !state.live : return
     let sources = Array[Decl]{}
     publication_sources(value, state, sources)
-    each sources as source : state.link(source, flow.world)
+    each sources as source : publication_link_world(source, state, flow, value, what) !>
+}
+
+// Whether `value`'s graph holds storage lent to a call
+fn publication_holds_lent(value: ?Value, state: PublicationState, flow: PublicationFlow) bool {
+    if !isset(value) || !state.live : return false
+    let sources = Array[Decl]{}
+    publication_sources(value, state, sources)
+    each sources as source {
+        if state.related(source).contains(flow.lent) : return true
+    }
+    return false
 }
 
 // A local that owns this storage, or null when the storage is not local
@@ -207,10 +236,10 @@ fn publication_call_effects(call: Value, func: ?Func, state: PublicationState, f
     if !state.live : return
     let callee = call.value1
     if !isset(func) {
-        publication_escape(isset(callee) && callee.type == VAL.func ? callee.value1 : callee, state, flow)
+        publication_escape(isset(callee) && callee.type == VAL.func ? callee.value1 : callee, state, flow) !>
         let args = call.values
         if isset(args) {
-            each args as arg : publication_escape(arg, state, flow)
+            each args as arg : publication_escape(arg, state, flow) !>
         }
         return
     }
@@ -220,7 +249,7 @@ fn publication_call_effects(call: Value, func: ?Func, state: PublicationState, f
         let input = value_call_argument(call, func, index)
         if !isset(input) || !publication_tracks_graph(input.rett) : continue
         if !known {
-            publication_escape(input, state, flow)
+            publication_escape(input, state, flow) !>
             continue
         }
         decl_resolve_pending_absorbs(param.decl) !>
@@ -238,8 +267,35 @@ fn publication_call_effects(call: Value, func: ?Func, state: PublicationState, f
             absorbed = true
         }
         if (param.may_escape && !absorbed) || param.invalidates_unique {
-            each sources as source : state.link(source, flow.world)
+            each sources as source : publication_link_world(source, state, flow, input, "this call", param.may_retain && !absorbed) !>
         }
+    }
+}
+
+// Frame storage lent to argument `index` of `call`: its held slot stands for
+// the storage and is linked to `lent`; the callee keeps it in its result
+// (found through the slot) or moves it into another argument's graph
+fn publication_lend(call: Value, func: ?Func, index: uint, state: PublicationState, flow: PublicationFlow) !Error {
+    if !state.live : return
+    let meta = call.ensure_meta()
+    let holds = meta.publication_holds ?! return
+    let held = holds.get(index + 1) !? null
+    if !isset(held) : return
+    state.link(held, flow.lent)
+    let callee = call.value1
+    let f = func
+    if !isset(f) || !isset(callee) || !f.unique_summary_ready || func_unique_summary_unavailable_in_lsp(f) {
+        publication_link_world(held, state, flow, call, "this call") !>
+        return
+    }
+    let param_index = index + call_receiver_skip(callee, f)
+    each f.args as target, target_index {
+        let absorbs = target.absorbs_args ?! continue
+        if !absorbs.contains(param_index) : continue
+        let holder = value_call_argument(call, f, target_index) ?! continue
+        let others = Array[Decl]{}
+        publication_sources(holder, state, others)
+        each others as other : state.link(held, other)
     }
 }
 
@@ -275,7 +331,7 @@ fn publication_loop(value: Value, state: PublicationState, flow: PublicationFlow
     let entry = state.copy()
     let head = entry.copy()
     let seen = Array[PublicationState]{ head }
-    let exits = PublicationState { live: false }
+    let exits = PublicationState { live: false, barrier: state.barrier }
     while true {
         let iteration = head.copy()
         let breaks = Array[PublicationState]{}
@@ -287,7 +343,7 @@ fn publication_loop(value: Value, state: PublicationState, flow: PublicationFlow
         if isset(condition) && condition.type == VAL.bool && !condition.bool_val : iteration.live = false
         publication_values(value.values, iteration, inner) !>
         each breaks as stopped : exits.merge(stopped)
-        let next = PublicationState { live: false }
+        let next = PublicationState { live: false, barrier: state.barrier }
         next.merge(iteration)
         each continues as resumed : next.merge(resumed)
         if !next.live : break
@@ -305,8 +361,8 @@ fn publication_loop(value: Value, state: PublicationState, flow: PublicationFlow
     state.merge(exits)
 }
 
-fn publication_hold_input(call: Value, input: ?Value, index: uint, state: PublicationState, flow: PublicationFlow) {
-    if !isset(input) || !state.live || !publication_tracks_graph(input.rett) : return
+fn publication_hold_input(call: Value, input: ?Value, index: uint, state: PublicationState, flow: PublicationFlow, force: bool (false)) {
+    if !isset(input) || !state.live || (!force && !publication_tracks_graph(input.rett)) : return
     let sources = Array[Decl]{}
     publication_sources(input, state, sources)
     if sources.length == 0 : return
@@ -351,14 +407,28 @@ fn publication_call(value: Value, state: PublicationState, flow: PublicationFlow
     let receiver = isset(callee) && callee.type == VAL.func ? callee.value1 : callee
     publication_hold_input(value, receiver, 0, state, flow)
     let args = value.values
+    let lent: ?Array[uint] = null
     if isset(args) {
         each args as arg, index {
             publication_value(arg, state, flow) !>
-            publication_hold_input(value, arg, index + 1, state, flow)
+            let arg_meta = arg.meta
+            let lends = isset(arg_meta) && arg_meta.lent_borrow
+            publication_hold_input(value, arg, index + 1, state, flow, lends)
+            if lends {
+                let list = lent ?? <{
+                    let created = Array[uint]{}
+                    lent = created
+                    return created
+                }
+                list.append(index)
+            }
         }
     }
     publication_check_holds(value, state, "An ordinary call argument or receiver aliases a graph published while evaluating the call") !>
     publication_call_effects(value, func, state, flow) !>
+    if isset(lent) {
+        each lent as index : publication_lend(value, func, index, state, flow) !>
+    }
     if isset(func) && (func.must_exit || func.will_exit) : state.live = false
 }
 
@@ -418,6 +488,9 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
     } else if kind == VAL.return || kind == VAL.throw {
         publication_value(value.value1, state, flow) !>
         publication_values(value.values, state, flow) !>
+        if kind == VAL.return && publication_holds_lent(value.value1, state, flow) {
+            value.error("Frame storage lent to a call must not leave this function, but the returned value holds an object holding it; copy the storage into the heap first")
+        }
         if kind == VAL.return && state.live {
             let returns = flow.returns
             if isset(returns) : returns.append(state.copy())
@@ -425,6 +498,30 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
         state.live = false
     } else if kind == VAL.call {
         publication_call(value, state, flow) !>
+    } else if kind == VAL.co {
+        let launched = value.value1
+        if isset(launched) && launched.type == VAL.call {
+            // Inputs are evaluated by the call below; the launch itself is what
+            // keeps them, so it is reported first
+            let callee = launched.value1
+            let args = launched.values
+            if isset(args) {
+                each args as arg {
+                    if publication_holds_lent(arg, state, flow) : arg.error("Frame storage lent to a call must not leave this function, but a coroutine keeps an object holding it; copy the storage into the heap first")
+                }
+            }
+            let receiver = isset(callee) && callee.type == VAL.func ? callee.value1 : callee
+            if publication_holds_lent(receiver, state, flow) : value.error("Frame storage lent to a call must not leave this function, but a coroutine keeps an object holding it; copy the storage into the heap first")
+        }
+        publication_value(launched, state, flow) !>
+        if isset(launched) && launched.type == VAL.call {
+            let callee = launched.value1
+            publication_escape(isset(callee) && callee.type == VAL.func ? callee.value1 : callee, state, flow, "a coroutine") !>
+            let args = launched.values
+            if isset(args) {
+                each args as arg : publication_escape(arg, state, flow, "a coroutine") !>
+            }
+        }
     } else if kind == VAL.assign {
         let left = value.value1
         let right = value.value2
@@ -451,7 +548,7 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
                 publication_sources(root, state, others)
                 publication_link_sources(state, sources, others)
             } else {
-                publication_escape(right, state, flow)
+                publication_escape(right, state, flow, "this store") !>
             }
         }
     } else if kind == VAL.prop || kind == VAL.ptrv {
@@ -478,7 +575,7 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
     } else if kind == VAL.match {
         publication_value(value.value1, state, flow) !>
         let inner = flow.nested(flow.breaks, flow.continues, flow.returns, value.value1)
-        let joined = PublicationState { live: false }
+        let joined = PublicationState { live: false, barrier: state.barrier }
         let cases = value.values
         if isset(cases) {
             each cases as branch {
@@ -506,7 +603,7 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
                     if state.published.contains(captured) {
                         value.error("An ordinary value may be used again after its graph was published as shared")
                     }
-                    state.link(captured, flow.world)
+                    publication_link_world(captured, state, flow, value, "a closure") !>
                 }
             }
         }
@@ -529,6 +626,11 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
         if sources.contains(flow.world) {
             value.error("Only a provably unique value graph can be published as shared; an alias made on an earlier path may remain")
         }
+        each sources as source {
+            if state.related(source).contains(flow.lent) {
+                value.error("Frame storage lent to a call must not leave this function, but publishing this graph as shared would; copy the storage into the heap first")
+            }
+        }
         each sources as source : state.published.append(source, true)
     }
 }
@@ -536,5 +638,6 @@ fn publication_value(value: ?Value, state: PublicationState, flow: PublicationFl
 fn func_check_publication_flow(func: Func) !Error {
     let body = func.body_scope ?! return
     let world = Decl.new(func, type_ptr(func.ns.build), false, null)
-    publication_values(body.values, PublicationState {}, PublicationFlow { func: func, world: world }) !>
+    let lent = Decl.new(func, type_ptr(func.ns.build), false, null)
+    publication_values(body.values, PublicationState { barrier: world }, PublicationFlow { func: func, world: world, lent: lent }) !>
 }

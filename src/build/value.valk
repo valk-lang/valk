@@ -106,6 +106,9 @@ class ValueMeta {
     // An element read through a read-only borrow: its slot may not be written
     readonly_element: bool (false)
     publication_holds: ?Array[?Decl] (null)
+    // Frame storage lent to this call argument; the callee keeps it in an
+    // object (its result or another argument) that must stay in the frame
+    lent_borrow: bool (false)
     publication_store: ?Value (null)
     init_prop: ?Prop (null)
     implicit_borrow: bool (false)
@@ -1470,7 +1473,7 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     // Generated bodies need the same freshness proof as source functions.
     clone_func.unique_summary_saw_return = true
     clone_func.returns_unique_graph = value_summary_graph_is_unique(result, clone_func, clone_func.unique_return_args) !>
-    if !clone_func.returns_unique_graph : value_mark_summary_escape(result)
+    if !clone_func.returns_unique_graph : value_mark_summary_escape(result, false)
     func_finish_unique_summary(clone_func) !>
     body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
@@ -1818,7 +1821,7 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     result.rett = rett
     func.unique_summary_saw_return = true
     func.returns_unique_graph = value_summary_graph_is_unique(result, func, func.unique_return_args) !>
-    if !func.returns_unique_graph : value_mark_summary_escape(result)
+    if !func.returns_unique_graph : value_mark_summary_escape(result, false)
     body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
 
@@ -5335,7 +5338,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let receiver_arg = params.get(0) !? null
             let owner = ctx.get_func() !>
             // A flag that is already set is final; the rest may still flip
-            if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver)
+            if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver, func_arg_may_retain(func, 0))
             if func.unique_summary_ready && func_arg_invalidates_unique(func, 0) && !value_is_raw_pointer_arg(receiver) : value_invalidate_unique(receiver)
             else if !(value_absorb_call_args(func, receiver_arg, receiver, args, skip, owner, false) !>) : absorbs_known = false
             if !func_arg_summary_settled(func, 0) && isset(receiver_arg) {
@@ -5392,14 +5395,21 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             // callee's summary proves it neither keeps nor returns it; a
             // coroutine keeps its arguments, so never there
             let accepts_stack_borrow = false
+            // Storage the callee keeps in its result or in another argument is
+            // lent: the object holding it may not leave this frame, which the
+            // publication-flow pass checks once every summary has settled
+            let lends_into_holder = false
             if !is_coroutine && param.type.get_non_nullable().is_owned_borrow()
                 && !param.type.get_non_nullable().is_local
                 && value_is_stack_borrow_source(av) {
                 if !func.unique_summary_ready : ensure_func_unique_return_summary(func) !>
-                accepts_stack_borrow = func.unique_summary_ready && !func_arg_may_escape(func, param_i)
-                    && !(func.returns_unique_graph && func.unique_return_args.contains(param_i))
+                let absorbed = func_arg_absorbed_into_other(func, param_i) !>
+                accepts_stack_borrow = func.unique_summary_ready && (!func_arg_may_retain(func, param_i) || absorbed)
+                let settled = func_arg_summary_settled(func, param_i)
+                lends_into_holder = accepts_stack_borrow && (absorbed || !settled
+                    || (func.returns_unique_graph && func.unique_return_args.contains(param_i)))
                 // A provisional flag may still flip; re-checked once it settles
-                if accepts_stack_borrow && !func_arg_summary_settled(func, param_i) && !isset(param.cannot_escape_pos) {
+                if accepts_stack_borrow && !settled && !isset(param.cannot_escape_pos) {
                     param.cannot_escape_pos = Pos { src: at.src, i: at.i }
                 }
             }
@@ -5435,11 +5445,16 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 av = vgen_cast(av, av.rett.plain_type())
             }
             av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow, accepts_stack_borrow) !>
+            if lends_into_holder {
+                av.ensure_meta().lent_borrow = true
+                let caller = ctx.get_func() !>
+                caller.has_lends = true
+            }
             if isset(receiver) && receiver.rett.get_non_nullable().is_locked {
                 value_check_locked_call_arg(func, param_i, av, receiver, ctx) !>
             }
             let owner = ctx.get_func() !>
-            if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av)
+            if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))
             if func.unique_summary_ready && func_arg_invalidates_unique(func, param_i) && !value_is_raw_pointer_arg(av) : value_invalidate_unique(av)
             else if !(value_absorb_call_args(func, param, av, args, skip, owner, false) !>) : absorbs_known = false
             if !settled : value_defer_arg_effects(param, av, at, pending_shared_borrow) !>
@@ -5460,7 +5475,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let frame_closure = av.is_implicit_borrow() && source_kind == TYPE.closure && target_kind == TYPE.closure
             if frame_closure && !func.unique_summary_ready : ensure_func_unique_return_summary(func) !>
             let accepts_frame_closure = frame_closure
-                && func.unique_summary_ready && !func_arg_may_escape(func, param_i)
+                && func.unique_summary_ready && !func_arg_may_retain(func, param_i)
             if frame_closure && !accepts_frame_closure {
                 at.error("A method bound to a stack receiver cannot be passed to '" + func.name + "'; it is kept beyond the call through parameter '" + param.name + "'")
             }

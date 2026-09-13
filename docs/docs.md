@@ -309,13 +309,18 @@ the bare forms, never the other way around, and two different names never
 convert to each other: a name is a promise only its own class can keep.
 
 A fixed array on the stack, such as `let key: [u8 x 4] = { 1, 2, 3, 4 }`,
-also converts to `&[T]` or `&T` when passed to a function, as long as that
-function provably keeps nothing: it may read and pass the borrow on, but a
-callee that stores it in an object, returns it, or hands it to a coroutine
-gets "Cannot convert a stack borrow" at the call, because the storage dies
-with the caller's frame. The same applies to a `local &T` borrow. Storage
-that must be kept belongs in a class property, a global, or a heap slice
-such as `[u8]{ 0 x 4 }`.
+also converts to `&[T]` or `&T` when passed to a function. The compiler
+follows what the callee does with it: a callee that only reads or passes the
+borrow on is fine, and so is one that hands it back or keeps it in an object
+it returns or in another argument, such as `ByteReader.new(key)`, as long as
+that object stays in the caller's frame. The storage dies with the frame, so
+the object holding it may not be stored in a global or in an object that
+leaves the function, returned, captured by a closure, handed to a coroutine,
+or published as shared; each of those is reported where it happens. The same
+applies to a `local &T` borrow. A callee that hands the borrow to a place the
+caller cannot follow gets "Argument passed here must not escape" at the call.
+Storage that must outlive the frame belongs in a class property, a global, or
+a heap slice such as `[u8]{ 0 x 4 }`.
 
 A parameter declared `local &[T]` or `local mut &[T]` says up front that the
 callee keeps nothing, so it takes any of these without a proof, and a

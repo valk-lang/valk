@@ -354,7 +354,19 @@ fn value_stays_inside(value: Value, owner: Value) bool {
     return true
 }
 
-fn value_mark_summary_escape(value: Value) {
+// A local borrow of storage without managed elements cannot be kept by the
+// callee: the type forbids storing it, and its elements are plain bytes. A
+// raw pointer to it handed to unsafe code is the writer's concern.
+fn arg_cannot_retain(arg: Arg) bool {
+    let nn = arg.type.get_non_nullable()
+    if !nn.is_local || !nn.is_fat_borrow() : return false
+    let sub = nn.get_sub_type()
+    return !isset(sub) || !sub.has_gc_refs()
+}
+
+// `retain`: the value is kept somewhere the caller cannot follow; a return
+// only hands an alias back into the caller's frame
+fn value_mark_summary_escape(value: Value, retain: bool (true)) {
     let origins = value.rett.build.cache.origins_buf
     origins.clear()
     value_collect_escape_origins(value, origins, false)
@@ -362,6 +374,7 @@ fn value_mark_summary_escape(value: Value) {
         let arg = decl_escape_arg(origin)
         if isset(arg) {
             arg.may_escape = true
+            if retain && !arg_cannot_retain(arg) : arg.may_retain = true
         }
     }
 }
@@ -744,8 +757,8 @@ fn value_invalidate_unique(value: Value) {
     }
 }
 
-fn value_mark_actual_escape(value: Value) {
-    value_mark_summary_escape(value)
+fn value_mark_actual_escape(value: Value, retain: bool (true)) {
+    value_mark_summary_escape(value, retain)
     value_invalidate_unique(value)
 }
 
@@ -1268,6 +1281,7 @@ fn value_summary_hook_chain_is_unique(value: Value, owner: Func, dependencies: A
 fn func_unique_summary_conservative(func: Func) {
     each func.args as arg {
         arg.may_escape = true
+        arg.may_retain = true
         arg.invalidates_unique = true
         arg.may_write = true
     }
@@ -1281,6 +1295,7 @@ fn func_unique_summary_conservative(func: Func) {
 fn func_begin_unique_summary(func: Func) {
     each func.args as arg {
         arg.may_escape = false
+        arg.may_retain = false
         arg.invalidates_unique = false
         arg.may_write = false
         arg.absorbs_args = null
@@ -1302,7 +1317,7 @@ fn func_finish_unique_summary(func: Func) !Error {
     // the summary says the return is unique. Once it does not, those returns
     // are ordinary escapes.
     if !func.returns_unique_graph {
-        each func.pending_return_escapes as retv : value_mark_summary_escape(retv)
+        each func.pending_return_escapes as retv : value_mark_summary_escape(retv, false)
     }
     func.pending_return_escapes = .{}
     func.computing_unique_summary = false
@@ -1311,8 +1326,60 @@ fn func_finish_unique_summary(func: Func) !Error {
 
 fn ensure_func_unique_summary(func: Func) !Error {
     if func.unique_summary_ready || func.computing_unique_summary : return
-    if func.is_extern || func.is_interface || !isset(func.body) {
+    if func.is_interface {
+        func_unique_summary_open(func)
+        return
+    }
+    if func.is_extern || !isset(func.body) {
         func_unique_summary_conservative(func)
+    }
+}
+
+// An interface method has no body of its own: its flags start clear and
+// provisional, and `link_interface_summaries` makes them dependents of every
+// implementation at the end of the build, so a flag set in any implementation
+// flips the interface's and, through it, its callers'. Until then callers
+// defer their decisions the way they do for a recursion cycle.
+fn func_unique_summary_open(func: Func) {
+    each func.args as arg {
+        arg.may_escape = false
+        arg.may_retain = false
+        arg.invalidates_unique = false
+        arg.may_write = false
+        arg.provisional = true
+    }
+    func.returns_unique_graph = false
+    func.unique_return_args.clear()
+    func.unique_summary_saw_return = false
+    func.computing_unique_summary = false
+    func.unique_summary_ready = true
+}
+
+// Every implementation's parameter feeds the interface method's parameter
+fn link_interface_summaries(build: Build) !Error {
+    each build.lists.classes as class {
+        each class.interfaces as interface {
+            let slot: uint = 0
+            while slot < interface.interface_method_count {
+                let requirement = interface_method_at(interface, slot)
+                slot++
+                if !isset(requirement) : continue
+                let implementation = class.get_func(requirement.name) ?! continue
+                if func_unique_summary_unavailable_in_lsp(implementation) : continue
+                ensure_func_unique_return_summary(implementation) !>
+                ensure_func_unique_summary(requirement) !>
+                each requirement.args as target, index {
+                    let source = implementation.args.get(index) ! continue
+                    arg_append_dependent(source, target)
+                    let writes = source.write_dependents ?? <{
+                        let created = Array[Arg]{}
+                        source.write_dependents = created
+                        return created
+                    }
+                    writes.append(target, true)
+                }
+            }
+        }
     }
 }
 
@@ -1339,6 +1406,25 @@ fn func_arg_may_escape(func: Func, index: uint) bool {
     if !func.unique_summary_ready : return true
     let arg = func.args.get(index) !? null
     return !isset(arg) || arg.may_escape
+}
+
+fn func_arg_may_retain(func: Func, index: uint) bool {
+    if !func.unique_summary_ready : return true
+    let arg = func.args.get(index) !? null
+    return !isset(arg) || arg.may_retain
+}
+
+// Whether the callee moves argument `index` into another argument's graph
+// (`arr.append(item)`), which the caller can follow, unlike a real escape
+fn func_arg_absorbed_into_other(func: Func, index: uint) bool !Error {
+    if !func.unique_summary_ready : return false
+    each func.args as target, target_index {
+        if target_index == index : continue
+        decl_resolve_pending_absorbs(target.decl) !>
+        let absorbs = target.absorbs_args ?! continue
+        if absorbs.contains(index) : return true
+    }
+    return false
 }
 
 fn func_arg_invalidates_unique(func: Func, index: uint) bool {
@@ -1432,6 +1518,7 @@ fn value_defer_arg_effects(param: Arg, value: Value, at: Exp, force: bool (false
 }
 
 fn resolve_deferred_unique_effects(build: Build) !Error {
+    link_interface_summaries(build) !>
     each build.lists.units as unit {
         each unit.functions as func {
             if func_unique_summary_unavailable_in_lsp(func) : continue
@@ -1439,6 +1526,7 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
         }
     }
     let escape = Array[Arg]{}
+    let retain = Array[Arg]{}
     let invalidate = Array[Arg]{}
     let writes = Array[Arg]{}
     each build.lists.units as unit {
@@ -1446,6 +1534,7 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
             if func_unique_summary_unavailable_in_lsp(func) : continue
             each func.args as arg {
                 if arg.may_escape : escape.append(arg)
+                if arg.may_retain : retain.append(arg)
                 if arg.invalidates_unique : invalidate.append(arg)
                 if arg.may_write : writes.append(arg)
             }
@@ -1460,6 +1549,16 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
             if dependent.may_escape : continue
             dependent.may_escape = true
             escape.append(dependent)
+        }
+    }
+    while true {
+        let arg = retain.pop_last() ! break
+        let dependents = arg.escape_dependents
+        if !isset(dependents) : continue
+        each dependents as dependent {
+            if dependent.may_retain || arg_cannot_retain(dependent) : continue
+            dependent.may_retain = true
+            retain.append(dependent)
         }
     }
     while true {
@@ -1486,7 +1585,7 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
     each build.lists.units as unit {
         each unit.functions as func {
             if func_unique_summary_unavailable_in_lsp(func) : continue
-            each func.args as arg {
+            each func.args as arg, arg_index {
                 let enum_pos = arg.enum_receiver_pos
                 if isset(enum_pos) && (arg.may_write || arg.may_escape) {
                     enum_pos.error("Cannot call a method that modifies or exposes enum storage; copy its underlying value first")
@@ -1496,7 +1595,7 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
                     shared_borrow_pos.error("Only a provably unique value graph can be converted to '" + arg.type.compat_display_name() + "'; a mutable alias may remain")
                 }
                 let escape_pos = arg.cannot_escape_pos
-                if arg.may_escape && isset(escape_pos) {
+                if arg.may_retain && isset(escape_pos) && !(func_arg_absorbed_into_other(func, arg_index) !>) {
                     escape_pos.error("Argument passed here must not escape through '" + func.name
                         + "', but it is kept beyond the call through parameter '" + arg.name + "'")
                 }
@@ -1512,7 +1611,7 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
     // Publication flow needs the settled flags; every body is parsed by now
     each build.lists.units as unit {
         each unit.functions as func {
-            if !func.has_publications || func_unique_summary_unavailable_in_lsp(func) : continue
+            if (!func.has_publications && !func.has_lends) || func_unique_summary_unavailable_in_lsp(func) : continue
             func_check_publication_flow(func) !>
             func.body_scope = null
         }
