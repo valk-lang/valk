@@ -12,8 +12,10 @@
 * [Types](#types)
 * [Variables](#variables)
 * [Strings](#strings)
+    * [Regular expressions](#regular-expressions)
 * [Arrays](#arrays)
 * [Maps](#maps)
+    * [Sets, deques and heaps](#sets-deques-and-heaps)
 * [Typehints](#typehints)
 * [Tagged unions](#tagged-unions)
 
@@ -21,6 +23,7 @@
 <br></td><td width=200px><br>
 
 * [Functions](#functions)
+   * [Type default values](#type-default-values)
    * [Errors](#errors)
    * [Error handling](#error-handling)
    * [Throw functions](#throw-functions)
@@ -32,8 +35,10 @@
 * [Generics](#generics)
 * [Modes](#modes)
 * [Traits](#traits)
+* [Finalizers](#finalizers)
 * [Globals](#globals)
 * [Aliases](#aliases)
+* [Documentation comments](#documentation-comments)
 * [Tokens](#tokens)
     * [Let](#variables)
     * [If/Else](#if-else)
@@ -45,10 +50,13 @@
 
 * [Null checking](#null-checking)
 * [Files](#files)
+    * [File locks](#file-locks)
     * [Paths](#paths)
 * [JSON](#json)
 * [DateTime](#datetime)
 * [Coroutines](#coroutines)
+* [Channels and cancellation](#channels-and-cancellation)
+* [Signals](#signals)
 * [Access Types](#access-types)
 * [Value Scopes](#value-scopes)
 * [Compile macros](#compile-macros)
@@ -59,6 +67,7 @@
 * [Sockets](#sockets)
 * [Templates](#templates)
 * [Crypto](#crypto)
+* [Compression](#compression)
 
 <br></td><td width=200px><br>
 
@@ -863,7 +872,8 @@ fn write_fast(out: io.Writer, text: String) uint !io.IoError {
 
 That is how the standard library's `_into` functions work: `html.escape_into`,
 `url.encode_into`, `json.encode_into`, `DateTime.format_into`,
-`markdown.to_html_into`, `template.render_into` and the crypto `hash_into` /
+`markdown.to_html_into`, `template.render_into`, `fs.read_into`, the
+compression `gzip_into` / `gunzip_into` family and the crypto `hash_into` /
 `hex_encode_into` family take an `io.Writer`, write straight into a
 `ByteBuffer`, and hand any other writer the finished bytes. Each returns the
 bytes written and throws when the writer fails; the plain form returns a `String`.
@@ -1140,7 +1150,19 @@ fn print(msg: ?String) {
 
 API for [valk.fs](api.md#fs)
 
-Use `valk.fs` for file-system operations.
+Use `valk.fs` for file-system operations. `fs.read(path)` returns a whole
+file as a `String`, `fs.write(path, content, append)` takes any bytes, and
+`fs.read_into(path, writer)` / `fs.write_from(path, reader)` stream a file
+without holding it in memory:
+
+```rust
+use valk.fs
+use valk.io
+
+let text = fs.read("config.json") ! panic("Cannot read config")
+fs.write("log.txt", "started\n", true) ! panic("Cannot append to log")
+fs.read_into("big.bin", io.stdout()) ! panic("Cannot copy file")
+```
 
 `fs.stat(path)` returns a `FileInfo` with `size` in bytes, `kind` (`file`,
 `directory`, or `other`), `permissions`, and `modified_time` in Unix nanoseconds.
@@ -1210,7 +1232,9 @@ io.stderr().write("done\n") ! panic("write")
 
 `io.LineReader` reads any reader line by line. `read_line()` returns the next
 line without its `\n` or `\r\n` and null once the input is exhausted,
-`read_until(delimiter)` splits on any byte, and `lines()` collects what remains:
+`read_until(delimiter)` splits on any byte, and `lines()` collects what remains.
+`read_line_into(writer)` and `read_until_into(delimiter, writer)` do the same
+without allocating a `String`:
 
 ```rust
 let input = io.LineReader.new(io.stdin())
@@ -1223,6 +1247,24 @@ while true {
 
 Environment variables are read with `core.getenv(name)`, and changed for the
 process and its children with `core.setenv(name, value)` and `core.unsetenv(name)`.
+
+### File locks
+
+`fs.lock(path)` takes an advisory lock on a file, creating it when missing,
+and returns a `FileLock` that `unlock` (or collection) releases. A lock is
+exclusive unless `exclusive` is false, in which case it is shared: shared
+locks coexist and keep exclusive ones out. `fs.lock(path, true, 500)` gives
+up with `timeout` after half a second, and `fs.try_lock(path)` returns `null`
+instead of waiting. Waiting polls rather than blocking, so the other
+coroutines on the thread keep running. The locks only affect other lock
+callers, and other programs using `flock` or `LockFileEx`, never plain reads
+and writes.
+
+```rust
+let held = fs.lock("build.lock") ! panic("Could not lock")
+// ... work no other process may do at the same time ...
+held.unlock() ! panic("Could not unlock")
+```
 
 ## Paths
 
@@ -1734,24 +1776,6 @@ versions are handled as 1.1. A `Connection: close` on an HTTP/1.1 request
 ends the connection after that response; anything pipelined behind it is
 not served.
 
-### File locks
-
-`fs.lock(path)` takes an advisory lock on a file, creating it when missing,
-and returns a `FileLock` that `unlock` (or collection) releases. A lock is
-exclusive unless `exclusive` is false, in which case it is shared: shared
-locks coexist and keep exclusive ones out. `fs.lock(path, true, 500)` gives
-up with `timeout` after half a second, and `fs.try_lock(path)` returns `null`
-instead of waiting. Waiting polls rather than blocking, so the other
-coroutines on the thread keep running. The locks only affect other lock
-callers, and other programs using `flock` or `LockFileEx`, never plain reads
-and writes.
-
-```rust
-let held = fs.lock("build.lock") ! panic("Could not lock")
-// ... work no other process may do at the same time ...
-held.unlock() ! panic("Could not unlock")
-```
-
 ## Sockets
 
 API for [valk.net](api.md#net)
@@ -1794,7 +1818,7 @@ fn server() {
 // Client
 fn main() {
     // Start our server in the background
-    let s = co server()
+    co server()
     // Open client
     let con = net.tcp_client("127.0.0.1", 8000) ! panic("Failed to open socket")
     // Send
@@ -1942,7 +1966,7 @@ SHA-384, SHA-512, HMAC, PBKDF2, HKDF, and secure random values.
 use valk.crypto
 
 let hash = crypto.Blake2b.hash_string("test") ! panic("Failed to hash")
-let hex = crypto.sha512_encode("test")
+let hex = crypto.sha512_hex("test")
 ```
 
 The hash functions share the `Hasher` interface: `update` feeds input in
@@ -1956,9 +1980,9 @@ use valk.crypto
 let sha = crypto.hasher(crypto.HashAlgorithm.sha256)
 sha.update("ab")
 sha.update("c")
-let digest = [u8]{ 0 x sha.digest_size() }
-sha.finish(digest)
-println(crypto.hex_encode(digest)) // same as crypto.sha256_encode("abc")
+let digest: [u8 x 32] = @undefined // or [u8]{ 0 x sha.digest_size() } on the heap
+sha.finish(&digest)
+println(crypto.hex_encode(&digest)) // same as crypto.sha256_hex("abc")
 ```
 
 `Hmac` signs and verifies messages with any of those hashes. Compare MACs
