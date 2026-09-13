@@ -7426,6 +7426,8 @@ Counted in bytes, or in UTF-16 units on Windows.
 + fn is_file(path: String) bool
 // Returns whether `path` is a symbolic link, without following it.
 + fn is_symlink(path: String) bool
+// Takes a lock on the file at `path`, creating the file when it is missing, and returns it; also `FileLock.new`.
++ fn lock(path: String, exclusive: bool (true), timeout_ms: uint (0)) FileLock !io:IoError
 // Returns the MIME type for a file extension given without the dot, such as `png`.
 + fn mime_type(ext_without_dot: String) String
 // Returns the last modification time of `path` in nanoseconds since the Unix epoch.
@@ -7458,6 +7460,8 @@ Counted in bytes, or in UTF-16 units on Windows.
 + fn sync_all() void
 // Resizes the file at `path` to `length` bytes, cutting it off or padding it with zeros.
 + fn truncate(path: String, length: uint) void !io:IoError
+// Takes the lock only when it is free right now, else returns `null`; see `lock`.
++ fn try_lock(path: String, exclusive: bool (true)) ?FileLock !io:IoError
 // Writes `content` to the file at `path`, creating the file when it is missing.
 + fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
 // Writes everything `source` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
@@ -7606,6 +7610,19 @@ On Windows anything that exists and is not a directory counts as a file.
 
 Returns whether `path` is a symbolic link, without following it.
 
+### lock
+
+Takes a lock on the file at `path`, creating the file when it is missing, and
+returns it; also `FileLock.new`.
+
+An exclusive lock (the default) excludes every other lock on the file; a shared one
+coexists with other shared locks and excludes exclusive ones. Locks are advisory: they
+only affect other `lock` / `try_lock` callers (and other programs using the same OS
+mechanism, `flock` or `LockFileEx`), never plain reads and writes. Two locks taken in
+one process conflict like locks from two processes. `timeout_ms` 0 waits forever.
+Throws `open` when the file cannot be opened or created, `timeout` when `timeout_ms`
+passes first, and `os` when the system refuses.
+
 ### mime_type
 
 Returns the MIME type for a file extension given without the dot, such as `png`.
@@ -7721,6 +7738,10 @@ Resizes the file at `path` to `length` bytes, cutting it off or padding it with 
 Throws `.write` when `length` does not fit an `i64` or resizing fails. On Windows `.open`
 means the file could not be opened.
 
+### try_lock
+
+Takes the lock only when it is free right now, else returns `null`; see `lock`.
+
 ### write
 
 Writes `content` to the file at `path`, creating the file when it is missing.
@@ -7821,6 +7842,61 @@ otherwise, plus `0c111` for directories.
 #### size
 
 Size in bytes.
+
+```js
+// A lock on a file, held from `lock` / `try_lock` until `unlock` or collection.
++ class FileLock is Closer {
+    // Whether the lock excludes shared locks as well.
+    ~ exclusive: bool
+    // The descriptor the lock is held through.
+    ~ fd: i32
+    // The locked file.
+    ~ path: String
+
+    // The same as `unlock`.
+    + fn close() void !io:IoError
+    // Takes a lock on the file at `path`; see `fs.lock`.
+    + static fn new(path: String, exclusive: bool (true), timeout_ms: uint (0)) FileLock !io:IoError
+    // Takes the lock only when it is free right now, else returns `null`; see `fs.try_lock`.
+    + static fn try_new(path: String, exclusive: bool (true)) ?FileLock !io:IoError
+    // Releases the lock and closes its descriptor; does nothing when already released.
+    + fn unlock() void !io:IoError
+}
+```
+
+### FileLock
+
+A lock on a file, held from `lock` / `try_lock` until `unlock` or collection.
+
+#### exclusive
+
+Whether the lock excludes shared locks as well.
+
+#### fd
+
+The descriptor the lock is held through.
+
+#### path
+
+The locked file.
+
+#### close
+
+The same as `unlock`.
+
+#### new
+
+Takes a lock on the file at `path`; see `fs.lock`.
+
+#### try_new
+
+Takes the lock only when it is free right now, else returns `null`; see `fs.try_lock`.
+
+#### unlock
+
+Releases the lock and closes its descriptor; does nothing when already released.
+
+Throws `os` when the system reports a failure.
 
 ```js
 // An open file that reads and writes at a tracked position.

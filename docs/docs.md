@@ -1734,6 +1734,24 @@ versions are handled as 1.1. A `Connection: close` on an HTTP/1.1 request
 ends the connection after that response; anything pipelined behind it is
 not served.
 
+### File locks
+
+`fs.lock(path)` takes an advisory lock on a file, creating it when missing,
+and returns a `FileLock` that `unlock` (or collection) releases. A lock is
+exclusive unless `exclusive` is false, in which case it is shared: shared
+locks coexist and keep exclusive ones out. `fs.lock(path, true, 500)` gives
+up with `timeout` after half a second, and `fs.try_lock(path)` returns `null`
+instead of waiting. Waiting polls rather than blocking, so the other
+coroutines on the thread keep running. The locks only affect other lock
+callers, and other programs using `flock` or `LockFileEx`, never plain reads
+and writes.
+
+```rust
+let held = fs.lock("build.lock") ! panic("Could not lock")
+// ... work no other process may do at the same time ...
+held.unlock() ! panic("Could not unlock")
+```
+
 ## Sockets
 
 API for [valk.net](api.md#net)

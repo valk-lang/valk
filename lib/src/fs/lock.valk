@@ -1,0 +1,144 @@
+use ext
+use io
+use core
+use time
+
+// Locks are polled every few milliseconds instead of blocking in the OS, so the
+// other coroutines of the thread keep running while one waits
+value LOCK_POLL_MS (5)
+
+/// Takes a lock on the file at `path`, creating the file when it is missing, and
+/// returns it; also `FileLock.new`.
+///
+/// An exclusive lock (the default) excludes every other lock on the file; a shared one
+/// coexists with other shared locks and excludes exclusive ones. Locks are advisory: they
+/// only affect other `lock` / `try_lock` callers (and other programs using the same OS
+/// mechanism, `flock` or `LockFileEx`), never plain reads and writes. Two locks taken in
+/// one process conflict like locks from two processes. `timeout_ms` 0 waits forever.
+/// Throws `open` when the file cannot be opened or created, `timeout` when `timeout_ms`
+/// passes first, and `os` when the system refuses.
++ fn lock(path: String, exclusive: bool (true), timeout_ms: uint (0)) FileLock !io.IoError {
+    return FileLock.new(path, exclusive, timeout_ms) !>
+}
+
+/// Takes the lock only when it is free right now, else returns `null`; see `lock`.
++ fn try_lock(path: String, exclusive: bool (true)) ?FileLock !io.IoError {
+    return FileLock.try_new(path, exclusive) !>
+}
+
+/// A lock on a file, held from `lock` / `try_lock` until `unlock` or collection.
++ class FileLock is io.Closer {
+    /// The locked file.
+    ~ path: String
+    /// The descriptor the lock is held through.
+    ~ fd: Fd
+    /// Whether the lock excludes shared locks as well.
+    ~ exclusive: bool
+    - held: bool (true)
+
+    /// Takes a lock on the file at `path`; see `fs.lock`.
+    + static fn new(path: String, exclusive: bool (true), timeout_ms: uint (0)) FileLock !io.IoError {
+        let deadline = timeout_ms == 0 ? 0 : time.deadline_ms(timeout_ms)
+        let fd = lock_open(path) !>
+        while true {
+            let taken = lock_try(fd, exclusive) ! {
+                lock_close(fd)
+                throw E
+            }
+            if taken : return FileLock { path: path, fd: fd, exclusive: exclusive }
+            if deadline != 0 && time.mono_ms() >= deadline {
+                lock_close(fd)
+                throw .timeout
+            }
+            time.sleep_ms(LOCK_POLL_MS)
+        }
+        throw .os
+    }
+
+    /// Takes the lock only when it is free right now, else returns `null`; see `fs.try_lock`.
+    + static fn try_new(path: String, exclusive: bool (true)) ?FileLock !io.IoError {
+        let fd = lock_open(path) !>
+        let taken = lock_try(fd, exclusive) ! {
+            lock_close(fd)
+            throw E
+        }
+        if taken : return FileLock { path: path, fd: fd, exclusive: exclusive }
+        lock_close(fd)
+        return null
+    }
+
+    /// Releases the lock and closes its descriptor; does nothing when already released.
+    ///
+    /// Throws `os` when the system reports a failure.
+    + fn unlock() !io.IoError {
+        if !this.held : return
+        this.held = false
+        let released = lock_release(this.fd)
+        lock_close(this.fd)
+        if !released : throw .os
+    }
+
+    /// The same as `unlock`.
+    + fn close() !io.IoError {
+        this.unlock() !>
+    }
+
+    fn gc_free() {
+        if !this.held : return
+        this.held = false
+        lock_release(this.fd)
+        lock_close(this.fd)
+    }
+}
+
+// Opens the lock file for reading and writing, creating it, without truncating
+// it and without excluding other openers
+fn lock_open(path: String) Fd !io.IoError {
+    #if OS == "win"
+    @unsafe
+    let wide_path = windows_path(path) ! throw .open
+    let handle = ext.CreateFileW(wide_path.items().@cast(ptr), ext.GENERIC_READ | ext.GENERIC_WRITE,
+        ext.FILE_SHARE_READ | ext.FILE_SHARE_WRITE, null, ext.OPEN_ALWAYS, ext.FILE_ATTRIBUTE_NORMAL, 0)
+    if handle == ext.INVALID_HANDLE_VALUE : throw .open
+    return handle
+    #else
+    return open(path, OpenOptions { write: WriteMode.append, create: true }) ! throw .open
+    #end
+}
+
+// One non-blocking attempt; false when another lock is in the way
+fn lock_try(fd: Fd, exclusive: bool) bool !io.IoError {
+    #if OS == "win"
+    @unsafe
+    let overlapped = ext.OVERLAPPED { Internal: 0, InternalHigh: 0, Offset: 0, OffsetHigh: 0, hEvent: 0 }
+    let flags: u32 = ext.LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? ext.LOCKFILE_EXCLUSIVE_LOCK : 0)
+    if ext.LockFileEx(fd, flags, 0, 0xffffffff, 0xffffffff, @ref(overlapped)) != 0 : return true
+    let error = ext.GetLastError()
+    if error == ext.ERROR_LOCK_VIOLATION || error == ext.ERROR_IO_PENDING : return false
+    throw .os
+    #else
+    let operation: i32 = (exclusive ? ext.LOCK_EX : ext.LOCK_SH) | ext.LOCK_NB
+    if ext.flock(fd, operation) == 0 : return true
+    let error = ext.get_errno()
+    if error == ext.EWOULDBLOCK || error == ext.EAGAIN || error == ext.EINTR : return false
+    throw .os
+    #end
+}
+
+fn lock_release(fd: Fd) bool {
+    #if OS == "win"
+    @unsafe
+    let overlapped = ext.OVERLAPPED { Internal: 0, InternalHigh: 0, Offset: 0, OffsetHigh: 0, hEvent: 0 }
+    return ext.UnlockFileEx(fd, 0, 0xffffffff, 0xffffffff, @ref(overlapped)) != 0
+    #else
+    return ext.flock(fd, ext.LOCK_UN) == 0
+    #end
+}
+
+fn lock_close(fd: Fd) {
+    #if OS == "win"
+    if ext.CloseHandle(fd) == 0 : core.cleanup_warning("Failed to close lock file", __FILE__, __LINE__)
+    #else
+    io.close(fd) ! core.cleanup_warning("Failed to close lock file", __FILE__, __LINE__)
+    #end
+}

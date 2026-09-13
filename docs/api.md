@@ -2293,6 +2293,8 @@ alias pid_t for i32
 + fn is_file(path: String) bool
 // Returns whether `path` is a symbolic link, without following it.
 + fn is_symlink(path: String) bool
+// Takes a lock on the file at `path`, creating the file when it is missing, and returns it; also `FileLock.new`.
++ fn lock(path: String, exclusive: bool (true), timeout_ms: uint (0)) FileLock !io:IoError
 // Returns the MIME type for a file extension given without the dot, such as `png`.
 + fn mime_type(ext_without_dot: String) String
 // Returns the last modification time of `path` in nanoseconds since the Unix epoch.
@@ -2325,6 +2327,8 @@ alias pid_t for i32
 + fn sync_all() void
 // Resizes the file at `path` to `length` bytes, cutting it off or padding it with zeros.
 + fn truncate(path: String, length: uint) void !io:IoError
+// Takes the lock only when it is free right now, else returns `null`; see `lock`.
++ fn try_lock(path: String, exclusive: bool (true)) ?FileLock !io:IoError
 // Writes `content` to the file at `path`, creating the file when it is missing.
 + fn write(path: String, content: local &[u8], append: bool (false)) void !io:IoError
 // Writes everything `source` yields to the file at `path`, in chunks of `chunk_size` bytes, and returns the bytes written; the file is created when it is missing and replaced unless `append` is set.
@@ -2359,6 +2363,27 @@ alias pid_t for i32
     + permissions: u32
     // Size in bytes.
     + size: uint
+}
+```
+
+```js
+// A lock on a file, held from `lock` / `try_lock` until `unlock` or collection.
++ class FileLock is Closer {
+    // Whether the lock excludes shared locks as well.
+    ~ exclusive: bool
+    // The descriptor the lock is held through.
+    ~ fd: i32
+    // The locked file.
+    ~ path: String
+
+    // The same as `unlock`.
+    + fn close() void !io:IoError
+    // Takes a lock on the file at `path`; see `fs.lock`.
+    + static fn new(path: String, exclusive: bool (true), timeout_ms: uint (0)) FileLock !io:IoError
+    // Takes the lock only when it is free right now, else returns `null`; see `fs.try_lock`.
+    + static fn try_new(path: String, exclusive: bool (true)) ?FileLock !io:IoError
+    // Releases the lock and closes its descriptor; does nothing when already released.
+    + fn unlock() void !io:IoError
 }
 ```
 
