@@ -190,6 +190,23 @@ fi
 # A malformed valk.json is a build error naming the file.
 check_fail "config-bad-json" "Invalid JSON in '$DIR/config-bad-json/valk.json'"
 check_fail "config-wrong-type" "Invalid config '$DIR/config-wrong-type/valk.json': 'dependencies.widget' must be a JSON object, got string"
+check_ok "parse-used" "used only"
+check_fail "parse-all" "Unknown identifier: missing_identifier"
+check_fail "parse-bad-value" "Invalid config '$DIR/parse-bad-value/valk.json': 'dependencies.dep.parse' must be \"used\" or \"all\", got \"yes\""
+check_ok "parse-valk-all" "stdlib fully parsed"
+
+# --parse-all overrides the config: the unreached broken body is now checked
+count=$((count + 1))
+echo "> Build fail: parse-used --parse-all (expect message: Unknown identifier: missing_identifier)"
+set +e
+parse_all_out=$("$VALK" build "$DIR/parse-used" --no-warn --parse-all -o "$workdir/parse-used-all$EXE_SUFFIX" 2>&1)
+parse_all_status=$?
+set -e
+if [ "$parse_all_status" -eq 0 ] || [[ "$parse_all_out" != *"Unknown identifier: missing_identifier"* ]]; then
+    echo "# --parse-all must parse the dependency bodies the config leaves out"
+    echo "$parse_all_out"
+    failed=1
+fi
 
 if [ "$failed" -ne 0 ]; then
     echo "# GitHub dependency path tests failed"

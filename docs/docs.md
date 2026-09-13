@@ -2250,6 +2250,26 @@ producing an executable:
 valk build ./src --lint
 ```
 
+A build parses and checks every function of your own package, but of a
+dependency only the functions the program reaches, plus what the analysis of
+a caller needs. To check all of a dependency as part of your build, for
+example while working on it, set `"parse": "all"` on its entry; the same key
+under `"valk"` does it for the standard library:
+
+```json
+{
+    "dependencies": {
+        "mysql": { "src": "./mysql", "parse": "all" }
+    },
+    "valk": { "parse": "all" }
+}
+```
+
+`"used"` is the default. Errors in unreached dependency code are otherwise
+only reported by that dependency's own `--lint`. `valk build --parse-all`
+parses everything regardless of these settings, for one build that has to
+check all code, such as after a compiler upgrade.
+
 ## Unsafe
 
 Although Valk aims to be safe, it still supports low-level operations when needed. Unsafe features include:
