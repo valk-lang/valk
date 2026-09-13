@@ -29,7 +29,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ```js
 // Thrown when decompressing DEFLATE, zlib or gzip data fails.
-error CompressError (invalid_input, checksum, truncated, too_large, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+error CompressError (invalid_input, checksum, truncated, too_large) extends (io:IoError)
 ```
 
 ## Enums for 'compress'
@@ -2624,13 +2624,13 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 // An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
 error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
 // Thrown by the HTTP client and by starting an HTTP server.
-error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled, invalid, http413, incomplete, missing_host_header, not_implemented) extends (net:NetError, io:IoError, HttpParseError)
+error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large) extends (net:NetError, HttpParseError)
 // Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
-error HttpParseError (invalid, http413, incomplete, missing_host_header, not_implemented, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+error HttpParseError (invalid, http413, incomplete, missing_host_header, not_implemented) extends (io:IoError)
 // A router error.
 error RouteError (invalid)
 // Thrown by `WebSocket` methods.
-error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_request, init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (net:NetError, io:IoError)
+error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_request) extends (net:NetError)
 ```
 
 ## Enums for 'http'
@@ -3175,7 +3175,7 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 
 ```js
 // Thrown by typed decoding when the input does not fit the target type.
-+ error DecodeError (wrong_type, missing, invalid, too_deep, too_large) extends (ParseError) payload { at_index: uint, message: String, character: u8 (0) }
++ error DecodeError (wrong_type, missing) extends (ParseError)
 // Thrown when JSON input cannot be parsed.
 + error ParseError (invalid, too_deep, too_large) payload { at_index: uint, message: String, character: u8 (0) }
 ```
@@ -3534,14 +3534,14 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 
 ```js
 // Thrown by address resolution, sockets, connections and TLS.
-error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections, open, access, read, write, exists, os, closed, timeout, range, cancelled) extends (io:IoError)
+error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max_connections) extends (io:IoError)
 ```
 
 ## Enums for 'net'
 
 ```js
 // A TLS protocol version, for the minimum and maximum version settings.
-+ enum TlsVersion : : i32 { tls_1_2 (TLS1_2_VERSION), tls_1_3 (TLS1_3_VERSION) }
++ enum TlsVersion : i32 { tls_1_2 (TLS1_2_VERSION), tls_1_3 (TLS1_3_VERSION) }
 ```
 
 ## Functions for 'net'
@@ -4029,7 +4029,7 @@ error SignalError (unsupported, init)
 // The base error of `template`; functions throw it as `ParseError`.
 error Error (template_not_found) payload { template_name: String, message: String }
 // Thrown by `render` and `render_content` when a template cannot be rendered.
-error ParseError (parse, missing, write, template_not_found) extends (Error) payload { template_name: String, message: String, index: uint (0), line: uint (0) }
+error ParseError (parse, missing, write) extends (Error) payload { index: uint (0), line: uint (0) }
 ```
 
 ## Functions for 'template'

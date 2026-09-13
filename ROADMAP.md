@@ -5,6 +5,9 @@
 
 ```
 - Release 0.7.1
++ Api change guard
++ Enum/error output in `valk doc`
++ fmt correction
 
 - Release 0.7.0
 + Audit API & language syntax

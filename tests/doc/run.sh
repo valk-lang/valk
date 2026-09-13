@@ -68,7 +68,56 @@ for absent in \
     fi
 done
 
+echo "> Document error types and enums"
+for expect in \
+    '"description": "Failures of the box store."' \
+    '"description": "Sizes a box can take."' \
+    '"description": "An unmarked error type is still reachable from other packages."' \
+    '"extends": [' \
+    '"LookupError"' \
+    '"default-value": "3"' \
+    '"type": "u8"' \
+    '"value": "10"' \
+    '"HiddenError"' \
+    '"InternalSize"'; do
+    if ! grep -Fq "$expect" "$workdir/api.json"; then
+        echo "# Error type or enum documentation is missing from the API JSON: $expect"
+        cat "$workdir/api.json"
+        exit 1
+    fi
+done
+doc_codes=$(tr -d ' \n' < "$workdir/api.json")
+if [[ "$doc_codes" != *'"codes":["missing","full"]'* ]] \
+    || [[ "$doc_codes" != *'"box_name":{"type":"String"}'* ]] \
+    || [[ "$doc_codes" != *'"items":[{"name":"small"},{"name":"large","value":"10"}]'* ]]; then
+    echo "# Error codes, payload fields or enum items are not listed in order"
+    echo "$doc_codes"
+    exit 1
+fi
+
+out=$("$VALK" doc "$DIR/fixture" -o "$workdir/public.json" --no-private 2>&1)
+if [ $? -ne 0 ]; then
+    echo "$out"
+    exit 1
+fi
+public=$(<"$workdir/public.json")
+if [[ "$public" != *'"BoxError"'* ]] || [[ "$public" != *'"PlainError"'* ]] || [[ "$public" != *'"BoxSize"'* ]] \
+    || [[ "$public" == *'"HiddenError"'* ]] || [[ "$public" == *'"InternalSize"'* ]]; then
+    echo "# --no-private must keep reachable error types and public enums only"
+    echo "$public"
+    exit 1
+fi
+
 markdown=$(<"$workdir/api.md")
+if [[ "$markdown" != *'+ error BoxError (missing, full) extends (LookupError) payload { box_name: String, retries: uint (3) }'* ]] \
+    || [[ "$markdown" != *'error PlainError (plain)'* ]] \
+    || [[ "$markdown" != *'+ enum BoxSize : u8 { small, large (10) }'* ]] \
+    || [[ "$markdown" != *'// Failures of the box store.'* ]] \
+    || [[ "$markdown" != *'// Sizes a box can take.'* ]]; then
+    echo "# Markdown is missing the error type or enum declarations"
+    echo "$markdown"
+    exit 1
+fi
 if [[ "$markdown" != *'+ class Box[T]'* ]] \
     || [[ "$markdown" != *'+ get value_type: T'* ]] \
     || [[ "$markdown" != *'+ fn get(value: T) T'* ]] \
