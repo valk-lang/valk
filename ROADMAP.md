@@ -4,7 +4,13 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.1
+- Release 0.7.3
+
++ Release 0.7.2
++ Fix compiler analysis bug
++ Handle HTTP 100 continue request
+
++ Release 0.7.1
 + Api change guard
 + Enum/error output in `valk doc`
 + fmt correction
@@ -18,7 +24,7 @@
 + Json null value to string is now empty string instead of `"null"`
 + Deprecate flag on unsafe raw pointer functions
 
-- Release 0.7.0
++ Release 0.7.0
 + Audit API & language syntax
 + Bug fixes standard library
 + Documentation feature using `///`
