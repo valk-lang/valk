@@ -38,8 +38,10 @@ endif
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" --def "GC_DEBUG=1" --no-warn-deprecated -vv
 BENCH_JSON_ITERATIONS ?= 2000000
 
+# The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
+# release targets link the vendored static one
 valk: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --def "LLVM_DYNAMIC=1" $(NATIVE_LINK_FLAGS)
 
 valkexe: $(COMPILER_DEPS)
 	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static \
