@@ -194,6 +194,7 @@ check_ok "parse-used" "used only"
 check_fail "parse-all" "Unknown identifier: missing_identifier"
 check_fail "parse-bad-value" "Invalid config '$DIR/parse-bad-value/valk.json': 'dependencies.dep.parse' must be \"used\" or \"all\", got \"yes\""
 check_ok "parse-valk-all" "stdlib fully parsed"
+check_ok "net-with-compress" "hello from a pruned build"
 
 # --parse-all overrides the config: the unreached broken body is now checked
 count=$((count + 1))

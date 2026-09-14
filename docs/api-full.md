@@ -13750,38 +13750,38 @@ HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.
 
 Renders a template registered with `set_content`.
 
-Deprecated: create a `Engine` engine and call its `render`.
+Deprecated: create an `Engine` and call its `render`.
 
 ### render_content
 
 Renders the template text `content`; includes resolve against `set_content` templates.
 
-Deprecated: create a `Engine` engine and call its `render_content`.
+Deprecated: create an `Engine` and call its `render_content`.
 
 ### render_content_into
 
 Writes `render_content(content, data, options)` to `out`.
 
-Deprecated: create a `Engine` engine and call its `render_content_into`.
+Deprecated: create an `Engine` and call its `render_content_into`.
 
 ### render_into
 
 Writes `render(name, data, options)` to `out`.
 
-Deprecated: create a `Engine` engine and call its `render_into`.
+Deprecated: create an `Engine` and call its `render_into`.
 
 ### set_content
 
 Registers `content` as the template named `name` for the free `render` functions.
 
-Deprecated: create a `Engine` engine and call its `set`; see `Engine` for the
-per-thread pattern. The free functions keep one registry for all threads.
+Deprecated: create an `Engine` and call its `set`; see `Engine` for the per-thread
+pattern. The free functions keep one registry for all threads.
 
 ### set_content_many
 
 Registers every entry of `content` as a template for the free `render` functions.
 
-Deprecated: create a `Engine` engine and call its `set_many`.
+Deprecated: create an `Engine` and call its `set_many`.
 
 ## Classes for 'template'
 
