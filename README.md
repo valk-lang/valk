@@ -46,7 +46,7 @@ valk build main.valk -o ./main
 # valk main.valk
 ```
 
----
+## Development
 
 <picture>
     <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/roadmap.png">
