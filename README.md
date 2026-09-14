@@ -149,7 +149,7 @@ When not to use Valk:
 
 ## Language design
 
-- Our coroutines are stackful. Each one runs on its own 1 MB stack; `main` gets 8 MB.
+- Our coroutines are stackful. They start small 4-32KB and grow automatically when using more stack space.
 
 - Coroutines are single threaded. A coroutine will always run on the same thread it started on.
 
