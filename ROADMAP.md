@@ -14,6 +14,9 @@
 + Deprecation flagging
 + Reuse address option
 + HTTP server shutdown signal
++ Improve template api (breaking change: RenderOptions.escape is now fn(local &[u8], io.Writer)(uint !io.IoError))
++ Json null value to string is now empty string instead of `"null"`
++ Deprecate flag on unsafe raw pointer functions
 
 - Release 0.7.0
 + Audit API & language syntax
