@@ -123,10 +123,16 @@ memory our GC has no problem with this.
 
 ### HTTP server benchmark
 
-<picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-http-dark.svg">
-    <img alt="HTTP hello-world benchmark: Valk 6.46M, Rust hyper 5.07M, Go fasthttp 3.44M requests per second" src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk-http.svg">
-</picture>
+HTTP hello world. Higher requests per second is better.
+
+| Language | Library | Requests per second |
+|---|---|---:|
+| Valk 0.6.0 | http | 6,455,170 |
+| Rust 1.97.1 | hyper 1.11 on tokio 1.53 | 5,067,694 |
+| Go 1.27.1 | fasthttp 1.73 | 3,443,542 |
+
+4 workers pinned to 4 cores; wrk on 8 other cores. 900 keep-alive connections,
+16 pipelined requests. Median of three 5-second runs.
 
 Code: [Link](examples/bench/http)
 
