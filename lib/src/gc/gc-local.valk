@@ -19,6 +19,7 @@ shared gc_nr: uint (@undefined)
 
 // Bytes of pushed registers to keep from the point where the gc lock was released
 value blocked_regs_size (320)
+
 struct CollectCall {
     gc: ptr
     kind: CollectKind
@@ -35,6 +36,7 @@ enum CollectKind {
     local
     shared
     shutdown
+    auto      // Threshold-triggered: dead subtrees are freed in the background
 }
 
 struct ConditionalGlobalRoot {
@@ -61,6 +63,28 @@ struct Gc {
     shared_items: *Bump (Bump.new())
     mark_list: *Lifo (Lifo.new())
     props_removed: *Lifo (Lifo.new())
+
+    // Background dis-own (gc-background.valk)
+    bg_list: *Lifo (Lifo.new())          // Dead objects the helper still has to walk
+    bg_lost: *Bump (Bump.new())          // Owner died in the background, but co-owned
+    bg_shared_lost: *Bump (Bump.new())   // Shared objects whose local owner died
+    bg_blanks: *Bump (Bump.new())        // Walked dead objects with a gc_free hook
+    bg_decs: *Bump (Bump.new())          // Co-owners that died in the background
+    bg_freed_bytes: uint (0)
+    bg_disowned: uint (0)
+    bg_state: BgState (BgState.off)
+    bg_unavailable: bool (false)
+    /// Automatic collections that handed dead objects to the background thread.
+    ~+ bg_collections: uint (0)
+    #if OS == "win"
+    bg_crit: ext.CRITICAL_SECTION (@undefined)
+    bg_work: ext.CONDITION_VARIABLE (@undefined)
+    bg_done: ext.CONDITION_VARIABLE (@undefined)
+    #else
+    bg_mutex: ext.pthread_mutex_t ({})
+    bg_work: ext.pthread_cond_t ({})
+    bg_done: ext.pthread_cond_t ({})
+    #end
 
     // Native stacks
     stack_top: ptr (null_ptr())              // Highest address of the thread stack
@@ -89,7 +113,8 @@ struct Gc {
     pools_dirty: bool (false) // Slot state changed or a pool cleanup pass remains
     // Counts
     dis_own_count: uint (0)
-    collect_count: uint (0)
+    /// Collections run by this thread so far.
+    ~+ collect_count: uint (0)
     trigger_list: [uint x 5] ({ 0... })
     dis_own_list: [uint x 5] ({ 0... })
     // Info
@@ -178,10 +203,26 @@ struct Gc {
 
         let pause_start = time.mono_us()
 
+        // Automatic collections free dead subtrees in the background; explicit
+        // and shared collections and the shutdown finish everything here
+        let background = kind == CollectKind.auto && !this.bg_unavailable
+        #if is_defined(GC_NO_BACKGROUND)
+        background = false
+        #end
+        if background && this.bg_state == BgState.off : background = this.bg_thread_start()
+
+        // Stop the helper, then clear the stack items of the previous scan:
+        // their counts kept the helper away from stack-referenced objects
+        this.bg_join(!background)
+        this.bg_apply_frees()
+        this.bg_apply_decs()
+        this.clear_stack_items()
+
         let reset_pools_needed = this.did_shutdown || this.pools_dirty || this.mem_new != this.mem_marked
 
         // 
         if !this.did_shutdown : this.collect_stack_items()
+        this.bg_apply_lost()
 
         // Check if items have dissapeared from the stack
         this.loop_previous_stack_items()
@@ -190,8 +231,11 @@ struct Gc {
         // Mark stack items
         if !this.did_shutdown : this.loop_stack_items(Gc.mark_stack_item)
 
-        //
-        this.loop_dis_own()
+        // The dis-own runs before the updates: an updated holder inside a dead
+        // subtree must not hand out ownership, that makes ownership cycles.
+        // References from updated holders into the subtrees handed to the
+        // background raise co_count, and the helper leaves those objects alone
+        this.loop_dis_own(background)
         if !this.did_shutdown : this.loop_updates()
         else : this.clean_updates()
         this.loop_adopted()
@@ -205,11 +249,11 @@ struct Gc {
             close_current_alloc_windows(this.alc_list_ptr[0])
         }
 
-        // Leak check
-        if verify && !this.did_shutdown : this.leak_check()
+        // Leak check: only when nothing is left to the background
+        if verify && !this.did_shutdown && !background : this.leak_check()
 
-        // Clear stack items list
-        if kind != CollectKind.shared : this.clear_stack_items()
+        // The stack items stay until the next collection: their counts keep
+        // the background dis-own away from stack-referenced objects
 
         // Reset mem_new
         this.mem_new = this.mem_marked
@@ -253,12 +297,13 @@ struct Gc {
         if this.mem_trigger < mem_minimum_trigger : this.mem_trigger = mem_minimum_trigger
 
         // Stay closed until the last allocating call is done
-        if kind == CollectKind.local {
+        if kind == CollectKind.local || kind == CollectKind.auto {
             pause_last_us = time.mono_us() - pause_start
             if pause_last_us > pause_max_us : pause_max_us = pause_last_us
         }
 
         this.state = kind == CollectKind.shutdown ? GcState.stopping : GcState.idle
+        if background : this.bg_start()
     }
 
     fn leak_check() {
@@ -339,7 +384,7 @@ struct Gc {
         }
     }
 
-    fn loop_dis_own() {
+    fn loop_dis_own(background: bool) {
         let list = this.dis_owned_list
         let i: uint = 0
         let disowned: uint = 0
@@ -358,6 +403,16 @@ struct Gc {
 
             // A dis-owned item can become shared, so we need to make sure it's ignored
             if data.is_no_owner_not_shared() {
+                // Nothing reachable refers to a root without co-owners: the
+                // helper frees its subtree. It keeps its state, so an updated
+                // holder that stores it adopts it as before and the helper
+                // skips it; `freed` marks it as queued for a second entry
+                if background && data.co_count == 0 && data.offset > 0 {
+                    if data.freed == 3 : continue
+                    data.freed = 3
+                    this.bg_list.add(item)
+                    continue
+                }
                 let count, bytes = dis_own_rec(item)
                 disowned += count
                 unmarked_bytes += bytes
@@ -365,7 +420,8 @@ struct Gc {
         }
 
         list.reset()
-        this.dis_own_count = disowned
+        this.dis_own_count = disowned + this.bg_disowned
+        this.bg_disowned = 0
         if unmarked_bytes > this.mem_marked : panic("GC marked-memory accounting underflow")
         this.mem_marked -= unmarked_bytes
     }
@@ -509,8 +565,8 @@ struct Gc {
                 atomic(data.co_count - 1)
             } else {
                 data.co_count = data.co_count - 1
+                data.remove_on_stack()
             }
-            data.remove_on_stack()
         }
     }
     fn collect_stack_item(item: ptr) {
@@ -521,13 +577,16 @@ struct Gc {
         }
         #end
         let data = gcdata(item)
+        if data.is_shared() {
+            // No stack flag on a shared object: other threads scan it too, and
+            // the flag would outlive the scan. One count per word instead
+            atomic(data.co_count + 1)
+            this.stack_items.add_ptr(item)
+            return
+        }
         if data.is_on_stack() : return
         data.set_on_stack()
-        if data.is_shared() {
-            atomic(data.co_count + 1)
-        } else {
-            data.co_count = data.co_count + 1
-        }
+        data.co_count = data.co_count + 1
         this.stack_items.add_ptr(item)
     }
     fn collect_stack_items() {
@@ -637,6 +696,8 @@ struct Gc {
         if gcd.is_shared() : return item
         if range.gc != this.@cast(?*Gc) : return null
         if gcd.is_not_new() : return item
+        // Freed since it was last handed out: garbage, even inside the window
+        if gcd.freed != 0 : return null
         if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) : return item
         return null
     }
@@ -738,6 +799,12 @@ struct Gc {
     /// Unlocks and frees the gc. Nothing may use it afterwards.
     + fn free() {
         this.unlock()
+        this.bg_exit()
+        this.bg_list.free()
+        this.bg_lost.free()
+        this.bg_shared_lost.free()
+        this.bg_blanks.free()
+        this.bg_decs.free()
         this.mutex.free()
         this.globals.free()
         this.conditional_globals.free()

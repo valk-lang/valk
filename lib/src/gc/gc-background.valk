@@ -1,0 +1,381 @@
+@unsafe
+
+use core
+use ext
+use mem
+
+// Background dis-own. After an automatic collection a helper thread frees the
+// dead subtrees that nothing can reach while the thread keeps running.
+//
+// The collection hands over dead roots with co_count == 0. Everything the
+// helper walks is unreachable: a reference from a live object either adopted
+// the root during the collection (updates and stack marking run after the
+// hand-over and see its state unchanged) or made the object a co-owner, and
+// the stack items of that collection keep their counts until the next one.
+// The helper stops at every object that still has a co-owner and leaves it to
+// the next collection, never runs gc_free hooks (they belong to the owning
+// thread) and never writes a reachable object: a co-owner that died in the
+// background is counted down at the next collection. Only share() pauses it,
+// since a graph being published must not be freed halfway.
+
+enum BgState {
+    off       // no helper thread yet
+    idle
+    running
+    stopping  // the owning thread asked it to stop after the current object
+    paused    // stopped with objects left in the queue
+    exit
+    gone
+}
+
+fn bg_fatal(msg: String) $exit {
+    core.cleanup_warning(msg, __FILE__, __LINE__)
+    ext._exit(1)
+}
+
+// Helper thread: serves one collector, and its `gc` names that collector
+fn bg_entry(arg: ptr) {
+    let g: *Gc = arg
+    gc = g
+    g.bg_lock()
+    while true {
+        // A stop request can arrive before the first object was taken: it
+        // still needs the acknowledgement below
+        while g.bg_state == BgState.idle || g.bg_state == BgState.paused : g.bg_wait_work()
+        if g.bg_state == BgState.exit : break
+        g.bg_unlock()
+        bg_cascade(g)
+        g.bg_lock()
+        if g.bg_state != BgState.exit {
+            g.bg_state = g.bg_list.index > 0 ? BgState.paused : BgState.idle
+        }
+        g.bg_signal_done()
+    }
+    g.bg_state = BgState.gone
+    g.bg_signal_done()
+    g.bg_unlock()
+}
+
+// Every queued object is dead and unreachable: walk its references first, so
+// the slot is only free once nothing reads it anymore
+fn bg_cascade(g: *Gc) {
+    let ml = g.bg_list
+    while ml.index > 0 {
+        if g.bg_state == BgState.stopping : return
+        let item = ml.pop_unchecked()
+        let data = gcdata(item)
+        if !data.is_no_owner_not_shared() {
+            // A root that a live holder adopted during the collection
+            data.freed = 0
+            continue
+        }
+        if data.co_count > 0 {
+            // A root that a holder took as co-owner after it was queued:
+            // maybe live, the next collection decides
+            g.bg_lost.add_ptr(item)
+            continue
+        }
+        let block = data.block()
+        let layout = block.layout
+        if isset(layout) : each_ref(item, layout, ml, bg_dis_own_props)
+        if isset(block.onfree) {
+            // The hook runs on the owning thread, at the next collection
+            g.bg_blanks.add_ptr(item)
+            continue
+        }
+        data.freed = 1
+        data.publish_new()
+        block.slots_used--
+        g.bg_freed_bytes += block.isize
+        g.bg_disowned++
+        // Keep the live estimate current, so the next trigger is not set from
+        // garbage that is still queued
+        if g.bg_freed_bytes >= 65536 {
+            atomic(g.mem_marked - g.bg_freed_bytes)
+            g.bg_freed_bytes = 0
+        }
+    }
+}
+
+fn bg_dis_own_props(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    let sub = @ptrv(ref, ?ptr)
+    if !isset(sub) : return
+    if sub & prop_owned == prop_owned {
+        let sub_item = sub - prop_owned
+        #if GC_DEBUG
+        if sub_item == null : bg_fatal("GC error: 'owned' property slot is not a tagged pointer; its memory was reused (background)")
+        #end
+        @ptrv(ref, ptr) = sub_item
+        let sub_data = gcdata(sub_item)
+        if sub_data.offset == 0 : return
+        if sub_data.is_shared() {
+            gc.bg_shared_lost.add_ptr(sub_item)
+        } else if sub_data.co_count > 0 {
+            // Maybe live: the next collection decides
+            gc.bg_lost.add_ptr(sub_item)
+        } else {
+            sub_data.set_no_owner()
+            list.add(sub_item)
+        }
+    } else if sub & prop_co_owned == prop_co_owned {
+        let sub_item = sub - prop_co_owned
+        #if GC_DEBUG
+        if sub_item == null : bg_fatal("GC error: 'co-owned' property slot is not a tagged pointer; its memory was reused (background)")
+        #end
+        @ptrv(ref, ptr) = sub_item
+        let sub_data = gcdata(sub_item)
+        if sub_data.offset == 0 : return
+        if sub_data.is_shared() {
+            atomic(sub_data.co_count - 1)
+            return
+        }
+        // The object may be live: the next collection counts it down
+        gc.bg_decs.add_ptr(sub_item)
+    }
+}
+
+extend Gc {
+    // Creates the helper thread; false when the OS refuses, then everything
+    // stays on the owning thread
+    fn bg_thread_start() bool {
+        #if OS == "win"
+        ext.InitializeCriticalSection(@ref(this.bg_crit))
+        ext.InitializeConditionVariable(@ref(this.bg_work))
+        ext.InitializeConditionVariable(@ref(this.bg_done))
+        #else
+        if ext.pthread_mutex_init(@ref(this.bg_mutex), null) != 0 : panic("Failed to initialize the GC helper mutex")
+        if ext.pthread_cond_init(@ref(this.bg_work), null) != 0 : panic("Failed to initialize the GC helper condition")
+        if ext.pthread_cond_init(@ref(this.bg_done), null) != 0 : panic("Failed to initialize the GC helper condition")
+        #end
+        this.bg_state = BgState.idle
+        let entry = bg_entry.@cast(fnptr(ptr)())
+        #if OS == "win"
+        let handle = ext.CreateThread(null, 0, entry.@cast(ptr), this.@cast(ptr), 0, null)
+        if handle == 0 {
+            this.bg_state = BgState.off
+            this.bg_unavailable = true
+            return false
+        }
+        ext.CloseHandle(handle)
+        #else
+        let thr: ext.pthread_t = .{}
+        if ext.pthread_create(@ref(thr), null, entry.@cast(ptr), this.@cast(ptr)) != 0 {
+            this.bg_state = BgState.off
+            this.bg_unavailable = true
+            return false
+        }
+        if ext.pthread_detach(thr.data) != 0 : panic("Failed to detach the GC helper thread")
+        #end
+        return true
+    }
+
+    // End of an automatic collection: the queue, with the new roots, goes to
+    // the helper
+    fn bg_start() {
+        if this.bg_list.index == 0 : return
+        this.bg_collections++
+        this.bg_lock()
+        this.bg_state = BgState.running
+        this.bg_signal_work()
+        this.bg_unlock()
+    }
+
+    // Stops the helper after its current object; the queue keeps the rest
+    fn bg_pause() {
+        if this.bg_state != BgState.running : return
+        this.bg_lock()
+        if this.bg_state == BgState.running {
+            this.bg_state = BgState.stopping
+            while this.bg_state == BgState.stopping : this.bg_wait_done()
+        }
+        this.bg_unlock()
+    }
+
+    fn bg_resume() {
+        if this.bg_state != BgState.paused : return
+        this.bg_lock()
+        if this.bg_state == BgState.paused {
+            this.bg_state = BgState.running
+            this.bg_signal_work()
+        }
+        this.bg_unlock()
+    }
+
+    // Start of every collection: stops the helper. An automatic collection
+    // leaves it its queue and restarts it at the end; every other collection
+    // finishes the queue here with the full cascade, so nothing is pending
+    // when it returns. The stack counts of the previous scan still apply, so
+    // stack-referenced objects are preserved as before
+    fn bg_join(drain: bool) {
+        if this.bg_state == BgState.off : return
+        this.bg_pause()
+        if !drain : return
+        let list = this.bg_list
+        while list.index > 0 {
+            let item = list.pop_unchecked()
+            let data = gcdata(item)
+            if !data.is_no_owner_not_shared() {
+                data.freed = 0
+                continue
+            }
+            let count, bytes = dis_own_rec(item)
+            this.bg_disowned += count
+            this.bg_freed_bytes += bytes
+        }
+        if this.bg_state == BgState.paused {
+            this.bg_lock()
+            this.bg_state = BgState.idle
+            this.bg_unlock()
+        }
+    }
+
+    // Dead objects with a gc_free hook that the helper walked: freed here on
+    // the owning thread, before the stack scan could find them
+    fn bg_apply_frees() {
+        let list = this.bg_blanks
+        let adr = list.data
+        let end = adr + list.index
+        list.reset()
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            let data = gcdata(item)
+            let block = data.block()
+            data.run_onfree(block.onfree)
+            data.set_new()
+            #if GC_DEBUG
+            if data.co_count != 0 : panic("GC error: co_count not 0 before background free")
+            if data.flags != 0 : panic("GC error: Flags not 0 before background free")
+            #end
+            block.slots_used--
+            this.bg_freed_bytes += block.isize
+            this.bg_disowned++
+        }
+        if this.bg_freed_bytes > 0 {
+            if this.bg_freed_bytes > this.mem_marked : panic("GC marked-memory accounting underflow (background)")
+            this.mem_marked -= this.bg_freed_bytes
+            this.bg_freed_bytes = 0
+        }
+        if this.bg_disowned > 0 : this.pools_dirty = true
+    }
+
+    // Co-owner slots the helper found in dead objects: the same count-down
+    // as for an overwritten co-owner slot, including the dis-own of an object
+    // that only lived through its co-owners
+    fn bg_apply_decs() {
+        let list = this.bg_decs
+        let adr = list.data
+        let end = adr + list.index
+        list.reset()
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            gcdata(item).dis_co_own()
+        }
+    }
+
+    // After the stack scan: objects whose owner died in the background while
+    // they still had co-owners. Shared ones only lose their owner; the others
+    // are stack roots now, or dead roots for the full cascade
+    fn bg_apply_lost() {
+        let shared = this.bg_shared_lost
+        let adr = shared.data
+        let end = adr + shared.index
+        shared.reset()
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            gcdata(item).set_no_owner()
+        }
+
+        let list = this.bg_lost
+        adr = list.data
+        end = adr + list.index
+        list.reset()
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            let data = gcdata(item)
+            data.freed = 0
+            if data.is_still_co_owned() : data.remove_still_co_owned()
+            if data.is_shared() {
+                data.set_no_owner()
+                continue
+            }
+            // Already dis-owned by the leftovers of the helper
+            if data.is_new() : continue
+            if data.is_on_stack() {
+                preserve_stack_owner(item)
+                continue
+            }
+            data.set_no_owner()
+            this.dis_owned_list.add_ptr(item)
+        }
+    }
+
+    // Ends the helper thread; called with the collector unlocked, after the
+    // shutdown collection joined it
+    fn bg_exit() {
+        if this.bg_state == BgState.off : return
+        this.bg_lock()
+        this.bg_state = BgState.exit
+        this.bg_signal_work()
+        while this.bg_state != BgState.gone : this.bg_wait_done()
+        this.bg_unlock()
+        #if OS == "win"
+        ext.DeleteCriticalSection(@ref(this.bg_crit))
+        #else
+        if ext.pthread_mutex_destroy(@ref(this.bg_mutex)) != 0 {
+            core.cleanup_warning("Failed to destroy the GC helper mutex", __FILE__, __LINE__)
+        }
+        if ext.pthread_cond_destroy(@ref(this.bg_work)) != 0 || ext.pthread_cond_destroy(@ref(this.bg_done)) != 0 {
+            core.cleanup_warning("Failed to destroy the GC helper condition", __FILE__, __LINE__)
+        }
+        #end
+        this.bg_state = BgState.off
+    }
+
+    fn bg_lock() {
+        #if OS == "win"
+        ext.EnterCriticalSection(@ref(this.bg_crit))
+        #else
+        if ext.pthread_mutex_lock(@ref(this.bg_mutex)) != 0 : panic("Failed to lock the GC helper mutex")
+        #end
+    }
+    fn bg_unlock() {
+        #if OS == "win"
+        ext.LeaveCriticalSection(@ref(this.bg_crit))
+        #else
+        if ext.pthread_mutex_unlock(@ref(this.bg_mutex)) != 0 : panic("Failed to unlock the GC helper mutex")
+        #end
+    }
+    fn bg_wait_work() {
+        #if OS == "win"
+        if ext.SleepConditionVariableCS(@ref(this.bg_work), @ref(this.bg_crit), ext.INFINITE.to(u32)) == 0 : panic("GC helper wait failed")
+        #else
+        if ext.pthread_cond_wait(@ref(this.bg_work), @ref(this.bg_mutex)) != 0 : panic("GC helper wait failed")
+        #end
+    }
+    fn bg_wait_done() {
+        #if OS == "win"
+        if ext.SleepConditionVariableCS(@ref(this.bg_done), @ref(this.bg_crit), ext.INFINITE.to(u32)) == 0 : panic("GC helper wait failed")
+        #else
+        if ext.pthread_cond_wait(@ref(this.bg_done), @ref(this.bg_mutex)) != 0 : panic("GC helper wait failed")
+        #end
+    }
+    fn bg_signal_work() {
+        #if OS == "win"
+        ext.WakeConditionVariable(@ref(this.bg_work))
+        #else
+        if ext.pthread_cond_signal(@ref(this.bg_work)) != 0 : panic("Failed to signal the GC helper")
+        #end
+    }
+    fn bg_signal_done() {
+        #if OS == "win"
+        ext.WakeConditionVariable(@ref(this.bg_done))
+        #else
+        if ext.pthread_cond_signal(@ref(this.bg_done)) != 0 : panic("Failed to signal the GC helper")
+        #end
+    }
+}

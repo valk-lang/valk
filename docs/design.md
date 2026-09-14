@@ -918,6 +918,12 @@ The one lifetime the compiler still guarantees is for objects with a
 arguments and locals stay alive until the function returns, so a raw handle
 taken from them remains valid while the function waits on it.
 
+After an automatic collection the local collector frees the dead objects that
+nothing can reach on a helper thread while the owning thread keeps running.
+Objects that still have a co-owner at that point, and dead objects with a
+`gc_free` hook, are settled by the next collection. An explicit `gc.collect()`
+reclaims everything before it returns.
+
 The local collector invokes `gc_free` for unreachable local objects on the
 thread that owns that local collector. Once an object has been published as
 shared, only the shared collector may invoke its `gc_free`. The call runs on
