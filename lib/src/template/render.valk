@@ -95,7 +95,7 @@ use html
     + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
         let out = ByteBuffer.new(1024)
         this.render_into(name, data, out, options) !>
-        return out.to_string()
+        return out.into_string()
     }
 
     /// Writes `render(name, data, options)` to `out` and returns the bytes written.
@@ -107,8 +107,7 @@ use html
             template_name: name
         }
         let renderer = Renderer { engine: this, options: options, root: json.from(data) }
-        let page = renderer.render_top(compiled, Array[String]{ name }, 0) !>
-        return renderer.deliver(page, out, name) !>
+        return renderer.render_to(compiled, Array[String]{ name }, out, name) !>
     }
 
     /// Renders the template text `content` with `data` and returns the output.
@@ -118,7 +117,7 @@ use html
     + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
         let out = ByteBuffer.new(1024)
         this.render_content_into(content, data, out, options) !>
-        return out.to_string()
+        return out.into_string()
     }
 
     /// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
@@ -127,8 +126,7 @@ use html
     + fn render_content_into(content: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
         let compiled = Compiler { content: content }.compile() !>
         let renderer = Renderer { engine: this, options: options, root: json.from(data) }
-        let page = renderer.render_top(compiled, Array[String]{}, 0) !>
-        return renderer.deliver(page, out, "") !>
+        return renderer.render_to(compiled, Array[String]{}, out, "") !>
     }
 
     // The compiled template `name`, compiled on first use since its registration
@@ -231,14 +229,18 @@ class Renderer {
     options: ?RenderOptions
     root: json.Value
 
-    // Writes a rendered page to `out`
-    fn deliver(page: ByteBuffer, out: io.Writer, name: String) uint !ParseError {
+    // Renders `template` into `out`: straight into a `ByteBuffer`, through a page buffer for
+    // any other writer. Returns the bytes written.
+    fn render_to(template: Template, templates: Array[String], out: io.Writer, name: String) uint !ParseError {
         match out {
             ByteBuffer as buf => {
-                buf.write(page)
-                return page.length
+                let start = buf.length
+                this.render_template(template, Frame {}, templates, 0, Map[ByteBuffer]{}, this.root, buf) !>
+                return buf.length - start
             }
             default => {
+                let page = ByteBuffer.new(1024)
+                this.render_template(template, Frame {}, templates, 0, Map[ByteBuffer]{}, this.root, page) !>
                 return out.write(page) ! throw .write {
                     template_name: name
                     message: "The writer refused the rendered page"
@@ -247,42 +249,33 @@ class Renderer {
         }
     }
 
-    // Renders a template as the top of a chain or as an include: `templates` names the
-    // templates being rendered, for cycle detection, and `depth` how many levels of
-    // include/extend are above this one
-    fn render_top(template: Template, templates: Array[String], depth: uint) ByteBuffer !ParseError {
-        let frame = Frame {}
-        let chain = Map[String]{}
-        return this.render_template(template, frame, templates, depth, chain, this.root) !>
-    }
-
-    fn render_template(template: Template, frame: Frame, templates: Array[String], depth: uint, chain: Map[String], root: json.Value) ByteBuffer !ParseError {
-        let out = ByteBuffer.new(512)
+    // Renders one template into `out` at its current end, trimmed of leading and trailing
+    // whitespace like an include or the page itself. `templates` names the templates
+    // being rendered, for cycle detection, and `depth` how many includes and extends are
+    // above this one.
+    fn render_template(template: Template, frame: Frame, templates: Array[String], depth: uint, chain: Map[ByteBuffer], root: json.Value, out: ByteBuffer) !ParseError {
+        let start = out.length
         let state = RenderState { template: template, templates: templates, depth: depth, chain: chain, root: root }
         this.render_nodes(template.nodes, frame, state, out) !>
 
         let parent_name = template.extends
         if !isset(parent_name) {
-            out.trim(u8.is_whitespace)
-            return out
+            trim_region(out, start)
+            return
         }
         // An extending template: the text before `@extend`, then the parent with this
         // template's blocks, then the text after
-        let parent = this.load(parent_name, state, template.extends_line) !>
-        let next = this.next_templates(templates, parent_name, depth, state) !>
-        let parent_out = this.render_template(parent, frame, next, depth + 1, chain, root) !>
         let split = state.extend_offset
-        let head = ByteBuffer.new(split)
-        head.write(out.view(0, split))
         let tail = ByteBuffer.new(out.length - split)
         tail.write(out.view(split, out.length - split))
-        head.trim(u8.is_whitespace)
         tail.trim(u8.is_whitespace)
-        let result = ByteBuffer.new(head.length + parent_out.length + tail.length)
-        result.write(head)
-        result.write(parent_out)
-        result.write(tail)
-        return result
+        out.truncate(split)
+        trim_region(out, start)
+        let parent = this.load(parent_name, state, template.extends_line) !>
+        this.enter(templates, parent_name, depth, state) !>
+        this.render_template(parent, frame, templates, depth + 1, chain, root, out) !>
+        templates.pop_last() !? ""
+        out.write(tail)
     }
 
     fn render_nodes(nodes: Array[Node], frame: Frame, state: RenderState, out: ByteBuffer) !ParseError {
@@ -292,18 +285,22 @@ class Renderer {
             } else if node.type == NODE_OUTPUT {
                 let expr = node.expr ?! continue
                 let value = this.eval(expr, frame, state) !>
-                let text = value_text(value)
                 let options = this.options
-                if node.raw {
-                    out.write(text)
+                let escape: ?Escape = null
+                if !node.raw : escape = isset(options) ? options.escape : this.engine.escape
+                // A number's text is built on the stack; everything else is a string already
+                let digits: [u8 x 65] = @undefined
+                let scratch: local mut &[u8] = &digits
+                let text: local &[u8] = ""
+                match value {
+                    int as number => text = scratch.view(0, number.to_base_in(scratch, 10))
+                    float as number => text = scratch.view(0, number.to_shortest_string_in(scratch))
+                    default => text = value_text(value)
+                }
+                if isset(escape) {
+                    escape(text, out) ! throw .write { template_name: state.template.name ?? "?", message: "The escape function failed" }
                 } else {
-                    // The render's options replace the engine's escape
-                    let escape = isset(options) ? options.escape : this.engine.escape
-                    if isset(escape) {
-                        escape(text, out) ! throw .write { template_name: state.template.name ?? "?", message: "The escape function failed" }
-                    } else {
-                        out.write(text)
-                    }
+                    out.write(text)
                 }
             } else if node.type == NODE_IF {
                 each node.branches as arm {
@@ -346,7 +343,6 @@ class Renderer {
                 }
             } else if node.type == NODE_INCLUDE {
                 let included = this.load(node.name, state, node.line) !>
-                let next = this.next_templates(state.templates, node.name, state.depth, state) !>
                 let include_frame = frame
                 let include_root = state.root
                 let expr = node.expr
@@ -355,9 +351,9 @@ class Renderer {
                     include_root = this.eval(expr, frame, state) !>
                     include_frame = Frame {}
                 }
-                let sub_chain = Map[String]{}
-                let part = this.render_template(included, include_frame, next, state.depth + 1, sub_chain, include_root) !>
-                out.write(part)
+                this.enter(state.templates, node.name, state.depth, state) !>
+                this.render_template(included, include_frame, state.templates, state.depth + 1, Map[ByteBuffer]{}, include_root, out) !>
+                state.templates.pop_last() !? ""
             } else if node.type == NODE_EXTEND {
                 state.extend_offset = out.length
             } else if node.type == NODE_BLOCK {
@@ -366,7 +362,7 @@ class Renderer {
                     let body = ByteBuffer.new(256)
                     this.render_nodes(node.body, frame, state, body) !>
                     body.trim(u8.is_whitespace)
-                    state.chain.set(node.name, body.to_string())
+                    state.chain.set(node.name, body)
                 }
             } else if node.type == NODE_YIELD {
                 let content = state.chain.get(node.name) ! this.fail("No block found named: " + node.name, node.line, state)
@@ -518,20 +514,21 @@ class Renderer {
         }
     }
 
-    fn next_templates(templates: Array[String], name: String, depth: uint, state: RenderState) Array[String] !ParseError {
-        let next = templates.copy()
-        each next as active {
+    // Pushes `name` on the stack of templates being rendered; the caller pops it. `depth` is
+    // the nesting of the template doing the include or extend.
+    fn enter(templates: Array[String], name: String, depth: uint, state: RenderState) !ParseError {
+        each templates as active {
             if active == name {
-                next.append(name)
-                this.fail("Template cycle: " + next.join(" -> "), 0, state)
+                let chain = templates.copy()
+                chain.append(name)
+                this.fail("Template cycle: " + chain.join(" -> "), 0, state)
             }
         }
-        next.append(name)
         let max_depth = TEMPLATE_MAX_DEPTH
         let options = this.options
         if isset(options) : max_depth = options.max_depth
         if depth + 1 > max_depth : this.fail("Template depth exceeds the maximum of " + max_depth, 0, state)
-        return next
+        templates.append(name)
     }
 
     fn fail(msg: String, line: uint, state: RenderState) !ParseError $throw {
@@ -551,10 +548,20 @@ class RenderState {
     templates: Array[String]
     depth: uint
     // The blocks of the chain being rendered: the most derived template fills it first
-    chain: Map[String]
+    chain: Map[ByteBuffer]
     root: json.Value
     // Where `@extend` split this template's own output
     extend_offset: uint (0)
+}
+
+// Trims whitespace at both ends of what was written from `start` on
+fn trim_region(out: ByteBuffer, start: uint) {
+    let end = out.length
+    while end > start && out.get(end - 1).is_whitespace() : end--
+    out.truncate(end)
+    let lead = start
+    while lead < end && out.get(lead).is_whitespace() : lead++
+    if lead > start : out.clear_range(start, lead - start)
 }
 
 /// HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
