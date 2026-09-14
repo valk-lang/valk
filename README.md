@@ -46,6 +46,12 @@ valk build main.valk -o ./main
 # valk main.valk
 ```
 
+---
+
+<picture>
+    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/roadmap.png">
+</picture>
+
 ## Build from source (Linux / macOS / WSL)
 
 valk/vman: `curl -sSL https://valk-lang.dev/install.sh | bash`
