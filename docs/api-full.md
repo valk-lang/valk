@@ -10538,6 +10538,8 @@ The reference point of a seek offset.
 + fn read_sync(fd: i32, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError
 // Moves the position of `fd` to `offset` bytes from `from` and returns the new position.
 + fn seek(fd: i32, offset: int, from: SeekFrom (SeekFrom.start)) uint !IoError
+// Marks `fd` close-on-exec, so a program started with `core.Process.run` or `core.exec` does not inherit it. Every descriptor the standard library creates for itself is marked this way; the flag only matters for descriptors handed out by other code. Does nothing on Windows, where children only inherit the handles they are given.
++ fn set_close_on_exec(fd: i32) void !IoError
 // Sets the newline translation mode of a C runtime descriptor such as 0, 1 or 2.
 + fn set_mode(fd: i32, mode: Mode) void !IoError
 // Turns non-blocking mode of `fd` on or off.
@@ -10633,6 +10635,13 @@ Moves the position of `fd` to `offset` bytes from `from` and returns the new pos
 
 Throws `.os` on failure. `read` and `write` with their default offset read and write at this
 position and advance it; an explicit offset neither uses nor moves it.
+
+### set_close_on_exec
+
+Marks `fd` close-on-exec, so a program started with `core.Process.run` or `core.exec`
+does not inherit it. Every descriptor the standard library creates for itself is
+marked this way; the flag only matters for descriptors handed out by other code.
+Does nothing on Windows, where children only inherit the handles they are given.
 
 ### set_mode
 
