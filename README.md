@@ -131,9 +131,6 @@ HTTP hello world. Higher requests per second is better.
 | Rust 1.97.1 | hyper 1.11 on tokio 1.53 | 7,554,694 |
 | Go 1.27.1 | fasthttp 1.73 | 5,282,109 |
 
-4 workers pinned to 4 cores; wrk on 8 other cores. 900 keep-alive connections,
-16 pipelined requests. Median of three 5-second runs.
-
 Code: [Link](examples/bench/http)
 
 ## Why Valk over Rust, Go, Zig?
