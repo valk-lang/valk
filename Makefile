@@ -3,7 +3,7 @@
 .DELETE_ON_ERROR:
 
 VALKV := 0.7.0
-VERSION := 0.7.1
+VERSION := 0.7.2
 
 SRC := $(wildcard src/*.valk src/*/*.valk)
 LIB_SRC := $(wildcard lib/src/*.valk lib/src/*/*.valk lib/src/*/*/*.valk lib/src/*/*/*/*.valk)
