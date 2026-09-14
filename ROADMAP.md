@@ -5,6 +5,8 @@
 
 ```
 - Release 0.7.3
++ Close file descriptors properly
++ Use Process for `--run`
 
 + Release 0.7.2
 + Fix compiler analysis bug
