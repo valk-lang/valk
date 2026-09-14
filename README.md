@@ -157,7 +157,7 @@ When not to use Valk:
 
 - The local GC has no timers or background threads. Collections happen at allocation thresholds, so a program behaves the same way every time you run it.
 
-- We are a self hosted language with an embedded LLVM 22 backend. Pass `--clang` to compile the emitted textual IR with external clang instead. We depend on libc for system calls. We use the system linker on Linux and macOS, and lld when cross compiling or targeting Windows.
+- We are a self hosted language with an embedded LLVM 22 backend. We depend on libc for system calls. We use the system linker on Linux and macOS, and lld when cross compiling or targeting Windows.
 
 - How to trust a self hosted compiler? You can compile the valk source with --ir to a single IR file. Then you can compile that IR file with clang to create your new valk compiler and at that point you know there is no hidden code inside the compiler.
 
