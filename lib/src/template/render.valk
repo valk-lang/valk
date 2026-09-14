@@ -1,135 +1,563 @@
 use io
-
 use json
-use fs
 use core
+use html
 
-// Shared by every thread, so templates registered on the main thread render on HTTP
-// worker threads too. The lock is held only for a lookup or a store, never while
-// rendering: an @include looks its template up again and the lock is not reentrant.
-shared contents: core.Lock[Map[String]] (.new(.{}) !!)
+/// A set of templates and their filters.
+///
+/// An engine is an ordinary object: create one, register templates and filters, render.
+/// Nothing in it is shared between threads. A server that renders on several worker
+/// threads gives each thread its own engine through a `global`, whose initializer runs on
+/// every thread:
+///
+/// ```valk
+/// global views: template.Engine (load_views())
+///
+/// fn load_views() template.Engine {
+///     let engine = template.Engine.new()
+///     engine.set_many(#embed_dir("views"))
+///     engine.set_filter("money", fn(v: json.Value, args: Array[json.Value]) json.Value {
+///         return json.from("$" + v.float.to_string(2))
+///     })
+///     return engine
+/// }
+///
+/// fn handler(req: http.Request) http.Response {
+///     return http.Response.html(views.render("index.html", data) !? "render failed")
+/// }
+/// ```
+///
+/// A template is compiled the first time it renders and the compiled form is kept until
+/// it is registered again. Output is HTML-escaped unless `escape` says otherwise, so an
+/// engine can just as well produce plain text, SQL or any other format.
++ class Engine {
+    - sources: Map[String] (.{})
+    - compiled: Map[Template] (.{})
+    - filters: Map[Filter] (.{})
+    /// Writes every `{{ }}` output escaped; HTML escaping by default. Set it to `null` for
+    /// plain text, or to your own `Escape` for another format: templates are not tied to
+    /// HTML. A `RenderOptions.escape` overrides it for one render.
+    ///
+    /// ```valk
+    /// engine.escape = fn(input: local &[u8], out: io.Writer) uint !io.IoError {
+    ///     return out.write(input.to_string().replace("'", "''")) !>
+    /// }
+    /// ```
+    + escape: ?Escape (html_escape)
 
-fn get_content(name: String) String !LookupError {
-    lock contents as c : return c.get(name) !>
+    /// Creates an empty engine.
+    + static fn new() SELF $default {
+        return SELF {}
+    }
+
+    /// Registers `content` as the template named `name`, replacing any earlier one.
+    + fn set(name: String, content: String) {
+        this.sources.set(name, content)
+        this.compiled.remove(name)
+    }
+
+    /// Registers every entry of `content` as a template, keyed by name.
+    ///
+    /// Pairs with `#embed_dir`, which yields a map of relative paths to file contents.
+    + fn set_many(content: Map[String]) {
+        each content as text, name : this.set(name, text)
+    }
+
+    /// Registers `filter` for `{{ value | name }}` and `{{ value | name(args) }}`.
+    ///
+    /// The filter receives the value and the evaluated arguments and returns the value the
+    /// output continues with. A custom filter replaces a built-in one of the same name. The
+    /// built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length`, `default(x)`,
+    /// `join(sep)`, `first`, `last`, `reverse`, `round(decimals)`, `truncate(n, suffix)`,
+    /// `replace(from, to)`, `json`, `escape`, `urlencode` and `keys`.
+    + fn set_filter(name: String, filter: Filter) {
+        this.filters.set(name, filter)
+    }
+
+    /// Whether a template named `name` is registered.
+    + fn has(name: String) bool {
+        return this.sources.has(name)
+    }
+
+    /// Renders the registered template `name` with `data` and returns the output.
+    ///
+    /// `data` is converted with `json.from`, so template variables are its fields or map
+    /// keys. `{{ }}` output goes through the engine's `escape` (HTML by default), or
+    /// through `options.escape` when options are given, `{! !}` is written raw, and leading and trailing whitespace is trimmed
+    /// from the result. `@include` and `@extend` look templates up in this engine, may not
+    /// form a cycle, and may nest at most `options.max_depth` templates deep (64 by
+    /// default), not counting `name` itself.
+    ///
+    /// Throws `.template_not_found` when `name` is not registered, `.parse` on a syntax error,
+    /// an unknown template in `@include`/`@extend`, a cycle, too deep nesting, an unknown
+    /// filter or a variable or property that does not exist (`message` names the line and
+    /// template).
+    + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
+        let out = ByteBuffer.new(1024)
+        this.render_into(name, data, out, options) !>
+        return out.to_string()
+    }
+
+    /// Writes `render(name, data, options)` to `out` and returns the bytes written.
+    ///
+    /// Throws `ParseError` as `render` does, and `.write` when `out` fails.
+    + fn render_into(name: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
+        let compiled = this.compiled_template(name) ! throw .template_not_found {
+            message: "Template not found. Did you forget to register it with 'set'?"
+            template_name: name
+        }
+        let renderer = Renderer { engine: this, options: options, root: json.from(data) }
+        let page = renderer.render_top(compiled, Array[String]{ name }, 0) !>
+        return renderer.deliver(page, out, name) !>
+    }
+
+    /// Renders the template text `content` with `data` and returns the output.
+    ///
+    /// Works like `render` without looking up a name first; `@include` and `@extend` still
+    /// resolve against the registered templates. Throws `.parse` as `render` does.
+    + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
+        let out = ByteBuffer.new(1024)
+        this.render_content_into(content, data, out, options) !>
+        return out.to_string()
+    }
+
+    /// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
+    ///
+    /// Throws `ParseError` as `render_content` does, and `.write` when `out` fails.
+    + fn render_content_into(content: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
+        let compiled = Compiler { content: content }.compile() !>
+        let renderer = Renderer { engine: this, options: options, root: json.from(data) }
+        let page = renderer.render_top(compiled, Array[String]{}, 0) !>
+        return renderer.deliver(page, out, "") !>
+    }
+
+    // The compiled template `name`, compiled on first use since its registration
+    fn compiled_template(name: String) Template !ParseError {
+        this.compiled.get(name) -> ready : return ready
+        let source = this.sources.get(name) ! throw .missing { message: "Template not found", template_name: name }
+        let compiled = Compiler { name: name, content: source }.compile() !>
+        this.compiled.set(name, compiled)
+        return compiled
+    }
+
+    fn filter(name: String) ?Filter {
+        return this.filters.get(name) !? null
+    }
 }
 
-/// Registers `content` as the template named `name`, replacing any earlier one.
-///
-/// The registry is shared by all threads: a template registered on one thread can be
-/// rendered on any other.
-+ fn set_content(name: String, content: String) {
-    lock contents as c : c.set(name, content)
+// ---- The 0.7.0 free functions --------------------------------------------------------
+// They shared one registry between all threads; an engine of its own per thread is the
+// design now. The registry survives so programs that register on the main thread and
+// render on HTTP workers keep working: each thread copies the sources into a private engine
+// when it sees a registration it has not seen yet.
+
+class LegacyRegistry {
+    sources: Map[String] (.{})
+    version: uint (1)
 }
-/// Registers every entry of `content` as a template, keyed by name; see `set_content`.
+
+shared legacy_sources: core.Lock[LegacyRegistry] (.new(.{}) !!)
+global legacy_engine: Engine (.{})
+global legacy_version: uint (0)
+
+fn legacy_templates() Engine {
+    let version: uint = 0
+    lock legacy_sources as r : version = r.version
+    if legacy_version != version {
+        let engine = Engine.new()
+        lock legacy_sources as r {
+            each r.sources as content, name : engine.set(name, content)
+        }
+        legacy_engine = engine
+        legacy_version = version
+    }
+    return legacy_engine
+}
+
+/// Registers `content` as the template named `name` for the free `render` functions.
 ///
-/// Pairs with `#embed_dir`, which yields a map of relative paths to file contents.
-+ fn set_content_many(content: Map[String]) {
-    lock contents as c {
-        each content as text, name {
-            c.set(name, text)
+/// Deprecated: create a `Engine` engine and call its `set`; see `Engine` for the
+/// per-thread pattern. The free functions keep one registry for all threads.
++ fn set_content(name: String, content: String) $deprecated {
+    lock legacy_sources as r {
+        r.sources.set(name, content)
+        r.version++
+    }
+}
+/// Registers every entry of `content` as a template for the free `render` functions.
+///
+/// Deprecated: create a `Engine` engine and call its `set_many`.
++ fn set_content_many(content: Map[String]) $deprecated {
+    lock legacy_sources as r {
+        each content as text, name : r.sources.set(name, text)
+        r.version++
+    }
+}
+/// Renders a template registered with `set_content`.
+///
+/// Deprecated: create a `Engine` engine and call its `render`.
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated {
+    return legacy_templates().render(name, data, options) !>
+}
+/// Writes `render(name, data, options)` to `out`.
+///
+/// Deprecated: create a `Engine` engine and call its `render_into`.
++ fn render_into(name: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated {
+    return legacy_templates().render_into(name, data, out, options) !>
+}
+/// Renders the template text `content`; includes resolve against `set_content` templates.
+///
+/// Deprecated: create a `Engine` engine and call its `render_content`.
++ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated {
+    return legacy_templates().render_content(content, data, options) !>
+}
+/// Writes `render_content(content, data, options)` to `out`.
+///
+/// Deprecated: create a `Engine` engine and call its `render_content_into`.
++ fn render_content_into(content: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated {
+    return legacy_templates().render_content_into(content, data, out, options) !>
+}
+
+// ---- Rendering --------------------------------------------------------------------------
+
+// Variables set by a loop or `@set`; the chain ends at the render's root data
+class Frame {
+    parent: ?Frame (null)
+    vars: Map[json.Value] (.{})
+}
+
+class Renderer {
+    engine: Engine
+    options: ?RenderOptions
+    root: json.Value
+
+    // Writes a rendered page to `out`
+    fn deliver(page: ByteBuffer, out: io.Writer, name: String) uint !ParseError {
+        match out {
+            ByteBuffer as buf => {
+                buf.write(page)
+                return page.length
+            }
+            default => {
+                return out.write(page) ! throw .write {
+                    template_name: name
+                    message: "The writer refused the rendered page"
+                }
+            }
+        }
+    }
+
+    // Renders a template as the top of a chain or as an include: `templates` names the
+    // templates being rendered, for cycle detection, and `depth` how many levels of
+    // include/extend are above this one
+    fn render_top(template: Template, templates: Array[String], depth: uint) ByteBuffer !ParseError {
+        let frame = Frame {}
+        let chain = Map[String]{}
+        return this.render_template(template, frame, templates, depth, chain, this.root) !>
+    }
+
+    fn render_template(template: Template, frame: Frame, templates: Array[String], depth: uint, chain: Map[String], root: json.Value) ByteBuffer !ParseError {
+        let out = ByteBuffer.new(512)
+        let state = RenderState { template: template, templates: templates, depth: depth, chain: chain, root: root }
+        this.render_nodes(template.nodes, frame, state, out) !>
+
+        let parent_name = template.extends
+        if !isset(parent_name) {
+            out.trim(u8.is_whitespace)
+            return out
+        }
+        // An extending template: the text before `@extend`, then the parent with this
+        // template's blocks, then the text after
+        let parent = this.load(parent_name, state, template.extends_line) !>
+        let next = this.next_templates(templates, parent_name, depth, state) !>
+        let parent_out = this.render_template(parent, frame, next, depth + 1, chain, root) !>
+        let split = state.extend_offset
+        let head = ByteBuffer.new(split)
+        head.write(out.view(0, split))
+        let tail = ByteBuffer.new(out.length - split)
+        tail.write(out.view(split, out.length - split))
+        head.trim(u8.is_whitespace)
+        tail.trim(u8.is_whitespace)
+        let result = ByteBuffer.new(head.length + parent_out.length + tail.length)
+        result.write(head)
+        result.write(parent_out)
+        result.write(tail)
+        return result
+    }
+
+    fn render_nodes(nodes: Array[Node], frame: Frame, state: RenderState, out: ByteBuffer) !ParseError {
+        each nodes as node {
+            if node.type == NODE_TEXT {
+                out.write(node.text)
+            } else if node.type == NODE_OUTPUT {
+                let expr = node.expr ?! continue
+                let value = this.eval(expr, frame, state) !>
+                let text = value_text(value)
+                let options = this.options
+                if node.raw {
+                    out.write(text)
+                } else {
+                    // The render's options replace the engine's escape
+                    let escape = isset(options) ? options.escape : this.engine.escape
+                    if isset(escape) {
+                        escape(text, out) ! throw .write { template_name: state.template.name ?? "?", message: "The escape function failed" }
+                    } else {
+                        out.write(text)
+                    }
+                }
+            } else if node.type == NODE_IF {
+                each node.branches as arm {
+                    let cond = arm.cond
+                    if !isset(cond) || value_truthy(this.eval(cond, frame, state) !>) {
+                        this.render_nodes(arm.nodes, frame, state, out) !>
+                        break
+                    }
+                }
+            } else if node.type == NODE_EACH {
+                let expr = node.expr ?! continue
+                let list = this.eval(expr, frame, state) !>
+                let items: ?Array[json.Value] = null
+                let keys: ?Array[String] = null
+                match list {
+                    json.ArrayValue as array => items = array.values
+                    json.ObjectValue as object => {
+                        items = object.values.values()
+                        keys = object.values.keys()
+                    }
+                    default => {}
+                }
+                if !isset(items) : this.fail("@each value must be an array or object", node.line, state)
+                if items.length == 0 {
+                    let empty = node.empty_body
+                    if isset(empty) : this.render_nodes(empty, frame, state, out) !>
+                    continue
+                }
+                let inner = Frame { parent: frame }
+                each items as item, index {
+                    inner.vars.set(node.vname, item)
+                    let kname = node.kname
+                    if isset(kname) {
+                        if isset(keys) : inner.vars.set(kname, json.from(keys.get(index) !? ""))
+                        else : inner.vars.set(kname, json.from(index))
+                    }
+                    let iname = node.iname
+                    if isset(iname) : inner.vars.set(iname, json.from(index))
+                    this.render_nodes(node.body, inner, state, out) !>
+                }
+            } else if node.type == NODE_INCLUDE {
+                let included = this.load(node.name, state, node.line) !>
+                let next = this.next_templates(state.templates, node.name, state.depth, state) !>
+                let include_frame = frame
+                let include_root = state.root
+                let expr = node.expr
+                if isset(expr) {
+                    // `@include("x", value)`: the partial sees only that value
+                    include_root = this.eval(expr, frame, state) !>
+                    include_frame = Frame {}
+                }
+                let sub_chain = Map[String]{}
+                let part = this.render_template(included, include_frame, next, state.depth + 1, sub_chain, include_root) !>
+                out.write(part)
+            } else if node.type == NODE_EXTEND {
+                state.extend_offset = out.length
+            } else if node.type == NODE_BLOCK {
+                // A block of a more derived template was stored first and wins
+                if !state.chain.has(node.name) {
+                    let body = ByteBuffer.new(256)
+                    this.render_nodes(node.body, frame, state, body) !>
+                    body.trim(u8.is_whitespace)
+                    state.chain.set(node.name, body.to_string())
+                }
+            } else if node.type == NODE_YIELD {
+                let content = state.chain.get(node.name) ! this.fail("No block found named: " + node.name, node.line, state)
+                out.write(content)
+            } else if node.type == NODE_SET {
+                let expr = node.expr ?! continue
+                frame.vars.set(node.name, this.eval(expr, frame, state) !>)
+            }
+        }
+    }
+
+    // ---- Expressions ---------------------------------------------------------------
+
+    fn eval(expr: Expr, frame: Frame, state: RenderState) json.Value !ParseError {
+        if expr.type == EXPR_LITERAL : return expr.value
+        if expr.type == EXPR_VAR || expr.type == EXPR_MEMBER || expr.type == EXPR_INDEX {
+            return this.lookup(expr, frame, state, false) !>
+        }
+        if expr.type == EXPR_NOT {
+            let inner = expr.left ?! return null
+            return json.from(!value_truthy(this.eval(inner, frame, state) !>))
+        }
+        if expr.type == EXPR_AND || expr.type == EXPR_OR {
+            let left = expr.left ?! return null
+            let right = expr.right ?! return null
+            let first = value_truthy(this.eval(left, frame, state) !>)
+            if expr.type == EXPR_AND && !first : return json.from(false)
+            if expr.type == EXPR_OR && first : return json.from(true)
+            return json.from(value_truthy(this.eval(right, frame, state) !>))
+        }
+        if expr.type == EXPR_COMPARE {
+            let left = expr.left ?! return null
+            let right = expr.right ?! return null
+            let a = this.eval(left, frame, state) !>
+            let b = this.eval(right, frame, state) !>
+            let op = expr.op
+            if a.is_number && b.is_number {
+                let x = value_number(a)
+                let y = value_number(b)
+                if op == "==" : return json.from(x == y)
+                if op == "!=" : return json.from(x != y)
+                if op == "<" : return json.from(x < y)
+                if op == "<=" : return json.from(x <= y)
+                if op == ">" : return json.from(x > y)
+                return json.from(x >= y)
+            }
+            // Anything else compares by its text form; only equality is defined
+            let equal = value_text(a) == value_text(b)
+            if op == "==" : return json.from(equal)
+            if op == "!=" : return json.from(!equal)
+            return json.from(false)
+        }
+        if expr.type == EXPR_ISSET {
+            let inner = expr.left ?! return null
+            let found = this.lookup(inner, frame, state, true) ! {
+                if E.code == E.missing : return json.from(false)
+                throw E
+            }
+            return json.from(!found.is_null)
+        }
+        if expr.type == EXPR_LEN {
+            let inner = expr.left ?! return null
+            let found = this.lookup(inner, frame, state, true) ! {
+                if E.code == E.missing : return json.from(0)
+                throw E
+            }
+            return json.from(value_size(found))
+        }
+        if expr.type == EXPR_FILTER {
+            let inner = expr.left ?! return null
+            let value = this.eval(inner, frame, state) !>
+            let args = Array[json.Value]{}
+            each expr.args as arg : args.append(this.eval(arg, frame, state) !>)
+            let custom = this.engine.filter(expr.name)
+            if isset(custom) : return custom(value, args)
+            let builtin = builtin_filter(expr.name, value, args)
+            if isset(builtin) : return builtin
+            this.fail("Unknown filter '" + expr.name + "'", expr.line, state)
+        }
+        this.fail("Invalid expression", expr.line, state)
+    }
+
+    // Resolves a variable path. With `probe` a missing step throws `.missing` instead of
+    // failing the render, which `@isset` and `@len` turn into their answer.
+    fn lookup(expr: Expr, frame: Frame, state: RenderState, probe: bool) json.Value !ParseError {
+        if expr.type == EXPR_VAR {
+            let name = expr.name
+            let f: ?Frame = frame
+            while isset(f) {
+                f.vars.get(name) -> value : return value
+                f = f.parent
+            }
+            let root = state.root
+            if !root.has(name) {
+                if probe : throw .missing { message: "Data not found", template_name: state.template.name ?? "?", line: expr.line }
+                this.fail("Data not found: '" + name + "'", expr.line, state)
+            }
+            return root.get(name)
+        }
+        if expr.type == EXPR_MEMBER {
+            let left = expr.left ?! return null
+            let owner = this.lookup_or_eval(left, frame, state, probe) !>
+            if !owner.has(expr.name) {
+                if probe : throw .missing { message: "Data not found", template_name: state.template.name ?? "?", line: expr.line }
+                this.fail("Property not found: '" + expr.name + "'", expr.line, state)
+            }
+            return owner.get(expr.name)
+        }
+        if expr.type == EXPR_INDEX {
+            let left = expr.left ?! return null
+            let key_expr = expr.right ?! return null
+            let owner = this.lookup_or_eval(left, frame, state, probe) !>
+            let key = this.eval(key_expr, frame, state) !>
+            let found = false
+            let value: json.Value = null
+            match key {
+                int as index => {
+                    if index >= 0 {
+                        found = owner.has(index.to(uint))
+                        value = owner.get(index.to(uint))
+                    }
+                }
+                String as name => {
+                    found = owner.has(name)
+                    value = owner.get(name)
+                }
+                default => {}
+            }
+            if !found {
+                if probe : throw .missing { message: "Data not found", template_name: state.template.name ?? "?", line: expr.line }
+                this.fail("Indexed value not found", expr.line, state)
+            }
+            return value
+        }
+        return this.eval(expr, frame, state) !>
+    }
+
+    fn lookup_or_eval(expr: Expr, frame: Frame, state: RenderState, probe: bool) json.Value !ParseError {
+        if expr.type == EXPR_VAR || expr.type == EXPR_MEMBER || expr.type == EXPR_INDEX : return this.lookup(expr, frame, state, probe) !>
+        return this.eval(expr, frame, state) !>
+    }
+
+    // ---- Engine -----------------------------------------------------------------
+
+    fn load(name: String, state: RenderState, line: uint) Template !ParseError {
+        return this.engine.compiled_template(name) ! {
+            if E.code == E.missing : this.fail("Template not found: " + name, line, state)
+            throw E
+        }
+    }
+
+    fn next_templates(templates: Array[String], name: String, depth: uint, state: RenderState) Array[String] !ParseError {
+        let next = templates.copy()
+        each next as active {
+            if active == name {
+                next.append(name)
+                this.fail("Template cycle: " + next.join(" -> "), 0, state)
+            }
+        }
+        next.append(name)
+        let max_depth = TEMPLATE_MAX_DEPTH
+        let options = this.options
+        if isset(options) : max_depth = options.max_depth
+        if depth + 1 > max_depth : this.fail("Template depth exceeds the maximum of " + max_depth, 0, state)
+        return next
+    }
+
+    fn fail(msg: String, line: uint, state: RenderState) !ParseError $throw {
+        let name = state.template.name ?? "{content}"
+        throw .parse {
+            message: "[ Error at line " + line + " in " + name + " | Error: " + msg + " ]"
+            template_name: state.template.name ?? "?"
+            line: line
+            index: 0
         }
     }
 }
 
-/// Renders the registered template `name` with `data` and returns the output.
-///
-/// `data` is converted with `json.from`, so template variables are its fields or map
-/// keys. `{{ }}` output goes through `options.escape` (HTML escaping by default, none when
-/// it is `null`), `{! !}` is written raw, and leading and trailing whitespace is trimmed
-/// from the result. `@include` and `@extend` look templates up in the same registry, may
-/// not form a cycle, and may nest at most `options.max_depth` templates deep (64 by
-/// default), not counting `name` itself.
-///
-/// Throws `.template_not_found` when `name` is not registered, `.parse` on a syntax error,
-/// an unknown template in `@include`/`@extend`, a cycle, too deep nesting or a variable or
-/// property that does not exist (`message` names the line and template).
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
-    let d = json.from(data)
-    let content = get_content(name) ! throw .template_not_found {
-        message: "Template not found. Did you forget to use 'set_content'?"
-        template_name: name
-    }
-    let p = Parser {
-        name: name
-        content: content
-        data: d
-        options: options
-        templates: Array[String]{ name }
-    }
-    return p.render()
+// What one template's render carries besides its frames
+class RenderState {
+    template: Template
+    templates: Array[String]
+    depth: uint
+    // The blocks of the chain being rendered: the most derived template fills it first
+    chain: Map[String]
+    root: json.Value
+    // Where `@extend` split this template's own output
+    extend_offset: uint (0)
 }
 
-/// Writes `render(name, data, options)` to `out` and returns the bytes written.
-///
-/// A `ByteBuffer` is written directly; any other writer receives the page in one write.
-/// Throws `ParseError` as `render` does, and `.write` when `out` fails.
-+ fn render_into(name: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
-    match out {
-        ByteBuffer as buf => {
-            let before = buf.length
-            let d = json.from(data)
-            let content = get_content(name) ! throw .template_not_found {
-                message: "Template not found. Did you forget to use 'set_content'?"
-                template_name: name
-            }
-            let p = Parser {
-                name: name
-                content: content
-                data: d
-                options: options
-                templates: Array[String]{ name }
-                final: buf
-            }
-            p.render() !>
-            return buf.length - before
-        }
-        default => {
-            let page = render(name, data, options) !>
-            return out.write(page) ! throw .write {
-                template_name: name
-                message: "The writer refused the rendered page"
-            }
-        }
-    }
-}
-
-/// Renders the template text `content` with `data` and returns the output.
-///
-/// Works like `render` without looking up a name first; `@include` and `@extend` still
-/// resolve against the registered templates. Throws `.parse` as `render` does.
-+ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError {
-    let d = json.from(data)
-    let p = Parser {
-        content: content
-        data: d
-        options: options
-    }
-    return p.render()
-}
-
-/// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
-///
-/// A `ByteBuffer` is written directly; any other writer receives the page in one write.
-/// Throws `ParseError` as `render_content` does, and `.write` when `out` fails.
-+ fn render_content_into(content: String, data: $T, out: io.Writer, options: ?RenderOptions (null)) uint !ParseError {
-    match out {
-        ByteBuffer as buf => {
-            let before = buf.length
-            let p = Parser {
-                content: content
-                data: json.from(data)
-                options: options
-                final: buf
-            }
-            p.render() !>
-            return buf.length - before
-        }
-        default => {
-            let page = render_content(content, data, options) !>
-            return out.write(page) ! throw .write {
-                template_name: ""
-                message: "The writer refused the rendered page"
-            }
-        }
-    }
+/// HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
++ fn html_escape(input: local &[u8], out: io.Writer) uint !io.IoError {
+    return html.escape_into(input, out) !>
 }

@@ -2041,7 +2041,8 @@ class PageData {
 //
 fn main() {
     // Embed templates at compile time and register them by relative path.
-    template.set_content_many(#embed_dir("views"))
+    let views = template.Engine.new()
+    views.set_many(#embed_dir("views"))
     // Template data
     let data = PageData {
         title: "Hello world"
@@ -2053,7 +2054,7 @@ fn main() {
         }
     }
     // Render the template
-    let result = template.render("example.html", data) ! panic("Template error: %{E.message}")
+    let result = views.render("example.html", data) ! panic("Template error: %{E.message}")
 
     println(result)
 }
@@ -2062,17 +2063,85 @@ fn main() {
 Template engine tokens:
 
 ```
-@if(...) @elif(...) @else @end
-
-@each(... as val) @end // Loop over array or map
-@each(... as val, key) // With key
-@each(... as val, key, index) // With key & index
-
+@if(...) @elif(...) @else @end        // Conditions: ==, !=, <, <=, >, >=, &&, ||, !, ( )
+@each(... as val) @end                // Loop over an array or map
+@each(... as val, key) @end           // With key
+@each(... as val, key, index) @end    // With key & index
+@each(...) ... @empty ... @end        // @empty renders when the list is empty
+@set(name = expr)                     // A variable for the rest of the block
 {{ }}   // Print an HTML-escaped value (or use the configured escape function)
 {! !}   // Print a raw value without escaping
-
-@include("...") // Include another template registered with set_content/set_content_many
+{{ value | upper | truncate(20) }}   // Filters, applied left to right
+{# a comment #}
+@include("...")          // Include a template registered with `set`/`set_many`
+@include("...", expr)    // The same, with `expr` as the partial's data instead of the caller's
+@extend("layout.html") @block("name") ... @end   // Fill the blocks of a layout
+@yield("name")           // Where a layout prints a block
+@isset(x) @len(x)        // In expressions: whether a value exists, and its length
 ```
+
+Variables are the fields or keys of the data, with `.` and `[index]` to go
+deeper; a name that does not exist is an error, so use `@isset` when it may be
+missing. Literals are `"text"`, numbers, `true`, `false` and `null`.
+
+A directive that stands alone on its line, such as an `@if` or `@end` with
+only indentation around it, disappears together with its line, so control
+flow does not leave blank lines in the output. Write `\@if` or `\{{` for
+text that must stay literal, and note that an `@word` without a `(` after it,
+such as `@unsafe` in prose, is plain text.
+
+The built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length`,
+`default(x)`, `join(sep)`, `first`, `last`, `reverse`, `round(decimals)`,
+`truncate(n, suffix)`, `replace(from, to)`, `json`, `escape`, `urlencode`
+and `keys`. `views.set_filter(name, fn)` registers your own; the function
+receives the value and the evaluated arguments as `json.Value` and returns
+the value to continue with, and it is an ordinary closure that may capture
+what it needs:
+
+```rust
+views.set_filter("money", fn(value: json.Value, args: Array[json.Value]) json.Value {
+    return json.from("$" + value.float.to_string(2))
+})
+// {{ price | money }}
+```
+
+An engine is a plain object: nothing in it is shared between threads. A
+server that renders on several worker threads gives each thread its own
+engine through a `global`, since every thread runs the global initializers:
+
+```rust
+global views: template.Engine (load_views())
+
+fn load_views() template.Engine {
+    let engine = template.Engine.new()
+    engine.set_many(#embed_dir("views"))
+    return engine
+}
+
+fn handler(req: http.Request) http.Response {
+    return http.Response.html(views.render("index.html", data) !? "render failed")
+}
+```
+
+Templates are not tied to HTML: `{{ }}` output goes through the engine's
+`escape`, which is HTML escaping by default. Set `views.escape = null` for
+plain text, or your own function for another format; it gets the value's
+bytes and the output writer, so nothing is allocated per value:
+
+```rust
+views.escape = fn(input: local &[u8], out: io.Writer) uint !io.IoError {
+    return out.write(input.to_string().replace("'", "''")) !>
+}
+```
+
+`RenderOptions.escape` is the same type and applies when options are passed
+to a render: HTML by default, `null` for none, so an engine with an escape of
+its own passes it along, `RenderOptions { escape: views.escape, max_depth: 2 }`.
+
+A template is compiled the first time it renders and kept until it is
+registered again. The free functions `template.set_content` and
+`template.render` from earlier versions still work through one registry for
+all threads, but are deprecated in favour of an engine.
 
 Note: `valk.template` works at runtime and therefore cannot detect incorrect template syntax at compile time.
 

@@ -290,7 +290,7 @@ readme=$(<"$repo/README.md")
 if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" != *'path = path.resolve()'* ]] \
     || [[ "$guide" != *'con.write("PING")'* ]] \
-    || [[ "$guide" != *'template.render("example.html", data)'* ]] \
+    || [[ "$guide" != *'views.render("example.html", data)'* ]] \
     || [[ "$guide" != *'let running = co s.start()'* ]] \
     || [[ "$guide" != *'await running'* ]] \
     || [[ "$guide" != *'s.request_shutdown(5000)'* ]] \

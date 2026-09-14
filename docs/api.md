@@ -2685,9 +2685,9 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
 ```js
 // Returns `code` with the HTML special characters `<`, `>`, `"`, `'` and `&` as entities.
-+ fn escape(code: String, options: ?EscapeOptions (null)) String
++ fn escape(code: local &[u8], options: ?EscapeOptions (null)) String
 // Writes `code` escaped as `escape` does to `out` and returns the bytes written.
-+ fn escape_into(code: String, out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
++ fn escape_into(code: local &[u8], out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
@@ -4135,6 +4135,13 @@ error SignalError (unsupported, init)
 
 # template
 
+## Aliases for 'template'
+
+```js
+type Escape (fn(local &[u8], Writer)(uint !IoError))
+type Filter (fn(Value, Array[Value])(Value))
+```
+
 ## Errors for 'template'
 
 ```js
@@ -4147,27 +4154,56 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ## Functions for 'template'
 
 ```js
-// Renders the registered template `name` with `data` and returns the output.
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
-// Renders the template text `content` with `data` and returns the output.
-+ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
-// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
-+ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
-// Writes `render(name, data, options)` to `out` and returns the bytes written.
-+ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
-// Registers `content` as the template named `name`, replacing any earlier one.
-+ fn set_content(name: String, content: String) void
-// Registers every entry of `content` as a template, keyed by name; see `set_content`.
-+ fn set_content_many(content: Map[String]) void
+// HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
++ fn html_escape(input: local &[u8], out: Writer) uint !io:IoError
+// Renders a template registered with `set_content`.
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
+// Renders the template text `content`; includes resolve against `set_content` templates.
++ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
+// Writes `render_content(content, data, options)` to `out`.
++ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
+// Writes `render(name, data, options)` to `out`.
++ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
+// Registers `content` as the template named `name` for the free `render` functions.
++ fn set_content(name: String, content: String) void $deprecated
+// Registers every entry of `content` as a template for the free `render` functions.
++ fn set_content_many(content: Map[String]) void $deprecated
 ```
 
 ## Classes for 'template'
 
 ```js
-// Options for `render` and `render_content`.
+// A set of templates and their filters.
++ class Engine {
+    // Writes every `{{ }}` output escaped; HTML escaping by default. Set it to `null` for plain text, or to your own `Escape` for another format: templates are not tied to HTML. A `RenderOptions.escape` overrides it for one render.
+    + escape: ?fn(local &[u8], Writer)(uint !IoError)
+
+    // Whether a template named `name` is registered.
+    + fn has(name: String) bool
+    // Creates an empty engine.
+    + static fn new() Engine
+    // Renders the registered template `name` with `data` and returns the output.
+    + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
+    // Renders the template text `content` with `data` and returns the output.
+    + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
+    // Writes `render_content(content, data, options)` to `out` and returns the bytes written.
+    + fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
+    // Writes `render(name, data, options)` to `out` and returns the bytes written.
+    + fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
+    // Registers `content` as the template named `name`, replacing any earlier one.
+    + fn set(name: String, content: String) void
+    // Registers `filter` for `{{ value | name }}` and `{{ value | name(args) }}`.
+    + fn set_filter(name: String, filter: fn(Value, Array[Value])(Value)) void
+    // Registers every entry of `content` as a template, keyed by name.
+    + fn set_many(content: Map[String]) void
+}
+```
+
+```js
+// Options for one `render` or `render_content` call.
 + class RenderOptions {
-    // Function applied to every `{{ }}` output; HTML escaping by default, `null` for none.
-    + escape: ?fn(String)(String)
+    // The `Escape` applied to every `{{ }}` output of this render; HTML escaping by default, `null` for none. Options replace the engine's `escape` for the render, so an engine with an escape of its own passes it along: `RenderOptions { escape: engine.escape, max_depth: 2 }`.
+    + escape: ?fn(local &[u8], Writer)(uint !IoError)
     // Maximum nesting of `@include`/`@extend` templates.
     + max_depth: uint
 }

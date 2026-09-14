@@ -1,0 +1,568 @@
+use json
+
+// Compiles template text into a `Template` tree. Syntax:
+//
+//   text, with `\@` and `\{{` writing the characters literally
+//   {{ expr }}  {! expr !}  {# comment #}
+//   @if(expr) ... @elif(expr) ... @else ... @end
+//   @each(expr as value[, key[, index]]) ... @empty ... @end
+//   @include("name"[, expr])   @extend("name")   @block("name") ... @end   @yield("name")
+//   @set(name = expr)
+//
+// A directive that has nothing but spaces around it on its line takes the whole line
+// with it, so control flow does not leave blank lines in the output.
+
+value TOK_END (0)
+value TOK_WORD (1)     // a name, a keyword or a `@directive`
+value TOK_NUMBER (2)
+value TOK_STRING (3)
+value TOK_SIGN (4)     // punctuation and operators
+
+class Compiler {
+    name: ?String (null)
+    content: String
+    // Scan position inside directives and expressions
+    i: uint (0)
+    line: uint (1)
+    token: String ("")
+    token_type: int (TOK_END)
+    token_line: uint (1)
+
+    fn compile() Template !ParseError {
+        let template = Template { name: this.name }
+        let closers = Array[String]{}
+        template.nodes = this.compile_nodes(closers, 0) !>
+        each template.nodes as node {
+            if node.type == NODE_EXTEND {
+                if isset(template.extends) : this.fail("A template can extend one template", node.line)
+                template.extends = node.name
+                template.extends_line = node.line
+            }
+        }
+        return template
+    }
+
+    // Reads nodes until the end of the text or one of `closers` (`@end`, `@else`, ...),
+    // which is left in `this.token` for the caller
+    fn compile_nodes(closers: Array[String], line: uint) Array[Node] !ParseError {
+        let nodes = Array[Node]{}
+        let content = this.content
+        let length = content.bytes
+        let text = ByteBuffer.new(256)
+        let text_line = this.line
+        // Something other than text was written on the current line: a directive after
+        // it is not alone on its line
+        let dirty = false
+
+        while this.i < length {
+            let ch = content.get(this.i)
+            let next = this.i + 1 < length ? content.get(this.i + 1) : 0
+
+            // `\@x` and `\{{` are literal text
+            if ch == '\\' && (next == '@' || next == '{') {
+                text.write_byte(next)
+                this.i += 2
+                continue
+            }
+            if ch == '{' && next == '#' {
+                let start_line = this.line
+                let at_line_start = !dirty && this.text_ends_line(text)
+                let close = content.index_of("#}", this.i + 2) ! this.fail("Missing '#}' after '{#'", start_line)
+                let k = this.i
+                while k < close {
+                    if content.get(k) == '\n' : this.line++
+                    k++
+                }
+                this.i = close + 2
+                if at_line_start : this.consume_line_end(text)
+                continue
+            }
+            if ch == '{' && (next == '{' || next == '!') {
+                this.flush_text(nodes, text, text_line)
+                let raw = next == '!'
+                let node_line = this.line
+                this.i += 2
+                this.next_token() !>
+                let expr = this.parse_expr() !>
+                this.expect_sign(raw ? "!}" : "}}", true) !>
+                nodes.append(Node { type: NODE_OUTPUT, line: node_line, expr: expr, raw: raw })
+                text_line = this.line
+                dirty = true
+                continue
+            }
+            if ch == '@' {
+                let word = this.directive_at(this.i)
+                if word.bytes > 0 {
+                    // Directives with arguments only count when the `(` follows
+                    let is_closer = word == "@end" || word == "@else" || word == "@elif" || word == "@empty"
+                    let takes_args = word != "@end" && word != "@else" && word != "@empty"
+                    let after = this.i + word.bytes
+                    if !takes_args || (after < length && content.get(after) == '(') {
+                        if is_closer {
+                            if closers.contains(word) {
+                                let at_line_start = !dirty && this.text_ends_line(text)
+                                this.i = after
+                                this.token = word
+                                this.flush_text(nodes, text, text_line)
+                                // The caller reads the arguments and the rest of the line
+                                this.closer_at_line_start = at_line_start
+                                return nodes
+                            }
+                            this.fail("Unexpected '" + word + "'", this.line)
+                        }
+                        let at_line_start = !dirty && this.text_ends_line(text)
+                        this.flush_text(nodes, text, text_line)
+                        let node_line = this.line
+                        this.i = after
+                        // A control directive alone on its line vanishes with the line;
+                        // `compile_directive` consumes it right after the arguments, before
+                        // the body that may follow
+                        let node = this.compile_directive(word, node_line, at_line_start, nodes) !>
+                        if node.type == NODE_INCLUDE || node.type == NODE_YIELD : dirty = true
+                        nodes.append(node)
+                        text_line = this.line
+                        continue
+                    }
+                }
+            }
+            if ch == '\n' {
+                this.line++
+                dirty = false
+            }
+            text.write_byte(ch)
+            this.i++
+        }
+        if closers.length > 0 : this.fail("Missing '@end'", line)
+        this.flush_text(nodes, text, text_line)
+        this.token = ""
+        return nodes
+    }
+
+    // Set by `compile_nodes` when it returns on a closer: the closer started its line
+    closer_at_line_start: bool (false)
+
+    fn compile_directive(word: String, node_line: uint, at_line_start: bool, before: Array[Node]) Node !ParseError {
+        if word == "@if" {
+            let node = Node { type: NODE_IF, line: node_line }
+            this.expect_open() !>
+            let cond = this.parse_expr() !>
+            this.expect_sign(")", true) !>
+            if at_line_start : this.consume_line_end_at(before)
+            while true {
+                let arm = Branch { cond: cond }
+                arm.nodes = this.compile_nodes(Array[String]{ "@end", "@else", "@elif" }, node_line) !>
+                node.branches.append(arm)
+                let closer = this.token
+                let at_line_start = this.closer_at_line_start
+                if closer == "@elif" {
+                    this.expect_open() !>
+                    cond = this.parse_expr() !>
+                    this.expect_sign(")", true) !>
+                    if at_line_start : this.consume_line_end_at(arm.nodes)
+                    continue
+                }
+                if closer == "@else" {
+                    if at_line_start : this.consume_line_end_at(arm.nodes)
+                    let rest = Branch {}
+                    rest.nodes = this.compile_nodes(Array[String]{ "@end" }, node_line) !>
+                    node.branches.append(rest)
+                    if this.closer_at_line_start : this.consume_line_end_at(rest.nodes)
+                    return node
+                }
+                if at_line_start : this.consume_line_end_at(arm.nodes)
+                return node
+            }
+        }
+        if word == "@each" {
+            let node = Node { type: NODE_EACH, line: node_line }
+            this.expect_open() !>
+            node.expr = this.parse_expr() !>
+            if this.token != "as" : this.fail("Expected 'as' after the @each value", this.token_line)
+            this.next_token() !>
+            node.vname = this.read_name() !>
+            if this.accept_sign(",") {
+                node.kname = this.read_name() !>
+                if this.accept_sign(",") : node.iname = this.read_name() !>
+            }
+            this.expect_sign(")", true) !>
+            if at_line_start : this.consume_line_end_at(before)
+            node.body = this.compile_nodes(Array[String]{ "@end", "@empty" }, node_line) !>
+            if this.closer_at_line_start : this.consume_line_end_at(node.body)
+            if this.token == "@empty" {
+                let empty = this.compile_nodes(Array[String]{ "@end" }, node_line) !>
+                if this.closer_at_line_start : this.consume_line_end_at(empty)
+                node.empty_body = empty
+            }
+            return node
+        }
+        if word == "@include" {
+            let node = Node { type: NODE_INCLUDE, line: node_line }
+            this.expect_open() !>
+            node.name = this.read_string_token() !>
+            if this.accept_sign(",") : node.expr = this.parse_expr() !>
+            this.expect_sign(")", true) !>
+            return node
+        }
+        if word == "@extend" {
+            let node = Node { type: NODE_EXTEND, line: node_line }
+            this.expect_open() !>
+            node.name = this.read_string_token() !>
+            this.expect_sign(")", true) !>
+            if at_line_start : this.consume_line_end_at(before)
+            return node
+        }
+        if word == "@yield" {
+            let node = Node { type: NODE_YIELD, line: node_line }
+            this.expect_open() !>
+            node.name = this.read_string_token() !>
+            this.expect_sign(")", true) !>
+            return node
+        }
+        if word == "@block" {
+            let node = Node { type: NODE_BLOCK, line: node_line }
+            this.expect_open() !>
+            node.name = this.read_string_token() !>
+            this.expect_sign(")", true) !>
+            if at_line_start : this.consume_line_end_at(before)
+            node.body = this.compile_nodes(Array[String]{ "@end" }, node_line) !>
+            if this.closer_at_line_start : this.consume_line_end_at(node.body)
+            return node
+        }
+        if word == "@set" {
+            let node = Node { type: NODE_SET, line: node_line }
+            this.expect_open() !>
+            node.name = this.read_name() !>
+            this.expect_sign("=") !>
+            node.expr = this.parse_expr() !>
+            this.expect_sign(")", true) !>
+            if at_line_start : this.consume_line_end_at(before)
+            return node
+        }
+        this.fail("Unknown directive '" + word + "'", node_line)
+    }
+
+    // ---- Whitespace ----------------------------------------------------------------
+
+    // Whether the text so far ends with a line break followed by spaces only (or is the
+    // start of the template), so a directive here starts its line
+    fn text_ends_line(text: ByteBuffer) bool {
+        let i = text.length
+        while i > 0 {
+            let ch = text.get(i - 1)
+            if ch == ' ' || ch == '\t' {
+                i--
+                continue
+            }
+            return ch == '\n'
+        }
+        return true
+    }
+
+    // After a control directive that started its line: when only spaces follow up to the
+    // line break, drop the indentation before it and the line break after it
+    fn consume_line_end(text: ByteBuffer) {
+        let content = this.content
+        let length = content.bytes
+        let j = this.i
+        while j < length && (content.get(j) == ' ' || content.get(j) == '\t') : j++
+        if j < length && content.get(j) == '\r' : j++
+        if j < length && content.get(j) != '\n' : return
+        let keep = text.length
+        while keep > 0 && (text.get(keep - 1) == ' ' || text.get(keep - 1) == '\t') : keep--
+        text.truncate(keep)
+        if j < length {
+            this.line++
+            j++
+        }
+        this.i = j
+    }
+
+    // The same for a closer (`@end`, `@else`, ...) whose preceding text was already
+    // flushed into `nodes`
+    fn consume_line_end_at(nodes: Array[Node]) {
+        let last = nodes.get(nodes.length - 1) !? null
+        let text = ByteBuffer.new(0)
+        if isset(last) && last.type == NODE_TEXT : text.write(last.text)
+        let before = text.length
+        this.consume_line_end(text)
+        if isset(last) && last.type == NODE_TEXT && text.length != before : last.text = text.to_string()
+    }
+
+    fn flush_text(nodes: Array[Node], text: ByteBuffer, line: uint) {
+        if text.length == 0 : return
+        nodes.append(Node { type: NODE_TEXT, line: line, text: text.to_string() })
+        text.clear()
+    }
+
+    // The `@word` at `at`, or an empty string when it is not one
+    fn directive_at(at: uint) String {
+        let content = this.content
+        let length = content.bytes
+        let j = at + 1
+        while j < length && (content.get(j).is_alpha() || content.get(j) == '_') : j++
+        return content.range(at, j - at)
+    }
+
+    // ---- Expressions ---------------------------------------------------------------
+    // Grammar, lowest precedence first: or, and, comparison, not, filter, postfix, primary
+
+    fn parse_expr() Expr !ParseError {
+        let left = this.parse_and() !>
+        while this.token_type == TOK_SIGN && this.token == "||" {
+            let line = this.token_line
+            this.next_token() !>
+            let right = this.parse_and() !>
+            left = Expr { type: EXPR_OR, line: line, left: left, right: right }
+        }
+        return left
+    }
+
+    fn parse_and() Expr !ParseError {
+        let left = this.parse_compare() !>
+        while this.token_type == TOK_SIGN && this.token == "&&" {
+            let line = this.token_line
+            this.next_token() !>
+            let right = this.parse_compare() !>
+            left = Expr { type: EXPR_AND, line: line, left: left, right: right }
+        }
+        return left
+    }
+
+    fn parse_compare() Expr !ParseError {
+        let left = this.parse_not() !>
+        while this.token_type == TOK_SIGN && (this.token == "==" || this.token == "!=" || this.token == "<" || this.token == "<=" || this.token == ">" || this.token == ">=") {
+            let op = this.token
+            let line = this.token_line
+            this.next_token() !>
+            let right = this.parse_not() !>
+            left = Expr { type: EXPR_COMPARE, line: line, left: left, right: right, op: op }
+        }
+        return left
+    }
+
+    fn parse_not() Expr !ParseError {
+        if this.token_type == TOK_SIGN && this.token == "!" {
+            let line = this.token_line
+            this.next_token() !>
+            let inner = this.parse_not() !>
+            return Expr { type: EXPR_NOT, line: line, left: inner }
+        }
+        return this.parse_filter() !>
+    }
+
+    fn parse_filter() Expr !ParseError {
+        let expr = this.parse_postfix() !>
+        while this.token_type == TOK_SIGN && this.token == "|" {
+            let line = this.token_line
+            this.next_token() !>
+            let filter = Expr { type: EXPR_FILTER, line: line, left: expr }
+            filter.name = this.read_name() !>
+            if this.accept_sign("(") {
+                if !this.accept_sign(")") {
+                    while true {
+                        filter.args.append(this.parse_expr() !>)
+                        if this.accept_sign(",") : continue
+                        this.expect_sign(")") !>
+                        break
+                    }
+                }
+            }
+            expr = filter
+        }
+        return expr
+    }
+
+    fn parse_postfix() Expr !ParseError {
+        let expr = this.parse_primary() !>
+        while true {
+            if this.token_type == TOK_SIGN && this.token == "." {
+                let line = this.token_line
+                this.next_token() !>
+                let name = this.read_name() !>
+                expr = Expr { type: EXPR_MEMBER, line: line, left: expr, name: name }
+                continue
+            }
+            if this.token_type == TOK_SIGN && this.token == "[" {
+                let line = this.token_line
+                this.next_token() !>
+                let index = this.parse_expr() !>
+                this.expect_sign("]") !>
+                expr = Expr { type: EXPR_INDEX, line: line, left: expr, right: index }
+                continue
+            }
+            break
+        }
+        return expr
+    }
+
+    fn parse_primary() Expr !ParseError {
+        let line = this.token_line
+        if this.token_type == TOK_STRING {
+            let value = this.token
+            this.next_token() !>
+            return Expr { type: EXPR_LITERAL, line: line, value: json.from(value) }
+        }
+        if this.token_type == TOK_NUMBER {
+            let text = this.token
+            this.next_token() !>
+            if text.contains(".") : return Expr { type: EXPR_LITERAL, line: line, value: json.from(text.to_float() !? 0.0) }
+            return Expr { type: EXPR_LITERAL, line: line, value: json.from(text.to_int() !? 0) }
+        }
+        if this.token_type == TOK_SIGN && this.token == "(" {
+            this.next_token() !>
+            let inner = this.parse_expr() !>
+            this.expect_sign(")") !>
+            return inner
+        }
+        if this.token_type == TOK_WORD {
+            let word = this.token
+            if word == "true" || word == "false" {
+                this.next_token() !>
+                return Expr { type: EXPR_LITERAL, line: line, value: json.from(word == "true") }
+            }
+            if word == "null" {
+                this.next_token() !>
+                return Expr { type: EXPR_LITERAL, line: line, value: null }
+            }
+            if word == "@isset" || word == "@len" || word == "@length" {
+                this.next_token() !>
+                this.expect_sign("(") !>
+                let inner = this.parse_expr() !>
+                this.expect_sign(")") !>
+                return Expr { type: word == "@isset" ? EXPR_ISSET : EXPR_LEN, line: line, left: inner }
+            }
+            if word.get(0) == '@' : this.fail("Unknown function '" + word + "'", line)
+            this.next_token() !>
+            return Expr { type: EXPR_VAR, line: line, name: word }
+        }
+        if this.token_type == TOK_END : this.fail("Unexpected end of the template inside an expression", line)
+        this.fail("Unexpected '" + this.token + "'", line)
+    }
+
+    // ---- Tokens ----------------------------------------------------------------------
+
+    fn next_token() !ParseError {
+        let content = this.content
+        let length = content.bytes
+        let i = this.i
+        while i < length {
+            let ch = content.get(i)
+            if ch == '\n' : this.line++
+            if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+                i++
+                continue
+            }
+            break
+        }
+        this.token_line = this.line
+        if i >= length {
+            this.i = i
+            this.token = ""
+            this.token_type = TOK_END
+            return
+        }
+        let ch = content.get(i)
+        if ch.is_alpha() || ch == '_' || ch == '@' {
+            let j = i + 1
+            while j < length && (content.get(j).is_alpha_numeric() || content.get(j) == '_') : j++
+            this.token = content.range(i, j - i)
+            this.token_type = TOK_WORD
+            this.i = j
+            return
+        }
+        if ch.is_number() {
+            let j = i + 1
+            while j < length && (content.get(j).is_number() || (content.get(j) == '.' && j + 1 < length && content.get(j + 1).is_number())) : j++
+            this.token = content.range(i, j - i)
+            this.token_type = TOK_NUMBER
+            this.i = j
+            return
+        }
+        if ch == '"' {
+            let j = i + 1
+            let text = ByteBuffer.new(32)
+            while true {
+                if j >= length : this.fail("Missing closing '\"'", this.token_line)
+                let c = content.get(j)
+                if c == '"' : break
+                if c == '\\' && j + 1 < length {
+                    j++
+                    let e = content.get(j)
+                    if e == 'n' : text.write_byte('\n')
+                    else if e == 't' : text.write_byte('\t')
+                    else : text.write_byte(e)
+                } else {
+                    if c == '\n' : this.line++
+                    text.write_byte(c)
+                }
+                j++
+            }
+            this.token = text.to_string()
+            this.token_type = TOK_STRING
+            this.i = j + 1
+            return
+        }
+        // Two-character signs first
+        let next = i + 1 < length ? content.get(i + 1) : 0
+        let two = ""
+        if (ch == '=' && next == '=') || (ch == '!' && next == '=') || (ch == '<' && next == '=')
+            || (ch == '>' && next == '=') || (ch == '&' && next == '&') || (ch == '|' && next == '|')
+            || (ch == '}' && next == '}') || (ch == '!' && next == '}') {
+            two = content.range(i, 2)
+        }
+        if two.bytes > 0 {
+            this.token = two
+            this.i = i + 2
+        } else {
+            this.token = content.range(i, 1)
+            this.i = i + 1
+        }
+        this.token_type = TOK_SIGN
+    }
+
+    fn expect_open() !ParseError {
+        // The `(` right after the directive word was checked by the caller
+        this.i++
+        this.next_token() !>
+    }
+
+    // `stop` is set for the sign that ends a directive or output: what follows is text
+    // again, so no token is read past it
+    fn expect_sign(sign: String, stop: bool (false)) !ParseError {
+        if this.token_type != TOK_SIGN || this.token != sign {
+            let found = this.token_type == TOK_END ? "the end of the template" : "'" + this.token + "'"
+            this.fail("Expected '" + sign + "' instead of " + found, this.token_line)
+        }
+        if stop : return
+        this.next_token() !>
+    }
+
+    fn accept_sign(sign: String) bool {
+        if this.token_type != TOK_SIGN || this.token != sign : return false
+        this.next_token() ! return false
+        return true
+    }
+
+    fn read_name() String !ParseError {
+        if this.token_type != TOK_WORD || this.token.get(0) == '@' : this.fail("Expected a name instead of '" + this.token + "'", this.token_line)
+        let name = this.token
+        this.next_token() !>
+        return name
+    }
+
+    fn read_string_token() String !ParseError {
+        if this.token_type != TOK_STRING : this.fail("Expected a quoted name instead of '" + this.token + "'", this.token_line)
+        let text = this.token
+        this.next_token() !>
+        return text
+    }
+
+    fn fail(msg: String, line: uint) !ParseError $throw {
+        throw .parse {
+            message: "[ Error at line " + line + " in " + (this.name ?? "{content}") + " | Error: " + msg + " ]"
+            template_name: this.name ?? "?"
+            line: line
+            index: this.i
+        }
+    }
+}

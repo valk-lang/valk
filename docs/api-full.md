@@ -8875,9 +8875,9 @@ Set at startup: `true` in `GC_DEBUG` builds (such as `make test`), `false` other
 
 ```js
 // Returns `code` with the HTML special characters `<`, `>`, `"`, `'` and `&` as entities.
-+ fn escape(code: String, options: ?EscapeOptions (null)) String
++ fn escape(code: local &[u8], options: ?EscapeOptions (null)) String
 // Writes `code` escaped as `escape` does to `out` and returns the bytes written.
-+ fn escape_into(code: String, out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
++ fn escape_into(code: local &[u8], out: Writer, options: ?EscapeOptions (null)) uint !io:IoError
 // Returns `code` with the value of every URL attribute whose scheme is not allowed emptied.
 + fn sanitize_url_attributes(code: String, allowed_schemes: Array[String] (.{ "http", "https", "mailto" })) String
 // Returns whether a URL taken from an HTML attribute uses a scheme in `allowed_schemes`.
@@ -13686,6 +13686,13 @@ Wakes the waiter; safe from any thread, and kept for the next `wait` when nobody
 
 # template
 
+## Aliases for 'template'
+
+```js
+type Escape (fn(local &[u8], Writer)(uint !IoError))
+type Filter (fn(Value, Array[Value])(Value))
+```
+
 ## Errors for 'template'
 
 ```js
@@ -13719,76 +13726,202 @@ in the template where the error was found.
 ## Functions for 'template'
 
 ```js
-// Renders the registered template `name` with `data` and returns the output.
-+ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
-// Renders the template text `content` with `data` and returns the output.
-+ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
-// Writes `render_content(content, data, options)` to `out` and returns the bytes written.
-+ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
-// Writes `render(name, data, options)` to `out` and returns the bytes written.
-+ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
-// Registers `content` as the template named `name`, replacing any earlier one.
-+ fn set_content(name: String, content: String) void
-// Registers every entry of `content` as a template, keyed by name; see `set_content`.
-+ fn set_content_many(content: Map[String]) void
+// HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
++ fn html_escape(input: local &[u8], out: Writer) uint !io:IoError
+// Renders a template registered with `set_content`.
++ fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
+// Renders the template text `content`; includes resolve against `set_content` templates.
++ fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError $deprecated
+// Writes `render_content(content, data, options)` to `out`.
++ fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
+// Writes `render(name, data, options)` to `out`.
++ fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError $deprecated
+// Registers `content` as the template named `name` for the free `render` functions.
++ fn set_content(name: String, content: String) void $deprecated
+// Registers every entry of `content` as a template for the free `render` functions.
++ fn set_content_many(content: Map[String]) void $deprecated
 ```
 
+### html_escape
+
+HTML escaping as an `Escape`: the default of `Engine.escape` and `RenderOptions.escape`.
+
 ### render
+
+Renders a template registered with `set_content`.
+
+Deprecated: create a `Engine` engine and call its `render`.
+
+### render_content
+
+Renders the template text `content`; includes resolve against `set_content` templates.
+
+Deprecated: create a `Engine` engine and call its `render_content`.
+
+### render_content_into
+
+Writes `render_content(content, data, options)` to `out`.
+
+Deprecated: create a `Engine` engine and call its `render_content_into`.
+
+### render_into
+
+Writes `render(name, data, options)` to `out`.
+
+Deprecated: create a `Engine` engine and call its `render_into`.
+
+### set_content
+
+Registers `content` as the template named `name` for the free `render` functions.
+
+Deprecated: create a `Engine` engine and call its `set`; see `Engine` for the
+per-thread pattern. The free functions keep one registry for all threads.
+
+### set_content_many
+
+Registers every entry of `content` as a template for the free `render` functions.
+
+Deprecated: create a `Engine` engine and call its `set_many`.
+
+## Classes for 'template'
+
+```js
+// A set of templates and their filters.
++ class Engine {
+    // Writes every `{{ }}` output escaped; HTML escaping by default. Set it to `null` for plain text, or to your own `Escape` for another format: templates are not tied to HTML. A `RenderOptions.escape` overrides it for one render.
+    + escape: ?fn(local &[u8], Writer)(uint !IoError)
+
+    // Whether a template named `name` is registered.
+    + fn has(name: String) bool
+    // Creates an empty engine.
+    + static fn new() Engine
+    // Renders the registered template `name` with `data` and returns the output.
+    + fn render(name: String, data: $T, options: ?RenderOptions (null)) String !ParseError
+    // Renders the template text `content` with `data` and returns the output.
+    + fn render_content(content: String, data: $T, options: ?RenderOptions (null)) String !ParseError
+    // Writes `render_content(content, data, options)` to `out` and returns the bytes written.
+    + fn render_content_into(content: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
+    // Writes `render(name, data, options)` to `out` and returns the bytes written.
+    + fn render_into(name: String, data: $T, out: Writer, options: ?RenderOptions (null)) uint !ParseError
+    // Registers `content` as the template named `name`, replacing any earlier one.
+    + fn set(name: String, content: String) void
+    // Registers `filter` for `{{ value | name }}` and `{{ value | name(args) }}`.
+    + fn set_filter(name: String, filter: fn(Value, Array[Value])(Value)) void
+    // Registers every entry of `content` as a template, keyed by name.
+    + fn set_many(content: Map[String]) void
+}
+```
+
+### Engine
+
+A set of templates and their filters.
+
+An engine is an ordinary object: create one, register templates and filters, render.
+Nothing in it is shared between threads. A server that renders on several worker
+threads gives each thread its own engine through a `global`, whose initializer runs on
+every thread:
+
+```valk
+global views: template.Engine (load_views())
+
+fn load_views() template.Engine {
+    let engine = template.Engine.new()
+    engine.set_many(#embed_dir("views"))
+    engine.set_filter("money", fn(v: json.Value, args: Array[json.Value]) json.Value {
+        return json.from("$" + v.float.to_string(2))
+    })
+    return engine
+}
+
+fn handler(req: http.Request) http.Response {
+    return http.Response.html(views.render("index.html", data) !? "render failed")
+}
+```
+
+A template is compiled the first time it renders and the compiled form is kept until
+it is registered again. Output is HTML-escaped unless `escape` says otherwise, so an
+engine can just as well produce plain text, SQL or any other format.
+
+#### escape
+
+Writes every `{{ }}` output escaped; HTML escaping by default. Set it to `null` for
+plain text, or to your own `Escape` for another format: templates are not tied to
+HTML. A `RenderOptions.escape` overrides it for one render.
+
+```valk
+engine.escape = fn(input: local &[u8], out: io.Writer) uint !io.IoError {
+    return out.write(input.to_string().replace("'", "''")) !>
+}
+```
+
+#### has
+
+Whether a template named `name` is registered.
+
+#### new
+
+Creates an empty engine.
+
+#### render
 
 Renders the registered template `name` with `data` and returns the output.
 
 `data` is converted with `json.from`, so template variables are its fields or map
-keys. `{{ }}` output goes through `options.escape` (HTML escaping by default, none when
-it is `null`), `{! !}` is written raw, and leading and trailing whitespace is trimmed
-from the result. `@include` and `@extend` look templates up in the same registry, may
-not form a cycle, and may nest at most `options.max_depth` templates deep (64 by
+keys. `{{ }}` output goes through the engine's `escape` (HTML by default), or
+through `options.escape` when options are given, `{! !}` is written raw, and leading and trailing whitespace is trimmed
+from the result. `@include` and `@extend` look templates up in this engine, may not
+form a cycle, and may nest at most `options.max_depth` templates deep (64 by
 default), not counting `name` itself.
 
 Throws `.template_not_found` when `name` is not registered, `.parse` on a syntax error,
-an unknown template in `@include`/`@extend`, a cycle, too deep nesting or a variable or
-property that does not exist (`message` names the line and template).
+an unknown template in `@include`/`@extend`, a cycle, too deep nesting, an unknown
+filter or a variable or property that does not exist (`message` names the line and
+template).
 
-### render_content
+#### render_content
 
 Renders the template text `content` with `data` and returns the output.
 
 Works like `render` without looking up a name first; `@include` and `@extend` still
 resolve against the registered templates. Throws `.parse` as `render` does.
 
-### render_content_into
+#### render_content_into
 
 Writes `render_content(content, data, options)` to `out` and returns the bytes written.
 
-A `ByteBuffer` is written directly; any other writer receives the page in one write.
 Throws `ParseError` as `render_content` does, and `.write` when `out` fails.
 
-### render_into
+#### render_into
 
 Writes `render(name, data, options)` to `out` and returns the bytes written.
 
-A `ByteBuffer` is written directly; any other writer receives the page in one write.
 Throws `ParseError` as `render` does, and `.write` when `out` fails.
 
-### set_content
+#### set
 
 Registers `content` as the template named `name`, replacing any earlier one.
 
-The registry is shared by all threads: a template registered on one thread can be
-rendered on any other.
+#### set_filter
 
-### set_content_many
+Registers `filter` for `{{ value | name }}` and `{{ value | name(args) }}`.
 
-Registers every entry of `content` as a template, keyed by name; see `set_content`.
+The filter receives the value and the evaluated arguments and returns the value the
+output continues with. A custom filter replaces a built-in one of the same name. The
+built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length`, `default(x)`,
+`join(sep)`, `first`, `last`, `reverse`, `round(decimals)`, `truncate(n, suffix)`,
+`replace(from, to)`, `json`, `escape`, `urlencode` and `keys`.
+
+#### set_many
+
+Registers every entry of `content` as a template, keyed by name.
 
 Pairs with `#embed_dir`, which yields a map of relative paths to file contents.
 
-## Classes for 'template'
-
 ```js
-// Options for `render` and `render_content`.
+// Options for one `render` or `render_content` call.
 + class RenderOptions {
-    // Function applied to every `{{ }}` output; HTML escaping by default, `null` for none.
-    + escape: ?fn(String)(String)
+    // The `Escape` applied to every `{{ }}` output of this render; HTML escaping by default, `null` for none. Options replace the engine's `escape` for the render, so an engine with an escape of its own passes it along: `RenderOptions { escape: engine.escape, max_depth: 2 }`.
+    + escape: ?fn(local &[u8], Writer)(uint !IoError)
     // Maximum nesting of `@include`/`@extend` templates.
     + max_depth: uint
 }
@@ -13796,11 +13929,14 @@ Pairs with `#embed_dir`, which yields a map of relative paths to file contents.
 
 ### RenderOptions
 
-Options for `render` and `render_content`.
+Options for one `render` or `render_content` call.
 
 #### escape
 
-Function applied to every `{{ }}` output; HTML escaping by default, `null` for none.
+The `Escape` applied to every `{{ }}` output of this render; HTML escaping by
+default, `null` for none. Options replace the engine's `escape` for the render, so
+an engine with an escape of its own passes it along: `RenderOptions { escape:
+engine.escape, max_depth: 2 }`.
 
 #### max_depth
 
