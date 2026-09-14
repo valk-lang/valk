@@ -34,7 +34,8 @@ NATIVE_LINK_FLAGS := -L $(LLVM_DIR)/lib -L $(GCC_LIB_DIR)
 endif
 # GC_DEBUG turns on the GC's internal assertions: a corrupted property slot
 # or a misaligned root panics by name instead of faulting later elsewhere
-TEST_FLAGS := --test --def "DEF_TEST=TestValue" --def "GC_DEBUG=1" -vv
+# The suite covers deprecated functions on purpose, so their warnings are off here
+TEST_FLAGS := --test --def "DEF_TEST=TestValue" --def "GC_DEBUG=1" --no-warn-deprecated -vv
 BENCH_JSON_ITERATIONS ?= 2000000
 
 valk: $(COMPILER_DEPS)

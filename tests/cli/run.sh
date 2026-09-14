@@ -597,5 +597,17 @@ if [[ "$quiet_deprecated_out" == *"is deprecated"* ]] || [[ "$quiet_deprecated_o
     exit 1
 fi
 
+# An unreachable break or continue is reported, and must not change the divergence analysis
+divergence_out=$("$VALK" build "$DIR/divergence.valk" -o "$output" --run 2>&1) || {
+    echo "# The divergence program failed to build or run"
+    echo "$divergence_out"
+    exit 1
+}
+if [ "$(printf '%s' "$divergence_out" | grep -c "Unreachable code")" -ne 2 ] || [[ "$divergence_out" != *"divergence ok"* ]]; then
+    echo "# Expected two unreachable-code warnings and a successful run"
+    echo "$divergence_out"
+    exit 1
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 36"
+echo "# Test count: 37"
