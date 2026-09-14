@@ -153,7 +153,7 @@ When not to use Valk:
 
 - Coroutines are single threaded. A coroutine will always run on the same thread it started on.
 
-- Each thread manages its own memory, so a local collection never blocks other threads. Data can be shared with to other threads (the language handles this for you), but that data is then handled by another slower GC.
+- Each thread manages its own memory, so a local collection never blocks other threads. Data can be shared with other threads, but that data will be tagged and is then handled by a slower cross-thread GC.
 
 - The local GC has no timers or background threads. Collections happen at allocation thresholds, so a program behaves the same way every time you run it.
 
