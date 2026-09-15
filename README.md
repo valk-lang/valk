@@ -7,11 +7,11 @@
 
 [Website](https://valk-lang.dev) | [Documentation](https://valk-lang.dev/docs) | [Discord](https://discord.gg/RwEGqdSERA) | [Packages](https://vpkg.dev) | [vman](https://github.com/valk-lang/vman)
 
-Valk is a programming language aimed to be fast & simple at the same time. The simplicity of Go with the performance of Rust. Valk is also the first programming language with a fully stateful garbage collector. Meaning no more mark/sweep mechanisms that cause performance problems. We aim to be a feature rich language with a large standard library.
+Valk is a programming language aimed to be fast & simple at the same time. The simplicity of Go with the performance of Rust. We aim to be a feature rich language with a large standard library.
 
-**Features**: Fastest GC, Coroutines, Async IO, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory management, Integrate c libraries, and more...
+**Features**: Stateful GC, Coroutines, Async IO, No undefined behaviour, Package management, Generics, Traits, Closures, Fast compile times, Cross compiling, Optional manual memory management, Integrate c libraries, and more...
 
-To see what a stateful GC can do, see the [benchmarks](#benchmarks)
+Language performance: [benchmarks](#benchmarks)
 
 Extensions: [vscode](https://marketplace.visualstudio.com/items?itemName=valk-lang.valk) | [vim](https://github.com/valk-lang/valk-vim)
 
