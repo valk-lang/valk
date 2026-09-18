@@ -1870,18 +1870,18 @@ fn handler(req: http.Request) http.Response {
     let session = req.cookie("session") !? ""
     let res = http.Response.html("Hello world!")
     let cookie = http.Cookie.new("session", new_id)
-    cookie.secure = true
     cookie.max_age = 3600
     res.set_cookie(cookie)
     return res
 }
 ```
 
-`req.cookies()` gives them all as a map. A new `Cookie` is `HttpOnly` with
-`SameSite=Lax` and path `/`; set `secure` yourself, since it would break plain
-HTTP during development. `expires` takes a `time.DateTime`, `max_age` seconds,
-and `res.clear_cookie(name)` deletes one at the browser. A client reads what a
-server set with `response.cookies()`; nothing is stored between requests.
+`req.cookies()` gives them all as a map. A new `Cookie` is `Secure`, `HttpOnly`
+and `SameSite=Lax` with path `/`, so the one you forget about is the safe one;
+turn `secure` off while developing over plain HTTP. `expires` takes a
+`time.DateTime`, `max_age` seconds, and `res.clear_cookie(name)` deletes one at
+the browser. A client reads what a server set with `response.cookies()`; nothing
+is stored between requests.
 
 `start` runs until shutdown. Use `co` to keep doing other work:
 

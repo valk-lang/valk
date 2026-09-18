@@ -9499,7 +9499,7 @@ Decoded like `params`.
     + path: String
     // When the cookie is sent on requests another site caused.
     + same_site: SameSite
-    // Only send the cookie over HTTPS.
+    // Only send the cookie over HTTPS. Off during plain-HTTP development.
     + secure: bool
     // The value. It is sent as it is, in double quotes when it holds a space or a comma.
     + value: String
@@ -9519,16 +9519,20 @@ Decoded like `params`.
 
 A cookie to send with a response.
 
-`http_only` and `SameSite.lax` are on by default, so a cookie is out of reach of page
-scripts and is not sent along by another site unless that is asked for. Set `secure`
-on anything that matters: without it the cookie also travels over plain HTTP.
+`secure`, `http_only` and `SameSite.lax` are on by default: the cookie travels over
+HTTPS only, is out of reach of page scripts, and is not sent along by another site.
+A cookie that is forgotten about is then the safe one, and a program that wants less
+says so.
 
 ```valk
 let cookie = http.Cookie.new("session", id)
-cookie.secure = true
 cookie.max_age = 3600
 response.set_cookie(cookie)
 ```
+
+Development over plain HTTP is the one place to turn `secure` off. Browsers make an
+exception for `localhost` and keep the cookie there, but on any other plain-HTTP
+address, such as a LAN IP or a staging hostname, they drop it without saying so.
 
 #### domain
 
@@ -9562,7 +9566,7 @@ When the cookie is sent on requests another site caused.
 
 #### secure
 
-Only send the cookie over HTTPS.
+Only send the cookie over HTTPS. Off during plain-HTTP development.
 
 #### value
 

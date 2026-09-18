@@ -2873,7 +2873,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + path: String
     // When the cookie is sent on requests another site caused.
     + same_site: SameSite
-    // Only send the cookie over HTTPS.
+    // Only send the cookie over HTTPS. Off during plain-HTTP development.
     + secure: bool
     // The value. It is sent as it is, in double quotes when it holds a space or a comma.
     + value: String
