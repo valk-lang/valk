@@ -445,7 +445,18 @@ any class with a `static fn fill(count, value)`, as `Array` has.
 
 ## Typehints
 
-Variables, properties, globals, and function arguments can have explicit type hints. When the expected type is known, `.` can construct a value of that type without repeating its name.
+Variables, properties, globals, and function arguments can have explicit type hints. When the expected type is known, `.` names something of that type without repeating its name: a value built with `.{ ... }`, an enum member, a static function, or an error code.
+
+```rust
+enum Color { red, green }
+
+let color: Color = .red          // enum member
+let tool: Tool = .of_size(4)     // static function
+let point: Point = .{ x: 1 }     // class init
+paint(.green)                    // through the type of the argument
+```
+
+A `.name` with no expected type to resolve against is an error that says so.
 
 ```rust
 // Variables

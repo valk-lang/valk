@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.3
++ Enum members and clearer errors for `.name` typehints
 + Fix conditions that carry an error handler
 + Close file descriptors properly
 + Use Process for `--run`
