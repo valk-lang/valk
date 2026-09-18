@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.3
++ Fix conditions that carry an error handler
 + Close file descriptors properly
 + Use Process for `--run`
 

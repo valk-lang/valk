@@ -671,6 +671,19 @@ my_func() _
 let v = my_func() !!
 ```
 
+An `if`, `while` or `each` may carry a handler on its condition; the `{` that follows opens the
+body, not a class init:
+
+```rust
+while rows.next() ! panic("Cannot read: %{E.message}") {
+    println(rows.name)
+}
+```
+
+A handler written as a block is the exception: `while value() ! { ... }` reads that block as the
+handler, so a loop that needs a body as well puts the condition in parentheses,
+`while (value() ! { ... }) { ... }`.
+
 You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown. `error_is(E.code, name)` compares against one or more bare code names and is the same as `E.code == E.name`:
 
 ```rust
