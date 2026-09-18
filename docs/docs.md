@@ -1863,6 +1863,26 @@ A handler gets the parsed request: `method`, `path`, `query_string` and
 `html`, `json`, `json_of` (encodes any value), `redirect`, `file`, `stream`,
 `empty` and the general `Response.new(body, code, content_type)`.
 
+Cookies are read from the request by name and set on the response:
+
+```rust
+fn handler(req: http.Request) http.Response {
+    let session = req.cookie("session") !? ""
+    let res = http.Response.html("Hello world!")
+    let cookie = http.Cookie.new("session", new_id)
+    cookie.secure = true
+    cookie.max_age = 3600
+    res.set_cookie(cookie)
+    return res
+}
+```
+
+`req.cookies()` gives them all as a map. A new `Cookie` is `HttpOnly` with
+`SameSite=Lax` and path `/`; set `secure` yourself, since it would break plain
+HTTP during development. `expires` takes a `time.DateTime`, `max_age` seconds,
+and `res.clear_cookie(name)` deletes one at the browser. A client reads what a
+server set with `response.cookies()`; nothing is stored between requests.
+
 `start` runs until shutdown. Use `co` to keep doing other work:
 
 ```rust

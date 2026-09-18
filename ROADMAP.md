@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.4
++ Cookies in the http namespace
 + `each`/`lock` take a literal without parentheses
 
 + Release 0.7.3
@@ -48,7 +49,6 @@
 ```
 - Complete libc integration
 - vman templates -> vman template http-server-router ./src
-- Built-in cookie functions
 - on exit thread/process { ... }
 - WASM support
 - Allow @undefined for entire struct. E.g. let user = User { @undefined }

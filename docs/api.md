@@ -2732,6 +2732,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ## Enums for 'http'
 
 ```js
+// When a browser sends a cookie on a request that another site caused.
++ enum SameSite { lax, strict, none }
 // The kind of a WebSocket message.
 + enum WebSocketMessageType { text, binary }
 ```
@@ -2745,10 +2747,14 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 + fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and writes the response body to the file at `to_path`.
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
+// Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
++ fn format_date(date: DateTime) String
 // Sends a GET request; see `request`.
 + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a HEAD request; see `request`.
 + fn head(url: String, options: ?Options (null)) ClientResponse !HttpError
+// Reads an HTTP date such as `Sun, 06 Nov 1994 08:49:37 GMT`.
++ fn parse_date(text: String) DateTime !SyntaxError
 // Sends a PATCH request with `body`; see `post`.
 + fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a POST request with `body`; see `request`.
@@ -2807,6 +2813,9 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + headers: Headers
     // The HTTP status code, such as `200` or `404`.
     + status: u16
+
+    // Returns the cookies the server set, in the order it sent them.
+    + fn cookies() Array[Cookie]
 }
 ```
 
@@ -2826,6 +2835,10 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 
     // The message body, with chunked encoding removed; empty until the message is complete.
     + get body: String
+    // Returns the value of one cookie; throws `LookupError` when the request has no cookie of that name.
+    + fn cookie(name: String) String !LookupError
+    // Returns the cookies of the request, by name.
+    + fn cookies() Map[String]
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
@@ -2840,6 +2853,39 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
     + fn query_grouped() Map[Array[String]]
+}
+```
+
+```js
+// A cookie to send with a response.
++ class Cookie {
+    // The hosts the cookie is sent to. Without one it is the host that set it, without its subdomains; with one, that domain and every subdomain of it.
+    + domain: ?String
+    // The moment the cookie is dropped. A moment in the past deletes it.
+    + expires: ?DateTime
+    // Keep the cookie away from page scripts (`document.cookie`).
+    + http_only: bool
+    // How many seconds the cookie lives. `0` deletes it. Browsers prefer this over `expires` when both are given.
+    + max_age: ?int
+    // The name, which may not be empty or hold a separator.
+    + name: String
+    // The paths the cookie is sent on; `/` is the whole site.
+    + path: String
+    // When the cookie is sent on requests another site caused.
+    + same_site: SameSite
+    // Only send the cookie over HTTPS.
+    + secure: bool
+    // The value. It is sent as it is, in double quotes when it holds a space or a comma.
+    + value: String
+
+    // Whether the cookie can be sent: a name and a value a header can carry.
+    + fn is_valid() bool
+    // Creates a cookie with `name` and `value`, and the defaults of the class.
+    + static fn new(name: String, value: String) Cookie
+    // Reads a `Set-Cookie` field value, as a client does.
+    + static fn parse(header: String) Cookie !SyntaxError
+    // Returns the `Set-Cookie` field value for this cookie.
+    + fn to_header() String
 }
 ```
 
@@ -2938,6 +2984,10 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 
     // The request body; empty when there is none.
     + get body: String
+    // Returns the value of one cookie; throws `LookupError` when the request has no cookie of that name.
+    + fn cookie(name: String) String !LookupError
+    // Returns the cookies of the request, by name.
+    + fn cookies() Map[String]
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
@@ -2965,6 +3015,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 
     // Adds a header field, keeping earlier fields with the same name.
     + fn add_header(name: String, value: String) void
+    // Deletes the cookie `name` at the browser, by sending it expired.
+    + fn clear_cookie(name: String, path: String ("/"), domain: ?String (null)) void
     // Creates a response with an empty body; also backs default construction.
     + static fn empty(code: u16 (200), headers: ?Headers (null)) Response
     // Creates a response that sends the file at `path`.
@@ -2981,6 +3033,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + static fn new(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
     // Creates a redirect to `location` with an empty body.
     + static fn redirect(location: String, code: u16 (302), headers: ?Headers (null)) Response
+    // Sends `cookie` with this response, next to any cookie already set.
+    + fn set_cookie(cookie: Cookie) void
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.

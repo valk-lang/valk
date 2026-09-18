@@ -9054,9 +9054,15 @@ closed, from either side, `ssl` for a failed `wss://` handshake, and `timeout`,
 ## Enums for 'http'
 
 ```js
+// When a browser sends a cookie on a request that another site caused.
++ enum SameSite { lax, strict, none }
 // The kind of a WebSocket message.
 + enum WebSocketMessageType { text, binary }
 ```
+
+### SameSite
+
+When a browser sends a cookie on a request that another site caused.
 
 ### WebSocketMessageType
 
@@ -9071,10 +9077,14 @@ The kind of a WebSocket message.
 + fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a request and writes the response body to the file at `to_path`.
 + fn download(url: String, to_path: String, method: String ("GET"), options: ?Options (null)) void !HttpError
+// Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
++ fn format_date(date: DateTime) String
 // Sends a GET request; see `request`.
 + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a HEAD request; see `request`.
 + fn head(url: String, options: ?Options (null)) ClientResponse !HttpError
+// Reads an HTTP date such as `Sun, 06 Nov 1994 08:49:37 GMT`.
++ fn parse_date(text: String) DateTime !SyntaxError
 // Sends a PATCH request with `body`; see `post`.
 + fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
 // Sends a POST request with `body`; see `request`.
@@ -9112,6 +9122,12 @@ in it. The body is written whatever the status code is. The request uses a copy 
 `options` the timeout is 30 seconds instead of the usual 10. Failing to close the
 file throws `write`.
 
+### format_date
+
+Returns `date` as an HTTP date: `Sun, 06 Nov 1994 08:49:37 GMT`.
+
+The value is read as UTC, which is the only zone HTTP dates are written in.
+
 ### get
 
 Sends a GET request; see `request`.
@@ -9119,6 +9135,13 @@ Sends a GET request; see `request`.
 ### head
 
 Sends a HEAD request; see `request`.
+
+### parse_date
+
+Reads an HTTP date such as `Sun, 06 Nov 1994 08:49:37 GMT`.
+
+Throws `SyntaxError` for anything else, including the two formats RFC 9110 calls
+obsolete.
 
 ### patch
 
@@ -9292,6 +9315,9 @@ when it ended in an error.
     + headers: Headers
     // The HTTP status code, such as `200` or `404`.
     + status: u16
+
+    // Returns the cookies the server set, in the order it sent them.
+    + fn cookies() Array[Cookie]
 }
 ```
 
@@ -9311,6 +9337,14 @@ The response headers; names are stored lowercased.
 
 The HTTP status code, such as `200` or `404`.
 
+#### cookies
+
+Returns the cookies the server set, in the order it sent them.
+
+A `Set-Cookie` field that does not start with `name=value` is skipped. Nothing is
+stored between requests: a client that wants to send these back adds them to the
+`Cookie` header of its next request itself.
+
 ```js
 // The parse state of one HTTP/1.x message; `fast` handlers receive it as the request.
 + class Context {
@@ -9327,6 +9361,10 @@ The HTTP status code, such as `200` or `404`.
 
     // The message body, with chunked encoding removed; empty until the message is complete.
     + get body: String
+    // Returns the value of one cookie; throws `LookupError` when the request has no cookie of that name.
+    + fn cookie(name: String) String !LookupError
+    // Returns the cookies of the request, by name.
+    + fn cookies() Map[String]
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
@@ -9377,6 +9415,20 @@ The status code of a parsed response; 0 for a request.
 
 The message body, with chunked encoding removed; empty until the message is
 complete.
+
+#### cookie
+
+Returns the value of one cookie; throws `LookupError` when the request has no
+cookie of that name.
+
+#### cookies
+
+Returns the cookies of the request, by name.
+
+The `Cookie` header is split on `;` only, and a value keeps every `=` after the
+first one, so a base64 value arrives whole. Surrounding double quotes are removed.
+A browser sends the cookie of the most specific path first, and that is the one
+kept when a name is sent more than once.
 
 #### files
 
@@ -9429,6 +9481,115 @@ for a repeated key the last value wins; see `params_grouped`.
 Returns every value of each query string parameter, in order.
 
 Decoded like `params`.
+
+```js
+// A cookie to send with a response.
++ class Cookie {
+    // The hosts the cookie is sent to. Without one it is the host that set it, without its subdomains; with one, that domain and every subdomain of it.
+    + domain: ?String
+    // The moment the cookie is dropped. A moment in the past deletes it.
+    + expires: ?DateTime
+    // Keep the cookie away from page scripts (`document.cookie`).
+    + http_only: bool
+    // How many seconds the cookie lives. `0` deletes it. Browsers prefer this over `expires` when both are given.
+    + max_age: ?int
+    // The name, which may not be empty or hold a separator.
+    + name: String
+    // The paths the cookie is sent on; `/` is the whole site.
+    + path: String
+    // When the cookie is sent on requests another site caused.
+    + same_site: SameSite
+    // Only send the cookie over HTTPS.
+    + secure: bool
+    // The value. It is sent as it is, in double quotes when it holds a space or a comma.
+    + value: String
+
+    // Whether the cookie can be sent: a name and a value a header can carry.
+    + fn is_valid() bool
+    // Creates a cookie with `name` and `value`, and the defaults of the class.
+    + static fn new(name: String, value: String) Cookie
+    // Reads a `Set-Cookie` field value, as a client does.
+    + static fn parse(header: String) Cookie !SyntaxError
+    // Returns the `Set-Cookie` field value for this cookie.
+    + fn to_header() String
+}
+```
+
+### Cookie
+
+A cookie to send with a response.
+
+`http_only` and `SameSite.lax` are on by default, so a cookie is out of reach of page
+scripts and is not sent along by another site unless that is asked for. Set `secure`
+on anything that matters: without it the cookie also travels over plain HTTP.
+
+```valk
+let cookie = http.Cookie.new("session", id)
+cookie.secure = true
+cookie.max_age = 3600
+response.set_cookie(cookie)
+```
+
+#### domain
+
+The hosts the cookie is sent to. Without one it is the host that set it, without
+its subdomains; with one, that domain and every subdomain of it.
+
+#### expires
+
+The moment the cookie is dropped. A moment in the past deletes it.
+
+#### http_only
+
+Keep the cookie away from page scripts (`document.cookie`).
+
+#### max_age
+
+How many seconds the cookie lives. `0` deletes it. Browsers prefer this over
+`expires` when both are given.
+
+#### name
+
+The name, which may not be empty or hold a separator.
+
+#### path
+
+The paths the cookie is sent on; `/` is the whole site.
+
+#### same_site
+
+When the cookie is sent on requests another site caused.
+
+#### secure
+
+Only send the cookie over HTTPS.
+
+#### value
+
+The value. It is sent as it is, in double quotes when it holds a space or a comma.
+
+#### is_valid
+
+Whether the cookie can be sent: a name and a value a header can carry.
+
+#### new
+
+Creates a cookie with `name` and `value`, and the defaults of the class.
+
+#### parse
+
+Reads a `Set-Cookie` field value, as a client does.
+
+Attributes it does not know are skipped, and so is an `Expires` it cannot read;
+`Max-Age` then still says how long the cookie lives. Throws `SyntaxError` when
+there is no `name=value` in front.
+
+#### to_header
+
+Returns the `Set-Cookie` field value for this cookie.
+
+Attributes left null are not written. An invalid name or value gives an empty
+string, which the server leaves out of the response.
 
 ```js
 // An ordered list of HTTP header fields with case-insensitive names.
@@ -9713,6 +9874,10 @@ in `headers` are all kept. Names not in `headers` stay untouched.
 
     // The request body; empty when there is none.
     + get body: String
+    // Returns the value of one cookie; throws `LookupError` when the request has no cookie of that name.
+    + fn cookie(name: String) String !LookupError
+    // Returns the cookies of the request, by name.
+    + fn cookies() Map[String]
     // Returns the uploaded files of a `multipart/form-data` body, by field name.
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
@@ -9754,6 +9919,20 @@ The query string without the leading `?`, not decoded; empty when absent.
 #### body
 
 The request body; empty when there is none.
+
+#### cookie
+
+Returns the value of one cookie; throws `LookupError` when the request has no
+cookie of that name.
+
+#### cookies
+
+Returns the cookies of the request, by name.
+
+The `Cookie` header is split on `;` only, and a value keeps every `=` after the
+first one, so a base64 value arrives whole. Surrounding double quotes are removed.
+A browser sends the cookie of the most specific path first, and that is the one
+kept when a name is sent more than once.
 
 #### files
 
@@ -9812,6 +9991,8 @@ Decoded like `params`.
 
     // Adds a header field, keeping earlier fields with the same name.
     + fn add_header(name: String, value: String) void
+    // Deletes the cookie `name` at the browser, by sending it expired.
+    + fn clear_cookie(name: String, path: String ("/"), domain: ?String (null)) void
     // Creates a response with an empty body; also backs default construction.
     + static fn empty(code: u16 (200), headers: ?Headers (null)) Response
     // Creates a response that sends the file at `path`.
@@ -9828,6 +10009,8 @@ Decoded like `params`.
     + static fn new(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
     // Creates a redirect to `location` with an empty body.
     + static fn redirect(location: String, code: u16 (302), headers: ?Headers (null)) Response
+    // Sends `cookie` with this response, next to any cookie already set.
+    + fn set_cookie(cookie: Cookie) void
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
@@ -9863,6 +10046,13 @@ The HTTP status code, also for `file` and `stream` responses.
 #### add_header
 
 Adds a header field, keeping earlier fields with the same name.
+
+#### clear_cookie
+
+Deletes the cookie `name` at the browser, by sending it expired.
+
+`path` and `domain` must be the ones it was set with, or the browser keeps the
+cookie and this one sits next to it.
 
 #### empty
 
@@ -9904,6 +10094,13 @@ other constructors are shortcuts for.
 Creates a redirect to `location` with an empty body.
 
 Sets `Location` on `headers` when given, so a passed `Headers` object is modified.
+
+#### set_cookie
+
+Sends `cookie` with this response, next to any cookie already set.
+
+A cookie whose name or value cannot go in a header is left out, as an invalid
+header field is.
 
 #### set_header
 
