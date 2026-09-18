@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.4
++ `each`/`lock` take a literal without parentheses
 
 + Release 0.7.3
 + Method chains over several lines

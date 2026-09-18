@@ -292,6 +292,11 @@ element type; for an `Array[Array[int]]`:
 `rows.sort(fn(a: Array[int], b: Array[int]) bool { return a[0] > b[0] })`.
 The comparator returns true when `a` should come after `b`.
 
+The value of an `each` or a `lock` ends at the keyword that follows it (`skip`, `as`), so a
+literal there needs no parentheses: `each Array[String]{ "a", "b" } as word { ... }`. The value
+of an `if` or a `while` is followed by the body instead, so `{` opens that body and a literal in
+the condition is written `if (Thing{ ok: true }).ok { ... }`.
+
 Fresh slice storage is a language form, not a class: `[int]{ 1, 2, 3 }`
 allocates from a list and returns the `mut &[int]` that owns the elements,
 `[u8]{ 0 x n }` repeats a value `n` times. `[T]{ null x n }` skips the fill and is only safe when every
