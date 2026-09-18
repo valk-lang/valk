@@ -4,7 +4,9 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.3
+- Release 0.7.4
+
++ Release 0.7.3
 + Method chains over several lines
 + Enum members and clearer errors for `.name` typehints
 + Fix conditions that carry an error handler
