@@ -823,6 +823,24 @@ fn main() {
 }
 ```
 
+### Method chains
+
+A method that returns its receiver can be called again on the result. Inside a statement the
+chain may run over several lines: a line that starts with `.name` continues the value before
+it, since no statement can begin with one.
+
+```rust
+let query = db.select("id, name")
+    .from("users")
+    .where("age > ?", .{ 18 })
+    // comments and blank lines between the parts are fine
+    .limit(10)
+```
+
+This applies to the value of a `let`, an assignment, a `return`, a `throw`, a `defer` and an
+expression on its own. Elsewhere — a match arm, the items of a literal, a condition — a leading
+`.name` still names a member of the type that is expected there, so those are unaffected.
+
 ## Classes
 
 ```rust
