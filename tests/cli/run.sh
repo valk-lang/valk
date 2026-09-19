@@ -618,6 +618,13 @@ if [ -e "$VALK" ]; then
     VALK_BIN="$(cd "$(dirname "$VALK")" && pwd)/$(basename "$VALK")"
 fi
 
+host_os=linux
+other_os=macos
+case "$(uname -s)" in
+    Darwin) host_os=macos; other_os=linux ;;
+    MINGW*|MSYS*|CYGWIN*) host_os=win; other_os=linux ;;
+esac
+
 project="$workdir/declared"
 mkdir -p "$project/src"
 cat > "$project/valk.json" <<'JSON'
@@ -704,8 +711,15 @@ cat > "$project/valk.json" <<'JSON'
 }
 JSON
 defines_out=$(cd "$project" && "$VALK_BIN" make show 2>&1)
-if [[ "$defines_out" != *"version=1.2.3 braced=1.2.3 missing=[] shell=sub"* ]]; then
-    echo "# A target must use what 'define' says, and leave the rest to the shell"
+if [[ "$defines_out" != *"version=1.2.3 braced=1.2.3"* ]]; then
+    echo "# A target must use what 'define' says"
+    echo "$defines_out"
+    exit 1
+fi
+# What the project does not declare is left for the shell, which only expands it where
+# there is one: cmd prints \$NOPE and \$(echo sub) as they are written
+if [ "$host_os" != win ] && [[ "$defines_out" != *"missing=[] shell=sub"* ]]; then
+    echo "# A target must leave what it does not declare to the shell"
     echo "$defines_out"
     exit 1
 fi
@@ -727,7 +741,7 @@ cat > "$project/valk.json" <<'JSON'
     "make": {
         "steps": ["echo first", "echo second"],
         "app": { "dir": "src", "args": "$FLAGS" },
-        "list": "for t in $TARGETS; do echo item $t; done",
+        "list": "echo items $TARGETS",
         "all": { "needs": ["steps", "app"], "cmd": "echo done" },
         "loop": { "needs": ["loop"], "cmd": "echo never" }
     }
@@ -740,7 +754,7 @@ if [[ "$steps_out" != *"first"* ]] || [[ "$steps_out" != *"second"* ]]; then
     exit 1
 fi
 list_out=$(cd "$project" && "$VALK_BIN" make list 2>&1)
-if [[ "$list_out" != *"item one"* ]] || [[ "$list_out" != *"item two"* ]]; then
+if [[ "$list_out" != *"items one two"* ]]; then
     echo "# A list var must join with spaces"
     echo "$list_out"
     exit 1
@@ -773,12 +787,6 @@ if [[ "$inner_out" != *"declares no targets"* ]]; then
 fi
 
 # A line may be written per platform
-host_os=linux
-other_os=macos
-case "$(uname -s)" in
-    Darwin) host_os=macos; other_os=linux ;;
-    MINGW*|MSYS*|CYGWIN*) host_os=win; other_os=linux ;;
-esac
 cat > "$project/valk.json" <<JSON
 {
     "make": {
