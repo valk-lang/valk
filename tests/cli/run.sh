@@ -662,9 +662,10 @@ if [[ "$default_out" != *"hello world"* ]] || [[ "$default_out" == *"dev: "* ]];
     exit 1
 fi
 
-# A target with a command is run, with what follows '--' appended
+# A target with a command is run, with what follows '--' appended as one argument.
+# `echo` keeps the quotes on Windows and drops them in a shell, so both spellings pass.
 command_out=$(cd "$project" && "$VALK_BIN" make greet -- "two words" 2>&1)
-if [[ "$command_out" != *"greeting two words"* ]]; then
+if [[ "$command_out" != *"greeting two words"* ]] && [[ "$command_out" != *'greeting "two words"'* ]]; then
     echo "# 'valk make greet -- \"two words\"' must run the command with its argument"
     echo "$command_out"
     exit 1
