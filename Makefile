@@ -15,7 +15,7 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
-DIST_FLAGS := . src/*.valk --static --release -vv -c
+DIST_FLAGS := . --static --release -vv -c
 IR_TARGETS := linux-x64 macos-x64 macos-arm64 win-x64
 HOST_SYSTEM := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
@@ -40,10 +40,10 @@ BENCH_JSON_ITERATIONS ?= 2000000
 # The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
 # release targets link the vendored static one
 valk: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --def "LLVM_DYNAMIC=1" $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv $(FLAGS) --def "LLVM_DYNAMIC=1" $(NATIVE_LINK_FLAGS)
 
 valkexe: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv $(FLAGS) --target win-x64 --static \
+	$(VC) build . -o ./valk -vv $(FLAGS) --target win-x64 --static \
 	-L toolchains/libraries/win-llvm-22-x64/lib
 
 doc: valk
@@ -52,13 +52,13 @@ doc: valk
 
 valk-profile: $(COMPILER_DEPS)
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
-	$(VC) build . src/*.valk -o ./valk3 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk3 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 valkd: $(COMPILER_DEPS)
-	gdb --args $(VC) build . src/*.valk -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
+	gdb --args $(VC) build . -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 static: $(COMPILER_DEPS)
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 install: valk
 	rm -rf ~/.vman/versions/${VERSION}/
@@ -205,15 +205,15 @@ lint-lib-cross: valk
 # CI commands
 ci-linux: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . src/*.valk -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 ci-win: $(COMPILER_DEPS)
 	~/valk-dev/valk.exe -h || echo ""
-	$$HOME/valk-dev/valk.exe build . src/*.valk -o ./valk -vv -c --static $(FLAGS) \
+	$$HOME/valk-dev/valk.exe build . -o ./valk -vv -c --static $(FLAGS) \
 	-L toolchains/libraries/win-llvm-22-x64/lib $(CI_SYSTEM_LIB_FLAGS)
 
 # Distributions

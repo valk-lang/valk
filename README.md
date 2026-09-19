@@ -43,7 +43,7 @@ fn main() {
 valk build main.valk -o ./main
 ./main
 # Or to quickly build & run a script:
-# valk main.valk
+# valk run main.valk
 ```
 
 ## Project stage
@@ -66,8 +66,11 @@ cd valk
 vman use
 make toolchains
 make
-# optional: make test
+# optional: ./valk make test
 ```
+
+`./valk ls` lists what the project declares: `test`, the test suites, `docs`,
+`install` and `uninstall`.
 
 ## Supported platforms
 
