@@ -2635,6 +2635,8 @@ after `detach`, and `os` when the kill fails.
     + fn ansi.blue(bold: bool (false)) String
     // Returns the string colored cyan with ANSI codes, then a reset; `bold` makes it bold.
     + fn ansi.cyan(bold: bool (false)) String
+    // Returns the string at reduced intensity, for text that matters less.
+    + fn ansi.dim() String
     // Returns the string colored green with ANSI codes, then a reset; `bold` makes it bold.
     + fn ansi.green(bold: bool (false)) String
     // Returns the string colored purple with ANSI codes, then a reset; `bold` makes it bold.
@@ -2807,6 +2809,14 @@ Returns the string colored blue with ANSI codes, then a reset; `bold` makes it b
 #### ansi.cyan
 
 Returns the string colored cyan with ANSI codes, then a reset; `bold` makes it bold.
+
+#### ansi.dim
+
+Returns the string at reduced intensity, for text that matters less.
+
+It keeps the color the terminal writes in, so it reads on light and dark themes
+alike, and a terminal that does not know the code shows the text as it is. Only
+the intensity is set back afterwards, so a color around it stays on.
 
 #### ansi.green
 

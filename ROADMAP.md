@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.5
++ `dim()` in the ansi group of String
 
 + Release 0.7.4
 + Make commands in valk.json: `valk make {name}` and `valk ls`
