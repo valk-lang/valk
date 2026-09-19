@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.4
++ Release 0.7.4
 + Targets in valk.json: `valk make {name}` and `valk ls`
 + Cookies in the http namespace
 + `each`/`lock` take a literal without parentheses
