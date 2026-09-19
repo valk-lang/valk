@@ -2580,6 +2580,7 @@ that is a line is run; one with a `dir` is compiled:
 
 ```sh
 valk ls                 # the targets of this project
+valk ls test            # what one target does
 valk make               # the first target
 valk make hello         # a target with a directory, compiled
 valk make hello -c      # with arguments of your own, which win over the declared ones

@@ -646,10 +646,24 @@ fn main(args: Array[String]) {
 VALK
 
 ls_out=$(cd "$project" && "$VALK_BIN" ls 2>&1)
-if [[ "$ls_out" != *"Targets:"* ]] || [[ "$ls_out" != *"(global)"* ]] || [[ "$ls_out" != *"(default)"* ]] \
-    || [[ "$ls_out" != *"greet"* ]]; then
+if [[ "$ls_out" != *"Targets:"* ]] || [[ "$ls_out" != *"global"* ]] || [[ "$ls_out" != *"default"* ]] \
+    || [[ "$ls_out" != *"greet"* ]] || [[ "$ls_out" != *"build src"* ]]; then
     echo "# 'valk ls' must list the targets, and mark the global and default ones"
     echo "$ls_out"
+    exit 1
+fi
+
+# One target shows what it does
+one_out=$(cd "$project" && "$VALK_BIN" ls dev 2>&1)
+if [[ "$one_out" != *"valk build src"* ]] || [[ "$one_out" != *'--def "DEV=1"'* ]]; then
+    echo "# 'valk ls {name}' must show what the target does"
+    echo "$one_out"
+    exit 1
+fi
+unknown_ls=$(cd "$project" && "$VALK_BIN" ls nope 2>&1)
+if [[ "$unknown_ls" != *"no target named 'nope'"* ]]; then
+    echo "# 'valk ls {name}' must report a name that is not there"
+    echo "$unknown_ls"
     exit 1
 fi
 
@@ -844,4 +858,4 @@ if [[ "$neither_out" != *"has neither a 'dir' to build nor a 'cmd' to run"* ]]; 
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 55"
+echo "# Test count: 57"
