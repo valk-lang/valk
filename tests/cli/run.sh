@@ -610,7 +610,7 @@ if [ "$(printf '%s' "$divergence_out" | grep -c "Unreachable code")" -ne 2 ] || 
 fi
 
 echo ""
-echo "# Test the targets a project declares"
+echo "# Test the make commands a project declares"
 
 # The project is built from another directory, so the compiler needs its full path
 VALK_BIN="$VALK"
@@ -646,22 +646,22 @@ fn main(args: Array[String]) {
 VALK
 
 ls_out=$(cd "$project" && "$VALK_BIN" ls 2>&1)
-if [[ "$ls_out" != *"Targets:"* ]] || [[ "$ls_out" != *"global"* ]] || [[ "$ls_out" != *"default"* ]] \
+if [[ "$ls_out" != *"Make commands:"* ]] || [[ "$ls_out" != *"global"* ]] || [[ "$ls_out" != *"default"* ]] \
     || [[ "$ls_out" != *"greet"* ]] || [[ "$ls_out" != *"build src"* ]]; then
-    echo "# 'valk ls' must list the targets, and mark the global and default ones"
+    echo "# 'valk ls' must list the make commands, and mark the global and default ones"
     echo "$ls_out"
     exit 1
 fi
 
-# One target shows what it does
+# One make command shows what it does
 one_out=$(cd "$project" && "$VALK_BIN" ls dev 2>&1)
 if [[ "$one_out" != *"valk build src"* ]] || [[ "$one_out" != *'--def "DEV=1"'* ]]; then
-    echo "# 'valk ls {name}' must show what the target does"
+    echo "# 'valk ls {name}' must show what the make command does"
     echo "$one_out"
     exit 1
 fi
 unknown_ls=$(cd "$project" && "$VALK_BIN" ls nope 2>&1)
-if [[ "$unknown_ls" != *"no target named 'nope'"* ]]; then
+if [[ "$unknown_ls" != *"no make command named 'nope'"* ]]; then
     echo "# 'valk ls {name}' must report a name that is not there"
     echo "$unknown_ls"
     exit 1
@@ -675,15 +675,15 @@ if [[ "$named_out" != *"dev: hello Ada"* ]]; then
     exit 1
 fi
 
-# Without a name the first target is made
+# Without a name the first make command is run
 default_out=$(cd "$project" && "$VALK_BIN" make --run 2>&1)
 if [[ "$default_out" != *"hello world"* ]] || [[ "$default_out" == *"dev: "* ]]; then
-    echo "# 'valk make' must make the first target"
+    echo "# 'valk make' must run the first make command"
     echo "$default_out"
     exit 1
 fi
 
-# A target with a command is run, with what follows '--' appended as one argument.
+# A make command that is a line is run, with what follows '--' appended as one argument.
 # `echo` keeps the quotes on Windows and drops them in a shell, so both spellings pass.
 command_out=$(cd "$project" && "$VALK_BIN" make greet -- "two words" 2>&1)
 if [[ "$command_out" != *"greeting two words"* ]] && [[ "$command_out" != *'greeting "two words"'* ]]; then
@@ -694,8 +694,8 @@ fi
 
 # build and run take paths, and point at make for a target
 target_build_out=$(cd "$project" && "$VALK_BIN" build greet 2>&1)
-if [[ "$target_build_out" != *"is a target of this project, make it with: valk make greet"* ]]; then
-    echo "# Building a target must point at 'valk make'"
+if [[ "$target_build_out" != *"is a make command of this project, run it with: valk make greet"* ]]; then
+    echo "# Building a make command must point at 'valk make'"
     echo "$target_build_out"
     exit 1
 fi
@@ -706,10 +706,10 @@ if [[ "$path_run_out" != *"hello Ada"* ]]; then
     exit 1
 fi
 
-# An unknown target says what to look at
+# An unknown make command says what to look at
 unknown_out=$(cd "$project" && "$VALK_BIN" make nope 2>&1)
-if [[ "$unknown_out" != *"no target named 'nope'"* ]]; then
-    echo "# An unknown target must be reported"
+if [[ "$unknown_out" != *"no make command named 'nope'"* ]]; then
+    echo "# An unknown make command must be reported"
     echo "$unknown_out"
     exit 1
 fi
@@ -726,14 +726,14 @@ cat > "$project/valk.json" <<'JSON'
 JSON
 defines_out=$(cd "$project" && "$VALK_BIN" make show 2>&1)
 if [[ "$defines_out" != *"version=1.2.3 braced=1.2.3"* ]]; then
-    echo "# A target must use what 'define' says"
+    echo "# A make command must use what 'define' says"
     echo "$defines_out"
     exit 1
 fi
 # What the project does not declare is left for the shell, which only expands it where
 # there is one: cmd prints \$NOPE and \$(echo sub) as they are written
 if [ "$host_os" != win ] && [[ "$defines_out" != *"missing=[] shell=sub"* ]]; then
-    echo "# A target must leave what it does not declare to the shell"
+    echo "# A make command must leave what it does not declare to the shell"
     echo "$defines_out"
     exit 1
 fi
@@ -763,7 +763,7 @@ cat > "$project/valk.json" <<'JSON'
 JSON
 steps_out=$(cd "$project" && "$VALK_BIN" make steps 2>&1)
 if [[ "$steps_out" != *"first"* ]] || [[ "$steps_out" != *"second"* ]]; then
-    echo "# The lines of a command must run in order"
+    echo "# The lines of a make command must run in order"
     echo "$steps_out"
     exit 1
 fi
@@ -775,18 +775,18 @@ if [[ "$list_out" != *"items one two"* ]]; then
 fi
 needs_out=$(cd "$project" && "$VALK_BIN" make all 2>&1 && ls "$project")
 if [[ "$needs_out" != *"first"* ]] || [[ "$needs_out" != *"done"* ]] || [[ "$needs_out" != *"app-1.2.3"* ]]; then
-    echo "# A target must make what it needs first"
+    echo "# A make command must run what it needs first"
     echo "$needs_out"
     exit 1
 fi
 loop_out=$(cd "$project" && "$VALK_BIN" make loop 2>&1)
 if [[ "$loop_out" != *"needs itself"* ]]; then
-    echo "# A target that needs itself must be reported"
+    echo "# A make command that needs itself must be reported"
     echo "$loop_out"
     exit 1
 fi
 
-# A package inside a project is its own project, so its config is where the targets come from
+# A package inside a project is its own project, so its config is where the make commands come from
 mkdir -p "$project/inner"
 cat > "$project/inner/valk.json" <<'JSON'
 {
@@ -794,8 +794,8 @@ cat > "$project/inner/valk.json" <<'JSON'
 }
 JSON
 inner_out=$(cd "$project/inner" && "$VALK_BIN" make steps 2>&1)
-if [[ "$inner_out" != *"declares no targets"* ]]; then
-    echo "# A package with a config of its own must not run the targets of a parent"
+if [[ "$inner_out" != *"declares no make commands"* ]]; then
+    echo "# A package with a config of its own must not run the make commands of a parent"
     echo "$inner_out"
     exit 1
 fi
@@ -833,15 +833,15 @@ if [[ "$platform_bad" != *"no platform 'windows'"* ]]; then
     exit 1
 fi
 
-# A target is built or run, not both, and never neither
+# A make command is built or run, not both, and never neither
 cat > "$project/valk.json" <<'JSON'
 {
     "make": { "both": { "dir": "src", "cmd": "echo greeting" } }
 }
 JSON
 both_out=$(cd "$project" && "$VALK_BIN" ls 2>&1)
-if [[ "$both_out" != *"a target is built or run, not both"* ]]; then
-    echo "# A target with a dir and a cmd must be rejected"
+if [[ "$both_out" != *"it is built or run, not both"* ]]; then
+    echo "# A make command with a dir and a cmd must be rejected"
     echo "$both_out"
     exit 1
 fi
@@ -852,7 +852,7 @@ cat > "$project/valk.json" <<'JSON'
 JSON
 neither_out=$(cd "$project" && "$VALK_BIN" ls 2>&1)
 if [[ "$neither_out" != *"has neither a 'dir' to build nor a 'cmd' to run"* ]]; then
-    echo "# A target with neither must be rejected"
+    echo "# A make command with neither must be rejected"
     echo "$neither_out"
     exit 1
 fi
