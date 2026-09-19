@@ -1,0 +1,454 @@
+use valk.fs
+use valk.json
+use valk.core
+use helper
+
+// What a project declares in its valk.json:
+//
+//   "make": {
+//       "test": "valk build ./tests --test --run",
+//       "hello": { "dir": "src", "global": true },
+//       "dev": { "dir": "src", "args": "--def \"DEV=1\"" }
+//   }
+//
+// A line of a command may be written per platform:
+//
+//   { "win": "md debug", "default": "mkdir -p ./debug" }
+//
+// A target that is a line is run; one with `dir` is built. `valk make [name]` makes one,
+// and `valk ls` lists them.
+class MakeTarget {
+    name: String
+    // A build: the directory to compile and what to pass the compiler, as written
+    dir: String ("")
+    args: String ("")
+    // A command: the lines to run, in order
+    cmd: Array[String] (.{})
+    // Targets to make first
+    needs: Array[String] (.{})
+    // Offered to `vman global install` as a program
+    global: bool (false)
+
+    fn is_command() bool {
+        return this.cmd.length > 0
+    }
+}
+
+class Project {
+    dir: String
+    targets: Array[MakeTarget] (.{})
+    // The `define` values of the project, which a target may name with `$NAME`
+    defines: Map[String] (.{})
+
+    fn target_named(name: String) ?MakeTarget {
+        each this.targets as target {
+            if target.name == name : return target
+        }
+        return null
+    }
+}
+
+// Reads the valk.json of the directory the command was started in, or of a parent. The
+// first one found is the project: a package inside a project is its own, and its targets
+// are the ones it declares itself.
++ fn load_project() ?Project {
+    let dir = helper.resolve(fs.cwd() !? ".")
+    let config_dir = project_dir_of(dir) ?! return null
+    let config = helper.Config.load(helper.add(config_dir, "valk.json")) !? null
+    if !isset(config) : return null
+
+    let project = Project { dir: config_dir }
+    each config.json.get("define").object.values as value, name {
+        match value {
+            String as text => project.defines.set(name, text)
+            bool as enabled => project.defines.set(name, enabled ? "true" : "false")
+            default => {}
+        }
+    }
+    // Values of the project itself, which may use the ones declared before them
+    each config.json.get("vars").object.values as value, name {
+        if project.defines.has(name) {
+            build_error("'" + name + "' is both a define and a var")
+        }
+        match value {
+            String as text => project.defines.set(name, fill_defines(text, project.defines))
+            json.ArrayValue as items => {
+                let parts = Array[String]{}
+                each items.values as item : parts.append(fill_defines(item.string, project.defines))
+                project.defines.set(name, parts.join(" "))
+            }
+            default => {}
+        }
+    }
+
+    let make = config.json.get("make")
+    each make.object.values.keys() as name {
+        let value = make.get(name)
+        // `"name": "a line"` is a command, which is what most targets are
+        let is_text = value.kind == json.Kind.string
+        let target = MakeTarget {
+            name: name
+            dir: is_text ? "" : value.get("dir").string
+            args: fill_defines(is_text ? "" : value.get("args").string, project.defines)
+            cmd: command_lines(value, is_text, project.defines)
+            needs: string_list(is_text ? null : value.get("needs"))
+            global: is_text ? false : value.get("global").bool_value() !? false
+        }
+        if target.dir.is_empty() && !target.is_command() {
+            build_error("Target '" + name + "' has neither a 'dir' to build nor a 'cmd' to run")
+        }
+        if !target.dir.is_empty() && target.is_command() {
+            build_error("Target '" + name + "' has both a 'dir' and a 'cmd'; a target is built or run, not both")
+        }
+        project.targets.append(target)
+    }
+    return project
+}
+
+// The lines of a command: a target written as a line or a list of lines, or the `cmd` of a
+// target written as an object
+fn command_lines(value: json.Value, is_text: bool, defines: Map[String]) Array[String] {
+    let result = Array[String]{}
+    if is_text {
+        result.append(fill_defines(value.string, defines))
+        return result
+    }
+    let lines = value.kind == json.Kind.array ? lines_of(value) : lines_of(value.get("cmd"))
+    each lines as line : result.append(fill_defines(line, defines))
+    return result
+}
+
+// The lines of a value that is a line, a list of lines, or a line per platform
+fn lines_of(value: ?json.Value) Array[String] {
+    let result = Array[String]{}
+    if !isset(value) : return result
+    match value {
+        String as text => {
+            if !text.is_empty() : result.append(text)
+        }
+        json.ArrayValue as items => {
+            each items.values as item {
+                let line = line_for_host(item)
+                if !line.is_empty() : result.append(line)
+            }
+        }
+        json.ObjectValue as _ => {
+            // An object of `cmd` is a line written per platform, not a target
+            let line = line_for_host(value)
+            if !line.is_empty() : result.append(line)
+        }
+        default => {}
+    }
+    return result
+}
+
+// A line written per platform: the most exact key wins, and a platform this one says
+// nothing about is left out of the command
+fn line_for_host(value: json.Value) String {
+    match value {
+        String as text => return text
+        default => {}
+    }
+    let known = Array[String]{ "default", "linux", "macos", "win", "linux-x64", "macos-x64", "macos-arm64", "win-x64" }
+    each value.object.values.keys() as name {
+        if known.contains(name) : continue
+        build_error("A line of a command has no platform '" + name + "'. It takes: " + known.join(", "))
+    }
+
+    let os = default_os()
+    let arch = default_arch()
+    let exact = value.get(os + "-" + arch).string
+    if !exact.is_empty() : return exact
+    let for_os = value.get(os).string
+    if !for_os.is_empty() : return for_os
+    return value.get("default").string
+}
+
+// The strings of a value that is a list, or the one string of a value that is a line
+fn string_list(value: ?json.Value) Array[String] {
+    let result = Array[String]{}
+    if !isset(value) : return result
+    match value {
+        json.ArrayValue as items => {
+            each items.values as item {
+                let text = item.string
+                if !text.is_empty() : result.append(text)
+            }
+        }
+        String as text => {
+            if !text.is_empty() : result.append(text)
+        }
+        default => {}
+    }
+    return result
+}
+
+fn project_dir_of(dir: String) ?String {
+    if fs.exists(helper.add(dir, "valk.json")) : return dir
+    let parent = fs.dir_of(dir)
+    if parent == dir : return null
+    return project_dir_of(parent)
+}
+
+// `valk make [name]`: makes a target the project declares, which is a directory to build
+// or a command to run. Without a name the default target is made.
++ fn make_action(args: Array[String]) i32 {
+    let project = load_project() ?! {
+        build_error("No valk.json found in this directory or its parents")
+    }
+    if project.targets.length == 0 {
+        build_error("This project declares no targets. They go in valk.json under \"make\"")
+    }
+
+    let rest = args.copy()
+    let name = args.get(0) !? ""
+    if name.is_empty() || name.starts_with("-") {
+        // Without a name the first target is made, the way a Makefile's first rule is
+        name = (project.targets.get(0) !? MakeTarget { name: "" }).name
+    } else {
+        rest.remove(0)
+    }
+
+    return make_target(project, name, rest, Array[String]{})
+}
+
+// Makes `name`, and what it needs before it. `making` is the chain that led here, so that a
+// target which needs itself is reported instead of running forever.
+fn make_target(project: Project, name: String, rest: Array[String], making: Array[String]) i32 {
+    let target = project.target_named(name) ?! {
+        build_error("This project has no target named '" + name + "'. See: valk ls")
+    }
+    if making.contains(name) {
+        build_error("Target '" + name + "' needs itself: " + making.join(" -> ") + " -> " + name)
+    }
+
+    let chain = making.copy()
+    chain.append(name)
+    each target.needs as needed {
+        let code = make_target(project, needed, Array[String]{}, chain)
+        if code != 0 : return code
+    }
+
+    if target.is_command() : return run_command(project, target, rest)
+
+    // The directory and arguments of the target, then whatever was typed after the name, so
+    // that the command line wins over the config
+    let build_args = Array[String]{ helper.add(project.dir, target.dir) }
+    // `$(uname)` and the like are the shell's, so they are expanded before the split
+    build_args.append_many(split_args(expand_shell(target.args)))
+    build_args.append_many(rest)
+    Build.from_args(build_args)
+    return 0
+}
+
+// `valk build` and `valk run` take paths. A name that is a target of the project is worth
+// pointing at `valk make` before the build fails on a path that is not there.
++ fn check_not_a_target(args: Array[String]) {
+    let name = args.get(0) !? ""
+    if name.is_empty() || name.starts_with("-") : return
+    // Something that can be built is a path, whatever the project declares
+    if name.ends_with(".valk") || fs.is_dir(helper.resolve(name)) : return
+    let project = load_project() ?! return
+    if !isset(project.target_named(name)) : return
+    build_error("'" + name + "' is a target of this project, make it with: valk make " + name)
+}
+
+// `valk run` builds what it is given and runs it, the way `valk build ... --run` does
++ fn run_paths(args: Array[String]) i32 {
+    check_not_a_target(args)
+
+    let build_args = Array[String]{}
+    let after_dashes = false
+    each args as arg {
+        // `--` and what follows belong to the program, so `--run` goes in front of them
+        if arg == "--" && !after_dashes {
+            after_dashes = true
+            if !args.contains("--run") && !args.contains("-r") : build_args.append("--run")
+        }
+        build_args.append(arg)
+    }
+    if !after_dashes && !args.contains("--run") && !args.contains("-r") : build_args.append("--run")
+    Build.from_args(build_args)
+    return 0
+}
+
+fn run_command(project: Project, target: MakeTarget, rest: Array[String]) i32 {
+    // Anything after `--` is handed to the last line of the command as arguments
+    let extra = ""
+    let after_dashes = false
+    each rest as arg {
+        if !after_dashes {
+            if arg != "--" : build_error("Unexpected argument: " + arg + ". Arguments for a command go after '--'")
+            after_dashes = true
+            continue
+        }
+        extra += " " + shell_quote(arg)
+    }
+
+    // A command means the same thing from anywhere in the project
+    fs.chdir(project.dir) ! build_error("Failed to enter directory: " + project.dir)
+
+    let last = target.cmd.length - 1
+    each target.cmd as line, i {
+        let code = run_line(i == last ? line + extra : line)
+        // A line that fails stops the target, the way a recipe does
+        if code != 0 : return code
+    }
+    return 0
+}
+
+fn run_line(line: String) i32 {
+    // The command shares this process's streams, so its output shows as it happens and its
+    // stdin and terminal are its own; `core.exec` would pipe it and hold the output back
+    close_descriptors_on_exec()
+    #if OS == "win"
+    let process = core.Process.run("cmd", Array[String]{ "/c", line }, true) ! {
+        build_error("Failed to run: " + line)
+    }
+    #else
+    let process = core.Process.run("/bin/sh", Array[String]{ "-c", line }, true) ! {
+        build_error("Failed to run: " + line)
+    }
+    #end
+    return process.exit_code() ! build_error("Failed to wait for: " + line)
+}
+
+// What a shell would put in a build argument: `$(uname)` and names of the environment that
+// the project does not declare itself
+fn expand_shell(text: String) String {
+    if !text.contains("$") && !text.contains("`") : return text
+    let arg = text
+    #if OS == "win"
+    let code, output = core.exec("cmd /c echo " + arg)
+    #else
+    let code, output = core.exec("/bin/sh -c " + shell_quote("printf '\%s' \"" + arg + "\""))
+    #end
+    if code != 0 : return arg
+    return output.trim("\n")
+}
+
++ fn list_action() i32 {
+    let project = load_project() ?! {
+        println("No valk.json found in this directory or its parents")
+        return 1
+    }
+    if project.targets.length == 0 {
+        println("This project declares no targets")
+        println("")
+        println("They go in " + helper.add(project.dir, "valk.json") + ":")
+        println("  \"make\": {")
+        println("      \"hello\": { \"dir\": \"src\" },")
+        println("      \"test\": { \"cmd\": \"valk build ./tests --test --run\" }")
+        println("  }")
+        return 0
+    }
+
+    println("Targets:")
+    each project.targets as target, i {
+        let line = "  " + pad(target.name, 10)
+        if target.is_command() {
+            line += target.cmd.get(0) !? ""
+            if target.cmd.length > 1 : line += " ; …"
+        } else {
+            line += target.dir
+            if !target.args.is_empty() : line += "  " + target.args
+        }
+        if target.needs.length > 0 : line += "  (needs " + target.needs.join(", ") + ")"
+        if target.global : line += "  (global)"
+        if i == 0 : line += "  (default)"
+        println(line)
+    }
+    return 0
+}
+
+fn pad(name: String, width: uint) String {
+    let result = name
+    while result.bytes < width : result += " "
+    return result + " "
+}
+
+// Replaces `$NAME` and `${NAME}` with what `define` says, and leaves the rest for the
+// shell: `$HOME` and `$(uname)` are none of our business
+fn fill_defines(text: String, defines: Map[String]) String {
+    if !text.contains("$") || defines.length == 0 : return text
+    let result = ByteBuffer.new(text.bytes + 16)
+    let i: uint = 0
+    while i < text.bytes {
+        let ch = text.get(i)
+        if ch != '$' {
+            result.write_byte(ch)
+            i++
+            continue
+        }
+
+        let start = i + 1
+        let braced = start < text.bytes && text.get(start) == '{'
+        if braced : start++
+        let end = start
+        while end < text.bytes && is_define_byte(text.get(end), end == start) : end++
+
+        let name = text.range(start, end - start)
+        let closed = !braced || (end < text.bytes && text.get(end) == '}')
+        let value: ?String = null
+        if !name.is_empty() && closed : value = defines.get(name) !? null
+        if !isset(value) {
+            // Not a name this project defines, so it stays as it was written
+            result.write_byte(ch)
+            i++
+            continue
+        }
+        result.write(value)
+        i = braced ? end + 1 : end
+    }
+    return result.into_string()
+}
+
+fn is_define_byte(ch: u8, first: bool) bool {
+    if ch >= 'a' && ch <= 'z' : return true
+    if ch >= 'A' && ch <= 'Z' : return true
+    if ch == '_' : return true
+    if first : return false
+    return ch >= '0' && ch <= '9'
+}
+
+// Splits the `args` of a build the way a shell would: quotes hold a value together
+fn split_args(text: String) Array[String] {
+    let result = Array[String]{}
+    let current = ByteBuffer.new(16)
+    let quote: u8 = 0
+    let has_value = false
+    let i: uint = 0
+    while i < text.bytes {
+        let ch = text.get(i++)
+        if quote != 0 {
+            if ch == quote : quote = 0
+            else : current.write_byte(ch)
+            continue
+        }
+        if ch == '"' || ch == '\'' {
+            quote = ch
+            has_value = true
+            continue
+        }
+        if ch == ' ' || ch == '\t' {
+            if has_value {
+                result.append(current.to_string())
+                current.clear()
+                has_value = false
+            }
+            continue
+        }
+        current.write_byte(ch)
+        has_value = true
+    }
+    if has_value : result.append(current.to_string())
+    return result
+}
+
+fn shell_quote(value: String) String {
+    #if OS == "win"
+    return "\"" + value.replace("\"", "\\\"") + "\""
+    #else
+    return "'" + value.replace("'", "'\\''") + "'"
+    #end
+}

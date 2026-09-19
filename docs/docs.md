@@ -2553,6 +2553,77 @@ dependencies are folded into the archive:
 valk build src/*.valk --lib --static-lib --static -o libmylib
 ```
 
+## Targets
+
+A project can name what it builds and what it runs, under `make` in `valk.json`. A target
+that is a line is run; one with a `dir` is compiled:
+
+```json
+{
+    "vars": {
+        "TEST_FLAGS": "--test --def \"GC_DEBUG=1\"",
+        "TARGETS": ["linux-x64", "macos-x64", "win-x64"]
+    },
+    "make": {
+        "hello": { "dir": "src", "args": "-o ./hello", "global": true },
+        "test": {
+            "needs": ["hello"],
+            "cmd": [
+                "./valk build ./tests $TEST_FLAGS -o ./debug/test",
+                "./debug/test"
+            ]
+        },
+        "lint-all": "for t in $TARGETS; do valk build ./src --lint --target $t || exit $?; done"
+    }
+}
+```
+
+```sh
+valk ls                 # the targets of this project
+valk make               # the first target
+valk make hello         # a target with a directory, compiled
+valk make hello -c      # with arguments of your own, which win over the declared ones
+valk make test          # a target that is a line, run from the project root
+valk make test -- -t    # anything after `--` is passed to its last line
+```
+
+A target takes `dir` (what to compile) with `args` (given to the compiler as written), or
+`cmd` (a line, or a list of lines run in order), never both; a target written as a plain
+string or a list of strings is its `cmd`. `needs` names targets to make first, and `global`
+whether `vman global install` offers it as a program.
+
+A line may be written per platform, for the places where one line cannot serve every
+system:
+
+```json
+{
+    "make": {
+        "clean": [
+            { "win": "rmdir /s /q debug", "default": "rm -rf ./debug" },
+            "echo cleaned"
+        ]
+    }
+}
+```
+
+The keys are `linux`, `macos` and `win`, an operating system with its architecture
+(`macos-arm64`, `win-x64`, …) and `default`; the most exact one wins. A line that says
+nothing about the system it runs on is left out, so a step meant for one platform needs no
+`default`.
+
+`vars` holds values of the project, as a string or a list of strings; a list joins with
+spaces, which is what a shell `for` loop reads. A target may name a var or a `define` value
+with `$NAME` or `${NAME}`, in `args` as well as in `cmd`, and a var may use the ones
+declared before it. A name the project does not declare is left as it was written, so
+`$HOME`, `$(uname)` and `${NAME:-default}` reach the shell untouched; in `args`, where
+there is no shell, `$(…)` and names of the environment are expanded before the build runs.
+
+A command runs only when you ask for it with `valk make`, never as part of a build. A line
+that fails stops the target, and a target that needs itself is reported rather than run.
+
+`valk build` and `valk run` take paths, as they always have, and point at `valk make` when
+they are given the name of a target.
+
 ## Valk manager
 
 The valk manager aka `vman` can be used to install/update new versions of `valk`. It is also used to install packages for your project.

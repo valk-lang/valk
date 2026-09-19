@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.4
++ Targets in valk.json: `valk make {name}` and `valk ls`
 + Cookies in the http namespace
 + `each`/`lock` take a literal without parentheses
 
@@ -48,7 +49,6 @@
 
 ```
 - Complete libc integration
-- vman templates -> vman template http-server-router ./src
 - on exit thread/process { ... }
 - WASM support
 - Allow @undefined for entire struct. E.g. let user = User { @undefined }
