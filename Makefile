@@ -40,7 +40,7 @@ BENCH_JSON_ITERATIONS ?= 2000000
 # The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
 # release targets link the vendored static one
 valk: $(COMPILER_DEPS)
-	$(VC) build . -o ./valk -vv $(FLAGS) --def "LLVM_DYNAMIC=1" $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 valkexe: $(COMPILER_DEPS)
 	$(VC) build . -o ./valk -vv $(FLAGS) --target win-x64 --static \
