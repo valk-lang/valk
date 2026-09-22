@@ -852,3 +852,209 @@ synctest "GC: mem_usage_peak covers the current usage" {
     assert(gc.mem_usage_peak >= gc.mem_usage())
     assert(gc.mem_usage_peak > 0)
 }
+
+// Stores into an array that was collected before log the slot they write; a
+// raw move before the next collection must log the element's new slot, or
+// the collection treats the element as garbage
+class SlotLogItem {
+    value: uint
+    freed: bool (false)
+    fn gc_free() {
+        this.freed = true
+    }
+}
+
+fn slot_log_array(count: uint) Array[SlotLogItem] {
+    let arr = Array[SlotLogItem]{}
+    let i: uint = 0
+    while i < count : arr.append(SlotLogItem { value: i++ })
+    return arr
+}
+
+// Checked before anything allocates again, so a freed slot is not reused yet
+fn slot_log_values(arr: Array[SlotLogItem]) String $noinline {
+    each arr as item {
+        if item.freed : return "freed"
+    }
+    let out = ""
+    each arr as item : out += item.value + ","
+    return out
+}
+
+// A 64-slot array logs up to 16 slots before it is walked whole; the same
+// steps on plain numbers give the expected order
+fn slot_log_moves() String $noinline {
+    let arr = slot_log_array(64)
+    let model = Array[uint]{}
+    let i: uint = 0
+    while i < 64 : model.append(i++)
+    gc.collect()
+    // New values in logged slots, each moved by a raw move right after
+    arr.set(5, SlotLogItem { value: 1005 }) _
+    model.set(5, 1005) _
+    arr.remove(0)
+    model.remove(0)
+    arr.set(62, SlotLogItem { value: 1062 }) _
+    model.set(62, 1062) _
+    arr.swap_remove(1)
+    model.swap_remove(1)
+    arr.set(2, SlotLogItem { value: 1002 }) _
+    model.set(2, 1002) _
+    arr.pop_first() _
+    model.pop_first() _
+    arr.set(1, SlotLogItem { value: 1001 }) _
+    model.set(1, 1001) _
+    arr.swap(1, 40)
+    model.swap(1, 40)
+    arr.set(0, SlotLogItem { value: 1000 }) _
+    model.set(0, 1000) _
+    arr.prepend(SlotLogItem { value: 1099 })
+    model.prepend(1099)
+    gc.collect()
+    gc.collect()
+    let got = slot_log_values(arr)
+    let want = ""
+    each model as v : want += v + ","
+    if got == want : return "ok"
+    return got
+}
+
+fn slot_log_budget() String $noinline {
+    let arr = slot_log_array(16)
+    gc.collect()
+    // More stores than the array logs slots for: it is walked whole
+    let i: uint = 0
+    while i < 16 {
+        arr.set(i, SlotLogItem { value: 100 + i }) _
+        i++
+    }
+    arr.remove(3)
+    gc.collect()
+    gc.collect()
+    return slot_log_values(arr)
+}
+
+synctest "GC: References stored into an old array survive raw moves before the next collection" {
+    assert(slot_log_moves() == "ok")
+    assert(slot_log_budget() == "100,101,102,104,105,106,107,108,109,110,111,112,113,114,115,")
+}
+
+// Stores that allocate nothing start collections from the store guard once
+// the change logs are full: every object stays intact through them
+class RetargetItem {
+    target: ?RetargetItem (null)
+    freed: bool (false)
+    fn gc_free() {
+        this.freed = true
+    }
+}
+
+fn retarget_intact(items: Array[RetargetItem]) bool $noinline {
+    each items as item {
+        if item.freed : return false
+        let target = item.target ?! continue
+        if target.freed : return false
+    }
+    return true
+}
+
+fn retarget_loop() bool $noinline {
+    let items = Array[RetargetItem]{}
+    let i: uint = 0
+    // More objects than the logs hold: each one logged once per collection
+    while i < 140000 {
+        items.append(RetargetItem {})
+        i++
+    }
+    gc.collect()
+    let j: uint = 0
+    while j < 400000 {
+        items[j % 140000].target = items[(j * 7919) % 140000]
+        j++
+    }
+    gc.collect()
+    return retarget_intact(items)
+}
+
+synctest "GC: Collections started by stores that allocate nothing keep everything intact" {
+    assert(retarget_loop())
+}
+
+// A large structure dies while something else still holds a part of it, which
+// the program moves around while collections run: that part survives and
+// exactly the rest is freed
+@shared drop_freed: uint (0)
+
+class DropNode {
+    next: ?DropNode
+    value: uint
+    fn gc_free() {
+        atomic(drop_freed + 1)
+    }
+}
+
+class DropKeeper {
+    node: ?DropNode (null)
+}
+
+fn drop_install(holder: Array[?DropNode], n: uint) $noinline {
+    let head = DropNode { value: 0 }
+    let i: uint = 1
+    while i < n {
+        head = DropNode { next: head, value: i }
+        i++
+    }
+    holder.set(0, head) _
+}
+
+fn drop_node_at(holder: Array[?DropNode], depth: uint) DropNode $noinline {
+    let node = (holder.get(0) ! panic("missing")) ?? panic("missing")
+    let i: uint = 0
+    while i < depth {
+        node = node.next ?? panic("chain too short")
+        i++
+    }
+    return node
+}
+
+fn drop_clear(holder: Array[?DropNode]) $noinline {
+    holder.set(0, null) _
+}
+
+// Allocation that drives threshold collections
+fn drop_churn(count: uint) $noinline {
+    let keep = Array[DropKeeper]{}
+    let i: uint = 0
+    while i < count {
+        keep.append(DropKeeper {})
+        if keep.length > 1000 : keep.clear()
+        i++
+    }
+}
+
+fn drop_chain_length(node: ?DropNode) uint $noinline {
+    let n: uint = 0
+    let cur = node
+    while isset(cur) {
+        n++
+        cur = cur.next
+    }
+    return n
+}
+
+synctest "GC: A large structure that died is freed except the part something still holds" {
+    drop_freed = 0
+    let holder = Array[?DropNode]{ null }
+    drop_install(holder, 200000)
+    let keeper = DropKeeper { node: drop_node_at(holder, 150000) }
+    gc.collect()
+    drop_clear(holder)
+    drop_churn(2000000)
+    // Moved while the rest of the chain may still be waiting for its dis-own
+    let moved = DropKeeper { node: keeper.node }
+    keeper.node = null
+    drop_churn(2000000)
+    gc.collect()
+    assert(drop_freed == 150000)
+    assert(drop_chain_length(moved.node) == 50000)
+}
