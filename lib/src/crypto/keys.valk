@@ -1,0 +1,535 @@
+use json
+use mem
+
+/// The kind of a `PrivateKey` or `PublicKey`.
++ enum KeyType {
+    rsa
+    ec
+    ed25519
+}
+
+/// An elliptic curve for ECDSA keys: NIST P-256, P-384 or P-521.
++ enum Curve {
+    p256
+    p384
+    p521
+}
+
+/// How `PrivateKey.sign` and `PublicKey.verify` hash and pad.
+///
+/// Together these cover the JWT algorithms EdDSA (`ed25519`), ES256 to ES512 (`ecdsa_*`, but
+/// see `ecdsa_signature_to_raw`), RS256 to RS512 (`rsa_pkcs1_*`) and PS256 to PS512
+/// (`rsa_pss_*`, with a salt as long as the hash).
++ enum SignatureAlgorithm {
+    ed25519
+    ecdsa_sha256
+    ecdsa_sha384
+    ecdsa_sha512
+    rsa_pkcs1_sha256
+    rsa_pkcs1_sha384
+    rsa_pkcs1_sha512
+    rsa_pss_sha256
+    rsa_pss_sha384
+    rsa_pss_sha512
+}
+
+/// A private key for signing: RSA, ECDSA or Ed25519.
+///
+/// Create one with `generate_rsa`, `generate_ec` or `generate_ed25519`, or read one with
+/// `from_pem`. A key can be shared between threads.
++ class PrivateKey {
+    - handle: EVP_PKEY
+    - info: KeyInfo
+
+    /// Generates an RSA key of `bits` bits, 2048 to 16384.
+    ///
+    /// Throws `invalid_input` for a size outside that range. Keys of 3072 bits and more take
+    /// noticeably longer to generate.
+    + static fn generate_rsa(bits: uint (2048)) SELF !KeyError {
+        @unsafe
+        if bits < 2048 || bits > 16384 : throw .invalid_input
+        return SELF.adopt(generate_key(EVP_PKEY_RSA, EVP_PKEY_CTRL_RSA_KEYGEN_BITS, bits.to(i32)) !>) !>
+    }
+
+    /// Generates an ECDSA key on `curve`.
+    + static fn generate_ec(curve: Curve (Curve.p256)) SELF !KeyError {
+        @unsafe
+        return SELF.adopt(generate_key(EVP_PKEY_EC, EVP_PKEY_CTRL_EC_PARAMGEN_CURVE_NID, curve_nid(curve)) !>) !>
+    }
+
+    /// Generates an Ed25519 key.
+    + static fn generate_ed25519() SELF !KeyError {
+        @unsafe
+        return SELF.adopt(generate_key(EVP_PKEY_ED25519, 0, 0) !>) !>
+    }
+
+    /// Reads a PEM private key: PKCS#8 (`BEGIN PRIVATE KEY`, or `ENCRYPTED PRIVATE KEY` with
+    /// `password`) or the older RSA and EC forms.
+    ///
+    /// Throws `key` when the text holds no readable key, the password is wrong, or the key is
+    /// not RSA, EC or Ed25519.
+    + static fn from_pem(pem: String, password: String ("")) SELF !KeyError {
+        @unsafe
+        let bio = pem_bio(pem) !>
+        // A password is always passed, so OpenSSL never asks for one on the terminal
+        let key = PEM_read_bio_PrivateKey(bio, null, null, password.data_cstring)
+        BIO_free(bio)
+        return SELF.adopt(key) !>
+    }
+
+    /// Reads a DER private key, PKCS#8 or the older RSA and EC forms.
+    ///
+    /// Throws `key` when `der` holds no readable key of a supported type.
+    + static fn from_der(der: local &[u8]) SELF !KeyError {
+        @unsafe
+        let input: ptr = der.data
+        return SELF.adopt(d2i_AutoPrivateKey(null, @ref(input), der.length.to(c_long))) !>
+    }
+
+    /// Returns the Ed25519 key whose 32-byte private seed is `seed`.
+    ///
+    /// Throws `invalid_input` when `seed` is not 32 bytes.
+    + static fn from_ed25519_seed(seed: local &[u8]) SELF !KeyError {
+        @unsafe
+        if seed.length != 32 : throw .invalid_input
+        return SELF.adopt(EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, null, seed.data, 32)) !>
+    }
+
+    /// Returns the kind of key.
+    + fn key_type() KeyType {
+        return this.info.key_type
+    }
+
+    /// Returns the key size in bits: the modulus for RSA, the curve size for EC, 253 for Ed25519.
+    + fn bits() uint {
+        return this.info.bits
+    }
+
+    /// Returns the public half of the key.
+    + fn public_key() PublicKey !KeyError {
+        @unsafe
+        let length = i2d_PUBKEY(this.handle, null)
+        if length <= 0 {
+            ERR_clear_error()
+            throw .failed
+        }
+        let der = String.alloc(length.to(uint))
+        let out: ptr = der.data
+        if i2d_PUBKEY(this.handle, @ref(out)) != length {
+            ERR_clear_error()
+            throw .failed
+        }
+        return PublicKey.from_der(der) !>
+    }
+
+    /// Returns the key as unencrypted PKCS#8 PEM text (`BEGIN PRIVATE KEY`).
+    + fn to_pem() String !KeyError {
+        @unsafe
+        let bio = BIO_new(BIO_s_mem()) ?! throw .failed
+        if PEM_write_bio_PKCS8PrivateKey(bio, this.handle, null, null, 0, null, null) != 1 {
+            BIO_free(bio)
+            ERR_clear_error()
+            throw .failed
+        }
+        return bio_text(bio)
+    }
+
+    /// Signs `data` with `algorithm` and returns the signature.
+    ///
+    /// ECDSA signatures are DER encoded, as OpenSSL and most other libraries use them;
+    /// `ecdsa_signature_to_raw` gives the fixed-size form of JWT and WebCrypto. Throws `key`
+    /// when the algorithm does not fit the key, such as an RSA algorithm with an EC key.
+    + fn sign(algorithm: SignatureAlgorithm, data: local &[u8]) String !KeyError {
+        @unsafe
+        check_algorithm(this.info.key_type, algorithm) !>
+        let ctx = EVP_MD_CTX_new() ?! throw .failed
+        let pctx: ?EVP_PKEY_CTX = null
+        let length: uint = 0
+        let ok = EVP_DigestSignInit(ctx, @ref(pctx), signature_digest(algorithm), null, this.handle) == 1
+            && set_pss_padding(pctx, algorithm)
+            && EVP_DigestSign(ctx, null, @ref(length), data.data, data.length) == 1
+        if !ok {
+            EVP_MD_CTX_free(ctx)
+            ERR_clear_error()
+            throw .failed
+        }
+        let signature = String.alloc(length)
+        ok = EVP_DigestSign(ctx, signature.data, @ref(length), data.data, data.length) == 1
+        EVP_MD_CTX_free(ctx)
+        if !ok {
+            ERR_clear_error()
+            throw .failed
+        }
+        // An ECDSA signature can come out shorter than the size asked for
+        if length < signature.bytes : return signature.range(0, length)
+        return signature
+    }
+
+    fn clone() SELF $clone {
+        @unsafe
+        EVP_PKEY_up_ref(this.handle)
+        return SELF { handle: this.handle, info: this.info }
+    }
+
+    // Takes ownership of a key OpenSSL made or read, if it is of a supported type
+    static fn adopt(key: ?EVP_PKEY) SELF !KeyError {
+        @unsafe
+        let handle = key ?! {
+            ERR_clear_error()
+            throw .key
+        }
+        let info = key_info(handle) ! {
+            EVP_PKEY_free(handle)
+            throw .key
+        }
+        return SELF { handle: handle, info: info }
+    }
+
+    fn gc_free() {
+        @unsafe
+        EVP_PKEY_free(this.handle)
+    }
+}
+
+/// A public key for checking signatures: RSA, ECDSA or Ed25519.
+///
+/// Read one with `from_pem`, `from_der` or `from_jwk`, or take it from a `PrivateKey`. A key
+/// can be shared between threads.
++ class PublicKey {
+    - handle: EVP_PKEY
+    - info: KeyInfo
+
+    /// Reads a PEM public key (`BEGIN PUBLIC KEY`) or the key of a certificate
+    /// (`BEGIN CERTIFICATE`).
+    ///
+    /// The certificate itself is not checked. Throws `key` when the text holds no readable key
+    /// of a supported type.
+    + static fn from_pem(pem: String) SELF !KeyError {
+        @unsafe
+        let bio = pem_bio(pem) !>
+        let key: ?EVP_PKEY = null
+        if pem.contains("-----BEGIN CERTIFICATE-----") {
+            let cert = PEM_read_bio_X509(bio, null, null, null)
+            if isset(cert) {
+                key = X509_get_pubkey(cert)
+                X509_free(cert)
+            }
+        } else {
+            key = PEM_read_bio_PUBKEY(bio, null, null, null)
+        }
+        BIO_free(bio)
+        return SELF.adopt(key) !>
+    }
+
+    /// Reads a DER public key in the SubjectPublicKeyInfo form.
+    ///
+    /// Throws `key` when `der` holds no readable key of a supported type.
+    + static fn from_der(der: local &[u8]) SELF !KeyError {
+        @unsafe
+        let input: ptr = der.data
+        return SELF.adopt(d2i_PUBKEY(null, @ref(input), der.length.to(c_long))) !>
+    }
+
+    /// Returns the Ed25519 public key with the 32 bytes `raw`.
+    ///
+    /// Throws `invalid_input` when `raw` is not 32 bytes.
+    + static fn from_ed25519(raw: local &[u8]) SELF !KeyError {
+        @unsafe
+        if raw.length != 32 : throw .invalid_input
+        return SELF.adopt(EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, null, raw.data, 32)) !>
+    }
+
+    /// Reads a public key in JSON Web Key form (RFC 7517), as found in the JWKS documents of
+    /// OAuth and OpenID providers.
+    ///
+    /// Supports `kty` `RSA` (`n`, `e`), `EC` (`crv` P-256, P-384 or P-521, `x`, `y`) and `OKP`
+    /// (`crv` Ed25519, `x`). Other members, such as `kid` and `alg`, are left for the caller.
+    /// Throws `key` for anything else.
+    + static fn from_jwk(jwk: String) SELF !KeyError {
+        let value = json.decode(jwk) ! throw .key
+        let kty = value.get_string("kty") ! throw .key
+        if kty == "RSA" {
+            let n = jwk_bytes(value, "n") !>
+            let e = jwk_bytes(value, "e") !>
+            let key = der_sequence(der_integer(n) + der_integer(e))
+            return SELF.from_der(der_sequence(der_sequence(oid_rsa_encryption() + der_null()) + der_bit_string(key))) ! throw .key
+        }
+        if kty == "EC" {
+            let crv = value.get_string("crv") ! throw .key
+            let curve = Curve.p256
+            if crv == "P-384" : curve = Curve.p384
+            else if crv == "P-521" : curve = Curve.p521
+            else if crv != "P-256" : throw .key
+            let size = curve_size(curve)
+            let x = jwk_bytes(value, "x") !>
+            let y = jwk_bytes(value, "y") !>
+            if x.bytes != size || y.bytes != size : throw .key
+            // An uncompressed point: 0x04, then x and y
+            let point = ByteBuffer.new(1 + size * 2)
+            point.write_byte(4)
+            point.write(x)
+            point.write(y)
+            let algorithm = der_sequence(oid_ec_public_key() + curve_oid(curve))
+            return SELF.from_der(der_sequence(algorithm + der_bit_string(point.to_string()))) ! throw .key
+        }
+        if kty == "OKP" {
+            if (value.get_string("crv") ! throw .key) != "Ed25519" : throw .key
+            return SELF.from_ed25519(jwk_bytes(value, "x") !>) ! throw .key
+        }
+        throw .key
+    }
+
+    /// Returns the kind of key.
+    + fn key_type() KeyType {
+        return this.info.key_type
+    }
+
+    /// Returns the key size in bits: the modulus for RSA, the curve size for EC, 253 for Ed25519.
+    + fn bits() uint {
+        return this.info.bits
+    }
+
+    /// Returns whether `signature` is a valid signature of `data` by this key with `algorithm`.
+    ///
+    /// ECDSA signatures must be DER encoded; convert a raw one with
+    /// `ecdsa_signature_from_raw` first. An algorithm that does not fit the key gives false.
+    + fn verify(algorithm: SignatureAlgorithm, data: local &[u8], signature: local &[u8]) bool {
+        @unsafe
+        check_algorithm(this.info.key_type, algorithm) ! return false
+        let ctx = EVP_MD_CTX_new() ?! return false
+        let pctx: ?EVP_PKEY_CTX = null
+        let valid = EVP_DigestVerifyInit(ctx, @ref(pctx), signature_digest(algorithm), null, this.handle) == 1
+            && set_pss_padding(pctx, algorithm)
+            && EVP_DigestVerify(ctx, signature.data, signature.length, data.data, data.length) == 1
+        EVP_MD_CTX_free(ctx)
+        if !valid : ERR_clear_error()
+        return valid
+    }
+
+    /// Returns the key as PEM text (`BEGIN PUBLIC KEY`).
+    + fn to_pem() String !KeyError {
+        @unsafe
+        let bio = BIO_new(BIO_s_mem()) ?! throw .failed
+        if PEM_write_bio_PUBKEY(bio, this.handle) != 1 {
+            BIO_free(bio)
+            ERR_clear_error()
+            throw .failed
+        }
+        return bio_text(bio)
+    }
+
+    fn clone() SELF $clone {
+        @unsafe
+        EVP_PKEY_up_ref(this.handle)
+        return SELF { handle: this.handle, info: this.info }
+    }
+
+    // Takes ownership of a key OpenSSL made or read, if it is of a supported type
+    static fn adopt(key: ?EVP_PKEY) SELF !KeyError {
+        @unsafe
+        let handle = key ?! {
+            ERR_clear_error()
+            throw .key
+        }
+        let info = key_info(handle) ! {
+            EVP_PKEY_free(handle)
+            throw .key
+        }
+        return SELF { handle: handle, info: info }
+    }
+
+    fn gc_free() {
+        @unsafe
+        EVP_PKEY_free(this.handle)
+    }
+}
+
+/// Converts a DER encoded ECDSA signature, as `sign` returns it, into the fixed-size form
+/// JWT and WebCrypto use: `r` and `s` side by side, each as long as the curve's size.
+///
+/// Throws `invalid_input` when `der` is not an ECDSA signature for `curve`.
++ fn ecdsa_signature_to_raw(der: local &[u8], curve: Curve) String !KeyError {
+    let size = curve_size(curve)
+    let reader = DerReader { data: bytes_to_string(der) }
+    let body = reader.element(0x30) !>
+    if !reader.done() : throw .invalid_input
+    let values = DerReader { data: body }
+    let r = values.element(0x02) !>
+    let s = values.element(0x02) !>
+    if !values.done() : throw .invalid_input
+    return fixed_width(r, size) !> + fixed_width(s, size) !>
+}
+
+/// Converts a fixed-size ECDSA signature (`r` and `s` side by side, as in JWT) into the DER
+/// form `verify` takes.
+///
+/// Throws `invalid_input` when `raw` is empty or has an odd length.
++ fn ecdsa_signature_from_raw(raw: local &[u8]) String !KeyError {
+    if raw.length == 0 || raw.length % 2 != 0 : throw .invalid_input
+    let half = raw.length / 2
+    return der_sequence(der_integer(bytes_to_string(raw.view(0, half))) + der_integer(bytes_to_string(raw.view(half, half))))
+}
+
+//////////////////////////////
+// Helpers
+//////////////////////////////
+
+fn generate_key(id: i32, command: i32, argument: i32) EVP_PKEY !KeyError {
+    @unsafe
+    let ctx = EVP_PKEY_CTX_new_id(id, null) ?! throw .failed
+    let key: ?EVP_PKEY = null
+    let ok = EVP_PKEY_keygen_init(ctx) == 1
+    if ok && command != 0 : ok = EVP_PKEY_CTX_ctrl(ctx, -1, -1, command, argument, null) > 0
+    ok = ok && EVP_PKEY_keygen(ctx, @ref(key)) == 1
+    EVP_PKEY_CTX_free(ctx)
+    if !ok || !isset(key) {
+        ERR_clear_error()
+        throw .failed
+    }
+    return key
+}
+
+struct KeyInfo {
+    key_type: KeyType
+    bits: uint
+}
+
+// The type and size of a key, read from the algorithm in its public key DER: the functions
+// that report them have other names in OpenSSL 1.1 than in 3
+fn key_info(key: EVP_PKEY) KeyInfo !KeyError {
+    @unsafe
+    let length = i2d_PUBKEY(key, null)
+    if length <= 0 {
+        ERR_clear_error()
+        throw .key
+    }
+    let der = String.alloc(length.to(uint))
+    let out: ptr = der.data
+    if i2d_PUBKEY(key, @ref(out)) != length {
+        ERR_clear_error()
+        throw .key
+    }
+    let outer = DerReader { data: der }
+    let info = DerReader { data: outer.element(0x30) ! throw .key }
+    let algorithm = DerReader { data: info.element(0x30) ! throw .key }
+    let oid = algorithm.element(0x06) ! throw .key
+    let public_bits = info.element(0x03) ! throw .key
+
+    // rsaEncryption and RSASSA-PSS: the bit string holds SEQUENCE { INTEGER n, INTEGER e }
+    if oid == oid_content(oid_rsa_encryption()) || oid == bytes_of(.{ 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0A }) {
+        if public_bits.bytes < 2 : throw .key
+        let rsa = DerReader { data: public_bits.range(1, public_bits.bytes - 1) }
+        let numbers = DerReader { data: rsa.element(0x30) ! throw .key }
+        return .{ key_type: KeyType.rsa, bits: unsigned_bits(numbers.element(0x02) ! throw .key) }
+    }
+    if oid == oid_content(oid_ec_public_key()) {
+        let curve = algorithm.element(0x06) ! throw .key
+        if curve == oid_content(curve_oid(Curve.p256)) : return .{ key_type: KeyType.ec, bits: 256 }
+        if curve == oid_content(curve_oid(Curve.p384)) : return .{ key_type: KeyType.ec, bits: 384 }
+        if curve == oid_content(curve_oid(Curve.p521)) : return .{ key_type: KeyType.ec, bits: 521 }
+        throw .key
+    }
+    // 1.3.101.112
+    if oid == bytes_of(.{ 0x2B, 0x65, 0x70 }) : return .{ key_type: KeyType.ed25519, bits: 253 }
+    throw .key
+}
+
+// The content of an encoded OBJECT IDENTIFIER, without tag and length
+fn oid_content(oid: String) String {
+    return oid.range(2, oid.bytes - 2)
+}
+
+// The significant bits of an unsigned big-endian number
+fn unsigned_bits(value: String) uint {
+    let start: uint = 0
+    while start < value.bytes && value.get(start) == 0 : start++
+    if start == value.bytes : return 0
+    let top = value.get(start)
+    let bits: uint = 0
+    while top > 0 {
+        bits++
+        top = top >> 1
+    }
+    return (value.bytes - start - 1) * 8 + bits
+}
+
+fn check_algorithm(key_type: KeyType, algorithm: SignatureAlgorithm) !KeyError {
+    if algorithm == SignatureAlgorithm.ed25519 {
+        if key_type != KeyType.ed25519 : throw .key
+        return
+    }
+    if algorithm == SignatureAlgorithm.ecdsa_sha256 || algorithm == SignatureAlgorithm.ecdsa_sha384 || algorithm == SignatureAlgorithm.ecdsa_sha512 {
+        if key_type != KeyType.ec : throw .key
+        return
+    }
+    if key_type != KeyType.rsa : throw .key
+}
+
+// The hash to sign with; Ed25519 hashes on its own
+fn signature_digest(algorithm: SignatureAlgorithm) ?EVP_MD {
+    if algorithm == SignatureAlgorithm.ed25519 : return null
+    if algorithm == SignatureAlgorithm.ecdsa_sha384 || algorithm == SignatureAlgorithm.rsa_pkcs1_sha384 || algorithm == SignatureAlgorithm.rsa_pss_sha384 : return EVP_sha384()
+    if algorithm == SignatureAlgorithm.ecdsa_sha512 || algorithm == SignatureAlgorithm.rsa_pkcs1_sha512 || algorithm == SignatureAlgorithm.rsa_pss_sha512 : return EVP_sha512()
+    return EVP_sha256()
+}
+
+// PSS padding with a salt as long as the hash, as JWT's PS algorithms require
+fn set_pss_padding(pctx: ?EVP_PKEY_CTX, algorithm: SignatureAlgorithm) bool {
+    @unsafe
+    if algorithm != SignatureAlgorithm.rsa_pss_sha256 && algorithm != SignatureAlgorithm.rsa_pss_sha384 && algorithm != SignatureAlgorithm.rsa_pss_sha512 : return true
+    if !isset(pctx) : return false
+    return EVP_PKEY_CTX_ctrl(pctx, -1, -1, EVP_PKEY_CTRL_RSA_PADDING, RSA_PKCS1_PSS_PADDING, null) > 0
+        && EVP_PKEY_CTX_ctrl(pctx, -1, -1, EVP_PKEY_CTRL_RSA_PSS_SALTLEN, RSA_PSS_SALTLEN_DIGEST, null) > 0
+}
+
+fn curve_nid(curve: Curve) i32 {
+    if curve == Curve.p384 : return NID_SECP384R1
+    if curve == Curve.p521 : return NID_SECP521R1
+    return NID_X9_62_PRIME256V1
+}
+
+fn curve_size(curve: Curve) uint {
+    if curve == Curve.p384 : return 48
+    if curve == Curve.p521 : return 66
+    return 32
+}
+
+fn pem_bio(pem: String) BIO !KeyError {
+    @unsafe
+    if pem.bytes > 0x7FFF_FFFF : throw .key
+    return BIO_new_mem_buf(pem.data, pem.bytes.to(i32)) ?! throw .failed
+}
+
+// The text written to a memory BIO; frees the BIO
+fn bio_text(bio: BIO) String {
+    @unsafe
+    let data: ?ptr = null
+    let length = BIO_ctrl(bio, BIO_CTRL_INFO, 0, @ref(data)).to(int)
+    let text = String.alloc(0)
+    if length > 0 && isset(data) {
+        text = String.alloc(length.to(uint))
+        mem.copy_bytes(data, text.data, length.to(uint))
+    }
+    BIO_free(bio)
+    return text
+}
+
+fn jwk_bytes(value: json.Value, name: String) String !KeyError {
+    let text = value.get_string(name) ! throw .key
+    let bytes = base64url_decode(text) ! throw .key
+    if bytes.bytes == 0 : throw .key
+    return bytes
+}
+
+// `bytes` as an unsigned number of exactly `size` bytes
+fn fixed_width(bytes: String, size: uint) String !KeyError {
+    let start: uint = 0
+    while start < bytes.bytes && bytes.get(start) == 0 : start++
+    let length = bytes.bytes - start
+    if length > size : throw .invalid_input
+    let result = ByteBuffer.new(size)
+    let pad = size - length
+    while pad-- > 0 : result.write_byte(0)
+    result.write(bytes.view(start, length))
+    return result.to_string()
+}

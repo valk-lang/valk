@@ -1,0 +1,656 @@
+use core
+use ext
+use fs
+use mem
+
+/// A time zone could not be loaded: `missing` when no zone has that name, `invalid` when its
+/// data or rule text is malformed.
++ error ZoneError (missing, invalid)
+
+// The offset, daylight saving flag and abbreviation in force for a stretch of time
+struct ZoneType {
+    offset: int
+    dst: bool
+    abbreviation: String
+}
+
+// A POSIX TZ date: `Jn` (kind 0), `n` (kind 1) or `Mm.w.d` (kind 2), and the local time of
+// day, in seconds, at which the change happens
+struct RuleDate {
+    kind: uint
+    day: int
+    month: uint
+    week: uint
+    weekday: int
+    time: int
+}
+
+// A POSIX TZ rule, such as `CET-1CEST,M3.5.0,M10.5.0/3`: the offsets a zone keeps using after
+// its last listed transition
+class ZoneRule {
+    std: ZoneType
+    dst: ZoneType
+    has_dst: bool
+    start: RuleDate
+    end: RuleDate
+
+    fn type_at(unix_seconds: int) ZoneType {
+        if !this.has_dst : return this.std
+        let year = year_of_day(floor_div(unix_seconds + this.std.offset, SECONDS_PER_DAY))
+        // The start is given in standard time, the end in daylight saving time
+        let start = rule_date_seconds(this.start, year) - this.std.offset
+        let end = rule_date_seconds(this.end, year) - this.dst.offset
+        if start < end {
+            if unix_seconds >= start && unix_seconds < end : return this.dst
+            return this.std
+        }
+        // Southern hemisphere: daylight saving time spans the new year
+        if unix_seconds >= end && unix_seconds < start : return this.std
+        return this.dst
+    }
+}
+
+/// A time zone: the UTC offsets, daylight saving time and abbreviations of a region through
+/// its history.
+///
+/// Get one with `time.zone`, `time.local_zone`, `time.utc` or `time.fixed_zone`, and use it
+/// with `DateTime.in_zone`, `DateTime.now_in` and `DateTime.new_in`. A zone never changes
+/// after it is created.
++ class Zone {
+    /// The name, such as `Europe/Amsterdam`, `UTC` or `+02:00`.
+    ~ name: String
+    transitions: Array[int] (.{})
+    transition_types: Array[u8] (.{})
+    types: Array[ZoneType] (.{})
+    rule: ?ZoneRule (null)
+
+    /// Returns the offset from UTC in seconds at the instant `unix_seconds`, positive east of
+    /// Greenwich: 3600 for CET, -18000 for EST.
+    + fn offset_at(unix_seconds: int) int {
+        return this.type_at(unix_seconds).offset
+    }
+
+    /// Returns the abbreviation in use at the instant `unix_seconds`, such as `CET` or `CEST`.
+    ///
+    /// Zones without a customary abbreviation use their offset, such as `+04`.
+    + fn abbreviation_at(unix_seconds: int) String {
+        return this.type_at(unix_seconds).abbreviation
+    }
+
+    /// Returns whether daylight saving time is in effect at the instant `unix_seconds`.
+    + fn is_dst_at(unix_seconds: int) bool {
+        return this.type_at(unix_seconds).dst
+    }
+
+    fn type_at(unix_seconds: int) ZoneType {
+        let count = this.transitions.length
+        if count == 0 || unix_seconds >= this.transitions[count - 1] {
+            let rule = this.rule
+            if isset(rule) : return rule.type_at(unix_seconds)
+            if count == 0 : return this.types[0]
+            return this.types[this.transition_types[count - 1].to(uint)]
+        }
+        if unix_seconds < this.transitions[0] : return this.types[0]
+        // The last transition at or before the instant
+        let low: uint = 0
+        let high: uint = count - 1
+        while high - low > 1 {
+            let middle = (low + high) / 2
+            if this.transitions[middle] <= unix_seconds : low = middle
+            else : high = middle
+        }
+        return this.types[this.transition_types[low].to(uint)]
+    }
+
+    // The offset that turns the wall-clock time `wall` (seconds, counted as if it were UTC)
+    // into an instant. A time that happens twice takes its first occurrence; one that the
+    // clocks skip takes the offset from before the gap, which moves it past the gap
+    fn offset_for_wall(wall: int) int {
+        let before = this.offset_at(wall - SECONDS_PER_DAY)
+        let after = this.offset_at(wall + SECONDS_PER_DAY)
+        if this.offset_at(wall - before) == before : return before
+        if this.offset_at(wall - after) == after : return after
+        return before
+    }
+}
+
+//////////////////////////////
+// Getting zones
+//////////////////////////////
+
+global zone_cache: ?HashMap[String, Zone] (null)
+global utc_zone: ?Zone (null)
+global local_zone_value: ?Zone (null)
+
+/// Returns the time zone called `name` in the IANA time zone database, such as
+/// `Europe/Amsterdam` or `America/New_York`.
+///
+/// Zones come from the system's database, `/usr/share/zoneinfo` or the directory in the
+/// `TZDIR` environment variable. Windows has no such database, so there a copy built into
+/// the standard library is used. `UTC` always exists. Loaded zones are kept per thread, so
+/// asking again is cheap. Throws `missing` when no zone has that name and `invalid` when its
+/// data is malformed.
++ fn zone(name: String) Zone !ZoneError {
+    if name == "UTC" : return utc()
+    let cache = zone_cache ?? HashMap[String, Zone].new()
+    zone_cache = cache
+    let cached = cache.get(name) ! {
+        let loaded = load_zone(name) !>
+        cache.set(name, loaded)
+        return loaded
+    }
+    return cached
+}
+
+/// Returns the UTC zone: offset 0, no daylight saving time.
++ fn utc() Zone {
+    let zone = utc_zone ?? fixed_zone_named("UTC", 0)
+    utc_zone = zone
+    return zone
+}
+
+/// Returns a zone that is always `offset_seconds` east of UTC, without daylight saving time.
+///
+/// It is named after its offset, such as `+02:00` or `-05:30`. Panics when the offset is 24
+/// hours or more either way.
++ fn fixed_zone(offset_seconds: int) Zone {
+    if offset_seconds <= -SECONDS_PER_DAY || offset_seconds >= SECONDS_PER_DAY : panic("A fixed zone offset must be under 24 hours, got " + offset_seconds)
+    return fixed_zone_named(offset_name(offset_seconds), offset_seconds)
+}
+
+/// Returns the time zone this program runs in.
+///
+/// The `TZ` environment variable decides when it is set: a zone name such as
+/// `Europe/Paris`, the path of a zone file, or a POSIX rule such as
+/// `EST5EDT,M3.2.0,M11.1.0`; an empty `TZ` means UTC. Without it, `/etc/localtime` is used,
+/// or the time zone settings on Windows. When none of these gives a zone, the result is UTC.
+/// The zone is looked up once per thread.
++ fn local_zone() Zone {
+    let cached = local_zone_value
+    if isset(cached) : return cached
+    let tz = core.getenv("TZ") ! {
+        let zone = system_local_zone() ?? utc()
+        local_zone_value = zone
+        return zone
+    }
+    let zone = zone_from_tz(tz) ?? utc()
+    local_zone_value = zone
+    return zone
+}
+
+/// Returns a zone read from `data`, the contents of a TZif zone file, and named `name`.
+///
+/// For zone data that does not come from the system, such as a file shipped with a program.
+/// Throws `invalid` when the data is malformed.
++ fn zone_from_tzif(name: String, data: String) Zone !ZoneError {
+    return parse_tzif(name, data) !>
+}
+
+/// Returns a zone following the POSIX TZ rule `rule`, such as `CET-1CEST,M3.5.0,M10.5.0/3`,
+/// and named after it.
+///
+/// As in the `TZ` environment variable, the offsets count hours west of UTC. Daylight saving
+/// time without dates follows the United States rules. Throws `invalid` when the rule is
+/// malformed.
++ fn zone_from_posix(rule: String) Zone !ZoneError {
+    let parsed = parse_rule(rule) !>
+    return Zone { name: rule, types: .{ parsed.std }, rule: parsed }
+}
+
+fn fixed_zone_named(name: String, offset: int) Zone {
+    return Zone {
+        name: name
+        types: .{ ZoneType { offset: offset, dst: false, abbreviation: name } }
+    }
+}
+
+fn load_zone(name: String) Zone !ZoneError {
+    if !zone_name_valid(name) : throw .missing
+    #if OS == "win"
+    let data = embedded_zone(name) ?! throw .missing
+    return parse_tzif(name, data) !>
+    #else
+    let dir = core.getenv("TZDIR") !? "/usr/share/zoneinfo"
+    let path = dir + "/" + name
+    if !fs.is_file(path) : throw .missing
+    let data = fs.read(path) ! throw .missing
+    return parse_tzif(name, data) !>
+    #end
+}
+
+// Zone names are paths inside the database: the characters they use, never absolute and
+// never climbing out of it
+fn zone_name_valid(name: String) bool {
+    if name.bytes == 0 || name.bytes > 255 || name.get(0) == '/' : return false
+    let i: uint = 0
+    while i < name.bytes {
+        let ch = name.get(i++)
+        if ch >= 'a' && ch <= 'z' : continue
+        if ch >= 'A' && ch <= 'Z' : continue
+        if ch >= '0' && ch <= '9' : continue
+        if ch == '/' || ch == '_' || ch == '-' || ch == '+' : continue
+        return false
+    }
+    return true
+}
+
+// The value of TZ: empty for UTC, `:` optionally in front, a file path, a zone name or a
+// POSIX rule
+fn zone_from_tz(tz: String) ?Zone {
+    if tz.bytes == 0 : return utc()
+    let value = tz.starts_with(":") ? tz.range(1, tz.bytes - 1) : tz
+    if value.starts_with("/") {
+        let data = fs.read(value) ! return null
+        return parse_tzif(zone_name_from_path(value) ?? value, data) ! return null
+    }
+    let named = zone(value) ! {
+        return zone_from_posix(value) ! return null
+    }
+    return named
+}
+
+// The zone name at the end of a path into a zone database
+fn zone_name_from_path(path: String) ?String {
+    let marker = "zoneinfo/"
+    let at = path.index_of(marker) ! return null
+    let name = path.range(at + marker.bytes, path.bytes - at - marker.bytes)
+    if name.starts_with("posix/") : name = name.range(6, name.bytes - 6)
+    if name.bytes == 0 : return null
+    return name
+}
+
+#if OS == "win"
+fn system_local_zone() ?Zone {
+    @unsafe
+    let info: ext.DYNAMIC_TIME_ZONE_INFORMATION = @undefined
+    if ext.GetDynamicTimeZoneInformation(@ref(info)) == 0xFFFF_FFFF : return null
+    let name = fs.windows_cstring(@ref(info.TimeZoneKeyName).@cast(*u16), 128) !? "Local"
+    let std_offset = -(info.Bias.to(int) + info.StandardBias.to(int)) * 60
+    let std = ZoneType { offset: std_offset, dst: false, abbreviation: offset_abbreviation(std_offset) }
+    let rule = ZoneRule { std: std, dst: std, has_dst: false, start: default_start(), end: default_end() }
+    // A recurring rule has year 0; one-off dates only apply to their own year and are left out
+    let daylight = info.DaylightDate
+    let standard = info.StandardDate
+    if info.DynamicDaylightTimeDisabled == 0 && daylight.wMonth != 0 && standard.wMonth != 0 && daylight.wYear == 0 && standard.wYear == 0 {
+        let dst_offset = -(info.Bias.to(int) + info.DaylightBias.to(int)) * 60
+        rule.dst = ZoneType { offset: dst_offset, dst: true, abbreviation: offset_abbreviation(dst_offset) }
+        rule.has_dst = true
+        rule.start = windows_rule_date(daylight)
+        rule.end = windows_rule_date(standard)
+    }
+    return Zone { name: name, types: .{ std }, rule: rule }
+}
+
+fn windows_rule_date(date: ext.SYSTEMTIME) RuleDate {
+    return RuleDate {
+        kind: 2
+        day: 0
+        month: date.wMonth.to(uint)
+        week: date.wDay.to(uint)
+        weekday: date.wDayOfWeek.to(int)
+        time: date.wHour.to(int) * SECONDS_PER_HOUR + date.wMinute.to(int) * SECONDS_PER_MINUTE + date.wSecond.to(int)
+    }
+}
+
+// The zone in the bundle built by misc/generate-tzdata.py
+fn embedded_zone(name: String) ?String {
+    @unsafe
+    let bundle = tzdata_bundle()
+    if bundle.bytes < 9 || !bundle.starts_with("VTZ1") : return null
+    let reader = bundle.reader()
+    reader.pos = 4
+    reader.skip(reader.read_byte().to(uint))
+    let count = reader.read_u32_be().to(uint)
+    let found = false
+    let offset: uint = 0
+    let length: uint = 0
+    while count-- > 0 {
+        let name_length = reader.read_byte().to(uint)
+        let at = reader.pos
+        reader.skip(name_length)
+        let data_offset = reader.read_u32_be().to(uint)
+        let data_length = reader.read_u32_be().to(uint)
+        if !found && name_length == name.bytes && mem.equals_bytes(bundle.data + at, name.data, name_length) {
+            found = true
+            offset = data_offset
+            length = data_length
+        }
+    }
+    if !found : return null
+    // The zone files follow the list of names
+    let start = reader.pos + offset
+    if start > bundle.bytes || length > bundle.bytes - start : return null
+    return bundle.range(start, length)
+}
+
+fn tzdata_bundle() String {
+    return #embed("data/tzdata.bin")
+}
+#else
+fn system_local_zone() ?Zone {
+    let data = fs.read("/etc/localtime") ! return null
+    return parse_tzif(localtime_name() ?? "Local", data) ! return null
+}
+
+// /etc/localtime usually links into the zone database, so its target ends in the zone name
+fn localtime_name() ?String {
+    @unsafe
+    let buffer = mem.alloc(1024)
+    let length = ext.readlink("/etc/localtime".data_cstring, buffer, 1024)
+    if length <= 0 || length >= 1024 {
+        mem.free(buffer)
+        return null
+    }
+    let target = String.alloc(length.to(uint))
+    mem.copy_bytes(buffer, target.data, length.to(uint))
+    mem.free(buffer)
+    return zone_name_from_path(target)
+}
+#end
+
+//////////////////////////////
+// TZif data
+//////////////////////////////
+
+struct TzifCounts {
+    utc_flags: uint
+    std_flags: uint
+    leaps: uint
+    times: uint
+    types: uint
+    chars: uint
+}
+
+// Reads a TZif file (RFC 8536): the 64-bit data of version 2 and up, with the POSIX rule
+// after it, or the 32-bit data of a version 1 file
+fn parse_tzif(name: String, data: String) Zone !ZoneError {
+    let counts = tzif_counts(data, 0) !>
+    let at: uint = 44
+    let time_size: uint = 4
+    let version = data.get(4)
+    if version >= '2' {
+        at += tzif_block_size(counts, 4)
+        counts = tzif_counts(data, at) !>
+        at += 44
+        time_size = 8
+    }
+    let block_end = at + tzif_block_size(counts, time_size)
+    if block_end > data.bytes : throw .invalid
+    // Transition types are indexed by a byte
+    if counts.types == 0 || counts.types > 256 || counts.chars == 0 : throw .invalid
+
+    let reader = data.reader()
+    reader.pos = at
+    let transitions = Array[int].new(counts.times)
+    let i: uint = 0
+    while i++ < counts.times {
+        let time = read_signed(reader, time_size)
+        if transitions.length > 0 && time <= transitions[transitions.length - 1] : throw .invalid
+        transitions.append(time)
+    }
+    let transition_types = Array[u8].new(counts.times)
+    i = 0
+    while i++ < counts.times {
+        let index = reader.read_byte()
+        if index.to(uint) >= counts.types : throw .invalid
+        transition_types.append(index)
+    }
+    // Local time types: offset, daylight saving flag, abbreviation index
+    let chars_at = reader.pos + counts.types * 6
+    let types = Array[ZoneType].new(counts.types)
+    i = 0
+    while i++ < counts.types {
+        let offset = read_signed(reader, 4)
+        let dst = reader.read_byte() != 0
+        let abbreviation_index = reader.read_byte().to(uint)
+        if abbreviation_index >= counts.chars : throw .invalid
+        types.append(ZoneType {
+            offset: offset
+            dst: dst
+            abbreviation: tzif_abbreviation(data, chars_at + abbreviation_index, chars_at + counts.chars)
+        })
+    }
+    let zone = Zone { name: name, transitions: transitions, transition_types: transition_types, types: types }
+
+    // Version 2 and up: a POSIX rule between newlines covers the times after the last
+    // transition
+    if time_size == 8 && block_end < data.bytes && data.get(block_end) == '\n' {
+        let rule_end = data.index_of_byte('\n', block_end + 1) ! throw .invalid
+        if rule_end > block_end + 1 {
+            zone.rule = parse_rule(data.range(block_end + 1, rule_end - block_end - 1)) !>
+        }
+    }
+    return zone
+}
+
+fn tzif_counts(data: String, at: uint) TzifCounts !ZoneError {
+    if at > data.bytes || data.bytes - at < 44 : throw .invalid
+    if data.get(at) != 'T' || data.get(at + 1) != 'Z' || data.get(at + 2) != 'i' || data.get(at + 3) != 'f' : throw .invalid
+    let reader = data.reader()
+    reader.pos = at + 20
+    return TzifCounts {
+        utc_flags: reader.read_u32_be().to(uint)
+        std_flags: reader.read_u32_be().to(uint)
+        leaps: reader.read_u32_be().to(uint)
+        times: reader.read_u32_be().to(uint)
+        types: reader.read_u32_be().to(uint)
+        chars: reader.read_u32_be().to(uint)
+    }
+}
+
+fn tzif_block_size(counts: TzifCounts, time_size: uint) uint {
+    return counts.times * (time_size + 1) + counts.types * 6 + counts.chars
+        + counts.leaps * (time_size + 4) + counts.std_flags + counts.utc_flags
+}
+
+fn read_signed(reader: ByteReader, size: uint) int {
+    if size == 8 : return reader.read_u64_be().to(int)
+    return reader.read_u32_be().to(i32).to(int)
+}
+
+fn tzif_abbreviation(data: String, start: uint, end: uint) String {
+    let at = start
+    while at < end && data.get(at) != 0 : at++
+    return data.range(start, at - start)
+}
+
+//////////////////////////////
+// POSIX TZ rules
+//////////////////////////////
+
+// The text of a rule being parsed
+class RuleText {
+    text: String
+    pos: uint (0)
+
+    fn done() bool {
+        return this.pos >= this.text.bytes
+    }
+    fn peek() u8 {
+        if this.done() : return 0
+        return this.text.get(this.pos)
+    }
+    fn expect(ch: u8) !ZoneError {
+        if this.peek() != ch : throw .invalid
+        this.pos++
+    }
+
+    // A name of at least three letters, or anything between `<` and `>`, such as `<+03>`
+    fn name() String !ZoneError {
+        if this.peek() == '<' {
+            this.pos++
+            let start = this.pos
+            while !this.done() && this.peek() != '>' : this.pos++
+            if this.done() || this.pos == start : throw .invalid
+            let name = this.text.range(start, this.pos - start)
+            this.pos++
+            return name
+        }
+        let start = this.pos
+        while (this.peek() >= 'a' && this.peek() <= 'z') || (this.peek() >= 'A' && this.peek() <= 'Z') : this.pos++
+        if this.pos - start < 3 : throw .invalid
+        return this.text.range(start, this.pos - start)
+    }
+
+    // `[+-]hh[:mm[:ss]]` in seconds, sign included
+    fn time() int !ZoneError {
+        let sign = 1
+        if this.peek() == '+' : this.pos++
+        else if this.peek() == '-' {
+            sign = -1
+            this.pos++
+        }
+        let seconds = this.number(0, 167) !> * SECONDS_PER_HOUR
+        if this.peek() == ':' {
+            this.pos++
+            seconds += this.number(0, 59) !> * SECONDS_PER_MINUTE
+            if this.peek() == ':' {
+                this.pos++
+                seconds += this.number(0, 59) !>
+            }
+        }
+        return sign * seconds
+    }
+
+    fn number(min: int, max: int) int !ZoneError {
+        let start = this.pos
+        let value: int = 0
+        while this.peek() >= '0' && this.peek() <= '9' && this.pos - start < 4 {
+            value = value * 10 + (this.peek() - '0').to(int)
+            this.pos++
+        }
+        if this.pos == start || value < min || value > max : throw .invalid
+        return value
+    }
+
+    fn date() RuleDate !ZoneError {
+        let date = RuleDate { kind: 1, day: 0, month: 1, week: 1, weekday: 0, time: 2 * SECONDS_PER_HOUR }
+        if this.peek() == 'J' {
+            this.pos++
+            date.kind = 0
+            date.day = this.number(1, 365) !>
+        } else if this.peek() == 'M' {
+            this.pos++
+            date.kind = 2
+            let month = this.number(1, 12) !>
+            date.month = month.to(uint)
+            this.expect('.') !>
+            let week = this.number(1, 5) !>
+            date.week = week.to(uint)
+            this.expect('.') !>
+            date.weekday = this.number(0, 6) !>
+        } else {
+            date.day = this.number(0, 365) !>
+        }
+        if this.peek() == '/' {
+            this.pos++
+            date.time = this.time() !>
+        }
+        return date
+    }
+}
+
+fn parse_rule(text: String) ZoneRule !ZoneError {
+    let rule_text = RuleText { text: text }
+    let std_name = rule_text.name() !>
+    // POSIX offsets count west of UTC
+    let std = ZoneType { offset: -(rule_text.time() !>), dst: false, abbreviation: std_name }
+    let rule = ZoneRule { std: std, dst: std, has_dst: false, start: default_start(), end: default_end() }
+    if rule_text.done() : return rule
+
+    let dst_name = rule_text.name() !>
+    let dst_offset = std.offset + SECONDS_PER_HOUR
+    if !rule_text.done() && rule_text.peek() != ',' : dst_offset = -(rule_text.time() !>)
+    rule.dst = ZoneType { offset: dst_offset, dst: true, abbreviation: dst_name }
+    rule.has_dst = true
+    if !rule_text.done() {
+        rule_text.expect(',') !>
+        rule.start = rule_text.date() !>
+        rule_text.expect(',') !>
+        rule.end = rule_text.date() !>
+        if !rule_text.done() : throw .invalid
+    }
+    return rule
+}
+
+// The United States rules, which POSIX leaves as the default: the second Sunday of March to
+// the first Sunday of November, at 02:00
+fn default_start() RuleDate {
+    return RuleDate { kind: 2, day: 0, month: 3, week: 2, weekday: 0, time: 2 * SECONDS_PER_HOUR }
+}
+fn default_end() RuleDate {
+    return RuleDate { kind: 2, day: 0, month: 11, week: 1, weekday: 0, time: 2 * SECONDS_PER_HOUR }
+}
+
+// The local seconds since the epoch, counted as if UTC, at which `date` happens in `year`
+fn rule_date_seconds(date: RuleDate, year: int) int {
+    let first = day_of_civil(year, 1, 1)
+    let day: int = 0
+    if date.kind == 0 {
+        // Julian day 1 to 365, February 29 never counted
+        day = date.day - 1
+        if year_is_leap(year) && date.day >= 60 : day++
+    } else if date.kind == 1 {
+        day = date.day
+    } else {
+        // Weekday `weekday` of week `week` in `month`, week 5 being the last
+        let month_start = day_of_civil(year, date.month, 1)
+        let month_day = 1 + floor_mod(date.weekday - weekday_of_day(month_start), 7) + (date.week.to(int) - 1) * 7
+        let last_day = days_in_month(year, date.month).to(int)
+        while month_day > last_day : month_day -= 7
+        day = month_start - first + month_day - 1
+    }
+    return (first + day) * SECONDS_PER_DAY + date.time
+}
+
+// Days since 1970-01-01
+fn day_of_civil(year: int, month: uint, day: uint) int {
+    return floor_div(timestamp_from_parts(year, month, day, 0, 0, 0, 0), SECONDS_PER_DAY * MICROSECONDS_PER_SECOND)
+}
+
+// 0 for Sunday; 1970-01-01 was a Thursday
+fn weekday_of_day(day: int) int {
+    return floor_mod(day + 4, 7)
+}
+
+fn year_of_day(day: int) int {
+    // Keep far-off instants inside what the calendar conversion handles
+    if day > 4_000_000 : day = 4_000_000
+    if day < -4_000_000 : day = -4_000_000
+    return parts_from_timestamp(day * SECONDS_PER_DAY * MICROSECONDS_PER_SECOND).year
+}
+
+//////////////////////////////
+// Offset text
+//////////////////////////////
+
+// `+02:00`, `-05:30`, `+00:19:32`
+fn offset_name(offset: int) String {
+    let result = ByteBuffer.new(9)
+    write_offset(result, offset, true)
+    return result
+}
+
+// `+02`, `-0530`, as the tz database writes offsets without a customary abbreviation
+fn offset_abbreviation(offset: int) String {
+    let result = ByteBuffer.new(7)
+    let sign: u8 = offset < 0 ? '-' : '+'
+    let value = (offset < 0 ? -offset : offset).to(uint)
+    result.write_byte(sign)
+    write_datetime_padded(result, value / 3600, 2)
+    if value % 3600 / 60 != 0 : write_datetime_padded(result, value % 3600 / 60, 2)
+    return result
+}
+
+fn write_offset(result: ByteBuffer, offset: int, colons: bool) {
+    let sign: u8 = offset < 0 ? '-' : '+'
+    let value = (offset < 0 ? -offset : offset).to(uint)
+    result.write_byte(sign)
+    write_datetime_padded(result, value / 3600, 2)
+    if colons : result.write_byte(':')
+    write_datetime_padded(result, value % 3600 / 60, 2)
+    if value % 60 != 0 {
+        if colons : result.write_byte(':')
+        write_datetime_padded(result, value % 60, 2)
+    }
+}

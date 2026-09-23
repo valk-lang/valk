@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [regex](#regex) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [log](#log) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [regex](#regex) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -1774,18 +1774,40 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 
 # crypto
 
+## Aliases for 'crypto'
+
+```js
+// The nonce size in bytes of every `Cipher`.
++ value CIPHER_NONCE_SIZE (12)
+// The size in bytes of the authentication tag every `Cipher` appends.
++ value CIPHER_TAG_SIZE (16)
+type c_long (int)
+```
+
 ## Errors for 'crypto'
 
 ```js
+// Thrown by `encrypt`, `decrypt`, `seal` and `unseal`.
+error CipherError (invalid_input, auth, failed)
 // Thrown by the decoders, password hashes and key derivation functions of `crypto`.
 error CryptoError (invalid_input, write)
+// Thrown by `PrivateKey`, `PublicKey` and the ECDSA signature conversions.
+error KeyError (invalid_input, key, failed)
 ```
 
 ## Enums for 'crypto'
 
 ```js
+// An authenticated encryption algorithm (AEAD) for `encrypt` and `decrypt`.
++ enum Cipher { aes_128_gcm, aes_256_gcm, chacha20_poly1305 }
+// An elliptic curve for ECDSA keys: NIST P-256, P-384 or P-521.
++ enum Curve { p256, p384, p521 }
 // The hash functions available through `hasher`, `hash` and `Hmac`.
 + enum HashAlgorithm { md5, sha1, sha256, sha384, sha512 }
+// The kind of a `PrivateKey` or `PublicKey`.
++ enum KeyType { rsa, ec, ed25519 }
+// How `PrivateKey.sign` and `PublicKey.verify` hash and pad.
++ enum SignatureAlgorithm { ed25519, ecdsa_sha256, ecdsa_sha384, ecdsa_sha512, rsa_pkcs1_sha256, rsa_pkcs1_sha384, rsa_pkcs1_sha512, rsa_pss_sha256, rsa_pss_sha384, rsa_pss_sha512 }
 ```
 
 ## Functions for 'crypto'
@@ -1807,16 +1829,30 @@ error CryptoError (invalid_input, write)
 + fn base64_encode_into(data: local &[u8], out: Writer) uint !io:IoError
 // Returns the number of base64 characters that encode `length` bytes, padding included.
 + fn base64_encoded_size(length: uint) uint
+// Decodes URL-safe base64 (`-` and `_`), with or without `=` padding.
++ fn base64url_decode(text: local &[u8]) String !CryptoError
+// Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
++ fn base64url_encode(data: local &[u8]) String
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
 + fn bcrypt(cost: uint, salt: local &[u8], password: local &[u8], output: ByteBuffer) void !CryptoError
 // Hashes `password` with bcrypt and a fresh random salt, for storing credentials.
 + fn bcrypt_hash(password: local &[u8], cost: uint (12)) String !CryptoError
 // Returns whether `password` matches the bcrypt `hash` string.
 + fn bcrypt_verify(password: local &[u8], hash: local &[u8]) bool
+// Returns the key size in bytes that `cipher` takes: 16 for AES-128-GCM, 32 for the others.
++ fn cipher_key_size(cipher: Cipher) uint
 // Returns whether `a` and `b` hold the same bytes, in time that depends only on their length.
 + fn constant_time_equals(a: local &[u8], b: local &[u8]) bool
+// Decrypts `ciphertext`, as returned by `encrypt`, with the same `key`, `nonce` and `aad`.
++ fn decrypt(cipher: Cipher, key: local &[u8], nonce: local &[u8], ciphertext: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the digest size in bytes of `algorithm`.
 + fn digest_size(algorithm: HashAlgorithm) uint
+// Converts a fixed-size ECDSA signature (`r` and `s` side by side, as in JWT) into the DER form `verify` takes.
++ fn ecdsa_signature_from_raw(raw: local &[u8]) String !KeyError
+// Converts a DER encoded ECDSA signature, as `sign` returns it, into the fixed-size form JWT and WebCrypto use: `r` and `s` side by side, each as long as the curve's size.
++ fn ecdsa_signature_to_raw(der: local &[u8], curve: Curve) String !KeyError
+// Encrypts `plaintext` with `key` and the 12-byte `nonce`, and returns the ciphertext with the 16-byte tag appended.
++ fn encrypt(cipher: Cipher, key: local &[u8], nonce: local &[u8], plaintext: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the raw digest of `data` as binary bytes (not text).
 + fn hash(algorithm: HashAlgorithm, data: local &[u8]) String
 // Returns the digest of `data` as lowercase hex.
@@ -1863,6 +1899,8 @@ error CryptoError (invalid_input, write)
 + fn random_bytes_in(out: local mut &[u8]) uint
 // Writes `length` cryptographically secure random bytes to `out`; returns the bytes written.
 + fn random_bytes_into(length: uint, out: Writer) uint !io:IoError
+// Encrypts `plaintext` with AES-256-GCM under the 32-byte `key` and a random nonce, and returns the nonce, ciphertext and tag together, ready for `unseal`.
++ fn seal(key: local &[u8], plaintext: local &[u8], aad: local &[u8] ("")) String !CipherError
 // Returns the SHA-1 digest of `data` as lowercase hex.
 + fn sha1_hex(data: local &[u8]) String
 // Writes the SHA-1 digest of `data` as hex into `out`; see `hash_hex_in`.
@@ -1887,6 +1925,8 @@ error CryptoError (invalid_input, write)
 + fn sha512_hex_in(data: local &[u8], out: local mut &[u8]) uint
 // Writes the SHA-512 digest of `data` as lowercase hex to `out`; returns the bytes written.
 + fn sha512_hex_into(data: local &[u8], out: Writer) uint !io:IoError
+// Decrypts what `seal` returned, with the same `key` and `aad`.
++ fn unseal(key: local &[u8], sealed: local &[u8], aad: local &[u8] ("")) String !CipherError
 ```
 
 ## Classes for 'crypto'
@@ -1958,6 +1998,56 @@ error CryptoError (invalid_input, write)
     + fn reset() void
     // Feeds more input into the hash.
     + fn update(data: local &[u8]) void
+}
+```
+
+```js
+// A private key for signing: RSA, ECDSA or Ed25519.
++ class PrivateKey {
+    // Returns the key size in bits: the modulus for RSA, the curve size for EC, 253 for Ed25519.
+    + fn bits() uint
+    // Reads a DER private key, PKCS#8 or the older RSA and EC forms.
+    + static fn from_der(der: local &[u8]) PrivateKey !KeyError
+    // Returns the Ed25519 key whose 32-byte private seed is `seed`.
+    + static fn from_ed25519_seed(seed: local &[u8]) PrivateKey !KeyError
+    // Reads a PEM private key: PKCS#8 (`BEGIN PRIVATE KEY`, or `ENCRYPTED PRIVATE KEY` with `password`) or the older RSA and EC forms.
+    + static fn from_pem(pem: String, password: String ("")) PrivateKey !KeyError
+    // Generates an ECDSA key on `curve`.
+    + static fn generate_ec(curve: Curve (Curve.p256)) PrivateKey !KeyError
+    // Generates an Ed25519 key.
+    + static fn generate_ed25519() PrivateKey !KeyError
+    // Generates an RSA key of `bits` bits, 2048 to 16384.
+    + static fn generate_rsa(bits: uint (2048)) PrivateKey !KeyError
+    // Returns the kind of key.
+    + fn key_type() KeyType
+    // Returns the public half of the key.
+    + fn public_key() PublicKey !KeyError
+    // Signs `data` with `algorithm` and returns the signature.
+    + fn sign(algorithm: SignatureAlgorithm, data: local &[u8]) String !KeyError
+    // Returns the key as unencrypted PKCS#8 PEM text (`BEGIN PRIVATE KEY`).
+    + fn to_pem() String !KeyError
+}
+```
+
+```js
+// A public key for checking signatures: RSA, ECDSA or Ed25519.
++ class PublicKey {
+    // Returns the key size in bits: the modulus for RSA, the curve size for EC, 253 for Ed25519.
+    + fn bits() uint
+    // Reads a DER public key in the SubjectPublicKeyInfo form.
+    + static fn from_der(der: local &[u8]) PublicKey !KeyError
+    // Returns the Ed25519 public key with the 32 bytes `raw`.
+    + static fn from_ed25519(raw: local &[u8]) PublicKey !KeyError
+    // Reads a public key in JSON Web Key form (RFC 7517), as found in the JWKS documents of OAuth and OpenID providers.
+    + static fn from_jwk(jwk: String) PublicKey !KeyError
+    // Reads a PEM public key (`BEGIN PUBLIC KEY`) or the key of a certificate (`BEGIN CERTIFICATE`).
+    + static fn from_pem(pem: String) PublicKey !KeyError
+    // Returns the kind of key.
+    + fn key_type() KeyType
+    // Returns the key as PEM text (`BEGIN PUBLIC KEY`).
+    + fn to_pem() String !KeyError
+    // Returns whether `signature` is a valid signature of `data` by this key with `algorithm`.
+    + fn verify(algorithm: SignatureAlgorithm, data: local &[u8], signature: local &[u8]) bool
 }
 ```
 
@@ -3544,6 +3634,89 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 }
 ```
 
+# log
+
+## Enums for 'log'
+
+```js
+// How records are written: `text` as one readable line each, `json` as one JSON object per line for log collectors.
++ enum Format { text, json }
+// How important a log record is. A logger drops records below its level.
++ enum Level { debug, info, warn, error }
+```
+
+## Functions for 'log'
+
+```js
+// Writes a debug record with this thread's logger; see `Logger.write`.
++ fn debug(message: String, fields: ?Map[Field] (null)) void
+// Returns this thread's logger, which the functions of this namespace write with.
++ fn default() Logger
+// Returns whether a record of `level` would be written.
++ fn enabled(level: Level) bool
+// Writes an error record with this thread's logger; see `Logger.write`.
++ fn error(message: String, fields: ?Map[Field] (null)) void
+// Writes an info record with this thread's logger; see `Logger.write`.
++ fn info(message: String, fields: ?Map[Field] (null)) void
+// Returns the lowest level that is written.
++ fn level() Level
+// Returns the level named `name`: `debug`, `info`, `warn` (or `warning`) or `error`, in any case, such as from an environment variable.
++ fn parse_level(name: String) Level !LookupError
+// Sets the record layout for every thread; `text` at the start.
++ fn set_format(format: Format) void
+// Sets the lowest level that is written, for every thread; `info` at the start.
++ fn set_level(level: Level) void
+// Makes timestamps use the local time zone instead of UTC, for every thread.
++ fn set_local_time(enabled: bool) void
+// Appends records to the file at `path`, created when missing, for every thread.
++ fn to_file(path: String) void !io:IoError
+// Writes records to standard error, for every thread; the destination at the start.
++ fn to_stderr() void
+// Writes records to standard output, for every thread.
++ fn to_stdout() void
+// Writes a warning record with this thread's logger; see `Logger.write`.
++ fn warn(message: String, fields: ?Map[Field] (null)) void
+// Returns this thread's logger with `fields` added to every record; see `Logger.with`.
++ fn with(fields: Map[Field]) Logger
+```
+
+## Classes for 'log'
+
+```js
+// The value of a log field: text, a number, a bool or null.
++ union Field : String | bool | float | int | uint | null {
+}
+```
+
+```js
+// Writes log records to one `io.Writer`, one write per record.
++ class Logger {
+    // The layout of the records.
+    + format: Format
+    // The lowest level that is written.
+    + level: Level
+    // Whether timestamps use the local time zone instead of UTC.
+    + local_time: bool
+
+    // Writes a debug record.
+    + fn debug(message: String, fields: ?Map[Field] (null)) void
+    // Returns whether a record of `level` would be written; use it to skip preparing expensive fields.
+    + fn enabled(level: Level) bool
+    // Writes an error record.
+    + fn error(message: String, fields: ?Map[Field] (null)) void
+    // Writes an info record.
+    + fn info(message: String, fields: ?Map[Field] (null)) void
+    // Returns a logger that writes to `out`, standard error when it is null.
+    + static fn new(out: ?Writer (null), level: Level (Level.info), format: Format (Format.text)) Logger
+    // Writes a warning record.
+    + fn warn(message: String, fields: ?Map[Field] (null)) void
+    // Returns a logger that writes where this one does and adds `fields` to every record, after the fields this logger already adds.
+    + fn with(fields: Map[Field]) Logger
+    // Writes a record of `level` with `message` and `fields`, when the level is enabled.
+    + fn write(level: Level, message: String, fields: ?Map[Field] (null)) void
+}
+```
+
 # markdown
 
 ## Functions for 'markdown'
@@ -3794,6 +3967,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     ~ error_code: uint
     // The socket descriptor the handshake ran on.
     ~ fd: i32
+    // True once `set_host` named the server; `TcpConnection.ssl_connect` then keeps that name.
+    ~ host_set: bool
     // The OpenSSL `SSL` handle.
     ~ ssl: OSSL
 
@@ -4333,13 +4508,26 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ## Aliases for 'time'
 
 ```js
-// A UTC date and time with microsecond precision, for the years 1 to 9999.
+// The buffer size `DateTime.to_iso8601_in` requires for a UTC value: `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`.
 + value ISO8601_TEXT_SIZE (27)
+// The buffer size `DateTime.to_iso8601_in` requires for a value in a time zone: `YYYY-MM-DDTHH:MM:SS.uuuuuu+hh:mm:ss`.
++ value ISO8601_ZONED_TEXT_SIZE (35)
+```
+
+## Errors for 'time'
+
+```js
+// A time zone could not be loaded: `missing` when no zone has that name, `invalid` when its data or rule text is malformed.
++ error ZoneError (missing, invalid)
 ```
 
 ## Functions for 'time'
 
 ```js
+// Returns a zone that is always `offset_seconds` east of UTC, without daylight saving time.
++ fn fixed_zone(offset_seconds: int) Zone
+// Returns the time zone this program runs in.
++ fn local_zone() Zone
 // Returns a monotonic clock reading in milliseconds, for measuring durations.
 + fn mono_ms() uint
 // Returns a monotonic clock reading in nanoseconds, for measuring durations.
@@ -4356,13 +4544,21 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 + fn unix_ns() uint
 // Returns the wall-clock time in microseconds since the Unix epoch (UTC).
 + fn unix_us() uint
+// Returns the UTC zone: offset 0, no daylight saving time.
++ fn utc() Zone
+// Returns the time zone called `name` in the IANA time zone database, such as `Europe/Amsterdam` or `America/New_York`.
++ fn zone(name: String) Zone !ZoneError
+// Returns a zone following the POSIX TZ rule `rule`, such as `CET-1CEST,M3.5.0,M10.5.0/3`, and named after it.
++ fn zone_from_posix(rule: String) Zone !ZoneError
+// Returns a zone read from `data`, the contents of a TZif zone file, and named `name`.
++ fn zone_from_tzif(name: String, data: String) Zone !ZoneError
 ```
 
 ## Classes for 'time'
 
 ```js
 + class DateTime {
-    // Returns a copy moved by `amount` days of exactly 24 hours, which may be negative.
+    // Returns a copy moved by `amount` calendar days, which may be negative.
     + fn add_days(amount: int) DateTime !LookupError
     // Returns a copy moved by `amount` hours, which may be negative.
     + fn add_hours(amount: int) DateTime !LookupError
@@ -4396,6 +4592,10 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + static fn format_size(pattern: String) uint
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
+    // Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format` and, for times around a daylight saving change, `new_in`.
+    + static fn from_format_in(zone: Zone, pattern: String, value: String) DateTime !SyntaxError
+    // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z` or `2024-03-05 15:07:09.25+01:00`.
+    + static fn from_iso8601(value: String) DateTime !SyntaxError
     // Creates a date and time from whole seconds since the Unix epoch.
     + static fn from_unix_seconds(timestamp: int) DateTime !LookupError
     // Creates a date and time from microseconds since the Unix epoch.
@@ -4406,6 +4606,12 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn hash() uint
     // Returns the hour, 0 to 23.
     + fn hour() uint
+    // Returns the same instant shown in UTC.
+    + fn in_utc() DateTime !LookupError
+    // Returns the same instant shown in `zone`.
+    + fn in_zone(zone: Zone) DateTime !LookupError
+    // Returns whether daylight saving time is in effect in the zone at this instant.
+    + fn is_dst() bool
     // Returns whether the year is a leap year in the Gregorian calendar.
     + fn is_leap_year() bool
     // Returns whether this value is earlier than `other`; backs the `<` operator (`$lt`).
@@ -4414,7 +4620,7 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn microsecond() uint
     // Returns the minute, 0 to 59.
     + fn minute() uint
-    // Moves this value by `amount` days of 24 hours in place.
+    // Moves this value by `amount` calendar days in place; see `add_days`.
     + fn modify_add_days(amount: int) void !LookupError
     // Moves this value by `amount` hours in place.
     + fn modify_add_hours(amount: int) void !LookupError
@@ -4446,11 +4652,15 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn month() uint
     // Creates a date and time from its components.
     + static fn new(year: ?int (null), month: ?uint (null), day: ?uint (null), hour: ?uint (null), minute: ?uint (null), second: ?uint (null), microsecond: ?uint (null)) DateTime !LookupError
+    // Creates a date and time from its components as wall-clock time in `zone`.
+    + static fn new_in(zone: Zone, year: ?int (null), month: ?uint (null), day: ?uint (null), hour: ?uint (null), minute: ?uint (null), second: ?uint (null), microsecond: ?uint (null)) DateTime !LookupError
     // Returns the current UTC date and time.
     + static fn now() DateTime
+    // Returns the current date and time in `zone`, such as `time.local_zone()`.
+    + static fn now_in(zone: Zone) DateTime
     // Returns the second, 0 to 59.
     + fn second() uint
-    // Returns the value as ISO 8601 text in UTC, such as `2024-03-05T14:07:09Z`.
+    // Returns the value as ISO 8601 text, such as `2024-03-05T14:07:09Z` in UTC or `2024-03-05T15:07:09+01:00` in a time zone.
     + fn to_iso8601() String
     // Writes `to_iso8601()` into `buf` and returns the byte count.
     + fn to_iso8601_in(buf: local mut &[u8]) uint
@@ -4462,6 +4672,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn unix_seconds() int
     // Returns the microseconds since the Unix epoch.
     + fn unix_us() int
+    // Returns the offset from UTC of the zone at this instant, in seconds east of Greenwich.
+    + fn utc_offset() int
     // Returns a copy with the day of the month set to `day`.
     + fn with_day(day: uint) DateTime !LookupError
     // Returns a copy with the hour set to `hour`; throws `LookupError` above 23.
@@ -4478,6 +4690,25 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn with_year(year: int) DateTime !LookupError
     // Returns the year, 1 to 9999.
     + fn year() int
+    // Returns the zone this value is shown in; `time.utc()` unless it was made for a zone.
+    + fn zone() Zone
+    // Returns the zone's abbreviation at this instant, such as `CET`, or `UTC`.
+    + fn zone_abbreviation() String
+}
+```
+
+```js
+// A time zone: the UTC offsets, daylight saving time and abbreviations of a region through its history.
++ class Zone {
+    // The name, such as `Europe/Amsterdam`, `UTC` or `+02:00`.
+    ~ name: String
+
+    // Returns the abbreviation in use at the instant `unix_seconds`, such as `CET` or `CEST`.
+    + fn abbreviation_at(unix_seconds: int) String
+    // Returns whether daylight saving time is in effect at the instant `unix_seconds`.
+    + fn is_dst_at(unix_seconds: int) bool
+    // Returns the offset from UTC in seconds at the instant `unix_seconds`, positive east of Greenwich: 3600 for CET, -18000 for EST.
+    + fn offset_at(unix_seconds: int) int
 }
 ```
 

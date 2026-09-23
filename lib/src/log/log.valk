@@ -1,0 +1,449 @@
+use io
+use fs
+use json
+use time
+use core
+use ext
+
+/// How important a log record is. A logger drops records below its level.
++ enum Level {
+    debug
+    info
+    warn
+    error
+}
+
+/// How records are written: `text` as one readable line each, `json` as one JSON object per
+/// line for log collectors.
++ enum Format {
+    text
+    json
+}
+
+/// The value of a log field: text, a number, a bool or null.
++ union Field : String | int | uint | float | bool | null {}
+
+/// Writes log records to one `io.Writer`, one write per record.
+///
+/// `log.info` and the other functions of this namespace use a logger per thread, made from
+/// the process-wide settings of `set_level`, `set_format`, `set_local_time` and `to_stderr`,
+/// `to_stdout` or `to_file`. Create a logger yourself to write elsewhere, such as into a
+/// `ByteBuffer`; like the writer it holds, it belongs to the thread that made it. Write errors
+/// are ignored.
++ class Logger {
+    /// The lowest level that is written.
+    + level: Level (Level.info)
+    /// The layout of the records.
+    + format: Format (Format.text)
+    /// Whether timestamps use the local time zone instead of UTC.
+    + local_time: bool (false)
+    - out: io.Writer
+    - fields: Map[Field] (.{})
+    - buffer: ByteBuffer (ByteBuffer.new(256))
+
+    /// Returns a logger that writes to `out`, standard error when it is null.
+    + static fn new(out: ?io.Writer (null), level: Level (Level.info), format: Format (Format.text)) SELF {
+        return SELF { out: out ?? io.stderr(), level: level, format: format }
+    }
+
+    /// Returns a logger that writes where this one does and adds `fields` to every record,
+    /// after the fields this logger already adds.
+    ///
+    /// Use it for context that many records share, such as a request id.
+    + fn with(fields: Map[Field]) Logger {
+        let merged = Map[Field]{}
+        each this.fields as value, key : merged.set(key, value)
+        each fields as value, key : merged.set(key, value)
+        return Logger { out: this.out, level: this.level, format: this.format, local_time: this.local_time, fields: merged }
+    }
+
+    /// Returns whether a record of `level` would be written; use it to skip preparing
+    /// expensive fields.
+    + fn enabled(level: Level) bool {
+        return rank(level) >= rank(this.level)
+    }
+
+    /// Writes a debug record.
+    + fn debug(message: String, fields: ?Map[Field] (null)) {
+        this.write(Level.debug, message, fields)
+    }
+    /// Writes an info record.
+    + fn info(message: String, fields: ?Map[Field] (null)) {
+        this.write(Level.info, message, fields)
+    }
+    /// Writes a warning record.
+    + fn warn(message: String, fields: ?Map[Field] (null)) {
+        this.write(Level.warn, message, fields)
+    }
+    /// Writes an error record.
+    + fn error(message: String, fields: ?Map[Field] (null)) {
+        this.write(Level.error, message, fields)
+    }
+
+    /// Writes a record of `level` with `message` and `fields`, when the level is enabled.
+    ///
+    /// A text record reads `2024-03-05T14:07:09.250Z INFO  message key=value`; a JSON record
+    /// `{"time":"...","level":"info","msg":"message","key":"value"}`.
+    + fn write(level: Level, message: String, fields: ?Map[Field] (null)) {
+        if !this.enabled(level) : return
+        let buf = this.buffer
+        buf.clear()
+        let now = time.DateTime.now()
+        if this.local_time : now = now.in_zone(time.local_zone()) !? now
+        if this.format == Format.json {
+            buf.write("{\"time\":\"")
+            write_time(buf, now)
+            buf.write("\",\"level\":\"")
+            buf.write(level_name(level))
+            buf.write("\",\"msg\":\"")
+            json.write_json_escaped(message, buf)
+            buf.write_byte('"')
+            write_json_fields(buf, this.fields)
+            let own = fields
+            if isset(own) : write_json_fields(buf, own)
+            buf.write("}\n")
+        } else {
+            write_time(buf, now)
+            buf.write_byte(' ')
+            buf.write(level_label(level))
+            buf.write_byte(' ')
+            write_text_message(buf, message)
+            write_text_fields(buf, this.fields)
+            let own = fields
+            if isset(own) : write_text_fields(buf, own)
+            buf.write_byte('\n')
+        }
+        this.out.write(buf) ! return
+    }
+}
+
+//////////////////////////////
+// The default logger
+//////////////////////////////
+
+// Process-wide settings; every thread rebuilds its logger when the generation changes
+@shared settings_generation: uint (1)
+@shared settings_level: uint (1)
+@shared settings_json: bool (false)
+@shared settings_local_time: bool (false)
+// 0 standard error, 1 standard output, 2 the file
+@shared settings_output: uint (0)
+// The log file: one handle for every thread, written under the lock
+@shared file_lock: core.SyncMutex (core.SyncMutex.new())
+@shared file_handle: uint (0)
+@shared file_open: bool (false)
+
+global thread_logger: ?Logger (null)
+global thread_generation: uint (0)
+
+/// Returns this thread's logger, which the functions of this namespace write with.
++ fn default() Logger {
+    let generation = atomic_load(settings_generation)
+    let current = thread_logger
+    if isset(current) && thread_generation == generation : return current
+    let logger = Logger.new(settings_writer())
+    logger.level = level_of_rank(atomic_load(settings_level))
+    logger.format = settings_json ? Format.json : Format.text
+    logger.local_time = settings_local_time
+    thread_logger = logger
+    thread_generation = generation
+    return logger
+}
+
+fn settings_writer() io.Writer {
+    let output = atomic_load(settings_output)
+    if output == 1 : return io.stdout()
+    if output == 2 : return FileOutput {}
+    return io.stderr()
+}
+
+// Appends records to the log file every thread shares; standard error once it is closed
+class FileOutput is io.Writer {
+    + fn write(data: local &[u8]) uint !io.IoError {
+        @unsafe
+        file_lock.lock()
+        if file_open {
+            write_file(file_handle, data)
+        } else {
+            io.write_all_sync(2, data.data, data.length)
+        }
+        file_lock.unlock()
+        return data.length
+    }
+}
+
+// An append-only handle that other handles may also write to, for synchronous writes from
+// any thread; `fs.open` handles belong to the thread that opened them on Windows
+fn open_log_file(path: String) uint !io.IoError {
+    @unsafe
+    #if OS == "win"
+    let wide = fs.windows_path(path) ! throw .open
+    let handle = ext.CreateFileW(wide.items().@cast(ptr), fs.append_access, ext.FILE_SHARE_READ | ext.FILE_SHARE_WRITE, null, ext.OPEN_ALWAYS, ext.FILE_ATTRIBUTE_NORMAL, 0)
+    if handle == ext.INVALID_HANDLE_VALUE : throw .open
+    return handle
+    #else
+    let fd = ext.open(path.data_cstring, ext.O_WRONLY | ext.O_CREAT | ext.O_APPEND | ext.O_CLOEXEC, 0c644)
+    if fd < 0 : throw .open
+    return fd.to(uint)
+    #end
+}
+
+fn write_file(handle: uint, data: local &[u8]) {
+    @unsafe
+    #if OS == "win"
+    let done: uint = 0
+    while done < data.length {
+        let written: u32 = 0
+        if ext.WriteFile(handle, data.data + done, (data.length - done).to(u32), @ref(written), null) == 0 || written == 0 : return
+        done += written.to(uint)
+    }
+    #else
+    io.write_all_sync(handle.to(i32), data.data, data.length)
+    #end
+}
+
+// Lock held
+fn close_log_file() {
+    @unsafe
+    if !file_open : return
+    file_open = false
+    #if OS == "win"
+    ext.CloseHandle(file_handle)
+    #else
+    ext.close(file_handle.to(i32))
+    #end
+}
+
+fn settings_changed() {
+    atomic(settings_generation + 1)
+}
+
+/// Sets the lowest level that is written, for every thread; `info` at the start.
++ fn set_level(level: Level) {
+    atomic_store(settings_level, rank(level))
+    settings_changed()
+}
+
+/// Returns the lowest level that is written.
++ fn level() Level {
+    return level_of_rank(atomic_load(settings_level))
+}
+
+/// Sets the record layout for every thread; `text` at the start.
++ fn set_format(format: Format) {
+    settings_json = format == Format.json
+    settings_changed()
+}
+
+/// Makes timestamps use the local time zone instead of UTC, for every thread.
++ fn set_local_time(enabled: bool) {
+    settings_local_time = enabled
+    settings_changed()
+}
+
+/// Writes records to standard error, for every thread; the destination at the start.
+///
+/// Closes the log file that `to_file` opened.
++ fn to_stderr() {
+    set_output(0)
+}
+
+/// Writes records to standard output, for every thread.
+///
+/// Closes the log file that `to_file` opened.
++ fn to_stdout() {
+    set_output(1)
+}
+
+/// Appends records to the file at `path`, created when missing, for every thread.
+///
+/// All threads write through one handle, a whole record at a time, so records of several
+/// threads never mix; other programs may read the file meanwhile. A file opened earlier is
+/// closed. Throws when the file cannot be opened, and then leaves the destination as it was.
++ fn to_file(path: String) !io.IoError {
+    let handle = open_log_file(path) !>
+    file_lock.lock()
+    close_log_file()
+    file_handle = handle
+    file_open = true
+    file_lock.unlock()
+    atomic_store(settings_output, 2)
+    settings_changed()
+}
+
+fn set_output(output: uint) {
+    atomic_store(settings_output, output)
+    settings_changed()
+    file_lock.lock()
+    close_log_file()
+    file_lock.unlock()
+}
+
+/// Returns whether a record of `level` would be written.
++ fn enabled(level: Level) bool {
+    return rank(level) >= atomic_load(settings_level)
+}
+
+/// Writes a debug record with this thread's logger; see `Logger.write`.
++ fn debug(message: String, fields: ?Map[Field] (null)) {
+    if !enabled(Level.debug) : return
+    default().debug(message, fields)
+}
+/// Writes an info record with this thread's logger; see `Logger.write`.
++ fn info(message: String, fields: ?Map[Field] (null)) {
+    if !enabled(Level.info) : return
+    default().info(message, fields)
+}
+/// Writes a warning record with this thread's logger; see `Logger.write`.
++ fn warn(message: String, fields: ?Map[Field] (null)) {
+    if !enabled(Level.warn) : return
+    default().warn(message, fields)
+}
+/// Writes an error record with this thread's logger; see `Logger.write`.
++ fn error(message: String, fields: ?Map[Field] (null)) {
+    default().error(message, fields)
+}
+
+/// Returns this thread's logger with `fields` added to every record; see `Logger.with`.
++ fn with(fields: Map[Field]) Logger {
+    return default().with(fields)
+}
+
+/// Returns the level named `name`: `debug`, `info`, `warn` (or `warning`) or `error`, in any
+/// case, such as from an environment variable.
+///
+/// Throws `missing` for any other name.
++ fn parse_level(name: String) Level !LookupError {
+    let lower = name.lower()
+    if lower == "debug" : return Level.debug
+    if lower == "info" : return Level.info
+    if lower == "warn" || lower == "warning" : return Level.warn
+    if lower == "error" : return Level.error
+    throw .missing
+}
+
+//////////////////////////////
+// Record layout
+//////////////////////////////
+
+fn rank(level: Level) uint {
+    if level == Level.debug : return 0
+    if level == Level.info : return 1
+    if level == Level.warn : return 2
+    return 3
+}
+
+fn level_of_rank(rank: uint) Level {
+    if rank == 0 : return Level.debug
+    if rank == 1 : return Level.info
+    if rank == 2 : return Level.warn
+    return Level.error
+}
+
+fn level_name(level: Level) String {
+    if level == Level.debug : return "debug"
+    if level == Level.info : return "info"
+    if level == Level.warn : return "warn"
+    return "error"
+}
+
+fn level_label(level: Level) String {
+    if level == Level.debug : return "DEBUG"
+    if level == Level.info : return "INFO "
+    if level == Level.warn : return "WARN "
+    return "ERROR"
+}
+
+// RFC 3339 with milliseconds: `Z` in UTC, the offset otherwise
+fn write_time(buf: ByteBuffer, now: time.DateTime) {
+    now.format_into("Y-m-d\\TH:i:s.v", buf) ! return
+    let offset = now.utc_offset()
+    if now.zone().name == "UTC" {
+        buf.write_byte('Z')
+        return
+    }
+    let value = (offset < 0 ? -offset : offset).to(uint)
+    buf.write_byte(offset < 0 ? '-' : '+')
+    write_two(buf, value / 3600)
+    buf.write_byte(':')
+    write_two(buf, value % 3600 / 60)
+}
+
+fn write_two(buf: ByteBuffer, value: uint) {
+    buf.write_byte(('0' + value / 10).to(u8))
+    buf.write_byte(('0' + value % 10).to(u8))
+}
+
+fn write_json_fields(buf: ByteBuffer, fields: Map[Field]) {
+    each fields as value, key {
+        buf.write(",\"")
+        json.write_json_escaped(key, buf)
+        buf.write("\":")
+        match value {
+            null => buf.write("null")
+            String as text => {
+                buf.write_byte('"')
+                json.write_json_escaped(text, buf)
+                buf.write_byte('"')
+            }
+            int as number => buf.write(number.to_string())
+            uint as number => buf.write(number.to_string())
+            float as number => json.write_json_float(number, buf)
+            bool as flag => buf.write(flag ? "true" : "false")
+        }
+    }
+}
+
+fn write_text_fields(buf: ByteBuffer, fields: Map[Field]) {
+    each fields as value, key {
+        buf.write_byte(' ')
+        write_text_value(buf, key)
+        buf.write_byte('=')
+        match value {
+            null => buf.write("null")
+            String as text => write_text_value(buf, text)
+            int as number => buf.write(number.to_string())
+            uint as number => buf.write(number.to_string())
+            float as number => buf.write(number.to_shortest_string())
+            bool as flag => buf.write(flag ? "true" : "false")
+        }
+    }
+}
+
+// The message as is, except that line breaks are escaped: a record is one line
+fn write_text_message(buf: ByteBuffer, message: String) {
+    let i: uint = 0
+    while i < message.bytes {
+        let ch = message.get(i++)
+        if ch == '\n' : buf.write("\\n")
+        else if ch == '\r' : buf.write("\\r")
+        else : buf.write_byte(ch)
+    }
+}
+
+// A field text: bare when it holds no space, quote, `=` or control character, quoted with
+// escapes otherwise
+fn write_text_value(buf: ByteBuffer, text: String) {
+    let plain = text.bytes > 0
+    let i: uint = 0
+    while i < text.bytes && plain {
+        let ch = text.get(i++)
+        if ch <= ' ' || ch == '"' || ch == '=' || ch == '\\' || ch == 127 : plain = false
+    }
+    if plain {
+        buf.write(text)
+        return
+    }
+    buf.write_byte('"')
+    i = 0
+    while i < text.bytes {
+        let ch = text.get(i++)
+        if ch == '"' : buf.write("\\\"")
+        else if ch == '\\' : buf.write("\\\\")
+        else if ch == '\n' : buf.write("\\n")
+        else if ch == '\r' : buf.write("\\r")
+        else if ch == '\t' : buf.write("\\t")
+        else : buf.write_byte(ch)
+    }
+    buf.write_byte('"')
+}

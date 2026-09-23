@@ -54,6 +54,8 @@
     * [Paths](#paths)
 * [JSON](#json)
 * [DateTime](#datetime)
+* [Time zones](#time-zones)
+* [Logging](#logging)
 * [Coroutines](#coroutines)
 * [Threads](#threads)
 * [Channels and cancellation](#channels-and-cancellation)
@@ -1469,6 +1471,58 @@ println(datetime) // Defaults to to_iso8601 string
 (month), `d` (day), `H` (hour), `i` (minute), `s` (second), `v`
 (milliseconds), and `u` (microseconds).
 
+## Time zones
+
+`time.zone` loads a zone from the IANA time zone database by name. A `DateTime`
+made with `in_zone`, `now_in` or `new_in` shows its instant as wall-clock time
+in that zone; the same instant still compares equal in any zone. Windows has no
+zone database of its own, so the standard library carries a copy for it.
+
+```rust
+use valk.time
+
+let amsterdam = time.zone("Europe/Amsterdam") ! panic("Unknown zone")
+let meeting = time.DateTime.new_in(amsterdam, 2026, 3, 30, 9) ! panic("Invalid date")
+println(meeting)                             // 2026-03-30T09:00:00+02:00
+println(meeting.in_utc() !? meeting)         // 2026-03-30T07:00:00Z
+println(meeting.zone_abbreviation())         // CEST
+
+let here = time.DateTime.now_in(time.local_zone())
+let parsed = time.DateTime.from_iso8601("2026-03-30T09:00:00+02:00") ! panic("Invalid date")
+```
+
+`add_days`, `add_months` and `with_*` keep the wall-clock time across daylight
+saving changes; `add_hours` and smaller units count elapsed time. `time.local_zone()`
+follows the `TZ` environment variable, then the system settings, and
+`time.fixed_zone(3600)` gives a zone with a constant offset.
+
+## Logging
+
+API for [valk.log](api.md#log)
+
+The `log` functions write one line per record to standard error, as readable
+text or as JSON. Fields keep their type in JSON output. The settings apply to
+every thread, and records of several threads never mix.
+
+```rust
+use valk.log
+
+log.info("server started", .{ "port" => 8080, "host" => host })
+// 2026-03-30T07:00:00.250Z INFO  server started port=8080 host=example.com
+
+log.set_level(log.Level.debug)
+log.set_format(log.Format.json)
+log.to_file("app.log") ! panic("Cannot open the log file")
+
+let request = log.with(.{ "request" => id })
+request.warn("slow query", .{ "ms" => 1250 })
+// {"time":"...","level":"warn","msg":"slow query","request":"r-17","ms":1250}
+```
+
+`log.Logger.new(writer)` makes a logger that writes to any `io.Writer`, and
+`log.parse_level(text)` reads a level name, for example from an environment
+variable.
+
 ## Coroutines
 
 Coroutines let multiple functions make progress on one thread.
@@ -2215,7 +2269,8 @@ Note: `valk.template` works at runtime and therefore cannot detect incorrect tem
 ## Crypto
 
 Supported utilities include bcrypt, BLAKE2b, Base64, MD5, SHA-1, SHA-256,
-SHA-384, SHA-512, HMAC, PBKDF2, HKDF, and secure random values.
+SHA-384, SHA-512, HMAC, PBKDF2, HKDF, secure random values, authenticated
+encryption (AES-GCM, ChaCha20-Poly1305) and signatures (Ed25519, ECDSA, RSA).
 
 ```rust
 use valk.crypto
@@ -2275,6 +2330,33 @@ fn main() {
     } else {
         println("❌")
     }
+}
+```
+
+`seal` encrypts with AES-256-GCM under a 32-byte key and a random nonce, and
+`unseal` decrypts and rejects anything that was altered. `encrypt` and
+`decrypt` take the cipher and the nonce yourself:
+
+```rust
+use valk.crypto
+
+let key = crypto.random_bytes(32)
+let sealed = crypto.seal(key, "user=17") ! panic("Bad key")
+let text = crypto.unseal(key, sealed) ! panic("Altered or wrong key")
+```
+
+`PrivateKey` signs and `PublicKey` verifies, with Ed25519, ECDSA or RSA keys.
+Keys are generated, or read from PEM, DER or JSON Web Key text:
+
+```rust
+use valk.crypto
+
+let key = crypto.PrivateKey.generate_ed25519() ! panic("Failed")
+let signature = key.sign(crypto.SignatureAlgorithm.ed25519, message) ! panic("Failed")
+
+let public = crypto.PublicKey.from_pem(pem) ! panic("Not a public key")
+if !public.verify(crypto.SignatureAlgorithm.rsa_pkcs1_sha256, message, signature) {
+    println("bad signature")
 }
 ```
 
