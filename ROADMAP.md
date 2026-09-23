@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.7.6
+
 + Release 0.7.5
 + `dim()` in the ansi group of String
 + GC optimizations
