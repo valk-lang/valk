@@ -1,0 +1,464 @@
+// C calling convention of externs and exports: how a struct argument or result
+// crosses the call. Scalars pass as they are, small integers extended.
+
+enum C_PASS : u8 {
+    direct
+    // Register-sized pieces, loaded at 8-byte steps
+    split
+    // SysV: a pointer marked byval, the callee gets its own copy on the stack
+    byval
+    // Win64 / AArch64: a pointer to a copy the caller made
+    ref
+    // Results only: written through a hidden first pointer
+    sret
+}
+
+class CPass {
+    kind: C_PASS (C_PASS.direct)
+    pieces: Array[String] (.{})
+    size: uint (0)
+    align: uint (1)
+    // `zeroext` / `signext` for small integer arguments
+    ext: String ("")
+}
+
+class CAbi {
+    args: Array[CPass] (.{})
+    result: CPass
+    // Nothing differs from the plain lowering
+    plain: bool (true)
+}
+
+// The scalar leaves of a struct: kinds per 8-byte word
+value C_WORD_INT (1)
+value C_WORD_F32 (2)
+value C_WORD_F64 (4)
+
+class CLeaves {
+    word0: u8 (0)
+    word1: u8 (0)
+    // Bytes in use of each word
+    used0: uint (0)
+    used1: uint (0)
+    count: uint (0)
+    floats: uint (0)
+    float_size: uint (0)
+    mixed_floats: bool (false)
+    unaligned: bool (false)
+}
+
+// Externs and exports follow the C convention; null when it changes nothing
+fn ir_c_abi_of(func: Func) ?CAbi !Error {
+    if !func.is_extern && (!func.is_export || func.can_error) : return null
+    let abi = ir_c_abi(func) !>
+    return abi.plain ? null : abi
+}
+
+fn ir_c_abi(func: Func) CAbi !Error {
+    let generated = func.get_generated()
+    let cached = generated.c_abi
+    if isset(cached) : return cached
+    let abi = ir_c_abi_compute(func) !>
+    generated.c_abi = abi
+    return abi
+}
+
+fn ir_c_abi_compute(func: Func) CAbi !Error {
+    let target = func.ns.build.options.target
+    let sysv = target.arch == "x64" && target.os != "win"
+    // SysV registers left: a struct that does not fit whole goes on the stack
+    let int_regs : uint = 6
+    let sse_regs : uint = 8
+
+    let result = ir_c_pass(func.get_rett(), true, target) !>
+    let abi = CAbi { result: result }
+    if result.kind != C_PASS.direct : abi.plain = false
+    if result.kind == C_PASS.sret : int_regs--
+
+    each func.args as arg {
+        let pass = ir_c_pass(arg.type, false, target) !>
+        if pass.kind == C_PASS.direct {
+            pass.ext = ir_c_ext(arg.type, target) !>
+            if sysv {
+                let t = arg.type.get_non_nullable()
+                if t.kind == TYPE.float {
+                    if sse_regs > 0 : sse_regs--
+                } else if int_regs > 0 {
+                    int_regs--
+                }
+            }
+        } else if sysv && pass.kind == C_PASS.split {
+            let need_int : uint = 0
+            let need_sse : uint = 0
+            each pass.pieces as piece {
+                if piece.starts_with("i") : need_int++
+                else : need_sse++
+            }
+            if need_int > int_regs || need_sse > sse_regs {
+                pass.kind = C_PASS.byval
+                pass.pieces.clear()
+            } else {
+                int_regs -= need_int
+                sse_regs -= need_sse
+            }
+        }
+        if pass.kind != C_PASS.direct || pass.ext.bytes > 0 : abi.plain = false
+        abi.args.append(pass)
+    }
+    return abi
+}
+
+fn ir_c_ext(type: Type, target: Target) String !Error {
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.bool : return "zeroext"
+    // Win64 callers leave the upper bits of small integers undefined
+    if t.kind != TYPE.int || target.os == "win" || (t.byte_size() !>) >= 4 : return ""
+    return t.unsigned ? "zeroext" : "signext"
+}
+
+fn ir_c_is_struct(type: Type) bool {
+    let t = type.get_non_nullable()
+    let class = t.class
+    return t.is_inline && isset(class) && class.kind == CLASS_KIND.struct && !t.is_fixed_array_type()
+}
+
+fn ir_c_pass(type: Type, result: bool, target: Target) CPass !Error {
+    if !ir_c_is_struct(type) : return CPass {}
+    let size = (type.byte_size() !>).to(uint)
+    let align = (type.storage_alignment() !>).to(uint)
+    let pass = CPass { size: size, align: align }
+    if size == 0 : return pass
+    let leaves = CLeaves {}
+    ir_c_leaves(type, 0, leaves) !>
+    let memory = result ? C_PASS.sret : C_PASS.ref
+
+    if target.os == "win" && target.arch == "x64" {
+        if size == 1 || size == 2 || size == 4 || size == 8 {
+            pass.kind = C_PASS.split
+            pass.pieces.append("i" + (size * 8))
+        } else {
+            pass.kind = memory
+        }
+        return pass
+    }
+
+    if target.arch == "x64" {
+        if size > 16 || leaves.unaligned {
+            pass.kind = result ? C_PASS.sret : C_PASS.byval
+            return pass
+        }
+        pass.kind = C_PASS.split
+        let words = (size + 7) / 8
+        let w : uint = 0
+        while w < words {
+            let kind = w == 0 ? leaves.word0 : leaves.word1
+            let used = w == 0 ? leaves.used0 : leaves.used1
+            let last = w == words - 1
+            if kind == 0 || (kind & C_WORD_INT) != 0 {
+                // A partial last word is passed as an integer of its own size
+                let bytes = last ? size - w * 8 : 8
+                pass.pieces.append("i" + (bytes * 8))
+            } else if last && used <= 4 {
+                pass.pieces.append("float")
+            } else if (kind & C_WORD_F64) != 0 {
+                pass.pieces.append("double")
+            } else {
+                pass.pieces.append("<2 x float>")
+            }
+            w++
+        }
+        return pass
+    }
+
+    // AArch64: up to 4 floats of one size go in vector registers
+    if leaves.count > 0 && leaves.floats == leaves.count && !leaves.mixed_floats && leaves.count <= 4 {
+        let float = leaves.float_size == 4 ? "float" : "double"
+        pass.kind = C_PASS.split
+        let piece = ByteBuffer.new(40)
+        if result {
+            piece.append_text("{ ")
+            let i : uint = 0
+            while i < leaves.count {
+                if i > 0 : piece.append_text(", ")
+                piece.append_text(float)
+                i++
+            }
+            piece.append_text(" }")
+        } else {
+            piece.append_text("[")
+            piece.write_uint_ascii(leaves.count)
+            piece.append_text(" x ")
+            piece.append_text(float)
+            piece.append_text("]")
+        }
+        pass.pieces.append(piece.to_string())
+        return pass
+    }
+    if size > 16 {
+        pass.kind = memory
+        return pass
+    }
+    pass.kind = C_PASS.split
+    pass.pieces.append(size <= 8 ? "i64" : "[2 x i64]")
+    return pass
+}
+
+fn ir_c_leaves(type: Type, offset: uint, out: CLeaves) !Error {
+    let t = type.get_non_nullable()
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
+        if !isset(sub) : return
+        let step = (sub.byte_size() !>).to(uint)
+        let i : uint = 0
+        while i < t.length.to(uint) {
+            ir_c_leaves(sub, offset + i * step, out) !>
+            i++
+        }
+        return
+    }
+    let class = t.class
+    if ir_c_is_struct(t) && isset(class) {
+        each class.props as prop {
+            if prop.is_slice_data : continue
+            ir_c_leaves(prop.type, offset + prop.offset.to(uint), out) !>
+        }
+        return
+    }
+    let size = (t.byte_size() !>).to(uint)
+    if size == 0 : return
+    let natural = size < 8 ? size : 8
+    if offset % natural != 0 : out.unaligned = true
+    out.count++
+    let kind = C_WORD_INT
+    if t.kind == TYPE.float {
+        kind = size == 4 ? C_WORD_F32 : C_WORD_F64
+        out.floats++
+        if out.float_size == 0 : out.float_size = size
+        else if out.float_size != size : out.mixed_floats = true
+    }
+    let end = offset + size
+    if offset < 8 {
+        out.word0 = out.word0 | kind.to(u8)
+        let used = end < 8 ? end : 8
+        if used > out.used0 : out.used0 = used
+    } else if offset < 16 {
+        out.word1 = out.word1 | kind.to(u8)
+        let used = end - 8
+        if used > out.used1 : out.used1 = used
+    }
+}
+
+// LLVM result type of a lowered extern
+fn ir_c_result_type(func: Func, abi: CAbi) String !Error {
+    let result = abi.result
+    if result.kind == C_PASS.sret : return "void"
+    if result.kind == C_PASS.direct : return ir_type(func.get_rett()) !>
+    return ir_c_pieces_type(result)
+}
+
+fn ir_c_pieces_type(pass: CPass) String {
+    if pass.pieces.length == 1 : return pass.pieces.get(0) !? ""
+    let out = ByteBuffer.new(40)
+    out.append_text("{ ")
+    each pass.pieces as piece, i {
+        if i > 0 : out.append_text(", ")
+        out.append_text(piece)
+    }
+    out.append_text(" }")
+    return out.to_string()
+}
+
+fn ir_c_pointer_param(pass: CPass) String {
+    let out = ByteBuffer.new(48)
+    if pass.kind == C_PASS.ref : return "ptr"
+    out.append_text(pass.kind == C_PASS.sret ? "ptr sret([" : "ptr byval([")
+    out.write_uint_ascii(pass.size)
+    out.append_text(" x i8]) align ")
+    let align = pass.align
+    if pass.kind == C_PASS.byval && align < 8 : align = 8
+    out.write_uint_ascii(align)
+    return out.to_string()
+}
+
+// The lowered parameter list, as the declaration and a variadic call write it;
+// `named` adds the names an export definition reads them by
+fn ir_c_params(func: Func, abi: CAbi, named: bool (false)) String !Error {
+    let build = func.ns.build
+    let out = ByteBuffer.new(64)
+    let count : uint = 0
+    if abi.result.kind == C_PASS.sret {
+        out.append_text(ir_c_pointer_param(abi.result))
+        if named : out.append_text(" \%c.ret")
+        count++
+    }
+    each func.args as arg, i {
+        let pass = abi.args.get(i) !? CPass {}
+        if pass.kind == C_PASS.split {
+            each pass.pieces as piece, p {
+                if count++ > 0 : out.append_text(", ")
+                out.append_text(piece)
+                if named {
+                    out.append_text(" ")
+                    out.append_text(ir_c_piece_name(build, i, p))
+                }
+            }
+            continue
+        }
+        if count++ > 0 : out.append_text(", ")
+        if pass.kind == C_PASS.direct {
+            out.append_text(ir_type(arg.type) !>)
+            if pass.ext.bytes > 0 {
+                out.append_text(" ")
+                out.append_text(pass.ext)
+            }
+        } else {
+            out.append_text(ir_c_pointer_param(pass))
+        }
+        if named {
+            out.append_text(" ")
+            out.append_text(ir_arg_name(build, i))
+        }
+    }
+    if func.infinite_args {
+        if count > 0 : out.append_text(", ")
+        out.append_text("...")
+    }
+    return out.to_string()
+}
+
+fn ir_write_c_signature(out: ByteBuffer, func: Func, abi: CAbi) !Error {
+    out.append_text("declare ")
+    out.append_text(ir_c_result_type(func, abi) !>)
+    out.append_text(" @\"")
+    out.append_text(func_ir_name(func))
+    out.append_text("\"(")
+    out.append_text(ir_c_params(func, abi) !>)
+    out.append_text(")\n")
+}
+
+// Room for a struct and its last partial word
+fn ir_c_temp(ir: IRFunc, pass: CPass) String {
+    let words = (pass.size + 7) / 8
+    if words == 0 : words = 1
+    let type = ByteBuffer.new(32)
+    type.append_text("[")
+    type.write_uint_ascii(words)
+    type.append_text(" x i64], align 16")
+    return ir_emit_alloca(ir, type.to_string())
+}
+
+fn ir_write_c_arg(ir: IRFunc, mark: uint, arg: Value, expected: Type, pass: CPass) !Error {
+    if pass.kind == C_PASS.direct {
+        let rendered = ir_emit_value(ir, arg) !>
+        if ir.terminated : return
+        let type = ir_type(expected) !>
+        if pass.ext.bytes > 0 : type = type + " " + pass.ext
+        ir.write_arg(mark, type, ir_emit_cast(ir, rendered, arg.rett, expected) !>)
+        return
+    }
+    let rendered = ir_emit_value(ir, arg) !>
+    if ir.terminated : return
+    rendered = ir_emit_cast(ir, rendered, arg.rett, expected) !>
+    let temp = ir_c_temp(ir, pass)
+    ir_emit_store(ir, ir_type(expected) !>, rendered, temp)
+    if pass.kind != C_PASS.split {
+        ir.write_arg(mark, ir_c_pointer_param(pass), temp)
+        return
+    }
+    each pass.pieces as piece, i {
+        let address = i == 0 ? temp : ir_offset_address(ir, temp, i * 8)
+        ir.write_arg(mark, piece, ir_emit_load(ir, piece, address))
+    }
+}
+
+// A direct call of an extern whose signature is lowered for C
+fn ir_emit_c_call(ir: IRFunc, value: Value, func: Func, abi: CAbi) String !Error {
+    let mark = ir.arg_list.length
+    let result = abi.result
+    let rett = func.get_rett()
+    let result_temp = ""
+    if result.kind != C_PASS.direct : result_temp = ir_c_temp(ir, result)
+    if result.kind == C_PASS.sret : ir.write_arg(mark, ir_c_pointer_param(result), result_temp)
+
+    let args = value.values
+    if isset(args) {
+        each args as arg, i {
+            let expected = arg.rett
+            let pass = CPass {}
+            func.args.get(i) -> func_arg {
+                expected = func_arg.type
+                pass = abi.args.get(i) !? pass
+            }
+            ir_write_c_arg(ir, mark, arg, expected, pass) !>
+            if ir.terminated : return ir_abandon_call(ir, mark)
+        }
+    }
+
+    let exits = func.must_exit || func.will_exit
+    if exits : ir_emit_func_cleanup(ir) !>
+    let call_type = ir_c_result_type(func, abi) !>
+    let out = call_type == "void" ? "" : ir.var()
+    ir_open_call(ir, out, call_type)
+    if func.infinite_args {
+        ir.write(" (")
+        ir.write(ir_c_params(func, abi) !>)
+        ir.write(")")
+    }
+    ir_close_call(ir, ir_func_address(func), mark)
+    if exits {
+        ir.line("unreachable")
+        ir.terminated = true
+        return ""
+    }
+    if result.kind == C_PASS.direct : return out
+    if result.kind == C_PASS.split : ir_emit_store(ir, call_type, out, result_temp)
+    return ir_emit_load(ir, ir_type(rett) !>, result_temp)
+}
+
+fn ir_c_piece_name(build: Build, arg: uint, piece: uint) String {
+    return ir_arg_name(build, arg) + "." + piece
+}
+
+// Export entry: rebuild each lowered argument in its local
+fn ir_c_store_args(ir: IRFunc, func: Func, abi: CAbi) !Error {
+    let build = func.ns.build
+    each func.args as arg, i {
+        let type = ir_type(arg.type) !>
+        let pass = abi.args.get(i) !? CPass {}
+        let incoming = ir_arg_name(build, i)
+        if pass.kind == C_PASS.split {
+            let temp = ir_c_temp(ir, pass)
+            each pass.pieces as piece, p {
+                let address = p == 0 ? temp : ir_offset_address(ir, temp, p * 8)
+                ir_emit_store(ir, piece, ir_c_piece_name(build, i, p), address)
+            }
+            incoming = ir_emit_load(ir, type, temp)
+        } else if pass.kind != C_PASS.direct {
+            incoming = ir_emit_load(ir, type, incoming)
+        }
+        ir_emit_store(ir, type, incoming, arg.decl.ir_name)
+    }
+}
+
+// `ret` of a plain value; an export may return it through C's convention
+fn ir_emit_ret(ir: IRFunc, type: String, rendered: String) {
+    let abi = ir.c_abi
+    if isset(abi) && abi.result.kind == C_PASS.sret {
+        if rendered != "undef" : ir_emit_store(ir, type, rendered, "\%c.ret")
+        ir.line("ret void")
+        return
+    }
+    if isset(abi) && abi.result.kind == C_PASS.split {
+        let pieces = ir_c_pieces_type(abi.result)
+        let temp = ir_c_temp(ir, abi.result)
+        ir_emit_store(ir, type, rendered, temp)
+        rendered = ir_emit_load(ir, pieces, temp)
+        type = pieces
+    }
+    ir.line_start()
+    ir.write("ret ")
+    ir.write(type)
+    ir.write(" ")
+    ir.write(rendered)
+    ir.line_end()
+}

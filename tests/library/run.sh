@@ -180,5 +180,13 @@ if [ "$archive_ext" = ".a" ] && [ -z "$(ar t "$plain_archive")" ]; then
     exit 1
 fi
 
+echo "> Pass structs by value to and from C"
+"$cc" -c "$DIR/c-abi.c" -o "$workdir/cabi.o" || exit $?
+ar rcs "$workdir/libcabi.a" "$workdir/cabi.o" || exit $?
+out=$("$VALK" build "$DIR/c-abi.valk" --no-warn -L "$workdir" -o "$workdir/c-abi" 2>&1)
+status=$?
+check_build "$out" "C ABI test"
+"$workdir/c-abi" || exit $?
+
 echo "# Library tests passed"
-echo "# Test count: 7"
+echo "# Test count: 8"

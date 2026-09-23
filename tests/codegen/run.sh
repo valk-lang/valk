@@ -37,6 +37,7 @@ ir_result() {
     cat "$1.log"
     return "$(cat "$1.status")"
 }
+for target in linux-x64 macos-arm64 win-x64; do queue_ir "$workdir/c-abi-$target.ll" "$DIR/../library/c-abi.valk" --target "$target" --ir --no-warn; done
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/gc-direct-entry-$target.ll" "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn; done
 queue_ir "$workdir/buffer-roots.ll" "$DIR/buffer-roots.valk" --ir --no-warn
 queue_ir "$workdir/native-address.ll" "$DIR/native-address.valk" --ir --no-warn
@@ -1161,6 +1162,48 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     done
 done
 
+echo "> Lower extern struct arguments and results for the C ABI of each target"
+check_c_abi() {
+    local target="$1"
+    shift
+    local ir="$workdir/c-abi-$target.ll" line
+    if ! out=$(ir_result "$ir"); then
+        echo "# Failed to build the C ABI fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    for line in "$@"; do
+        if ! grep -qxF "$line" "$ir"; then
+            echo "# Missing C ABI declaration on $target: $line"
+            grep '^declare' "$ir" | grep -v 'valk\|pthread'
+            exit 1
+        fi
+    done
+}
+check_c_abi linux-x64 \
+    'declare { <2 x float>, float } @"v3_make"(float)' \
+    'declare i32 @"col_sum"(i32)' \
+    'declare i32 @"s3_sum"(i48)' \
+    'declare double @"df_sum"(double, float)' \
+    'declare void @"cam_make"(ptr sret([44 x i8]) align 4, float)' \
+    'declare float @"v3_many"(<2 x float>, float, <2 x float>, float, <2 x float>, float, <2 x float>, float, ptr byval([12 x i8]) align 8)' \
+    'declare void @"ints_then_pair"(ptr sret([20 x i8]) align 4, i64, i64, i64, i64, i64, ptr byval([16 x i8]) align 8)' \
+    'declare double @"doubles_then_v2"(double, double, double, double, double, double, double, double, ptr byval([8 x i8]) align 8)' \
+    'declare i32 @"small"(i8 zeroext, i8 signext, i16 zeroext, i16 signext)'
+check_c_abi macos-arm64 \
+    'declare { float, float, float } @"v3_make"(float)' \
+    'declare float @"v3_sum"([3 x float])' \
+    'declare double @"df_sum"([2 x i64])' \
+    'declare i32 @"col_sum"(i64)' \
+    'declare float @"mat_sum"(ptr)' \
+    'declare void @"mat_make"(ptr sret([64 x i8]) align 4, float)'
+check_c_abi win-x64 \
+    'declare void @"v3_make"(ptr sret([12 x i8]) align 4, float)' \
+    'declare float @"v2_sum"(i64)' \
+    'declare i64 @"v2_make"(float)' \
+    'declare i32 @"s3_sum"(ptr)' \
+    'declare i32 @"tex_sum"(ptr, i64, i32)'
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 46"
+echo "# Test count: 47"
 echo ""

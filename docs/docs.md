@@ -2652,6 +2652,20 @@ Variadic arguments keep their own type and follow the C promotion rules
 (`f32` becomes `double`, small integers become `i32`); only integers, floats
 and raw pointers can be passed.
 
+Structs can be passed and returned by value, in `extern` and `export`
+functions alike. A struct has the same layout as the C struct with the same
+fields, and is passed the way a C compiler for the target passes it.
+
+```rust
+struct Vector3 {
+    x: f32
+    y: f32
+    z: f32
+}
+
+extern fn Vector3Scale(v: Vector3, factor: f32) Vector3;
+```
+
 ## Linking
 
 To link with your library you have 2 options:

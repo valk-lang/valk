@@ -5,6 +5,8 @@
 
 ```
 - Release 0.7.7
++ Structs by value to and from C: extern and export functions follow the target's C calling convention
++ Struct sizes round up to their own alignment, like C
 
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)
