@@ -134,16 +134,16 @@ fi
 
 debug_out=$(build --debug)
 status=$?
-if [ "$status" -eq 0 ] || [[ "$debug_out" != *"Unknown build argument: --debug"* ]]; then
-    echo "# Expected --debug to be rejected"
+if [ "$status" -ne 0 ]; then
+    echo "# Expected --debug to build"
     echo "$debug_out"
     exit 1
 fi
 
 debug_short_out=$(build -d)
 status=$?
-if [ "$status" -eq 0 ] || [[ "$debug_short_out" != *"Unknown build argument: -d"* ]]; then
-    echo "# Expected -d to be rejected"
+if [ "$status" -ne 0 ]; then
+    echo "# Expected -d to build"
     echo "$debug_short_out"
     exit 1
 fi
@@ -857,5 +857,50 @@ if [[ "$neither_out" != *"has neither a 'dir' to build nor a 'cmd' to run"* ]]; 
     exit 1
 fi
 
+echo ""
+echo "# Test --debug: stack traces and debug info"
+trace_out=$($TIMEOUT "$VALK" build "$DIR/debug-trace.valk" --no-warn -d -o "$workdir/debug-trace$EXE_SUFFIX" 2>&1 && $TIMEOUT "$workdir/debug-trace$EXE_SUFFIX" 2>&1)
+trace_code=$?
+# Paths are shown relative to where the build ran
+trace_out=$(printf '%s' "$trace_out" | tr -d '\r' | sed 's#[^ (]*/debug-trace\.valk#debug-trace.valk#g')
+expected_trace="Unhandled error 'LookupError.missing' at debug-trace.valk:5
+Stack trace:
+  at Box.pick (debug-trace.valk:5)
+  at closure in main.deeper[int] (debug-trace.valk:12)
+  at main.deeper[int] (debug-trace.valk:14)
+  at main.main (debug-trace.valk:20)"
+if [ "$trace_code" -ne 1 ] || [[ "$trace_out" != *"$expected_trace"* ]]; then
+    echo "# A panic in a --debug build must print the stack trace (exit code $trace_code)"
+    echo "$trace_out"
+    exit 1
+fi
+plain_out=$($TIMEOUT "$VALK" build "$DIR/debug-trace.valk" --no-warn -o "$workdir/plain-trace$EXE_SUFFIX" 2>&1 && $TIMEOUT "$workdir/plain-trace$EXE_SUFFIX" 2>&1)
+plain_out=$(printf '%s' "$plain_out" | tr -d '\r' | sed 's#[^ (]*/debug-trace\.valk#debug-trace.valk#g')
+if [[ "$plain_out" == *"Stack trace"* ]] || [[ "$plain_out" != *"Unhandled error 'LookupError.missing' at debug-trace.valk:5"* ]]; then
+    echo "# Without --debug a panic prints no stack trace"
+    echo "$plain_out"
+    exit 1
+fi
+debug_ir=$("$VALK" build "$DIR/debug-trace.valk" --no-warn -d --ir -o "$workdir/debug-trace.ir" 2>&1 && cat "$workdir/debug-trace.ir")
+for needle in "!DICompileUnit(" "name: \"Box.pick\"" "!DILocalVariable(name: \"box\", arg: 1" "!DILocation(line: 12"; do
+    if [[ "$debug_ir" != *"$needle"* ]]; then
+        echo "# The --debug IR is missing: $needle"
+        exit 1
+    fi
+done
+if [ -z "$EXE_SUFFIX" ]; then
+    fault_out=$($TIMEOUT "$VALK" build "$DIR/debug-fault.valk" --no-warn -d -o "$workdir/debug-fault" 2>&1 && $TIMEOUT "$workdir/debug-fault" 2>&1)
+    fault_out=$(printf '%s' "$fault_out" | sed 's#[^ (]*/debug-fault\.valk#debug-fault.valk#g')
+    expected_fault="Segmentation fault
+Stack trace:
+  at main.poke (debug-fault.valk:4)
+  at main.main (debug-fault.valk:9)"
+    if [[ "$fault_out" != *"$expected_fault"* ]]; then
+        echo "# A crash in a --debug build must print the stack trace"
+        echo "$fault_out"
+        exit 1
+    fi
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 57"
+echo "# Test count: 61"

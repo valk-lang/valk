@@ -1,0 +1,281 @@
+use valk.fs
+
+// --debug: line info for debuggers (DWARF, CodeView on Windows) and the frame records a panic
+// prints its stack trace from. Every function links a record into `core.debug_frames` on entry
+// and unlinks it before it returns; a statement or call first stores its line in the record.
+
+// Metadata ids below this one are the module's own nodes (see ir_debug_module_nodes)
+value DEBUG_FIRST_ID (10)
+// Frame record: previous record, function info, line of the call in progress
+value DEBUG_FRAME_TYPE ("{ ptr, ptr, i32 }")
+
+// Gives the function its subprogram id and opening position; before the `define` line ends
+fn ir_debug_prepare(ir: IRFunc) {
+    let func = ir.func
+    if !func.ns.build.options.debug : return
+    let origin = message_resolve(func.exp.src, func.exp.i)
+    // Code without a file of its own gets no debug info
+    if !isset(origin.src.path) : return
+    ir.debug = true
+    ir.debug_src = origin.src
+    ir.debug_sp = "!" + (DEBUG_FIRST_ID + func.unit.debug_ids++)
+    ir_debug_at(ir, func.exp)
+}
+
+// Links the frame record of the function; after the entry block's allocas
+fn ir_debug_frame_enter(ir: IRFunc) !Error {
+    if !ir.debug : return
+    // Helpers the compiler generates, such as bounds checks, stay out of the trace
+    if !ir.func.is_literal && ir.func.name.starts_with("<") : return
+    let global = ir_debug_frames_global(ir) !>
+    let chain = ir_global_address(global)
+    ir.debug_chain = chain
+    ir.line3("\%dbg.frame = alloca ", DEBUG_FRAME_TYPE, ", align 8")
+    ir.line2("\%dbg.prev = load ptr, ptr ", chain)
+    ir.line("store ptr \%dbg.prev, ptr \%dbg.frame")
+    ir.line3("\%dbg.info = getelementptr ", DEBUG_FRAME_TYPE, ", ptr \%dbg.frame, i32 0, i32 1")
+    ir.line3("store ptr @\"valk.dbg.", func_ir_name(ir.func), "\", ptr \%dbg.info")
+    ir.line3("\%dbg.line = getelementptr ", DEBUG_FRAME_TYPE, ", ptr \%dbg.frame, i32 0, i32 2")
+    ir.line3("store i32 ", ir.debug_frame_line.to_string(), ", ptr \%dbg.line")
+    ir.debug_stored_line = ir.debug_frame_line
+    ir.line2("store ptr \%dbg.frame, ptr ", chain)
+}
+
+// Unlinks the frame record; before every `ret`
+fn ir_debug_frame_exit(ir: IRFunc) {
+    if ir.debug_chain.length == 0 : return
+    ir.line2("store ptr \%dbg.prev, ptr ", ir.debug_chain)
+}
+
+// Stores the line being run in the frame record, before a call or a statement
+fn ir_debug_store_line(ir: IRFunc) {
+    if ir.debug_chain.length == 0 : return
+    if ir.debug_frame_line == ir.debug_stored_line : return
+    ir.line3("store i32 ", ir.debug_frame_line.to_string(), ", ptr \%dbg.line")
+    ir.debug_stored_line = ir.debug_frame_line
+}
+
+fn ir_debug_frames_global(ir: IRFunc) Global !Error {
+    let idf = valk_idf(ir.func.ns.build, "core", "debug_frames") !>
+    let global = idf.global
+    if !isset(global) : ir.func.exp.bug("core.debug_frames is not a global")
+    ir_use_global(ir, global)
+    return global
+}
+
+// Makes `exp` the position of the instructions that follow
+fn ir_debug_at(ir: IRFunc, exp: Exp) {
+    let origin = message_resolve(exp.src, exp.i)
+    let src = origin.src
+    let at = src.line_col(origin.i)
+    if at.line == ir.debug_line && at.col == ir.debug_col && src == ir.debug_loc_src : return
+    ir.debug_line = at.line
+    ir.debug_col = at.col
+    ir.debug_loc_src = src
+    let scope = ir.debug_sp
+    let own = ir.debug_src
+    if isset(own) && src == own {
+        ir.debug_frame_line = at.line
+    } else {
+        // Code from another file, such as a default argument: its lines are counted there
+        let path = src.path ?! return
+        scope = "!DILexicalBlockFile(scope: " + ir.debug_sp + ", file: " + ir_debug_file(path) + ", discriminator: 0)"
+    }
+    ir.debug_loc = ", !dbg !DILocation(line: " + at.line + ", column: " + at.col + ", scope: " + scope + ")"
+}
+
+// Writes the function's subprogram and the info its frame record points to; after its body
+fn ir_debug_finish(ir: IRFunc, out: ByteBuffer) {
+    if !ir.debug : return
+    let func = ir.func
+    let src = ir.debug_src ?! return
+    let path = src.path ?! return
+    let line = src.line_of(message_resolve(func.exp.src, func.exp.i).i)
+    let file = ir_debug_file(path)
+    let name = func_debug_name(func)
+    out.append_text(ir.debug_sp)
+    out.append_text(" = distinct !DISubprogram(name: ")
+    out.append_text(ir_debug_string(name))
+    out.append_text(", scope: ")
+    out.append_text(file)
+    out.append_text(", file: ")
+    out.append_text(file)
+    out.append_text(", line: ")
+    out.write_uint_ascii(line)
+    out.append_text(", type: !DISubroutineType(types: !{}), scopeLine: ")
+    out.write_uint_ascii(line)
+    out.append_text(", flags: DIFlagPrototyped, spFlags: DISPFlagDefinition, unit: !0)\n")
+
+    if ir.debug_chain.length == 0 : return
+    let display = source_display(src)
+    let name_index = ir_use_string(ir, name)
+    let file_index = ir_use_string(ir, display.path)
+    let pkg_index = ir_use_string(ir, display.pkg)
+    out.append_text("@\"valk.dbg.")
+    out.append_text(func_ir_name(func))
+    out.append_text("\" = private unnamed_addr constant { ptr, ptr, ptr } { ")
+    ir_debug_write_cstring(out, name_index)
+    out.append_text(", ")
+    ir_debug_write_cstring(out, file_index)
+    out.append_text(", ")
+    ir_debug_write_cstring(out, pkg_index)
+    out.append_text(" }\n\n")
+}
+
+// The characters of a string constant; they start after its 16-byte header and end in a zero
+fn ir_debug_write_cstring(out: ByteBuffer, index: uint) {
+    out.append_text("ptr getelementptr (i8, ptr @\"valk.str.")
+    out.write_uint_ascii(index)
+    out.append_text("\", i64 16)")
+}
+
+// The compile unit and the module flags that make LLVM keep the debug info
+fn ir_debug_module_nodes(out: ByteBuffer, build: Build, unit: Unit) {
+    out.append_text("\n!llvm.dbg.cu = !{!0}\n!llvm.module.flags = !{!1, !2}\n")
+    out.append_text("!0 = distinct !DICompileUnit(language: DW_LANG_C, file: ")
+    out.append_text(ir_debug_file(unit.path.length > 0 ? unit.path : unit.name))
+    out.append_text(", producer: ")
+    out.append_text(ir_debug_string("valk " + VERSION))
+    out.append_text(", isOptimized: ")
+    out.append_text(build.options.optimize ? "true" : "false")
+    out.append_text(", runtimeVersion: 0, emissionKind: FullDebug)\n")
+    if build.options.target.os == "win" : out.append_text("!1 = !{i32 2, !\"CodeView\", i32 1}\n")
+    else : out.append_text("!1 = !{i32 7, !\"Dwarf Version\", i32 4}\n")
+    out.append_text("!2 = !{i32 2, !\"Debug Info Version\", i32 3}\n")
+}
+
+fn ir_debug_file(path: String) String {
+    return "!DIFile(filename: " + ir_debug_string(fs.basename(path)) + ", directory: " + ir_debug_string(fs.dir_of(path)) + ")"
+}
+
+// A metadata string; LLVM escapes bytes as a backslash and two hex digits
+fn ir_debug_string(text: String) String {
+    let out = ByteBuffer.new(text.bytes + 2)
+    out.write_byte('"')
+    let i : uint = 0
+    while i < text.bytes {
+        let byte = @ptrv(text.data, u8, i++)
+        if byte >= 32 && byte <= 126 && byte != '"' && byte != '\\' {
+            out.write_byte(byte)
+            continue
+        }
+        out.write_byte('\\')
+        let hex = byte.to_hex()
+        if hex.bytes < 2 : out.write_byte('0')
+        out.append_text(hex)
+    }
+    out.write_byte('"')
+    return out.to_string()
+}
+
+// `Class.method`, `namespace.function[T]` or `closure in ...`, the way a stack trace names it
+fn func_debug_name(func: Func) String {
+    let owner = func.literal_owner
+    if isset(owner) : return "closure in " + func_debug_name(owner)
+    let name = func.name
+    let base = func.generic_from
+    let types = func.generic_types
+    if isset(base) && isset(types) : name = base.name + generic_types_display(types)
+    let class = func.class
+    if isset(class) : return class.pretty_name() + "." + name
+    return func.ns.name + "." + name
+}
+
+// Describes the arguments and locals to the debugger; after the entry block's allocas
+fn ir_debug_variables(ir: IRFunc) !Error {
+    if !ir.debug : return
+    let func = ir.func
+    let src = ir.debug_src ?! return
+    let path = src.path ?! return
+    let file = ir_debug_file(path)
+    each func.all_decls as decl {
+        if decl.is_bind || decl.is_shared_capture : continue
+        let name = decl.name ?! continue
+        // Hidden locals the compiler adds have no name a user could have written
+        if name.bytes == 0 : continue
+        let first = @ptrv(name.data, u8, 0)
+        if !first.is_alpha() && first != '_' : continue
+        let exp = decl.exp ?! continue
+        let origin = message_resolve(exp.src, exp.i)
+        if origin.src != src : continue
+        let type = ir_debug_type(decl.type, 0) !>
+        if type.length == 0 : continue
+        let arg = ""
+        each func.args as candidate, i {
+            if candidate.decl == decl : arg = ", arg: " + (i + 1)
+        }
+        ir.line("call void @llvm.dbg.declare(metadata ptr " + decl.ir_name + ", metadata !DILocalVariable(name: " + ir_debug_string(name) + arg + ", scope: " + ir.debug_sp + ", file: " + file + ", line: " + src.line_of(origin.i) + ", type: " + type + "), metadata !DIExpression())")
+    }
+}
+
+// The debug type of a value of `type` as an inline metadata node, or "" when it has none.
+// Objects show their fields one level deep; deeper objects are plain pointers.
+fn ir_debug_type(type: Type, depth: uint) String !Error {
+    if type.is_tagged_nullable() : return ""
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.bool : return "!DIBasicType(name: \"bool\", size: 8, encoding: DW_ATE_boolean)"
+    if t.kind == TYPE.int || t.kind == TYPE.float {
+        let encoding = t.kind == TYPE.float ? "DW_ATE_float" : (t.is_signed_type() ? "DW_ATE_signed" : "DW_ATE_unsigned")
+        return "!DIBasicType(name: " + ir_debug_string(t.compat_display_name()) + ", size: " + ((t.byte_size() !>) * 8) + ", encoding: " + encoding + ")"
+    }
+    if t.kind == TYPE.ref_slice {
+        // { owner, data, length }: strings show their text
+        let sub = t.get_sub_type()
+        let element = "!DIBasicType(name: \"char\", size: 8, encoding: DW_ATE_unsigned_char)"
+        if isset(sub) && (sub.byte_size() !>) != 1 {
+            element = depth > 0 ? "" : (ir_debug_type(sub, depth + 1) !>)
+        }
+        let members = ir_debug_member("data", ir_debug_pointer(element), 64, 64)
+        members += ", " + ir_debug_member("length", "!DIBasicType(name: \"uint\", size: 64, encoding: DW_ATE_unsigned)", 64, 128)
+        return ir_debug_struct(t.compat_display_name(), 192, members)
+    }
+    let class = t.class
+    if t.is_pointer() {
+        if isset(class) && !t.is_inline && (t.kind == TYPE.struct || t.kind == TYPE.gcptr || t.kind == TYPE.array) {
+            let kind = class.kind
+            if kind == CLASS_KIND.class || kind == CLASS_KIND.struct || kind == CLASS_KIND.array {
+                if depth > 0 : return ir_debug_pointer("!DICompositeType(tag: DW_TAG_structure_type, name: " + ir_debug_string(class.pretty_name()) + ", flags: DIFlagFwdDecl)")
+                return ir_debug_pointer(ir_debug_class(class, depth) !>)
+            }
+        }
+        return ir_debug_pointer("")
+    }
+    if t.is_inline && isset(class) && class.kind == CLASS_KIND.struct {
+        if depth > 1 : return ""
+        return ir_debug_class(class, depth) !>
+    }
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type() ?! return ""
+        let element = ir_debug_type(sub, depth + 1) !>
+        if element.length == 0 : return ""
+        return "!DICompositeType(tag: DW_TAG_array_type, baseType: " + element + ", size: " + ((t.byte_size() !>) * 8) + ", elements: !{!DISubrange(count: " + t.length + ")})"
+    }
+    return ""
+}
+
+fn ir_debug_class(class: Class, depth: uint) String !Error {
+    let size = class.compute_size() !>
+    let members = ""
+    each class.props as prop {
+        if prop.is_slice_data : continue
+        let name = prop.name ?! continue
+        let type = ir_debug_type(prop.type, depth + 1) !>
+        if type.length == 0 : continue
+        if members.length > 0 : members += ", "
+        members += ir_debug_member(name, type, (prop.type.byte_size() !>).to(uint) * 8, prop.offset.to(uint) * 8)
+    }
+    return ir_debug_struct(class.pretty_name(), size.to(uint) * 8, members)
+}
+
+fn ir_debug_struct(name: String, bits: uint, members: String) String {
+    return "!DICompositeType(tag: DW_TAG_structure_type, name: " + ir_debug_string(name) + ", size: " + bits + ", elements: !{" + members + "})"
+}
+
+fn ir_debug_member(name: String, type: String, bits: uint, offset: uint) String {
+    return "!DIDerivedType(tag: DW_TAG_member, name: " + ir_debug_string(name) + ", baseType: " + type + ", size: " + bits + ", offset: " + offset + ")"
+}
+
+// A pointer to `to`; "" points to nothing in particular
+fn ir_debug_pointer(to: String) String {
+    return "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: " + (to.length > 0 ? to : "null") + ", size: 64)"
+}
