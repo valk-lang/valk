@@ -103,15 +103,17 @@ Code: [Link](examples/bench)
 
 ### GC benchmarks
 
+Valk 0.7.6 (dev), Go 1.27.1, LDC 1.43.0, .NET 10.0.112. Median of 3 runs.
+
 | Scenario | Valk | Go | D | C# |
 |---|---:|---:|---:|---:|
-| short-lived alloc | 9 ms | 76 ms | 128 ms | 82 ms |
-| stable-heap forced collects | 4 ms | 4195 ms | 1541 ms | 2851 ms |
-| build long-lived chain | 49 ms | 67 ms | 144 ms | 201 ms |
-| free long-lived chain | 62 ms | 65 ms | 9 ms | 13 ms |
-| mutate live links | 9 ms | 8 ms | 10 ms | 12 ms |
-| short-lived churn with large live set | 31 ms | 74 ms | 102 ms | 50 ms |
-| tree churn | 72 ms | 119 ms | 269 ms | 120 ms |
+| short-lived alloc | 9 ms | 74 ms | 131 ms | 78 ms |
+| stable-heap forced collects | 0 ms | 4230 ms | 2626 ms | 2980 ms |
+| build long-lived chain | 51 ms | 61 ms | 138 ms | 216 ms |
+| free long-lived chain | 25 ms | 54 ms | 2 ms | 13 ms |
+| mutate live links | 9 ms | 7 ms | 10 ms | 13 ms |
+| short-lived churn with large live set | 4 ms | 77 ms | 89 ms | 48 ms |
+| tree churn | 40 ms | 121 ms | 251 ms | 123 ms |
 
 Code: [Link](examples/bench/gc)
 
