@@ -1,0 +1,435 @@
+use core
+
+// Lazy DFA over the Pike VM's program. A state is the ordered list of program
+// positions still alive (the seeds, expanded when the next byte is known) plus the
+// kind of byte before it, which `\b`, `^` and `$` need. States and transitions are
+// built as a search reaches them and cached, so a search costs a table lookup per
+// ASCII byte; a non-ASCII character takes an uncached step. Captures are left to
+// the VM, which then only runs over the matched span
+
+value DFA_FLAG_NONE (0) // no byte: an edge of the text or of the searched span
+value DFA_FLAG_WORD (1)
+value DFA_FLAG_NL (2)
+value DFA_FLAG_OTHER (3)
+
+value DFA_DEAD (0)
+// Restarts the program at every position of an unanchored search, lowest priority
+value DFA_RESTART (uint.$max)
+value DFA_STATE_LIMIT (4096)
+// Cache resets a DFA may need before the regex falls back to the VM for good
+value DFA_RESET_LIMIT (16)
+value DFA_NONE (uint.$max)
+value DFA_FAIL (uint.$max - 1)
+// Transitions on non-ASCII characters, cached by (state, code point), direct-mapped
+value DFA_HIGH_CACHE (4096)
+
+fn dfa_flag(b: u8) uint $inline {
+    if b == 10 : return DFA_FLAG_NL
+    if is_word_byte(b) : return DFA_FLAG_WORD
+    return DFA_FLAG_OTHER
+}
+
+fn dfa_assert(kind: uint, prev: uint, next: uint) bool {
+    if kind == ASSERT_TEXT_START : return prev == DFA_FLAG_NONE
+    if kind == ASSERT_TEXT_END : return next == DFA_FLAG_NONE
+    if kind == ASSERT_LINE_START : return prev == DFA_FLAG_NONE || prev == DFA_FLAG_NL
+    if kind == ASSERT_LINE_END : return next == DFA_FLAG_NONE || next == DFA_FLAG_NL
+    let boundary = (prev == DFA_FLAG_WORD) != (next == DFA_FLAG_WORD)
+    if kind == ASSERT_WORD : return boundary
+    return !boundary
+}
+
+fn inst_accepts(inst: Inst, code: u32) bool {
+    let op = inst.op
+    if op == OP_CHAR : return code == inst.code
+    if op == OP_SET {
+        let set = inst.set
+        return isset(set) && set.has(code)
+    }
+    if op == OP_ANY : return code != 10
+    return op == OP_ANY_NL
+}
+
+class DfaState {
+    seeds: Array[uint]
+    prev: uint
+    // Per flag of the next byte: 0 unknown, 1 no match, 2 a match ends here
+    finals: [u8 x 4] ({ 0... })
+}
+
+class Dfa {
+    program: Array[Inst]
+    // The longest match instead of the leftmost-first one (the reverse search)
+    longest: bool
+    // ASCII bytes that no instruction or assertion tells apart share a class
+    classes: [u8 x 128] ({ 0... })
+    class_count: uint (0)
+    class_flags: Array[uint] (.{})
+    class_codes: Array[u32] (.{})
+    states: Array[DfaState] (.{})
+    // Unanchored start states, where the search may skip bytes that cannot begin a match
+    start_marks: Array[u8] (.{})
+    // Per state and class: 0 unknown, else next state's row << 3 | 4 | it is an unanchored
+    // start state << 1 | a match ends before the byte, a row being state × class_count
+    table: Array[u32] (.{})
+    lookup: HashMap[String, uint] (.{})
+    // Start states per flag, anchored and unanchored; 0 unknown
+    start_cache: [uint x 8] ({ 0... })
+    // Keys ((state + 1) << 32 | code point, 0 = empty) and entries like `table`'s
+    high_keys: Array[u64] (Array[u64]{ 0 x DFA_HIGH_CACHE })
+    high_entries: Array[u32] (Array[u32]{ 0 x DFA_HIGH_CACHE })
+    resets: uint (0)
+    // How often skipping by the first-byte table was tried, and the bytes it skipped: when
+    // most bytes can begin a match it only costs, and the DFA steps through them instead
+    skip_tries: uint (0)
+    skip_gain: uint (0)
+    reset_happened: bool (false)
+    failed: bool (false)
+    mark: Array[uint]
+    epoch: uint (0)
+    stack: Array[uint]
+    consuming: Array[uint] (.{})
+    seeds: Array[uint] (.{})
+    key: ByteBuffer (ByteBuffer.new(64))
+
+    static fn new(program: Array[Inst], longest: bool) SELF {
+        let dfa = SELF {
+            program: program
+            longest: longest
+            mark: Array[uint]{ 0 x program.length }
+            stack: Array[uint]{ 0 x (program.length * 2 + 8) }
+        }
+        dfa.build_classes()
+        dfa.reset()
+        return dfa
+    }
+
+    fn build_classes() {
+        // Start from the byte kinds, then split the classes by every consuming instruction
+        let class_of = Array[uint]{ 0 x 128 }
+        let b: uint = 0
+        while b < 128 {
+            class_of[b] = dfa_flag(b.to(u8))
+            b++
+        }
+        let count: uint = 4
+        each this.program as inst {
+            if inst.op > OP_ANY_NL : continue
+            let remap = Array[uint]{ uint.$max x (count * 2) }
+            let next_count: uint = 0
+            b = 0
+            while b < 128 {
+                let key = class_of[b] * 2 + (inst_accepts(inst, b.to(u32)) ? 1 : 0)
+                if remap[key] == uint.$max : remap[key] = next_count++
+                class_of[b] = remap[key]
+                b++
+            }
+            count = next_count
+        }
+        // Number the classes densely
+        let remap = Array[uint]{ uint.$max x count }
+        let next_count: uint = 0
+        b = 0
+        while b < 128 {
+            let old = class_of[b]
+            if remap[old] == uint.$max {
+                remap[old] = next_count++
+                this.class_flags.append(dfa_flag(b.to(u8)))
+                this.class_codes.append(b.to(u32))
+            }
+            this.classes[b] = remap[old].to(u8)
+            b++
+        }
+        this.class_count = next_count
+    }
+
+    fn reset() {
+        this.states.clear()
+        this.start_marks.clear()
+        this.table.clear()
+        this.lookup.clear()
+        let i: uint = 0
+        while i < 8 {
+            this.start_cache[i] = 0
+            i++
+        }
+        i = 0
+        while i < DFA_HIGH_CACHE {
+            this.high_keys[i] = 0
+            i++
+        }
+        // State 0 is dead: no thread left
+        this.states.append(DfaState { seeds: Array[uint]{}, prev: DFA_FLAG_NONE })
+        this.start_marks.append(0)
+        i = 0
+        while i < this.class_count {
+            this.table.append(0)
+            i++
+        }
+    }
+
+    fn state_for(seeds: Array[uint], prev: uint) uint {
+        if seeds.length == 0 : return DFA_DEAD
+        let key = this.key
+        key.clear()
+        key.write_byte(prev.to(u8))
+        each seeds as seed : key.write_u32_le(seed.to(u32))
+        let text = key.to_string()
+        let found = this.lookup.get(text) !? DFA_NONE
+        if found != DFA_NONE : return found
+        if this.states.length >= DFA_STATE_LIMIT {
+            this.resets++
+            if this.resets > DFA_RESET_LIMIT : this.failed = true
+            this.reset()
+            this.reset_happened = true
+        }
+        let index = this.states.length
+        this.states.append(DfaState { seeds: seeds.copy(), prev: prev })
+        this.start_marks.append(seeds.length == 1 && seeds[0] == DFA_RESTART ? 1 : 0)
+        let i: uint = 0
+        while i < this.class_count {
+            this.table.append(0)
+            i++
+        }
+        this.lookup.set(text, index)
+        return index
+    }
+
+    fn start_state(prev: uint, unanchored: bool) uint {
+        let slot = prev * 2 + (unanchored ? 1 : 0)
+        let cached = this.start_cache[slot]
+        if cached != 0 : return cached
+        let seeds = this.seeds
+        seeds.clear()
+        seeds.append(unanchored ? DFA_RESTART : 0)
+        let state = this.state_for(seeds, prev)
+        this.start_cache[slot] = state
+        return state
+    }
+
+    // Follows `seeds` in priority order at a position between a byte of kind `prev` and one
+    // of kind `next`, collecting the consuming instructions in `consuming`. Returns whether a
+    // match ends here, and whether the restart seed is still alive
+    fn expand(seeds: Array[uint], prev: uint, next: uint) (bool, bool) {
+        let program = this.program
+        let consuming = this.consuming
+        consuming.clear()
+        this.epoch++
+        let epoch = this.epoch
+        let mark = this.mark
+        let stack = this.stack
+        let matched = false
+        let restart = false
+        each seeds as seed {
+            let top: uint = 0
+            if seed == DFA_RESTART {
+                restart = true
+                stack[top++] = 0
+            } else {
+                stack[top++] = seed
+            }
+            while top > 0 {
+                let pc = stack[--top]
+                if mark[pc] == epoch : continue
+                mark[pc] = epoch
+                let inst = program[pc]
+                let op = inst.op
+                if op == OP_JMP {
+                    stack[top++] = inst.x
+                } else if op == OP_SPLIT {
+                    stack[top++] = inst.y
+                    stack[top++] = inst.x
+                } else if op == OP_SAVE {
+                    stack[top++] = pc + 1
+                } else if op == OP_ASSERT {
+                    if dfa_assert(inst.x, prev, next) : stack[top++] = pc + 1
+                } else if op == OP_MATCH {
+                    matched = true
+                    // Leftmost-first: the lower priority threads are cut
+                    if !this.longest : return (true, false)
+                } else {
+                    consuming.append(pc)
+                }
+            }
+        }
+        return (matched, restart)
+    }
+
+    // The state after `code` from `state`, whose next byte is of kind `next`
+    fn advance(state: uint, next: uint, code: u32) (uint, bool) {
+        let s = this.states[state]
+        let matched, restart = this.expand(s.seeds, s.prev, next)
+        let seeds = this.seeds
+        seeds.clear()
+        each this.consuming as pc {
+            if inst_accepts(this.program[pc], code) : seeds.append(pc + 1)
+        }
+        if restart : seeds.append(DFA_RESTART)
+        return (this.state_for(seeds, next), matched)
+    }
+
+    fn entry(target: uint, matched: bool) u32 {
+        let start = this.start_marks[target].to(uint)
+        return ((target * this.class_count) << 3 | 4 | start << 1 | (matched ? 1 : 0)).to(u32)
+    }
+
+    fn compute(state: uint, class: uint) u32 {
+        this.reset_happened = false
+        let target, matched = this.advance(state, this.class_flags[class], this.class_codes[class])
+        let entry = this.entry(target, matched)
+        // A reset renumbered the states: only the new target is valid
+        if !this.reset_happened : this.table[state * this.class_count + class] = entry
+        return entry
+    }
+
+    // The table entry for a non-ASCII character
+    fn high(state: uint, code: u32) u32 {
+        let key = (state + 1).to(u64) << 32 | code.to(u64)
+        let slot = ((key * 0x9E3779B97F4A7C15) >> 52).to(uint)
+        if this.high_keys[slot] == key : return this.high_entries[slot]
+        this.reset_happened = false
+        let target, matched = this.advance(state, DFA_FLAG_OTHER, code)
+        let entry = this.entry(target, matched)
+        if !this.reset_happened {
+            this.high_keys[slot] = key
+            this.high_entries[slot] = entry
+        }
+        return entry
+    }
+
+    fn final_match(state: uint, next: uint) bool {
+        let s = this.states[state]
+        let cached = s.finals[next]
+        if cached != 0 : return cached == 2
+        let matched, restart = this.expand(s.seeds, s.prev, next)
+        s.finals[next] = matched ? 2 : 1
+        return matched
+    }
+
+    // The end of the leftmost-first match at or after `start` (with `earliest`, the first
+    // position where any match ends); DFA_NONE without a match, DFA_FAIL when the cache
+    // thrashes and the VM should search instead
+    fn find_end(text: String, start: uint, anchored: bool, earliest: bool, first: Array[u8], prefix: ?String) uint {
+        @unsafe
+        if this.failed : return DFA_FAIL
+        let length = text.bytes
+        let data = text.data
+        let stride = this.class_count
+        let pos = start
+        let state = this.start_state(start == 0 ? DFA_FLAG_NONE : dfa_flag(text[start - 1]), !anchored)
+        let row = state * stride
+        // After the start state: adding a state can move the table
+        let cells = this.table.items()
+        let at_start = !anchored
+        // Decided once per search, so the start-state test is predictable when skipping is off
+        let can_skip = isset(prefix) || (first.length > 0 && (this.skip_tries < 64 || this.skip_gain >= this.skip_tries * 4))
+        let last = DFA_NONE
+        while pos < length {
+            if can_skip && at_start {
+                // Nothing alive yet: skip to the next byte that can begin a match
+                let skip = pos
+                if isset(prefix) {
+                    skip = text.index_of(prefix, pos) ! return last
+                } else {
+                    while skip < length && first[@ptrv(data, u8, skip).to(uint)] == 0 : skip++
+                    this.skip_gain += skip - pos
+                    if ++this.skip_tries >= 4096 {
+                        // Forget old texts slowly
+                        this.skip_tries = this.skip_tries / 2
+                        this.skip_gain = this.skip_gain / 2
+                    }
+                    if skip >= length : break
+                }
+                if skip != pos {
+                    pos = skip
+                    row = this.start_state(dfa_flag(@ptrv(data, u8, pos - 1)), true) * stride
+                    cells = this.table.items()
+                }
+            }
+            let b = @ptrv(data, u8, pos)
+            if b < 0x80 {
+                let class = this.classes[b.to(uint)].to(uint)
+                let entry = @ptrv(cells, u32, row + class)
+                if entry == 0 {
+                    entry = this.compute(row / stride, class)
+                    if this.failed : return DFA_FAIL
+                    cells = this.table.items()
+                }
+                if (entry & 1) != 0 {
+                    last = pos
+                    if earliest : return pos
+                }
+                at_start = (entry & 2) != 0
+                row = (entry >> 3).to(uint)
+                pos++
+                if row == 0 : return last
+                continue
+            }
+            let ch = core.unicode_read(text, pos)
+            let entry = this.high(row / stride, ch.code)
+            if this.failed : return DFA_FAIL
+            cells = this.table.items()
+            if (entry & 1) != 0 {
+                last = pos
+                if earliest : return pos
+            }
+            at_start = (entry & 2) != 0
+            row = (entry >> 3).to(uint)
+            pos += ch.count
+            if row == 0 : return last
+        }
+        if this.final_match(row / stride, DFA_FLAG_NONE) : last = length
+        return last
+    }
+
+    // Runs the reversed program backwards from `end`, not below `bound`, and returns the
+    // start of the longest match; DFA_FAIL on invalid UTF-8 or a thrashing cache
+    fn find_start(text: String, end: uint, bound: uint) uint {
+        @unsafe
+        if this.failed : return DFA_FAIL
+        let length = text.bytes
+        let data = text.data
+        let stride = this.class_count
+        let pos = end
+        let row = this.start_state(end >= length ? DFA_FLAG_NONE : dfa_flag(text[end]), false) * stride
+        // After the start state: adding a state can move the table
+        let cells = this.table.items()
+        let last = DFA_NONE
+        while pos > bound {
+            let b = @ptrv(data, u8, pos - 1)
+            if b < 0x80 {
+                let class = this.classes[b.to(uint)].to(uint)
+                let entry = @ptrv(cells, u32, row + class)
+                if entry == 0 {
+                    entry = this.compute(row / stride, class)
+                    if this.failed : return DFA_FAIL
+                    cells = this.table.items()
+                }
+                if (entry & 1) != 0 : last = pos
+                row = (entry >> 3).to(uint)
+                pos--
+                if row == 0 : return last
+                continue
+            }
+            // The character that ends at `pos`; anything but valid UTF-8 is left to the VM
+            let lead = pos - 1
+            let back: uint = 0
+            while lead > bound && back < 3 && (@ptrv(data, u8, lead) & 0xC0) == 0x80 {
+                lead--
+                back++
+            }
+            let ch = core.unicode_read(text, lead)
+            if !ch.valid || lead + ch.count != pos : return DFA_FAIL
+            let entry = this.high(row / stride, ch.code)
+            if this.failed : return DFA_FAIL
+            cells = this.table.items()
+            if (entry & 1) != 0 : last = pos
+            row = (entry >> 3).to(uint)
+            pos = lead
+            if row == 0 : return last
+        }
+        let next = bound == 0 ? DFA_FLAG_NONE : dfa_flag(text[bound - 1])
+        if this.final_match(row / stride, next) : last = pos
+        return last
+    }
+}

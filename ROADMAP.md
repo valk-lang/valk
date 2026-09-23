@@ -14,6 +14,8 @@
 + Faster float to text, and Eisel-Lemire float parsing
 + Faster JSON number scanning
 + Fix a struct literal inside a loop growing the stack until it overflows
++ Regex: a lazy DFA finds matches (5 to 20x faster); the VM only fills in capture groups
++ Fix regex matches that could start inside a multi-byte character
 
 + Release 0.7.5
 + `dim()` in the ansi group of String

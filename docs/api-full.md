@@ -14376,8 +14376,9 @@ Returns the text of the whole match.
 
 A compiled regular expression, matched without backtracking.
 
-The engine is a Pike VM: matching takes time proportional to the text length times the
-pattern size, and backreferences and lookaround are not supported. Offsets are byte offsets into the text. `$` without the `m` flag matches only
+The engine builds a DFA as it searches and runs a Pike VM only to fill in capture groups:
+matching takes time proportional to the text length times the pattern size, and
+backreferences and lookaround are not supported. Offsets are byte offsets into the text. `$` without the `m` flag matches only
 at the very end of the text, and `\b`, `\w` and `\d` are ASCII-only. A `Regex` keeps a
 matcher cache that every match call reuses, so do not use one object from several
 threads at once.
