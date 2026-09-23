@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.6
++ Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)
 + Faster JSON encoding and float decoding
 + Integer bit counts and the wide product: `leading_zeros`, `trailing_zeros`, `count_ones`, `mul_wide`
@@ -16,6 +16,7 @@
 + Fix a struct literal inside a loop growing the stack until it overflows
 + Regex: a lazy DFA finds matches (5 to 20x faster); the VM only fills in capture groups
 + Fix regex matches that could start inside a multi-byte character
++ Fix an HTTP/2 connection closing without its GOAWAY during a shutdown
 
 + Release 0.7.5
 + `dim()` in the ansi group of String
