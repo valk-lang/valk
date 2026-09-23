@@ -446,8 +446,9 @@ Throws `missing` when it is not set.
 Prints `msg` to stdout and ends the process with exit code 1.
 
 The compiler fills `location` with the panic's source position, relative to the root of
-the package it was compiled in, and the output reads `msg at path:line`. C exit handlers
-do not run. Marked `$exit`: the compiler knows a call never returns.
+the package it was compiled in, and the output reads `msg at path:line`. A program built
+with `--debug` also prints the stack trace. C exit handlers do not run. Marked `$exit`:
+the compiler knows a call never returns.
 
 ### raise
 
@@ -1083,7 +1084,8 @@ Backs `&arr[start .. amount]`. A `start` past the end gives an empty view. The v
 shares the array's storage block and keeps it alive on its own: it sees in-place
 writes through the array, including the shifting and zeroed slots left by removals.
 Once the array grows (or `clear(true)` replaces its storage) the view keeps covering
-the old block, and the two no longer see each other's writes.
+the old block, and the two no longer see each other's writes. Marked `$auto`: an array
+converts to a view where a `&[T]`, `local &[T]` or `mut &[T]` is expected.
 
 ```js
 + extend Array[uint] {
@@ -10028,6 +10030,12 @@ the `Headers{ name => value }` literal.
     + ca_cert_path: ?String
     // The expected SHA-256 fingerprint of the server certificate, in hex.
     + certificate_sha256: ?String
+    // A PEM file with the client certificate, sent when the server asks for one (mutual TLS); intermediate certificates may follow it.
+    + client_certificate_file: ?String
+    // The PEM private key of `client_certificate_file`; `null` reads it from that file.
+    + client_key_file: ?String
+    // The password of an encrypted client key.
+    + client_key_password: String
     // The limit for connecting plus the TLS handshake, in milliseconds.
     + connect_timeout_ms: uint
     // Whether 301, 302, 303, 307 and 308 responses with a `Location` are followed.
@@ -10094,6 +10102,19 @@ A CA certificate file to verify the server certificate against.
 The expected SHA-256 fingerprint of the server certificate, in hex.
 
 Colons are ignored and case does not matter. A mismatch fails with `ssl`.
+
+#### client_certificate_file
+
+A PEM file with the client certificate, sent when the server asks for one (mutual
+TLS); intermediate certificates may follow it.
+
+#### client_key_file
+
+The PEM private key of `client_certificate_file`; `null` reads it from that file.
+
+#### client_key_password
+
+The password of an encrypted client key.
 
 #### connect_timeout_ms
 
@@ -10203,6 +10224,10 @@ in `headers` are all kept. Names not in `headers` stay untouched.
 ```js
 // A request passed to a server handler.
 + class Request {
+    // The SHA-256 fingerprint of that certificate as 64 lowercase hex characters; empty when the client sent none.
+    + client_certificate_sha256: String
+    // The subject of the certificate the client sent, such as `CN=alice,O=Example`; empty when it sent none. A server asks for one with `Server.tls_client_ca`.
+    + client_subject: String
     // The request method as sent, such as `GET`.
     + method: String
     // The path of the request target without the query string, not percent-decoded.
@@ -10239,6 +10264,16 @@ A request passed to a server handler.
 
 `headers()`, `query()`, `form()`, `json()` and `files()` parse the request on first
 use and cache the result.
+
+#### client_certificate_sha256
+
+The SHA-256 fingerprint of that certificate as 64 lowercase hex characters; empty when
+the client sent none.
+
+#### client_subject
+
+The subject of the certificate the client sent, such as `CN=alice,O=Example`; empty
+when it sent none. A server asks for one with `Server.tls_client_ca`.
 
 #### method
 
@@ -10664,6 +10699,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + fn start(worker_count: uint (0)) void !HttpError
     // Serves over TLS with the given PEM certificate and private key files.
     + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) void !HttpError
+    // Asks every client for a certificate that leads to a CA in the PEM file `ca_file` (mutual TLS); call it after `tls` and before `start`.
+    + fn tls_client_ca(ca_file: String, required: bool (true)) void !HttpError
 }
 ```
 
@@ -10820,6 +10857,16 @@ Serves over TLS with the given PEM certificate and private key files.
 
 `cipher_list` applies to TLS 1.2 and older, `cipher_suites` to TLS 1.3. Throws when
 the files or settings cannot be loaded.
+
+#### tls_client_ca
+
+Asks every client for a certificate that leads to a CA in the PEM file `ca_file`
+(mutual TLS); call it after `tls` and before `start`.
+
+With `required` a client without a valid certificate cannot connect; without it a
+client may send none. A handler finds the certificate in `Request.client_subject` and
+`Request.client_certificate_sha256`. Throws `init` before `tls`, and `ssl` when the file
+cannot be read.
 
 ```js
 // A WebSocket connection (RFC 6455), on the server or the client side.
@@ -12801,6 +12848,7 @@ maximum.
 ```js
 // An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint. The buffer size `SocketAddress.ip_in` and `to_string_in` require.
 + value ADDRESS_TEXT_SIZE (64)
+type c_long (int)
 ```
 
 ### ADDRESS_TEXT_SIZE
@@ -13081,6 +13129,8 @@ Writes `to_string()` into `buf` and returns the byte count.
     + static fn new() Ssl
     // Returns the SHA-256 fingerprint of the peer certificate as 64 lowercase hex characters.
     + fn peer_certificate_sha256() String !NetError
+    // Returns the subject of the peer certificate in RFC 2253 form, such as `CN=alice,O=Example`.
+    + fn peer_certificate_subject() String !NetError
     // Reads up to `buf.length` decrypted bytes into `buf` and returns the count.
     + fn recv(buf: local mut &[u8], timeout_ms: uint (5000)) uint !NetError
     // Returns the ALPN protocol agreed in the handshake, or `""` when none was.
@@ -13212,6 +13262,14 @@ Returns the SHA-256 fingerprint of the peer certificate as 64 lowercase hex char
 Hashes the peer's own certificate: the server's on a client, the client's on a server.
 Throws `ssl` when the peer sent no certificate.
 
+#### peer_certificate_subject
+
+Returns the subject of the peer certificate in RFC 2253 form, such as
+`CN=alice,O=Example`.
+
+The peer's own certificate: the server's on a client, the client's on a server. Throws
+`ssl` when the peer sent no certificate.
+
 #### recv
 
 Reads up to `buf.length` decrypted bytes into `buf` and returns the count.
@@ -13310,6 +13368,8 @@ and `write`.
     + static fn connection(context: shared SslServerContext) Ssl
     // Loads the PEM `certificate_file` and `private_key_file` and checks that they match.
     + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) SslServerContext !NetError
+    // Asks every client for a certificate that leads to a CA in the PEM file `ca_file` (mutual TLS), and tells clients which CAs those are.
+    + fn set_client_ca(ca_file: String, required: bool (true)) void !NetError
 }
 ```
 
@@ -13337,6 +13397,17 @@ Loads the PEM `certificate_file` and `private_key_file` and checks that they mat
 `cipher_list` (OpenSSL cipher string) applies to TLS 1.2, `cipher_suites` (colon-separated
 names) to TLS 1.3; `null` keeps OpenSSL's defaults. Throws `ssl` when a file cannot be
 loaded, the key does not match, or a setting is rejected.
+
+#### set_client_ca
+
+Asks every client for a certificate that leads to a CA in the PEM file `ca_file`
+(mutual TLS), and tells clients which CAs those are.
+
+With `required` a client without a valid certificate fails the handshake; without it a
+client may send none, but one it sends must be valid. On an accepted connection,
+`Ssl.peer_certificate_subject` and `Ssl.peer_certificate_sha256` say who the client is.
+Call it before the context serves connections. Throws `ssl` when OpenSSL cannot read
+the file.
 
 ```js
 // A connected TCP stream, optionally with TLS, read and written from a coroutine.

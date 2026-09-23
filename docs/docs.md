@@ -65,6 +65,7 @@
 * [Compile macros](#compile-macros)
 * [Atomics](#atomics)
 * [Testing](#testing)
+* [Debugging](#debugging)
 * [HTTP Client](#http-client)
 * [HTTP Server](#http-server)
     * [WebSockets](#websockets)
@@ -378,6 +379,24 @@ view[0] = 20               // values is now { 1, 20, 3, 4 }
 Both forms call an instance method: `$range` for the copy and `$view` for the
 view. The hook must accept `(start_index: uint, length: uint)` and return one
 value. This lets custom collection types support the same syntax.
+
+An `Array` also converts to a view where one is expected: passing it to a
+`&[T]`, `local &[T]` or `mut &[T]` parameter passes `values.view()`. A function
+written for views therefore takes arrays, other views, fixed arrays and
+literals alike:
+
+```rust
+fn total(values: local &[int]) int {
+    let sum = 0
+    each values as value : sum += value
+    return sum
+}
+total(Array[int]{ 1, 2, 3 }) // 6
+total(.{ 4, 5 })             // 9
+```
+
+A view that is kept covers the storage the array had at that moment: after the
+array grows, the two no longer see each other's changes.
 
 ## Maps
 
@@ -1211,6 +1230,21 @@ each m as v {
 // 10 20 30
 ```
 
+`each start .. count` walks `count` numbers from `start` on, the same numbers `arr[start .. count]`
+takes as indexes. The numbers have the integer type of the bounds, and a second name gets the
+position from 0.
+
+```rust
+each 0 .. 3 as i {
+    println(i)
+}
+// 0 1 2
+each 5 .. 3 as number, position {
+    println(number + " at " + position)
+}
+// 5 at 0, 6 at 1, 7 at 2
+```
+
 ## Null-checking
 
 Before using a nullable value such as `?String`, check that it is not `null`.
@@ -1849,6 +1883,32 @@ Use `--filter` to compile only tests whose names contain a string:
 valk build ./src ./tests --test --filter "database" --run
 ```
 
+## Debugging
+
+Build with `-d` or `--debug` to debug a program:
+
+```sh
+valk build ./src -d -o app
+```
+
+A panic then prints the stack trace: every call that led to it, with its file and line. A
+crash, such as a segmentation fault or a stack overflow, prints the trace too.
+
+```
+Unhandled error 'LookupError.missing' at src/main.valk:5
+Stack trace:
+  at Box.pick (src/main.valk:5)
+  at main.load (src/main.valk:14)
+  at main.main (src/main.valk:20)
+```
+
+The executable also carries debug info (DWARF, and a `.pdb` file on Windows), so gdb, lldb and
+Visual Studio show the functions, the source lines, the arguments and the local variables.
+
+A debug build keeps its local variables in memory, where a debugger can read them. It is
+slower, its stack frames are larger (a coroutine gets 4 MiB of stack instead of 1 MiB), and an
+object can stay alive a little longer before it is collected.
+
 ## HTTP
 
 API for [valk.http](api.md#http)
@@ -1959,6 +2019,21 @@ s.start() !!
 
 HTTP/2 uses the same request handlers and responses, with HTTP/1.1 fallback.
 It currently requires TLS and the regular handler API, not `fast` handlers.
+
+A server can also ask its clients for a certificate (mutual TLS). A client without a valid
+one then cannot connect, and a handler reads who the client is from the request:
+
+```rust
+s.tls("certificate.pem", "private-key.pem") !!
+s.tls_client_ca("clients-ca.pem") !!
+
+fn handler(req: http.Request) http.Response {
+    return http.Response.text("Hello " + req.client_subject) // CN=alice,O=Example
+}
+```
+
+The client side sends its certificate with `client_certificate_file` and
+`client_key_file` in `http.Options`.
 
 HTTP/1.0 clients are served as well: a `Host` header is not required, the
 connection closes after the response unless the request says

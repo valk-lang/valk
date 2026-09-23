@@ -3018,6 +3018,12 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + ca_cert_path: ?String
     // The expected SHA-256 fingerprint of the server certificate, in hex.
     + certificate_sha256: ?String
+    // A PEM file with the client certificate, sent when the server asks for one (mutual TLS); intermediate certificates may follow it.
+    + client_certificate_file: ?String
+    // The PEM private key of `client_certificate_file`; `null` reads it from that file.
+    + client_key_file: ?String
+    // The password of an encrypted client key.
+    + client_key_password: String
     // The limit for connecting plus the TLS handshake, in milliseconds.
     + connect_timeout_ms: uint
     // Whether 301, 302, 303, 307 and 308 responses with a `Location` are followed.
@@ -3065,6 +3071,10 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ```js
 // A request passed to a server handler.
 + class Request {
+    // The SHA-256 fingerprint of that certificate as 64 lowercase hex characters; empty when the client sent none.
+    + client_certificate_sha256: String
+    // The subject of the certificate the client sent, such as `CN=alice,O=Example`; empty when it sent none. A server asks for one with `Server.tls_client_ca`.
+    + client_subject: String
     // The request method as sent, such as `GET`.
     + method: String
     // The path of the request target without the query string, not percent-decoded.
@@ -3230,6 +3240,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn start(worker_count: uint (0)) void !HttpError
     // Serves over TLS with the given PEM certificate and private key files.
     + fn tls(certificate_file: String, private_key_file: String, min_version: TlsVersion (net.TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) void !HttpError
+    // Asks every client for a certificate that leads to a CA in the PEM file `ca_file` (mutual TLS); call it after `tls` and before `start`.
+    + fn tls_client_ca(ca_file: String, required: bool (true)) void !HttpError
 }
 ```
 
@@ -3868,6 +3880,7 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 ```js
 // An IPv4 or IPv6 address with a port: the peer of a datagram, or a bound endpoint. The buffer size `SocketAddress.ip_in` and `to_string_in` require.
 + value ADDRESS_TEXT_SIZE (64)
+type c_long (int)
 ```
 
 ## Errors for 'net'
@@ -3990,6 +4003,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + static fn new() Ssl
     // Returns the SHA-256 fingerprint of the peer certificate as 64 lowercase hex characters.
     + fn peer_certificate_sha256() String !NetError
+    // Returns the subject of the peer certificate in RFC 2253 form, such as `CN=alice,O=Example`.
+    + fn peer_certificate_subject() String !NetError
     // Reads up to `buf.length` decrypted bytes into `buf` and returns the count.
     + fn recv(buf: local mut &[u8], timeout_ms: uint (5000)) uint !NetError
     // Returns the ALPN protocol agreed in the handshake, or `""` when none was.
@@ -4029,6 +4044,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + static fn connection(context: shared SslServerContext) Ssl
     // Loads the PEM `certificate_file` and `private_key_file` and checks that they match.
     + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) SslServerContext !NetError
+    // Asks every client for a certificate that leads to a CA in the PEM file `ca_file` (mutual TLS), and tells clients which CAs those are.
+    + fn set_client_ca(ca_file: String, required: bool (true)) void !NetError
 }
 ```
 

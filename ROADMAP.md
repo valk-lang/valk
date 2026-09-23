@@ -7,6 +7,18 @@
 - Release 0.7.5
 + `dim()` in the ansi group of String
 + GC optimizations
++ Time zones in DateTime (bundled time zone database on Windows)
++ `log` namespace
++ Ciphers (AES-GCM, ChaCha20-Poly1305), keys and signatures (RSA, ECDSA, Ed25519) in the crypto namespace
++ base64url encoding
++ TLS client certificates: `Ssl.set_certificate`
++ Fix `ssl_connect` replacing a name set with `Ssl.set_host`
++ Fix `??` staying nullable with an isset-checked local on the right
++ `--debug`: debug info for gdb/lldb/Visual Studio, and stack traces on panics and crashes
++ `each start .. count as i`
++ Servers can require client certificates (`SslServerContext.set_client_ca`, `http.Server.tls_client_ca`), and the HTTP client can send one
++ Arrays convert to `&[T]` views where one is expected
++ Fix a runtime NaN printing as `-nan`
 
 + Release 0.7.4
 + Make commands in valk.json: `valk make {name}` and `valk ls`
