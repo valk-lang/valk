@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.7.7
+
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)
 + Faster JSON encoding and float decoding
