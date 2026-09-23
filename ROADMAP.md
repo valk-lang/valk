@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.5
++ Release 0.7.5
 + `dim()` in the ansi group of String
 + GC optimizations
 + Time zones in DateTime (bundled time zone database on Windows)
