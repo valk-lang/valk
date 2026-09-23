@@ -623,7 +623,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn merge(map: HashMap[K, T]) HashMap[K, T]
     // Copies every entry of `map` into this map, replacing values of keys both maps have.
     + fn merge_in_place(map: HashMap[K, T]) void
-    // Creates an empty map whose bucket table fits `capacity` entries without rehashing.
+    // Creates an empty map with room for `capacity` entries, without rehashing.
     + static fn new(capacity: uint (0)) HashMap[K, T]
     // Removes the entry for `key`; does nothing when it is absent.
     + fn remove(key: K) void
@@ -1123,8 +1123,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: i16) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: i16, maximum: i16) i16
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: i16) i16
     // Returns the smaller of `this` and `other`.
@@ -1153,6 +1157,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: i16, to: *[u8 x 2]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1169,8 +1175,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: i32) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: i32, maximum: i32) i32
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: i32) i32
     // Returns the smaller of `this` and `other`.
@@ -1199,6 +1209,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: i32, to: *[u8 x 4]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1215,8 +1227,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: i64) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: i64, maximum: i64) i64
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: i64) i64
     // Returns the smaller of `this` and `other`.
@@ -1245,6 +1261,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: i64, to: *[u8 x 8]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1261,8 +1279,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: i8) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: i8, maximum: i8) i8
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: i8) i8
     // Returns the smaller of `this` and `other`.
@@ -1291,6 +1313,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: i8, to: *u8) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1307,8 +1331,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: int) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: int, maximum: int) int
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: int) int
     // Returns the smaller of `this` and `other`.
@@ -1337,6 +1365,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: int, to: *[u8 x 8]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1479,8 +1509,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: u16) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: u16, maximum: u16) u16
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: u16) u16
     // Returns the smaller of `this` and `other`.
@@ -1509,6 +1543,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: u16, to: *[u8 x 2]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1525,8 +1561,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: u32) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: u32, maximum: u32) u32
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: u32) u32
     // Returns the smaller of `this` and `other`.
@@ -1555,6 +1595,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: u32, to: *[u8 x 4]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1571,12 +1613,18 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: u64) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: u64, maximum: u64) u64
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: u64) u64
     // Returns the smaller of `this` and `other`.
     + fn min(other: u64) u64
+    // Returns the full 128-bit product of this value and `other` as its high and low halves.
+    + fn mul_wide(other: u64) (u64, u64)
     // Writes the value as text in `base` to stdout, without a newline.
     + fn print(base: u64) void
     // Returns a random value from the operating system's secure entropy source.
@@ -1601,6 +1649,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: u64, to: *[u8 x 8]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
@@ -1617,6 +1667,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn character_length(base: u8) uint
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: u8, maximum: u8) u8
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
     // Returns the value (0 to 15) of a hex digit byte like `7`, `a` or `F`.
@@ -1647,6 +1699,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn is_upper() bool
     // Returns true for space, `\t`, `\n`, `\v`, `\f` and `\r`.
     + fn is_whitespace() bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: u8) u8
     // Returns the smaller of `this` and `other`.
@@ -1677,6 +1731,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Returns the byte an escape letter stands for, e.g. `n` gives `\n`.
     + fn unescape() u8
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
@@ -1699,12 +1755,18 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn checked_multiply(other: uint) uint !LookupError
     // Returns the value limited to the range `minimum` to `maximum`, both inclusive.
     + fn clamp(minimum: uint, maximum: uint) uint
+    // Returns how many bits are one.
+    + fn count_ones() uint
     // Returns true when `str` parses as an integer equal to this value.
     + fn equals_string(str: String) bool
+    // Returns how many zero bits come before the highest one bit; the bit width for 0.
+    + fn leading_zeros() uint
     // Returns the larger of `this` and `other`.
     + fn max(other: uint) uint
     // Returns the smaller of `this` and `other`.
     + fn min(other: uint) uint
+    // Returns the full 128-bit product of this value and `other` as its high and low halves.
+    + fn mul_wide(other: uint) (u64, u64)
     // Writes the value as text in `base` to stdout, without a newline.
     + fn print(base: uint) void
     // Returns a random value from the operating system's secure entropy source.
@@ -1729,6 +1791,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_hex() String
     // Returns the value in decimal, with a leading `-` when negative.
     + fn to_string() String
+    // Returns how many zero bits come after the lowest one bit; the bit width for 0.
+    + fn trailing_zeros() uint
     // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
     + static fn write_big_endian(v: uint, to: *[u8 x 8]) void
     // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.

@@ -1,3 +1,6 @@
+// Up to this many entries a map finds keys by a linear scan and keeps no bucket table
+value HASHMAP_SMALL_LIMIT (8)
+
 /// A hash table from keys of type `K` to values of type `T`.
 ///
 /// Keys hash with their `$hash` method, otherwise integers by value and pointers by
@@ -8,12 +11,13 @@
 + class HashMap[K, T] $global {
     _keys: Array[K] (.{})
     - values_: Array[T] (.{})
-    // 0 is empty; positive values are dense entry indexes + 1.
-    - buckets: Array[int] (.{})
-    - entry_buckets: Array[uint] (.{})
+    // Only once the map holds more than HASHMAP_SMALL_LIMIT entries; a smaller map finds
+    // keys by a linear scan. 0 is empty; positive values are dense entry indexes + 1.
+    - buckets: ?Array[int] (null)
+    - entry_buckets: ?Array[uint] (null)
     - bucket_count: uint (16)
 
-    /// Creates an empty map whose bucket table fits `capacity` entries without rehashing.
+    /// Creates an empty map with room for `capacity` entries, without rehashing.
     ///
     /// Panics when `capacity` is too large. Marked `$default`: it also provides the type's
     /// default value.
@@ -26,7 +30,10 @@
             bucket_count *= 2
             if bucket_count == 0 : panic("HashMap capacity is too large")
         }
-        map.rebuild_buckets(bucket_count)
+        map.bucket_count = bucket_count
+        map._keys.increase_size(capacity)
+        map.values_.increase_size(capacity)
+        if capacity > HASHMAP_SMALL_LIMIT : map.rebuild_buckets(bucket_count)
         return map
     }
 
@@ -51,7 +58,7 @@
 
         this._keys = keys
         this.values_ = values
-        this.rebuild_buckets(this.bucket_count)
+        if isset(this.buckets) : this.rebuild_buckets(this.bucket_count)
     }
     #end
     /// Returns a new array of the values, in entry order.
@@ -88,21 +95,48 @@
         return hash
     }
 
-    fn bucket_value(index: uint) int {
-        return @ptrv(this.buckets.items(), int, index)
-    }
-
-    fn find_bucket(key: K) (uint, bool) {
+    // The dense index of `key`, and whether it is in the map
+    fn find_entry(key: K) (uint, bool) {
         #if K.$is_raw_pointer
         @unsafe
         #end
-        let bucket_count = this.buckets.length
+        if isset(this.buckets) {
+            let bucket_index, found = this.find_bucket(key)
+            if !found : return (0, false)
+            return ((this.bucket_value(bucket_index) - 1).to(uint), true)
+        }
+        let keys = this._keys.items()
+        let length = this._keys.length
+        let i: uint = 0
+        while i < length {
+            if @property_get(@ptrv(keys, K, i)) == key : return (i, true)
+            i++
+        }
+        return (0, false)
+    }
+
+    fn bucket_value(index: uint) int {
+        let buckets = this.buckets ?! panic("HashMap has no buckets")
+        return @ptrv(buckets.items(), int, index)
+    }
+
+    fn find_bucket(key: K) (uint, bool) {
+        @unsafe
+        let buckets = this.buckets ?! return (0, false)
+        return this.probe(buckets.items(), buckets.length, key)
+    }
+
+    // The bucket of `key` among `bucket_count` slots, or the empty one where it would go
+    fn probe(slots: ptr, bucket_count: uint, key: K) (uint, bool) {
+        #if K.$is_raw_pointer
+        @unsafe
+        #end
         if bucket_count == 0 : return (0, false)
 
         let index = SELF.key_hash(key) & (bucket_count - 1)
         let checked: uint = 0
         while checked++ < bucket_count {
-            let bucket = this.bucket_value(index)
+            let bucket = @ptrv(slots, int, index)
             if bucket == 0 : return (index, false)
             if bucket < 0 : panic("HashMap contains a deleted bucket")
             let entry_index = (bucket - 1).to(uint)
@@ -114,36 +148,47 @@
         return (bucket_count, false)
     }
 
-    fn entry_index(key: K) uint !LookupError {
-        let bucket_index, found = this.find_bucket(key)
-        if !found : throw .missing
-        let bucket = this.bucket_value(bucket_index)
-        if bucket <= 0 : throw .missing
-        return (bucket - 1).to(uint)
-    }
-
     fn rebuild_buckets(new_bucket_count: uint) {
-        this.bucket_count = new_bucket_count
-        this.buckets = Array[int].new(new_bucket_count)
-        this.buckets.set_expand(new_bucket_count - 1, 0, 0)
-        this.entry_buckets = Array[uint].new(this.length)
+        @unsafe
+        let buckets = Array[int].new(new_bucket_count)
+        buckets.set_expand(new_bucket_count - 1, 0, 0)
+        let entry_buckets = Array[uint].new(this.length)
         each this._keys into key, index {
-            let bucket_index, found = this.find_bucket(key)
+            let bucket_index, found = this.probe(buckets.items(), new_bucket_count, key)
             if found : panic("HashMap contains a duplicate key")
-            this.buckets.set(bucket_index, (index + 1).to(int)) _
-            this.entry_buckets.append(bucket_index)
+            buckets.set(bucket_index, (index + 1).to(int)) _
+            entry_buckets.append(bucket_index)
         }
+        this.bucket_count = new_bucket_count
+        this.buckets = buckets
+        this.entry_buckets = entry_buckets
     }
 
-    fn prepare_insert() bool {
-        if this.buckets.length == 0 {
-            this.rebuild_buckets(this.bucket_count)
-            return true
+    // Adds an entry for a key the map does not hold yet
+    fn insert_new(key: K, value: T) {
+        let entry_index = this._keys.length
+        if entry_index == 0 {
+            // Most maps stay small: one allocation holds their first entries
+            this._keys.increase_size(4)
+            this.values_.increase_size(4)
         }
+        this._keys.append(key)
+        this.values_.append(value)
 
-        if (this.length + 1) * 4 <= this.bucket_count * 3 : return false
-        this.rebuild_buckets(this.bucket_count * 2)
-        return true
+        let buckets = this.buckets
+        if !isset(buckets) {
+            if entry_index >= HASHMAP_SMALL_LIMIT : this.rebuild_buckets(this.bucket_count)
+            return
+        }
+        if (entry_index + 1) * 4 > this.bucket_count * 3 {
+            this.rebuild_buckets(this.bucket_count * 2)
+            return
+        }
+        let bucket_index, found = this.find_bucket(key)
+        if found : panic("HashMap contains a duplicate key")
+        buckets.set(bucket_index, (entry_index + 1).to(int)) _
+        let entry_buckets = this.entry_buckets ?! panic("HashMap has no entry buckets")
+        entry_buckets.append(bucket_index)
     }
 
     // Remove one bucket while preserving every linear-probe search chain.
@@ -152,10 +197,12 @@
         #if K.$is_raw_pointer || T.$is_raw_pointer
         @unsafe
         #end
+        let buckets = this.buckets ?! throw .missing
+        let entry_buckets = this.entry_buckets ?! throw .missing
         let removed = this.bucket_value(bucket_index)
         if removed <= 0 : throw .missing
         let removed_index = (removed - 1).to(uint)
-        let mask = this.buckets.length - 1
+        let mask = buckets.length - 1
         let hole = bucket_index
         let scan = (hole + 1) & mask
 
@@ -169,13 +216,13 @@
             let scan_distance = (scan - home) & mask
             let hole_distance = (hole - home) & mask
             if scan_distance > hole_distance {
-                @ptrv(this.buckets.items(), int, hole) = candidate
-                @ptrv(this.entry_buckets.items(), uint, entry_index) = hole
+                @ptrv(buckets.items(), int, hole) = candidate
+                @ptrv(entry_buckets.items(), uint, entry_index) = hole
                 hole = scan
             }
             scan = (scan + 1) & mask
         }
-        @ptrv(this.buckets.items(), int, hole) = 0
+        @ptrv(buckets.items(), int, hole) = 0
         return (removed_index, hole)
     }
 
@@ -183,15 +230,17 @@
         #if K.$is_raw_pointer || T.$is_raw_pointer
         @unsafe
         #end
+        let buckets = this.buckets ?! throw .missing
+        let entry_buckets = this.entry_buckets ?! throw .missing
         let index, hole = this.delete_bucket(bucket_index) !>
         let last_index = this.length - 1
         if index != last_index {
-            let moved_bucket = @ptrv(this.entry_buckets.items(), uint, last_index)
-            @ptrv(this.buckets.items(), int, moved_bucket) = (index + 1).to(int)
+            let moved_bucket = @ptrv(entry_buckets.items(), uint, last_index)
+            @ptrv(buckets.items(), int, moved_bucket) = (index + 1).to(int)
         }
         this._keys.swap_remove(index)
         this.values_.swap_remove(index)
-        this.entry_buckets.swap_remove(index)
+        entry_buckets.swap_remove(index)
         return hole
     }
 
@@ -203,44 +252,21 @@
         #if K.$is_raw_pointer || T.$is_raw_pointer
         @unsafe
         #end
-        let bucket_index, found = this.find_bucket(key)
+        let index, found = this.find_entry(key)
         if found {
-            let index = (this.bucket_value(bucket_index) - 1).to(uint)
             @property_update(this.values_.data, @ptrv(this.values_.items(), T, index), value)
             return
         }
-
-        if this.prepare_insert() {
-            let rebuilt_bucket_index, rebuilt_found = this.find_bucket(key)
-            if rebuilt_found : panic("HashMap rebuild introduced a duplicate key")
-            bucket_index = rebuilt_bucket_index
-        }
-
-        let entry_index = this._keys.length
-        this._keys.append(key)
-        this.values_.append(value)
-        this.entry_buckets.append(bucket_index)
-        this.buckets.set(bucket_index, (entry_index + 1).to(int)) _
+        this.insert_new(key, value)
     }
 
     /// Adds a new entry for `key`.
     ///
     /// Throws `exists`, leaving the map unchanged, when `key` is already present.
     + fn set_unique(key: K, value: T) !LookupError {
-        let bucket_index, found = this.find_bucket(key)
+        let index, found = this.find_entry(key)
         if found : throw .exists
-
-        if this.prepare_insert() {
-            let rebuilt_bucket_index, rebuilt_found = this.find_bucket(key)
-            if rebuilt_found : panic("HashMap rebuild introduced a duplicate key")
-            bucket_index = rebuilt_bucket_index
-        }
-
-        let entry_index = this._keys.length
-        this._keys.append(key)
-        this.values_.append(value)
-        this.entry_buckets.append(bucket_index)
-        this.buckets.set(bucket_index, (entry_index + 1).to(int)) _
+        this.insert_new(key, value)
     }
 
     /// Returns the value stored under `key`; backs `map[key]`.
@@ -250,7 +276,8 @@
         #if K.$is_raw_pointer
         @unsafe
         #end
-        let index = this.entry_index(key) !>
+        let index, found = this.find_entry(key)
+        if !found : throw .missing
         return @property_get(@ptrv(this.values_.items(), T, index))
     }
 
@@ -264,6 +291,18 @@
         #if K.$is_raw_pointer || T.$is_raw_pointer
         @unsafe
         #end
+        let buckets = this.buckets
+        if !isset(buckets) {
+            let index, found = this.find_entry(key)
+            if found : return (@property_get(@ptrv(this.values_.items(), T, index)), true)
+            let remove_index, remove_found = this.find_entry(remove_key)
+            if !remove_found : throw .missing
+            this._keys.swap_remove(remove_index)
+            this.values_.swap_remove(remove_index)
+            this.insert_new(key, replacement)
+            return (replacement, false)
+        }
+
         let bucket_index, found = this.find_bucket(key)
         if found {
             let bucket = this.bucket_value(bucket_index)
@@ -275,7 +314,7 @@
         let remove_bucket_index, remove_found = this.find_bucket(remove_key)
         if !remove_found : throw .missing
         let new_hole = this.remove_bucket_entry(remove_bucket_index) !>
-        let mask = this.buckets.length - 1
+        let mask = buckets.length - 1
         let home = SELF.key_hash(key) & mask
         if ((new_hole - home) & mask) < ((bucket_index - home) & mask) {
             bucket_index = new_hole
@@ -284,14 +323,15 @@
         let entry_index = this._keys.length
         this._keys.append(key)
         this.values_.append(replacement)
-        this.entry_buckets.append(bucket_index)
-        this.buckets.set(bucket_index, (entry_index + 1).to(int)) _
+        let entry_buckets = this.entry_buckets ?! throw .missing
+        entry_buckets.append(bucket_index)
+        buckets.set(bucket_index, (entry_index + 1).to(int)) _
         return (replacement, false)
     }
 
     /// Returns whether an entry for `key` exists.
     + fn has(key: K) bool {
-        let bucket_index, found = this.find_bucket(key)
+        let index, found = this.find_entry(key)
         return found
     }
     /// Returns whether any entry holds a value equal to `value` (a linear scan using `==`).
@@ -306,8 +346,9 @@
     }
     /// Returns the number of occupied buckets. Only compiled in test builds.
     + fn allocated_buckets_for_test() uint {
+        let buckets = this.buckets ?! return 0
         let count: uint = 0
-        each this.buckets as bucket {
+        each buckets as bucket {
             if bucket > 0 : count++
         }
         return count
@@ -318,10 +359,16 @@
     ///
     /// The last entry moves into the removed entry's position, so iteration order changes.
     + fn remove(key: K) {
-        let bucket_index, found = this.find_bucket(key)
+        if isset(this.buckets) {
+            let bucket_index, found = this.find_bucket(key)
+            if !found : return
+            this.remove_bucket_entry(bucket_index) ! panic("HashMap bucket index is out of bounds")
+            return
+        }
+        let index, found = this.find_entry(key)
         if !found : return
-
-        this.remove_bucket_entry(bucket_index) ! panic("HashMap bucket index is out of bounds")
+        this._keys.swap_remove(index)
+        this.values_.swap_remove(index)
     }
 
     /// Removes every entry.
@@ -329,8 +376,8 @@
     /// The bucket table's memory is released, but its size is kept: refilling the map to its
     /// earlier size, or to the capacity passed to `new`, does not rehash.
     + fn clear() {
-        this.buckets.clear(true)
-        this.entry_buckets.clear()
+        this.buckets = null
+        this.entry_buckets = null
         this._keys.clear()
         this.values_.clear()
     }

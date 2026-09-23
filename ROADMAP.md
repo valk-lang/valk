@@ -5,6 +5,10 @@
 
 ```
 - Release 0.7.6
++ Faster small HashMaps (linear scan up to 8 entries)
++ Faster JSON encoding and float decoding
++ Integer bit counts and the wide product: `leading_zeros`, `trailing_zeros`, `count_ones`, `mul_wide`
++ Faster MD5/SHA updates on large inputs
 
 + Release 0.7.5
 + `dim()` in the ansi group of String

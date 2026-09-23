@@ -165,6 +165,9 @@ intentionally forging an address. A raw `ptr` converts implicitly to `uint`.
 
 Every integer type exposes its range as `T.$max` and `T.$min`, e.g. `u8.$max` is `255`
 
+Integers count bits with `x.leading_zeros()`, `x.trailing_zeros()` and `x.count_ones()`.
+`a.mul_wide(b)` on `u64`/`uint` returns the full 128-bit product as `(high, low)`
+
 `float` becomes `f32` or `f64` based on the compile target
 
 ## Variables
