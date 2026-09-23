@@ -1,11 +1,6 @@
 use valk.http
 use valk.net
 
-// Raw OpenSSL calls to make a TLS server ask for a client certificate, which the
-// standard library has no API for
-extern fn SSL_CTX_load_verify_locations(ctx: ptr, ca_file: ?cstring, ca_path: ?cstring) i32;
-extern fn SSL_CTX_set_verify(ctx: ptr, mode: i32, cb: ?ptr) void;
-
 // The SHA-256 fingerprint of tests/assets/tls-cert.pem
 fn tls_cert_sha256() String {
     return "e63cdb9e606bce316e137c12ed84f847272fa277c29a327024d86d6da2eda627"
@@ -135,11 +130,9 @@ test "TLS: CA file and directory are stored and combined" {
 }
 
 test "TLS: a server hashes the client certificate" {
-    @unsafe
     let context: shared net.SslServerContext = net.SslServerContext.new(tls_cert_path(), tls_key_path()) !!
     // Ask for a client certificate and trust the test certificate
-    assert(SSL_CTX_load_verify_locations(context.ctx.@cast(ptr), tls_cert_path().data, null) == 1)
-    SSL_CTX_set_verify(context.ctx.@cast(ptr), 1, null)
+    context.set_client_ca(tls_cert_path(), false) !!
 
     let server = net.tcp_server("127.0.0.1", 19481) !!
     let running = co tls_server_echo(server, context)
@@ -249,11 +242,8 @@ test "TLS: client certificate files are checked" {
 }
 
 test "TLS: a server that requires a client certificate" {
-    @unsafe
     let context: shared net.SslServerContext = net.SslServerContext.new(tls_cert_path(), tls_key_path()) !!
-    // Verify the peer, and fail when it sends no certificate
-    assert(SSL_CTX_load_verify_locations(context.ctx.@cast(ptr), tls_cert_path().data, null) == 1)
-    SSL_CTX_set_verify(context.ctx.@cast(ptr), 3, null)
+    context.set_client_ca(tls_cert_path()) !!
 
     // Without a certificate the server refuses the handshake
     let server = net.tcp_server("127.0.0.1", 19501) !!
@@ -278,6 +268,107 @@ test "TLS: a server that requires a client certificate" {
     assert((await echo) == tls_cert_sha256())
     other.close() !!
     other_server.close() !!
+}
+
+// Accepts one TLS client and returns the subject of its certificate, "none", or what failed
+fn tls_server_subject(server: shared net.TcpServer, context: shared net.SslServerContext) String {
+    let connection = server.accept(3000) ! return "accept failed"
+    connection.ssl_accept(context, 3000) ! return "handshake failed"
+    let ssl = connection.ssl ?! return "no session"
+    let subject = ssl.peer_certificate_subject() !? "none"
+    let fingerprint = ssl.peer_certificate_sha256() !? "none"
+    let buffer = [u8]{ 0 x 8 }
+    connection.read(buffer) ! return "read failed"
+    connection.close() _
+    return subject + " " + fingerprint
+}
+
+// Connects to a test server on `port` and returns the subject of the server's certificate
+fn tls_client_with(port: u16, certificate: ?String) String {
+    let connection = net.tcp_client("127.0.0.1", port) ! return "connect failed"
+    let ssl = net.Ssl.new()
+    if isset(certificate) : ssl.set_certificate(tls_asset(certificate + "-cert.pem"), tls_asset(certificate + "-key.pem")) ! return "certificate failed"
+    ssl.set_ca_cert(tls_cert_path()) ! return "ca failed"
+    connection.ssl_connect(ssl, 3000) ! return "handshake failed"
+    let subject = ssl.peer_certificate_subject() ! return "no server subject"
+    connection.write("done") ! return "write failed"
+    // Closing with unread data (TLS 1.3 session tickets) resets the connection, which can
+    // drop the "done" before the server reads it: wait for the server to close first
+    let buffer = [u8]{ 0 x 64 }
+    while true : connection.read(buffer) ! break
+    connection.close() _
+    return subject
+}
+
+test "TLS: a server knows its clients by their certificate" {
+    let context: shared net.SslServerContext = net.SslServerContext.new(tls_cert_path(), tls_key_path()) !!
+    context.set_client_ca(tls_cert_path()) !!
+
+    // A client certificate the test CA issued, with an escaped comma in its subject
+    let server = net.tcp_server("127.0.0.1", 19503) !!
+    let running = co tls_server_subject(server, context)
+    assert(tls_client_with(19503, "tls-client") == "CN=localhost")
+    assert((await running) == "CN=alice,O=Example\\, Inc. b4580d34c4fc1330f955c0f87f6ce02e81e6c74ea03788046016f073b8b86025")
+    server.close() !!
+
+    // A file that is not there
+    let missing = false
+    let other: shared net.SslServerContext = net.SslServerContext.new(tls_cert_path(), tls_key_path()) !!
+    other.set_client_ca(tls_asset("missing.pem")) ! { missing = error_is(E.code, ssl) }
+    assert(missing)
+}
+
+test "TLS: a client certificate can be optional" {
+    let context: shared net.SslServerContext = net.SslServerContext.new(tls_cert_path(), tls_key_path()) !!
+    context.set_client_ca(tls_cert_path(), false) !!
+
+    let server = net.tcp_server("127.0.0.1", 19504) !!
+    let running = co tls_server_subject(server, context)
+    assert(tls_client_with(19504, null) == "CN=localhost")
+    assert((await running) == "none none")
+
+    // One that is sent must still be valid: tls-other-key.pem signs its own certificate
+    let untrusted = co tls_server_subject(server, context)
+    let connection = net.tcp_client("127.0.0.1", 19504) !!
+    let ssl = net.Ssl.new()
+    ssl.set_certificate(tls_asset("tls-self-signed-cert.pem"), tls_asset("tls-other-key.pem")) !!
+    ssl.set_ca_cert(tls_cert_path()) !!
+    connection.ssl_connect(ssl, 3000) _
+    assert((await untrusted) == "handshake failed")
+    connection.close() _
+    server.close() !!
+}
+
+fn mtls_test_handler(req: http.Request) http.Response {
+    return http.Response.text(req.client_subject + "|" + req.client_certificate_sha256.range(0, 8))
+}
+
+test "HTTPS: a server that wants client certificates" {
+    let before = http.Server.new("127.0.0.1", 9062, mtls_test_handler)
+    let without_tls = false
+    before.tls_client_ca(tls_cert_path()) ! { without_tls = error_is(E.code, init) }
+    assert(without_tls)
+
+    let server = http.Server.new("127.0.0.1", 9062, mtls_test_handler)
+    server.tls(tls_cert_path(), tls_key_path()) !!
+    server.tls_client_ca(tls_cert_path()) !!
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+
+    let response = http.request("GET", "https://127.0.0.1:9062/who", http.Options {
+        ca_cert_path: tls_cert_path()
+        client_certificate_file: tls_asset("tls-client-cert.pem")
+        client_key_file: tls_asset("tls-client-key.pem")
+    }) ! panic("mTLS request failed")
+    assert(response.body == "CN=alice,O=Example\\, Inc.|b4580d34")
+
+    // Without a certificate the connection fails
+    let refused = false
+    http.request("GET", "https://127.0.0.1:9062/who", http.Options {
+        ca_cert_path: tls_cert_path()
+        timeout_ms: 2000
+    }) ! { refused = true }
+    assert(refused)
 }
 
 test "TLS: default CA paths are a copy" {
