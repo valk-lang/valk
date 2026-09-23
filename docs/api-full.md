@@ -13091,6 +13091,8 @@ Writes `to_string()` into `buf` and returns the byte count.
     + fn set_ca_cert(path: ?String) void !NetError
     // Trusts the CA directory `dir` (OpenSSL `c_rehash` layout) and stores it as `cert_dir`.
     + fn set_ca_cert_dir(dir: ?String) void !NetError
+    // Presents a certificate to the server during the handshake, for servers that ask clients to prove who they are (mutual TLS).
+    + fn set_certificate(certificate_file: String, private_key_file: String, password: String ("")) void !NetError
     // Sets the TLS 1.2 and older ciphers as an OpenSSL cipher string.
     + fn set_cipher_list(ciphers: String) void !NetError
     // Sets the TLS 1.3 cipher suites as colon-separated names.
@@ -13247,6 +13249,17 @@ The directory is added to what is already trusted, and the `cert_file` set with
 `set_ca_cert` is loaded along with it. `null` clears `cert_dir`; what was loaded before
 stays trusted. On Windows a UNC path is refused. Throws `ssl` when OpenSSL rejects the
 directory or the file.
+
+#### set_certificate
+
+Presents a certificate to the server during the handshake, for servers that ask clients
+to prove who they are (mutual TLS).
+
+`certificate_file` is PEM: the client certificate, optionally followed by the
+intermediate certificates that lead to a CA the server trusts. `private_key_file` is its
+PEM key, and `password` unlocks an encrypted one. Call it before the handshake. Throws
+`ssl` when a file cannot be read, the password is wrong, or the key does not belong to
+the certificate.
 
 #### set_cipher_list
 
