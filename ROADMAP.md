@@ -9,6 +9,7 @@
 + Faster JSON encoding and float decoding
 + Integer bit counts and the wide product: `leading_zeros`, `trailing_zeros`, `count_ones`, `mul_wide`
 + Faster MD5/SHA updates on large inputs
++ GC: longer steps between collections when most allocations die young
 
 + Release 0.7.5
 + `dim()` in the ansi group of String
