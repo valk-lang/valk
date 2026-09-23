@@ -4,6 +4,11 @@ use core
 use fs
 use io
 
+#if TEST
+// Why each HTTP/2 connection of this thread stopped, so a failing test can report it
+global h2_test_end_reasons: Array[String] (.{})
+#end
+
 fn h2_close_file(file: ?fs.FileStream) {
     if isset(file) : file.close() ! {}
 }
@@ -54,6 +59,8 @@ class H2Connection {
     handlers: uint (0)
     processing_body: uint (0)
     reserved_body: uint (0)
+    // Why `run` stopped; kept for tests
+    end_reason: String ("closed")
 
     static fn new(owner: Connection) SELF !InitError {
         let settings = owner.worker.server
@@ -160,6 +167,7 @@ class H2Connection {
         while !this.closed {
             let now = time.mono_ms()
             if header_started != 0 && settings.header_timeout_ms > 0 && now - header_started >= settings.header_timeout_ms {
+                this.end_reason = "header timeout"
                 this.fail(1)
                 break
             }
@@ -170,21 +178,41 @@ class H2Connection {
             each expired as id : this.session.reset_stream(id, 8)
             this.sync_body()
             if settings.stopping != 0 : this.request_shutdown()
-            if !this.flush() : break
-            if this.session.draining && this.session.streams.length == 0 && this.handlers == 0 : break
+            if !this.flush() {
+                this.end_reason = "flush failed"
+                break
+            }
+            if this.session.draining && this.session.streams.length == 0 && this.handlers == 0 {
+                this.end_reason = "drained"
+                break
+            }
             let received = socket.read(chunk) ! {
-                if !error_is(E.code, timeout) : break
+                if !error_is(E.code, timeout) {
+                    let ssl_detail = socket.ssl
+                    let kind = error_is(E.code, closed) ? "closed" : (error_is(E.code, cancelled) ? "cancelled" : "error")
+                    this.end_reason = "read failed (" + kind + ")" + (isset(ssl_detail) ? ": " + ssl_detail.get_error_message() : "")
+                    break
+                }
                 let limit = input.length > 0 || !preface ? settings.header_timeout_ms : settings.idle_timeout_ms
-                if this.handlers == 0 && limit > 0 && time.mono_ms() - last_read >= limit : break
+                if this.handlers == 0 && limit > 0 && time.mono_ms() - last_read >= limit {
+                    this.end_reason = "idle for " + (time.mono_ms() - last_read) + " ms"
+                    break
+                }
                 continue
             }
-            if received == 0 : break
+            if received == 0 {
+                this.end_reason = "peer closed"
+                break
+            }
             last_read = time.mono_ms()
             input.write(chunk.view(0, received))
             if !preface {
                 let expected = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
                 let count = input.length < expected.bytes ? input.length : expected.bytes
-                if input.to_string().range(0, count) != expected.range(0, count) : break
+                if input.to_string().range(0, count) != expected.range(0, count) {
+                    this.end_reason = "bad preface"
+                    break
+                }
                 if input.length < expected.bytes : continue
                 input.clear_until(expected.bytes)
                 preface = true
@@ -194,6 +222,7 @@ class H2Connection {
             while reader.remaining().length > 0 && !this.closed {
                 let frame = h2_read_frame(reader) ! {
                     if error_is(E.code, incomplete) : break
+                    this.end_reason = "bad frame"
                     this.fail(error_is(E.code, frame_size) ? 6 : 1)
                     break
                 }
@@ -241,9 +270,16 @@ class H2Connection {
                 }
             }
             this.reading_batch = false
-            if !this.flush() : break
+            if !this.flush() {
+                this.end_reason = "flush failed"
+                break
+            }
             input.clear_until(reader.pos)
         }
+        #if TEST
+        let port = (socket.local_address() !? net.SocketAddress {}).port
+        h2_test_end_reasons.append("port " + port + ": " + this.end_reason + ", draining " + this.session.draining + ", streams " + this.session.streams.length + ", handlers " + this.handlers)
+        #end
         this.closed = true
         socket.interrupt()
         each this.session.streams as stream : stream.cancelled = true
@@ -253,6 +289,7 @@ class H2Connection {
     }
 
     fn fail(code: u32) {
+        if this.end_reason == "closed" : this.end_reason = "failed with code " + code
         this.reading_batch = false
         let payload = ByteBuffer.new()
         payload.write_u32_be(this.session.draining ? this.session.goaway_last_stream : this.session.last_stream)
