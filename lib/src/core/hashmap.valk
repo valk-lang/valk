@@ -1,6 +1,38 @@
 // Up to this many entries a map finds keys by a linear scan and keeps no bucket table
 value HASHMAP_SMALL_LIMIT (8)
 
+// The bucket table is split in groups of 8 buckets. Each bucket has a control byte:
+// 7 bits of its key's hash, or EMPTY, or DELETED (a removed entry that searches pass).
+// A search compares a whole group of control bytes at once.
+value HASHMAP_EMPTY (0xFF)
+value HASHMAP_DELETED (0x80)
+value HASHMAP_GROUP_LSB (0x0101010101010101)
+value HASHMAP_GROUP_MSB (0x8080808080808080)
+// No entry or bucket; one value instead of a (uint, bool) keeps the lookup short
+value HASHMAP_NONE (uint.$max)
+
+// A high bit for every byte of `group` equal to the byte in `pattern`; the rare false
+// positive only costs a key comparison
+fn hashmap_match_byte(group: u64, pattern: u64) u64 $inline {
+    let x = group ^ pattern
+    return (x - HASHMAP_GROUP_LSB) & ~x & HASHMAP_GROUP_MSB
+}
+
+// The 7 hash bits a bucket's control byte holds
+fn hashmap_h2(hash: uint) u8 $inline {
+    return (hash >> (size_of(uint) * 8 - 7)).to(u8)
+}
+
+// A high bit for every EMPTY byte of `group`
+fn hashmap_match_empty(group: u64) u64 $inline {
+    return group & (group << 1) & HASHMAP_GROUP_MSB
+}
+
+// The entries a table of `bucket_count` buckets holds before it grows (3/4)
+fn hashmap_capacity(bucket_count: uint) uint $inline {
+    return bucket_count - bucket_count / 4
+}
+
 /// A hash table from keys of type `K` to values of type `T`.
 ///
 /// Keys hash with their `$hash` method, otherwise integers by value and pointers by
@@ -12,10 +44,14 @@ value HASHMAP_SMALL_LIMIT (8)
     _keys: Array[K] (.{})
     - values_: Array[T] (.{})
     // Only once the map holds more than HASHMAP_SMALL_LIMIT entries; a smaller map finds
-    // keys by a linear scan. 0 is empty; positive values are dense entry indexes + 1.
-    - buckets: ?Array[int] (null)
-    - entry_buckets: ?Array[uint] (null)
+    // keys by a linear scan. One u64 of control bytes per group, then per bucket the u32
+    // index of its entry in `_keys`/`values_`, from u32 position bucket_count / 4.
+    - table: ?Array[u64] (null)
     - bucket_count: uint (16)
+    // EMPTY buckets that may still be filled before the table is rebuilt
+    - growth_left: uint (0)
+    // DELETED buckets; too many make searches long, so the table is rebuilt
+    - deleted: uint (0)
 
     /// Creates an empty map with room for `capacity` entries, without rehashing.
     ///
@@ -26,7 +62,7 @@ value HASHMAP_SMALL_LIMIT (8)
         if capacity == 0 : return map
 
         let bucket_count: uint = 16
-        while capacity > bucket_count - bucket_count / 4 {
+        while capacity > hashmap_capacity(bucket_count) {
             bucket_count *= 2
             if bucket_count == 0 : panic("HashMap capacity is too large")
         }
@@ -58,7 +94,7 @@ value HASHMAP_SMALL_LIMIT (8)
 
         this._keys = keys
         this.values_ = values
-        if isset(this.buckets) : this.rebuild_buckets(this.bucket_count)
+        if isset(this.table) : this.rebuild_buckets(this.bucket_count)
     }
     #end
     /// Returns a new array of the values, in entry order.
@@ -95,77 +131,94 @@ value HASHMAP_SMALL_LIMIT (8)
         return hash
     }
 
-    // The dense index of `key`, and whether it is in the map
-    fn find_entry(key: K) (uint, bool) {
+    // The dense index of `key`, or HASHMAP_NONE
+    fn find_entry(key: K) uint {
         #if K.$is_raw_pointer
         @unsafe
         #end
-        if isset(this.buckets) {
-            let bucket_index, found = this.find_bucket(key)
-            if !found : return (0, false)
-            return ((this.bucket_value(bucket_index) - 1).to(uint), true)
+        let table = this.table
+        if isset(table) {
+            let slot = this.find_slot(key, SELF.key_hash(key))
+            if slot == HASHMAP_NONE : return HASHMAP_NONE
+            return @ptrv(table.items(), u32, this.bucket_count / 4 + slot).to(uint)
         }
         let keys = this._keys.items()
         let length = this._keys.length
         let i: uint = 0
         while i < length {
-            if @property_get(@ptrv(keys, K, i)) == key : return (i, true)
+            if @property_get(@ptrv(keys, K, i)) == key : return i
             i++
         }
-        return (0, false)
+        return HASHMAP_NONE
     }
 
-    fn bucket_value(index: uint) int {
-        let buckets = this.buckets ?! panic("HashMap has no buckets")
-        return @ptrv(buckets.items(), int, index)
-    }
-
-    fn find_bucket(key: K) (uint, bool) {
+    // The bucket holding `key`, or HASHMAP_NONE
+    fn find_slot(key: K, hash: uint) uint {
         @unsafe
-        let buckets = this.buckets ?! return (0, false)
-        return this.probe(buckets.items(), buckets.length, key)
-    }
-
-    // The bucket of `key` among `bucket_count` slots, or the empty one where it would go
-    fn probe(slots: ptr, bucket_count: uint, key: K) (uint, bool) {
-        #if K.$is_raw_pointer
-        @unsafe
-        #end
-        if bucket_count == 0 : return (0, false)
-
-        let index = SELF.key_hash(key) & (bucket_count - 1)
-        let checked: uint = 0
-        while checked++ < bucket_count {
-            let bucket = @ptrv(slots, int, index)
-            if bucket == 0 : return (index, false)
-            if bucket < 0 : panic("HashMap contains a deleted bucket")
-            let entry_index = (bucket - 1).to(uint)
-            let stored_key = @property_get(@ptrv(this._keys.items(), K, entry_index))
-            if stored_key == key : return (index, true)
-            index++
-            if index == bucket_count : index = 0
+        let table = this.table ?! return HASHMAP_NONE
+        let groups = table.items()
+        let keys = this._keys.items()
+        let entries_at = this.bucket_count / 4
+        let group_mask = this.bucket_count / 8 - 1
+        let pattern = hashmap_h2(hash).to(u64) * HASHMAP_GROUP_LSB
+        let index = hash & group_mask
+        let stride: uint = 0
+        while true {
+            let group = @ptrv(groups, u64, index)
+            let matches = hashmap_match_byte(group, pattern)
+            while matches != 0 {
+                let slot = index * 8 + matches.trailing_zeros() / 8
+                let entry = @ptrv(groups, u32, entries_at + slot)
+                if @property_get(@ptrv(keys, K, entry)) == key : return slot
+                matches &= matches - 1
+            }
+            if hashmap_match_empty(group) != 0 : return HASHMAP_NONE
+            stride++
+            index = (index + stride) & group_mask
         }
-        return (bucket_count, false)
+        return HASHMAP_NONE
+    }
+
+    // The first EMPTY or DELETED bucket on the search path of `hash`
+    static fn find_free_slot(groups: ptr, group_mask: uint, hash: uint) uint {
+        @unsafe
+        let index = hash & group_mask
+        let stride: uint = 0
+        while true {
+            let free = @ptrv(groups, u64, index) & HASHMAP_GROUP_MSB
+            if free != 0 : return index * 8 + free.trailing_zeros() / 8
+            stride++
+            index = (index + stride) & group_mask
+        }
+        return 0
     }
 
     fn rebuild_buckets(new_bucket_count: uint) {
         @unsafe
-        let buckets = Array[int].new(new_bucket_count)
-        buckets.set_expand(new_bucket_count - 1, 0, 0)
-        let entry_buckets = Array[uint].new(this.length)
+        if this.length > u32.$max.to(uint) : panic("HashMap capacity is too large")
+        let group_count = new_bucket_count / 8
+        // Control groups all EMPTY; the entry indexes are written as buckets fill
+        let table = Array[u64].fill(group_count + new_bucket_count / 2, 0xFFFFFFFFFFFFFFFF)
+        let groups = table.items()
+        let entries_at = new_bucket_count / 4
         each this._keys into key, index {
-            let bucket_index, found = this.probe(buckets.items(), new_bucket_count, key)
-            if found : panic("HashMap contains a duplicate key")
-            buckets.set(bucket_index, (index + 1).to(int)) _
-            entry_buckets.append(bucket_index)
+            let hash = SELF.key_hash(key)
+            let slot = SELF.find_free_slot(groups, group_count - 1, hash)
+            @ptrv(groups, u8, slot) = hashmap_h2(hash)
+            @ptrv(groups, u32, entries_at + slot) = index.to(u32)
         }
         this.bucket_count = new_bucket_count
-        this.buckets = buckets
-        this.entry_buckets = entry_buckets
+        this.growth_left = hashmap_capacity(new_bucket_count) - this.length
+        this.deleted = 0
+        this.table = table
     }
 
     // Adds an entry for a key the map does not hold yet
     fn insert_new(key: K, value: T) {
+        if isset(this.table) {
+            this.append_entry(key, value, SELF.key_hash(key))
+            return
+        }
         let entry_index = this._keys.length
         if entry_index == 0 {
             // Most maps stay small: one allocation holds their first entries
@@ -174,74 +227,93 @@ value HASHMAP_SMALL_LIMIT (8)
         }
         this._keys.append(key)
         this.values_.append(value)
-
-        let buckets = this.buckets
-        if !isset(buckets) {
-            if entry_index >= HASHMAP_SMALL_LIMIT : this.rebuild_buckets(this.bucket_count)
-            return
-        }
-        if (entry_index + 1) * 4 > this.bucket_count * 3 {
-            this.rebuild_buckets(this.bucket_count * 2)
-            return
-        }
-        let bucket_index, found = this.find_bucket(key)
-        if found : panic("HashMap contains a duplicate key")
-        buckets.set(bucket_index, (entry_index + 1).to(int)) _
-        let entry_buckets = this.entry_buckets ?! panic("HashMap has no entry buckets")
-        entry_buckets.append(bucket_index)
+        if entry_index >= HASHMAP_SMALL_LIMIT : this.rebuild_buckets(this.bucket_count)
     }
 
-    // Remove one bucket while preserving every linear-probe search chain.
-    // Returns the dense entry index and the final empty bucket.
-    fn delete_bucket(bucket_index: uint) (uint, uint) !LookupError {
-        #if K.$is_raw_pointer || T.$is_raw_pointer
+    // Adds an entry for a key the bucket table does not hold
+    fn append_entry(key: K, value: T, hash: uint) {
         @unsafe
-        #end
-        let buckets = this.buckets ?! throw .missing
-        let entry_buckets = this.entry_buckets ?! throw .missing
-        let removed = this.bucket_value(bucket_index)
-        if removed <= 0 : throw .missing
-        let removed_index = (removed - 1).to(uint)
-        let mask = buckets.length - 1
-        let hole = bucket_index
-        let scan = (hole + 1) & mask
+        let table = this.table ?! panic("HashMap has no buckets")
+        let entry_index = this._keys.length
+        this._keys.append(key)
+        this.values_.append(value)
+        let slot = SELF.find_free_slot(table.items(), this.bucket_count / 8 - 1, hash)
+        this.place_entry(entry_index, hash, slot)
+    }
 
-        while true {
-            let candidate = this.bucket_value(scan)
-            if candidate == 0 : break
-            if candidate < 0 : panic("HashMap contains a deleted bucket")
-            let entry_index = (candidate - 1).to(uint)
-            let key = @property_get(@ptrv(this._keys.items(), K, entry_index))
-            let home = SELF.key_hash(key) & mask
-            let scan_distance = (scan - home) & mask
-            let hole_distance = (hole - home) & mask
-            if scan_distance > hole_distance {
-                @ptrv(buckets.items(), int, hole) = candidate
-                @ptrv(entry_buckets.items(), uint, entry_index) = hole
-                hole = scan
+    // Puts the entry at `entry_index` in the free bucket `slot` on its search path
+    fn place_entry(entry_index: uint, hash: uint, slot: uint) {
+        @unsafe
+        let table = this.table ?! panic("HashMap has no buckets")
+        if entry_index > u32.$max.to(uint) : panic("HashMap capacity is too large")
+        let groups = table.items()
+        if @ptrv(groups, u8, slot) == HASHMAP_EMPTY {
+            if this.growth_left == 0 {
+                // Rebuilt at the same size when DELETED buckets used up the room
+                let entries = this._keys.length
+                let size = entries <= hashmap_capacity(this.bucket_count) / 2 ? this.bucket_count : this.bucket_count * 2
+                if size == 0 : panic("HashMap capacity is too large")
+                this.rebuild_buckets(size)
+                return
             }
-            scan = (scan + 1) & mask
+            this.growth_left--
+        } else {
+            this.deleted--
         }
-        @ptrv(buckets.items(), int, hole) = 0
-        return (removed_index, hole)
+        @ptrv(groups, u8, slot) = hashmap_h2(hash)
+        @ptrv(groups, u32, this.bucket_count / 4 + slot) = entry_index.to(u32)
     }
 
-    fn remove_bucket_entry(bucket_index: uint) uint !LookupError {
-        #if K.$is_raw_pointer || T.$is_raw_pointer
+    // The bucket of the entry at `entry_index`
+    fn slot_of_entry(entry_index: uint) uint {
         @unsafe
-        #end
-        let buckets = this.buckets ?! throw .missing
-        let entry_buckets = this.entry_buckets ?! throw .missing
-        let index, hole = this.delete_bucket(bucket_index) !>
+        let table = this.table ?! panic("HashMap has no buckets")
+        let groups = table.items()
+        let entries_at = this.bucket_count / 4
+        let group_mask = this.bucket_count / 8 - 1
+        let hash = SELF.key_hash(@property_get(@ptrv(this._keys.items(), K, entry_index)))
+        let pattern = hashmap_h2(hash).to(u64) * HASHMAP_GROUP_LSB
+        let index = hash & group_mask
+        let stride: uint = 0
+        while true {
+            let group = @ptrv(groups, u64, index)
+            let matches = hashmap_match_byte(group, pattern)
+            while matches != 0 {
+                let slot = index * 8 + matches.trailing_zeros() / 8
+                if @ptrv(groups, u32, entries_at + slot).to(uint) == entry_index : return slot
+                matches &= matches - 1
+            }
+            if hashmap_match_empty(group) != 0 : break
+            stride++
+            index = (index + stride) & group_mask
+        }
+        panic("HashMap entry has no bucket")
+    }
+
+    // Removes the entry in `slot`; the last entry takes its place in the dense arrays
+    fn remove_slot(slot: uint) {
+        @unsafe
+        let table = this.table ?! panic("HashMap has no buckets")
+        let groups = table.items()
+        let entries_at = this.bucket_count / 4
+        let index = @ptrv(groups, u32, entries_at + slot).to(uint)
+        // EMPTY when the group has an EMPTY bucket already, since no search continues past
+        // such a group; otherwise DELETED, so searches still pass it
+        if hashmap_match_empty(@ptrv(groups, u64, slot / 8)) != 0 {
+            @ptrv(groups, u8, slot) = HASHMAP_EMPTY
+            this.growth_left++
+        } else {
+            @ptrv(groups, u8, slot) = HASHMAP_DELETED
+            this.deleted++
+        }
         let last_index = this.length - 1
         if index != last_index {
-            let moved_bucket = @ptrv(entry_buckets.items(), uint, last_index)
-            @ptrv(buckets.items(), int, moved_bucket) = (index + 1).to(int)
+            let moved_slot = this.slot_of_entry(last_index)
+            @ptrv(groups, u32, entries_at + moved_slot) = index.to(u32)
         }
         this._keys.swap_remove(index)
         this.values_.swap_remove(index)
-        entry_buckets.swap_remove(index)
-        return hole
+        if this.deleted > this.bucket_count / 8 : this.rebuild_buckets(this.bucket_count)
     }
 
     /// Stores `value` under `key`, replacing the value of an existing entry in place.
@@ -252,8 +324,20 @@ value HASHMAP_SMALL_LIMIT (8)
         #if K.$is_raw_pointer || T.$is_raw_pointer
         @unsafe
         #end
-        let index, found = this.find_entry(key)
-        if found {
+        let table = this.table
+        if isset(table) {
+            let hash = SELF.key_hash(key)
+            let slot = this.find_slot(key, hash)
+            if slot != HASHMAP_NONE {
+                let index = @ptrv(table.items(), u32, this.bucket_count / 4 + slot)
+                @property_update(this.values_.data, @ptrv(this.values_.items(), T, index), value)
+                return
+            }
+            this.append_entry(key, value, hash)
+            return
+        }
+        let index = this.find_entry(key)
+        if index != HASHMAP_NONE {
             @property_update(this.values_.data, @ptrv(this.values_.items(), T, index), value)
             return
         }
@@ -264,8 +348,13 @@ value HASHMAP_SMALL_LIMIT (8)
     ///
     /// Throws `exists`, leaving the map unchanged, when `key` is already present.
     + fn set_unique(key: K, value: T) !LookupError {
-        let index, found = this.find_entry(key)
-        if found : throw .exists
+        if isset(this.table) {
+            let hash = SELF.key_hash(key)
+            if this.find_slot(key, hash) != HASHMAP_NONE : throw .exists
+            this.append_entry(key, value, hash)
+            return
+        }
+        if this.find_entry(key) != HASHMAP_NONE : throw .exists
         this.insert_new(key, value)
     }
 
@@ -276,8 +365,8 @@ value HASHMAP_SMALL_LIMIT (8)
         #if K.$is_raw_pointer
         @unsafe
         #end
-        let index, found = this.find_entry(key)
-        if !found : throw .missing
+        let index = this.find_entry(key)
+        if index == HASHMAP_NONE : throw .missing
         return @property_get(@ptrv(this.values_.items(), T, index))
     }
 
@@ -291,48 +380,35 @@ value HASHMAP_SMALL_LIMIT (8)
         #if K.$is_raw_pointer || T.$is_raw_pointer
         @unsafe
         #end
-        let buckets = this.buckets
-        if !isset(buckets) {
-            let index, found = this.find_entry(key)
-            if found : return (@property_get(@ptrv(this.values_.items(), T, index)), true)
-            let remove_index, remove_found = this.find_entry(remove_key)
-            if !remove_found : throw .missing
+        let table = this.table
+        if !isset(table) {
+            let index = this.find_entry(key)
+            if index != HASHMAP_NONE : return (@property_get(@ptrv(this.values_.items(), T, index)), true)
+            let remove_index = this.find_entry(remove_key)
+            if remove_index == HASHMAP_NONE : throw .missing
             this._keys.swap_remove(remove_index)
             this.values_.swap_remove(remove_index)
             this.insert_new(key, replacement)
             return (replacement, false)
         }
 
-        let bucket_index, found = this.find_bucket(key)
-        if found {
-            let bucket = this.bucket_value(bucket_index)
-            if bucket <= 0 : throw .missing
-            let index = (bucket - 1).to(uint)
+        let hash = SELF.key_hash(key)
+        let slot = this.find_slot(key, hash)
+        if slot != HASHMAP_NONE {
+            let index = @ptrv(table.items(), u32, this.bucket_count / 4 + slot).to(uint)
             return (@property_get(@ptrv(this.values_.items(), T, index)), true)
         }
 
-        let remove_bucket_index, remove_found = this.find_bucket(remove_key)
-        if !remove_found : throw .missing
-        let new_hole = this.remove_bucket_entry(remove_bucket_index) !>
-        let mask = buckets.length - 1
-        let home = SELF.key_hash(key) & mask
-        if ((new_hole - home) & mask) < ((bucket_index - home) & mask) {
-            bucket_index = new_hole
-        }
-
-        let entry_index = this._keys.length
-        this._keys.append(key)
-        this.values_.append(replacement)
-        let entry_buckets = this.entry_buckets ?! throw .missing
-        entry_buckets.append(bucket_index)
-        buckets.set(bucket_index, (entry_index + 1).to(int)) _
+        let remove_slot = this.find_slot(remove_key, SELF.key_hash(remove_key))
+        if remove_slot == HASHMAP_NONE : throw .missing
+        this.remove_slot(remove_slot)
+        this.append_entry(key, replacement, hash)
         return (replacement, false)
     }
 
     /// Returns whether an entry for `key` exists.
     + fn has(key: K) bool {
-        let index, found = this.find_entry(key)
-        return found
+        return this.find_entry(key) != HASHMAP_NONE
     }
     /// Returns whether any entry holds a value equal to `value` (a linear scan using `==`).
     + fn has_value(value: T) bool {
@@ -346,10 +422,11 @@ value HASHMAP_SMALL_LIMIT (8)
     }
     /// Returns the number of occupied buckets. Only compiled in test builds.
     + fn allocated_buckets_for_test() uint {
-        let buckets = this.buckets ?! return 0
+        let table = this.table ?! return 0
         let count: uint = 0
-        each buckets as bucket {
-            if bucket > 0 : count++
+        let group_count = this.bucket_count / 8
+        each table as group, index {
+            if index < group_count : count += (~group & HASHMAP_GROUP_MSB).count_ones()
         }
         return count
     }
@@ -359,14 +436,13 @@ value HASHMAP_SMALL_LIMIT (8)
     ///
     /// The last entry moves into the removed entry's position, so iteration order changes.
     + fn remove(key: K) {
-        if isset(this.buckets) {
-            let bucket_index, found = this.find_bucket(key)
-            if !found : return
-            this.remove_bucket_entry(bucket_index) ! panic("HashMap bucket index is out of bounds")
+        if isset(this.table) {
+            let slot = this.find_slot(key, SELF.key_hash(key))
+            if slot != HASHMAP_NONE : this.remove_slot(slot)
             return
         }
-        let index, found = this.find_entry(key)
-        if !found : return
+        let index = this.find_entry(key)
+        if index == HASHMAP_NONE : return
         this._keys.swap_remove(index)
         this.values_.swap_remove(index)
     }
@@ -376,8 +452,7 @@ value HASHMAP_SMALL_LIMIT (8)
     /// The bucket table's memory is released, but its size is kept: refilling the map to its
     /// earlier size, or to the capacity passed to `new`, does not rehash.
     + fn clear() {
-        this.buckets = null
-        this.entry_buckets = null
+        this.table = null
         this._keys.clear()
         this.values_.clear()
     }

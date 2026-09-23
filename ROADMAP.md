@@ -10,6 +10,10 @@
 + Integer bit counts and the wide product: `leading_zeros`, `trailing_zeros`, `count_ones`, `mul_wide`
 + Faster MD5/SHA updates on large inputs
 + GC: longer steps between collections when most allocations die young
++ HashMap buckets in groups of 8 (faster misses, inserts and large maps)
++ Faster float to text, and Eisel-Lemire float parsing
++ Faster JSON number scanning
++ Fix a struct literal inside a loop growing the stack until it overflows
 
 + Release 0.7.5
 + `dim()` in the ansi group of String

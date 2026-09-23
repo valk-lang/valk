@@ -185,6 +185,85 @@ fn float_cached_shortest(mantissa: u64, encoded_exponent: int) FloatCachedDecima
     return .{ digits: value, exponent: decimal_exponent + removed }
 }
 
+// Eight decimal digits of `n` (< 10^8), one per byte (not ASCII yet), the first digit in
+// the lowest byte: halves, then pairs, then single digits, each step for all lanes at once
+fn float_eight_digits(n: u64) u64 $inline {
+    let high = n / 10000
+    let x = high | ((n - high * 10000) << 32)
+    let hundreds = ((x * 10486) >> 20) & 0x0000007F0000007F
+    x = hundreds | ((x - hundreds * 100) << 16)
+    let tens = ((x * 103) >> 10) & 0x000F000F000F000F
+    return tens | ((x - tens * 10) << 8)
+}
+
+// Writes the ASCII digits of `value` (>= 1) ending at `end`; returns how many
+fn float_write_digits_before(value: u64, end: ptr) uint {
+    @unsafe
+    let count: uint = 0
+    while true {
+        let rest = value / 100000000
+        let chunk = float_eight_digits(value - rest * 100000000)
+        write_little_endian(end - count - 8, (chunk + 0x3030303030303030).to(uint), 8)
+        if rest == 0 : return count + 8 - chunk.trailing_zeros() / 8
+        count += 8
+        value = rest
+    }
+    return count
+}
+
+global float_pow10: [u64 x 20] ({
+    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000,
+    10000000000, 100000000000, 1000000000000, 10000000000000, 100000000000000,
+    1000000000000000, 10000000000000000, 100000000000000000, 1000000000000000000,
+    10000000000000000000
+})
+
+// The number of decimal digits of `value` (>= 1): the bit length estimates it, a
+// power of ten corrects it
+fn float_digit_count(value: u64) uint $inline {
+    let estimate = ((64 - value.leading_zeros()) * 1233) >> 12
+    return estimate + (value >= float_pow10[estimate] ? 1 : 0)
+}
+
+// Stores the 8 bytes of `word` at `at`, lowest byte first, at any alignment; LLVM merges
+// the byte stores into one
+fn float_store_word(at: ptr, word: u64) $inline {
+    @unsafe
+    @ptrv(at, u8, 0) = word.to(u8)
+    @ptrv(at, u8, 1) = (word >> 8).to(u8)
+    @ptrv(at, u8, 2) = (word >> 16).to(u8)
+    @ptrv(at, u8, 3) = (word >> 24).to(u8)
+    @ptrv(at, u8, 4) = (word >> 32).to(u8)
+    @ptrv(at, u8, 5) = (word >> 40).to(u8)
+    @ptrv(at, u8, 6) = (word >> 48).to(u8)
+    @ptrv(at, u8, 7) = (word >> 56).to(u8)
+}
+
+// The last `count` (1 to 8) of the eight digits of `n` as ASCII in the low bytes
+fn float_ascii_tail(n: u64, count: uint) u64 $inline {
+    return (float_eight_digits(n) + 0x3030303030303030) >> ((8 - count) * 8)
+}
+
+// Writes `count` (1 to 24) digits of `value`, leading zeros included, at `at`. Every store
+// is 8 bytes, so up to 7 bytes after the digits are overwritten
+fn float_write_width(value: u64, count: uint, at: ptr) $inline {
+    @unsafe
+    if count <= 8 {
+        float_store_word(at, float_ascii_tail(value, count))
+        return
+    }
+    let high = value / 100000000
+    let low = float_eight_digits(value - high * 100000000) + 0x3030303030303030
+    if count <= 16 {
+        float_store_word(at, float_ascii_tail(high, count - 8))
+    } else {
+        let top = high / 100000000
+        float_store_word(at, float_ascii_tail(top, count - 16))
+        float_store_word(at + count - 16, float_eight_digits(high - top * 100000000) + 0x3030303030303030)
+    }
+    float_store_word(at + count - 8, low)
+}
+
 fn format_float_cached(value: f64, buf: ptr, force_exponent: bool (false)) uint {
     @unsafe
     let bits = f64_to_bits(value)
@@ -192,16 +271,42 @@ fn format_float_cached(value: f64, buf: ptr, force_exponent: bool (false)) uint 
     let mantissa = bits & ((1.to(u64) << 52) - 1)
     let encoded_exponent = ((bits >> 52) & 0x7ff).to(int)
     let decimal = float_cached_shortest(mantissa, encoded_exponent)
-
-    let reversed: [u8 x 24] = @undefined
-    let count: uint = 0
     let digits = decimal.digits
-    while digits > 0 {
-        reversed[count++] = (digits % 10).to(u8)
-        digits /= 10
+    let count = float_digit_count(digits)
+    let exponent = decimal.exponent + count.to(int) - 1
+
+    // The usual shapes, stored as whole words straight into `buf`: they end at most 7
+    // bytes past the text and within 32 bytes of `buf`
+    if !force_exponent && count <= 17 {
+        let offset: uint = 0
+        if negative {
+            @ptrv(buf, u8, 0) = '-'
+            offset = 1
+        }
+        if exponent >= 0 && exponent < 8 && exponent.to(uint) + 1 < count {
+            // ddd.ddd
+            let integer_digits = exponent.to(uint) + 1
+            let fraction_digits = count - integer_digits
+            let scale = float_pow10[fraction_digits]
+            let integer = digits / scale
+            let head = float_ascii_tail(integer, integer_digits)
+            if integer_digits < 8 : head |= '.'.to(u64) << (integer_digits * 8)
+            float_store_word(buf + offset, head)
+            if integer_digits == 8 : @ptrv(buf, u8, offset + 8) = '.'
+            float_write_width(digits - integer * scale, fraction_digits, buf + offset + integer_digits + 1)
+            return offset + count + 1
+        }
+        if exponent < 0 && exponent >= -6 {
+            // 0.000ddd
+            let zeros = (0 - exponent - 1).to(uint)
+            float_store_word(buf + offset, 0x3030303030302E30)
+            float_write_width(digits, count, buf + offset + 2 + zeros)
+            return offset + 2 + zeros + count
+        }
     }
-    let ordered: [u8 x 32] = @undefined
-    let i: uint = 0
-    while i < count : ordered[i] = reversed[count - i++ - 1]
-    return float_format_write_digits(buf, negative, &ordered, count, decimal.exponent + count.to(int) - 1, force_exponent)
+
+    let text: [u8 x 32] = @undefined
+    let end: ptr = @ref(text[31]) + 1
+    float_write_digits_before(digits, end)
+    return float_format_write_ascii(buf, negative, end - count, count, exponent, force_exponent)
 }

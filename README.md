@@ -83,19 +83,19 @@ make
 
 ## Benchmarks
 
-Valk 0.7.0, Go 1.27.1, Rust 1.97.1. Median of 3 runs after one warm-up, memory is peak RSS.
+Valk 0.7.6 (dev), Go 1.27.1, Rust 1.97.1. Median of 5 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
-| binary-tree | 19 | 0.450s (53.4 MB) | 1.310s (57.4 MB) | 2.510s (66.3 MB) |
-| binary-tree-multi | 19 | 0.190s (72.7 MB) | 0.500s (86.1 MB) | 0.690s (66.4 MB) |
-| json | 2000000 | 0.730s (2.5 MB) | 2.100s (11.5 MB) | 0.420s (2.6 MB) |
-| json-serde | sample, 50000 | 0.320s (151.6 MB) | 0.400s (228.3 MB) | 0.230s (119.2 MB) |
-| lru | 1000, 11000000 | 0.640s (4.5 MB) | 0.750s (3.5 MB) | 0.430s (2.6 MB) |
-| merkletrees | 18 | 0.400s (69.1 MB) | 1.120s (71.1 MB) | 1.620s (66.2 MB) |
-| nsieve | 13 | 0.720s (80.3 MB) | 0.800s (141.8 MB) | 0.760s (80.5 MB) |
-| spectral-norm | 5500 | 1.070s (2.5 MB) | 1.110s (5.6 MB) | 1.070s (2.5 MB) |
-| spectral-norm-multi | 8000, 4 workers | 0.620s (5.7 MB) | 0.610s (9.7 MB) | 0.630s (2.8 MB) |
+| binary-tree | 19 | 0.470s (56.0 MB) | 1.340s (56.4 MB) | 2.590s (66.2 MB) |
+| binary-tree-multi | 19 | 0.310s (75.4 MB) | 0.520s (85.7 MB) | 0.720s (66.3 MB) |
+| json | 2000000 | 0.430s (3.2 MB) | 2.090s (12.7 MB) | 0.430s (2.5 MB) |
+| json-serde | sample, 50000 | 0.220s (155.3 MB) | 0.380s (228.6 MB) | 0.230s (119.3 MB) |
+| lru | 1000, 11000000 | 0.360s (4.8 MB) | 0.760s (3.5 MB) | 0.440s (2.6 MB) |
+| merkletrees | 18 | 0.540s (66.6 MB) | 1.170s (70.8 MB) | 1.670s (66.3 MB) |
+| nsieve | 13 | 0.810s (80.4 MB) | 0.870s (141.8 MB) | 0.840s (80.5 MB) |
+| spectral-norm | 5500 | 1.080s (4.5 MB) | 1.110s (5.7 MB) | 1.080s (2.6 MB) |
+| spectral-norm-multi | 8000, 4 workers | 0.650s (4.6 MB) | 0.630s (9.7 MB) | 0.640s (2.8 MB) |
 
 Code: [Link](examples/bench)
 
