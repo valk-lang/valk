@@ -305,7 +305,7 @@ the condition is written `if (Thing{ ok: true }).ok { ... }`.
 
 Fresh slice storage is a language form, not a class: `[int]{ 1, 2, 3 }`
 allocates from a list and returns the `mut &[int]` that owns the elements,
-`[u8]{ 0 x n }` repeats a value `n` times. `[T]{ null x n }` skips the fill and is only safe when every
+`[u8]{ 0 x n }` repeats a value `n` times; the `x n` goes on the value's line. `[T]{ null x n }` skips the fill and is only safe when every
 zero `T` is a valid value; for reference elements it requires `@unsafe`.
 Container methods resize containers and create views. Writing the raw storage
 fields of an `array` or `slice`, including their length, requires `@unsafe`,
