@@ -1003,8 +1003,8 @@ order does not matter.
 
 Removes every element equal to an earlier one, keeping first occurrences in order.
 
-Compares with `==` (so `$eq` applies). Integers and types with `$hash` (such as
-`String`) are tracked in a set, which costs O(n); other types cost O(n²).
+Compares with `==` (so `$eq` applies). From 128 items, integers and types with `$hash`
+(such as `String`) are tracked in a set, which costs O(n); otherwise it costs O(n²).
 
 #### remove_value
 

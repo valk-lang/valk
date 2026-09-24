@@ -35,7 +35,7 @@
 + `log`: a record field replaces a context field from `with` that has the same key, instead of writing the key twice
 + `json` object members keep their order when one is removed
 + `valk doc` labels an extension that only some key or element types get by its pattern, such as `HashMap[String, T]` and `HashMap[u32, T]`, instead of one concrete instantiation
-+ `Array.unique`, `remove_duplicates`, `intersect` and `append_many(.., true)` use a set for integers and `$hash` types (such as `String`): O(n) instead of O(n²)
++ `Array.unique`, `remove_duplicates`, `intersect` and `append_many(.., true)` use a set for integers and `$hash` types (such as `String`) from 128 items: O(n) instead of O(n²)
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
 + `utf8.length` and `utf8.chars()` end an invalid sequence at a byte that cannot continue it, instead of swallowing the next character
