@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `valk ls` colors its output only on a terminal and not when `NO_COLOR` is set
 + Test failures print paths relative to the package root like panics; a `--filter` that matches no test is an error; `valk make` names the line that failed
 + `valk run src alice` points at `valk run src -- alice` when `alice` is not a path
 + `valk fmt` lists the files it changed (and leaves unchanged files untouched); `valk fmt -h` and `valk make -h` have their own help; an unknown command says so; `valk -h` lists `valk lsp`

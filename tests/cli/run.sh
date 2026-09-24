@@ -729,7 +729,11 @@ fn main(args: Array[String]) {
 }
 VALK
 
-ls_out=$(cd "$project" && "$VALK_BIN" ls 2>&1)
+ls_out=$(cd "$project" && TERM=xterm "$VALK_BIN" ls 2>&1)
+if [[ "$ls_out" == *$'\e'* ]]; then
+    echo "# 'valk ls' must not write colors into a pipe"
+    exit 1
+fi
 if [[ "$ls_out" != *"Make commands:"* ]] || [[ "$ls_out" != *"global"* ]] || [[ "$ls_out" != *"default"* ]] \
     || [[ "$ls_out" != *"greet"* ]] || [[ "$ls_out" != *"build src"* ]]; then
     echo "# 'valk ls' must list the make commands, and mark the global and default ones"
