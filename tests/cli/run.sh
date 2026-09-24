@@ -484,6 +484,30 @@ if ! grep -q '^    let x = 1$' "$workdir/fmt.valk"; then
     cat "$workdir/fmt.valk"
     exit 1
 fi
+if [[ "$fmt_out" != *"fmt.valk"* ]] || [[ "$fmt_out" != *"Formatted 1 file"* ]] || [[ "$fmt_out" == *"Compiled in"* ]]; then
+    echo "# valk fmt should list the changed file"
+    echo "$fmt_out"
+    exit 1
+fi
+fmt_again=$("$VALK" fmt "$workdir/fmt.valk" 2>&1)
+if [[ "$fmt_again" != *"Already formatted"* ]]; then
+    echo "# A formatted file should be reported as such"
+    echo "$fmt_again"
+    exit 1
+fi
+
+echo "> Command help and unknown commands"
+if [[ "$("$VALK" fmt -h 2>&1)" != *"Usage: valk fmt"* ]] || [[ "$("$VALK" make -h 2>&1)" != *"Usage: valk make"* ]]; then
+    echo "# valk fmt -h and valk make -h need their own help"
+    exit 1
+fi
+unknown_out=$("$VALK" nope 2>&1)
+unknown_code=$?
+if [ "$unknown_code" -ne 1 ] || [[ "$unknown_out" != *"Unknown command 'nope'"* ]] || [[ "$("$VALK" -h)" != *"valk lsp"* ]]; then
+    echo "# An unknown command must say so"
+    echo "$unknown_out"
+    exit 1
+fi
 
 echo "> Concurrent builds never fail on the IR cache"
 concurrent_pids=()
@@ -984,4 +1008,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 66"
+echo "# Test count: 67"
