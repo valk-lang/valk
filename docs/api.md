@@ -1027,14 +1027,14 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
-    // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
-    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
+    + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
-    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
-    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
+    + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -1071,14 +1071,14 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
-    // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
-    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
+    + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
-    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
-    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
+    + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -1115,14 +1115,14 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
-    // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
-    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
+    + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
-    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
-    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
+    + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 

@@ -3440,14 +3440,14 @@ Returns a new `String` holding a copy of the bytes before the zero terminator.
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
-    // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
-    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
+    + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
-    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
-    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
+    + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -3550,9 +3550,12 @@ exponent form is always used. Throws when `out` fails.
 
 #### to_string
 
-Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
+Returns the value as text; with `decimals`, with exactly that many digits after the dot.
 
-At most 19 decimals are written; larger values are clamped to 19. With `trim_zeros`,
+Without `decimals` it is the shortest text that parses back to the same value, the
+same as `to_shortest_string` and string interpolation: `3.14159`, `3`, `0.0001`. With
+`decimals`, e.g. `(1.5).to_string(2)` is `1.50`; at most 19 decimals are written,
+larger values are clamped to 19. With `trim_zeros`,
 trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
 rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
 infinities and values of magnitude
@@ -3612,14 +3615,14 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
-    // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
-    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
+    + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
-    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
-    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
+    + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -3722,9 +3725,12 @@ exponent form is always used. Throws when `out` fails.
 
 #### to_string
 
-Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
+Returns the value as text; with `decimals`, with exactly that many digits after the dot.
 
-At most 19 decimals are written; larger values are clamped to 19. With `trim_zeros`,
+Without `decimals` it is the shortest text that parses back to the same value, the
+same as `to_shortest_string` and string interpolation: `3.14159`, `3`, `0.0001`. With
+`decimals`, e.g. `(1.5).to_string(2)` is `1.50`; at most 19 decimals are written,
+larger values are clamped to 19. With `trim_zeros`,
 trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
 rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
 infinities and values of magnitude
@@ -3784,14 +3790,14 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn to_shortest_string_in_ptr(buf: ptr, force_exponent: bool (false)) uint $deprecated
     // Writes the value like `to_shortest_string` to `out` and returns the bytes written.
     + fn to_shortest_string_into(out: Writer, force_exponent: bool (false)) uint !io:IoError
-    // Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
-    + fn to_string(decimals: uint (2), trim_zeros: bool (false)) String
+    // Returns the value as text; with `decimals`, with exactly that many digits after the dot.
+    + fn to_string(decimals: ?uint (null), trim_zeros: bool (false)) String
     // Writes the value like `to_string` into `buf` and returns the byte count.
-    + fn to_string_in(buf: local mut &[u8], decimals: uint (2), trim_zeros: bool (false)) uint
+    + fn to_string_in(buf: local mut &[u8], decimals: ?uint (null), trim_zeros: bool (false)) uint
     // Writes the value like `to_string` to `buf` and returns the byte count.
     + fn to_string_in_ptr(buf: ptr, decimals: uint (2), trim_zeros: bool (false)) uint $deprecated
     // Writes the value like `to_string` to `out` and returns the bytes written.
-    + fn to_string_into(out: Writer, decimals: uint (2), trim_zeros: bool (false)) uint !io:IoError
+    + fn to_string_into(out: Writer, decimals: ?uint (null), trim_zeros: bool (false)) uint !io:IoError
 }
 ```
 
@@ -3894,9 +3900,12 @@ exponent form is always used. Throws when `out` fails.
 
 #### to_string
 
-Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
+Returns the value as text; with `decimals`, with exactly that many digits after the dot.
 
-At most 19 decimals are written; larger values are clamped to 19. With `trim_zeros`,
+Without `decimals` it is the shortest text that parses back to the same value, the
+same as `to_shortest_string` and string interpolation: `3.14159`, `3`, `0.0001`. With
+`decimals`, e.g. `(1.5).to_string(2)` is `1.50`; at most 19 decimals are written,
+larger values are clamped to 19. With `trim_zeros`,
 trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
 rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
 infinities and values of magnitude

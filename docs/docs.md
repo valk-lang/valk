@@ -158,6 +158,9 @@ Integer types: `int`, `uint`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u6
 
 Float types: `float`, `f32`, `f64`. Float literals may use an exponent: `2.5e-3`, `1e10`
 
+`x.to_string()` gives the shortest text that reads back as the same float (`3.14159`, `3`),
+as `"%x"` does; `x.to_string(2)` gives exactly two decimals (`3.14`, `3.00`).
+
 Integer literals: `255`, hex `0xff`, octal `0c377`. A leading zero is still decimal
 (`017` is 17), and there is no binary form.
 
