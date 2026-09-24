@@ -3017,6 +3017,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn json() Value
     // Whether the client expects the connection to stay open after the response.
     + get keep_alive: bool
+    // Returns the request body as JSON, like `json()`, but throws when it is not valid JSON.
+    + fn parse_json() Value !json:ParseError
     // Returns the query string parameters.
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
@@ -3174,6 +3176,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn headers() Headers
     // Returns the request body as JSON.
     + fn json() Value
+    // Returns the request body as JSON, like `json()`, but throws when it is not valid JSON.
+    + fn parse_json() Value !json:ParseError
     // Returns the query string parameters.
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.

@@ -10119,6 +10119,8 @@ stored between requests: a client that wants to send these back adds them to the
     + fn json() Value
     // Whether the client expects the connection to stay open after the response.
     + get keep_alive: bool
+    // Returns the request body as JSON, like `json()`, but throws when it is not valid JSON.
+    + fn parse_json() Value !json:ParseError
     // Returns the query string parameters.
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
@@ -10204,7 +10206,7 @@ Returns the request body as JSON.
 
 Form bodies are turned into an object of string values, see `data()`. Any other
 body is decoded as JSON regardless of its content type; a body that is not valid
-JSON gives an empty object.
+JSON gives an empty object. `parse_json` throws for such a body instead.
 
 #### keep_alive
 
@@ -10212,6 +10214,18 @@ Whether the client expects the connection to stay open after the response.
 
 HTTP/1.1 keeps it unless `Connection: close` was sent; HTTP/1.0 only when
 `Connection: keep-alive` was sent.
+
+#### parse_json
+
+Returns the request body as JSON, like `json()`, but throws when it is not valid JSON.
+
+Form bodies are turned into an object of string values as `json()` does and never
+fail. Any other body must be valid JSON, so an empty body throws too. Throws the
+`json.ParseError` of `json.decode`.
+
+```valk
+let body = req.parse_json() ! return http.Response.text("Invalid JSON", 400)
+```
 
 #### query
 
@@ -10657,6 +10671,8 @@ in `headers` are all kept. Names not in `headers` stay untouched.
     + fn headers() Headers
     // Returns the request body as JSON.
     + fn json() Value
+    // Returns the request body as JSON, like `json()`, but throws when it is not valid JSON.
+    + fn parse_json() Value !json:ParseError
     // Returns the query string parameters.
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
@@ -10746,7 +10762,19 @@ Returns the request body as JSON.
 
 Form bodies are turned into an object of string values, see `data()`. Any other
 body is decoded as JSON regardless of its content type; a body that is not valid
-JSON gives an empty object.
+JSON gives an empty object. `parse_json` throws for such a body instead.
+
+#### parse_json
+
+Returns the request body as JSON, like `json()`, but throws when it is not valid JSON.
+
+Form bodies are turned into an object of string values as `json()` does and never
+fail. Any other body must be valid JSON, so an empty body throws too. Throws the
+`json.ParseError` of `json.decode`.
+
+```valk
+let body = req.parse_json() ! return http.Response.text("Invalid JSON", 400)
+```
 
 #### query
 

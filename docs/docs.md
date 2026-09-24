@@ -2089,7 +2089,8 @@ fn main() {
 
 A handler gets the parsed request: `method`, `path`, `query_string` and
 `peer_address` as fields, and `headers()`, `query()`, `form()`, `json()` and
-`files()` which parse on first use. Responses come from `Response.text`,
+`files()` which parse on first use. `json()` gives an empty object for a body that
+is not JSON; `parse_json()` throws for it instead. Responses come from `Response.text`,
 `html`, `json`, `json_of` (encodes any value), `redirect`, `file`, `stream`,
 `empty` and the general `Response.new(body, code, content_type)`.
 
