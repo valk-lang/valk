@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `crypto.base64_decode` and its variants skip line breaks, so wrapped PEM and MIME bodies decode
 + HTTP: `parse_date` reads the RFC 850 and asctime forms too; an oversized request head gets 431 instead of 413; `code_name` knows every RFC 9110 status
 + HTTP `Response.text`, `Response.html` and the plain-text defaults send `charset=utf-8`
 + HTTP `query()` keeps a key without `=` (`?flag`) with the value `""` instead of dropping it

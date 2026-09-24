@@ -6870,9 +6870,10 @@ see `ecdsa_signature_to_raw`), RS256 to RS512 (`rsa_pkcs1_*`) and PS256 to PS512
 
 Decodes standard base64 (`+` and `/`) into the raw bytes it represents.
 
-The `=` padding is optional. Throws `invalid_input` on any other character (including
-whitespace and line breaks, and the URL-safe `-` and `_`), on an impossible length, or
-when the unused bits of the last character are not zero.
+The `=` padding is optional, and line breaks (`\n`, `\r`), as in PEM and MIME bodies,
+are skipped. Throws `invalid_input` on any other character (including spaces and the
+URL-safe `-` and `_`), on an impossible length, or when the unused bits of the last
+character are not zero.
 
 ### base64_decode_in
 
