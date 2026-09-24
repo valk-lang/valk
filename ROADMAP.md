@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ A panic (and its `--debug` stack trace) is written to stderr, so `./app > out.json` no longer swallows the crash
 + `-o` creates the missing directories of the output path
 + A repeated compiler option (`-o`, `--target`, `--filter`, ...) keeps its last value instead of stopping with an internal panic, so arguments after `valk make name` override the declared ones
 + `crypto.base64_decode` and its variants skip line breaks, so wrapped PEM and MIME bodies decode

@@ -381,7 +381,7 @@ An operating-system call failed (`failed`) or is not available on this platform
 + fn exit(code: i32) void
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
-// Prints `msg` to stdout and ends the process with exit code 1.
+// Prints `msg` to stderr and ends the process with exit code 1.
 + fn panic(msg: String, location: String ("")) void
 // Sends signal `code` to the current process.
 + fn raise(code: i32) void
@@ -443,7 +443,7 @@ Throws `missing` when it is not set.
 
 ### panic
 
-Prints `msg` to stdout and ends the process with exit code 1.
+Prints `msg` to stderr and ends the process with exit code 1.
 
 The compiler fills `location` with the panic's source position, relative to the root of
 the package it was compiled in, and the output reads `msg at path:line`. A program built

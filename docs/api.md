@@ -149,7 +149,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn exit(code: i32) void
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
-// Prints `msg` to stdout and ends the process with exit code 1.
+// Prints `msg` to stderr and ends the process with exit code 1.
 + fn panic(msg: String, location: String ("")) void
 // Sends signal `code` to the current process.
 + fn raise(code: i32) void

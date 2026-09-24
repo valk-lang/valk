@@ -438,6 +438,15 @@ if [ ! -f "$workdir/new/sub/app$EXE_SUFFIX" ]; then
     exit 1
 fi
 
+echo "> A panic writes to stderr"
+"$VALK" build "$DIR/../exit-code/panic-line.valk" --no-warn -o "$workdir/panic-line$EXE_SUFFIX" >/dev/null 2>&1
+panic_stdout=$("$workdir/panic-line$EXE_SUFFIX" 2>/dev/null)
+panic_stderr=$("$workdir/panic-line$EXE_SUFFIX" 2>&1 >/dev/null)
+if [ -n "$panic_stdout" ] || [[ "$panic_stderr" != *"Explicit panic at"* ]]; then
+    echo "# The panic message belongs on stderr: stdout '$panic_stdout', stderr '$panic_stderr'"
+    exit 1
+fi
+
 echo "> ansi.supported respects NO_COLOR"
 "$VALK" build "$DIR/no-color.valk" --no-warn -o "$workdir/no-color$EXE_SUFFIX" >/dev/null 2>&1
 colored=$(TERM=xterm NO_COLOR= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
@@ -967,4 +976,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 64"
+echo "# Test count: 65"
