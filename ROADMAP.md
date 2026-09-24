@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `Array.unique`, `remove_duplicates`, `intersect` and `append_many(.., true)` use a set for integers and `$hash` types (such as `String`): O(n) instead of O(n²)
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
 + `utf8.length` and `utf8.chars()` end an invalid sequence at a byte that cannot continue it, instead of swallowing the next character

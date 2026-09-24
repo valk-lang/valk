@@ -240,7 +240,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn any(func: fn(T)(bool)) bool
     // Appends `item` to the end, growing the storage when it is full.
     + fn append(item: T, unique: bool (false)) void
-    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present.
+    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and `$hash` types).
     + fn append_many(items: Array[T], unique: bool (false)) void
     // Removes every element.
     + fn clear(reduce_size: bool (false)) void
@@ -533,6 +533,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn contains(value: T) bool
     // Returns a shallow copy: a new deque holding the same items.
     + fn copy() Deque[T]
+    // Builds a deque from a JSON array, front first, converting each item with `to_type`.
+    + static fn from_json_value_auto[X](value: X) Deque[T] !LookupError
     // Returns the item `index` places from the front; backs `deque[index]` (`$offset`).
     + fn get(index: uint) T !LookupError
     // Returns true when the deque holds no items.
@@ -637,16 +639,9 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
-+ extend HashMap[String, T] {
++ extend HashMap[String, String] {
     // Builds a map from a JSON object, converting each member with `to_type`.
-    + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
-    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-    + fn sort_keys() void
-}
-```
-
-```js
-+ extend HashMap[u32, H2Stream] {
+    + static fn from_json_value_auto[X](value: X) HashMap[String, String] !LookupError
     // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
     + fn sort_keys() void
 }
@@ -669,6 +664,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn difference(other: HashSet[T]) HashSet[T]
     // Returns true when both sets hold the same values, in any order; backs `==` (`$eq`).
     + fn equals(other: HashSet[T]) bool
+    // Builds a set from a JSON array, converting each item with `to_type`.
+    + static fn from_json_value_auto[X](value: X) HashSet[T] !LookupError
     // Returns true when `value` is in the set.
     + fn has(value: T) bool
     // Adds `value` and returns true when it was not present yet.
@@ -4681,6 +4678,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + static fn from_format_in(zone: Zone, pattern: String, value: String) DateTime !SyntaxError
     // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z` or `2024-03-05 15:07:09.25+01:00`.
     + static fn from_iso8601(value: String) DateTime !SyntaxError
+    // Reads a DateTime from a JSON string in ISO 8601 form (see `from_iso8601`).
+    + static fn from_json_value_auto[X](value: X) DateTime !LookupError
     // Creates a date and time from whole seconds since the Unix epoch.
     + static fn from_unix_seconds(timestamp: int) DateTime !LookupError
     // Creates a date and time from microseconds since the Unix epoch.
@@ -4751,6 +4750,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn to_iso8601_in(buf: local mut &[u8]) uint
     // Writes `to_iso8601()` to `out` and returns the bytes written.
     + fn to_iso8601_into(out: Writer) uint !io:IoError
+    // Returns `to_iso8601()`: valk.json writes a DateTime as this text and reads it back with `from_json_value_auto`.
+    + fn to_json_string() String
     // Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.
     + fn to_string() String
     // Returns the whole seconds since the Unix epoch, rounded down (towards the past).

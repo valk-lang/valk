@@ -692,7 +692,7 @@ the sign, or a value that does not fit.
     + fn any(func: fn(T)(bool)) bool
     // Appends `item` to the end, growing the storage when it is full.
     + fn append(item: T, unique: bool (false)) void
-    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present.
+    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and `$hash` types).
     + fn append_many(items: Array[T], unique: bool (false)) void
     // Removes every element.
     + fn clear(reduce_size: bool (false)) void
@@ -822,7 +822,7 @@ Marked `$append`: backs the list literal `Array[T]{ a, b, c }`.
 #### append_many
 
 Appends every element of `items` in order; with `unique`, each one is skipped when an
-equal item is already present.
+equal item is already present (tracked in a set for integers and `$hash` types).
 
 #### clear
 
@@ -1003,7 +1003,8 @@ order does not matter.
 
 Removes every element equal to an earlier one, keeping first occurrences in order.
 
-Compares with `==` (so `$eq` applies) and costs O(n²).
+Compares with `==` (so `$eq` applies). Integers and types with `$hash` (such as
+`String`) are tracked in a set, which costs O(n); other types cost O(n²).
 
 #### remove_value
 
@@ -1782,6 +1783,8 @@ Advances the position by `amount` bytes, stopping at the end.
     + fn contains(value: T) bool
     // Returns a shallow copy: a new deque holding the same items.
     + fn copy() Deque[T]
+    // Builds a deque from a JSON array, front first, converting each item with `to_type`.
+    + static fn from_json_value_auto[X](value: X) Deque[T] !LookupError
     // Returns the item `index` places from the front; backs `deque[index]` (`$offset`).
     + fn get(index: uint) T !LookupError
     // Returns true when the deque holds no items.
@@ -1830,6 +1833,13 @@ Returns true when an item equals `value` (compared with `==`), in linear time.
 #### copy
 
 Returns a shallow copy: a new deque holding the same items.
+
+#### from_json_value_auto
+
+Builds a deque from a JSON array, front first, converting each item with `to_type`.
+
+Throws `.missing` when `value` is not an array or an item cannot be converted to the
+item type.
 
 #### get
 
@@ -2156,33 +2166,22 @@ Throws `exists`, leaving the map unchanged, when `key` is already present.
 Returns a new array of the values, in entry order.
 
 ```js
-+ extend HashMap[String, T] {
++ extend HashMap[String, String] {
     // Builds a map from a JSON object, converting each member with `to_type`.
-    + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
+    + static fn from_json_value_auto[X](value: X) HashMap[String, String] !LookupError
     // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
     + fn sort_keys() void
 }
 ```
 
-#### HashMap[String, T].from_json_value_auto
+#### HashMap[String, String].from_json_value_auto
 
 Builds a map from a JSON object, converting each member with `to_type`.
 
 Only available when the key type is `String`. Throws `.missing` when `value` is
 not an object or a member cannot be converted to the value type.
 
-#### HashMap[String, T].sort_keys
-
-Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-
-```js
-+ extend HashMap[u32, H2Stream] {
-    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-    + fn sort_keys() void
-}
-```
-
-#### HashMap[u32, H2Stream].sort_keys
+#### HashMap[String, String].sort_keys
 
 Reorders the entries so iteration, `keys` and `values` follow ascending key order.
 
@@ -2203,6 +2202,8 @@ Reorders the entries so iteration, `keys` and `values` follow ascending key orde
     + fn difference(other: HashSet[T]) HashSet[T]
     // Returns true when both sets hold the same values, in any order; backs `==` (`$eq`).
     + fn equals(other: HashSet[T]) bool
+    // Builds a set from a JSON array, converting each item with `to_type`.
+    + static fn from_json_value_auto[X](value: X) HashSet[T] !LookupError
     // Returns true when `value` is in the set.
     + fn has(value: T) bool
     // Adds `value` and returns true when it was not present yet.
@@ -2263,6 +2264,13 @@ Returns a new set with the values of this set that are not in `other`; backs `a 
 #### equals
 
 Returns true when both sets hold the same values, in any order; backs `==` (`$eq`).
+
+#### from_json_value_auto
+
+Builds a set from a JSON array, converting each item with `to_type`.
+
+Throws `.missing` when `value` is not an array or an item cannot be converted to the
+item type.
 
 #### has
 
@@ -3185,8 +3193,9 @@ is none. The string is walked from the start, so the cost grows with the positio
 
 The number of UTF-8 characters, counted by walking the string from the start.
 
-Characters are delimited by their lead byte only: a stray continuation byte or an
-invalid lead byte counts as one character, and sequences are not validated.
+Characters are delimited by their lead byte: a stray continuation byte or an
+invalid lead byte counts as one character, and a sequence ends early at a byte that
+cannot continue it.
 
 #### utf8.range
 
@@ -3220,8 +3229,9 @@ empty view, and the view never includes the zero terminator.
 An iterator over the UTF-8 characters of a string, returned by `str.utf8.chars()`.
 
 `each str.utf8.chars() as ch` yields each character as its own `String`. Characters are
-delimited by their lead byte only; a stray continuation byte or an invalid lead byte is
-yielded as a one-byte string, and sequences are not validated.
+delimited by their lead byte; a stray continuation byte or an invalid lead byte is
+yielded as a one-byte string, and a sequence ends early at a byte that cannot continue
+it, so an invalid sequence never swallows the character after it.
 
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
@@ -3438,8 +3448,8 @@ Returns the value in exponent form with `decimals` digits after the dot, e.g.
 The mantissa has one digit before the dot; the exponent is written as `to_shortest_string`
 writes it, without a sign for positive values or padding. At most 19 decimals are written;
 larger values are clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the
-dot too when nothing remains after it. Rounding follows `to_string`: halfway cases round
-toward zero. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
+dot too when nothing remains after it. Rounding follows `to_string`: an exact half rounds
+to the even digit. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
 
 #### to_scientific_string_in
 
@@ -3490,8 +3500,9 @@ exponent form is always used. Throws when `out` fails.
 Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
 
 At most 19 decimals are written; larger values are clamped to 19. With `trim_zeros`,
-trailing zeros are dropped, and the dot too when nothing remains after it. Halfway cases
-round toward zero: `(2.5).to_string(0)` is `2`. NaN, infinities and values of magnitude
+trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
+rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
+infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
 #### to_string_in
@@ -3609,8 +3620,8 @@ Returns the value in exponent form with `decimals` digits after the dot, e.g.
 The mantissa has one digit before the dot; the exponent is written as `to_shortest_string`
 writes it, without a sign for positive values or padding. At most 19 decimals are written;
 larger values are clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the
-dot too when nothing remains after it. Rounding follows `to_string`: halfway cases round
-toward zero. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
+dot too when nothing remains after it. Rounding follows `to_string`: an exact half rounds
+to the even digit. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
 
 #### to_scientific_string_in
 
@@ -3661,8 +3672,9 @@ exponent form is always used. Throws when `out` fails.
 Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
 
 At most 19 decimals are written; larger values are clamped to 19. With `trim_zeros`,
-trailing zeros are dropped, and the dot too when nothing remains after it. Halfway cases
-round toward zero: `(2.5).to_string(0)` is `2`. NaN, infinities and values of magnitude
+trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
+rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
+infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
 #### to_string_in
@@ -3780,8 +3792,8 @@ Returns the value in exponent form with `decimals` digits after the dot, e.g.
 The mantissa has one digit before the dot; the exponent is written as `to_shortest_string`
 writes it, without a sign for positive values or padding. At most 19 decimals are written;
 larger values are clamped to 19. With `trim_zeros`, trailing zeros are dropped, and the
-dot too when nothing remains after it. Rounding follows `to_string`: halfway cases round
-toward zero. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
+dot too when nothing remains after it. Rounding follows `to_string`: an exact half rounds
+to the even digit. Special values are `nan`, `inf` and `-inf`; zero is `0.000000e0`.
 
 #### to_scientific_string_in
 
@@ -3832,8 +3844,9 @@ exponent form is always used. Throws when `out` fails.
 Returns the value with exactly `decimals` digits after the dot, e.g. `1.50`.
 
 At most 19 decimals are written; larger values are clamped to 19. With `trim_zeros`,
-trailing zeros are dropped, and the dot too when nothing remains after it. Halfway cases
-round toward zero: `(2.5).to_string(0)` is `2`. NaN, infinities and values of magnitude
+trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
+rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
+infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
 #### to_string_in
@@ -12738,8 +12751,9 @@ A text record reads `2024-03-05T14:07:09.250Z INFO  message key=value`; a JSON r
 Converts the markdown text `md` to an HTML fragment.
 
 Supports `#` and underlined headings, paragraphs, `>` quotes, `-`/`+`/`*` and `1.`
-lists, fenced code blocks, `---` rules, inline code, `*` emphasis, `**`/`__` bold,
-`~~` strikethrough, links and images. Raw HTML is not supported: every `<`, `>`, `"`,
+lists, fenced code blocks, `---`/`***`/`* * *` rules, inline code, `*` emphasis,
+`**`/`__` bold, `~~` strikethrough, links and images with an optional `"title"`, and
+backslash escapes of punctuation. Raw HTML is not supported: every `<`, `>`, `"`,
 `'` and `&` in the input is escaped, so the output is safe to embed. Lines of one
 paragraph are joined with `<br>`, headings get no inline formatting, and an ordered list
 must start at `1.`. Quotes and lists nest at most 64 levels deep; deeper markers stay text.
@@ -13279,7 +13293,8 @@ does). `timeout_ms` 0 waits forever. Throws `timeout`, `write`, or `closed` on m
 A resolved host: the list `getaddrinfo` returned, with one entry chosen.
 
 IPv4 and IPv6 are both accepted; when a name resolves to both, the first IPv4 entry is
-used. The list is freed when the object is collected.
+used, and a TCP connect that fails there tries the other entries. The list is freed when
+the object is collected.
 
 #### data
 
@@ -15515,6 +15530,8 @@ Throws `invalid` when the data is malformed.
     + static fn from_format_in(zone: Zone, pattern: String, value: String) DateTime !SyntaxError
     // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z` or `2024-03-05 15:07:09.25+01:00`.
     + static fn from_iso8601(value: String) DateTime !SyntaxError
+    // Reads a DateTime from a JSON string in ISO 8601 form (see `from_iso8601`).
+    + static fn from_json_value_auto[X](value: X) DateTime !LookupError
     // Creates a date and time from whole seconds since the Unix epoch.
     + static fn from_unix_seconds(timestamp: int) DateTime !LookupError
     // Creates a date and time from microseconds since the Unix epoch.
@@ -15585,6 +15602,8 @@ Throws `invalid` when the data is malformed.
     + fn to_iso8601_in(buf: local mut &[u8]) uint
     // Writes `to_iso8601()` to `out` and returns the bytes written.
     + fn to_iso8601_into(out: Writer) uint !io:IoError
+    // Returns `to_iso8601()`: valk.json writes a DateTime as this text and reads it back with `from_json_value_auto`.
+    + fn to_json_string() String
     // Returns `to_iso8601()`; `$auto` lets a `DateTime` convert to `String` implicitly.
     + fn to_string() String
     // Returns the whole seconds since the Unix epoch, rounded down (towards the past).
@@ -15727,6 +15746,13 @@ digits (kept to the microsecond) are optional. An offset such as `+01:00`, `+010
 `+01` gives a value in `time.fixed_zone` of that offset; `Z`, or no offset at all, gives
 a UTC value. Throws `SyntaxError` on anything else, or a date or time that does not
 exist.
+
+#### from_json_value_auto
+
+Reads a DateTime from a JSON string in ISO 8601 form (see `from_iso8601`).
+
+Used by valk.json's `to_type` and `decode_to`. Throws `.missing` when `value` is not
+a string or not a valid date and time.
 
 #### from_unix_seconds
 
@@ -15907,6 +15933,11 @@ Writes `to_iso8601()` to `out` and returns the bytes written.
 
 A `ByteBuffer` is written directly; any other writer receives the text in one write.
 Throws when `out` fails.
+
+#### to_json_string
+
+Returns `to_iso8601()`: valk.json writes a DateTime as this text and reads it back
+with `from_json_value_auto`.
 
 #### to_string
 
