@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ A call that can throw in a function without an error type names the error and the ways to handle it (`!`, `!?`, `!!` or adding `!Error` to the signature)
 + LSP: empty hover, definition and completion replies are `null`; completion no longer offers compiler-made names (`&`, main's implicit `cli_args`)
 + `valk ls` colors its output only on a terminal and not when `NO_COLOR` is set
 + Test failures print paths relative to the package root like panics; a `--filter` that matches no test is an error; `valk make` names the line that failed
