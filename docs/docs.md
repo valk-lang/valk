@@ -145,6 +145,7 @@ valk build ./src -o ./app --run --watch     # Rebuild and restart when a file ch
 valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, macos-x64, macos-arm64, win-x64
 valk build ./src --lint                     # Check without building
 valk fmt ./src                              # Format in place and list the changed files
+valk fmt ./src --check                      # For CI: list unformatted files, exit 1, write nothing
 valk build -h                               # Every option
 ```
 

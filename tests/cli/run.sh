@@ -513,6 +513,28 @@ if [[ "$run_out" != *"Arguments for the program go after '--'"* ]]; then
     exit 1
 fi
 
+echo "> valk fmt --check lists unformatted files and writes nothing"
+printf 'fn main() {\n  let  y = 2\n}\n' > "$workdir/check.valk"
+cp "$workdir/check.valk" "$workdir/check.orig"
+check_out=$("$VALK" fmt "$workdir/check.valk" --check 2>&1)
+check_code=$?
+if [ "$check_code" -ne 1 ] || [[ "$check_out" != *"check.valk"* ]] || ! cmp -s "$workdir/check.valk" "$workdir/check.orig"; then
+    echo "# valk fmt --check must fail without writing (exit $check_code)"
+    echo "$check_out"
+    exit 1
+fi
+"$VALK" fmt "$workdir/check.valk" >/dev/null 2>&1
+if ! "$VALK" fmt "$workdir/check.valk" --check >/dev/null 2>&1; then
+    echo "# valk fmt --check must pass on a formatted file"
+    exit 1
+fi
+
+echo "> valk --version"
+if [[ "$("$VALK" --version 2>&1)" != "valk-"* ]]; then
+    echo "# valk --version must print the version"
+    exit 1
+fi
+
 echo "> Command help and unknown commands"
 if [[ "$("$VALK" fmt -h 2>&1)" != *"Usage: valk fmt"* ]] || [[ "$("$VALK" make -h 2>&1)" != *"Usage: valk make"* ]]; then
     echo "# valk fmt -h and valk make -h need their own help"
@@ -1039,4 +1061,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 69"
+echo "# Test count: 71"
