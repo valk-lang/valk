@@ -3923,7 +3923,7 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn round_down(modulo: i16) i16
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i16) i16
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i16) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
@@ -3997,7 +3997,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -4041,9 +4041,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -4066,7 +4067,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -4130,7 +4131,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: i32) i32
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i32) i32
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i32) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
@@ -4204,7 +4205,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -4248,9 +4249,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -4273,7 +4275,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -4337,7 +4339,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: i64) i64
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i64) i64
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i64) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
@@ -4411,7 +4413,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -4455,9 +4457,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -4480,7 +4483,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -4544,7 +4547,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: i8) i8
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i8) i8
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i8) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
@@ -4618,7 +4621,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -4662,9 +4665,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -4687,7 +4691,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -4751,7 +4755,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: int) int
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: int) int
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: int) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
@@ -4825,7 +4829,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -4869,9 +4873,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -4894,7 +4899,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -5421,7 +5426,7 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     + fn round_down(modulo: u16) u16
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u16) u16
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u16) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
@@ -5495,7 +5500,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -5539,9 +5544,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -5564,7 +5570,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -5628,7 +5634,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: u32) u32
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u32) u32
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u32) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
@@ -5702,7 +5708,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -5746,9 +5752,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -5771,7 +5778,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -5837,7 +5844,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: u64) u64
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u64) u64
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u64) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
@@ -5917,7 +5924,7 @@ Compiles to one multiply on 64-bit CPUs.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -5961,9 +5968,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -5986,7 +5994,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -6080,7 +6088,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_up(modulo: u8) u8
     // Returns a one-byte `String` holding this byte.
     + fn to_ascii_string() String
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u8) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
@@ -6214,7 +6222,7 @@ Returns the smaller of `this` and `other`.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -6265,9 +6273,10 @@ UTF-8.
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -6290,7 +6299,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 
@@ -6367,7 +6376,7 @@ u32.write_little_endian(0x01020304, &buf)
     + fn round_down(modulo: uint) uint
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: uint) uint
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: uint) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
@@ -6455,7 +6464,7 @@ Compiles to one multiply on 64-bit CPUs.
 Writes the value as text in `base` to stdout, without a newline.
 
 The write is unbuffered and write errors are ignored. Digits above 9 are uppercase. A
-`base` above 16 is treated as 16 and one below 2 as 10.
+`base` above 36 is treated as 36 and one below 2 as 10.
 
 #### random
 
@@ -6499,9 +6508,10 @@ matter. Panics when `modulo` is 0 or the rounded value does not fit in the type,
 
 #### to_base
 
-Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
 
-Digits above 9 are uppercase. A `base` above 16 is treated as 16 and one below 2 as 10.
+Digits above 9 are uppercase letters. A `base` above 36 is treated as 36 and one below 2
+as 10.
 
 #### to_base_in
 
@@ -6524,7 +6534,7 @@ Throws when `out` fails.
 Writes the value as text in `base` to `result` and returns the byte count.
 
 Digits above 9 are lowercase when `lowercase` is true, uppercase otherwise. A `base`
-above 16 is treated as 16 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
+above 36 is treated as 36 and one below 2 as 10. Writes at most 65 bytes (a sign plus 64
 binary digits) and no terminating zero. Deprecated: unchecked; use `to_base_in`, which
 takes a bounds-checked slice, or `to_base_into`.
 

@@ -1151,7 +1151,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: i16) i16
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i16) i16
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i16) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i16, lowercase: bool (false)) uint
@@ -1203,7 +1203,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: i32) i32
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i32) i32
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i32) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i32, lowercase: bool (false)) uint
@@ -1255,7 +1255,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: i64) i64
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i64) i64
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i64) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i64, lowercase: bool (false)) uint
@@ -1307,7 +1307,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: i8) i8
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: i8) i8
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: i8) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: i8, lowercase: bool (false)) uint
@@ -1359,7 +1359,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: int) int
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: int) int
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: int) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: int, lowercase: bool (false)) uint
@@ -1537,7 +1537,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: u16) u16
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u16) u16
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u16) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u16, lowercase: bool (false)) uint
@@ -1589,7 +1589,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: u32) u32
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u32) u32
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u32) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u32, lowercase: bool (false)) uint
@@ -1643,7 +1643,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: u64) u64
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: u64) u64
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u64) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u64, lowercase: bool (false)) uint
@@ -1725,7 +1725,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_up(modulo: u8) u8
     // Returns a one-byte `String` holding this byte.
     + fn to_ascii_string() String
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: u8) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: u8, lowercase: bool (false)) uint
@@ -1785,7 +1785,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn round_down(modulo: uint) uint
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_up(modulo: uint) uint
-    // Returns the value as text in `base` (2 to 16), with a leading `-` when negative.
+    // Returns the value as text in `base` (2 to 36), with a leading `-` when negative.
     + fn to_base(base: uint) String
     // Writes the value as text in `base` into `buf` and returns the byte count.
     + fn to_base_in(buf: local mut &[u8], base: uint, lowercase: bool (false)) uint
