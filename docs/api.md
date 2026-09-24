@@ -3591,7 +3591,7 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
     + fn has(key: String) bool
     // Returns the number of members.
     + get length: uint
-    // Removes the member `key`; does nothing when it does not exist.
+    // Removes the member `key`; does nothing when it does not exist. The other members keep their order.
     + fn remove(key: String) void
     // Sets the member `key` to `value`; an existing member keeps its position.
     + fn set(key: String, value: Value) void

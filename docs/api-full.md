@@ -12037,7 +12037,7 @@ Removes the item at `index`, moving later items down; does nothing when out of r
     + fn has(key: String) bool
     // Returns the number of members.
     + get length: uint
-    // Removes the member `key`; does nothing when it does not exist.
+    // Removes the member `key`; does nothing when it does not exist. The other members keep their order.
     + fn remove(key: String) void
     // Sets the member `key` to `value`; an existing member keeps its position.
     + fn set(key: String, value: Value) void
@@ -12077,10 +12077,8 @@ Returns the number of members.
 
 #### remove
 
-Removes the member `key`; does nothing when it does not exist.
-
-The last member moves into the removed member's position, so key order is not
-preserved.
+Removes the member `key`; does nothing when it does not exist. The other members keep
+their order.
 
 #### set
 
@@ -12459,8 +12457,8 @@ Removes the object member named `key` or the array item at index `key`, and retu
 container.
 
 The container is changed in place and returned, so assign the result; a value of any
-other kind is left alone. Does nothing when the key is absent. Removing an object member
-moves the last member into its position, so key order is not preserved.
+other kind is left alone. Does nothing when the key is absent. The other object members
+keep their order.
 
 ```valk
 doc = doc.remove("name")
