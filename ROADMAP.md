@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.7
++ Release 0.7.7
 + Structs by value to and from C: extern and export functions follow the target's C calling convention
 + Struct sizes round up to their own alignment, like C
 + The `x n` of a fill goes on the value's line, so a field named `x` can start a line in a literal
