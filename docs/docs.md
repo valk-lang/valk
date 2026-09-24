@@ -1055,6 +1055,8 @@ and `$T` may also sit inside a type: `?$T`, `&$T`, `&[$T]`, `local &$T`, `*$T` a
 class arguments such as `Array[$T]` or `HashMap[$K, $V]` infer `T` through that
 wrapper. A `?$T` parameter also takes a plain value. A nullable variable that was
 just checked with `isset` infers its plain type, as it would pass to a plain parameter.
+`&[$T]` infers `T` from anything that passes as a slice: an `Array[f32]` gives `f32`,
+a `[int x 3]` gives `int`, and a `String` or `ByteBuffer` gives `u8`.
 
 ```rust
 fn pair(a: $T, b: T) T { return a + b }

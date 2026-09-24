@@ -20,6 +20,7 @@
 + Tuple members by position: `pair[0]`, `pair[1]`
 + `each 0 .. 4 { ... }` / `each items : stmt` without names
 + `String.trim()`, `ltrim()`, `rtrim()` without an argument remove whitespace
++ `&[$T]` infers `T` from an Array, fixed array, String or ByteBuffer argument
 
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)
