@@ -2707,8 +2707,8 @@ after `detach`, and `os` when the kill fails.
     + fn lt(cmp: String) bool
     // Returns whether the string equals `cmp` or sorts before it in byte order; backs `<=`.
     + fn lte(cmp: String) bool
-    // Removes repeated copies of `part` from the start of the string.
-    + fn ltrim(part: String, limit: uint (0)) String
+    // Removes whitespace, or repeated copies of `part`, from the start of the string.
+    + fn ltrim(part: ?String (null), limit: uint (0)) String
     // Parses the string as an octal signed integer: optional `-` or `+`, optional `0c`, digits.
     + fn octal_to_int() int !SyntaxError
     // Parses the string as an octal unsigned integer: optional `+`, optional `0c`, digits.
@@ -2725,8 +2725,8 @@ after `detach`, and `os` when the kill fails.
     + fn reader() ByteReader
     // Returns a copy with every occurrence of `part` replaced by `with`.
     + fn replace(part: String, with: String) String
-    // Removes repeated copies of `part` from the end of the string.
-    + fn rtrim(part: String, limit: uint (0)) String
+    // Removes whitespace, or repeated copies of `part`, from the end of the string.
+    + fn rtrim(part: ?String (null), limit: uint (0)) String
     // Splits the string on every occurrence of `on` and returns the parts, empty ones included.
     + fn split(on: String) Array[String]
     // Returns whether the string begins with the bytes of `part`; an empty `part` always matches.
@@ -2741,8 +2741,8 @@ after `detach`, and `os` when the kill fails.
     + fn to_string() String
     // Parses the string as a decimal unsigned integer, with an optional leading `+`.
     + fn to_uint() uint !SyntaxError
-    // Removes repeated copies of `part` from both ends of the string.
-    + fn trim(part: String, limit: uint (0)) String
+    // Removes whitespace, or repeated copies of `part`, from both ends of the string.
+    + fn trim(part: ?String (null), limit: uint (0)) String
     // Returns a copy with backslash escapes turned back into the bytes they stand for.
     + fn unescape() String
     // Returns the string with every character mapped to upper case by the Unicode case mappings.
@@ -3018,10 +3018,10 @@ Returns whether the string equals `cmp` or sorts before it in byte order; backs 
 
 #### ltrim
 
-Removes repeated copies of `part` from the start of the string.
+Removes whitespace, or repeated copies of `part`, from the start of the string.
 
-`limit` caps how many copies are removed; 0 removes all of them. Returns the string
-unchanged when `part` is empty or nothing matches.
+`limit` caps how many bytes of whitespace or copies of `part` are removed; 0 removes all
+of them. Returns the string unchanged when `part` is empty or nothing matches.
 
 #### octal_to_int
 
@@ -3080,10 +3080,10 @@ unchanged.
 
 #### rtrim
 
-Removes repeated copies of `part` from the end of the string.
+Removes whitespace, or repeated copies of `part`, from the end of the string.
 
-`limit` caps how many copies are removed; 0 removes all of them. Returns the string
-unchanged when `part` is empty or nothing matches.
+`limit` caps how many bytes of whitespace or copies of `part` are removed; 0 removes all
+of them. Returns the string unchanged when `part` is empty or nothing matches.
 
 #### split
 
@@ -3136,10 +3136,16 @@ Throws `SyntaxError` for an empty string, any byte other than the digits `0`-`9`
 
 #### trim
 
-Removes repeated copies of `part` from both ends of the string.
+Removes whitespace, or repeated copies of `part`, from both ends of the string.
 
-`limit` caps how many copies are removed from each end; 0 removes all of them. Returns the
-string unchanged when `part` is empty or nothing matches.
+Whitespace is what `u8.is_whitespace` says: spaces, tabs and line breaks. `limit` caps
+how many bytes of whitespace or copies of `part` are removed from each end; 0 removes
+all of them. Returns the string unchanged when `part` is empty or nothing matches.
+
+```valk
+"  hello \n".trim()   // "hello"
+"--a--".trim("-")     // "a"
+```
 
 #### unescape
 

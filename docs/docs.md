@@ -200,6 +200,7 @@ s.starts_with(x) bool
 s.ends_with(x) bool
 s.is_empty() bool
 s.contains(x) bool
+s.trim() String // Without whitespace at both ends; s.trim("-") removes "-" instead
 s.lower() String // Convert Unicode text to lowercase
 s.upper() String // Convert Unicode text to uppercase
 s.range(start_index, length) String // Sub string using byte offsets
@@ -578,6 +579,19 @@ fn main() {
 ```
 
 Calls evaluate the callable or method receiver first, then arguments from left to right. `co` uses the same order before starting the coroutine.
+
+A function returns several values as a tuple. Take them apart with names, or
+read one with `[n]`, where `n` is a constant:
+
+```rust
+fn size() (int, int) {
+    return (640, 480)
+}
+
+let w, h = size()
+let s = size()
+println(s[0] + "x" + s[1]) // 640x480
+```
 
 Command line arguments are passed to `main` when it declares an `Array[String]` argument (the first item is the program path):
 
@@ -1260,6 +1274,7 @@ each 5 .. 3 as number, position {
     println(number + " at " + position)
 }
 // 5 at 0, 6 at 1, 7 at 2
+each 0 .. 3 : print("x") // Without names: xxx
 ```
 
 ## Null-checking

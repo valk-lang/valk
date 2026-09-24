@@ -17,6 +17,9 @@
 + An import used only in `test` blocks is no longer reported as unused
 + A literal in a ternary takes the type of the other side (`cond ? 0 : n`), or the closest type holding both (`cond ? 300 : small_u8` is u16); `value` number constants type like their literal
 + A variable declared from a number that does not fit where it is used gets a fix: 'let bar: i32 = 360'
++ Tuple members by position: `pair[0]`, `pair[1]`
++ `each 0 .. 4 { ... }` / `each items : stmt` without names
++ `String.trim()`, `ltrim()`, `rtrim()` without an argument remove whitespace
 
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)

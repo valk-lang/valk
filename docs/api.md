@@ -875,8 +875,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn lt(cmp: String) bool
     // Returns whether the string equals `cmp` or sorts before it in byte order; backs `<=`.
     + fn lte(cmp: String) bool
-    // Removes repeated copies of `part` from the start of the string.
-    + fn ltrim(part: String, limit: uint (0)) String
+    // Removes whitespace, or repeated copies of `part`, from the start of the string.
+    + fn ltrim(part: ?String (null), limit: uint (0)) String
     // Parses the string as an octal signed integer: optional `-` or `+`, optional `0c`, digits.
     + fn octal_to_int() int !SyntaxError
     // Parses the string as an octal unsigned integer: optional `+`, optional `0c`, digits.
@@ -893,8 +893,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn reader() ByteReader
     // Returns a copy with every occurrence of `part` replaced by `with`.
     + fn replace(part: String, with: String) String
-    // Removes repeated copies of `part` from the end of the string.
-    + fn rtrim(part: String, limit: uint (0)) String
+    // Removes whitespace, or repeated copies of `part`, from the end of the string.
+    + fn rtrim(part: ?String (null), limit: uint (0)) String
     // Splits the string on every occurrence of `on` and returns the parts, empty ones included.
     + fn split(on: String) Array[String]
     // Returns whether the string begins with the bytes of `part`; an empty `part` always matches.
@@ -909,8 +909,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn to_string() String
     // Parses the string as a decimal unsigned integer, with an optional leading `+`.
     + fn to_uint() uint !SyntaxError
-    // Removes repeated copies of `part` from both ends of the string.
-    + fn trim(part: String, limit: uint (0)) String
+    // Removes whitespace, or repeated copies of `part`, from both ends of the string.
+    + fn trim(part: ?String (null), limit: uint (0)) String
     // Returns a copy with backslash escapes turned back into the bytes they stand for.
     + fn unescape() String
     // Returns the string with every character mapped to upper case by the Unicode case mappings.
