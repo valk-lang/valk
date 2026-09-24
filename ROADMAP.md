@@ -7,6 +7,7 @@
 - Release 0.7.8
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
++ A bool is not a number in operators: `n + flag`, `flag == 1` and `0 < x < 3` are errors (use `.to(int)`); `&`, `|` and `^` of two bools give a bool (was `u8`)
 + `to_string(decimals)` and `to_scientific_string` round an exact half to the even digit, like C, Python, Go and Rust (`(1.5).to_string(0)` was "1")
 + A statement `match` case with a one-line body may be followed by a `.member` case; the next line no longer continues the body as a method chain
 + One ordering hook (`$lt`, `$gt`, `$lte` or `$gte`) answers all four comparisons; `>=` with only `$lt` no longer gives a wrong answer for equal values, and objects without a hook can no longer be ordered (or sorted) by address
