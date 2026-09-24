@@ -7,6 +7,7 @@
 - Release 0.7.8
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
++ `to_string(decimals)` and `to_scientific_string` round an exact half to the even digit, like C, Python, Go and Rust (`(1.5).to_string(0)` was "1")
 + A statement `match` case with a one-line body may be followed by a `.member` case; the next line no longer continues the body as a method chain
 + One ordering hook (`$lt`, `$gt`, `$lte` or `$gte`) answers all four comparisons; `>=` with only `$lt` no longer gives a wrong answer for equal values, and objects without a hook can no longer be ordered (or sorted) by address
 + TCP connections send small writes right away (`TCP_NODELAY`); file and stream responses no longer wait ~40 ms. `TcpConnection.set_no_delay(false)` turns it off
