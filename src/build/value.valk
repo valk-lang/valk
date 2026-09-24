@@ -2582,6 +2582,103 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
     return call
 }
 
+// `x[i] op= v` through the `$offset` / `$offset_assign` hooks, or the native Array get
+// and set: `x` and `i` are evaluated once, `x[i]` is read into a temporary that takes
+// `op= v` as a variable does, and the result is stored back. Like `x[i] = v`, a read or
+// store that throws passes its error on, or goes to a `! handler` after `v`.
+fn value_from_offset_compound_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right_exp: Exp, op: ASSIGN_OP, at: Exp) ?Value !Error {
+    let b = ctx.build
+    let base_exp = left_exp.get(VALUE_EXP.left) ?! left_exp.bug("offset is missing base")
+    let body = left_exp.get(VALUE_EXP.right) ?! left_exp.bug("offset is missing body")
+    if body.type != EXP.body : return null
+    let access = parse_offset_access(body) !>
+    if access.value_kind == VALUE_KIND.bracket_range : return null
+
+    let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
+    if on.rett.get_non_nullable().kind != TYPE.union : on = value_try_remove_nullable(on, scope, ctx) !>
+    on = value_through_borrow(on, ctx)
+    let on_t = on.rett.get_non_nullable()
+    let class = on_t.get_class_or_null() ?! return null
+    if on_t.kind == TYPE.ptr_of || on_t.is_fixed_array_type() : return null
+    let get_func = resolve_offset_get_func(class)
+    let set_func = resolve_offset_assign_func(class)
+    let native = on_t.kind == TYPE.array && !isset(get_func) && !isset(set_func)
+    if !native && (!isset(get_func) || !isset(set_func)) : return null
+    if native && (type_native_sequence(on.rett).is_shared || type_native_sequence(on.rett).is_locked) : return null
+    if on.rett.is_nullable_type() : left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    if value_is_readonly_storage(on, ctx) : left_exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(on, ctx))
+
+    let setup = Array[Value]{}
+    let receiver = value_bind_once(on, ctx, at, setup)
+    let uint_t = type_from_core(b, "uint") !>
+    let index_type = uint_t
+    let get: ?Func = null
+    let set: ?Func = null
+    if native {
+        get = native_sequence_get_func(on.rett, ctx, left_exp) !>
+        set = native_sequence_set_func(on.rett, ctx, left_exp) !>
+    } else if isset(get_func) && isset(set_func) {
+        act_check(left_exp, get_func.act, get_func.exp, false, "function '" + get_func.name + "'") !>
+        act_check(at, set_func.act, set_func.exp, true, "function '" + set_func.name + "'") !>
+        get = func_for_receiver(get_func, on, left_exp, ctx.func) !>
+        set = func_for_receiver(set_func, on, left_exp, ctx.func) !>
+    }
+    let getter = get ?! left_exp.bug("compound offset assign has no get function")
+    let setter = set ?! left_exp.bug("compound offset assign has no set function")
+    let skip: uint = native || (isset(getter.class) && !getter.is_static) ? 1 : 0
+    let index_arg = getter.args.get(skip) ! left_exp.bug("'$offset' function is missing its index parameter")
+    index_type = index_arg.type
+    let index = value_from_exp(access, scope, ctx.with_suggested_type(index_type)) !>
+    index = value_try_convert(index, scope, ctx, index_type) !>
+    index_type.compat_check(index.rett, access) !>
+    index = value_bind_once(index, ctx, at, setup)
+
+    // `x[i] += v ! handler`: the handler takes a read or store that throws, unless `v` throws
+    let handler_exp: ?Exp = null
+    let given: ?Value = null
+    let value_exp = right_exp
+    if (getter.can_error || setter.can_error) && right_exp.type == EXP.value && right_exp.value_kind == VALUE_KIND.error_handler {
+        let inner_exp = right_exp.get(VALUE_EXP.left) ?! right_exp.bug("error_handler missing call")
+        let inner = value_from_call_raw(inner_exp, scope, ctx.with_suggested_type(getter.get_rett())) !>
+        if inner.can_error {
+            given = value_apply_error_handler(inner, right_exp, scope, ctx) !>
+        } else {
+            given = inner
+            handler_exp = right_exp
+            value_exp = inner_exp
+        }
+    }
+
+    let read_args = native ? Array[Value]{ receiver, index } : Array[Value]{ index }
+    let read_callee = native ? vgen_func(getter) : vgen_func(getter, receiver)
+    value_check_call_args(getter, read_callee, read_args, scope, ctx, left_exp, !native) !>
+    let read = vgen_call(ctx, read_callee, read_args, getter.get_rett(), scope)
+    read.exp = left_exp
+    read = value_offset_hook_errors(read, getter, handler_exp, scope, ctx, at) !>
+    let current = value_bind_once(read, ctx, at, setup, true)
+    setup.append(value_assign_to(ctx, scope, at, current, value_exp, given, op) !>)
+
+    let set_skip: uint = native || (isset(setter.class) && !setter.is_static) ? 1 : 0
+    let set_index_arg = setter.args.get(set_skip) ! at.bug("'$offset_assign' function is missing its index parameter")
+    let set_index = value_try_convert(index, scope, ctx, set_index_arg.type) !>
+    let write_args = native ? Array[Value]{ receiver, set_index, current } : Array[Value]{ set_index, current }
+    let write_callee = native ? vgen_func(setter) : vgen_func(setter, receiver)
+    value_check_call_args(setter, write_callee, write_args, scope, ctx, at, !native) !>
+    let write = vgen_call(ctx, write_callee, write_args, setter.get_rett(), scope)
+    write.exp = at
+    setup.append(value_offset_hook_errors(write, setter, handler_exp, scope, ctx, at) !>)
+    return vgen_block(setup, b, at)
+}
+
+// A hook call that can throw passes its error on, or goes to `handler_exp`
+fn value_offset_hook_errors(call: Value, func: Func, handler_exp: ?Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    if !func.can_error : return call
+    call.can_error = true
+    call.set_error_type(func.error_type)
+    if isset(handler_exp) : return value_apply_error_handler(call, handler_exp, scope, ctx) !>
+    return value_apply_error_pass(call, scope, ctx, at) !>
+}
+
 // Generic class base from a value left of `[T, …]`.
 fn offset_generic_class(on: Value) ?Class {
     if on.type == VAL.type {

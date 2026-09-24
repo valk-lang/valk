@@ -472,6 +472,11 @@ throws, the handler belongs to that value; parenthesize it to give the
 assignment its own: `deque[i] = (compute() !? 0) !!`. `Type{ v x n }` builds
 any class with a `static fn fill(count, value)`, as `Array` has.
 
+A compound assignment such as `values[i] += 1` reads the element through
+`$offset` and stores it back through `$offset_assign`, evaluating `values` and
+`i` once. A handler after the value covers both: `counts[word] += 1 !? 0`
+starts a missing key at 0.
+
 ## Typehints
 
 Variables, properties, globals, and function arguments can have explicit type hints. When the expected type is known, `.` names something of that type without repeating its name: a value built with `.{ ... }`, an enum member, a static function, or an error code.
