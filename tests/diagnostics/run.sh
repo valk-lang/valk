@@ -192,9 +192,9 @@ else
     assert_status=$?
     assert_out=$(printf '%s' "$assert_out" | normalize_paths)
     if [ "$assert_status" -eq 0 ] || [[ "$assert_out" != *"assert(actual == expected)"* ]] || \
-       [[ "$assert_out" != *"[file] $DIR/assert.valk:4"* ]]; then
+       [[ "$assert_out" != *"[file] tests/diagnostics/assert.valk:4"* ]]; then
         echo "# Wrong failed-assertion location"
-        echo "- Expected: $DIR/assert.valk:4"
+        echo "- Expected: tests/diagnostics/assert.valk:4 (relative to the package root)"
         echo "- Exit code: $assert_status"
         echo "$assert_out"
         failed=1

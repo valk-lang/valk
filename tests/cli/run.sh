@@ -496,6 +496,15 @@ if [[ "$fmt_again" != *"Already formatted"* ]]; then
     exit 1
 fi
 
+echo "> A --filter that matches no test fails"
+filter_out=$("$VALK" build "$DIR/../diagnostics/assert.valk" --test --filter nomatch -o "$workdir/nomatch$EXE_SUFFIX" 2>&1)
+filter_code=$?
+if [ "$filter_code" -eq 0 ] || [[ "$filter_out" != *"No test name contains 'nomatch'"* ]]; then
+    echo "# --filter without a match must fail"
+    echo "$filter_out"
+    exit 1
+fi
+
 echo "> valk run hints at -- for program arguments"
 run_out=$("$VALK" run "$input" alice 2>&1)
 if [[ "$run_out" != *"Arguments for the program go after '--'"* ]]; then
@@ -706,7 +715,8 @@ cat > "$project/valk.json" <<'JSON'
     "make": {
         "hello": { "dir": "src", "global": true },
         "dev": { "dir": "src", "args": "--def \"DEV=1\"" },
-        "greet": "echo greeting"
+        "greet": "echo greeting",
+        "broken": ["echo first", "exit 3", "echo never"]
     }
 }
 JSON
@@ -763,6 +773,15 @@ command_out=$(cd "$project" && "$VALK_BIN" make greet -- "two words" 2>&1)
 if [[ "$command_out" != *"greeting two words"* ]] && [[ "$command_out" != *'greeting "two words"'* ]]; then
     echo "# 'valk make greet -- \"two words\"' must run the command with its argument"
     echo "$command_out"
+    exit 1
+fi
+
+# A failing line stops the command and is named
+broken_out=$(cd "$project" && "$VALK_BIN" make broken 2>&1)
+broken_code=$?
+if [ "$broken_code" -ne 3 ] || [[ "$broken_out" == *"never"* ]] || { [ "$host_os" != "win" ] && [[ "$broken_out" != *"failed with exit code 3 at: exit 3"* ]]; }; then
+    echo "# A failing make line must stop the command and be reported (exit $broken_code)"
+    echo "$broken_out"
     exit 1
 fi
 
@@ -1016,4 +1035,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 68"
+echo "# Test count: 69"
