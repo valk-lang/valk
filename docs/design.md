@@ -346,12 +346,15 @@ let text, number = whole    // destructures it
 let first, _ = pair()       // only the first member
 ```
 
-`each ... as ...` always splits a tuple value across the names, which is how
-map iteration exposes value, key and index. `each ... into ...` binds the
-iterated value whole, so a tuple stays one value; an extra trailing name is
-still the index:
+`each ... as ...` splits a tuple value across the names, which is how map
+iteration exposes value, key and index. Over a sequence of tuples, one name
+holds each element whole (so generic code's `each items as item` gets the
+element), several names split it and must name every member, and
+`each ... into ...` binds the element whole with an extra trailing name for the
+index:
 
 ```valk
+each pairs as pair { }                 // the pair value
 each pairs as left, right, index { }   // split, with the element index
 each pairs into pair, index { }        // the pair value, with the index
 ```

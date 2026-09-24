@@ -275,6 +275,18 @@ each arr as value {}
 each arr as value, index {}
 ```
 
+Over an array of tuples, one name holds each element whole, and several names
+split it into its members, with the index after them. `each ... into` keeps the
+element whole next to its index, which generic code over `Array[T]` should use
+when it needs the index:
+
+```rust
+let pairs = Array[(String, int)]{ ("a", 1), ("b", 2) }
+each pairs as pair {}                  // pair[0], pair[1]
+each pairs as name, count, index {}
+each pairs into pair, index {}
+```
+
 Full `Array` API: [core](api.md#core)
 
 Callbacks cover the common searches and transforms: `any`, `all` and `find`
