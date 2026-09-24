@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `valk run src alice` points at `valk run src -- alice` when `alice` is not a path
 + `valk fmt` lists the files it changed (and leaves unchanged files untouched); `valk fmt -h` and `valk make -h` have their own help; an unknown command says so; `valk -h` lists `valk lsp`
 + The compiler writes errors and warnings to stderr
 + A panic (and its `--debug` stack trace) is written to stderr, so `./app > out.json` no longer swallows the crash

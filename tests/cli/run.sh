@@ -496,6 +496,14 @@ if [[ "$fmt_again" != *"Already formatted"* ]]; then
     exit 1
 fi
 
+echo "> valk run hints at -- for program arguments"
+run_out=$("$VALK" run "$input" alice 2>&1)
+if [[ "$run_out" != *"Arguments for the program go after '--'"* ]]; then
+    echo "# valk run with a stray argument should point at '--'"
+    echo "$run_out"
+    exit 1
+fi
+
 echo "> Command help and unknown commands"
 if [[ "$("$VALK" fmt -h 2>&1)" != *"Usage: valk fmt"* ]] || [[ "$("$VALK" make -h 2>&1)" != *"Usage: valk make"* ]]; then
     echo "# valk fmt -h and valk make -h need their own help"
@@ -1008,4 +1016,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 67"
+echo "# Test count: 68"
