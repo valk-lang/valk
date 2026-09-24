@@ -858,6 +858,45 @@ if [[ "$neither_out" != *"has neither a 'dir' to build nor a 'cmd' to run"* ]]; 
 fi
 
 echo ""
+echo "# Test require.valk.min: a warning, also shown with an error"
+min_project="$workdir/valk-min"
+mkdir -p "$min_project/src" "$min_project/dep/src"
+cat > "$min_project/valk.json" <<'JSON'
+{
+    "dependencies": { "dep": { "src": "./dep" } }
+}
+JSON
+cat > "$min_project/dep/valk.json" <<'JSON'
+{
+    "name": "dep",
+    "require": { "valk": { "min": "99.0.0" } }
+}
+JSON
+printf '+ fn hello() String { return "hi" }\n' > "$min_project/dep/src/dep.valk"
+printf 'use dep\nfn main() { println(dep.hello()) }\n' > "$min_project/src/main.valk"
+min_out=$("$VALK" build "$min_project/src" -o "$workdir/valk-min-app$EXE_SUFFIX" 2>&1)
+if [ $? -ne 0 ] || [[ "$min_out" != *"Package 'dep' requires valk 99.0.0 or newer"* ]]; then
+    echo "# A package that needs a newer valk must build with a warning"
+    echo "$min_out"
+    exit 1
+fi
+printf 'use dep\nfn main() { println(dep.hello_new()) }\n' > "$min_project/src/main.valk"
+min_out=$("$VALK" build "$min_project/src" --no-warn -o "$workdir/valk-min-app$EXE_SUFFIX" 2>&1)
+if [ $? -eq 0 ] || [[ "$min_out" != *"requires valk 99.0.0 or newer"* ]] || [[ "$min_out" != *"hello_new"* ]]; then
+    echo "# A failed build must show the valk requirement next to the error"
+    echo "$min_out"
+    exit 1
+fi
+printf 'use dep\nfn main() { println(dep.hello()) }\n' > "$min_project/src/main.valk"
+sed -i.bak 's/"99.0.0"/"0.1.0"/' "$min_project/dep/valk.json"
+min_out=$("$VALK" build "$min_project/src" -o "$workdir/valk-min-app$EXE_SUFFIX" 2>&1)
+if [ $? -ne 0 ] || [[ "$min_out" == *"requires valk"* ]]; then
+    echo "# A requirement that is met must stay quiet"
+    echo "$min_out"
+    exit 1
+fi
+
+echo ""
 echo "# Test --debug: stack traces and debug info"
 trace_out=$($TIMEOUT "$VALK" build "$DIR/debug-trace.valk" --no-warn -d -o "$workdir/debug-trace$EXE_SUFFIX" 2>&1 && $TIMEOUT "$workdir/debug-trace$EXE_SUFFIX" 2>&1)
 trace_code=$?

@@ -2566,6 +2566,18 @@ only reported by that dependency's own `--lint`. `valk build --parse-all`
 parses everything regardless of these settings, for one build that has to
 check all code, such as after a compiler upgrade.
 
+A package names the oldest valk it works with under `require`:
+
+```json
+{
+    "require": { "valk": { "min": "0.7.7" } }
+}
+```
+
+A build with an older compiler warns and still builds; when it fails, the
+warning is shown with the error. `vman` does not install such a package unless
+you pass `--ignore-min`.
+
 ## Unsafe
 
 Although Valk aims to be safe, it still supports low-level operations when needed. Unsafe features include:
