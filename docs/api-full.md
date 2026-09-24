@@ -9668,7 +9668,7 @@ error H2Error (incomplete, protocol, frame_size, flow_control, compression, limi
 // Thrown by the HTTP client and by starting an HTTP server.
 error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large) extends (net:NetError, HttpParseError)
 // Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
-error HttpParseError (invalid, http413, incomplete, missing_host_header, not_implemented) extends (io:IoError)
+error HttpParseError (invalid, http413, http431, incomplete, missing_host_header, not_implemented) extends (io:IoError)
 // A router error.
 error RouteError (invalid)
 // Thrown by `WebSocket` methods.
@@ -9715,8 +9715,8 @@ Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
 
 - `invalid`: the start line, a header, `Content-Length` or chunked framing is malformed
   or contradictory.
-- `http413`: the header section exceeds `max_header_size` or the body exceeds
-  `max_body_size`.
+- `http431`: the header section (or the trailers) exceeds `max_header_size`.
+- `http413`: the body exceeds `max_body_size`.
 - `incomplete`: more input is needed; call again once more bytes arrived.
 - `missing_host_header`: an HTTP/1.1 request has no `Host` header.
 - `not_implemented`: `Transfer-Encoding` names a coding other than a final `chunked`.
@@ -9836,8 +9836,9 @@ Sends a HEAD request; see `request`.
 
 Reads an HTTP date such as `Sun, 06 Nov 1994 08:49:37 GMT`.
 
-Throws `SyntaxError` for anything else, including the two formats RFC 9110 calls
-obsolete.
+Also accepts the two obsolete forms RFC 9110 asks recipients to read:
+`Sunday, 06-Nov-94 08:49:37 GMT` (a two-digit year below 69 is in the 2000s) and
+`Sun Nov  6 08:49:37 1994`. Throws `SyntaxError` for anything else.
 
 ### patch
 
@@ -10889,8 +10890,8 @@ Whether a response has been written for the current request.
 
 Returns the reason phrase for `code`, such as `Bad Request`.
 
-Only 200, 301, 302, 303, 307, 308, 400, 413, 501 and 503 have a phrase; every
-other code, 404 included, returns an empty string.
+Covers the codes RFC 9110 defines plus 428, 429 and 431; any other code returns an
+empty string, which the status line allows.
 
 #### send
 
@@ -11114,7 +11115,7 @@ Larger requests are answered with 413 and the connection is closed.
 The largest accepted request head (request line and headers) in bytes; 0 means
 no limit. Defaults to 8 KiB.
 
-Larger requests are answered with 413 and the connection is closed.
+Larger requests are answered with 431 and the connection is closed.
 
 #### max_server_wide_body_size
 

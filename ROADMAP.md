@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP: `parse_date` reads the RFC 850 and asctime forms too; an oversized request head gets 431 instead of 413; `code_name` knows every RFC 9110 status
 + HTTP `Response.text`, `Response.html` and the plain-text defaults send `charset=utf-8`
 + HTTP `query()` keeps a key without `=` (`?flag`) with the value `""` instead of dropping it
 + HTTP static directories percent-decode the request path, so `/my%20file.txt` serves `my file.txt` (HTTP/1 and HTTP/2)
