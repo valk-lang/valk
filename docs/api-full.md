@@ -13564,8 +13564,9 @@ That is OpenSSL's message for `get_error`, or the message given to `custom_error
 Returns a client session that verifies the server certificate.
 
 Loads the first CA bundle from `default_ca_cert_paths` that OpenSSL accepts, or
-OpenSSL's default verify paths when none does. Each session owns its own OpenSSL
-context. Tagged `$default`, so it also supplies `Ssl`'s default value.
+OpenSSL's default verify paths when none does; on Windows it then also trusts the
+certificates of the system store, so no `cacert.pem` is needed. Each session owns its
+own OpenSSL context. Tagged `$default`, so it also supplies `Ssl`'s default value.
 
 #### peer_certificate_sha256
 
