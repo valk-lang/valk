@@ -6,6 +6,7 @@
 ```
 - Release 0.7.8
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
++ HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
 
 + Release 0.7.7
 + Structs by value to and from C: extern and export functions follow the target's C calling convention
