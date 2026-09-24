@@ -629,6 +629,14 @@ case "$quickfix_out" in
         failed=1
         ;;
 esac
+case "$quickfix_out" in
+    *'"range":{"start":{"line":3,"character":0},"end":{"line":4,"character":0}}'*) ;;
+    *)
+        echo "# The fix for the indented directive should remove its whole line"
+        echo "$quickfix_out"
+        failed=1
+        ;;
+esac
 check "generic errors point at the instantiation" "\"message\":\"while instantiating 'Box[String]' here\"" \
     "$(notify_open generic-chain.valk)"
 count=$((count + 1))
