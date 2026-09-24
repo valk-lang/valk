@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `let v = f() ! { ... }` with a block that carries on explains that the handler gives no value, instead of "A void expression does not produce a value"
 + A call that can throw in a function without an error type names the error and the ways to handle it (`!`, `!?`, `!!` or adding `!Error` to the signature)
 + LSP: empty hover, definition and completion replies are `null`; completion no longer offers compiler-made names (`&`, main's implicit `cli_args`)
 + `valk ls` colors its output only on a terminal and not when `NO_COLOR` is set
