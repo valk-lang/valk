@@ -308,7 +308,8 @@ if [[ "$guide" != *'let path : fs.Path = "."'* ]] \
     || [[ "$guide" == *'sanitize:'* ]] \
     || [[ "$guide" == *'[valk.type](api.md#core)'* ]] \
     || [[ "$guide" == *'Install a package globally'* ]] \
-    || [[ "$guide" == *'configured sanitizer'* ]]; then
+    || [[ "$guide" == *'configured sanitizer'* ]] \
+    || [[ "$guide" == *').!.'* ]]; then
     echo "# Basic documentation contains stale API examples"
     exit 1
 fi

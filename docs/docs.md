@@ -238,7 +238,8 @@ each re.find_all("a@b.c x@y.z") as found : println(found.str())
 re.is_match("nothing here")           // false
 re.replace("me@home you@work", "${host}:${user}")   // home:me work:you
 re.replace_with(text, fn(m: regex.Match) String { return m.str().upper() })
-regex.Regex.new("\\s*,\\s*").!.split("a , b,c")     // ["a", "b", "c"]
+let comma = regex.Regex.new("\\s*,\\s*") ! panic("bad pattern")
+comma.split("a , b,c")                 // ["a", "b", "c"]
 regex.escape("1+1=2")                  // 1\+1=2
 ```
 
