@@ -9670,7 +9670,7 @@ Replaces `'` with `&#39;`.
 // An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
 error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
 // Thrown by the HTTP client and by starting an HTTP server.
-error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large) extends (net:NetError, HttpParseError)
+error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, status) extends (net:NetError, HttpParseError)
 // Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
 error HttpParseError (invalid, http413, http431, incomplete, missing_host_header, not_implemented) extends (io:IoError)
 // A router error.
@@ -9708,6 +9708,7 @@ Thrown by the HTTP client and by starting an HTTP server.
   header is one the client sets itself.
 - `response_too_large`: the response exceeds `max_response_header_size` or
   `max_response_body_size`.
+- `status`: `download` got a final status outside 2xx.
 
 Also carries every `net.NetError` and `HttpParseError` code; the client uses `timeout`,
 `read`, `write` and `ssl`; `Server.start` throws `init` when it was started before, when
@@ -9816,11 +9817,12 @@ Sends a DELETE request; see `request`.
 
 Sends a request and writes the response body to the file at `to_path`.
 
-The file is created or truncated first; a failed request leaves what was received
-in it. The body is written whatever the status code is. The request uses a copy of
-`options` whose `output` is the file; the caller's object is not changed. Without
-`options` the timeout is 30 seconds instead of the usual 10. Failing to close the
-file throws `write`.
+Redirects are followed as `request` does. The final response must have a 2xx status:
+any other status throws `status` (`request` with `Options.output` set to a file gives
+the code itself). The file is created or truncated first and removed again when the
+download fails, so it only exists after a successful one. The request uses a copy of `options` whose `output` is the file; the
+caller's object is not changed. Without `options` the timeout is 30 seconds instead of
+the usual 10. Failing to close the file throws `write`.
 
 ### format_date
 

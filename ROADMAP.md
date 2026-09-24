@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `http.download` throws `status` when the final answer is not 2xx, and removes the file on any failure, so an error page is never saved as the download
 + `json.decode` reads an integer beyond the `int` range as the nearest float (like JavaScript) instead of failing; `decode_to` into a `u64` field still reads it exactly
 + `Mutex`, `Lock`, `Channel`, `CancelToken` and `Waker` no longer hold a pipe each: a free lock is one atomic operation, waiters are parked and woken directly (from another thread through one wake handle per thread), and creating them never runs out of file descriptors; a cross-thread channel moved 200k values in 11 ms instead of 1.2 s
 + Removing entries of a `Map`, `HashMap`, `HashSet`, `FlatMap` or JSON object inside `each` over it is safe: every other entry is still visited once, and the index stays 0, 1, 2, ... (it used to skip entries silently)

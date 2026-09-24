@@ -2044,7 +2044,7 @@ let json_data = json.from(Map[String]{ "key1" => "val1" })
 let res = http.request("POST", "http://some-website/api/endpoint", http.Options{ body: json.encode(json_data) }) ! panic("Request failed")
 
 // Download file
-http.download(url, to_path) ! panic("Failed to download file")
+http.download(url, to_path) ! panic("Failed to download file") // also for a 4xx/5xx status
 
 // Stream the response body into any io.Writer instead of keeping it in memory
 let out = fs.stream(to_path, fs.OpenOptions { read: false, write: fs.WriteMode.truncate, create: true }) ! panic("Failed to open file")

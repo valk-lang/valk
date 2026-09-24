@@ -2882,7 +2882,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 // An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
 error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
 // Thrown by the HTTP client and by starting an HTTP server.
-error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large) extends (net:NetError, HttpParseError)
+error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, status) extends (net:NetError, HttpParseError)
 // Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
 error HttpParseError (invalid, http413, http431, incomplete, missing_host_header, not_implemented) extends (io:IoError)
 // A router error.
