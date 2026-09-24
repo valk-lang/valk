@@ -7,6 +7,7 @@
 - Release 0.7.8
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
++ `utf8.length` and `utf8.chars()` end an invalid sequence at a byte that cannot continue it, instead of swallowing the next character
 + Markdown: `---` after a blank line and `* * *` are rules, a heading's closing `##` is dropped, link and image titles become a `title` attribute, and backslash escapes work
 + A `value` number constant that does not fit the other operand widens like its literal (`small_u8 + BIG`), and a misfit is reported at the use instead of the declaration
 + JSON writes a `DateTime` as ISO 8601 text and reads it back, a `HashSet` or `Deque` as an array, and a `HashMap` with integer keys as an object (they wrote their internal fields)
