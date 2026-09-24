@@ -11887,13 +11887,15 @@ The type of a JSON value, as reported by `Value.kind`.
 Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
 
 Throws `.invalid` on a syntax error, invalid UTF-8 in a string, trailing non-whitespace
-or a number outside the range of `int`/`float`; `.too_deep` when containers nest deeper
+or a number outside the range of `float`; `.too_deep` when containers nest deeper
 than `max_depth`; and `.too_large` when the input is longer than `max_bytes` or holds
 more than `max_entries` array items and object members in total. A `max_bytes` or
 `max_entries` of `0` disables that limit; `max_depth` is capped at 1000. The defaults
 are a depth of 128, 64 MiB and 1,000,000 entries.
 
-A number is an integer unless it has a fraction or an exponent. When an object repeats
+A number is an integer unless it has a fraction or an exponent, or lies outside the range
+of `int`: then it becomes the nearest float, as in JavaScript (`decode_to` into a `u64`
+field reads such a number exactly). When an object repeats
 a key, the last value wins. An unpaired `\u` surrogate escape decodes to U+FFFD.
 
 ### decode_to

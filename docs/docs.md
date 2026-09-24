@@ -1528,6 +1528,9 @@ document = document.set_bool("active", true)
 println(json.encode(document))
 ```
 
+A number without a fraction or exponent is an `int`; one beyond the `int` range becomes the
+nearest `float`, as in JavaScript. `json.decode_to` into a `u64` field reads such a number exactly.
+
 Objects use string keys and arrays use integer indexes. The same operations work for either:
 
 ```rust
