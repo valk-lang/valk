@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ An object compares with `==` to an interface it implements; interpolating a value whose `$to` String hook is not `$auto` says how to fix it
 + A private hook (`$eq`, `$offset`, `$to`, ...) used by an operator elsewhere, such as inside `Array`, is reported at the hook with "mark it public", and the use as a note
 + A `match` on an enum, union, error code or bool that misses cases lists them
 + A `match` used as a value without its type, or a `{ ... }` case in a value `match`, gets an error that shows the right form
