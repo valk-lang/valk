@@ -639,9 +639,18 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
-+ extend HashMap[String, String] {
++ extend HashMap[String, T] {
     // Builds a map from a JSON object, converting each member with `to_type`.
-    + static fn from_json_value_auto[X](value: X) HashMap[String, String] !LookupError
+    + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
+    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+    + fn sort_keys() void
+}
+```
+
+```js
++ extend HashMap[u32, T] {
+    // Builds a map from a JSON object whose member names are integers, converting each member with `to_type`.
+    + static fn from_json_value_auto[X](value: X) HashMap[u32, T] !LookupError
     // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
     + fn sort_keys() void
 }

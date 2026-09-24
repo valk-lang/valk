@@ -140,7 +140,12 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
     || [[ "$markdown" != *'+ fn name() String'* ]] \
     || [[ "$markdown" != *'+ extend Box[String] {'* ]] \
     || [[ "$markdown" != *'+ fn shout() String'* ]] \
-    || [[ "$markdown" == *'+ extend Box[uint]'* ]]; then
+    || [[ "$markdown" == *'+ extend Box[uint]'* ]] \
+    || [[ "$markdown" != *'+ extend Slot[String, V] {'* ]] \
+    || [[ "$markdown" != *'+ extend Slot[u8, V] {'* ]] \
+    || [[ "$markdown" == *'+ extend Slot[uint'* ]] \
+    || [[ "$markdown" == *'+ extend Slot[String, uint]'* ]] \
+    || [[ "$markdown" == *'+ extend Slot[String, bool]'* ]]; then
     echo "# Markdown sorting did not preserve class declarations"
     echo "$markdown"
     exit 1

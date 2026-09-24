@@ -2166,22 +2166,43 @@ Throws `exists`, leaving the map unchanged, when `key` is already present.
 Returns a new array of the values, in entry order.
 
 ```js
-+ extend HashMap[String, String] {
++ extend HashMap[String, T] {
     // Builds a map from a JSON object, converting each member with `to_type`.
-    + static fn from_json_value_auto[X](value: X) HashMap[String, String] !LookupError
+    + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
     // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
     + fn sort_keys() void
 }
 ```
 
-#### HashMap[String, String].from_json_value_auto
+#### HashMap[String, T].from_json_value_auto
 
 Builds a map from a JSON object, converting each member with `to_type`.
 
 Only available when the key type is `String`. Throws `.missing` when `value` is
 not an object or a member cannot be converted to the value type.
 
-#### HashMap[String, String].sort_keys
+#### HashMap[String, T].sort_keys
+
+Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+
+```js
++ extend HashMap[u32, T] {
+    // Builds a map from a JSON object whose member names are integers, converting each member with `to_type`.
+    + static fn from_json_value_auto[X](value: X) HashMap[u32, T] !LookupError
+    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+    + fn sort_keys() void
+}
+```
+
+#### HashMap[u32, T].from_json_value_auto
+
+Builds a map from a JSON object whose member names are integers, converting each
+member with `to_type`.
+
+Throws `.missing` when `value` is not an object, a name is not an integer of the key
+type, or a member cannot be converted to the value type.
+
+#### HashMap[u32, T].sort_keys
 
 Reorders the entries so iteration, `keys` and `values` follow ascending key order.
 
