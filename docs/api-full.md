@@ -8745,7 +8745,8 @@ without it the file becomes read-only.
 
 Copies the file or directory at `from_path` to `to_path`.
 
-A file copy overwrites `to_path`; a new file gets `0c644`, permissions are not copied.
+A file copy overwrites `to_path`. On Linux and macOS the copy gets the permission bits
+(`0c777`) of the source, like `cp`.
 For a directory, `to_path` is created when missing (`.open` when it exists and is not a
 directory) and the files directly inside are copied; subdirectories are copied only when
 `recursive` is set. Symlinks inside a directory are recreated as symlinks with the same
