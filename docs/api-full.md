@@ -11159,8 +11159,8 @@ Serves files from the directory `path` before a request reaches the handler.
 
 Throws `open` when `path` is not a directory. A request whose path names a file
 inside the directory gets that file whatever the method (over HTTP/2: except
-`CONNECT`); paths containing `..` are never served. The directory added last is
-searched first.
+`CONNECT`). The path is percent-decoded first (`+` stays `+`); paths containing
+`..` are never served. The directory added last is searched first.
 
 #### fast
 
