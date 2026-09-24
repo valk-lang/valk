@@ -9,6 +9,7 @@
 * [Standard library API](#standard-library-api)
 * [Getting started](#getting-started)
 * [Basic example](#basic-example)
+* [Command line](#command-line)
 * [Types](#types)
 * [Variables](#variables)
 * [Strings](#strings)
@@ -134,11 +135,30 @@ fn main(args: Array[String]) {
 }
 ```
 
+## Command line
+
+```sh
+valk build ./src -o ./app                   # Compile a directory or .valk files
+valk build ./src -o ./app --run             # Compile, then run
+valk run ./src -- alice bob                 # Compile and run; program arguments go after --
+valk build ./src -o ./app --run --watch     # Rebuild and restart when a file changes
+valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, macos-x64, macos-arm64, win-x64
+valk build ./src --lint                     # Check without building
+valk fmt ./src                              # Format in place and list the changed files
+valk build -h                               # Every option
+```
+
+Editors talk to `valk lsp run`, a language server over stdin and stdout. The
+[VS Code extension](https://github.com/valk-lang/valk-vscode) starts it for you.
+
 ## Types
 
 Integer types: `int`, `uint`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`
 
 Float types: `float`, `f32`, `f64`. Float literals may use an exponent: `2.5e-3`, `1e10`
+
+Integer literals: `255`, hex `0xff`, octal `0c377`. A leading zero is still decimal
+(`017` is 17), and there is no binary form.
 
 Built-in classes: `String`, `Array`, `Map`, `HashMap`
 
@@ -427,6 +447,8 @@ m.set(key, value)
 m.remove(key) // Swap-remove: the last entry takes the removed slot, so iteration order changes
 m.has(key)
 m.clear()
+let v = m.get("a") !? 0 // get throws when the key is missing
+let w = m["a"]          // [] gives the zero value (0, false, or null) for a missing key
 //
 each m as value {}
 each m as value, key {}
@@ -590,6 +612,9 @@ fn main() {
     add()     // Compile error
 }
 ```
+
+`_` keeps the default of an argument when a later one is given:
+`greet(_, "?")` for `fn greet(name: String ("world"), end: String ("!"))`.
 
 Calls evaluate the callable or method receiver first, then arguments from left to right. `co` uses the same order before starting the coroutine.
 
@@ -1290,6 +1315,26 @@ each 5 .. 3 as number, position {
 }
 // 5 at 0, 6 at 1, 7 at 2
 each 0 .. 3 : print("x") // Without names: xxx
+```
+
+`skip n` starts after the first `n` items; the index still counts from the start.
+
+```rust
+each Array[int]{ 1, 2, 3, 4 } skip 2 as v, i : print("%v@%i ") // 3@2 4@3
+```
+
+A class of your own works with `each` when it has `_next(index: uint) T !IterError`, which
+returns the item at `index` or throws `.end`:
+
+```rust
+class Countdown {
+    from: uint
+    fn _next(index: uint) uint !IterError {
+        if index >= this.from : throw .end
+        return this.from - index
+    }
+}
+each Countdown { from: 3 } as n : print(n) // 321
 ```
 
 ## Null-checking
@@ -2887,8 +2932,12 @@ The valk manager aka `vman` can be used to install/update new versions of `valk`
 vman use latest # Will install/use the latest version of valk
 vman use # Will install/use the valk version defined in your {cwd}/valk.json config -> { "use": "x.x.x" }
 vman use {version} # Install/use a specific version
+vman init # Write a valk.json for this project
+vman template # List the starting templates: hello, cli, http-server, package
+vman template {name} # Write one into this project
 vman install # Install packages defined in valk.json
 vman install {pkg} # Install a package in the current project
+vman update # Update packages to the newest versions their masks allow
 vman remove {pkg} # Remove a package
 ```
 
