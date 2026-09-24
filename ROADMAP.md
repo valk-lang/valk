@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.7.8
+
 + Release 0.7.7
 + Structs by value to and from C: extern and export functions follow the target's C calling convention
 + Struct sizes round up to their own alignment, like C
