@@ -422,6 +422,14 @@ if [ $? -eq 0 ] || [[ "$missing_out" != *"Option '-o' expects a value"* ]]; then
     exit 1
 fi
 
+echo "> A repeated option keeps its last value"
+out=$("$VALK" build "$input" --no-warn -o "$workdir/first$EXE_SUFFIX" -o "$workdir/last$EXE_SUFFIX" 2>&1)
+if [ ! -f "$workdir/last$EXE_SUFFIX" ] || [ -f "$workdir/first$EXE_SUFFIX" ]; then
+    echo "# The last -o should win"
+    echo "$out"
+    exit 1
+fi
+
 echo "> ansi.supported respects NO_COLOR"
 "$VALK" build "$DIR/no-color.valk" --no-warn -o "$workdir/no-color$EXE_SUFFIX" >/dev/null 2>&1
 colored=$(TERM=xterm NO_COLOR= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
@@ -951,4 +959,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 62"
+echo "# Test count: 63"
