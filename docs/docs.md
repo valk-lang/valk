@@ -1507,6 +1507,10 @@ let json_usr = json.from(user)
 let json_string = json_usr.encode()
 ```
 
+A `DateTime` is written as its ISO 8601 text and read back from one; a `HashSet`
+or `Deque` is an array, and a `HashMap` with integer keys is an object whose
+member names are the numbers.
+
 You can also decode directly to a type using `json.decode_to[T](text)`
 
 ```rust

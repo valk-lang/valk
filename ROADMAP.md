@@ -7,6 +7,7 @@
 - Release 0.7.8
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
++ JSON writes a `DateTime` as ISO 8601 text and reads it back, a `HashSet` or `Deque` as an array, and a `HashMap` with integer keys as an object (they wrote their internal fields)
 + Tuples as values of `Map`, `HashMap` and `Deque`; one name over an array of tuples holds each element whole (generic `each items as item` got the first member only, and `json.encode` of an array of tuples wrote invalid JSON)
 + A panic in a test names the test and its location and still prints the summary of the tests that finished
 + A TCP connect to a name tries its other addresses when the first refuses: `localhost` reaches a server on `::1` only
