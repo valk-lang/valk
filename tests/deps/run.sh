@@ -152,6 +152,9 @@ check_fail "extern-signature-conflict" "one C symbol needs one prototype"
 # Missing vendor dir reports the new assoc path (not github.com.user.repo).
 check_fail "github-missing" "vendor/github-acme-widget/9.9.9"
 
+# A 'src' that is neither relative nor on GitHub says so, instead of "no package named"
+check_fail "invalid-src" "Invalid dependency 'src' for 'widget'"
+
 current_only="$workdir/github-current-prefers"
 mkdir -p "$current_only"
 cp -a "$DIR/github-version/." "$current_only/"
