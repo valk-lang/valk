@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ A `use` of a namespace that does not exist is reported at the `use` (with "did you mean 'use valk.fs'"), and an unknown identifier suggests a close name (`printn` -> `println`)
 + An object compares with `==` to an interface it implements; interpolating a value whose `$to` String hook is not `$auto` says how to fix it
 + A private hook (`$eq`, `$offset`, `$to`, ...) used by an operator elsewhere, such as inside `Array`, is reported at the hook with "mark it public", and the use as a note
 + A `match` on an enum, union, error code or bool that misses cases lists them
