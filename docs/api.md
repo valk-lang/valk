@@ -463,6 +463,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn get_pos() uint
     // Creates a reader at position 0 over `source`.
     + static fn new(source: &[u8]) ByteReader
+    // Parses a decimal float like `read_float` and advances past it.
+    + fn parse_float() float !SyntaxError
+    // Parses a decimal integer like `read_int` and advances past it.
+    + fn parse_int() int !SyntaxError
+    // Parses an unsigned decimal integer like `read_uint` and advances past it.
+    + fn parse_uint() uint !SyntaxError
     // Copies up to `buf.length` unread bytes into `buf` and advances past them.
     + fn read(buf: local mut &[u8]) uint !io:IoError
     // Reads `bytes` bytes as an unsigned big-endian integer (meant for 1 to 8 bytes).

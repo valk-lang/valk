@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `ByteReader.parse_int`, `parse_uint` and `parse_float` throw `syntax` without advancing when there is no number, where `read_int` and friends return 0
 + `url.decode_path` (and `_into`) decode a path or route parameter and keep `+` (`url.decode` turns it into a space); the HTTP and WebSocket clients reject a port that is not a number with `invalid_url`
 + `http.download` throws `status` when the final answer is not 2xx, and removes the file on any failure, so an error page is never saved as the download
 + `json.decode` reads an integer beyond the `int` range as the nearest float (like JavaScript) instead of failing; `decode_to` into a `u64` field still reads it exactly

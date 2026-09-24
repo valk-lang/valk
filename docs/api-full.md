@@ -1525,6 +1525,12 @@ A `base` above 16 is treated as 16 and one below 2 as 10.
     + fn get_pos() uint
     // Creates a reader at position 0 over `source`.
     + static fn new(source: &[u8]) ByteReader
+    // Parses a decimal float like `read_float` and advances past it.
+    + fn parse_float() float !SyntaxError
+    // Parses a decimal integer like `read_int` and advances past it.
+    + fn parse_int() int !SyntaxError
+    // Parses an unsigned decimal integer like `read_uint` and advances past it.
+    + fn parse_uint() uint !SyntaxError
     // Copies up to `buf.length` unread bytes into `buf` and advances past them.
     + fn read(buf: local mut &[u8]) uint !io:IoError
     // Reads `bytes` bytes as an unsigned big-endian integer (meant for 1 to 8 bytes).
@@ -1612,6 +1618,27 @@ Returns the current position in bytes.
 
 Creates a reader at position 0 over `source`.
 
+#### parse_float
+
+Parses a decimal float like `read_float` and advances past it.
+
+Throws `syntax`, without advancing, when the text at the position is not a valid
+number or is out of range.
+
+#### parse_int
+
+Parses a decimal integer like `read_int` and advances past it.
+
+Throws `syntax`, without advancing, when there is no number at the position or it
+does not fit in `int`.
+
+#### parse_uint
+
+Parses an unsigned decimal integer like `read_uint` and advances past it.
+
+Throws `syntax`, without advancing, when there is no number at the position or it
+does not fit in `uint`.
+
 #### read
 
 Copies up to `buf.length` unread bytes into `buf` and advances past them.
@@ -1643,7 +1670,8 @@ Parses a decimal float and advances past it.
 Accepts an optional `-` or `+` sign, digits with at most one `.` (at least one digit),
 and an optional exponent (`e` or `E`, optional sign, digits). An `e` not followed by
 digits is not part of the number, so `2em` reads 2 and leaves `em`. Returns 0 without
-advancing when the text is not a valid number or is out of range.
+advancing when the text is not a valid number or is out of range; `parse_float` throws
+instead.
 
 #### read_hex_int
 
@@ -1667,7 +1695,7 @@ Parses a decimal integer with an optional `-` or `+` sign and advances past it.
 
 Parsing starts at the position (whitespace is not skipped) and stops at the first
 non-digit. Returns 0 without advancing when there is no number or it does not fit in
-`int`.
+`int`; `parse_int` throws instead.
 
 #### read_little_endian
 
@@ -1731,7 +1759,7 @@ Parses an unsigned decimal integer with an optional `+` sign and advances past i
 
 Parsing starts at the position (whitespace is not skipped) and stops at the first
 non-digit. Returns 0 without advancing when there is no number or it does not fit in
-`uint`.
+`uint`; `parse_uint` throws instead.
 
 #### read_uint_be
 
