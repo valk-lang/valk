@@ -49,6 +49,8 @@ cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-l
 # for loose files; a dependency names its package
 cases="$cases panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:1:tests/exit-code/fixed-array-bounds.valk:4"
 cases="$cases panic-in-library:1:ByteBuffer.valk:124"
+# A `test-` fixture is built with --test: a panic names its test and prints the summary
+cases="$cases test-crash-named:1:panicked"
 # Windows delivers the overflow exception only when it can still push a frame
 if [ -z "$EXE_SUFFIX" ]; then
     cases="$cases stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"
@@ -68,8 +70,10 @@ run_case() {
         return
     fi
 
-    echo "> Run: $VALK build $input -o $exe (expect exit $want)" > "$log"
-    out=$("$VALK" build "$input" --no-warn -o "$exe" 2>&1)
+    local test_flag=""
+    [[ "$name" == test-* ]] && test_flag="--test"
+    echo "> Run: $VALK build $input $test_flag -o $exe (expect exit $want)" > "$log"
+    out=$("$VALK" build "$input" $test_flag --no-warn -o "$exe" 2>&1)
     status=$?
     if [ "$status" -ne 0 ]; then
         {
@@ -98,6 +102,11 @@ run_case() {
 
     if [ "$name" = "panic-line" ] && [[ "$output" != *"Explicit panic at tests/exit-code/panic-line.valk:2"* ]]; then
         echo "# Missing panic message or source location: $output" >> "$log"
+        : > "$fail"
+    fi
+
+    if [ "$name" = "test-crash-named" ] && { [[ "$output" != *"> panics in a test "* ]] || [[ "$output" != *"TEST RESULTS"* ]]; }; then
+        echo "# Missing the panicking test's name or the summary: $output" >> "$log"
         : > "$fail"
     fi
 
