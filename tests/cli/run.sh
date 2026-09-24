@@ -447,6 +447,14 @@ if [ -n "$panic_stdout" ] || [[ "$panic_stderr" != *"Explicit panic at"* ]]; the
     exit 1
 fi
 
+echo "> Compile errors write to stderr"
+error_stdout=$("$VALK" build "$DIR/../compile-errors/ce-default-uses-param.valk" --no-warn 2>/dev/null)
+error_stderr=$("$VALK" build "$DIR/../compile-errors/ce-default-uses-param.valk" --no-warn 2>&1 >/dev/null)
+if [ -n "$error_stdout" ] || [[ "$error_stderr" != *"# Error: "* ]]; then
+    echo "# The compile error belongs on stderr: stdout '$error_stdout', stderr '$error_stderr'"
+    exit 1
+fi
+
 echo "> ansi.supported respects NO_COLOR"
 "$VALK" build "$DIR/no-color.valk" --no-warn -o "$workdir/no-color$EXE_SUFFIX" >/dev/null 2>&1
 colored=$(TERM=xterm NO_COLOR= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
@@ -976,4 +984,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 65"
+echo "# Test count: 66"
