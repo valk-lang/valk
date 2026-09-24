@@ -511,6 +511,15 @@ A typehint on a number only types plain literals: `let x: u8 = 200 + 55` is a `u
 constant, while `let y: i16 = a + b` computes `a + b` in the operands' type and
 converts the result.
 
+A literal next to a typed value takes that value's type: in `x * 2.0`,
+`cond ? 0 : n` and `cond ? n : 0` the literal has the type of `x` or `n`. When
+it does not fit that type, an operator computes in the literal's own type
+(`small_u8 + 300` is an `int`), and a ternary takes the closest type that holds
+both: `cond ? 300 : small_u8` is a `u16`, `cond ? -1 : small_u8` an `i16`. A
+`value NAME (28.0)` constant behaves as the literal it stands for. A variable
+does not: `let bar = 360` is an `int`, so declare `let bar: i32 = 360` when it is
+meant for an `i32`.
+
 ## Tagged unions
 
 A tagged union lets a value be one of several types. Give the union a name when

@@ -15,6 +15,8 @@
 + A package whose `require.valk.min` is newer than the compiler gives a warning, shown with the error when the build fails
 + `x[i] += v` (and the other compound assignments) on Array, HashMap, ByteBuffer and other `$offset` types
 + An import used only in `test` blocks is no longer reported as unused
++ A literal in a ternary takes the type of the other side (`cond ? 0 : n`), or the closest type holding both (`cond ? 300 : small_u8` is u16); `value` number constants type like their literal
++ A variable declared from a number that does not fit where it is used gets a fix: 'let bar: i32 = 360'
 
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)

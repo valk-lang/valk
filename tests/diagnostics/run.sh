@@ -170,6 +170,15 @@ if [ "$test_import_status" -ne 0 ] || [[ "$test_import_out" == *"'valk.math' is 
 fi
 
 count=$((count + 1))
+echo "> no type hint for a number that does not fit"
+no_hint_out=$("$VALK" build "./tests/compile-errors/ce-let-literal-no-hint.valk" -o "$workdir/no-hint$EXE_SUFFIX" 2>&1)
+if [[ "$no_hint_out" != *"Expected 'u8', got 'int'"* ]] || [[ "$no_hint_out" == *"Declare the type"* ]]; then
+    echo "# 300 must not be suggested as a u8"
+    echo "$no_hint_out"
+    failed=1
+fi
+
+count=$((count + 1))
 echo "> failed assertion location"
 assert_bin="$workdir/assert-test$EXE_SUFFIX"
 assert_build=$("$VALK" build "$DIR/assert.valk" --test --no-warn -o "$assert_bin" 2>&1)
