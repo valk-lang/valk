@@ -21,8 +21,8 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 Returns whether the terminal likely understands ANSI escape codes, judged from `TERM`.
 
 True when `TERM` contains `xterm`, `vt`, `ansi`, `linux`, `screen` or `tmux`; false when
-it is unset. The answer is cached after the first call. It does not check whether
-stdout is a terminal.
+it is unset, or when `NO_COLOR` is set to a non-empty value. The answer is cached after
+the first call. It does not check whether stdout is a terminal.
 
 ### utf8_supported
 

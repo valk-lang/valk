@@ -422,6 +422,15 @@ if [ $? -eq 0 ] || [[ "$missing_out" != *"Option '-o' expects a value"* ]]; then
     exit 1
 fi
 
+echo "> ansi.supported respects NO_COLOR"
+"$VALK" build "$DIR/no-color.valk" --no-warn -o "$workdir/no-color$EXE_SUFFIX" >/dev/null 2>&1
+colored=$(TERM=xterm NO_COLOR= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
+plain=$(TERM=xterm NO_COLOR=1 "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
+if [ "$colored" != "true" ] || [ "$plain" != "false" ]; then
+    echo "# NO_COLOR was not respected: '$colored' '$plain'"
+    exit 1
+fi
+
 echo "> The target list in --help matches the invalid target message"
 help_targets=$("$VALK" build --help | grep -A1 -- '--target' | tail -n 1 | sed 's/^ *//')
 invalid_targets=$("$VALK" build "$input" --target nope 2>&1 | sed -n 's/^Supported: //p')
@@ -942,4 +951,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 61"
+echo "# Test count: 62"
