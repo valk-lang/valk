@@ -10732,14 +10732,14 @@ Decoded like `query`.
     + static fn file(path: String, filename: ?String (null)) Response
     // The extra response headers, created empty on first access.
     + get headers: Headers
-    // Creates a `text/html` response.
+    // Creates a `text/html; charset=utf-8` response.
     + static fn html(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Creates an `application/json` response; `body` must already be encoded JSON.
     + static fn json(body: String, code: u16 (200), headers: ?Headers (null)) Response
     // Creates an `application/json` response from any value, encoded with `json.encode`.
     + static fn json_of(data: $T, code: u16 (200), headers: ?Headers (null)) Response
     // Creates a response with `body`, `code` and `content_type`; the general form the other constructors are shortcuts for.
-    + static fn new(body: String, code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) Response
+    + static fn new(body: String, code: u16 (200), content_type: String ("text/plain; charset=utf-8"), headers: ?Headers (null)) Response
     // Creates a redirect to `location` with an empty body.
     + static fn redirect(location: String, code: u16 (302), headers: ?Headers (null)) Response
     // Sends `cookie` with this response, next to any cookie already set.
@@ -10748,7 +10748,7 @@ Decoded like `query`.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
     + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
-    // Creates a `text/plain` response.
+    // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
 }
 ```
@@ -10807,7 +10807,7 @@ Fields with invalid names or values are left out when the response is sent.
 
 #### html
 
-Creates a `text/html` response.
+Creates a `text/html; charset=utf-8` response.
 
 #### json
 
@@ -10849,7 +10849,7 @@ as a download under that name. The reader is not closed.
 
 #### text
 
-Creates a `text/plain` response.
+Creates a `text/plain; charset=utf-8` response.
 
 ```js
 // Writes the HTTP/1.1 response for one request; passed to `fast` handlers.
@@ -10860,7 +10860,7 @@ Creates a `text/plain` response.
     // Returns the reason phrase for `code`, such as `Bad Request`.
     + static fn code_name(code: u16) String
     // Responds with status `code`, `content_type` and `body`.
-    + fn send(body: local &[u8], code: u16 (200), content_type: String ("text/plain"), headers: ?Headers (null)) void
+    + fn send(body: local &[u8], code: u16 (200), content_type: String ("text/plain; charset=utf-8"), headers: ?Headers (null)) void
     // Responds with status `code` and the file at `path`; responds 404 when it cannot be opened.
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Responds with `status_code` and an empty `text/plain` body.
