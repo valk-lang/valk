@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ A `match` on an enum, union, error code or bool that misses cases lists them
 + A `match` used as a value without its type, or a `{ ... }` case in a value `match`, gets an error that shows the right form
 + `let v = f() ! { ... }` with a block that carries on explains that the handler gives no value, instead of "A void expression does not produce a value"
 + A call that can throw in a function without an error type names the error and the ways to handle it (`!`, `!?`, `!!` or adding `!Error` to the signature)
