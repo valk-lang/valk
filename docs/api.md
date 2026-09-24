@@ -4440,13 +4440,13 @@ error SignalError (unsupported, init)
     + fn close() void
     // Returns true once `close` was called.
     + fn is_closed() bool
-    // The number of values currently queued.
+    // The number of values currently queued; on a rendezvous channel, those of waiting senders.
     + get length: uint
-    // Returns an empty channel holding at most `capacity` values; 0 is unbounded.
-    + static fn new(capacity: uint (0)) Channel[T] !SyncError
+    // Returns an empty channel holding at most `capacity` values; without one it is unbounded.
+    + static fn new(capacity: ?uint (null)) Channel[T] !SyncError
     // Returns the next value, waiting for one.
     + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
-    // Queues `value`, waiting while the channel is full.
+    // Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until a receiver took it.
     + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
     // Returns the next value without waiting; throws `empty` when none is queued.
     + fn try_recv() T !SyncError

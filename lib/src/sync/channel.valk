@@ -8,30 +8,35 @@ class ChannelState[T] {
     reserved: uint (0)
     readers: Array[shared Waker] (.{})
     writers: Array[shared Waker] (.{})
+    // Rendezvous only: per queued value, the waker of the sender waiting until it is taken
+    handoff: Deque[?shared Waker] (.{})
 }
 
 /// A first-in first-out queue of values between coroutines, on one thread or across threads.
 ///
 /// With a capacity, `send` waits while the channel is full; without one it never waits.
+/// A capacity of 0 makes a rendezvous channel: `send` waits until a receiver took the value.
 /// Class objects must be `shared` to travel: `Channel[shared Message]`. Closing a channel
 /// fails later sends and ends waiting receivers once the remaining values are drained.
 /// `each channel as value` receives until a receive fails, normally because the channel
 /// was closed.
 + class Channel[T] {
     - state: shared core.Lock[ChannelState[T]]
+    // uint.$max when unbounded, 0 for a rendezvous
     - capacity: uint
 
-    /// Returns an empty channel holding at most `capacity` values; 0 is unbounded.
+    /// Returns an empty channel holding at most `capacity` values; without one it is unbounded.
     ///
-    /// Throws `init` when the lock cannot be created.
-    + static fn new(capacity: uint (0)) SELF !SyncError {
+    /// A capacity of 0 holds no values of its own: each `send` waits until a receiver took
+    /// its value. Throws `init` when the lock cannot be created.
+    + static fn new(capacity: ?uint (null)) SELF !SyncError {
         return SELF {
             state: core.Lock[ChannelState[T]].new(ChannelState[T] {}) ! throw .init
-            capacity: capacity
+            capacity: capacity ?? uint.$max
         }
     }
 
-    /// The number of values currently queued.
+    /// The number of values currently queued; on a rendezvous channel, those of waiting senders.
     + get length: uint {
         lock this.state as s : return s.items.length
     }
@@ -41,30 +46,118 @@ class ChannelState[T] {
         lock this.state as s : return s.closed
     }
 
-    /// Queues `value`, waiting while the channel is full.
+    /// Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until
+    /// a receiver took it.
     ///
     /// `timeout_ms` 0 waits forever. Throws `closed` (also when the channel closes while
     /// waiting; `value` is then dropped), `timeout`, `cancelled` when `cancel` fires, and
-    /// `init`.
+    /// `init`. A value that was not taken yet is withdrawn when the send fails.
     + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) !SyncError @threadsafe {
+        if this.capacity == 0 {
+            this.hand_over(value, timeout_ms, cancel) !>
+            return
+        }
         this.reserve_slot(timeout_ms, cancel) !>
         this.push_reserved(value) !>
     }
 
     /// Queues `value` without waiting.
     ///
-    /// Throws `full` when the channel is full and `closed` when it is closed.
+    /// Throws `full` when the channel is full (on a rendezvous channel: when no receiver is
+    /// waiting) and `closed` when it is closed.
     + fn try_send(value: T) !SyncError @threadsafe {
         let reserved = false
         lock this.state as s {
             if s.closed : throw .closed
-            if this.capacity == 0 || s.items.length + s.reserved < this.capacity {
+            // Waiting receivers not handed a value yet
+            let room = this.capacity == 0 ? s.readers.length > s.reserved : s.items.length + s.reserved < this.capacity
+            if room {
                 s.reserved++
                 reserved = true
             }
         }
         if !reserved : throw .full
         this.push_reserved(value) !>
+    }
+
+    // Rendezvous: queues the value and waits until a receiver took it
+    fn hand_over(value: T, timeout_ms: uint, cancel: ?shared CancelToken) !SyncError @threadsafe {
+        let waker = take_waker() !>
+        let deadline = time.deadline_ms(timeout_ms)
+        let reader: ?shared Waker = null
+        let closed = false
+        lock this.state as s {
+            if s.closed {
+                closed = true
+            } else {
+                s.items.push_back(value)
+                s.handoff.push_back(waker)
+                reader = s.readers.pop_first() !? null
+            }
+        }
+        if closed {
+            release_waker(waker)
+            throw .closed
+        }
+        if isset(reader) : reader.wake()
+        while true {
+            let taken = false
+            lock this.state as s {
+                taken = !s.handoff.contains(waker)
+                closed = s.closed
+            }
+            if taken : break
+            if closed {
+                // Taken in the meantime: the send succeeded
+                if !this.withdraw(waker) : break
+                release_waker(waker)
+                throw .closed
+            }
+            let remaining: uint = 0
+            if deadline > 0 {
+                let now = time.mono_ms()
+                if now >= deadline {
+                    if !this.withdraw(waker) : break
+                    release_waker(waker)
+                    throw .timeout
+                }
+                remaining = deadline - now
+            }
+            if isset(cancel) && cancel.register(waker) {
+                if !this.withdraw(waker) : break
+                release_waker(waker)
+                throw .cancelled
+            }
+            waker.wait(remaining)
+            if isset(cancel) {
+                cancel.forget(waker)
+                if cancel.is_cancelled() {
+                    if !this.withdraw(waker) : break
+                    release_waker(waker)
+                    throw .cancelled
+                }
+            }
+        }
+        release_waker(waker)
+    }
+
+    // Takes back the value of a rendezvous sender; false when a receiver already took it
+    fn withdraw(waker: shared Waker) bool @threadsafe {
+        let found = false
+        lock this.state as s {
+            let count = s.handoff.length
+            each 0 .. count {
+                let item = s.items.pop_front() ! break
+                let sender = s.handoff.pop_front() ! break
+                if !found && sender == waker {
+                    found = true
+                    continue
+                }
+                s.items.push_back(item)
+                s.handoff.push_back(sender)
+            }
+        }
+        return found
     }
 
     // Waits until a slot is reserved for the caller's value
@@ -78,7 +171,7 @@ class ChannelState[T] {
                     if isset(waker) : release_waker(waker)
                     throw .closed
                 }
-                if this.capacity == 0 || s.items.length + s.reserved < this.capacity {
+                if s.items.length + s.reserved < this.capacity {
                     s.reserved++
                     reserved = true
                 } else if isset(waker) {
@@ -125,6 +218,8 @@ class ChannelState[T] {
             s.reserved--
             if s.closed : throw .closed
             s.items.push_back(value)
+            // A value from `try_send` has no sender waiting for it
+            if this.capacity == 0 : s.handoff.push_back(null)
             reader = s.readers.pop_first() !? null
         }
         if isset(reader) : reader.wake()
@@ -194,7 +289,8 @@ class ChannelState[T] {
             let item = s.items.pop_front() !? null
             if isset(item) {
                 result = item
-                writer = s.writers.pop_first() !? null
+                if this.capacity == 0 : writer = s.handoff.pop_front() !? null
+                else : writer = s.writers.pop_first() !? null
             } else if s.closed {
                 closed = true
             } else if isset(waker) {
@@ -217,7 +313,12 @@ class ChannelState[T] {
             if s.closed : return
             s.closed = true
             readers = s.readers.copy()
-            writers = s.writers.copy()
+            let wake = s.writers.copy()
+            // Rendezvous senders take their values back
+            each s.handoff.to_array() as sender {
+                if isset(sender) : wake.append(sender)
+            }
+            writers = wake
             s.readers.clear()
             s.writers.clear()
         }

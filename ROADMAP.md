@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `sync.Channel.new(0)` makes a rendezvous channel: `send` returns once a receiver took the value (as in Go, Rust's `sync_channel(0)` and crossbeam's `bounded(0)`). `new()` stays unbounded; before, `0` meant unbounded too
 + HTTP `req.parse_json()` throws `json.ParseError` for a body that is not JSON, so a handler can answer 400; `json()` stays lenient and gives an empty object
 + `json` integer readers (`.int`, `int_value`, `get_int`, `to_type`, `decode_to`) accept a whole float such as `3.0`; `3.5` still is not an integer
 + `json` writes a whole float as `2.0` instead of `2`, so it reads back as a float (as Python and serde_json do)

@@ -14899,13 +14899,13 @@ Parks the current coroutine, or blocks a native thread outside one.
     + fn close() void
     // Returns true once `close` was called.
     + fn is_closed() bool
-    // The number of values currently queued.
+    // The number of values currently queued; on a rendezvous channel, those of waiting senders.
     + get length: uint
-    // Returns an empty channel holding at most `capacity` values; 0 is unbounded.
-    + static fn new(capacity: uint (0)) Channel[T] !SyncError
+    // Returns an empty channel holding at most `capacity` values; without one it is unbounded.
+    + static fn new(capacity: ?uint (null)) Channel[T] !SyncError
     // Returns the next value, waiting for one.
     + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
-    // Queues `value`, waiting while the channel is full.
+    // Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until a receiver took it.
     + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
     // Returns the next value without waiting; throws `empty` when none is queued.
     + fn try_recv() T !SyncError
@@ -14919,6 +14919,7 @@ Parks the current coroutine, or blocks a native thread outside one.
 A first-in first-out queue of values between coroutines, on one thread or across threads.
 
 With a capacity, `send` waits while the channel is full; without one it never waits.
+A capacity of 0 makes a rendezvous channel: `send` waits until a receiver took the value.
 Class objects must be `shared` to travel: `Channel[shared Message]`. Closing a channel
 fails later sends and ends waiting receivers once the remaining values are drained.
 `each channel as value` receives until a receive fails, normally because the channel
@@ -14936,13 +14937,14 @@ Returns true once `close` was called.
 
 #### length
 
-The number of values currently queued.
+The number of values currently queued; on a rendezvous channel, those of waiting senders.
 
 #### new
 
-Returns an empty channel holding at most `capacity` values; 0 is unbounded.
+Returns an empty channel holding at most `capacity` values; without one it is unbounded.
 
-Throws `init` when the lock cannot be created.
+A capacity of 0 holds no values of its own: each `send` waits until a receiver took
+its value. Throws `init` when the lock cannot be created.
 
 #### recv
 
@@ -14953,11 +14955,12 @@ Returns the next value, waiting for one.
 
 #### send
 
-Queues `value`, waiting while the channel is full.
+Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until
+a receiver took it.
 
 `timeout_ms` 0 waits forever. Throws `closed` (also when the channel closes while
 waiting; `value` is then dropped), `timeout`, `cancelled` when `cancel` fires, and
-`init`.
+`init`. A value that was not taken yet is withdrawn when the send fails.
 
 #### try_recv
 
@@ -14969,7 +14972,8 @@ Throws `closed` instead once the channel is closed and empty.
 
 Queues `value` without waiting.
 
-Throws `full` when the channel is full and `closed` when it is closed.
+Throws `full` when the channel is full (on a rendezvous channel: when no receiver is
+waiting) and `closed` when it is closed.
 
 ```js
 // A wakeup for the coroutine or thread that waits on it; `wake` may be called from any thread.

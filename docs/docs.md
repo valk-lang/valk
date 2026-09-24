@@ -1773,6 +1773,10 @@ fn main() {
 
 `try_send` and `try_recv` never wait and fail with `full` or `empty`.
 
+`new()` makes an unbounded channel and `new(n)` one that holds `n` values.
+`new(0)` makes a rendezvous channel: `send` waits until a receiver took the
+value, and `try_send` only succeeds while a receiver is waiting.
+
 A `CancelToken` is a shared flag with waiters. `cancel()` wakes every
 `wait()`, cancels every token made with `child()`, and runs the callbacks
 given to `on_cancel`. `cancel_after(ms)` cancels from a timer on the calling
