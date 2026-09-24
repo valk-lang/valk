@@ -12751,7 +12751,7 @@ Use it for context that many records share, such as a request id.
 
 Writes a record of `level` with `message` and `fields`, when the level is enabled.
 
-A text record reads `2024-03-05T14:07:09.250Z INFO  message key=value`; a JSON record
+A field of the record replaces a field of the logger with the same key. A text record reads `2024-03-05T14:07:09.250Z INFO  message key=value`; a JSON record
 `{"time":"...","level":"info","msg":"message","key":"value"}`.
 
 # markdown

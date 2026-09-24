@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `log`: a record field replaces a context field from `with` that has the same key, instead of writing the key twice
 + `json` object members keep their order when one is removed
 + `valk doc` labels an extension that only some key or element types get by its pattern, such as `HashMap[String, T]` and `HashMap[u32, T]`, instead of one concrete instantiation
 + `Array.unique`, `remove_duplicates`, `intersect` and `append_many(.., true)` use a set for integers and `$hash` types (such as `String`): O(n) instead of O(n²)
