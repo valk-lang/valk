@@ -8865,7 +8865,8 @@ reports `true`.
 Returns the extension of the last path component, without the dot unless `with_dot` is set.
 
 Returns `""` when there is none. Only the part after the last `.` counts (`a.tar.gz` gives
-`gz`), and a leading dot counts too (`.bashrc` gives `bashrc`).
+`gz`). Leading dots of the name do not start an extension, so a hidden file such as
+`.bashrc` has none, while `.config.json` gives `json`.
 
 ### files_in
 
