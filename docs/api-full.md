@@ -10595,7 +10595,7 @@ in `headers` are all kept. Names not in `headers` stay untouched.
     + client_subject: String
     // The request method as sent, such as `GET`.
     + method: String
-    // The path of the request target without the query string, not percent-decoded.
+    // The path of the request target without the query string, not percent-decoded (see `url.decode_path`).
     + path: String
     // The client's address.
     + peer_address: SocketAddress
@@ -10646,7 +10646,8 @@ The request method as sent, such as `GET`.
 
 #### path
 
-The path of the request target without the query string, not percent-decoded.
+The path of the request target without the query string, not percent-decoded (see
+`url.decode_path`).
 
 #### peer_address
 
@@ -10964,7 +10965,7 @@ The value registered with `Router.add`.
 Returns the values of the route's `@name` parts, taken from `path`.
 
 Pass the same path that was given to `Router.find`. Values are not
-percent-decoded. Empty parts are ignored like `Router.find` ignores them, so
+percent-decoded; `url.decode_path` decodes one and keeps a `+`. Empty parts are ignored like `Router.find` ignores them, so
 doubled slashes and a missing leading `/` do not shift the values; missing parts
 are left out.
 
@@ -16117,6 +16118,10 @@ space.
 + fn decode(str: String) String
 // Writes `str` decoded as `decode` does to `out` and returns the bytes written.
 + fn decode_into(str: String, out: Writer) uint !io:IoError
+// Decodes `%XX` escapes in a URL path; unlike `decode`, a `+` stays a `+`.
++ fn decode_path(str: String) String
+// Writes `str` decoded as `decode_path` does to `out` and returns the bytes written.
++ fn decode_path_into(str: String, out: Writer) uint !io:IoError
 // Percent-encodes `str` for use in the given URL `component`.
 + fn encode(str: String, component: Component (Component.unreserved)) String
 // Writes `str` percent-encoded as `encode` does to `out` and returns the bytes written.
@@ -16130,11 +16135,27 @@ space.
 Decodes `%XX` escapes and turns every `+` into a space.
 
 A `%` that is not followed by two hex digits is kept as is. `+` is decoded as a space
-in every position, including paths. The result is not checked for valid UTF-8.
+in every position, as in a query string or a form; `decode_path` keeps it. The result is
+not checked for valid UTF-8.
 
 ### decode_into
 
 Writes `str` decoded as `decode` does to `out` and returns the bytes written.
+
+A `ByteBuffer` is written directly; any other writer receives the text in one write.
+Throws when `out` fails.
+
+### decode_path
+
+Decodes `%XX` escapes in a URL path; unlike `decode`, a `+` stays a `+`.
+
+Use it for paths and route parameters, where `+` is a literal plus (`/tags/c++`).
+A `%` that is not followed by two hex digits is kept as is. The result is not checked
+for valid UTF-8.
+
+### decode_path_into
+
+Writes `str` decoded as `decode_path` does to `out` and returns the bytes written.
 
 A `ByteBuffer` is written directly; any other writer receives the text in one write.
 Throws when `out` fails.

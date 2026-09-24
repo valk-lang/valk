@@ -3147,7 +3147,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + client_subject: String
     // The request method as sent, such as `GET`.
     + method: String
-    // The path of the request target without the query string, not percent-decoded.
+    // The path of the request target without the query string, not percent-decoded (see `url.decode_path`).
     + path: String
     // The client's address.
     + peer_address: SocketAddress
@@ -4823,6 +4823,10 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 + fn decode(str: String) String
 // Writes `str` decoded as `decode` does to `out` and returns the bytes written.
 + fn decode_into(str: String, out: Writer) uint !io:IoError
+// Decodes `%XX` escapes in a URL path; unlike `decode`, a `+` stays a `+`.
++ fn decode_path(str: String) String
+// Writes `str` decoded as `decode_path` does to `out` and returns the bytes written.
++ fn decode_path_into(str: String, out: Writer) uint !io:IoError
 // Percent-encodes `str` for use in the given URL `component`.
 + fn encode(str: String, component: Component (Component.unreserved)) String
 // Writes `str` percent-encoded as `encode` does to `out` and returns the bytes written.
