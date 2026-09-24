@@ -158,6 +158,18 @@ if [ "$generic_import_status" -ne 0 ] || [[ "$generic_import_out" == *"imported 
 fi
 
 count=$((count + 1))
+echo "> imports used only by tests are used, also when tests are not built"
+test_import_out=$("$VALK" build "$DIR/unused-import-test-only.valk" -o "$workdir/test-import$EXE_SUFFIX" 2>&1)
+test_import_status=$?
+if [ "$test_import_status" -ne 0 ] || [[ "$test_import_out" == *"'valk.math' is imported but never used"* ]] \
+    || [[ "$test_import_out" != *"'valk.fs' is imported but never used"* ]]; then
+    echo "# An import used only by a test was reported, or an unused one was not"
+    echo "- Exit code: $test_import_status"
+    echo "$test_import_out"
+    failed=1
+fi
+
+count=$((count + 1))
 echo "> failed assertion location"
 assert_bin="$workdir/assert-test$EXE_SUFFIX"
 assert_build=$("$VALK" build "$DIR/assert.valk" --test --no-warn -o "$assert_bin" 2>&1)

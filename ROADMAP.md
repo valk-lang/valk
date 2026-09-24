@@ -13,6 +13,7 @@
 + `&fixed[start .. length]` is a view into a fixed array, as it is for arrays and slices
 + Integer `read/write_big/little_endian` take byte slices (`&buf`, `&bytes[i .. 4]`) and panic when too short
 + A package whose `require.valk.min` is newer than the compiler gives a warning, shown with the error when the build fails
++ An import used only in `test` blocks is no longer reported as unused
 
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)
