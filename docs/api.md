@@ -4141,6 +4141,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn read(buf: local mut &[u8]) uint !io:IoError
     // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
     + fn set_cancel(token: shared CancelToken) void
+    // Whether small writes are sent right away. On by default: with it off (Nagle's algorithm) a write that follows another write waits for the peer's acknowledgement, which can add about 40 ms per response.
+    + fn set_no_delay(enabled: bool) void !NetError
     // Asks the system for a receive buffer of `bytes`; it may round or cap the size.
     + fn set_receive_buffer(bytes: uint) void !NetError
     // Asks the system for a send buffer of `bytes`; it may round or cap the size.

@@ -7,6 +7,7 @@
 - Release 0.7.8
 + HTTPS on Windows verifies servers with the certificates of the system store; no `cacert.pem` needed
 + HTTP ignores chunk extensions (`5;name=value`) in requests and responses, as RFC 9112 asks
++ TCP connections send small writes right away (`TCP_NODELAY`); file and stream responses no longer wait ~40 ms. `TcpConnection.set_no_delay(false)` turns it off
 
 + Release 0.7.7
 + Structs by value to and from C: extern and export functions follow the target's C calling convention
