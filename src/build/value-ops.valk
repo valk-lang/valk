@@ -2454,19 +2454,73 @@ fn hook_select_compare(hooks: Array[Func], left_type: Type, right_type: Type) ?F
     return null
 }
 
-fn class_get_compare_hook(class: Class, left_type: Type, right_type: Type, op: VALUE_OP, flipped: bool) ?Func {
+fn class_get_compare_hook(class: Class, left_type: Type, right_type: Type, op: VALUE_OP) ?Func {
     let hooks: ?Array[Func] = null
     if op == VALUE_OP.eq : hooks = class.eq_hooks
-    else if op == VALUE_OP.lt : hooks = flipped ? class.gte_hooks : class.lt_hooks
-    else if op == VALUE_OP.lte : hooks = flipped ? class.gt_hooks : class.lte_hooks
-    else if op == VALUE_OP.gt : hooks = flipped ? class.lte_hooks : class.gt_hooks
-    else if op == VALUE_OP.gte : hooks = flipped ? class.lt_hooks : class.gte_hooks
+    else if op == VALUE_OP.lt : hooks = class.lt_hooks
+    else if op == VALUE_OP.lte : hooks = class.lte_hooks
+    else if op == VALUE_OP.gt : hooks = class.gt_hooks
+    else if op == VALUE_OP.gte : hooks = class.gte_hooks
     let hook = isset(hooks) ? hook_select_compare(hooks, left_type, right_type) : null
     if isset(hook) : return hook
     // A mode compares like the type it is a mode of unless it overrides the hook.
     let for_class = class.mode_for_class
-    if isset(for_class) : return class_get_compare_hook(for_class, left_type, right_type, op, flipped)
+    if isset(for_class) : return class_get_compare_hook(for_class, left_type, right_type, op)
     return null
+}
+
+// `a < b` is `b > a`
+fn compare_op_converse(op: VALUE_OP) VALUE_OP {
+    if op == VALUE_OP.lt : return VALUE_OP.gt
+    if op == VALUE_OP.gt : return VALUE_OP.lt
+    if op == VALUE_OP.lte : return VALUE_OP.gte
+    if op == VALUE_OP.gte : return VALUE_OP.lte
+    return op
+}
+
+// `a < b` is `!(a >= b)`
+fn compare_op_complement(op: VALUE_OP) VALUE_OP {
+    if op == VALUE_OP.lt : return VALUE_OP.gte
+    if op == VALUE_OP.gte : return VALUE_OP.lt
+    if op == VALUE_OP.gt : return VALUE_OP.lte
+    if op == VALUE_OP.lte : return VALUE_OP.gt
+    return op
+}
+
+// The hook that answers `left op right`: the operator's own hook, or one that gives the
+// same answer with the operands swapped and/or the result negated, so a single ordering
+// hook serves all four comparisons
+struct CompareHook {
+    func: ?Func
+    swap: bool
+    negate: bool
+}
+
+fn find_compare_hook(lc: ?Class, rc: ?Class, left_type: Type, right_type: Type, op: VALUE_OP) CompareHook {
+    if isset(lc) {
+        let direct = class_get_compare_hook(lc, left_type, right_type, op)
+        if isset(direct) : return CompareHook { func: direct, swap: false, negate: false }
+    }
+    if op == VALUE_OP.eq {
+        if isset(rc) {
+            let swapped = class_get_compare_hook(rc, right_type, left_type, op)
+            if isset(swapped) : return CompareHook { func: swapped, swap: true, negate: false }
+        }
+        return CompareHook { func: null, swap: false, negate: false }
+    }
+    if isset(rc) {
+        let converse = class_get_compare_hook(rc, right_type, left_type, compare_op_converse(op))
+        if isset(converse) : return CompareHook { func: converse, swap: true, negate: false }
+    }
+    if isset(lc) {
+        let complement = class_get_compare_hook(lc, left_type, right_type, compare_op_complement(op))
+        if isset(complement) : return CompareHook { func: complement, swap: false, negate: true }
+    }
+    if isset(rc) {
+        let both = class_get_compare_hook(rc, right_type, left_type, compare_op_complement(compare_op_converse(op)))
+        if isset(both) : return CompareHook { func: both, swap: true, negate: true }
+    }
+    return CompareHook { func: null, swap: false, negate: false }
 }
 
 ////////////////////////////
@@ -2724,24 +2778,45 @@ fn value_native_comparable(type: Type) bool {
     return t.is_number_type() || t.is_pointer() || t.kind == TYPE.interface || t.kind == TYPE.error_code
 }
 
+// A class instance or array: a pointer to an object, not a raw pointer or a number
+fn value_is_object_type(type: Type) bool {
+    let t = type.get_non_nullable()
+    if !t.is_gc_type() || t.kind == TYPE.co : return false
+    let c = t.get_class_or_null() ?! return t.kind == TYPE.array
+    let kind = c.representation_class().kind
+    return kind == CLASS_KIND.class || kind == CLASS_KIND.array
+}
+
+fn class_declares_order_hook(class: Class) bool {
+    each class.funcs as func {
+        let flags = func.flags ?! continue
+        if flags.contains("$lt") || flags.contains("$gt") || flags.contains("$lte") || flags.contains("$gte") : return true
+    }
+    return false
+}
+
 fn type_can_order(type: Type) bool !Error {
     let t = type.get_non_nullable()
     if t.kind == TYPE.union || t.kind == TYPE.closure : return false
-    if value_native_comparable(t) : return true
+    let object = value_is_object_type(t)
+    if value_native_comparable(t) && !object : return true
     let class = t.get_class_or_null() ?! return false
+    // An object orders only through a hook. The declared flags tell without parsing the
+    // class, which may be in the middle of its own instantiation here
+    if object && !isset(class.mode_for_exp) : return class_declares_order_hook(class)
     let current: ?Class = class
     while isset(current) {
         parse_class_properties(current) !>
         each current.funcs as func {
             let flags = func.flags
-            if isset(flags) && (flags.contains("$gt") || flags.contains("$lte")) {
+            if isset(flags) && (flags.contains("$lt") || flags.contains("$gt") || flags.contains("$lte") || flags.contains("$gte")) {
                 parse_func_types(func) !>
             }
         }
         current = current.mode_for_class
     }
-    return isset(class_get_compare_hook(class, t, t, VALUE_OP.gt, false))
-        || isset(class_get_compare_hook(class, t, t, VALUE_OP.gt, true))
+    // Any one ordering hook answers all four comparisons
+    return isset(find_compare_hook(class, class, t, t, VALUE_OP.gt).func)
 }
 
 fn value_structural_equal_part(result: Value, left: Value, right: Value, offset: u32, type: Type,
@@ -2895,26 +2970,15 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
         else if rsc == string_class && lsc != string_class && nnl.rett.is_number_type() : nnl = value_try_convert(nnl, scope, ctx, type_string(b)) !>
     }
 
-    let hook: ?Func = null
-    let lc = nnl.rett.get_class_or_null()
-    if isset(lc) {
-        hook = class_get_compare_hook(lc, nnl.rett, nnr.rett, cmp_op, false)
-    }
-
-    if !isset(hook) {
-        let rc = nnr.rett.get_class_or_null()
-        if isset(rc) {
-            let flipped = class_get_compare_hook(rc, nnr.rett, nnl.rett, cmp_op, true)
-            if isset(flipped) {
-                hook = flipped
-                let tmp = nnl
-                nnl = nnr
-                nnr = tmp
-                let tmp2 = l
-                l = r
-                r = tmp2
-            }
-        }
+    let found = find_compare_hook(nnl.rett.get_class_or_null(), nnr.rett.get_class_or_null(), nnl.rett, nnr.rett, cmp_op)
+    let hook = found.func
+    if found.swap {
+        let tmp = nnl
+        nnl = nnr
+        nnr = tmp
+        let tmp2 = l
+        l = r
+        r = tmp2
     }
 
     let cmp: Value = vgen_op(nnl, nnr, cmp_op, type_bool(b))
@@ -2925,6 +2989,7 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
         let args = Array[Value]{ nnr }
         value_check_call_args(hook, callee, args, scope, ctx, exp) !>
         cmp = vgen_call(ctx, callee, args, type_bool(b), scope)
+        if found.negate : cmp = vgen_unary(cmp, VALUE_OP.not, type_bool(b))
     } else {
         let pointers = value_balance_pointer_integer(nnl, nnr, b)
         nnl = pointers.left
@@ -2949,6 +3014,13 @@ fn value_compare_values(left: Value, right: Value, op: VALUE_OP, scope: Scope, c
             }
             if nnr.rett.get_non_nullable().kind != TYPE.closure && !value_native_comparable(nnr.rett) {
                 exp.error("The right value type does not support compare operators: '" + nnr.rett.compat_display_name() + "'")
+            }
+            // Objects are equal when they are the same object, but their addresses have no order
+            if cmp_op != VALUE_OP.eq {
+                let unordered = value_is_object_type(nnl.rett) ? nnl.rett : (value_is_object_type(nnr.rett) ? nnr.rett : null)
+                if isset(unordered) {
+                    exp.error("Type '" + unordered.compat_display_name() + "' has no order: give it a method marked '$lt' (or '$gt', '$lte', '$gte')")
+                }
             }
             cmp = vgen_op(nnl, nnr, cmp_op, type_bool(b))
         }
