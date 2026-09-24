@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `String.escape` writes other control characters as `\xHH` and a zero byte as `\0`; `unescape` reads `\xHH` and keeps the backslash of an unknown escape, so the two round trip
 + `fs.copy` gives the copy the permission bits of the source on Linux and macOS, like `cp`
 + `log`: a record field replaces a context field from `with` that has the same key, instead of writing the key twice
 + `json` object members keep their order when one is removed

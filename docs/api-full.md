@@ -2916,8 +2916,9 @@ Bytes outside ASCII, including non-ASCII letters, must match exactly.
 
 Returns a copy with special characters written as backslash escapes, as in a string literal.
 
-Produces `\n`, `\r`, `\t`, `\f`, `\b`, `\v`, `\a`, `\e` (ESC), `\\` and `\"`. Other
-bytes, including other control characters and zero bytes, are copied unchanged.
+Produces `\n`, `\r`, `\t`, `\f`, `\b`, `\v`, `\a`, `\e` (ESC), `\0`, `\\` and `\"`;
+other control characters and DEL become `\xHH`. Bytes from 128 up (UTF-8) are copied
+unchanged. `unescape` turns the result back into the original.
 
 #### get
 
@@ -3180,9 +3181,9 @@ all of them. Returns the string unchanged when `part` is empty or nothing matche
 
 Returns a copy with backslash escapes turned back into the bytes they stand for.
 
-Recognizes `\n`, `\r`, `\t`, `\f`, `\b`, `\v`, `\a`, `\e` and `\0`; any other escaped
-byte stands for itself, so `\\` gives `\` and `\"` gives `"`. A trailing lone `\` is
-kept as it is.
+Recognizes the escapes of a string literal: `\n`, `\r`, `\t`, `\f`, `\b`, `\v`, `\a`,
+`\e`, `\0`, `\xHH`, `\\`, `\"`, `\'` and `\%`. Any other escape, `\u{...}` included,
+and a trailing lone `\` are kept as they are.
 
 #### upper
 
