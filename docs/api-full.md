@@ -3557,7 +3557,8 @@ same as `to_shortest_string` and string interpolation: `3.14159`, `3`, `0.0001`.
 `decimals`, e.g. `(1.5).to_string(2)` is `1.50`; at most 19 decimals are written,
 larger values are clamped to 19. With `trim_zeros`,
 trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
-rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
+rounds to the even digit, as `printf` does in C, Go and Rust: `(2.5).to_string(0)` is
+`2`, `(3.5).to_string(0)` is `4`; `math.round` rounds halves away from zero instead. NaN,
 infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
@@ -3732,7 +3733,8 @@ same as `to_shortest_string` and string interpolation: `3.14159`, `3`, `0.0001`.
 `decimals`, e.g. `(1.5).to_string(2)` is `1.50`; at most 19 decimals are written,
 larger values are clamped to 19. With `trim_zeros`,
 trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
-rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
+rounds to the even digit, as `printf` does in C, Go and Rust: `(2.5).to_string(0)` is
+`2`, `(3.5).to_string(0)` is `4`; `math.round` rounds halves away from zero instead. NaN,
 infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
@@ -3907,7 +3909,8 @@ same as `to_shortest_string` and string interpolation: `3.14159`, `3`, `0.0001`.
 `decimals`, e.g. `(1.5).to_string(2)` is `1.50`; at most 19 decimals are written,
 larger values are clamped to 19. With `trim_zeros`,
 trailing zeros are dropped, and the dot too when nothing remains after it. An exact half
-rounds to the even digit: `(2.5).to_string(0)` is `2`, `(3.5).to_string(0)` is `4`. NaN,
+rounds to the even digit, as `printf` does in C, Go and Rust: `(2.5).to_string(0)` is
+`2`, `(3.5).to_string(0)` is `4`; `math.round` rounds halves away from zero instead. NaN,
 infinities and values of magnitude
 2^63 or more fall back to `to_shortest_string` formatting. Negative zero keeps its sign.
 
@@ -13033,6 +13036,10 @@ Returns `base` raised to the power `exponent`.
 ### round
 
 Returns `value` rounded to the nearest whole number, halfway cases away from zero.
+
+`math.round(2.5)` is `3` and `math.round(-2.5)` is `-3`, as in C, Go and Rust. Formatting
+with a fixed number of decimals rounds halves to the even digit instead:
+`(2.5).to_string(0)` is `2`.
 
 ### sin
 
