@@ -102,3 +102,6 @@ int check_exports(void) {
     if (t.id != 15 || t.w != 42 || t.h != 1 || t.fmt != 7) bad |= 2048;
     return bad;
 }
+
+// Pointers to valk structs: C changes them in place
+void v3_bump(V3 *v, float k) { v->x += k; v->y += 2 * k; }

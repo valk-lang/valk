@@ -2574,10 +2574,15 @@ Although Valk aims to be safe, it still supports low-level operations when neede
 - Offset access on unbounded pointers
 
 Tokens that start with `@`, such as `@ptrv`, `@ref`, and `@cast`, do not by
-themselves require an unsafe scope. `@ref(x)` is the address of `x` as a
-raw `ptr`, except when `x` is a struct held inline (a local or a struct
-property): then it is the typed `*Struct` pointer, so the struct's methods
-are reachable through it, and it still converts to `ptr` and `*[Struct]`.
+themselves require an unsafe scope. `@ref(x)` is the address of `x`: a `*T`
+when `x` is a `T`, just as `&x` is a `&T`. Both use the type `x` was declared
+with, so a `?T` variable gives `*?T` and `&?T`, also after `isset(x)`. A
+`*T` converts to `ptr` and `*[T]`; for any other type, use `.@cast`:
+
+```rust
+let n : u32 = 7
+let bytes = @ref(n).@cast(*[u8 x 4])
+```
 
 Place `@unsafe` in a scope to use these features in that scope and its child scopes:
 
@@ -2646,6 +2651,22 @@ fn main() {
     let count: i32 = 7
     printf("\%d \%f\n".data_cstring, count, 1.5)
 }
+```
+
+A pointer parameter (`*T` or `ptr`) takes an address: pass `&value`, or a
+borrow you already have, such as `this` in a struct method.
+
+```rust
+struct Vector3 {
+    x: f32
+    y: f32
+    z: f32
+}
+
+extern fn vector3_normalize(v: *Vector3) void;
+
+let v = Vector3{ x: 3, y: 4, z: 0 }
+vector3_normalize(&v)
 ```
 
 Variadic arguments keep their own type and follow the C promotion rules

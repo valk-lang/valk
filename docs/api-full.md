@@ -3874,10 +3874,10 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn print(base: i16) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() i16
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 2]) i16
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 2]) i16
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) i16
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) i16
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i16) i16
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -3896,10 +3896,10 @@ The text is built on the stack, so nothing is allocated. Throws when `out` fails
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: i16, to: *[u8 x 2]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: i16, to: *[u8 x 2]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: i16, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: i16, to: local mut &[u8]) void
 }
 ```
 
@@ -3967,11 +3967,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -4038,11 +4045,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -4072,10 +4081,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: i32) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() i32
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 4]) i32
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 4]) i32
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) i32
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) i32
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i32) i32
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -4094,10 +4103,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: i32, to: *[u8 x 4]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: i32, to: *[u8 x 4]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: i32, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: i32, to: local mut &[u8]) void
 }
 ```
 
@@ -4165,11 +4174,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -4236,11 +4252,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -4270,10 +4288,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: i64) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() i64
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 8]) i64
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 8]) i64
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) i64
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) i64
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i64) i64
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -4292,10 +4310,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: i64, to: *[u8 x 8]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: i64, to: *[u8 x 8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: i64, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: i64, to: local mut &[u8]) void
 }
 ```
 
@@ -4363,11 +4381,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -4434,11 +4459,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -4468,10 +4495,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: i8) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() i8
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *u8) i8
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *u8) i8
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) i8
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) i8
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: i8) i8
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -4490,10 +4517,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: i8, to: *u8) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: i8, to: *u8) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: i8, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: i8, to: local mut &[u8]) void
 }
 ```
 
@@ -4561,11 +4588,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -4632,11 +4666,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -4666,10 +4702,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: int) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() int
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 8]) int
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 8]) int
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) int
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) int
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: int) int
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -4688,10 +4724,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: int, to: *[u8 x 8]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: int, to: *[u8 x 8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: int, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: int, to: local mut &[u8]) void
 }
 ```
 
@@ -4759,11 +4795,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -4830,11 +4873,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -5327,10 +5372,10 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     + fn print(base: u16) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() u16
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 2]) u16
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 2]) u16
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) u16
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) u16
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u16) u16
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -5349,10 +5394,10 @@ Writes `v` as `size_of(uint)` little-endian bytes to this address.
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: u16, to: *[u8 x 2]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: u16, to: *[u8 x 2]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: u16, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: u16, to: local mut &[u8]) void
 }
 ```
 
@@ -5420,11 +5465,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -5491,11 +5543,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -5525,10 +5579,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: u32) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() u32
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 4]) u32
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 4]) u32
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) u32
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) u32
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u32) u32
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -5547,10 +5601,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: u32, to: *[u8 x 4]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: u32, to: *[u8 x 4]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: u32, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: u32, to: local mut &[u8]) void
 }
 ```
 
@@ -5618,11 +5672,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -5689,11 +5750,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -5725,10 +5788,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: u64) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() u64
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 8]) u64
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 8]) u64
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) u64
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) u64
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u64) u64
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -5747,10 +5810,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: u64, to: *[u8 x 8]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: u64, to: *[u8 x 8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: u64, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: u64, to: local mut &[u8]) void
 }
 ```
 
@@ -5824,11 +5887,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -5895,11 +5965,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -5957,10 +6029,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: u8) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() u8
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *u8) u8
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *u8) u8
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) u8
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) u8
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: u8) u8
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -5983,10 +6055,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn trailing_zeros() uint
     // Returns the byte an escape letter stands for, e.g. `n` gives `\n`.
     + fn unescape() u8
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: u8, to: *u8) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: u8, to: *u8) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: u8, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: u8, to: local mut &[u8]) void
 }
 ```
 
@@ -6112,11 +6184,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -6197,11 +6276,13 @@ is returned unchanged.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined
@@ -6237,10 +6318,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn print(base: uint) void
     // Returns a random value from the operating system's secure entropy source.
     + static fn random() uint
-    // Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
-    + static fn read_big_endian(from: *[u8 x 8]) uint
-    // Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
-    + static fn read_little_endian(from: *[u8 x 8]) uint
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first. Panics when `from` is shorter.
+    + static fn read_big_endian(from: local &[u8]) uint
+    // Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first. Panics when `from` is shorter.
+    + static fn read_little_endian(from: local &[u8]) uint
     // Rounds down, toward negative infinity, to a multiple of `modulo`; multiples are returned unchanged.
     + fn round_down(modulo: uint) uint
     // Rounds up, toward positive infinity, to a multiple of `modulo`; multiples are returned unchanged.
@@ -6259,10 +6340,10 @@ u32.write_little_endian(0x01020304, &buf)
     + fn to_string() String
     // Returns how many zero bits come after the lowest one bit; the bit width for 0.
     + fn trailing_zeros() uint
-    // Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
-    + static fn write_big_endian(v: uint, to: *[u8 x 8]) void
-    // Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
-    + static fn write_little_endian(v: uint, to: *[u8 x 8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first. Panics when `to` is shorter.
+    + static fn write_big_endian(v: uint, to: local mut &[u8]) void
+    // Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first. Panics when `to` is shorter.
+    + static fn write_little_endian(v: uint, to: local mut &[u8]) void
 }
 ```
 
@@ -6344,11 +6425,18 @@ provide random bytes.
 
 #### read_big_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, most significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, most significant first.
+Panics when `from` is shorter.
 
 #### read_little_endian
 
-Reads a value from `size_of(SELF)` bytes at `from`, least significant first.
+Reads a value from the first `size_of(SELF)` bytes of `from`, least significant first.
+Panics when `from` is shorter.
+
+```valk
+let bytes = Array[u8]{ 0xFF, 0x04, 0x03, 0x02, 0x01 }
+let v = u32.read_little_endian(&bytes[1 .. 4]) // 0x01020304
+```
 
 #### round_down
 
@@ -6415,11 +6503,13 @@ Returns how many zero bits come after the lowest one bit; the bit width for 0.
 
 #### write_big_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, most significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, most significant first.
+Panics when `to` is shorter.
 
 #### write_little_endian
 
-Writes `v` to `to` as `size_of(SELF)` bytes, least significant first.
+Writes `v` to the first `size_of(SELF)` bytes of `to`, least significant first.
+Panics when `to` is shorter.
 
 ```valk
 let buf: [u8 x 4] = @undefined

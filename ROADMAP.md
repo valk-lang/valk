@@ -8,6 +8,10 @@
 + Structs by value to and from C: extern and export functions follow the target's C calling convention
 + Struct sizes round up to their own alignment, like C
 + The `x n` of a fill goes on the value's line, so a field named `x` can start a line in a literal
++ `@ref(x)` is typed `*T` for `x` of type `T` (was `ptr`), from the declared type: `*?T` after `isset` too
++ Extern pointer parameters take `&value` or a borrow such as `this`
++ `&fixed[start .. length]` is a view into a fixed array, as it is for arrays and slices
++ Integer `read/write_big/little_endian` take byte slices (`&buf`, `&bytes[i .. 4]`) and panic when too short
 
 + Release 0.7.6
 + Faster small HashMaps (linear scan up to 8 entries)

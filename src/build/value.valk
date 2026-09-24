@@ -511,6 +511,7 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             // a slice, or `&[T]` is borrowed with the storage block as owner.
             let base_exp = operand_exp.get(VALUE_EXP.left) ?! operand_exp.bug("offset is missing base")
             let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
+            on = value_fixed_array_range_base(on, operand_exp, scope, ctx, exp) !>
             let element_borrow = value_borrow_sequence_element(on, operand_exp, scope, ctx, exp, true) !>
             if isset(element_borrow) : return element_borrow
             operand = value_from_offset_on(on, operand_exp, scope, ctx) !>
@@ -1115,7 +1116,7 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
     source.is_captured = true
     value_mark_actual_escape(vgen_decl(source))
     if source.implicit_borrow {
-        at.error("An implicit pointer borrow cannot be captured; use '@ref' explicitly")
+        at.error("An implicit pointer borrow cannot be captured: the address would outlive the value")
     }
 
     let local_idf = func.arg_scope.identifiers
@@ -1642,6 +1643,23 @@ fn value_from_intrinsic_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 }
 
 // @ref(assignable) — body is a single lvalue; result is raw ptr.
+// `&fixed[a .. n]`: a fixed array, or a borrow of one, is taken as a `&[T]`, then
+// the range is taken from that
+fn value_fixed_array_range_base(on: Value, offset_exp: Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let bounded = on.rett.kind == TYPE.ref_of && on.rett.length > 1
+    if !bounded && (!on.rett.is_fixed_array_type() || !on.assignable()) : return on
+    let body = offset_exp.get(VALUE_EXP.right) ?! return on
+    if body.type != EXP.body : return on
+    let access = parse_offset_access(body) !>
+    if access.value_kind != VALUE_KIND.bracket_range : return on
+    let whole = bounded ? on : (value_borrow_of(on, scope, ctx, at, true) !>)
+    let t = whole.rett
+    let element = t.get_sub_type() ?! at.bug("Fixed array has no element type")
+    let slice = t.is_local ? element.local_ref_slice() : element.ref_slice()
+    if t.is_mut : slice = slice.mut_type()
+    return value_try_convert(whole, scope, ctx, slice) !>
+}
+
 fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let body = exp.get(VALUE_EXP.right)
     if !isset(body) : exp.bug("@ref is missing body")
@@ -1650,7 +1668,7 @@ fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let on_exp = parse_body_as_value_exp(body) !>
     let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
     if !on.assignable() {
-        exp.error("Cannot use '@ref on this value. It can only be used on assignable values, like variable names or object properties.")
+        exp.error("Cannot use '@ref' on this value. It can only be used on assignable values, like variable names or object properties.")
     }
     act_check_assign(on, exp, scope) !>
     value_check_shared_address(on, exp) !>
@@ -1659,16 +1677,26 @@ fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if !isset(storage) : storage = on
     value_clear_borrowed_local_facts(on, scope)
 
-    // Raw `ptr`, except for inline struct storage: its address is the struct
-    // object type, so the struct's own methods resolve instead of the `ptr`
-    // extension methods
-    let rett = type_ptr(ctx.build)
+    // `*T` for storage of type `T`, from the declared type: `*?T` even after `isset`.
+    // Inline struct storage is the struct object type, like `*Struct` in a signature.
+    let rett = on.rett.pointer()
     let on_nn = on.rett.get_non_nullable()
     let class = on_nn.get_direct_class_or_null()
     if on_nn.is_inline && isset(class) && class.representation_class().kind == CLASS_KIND.struct && !on.rett.is_nullable_type() {
         rett = on_nn.non_inline()
     }
     return vgen_ptr_of(storage, rett, exp)
+}
+
+// The address a borrow points at, typed `*T`; null when `value` is not a borrow
+fn value_borrow_target_address(value: Value) ?Value {
+    if value.rett.is_nullable_type() : return null
+    let t = value.rett.get_non_nullable()
+    if t.kind != TYPE.ref_of : return null
+    let sub = t.get_sub_type() ?! return null
+    let rett = t.length > 1 ? sub.pointer(t.length, false) : sub.pointer()
+    if t.length <= 1 && sub.is_inline && sub.kind == TYPE.struct : rett = sub.non_inline()
+    return vgen_cast(value_owned_borrow_address(value), rett)
 }
 
 ////////////////////////////
@@ -2894,7 +2922,7 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
                 fv = value_try_convert(fv, field_scope, ctx, field_type) !>
                 field_type.compat_check(fv.rett, vexp) !>
                 if fv.is_implicit_borrow() {
-                    vexp.error("An implicit pointer borrow cannot be stored in an object; use '@ref' explicitly")
+                    vexp.error("An implicit pointer borrow cannot be stored in an object: the address would outlive the value")
                 }
             }
             fvals.set(prop, fv)
@@ -5480,7 +5508,11 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 let pointer_boundary = target.is_raw_pointer() || target.kind == TYPE.ptr_of || target.is_struct_object()
                 let explicit_raw = source.is_raw_pointer() || source.kind == TYPE.ptr_of || source.is_struct_object()
                 if pointer_boundary && !explicit_raw {
-                    at.error("Extern pointer arguments require an explicit raw pointer; use '@ref(...)'")
+                    // `&value`, or a borrow such as `this`: C gets the address it points at
+                    let address = value_borrow_target_address(av)
+                    if !isset(address) : at.error("Extern pointer arguments take an address: pass '&value'")
+                    address.exp = av.exp
+                    av = address
                 }
             }
             // Convert first (literal int → i32, nullable strip, $to hooks, …)
@@ -5579,7 +5611,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 param.cannot_escape_pos = Pos { src: at.src, i: at.i }
             }
             if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !accepts_frame_closure {
-                at.error("An implicit pointer borrow cannot be passed to raw pointer storage; use '@ref' explicitly")
+                at.error("An implicit pointer borrow cannot be passed to raw pointer storage: the address would outlive the value")
             }
             args.set(i, av) ! at.bug("value_check_call_args: args.set out of range")
             let avt = av.rett

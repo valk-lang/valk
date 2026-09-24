@@ -968,13 +968,15 @@ are compile errors rather than silently using an incorrect calling convention.
 Extern and export signatures cannot contain GC-managed references, including
 references nested in inline aggregates. Extern signatures also cannot contain
 `&T`. Pointer parameters use raw `*T` or `ptr`, and callers must cross an extern
-boundary explicitly:
+boundary explicitly, with a borrow: C gets the address the borrow points at.
+A borrow held in a variable, such as `this` in a struct method, passes the same
+way.
 
 ```valk
 extern fn inspect(value: *Value) void
 
 let value = Value {}
-inspect(@ref(value))
+inspect(&value)
 ```
 
 C-style variadic arguments use a final `...` marker and are restricted to
@@ -985,7 +987,11 @@ checked against each other, and a differing signature is a compile error, since
 one module would otherwise emit a declaration that disagrees with a call site.
 
 `@ref` stabilizes inline stack storage and retains the exact GC owner of an
-interior address for the current function or coroutine frame. It still returns
+interior address for the current function or coroutine frame. `@ref(x)` is
+typed `*T` for `x` declared as `T`, as `&x` is `&T`: the declared type, never a
+narrowed one, so a `?T` variable gives `*?T` and `&?T` after `isset(x)` too, and
+a variable holding a borrow gives `*&T`. Typed pointers are invariant in what
+they point at. It still returns
 an unsafe raw pointer with no lifetime guarantee beyond that frame. An extern
 API that retains a pointer must therefore use a longer-lived explicit
 pinning/rooting protocol.
