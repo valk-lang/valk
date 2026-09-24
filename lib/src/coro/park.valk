@@ -1,0 +1,381 @@
+@unsafe
+
+// Parking: a coroutine (or a thread outside one) waits until any thread wakes it.
+//
+// The waiter describes itself in a `Park`, puts that in the queue of whatever it waits for
+// (a Mutex, a Waker) and suspends. A waker takes the Park out of the queue and calls
+// `wake_park`. On the waiter's own thread that appends the coroutine to the run queue; from
+// another thread it goes into the waiter thread's inbox (its `Home`) and rings the thread's
+// doorbell, which ends the thread's event wait: an eventfd read in io_uring on Linux, a user
+// event in kqueue on macOS, a completion packet on Windows. No file descriptor per lock.
+//
+// Parks and homes are allocated by hand and counted, so a waker never touches freed memory
+// even when the waiter's thread has already ended.
+
+use ext
+use core
+use mem
+use gc
+use io
+use time
+
+// State bits of a Park
+value PARK_WOKEN (1)
+// The waiter left `park_wait`: a wake still on its way must not deliver anymore
+value PARK_LEFT (2)
+
+// The user data of the doorbell event, told apart before any coroutine event id is decoded
+value HOME_EVENT (3)
+#if OS == "macos"
+value HOME_IDENT (0x7661_6c6b)
+value NOTE_TRIGGER (0x01000000)
+#end
+#if OS == "linux"
+value EFD_CLOEXEC (0x80000)
+#end
+
+struct Park {
+    state: uint
+    // One for the waiter, one for the queue side (the queue, then the waker, then the inbox)
+    refs: uint
+    // The waiting coroutine, null for a thread outside coroutines
+    coro: ?ptr
+    // *Home of the waiter's thread, null outside coroutines
+    home: ?ptr
+    // Link in a wait queue, then in an inbox
+    next: ?ptr
+    // Monotonic ms after which the waiter gives up, 0 for never
+    deadline_ms: uint
+}
+
+struct Home {
+    guard: uint
+    first: ?ptr
+    last: ?ptr
+    rung: uint
+    alive: uint
+    // One for the thread, one per Park that names this home
+    refs: uint
+    #if OS == "linux"
+    efd: i32
+    count: u64
+    #elif OS == "macos"
+    kq: i32
+    #elif OS == "win"
+    port: ext.HANDLE
+    #end
+}
+
+global home_ptr: ?ptr (null)
+// Parks of this thread's coroutines that wait with a deadline
+global timed_parks: Array[ptr] (.new(8))
+
+//////////////////////
+// Spin guard
+//////////////////////
+
+// Guards are held for a few pointer updates; a waiter lets other threads run after a while
+fn spin_acquire(guard: *uint) {
+    let spins: uint = 0
+    while atomic(guard[0] | 1) != 0 {
+        spins++
+        if spins > 64 {
+            cpu_yield()
+            spins = 0
+        }
+    }
+}
+
+fn spin_release(guard: *uint) {
+    atomic(guard[0] & 0)
+}
+
+fn cpu_yield() {
+    #if OS == "win"
+    ext.SwitchToThread()
+    #else
+    ext.sched_yield()
+    #end
+}
+
+//////////////////////
+// Parks
+//////////////////////
+
+// A park for the current coroutine, or for this thread when no coroutine runs
+fn park_new() *Park {
+    let p = mem.new[Park]()
+    p.state = 0
+    p.refs = 2
+    p.next = null
+    p.deadline_ms = 0
+    let current = current_coro
+    if isset(current) {
+        let h = home()
+        atomic(h.refs + 1)
+        p.coro = current.@cast(ptr)
+        p.home = h.@cast(ptr)
+    } else {
+        p.coro = null
+        p.home = null
+    }
+    return p
+}
+
+// Drops one reference; the last one frees the park
+fn park_release(p: *Park) {
+    if atomic(p.refs - 1) != 1 : return
+    let h = p.home
+    if isset(h) : home_release(h.@cast(*Home))
+    mem.free(p)
+}
+
+// A park that never went into a queue
+fn park_discard(p: *Park) {
+    park_release(p)
+    park_release(p)
+}
+
+// Suspends until `wake_park`, or until `timeout_ms` passed (0: no limit). Returns whether it
+// was woken. The caller still holds its own reference afterwards.
+fn park_wait(p: *Park, timeout_ms: uint) bool {
+    let current = current_coro
+    if !isset(current) : return park_wait_native(p, timeout_ms)
+    if timeout_ms > 0 {
+        p.deadline_ms = time.deadline_ms(timeout_ms)
+        timed_parks.append(p.@cast(ptr))
+    }
+    while (atomic_load(p.state) & PARK_WOKEN) == 0 {
+        if p.deadline_ms > 0 && time.mono_ms() >= p.deadline_ms : break
+        current.park = p.@cast(ptr)
+        current.yield()
+        current.park = null
+    }
+    if timeout_ms > 0 : timed_parks.remove_value(p.@cast(ptr))
+    // A wake that raced a timeout still counts, its delivery is dropped from here on
+    return (atomic(p.state | PARK_LEFT) & PARK_WOKEN) != 0
+}
+
+fn park_wait_native(p: *Park, timeout_ms: uint) bool {
+    let deadline = time.deadline_ms(timeout_ms)
+    let pause_us: uint = 1
+    while (atomic_load(p.state) & PARK_WOKEN) == 0 {
+        if deadline > 0 && time.mono_ms() >= deadline : break
+        gc.unlock()
+        #if OS == "win"
+        ext.Sleep(pause_us >= 1000 ? 1 : 0)
+        #else
+        let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: (pause_us * 1000).to(int) }
+        let rem = ext.libc_timespec { tv_sec: 0, tv_nsec: 0 }
+        ext.nanosleep(@ref(ts), @ref(rem))
+        #end
+        gc.lock()
+        if pause_us < 1000 : pause_us *= 2
+    }
+    return (atomic(p.state | PARK_LEFT) & PARK_WOKEN) != 0
+}
+
+// Wakes the waiter of `p` from any thread and takes over the queue side's reference. Returns
+// false when the waiter had already left (timed out) or its thread ended; the caller then keeps
+// what it offered.
+fn wake_park(p: *Park) bool {
+    if atomic(p.state | PARK_WOKEN) != 0 {
+        park_release(p)
+        return false
+    }
+    let target = p.home
+    if !isset(target) {
+        // A thread outside coroutines polls its park
+        park_release(p)
+        return true
+    }
+    let own = home_ptr
+    if isset(own) && own == target {
+        deliver(p)
+        park_release(p)
+        return true
+    }
+    let h = target.@cast(*Home)
+    spin_acquire(@ref(h.guard))
+    if h.alive == 0 {
+        // Its thread ended: nobody can take what was offered
+        spin_release(@ref(h.guard))
+        park_release(p)
+        return false
+    }
+    p.next = null
+    let last = h.last
+    if isset(last) {
+        let previous = last.@cast(*Park)
+        previous.next = p.@cast(ptr)
+    } else {
+        h.first = p.@cast(ptr)
+    }
+    h.last = p.@cast(ptr)
+    if h.rung == 0 {
+        h.rung = 1
+        // Rung under the guard: the thread closes its doorbell only after marking itself gone
+        home_ring(h)
+    }
+    spin_release(@ref(h.guard))
+    return true
+}
+
+// Runs the waiting coroutine again, unless it already left its wait. Only on its own thread.
+fn deliver(p: *Park) {
+    if (atomic_load(p.state) & PARK_LEFT) != 0 : return
+    let c = p.coro ?! return
+    let coro = c.@cast(Coro)
+    if coro.park != p.@cast(ptr) : return
+    coro.park = null
+    run_coros.append(coro)
+}
+
+//////////////////////
+// Deadlines
+//////////////////////
+
+// Runs coroutines whose park deadline passed
+fn expire_parks() {
+    if timed_parks.length == 0 : return
+    let now = time.mono_ms()
+    each timed_parks as p {
+        let park = p.@cast(*Park)
+        if park.deadline_ms <= now : deliver(park)
+    }
+}
+
+// Milliseconds until the nearest park deadline, uint.$max when none waits
+fn park_wait_ms() uint {
+    if timed_parks.length == 0 : return uint.$max
+    let now = time.mono_ms()
+    let nearest = uint.$max
+    each timed_parks as p {
+        let deadline = p.@cast(*Park).deadline_ms
+        if deadline <= now : return 0
+        if deadline - now < nearest : nearest = deadline - now
+    }
+    return nearest
+}
+
+//////////////////////
+// Homes
+//////////////////////
+
+// This thread's home, made on first use
+fn home() *Home {
+    let existing = home_ptr
+    if isset(existing) : return existing.@cast(*Home)
+    let h = mem.new[Home]()
+    h.guard = 0
+    h.first = null
+    h.last = null
+    h.rung = 0
+    h.alive = 1
+    h.refs = 1
+    home_open(h)
+    home_ptr = h.@cast(ptr)
+    return h
+}
+
+fn home_release(h: *Home) {
+    if atomic(h.refs - 1) != 1 : return
+    #if OS == "linux"
+    if h.efd >= 0 : ext.close(h.efd)
+    #end
+    mem.free(h)
+}
+
+// Runs the coroutines other threads woke; called by the event loop when the doorbell rang
+fn drain_home() {
+    let existing = home_ptr ?! return
+    let h = existing.@cast(*Home)
+    spin_acquire(@ref(h.guard))
+    let p = h.first
+    h.first = null
+    h.last = null
+    h.rung = 0
+    spin_release(@ref(h.guard))
+    while isset(p) {
+        let park = p.@cast(*Park)
+        p = park.next
+        deliver(park)
+        park_release(park)
+    }
+}
+
+// The thread ends: no wake can reach it anymore
+fn home_close() {
+    let existing = home_ptr ?! return
+    home_ptr = null
+    let h = existing.@cast(*Home)
+    spin_acquire(@ref(h.guard))
+    h.alive = 0
+    let p = h.first
+    h.first = null
+    h.last = null
+    spin_release(@ref(h.guard))
+    while isset(p) {
+        let park = p.@cast(*Park)
+        p = park.next
+        park_release(park)
+    }
+    home_release(h)
+}
+
+#if OS == "linux"
+fn home_open(h: *Home) {
+    h.count = 0
+    // Blocking: io_uring answers a read on a nonblocking descriptor at once with EAGAIN
+    h.efd = ext.eventfd(0, EFD_CLOEXEC)
+    if h.efd < 0 : panic("Failed to create the coroutine wake descriptor")
+    home_listen(h)
+}
+
+// Queues the doorbell read; its completion carries HOME_EVENT
+fn home_listen(h: *Home) {
+    let ring = io.uring() ! panic("Failed to initialize io_uring: the locked-memory limit leaves no room for a ring")
+    if io.uring_unsubmitted + 2 > 128 || io.sq_space_left(ring) < 2 : io.uring_submit(ring)
+    let sqe = ext.io_uring_get_sqe(ring) ?! panic("Failed to queue the coroutine wake read")
+    io.io_uring_prep_read(sqe, h.efd, @ref(h.count), 8, 0)
+    sqe.user_data = HOME_EVENT.to(u64)
+    io.uring_unsubmitted++
+}
+
+fn home_ring(h: *Home) {
+    let one: u64 = 1
+    while true {
+        if ext.write(h.efd, @ref(one), 8) == 8 : return
+        // A full counter already holds a wake
+        if ext.get_errno() != ext.EINTR : return
+    }
+}
+
+// The doorbell read completed: take the woken coroutines and listen again
+fn home_event(res: i32) {
+    drain_home()
+    let existing = home_ptr ?! return
+    if res >= 0 || res == 0 - ext.EAGAIN || res == 0 - ext.EINTR : home_listen(existing.@cast(*Home))
+}
+#elif OS == "macos"
+fn home_open(h: *Home) {
+    h.kq = io.kqueue()
+    let ev: ext.kEvent = @undefined
+    io.EV_SET(&ev, HOME_IDENT, io.EVFILT_USER, io.EV_ADD | io.EV_CLEAR, 0, 0, HOME_EVENT.to(uint).@cast(ptr))
+    if !io.kqueue_change(h.kq, &ev) : panic("Failed to register the coroutine wake event")
+}
+
+fn home_ring(h: *Home) {
+    let ev: ext.kEvent = @undefined
+    io.EV_SET(&ev, HOME_IDENT, io.EVFILT_USER, 0, NOTE_TRIGGER, 0, HOME_EVENT.to(uint).@cast(ptr))
+    io.kqueue_change(h.kq, &ev)
+}
+#elif OS == "win"
+fn home_open(h: *Home) {
+    h.port = io.iocp()
+}
+
+fn home_ring(h: *Home) {
+    ext.PostQueuedCompletionStatus(h.port, 0, HOME_EVENT.to(uint), null)
+}
+#end

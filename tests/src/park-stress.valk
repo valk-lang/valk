@@ -1,0 +1,153 @@
+use valk.core
+use valk.coro
+use valk.sync
+use valk.thread
+use valk.time
+
+// Locks and wakes park the waiting coroutine and wake it from any thread (coro/park.valk)
+
+class ParkStressCount {
+    value: uint (0)
+}
+
+fn park_stress_lock_loop(lock_value: shared core.Lock[ParkStressCount], rounds: uint) {
+    each 0 .. rounds {
+        lock lock_value as c {
+            let before = c.value
+            // Switching coroutines while holding the lock keeps other waiters queued
+            if before % 7 == 0 : coro.await_last()
+            c.value = before + 1
+        }
+    }
+}
+
+test "Park stress: threads and coroutines share one lock" {
+    let counter: shared core.Lock[ParkStressCount] = core.Lock[ParkStressCount].new(ParkStressCount {}) !!
+    let threads = Array[thread.Thread[void]]{}
+    each 0 .. 4 {
+        threads.append(thread.start(fn() {
+            let tasks = Array[co()]{}
+            each 0 .. 4 : tasks.append(co park_stress_lock_loop(counter, 2000))
+            each tasks as t : await t
+        }) !!)
+    }
+    let local = Array[co()]{}
+    each 0 .. 4 : local.append(co park_stress_lock_loop(counter, 2000))
+    each local as t : await t
+    each threads as th : th.await()
+    lock counter as c : assert(c.value == 20 * 2000)
+}
+
+fn park_stress_produce(ch: shared sync.Channel[uint], from: uint, count: uint) {
+    each 0 .. count as i : ch.send(from + i) !!
+}
+
+test "Park stress: a bounded channel between threads delivers everything once" {
+    let ch: shared sync.Channel[uint] = sync.Channel[uint].new(8) !!
+    let producers = Array[thread.Thread[void]]{}
+    each 0 .. 3 as p {
+        let from = p.to(uint) * 100000
+        producers.append(thread.start(fn() {
+            let tasks = Array[co()]{}
+            each 0 .. 2 as t : tasks.append(co park_stress_produce(ch, from + t.to(uint) * 10000, 5000))
+            each tasks as t : await t
+        }) !!)
+    }
+    let sum: uint = 0
+    let count: uint = 0
+    while count < 30000 {
+        sum += ch.recv() !!
+        count++
+    }
+    each producers as th : th.await()
+    // 3 producers x 2 coroutines x 5000 values from their own start
+    let expected: uint = 0
+    each 0 .. 3 as p {
+        each 0 .. 2 as t {
+            let from = p.to(uint) * 100000 + t.to(uint) * 10000
+            expected += from * 5000 + 4999 * 5000 / 2
+        }
+    }
+    assert(sum == expected)
+}
+
+class ParkStressRounds {
+    done: uint (0)
+}
+
+test "Park stress: wakes racing timeouts neither get lost nor resume twice" {
+    let waker: shared sync.Waker = sync.Waker.new() !!
+    let rounds: shared ParkStressRounds = .{}
+    // One wake per round, at varying moments against the waiter's 1 ms timeouts
+    let waking = thread.start(fn() {
+        each 0 .. 300 as round {
+            time.sleep_ns((round % 5) * 400_000)
+            waker.wake()
+            while rounds.done <= round.to(uint) : time.sleep_ns(50_000)
+        }
+    }) !!
+    let started = time.mono_ms()
+    let timeouts: uint = 0
+    while rounds.done < 300 && time.mono_ms() - started < 30000 {
+        if waker.wait(1) {
+            rounds.done++
+            continue
+        }
+        timeouts++
+        // A resume from a stale delivery would cut this sleep short
+        if timeouts % 16 == 0 : time.sleep_ns(10_000)
+    }
+    waking.await()
+    assert(rounds.done == 300)
+}
+
+test "Park stress: a timed out wait keeps a later wake for the next one" {
+    let waker: shared sync.Waker = sync.Waker.new() !!
+    assert(!waker.wait(5))
+    let other = thread.start(fn() {
+        time.sleep_ms(5)
+        waker.wake()
+    }) !!
+    other.await()
+    // Nobody waited when the wake came: it is kept
+    assert(waker.wait(1000))
+    assert(!waker.wait(1))
+}
+
+class ParkStressProgress {
+    parked: uint (0)
+}
+
+fn park_stress_wait_on(gate: shared core.Mutex, progress: shared ParkStressProgress) {
+    progress.parked = 1
+    gate.lock()
+    gate.unlock()
+}
+
+test "Park stress: a waiter whose thread ended does not take the mutex" {
+    let gate: shared core.Mutex = core.Mutex.new() !!
+    let progress: shared ParkStressProgress = .{}
+    gate.lock()
+    let leaving = thread.start(fn() {
+        // Waits on the mutex, but the thread's main coroutine ends first
+        let abandoned = co park_stress_wait_on(gate, progress)
+        coro.await_last()
+    }) !!
+    leaving.await()
+    assert(progress.parked == 1)
+    // The mutex skips the waiter of the ended thread
+    gate.unlock()
+    gate.lock()
+    gate.unlock()
+}
+
+test "Park stress: locking without contention needs no system resource" {
+    // Creating many locks used to open two descriptors each
+    let locks = Array[core.Mutex]{}
+    each 0 .. 5000 : locks.append(core.Mutex.new() !!)
+    each locks as m {
+        m.lock()
+        m.unlock()
+    }
+    assert(locks.length == 5000)
+}

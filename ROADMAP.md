@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `Mutex`, `Lock`, `Channel`, `CancelToken` and `Waker` no longer hold a pipe each: a free lock is one atomic operation, waiters are parked and woken directly (from another thread through one wake handle per thread), and creating them never runs out of file descriptors; a cross-thread channel moved 200k values in 11 ms instead of 1.2 s
 + Removing entries of a `Map`, `HashMap`, `HashSet`, `FlatMap` or JSON object inside `each` over it is safe: every other entry is still visited once, and the index stays 0, 1, 2, ... (it used to skip entries silently)
 + `valk fmt --check` lists files that need formatting and exits 1 without writing; `valk --version` prints the version
 + A dependency whose `src` is neither relative nor on GitHub gets that error instead of "No package named ... found"

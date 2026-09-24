@@ -2496,7 +2496,7 @@ Marked `$default`: it also provides the type's default value.
     + fn lock() void
     // Creates an unlocked mutex.
     + static fn new() Mutex !InitError
-    // Releases the mutex and wakes waiters.
+    // Releases the mutex and wakes the longest waiting waiter.
     + fn unlock() void
 }
 ```
@@ -2506,14 +2506,13 @@ Marked `$default`: it also provides the type's default value.
 A mutual-exclusion lock whose waiters yield to other coroutines instead of blocking the thread.
 
 Outside a coroutine, waiting blocks the thread. The mutex is not reentrant and has no
-owner: any coroutine or thread may `unlock` it. It works across threads.
+owner: any coroutine or thread may `unlock` it. It works across threads. Locking and
+unlocking without contention are single atomic operations; `unlock` wakes the longest
+waiting waiter, which takes the mutex unless another locker was quicker.
 
 #### await_unlock
 
 Waits until the mutex is unlocked, without keeping it locked.
-
-On Linux and macOS it takes the mutex and releases it at once. Panics when the
-underlying wait fails.
 
 #### clone
 
@@ -2525,19 +2524,19 @@ Takes the mutex, waiting while it is locked.
 
 Inside a coroutine the wait yields to other coroutines on the thread; outside one it
 blocks the thread. Locking it again from the same coroutine before `unlock` deadlocks.
-Panics when the underlying wait fails.
 
 #### new
 
 Creates an unlocked mutex.
 
-Throws `init` when the pipe behind it cannot be set up (Linux and macOS).
+Never fails since the mutex holds no operating system resource; the error type is kept
+for existing callers.
 
 #### unlock
 
-Releases the mutex and wakes waiters.
+Releases the mutex and wakes the longest waiting waiter.
 
-Does nothing when the mutex is not locked. Panics when the underlying write fails.
+Does nothing when the mutex is not locked.
 
 ```js
 // A stack of plain values in one manually allocated block, for recycling items.
@@ -14893,7 +14892,7 @@ Throws `full` when the channel is full and `closed` when it is closed.
 ```js
 // A wakeup for the coroutine or thread that waits on it; `wake` may be called from any thread.
 + class Waker {
-    // Returns a new waker; throws `init` when its pipe cannot be created (Linux and macOS).
+    // Returns a new waker.
     + static fn new() Waker !SyncError
     // Waits for a wake; returns false when `timeout_ms` (0 = forever) ran out first.
     + fn wait(timeout_ms: uint (0)) bool
@@ -14909,11 +14908,14 @@ A wakeup for the coroutine or thread that waits on it; `wake` may be called from
 `wait` parks the current coroutine (or blocks a native thread) until a wake arrives or
 the timeout runs out. Wakes are counted loosely: a wake that nobody waited for is kept
 and ends the next `wait` early, and several wakes may end just one, so callers re-check
-their condition in a loop.
+their condition in a loop. A waker holds no operating system resource.
 
 #### new
 
-Returns a new waker; throws `init` when its pipe cannot be created (Linux and macOS).
+Returns a new waker.
+
+Never fails since the waker holds no operating system resource; the error type is kept
+for existing callers.
 
 #### wait
 

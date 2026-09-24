@@ -1,74 +1,31 @@
 @unsafe
 
-use ext
 use coro
-use mem
-use io
-use gc
 
-#if OS == "win"
-// Plain data on purpose: the array stores these inline, so registering a
-// waiter allocates nothing, and sharing a Mutex does not pull the waiting
-// coroutines into shared memory.
-struct MutexWait {
-    coro: ptr
-    iocp: ext.HANDLE
-}
-#end
+// Bits of Mutex.state
+value MUTEX_HELD (1)
+// Waiters are queued; `unlock` then wakes the first of them
+value MUTEX_QUEUED (2)
 
 /// A mutual-exclusion lock whose waiters yield to other coroutines instead of blocking the thread.
 ///
 /// Outside a coroutine, waiting blocks the thread. The mutex is not reentrant and has no
-/// owner: any coroutine or thread may `unlock` it. It works across threads.
+/// owner: any coroutine or thread may `unlock` it. It works across threads. Locking and
+/// unlocking without contention are single atomic operations; `unlock` wakes the longest
+/// waiting waiter, which takes the mutex unless another locker was quicker.
 + class Mutex {
-    #if OS == "linux" || OS == "macos"
-    - pipe: [i32 x 2] ({ -1... })
-    - buf: uint (0)
-    // 1 while a holder has the pipe's token. `unlock` clears it atomically and
-    // only writes the token back when it was set, so the pipe never holds two.
-    - held: uint (0)
-    #elif OS == "win"
-    - locked: bool (false)
-    - mutex: SyncMutex (.new())
-    - waits: Array[MutexWait] (.new(128))
-    #end
+    - state: uint (0)
+    - guard: uint (0)
+    // Waiting coro.Park entries, first to last
+    - first: ?ptr (null)
+    - last: ?ptr (null)
 
     /// Creates an unlocked mutex.
     ///
-    /// Throws `init` when the pipe behind it cannot be set up (Linux and macOS).
+    /// Never fails since the mutex holds no operating system resource; the error type is kept
+    /// for existing callers.
     + static fn new() SELF !InitError {
-        let m = SELF {}
-        m.init() !>
-        return m
-    }
-
-    fn init() !InitError {
-        #if OS == "linux" || OS == "macos"
-        let res = ext.pipe(@ref(this.pipe))
-        if res != 0 : throw .init
-        io.set_close_on_exec(this.pipe[0]) ! res = -1
-        io.set_close_on_exec(this.pipe[1]) ! res = -1
-        if res != 0 {
-            io.close_cleanup(this.pipe[0], __FILE__, __LINE__)
-            io.close_cleanup(this.pipe[1], __FILE__, __LINE__)
-            this.pipe = { -1... }
-            throw .init
-        }
-        io.write(this.pipe[1], "v") ! {
-            io.close_cleanup(this.pipe[0], __FILE__, __LINE__)
-            io.close_cleanup(this.pipe[1], __FILE__, __LINE__)
-            this.pipe = { -1... }
-            throw .init
-        }
-        #if OS == "macos"
-        io.set_nonblocking(this.pipe[0], true) ! {
-            io.close_cleanup(this.pipe[0], __FILE__, __LINE__)
-            io.close_cleanup(this.pipe[1], __FILE__, __LINE__)
-            this.pipe = { -1... }
-            throw .init
-        }
-        #end
-        #end
+        return SELF {}
     }
 
     /// Returns this same mutex, so clones of an object that holds it share it (`$clone`).
@@ -76,155 +33,108 @@ struct MutexWait {
         return this
     }
 
-    #if OS == "win"
-    fn wait_entry() MutexWait @threadsafe {
-        let current = coro.current_coro
-        if !isset(current) : panic("Waiting on a mutex outside a coroutine")
-        current.iocp_ready = false
-        return MutexWait {
-            coro: current.@cast(ptr)
-            iocp: io.iocp()
-        }
-    }
-    #end
-
     /// Waits until the mutex is unlocked, without keeping it locked.
-    ///
-    /// On Linux and macOS it takes the mutex and releases it at once. Panics when the
-    /// underlying wait fails.
     + fn await_unlock() @threadsafe {
-        #if OS == "linux" || OS == "macos"
-        if !this.read_token() : panic("Mutex wait failed")
-        io.write(this.pipe[1], "v") ! panic("Mutex wake failed")
-        #elif OS == "win"
-        // Outside a coroutine there is nothing to park, so poll instead;
-        // Linux and macOS block on the pipe the same way.
-        if !isset(coro.current_coro) {
-            this.poll_unlocked()
-            return
-        }
-
-        // A queued wake packet can resume this coroutine without the mutex having
-        // been unlocked, so the state has to be checked again after every yield,
-        // exactly as `lock` does
-        while true {
-            this.mutex.lock()
-            if !this.locked {
-                this.mutex.unlock()
-                return
-            }
-            this.waits.append(this.wait_entry())
-            this.mutex.unlock()
-            coro.yield()
-        }
-        #end
+        this.lock()
+        this.unlock()
     }
-
-    #if OS == "win"
-    fn poll_unlocked() @threadsafe {
-        while true {
-            ext.Sleep(1)
-            this.mutex.lock()
-            let locked = this.locked
-            this.mutex.unlock()
-            if !locked : return
-        }
-    }
-    #end
 
     /// Takes the mutex, waiting while it is locked.
     ///
     /// Inside a coroutine the wait yields to other coroutines on the thread; outside one it
     /// blocks the thread. Locking it again from the same coroutine before `unlock` deadlocks.
-    /// Panics when the underlying wait fails.
     + fn lock() @threadsafe {
-        #if OS == "linux" || OS == "macos"
-        if !this.read_token() : panic("Mutex lock failed")
-        atomic(this.held | 1)
-        #elif OS == "win"
-        while true {
-            this.mutex.lock()
-            if !this.locked {
-                this.locked = true
-                this.mutex.unlock()
-                break
-            }
-            if !isset(coro.current_coro) {
-                this.mutex.unlock()
-                this.poll_unlocked()
-                continue
-            }
-            this.waits.append(this.wait_entry())
-            this.mutex.unlock()
-            coro.yield()
-        }
-        #end
+        if (atomic(this.state | MUTEX_HELD) & MUTEX_HELD) == 0 : return
+        this.lock_slow()
     }
 
-    /// Releases the mutex and wakes waiters.
+    fn lock_slow() @threadsafe {
+        // Held briefly by another thread most of the time: try a little before parking
+        let spins: uint = 0
+        while spins < 100 {
+            spins++
+            if (atomic_load(this.state) & MUTEX_HELD) != 0 : continue
+            if (atomic(this.state | MUTEX_HELD) & MUTEX_HELD) == 0 : return
+        }
+        let woken = false
+        while true {
+            let p = coro.park_new()
+            coro.spin_acquire(@ref(this.guard))
+            // Marked queued first, so an `unlock` from here on takes the slow path and finds us
+            let before = atomic(this.state | (MUTEX_HELD | MUTEX_QUEUED))
+            if (before & MUTEX_HELD) == 0 {
+                if !isset(this.first) : atomic(this.state & MUTEX_HELD)
+                coro.spin_release(@ref(this.guard))
+                coro.park_discard(p)
+                return
+            }
+            // A waiter that was woken and lost the race keeps its place in front
+            if woken : this.push_front(p)
+            else : this.push_back(p)
+            coro.spin_release(@ref(this.guard))
+            coro.park_wait(p, 0)
+            coro.park_release(p)
+            woken = true
+            if (atomic(this.state | MUTEX_HELD) & MUTEX_HELD) == 0 : return
+        }
+    }
+
+    fn push_back(p: *coro.Park) @threadsafe {
+        p.next = null
+        let last = this.last
+        if isset(last) {
+            let previous = last.@cast(*coro.Park)
+            previous.next = p.@cast(ptr)
+        } else {
+            this.first = p.@cast(ptr)
+        }
+        this.last = p.@cast(ptr)
+    }
+
+    fn push_front(p: *coro.Park) @threadsafe {
+        p.next = this.first
+        this.first = p.@cast(ptr)
+        if !isset(this.last) : this.last = p.@cast(ptr)
+    }
+
+    /// Releases the mutex and wakes the longest waiting waiter.
     ///
-    /// Does nothing when the mutex is not locked. Panics when the underlying write fails.
+    /// Does nothing when the mutex is not locked.
     + fn unlock() @threadsafe {
-        #if OS == "linux" || OS == "macos"
-        if atomic(this.held & 0) == 0 : return
-        io.write(this.pipe[1], "v") ! panic("Mutex unlock failed")
-        #elif OS == "win"
-        this.mutex.lock()
-        if !this.locked {
-            this.mutex.unlock()
-            return
-        }
-        each this.waits as w {
-            if !io.wake_coro(w.iocp, w.coro) {
-                this.mutex.unlock()
-                panic("PostQueuedCompletionStatus failed")
-            }
-        }
-        this.waits.clear()
-        this.locked = false
-        this.mutex.unlock()
-        #end
+        let before = atomic(this.state & MUTEX_QUEUED)
+        if (before & MUTEX_HELD) == 0 : return
+        if (before & MUTEX_QUEUED) == 0 : return
+        this.wake_next()
     }
 
-    #if OS == "linux" || OS == "macos"
-    fn read_token() bool @threadsafe {
-        if !isset(coro.current_coro) : return this.read_token_sync()
-        return (io.read_bytes(this.pipe[0], @ref(this.buf), 1, uint.$max) !? 0) == 1
-    }
-
-    fn read_token_sync() bool @threadsafe {
-        let wait = ext.libc_pollfd { fd: this.pipe[0], events: ext.POLLIN, revents: 0 }
-        let token: u8 = 0
-        let received = false
-        // Native callers must wait for macOS's nonblocking pipe without holding the GC lock.
-        gc.unlock()
+    fn wake_next() @threadsafe {
         while true {
-            let count = ext.read(wait.fd, @ref(token), 1)
-            if count == 1 {
-                received = true
-                break
+            coro.spin_acquire(@ref(this.guard))
+            let next = this.first
+            if !isset(next) {
+                atomic(this.state & MUTEX_HELD)
+                coro.spin_release(@ref(this.guard))
+                return
             }
-            if count == 0 : break
-            let error = ext.get_errno()
-            if error == ext.EINTR : continue
-            if error != ext.EAGAIN : break
-            let ready = ext.poll(@ref(wait), 1, -1)
-            if ready < 0 && ext.get_errno() == ext.EINTR : continue
-            if ready <= 0 || (wait.revents & ext.POLLIN) == 0 : break
+            let p = next.@cast(*coro.Park)
+            this.first = p.next
+            if !isset(this.first) {
+                this.last = null
+                atomic(this.state & MUTEX_HELD)
+            }
+            coro.spin_release(@ref(this.guard))
+            // A waiter whose thread ended cannot take it; wake the next one
+            if coro.wake_park(p) : return
         }
-        gc.lock()
-        return received
     }
-    #end
 
     fn gc_free() {
-        #if OS == "linux" || OS == "macos"
-        if this.pipe[0] >= 0 && ext.close(this.pipe[0]) != 0 {
-            cleanup_warning("Failed to close mutex read descriptor", __FILE__, __LINE__)
+        // Only waiters of threads that ended can be left
+        let p = this.first
+        while isset(p) {
+            let park = p.@cast(*coro.Park)
+            p = park.next
+            coro.park_release(park)
         }
-        if this.pipe[1] >= 0 && ext.close(this.pipe[1]) != 0 {
-            cleanup_warning("Failed to close mutex write descriptor", __FILE__, __LINE__)
-        }
-        #end
     }
 }

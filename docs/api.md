@@ -755,7 +755,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn lock() void
     // Creates an unlocked mutex.
     + static fn new() Mutex !InitError
-    // Releases the mutex and wakes waiters.
+    // Releases the mutex and wakes the longest waiting waiter.
     + fn unlock() void
 }
 ```
@@ -4448,7 +4448,7 @@ error SignalError (unsupported, init)
 ```js
 // A wakeup for the coroutine or thread that waits on it; `wake` may be called from any thread.
 + class Waker {
-    // Returns a new waker; throws `init` when its pipe cannot be created (Linux and macOS).
+    // Returns a new waker.
     + static fn new() Waker !SyncError
     // Waits for a wake; returns false when `timeout_ms` (0 = forever) ran out first.
     + fn wait(timeout_ms: uint (0)) bool
