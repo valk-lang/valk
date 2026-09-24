@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `-o` creates the missing directories of the output path
 + A repeated compiler option (`-o`, `--target`, `--filter`, ...) keeps its last value instead of stopping with an internal panic, so arguments after `valk make name` override the declared ones
 + `crypto.base64_decode` and its variants skip line breaks, so wrapped PEM and MIME bodies decode
 + HTTP: `parse_date` reads the RFC 850 and asctime forms too; an oversized request head gets 431 instead of 413; `code_name` knows every RFC 9110 status

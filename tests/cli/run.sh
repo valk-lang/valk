@@ -430,6 +430,14 @@ if [ ! -f "$workdir/last$EXE_SUFFIX" ] || [ -f "$workdir/first$EXE_SUFFIX" ]; th
     exit 1
 fi
 
+echo "> -o creates missing directories"
+out=$("$VALK" build "$input" --no-warn -o "$workdir/new/sub/app$EXE_SUFFIX" 2>&1)
+if [ ! -f "$workdir/new/sub/app$EXE_SUFFIX" ]; then
+    echo "# The output directory was not created"
+    echo "$out"
+    exit 1
+fi
+
 echo "> ansi.supported respects NO_COLOR"
 "$VALK" build "$DIR/no-color.valk" --no-warn -o "$workdir/no-color$EXE_SUFFIX" >/dev/null 2>&1
 colored=$(TERM=xterm NO_COLOR= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
@@ -959,4 +967,4 @@ Stack trace:
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 63"
+echo "# Test count: 64"
