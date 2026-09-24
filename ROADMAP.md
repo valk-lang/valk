@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `json` integer readers (`.int`, `int_value`, `get_int`, `to_type`, `decode_to`) accept a whole float such as `3.0`; `3.5` still is not an integer
 + `json` writes a whole float as `2.0` instead of `2`, so it reads back as a float (as Python and serde_json do)
 + A float's `to_string()` (and `_in`, `_into`) without `decimals` gives the shortest text that reads back, like interpolation; it gave 2 decimals, so `(0.0001).to_string()` was `0.00`. Pass `to_string(2)` for the old output
 + `fs.extension` gives no extension for a hidden file such as `.bashrc` (it gave `bashrc`); `.config.json` still gives `json`

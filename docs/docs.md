@@ -1533,7 +1533,9 @@ println(json.encode(document))
 
 A number without a fraction or exponent is an `int`; one beyond the `int` range becomes the
 nearest `float`, as in JavaScript. `json.decode_to` into a `u64` field reads such a number exactly.
-A whole float is written with its `.0` (`2.0`), so it reads back as a float.
+A whole float is written with its `.0` (`2.0`), so it reads back as a float. Reading an
+integer (`.int`, `get_int`, `decode_to` into an `int` field) accepts a whole float: `3.0` gives
+`3`, while `3.5` is not an integer.
 
 Objects use string keys and arrays use integer indexes. The same operations work for either:
 

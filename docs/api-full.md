@@ -11949,7 +11949,8 @@ Parses JSON text directly into `T`, without building an intermediate `Value`.
 Takes the same limits and throws the same errors as `decode`, plus `.wrong_type` when a
 value has the wrong JSON type or is out of range for the target number type, and
 `.missing` when a required field is absent. The type rules match `Value.to_type`:
-integer fields need a JSON integer, float fields accept any JSON number (`3` reads as
+integer fields need a JSON integer or a whole float (`3.0` reads as `3`), float fields
+accept any JSON number (`3` reads as
 `3.0`), nullable fields and fields with an explicit default may be absent or `null`
 (and then get their default), and unknown members are skipped.
 
@@ -12186,7 +12187,7 @@ Sets the member `key` to `value`; an existing member keeps its position.
     + fn get_bool(key: String | uint) bool !LookupError
     // Returns the number at `key` as a float; an integer is converted.
     + fn get_float(key: String | uint) float !LookupError
-    // Returns the integer at `key`.
+    // Returns the integer at `key`; a whole float counts as its integer.
     + fn get_int(key: String | uint) int !LookupError
     // Returns the object at `key`.
     + fn get_object(key: String | uint) ObjectValue !LookupError
@@ -12210,7 +12211,7 @@ Sets the member `key` to `value`; an existing member keeps its position.
     + fn has_string(key: String | uint) bool
     // Returns the integer held, or `0` when the value is not an integer.
     + get int: int
-    // Returns the integer held.
+    // Returns the integer held; a whole float counts as its integer (`3.0` gives `3`).
     + fn int_value() int !LookupError
     // Returns whether the value is an array.
     + get is_array: bool
@@ -12377,9 +12378,10 @@ Throws `.missing` when it is absent or not a number.
 
 #### get_int
 
-Returns the integer at `key`.
+Returns the integer at `key`; a whole float counts as its integer.
 
-Throws `.missing` when it is absent or not an integer (floats included).
+Throws `.missing` when it is absent or not an integer, including a float that is not
+whole.
 
 #### get_object
 
@@ -12435,13 +12437,14 @@ Returns whether the value at `key` exists and is a string.
 
 Returns the integer held, or `0` when the value is not an integer.
 
-A float is not converted: `1.5` and `1.0` both give `0`.
+A whole float counts as its integer (`3.0` gives `3`); `1.5` gives `0`.
 
 #### int_value
 
-Returns the integer held.
+Returns the integer held; a whole float counts as its integer (`3.0` gives `3`).
 
-Throws `.missing` when the value is not an integer (floats included).
+Throws `.missing` when the value is not an integer, including a float that is not whole
+or does not fit in `int`.
 
 #### is_array
 
@@ -12581,7 +12584,8 @@ Throws `.missing` when the value is not a string.
 Converts the value to `T`.
 
 Throws `.missing` when the value does not fit `T`. A nullable `T` accepts `null`.
-Integers must be JSON integers within the range of `T`; a float accepts any JSON
+Integers must be JSON integers, or whole floats such as `3.0`, within the range of `T`;
+a float accepts any JSON
 number, so an integer such as `3` converts to `3.0` (a value that overflows `f32` is
 rejected). Types with a static `from_json_value` method use it; arrays and
 string-keyed maps convert item by item. For a class or struct the value must be an

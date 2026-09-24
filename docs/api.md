@@ -3643,7 +3643,7 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
     + fn get_bool(key: String | uint) bool !LookupError
     // Returns the number at `key` as a float; an integer is converted.
     + fn get_float(key: String | uint) float !LookupError
-    // Returns the integer at `key`.
+    // Returns the integer at `key`; a whole float counts as its integer.
     + fn get_int(key: String | uint) int !LookupError
     // Returns the object at `key`.
     + fn get_object(key: String | uint) ObjectValue !LookupError
@@ -3667,7 +3667,7 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
     + fn has_string(key: String | uint) bool
     // Returns the integer held, or `0` when the value is not an integer.
     + get int: int
-    // Returns the integer held.
+    // Returns the integer held; a whole float counts as its integer (`3.0` gives `3`).
     + fn int_value() int !LookupError
     // Returns whether the value is an array.
     + get is_array: bool
