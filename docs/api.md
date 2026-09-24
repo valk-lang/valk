@@ -10,7 +10,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ## Functions for 'ansi'
 
 ```js
-// Returns whether the terminal likely understands ANSI escape codes, judged from `TERM`.
+// Returns whether standard output shows ANSI escape codes as colors.
 + fn supported() bool
 // Returns whether the console output expects UTF-8.
 + fn utf8_supported() bool

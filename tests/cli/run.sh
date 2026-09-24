@@ -455,12 +455,13 @@ if [ -n "$error_stdout" ] || [[ "$error_stderr" != *"# Error: "* ]]; then
     exit 1
 fi
 
-echo "> ansi.supported respects NO_COLOR"
+echo "> ansi.supported needs a terminal unless forced, and respects NO_COLOR"
 "$VALK" build "$DIR/no-color.valk" --no-warn -o "$workdir/no-color$EXE_SUFFIX" >/dev/null 2>&1
-colored=$(TERM=xterm NO_COLOR= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
-plain=$(TERM=xterm NO_COLOR=1 "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
-if [ "$colored" != "true" ] || [ "$plain" != "false" ]; then
-    echo "# NO_COLOR was not respected: '$colored' '$plain'"
+piped=$(TERM=xterm NO_COLOR= FORCE_COLOR= CLICOLOR_FORCE= "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
+forced=$(TERM=xterm NO_COLOR= FORCE_COLOR=1 "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
+plain=$(TERM=xterm NO_COLOR=1 FORCE_COLOR=1 "$workdir/no-color$EXE_SUFFIX" 2>&1 | tr -d '\r')
+if [ "$piped" != "false" ] || [ "$forced" != "true" ] || [ "$plain" != "false" ]; then
+    echo "# Color detection is wrong: piped '$piped', forced '$forced', NO_COLOR '$plain'"
     exit 1
 fi
 

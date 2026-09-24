@@ -10,7 +10,7 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 ## Functions for 'ansi'
 
 ```js
-// Returns whether the terminal likely understands ANSI escape codes, judged from `TERM`.
+// Returns whether standard output shows ANSI escape codes as colors.
 + fn supported() bool
 // Returns whether the console output expects UTF-8.
 + fn utf8_supported() bool
@@ -18,11 +18,13 @@ Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro
 
 ### supported
 
-Returns whether the terminal likely understands ANSI escape codes, judged from `TERM`.
+Returns whether standard output shows ANSI escape codes as colors.
 
-True when `TERM` contains `xterm`, `vt`, `ansi`, `linux`, `screen` or `tmux`; false when
-it is unset, or when `NO_COLOR` is set to a non-empty value. The answer is cached after
-the first call. It does not check whether stdout is a terminal.
+False when `NO_COLOR` is set to a non-empty value. True when `FORCE_COLOR` or
+`CLICOLOR_FORCE` is set to anything but `0`, for logs that keep colors such as CI output.
+Otherwise standard output must be a terminal, not a pipe or a file, and `TERM` must
+contain `xterm`, `vt`, `ansi`, `linux`, `screen` or `tmux`. The answer is cached after
+the first call.
 
 ### utf8_supported
 

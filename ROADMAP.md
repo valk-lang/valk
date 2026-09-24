@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `ansi.supported()` is false when standard output is a pipe or a file, so `./app > out.txt` gets no escape codes; `FORCE_COLOR` or `CLICOLOR_FORCE` (not `0`) turns colors on anyway, for CI logs. Piped test output uses the plain `OK`/`FAIL` rows
 + `sync.Channel.new(0)` makes a rendezvous channel: `send` returns once a receiver took the value (as in Go, Rust's `sync_channel(0)` and crossbeam's `bounded(0)`). `new()` stays unbounded; before, `0` meant unbounded too
 + HTTP `req.parse_json()` throws `json.ParseError` for a body that is not JSON, so a handler can answer 400; `json()` stays lenient and gives an empty object
 + `json` integer readers (`.int`, `int_value`, `get_int`, `to_type`, `decode_to`) accept a whole float such as `3.0`; `3.5` still is not an integer
