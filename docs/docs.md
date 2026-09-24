@@ -445,7 +445,7 @@ let m = Map[uint]{ "a" => 1, "b" => 2 } // Create map
 let m : Map[uint] = .{ "a" => 1, "b" => 2 } // Using typehint
 // Basics
 m.set(key, value)
-m.remove(key) // Swap-remove: the last entry takes the removed slot, so iteration order changes
+m.remove(key) // The last entry takes the removed slot, so iteration order changes
 m.has(key)
 m.clear()
 let v = m.get("a") !? 0 // get throws when the key is missing
@@ -454,6 +454,16 @@ let w = m["a"]          // [] gives the zero value (0, false, or null) for a mis
 each m as value {}
 each m as value, key {}
 each m as value, key, index {}
+```
+
+Removing entries inside `each` over the same map is safe (also for `HashMap`, `HashSet` and
+`FlatMap`): every entry you do not remove is still visited once, a removed entry that the
+loop has not reached yet is skipped, and the index keeps counting 0, 1, 2, ...
+
+```rust
+each m as value, key {
+    if value == 0 : m.remove(key)
+}
 ```
 
 Full `Map` API: [core](api.md#core)

@@ -1950,7 +1950,8 @@ A map that keeps its keys and values in two arrays and finds keys by linear sear
 
 Lookups, inserts and removals cost O(n), so it suits small maps. Keys are compared with
 `==` and need no hash. Entries stay in insertion order, also after removals. Build one
-with `FlatMap[K, T]{ k => v }` and iterate with `each map as value, key`.
+with `FlatMap[K, T]{ k => v }` and iterate with `each map as value, key`. Removing entries
+inside `each` is safe: the loop still visits every entry that was not removed, once.
 
 #### clear
 
@@ -2074,7 +2075,8 @@ A hash table from keys of type `K` to values of type `T`.
 Keys hash with their `$hash` method, otherwise integers by value and pointers by
 address; keys are compared with `==`, so equal keys must hash the same. Entries keep
 insertion order for `each`, `keys` and `values`, except that removing an entry moves
-the last entry into its place.
+the last entry into its place. Removing entries inside `each` is safe: the loop still
+visits every entry that was not removed, once, and skips the removed ones.
 Build one with `HashMap[K, T]{ k => v }` and iterate with `each map as value, key`.
 
 #### clear
@@ -2147,6 +2149,8 @@ default value.
 Removes the entry for `key`; does nothing when it is absent.
 
 The last entry moves into the removed entry's position, so iteration order changes.
+Inside an `each` over this map nothing moves until the loop ends, so the loop still
+visits every other entry once.
 
 #### set
 

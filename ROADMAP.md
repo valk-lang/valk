@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Removing entries of a `Map`, `HashMap`, `HashSet`, `FlatMap` or JSON object inside `each` over it is safe: every other entry is still visited once, and the index stays 0, 1, 2, ... (it used to skip entries silently)
 + `valk fmt --check` lists files that need formatting and exits 1 without writing; `valk --version` prints the version
 + A dependency whose `src` is neither relative nor on GitHub gets that error instead of "No package named ... found"
 + A `use` of a namespace that does not exist is reported at the `use` (with "did you mean 'use valk.fs'"), and an unknown identifier suggests a close name (`printn` -> `println`)
