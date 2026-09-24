@@ -10169,14 +10169,14 @@ HTTP/1.1 keeps it unless `Connection: close` was sent; HTTP/1.0 only when
 
 Returns the query string parameters.
 
-Keys and values are decoded with `url.decode`. A part without `=` is skipped, and
-for a repeated key the last value wins; see `params_grouped`.
+Keys and values are decoded with `url.decode`. A part without `=`, like `?flag`, has
+the value `""`, and for a repeated key the last value wins; see `query_grouped`.
 
 #### query_grouped
 
 Returns every value of each query string parameter, in order.
 
-Decoded like `params`.
+Decoded like `query`.
 
 ```js
 // A cookie to send with a response.
@@ -10703,14 +10703,14 @@ JSON gives an empty object.
 
 Returns the query string parameters.
 
-Keys and values are decoded with `url.decode`. A part without `=` is skipped, and
-for a repeated key the last value wins; see `params_grouped`.
+Keys and values are decoded with `url.decode`. A part without `=`, like `?flag`, has
+the value `""`, and for a repeated key the last value wins; see `query_grouped`.
 
 #### query_grouped
 
 Returns every value of each query string parameter, in order.
 
-Decoded like `params`.
+Decoded like `query`.
 
 ```js
 // A response returned by a server handler.

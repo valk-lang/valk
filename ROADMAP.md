@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP `query()` keeps a key without `=` (`?flag`) with the value `""` instead of dropping it
 + HTTP static directories percent-decode the request path, so `/my%20file.txt` serves `my file.txt` (HTTP/1 and HTTP/2)
 + `ansi.supported` is false when `NO_COLOR` is set (no-color.org); the compiler follows from the next release
 + `to_base` and its variants accept bases up to 36 (digits past 9 are letters); 17 to 36 used to give base 16
