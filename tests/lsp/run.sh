@@ -252,6 +252,12 @@ esac
 # Scope completion on a resolvable identifier: locals, functions and namespaces
 check "scope completion" '"label":"total"' \
     "$(request textDocument/completion nav.valk 7 15)"
+check "scope completion inside main" '"label":"greet"' \
+    "$(request textDocument/completion unicode.valk 7 14)"
+check_absent "scope completion hides main's implicit arguments" '"label":"cli_args"' \
+    "$(request textDocument/completion unicode.valk 7 14)"
+check_absent "scope completion hides compiler-made names" '"label":"&"' \
+    "$(request textDocument/completion unicode.valk 7 14)"
 
 check "diagnostics report every broken function (1/3)" '"message":"Unknown identifier: bad_one_xyz"' \
     "$(notify_save multi-error.valk)"
@@ -369,6 +375,12 @@ check "hover on a method shows its documentation" '"value":"```valk\nfn bump()\n
 
 check "hover ranges use UTF-16 columns" '"start":{"line":3,"character":20}' \
     "$(request textDocument/hover unicode.valk 3 21)"
+
+# Nothing under the cursor is a null result, not an empty object
+check "hover on a blank line returns null" '"result":null' \
+    "$(request textDocument/hover nav.valk 3 0)"
+check "definition on a blank line returns null" '"result":null' \
+    "$(request textDocument/definition nav.valk 3 0)"
 
 request_path() {
     printf '{"jsonrpc":"2.0","id":2,"method":"%s","params":{"textDocument":{"uri":"file://%s"}}}' "$1" "$2"
