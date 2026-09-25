@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `*=`, `/=` and `%=` on a `shared` integer are atomic like `+=` (a compare-and-swap loop); they stopped the build with a compiler bug before
 + Binary integer literals: `0b1010`, `0b1111_0000`
 + `break 2` and `continue 2` leave that many loops, counted from the innermost (`break 1` is a plain `break`). Collections whose `each` needs cleanup (removals inside `each`) get it for every loop that is left
 + Optional chaining: `user?.address?.city` is null when a value on the way is, and a null skips the rest of the chain (`user?.name.length`); the result is nullable, so it combines with `??` and `?!`, and `user?.save()` is skipped on null. Nothing can be assigned through `?.`. A ternary branch that starts with `.name` needs a space after the `?` now: `c ? .red : .blue`
