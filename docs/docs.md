@@ -1177,6 +1177,28 @@ enum can be read, but cannot be modified or borrowed separately. Methods must
 leave that storage unchanged and must not expose a writable alias. Copy to the
 underlying type before modifying its fields or calling a mutating method.
 
+Every enum knows the names of its items, and `extend` adds methods to it:
+
+```rust
+enum Color { red, green, blue }
+
+extend Color {
+    fn warm() bool { return this == .red }
+    static fn favorite() Color { return .blue }
+}
+
+let c = Color.green
+println(c)                          // green: `to(String)` and `%{c}` give the name
+println(c.to(int))                  // 1
+each Color.items() as item { }      // every item, in declaration order
+let parsed = Color.from_name("blue") ! panic("unknown color")
+```
+
+`name()`, `items()` and `from_name()` exist for every enum whose items compare
+with `==` (numbers, bools, text); `items()` for every enum. An enum of text
+(`enum Word: String { ... }`) keeps giving its text for `to(String)`, and its
+`name()` gives the item's name. The methods of the item type stay available.
+
 ## Traits
 
 A trait is a set of methods that classes and structs can copy into their own
