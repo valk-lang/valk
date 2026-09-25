@@ -3482,6 +3482,7 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let pos = body.pos
     if !isset(pos) : body.bug("match body is missing a position")
     let p = pos.copy().init_parser()
+    p.in_match_arms = true
     let cases = Array[Value]{}
     let found_default = false
     let covered_union_members = Array[Type]{}
@@ -3524,16 +3525,39 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         let cond: ?Value = null
         let bound_name: ?String = null
         let bound_type: ?Type = null
+        let bool_t = type_bool(ctx.build)
+        // What this case covers; it counts for exhaustiveness and duplicates only without a guard
+        let pending_union_members = Array[Type]{}
+        let pending_union_null = false
+        let pending_enum_values = Array[Value]{}
+        let pending_null_case = false
+        let pending_error_codes = Array[String]{}
+        let pending_true = false
+        let pending_false = false
+        let pending_interface_classes = Array[Class]{}
+        let pattern_count: uint = 0
+        // `_ if cond =>`: any value, for a guard on its own
+        let wildcard = t == TOK.word && p.word_is("_")
         let is_default = t == TOK.word && p.word_is("default")
         if is_default {
             p.tok(true, true) !>
             found_default = true
+        } else if wildcard {
+            p.tok(true, true) !>
+            cond = vgen_bool(true, bool_t)
         } else {
+          // Several patterns, `a, b =>`, match when any of them does
+          while true {
+            pattern_count++
+            let pattern_cond: ?Value = null
             let raw_item_exp: ?Exp = null
             let raw_item: ?Value = null
+            let range_count: ?Value = null
+            let range_count_exp: ?Exp = null
+            let pt = p.tok(true, true, false) !>
             // A tagged union is matched by type, and `(A, B)` is a type: a
             // leading `(` is one there, while elsewhere it starts a value.
-            if t == TOK.sign && (p.word_is("<") || p.word_is("[") || p.word_is("*") || p.word_is("&")
+            if pt == TOK.sign && (p.word_is("<") || p.word_is("[") || p.word_is("*") || p.word_is("&")
                 || (isset(union_type) && p.word_is("("))) {
                 let type_exp = read_type_exp(p, true, true) !>
                 let item_type = type_from_exp(type_exp, scope) !>
@@ -3546,33 +3570,42 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 let item_ctx = (isset(union_type) || isset(interface_class)) && !is_null_case ? ctx.without_suggested_type() : ctx.with_suggested_type(on.rett)
                 raw_item_exp = value_exp
                 raw_item = value_from_exp(value_exp, scope, item_ctx) !>
+                // `start .. count`: count numbers from start on, as in `each` and slices
+                let rt = p.tok(true, true, false) !>
+                if rt == TOK.sign && p.word_is("..") {
+                    p.tok(true, true) !>
+                    let count_exp = read_value_exp(p, true, false) !>
+                    range_count_exp = count_exp
+                    range_count = value_from_exp(count_exp, scope, ctx.with_suggested_type(on.rett)) !>
+                }
             }
             let item_exp = raw_item_exp ?! exp.bug("Union match case is missing its expression")
             let item = raw_item ?! exp.bug("Union match case is missing its value")
             let is_null_case = item_exp.type == EXP.value && item_exp.value_kind == VALUE_KIND.null
+            if isset(range_count) && (isset(union_type) || isset(interface_class) || isset(enum_type) || isset(error_type) || !on_non_nullable.is_integer_type()) {
+                item_exp.error("A range case 'start .. count' only matches integers")
+            }
             if isset(union_type) && is_null_case {
                 // Covers the union's `null` alternative and, for a nullable subject, the missing value
                 let null_tag = union_type.union_null_tag()
                 if !subject_nullable && !isset(null_tag) {
                     item_exp.error("This tagged union has no 'null' alternative and cannot be null")
                 }
-                if covered_union_null : item_exp.error("Duplicate tagged-union null case")
-                covered_union_null = true
-                let bool_t = type_bool(ctx.build)
+                if covered_union_null || pending_union_null : item_exp.error("Duplicate tagged-union null case")
+                pending_union_null = true
                 if isset(null_tag) {
                     let members = union_type.get_members() ?! exp.bug("Tagged union is missing alternatives")
-                    covered_union_members.append(members.get(null_tag) ! exp.bug("Tagged union null alternative is missing"))
-                    cond = vgen_union_is(on, null_tag, item_exp)
+                    pending_union_members.append(members.get(null_tag) ! exp.bug("Tagged union null alternative is missing"))
+                    pattern_cond = vgen_union_is(on, null_tag, item_exp)
                     if subject_nullable {
                         let missing = vgen_unary(vgen_isset_val(on, bool_t), VALUE_OP.not, bool_t)
-                        cond = vgen_op(missing, cond, VALUE_OP.or, bool_t)
+                        pattern_cond = vgen_op(missing, vgen_union_is(on, null_tag, item_exp), VALUE_OP.or, bool_t)
                     }
                 } else {
-                    cond = vgen_op(on, item, VALUE_OP.eq, bool_t)
+                    pattern_cond = vgen_op(on, item, VALUE_OP.eq, bool_t)
                 }
-                cond.exp = item_exp
             } else if isset(union_type) && item.type == VAL.type {
-                if on.rett.is_nullable_type() && !covered_union_null && !isset(union_type_before_null) {
+                if on.rett.is_nullable_type() && !covered_union_null && !pending_union_null && !isset(union_type_before_null) {
                     union_type_before_null = item_exp
                 }
                 let member = item.get_of_type()
@@ -3586,9 +3619,14 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                         item_exp.error("Duplicate tagged-union match case: " + member.compat_display_name())
                     }
                 }
-                covered_union_members.append(member)
+                each pending_union_members as covered {
+                    if type_identity_key(covered) == type_identity_key(member) {
+                        item_exp.error("Duplicate tagged-union match case: " + member.compat_display_name())
+                    }
+                }
+                pending_union_members.append(member)
                 bound_type = member
-                cond = vgen_union_is(on, tag, item_exp)
+                pattern_cond = vgen_union_is(on, tag, item_exp)
 
                 let next = p.tok(true, true, false) !>
                 if next == TOK.word && p.word_is("as") {
@@ -3607,13 +3645,13 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                 if !class_implements_interface(concrete, interface_class) {
                     item_exp.error("Class '" + concrete.pretty_name() + "' does not implement '" + interface_class.pretty_name() + "', so this case can never match")
                 }
-                if covered_interface_classes.contains(concrete) {
+                if covered_interface_classes.contains(concrete) || pending_interface_classes.contains(concrete) {
                     item_exp.error("Duplicate interface match case: " + concrete.pretty_name())
                 }
-                covered_interface_classes.append(concrete)
+                pending_interface_classes.append(concrete)
                 bound_type = concrete_type
                 let adapter = interface_class.interface_adapters.get(interface_adapter_key(concrete)) !? null
-                cond = vgen_is_a(on, adapter, ctx.build, item_exp)
+                pattern_cond = vgen_is_a(on, adapter, ctx.build, item_exp)
 
                 let next = p.tok(true, true, false) !>
                 if next == TOK.word && p.word_is("as") {
@@ -3621,48 +3659,107 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
                     bound_name = p.read_word(true, true) !>
                 }
             } else if is_null_case && on.rett.is_nullable_type() {
-                if covered_null_case : item_exp.error("Duplicate match case: null is already handled")
-                covered_null_case = true
-                cond = vgen_unary(vgen_isset_val(on, type_bool(ctx.build)), VALUE_OP.not, type_bool(ctx.build))
-                cond.exp = item_exp
+                if covered_null_case || pending_null_case : item_exp.error("Duplicate match case: null is already handled")
+                pending_null_case = true
+                pattern_cond = vgen_unary(vgen_isset_val(on, bool_t), VALUE_OP.not, bool_t)
             } else {
                 // A nullable subject matches a value only when it holds one
                 let subject = on.rett.is_nullable_type() ? value_force_remove_nullable(on) : on
                 item = value_try_convert(item, scope, ctx, subject.rett) !>
                 subject.rett.compat_check(item.rett, item_exp) !>
-                if subject.rett.is_bool_type() && item.type == VAL.bool {
-                    if item.bool_val : covered_true = true
-                    else : covered_false = true
-                }
-                if isset(enum_type) {
-                    each covered_enum_values as covered {
-                        let equal = enum_match_values_equal(covered, item)
-                        if equal == 1 {
-                            item_exp.error("Duplicate enum match case: this value is already handled")
+                let count = range_count
+                if isset(count) {
+                    let count_at = range_count_exp ?! exp.bug("Match range is missing its count expression")
+                    if item.type != VAL.int || count.type != VAL.int {
+                        item_exp.error("A range case needs numbers known while compiling: 'start .. count'")
+                    }
+                    if count.int_val <= 0 : count_at.error("A range case needs a count of at least 1")
+                    let last = vgen_int(item.int_val + (count.int_val - 1), subject.rett)
+                    last.exp = count_at
+                    last = value_try_convert(last, scope, ctx, subject.rett) !>
+                    subject.rett.compat_check(last.rett, count_at) !>
+                    let from = value_compare_values(subject, item, VALUE_OP.gte, scope, ctx, item_exp) !>
+                    let to = value_compare_values(subject, last, VALUE_OP.lte, scope, ctx, item_exp) !>
+                    pattern_cond = vgen_op(from, to, VALUE_OP.and, bool_t)
+                } else {
+                    if subject.rett.is_bool_type() && item.type == VAL.bool {
+                        if item.bool_val : pending_true = true
+                        else : pending_false = true
+                    }
+                    if isset(enum_type) {
+                        each covered_enum_values as covered {
+                            if enum_match_values_equal(covered, item) == 1 {
+                                item_exp.error("Duplicate enum match case: this value is already handled")
+                            }
                         }
+                        each pending_enum_values as covered {
+                            if enum_match_values_equal(covered, item) == 1 {
+                                item_exp.error("Duplicate enum match case: this value is already handled")
+                            }
+                        }
+                        pending_enum_values.append(item)
                     }
-                    covered_enum_values.append(item)
-                }
-                if isset(error_type) && item.type == VAL.error_value && item.get_string().length > 0 {
-                    let code = item.get_string()
-                    if covered_error_codes.contains(code) {
-                        item_exp.error("Duplicate error code match case: '" + code + "' is already handled")
+                    if isset(error_type) && item.type == VAL.error_value && item.get_string().length > 0 {
+                        let code = item.get_string()
+                        if covered_error_codes.contains(code) || pending_error_codes.contains(code) {
+                            item_exp.error("Duplicate error code match case: '" + code + "' is already handled")
+                        }
+                        pending_error_codes.append(code)
                     }
-                    covered_error_codes.append(code)
+                    pattern_cond = value_compare_values(subject, item, VALUE_OP.eq, scope, ctx, item_exp) !>
                 }
-                cond = value_compare_values(subject, item, VALUE_OP.eq, scope, ctx, item_exp) !>
+                let matched = pattern_cond ?! exp.bug("Match case is missing its condition")
                 if subject != on {
-                    let bool_t = type_bool(ctx.build)
-                    cond = vgen_op(vgen_isset_val(on, bool_t), cond, VALUE_OP.and, bool_t)
+                    pattern_cond = vgen_op(vgen_isset_val(on, bool_t), matched, VALUE_OP.and, bool_t)
                 }
-                cond.exp = item_exp
             }
+            let pc = pattern_cond ?! exp.bug("Match case is missing its condition")
+            pc.exp = item_exp
+            if isset(bound_name) && pattern_count > 1 {
+                item_exp.error("A case with several patterns cannot bind a name with 'as'")
+            }
+            let before = cond
+            if isset(before) {
+                let either = vgen_op(before, pc, VALUE_OP.or, bool_t)
+                either.exp = item_exp
+                cond = either
+            } else {
+                cond = pc
+            }
+            let sep = p.tok(true, true, false) !>
+            if sep == TOK.sign && p.word_is(",") {
+                if isset(bound_name) : item_exp.error("A case with several patterns cannot bind a name with 'as'")
+                p.tok(true, true) !>
+                continue
+            }
+            break
+          }
+        }
+
+        // A guard: the case matches only when the condition after `if` holds too
+        let guard_exp: ?Exp = null
+        let gt = p.tok(true, true, false) !>
+        if gt == TOK.word && p.word_is("if") {
+            if is_default : p.error("A 'default' case takes every value that is left and cannot have an 'if' guard")
+            p.tok(true, true) !>
+            guard_exp = read_value_exp(p, true, false) !>
+        } else {
+            if wildcard : p.error("'_' matches every value and needs a guard: '_ if condition =>'; write 'default' for the rest")
+            each pending_union_members as member : covered_union_members.append(member)
+            if pending_union_null : covered_union_null = true
+            each pending_enum_values as value : covered_enum_values.append(value)
+            if pending_null_case : covered_null_case = true
+            each pending_error_codes as code : covered_error_codes.append(code)
+            if pending_true : covered_true = true
+            if pending_false : covered_false = true
+            each pending_interface_classes as class : covered_interface_classes.append(class)
         }
 
         p.expect("=>", true, true) !>
         let case_scope = scope.sub_scope()
         if covered_null_case && isset(narrow_decl) : case_scope.mark_not_null(narrow_decl)
         let case_prefix = Array[Value]{}
+        let bind_assign: ?Value = null
         if isset(bound_name) && bound_name != "_" {
             let member = bound_type ?! exp.bug("Union match binding is missing its type")
             // A payload pulled out of a shared union keeps the shared view
@@ -3675,7 +3772,23 @@ fn value_from_match_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
             case_scope.add_decl(decl)
             case_scope.set_idf(bound_name, Idf.for_decl(decl))
             let extracted = isset(interface_class) ? vgen_interface_object(on, member, exp) : (vgen_union_extract(on, member, ctx, exp) !>)
-            case_prefix.append(vgen_assign(vgen_decl(decl), extracted, ASSIGN_OP.set, ctx.build, exp))
+            bind_assign = vgen_assign(vgen_decl(decl), extracted, ASSIGN_OP.set, ctx.build, exp)
+        }
+        let guard_at = guard_exp
+        if isset(guard_at) {
+            let guard = value_from_exp(guard_at, case_scope, ctx.with_suggested_type(bool_t)) !>
+            guard = value_try_convert(guard, case_scope, ctx, bool_t) !>
+            bool_t.compat_check(guard.rett, guard_at) !>
+            let assign = bind_assign
+            // The name is bound before the guard reads it
+            if isset(assign) : guard = vgen_scoped_value(Array[Value]{ assign }, guard, guard_at)
+            let base = cond ?! exp.bug("Guarded match case is missing its condition")
+            let both = vgen_op(base, guard, VALUE_OP.and, bool_t)
+            both.exp = guard_at
+            cond = both
+        } else {
+            let assign = bind_assign
+            if isset(assign) : case_prefix.append(assign)
         }
         let casev = Value {
             type: VAL.block

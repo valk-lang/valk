@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `match` cases take several patterns (`1, 2 =>`, `.red, .blue =>`, `int, float =>`), guards (`int as n if n > 9 =>`, `_ if x < 0 =>`) and integer ranges (`'a' .. 26 =>`, start + count like `each`); a guarded case does not count toward exhaustiveness. The formatter no longer indents `.name =>` cases as a method chain
 + `valk completion bash|zsh|fish` prints a tab-completion script: commands, build options, `--target` values and the make commands of the project (`valk ls --names` lists those one per line)
 + Template expressions compute: `{{ count + 1 }}`, `* / %`, a leading `-` and parentheses; `+` with text joins it, and dividing by zero is a render error
 + `time.Duration`: `of_days` to `of_us`, whole-unit getters, `+`, `-`, comparisons and text like `1h30m`. `later - earlier` on two `DateTime` values gives one (`since`), `DateTime.add` and `subtract` take one, and `time.sleep(duration)` waits one

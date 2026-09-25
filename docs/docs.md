@@ -43,6 +43,7 @@
 * [Tokens](#tokens)
     * [Let](#variables)
     * [If/Else](#if-else)
+    * [Match](#match)
     * [While](#while)
     * [Each](#each)
     * [Throw](#errors)
@@ -1301,6 +1302,31 @@ else if a == c { ... }
 else { ... }
 let c = a == b ? "true" : "false"  // inline
 ```
+
+### Match
+
+```rust
+let size = match n : String {
+    0 => "none"
+    1, 2, 3 => "few"          // several patterns
+    4 .. 6 => "some"           // a range: start .. count, so 4 to 9
+    _ if n < 0 => "negative"   // any value, when the guard holds
+    default => "many"
+}
+match shape {
+    int as i if i > 100 => println("big")   // a guard after a pattern
+    int, float => println("number")
+    String as s => println(s)
+}
+```
+
+A case may list several patterns separated by commas; it cannot bind a name with
+`as` then. `if` after the patterns adds a guard: the case only matches when the
+guard holds too, and a guarded case does not count toward covering every value.
+A range works on integers, including characters (`'a' .. 26`), with numbers
+known while compiling. Enum items, error codes and union types can be listed
+the same way: `.red, .yellow =>`. See [Tagged unions](#tagged-unions) for
+matching by type.
 
 ### While
 
