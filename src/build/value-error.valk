@@ -437,6 +437,9 @@ fn value_from_call_args(callee: Value, call_func: ?Func, args_exp: ?Exp, scope: 
     let skip = call_receiver_skip(callee, call_func)
     if isset(call_func) && call_func.is_deprecated : warn_deprecated_call(call_func, at)
 
+    // Named arguments and variadic values are placed by the function's parameters
+    if call_args_need_placing(call_func, args_exp) : return value_place_call_args(callee, call_func, args_exp, skip, scope, ctx, at) !>
+
     // A generic base has no parsed parameters: a function-type parameter still tells a
     // literal argument its parameter types, using what the arguments before it bound
     let base_exps: ?Array[Exp] = null
@@ -488,6 +491,164 @@ fn value_from_call_args(callee: Value, call_func: ?Func, args_exp: ?Exp, scope: 
         args.set(1, vgen_string(panic_location(at.src, at.i), type_string(ctx.build))) ! at.bug("Missing panic location argument")
     }
     return args
+}
+
+fn call_args_need_placing(call_func: ?Func, args_exp: ?Exp) bool {
+    if isset(call_func) && !call_func.is_generic_base {
+        let last = call_func.args.get(call_func.args.length - 1) !? null
+        if isset(last) && isset(last.variadic) : return true
+    }
+    let list = args_exp ?! return false
+    let i: uint = 0
+    while true {
+        let a = list.get(i++) ?! break
+        if a.type == EXP.value && (a.value_kind == VALUE_KIND.named_arg || a.value_kind == VALUE_KIND.spread) : return true
+    }
+    return false
+}
+
+// Arguments by position, `name: value` and variadic values, placed in parameter order. Values
+// given by name out of order are still evaluated in the order written.
+fn value_place_call_args(callee: Value, call_func: ?Func, args_exp: ?Exp, skip: uint, scope: Scope, ctx: Context, at: Exp) Array[Value] !Error {
+    let func = call_func ?! at.error("Named arguments and '...' need a function whose parameters are known, not a function value")
+    if func.is_generic_base {
+        at.error("Named arguments and '...' need the generic arguments given: call it as " + func.name + "[" + (func.generic_names ?? Array[String]{}).join(", ") + "](...)")
+    }
+    let params = func.args
+    let count = params.length - skip
+    let slots = Array[?Value]{}
+    each 0 .. count : slots.append(null)
+    let variadic_slot = count
+    let variadic_element: ?Type = null
+    let last = params.get(params.length - 1) !? null
+    if isset(last) && isset(last.variadic) && count > 0 {
+        variadic_slot = count - 1
+        variadic_element = last.variadic
+    }
+    let variadic_values = Array[Value]{}
+    let spread: ?Value = null
+    let order = Array[uint]{}
+    let pos: uint = 0
+    let seen_named = false
+    let list = args_exp
+    if isset(list) {
+        let i: uint = 0
+        while true {
+            let a = list.get(i++) ?! break
+            let kind = a.type == EXP.value ? a.value_kind : VALUE_KIND.id
+            if kind == VALUE_KIND.named_arg {
+                seen_named = true
+                let name = a.str1
+                let slot = count
+                each 0 .. count as j {
+                    let param = params.get(skip + j.to(uint)) ! break
+                    if param.name == name && !param.implicit : slot = j.to(uint)
+                }
+                if slot == count : a.error("'" + func.name + "' has no parameter named '" + name + "'")
+                if slot == variadic_slot : a.error("Variadic values are passed by position, or as an array with '...values'")
+                if isset(slots.get(slot) !? null) : a.error("The argument '" + name + "' is given twice")
+                let param = params.get(skip + slot) ! a.bug("Named parameter is missing")
+                let value_exp = a.get(VALUE_EXP.left) ?! a.bug("Named argument is missing its value")
+                slots.set(slot, value_from_exp(value_exp, scope, ctx.with_suggested_type(param.type)) !>) _
+                order.append(slot)
+                continue
+            }
+            if kind == VALUE_KIND.spread {
+                if !isset(variadic_element) : a.error("'...values' passes an array as variadic values, and '" + func.name + "' takes none")
+                if pos != variadic_slot || isset(spread) || variadic_values.length > 0 : a.error("'...values' goes where the variadic values start, instead of them")
+                let value_exp = a.get(VALUE_EXP.left) ?! a.bug("Spread is missing its value")
+                let param = params.get(skip + variadic_slot) ! a.bug("Variadic parameter is missing")
+                spread = value_from_exp(value_exp, scope, ctx.with_suggested_type(param.type)) !>
+                continue
+            }
+            if seen_named : a.error("A positional argument cannot follow a named one")
+            if pos >= variadic_slot && isset(variadic_element) {
+                if isset(spread) : a.error("No values can follow '...values'")
+                variadic_values.append(value_from_exp(a, scope, ctx.with_suggested_type(variadic_element)) !>)
+                continue
+            }
+            if pos >= count : a.error("'" + func.name + "' takes " + count + " argument(s)")
+            let param = params.get(skip + pos) ! a.bug("Positional parameter is missing")
+            if value_is_default_arg_marker(a) {
+                slots.set(pos, value_from_func_arg_default(func, param, scope, ctx, a) !>) _
+            } else {
+                let arg_ctx = param.is_generic ? ctx.without_suggested_type() : ctx.with_suggested_type(param.type)
+                slots.set(pos, value_from_exp(a, scope, arg_ctx) !>) _
+                order.append(pos)
+            }
+            pos++
+        }
+    }
+
+    let args = Array[Value]{}
+    each slots as slot_value, j {
+        let slot = j.to(uint)
+        let param = params.get(skip + slot) ! at.bug("Call parameter is missing")
+        if slot == variadic_slot {
+            let element = variadic_element ?! at.bug("Variadic parameter has no element type")
+            let given = spread
+            if isset(given) : args.append(given)
+            else : args.append(value_array_of(element, param.type, variadic_values, scope, ctx, at) !>)
+            continue
+        }
+        if isset(slot_value) {
+            args.append(slot_value)
+            continue
+        }
+        if param.implicit || !isset(param.default) {
+            at.error("Missing the argument '" + param.name + "' of '" + func.name + "'")
+        }
+        args.append(value_from_func_arg_default(func, param, scope, ctx, at) !>)
+    }
+
+    // Values the call would evaluate in another order than written are bound first
+    let in_order = true
+    each order as slot, k {
+        if k > 0 && slot < (order.get(k - 1) !? 0) : in_order = false
+    }
+    if in_order || order.length < 2 : return args
+    let owner = ctx.get_func() !>
+    let setup = Array[Value]{}
+    let first_slot: uint = count
+    each order as slot {
+        if slot < first_slot : first_slot = slot
+        let value = args.get(slot) ! at.bug("Ordered argument is missing")
+        let local = vgen_scratch_value(owner, value.rett, at)
+        setup.append(vgen_assign(local, value, ASSIGN_OP.set, ctx.build, at))
+        args.set(slot, local) _
+    }
+    let first = args.get(first_slot) ! at.bug("First argument is missing")
+    args.set(first_slot, vgen_scoped_value(setup, first, at)) _
+    return args
+}
+
+// An `Array[T]` holding `values`, for a variadic parameter
+fn value_array_of(element: Type, array_type: Type, values: Array[Value], scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let class = array_type.get_class_or_null() ?! at.bug("Variadic parameter is not an Array")
+    let construct = class_default_construct(class, array_type, scope, ctx, at) !>
+    let chain = class_init_hook_base(ctx, construct)
+    let append_f = class.get_append_hook() ?! at.bug("Array has no '$append' hook")
+    if !append_f.parsed_types : parse_func_types(append_f) !>
+    let hooks = Array[Value]{}
+    each values as value {
+        let converted = value_try_convert(value, scope, ctx, element) !>
+        element.compat_check(converted.rett, value.exp ?? at) !>
+        let callee = vgen_func(append_f, class_init_hook_receiver(chain))
+        let args = Array[Value]{ converted }
+        value_fill_trailing_defaults(append_f, call_receiver_skip(callee, append_f), args, scope, ctx, at) !>
+        value_check_call_args(append_f, callee, args, scope, ctx, at) !>
+        let call = vgen_call(ctx, callee, args, append_f.get_rett(), scope)
+        call.exp = value.exp ?? at
+        hooks.append(call)
+        if class_init_hook_chains(chain, call, array_type) : chain = call
+    }
+    return Value {
+        type: VAL.class_init
+        value1: chain
+        values: hooks
+        rett: array_type
+        exp: at
+    }
 }
 
 // A `$deprecated` function warns when called from another package; the package that

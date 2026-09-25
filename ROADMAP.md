@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Named arguments: `resize(height: 5, width: 7)` after the positional ones, in any order, leaving out defaults; they are evaluated in the order written. Variadic parameters: `fn sum(values: ...int)` receives an `Array[int]`, called as `sum(1, 2, 3)` or `sum(...numbers)`
 + Interface methods may have a default body, used by classes that do not define the method; a class method overrides a trait method of the same name (two traits with one name need the class to choose)
 + Function literals leave out parameter and return types where a function type is expected (`nums.filter(fn(x) { return x > 1 })`, `let f: fn(int)(int) = fn(x) { return x * 2 }`). Generic arguments in `[R]` are inferred from the arguments when left out: `nums.map(fn(x) { return "n" + x })` (R from the literal's first return value), `nums.reduce(0, fn(t, v) { return t + v })`; `$R` also works inside a function type
 + Structs, tuples and fixed arrays are `HashMap`/`HashSet` keys without a `$hash` of their own: they hash their parts (integers, enums, pointers, `$hash` types such as `String`, nested structs, nullable parts) consistently with `==`. `each` over a custom `_next` that returns a type parameter holding a tuple gives the tuple whole, like `$offset` (only a declared `(A, B)` list is several values)

@@ -658,8 +658,25 @@ fn main() {
 
 `_` keeps the default of an argument when a later one is given:
 `greet(_, "?")` for `fn greet(name: String ("world"), end: String ("!"))`.
+Arguments can also be given by name, after the positional ones and in any order,
+leaving out those with a default: `greet(end: "?")`, `resize(height: 5, width: 7)`.
 
-Calls evaluate the callable or method receiver first, then arguments from left to right. `co` uses the same order before starting the coroutine.
+A last parameter written `name: ...Type` takes any number of values, which the
+function receives as an `Array[Type]`. `...array` passes an existing array instead:
+
+```rust
+fn sum(values: ...int) int {
+    let total = 0
+    each values as v : total += v
+    return total
+}
+
+sum()            // 0
+sum(1, 2, 3)     // 6
+sum(...numbers)  // the elements of an Array[int]
+```
+
+Calls evaluate the callable or method receiver first, then arguments from left to right, in the order they are written. `co` uses the same order before starting the coroutine.
 
 A function returns several values as a tuple. Take them apart with names, or
 read one with `[n]`, where `n` is a constant:
