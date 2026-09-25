@@ -16612,6 +16612,8 @@ Returns the zone's abbreviation at this instant, such as `CET`, or `UTC`.
     + fn abs() Duration
     // The whole days.
     + fn days() int
+    // Returns the duration divided by `divisor`, rounded toward zero; backs `d / 2`.
+    + fn divided_by(divisor: int) Duration
     // Backs `==`.
     + fn equals(other: Duration) bool
     // Backs `>`.
@@ -16648,7 +16650,7 @@ Returns the zone's abbreviation at this instant, such as `CET`, or `UTC`.
     + fn seconds() int
     // The seconds with their fraction.
     + fn seconds_float() float
-    // Returns the duration `factor` times as long.
+    // Returns the duration `factor` times as long; backs `d * 3`.
     + fn times(factor: int) Duration
     // Returns the duration as text such as `2d3h`, `1h30m`, `4.5s`, `250ms`, `15us` or `0s`.
     + fn to_string() String
@@ -16671,6 +16673,12 @@ Returns the duration without its sign.
 #### days
 
 The whole days.
+
+#### divided_by
+
+Returns the duration divided by `divisor`, rounded toward zero; backs `d / 2`.
+
+Dividing by 0 panics, as it does for integers.
 
 #### equals
 
@@ -16746,7 +16754,7 @@ The seconds with their fraction.
 
 #### times
 
-Returns the duration `factor` times as long.
+Returns the duration `factor` times as long; backs `d * 3`.
 
 #### to_string
 

@@ -1201,7 +1201,7 @@ fn main() {
 }
 ```
 
-`$add` and `$sub` customize `+` and `-` (and `+=`, `-=`) for a class; the method takes the right-hand value and returns the result. `$eq` customizes `==`. `$lt`, `$gt`, `$lte` and `$gte` order a class for `<`, `>`, `<=` and `>=`; one of them is enough, the others follow from it, and `arr.sort()` then works without a comparator. Objects without one compare only with `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` / `Array.remove_duplicates()` already honour `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
+`$add`, `$sub`, `$mul` and `$div` customize `+`, `-`, `*` and `/` (and `+=`, `-=`, `*=`, `/=`) for a class; the method takes the right-hand value and returns the result, and a class can have one per right-hand type. `$eq` customizes `==`. `$lt`, `$gt`, `$lte` and `$gte` order a class for `<`, `>`, `<=` and `>=`; one of them is enough, the others follow from it, and `arr.sort()` then works without a comparator. Objects without one compare only with `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` / `Array.remove_duplicates()` already honour `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
 
 Generic specializations remain distinct and invariant even when their type
 arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`
