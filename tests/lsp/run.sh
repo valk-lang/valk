@@ -278,6 +278,47 @@ check "diagnostics report every broken function (2/3)" '"message":"Unknown ident
 check "diagnostics report every broken function (3/3)" "Expected 'uint', got 'String'" \
     "$(notify_save multi-error.valk)"
 
+# A broken statement is skipped: the rest of its function still answers, and each broken
+# statement reports its own error without follow-up errors for the names it declared
+check "hover before a broken statement" '"value":"```valk\nfn helper(count: uint) String\n```"' \
+    "$(request textDocument/hover recover.valk 12 16)"
+check "hover after an unfinished statement" '"value":"```valk\nfn helper(count: uint) String\n```"' \
+    "$(request textDocument/hover recover.valk 14 16)"
+check "hover after a type error" '"value":"```valk\nString\n```"' \
+    "$(request textDocument/hover recover.valk 16 26)"
+check "definition after broken statements" '"range":{"start":{"line":14' \
+    "$(request textDocument/definition recover.valk 16 26)"
+check "hover in a nested block after a broken statement" '"value":"```valk\nfn helper(count: uint) String\n```"' \
+    "$(request textDocument/hover recover.valk 19 20)"
+check "hover after a value still to be written" '"value":"```valk\nfn helper(count: uint) String\n```"' \
+    "$(request textDocument/hover recover.valk 23 16)"
+check "completion after broken statements" '"label":"describe"' \
+    "$(request textDocument/completion recover.valk 24 6)"
+check "a broken statement reports its error" "no_such_method_xyz" \
+    "$(notify_save recover.valk)"
+check "an unfinished statement reports its error" "in call arguments, found: 'other'" \
+    "$(notify_save recover.valk)"
+check "an unfinished statement in a nested block reports its error" "in call arguments, found: 'deep'" \
+    "$(notify_save recover.valk)"
+check "a value still to be written is reported at its '='" "Missing a value after '='" \
+    "$(notify_save recover.valk)"
+check_absent "a broken statement in an error handler is no compiler bug" 'Compiler bug' \
+    "$(notify_save recover.valk)"
+check "hover after a value missing before a comment" '"value":"```valk\nfn helper(count: uint) String\n```"' \
+    "$(request textDocument/hover recover.valk 35 16)"
+check_absent "names of a broken let report no unknown identifier" 'Unknown identifier' \
+    "$(notify_save recover.valk)"
+
+count=$((count + 1))
+echo "> CLI still stops at the first broken statement"
+cli_out=$("$VALK" build "$DIR/recover.valk" --no-warn 2>&1)
+cli_errors=$(printf '%s\n' "$cli_out" | grep -c '^# Error')
+if [ "$cli_errors" -ne 1 ]; then
+    echo "# CLI should report exactly one error, got $cli_errors"
+    echo "$cli_out"
+    failed=1
+fi
+
 # One package, two files: errors in one file must not stop the other from being checked
 check "a broken sibling file does not hide the checked file's own error" '"message":"Unknown identifier: keep_going_missing_xyz"' \
     "$(notify_save keep-going/src/good.valk)"

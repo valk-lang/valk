@@ -51,7 +51,8 @@ check_build_error() {
     fi
 }
 
-check_build_error "parser error" parser "4 | Col: 1" "Unexpected token in value expression: '}'"
+check_build_error "parser error" parser "3 | Col: 13" "Unexpected token in value expression: ']'"
+check_build_error "a value missing at the end of a line" missing-value "3 | Col: 11" "Missing a value after '='"
 check_build_error "type error" type "3 | Col: 13" "Incompatible types"
 check_build_error "interpolated expression error" interpolation "3 | Col: 26" "Unknown identifier: missing_name"
 check_build_error "compile macro error" macro "3 | Col: 5" "Unexpected '#else'"
