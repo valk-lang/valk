@@ -1963,6 +1963,10 @@ Returns a new array with the items from front to back.
     + static fn new() FlatMap[K, T]
     // Removes the entry for `key`, keeping the order of the rest; does nothing when absent.
     + fn remove(key: K) void
+    // Removes the entries for which `func` returns true; the rest keep their order.
+    + fn remove_where(func: fn(T, K)(bool)) void
+    // Keeps only the entries for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T, K)(bool)) void
     // Stores `value` under `key`, replacing the value of an existing entry in place.
     + fn set(key: K, value: T) void
     // Copies every entry of `map` into this map, replacing values of keys both maps have.
@@ -2039,6 +2043,17 @@ Marked `$default`: it also provides the type's default value.
 
 Removes the entry for `key`, keeping the order of the rest; does nothing when absent.
 
+#### remove_where
+
+Removes the entries for which `func` returns true; the rest keep their order.
+
+`func` gets the value and the key, like `each map as value, key`, and must not change
+the map. Inside an `each` over this map the loop still visits every kept entry once.
+
+#### retain
+
+Keeps only the entries for which `func` returns true; the opposite of `remove_where`.
+
 #### set
 
 Stores `value` under `key`, replacing the value of an existing entry in place.
@@ -2089,6 +2104,10 @@ Returns a new array of the values, in entry order.
     + static fn new(capacity: uint (0)) HashMap[K, T]
     // Removes the entry for `key`; does nothing when it is absent.
     + fn remove(key: K) void
+    // Removes the entries for which `func` returns true; the rest keep their order.
+    + fn remove_where(func: fn(T, K)(bool)) void
+    // Keeps only the entries for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T, K)(bool)) void
     // Stores `value` under `key`, replacing the value of an existing entry in place.
     + fn set(key: K, value: T) void
     // Adds a new entry for `key`.
@@ -2181,6 +2200,17 @@ Removes the entry for `key`; does nothing when it is absent.
 The last entry moves into the removed entry's position, so iteration order changes.
 Inside an `each` over this map nothing moves until the loop ends, so the loop still
 visits every other entry once.
+
+#### remove_where
+
+Removes the entries for which `func` returns true; the rest keep their order.
+
+`func` gets the value and the key, like `each map as value, key`, and must not change
+the map. Inside an `each` over this map the loop still visits every kept entry once.
+
+#### retain
+
+Keeps only the entries for which `func` returns true; the opposite of `remove_where`.
 
 #### set
 
@@ -2277,6 +2307,10 @@ Reorders the entries so iteration, `keys` and `values` follow ascending key orde
     + static fn new(capacity: uint (0)) HashSet[T]
     // Removes `value` and returns true when it was present.
     + fn remove(value: T) bool
+    // Removes the values for which `func` returns true; the rest keep their order.
+    + fn remove_where(func: fn(T)(bool)) void
+    // Keeps only the values for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T)(bool)) void
     // Returns a new set with the values in this set or in `other`; backs `a + b` (`$add`).
     + fn union(other: HashSet[T]) HashSet[T]
 }
@@ -2366,6 +2400,14 @@ Marked `$default`: it also provides `HashSet[T].$default_value`.
 Removes `value` and returns true when it was present.
 
 The last value in iteration order moves into the position of the removed one.
+
+#### remove_where
+
+Removes the values for which `func` returns true; the rest keep their order.
+
+#### retain
+
+Keeps only the values for which `func` returns true; the opposite of `remove_where`.
 
 #### union
 

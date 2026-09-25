@@ -469,6 +469,13 @@ each m as value, key {
 }
 ```
 
+`remove_where` does the same in one call and keeps the order of the rest; `retain`
+keeps the matching entries instead. Both work on sets with a one-argument function.
+
+```rust
+m.remove_where(fn(value: uint, key: String) bool { return value == 0 })
+```
+
 Full `Map` API: [core](api.md#core)
 
 If you need non-string keys, use `HashMap`. `HashMap` and `Map` are compatible types.

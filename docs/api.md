@@ -595,6 +595,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + static fn new() FlatMap[K, T]
     // Removes the entry for `key`, keeping the order of the rest; does nothing when absent.
     + fn remove(key: K) void
+    // Removes the entries for which `func` returns true; the rest keep their order.
+    + fn remove_where(func: fn(T, K)(bool)) void
+    // Keeps only the entries for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T, K)(bool)) void
     // Stores `value` under `key`, replacing the value of an existing entry in place.
     + fn set(key: K, value: T) void
     // Copies every entry of `map` into this map, replacing values of keys both maps have.
@@ -635,6 +639,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + static fn new(capacity: uint (0)) HashMap[K, T]
     // Removes the entry for `key`; does nothing when it is absent.
     + fn remove(key: K) void
+    // Removes the entries for which `func` returns true; the rest keep their order.
+    + fn remove_where(func: fn(T, K)(bool)) void
+    // Keeps only the entries for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T, K)(bool)) void
     // Stores `value` under `key`, replacing the value of an existing entry in place.
     + fn set(key: K, value: T) void
     // Adds a new entry for `key`.
@@ -699,6 +707,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + static fn new(capacity: uint (0)) HashSet[T]
     // Removes `value` and returns true when it was present.
     + fn remove(value: T) bool
+    // Removes the values for which `func` returns true; the rest keep their order.
+    + fn remove_where(func: fn(T)(bool)) void
+    // Keeps only the values for which `func` returns true; the opposite of `remove_where`.
+    + fn retain(func: fn(T)(bool)) void
     // Returns a new set with the values in this set or in `other`; backs `a + b` (`$add`).
     + fn union(other: HashSet[T]) HashSet[T]
 }
