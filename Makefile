@@ -17,6 +17,8 @@ EXE_SUFFIX ?=
 FLAGS := --def "VERSION=$(VERSION)"
 DIST_FLAGS := . --static --release -vv -c
 IR_TARGETS := linux-x64 macos-x64 macos-arm64 win-x64
+# Targets that build programs; the compiler itself is only distributed for IR_TARGETS
+BUILD_TARGETS := $(IR_TARGETS) linux-arm64
 HOST_SYSTEM := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_SYSTEM),Darwin)
@@ -180,11 +182,17 @@ test-win-build: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-win-x64.exe --target win-x64
 
+# CI runs the result on an arm64 runner
+test-linux-arm64-build: valk
+	mkdir -p ./debug
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-linux-arm64 --target linux-arm64
+
 test-cross-ir: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-x64-ir --target macos-x64 --ir --clean
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-arm64-ir --target macos-arm64 --ir --clean
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-win-x64-ir --target win-x64 --ir --clean
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-linux-arm64-ir --target linux-arm64 --ir --clean
 
 # The other targets only; the host build is what `test` already made
 test-cross: valk
@@ -192,12 +200,13 @@ test-cross: valk
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-x64 -vv $(FLAGS) --target macos-x64
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-macos-arm64 -vv $(FLAGS) --target macos-arm64
 	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-win-x64.exe -vv $(FLAGS) --target win-x64
+	./valk build ./tests $(TEST_FLAGS) -o ./debug/test-linux-arm64 -vv $(FLAGS) --target linux-arm64
 
 lint-lib: valk
 	./valk build ./lib --lint
 
 lint-lib-cross: valk
-	@set -e; for target in $(IR_TARGETS); do \
+	@set -e; for target in $(BUILD_TARGETS); do \
 		echo "# Lint lib ($$target)"; \
 		./valk build ./lib --lint --target $$target; \
 	done
@@ -291,6 +300,7 @@ asm:
 	clang-22 -c ./misc/asm/coro/x64.s --target=x86_64-apple-darwin -o ./lib/libs/macos-x64/valk-stack-swap.o
 	clang-22 -c ./misc/asm/coro/x64-win.s --target=x86_64-pc-windows-msvc -o ./lib/libs/win-x64/valk-stack-swap.o
 	clang-22 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
+	clang-22 -c ./misc/asm/coro/arm64-linux.s --target=aarch64-linux-gnu -o ./lib/libs/linux-arm64/valk-stack-swap.o
 
 # Misc
 clean:

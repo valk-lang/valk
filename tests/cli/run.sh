@@ -231,7 +231,7 @@ if [ "$status" -eq 0 ] || [[ "$lint_output_out" != *"'--lint' cannot produce, ru
     exit 1
 fi
 
-for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+for target in linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64; do
     lint_target_out=$("$VALK" build "$lint_input" --lint --target "$target" 2>&1) || {
         echo "# --lint failed for $target"
         echo "$lint_target_out"
@@ -245,7 +245,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
 done
 
 conditional_unsafe_input="$DIR/lint-conditional-unsafe.valk"
-for target in linux-x64 macos-x64 macos-arm64 win-x64; do
+for target in linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64; do
     conditional_unsafe_out=$("$VALK" build "$conditional_unsafe_input" --lint --target "$target" 2>&1) || {
         echo "# --lint failed for a target-specific unsafe scope on $target"
         echo "$conditional_unsafe_out"

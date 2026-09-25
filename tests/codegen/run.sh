@@ -37,7 +37,7 @@ ir_result() {
     cat "$1.log"
     return "$(cat "$1.status")"
 }
-for target in linux-x64 macos-arm64 win-x64; do queue_ir "$workdir/c-abi-$target.ll" "$DIR/../library/c-abi.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 linux-arm64 macos-arm64 win-x64; do queue_ir "$workdir/c-abi-$target.ll" "$DIR/../library/c-abi.valk" --target "$target" --ir --no-warn; done
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/gc-direct-entry-$target.ll" "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn; done
 queue_ir "$workdir/buffer-roots.ll" "$DIR/buffer-roots.valk" --ir --no-warn
 queue_ir "$workdir/native-address.ll" "$DIR/native-address.valk" --ir --no-warn
@@ -1198,6 +1198,13 @@ check_c_abi macos-arm64 \
     'declare i32 @"col_sum"(i64)' \
     'declare float @"mat_sum"(ptr)' \
     'declare void @"mat_make"(ptr sret([64 x i8]) align 4, float)'
+# AAPCS64 as on macOS, but the callee extends small integers
+check_c_abi linux-arm64 \
+    'declare { float, float, float } @"v3_make"(float)' \
+    'declare double @"doubles_then_v2"(double, double, double, double, double, double, double, double, [2 x float])' \
+    'declare void @"mat_make"(ptr sret([64 x i8]) align 4, float)' \
+    'declare i32 @"small"(i8, i8, i16, i16)' \
+    'declare i1 @"b_not"(i1)'
 check_c_abi win-x64 \
     'declare void @"v3_make"(ptr sret([12 x i8]) align 4, float)' \
     'declare float @"v2_sum"(i64)' \

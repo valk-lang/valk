@@ -144,7 +144,7 @@ valk build ./src -o ./app                   # Compile a directory or .valk files
 valk build ./src -o ./app --run             # Compile, then run
 valk run ./src -- alice bob                 # Compile and run; program arguments go after --
 valk build ./src -o ./app --run --watch     # Rebuild and restart when a file changes
-valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, macos-x64, macos-arm64, win-x64
+valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, linux-arm64, macos-x64, macos-arm64, win-x64
 valk build ./src --lint                     # Check without building
 valk fmt ./src                              # Format in place and list the changed files
 valk fmt ./src --check                      # For CI: list unformatted files, exit 1, write nothing
