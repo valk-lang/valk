@@ -1639,9 +1639,16 @@ println(datetime) // Defaults to to_iso8601 string
 ```
 
 `with_*` and `add_*` methods return a new object. Methods starting with
-`modify_` update the existing object. Format tokens are `Y` (year), `m`
-(month), `d` (day), `H` (hour), `i` (minute), `s` (second), `v`
-(milliseconds), and `u` (microseconds).
+`modify_` update the existing object.
+
+Format tokens follow PHP's `date()`: `Y`/`y` (year), `m`/`n` (month with and
+without a leading zero), `M`/`F` (`Jan`/`January`), `d`/`j` (day), `D`/`l`
+(`Mon`/`Monday`), `N` (weekday 1-7), `H`/`G` (24-hour), `h`/`g` (12-hour),
+`A`/`a` (`AM`/`am`), `i` (minute), `s` (second), `v` (milliseconds), `u`
+(microseconds), `O`/`P` (offset `+0100`/`+01:00`), `T` (zone abbreviation) and
+`U` (Unix seconds). Put a `\` before a letter to write it as is:
+`format("Y-m-d\\TH:i")`. `from_format` reads the same tokens back, and
+`from_iso8601` also takes a date alone (`2024-03-05`, midnight UTC).
 
 ## Time zones
 

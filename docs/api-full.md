@@ -15917,13 +15917,13 @@ Throws `invalid` when the data is malformed.
     + fn format_in(pattern: String, buf: local mut &[u8]) uint
     // Writes `format(pattern)` to `out` and returns the bytes written.
     + fn format_into(pattern: String, out: Writer) uint !io:IoError
-    // Returns the number of bytes `format(pattern)` writes for any date.
+    // Returns the most bytes `format(pattern)` can write for any date.
     + static fn format_size(pattern: String) uint
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
-    // Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format` and, for times around a daylight saving change, `new_in`.
+    // Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format` and, for times around a daylight saving change, `new_in`. An offset in the value wins over `zone`.
     + static fn from_format_in(zone: Zone, pattern: String, value: String) DateTime !SyntaxError
-    // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z` or `2024-03-05 15:07:09.25+01:00`.
+    // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z`, `2024-03-05 15:07:09.25+01:00` or `2024-03-05`.
     + static fn from_iso8601(value: String) DateTime !SyntaxError
     // Reads a DateTime from a JSON string in ISO 8601 form (see `from_iso8601`).
     + static fn from_json_value_auto[X](value: X) DateTime !LookupError
@@ -16090,13 +16090,24 @@ Returns whether both values name the same instant; backs the `==` operator (`$eq
 
 Returns the value as text laid out by `pattern`.
 
-Tokens: `Y` year (4 digits), `m` month, `d` day, `H` hour (24-hour), `i` minute, `s`
-second (2 digits each), `v` milliseconds (3 digits) and `u` microseconds (6 digits). A
-backslash inserts the next byte literally; every other byte is copied as is. Panics when
-the pattern ends with a backslash.
+Tokens, as in PHP's `date()`:
+
+- Year: `Y` four digits, `y` two digits.
+- Month: `m` two digits, `n` without a leading zero, `M` `Jan`, `F` `January`.
+- Day: `d` two digits, `j` without a leading zero, `D` `Mon`, `l` `Monday`, `N` the
+  ISO weekday (1 for Monday to 7 for Sunday).
+- Time: `H` hour (24-hour) and `h` hour (12-hour) in two digits, `G` and `g` the same
+  without a leading zero, `A` `AM` or `PM`, `a` `am` or `pm`, `i` minute, `s` second,
+  `v` milliseconds (3 digits), `u` microseconds (6 digits).
+- Zone: `O` offset `+0100`, `P` offset `+01:00`, `T` abbreviation such as `CET`.
+- `U` seconds since the Unix epoch.
+
+Names are English. A backslash inserts the next byte literally; every other byte is
+copied as is. Panics when the pattern ends with a backslash.
 
 ```valk
-dt.format("Y-m-d H:i:s") // 2024-03-05 14:07:09
+dt.format("Y-m-d H:i:s")        // 2024-03-05 14:07:09
+dt.format("D, j M Y g:i A")     // Tue, 5 Mar 2024 2:07 PM
 ```
 
 #### format_in
@@ -16115,32 +16126,41 @@ Throws when `out` fails.
 
 #### format_size
 
-Returns the number of bytes `format(pattern)` writes for any date.
+Returns the most bytes `format(pattern)` can write for any date.
+
+Tokens such as names and numbers without leading zeros write fewer bytes for some dates.
 
 #### from_format
 
 Parses `value` laid out by `pattern`, using the tokens of `format`.
 
-Each token needs exactly its digit count (`Y` four, `v` three, `u` six, the others two)
-and every other byte must match exactly. `Y`, `m` and `d` are required; missing time
-fields are 0. Throws `SyntaxError` on a mismatch, leftover input, a repeated token, both
-`v` and `u`, or a date or time that does not exist.
+Numbers need exactly their digit count (`Y` four, `v` three, `u` six, `y`, `m`, `d`,
+`H`, `h`, `i` and `s` two); `n`, `j`, `G` and `g` take one or two digits. `y` reads
+69 to 99 as 1969 to 1999 and 00 to 68 as 2000 to 2068. Names are read without regard
+to case; a weekday (`D`, `l`, `N`) is checked for its form but not against the date.
+`h` and `g` count with `A` or `a` when the pattern has one. `O` and `P` read an offset
+(or `Z`) and give a value in `time.fixed_zone` of it; `T` only reads `UTC`, `GMT` or
+`Z`. `U` reads a Unix timestamp and allows no other date or time token. Every other
+byte must match exactly. A year, month and day are required; missing time fields are 0.
+Throws `SyntaxError` on a mismatch, leftover input, a repeated field, or a date or time
+that does not exist.
 
 #### from_format_in
 
 Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format`
-and, for times around a daylight saving change, `new_in`.
+and, for times around a daylight saving change, `new_in`. An offset in the value wins
+over `zone`.
 
 #### from_iso8601
 
-Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z` or
-`2024-03-05 15:07:09.25+01:00`.
+Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z`,
+`2024-03-05 15:07:09.25+01:00` or `2024-03-05`.
 
-The date and time are separated by `T` or a space; seconds and a fraction of up to nine
-digits (kept to the microsecond) are optional. An offset such as `+01:00`, `+0100` or
-`+01` gives a value in `time.fixed_zone` of that offset; `Z`, or no offset at all, gives
-a UTC value. Throws `SyntaxError` on anything else, or a date or time that does not
-exist.
+A date alone is midnight UTC. The date and time are separated by `T`, `t` or a space;
+seconds and a fraction of up to nine digits (kept to the microsecond) are optional. An
+offset such as `+01:00`, `+0100` or `+01` gives a value in `time.fixed_zone` of that
+offset; `Z` or `z`, or no offset at all, gives a UTC value. Throws `SyntaxError` on
+anything else, or a date or time that does not exist.
 
 #### from_json_value_auto
 

@@ -4766,13 +4766,13 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + fn format_in(pattern: String, buf: local mut &[u8]) uint
     // Writes `format(pattern)` to `out` and returns the bytes written.
     + fn format_into(pattern: String, out: Writer) uint !io:IoError
-    // Returns the number of bytes `format(pattern)` writes for any date.
+    // Returns the most bytes `format(pattern)` can write for any date.
     + static fn format_size(pattern: String) uint
     // Parses `value` laid out by `pattern`, using the tokens of `format`.
     + static fn from_format(pattern: String, value: String) DateTime !SyntaxError
-    // Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format` and, for times around a daylight saving change, `new_in`.
+    // Parses `value` laid out by `pattern` as wall-clock time in `zone`; see `from_format` and, for times around a daylight saving change, `new_in`. An offset in the value wins over `zone`.
     + static fn from_format_in(zone: Zone, pattern: String, value: String) DateTime !SyntaxError
-    // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z` or `2024-03-05 15:07:09.25+01:00`.
+    // Parses ISO 8601 text as written by `to_iso8601`, such as `2024-03-05T14:07:09Z`, `2024-03-05 15:07:09.25+01:00` or `2024-03-05`.
     + static fn from_iso8601(value: String) DateTime !SyntaxError
     // Reads a DateTime from a JSON string in ISO 8601 form (see `from_iso8601`).
     + static fn from_json_value_auto[X](value: X) DateTime !LookupError
