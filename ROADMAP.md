@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Setters: `set name(value: T) { ... }` next to the getter `name` runs for `x.name = v` and for `+=` and the other compound operators (`x` is evaluated once). Assigning to a getter without a setter, and `++` on a getter, are errors now (`++` used to change a temporary copy)
 + `$mul` and `$div` hooks define `*` and `/` (and `*=`, `/=`) for a class, like `$add` and `$sub`; `time.Duration` uses them: `d * 3`, `d / 2`
 + `<<=` and `>>=`, also on `shared` integers (atomic) and array elements
 + `*=`, `/=` and `%=` on a `shared` integer are atomic like `+=` (a compare-and-swap loop); they stopped the build with a compiler bug before

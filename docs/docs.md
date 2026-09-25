@@ -1028,6 +1028,21 @@ fn main() {
 }
 ```
 
+A getter is read like a property. A setter with the same name runs when
+it is assigned, also for `+=` and the other compound operators:
+
+```rust
+class Temperature {
+    celsius: float
+    get fahrenheit: float { return this.celsius * 9.0 / 5.0 + 32.0 }
+    set fahrenheit(value: float) { this.celsius = (value - 32.0) * 5.0 / 9.0 }
+}
+
+let t = Temperature { celsius: 0.0 }
+t.fahrenheit = 212.0 // t.celsius is 100
+t.fahrenheit -= 18.0 // t.celsius is 90
+```
+
 ## Interfaces
 
 Interfaces define methods that different classes can provide. Interface methods
