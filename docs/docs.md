@@ -2400,6 +2400,21 @@ let res = http.request("GET", url, http.Options { headers: headers }) ! panic("R
 let cookies = res.headers.get_all("Set-Cookie")
 ```
 
+The client asks for gzip and decompresses the body unless
+`Options.decompress` is off. Credentials in the URL (`https://user:pass@host/`)
+or `options.basic_auth(user, pass)` send an `Authorization: Basic` header, and
+`Options.host` sends another `Host` than the URL's. `http.Multipart` builds a
+file upload:
+
+```rust
+let form = http.Multipart.new()
+form.add_field("title", "Holiday")
+form.add_file("photo", "beach.jpg", fs.read("beach.jpg") ! panic("read"), "image/jpeg")
+let options = http.Options {}
+form.apply(options)
+let res = http.request("POST", "https://example.com/upload", options) ! panic("Upload failed")
+```
+
 ### HTTP Server
 
 ```rust

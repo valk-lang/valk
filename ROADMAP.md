@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP client: `http.Multipart` builds a `multipart/form-data` upload (`add_field`, `add_file`, `apply(options)`)
 + HTTP client: `Options.host` sends another `Host` header, for reaching a virtual host through an IP
 + HTTP client: credentials in the URL (`https://user:pass@host/`) are sent as `Authorization: Basic` (they failed with `invalid_url`), and `Options.basic_auth(user, password)` sets it
 + HTTP client: asks for gzip and decompresses the body (`Options.decompress`, on by default; not with `output` or an own `Accept-Encoding`)

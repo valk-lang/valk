@@ -10849,6 +10849,68 @@ The new field goes to the end of the list. Also backs `headers[name] = value` an
 the `Headers{ name => value }` literal.
 
 ```js
+// A `multipart/form-data` request body with fields and files, for uploads.
++ class Multipart {
+    // The separator between the parts; random, so it does not occur in them.
+    ~ boundary: String
+
+    // Adds a text field.
+    + fn add_field(name: String, value: String) void
+    // Adds a file with its file name, contents and media type.
+    + fn add_file(name: String, filename: String, data: local &[u8], content_type: String ("application/octet-stream")) void
+    // Sets `options.body` to this form and its `Content-Type` header.
+    + fn apply(options: Options) void
+    // Returns the complete body.
+    + fn body() String
+    // The `Content-Type` header for this form: `multipart/form-data` with its boundary.
+    + fn content_type() String
+    // Returns an empty form with a random boundary.
+    + static fn new() Multipart
+}
+```
+
+### Multipart
+
+A `multipart/form-data` request body with fields and files, for uploads.
+
+```valk
+let form = http.Multipart.new()
+form.add_field("title", "Holiday")
+form.add_file("photo", "beach.jpg", fs.read("beach.jpg") !, "image/jpeg")
+let options = http.Options {}
+form.apply(options)
+let res = http.request("POST", "https://example.com/upload", options) !
+```
+
+#### boundary
+
+The separator between the parts; random, so it does not occur in them.
+
+#### add_field
+
+Adds a text field.
+
+#### add_file
+
+Adds a file with its file name, contents and media type.
+
+#### apply
+
+Sets `options.body` to this form and its `Content-Type` header.
+
+#### body
+
+Returns the complete body.
+
+#### content_type
+
+The `Content-Type` header for this form: `multipart/form-data` with its boundary.
+
+#### new
+
+Returns an empty form with a random boundary.
+
+```js
 // Settings for a client request made with `http.request`, `http.download` or `ClientRequest.create`.
 + class Options {
     // The ALPN protocols offered in the TLS handshake; defaults to `http/1.1`.
