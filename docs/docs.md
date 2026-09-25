@@ -642,6 +642,16 @@ case matches the alternative and, on a nullable subject, a missing value too.
 For a union used only once, write it directly as a type, such as
 `String | int`. Named unions can also contain functions and getters.
 
+A named union can contain itself through a container, which makes tree data such
+as JSON a union of its own. It cannot contain itself directly or by value, as in a
+fixed array or a tuple.
+
+```rust
+union Json : int | String | bool | null | Array[Json] | Map[Json] {}
+
+let doc: Json = Map[Json]{ "tags" => Array[Json]{ "a", "b" } }
+```
+
 ## Functions
 
 ```rust
