@@ -1012,7 +1012,8 @@ fn main() {
 ## Interfaces
 
 Interfaces define methods that different classes can provide. Interface methods
-end in `;`, and a class lists its interfaces with `is`.
+end in `;`, or give a default body that classes without their own version use,
+and a class lists its interfaces with `is`.
 
 ```rust
 interface Named {
@@ -1037,6 +1038,13 @@ class User is Named, Printable {
 
 fn print(value: Printable) {
     println(value.text("User: "))
+}
+
+interface Shape {
+    fn area() float;
+    fn describe() String {
+        return "a shape of " + this.area()   // default: runs as a method of the class
+    }
 }
 ```
 
@@ -1243,6 +1251,10 @@ fn main() {
     println(p.wrap("x").length) // 1
 }
 ```
+
+A method the class defines itself replaces the trait's method of the same name,
+wherever the `use` is; the trait's other methods then call the class's version.
+Two traits that define the same method need the class to define it.
 
 ## Finalizers
 
