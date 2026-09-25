@@ -1718,6 +1718,27 @@ fn main() {
 `fs.relative(path, base)` gives the way from one directory to a path:
 `fs.relative("/a/b/c", "/a/d")` is `../b/c`.
 
+## URLs
+
+API for [valk.url](api.md#url)
+
+`url.parse` splits a URL into its parts, which stay percent-encoded; `to_string`
+puts them back together. `resolve` reads a link against the page it was found on,
+the way a browser does, and the query helpers encode and decode `a=1&b=2`:
+
+```rust
+use valk.url
+
+let page = url.parse("https://example.com/docs/guide/intro.html")
+let logo = page.resolve("../img/logo.png") // https://example.com/docs/img/logo.png
+page.query = url.build_query(Map[String]{ "q" => "a b" })
+println(page) // https://example.com/docs/guide/intro.html?q=a%20b
+let params = url.parse_query("q=a%20b&page=2") // q => "a b", page => "2"
+```
+
+`url.encode` and `url.decode` convert single values, and `parse_query_grouped`
+keeps every value of a repeated key.
+
 ## JSON
 
 API for [valk.json](api.md#json)

@@ -5042,6 +5042,10 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ## Functions for 'url'
 
 ```js
+// Builds a query string such as `a=1&b=x%20y` (without a leading `?`) from `params`.
++ fn build_query(params: Map[String]) String
+// Builds a query string like `build_query`, with one `key=value` part per value of a key.
++ fn build_query_grouped(params: Map[Array[String]]) String
 // Decodes `%XX` escapes and turns every `+` into a space.
 + fn decode(str: String) String
 // Writes `str` decoded as `decode` does to `out` and returns the bytes written.
@@ -5056,6 +5060,12 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 + fn encode_into(str: String, out: Writer, component: Component (Component.unreserved)) uint !io:IoError
 // Splits `str` into a `Url`; it never fails.
 + fn parse(str: String) Url
+// Parses a query string such as `a=1&b=x%20y` (without the leading `?`) into its parameters.
++ fn parse_query(query: String) Map[String]
+// Parses a query string like `parse_query`, keeping every value of a repeated key in order.
++ fn parse_query_grouped(query: String) Map[Array[String]]
+// Removes the `.` and `..` segments from a URL path, as RFC 3986 section 5.2.4 describes.
++ fn remove_dot_segments(path: String) String
 ```
 
 ## Classes for 'url'
@@ -5082,6 +5092,10 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 
     // Returns `host` or `host:port`, the form used in a `Host` header.
     + fn host_with_port() String
+    // Resolves `reference`, a link found in the page at this URL, into an absolute `Url`.
+    + fn resolve(reference: String) Url
+    // Returns the URL as text: `scheme://user:password@host:port/path?query#fragment`.
+    + fn to_string() String
 }
 ```
 

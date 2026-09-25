@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ url: `parse_query` / `parse_query_grouped` and `build_query` / `build_query_grouped` outside HTTP, `Url.to_string()` (also `"%{u}"`), `Url.resolve(reference)` per RFC 3986 section 5 (all its examples are tests) and `remove_dot_segments`. HTTP requests, the client's query data and its redirects use them
 + String: `split(on, limit)` (`"key=a=b".split("=", 2)`, also `utf8.split`), `lines()`, `last_index_of`, `count`, `repeat`. `trim` / `ltrim` / `rtrim` also remove Unicode spaces such as the non-breaking space (U+00A0) and the ideographic space (U+3000), like JS, Python and Go; `limit` counts characters
 + Array: `insert(index, value)`, `first()` / `last()` (without removing), `binary_search(value)` on a sorted array (found, and the position or where to insert), `min_by(key)` / `max_by(key)`
 + `Array.sort` / `sorted` are stable (a merge sort; equal elements keep their order), and faster on numbers and presorted input: 1M random ints 99 -> 35 ms, sorted input 52 -> 5 ms. New `sort_by(fn(x) { return x.age })` / `sorted_by` with the key computed once per element

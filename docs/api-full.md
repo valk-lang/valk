@@ -16931,6 +16931,10 @@ space.
 ## Functions for 'url'
 
 ```js
+// Builds a query string such as `a=1&b=x%20y` (without a leading `?`) from `params`.
++ fn build_query(params: Map[String]) String
+// Builds a query string like `build_query`, with one `key=value` part per value of a key.
++ fn build_query_grouped(params: Map[Array[String]]) String
 // Decodes `%XX` escapes and turns every `+` into a space.
 + fn decode(str: String) String
 // Writes `str` decoded as `decode` does to `out` and returns the bytes written.
@@ -16945,7 +16949,23 @@ space.
 + fn encode_into(str: String, out: Writer, component: Component (Component.unreserved)) uint !io:IoError
 // Splits `str` into a `Url`; it never fails.
 + fn parse(str: String) Url
+// Parses a query string such as `a=1&b=x%20y` (without the leading `?`) into its parameters.
++ fn parse_query(query: String) Map[String]
+// Parses a query string like `parse_query`, keeping every value of a repeated key in order.
++ fn parse_query_grouped(query: String) Map[Array[String]]
+// Removes the `.` and `..` segments from a URL path, as RFC 3986 section 5.2.4 describes.
++ fn remove_dot_segments(path: String) String
 ```
+
+### build_query
+
+Builds a query string such as `a=1&b=x%20y` (without a leading `?`) from `params`.
+
+Keys and values are encoded with `encode`, in the map's order.
+
+### build_query_grouped
+
+Builds a query string like `build_query`, with one `key=value` part per value of a key.
 
 ### decode
 
@@ -17008,6 +17028,25 @@ let u = url.parse("https://example.com:8080/a/b?x=1#top")
 // u.host == "example.com", u.port == 8080, u.path == "/a/b", u.query == "x=1"
 ```
 
+### parse_query
+
+Parses a query string such as `a=1&b=x%20y` (without the leading `?`) into its parameters.
+
+Keys and values are decoded with `decode`, so `+` is a space. A part without `=`, like
+`flag`, has the value `""`, empty parts are skipped, and for a repeated key the last value
+wins; see `parse_query_grouped`.
+
+### parse_query_grouped
+
+Parses a query string like `parse_query`, keeping every value of a repeated key in order.
+
+### remove_dot_segments
+
+Removes the `.` and `..` segments from a URL path, as RFC 3986 section 5.2.4 describes.
+
+`"/a/b/../c/./d"` gives `"/a/c/d"`, and a `..` at the top stays there: `"/../a"` gives
+`"/a"`. A path that ends in `.` or `..` keeps its final `/`.
+
 ## Classes for 'url'
 
 ```js
@@ -17032,6 +17071,10 @@ let u = url.parse("https://example.com:8080/a/b?x=1#top")
 
     // Returns `host` or `host:port`, the form used in a `Host` header.
     + fn host_with_port() String
+    // Resolves `reference`, a link found in the page at this URL, into an absolute `Url`.
+    + fn resolve(reference: String) Url
+    // Returns the URL as text: `scheme://user:password@host:port/path?query#fragment`.
+    + fn to_string() String
 }
 ```
 
@@ -17077,6 +17120,27 @@ The userinfo before the first `:`, as written (still percent-encoded).
 #### host_with_port
 
 Returns `host` or `host:port`, the form used in a `Host` header.
+
+#### resolve
+
+Resolves `reference`, a link found in the page at this URL, into an absolute `Url`.
+
+Follows RFC 3986 section 5, as browsers do: `../img/a.png`, `/root`, `?page=2`,
+`#top` and `//other.host/x` are read against this URL, and a reference with its own
+scheme stands on its own. `.` and `..` segments are removed from the result.
+
+```valk
+url.parse("https://example.com/docs/guide/intro.html").resolve("../img/logo.png")
+// https://example.com/docs/img/logo.png
+```
+
+#### to_string
+
+Returns the URL as text: `scheme://user:password@host:port/path?query#fragment`.
+
+Empty parts are left out, and the parts are written as they are, so they must already
+be encoded. A `file` URL keeps its `//` without a host. Marked `$auto`: a `Url`
+converts to `String` where one is expected.
 
 # validate
 
