@@ -11694,8 +11694,8 @@ handler never runs.
     // The value registered with `Router.add`.
     + handler: T
 
-    // Returns the values of the route's `@name` parts, taken from `path`.
-    + fn params(path: String) Map[String]
+    // Returns the values of the route's `@name` parts, taken from `path`, and the rest of the path matched by a `*` part under the name `*`.
+    + fn params(path: String, decode: bool (true)) Map[String]
 }
 ```
 
@@ -11709,18 +11709,21 @@ The value registered with `Router.add`.
 
 #### params
 
-Returns the values of the route's `@name` parts, taken from `path`.
+Returns the values of the route's `@name` parts, taken from `path`, and the rest of
+the path matched by a `*` part under the name `*`.
 
-Pass the same path that was given to `Router.find`. Values are not
-percent-decoded; `url.decode_path` decodes one and keeps a `+`. Empty parts are ignored like `Router.find` ignores them, so
-doubled slashes and a missing leading `/` do not shift the values; missing parts
-are left out.
+Pass the same path that was given to `Router.find`. Values are percent-decoded, with
+a `+` kept as a `+` (like `url.decode_path`); `decode` off gives them as written.
+Empty parts are ignored like `Router.find` ignores them, so doubled slashes and a
+missing leading `/` do not shift the values; missing parts are left out.
 
 ```js
 // Maps a method and a URL path to a handler of type `T`.
 + class Router[T] {
     // Registers `handler` for `method` and the path pattern `url`.
     + fn add(method: String, url: String, handler: T) void
+    // Returns the methods with a route for the path `url`, sorted.
+    + fn allowed_methods(url: String) Array[String]
     // Returns the route that matches `method` and the path `url`.
     + fn find(method: String, url: String) Route[T] !LookupError
     // Creates an empty router; also backs `Router[T]{}` and default construction.
@@ -11733,8 +11736,10 @@ are left out.
 Maps a method and a URL path to a handler of type `T`.
 
 Patterns are split on `/`. A part `@name` matches any single part and is returned
-by `Route.params`; a part `*` matches one or more remaining parts. When several
-patterns match, a literal part is preferred over `@name`, and `@name` over `*`.
+by `Route.params`; a part `*` matches one or more remaining parts, returned as `*`.
+When several patterns match, a literal part is preferred over `@name`, and `@name`
+over `*`. When no route matches a request's method, `allowed_methods` tells whether
+the path exists for others, for a 405 answer.
 
 ```valk
 let router = http.Router[fn(http.Request)(http.Response)].new()
@@ -11751,6 +11756,18 @@ The method is compared case-sensitively. A leading `/` is optional and empty
 parts are ignored. Adding the same pattern again replaces the handler; patterns
 that differ only in their `@name` names count as the same. Parts after a `*` are
 never reached by `find`.
+
+#### allowed_methods
+
+Returns the methods with a route for the path `url`, sorted.
+
+For a request whose method `find` did not match: an empty list means 404, anything
+else 405 with these methods in its `Allow` header.
+
+```valk
+let allowed = router.allowed_methods(req.path)
+if allowed.length > 0 : return http.Response.empty(405, http.Headers { "Allow" => allowed.join(", ") })
+```
 
 #### find
 

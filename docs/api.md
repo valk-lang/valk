@@ -3441,8 +3441,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // The value registered with `Router.add`.
     + handler: T
 
-    // Returns the values of the route's `@name` parts, taken from `path`.
-    + fn params(path: String) Map[String]
+    // Returns the values of the route's `@name` parts, taken from `path`, and the rest of the path matched by a `*` part under the name `*`.
+    + fn params(path: String, decode: bool (true)) Map[String]
 }
 ```
 
@@ -3451,6 +3451,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 + class Router[T] {
     // Registers `handler` for `method` and the path pattern `url`.
     + fn add(method: String, url: String, handler: T) void
+    // Returns the methods with a route for the path `url`, sorted.
+    + fn allowed_methods(url: String) Array[String]
     // Returns the route that matches `method` and the path `url`.
     + fn find(method: String, url: String) Route[T] !LookupError
     // Creates an empty router; also backs `Router[T]{}` and default construction.

@@ -2489,6 +2489,23 @@ s.add_middleware(fn(req: http.Request, next: shared fn(http.Request)(http.Respon
 })
 ```
 
+`http.Router[T]` maps a method and path pattern to a value such as a handler.
+`@name` matches one part and `*` the rest; `route.params(path)` returns them
+decoded. When a path has routes for other methods only, `allowed_methods` gives
+them for a 405 answer:
+
+```rust
+let router = http.Router[fn(http.Request)(http.Response)].new()
+router.add("GET", "/users/@id", show_user)
+router.add("GET", "/files/*", serve_file)
+let route = router.find(req.method, req.path) ! {
+    let allowed = router.allowed_methods(req.path)
+    if allowed.length == 0 : return http.Response.empty(404)
+    return http.Response.empty(405, http.Headers { "Allow" => allowed.join(", ") })
+}
+let id = route.params(req.path).get("id") !? ""
+```
+
 `start` runs until shutdown. Use `co` to keep doing other work:
 
 ```rust
