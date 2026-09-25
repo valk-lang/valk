@@ -764,6 +764,17 @@ Deferred calls run in reverse order when the function returns or passes an
 error to its caller. Values are captured when `defer` is reached. If the call
 can return an error, handle it on the `defer` line.
 
+A block defers several statements at once. It captures values the same way, so
+assign to objects rather than to variables inside it, and it cannot `return` or
+`throw`: handle errors inside the block.
+
+```rust
+defer {
+    file.close() ! log.warn("close failed")
+    lock.unlock()
+}
+```
+
 ### Errors
 
 Functions can return errors using `throw`. But first you need to define an error type or you can use one of the built-in ones.

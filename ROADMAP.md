@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `defer { ... }` defers a block of statements; like `defer call()` it captures values when the line runs, and it cannot `return` or `throw`
 + Setters: `set name(value: T) { ... }` next to the getter `name` runs for `x.name = v` and for `+=` and the other compound operators (`x` is evaluated once). Assigning to a getter without a setter, and `++` on a getter, are errors now (`++` used to change a temporary copy)
 + `$mul` and `$div` hooks define `*` and `/` (and `*=`, `/=`) for a class, like `$add` and `$sub`; `time.Duration` uses them: `d * 3`, `d / 2`
 + `<<=` and `>>=`, also on `shared` integers (atomic) and array elements
