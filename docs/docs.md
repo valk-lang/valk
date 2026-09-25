@@ -2448,6 +2448,7 @@ Template engine tokens:
 
 ```
 @if(...) @elif(...) @else @end        // Conditions: ==, !=, <, <=, >, >=, &&, ||, !, ( )
+{{ count + 1 }}                       // Arithmetic: + - * / % and a leading -
 @each(... as val) @end                // Loop over an array or map
 @each(... as val, key) @end           // With key
 @each(... as val, key, index) @end    // With key & index
@@ -2467,6 +2468,9 @@ Template engine tokens:
 Variables are the fields or keys of the data, with `.` and `[index]` to go
 deeper; a name that does not exist is an error, so use `@isset` when it may be
 missing. Literals are `"text"`, numbers, `true`, `false` and `null`.
+Arithmetic works on numbers: two integers give an integer unless a division
+does not come out even, and `+` with text joins the text. Filters bind tighter
+than arithmetic, so `a + b | round` rounds `b`.
 
 A directive that stands alone on its line, such as an `@if` or `@end` with
 only indentation around it, disappears together with its line, so control
