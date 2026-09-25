@@ -2340,6 +2340,18 @@ Use `--filter` to compile only tests whose names contain a string:
 valk build ./src ./tests --test --filter "database" --run
 ```
 
+A built test binary takes the same option, so a different selection needs no rebuild:
+`./tests-bin --filter "database"`.
+
+A failed comparison shows both sides, and the summary lists the failed tests:
+
+```
+#1 [code] assert(user.name == "Ada")
+#1 [left] "ada"
+#1 [right] "Ada"
+#1 [file] tests/users.valk:12
+```
+
 ## Debugging
 
 Build with `-d` or `--debug` to debug a program:

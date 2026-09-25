@@ -199,6 +199,34 @@ else
         echo "$assert_out"
         failed=1
     fi
+
+    count=$((count + 1))
+    echo "> failed comparison shows both sides and the summary lists the test"
+    if [[ "$assert_out" != *"#1 [left] 1"* ]] || [[ "$assert_out" != *"#1 [right] 2"* ]] || \
+       [[ "$assert_out" != *"Tests: 2, 1 failed"* ]] || [[ "$assert_out" != *"Failed tests:"* ]] || \
+       [[ "$assert_out" != *"  diagnostic assertion location @ tests/diagnostics/assert.valk:1"* ]]; then
+        echo "# Missing values or summary"
+        echo "$assert_out"
+        failed=1
+    fi
+
+    count=$((count + 1))
+    echo "> the test binary takes --filter"
+    filter_out=$("$assert_bin" --filter NEIGHBOUR 2>&1)
+    filter_status=$?
+    if [ "$filter_status" -ne 0 ] || [[ "$filter_out" != *"Tests: 1 of 2 (--filter 'NEIGHBOUR')"* ]] || \
+       [[ "$filter_out" == *"diagnostic assertion location"* ]]; then
+        echo "# --filter did not select only the matching test"
+        echo "$filter_out"
+        failed=1
+    fi
+    none_out=$("$assert_bin" --filter nomatch 2>&1)
+    none_status=$?
+    if [ "$none_status" -eq 0 ] || [[ "$none_out" != *"No test name contains 'nomatch'"* ]]; then
+        echo "# A --filter without a match must fail"
+        echo "$none_out"
+        failed=1
+    fi
 fi
 
 if [ "$failed" -ne 0 ]; then

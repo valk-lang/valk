@@ -20,7 +20,9 @@ fn test_init_scope(func: Func, scope: Scope, ctx: Context) !Error {
     let entry_class = test_core_class(b, "TestEntry", func.exp) !>
     let init_func = test_class_func(entry_class, "init", func.exp) !>
     let at = message_resolve(func.exp.src, func.exp.i)
-    let path = at.src.path ?? "?"
+    // Relative to the package root, like assert and panic locations
+    let path = source_display(at.src).path
+    if path.is_empty() : path = "?"
     let line = at.src.line_of(at.i).to(uint)
 
     let init = vgen_call(ctx, vgen_func(init_func), Array[Value]{
@@ -70,19 +72,13 @@ fn value_from_assert_call(exp: Exp, scope: Scope, ctx: Context) ?Value !Error {
     if isset(args_exp.get(1)) : exp.error("'assert' expects 1 argument")
 
     let b = ctx.build
-    let check = value_from_exp(check_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
-    if !check.rett.is_bool_type() {
-        check_exp.error("The assert value must be of type 'bool' instead of '" + check.rett.compat_display_name() + "'")
-    }
-
     let source_code = check_exp.src.content.range(check_exp.i, check_exp.len)
     let at = message_resolve(check_exp.src, check_exp.i)
     // Relative to the package root, like panic locations
     let path = source_display(at.src).path
     if path.is_empty() : path = "?"
     let line = at.src.line_of(at.i).to(uint)
-    let args = Array[Value]{
-        check
+    let where = Array[Value]{
         vgen_string(source_code, type_string(b))
         vgen_string(path, type_string(b))
         vgen_int(line.to(int), type_from_core(b, "uint") !>)
@@ -91,6 +87,20 @@ fn value_from_assert_call(exp: Exp, scope: Scope, ctx: Context) ?Value !Error {
     let owner = test_core_class(b, "TestEntry", exp) !>
     let enclosing = ctx.func
     if !isset(enclosing) : exp.bug("'assert' is missing its function context")
+    if enclosing.is_test {
+        let entry = enclosing.test_entry_decl
+        if !isset(entry) : exp.bug("Test assert is missing its TestEntry declaration")
+        let compared = value_from_assert_compare(check_exp, scope, ctx, owner, entry, where, exp) !>
+        if isset(compared) : return compared
+    }
+
+    let check = value_from_exp(check_exp, scope, ctx.with_suggested_type(type_bool(b))) !>
+    if !check.rett.is_bool_type() {
+        check_exp.error("The assert value must be of type 'bool' instead of '" + check.rett.compat_display_name() + "'")
+    }
+    let args = Array[Value]{ check }
+    args.append_many(where)
+
     if enclosing.is_test {
         let func = test_class_func(owner, "assert_test", exp) !>
         let entry = enclosing.test_entry_decl
@@ -103,4 +113,81 @@ fn value_from_assert_call(exp: Exp, scope: Scope, ctx: Context) ?Value !Error {
     let call = vgen_call(ctx, vgen_func(func), args, func.get_rett(), scope)
     call.exp = exp
     return call
+}
+
+// `assert(a == b)` and the other comparisons in a test: each side is evaluated once and
+// kept, so a failure can show both. Null when `check_exp` is not a comparison.
+fn value_from_assert_compare(check_exp: Exp, scope: Scope, ctx: Context, owner: Class, entry: Decl, where: Array[Value], exp: Exp) ?Value !Error {
+    if check_exp.type != EXP.value || check_exp.value_kind != VALUE_KIND.op : return null
+    let op = check_exp.number.@cast(VALUE_OP)
+    if !value_op_is_compare(op) : return null
+    let left_exp = check_exp.get(VALUE_EXP.left) ?! return null
+    let right_exp = check_exp.get(VALUE_EXP.right) ?! return null
+    let b = ctx.build
+
+    // Lowered as `value_from_op_exp` lowers a comparison
+    let left = value_from_exp(left_exp, scope, value_op_left_ctx(op, ctx) !>) !>
+    let right_ctx = left.rett.is_void_type() ? ctx.without_suggested_type() : ctx.with_suggested_type(left.rett)
+    let right = value_from_exp(right_exp, scope, right_ctx) !>
+    let stores = Array[Value]{}
+    let l = value_compare_operand_once(left, stores, ctx)
+    let r = value_compare_operand_once(right, stores, ctx)
+    let check = value_compare_values(l, r, op, scope, ctx, check_exp) !>
+
+    let receiver = vgen_decl(entry)
+    let left_text = value_assert_operand_text(l, scope, ctx) !>
+    let right_text = value_assert_operand_text(r, scope, ctx) !>
+    let result: ?Value = null
+    if isset(left_text) && isset(right_text) {
+        let pass_func = test_class_func(owner, "assert_test", exp) !>
+        let pass_args = Array[Value]{ vgen_bool(true, type_bool(b)) }
+        pass_args.append_many(where)
+        let pass = vgen_call(ctx, vgen_func(pass_func, receiver), pass_args, pass_func.get_rett(), scope)
+        let fail_func = test_class_func(owner, "assert_compare_failed", exp) !>
+        let fail_args = Array[Value]{}
+        fail_args.append_many(where)
+        fail_args.append(left_text)
+        fail_args.append(right_text)
+        let fail = vgen_call(ctx, vgen_func(fail_func, vgen_decl(entry)), fail_args, fail_func.get_rett(), scope)
+        result = vgen_this_or_that(check, pass, fail, type_bool(b))
+    } else {
+        let func = test_class_func(owner, "assert_test", exp) !>
+        let args = Array[Value]{ check }
+        args.append_many(where)
+        result = vgen_call(ctx, vgen_func(func, receiver), args, func.get_rett(), scope)
+    }
+    let done = result ?! exp.bug("Assert has no result")
+    if stores.length > 0 {
+        done = vgen_wrap(done, done.rett)
+        done.set_pre_value(vgen_block(stores, b, exp))
+    }
+    done.exp = exp
+    return done
+}
+
+// An assert operand as text for a failure line: strings quoted, `null` for a null value;
+// null when the type has no text form
+fn value_assert_operand_text(v: Value, scope: Scope, ctx: Context) ?Value !Error {
+    let b = ctx.build
+    let string_type = type_string(b)
+    if v.rett.is_void_type() : return null
+    if v.rett.is_nullable_type() {
+        let present = vgen_isset_val(v, type_bool(b))
+        value_add_isset(present, v)
+        let present_scope = scope.sub_scope()
+        present_scope.apply_issets(present.get_issets())
+        let inner = value_try_remove_nullable(v, present_scope, ctx) !>
+        if inner.rett.is_nullable_type() : return null
+        let text = value_assert_operand_text(inner, present_scope, ctx) !> ?! return null
+        return vgen_this_or_that(present, text, vgen_string("null", string_type), string_type)
+    }
+    if v.rett.get_class_or_null() == string_type.get_class_or_null() {
+        let quote = valk_idf(b, "core", "test_quote") !>
+        let func = quote.func ?! return null
+        if !func.parsed_types : parse_func_types(func) !>
+        return vgen_call(ctx, vgen_func(func), Array[Value]{ v }, func.get_rett(), scope)
+    }
+    let converted = value_try_convert(v, scope, ctx, string_type) !>
+    if !string_type.compat(converted.rett) : return null
+    return converted
 }
