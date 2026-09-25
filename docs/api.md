@@ -3305,7 +3305,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + write_timeout_ms: uint
 
     // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String) void !io:IoError
+    + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: shared fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.

@@ -11121,7 +11121,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + write_timeout_ms: uint
 
     // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String) void !io:IoError
+    + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: shared fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.
@@ -11240,6 +11240,11 @@ Throws `open` when `path` is not a directory. A request whose path names a file
 inside the directory gets that file whatever the method (over HTTP/2: except
 `CONNECT`). The path is percent-decoded first (`+` stays `+`); paths containing
 `..` are never served. The directory added last is searched first.
+
+A path naming a directory that holds an `index` file gets that file, so `/` serves
+`index.html`. Without the trailing slash (`/docs`) the answer is a 301 redirect to
+`/docs/` first, so relative links in the page resolve inside the directory. Pass
+`index: ""` to let directory paths reach the handler.
 
 #### fast
 

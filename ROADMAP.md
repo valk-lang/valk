@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP static directories serve `index.html` for a directory path (`/` gives `public/index.html`) and redirect `/docs` to `/docs/` first, like Go, nginx and Caddy; `add_static_dir(path, index: "")` turns it off
 + The HTTP client keeps the trailing slash of a redirect's `Location` (and leaves its query alone), so a `/docs` -> `/docs/` redirect no longer loops until `too_many_redirects`
 + `ansi.supported()` is false when standard output is a pipe or a file, so `./app > out.txt` gets no escape codes; `FORCE_COLOR` or `CLICOLOR_FORCE` (not `0`) turns colors on anyway, for CI logs. Piped test output uses the plain `OK`/`FAIL` rows
 + `sync.Channel.new(0)` makes a rendezvous channel: `send` returns once a receiver took the value (as in Go, Rust's `sync_channel(0)` and crossbeam's `bounded(0)`). `new()` stays unbounded; before, `0` meant unbounded too

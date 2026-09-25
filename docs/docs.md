@@ -2098,6 +2098,10 @@ is not JSON; `parse_json()` throws for it instead. Responses come from `Response
 `html`, `json`, `json_of` (encodes any value), `redirect`, `file`, `stream`,
 `empty` and the general `Response.new(body, code, content_type)`.
 
+`s.add_static_dir("public")` serves the files in `public` before a request
+reaches the handler. A directory path serves its `index.html`, so `/` shows
+`public/index.html`; pass `index: ""` to leave directory paths to the handler.
+
 Cookies are read from the request by name and set on the response:
 
 ```rust
