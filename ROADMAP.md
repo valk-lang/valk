@@ -4,7 +4,9 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.7.8
++ Release 0.7.8
++ Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
++ LSP: a statement that does not parse or does not check is skipped, so the rest of its function keeps hover, go to definition and completion; diagnostics show one error per broken statement. `x =` or `a +` at the end of a line before a new statement is now "Missing a value after '='" instead of reading the next line's keyword as a name
 + Fix: a list or map literal of a struct with an `$append` / `$set_key` hook (`Bag{ 1, 2, 3 }`) gave the struct without its items; the hooks worked on copies
 + `valk doc http.Server.compress` prints one namespace, declaration or member (stdlib, or `valk doc <dir> <name>` for a package); `core.` is optional and an unknown name suggests close ones
 + Test runner: a failed comparison `assert(a == b)` (and `!=`, `<`, …) shows both sides; the summary counts tests and lists the failed ones; the test binary takes `--filter <text>` at run time
