@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `valk doc http.Server.compress` prints one namespace, declaration or member (stdlib, or `valk doc <dir> <name>` for a package); `core.` is optional and an unknown name suggests close ones
 + Test runner: a failed comparison `assert(a == b)` (and `!=`, `<`, …) shows both sides; the summary counts tests and lists the failed ones; the test binary takes `--filter <text>` at run time
 + Error codes as text: `E.code.name()`, `"failed: " + E.code`, `%{E.code}` and `E.code.to(String)` give the code's name, inherited codes included
 + `linux-arm64` target (Raspberry Pi, Graviton, arm64 Docker images): cross-compile with `--target linux-arm64` from any host; glibc 2.31 like linux-x64. CI builds the test suite on linux-x64 and runs it on a native arm64 runner. The compiler itself is not distributed for arm64 Linux yet

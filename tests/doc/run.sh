@@ -319,4 +319,46 @@ if [[ "$readme" != *'curl -sSL https://valk-lang.dev/install.sh | bash'* ]] \
     exit 1
 fi
 
-echo "# 4/4 documentation tests passed"
+echo "> Look up one declaration or member"
+
+lookup=$("$VALK" doc "$DIR/fixture" Box.get 2>&1)
+status=$?
+if [ "$status" -ne 0 ] || [[ "$lookup" != *'+ fn get(value: T) T'* ]] || [[ "$lookup" == *'class Ahead'* ]]; then
+    echo "# A package member lookup failed"
+    echo "$lookup"
+    exit 1
+fi
+lookup=$("$VALK" doc "$DIR/fixture" choose 2>&1)
+if [[ "$lookup" != *'Generic documentation is kept on every instantiation.'* ]]; then
+    echo "# A function lookup lacks its documentation"
+    echo "$lookup"
+    exit 1
+fi
+lookup=$("$VALK" doc http.Server.compress 2>&1)
+status=$?
+if [ "$status" -ne 0 ] || [[ "$lookup" != *'+ compress: bool'* ]] || [[ "$lookup" != *'Vary: Accept-Encoding'* ]]; then
+    echo "# A stdlib member lookup failed"
+    echo "$lookup"
+    exit 1
+fi
+lookup=$("$VALK" doc Array.insert 2>&1)
+if [[ "$lookup" != *'fn insert(index: uint, value: T)'* ]]; then
+    echo "# core. should be optional in a lookup"
+    echo "$lookup"
+    exit 1
+fi
+lookup=$("$VALK" doc Server 2>&1)
+if [[ "$lookup" != *'class Server {'* ]]; then
+    echo "# A declaration name alone should be found in its namespace"
+    echo "$lookup"
+    exit 1
+fi
+lookup=$("$VALK" doc http.Stdio 2>&1)
+status=$?
+if [ "$status" -eq 0 ] || [[ "$lookup" != *"No documentation found for 'http.Stdio'"* ]] || [[ "$lookup" != *'core.Stdio'* ]]; then
+    echo "# An unknown name must fail with suggestions"
+    echo "$lookup"
+    exit 1
+fi
+
+echo "# 5/5 documentation tests passed"

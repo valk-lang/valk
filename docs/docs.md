@@ -1408,6 +1408,14 @@ valk doc lib/ -o docs/api.md --markdown --full   # Whole blocks, not just summar
 
 In markdown the first paragraph of each block is shown as a comment above the signature, so the signature list stays readable; `--full` also prints the whole block under it.
 
+To read one declaration in the terminal, name it instead of a directory:
+
+```sh
+valk doc http.Server.compress    # a member of the standard library
+valk doc Array.sort              # core. may be left out
+valk doc ./my-package Client     # a declaration of a package
+```
+
 The JSON lists every namespace's aliases, classes, functions, globals, error
 types and enums, so tools can compare two versions of an API. The repository
 does exactly that: `make test-api-compat` checks that the standard library is
