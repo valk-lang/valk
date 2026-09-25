@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `<<=` and `>>=`, also on `shared` integers (atomic) and array elements
 + `*=`, `/=` and `%=` on a `shared` integer are atomic like `+=` (a compare-and-swap loop); they stopped the build with a compiler bug before
 + Binary integer literals: `0b1010`, `0b1111_0000`
 + `break 2` and `continue 2` leave that many loops, counted from the innermost (`break 1` is a plain `break`). Collections whose `each` needs cleanup (removals inside `each`) get it for every loop that is left
