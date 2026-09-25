@@ -3302,6 +3302,10 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + min_tls_version: TlsVersion
     // Receives the response body instead of `ClientResponse.body`.
     + output: ?Writer
+    // The proxy to send requests through: `http://host:port`, or with credentials `http://user:password@host:port`. `""` connects directly, and `null` leaves it to the environment (see `proxy_from_env`).
+    + proxy: ?String
+    // Whether a request without `proxy` uses `HTTPS_PROXY` (for https URLs) or `HTTP_PROXY` (for http URLs) and `NO_PROXY` from the environment, upper or lower case.
+    + proxy_from_env: bool
     // Parameters appended to the URL's query string, keys and values percent-encoded.
     + query_data: ?Map[String]
     // The limit for each socket read, in milliseconds; `timeout_ms` still applies.

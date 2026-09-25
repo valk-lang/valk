@@ -1,0 +1,125 @@
+use url
+use core
+use net
+use io
+
+class ProxyTarget {
+    host: String
+    port: u16
+    // The `Proxy-Authorization` value, empty without credentials
+    auth: String
+}
+
+// The proxy a request to `target` goes through, or null for a direct connection
+fn request_proxy(target: url.Url, options: ?Options) ?ProxyTarget !HttpError {
+    let setting: ?String = null
+    let from_env = true
+    if isset(options) {
+        setting = options.proxy
+        from_env = options.proxy_from_env
+    }
+    if !isset(setting) {
+        if !from_env : return null
+        setting = proxy_from_values(target.scheme, target.host, env_value("HTTPS_PROXY", "https_proxy"),
+            env_value("HTTP_PROXY", "http_proxy"), env_value("NO_PROXY", "no_proxy"),
+            isset(core.getenv("REQUEST_METHOD") !? null))
+    }
+    let value = setting ?? ""
+    if value.bytes == 0 : return null
+    return parse_proxy(value) !>
+}
+
+fn env_value(upper: String, lower: String) String {
+    let value = core.getenv(upper) !? ""
+    if value.bytes > 0 : return value
+    return core.getenv(lower) !? ""
+}
+
+// The environment's proxy for a request to `host`, or null
+fn proxy_from_values(scheme: String, host: String, https_proxy: String, http_proxy: String, no_proxy: String, cgi: bool) ?String {
+    let h = host.lower().trim("[").trim("]")
+    if h == "localhost" || h.ends_with(".localhost") || h.starts_with("127.") || h == "::1" : return null
+    if proxy_bypassed(h, no_proxy) : return null
+    if scheme == "https" : return https_proxy.bytes > 0 ? https_proxy : null
+    // In CGI a request's `Proxy` header arrives as HTTP_PROXY
+    if cgi : return null
+    return http_proxy.bytes > 0 ? http_proxy : null
+}
+
+fn proxy_bypassed(host: String, no_proxy: String) bool {
+    each no_proxy.split(",") as item {
+        let entry = item.trim().lower()
+        if entry.bytes == 0 : continue
+        if entry == "*" : return true
+        // A port in the entry is not compared
+        let colon = entry.last_index_of(":") !? null
+        if isset(colon) && !entry.contains("]") && entry.count(":") == 1 : entry = entry.range(0, colon)
+        let domain = entry.ltrim(".").trim("[").trim("]")
+        if host == domain || host.ends_with("." + domain) : return true
+    }
+    return false
+}
+
+fn parse_proxy(value: String) ProxyTarget !HttpError {
+    let proxy = url.parse(value.contains("://") ? value : "http://" + value)
+    if proxy.scheme != "http" || !request_host_is_safe(proxy.host) : throw .invalid_url
+    let port: u16 = 80
+    let given = proxy.port
+    if isset(given) {
+        if given == 0 || given > 65535 : throw .invalid_url
+        port = given.to(u16)
+    }
+    let auth = ""
+    if proxy.user.bytes > 0 || proxy.password.bytes > 0 : auth = basic_auth_header(url.decode(proxy.user), url.decode(proxy.password))
+    return ProxyTarget { host: proxy.host, port: port, auth: auth }
+}
+
+// Asks the proxy on `con` for a tunnel to `host:port` and reads its answer; a status
+// outside 2xx throws `status`
+fn open_proxy_tunnel(con: net.TcpConnection, host: String, port: u16, proxy: ProxyTarget, deadline_ms: uint) !HttpError {
+    let target = host + ":" + port
+    let request = ByteBuffer.new(128)
+    request.write("CONNECT ")
+    request.write(target)
+    request.write(" HTTP/1.1\r\nHost: ")
+    request.write(target)
+    request.write("\r\n")
+    if proxy.auth.bytes > 0 {
+        request.write("Proxy-Authorization: ")
+        request.write(proxy.auth)
+        request.write("\r\n")
+    }
+    request.write("\r\n")
+    con.write_timeout_ms = ClientRequest.remaining_timeout(deadline_ms, 0) !>
+    con.write(request) ! {
+        if error_is(E.code, timeout) : throw .timeout
+        throw .write
+    }
+
+    // The answer ends with an empty line; the proxy sends nothing after it until the
+    // handshake starts, so it can be read in chunks
+    let answer = ByteBuffer.new(256)
+    let chunk = [u8]{ 0 x 1024 }
+    while !answer.to_string().contains("\r\n\r\n") {
+        if answer.length > 8192 : throw .invalid_response
+        con.read_timeout_ms = ClientRequest.remaining_timeout(deadline_ms, 0) !>
+        let count = con.read(chunk) ! {
+            if error_is(E.code, timeout) : throw .timeout
+            throw .read
+        }
+        if count == 0 : throw .read
+        answer.write(chunk.view(0, count))
+    }
+    let text = answer.to_string()
+    if !text.starts_with("HTTP/1.") || text.bytes < 12 : throw .invalid_response
+    let status = text.range(9, 3).to_uint() ! throw .invalid_response
+    if status < 200 || status > 299 : throw .status
+    if !text.ends_with("\r\n\r\n") : throw .invalid_response
+}
+
+#if TEST
+/// Test hook, only in `TEST` builds: the proxy the environment values give for a request.
++ fn proxy_for_env_test(scheme: String, host: String, https_proxy: String, http_proxy: String, no_proxy: String, cgi: bool) String {
+    return proxy_from_values(scheme, host, https_proxy, http_proxy, no_proxy, cgi) ?? ""
+}
+#end

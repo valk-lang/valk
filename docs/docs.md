@@ -2415,8 +2415,10 @@ client.close()
 The client asks for gzip and decompresses the body unless
 `Options.decompress` is off. Credentials in the URL (`https://user:pass@host/`)
 or `options.basic_auth(user, pass)` send an `Authorization: Basic` header, and
-`Options.host` sends another `Host` than the URL's. `http.Multipart` builds a
-file upload:
+`Options.host` sends another `Host` than the URL's. Requests go through the
+proxy in `HTTPS_PROXY` / `HTTP_PROXY` (minus the hosts in `NO_PROXY`), or the one
+in `Options.proxy`, such as `"http://user:pass@proxy:3128"`; `""` connects
+directly. `http.Multipart` builds a file upload:
 
 ```rust
 let form = http.Multipart.new()

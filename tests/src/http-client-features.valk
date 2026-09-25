@@ -3,6 +3,7 @@ use valk.time
 use valk.compress
 use valk.net
 use valk.sync
+use valk.url
 
 fn client_feature_handler(req: http.Request) http.Response {
     if req.path == "/gzip" {
@@ -280,4 +281,121 @@ test "HTTP client: Client reuses TLS connections" {
     client.close()
     server.shutdown()
     await running !!
+}
+
+// A small proxy: logs the request line and the proxy credentials, tunnels CONNECT and
+// forwards absolute-form requests
+fn test_proxy(listener: shared net.TcpServer, log: shared sync.Channel[String]) {
+    while true {
+        let client = listener.accept(5000) ! return
+        co test_proxy_connection(client, log)
+    }
+}
+
+fn test_proxy_connection(client: net.TcpConnection, log: shared sync.Channel[String]) {
+    let head = ByteBuffer.new()
+    let chunk = [u8]{ 0 x 4096 }
+    while !head.to_string().contains("\r\n\r\n") {
+        let n = client.read(chunk) ! return
+        if n == 0 : return
+        head.write(chunk.view(0, n))
+    }
+    let text = head.to_string()
+    let lines = text.lines()
+    let first = lines.get(0) !? ""
+    log.send(first) ! {}
+    each lines as line {
+        if line.lower().starts_with("proxy-authorization:") : log.send("auth " + line.split(":", 2).get(1) !? "") ! {}
+    }
+    let parts = first.split(" ")
+    let method = parts.get(0) !? ""
+    let target = parts.get(1) !? ""
+    if method == "CONNECT" {
+        if target.ends_with(":19999") {
+            client.write("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n") ! {}
+            client.close() ! {}
+            return
+        }
+        let host = target.split(":", 2).get(0) !? ""
+        let port = (target.split(":", 2).get(1) !? "0").to_uint() !? 0
+        let upstream = net.tcp_client(host, port.to(u16)) ! return
+        client.write("HTTP/1.1 200 Connection established\r\n\r\n") ! return
+        co test_proxy_pipe(upstream, client)
+        test_proxy_pipe(client, upstream)
+        return
+    }
+    let u = url.parse(target)
+    let upstream = net.tcp_client(u.host, (u.port ?? 80).to(u16)) ! return
+    let origin = method + " " + u.path + (u.query.bytes > 0 ? "?" + u.query : "") + " HTTP/1.1"
+    upstream.write(origin + text.range(first.bytes, text.bytes - first.bytes)) ! return
+    co test_proxy_pipe(upstream, client)
+    test_proxy_pipe(client, upstream)
+}
+
+fn test_proxy_pipe(from: net.TcpConnection, to: net.TcpConnection) {
+    let buf = [u8]{ 0 x 4096 }
+    while true {
+        let n = from.read(buf) ! break
+        if n == 0 : break
+        to.write(buf.view(0, n)) ! break
+    }
+    to.close() ! {}
+}
+
+test "HTTP client: proxies" {
+    let server = http.Server.new("127.0.0.1", 19559, client_keepalive_handler)
+    let running = co server.start(1)
+    let secure = http.Server.new("127.0.0.1", 19560, client_keepalive_handler)
+    secure.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let secure_running = co secure.start(1)
+    let listener = net.tcp_server("127.0.0.1", 19561) !!
+    let log: shared sync.Channel[String] = sync.Channel[String].new() !!
+    let proxying = co test_proxy(listener, log)
+    time.sleep_ms(20)
+
+    // Plain HTTP: the proxy gets the full URL
+    let plain = http.get("http://127.0.0.1:19559/cookie", http.Options { proxy: "http://127.0.0.1:19561" }) !!
+    assert(plain.body == "-")
+    assert(log.try_recv() !! == "GET http://127.0.0.1:19559/cookie HTTP/1.1")
+
+    // HTTPS: a tunnel, with the proxy credentials ("u:p")
+    let options = http.Options { proxy: "http://u:p@127.0.0.1:19561", verify_tls_cert: false }
+    assert((http.get("https://127.0.0.1:19560/cookie", options) !!).body == "-")
+    assert(log.try_recv() !! == "CONNECT 127.0.0.1:19560 HTTP/1.1")
+    assert(log.try_recv() !! == "auth  Basic dTpw")
+
+    // A refused tunnel
+    let refused = false
+    http.get("https://127.0.0.1:19999/", http.Options { proxy: "127.0.0.1:19561" }) ! { refused = error_is(E.code, status) }
+    assert(refused)
+
+    // "" connects directly
+    assert((http.get("http://127.0.0.1:19559/cookie", http.Options { proxy: "" }) !!).body == "-")
+    assert(log.length == 1)
+
+    let bad = false
+    http.get("http://127.0.0.1:19559/", http.Options { proxy: "socks5://127.0.0.1:1080" }) ! { bad = error_is(E.code, invalid_url) }
+    assert(bad)
+
+    listener.close() ! {}
+    server.shutdown()
+    secure.shutdown()
+    await running !!
+    await secure_running !!
+    await proxying
+}
+
+test "HTTP client: proxy settings from the environment" {
+    assert(http.proxy_for_env_test("https", "api.example.com", "http://p:3128", "", "", false) == "http://p:3128")
+    assert(http.proxy_for_env_test("http", "api.example.com", "http://p:3128", "http://q:8080", "", false) == "http://q:8080")
+    assert(http.proxy_for_env_test("https", "api.example.com", "http://p:3128", "", "example.com", false) == "")
+    assert(http.proxy_for_env_test("https", "api.example.com", "http://p:3128", "", ".other.com, example.com:443", false) == "")
+    assert(http.proxy_for_env_test("https", "other.org", "http://p:3128", "", "example.com", false) == "http://p:3128")
+    assert(http.proxy_for_env_test("https", "api.example.com", "http://p:3128", "", "*", false) == "")
+    // Loopback is always direct
+    assert(http.proxy_for_env_test("http", "localhost", "", "http://q:8080", "", false) == "")
+    assert(http.proxy_for_env_test("http", "127.0.0.1", "", "http://q:8080", "", false) == "")
+    assert(http.proxy_for_env_test("http", "[::1]", "", "http://q:8080", "", false) == "")
+    // In CGI, HTTP_PROXY can come from a request header
+    assert(http.proxy_for_env_test("http", "api.example.com", "", "http://q:8080", "", true) == "")
 }

@@ -10147,8 +10147,8 @@ No public function throws it; the server answers with a connection error instead
 
 Thrown by the HTTP client and by starting an HTTP server.
 
-- `invalid_url`: the URL is not `http`/`https`, contains credentials, or has an
-  unsafe host or an invalid port.
+- `invalid_url`: the URL is not `http`/`https`, or has an unsafe host or an invalid
+  port; also a proxy URL that is not `http`.
 - `invalid_response`: the response could not be parsed, or `ClientRequest.response`
   was called on a request that failed.
 - `in_progress`: `ClientRequest.response` was called before the response arrived.
@@ -10157,7 +10157,7 @@ Thrown by the HTTP client and by starting an HTTP server.
   header is one the client sets itself.
 - `response_too_large`: the response exceeds `max_response_header_size` or
   `max_response_body_size`.
-- `status`: `download` got a final status outside 2xx.
+- `status`: `download` got a final status outside 2xx, or a proxy refused a tunnel.
 
 Also carries every `net.NetError` and `HttpParseError` code; the client uses `timeout`,
 `read`, `write` and `ssl`; `Server.start` throws `init` when it was started before, when
@@ -11104,6 +11104,10 @@ Returns an empty form with a random boundary.
     + min_tls_version: TlsVersion
     // Receives the response body instead of `ClientResponse.body`.
     + output: ?Writer
+    // The proxy to send requests through: `http://host:port`, or with credentials `http://user:password@host:port`. `""` connects directly, and `null` leaves it to the environment (see `proxy_from_env`).
+    + proxy: ?String
+    // Whether a request without `proxy` uses `HTTPS_PROXY` (for https URLs) or `HTTP_PROXY` (for http URLs) and `NO_PROXY` from the environment, upper or lower case.
+    + proxy_from_env: bool
     // Parameters appended to the URL's query string, keys and values percent-encoded.
     + query_data: ?Map[String]
     // The limit for each socket read, in milliseconds; `timeout_ms` still applies.
@@ -11235,6 +11239,25 @@ The lowest TLS version the client accepts.
 #### output
 
 Receives the response body instead of `ClientResponse.body`.
+
+#### proxy
+
+The proxy to send requests through: `http://host:port`, or with credentials
+`http://user:password@host:port`. `""` connects directly, and `null` leaves it to the
+environment (see `proxy_from_env`).
+
+Plain HTTP requests go to the proxy with the full URL. HTTPS goes through a `CONNECT`
+tunnel, so the proxy does not see the request, and the certificate is still checked
+against the URL's host. A proxy that refuses the tunnel fails the request with `status`.
+
+#### proxy_from_env
+
+Whether a request without `proxy` uses `HTTPS_PROXY` (for https URLs) or `HTTP_PROXY`
+(for http URLs) and `NO_PROXY` from the environment, upper or lower case.
+
+`NO_PROXY` lists hosts and domains to reach directly, or `*` for all; `localhost` and
+loopback addresses are always reached directly. Inside a CGI program (`REQUEST_METHOD`
+set), where a request header can set `HTTP_PROXY`, plain HTTP is not proxied.
 
 #### query_data
 
