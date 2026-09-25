@@ -920,6 +920,9 @@ fn main() {
 }
 ```
 
+An error code turns into its name as text, like an enum: `E.code.name()`,
+`"failed: " + E.code` and `%{E.code}` all give `fail`.
+
 ### Throw functions
 
 Throw functions centralize repeated error construction. They are ordinary error-returning functions marked with `$throw`, which lets callers invoke them where a `throw` statement is required.

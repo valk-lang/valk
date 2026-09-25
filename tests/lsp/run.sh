@@ -239,6 +239,10 @@ check "definition of a method called through '?.'" '"line":2' \
 check "hover on the value before '?.'" '"value":"```valk\n?Thing\n```"' \
     "$(request textDocument/hover optional.valk 13 11)"
 
+# An error code has one method, its name
+check "completion after an error code offers name()" '"label":"name"' \
+    "$(request textDocument/completion error-code.valk 8 26)"
+
 # `fs.` likewise, and private members of another package must not be offered
 check "namespace completion" '"label":"cwd"' \
     "$(request textDocument/completion namespace.valk 3 7)"

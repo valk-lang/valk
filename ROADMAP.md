@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Error codes as text: `E.code.name()`, `"failed: " + E.code`, `%{E.code}` and `E.code.to(String)` give the code's name, inherited codes included
 + `linux-arm64` target (Raspberry Pi, Graviton, arm64 Docker images): cross-compile with `--target linux-arm64` from any host; glibc 2.31 like linux-x64. CI builds the test suite on linux-x64 and runs it on a native arm64 runner. The compiler itself is not distributed for arm64 Linux yet
 + Tuple assignment: `(a, b) = (b, a)`, `(w, h) = size()`, also properties, setters and elements, `_` skips a value; the right side is evaluated first, then the targets left to right
 + HTTP server: `Response.stream(reader)` without a size streams until the reader ends (chunked; HTTP/1.0 clients until the connection closes; HTTP/2 DATA frames), and `Response.events(channel)` sends Server-Sent Events from a `Channel[String]` (a ping every 15 s; the stream ends when the channel closes or the server shuts down)
