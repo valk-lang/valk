@@ -6790,7 +6790,9 @@ How `PrivateKey.sign` and `PublicKey.verify` hash and pad.
 
 Together these cover the JWT algorithms EdDSA (`ed25519`), ES256 to ES512 (`ecdsa_*`, but
 see `ecdsa_signature_to_raw`), RS256 to RS512 (`rsa_pkcs1_*`) and PS256 to PS512
-(`rsa_pss_*`, with a salt as long as the hash).
+(`rsa_pss_*`). PSS signs with a salt as long as the hash, as JWT and TLS require, and
+verifies any salt length, so signatures made with the largest salt (Python's
+`PSS.MAX_LENGTH`, the `openssl` command) verify too.
 
 ## Functions for 'crypto'
 
@@ -7606,7 +7608,8 @@ Returns the key as PEM text (`BEGIN PUBLIC KEY`).
 Returns whether `signature` is a valid signature of `data` by this key with `algorithm`.
 
 ECDSA signatures must be DER encoded; convert a raw one with
-`ecdsa_signature_from_raw` first. An algorithm that does not fit the key gives false.
+`ecdsa_signature_from_raw` first. RSA-PSS accepts any salt length. An algorithm that
+does not fit the key gives false.
 
 ```js
 // A streaming SHA-1 `Hasher`; a literal `Sha1 {}` is ready for input.
