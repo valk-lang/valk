@@ -3245,6 +3245,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
+    // Sets an `Authorization: Basic` header with `user` and `password`.
+    + fn basic_auth(user: String, password: String) void
     // Removes every header set so far.
     + fn clear_headers() void
     // Returns `headers`, creating an empty set first when it is `null`.

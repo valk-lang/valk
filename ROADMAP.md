@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP client: credentials in the URL (`https://user:pass@host/`) are sent as `Authorization: Basic` (they failed with `invalid_url`), and `Options.basic_auth(user, password)` sets it
 + HTTP client: asks for gzip and decompresses the body (`Options.decompress`, on by default; not with `output` or an own `Accept-Encoding`)
 + sync: `select(.{ a, b }, timeout_ms)` waits on several channels (of any element types) and returns the ready one; `after(ms)` and `ticker(ms)` channels for deadlines and periodic work; `WaitGroup` (`add`, `done`, `wait`) and `Semaphore` (`acquire`, `try_acquire`, `release`)
 + url: `parse_query` / `parse_query_grouped` and `build_query` / `build_query_grouped` outside HTTP, `Url.to_string()` (also `"%{u}"`), `Url.resolve(reference)` per RFC 3986 section 5 (all its examples are tests) and `remove_dot_segments`. HTTP requests, the client's query data and its redirects use them

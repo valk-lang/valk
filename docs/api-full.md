@@ -10436,8 +10436,9 @@ The share of the request written so far, from 0 to 100.
 Validates the request, connects to the server and builds the request bytes.
 
 Nothing is sent yet. `deadline_ms` is an absolute `time.mono_ms()` value for the
-whole request; 0 uses `options.timeout_ms` from now. Fails with `invalid_url` for
-anything but an `http`/`https` URL with a host, credentials in the URL or a port
+whole request; 0 uses `options.timeout_ms` from now. Credentials in the URL are sent
+as `Authorization: Basic` unless `options` has its own `Authorization` header. Fails
+with `invalid_url` for anything but an `http`/`https` URL with a host, or a port
 outside 1-65535, with `invalid_request` for an invalid method, path or header,
 with `ssl` when TLS setup, the handshake or the certificate fingerprint check
 fails, and with `timeout` or a connection error when connecting fails.
@@ -10899,6 +10900,8 @@ the `Headers{ name => value }` literal.
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
+    // Sets an `Authorization: Basic` header with `user` and `password`.
+    + fn basic_auth(user: String, password: String) void
     // Removes every header set so far.
     + fn clear_headers() void
     // Returns `headers`, creating an empty set first when it is `null`.
@@ -11039,6 +11042,13 @@ Whether the server's TLS certificate is verified.
 #### write_timeout_ms
 
 The limit for each socket write, in milliseconds; `timeout_ms` still applies.
+
+#### basic_auth
+
+Sets an `Authorization: Basic` header with `user` and `password`.
+
+Credentials in the URL (`https://user:pass@host/`) do the same. The password travels
+base64-encoded but readable, so use HTTPS.
 
 #### clear_headers
 
