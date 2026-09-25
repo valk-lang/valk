@@ -860,7 +860,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     done
 done
 
-echo "> Sort with default and explicit comparators without allocating"
+echo "> Sort with default and explicit comparators without allocating a comparator"
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     ir="$workdir/array-sorting-$target.ll"
     if ! out=$(ir_result "$ir"); then
@@ -868,7 +868,8 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
         echo "$out"
         exit 1
     fi
-    for name in sort_numbers sort_slices sort sort_with sort_sift_down sort_after; do
+    # The merge itself takes spare storage, in array_sort_plain / array_stable_order
+    for name in sort_numbers sort_slices sort sort_with sort_after; do
         body=$(sed -n "/^define .*__${name}__/,/^}/p" "$ir")
         if [[ -z "$body" || "$body" == *'__ALC_'* || "$body" == *'__Pool__get__'* || "$body" == *'valk.alloc.'* ]]; then
             echo "# Array sorting acquired an allocation on $target: $name"
