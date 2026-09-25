@@ -2506,6 +2506,9 @@ let route = router.find(req.method, req.path) ! {
 let id = route.params(req.path).get("id") !? ""
 ```
 
+`s.compress = true` sends text, HTML, CSS, JavaScript, JSON, XML and SVG
+responses of 1 KiB and more gzip-compressed to clients that accept it.
+
 `start` runs until shutdown. Use `co` to keep doing other work:
 
 ```rust

@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP server: `compress = true` gzips text-like responses of 1 KiB and more for clients that accept it (HTTP/1.1 and HTTP/2), with `Vary: Accept-Encoding`
 + HTTP router: `route.params(path)` decodes the values (`decode: false` gives them as written; they were always raw before) and returns what `*` matched as `*`; `router.allowed_methods(path)` for 405 answers
 + HTTP server: `add_middleware(fn(req, next) Response)` wraps the handler; the first added runs first
 + HTTP client: proxies from `Options.proxy` or `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (localhost is always direct; plain HTTP is not proxied from the environment in CGI). HTTPS goes through a `CONNECT` tunnel and still checks the URL's certificate; proxy credentials in the proxy URL
