@@ -326,8 +326,8 @@ each pairs into pair, index {}
 Full `Array` API: [core](api.md#core)
 
 Callbacks cover the common searches and transforms: `any`, `all` and `find`
-take a `fn(T)(bool)`, `map[R]` builds a new array from a `fn(T)(R)`, and
-`reduce[R](init, fn(R, T)(R))` folds the elements into one value. `filter`
+take a `fn(T)(bool)`, `map` builds a new array from a `fn(T)(R)`, and
+`reduce(init, fn(R, T)(R))` folds the elements into one value. `filter`
 copies matching items into a new array. `remove_where` removes matching items
 from the original. `extract` takes matching items out of the original and
 returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`.
@@ -336,10 +336,16 @@ returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`.
 
 ```rust
 let nums = Array[int]{ 3, 1, 2 }
-let has_big = nums.any(fn(v: int) bool { return v > 2 })
-let strs = nums.map[String](fn(v: int) String { return v.to(String) })
-let total = nums.reduce[int](0, fn(t: int, v: int) int { return t + v }) // 6, same as nums.sum()
+let has_big = nums.any(fn(v) { return v > 2 })
+let strs = nums.map(fn(v) { return v.to(String) })         // Array[String]
+let total = nums.reduce(0, fn(t, v) { return t + v })      // 6, same as nums.sum()
 ```
+
+A function literal passed where a function type is expected may leave out its
+parameter types and return type; they come from that type. A generic argument
+such as the `R` of `map` follows from the literal's return value, and one given
+by an earlier argument, like `reduce`'s start value, types the literal's
+parameters. `nums.map[String](...)` still names it explicitly.
 
 Use `arr.sort()` for elements that support ordering, or `arr.sorted()` for a
 copy. Other element types require a comparator whose parameters have the
@@ -917,6 +923,10 @@ You can create anonymous functions using the `fn` keyword. A function literal th
 A raw function pointer can convert to a closure with a compatible signature. Use `fn` for callbacks that accept both raw function pointers and closures.
 
 `object.method` binds the object as its receiver and requires a `fn` callback. It cannot convert to `fnptr`. `Type.method` leaves the receiver as the first argument and can be used as either kind of callback. A shared callback can bind a shared receiver.
+
+Where the function type is known, such as an argument or a typed variable, a
+literal can leave out its parameter types and its return type:
+`let add: fn(int, int)(int) = fn(a, b) { return a + b }`.
 
 Callback signatures do not implicitly convert argument or return values. Use a wrapper when a callback needs a value conversion or an added error declaration:
 

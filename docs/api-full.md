@@ -980,7 +980,7 @@ Null elements are skipped and get no divider.
 Returns a new array holding `func` applied to each element, in order.
 
 ```valk
-let strs = values.map[String](fn(v: int) String { return v.to(String) })
+let strs = values.map(fn(v) { return v.to(String) }) // Array[String]
 ```
 
 #### merge

@@ -186,6 +186,12 @@ class Func {
     buffer_pool: Array[Decl] (.{})
     buffers_used: Array[Decl] (.{})
     is_literal: bool (false)
+    // A function literal passed where a function type is expected: the parameter types and
+    // return type it may leave out
+    literal_arg_types: ?Array[Type] (null)
+    literal_rett: ?Type (null)
+    // The expected return type is a generic still open: the first `return value` gives it
+    literal_rett_open: bool (false)
     // A shared literal publishes one capture environment for concurrent readers.
     is_shared: bool (false)
     // Cleared as soon as identifier resolution captures an outer declaration.
@@ -432,7 +438,10 @@ fn parse_func_types(func: Func) !Error {
     // Return type (optional; void when omitted)
     let rett_exp = func.rett_exp
     if isset(rett_exp) : func.rett_is_list = rett_exp.type_kind == TYPE_KIND.multi
-    if !isset(rett_exp) {
+    let literal_rett = func.literal_rett
+    if !isset(rett_exp) && isset(literal_rett) {
+        func.rett = literal_rett
+    } else if !isset(rett_exp) {
         func.rett = type_void(func.ns.build)
     } else if func.has_generic_args && !func.generic_args_defined
         && func.ns.build.options.mode != BUILDTYPE.doc {
@@ -1181,6 +1190,21 @@ fn parse_func_args_body(func: Func, body: Exp) !Error {
             if existing.name == name : p.error("Duplicate argument name: " + name)
         }
 
+        // A literal's parameter type may come from the function type expected there
+        let colon = p.tok(true, true, false) !>
+        if !(colon == TOK.sign && p.word_is(":")) && func.is_literal {
+            let expected = func.literal_arg_types
+            let slot = func.args.length
+            let inferred = isset(expected) ? expected.get(slot) !? null : null
+            if !isset(inferred) {
+                p.error("Give the type of '" + name + "': write '" + name + ": Type'. It can be left out only where the function type is known, such as an argument of a function type")
+            }
+            append_func_arg(func, name, inferred)
+            t = p.tok(true, true) !>
+            if t == TOK.sign && p.word_is(",") : continue
+            if t == TOK.sign && p.word_is(")") : break
+            p.error("Expected ',' or ')' in function arguments, found: '" + p.word() + "'")
+        }
         p.expect(":", true, true) !>
 
         // Type; `$G` anywhere inside it declares a generic parameter that is
@@ -1507,6 +1531,33 @@ fn type_exp_infer_generic_params(exp: Exp, actual: Type, bound: Map[Type], scope
         type_exp_infer_generic_params(inner, sub, bound, scope, func, at) !>
         return
     }
+    if kind == TYPE_KIND.fn || kind == TYPE_KIND.fnptr {
+        // `fn(T)($R)`: a function value's parameter and return types
+        if actual.kind != TYPE.closure && actual.kind != TYPE.fnptr : generic_infer_error(func, exp, actual, at)
+        let arg_exps = exp.get(TYPE_EXP.args)
+        let actual_args = actual.get_args() ?? Array[Type]{}
+        if isset(arg_exps) {
+            let i: uint = 0
+            while true {
+                let arg_exp = arg_exps.get(i) ?! break
+                let arg_type = actual_args.get(i) ! generic_infer_error(func, exp, actual, at)
+                type_exp_infer_generic_params(arg_exp, arg_type, bound, scope, func, at) !>
+                i++
+            }
+        }
+        let rett_exps = exp.get(TYPE_EXP.rett)
+        let actual_returns = actual.get_returns() ?? Array[Type]{}
+        if isset(rett_exps) {
+            let i: uint = 0
+            while true {
+                let rett_exp = rett_exps.get(i) ?! break
+                let rett_type = actual_returns.get(i) ! generic_infer_error(func, exp, actual, at)
+                type_exp_infer_generic_params(rett_exp, rett_type, bound, scope, func, at) !>
+                i++
+            }
+        }
+        return
+    }
     if kind == TYPE_KIND.named {
         // `Name[..$G..]`: the value must be a specialization of that class
         let id = exp.get(TYPE_EXP.id) ?! exp.bug("Named type is missing id")
@@ -1548,6 +1599,95 @@ fn type_viewed_element(t: Type) ?Type {
     let rett = view.get_rett().get_non_nullable()
     if rett.kind != TYPE.ref_slice : return null
     return rett.get_sub_type()
+}
+
+// The type expressions of a function's declared parameters, in order, `this` not included
+fn func_param_type_exps(func: Func) Array[Exp] !Error {
+    let exps = Array[Exp]{}
+    let body = func.args_exp ?! return exps
+    let pos = body.pos ?! return exps
+    let p = pos.copy().init_parser()
+    while true {
+        let t = p.tok(true, true) !>
+        if t == TOK.sign && p.word_is(")") : break
+        if t == TOK.end || t != TOK.word : break
+        if !(p.tok(true, true) !> == TOK.sign && p.word_is(":")) : break
+        p.tok(true, true, false) !>
+        exps.append(read_type_exp(p, true, true) !>)
+        t = p.tok(true, true, false) !>
+        if t == TOK.sign && p.word_is("(") {
+            p.tok(true, true) !>
+            read_body_exp(p, "(", ")") !>
+        }
+        t = p.tok(true, true) !>
+        if !(t == TOK.sign && p.word_is(",")) : break
+    }
+    return exps
+}
+
+// Binds the generic `names` found in `exp` from the type of the value given for it; a shape
+// that does not fit binds nothing
+fn type_exp_bind_generic_names(exp: Exp, actual: Type, names: Array[String], bound: Map[Type], scope: Scope) {
+    if exp.type != EXP.type : return
+    let kind = exp.type_kind
+    if kind == TYPE_KIND.named {
+        let id = exp.get(TYPE_EXP.id) ?! return
+        let generics = exp.get(TYPE_EXP.generics)
+        if !isset(generics) {
+            if !isset(id.str2) && names.contains(id.str1) && !bound.has(id.str1) : bound.set(id.str1, actual)
+            return
+        }
+        let idf: ?Idf = isset(id.str2) ? null : scope.get_idf(id.str1)
+        let base = isset(idf) ? idf.class : null
+        let actual_class = actual.get_non_nullable().class
+        if !isset(base) || !isset(actual_class) || actual_class.generic_from != base : return
+        let actual_types = actual_class.generic_types ?! return
+        let i: uint = 0
+        while true {
+            let arg_exp = generics.get(i) ?! break
+            let arg_type = actual_types.get(i) ! break
+            type_exp_bind_generic_names(arg_exp, arg_type, names, bound, scope)
+            i++
+        }
+        return
+    }
+    if kind == TYPE_KIND.nullable {
+        let inner = exp.get(TYPE_EXP.type) ?! return
+        type_exp_bind_generic_names(inner, actual.get_non_nullable(), names, bound, scope)
+        return
+    }
+    if kind == TYPE_KIND.ref || kind == TYPE_KIND.ptr {
+        let inner = exp.get(TYPE_EXP.type) ?! return
+        let sub = actual.get_non_nullable().get_sub_type() ?! return
+        type_exp_bind_generic_names(inner, sub, names, bound, scope)
+        return
+    }
+    if kind == TYPE_KIND.fn || kind == TYPE_KIND.fnptr {
+        let nn = actual.get_non_nullable()
+        if nn.kind != TYPE.closure && nn.kind != TYPE.fnptr : return
+        let arg_exps = exp.get(TYPE_EXP.args)
+        let actual_args = nn.get_args() ?? Array[Type]{}
+        if isset(arg_exps) {
+            let i: uint = 0
+            while true {
+                let arg_exp = arg_exps.get(i) ?! break
+                let arg_type = actual_args.get(i) ! break
+                type_exp_bind_generic_names(arg_exp, arg_type, names, bound, scope)
+                i++
+            }
+        }
+        let rett_exps = exp.get(TYPE_EXP.rett)
+        let actual_returns = nn.get_returns() ?? Array[Type]{}
+        if isset(rett_exps) {
+            let i: uint = 0
+            while true {
+                let rett_exp = rett_exps.get(i) ?! break
+                let rett_type = actual_returns.get(i) ! break
+                type_exp_bind_generic_names(rett_exp, rett_type, names, bound, scope)
+                i++
+            }
+        }
+    }
 }
 
 fn generic_infer_error(func: Func, exp: Exp, actual: Type, at: Exp) !Error $throw {
