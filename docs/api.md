@@ -259,6 +259,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn append(item: T, unique: bool (false)) void
     // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and `$hash` types).
     + fn append_many(items: Array[T], unique: bool (false)) void
+    // Searches this array, sorted with `func`, for `value` in O(log n).
+    + fn binary_search(value: T, func: fn(T, T)(bool)) (bool, uint)
     // Removes every element.
     + fn clear(reduce_size: bool (false)) void
     // Returns a deep copy: a new array holding a `$clone` of every element.
@@ -279,6 +281,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn filter(func: ?fn(T)(bool) (null)) Array[T]
     // Returns the first element for which `func` returns true.
     + fn find(func: fn(T)(bool)) T !LookupError
+    // Returns the first element without removing it.
+    + fn first() T !LookupError
     // Grows the storage, doubling its size, until `index` is a valid slot; the length does not change.
     + fn fit_index(index: uint) void
     // Builds an array from a JSON array, converting each item with `to_type`.
@@ -289,16 +293,24 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn increase_size(new_size: uint) void
     // Returns the index of the first element equal to `item` (compared with `==`).
     + fn index_of(item: T) uint !LookupError
+    // Inserts `value` at `index`, shifting the elements from there one slot up.
+    + fn insert(index: uint, value: T) void !LookupError
     // Returns a new array of the elements that also occur in `with`, in this array's order and without duplicates.
     + fn intersect(with: Array[T]) Array[T]
     // Returns a raw pointer to the first element.
     + fn items() *[T]
     // Converts each element to a `String` and joins them with `divider` between each pair.
     + fn join(divider: String) String
+    // Returns the last element without removing it.
+    + fn last() T !LookupError
     // Returns a new array holding `func` applied to each element, in order.
     + fn map[R](func: fn(T)(R)) Array[R]
+    // Returns the element with the largest key; on a tie, the first of them.
+    + fn max_by[K](key: fn(T)(K)) T !LookupError
     // Returns a new array with the elements of this array followed by those of `items`.
     + fn merge(items: Array[T]) Array[T]
+    // Returns the element with the smallest key; on a tie, the first of them.
+    + fn min_by[K](key: fn(T)(K)) T !LookupError
     // Creates an empty array with room for `start_size` elements before it has to grow.
     + static fn new(start_size: uint (0)) Array[T]
     // Removes and returns the first element, shifting the rest down (O(n)).

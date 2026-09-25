@@ -332,7 +332,12 @@ take a `fn(T)(bool)`, `map` builds a new array from a `fn(T)(R)`, and
 `reduce(init, fn(R, T)(R))` folds the elements into one value. `filter`
 copies matching items into a new array. `remove_where` removes matching items
 from the original. `extract` takes matching items out of the original and
-returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`.
+returns them. Arrays of numbers also offer `sum()`, `min()` and `max()`;
+`min_by(key)` and `max_by(key)` give the element with the smallest or largest key,
+such as `users.min_by(fn(u) { return u.age })`. `first()` and `last()` read an end
+without removing it, and `insert(index, value)` shifts the rest up. On a sorted
+array, `binary_search(value)` returns whether the value is there and its position,
+or where to insert it to keep the order.
 `sort`, `reverse`, `shuffle` and `remove_duplicates` update the array in place;
 `sorted`, `reversed`, `shuffled` and `unique` return a new array.
 
