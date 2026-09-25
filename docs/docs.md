@@ -153,6 +153,8 @@ valk build -h                               # Every option
 
 Editors talk to `valk lsp run`, a language server over stdin and stdout. The
 [VS Code extension](https://github.com/valk-lang/valk-vscode) starts it for you.
+Besides diagnostics, it answers hover, go to definition, completion, signature
+help, formatting, the outline, find references, rename and workspace symbols.
 
 Tab completion for commands, options, targets and the make commands of a
 project comes from `valk completion`:

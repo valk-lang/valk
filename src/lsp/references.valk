@@ -1,0 +1,244 @@
+use build
+use valk.json
+use valk.fs
+
+// Where a name is written: a file and a byte range
+class NameSpan {
+    path: String
+    content: String
+    i: u32
+    len: u32
+}
+
+extend Lsp {
+    // `textDocument/references`, or `textDocument/rename` with the new name
+    fn references(new_name: ?String) {
+        let params = this.data.get("params")
+        let uri = params.get("textDocument").get("uri").string_value() !? ""
+        if uri.is_empty() {
+            this.send_empty_response()
+            return
+        }
+        let file = lsp_path_from_uri(uri)
+        let pos = params.get("position")
+        let line = pos.get("line").int.to(u32) + 1
+        let col = pos.get("character").int.to(u32) + 1
+
+        let args = Array[String]{ file }
+        let b = build.Build.init_from_args(args) ! {
+            this.log(E.msg)
+            this.send_empty_response()
+            return
+        }
+        this.file = file
+        this.attach_to_build(b)
+        b.options.keep_going = true
+        b.lsp_collect_refs = true
+        b.run() ! {}
+
+        let content = this.file_content.get(file) !? (fs.read(file) !? "")
+        let cursor = lsp_offset_for(content, line, col)
+        let target = lsp_reference_target(b, file, cursor) ?! {
+            if isset(new_name) : this.error_response(-32602, "There is no symbol to rename here")
+            else : this.success(json.new_array())
+            return
+        }
+
+        // The declaration first, then every use, each once
+        let spans = Array[NameSpan]{}
+        let seen = Map[bool]{}
+        let decl = lsp_decl_name_span(target) ?! {
+            this.send_empty_response()
+            return
+        }
+        let include_decl = isset(new_name) || (params.get("context").get("includeDeclaration").bool_value() !? true)
+        if include_decl {
+            spans.append(decl)
+            seen.set(decl.path + ":" + decl.i, true)
+        }
+        each b.lsp_refs as ref {
+            // Parameters share their function's declaration span: the name tells them apart
+            if ref.target.src != target.target.src || ref.target.i != target.target.i || ref.name != target.name : continue
+            let span = lsp_use_name_span(ref) ?! continue
+            let key = span.path + ":" + span.i
+            if seen.has(key) : continue
+            seen.set(key, true)
+            spans.append(span)
+        }
+
+        let name = new_name
+        if !isset(name) {
+            let list = json.new_array()
+            each spans as span : list.append(lsp_span_location(span))
+            this.success(list)
+            return
+        }
+
+        // Rename: only names this package declares, to a valid name
+        if !lsp_valid_name(name) {
+            this.error_response(-32602, "'" + name + "' is not a valid name")
+            return
+        }
+        let ns = target.target.src.ns
+        if !isset(ns) || ns.pkg != b.main_pkg {
+            this.error_response(-32602, "'" + target.name + "' is declared outside this package and cannot be renamed here")
+            return
+        }
+        let by_file = Map[Array[json.Value]]{}
+        each spans as span {
+            let edit = json.new_object()
+            let from = lsp_line_col(span.content, span.i)
+            let to = lsp_line_col(span.content, span.i + span.len)
+            edit.set("range", json_range(from.line, from.col, to.line, to.col))
+            edit.set("newText", json.from(name))
+            let edits = by_file.get(span.path) !? <{
+                let created = Array[json.Value]{}
+                by_file.set(span.path, created)
+                return created
+            }
+            edits.append(edit)
+        }
+        let changes = json.new_object()
+        each by_file as edits, path {
+            let list = json.new_array()
+            each edits as edit : list.append(edit)
+            changes.set("file://" + path, list)
+        }
+        let result = json.new_object()
+        result.set("changes", changes)
+        this.success(result)
+    }
+
+    // `workspace/symbol`: the declarations of the open packages whose name contains the query
+    fn workspace_symbol() {
+        let query = (this.data.get("params").get("query").string_value() !? "").lower()
+        let inputs = Array[String]{}
+        each this.file_content as _, path : inputs.append(path)
+        if inputs.length == 0 && this.root.bytes > 0 : inputs.append(this.root)
+        let list = json.new_array()
+        let seen = Map[bool]{}
+        each inputs as input {
+            let b = build.Build.init_from_args(Array[String]{ input }) ! continue
+            this.attach_to_build(b)
+            b.options.keep_going = true
+            b.run() ! {}
+            let paths = Array[String]{}
+            each b.cache.loaded_files as src, path {
+                let ns = src.ns
+                if isset(ns) && ns.pkg == b.main_pkg : paths.append(path)
+            }
+            each paths as path {
+                let symbols = this.symbols_for(b, path)
+                each symbols as sym {
+                    lsp_add_workspace_symbol(list, seen, sym, path, query, "")
+                }
+            }
+        }
+        this.success(list)
+    }
+}
+
+// The reference the cursor is on, or the declaration whose name it is on
+fn lsp_reference_target(b: build.Build, file: String, cursor: u32) ?build.LspRef {
+    let best: ?build.LspRef = null
+    each b.lsp_refs as ref {
+        let span = lsp_use_name_span(ref) ?! continue
+        if span.path != file || cursor < span.i || cursor > span.i + span.len : continue
+        best = ref
+    }
+    if isset(best) : return best
+    each b.lsp_refs as ref {
+        let span = lsp_decl_name_span(ref) ?! continue
+        if span.path != file || cursor < span.i || cursor > span.i + span.len : continue
+        return ref
+    }
+    return null
+}
+
+// The name as written in a use: the last whole-word match in its expression, as in `a.b.name`
+fn lsp_use_name_span(ref: build.LspRef) ?NameSpan {
+    let at = build.message_resolve(ref.at.src, ref.at.i)
+    let path = at.src.path ?! return null
+    let content = at.src.content
+    let found = lsp_find_word(content, ref.name, at.i, at.i + ref.at.len, true)
+    if found == u32.$max : return null
+    return NameSpan { path: path, content: content, i: found, len: ref.name.bytes.to(u32) }
+}
+
+// The name in the declaration: its first whole-word match
+fn lsp_decl_name_span(ref: build.LspRef) ?NameSpan {
+    let at = build.message_resolve(ref.target.src, ref.target.i)
+    let path = at.src.path ?! return null
+    let content = at.src.content
+    let found = lsp_find_word(content, ref.name, at.i, at.i + ref.target.len, false)
+    if found == u32.$max : return null
+    return NameSpan { path: path, content: content, i: found, len: ref.name.bytes.to(u32) }
+}
+
+// The offset of `word` as a whole word within [from, to), the last one or the first; u32.$max when absent
+fn lsp_find_word(content: String, word: String, from: u32, to: u32, last: bool) u32 {
+    let result = u32.$max
+    if word.bytes == 0 : return result
+    let end = to.to(uint)
+    if end > content.bytes : end = content.bytes
+    let i = from.to(uint)
+    while i + word.bytes <= end {
+        let hit = content.range(i, word.bytes) == word
+        let before_ok = i == 0 || !lsp_word_byte(content.get(i - 1))
+        let after_ok = i + word.bytes >= content.bytes || !lsp_word_byte(content.get(i + word.bytes))
+        if hit && before_ok && after_ok {
+            result = i.to(u32)
+            if !last : return result
+        }
+        i++
+    }
+    return result
+}
+
+fn lsp_word_byte(ch: u8) bool {
+    return ch.is_alpha_numeric() || ch == '_'
+}
+
+fn lsp_valid_name(name: String) bool {
+    if name.bytes == 0 : return false
+    let first = name.get(0)
+    if !(first.is_alpha() || first == '_') : return false
+    let i: uint = 1
+    while i < name.bytes {
+        if !lsp_word_byte(name.get(i)) : return false
+        i++
+    }
+    return true
+}
+
+fn lsp_span_location(span: NameSpan) json.Value {
+    let from = lsp_line_col(span.content, span.i)
+    let to = lsp_line_col(span.content, span.i + span.len)
+    let loc = json.new_object()
+    loc.set("uri", json.from("file://" + span.path))
+    loc.set("range", json_range(from.line, from.col, to.line, to.col))
+    return loc
+}
+
+// A documentSymbol entry (and its children) as SymbolInformation, when its name matches
+fn lsp_add_workspace_symbol(list: json.Value, seen: Map[bool], sym: json.Value, path: String, query: String, container: String) {
+    let name = sym.get("name").string_value() !? ""
+    let range = sym.get("range")
+    let key = path + ":" + (range.get("start").get("line").int_value() !? 0) + ":" + name
+    if (query.bytes == 0 || name.lower().contains(query)) && !seen.has(key) {
+        seen.set(key, true)
+        let info = json.new_object()
+        info.set("name", json.from(name))
+        info.set("kind", sym.get("kind"))
+        let loc = json.new_object()
+        loc.set("uri", json.from("file://" + path))
+        loc.set("range", range)
+        info.set("location", loc)
+        if container.bytes > 0 : info.set("containerName", json.from(container))
+        list.append(info)
+    }
+    let children = sym.get("children")
+    if children.is_array {
+        each children as child : lsp_add_workspace_symbol(list, seen, child, path, query, name)
+    }
+}

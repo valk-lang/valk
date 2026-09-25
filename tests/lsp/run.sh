@@ -601,7 +601,7 @@ esac
 
 # Every request must be answered, or the client waits for its timeout
 check "unsupported request gets an error reply" '"code":-32601' \
-    '{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{}}'
+    '{"jsonrpc":"2.0","id":2,"method":"textDocument/typeDefinition","params":{}}'
 # Request ids may be strings; they are echoed back rather than coerced
 check "request id is echoed verbatim" '"id":"req-abc"' \
     '{"jsonrpc":"2.0","id":"req-abc","method":"textDocument/rename","params":{}}'
@@ -652,6 +652,40 @@ esac
 check "generic errors point at the instantiation" "\"message\":\"while instantiating 'Box[String]' here\"" \
     "$(notify_open generic-chain.valk)"
 count=$((count + 1))
+check "initialize advertises references, rename and workspace symbols" '"referencesProvider":true,"renameProvider":true,"workspaceSymbolProvider":true'
+
+# `helper` is declared on line 0 and used on lines 7 and 45 (0-based)
+refs_request() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/references","params":{"textDocument":{"uri":"file://%s"},"position":{"line":%s,"character":%s},"context":{"includeDeclaration":true}}}' \
+        "$DIR/$1" "$2" "$3"
+}
+rename_request() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{"textDocument":{"uri":"file://%s"},"position":{"line":%s,"character":%s},"newName":"%s"}}' \
+        "$DIR/$1" "$2" "$3" "$4"
+}
+check "references of a function include its declaration" '"start":{"line":0,"character":3},"end":{"line":0,"character":9}' \
+    "$(refs_request nav.valk 7 14)"
+check "references of a function include a use in another function" '"start":{"line":45,"character":11}' \
+    "$(refs_request nav.valk 7 14)"
+check_absent "references of a function leave out its parameters" '"start":{"line":1,"character":11}' \
+    "$(refs_request nav.valk 7 14)"
+check "references from the declaration's name" '"start":{"line":7,"character":14},"end":{"line":7,"character":20}' \
+    "$(refs_request nav.valk 0 5)"
+check "references of a local" '"start":{"line":7,"character":21}' \
+    "$(refs_request nav.valk 5 9)"
+check "rename edits the declaration and every use" '"newText":"assist"}' \
+    "$(rename_request nav.valk 7 14 assist)"
+check "rename of a method" '"start":{"line":39,"character":12},"end":{"line":39,"character":16}},"newText":"step"' \
+    "$(rename_request nav.valk 32 10 step)"
+check "rename refuses an invalid name" "'1x' is not a valid name" \
+    "$(rename_request nav.valk 7 14 1x)"
+check "rename refuses a name from the standard library" 'cannot be renamed here' \
+    "$(rename_request nav.valk 8 5 print_it)"
+check "workspace symbols match a query in open files" '"name":"Counter","kind":5' \
+    "$(notify_open nav.valk)" '{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"count"}}'
+check "workspace symbols name the container of a member" '"containerName":"Counter"' \
+    "$(notify_open nav.valk)" '{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"bump"}}'
+
 echo "> \$/cancelRequest is ignored silently"
 stream="$(frame "$init")$(frame '{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}')"
 out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)
