@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Structs, tuples and fixed arrays are `HashMap`/`HashSet` keys without a `$hash` of their own: they hash their parts (integers, enums, pointers, `$hash` types such as `String`, nested structs, nullable parts) consistently with `==`. `each` over a custom `_next` that returns a type parameter holding a tuple gives the tuple whole, like `$offset` (only a declared `(A, B)` list is several values)
 + Enums take methods with `extend Color { ... }` (instance and static), and every enum gets `name()`, `items()` and `from_name()`. `to(String)`, `%{c}` and `"x" + c` give an item's name instead of its number (`to(int)` gives the number); an enum of text keeps giving its text
 + `match` cases take several patterns (`1, 2 =>`, `.red, .blue =>`, `int, float =>`), guards (`int as n if n > 9 =>`, `_ if x < 0 =>`) and integer ranges (`'a' .. 26 =>`, start + count like `each`); a guarded case does not count toward exhaustiveness. The formatter no longer indents `.name =>` cases as a method chain
 + `valk completion bash|zsh|fish` prints a tab-completion script: commands, build options, `--target` values and the make commands of the project (`valk ls --names` lists those one per line)

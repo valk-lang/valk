@@ -499,6 +499,11 @@ let b : HashMap[String, uint] = a
 let c : Map[uint] = b
 ```
 
+Keys are integers, pointers, types with a `$hash` method (such as `String`), or
+structs, tuples and fixed arrays made of those: they hash their parts the way `==`
+compares them, so `HashMap[(int, int), T]` and a `struct Point` key need no code.
+A part that is a float, or a struct with its own `$eq`, needs a `$hash` of your own.
+
 Full `HashMap` API: [core](api.md#core)
 
 ## Sets, deques and heaps
