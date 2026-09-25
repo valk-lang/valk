@@ -1409,6 +1409,18 @@ while x++ < 5 {
 // output: 2 3
 ```
 
+A number after `break` or `continue` leaves that many loops, counting from
+the innermost: `break 2` ends the loop around this one too, and `continue 2`
+goes on with its next round.
+
+```rust
+each rows as row {
+    each row as cell {
+        if cell == target : break 2
+    }
+}
+```
+
 ### Each
 
 ```rust
