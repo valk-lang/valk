@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Comparing a nullable value with `==` or `!=` evaluates each side once: `next() == 3` called `next` twice when it returned a nullable, and a handled call inside a nullable ternary failed to compile when compared
 + Processes: `Process.start(exe, args, stdin:, stdout:, stderr:, cwd:, env:)` without a shell, each stream `.inherit`, `.pipe` or `.discard` (`p.stdin.write`, `p.stdout.read_all`), and `Process.output(exe, args, input:)` runs one to its end and returns its code, stdout and stderr. `wait(timeout_ms)`, `signal(.terminate)` and `id()`. Waiting for a child or its pipes only pauses the current coroutine, so a server on the same thread keeps answering (a child that called it hung before). `core.exec` runs on top of it; on Windows through `cmd.exe /d /s /c`, so a command that starts with a quote keeps it
 + LSP: find references, rename (declarations of the own package, checked names) and workspace symbols
 + Named arguments: `resize(height: 5, width: 7)` after the positional ones, in any order, leaving out defaults; they are evaluated in the order written. Variadic parameters: `fn sum(values: ...int)` receives an `Array[int]`, called as `sum(1, 2, 3)` or `sum(...numbers)`
