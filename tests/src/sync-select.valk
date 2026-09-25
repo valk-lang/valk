@@ -1,0 +1,177 @@
+use valk.sync
+use valk.time
+use valk.thread
+
+fn select_send_later(ch: shared sync.Channel[String], ms: uint) {
+    time.sleep_ms(ms)
+    ch.send("hello") ! {}
+}
+
+fn select_index_only(a: shared sync.Channel[int]) uint {
+    return sync.select(.{ a }, timeout_ms: 2000) !? 99
+}
+
+fn select_recv_one(a: shared sync.Channel[int]) int {
+    return a.recv(3000) !? -1
+}
+
+test "sync.select waits on several channels" {
+    let jobs: shared sync.Channel[String] = sync.Channel[String].new() !!
+    let quit: shared sync.Channel[bool] = sync.Channel[bool].new() !!
+    co select_send_later(jobs, 20)
+    let ready = sync.select(.{ quit, jobs }, timeout_ms: 2000) !!
+    assert(ready == 1)
+    assert(jobs.try_recv() !! == "hello")
+
+    // The first ready channel wins
+    jobs.send("a") !!
+    quit.send(true) !!
+    assert(sync.select(.{ quit, jobs }) !! == 0)
+
+    // A closed channel is ready: its receive ends
+    let closed: shared sync.Channel[int] = sync.Channel[int].new() !!
+    closed.close()
+    assert(sync.select(.{ closed }) !! == 0)
+
+    let empty: shared sync.Channel[int] = sync.Channel[int].new() !!
+    let timed_out = false
+    sync.select(.{ empty }, timeout_ms: 20) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+
+    let token: shared sync.CancelToken = sync.CancelToken.new() !!
+    token.cancel()
+    let cancelled = false
+    sync.select(.{ empty }, cancel: token) ! { cancelled = error_is(E.code, cancelled) }
+    assert(cancelled)
+
+    let none = false
+    sync.select(Array[sync.Selectable]{}) ! { none = error_is(E.code, empty) }
+    assert(none)
+}
+
+test "sync.select passes a wake on to the next receiver" {
+    // A send wakes one waiting receiver. When that is a select that leaves the value, the
+    // plain receiver waiting behind it must still get it.
+    let a: shared sync.Channel[int] = sync.Channel[int].new() !!
+    let selecting = co select_index_only(a)
+    time.sleep_ms(10)
+    let receiving = co select_recv_one(a)
+    time.sleep_ms(10)
+    let sent = time.mono_ms()
+    a.send(7) !!
+    assert(await selecting == 0)
+    assert(await receiving == 7)
+    // Woken by the select, not by its own timeout
+    assert(time.mono_ms() - sent < 1000)
+}
+
+fn select_thread_sender(ch: shared sync.Channel[uint]) {
+    time.sleep_ms(20)
+    ch.send(42) ! {}
+}
+
+test "sync.select across threads" {
+    let ch: shared sync.Channel[uint] = sync.Channel[uint].new() !!
+    let other: shared sync.Channel[bool] = sync.Channel[bool].new() !!
+    let worker = thread.start(fn() { select_thread_sender(ch) }) !!
+    assert(sync.select(.{ other, ch }, timeout_ms: 5000) !! == 1)
+    assert(ch.try_recv() !! == 42)
+    worker.await()
+}
+
+test "sync.after and sync.ticker" {
+    let never: shared sync.Channel[int] = sync.Channel[int].new() !!
+    let start = time.mono_ms()
+    assert(sync.select(.{ never, sync.after(30) !! }) !! == 1)
+    assert(time.mono_ms() - start >= 25)
+
+    let tick = sync.ticker(5) !!
+    let seen = Array[uint]{}
+    each tick.channel as n {
+        seen.append(n)
+        if seen.length == 3 : tick.stop()
+    }
+    assert(seen.length == 3 && (seen.get(0) !! ) == 1)
+    tick.stop()
+}
+
+fn wait_group_task(wg: shared sync.WaitGroup, results: shared sync.Channel[uint], n: uint) {
+    time.sleep_ms(n * 5)
+    results.send(n) ! {}
+    wg.done()
+}
+
+test "sync.WaitGroup" {
+    let wg: shared sync.WaitGroup = sync.WaitGroup.new() !!
+    // Nothing to wait for
+    wg.wait() !!
+    let results: shared sync.Channel[uint] = sync.Channel[uint].new() !!
+    each 1 .. 5 as n {
+        wg.add(1)
+        co wait_group_task(wg, results, n.to(uint))
+    }
+    assert(wg.count == 5)
+    wg.wait() !!
+    assert(wg.count == 0 && results.length == 5)
+
+    // Threads count down the same group
+    wg.add(3)
+    let workers = Array[thread.Thread[int]]{}
+    each 0 .. 3 as i {
+        workers.append(thread.Thread[int].start(fn() int {
+            time.sleep_ms(10)
+            wg.done()
+            return 0
+        }) !!)
+    }
+    wg.wait(5000) !!
+    assert(wg.count == 0)
+    each workers as w : w.await()
+
+    // A done without a task is ignored, and a wait can time out
+    wg.done()
+    assert(wg.count == 0)
+    wg.add(1)
+    let timed_out = false
+    wg.wait(10) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+    wg.done()
+}
+
+shared semaphore_running: uint (0)
+shared semaphore_peak: uint (0)
+
+fn semaphore_task(slots: shared sync.Semaphore, wg: shared sync.WaitGroup) {
+    slots.acquire() ! return
+    let now = atomic(semaphore_running + 1) + 1
+    if now > semaphore_peak : semaphore_peak = now
+    time.sleep_ms(5)
+    atomic(semaphore_running - 1)
+    slots.release()
+    wg.done()
+}
+
+test "sync.Semaphore" {
+    let slots: shared sync.Semaphore = sync.Semaphore.new(2) !!
+    slots.acquire() !!
+    assert(slots.try_acquire())
+    assert(!slots.try_acquire())
+    assert(slots.available == 0)
+    let timed_out = false
+    slots.acquire(10) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+    slots.release()
+    slots.release()
+    assert(slots.available == 2)
+
+    // At most 3 of 12 tasks run at once
+    let limit: shared sync.Semaphore = sync.Semaphore.new(3) !!
+    let wg: shared sync.WaitGroup = sync.WaitGroup.new() !!
+    each 0 .. 12 as i {
+        wg.add(1)
+        co semaphore_task(limit, wg)
+    }
+    wg.wait(5000) !!
+    assert(semaphore_peak == 3)
+    assert(limit.available == 3)
+}

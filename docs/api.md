@@ -4562,6 +4562,17 @@ error SignalError (unsupported, init)
 + error SyncError (closed, timeout, cancelled, empty, full, init)
 ```
 
+## Functions for 'sync'
+
+```js
+// Returns a channel that receives `true` once, `ms` milliseconds from now.
++ fn after(ms: uint) shared Channel[bool] !SyncError
+// Waits until one of `channels` has a value to receive or is closed, and returns its index.
++ fn select(channels: Array[Selectable], timeout_ms: uint (0), cancel: ?shared CancelToken (null)) uint !SyncError
+// Returns a `Ticker` whose channel receives every `interval_ms` milliseconds until `stop`.
++ fn ticker(interval_ms: uint) Ticker !SyncError
+```
+
 ## Classes for 'sync'
 
 ```js
@@ -4597,12 +4608,63 @@ error SignalError (unsupported, init)
     + static fn new(capacity: ?uint (null)) Channel[T] !SyncError
     // Returns the next value, waiting for one.
     + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
+    // Backs `select`: a channel converts to a `Selectable` where one is expected.
+    + fn selectable() Selectable
     // Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until a receiver took it.
     + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
     // Returns the next value without waiting; throws `empty` when none is queued.
     + fn try_recv() T !SyncError
     // Queues `value` without waiting.
     + fn try_send(value: T) void !SyncError
+}
+```
+
+```js
+// Something `select` waits on. A `Channel` converts to one where it is expected, so a list of channels of any element types can be passed: `sync.select(.{ jobs, quit })`.
++ class Selectable {
+}
+```
+
+```js
+// Limits how many tasks do something at once: `acquire` takes a permit, waiting while none is free, and `release` gives it back.
++ class Semaphore {
+    // Takes a permit, waiting while none is free.
+    + fn acquire(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
+    // The number of free permits.
+    + get available: uint
+    // Returns a semaphore with `permits` free permits; throws `init` when its lock cannot be created.
+    + static fn new(permits: uint) Semaphore !SyncError
+    // Gives a permit back and wakes one waiting `acquire`.
+    + fn release() void
+    // Takes a permit when one is free, without waiting; returns whether it did.
+    + fn try_acquire() bool
+}
+```
+
+```js
+// A clock that sends the tick number (1, 2, ...) to `channel` every interval, from `ticker`.
++ class Ticker {
+    // Receives the tick numbers; closed by `stop`.
+    ~ channel: shared Channel[uint]
+
+    // Stops the ticker and closes its channel; a second call does nothing.
+    + fn stop() void
+}
+```
+
+```js
+// Counts running tasks so another task can wait until all of them are done.
++ class WaitGroup {
+    // Counts `n` more running tasks.
+    + fn add(n: uint (1)) void
+    // The number of tasks that were added and are not done yet.
+    + get count: uint
+    // Marks one task done, and wakes the waiters when it was the last. A `done` without a task left to count is ignored.
+    + fn done() void
+    // Returns a group with a count of 0; throws `init` when its lock cannot be created.
+    + static fn new() WaitGroup !SyncError
+    // Waits until the count is 0; returns at once when it already is.
+    + fn wait(timeout_ms: uint (0)) void !SyncError
 }
 ```
 

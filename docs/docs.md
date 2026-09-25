@@ -2111,6 +2111,27 @@ let bytes = con.read(buffer) ! {
 }
 ```
 
+`sync.select` waits on several channels at once and returns the index of one
+that has a value or was closed; take the value with `try_recv`. `sync.after(ms)`
+gives a channel that receives once, for a deadline, and `sync.ticker(ms)` one that
+receives every interval until `stop()`:
+
+```rust
+let tick = sync.ticker(1000) ! panic("init")
+while true {
+    let ready = sync.select(.{ jobs, quit, tick.channel }) ! break
+    if ready == 0 : handle(jobs.try_recv() ! continue)
+    if ready == 1 : break
+    if ready == 2 : report(tick.channel.try_recv() ! continue)
+}
+tick.stop()
+```
+
+A `WaitGroup` waits until a number of tasks are done: `add(1)` before starting
+one, `done()` when it finishes and `wait()` for all of them. A `Semaphore` limits
+how many tasks run at once: `acquire()` takes one of its permits, waiting while
+none is free, and `release()` gives it back.
+
 ## Signals
 
 API for [valk.signal](api.md#signal)

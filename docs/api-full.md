@@ -15352,6 +15352,46 @@ out. `cancelled`: the cancellation token fired. `empty` / `full`: a `try_recv` /
 `try_send` that could not proceed. `init`: an OS resource (pipe, lock) could not be
 created.
 
+## Functions for 'sync'
+
+```js
+// Returns a channel that receives `true` once, `ms` milliseconds from now.
++ fn after(ms: uint) shared Channel[bool] !SyncError
+// Waits until one of `channels` has a value to receive or is closed, and returns its index.
++ fn select(channels: Array[Selectable], timeout_ms: uint (0), cancel: ?shared CancelToken (null)) uint !SyncError
+// Returns a `Ticker` whose channel receives every `interval_ms` milliseconds until `stop`.
++ fn ticker(interval_ms: uint) Ticker !SyncError
+```
+
+### after
+
+Returns a channel that receives `true` once, `ms` milliseconds from now.
+
+Use it with `select` for a deadline. The timer is a coroutine on the calling thread, so it
+only fires while that thread keeps running its coroutines. Throws `init` when the channel
+cannot be created.
+
+### select
+
+Waits until one of `channels` has a value to receive or is closed, and returns its index.
+
+Take the value with `try_recv` on that channel: another receiver may have taken it first,
+and `try_recv` then throws `empty`, so select again. Channels earlier in the list win
+when several are ready. `timeout_ms` 0 waits forever. Throws `timeout`, `cancelled` when
+`cancel` fires, and `empty` for an empty list. Inside a coroutine only the coroutine waits.
+
+```valk
+let ready = sync.select(.{ jobs, quit }, timeout_ms: 1000) !
+if ready == 0 : handle(jobs.try_recv() ! continue)
+```
+
+### ticker
+
+Returns a `Ticker` whose channel receives every `interval_ms` milliseconds until `stop`.
+
+Like `after`, the ticker is a coroutine on the calling thread. Throws `init` when the
+channel cannot be created.
+
 ## Classes for 'sync'
 
 ```js
@@ -15434,6 +15474,8 @@ Parks the current coroutine, or blocks a native thread outside one.
     + static fn new(capacity: ?uint (null)) Channel[T] !SyncError
     // Returns the next value, waiting for one.
     + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
+    // Backs `select`: a channel converts to a `Selectable` where one is expected.
+    + fn selectable() Selectable
     // Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until a receiver took it.
     + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
     // Returns the next value without waiting; throws `empty` when none is queued.
@@ -15482,6 +15524,10 @@ Returns the next value, waiting for one.
 `timeout_ms` 0 waits forever. Throws `closed` once the channel is closed and empty,
 `timeout`, `cancelled` when `cancel` fires, and `init`.
 
+#### selectable
+
+Backs `select`: a channel converts to a `Selectable` where one is expected.
+
 #### send
 
 Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until
@@ -15503,6 +15549,151 @@ Queues `value` without waiting.
 
 Throws `full` when the channel is full (on a rendezvous channel: when no receiver is
 waiting) and `closed` when it is closed.
+
+```js
+// Something `select` waits on. A `Channel` converts to one where it is expected, so a list of channels of any element types can be passed: `sync.select(.{ jobs, quit })`.
++ class Selectable {
+}
+```
+
+### Selectable
+
+Something `select` waits on. A `Channel` converts to one where it is expected, so a list
+of channels of any element types can be passed: `sync.select(.{ jobs, quit })`.
+
+```js
+// Limits how many tasks do something at once: `acquire` takes a permit, waiting while none is free, and `release` gives it back.
++ class Semaphore {
+    // Takes a permit, waiting while none is free.
+    + fn acquire(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
+    // The number of free permits.
+    + get available: uint
+    // Returns a semaphore with `permits` free permits; throws `init` when its lock cannot be created.
+    + static fn new(permits: uint) Semaphore !SyncError
+    // Gives a permit back and wakes one waiting `acquire`.
+    + fn release() void
+    // Takes a permit when one is free, without waiting; returns whether it did.
+    + fn try_acquire() bool
+}
+```
+
+### Semaphore
+
+Limits how many tasks do something at once: `acquire` takes a permit, waiting while none
+is free, and `release` gives it back.
+
+```valk
+let slots: shared sync.Semaphore = sync.Semaphore.new(10) !
+slots.acquire() !
+defer slots.release()
+```
+
+#### acquire
+
+Takes a permit, waiting while none is free.
+
+`timeout_ms` 0 waits forever. Throws `timeout` and `cancelled` when `cancel` fires. Inside
+a coroutine only the coroutine waits.
+
+#### available
+
+The number of free permits.
+
+#### new
+
+Returns a semaphore with `permits` free permits; throws `init` when its lock cannot be
+created.
+
+#### release
+
+Gives a permit back and wakes one waiting `acquire`.
+
+#### try_acquire
+
+Takes a permit when one is free, without waiting; returns whether it did.
+
+```js
+// A clock that sends the tick number (1, 2, ...) to `channel` every interval, from `ticker`.
++ class Ticker {
+    // Receives the tick numbers; closed by `stop`.
+    ~ channel: shared Channel[uint]
+
+    // Stops the ticker and closes its channel; a second call does nothing.
+    + fn stop() void
+}
+```
+
+### Ticker
+
+A clock that sends the tick number (1, 2, ...) to `channel` every interval, from `ticker`.
+
+A tick that finds the previous one still unreceived is dropped, so a slow receiver does
+not fall further behind.
+
+#### channel
+
+Receives the tick numbers; closed by `stop`.
+
+#### stop
+
+Stops the ticker and closes its channel; a second call does nothing.
+
+```js
+// Counts running tasks so another task can wait until all of them are done.
++ class WaitGroup {
+    // Counts `n` more running tasks.
+    + fn add(n: uint (1)) void
+    // The number of tasks that were added and are not done yet.
+    + get count: uint
+    // Marks one task done, and wakes the waiters when it was the last. A `done` without a task left to count is ignored.
+    + fn done() void
+    // Returns a group with a count of 0; throws `init` when its lock cannot be created.
+    + static fn new() WaitGroup !SyncError
+    // Waits until the count is 0; returns at once when it already is.
+    + fn wait(timeout_ms: uint (0)) void !SyncError
+}
+```
+
+### WaitGroup
+
+Counts running tasks so another task can wait until all of them are done.
+
+Call `add` before starting a task and `done` when it finishes; `wait` returns once the
+count is back to 0. Share it across threads as `shared WaitGroup`. It holds no results:
+use `await` or a `Channel` for those.
+
+```valk
+let wg: shared sync.WaitGroup = sync.WaitGroup.new() !
+each urls as u {
+    wg.add(1)
+    co download(u, wg) // calls wg.done() when finished
+}
+wg.wait() !
+```
+
+#### add
+
+Counts `n` more running tasks.
+
+#### count
+
+The number of tasks that were added and are not done yet.
+
+#### done
+
+Marks one task done, and wakes the waiters when it was the last. A `done` without a
+task left to count is ignored.
+
+#### new
+
+Returns a group with a count of 0; throws `init` when its lock cannot be created.
+
+#### wait
+
+Waits until the count is 0; returns at once when it already is.
+
+`timeout_ms` 0 waits forever. Throws `timeout`. Inside a coroutine only the coroutine
+waits.
 
 ```js
 // A wakeup for the coroutine or thread that waits on it; `wake` may be called from any thread.
