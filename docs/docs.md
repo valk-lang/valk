@@ -1650,6 +1650,17 @@ without a leading zero), `M`/`F` (`Jan`/`January`), `d`/`j` (day), `D`/`l`
 `format("Y-m-d\\TH:i")`. `from_format` reads the same tokens back, and
 `from_iso8601` also takes a date alone (`2024-03-05`, midnight UTC).
 
+A `time.Duration` is a length of time in microseconds. Subtracting two
+`DateTime` values gives one, and `add` and `subtract` move a date by one:
+
+```rust
+let took = finished - started               // Duration
+println(took)                               // 1h30m
+let deadline = started.add(time.Duration.of_hours(2)) ! panic("Invalid date")
+if took > time.Duration.of_minutes(45) { }
+time.sleep(time.Duration.of_ms(250))
+```
+
 ## Time zones
 
 `time.zone` loads a zone from the IANA time zone database by name. A `DateTime`

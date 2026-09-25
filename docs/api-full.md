@@ -15774,6 +15774,8 @@ data or rule text is malformed.
 + fn mono_ns() uint
 // Returns a monotonic clock reading in microseconds, for measuring durations.
 + fn mono_us() uint
+// Pauses the caller for at least `duration`; nothing happens for a negative one. See `sleep_ns`.
++ fn sleep(duration: Duration) void
 // Pauses the caller for at least `ms` milliseconds; see `sleep_ns`.
 + fn sleep_ms(ms: uint) void
 // Pauses the caller for at least `ns` nanoseconds.
@@ -15824,6 +15826,10 @@ The starting point is unspecified; only differences between readings are meaning
 ### mono_us
 
 Returns a monotonic clock reading in microseconds, for measuring durations.
+
+### sleep
+
+Pauses the caller for at least `duration`; nothing happens for a negative one. See `sleep_ns`.
 
 ### sleep_ms
 
@@ -15887,6 +15893,8 @@ Throws `invalid` when the data is malformed.
 
 ```js
 + class DateTime {
+    // Returns a copy moved forward by `duration` (back for a negative one), in the same zone.
+    + fn add(duration: Duration) DateTime !LookupError
     // Returns a copy moved by `amount` calendar days, which may be negative.
     + fn add_days(amount: int) DateTime !LookupError
     // Returns a copy moved by `amount` hours, which may be negative.
@@ -15991,6 +15999,10 @@ Throws `invalid` when the data is malformed.
     + static fn now_in(zone: Zone) DateTime
     // Returns the second, 0 to 59.
     + fn second() uint
+    // Returns the time from `earlier` to this value, negative when `earlier` is later.
+    + fn since(earlier: DateTime) Duration
+    // Returns a copy moved back by `duration`; see `add`.
+    + fn subtract(duration: Duration) DateTime !LookupError
     // Returns the value as ISO 8601 text, such as `2024-03-05T14:07:09Z` in UTC or `2024-03-05T15:07:09+01:00` in a time zone.
     + fn to_iso8601() String
     // Writes `to_iso8601()` into `buf` and returns the byte count.
@@ -16029,6 +16041,12 @@ Throws `invalid` when the data is malformed.
     + fn zone_abbreviation() String
 }
 ```
+
+#### add
+
+Returns a copy moved forward by `duration` (back for a negative one), in the same zone.
+
+Throws `LookupError` when the result falls outside years 1 to 9999.
 
 #### add_days
 
@@ -16327,6 +16345,16 @@ Panics when the system clock is outside the supported range.
 
 Returns the second, 0 to 59.
 
+#### since
+
+Returns the time from `earlier` to this value, negative when `earlier` is later.
+
+Backs `later - earlier`. Zones do not matter: both are instants.
+
+#### subtract
+
+Returns a copy moved back by `duration`; see `add`.
+
 #### to_iso8601
 
 Returns the value as ISO 8601 text, such as `2024-03-05T14:07:09Z` in UTC or
@@ -16417,6 +16445,157 @@ Returns the zone this value is shown in; `time.utc()` unless it was made for a z
 #### zone_abbreviation
 
 Returns the zone's abbreviation at this instant, such as `CET`, or `UTC`.
+
+```js
+// A length of time with microsecond precision, positive or negative.
++ struct Duration {
+    + microseconds: int
+
+    // Returns the duration without its sign.
+    + fn abs() Duration
+    // The whole days.
+    + fn days() int
+    // Backs `==`.
+    + fn equals(other: Duration) bool
+    // Backs `>`.
+    + fn greater_than(other: Duration) bool
+    // Hashes the length, so durations can be map keys.
+    + fn hash() uint
+    // The whole hours.
+    + fn hours() int
+    // Returns true when the duration is below zero.
+    + fn is_negative() bool
+    // Backs `<`.
+    + fn less_than(other: Duration) bool
+    // Returns this duration minus `other`; backs `a - b`.
+    + fn minus(other: Duration) Duration
+    // The whole minutes.
+    + fn minutes() int
+    // The whole milliseconds.
+    + fn ms() int
+    // A duration of `days` days of 24 hours.
+    + static fn of_days(days: int) Duration
+    // A duration of `hours` hours.
+    + static fn of_hours(hours: int) Duration
+    // A duration of `minutes` minutes.
+    + static fn of_minutes(minutes: int) Duration
+    // A duration of `ms` milliseconds.
+    + static fn of_ms(ms: int) Duration
+    // A duration of `seconds` seconds.
+    + static fn of_seconds(seconds: int) Duration
+    // A duration of `us` microseconds.
+    + static fn of_us(us: int) Duration
+    // Returns the sum of both durations; backs `a + b`.
+    + fn plus(other: Duration) Duration
+    // The whole seconds.
+    + fn seconds() int
+    // The seconds with their fraction.
+    + fn seconds_float() float
+    // Returns the duration `factor` times as long.
+    + fn times(factor: int) Duration
+    // Returns the duration as text such as `2d3h`, `1h30m`, `4.5s`, `250ms`, `15us` or `0s`.
+    + fn to_string() String
+}
+```
+
+### Duration
+
+A length of time with microsecond precision, positive or negative.
+
+Make one with `Duration.of_seconds(90)` and friends, or subtract two `DateTime` values:
+`later - earlier`. Durations add, subtract and compare with the usual operators, and
+print like `1h30m` or `-2.5s`. The getters give the whole number of each unit, rounded
+toward zero: a duration of 90 minutes has `hours()` 1 and `minutes()` 90.
+
+#### abs
+
+Returns the duration without its sign.
+
+#### days
+
+The whole days.
+
+#### equals
+
+Backs `==`.
+
+#### greater_than
+
+Backs `>`.
+
+#### hash
+
+Hashes the length, so durations can be map keys.
+
+#### hours
+
+The whole hours.
+
+#### is_negative
+
+Returns true when the duration is below zero.
+
+#### less_than
+
+Backs `<`.
+
+#### minus
+
+Returns this duration minus `other`; backs `a - b`.
+
+#### minutes
+
+The whole minutes.
+
+#### ms
+
+The whole milliseconds.
+
+#### of_days
+
+A duration of `days` days of 24 hours.
+
+#### of_hours
+
+A duration of `hours` hours.
+
+#### of_minutes
+
+A duration of `minutes` minutes.
+
+#### of_ms
+
+A duration of `ms` milliseconds.
+
+#### of_seconds
+
+A duration of `seconds` seconds.
+
+#### of_us
+
+A duration of `us` microseconds.
+
+#### plus
+
+Returns the sum of both durations; backs `a + b`.
+
+#### seconds
+
+The whole seconds.
+
+#### seconds_float
+
+The seconds with their fraction.
+
+#### times
+
+Returns the duration `factor` times as long.
+
+#### to_string
+
+Returns the duration as text such as `2d3h`, `1h30m`, `4.5s`, `250ms`, `15us` or `0s`.
+
+Units that are zero are left out; seconds carry their fraction.
 
 ```js
 // A time zone: the UTC offsets, daylight saving time and abbreviations of a region through its history.
