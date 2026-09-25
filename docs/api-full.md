@@ -11796,6 +11796,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
 
+    // Wraps the handler in `middleware`, which runs for every request that reaches the handler.
+    + fn add_middleware(middleware: shared fn(Request, shared fn(Request)(Response))(Response)) void
     // Serves files from the directory `path` before a request reaches the handler.
     + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
@@ -11907,6 +11909,24 @@ How long in-flight requests may take after a stop signal, in milliseconds.
 #### write_timeout_ms
 
 How long each socket write may take, in milliseconds.
+
+#### add_middleware
+
+Wraps the handler in `middleware`, which runs for every request that reaches the
+handler.
+
+It gets the request and `next`, the rest of the chain: it can answer by itself, or
+call `next(req)` and change or inspect the response, for logging, authentication or
+CORS headers. Middleware added first runs first. Static files and a `fast` handler
+are served without it.
+
+```valk
+server.add_middleware(fn(req: http.Request, next: shared fn(http.Request)(http.Response)) http.Response {
+    let res = next(req)
+    res.set_header("X-Frame-Options", "DENY")
+    return res
+})
+```
 
 #### add_static_dir
 

@@ -2473,8 +2473,21 @@ fn handler(req: http.Request) http.Response {
 and `SameSite=Lax` with path `/`, so the one you forget about is the safe one;
 turn `secure` off while developing over plain HTTP. `expires` takes a
 `time.DateTime`, `max_age` seconds, and `res.clear_cookie(name)` deletes one at
-the browser. A client reads what a server set with `response.cookies()`; nothing
-is stored between requests.
+the browser. A client reads what a server set with `response.cookies()`, and an
+`http.Client` keeps them between requests.
+
+`add_middleware` wraps the handler for logging, authentication or headers: a
+middleware gets the request and `next`, and answers by itself or through `next`.
+Middleware added first runs first:
+
+```rust
+s.add_middleware(fn(req: http.Request, next: shared fn(http.Request)(http.Response)) http.Response {
+    let start = time.mono_ms()
+    let res = next(req)
+    log.info(req.method + " " + req.path + " " + res.status + " " + (time.mono_ms() - start) + "ms")
+    return res
+})
+```
 
 `start` runs until shutdown. Use `co` to keep doing other work:
 

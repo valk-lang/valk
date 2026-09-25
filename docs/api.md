@@ -3492,6 +3492,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
 
+    // Wraps the handler in `middleware`, which runs for every request that reaches the handler.
+    + fn add_middleware(middleware: shared fn(Request, shared fn(Request)(Response))(Response)) void
     // Serves files from the directory `path` before a request reaches the handler.
     + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
