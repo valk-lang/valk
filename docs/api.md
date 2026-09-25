@@ -136,6 +136,13 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + error SystemError (failed, unsupported)
 ```
 
+## Enums for 'core'
+
+```js
+// How `Process.start` connects one standard stream of a child.
++ enum Stdio { inherit, pipe, discard }
+```
+
 ## Functions for 'core'
 
 ```js
@@ -804,18 +811,61 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
-// A child process started with `Process.run`.
+// A child process started with `Process.start`, `Process.run` or `Process.output`.
 + class Process {
+    // The child's stderr when it was started with `stderr: Stdio.pipe`.
+    ~ stderr: ProcessPipe
+    // The child's stdin when it was started with `stdin: Stdio.pipe`; close it to end the child's input.
+    ~ stdin: ProcessPipe
+    // The child's stdout when it was started with `stdout: Stdio.pipe`.
+    ~ stdout: ProcessPipe
+
     // Gives up control of the child, which keeps running on its own.
     + fn detach() void !io:IoError
     // Returns true when the child has exited, without waiting.
     + fn did_exit() bool !io:IoError
-    // Waits for the child to exit and returns its exit code.
+    // Waits for the child to exit and returns its exit code; `wait` without a timeout.
     + fn exit_code() i32 !io:IoError
+    // Returns the child's process id.
+    + fn id() uint
+    // Runs `exe` with `args` to its end and returns its exit code, stdout and stderr.
+    + static fn output(exe: String, args: ?Array[String] (null), input: ?String (null), cwd: ?String (null), env: ?Map[String] (null)) ProcessOutput !io:IoError
     // Starts `exe` with `args` and returns without waiting for it.
     + static fn run(exe: String, args: ?Array[String] (null), print_output: bool (false)) Process !io:IoError
-    // Kills the child and waits for it to exit.
+    // Sends `sig` to the child; does nothing once it has exited.
+    + fn signal(sig: Signal) void !io:IoError
+    // Starts `exe` with `args` and returns without waiting for it.
+    + static fn start(exe: String, args: ?Array[String] (null), stdin: Stdio (Stdio.inherit), stdout: Stdio (Stdio.inherit), stderr: Stdio (Stdio.inherit), cwd: ?String (null), env: ?Map[String] (null)) Process !io:IoError
+    // Kills the child and waits for it to exit; inside a coroutine only the coroutine waits.
     + fn stop() void !io:IoError
+    // Waits for the child to exit and returns its exit code.
+    + fn wait(timeout_ms: uint (0)) i32 !io:IoError
+}
+```
+
+```js
+// What `Process.output` collected from a child that ran to its end.
++ struct ProcessOutput {
+    // The exit code; see `Process.wait`.
+    + code: i32
+    // Everything the child wrote to stderr.
+    + stderr: String
+    // Everything the child wrote to stdout.
+    + stdout: String
+}
+```
+
+```js
+// This process's end of a pipe to one standard stream of a child, see `Process.start`.
++ class ProcessPipe is Reader, Writer, Closer {
+    // Closes this end; closing `stdin` ends the child's input. Does nothing when closed.
+    + fn close() void !io:IoError
+    // Reads up to `buf.length` bytes of the child's output into `buf` and returns the count.
+    + fn read(buf: local mut &[u8]) uint !io:IoError
+    // Reads until the child's end is closed and returns everything read as text.
+    + fn read_all() String !io:IoError
+    // Writes all of `data` to the child's stdin and returns `data.length`.
+    + fn write(data: local &[u8]) uint !io:IoError
 }
 ```
 

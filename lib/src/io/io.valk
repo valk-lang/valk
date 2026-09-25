@@ -120,7 +120,7 @@ fn read_bytes_sync(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
         let error = ext.GetLastError()
         if error != ext.ERROR_IO_PENDING {
             ext.CloseHandle(event)
-            if error == ext.ERROR_HANDLE_EOF : return 0
+            if error == ext.ERROR_HANDLE_EOF || error == ext.ERROR_BROKEN_PIPE : return 0
             throw .read
         }
     }
@@ -128,7 +128,7 @@ fn read_bytes_sync(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
     let error = ext.GetLastError()
     ext.CloseHandle(event)
     if ok == 0 {
-        if error == ext.ERROR_HANDLE_EOF : return 0
+        if error == ext.ERROR_HANDLE_EOF || error == ext.ERROR_BROKEN_PIPE : return 0
         throw .read
     }
     win_advance(fd, offset, transferred)
@@ -195,14 +195,16 @@ fn read_bytes(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
     let ok = ext.ReadFile(fd, buf, amount.to(u32), null, ov.@cast(ptr))
     if ok == 0 {
         let error = ext.GetLastError()
-        if error == ext.ERROR_HANDLE_EOF : return 0
+        if error == ext.ERROR_HANDLE_EOF || error == ext.ERROR_BROKEN_PIPE : return 0
         if error != ext.ERROR_IO_PENDING : throw .read
     }
     coro.yield()
 
     ok = ext.GetOverlappedResult(fd, ov.@cast(ptr), @ref(ov.transferred), 1)
     if ok == 0 {
-        if ext.GetLastError() == ext.ERROR_HANDLE_EOF : return 0
+        // A pipe whose writer closed reports a broken pipe: the end of input
+        let error = ext.GetLastError()
+        if error == ext.ERROR_HANDLE_EOF || error == ext.ERROR_BROKEN_PIPE : return 0
         throw .read
     }
     if ov.base.sys.Internal != 0 : throw .read
@@ -359,6 +361,11 @@ fn cancel_kqueue_wait_events(kq: i32, current: coro.Coro) {
     if current.io_wait_write_armed {
         current.io_wait_write_armed = false
         kqueue_delete_wait(kq, current.io_wait_fd, EVFILT_WRITE, current.io_wait_event_id)
+        current.disarm_kernel_event()
+    }
+    if current.io_wait_proc_armed {
+        current.io_wait_proc_armed = false
+        kqueue_delete_wait(kq, current.io_wait_fd, EVFILT_PROC, current.io_wait_event_id)
         current.disarm_kernel_event()
     }
     if current.io_wait_timer_armed {
@@ -521,6 +528,57 @@ fn cancel_kqueue_wait_events(kq: i32, current: coro.Coro) {
 
     return coro.poll_event
 }
+
+#if OS == "macos"
+// Suspends the current coroutine until child process `pid` exits or `timeout_ms` passes
+// (0: no limit; a longer span than one kqueue timer ends early). Returns false when the
+// wait cannot be set up; a process that is already gone ends the wait at once.
+fn await_process_exit(pid: i32, timeout_ms: uint) bool {
+    @unsafe
+    let coro = coro.current_coro
+    if !isset(coro) : panic("Waiting for a process outside coroutine")
+    let kq = kqueue()
+    let ev: ext.kEvent = @undefined
+    coro.io_wait_active = true
+    coro.io_wait_timed_out = false
+    coro.io_wait_fd = pid
+    coro.io_wait_event_id = coro.event_id()
+    coro.io_wait_read_armed = false
+    coro.io_wait_write_armed = false
+    coro.io_wait_timer_armed = false
+    coro.io_wait_proc_armed = false
+    coro.poll_event = 0
+
+    coro.arm_kernel_event()
+    EV_SET(&ev, pid.to(uint), EVFILT_PROC, EV_ADD | EV_ENABLE | EV_ONESHOT | EV_UDATA_SPECIFIC, NOTE_EXIT, 0, coro.io_wait_event_id.@cast(ptr))
+    if !kqueue_change(kq, &ev) {
+        coro.disarm_kernel_event()
+        coro.io_wait_active = false
+        // An exited child that was not reaped yet is refused with ESRCH
+        return ext.get_errno() == ext.ESRCH
+    }
+    coro.io_wait_proc_armed = true
+
+    if timeout_ms > 0 {
+        let budget: uint = timeout_ms > MAX_TIMER_MS ? MAX_TIMER_MS : timeout_ms
+        coro.io_timer_ident = coro.timer_id++
+        coro.arm_kernel_event()
+        EV_SET(&ev, coro.io_timer_ident, EVFILT_TIMER, EV_ADD | EV_ENABLE | EV_ONESHOT, 0, budget.to(i64), (coro.event_id() | 1).@cast(ptr))
+        if !kqueue_change(kq, &ev) {
+            coro.disarm_kernel_event()
+            coro.io_wait_active = false
+            cancel_kqueue_wait_events(kq, coro)
+            return false
+        }
+        coro.io_wait_timer_armed = true
+    }
+
+    coro.yield()
+    coro.io_wait_active = false
+    cancel_kqueue_wait_events(kq, coro)
+    return true
+}
+#end
 
 #if TEST && OS == "linux"
 /// Test hook: waits on an empty pipe for `timeout_ms` and returns whether the wait timed out.

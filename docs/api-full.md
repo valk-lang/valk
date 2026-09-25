@@ -370,6 +370,17 @@ Text could not be parsed (`syntax`), as thrown by the number parsers such as `to
 An operating-system call failed (`failed`) or is not available on this platform
 (`unsupported`).
 
+## Enums for 'core'
+
+```js
+// How `Process.start` connects one standard stream of a child.
++ enum Stdio { inherit, pipe, discard }
+```
+
+### Stdio
+
+How `Process.start` connects one standard stream of a child.
+
 ## Functions for 'core'
 
 ```js
@@ -448,14 +459,16 @@ Names are case-sensitive except on Windows, where the name keeps the case it was
 
 Runs `cmd` through the shell and returns its exit code and captured output.
 
-The shell is `/bin/sh` (through `popen`) on Linux and macOS and `cmd.exe` on Windows.
+A shortcut over `Process`: the shell is `/bin/sh -c` on Linux and macOS and
+`cmd.exe /d /s /c` on Windows. The shell reads quotes, spaces and characters such as `;`
+in `cmd`, so pass values that come from outside as arguments to `Process.output` instead.
 With `capture_stderr` the output includes stderr; with `print_output` it is also written
-to stdout as it arrives. The call blocks the thread until the command ends. When the shell
-cannot be started, returns `EXEC_FAILED` with an error message in place of the output. On
-Linux and macOS a command killed by a signal reports 128 plus the signal number.
+to stdout as it arrives. Inside a coroutine only the coroutine waits for the command. When
+the shell cannot be started, returns `EXEC_FAILED` with an error message in place of the
+output. On Linux and macOS a command killed by a signal reports 128 plus the signal number.
 
-On Windows, while the working directory is a UNC path (`\\server\...`), it changes the
-process-wide working directory to `C:/` for the length of the call.
+On Windows, while the working directory is a UNC path (`\\server\...`), which cmd.exe
+cannot use, the command runs in `C:/`.
 
 ### exit
 
@@ -2694,27 +2707,57 @@ Panics when the size in bytes overflows. Marked `$default`: it also provides
 `Pool[T].$default_value`.
 
 ```js
-// A child process started with `Process.run`.
+// A child process started with `Process.start`, `Process.run` or `Process.output`.
 + class Process {
+    // The child's stderr when it was started with `stderr: Stdio.pipe`.
+    ~ stderr: ProcessPipe
+    // The child's stdin when it was started with `stdin: Stdio.pipe`; close it to end the child's input.
+    ~ stdin: ProcessPipe
+    // The child's stdout when it was started with `stdout: Stdio.pipe`.
+    ~ stdout: ProcessPipe
+
     // Gives up control of the child, which keeps running on its own.
     + fn detach() void !io:IoError
     // Returns true when the child has exited, without waiting.
     + fn did_exit() bool !io:IoError
-    // Waits for the child to exit and returns its exit code.
+    // Waits for the child to exit and returns its exit code; `wait` without a timeout.
     + fn exit_code() i32 !io:IoError
+    // Returns the child's process id.
+    + fn id() uint
+    // Runs `exe` with `args` to its end and returns its exit code, stdout and stderr.
+    + static fn output(exe: String, args: ?Array[String] (null), input: ?String (null), cwd: ?String (null), env: ?Map[String] (null)) ProcessOutput !io:IoError
     // Starts `exe` with `args` and returns without waiting for it.
     + static fn run(exe: String, args: ?Array[String] (null), print_output: bool (false)) Process !io:IoError
-    // Kills the child and waits for it to exit.
+    // Sends `sig` to the child; does nothing once it has exited.
+    + fn signal(sig: Signal) void !io:IoError
+    // Starts `exe` with `args` and returns without waiting for it.
+    + static fn start(exe: String, args: ?Array[String] (null), stdin: Stdio (Stdio.inherit), stdout: Stdio (Stdio.inherit), stderr: Stdio (Stdio.inherit), cwd: ?String (null), env: ?Map[String] (null)) Process !io:IoError
+    // Kills the child and waits for it to exit; inside a coroutine only the coroutine waits.
     + fn stop() void !io:IoError
+    // Waits for the child to exit and returns its exit code.
+    + fn wait(timeout_ms: uint (0)) i32 !io:IoError
 }
 ```
 
 ### Process
 
-A child process started with `Process.run`.
+A child process started with `Process.start`, `Process.run` or `Process.output`.
 
 Dropping a `Process` does not stop its child. On Linux and macOS a background thread
 reaps a dropped child once it exits.
+
+#### stderr
+
+The child's stderr when it was started with `stderr: Stdio.pipe`.
+
+#### stdin
+
+The child's stdin when it was started with `stdin: Stdio.pipe`; close it to end the
+child's input.
+
+#### stdout
+
+The child's stdout when it was started with `stdout: Stdio.pipe`.
 
 #### detach
 
@@ -2732,32 +2775,146 @@ Throws `closed` after `detach`, and `os` when the child's status cannot be read.
 
 #### exit_code
 
-Waits for the child to exit and returns its exit code.
+Waits for the child to exit and returns its exit code; `wait` without a timeout.
 
-The wait blocks the thread, not only the coroutine. On Linux and macOS a child killed
-by a signal reports 128 plus the signal number. Throws `closed` after `detach`, and
-`os` when waiting fails.
+#### id
+
+Returns the child's process id.
+
+#### output
+
+Runs `exe` with `args` to its end and returns its exit code, stdout and stderr.
+
+Starts it like `start`, without a shell. `input` is written to the child's stdin,
+which is empty otherwise. The output is read while the child runs, and only the
+current coroutine waits. Throws `os` when the process cannot be started, and `read`
+when its output cannot be read.
 
 #### run
 
 Starts `exe` with `args` and returns without waiting for it.
 
-Without `print_output` the child's stdout and stderr are discarded; with it the child
-shares this process's standard streams. Throws `os` when the process cannot be created.
+Like `start`, with stdin inherited. Without `print_output` the child's stdout and
+stderr are discarded; with it the child shares this process's streams.
 
-A bare `exe` name is searched in `PATH`. On Linux and macOS a program that cannot be
-executed still yields a `Process` whose exit code is 127. On Windows `.exe` is added to
-a name without an extension, the directories Windows searches before `PATH` (the
-program's own, the current and the system directories) come first, and the arguments
-are quoted for the standard command-line parser.
+#### signal
+
+Sends `sig` to the child; does nothing once it has exited.
+
+Windows has no signals: `terminate` ends the child at once with exit code 143 there, and
+every other signal throws `os`. Throws `closed` after `detach`, and `os` when the signal
+cannot be sent.
+
+#### start
+
+Starts `exe` with `args` and returns without waiting for it.
+
+No shell is involved: every argument reaches the program as it is, without quoting.
+Each standard stream is inherited from this process, a pipe (see `stdin`, `stdout`
+and `stderr`) or discarded. `cwd` is the child's working directory. `env` replaces the
+child's environment; start from `env_vars()` to extend this process's own.
+
+A bare `exe` name is searched in `PATH`, on Linux and macOS in the `PATH` of `env` when
+it is given. On Linux and macOS a program that cannot be executed, or a `cwd` that
+cannot be entered, still yields a `Process` whose exit code is 127. On Windows `.exe`
+is added to a name without an extension, the directories Windows searches before
+`PATH` (the program's own, the current and the system directories) come first, and the
+arguments are quoted for the standard command-line parser. On Linux a piped stdin makes
+the process ignore `SIGPIPE` from then on, so writing to a child that exited throws
+instead of ending this process. Throws `os` when the process or a pipe cannot be
+created.
 
 #### stop
 
-Kills the child and waits for it to exit.
+Kills the child and waits for it to exit; inside a coroutine only the coroutine waits.
 
 Uses `SIGKILL` on Linux and macOS, and `TerminateProcess` with exit code 137 on Windows.
 Does nothing when the child has already exited or was stopped before. Throws `closed`
 after `detach`, and `os` when the kill fails.
+
+#### wait
+
+Waits for the child to exit and returns its exit code.
+
+Inside a coroutine only the coroutine waits; the thread keeps running the others. With
+a `timeout_ms` above 0 it throws `timeout` when the child still runs after that long,
+and the child keeps running. On Linux and macOS a child killed by a signal reports 128
+plus the signal number. Throws `closed` after `detach`, and `os` when waiting fails.
+
+```js
+// What `Process.output` collected from a child that ran to its end.
++ struct ProcessOutput {
+    // The exit code; see `Process.wait`.
+    + code: i32
+    // Everything the child wrote to stderr.
+    + stderr: String
+    // Everything the child wrote to stdout.
+    + stdout: String
+}
+```
+
+### ProcessOutput
+
+What `Process.output` collected from a child that ran to its end.
+
+#### code
+
+The exit code; see `Process.wait`.
+
+#### stderr
+
+Everything the child wrote to stderr.
+
+#### stdout
+
+Everything the child wrote to stdout.
+
+```js
+// This process's end of a pipe to one standard stream of a child, see `Process.start`.
++ class ProcessPipe is Reader, Writer, Closer {
+    // Closes this end; closing `stdin` ends the child's input. Does nothing when closed.
+    + fn close() void !io:IoError
+    // Reads up to `buf.length` bytes of the child's output into `buf` and returns the count.
+    + fn read(buf: local mut &[u8]) uint !io:IoError
+    // Reads until the child's end is closed and returns everything read as text.
+    + fn read_all() String !io:IoError
+    // Writes all of `data` to the child's stdin and returns `data.length`.
+    + fn write(data: local &[u8]) uint !io:IoError
+}
+```
+
+### ProcessPipe
+
+This process's end of a pipe to one standard stream of a child, see `Process.start`.
+
+Reads and writes suspend only the current coroutine while they wait. A stream that was
+not started as `Stdio.pipe` is closed.
+
+#### close
+
+Closes this end; closing `stdin` ends the child's input. Does nothing when closed.
+
+Throws `os` when the OS reports a failure.
+
+#### read
+
+Reads up to `buf.length` bytes of the child's output into `buf` and returns the count.
+
+Returns 0 once the child's end is closed, usually because it exited. Throws `closed`
+after `close` or when the stream is not a pipe, and `read` when reading fails.
+
+#### read_all
+
+Reads until the child's end is closed and returns everything read as text.
+
+Throws like `read`.
+
+#### write
+
+Writes all of `data` to the child's stdin and returns `data.length`.
+
+Throws `write` when the child closed its end, for example because it exited, and
+`closed` after `close` or when the stream is not a pipe.
 
 ```js
 // An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.

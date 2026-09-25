@@ -1839,6 +1839,47 @@ methods; `items.shuffle(rng)` takes one too. These numbers are predictable to
 someone who sees enough of them, so use `crypto.random_bytes`, `uint.random()`
 or `String.random` for keys and tokens.
 
+## Processes
+
+API for [Process](api.md#core)
+
+`core.exec` runs a command line through the shell and returns the exit code and
+output. When arguments come from outside, start the program with `Process`
+instead: each argument reaches it as it is, with no shell and no quoting.
+
+```rust
+use valk.core
+
+let code, out = core.exec("ls -l | wc -l")
+
+// Run to the end and collect the output
+let result = core.Process.output("git", .{ "log", "-1" }, cwd: "repo") ! panic("git failed to start")
+println(result.code)
+println(result.stdout)
+println(result.stderr)
+
+// Start it and keep control
+let vars = core.env_vars()
+vars.set("PORT", "8081")
+let worker = core.Process.start("./worker", env: vars) ! panic("worker failed to start")
+println(worker.id())
+worker.signal(.terminate) ! {}
+let status = worker.wait(timeout_ms: 5000) !? -1
+
+// Pipe data through a program
+let sorter = core.Process.start("sort", stdin: .pipe, stdout: .pipe) ! panic("sort failed to start")
+sorter.stdin.write("b\na\n") ! {}
+sorter.stdin.close() ! {}
+println(sorter.stdout.read_all() !? "") // a, b
+```
+
+Each standard stream is `.inherit` (the default), `.pipe` or `.discard`, and
+`Process.output` takes an `input` for the child's stdin. `env` replaces the
+child's environment. Waiting for a child and using its pipes only pauses the
+current coroutine, so a server on the same thread keeps running. `wait` with a
+timeout throws `timeout`, `signal` sends a `valk.signal` signal (on Windows
+only `.terminate`) and `stop` kills the child.
+
 ## Coroutines
 
 Coroutines let multiple functions make progress on one thread.

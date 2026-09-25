@@ -5,6 +5,7 @@ use valk.time
 use valk.fs
 use valk.net
 use valk.sync
+use valk.http
 
 test "Process" {
     #if OS == "win"
@@ -169,5 +170,180 @@ test "Process: a child inherits no descriptors beyond the standard streams" {
     mutex.unlock()
     fs.delete_file(path) ! {}
     fs.delete_file(counted) ! {}
+}
+#end
+
+class ProcessTicker {
+    count: uint (0)
+}
+
+fn process_tick(ticker: ProcessTicker) {
+    each 0 .. 30 as i {
+        time.sleep_ms(10)
+        ticker.count++
+    }
+}
+
+#if OS != "win"
+test "Process.output passes arguments without a shell and keeps the streams apart" {
+    let out = core.Process.output("printf", .{ "\%s|", "a b", "c;d", "$HOME", "'q'" }) !!
+    assert(out.code == 0)
+    assert(out.stdout == "a b|c;d|$HOME|'q'|")
+    assert(out.stderr == "")
+
+    let both = core.Process.output("sh", .{ "-c", "echo out; echo err >&2; exit 3" }) !!
+    assert(both.code == 3)
+    assert(both.stdout == "out\n")
+    assert(both.stderr == "err\n")
+
+    let missing = core.Process.output("valk-no-such-program-test") !!
+    assert(missing.code == 127)
+}
+
+test "Process.output feeds input while reading large output" {
+    let echoed = core.Process.output("cat", input: "hello") !!
+    assert(echoed.stdout == "hello")
+
+    // Far more than a pipe buffer in every direction at once
+    let fill = ByteBuffer.new(1_000_000)
+    fill.fill('x', 1_000_000)
+    let big = fill.to_string()
+    let copied = core.Process.output("cat", input: big) !!
+    assert(copied.stdout.bytes == 1_000_000)
+    let noisy = core.Process.output("sh", .{ "-c", "head -c 300000 /dev/zero; head -c 200000 /dev/zero >&2" }) !!
+    assert(noisy.stdout.bytes == 300_000 && noisy.stderr.bytes == 200_000)
+
+    // A child that stops reading early does not make it fail
+    let early = core.Process.output("true", input: big) !!
+    assert(early.code == 0)
+}
+
+test "Process.output sets the working directory and environment" {
+    let root = core.Process.output("pwd", cwd: "/") !!
+    assert(root.stdout == "/\n")
+    let bad_dir = core.Process.output("pwd", cwd: "/valk-no-such-dir") !!
+    assert(bad_dir.code == 127)
+
+    let vars = core.env_vars()
+    vars.set("VALK_PROCESS_TEST", "set here")
+    let extended = core.Process.output("sh", .{ "-c", "echo \"$VALK_PROCESS_TEST\"" }, env: vars) !!
+    assert(extended.stdout == "set here\n")
+
+    // The map is the whole environment; PATH is searched in it, with the default when missing
+    let only = Map[String]{ "ONLY" => "1" }
+    let replaced = core.Process.output("sh", .{ "-c", "echo \"[$ONLY][$HOME]\"" }, env: only) !!
+    assert(replaced.stdout == "[1][]\n")
+}
+
+test "Process pipes stream to and from a running child" {
+    let p = core.Process.start("cat", stdin: core.Stdio.pipe, stdout: core.Stdio.pipe) !!
+    assert(p.id() > 0 && p.id() != core.process_id())
+    p.stdin.write("line 1\n") !!
+    p.stdin.write("line 2\n") !!
+    p.stdin.close() !!
+    assert(p.stdout.read_all() !! == "line 1\nline 2\n")
+    assert(p.wait() !! == 0)
+
+    // Streams that are not pipes are closed
+    let closed = false
+    p.stderr.read_all() ! { closed = error_is(E.code, closed) }
+    assert(closed)
+}
+
+test "Process.wait times out and signal ends the child" {
+    let p = core.Process.start("sleep", .{ "10" }) !!
+    let timed_out = false
+    p.wait(50) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+    assert(p.waits_on_events_for_test())
+    p.signal(.terminate) !!
+    assert(p.wait(5000) !! == 143)
+    // Signalling a child that exited does nothing
+    p.signal(.terminate) !!
+}
+
+fn process_http_handler(req: http.Request) http.Response {
+    return http.Response.text("served " + req.path)
+}
+
+test "Process: a child can reach a server running on the same thread" {
+    let has_curl, _ = core.exec("command -v curl")
+    if has_curl != 0 : return
+    let server = http.Server.new("127.0.0.1", 19537, process_http_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    // exec used to block the thread, so the server never answered and this hung
+    let code, out = core.exec("curl -s http://127.0.0.1:19537/child")
+    assert(code == 0)
+    assert(out == "served /child")
+    let result = core.Process.output("curl", .{ "-s", "http://127.0.0.1:19537/output" }) !!
+    assert(result.stdout == "served /output")
+    server.shutdown()
+    await running !!
+}
+
+test "Process waits suspend only the current coroutine" {
+    let ticker = ProcessTicker {}
+    let task = co process_tick(ticker)
+    let code, _ = core.exec("sleep 0.2")
+    assert(code == 0)
+    let during_exec = ticker.count
+    let p = core.Process.start("sleep", .{ "0.1" }) !!
+    p.wait() !!
+    assert(during_exec >= 5)
+    assert(ticker.count > during_exec)
+    await task
+}
+#end
+
+#if OS == "win"
+test "Process.output on Windows" {
+    let both = core.Process.output("cmd", .{ "/d", "/c", "echo out& echo err 1>&2" }) !!
+    assert(both.code == 0)
+    assert(both.stdout == "out\r\n")
+    assert(both.stderr == "err \r\n")
+
+    let root = core.Process.output("cmd", .{ "/d", "/c", "cd" }, cwd: "C:\\") !!
+    assert(root.stdout == "C:\\\r\n")
+
+    let vars = core.env_vars()
+    vars.set("VALK_PROCESS_TEST", "set here")
+    let extended = core.Process.output("cmd", .{ "/d", "/c", "echo \%VALK_PROCESS_TEST\%" }, env: vars) !!
+    assert(extended.stdout == "set here\r\n")
+
+    let p = core.Process.start("cmd", .{ "/d", "/c", "exit" }, stdout: core.Stdio.pipe) !!
+    assert(p.id() > 0)
+    assert(p.stdout.read_all() !! == "")
+    assert(p.wait(10000) !! >= 0)
+}
+
+test "Process.wait times out and terminate ends the child on Windows" {
+    // `set /p` waits for a line on the child's stdin, which stays open
+    let p = core.Process.start("cmd", .{ "/d", "/c", "set /p line=" }, stdin: core.Stdio.pipe) !!
+    let timed_out = false
+    p.wait(50) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+    assert(p.waits_on_events_for_test())
+    let unsupported = false
+    p.signal(.interrupt) ! { unsupported = error_is(E.code, os) }
+    assert(unsupported)
+    p.signal(.terminate) !!
+    assert(p.wait(10000) !! == 143)
+}
+
+fn process_close_input_later(p: core.Process) {
+    time.sleep_ms(200)
+    p.stdin.close() ! {}
+}
+
+test "Process waits suspend only the current coroutine on Windows" {
+    let ticker = ProcessTicker {}
+    let task = co process_tick(ticker)
+    let p = core.Process.start("cmd", .{ "/d", "/c", "set /p line=" }, stdin: core.Stdio.pipe) !!
+    let closer = co process_close_input_later(p)
+    assert(p.wait(10000) !! >= 0)
+    assert(ticker.count >= 5)
+    await closer
+    await task
 }
 #end

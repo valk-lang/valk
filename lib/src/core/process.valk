@@ -2,6 +2,270 @@ use ext
 use io
 use gc
 use mem
+use coro
+use time
+use signal
+
+/// How `Process.start` connects one standard stream of a child.
++ enum Stdio {
+    /// The child uses this process's own stream.
+    inherit
+    /// A pipe: write the child's input through `Process.stdin`, read its output through
+    /// `Process.stdout` and `Process.stderr`.
+    pipe
+    /// Nothing: the child reads an empty input, or its output is thrown away.
+    discard
+}
+
+/// What `Process.output` collected from a child that ran to its end.
++ struct ProcessOutput {
+    /// The exit code; see `Process.wait`.
+    + code: i32
+    /// Everything the child wrote to stdout.
+    + stdout: String
+    /// Everything the child wrote to stderr.
+    + stderr: String
+}
+
+/// This process's end of a pipe to one standard stream of a child, see `Process.start`.
+///
+/// Reads and writes suspend only the current coroutine while they wait. A stream that was
+/// not started as `Stdio.pipe` is closed.
++ class ProcessPipe is io.Reader, io.Writer, io.Closer {
+    - fd: Fd
+    - open: bool
+
+    static fn new(fd: Fd) SELF {
+        #if OS == "win"
+        return SELF { fd: fd, open: fd != 0 }
+        #else
+        return SELF { fd: fd, open: fd >= 0 }
+        #end
+    }
+
+    /// Reads up to `buf.length` bytes of the child's output into `buf` and returns the count.
+    ///
+    /// Returns 0 once the child's end is closed, usually because it exited. Throws `closed`
+    /// after `close` or when the stream is not a pipe, and `read` when reading fails.
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        if !this.open : throw .closed
+        if buf.length == 0 : return 0
+        #if OS == "macos"
+        @unsafe
+        while true {
+            let count = ext.read(this.fd, buf.data, buf.length)
+            if count >= 0 : return count.to(uint)
+            let error = ext.get_errno()
+            if error == ext.EINTR : continue
+            if error != ext.EAGAIN : throw .read
+            process_pipe_wait(this.fd, true)
+        }
+        return 0
+        #else
+        return io.read(this.fd, buf) ! throw .read
+        #end
+    }
+
+    /// Reads until the child's end is closed and returns everything read as text.
+    ///
+    /// Throws like `read`.
+    + fn read_all() String !io.IoError {
+        if !this.open : throw .closed
+        return io.read_all(this).into_string()
+    }
+
+    /// Writes all of `data` to the child's stdin and returns `data.length`.
+    ///
+    /// Throws `write` when the child closed its end, for example because it exited, and
+    /// `closed` after `close` or when the stream is not a pipe.
+    + fn write(data: local &[u8]) uint !io.IoError {
+        if !this.open : throw .closed
+        let remaining = data
+        while remaining.length > 0 {
+            #if OS == "macos"
+            @unsafe
+            let written = ext.write(this.fd, remaining.data, remaining.length)
+            if written < 0 {
+                let error = ext.get_errno()
+                if error == ext.EINTR : continue
+                if error != ext.EAGAIN : throw .write
+                process_pipe_wait(this.fd, false)
+                continue
+            }
+            let count = written.to(uint)
+            #else
+            let count = io.write(this.fd, remaining) ! throw .write
+            #end
+            if count == 0 || count > remaining.length : throw .write
+            remaining = remaining.view(count, remaining.length - count)
+        }
+        return data.length
+    }
+
+    /// Closes this end; closing `stdin` ends the child's input. Does nothing when closed.
+    ///
+    /// Throws `os` when the OS reports a failure.
+    + fn close() !io.IoError {
+        if !this.open : return
+        this.open = false
+        io.close(this.fd) !>
+    }
+
+    fn gc_free() {
+        if this.open : io.close_cleanup(this.fd, __FILE__, __LINE__)
+    }
+}
+
+#if OS == "macos"
+// Parent pipe ends are nonblocking on macOS, so only the coroutine waits for them
+fn process_pipe_wait(fd: Fd, read: bool) {
+    @unsafe
+    if isset(coro.current_coro) {
+        io.await_fd(fd, read, !read)
+        return
+    }
+    let entry = ext.libc_pollfd { fd: fd, events: (read ? ext.POLLIN : ext.POLLOUT).to(i16), revents: 0 }
+    ext.poll(@ref(entry), 1, -1)
+}
+#end
+
+#if OS != "win"
+// Moves a descriptor the child gets above 0, 1 and 2, so placing one standard stream never
+// overwrites the source of another
+fn process_fd_above_stdio(fd: i32) i32 !io.IoError {
+    if fd > 2 : return fd
+    let moved = ext.fcntl(fd, ext.F_DUPFD_CLOEXEC, 3)
+    ext.close(fd)
+    if moved < 0 : throw .os
+    return moved
+}
+
+fn process_close_fd(fd: i32) {
+    if fd >= 0 : io.close_cleanup(fd, __FILE__, __LINE__)
+}
+
+// One child stream: (the child's descriptor, this process's pipe end), -1 where none
+fn process_stream_unix(mode: Stdio, child_reads: bool) (i32, i32) !io.IoError {
+    @unsafe
+    if mode == Stdio.inherit : return (-1, -1)
+    if mode == Stdio.discard {
+        let null_fd = ext.open("/dev/null".data_cstring, ext.O_RDWR | ext.O_CLOEXEC)
+        if null_fd < 0 : throw .os
+        return (process_fd_above_stdio(null_fd) !>, -1)
+    }
+    let fds: [i32 x 2] = { -1... }
+    #if OS == "linux"
+    if ext.pipe2(@ref(fds), ext.O_CLOEXEC) != 0 : throw .os
+    #else
+    if ext.pipe(@ref(fds)) != 0 : throw .os
+    #end
+    let parent = child_reads ? fds[1] : fds[0]
+    let child = child_reads ? fds[0] : fds[1]
+    #if OS == "macos"
+    io.set_close_on_exec(parent) ! {
+        process_close_fd(parent)
+        process_close_fd(child)
+        throw .os
+    }
+    io.set_close_on_exec(child) ! {
+        process_close_fd(parent)
+        process_close_fd(child)
+        throw .os
+    }
+    io.set_nonblocking(parent, true) ! {
+        process_close_fd(parent)
+        process_close_fd(child)
+        throw .os
+    }
+    // A write after the child closed its end fails with EPIPE instead of raising SIGPIPE
+    ext.fcntl(parent, ext.F_SETNOSIGPIPE, 1)
+    #else
+    // Writing to a child that exited must throw instead of ending this process
+    if child_reads : signal_ignore(13)
+    #end
+    child = process_fd_above_stdio(child) ! {
+        process_close_fd(parent)
+        throw .os
+    }
+    return (child, parent)
+}
+
+fn process_child_stream(fd: i32, target: i32) {
+    if fd < 0 : return
+    // The copy on 0, 1 or 2 is not close-on-exec, the original is
+    if ext.dup2(fd, target) < 0 : ext._exit(127)
+}
+
+// Starts the child; returns its pid and this process's ends of stdin, stdout and stderr
+fn process_spawn_unix(exe: String, args: ?Array[String], stdin: Stdio, stdout: Stdio, stderr: Stdio,
+    cwd: ?String, env: ?Map[String]) (i32, i32, i32, i32) !io.IoError {
+    @unsafe
+    // Built before fork: the child only makes async-signal-safe calls
+    let argv_strings = Array[String]{ exe }
+    if isset(args) {
+        each args as arg : argv_strings.append(arg)
+    }
+    let argv = Array[?cstring]{}
+    each argv_strings as arg : argv.append(arg.data_cstring)
+    argv.append(null)
+    let env_strings = Array[String]{}
+    let envp = Array[?cstring]{}
+    if isset(env) {
+        each env as value, key : env_strings.append(key + "=" + value)
+        each env_strings as entry : envp.append(entry.data_cstring)
+        envp.append(null)
+    }
+    let env_items: ?ptr = isset(env) ? envp.items().@cast(ptr) : null
+    let dir: ?cstring = null
+    if isset(cwd) : dir = cwd.data_cstring
+
+    let child_in, parent_in = process_stream_unix(stdin, true) !>
+    let child_out, parent_out = process_stream_unix(stdout, false) ! {
+        process_close_fd(child_in)
+        process_close_fd(parent_in)
+        throw E
+    }
+    let child_err, parent_err = process_stream_unix(stderr, false) ! {
+        process_close_fd(child_in)
+        process_close_fd(parent_in)
+        process_close_fd(child_out)
+        process_close_fd(parent_out)
+        throw E
+    }
+
+    let pid = ext.fork()
+    if pid == 0 {
+        process_child_stream(child_in, 0)
+        process_child_stream(child_out, 1)
+        process_child_stream(child_err, 2)
+        // This process may ignore SIGPIPE; a new program starts with the default action
+        ext.signal(13, null.@cast(ptr))
+        if isset(dir) && ext.chdir(dir) != 0 : ext._exit(127)
+        // execvp searches the PATH of the environment it passes on
+        if isset(env_items) {
+            #if OS == "linux"
+            ext.environ = env_items
+            #else
+            @ptrv(ext._NSGetEnviron(), ?ptr) = env_items
+            #end
+        }
+        ext.execvp(exe.data_cstring, argv.items().@cast(*?cstring))
+        ext._exit(127)
+    }
+    process_close_fd(child_in)
+    process_close_fd(child_out)
+    process_close_fd(child_err)
+    if pid < 0 {
+        process_close_fd(parent_in)
+        process_close_fd(parent_out)
+        process_close_fd(parent_err)
+        throw .os
+    }
+    // Keep every String backing argv and envp live until fork has returned in the parent
+    if argv_strings.length == 0 || env_strings.length > envp.length : throw .os
+    return (pid, parent_in, parent_out, parent_err)
+}
+#end
 
 #if OS != "win"
 struct ProcessReaperEntry {
@@ -200,7 +464,8 @@ fn process_standard_handle(kind: u32, access: u32, discard: bool) ext.HANDLE !io
 }
 
 fn process_create_windows(command: Array[u16], stdin_handle: ext.HANDLE,
-    stdout_handle: ext.HANDLE, stderr_handle: ext.HANDLE, flags: u32) ext.PROCESS_INFORMATION !io.IoError {
+    stdout_handle: ext.HANDLE, stderr_handle: ext.HANDLE, flags: u32, environment: ?Array[u16],
+    directory: ?Array[u16]) ext.PROCESS_INFORMATION !io.IoError {
     @unsafe
     let attribute_size: uint = 0
     ext.InitializeProcThreadAttributeList(null, 1, 0, @ref(attribute_size))
@@ -225,54 +490,130 @@ fn process_create_windows(command: Array[u16], stdin_handle: ext.HANDLE,
     si.StartupInfo.hStdOutput = stdout_handle
     si.StartupInfo.hStdError = stderr_handle
     si.lpAttributeList = attributes
+    let env_block: ?ptr = null
+    if isset(environment) {
+        env_block = environment.items().@cast(ptr)
+        flags = flags | ext.CREATE_UNICODE_ENVIRONMENT
+    }
+    let dir_path: ?ptr = null
+    if isset(directory) : dir_path = directory.items().@cast(ptr)
     let pi = ext.PROCESS_INFORMATION {}
     let created = ext.CreateProcessW(null, command.items().@cast(ptr), null, null, 1,
-        flags, null, null, @ref(si.StartupInfo), @ref(pi))
+        flags, env_block, dir_path, @ref(si.StartupInfo), @ref(pi))
     ext.DeleteProcThreadAttributeList(attributes)
     mem.free(attributes)
     if created == 0 : throw .os
     return pi
 }
 
-fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ext.HANDLE !io.IoError {
+shared process_pipe_serial: uint (0)
+
+// A pipe for one child stream: (the child's inheritable end, this process's overlapped end).
+// Anonymous pipes cannot do overlapped I/O, so it is a named pipe with a unique name.
+fn process_named_pipe(child_reads: bool) (ext.HANDLE, ext.HANDLE) !io.IoError {
+    @unsafe
+    let serial = atomic(process_pipe_serial + 1)
+    let name = process_utf16("\\\\.\\pipe\\valk-" + process_id() + "-" + serial + "-" + time.mono_ns()) !>
+    let direction: u32 = child_reads ? ext.PIPE_ACCESS_OUTBOUND : ext.PIPE_ACCESS_INBOUND
+    let open_mode = direction | ext.FILE_FLAG_OVERLAPPED | ext.FILE_FLAG_FIRST_PIPE_INSTANCE
+    let parent = ext.CreateNamedPipeW(name.items().@cast(ptr), open_mode,
+        ext.PIPE_TYPE_BYTE | ext.PIPE_READMODE_BYTE | ext.PIPE_WAIT | ext.PIPE_REJECT_REMOTE_CLIENTS,
+        1, 65536, 65536, 0, null)
+    if parent == ext.INVALID_HANDLE_VALUE : throw .os
+    let attributes = ext.SECURITY_ATTRIBUTES {
+        nLength: size_of(ext.SECURITY_ATTRIBUTES).to(u32)
+        bInheritHandle: 1
+    }
+    let access: u32 = child_reads ? ext.GENERIC_READ : ext.GENERIC_WRITE
+    let child = ext.CreateFileW(name.items().@cast(ptr), access, 0, @ref(attributes), ext.OPEN_EXISTING,
+        ext.FILE_ATTRIBUTE_NORMAL, 0)
+    if child == ext.INVALID_HANDLE_VALUE {
+        process_close_windows_handle(parent)
+        throw .os
+    }
+    if !io.associate(parent) {
+        process_close_windows_handle(parent)
+        process_close_windows_handle(child)
+        throw .os
+    }
+    return (child, parent)
+}
+
+// One child stream: (the child's handle, this process's pipe end or 0)
+fn process_stream_windows(mode: Stdio, kind: u32, child_reads: bool) (ext.HANDLE, ext.HANDLE) !io.IoError {
+    let access: u32 = child_reads ? ext.GENERIC_READ : ext.GENERIC_WRITE
+    if mode == Stdio.pipe : return process_named_pipe(child_reads) !>
+    // A child with no standard handles makes console programs such as cmd fail, so a
+    // discarded stream gets NUL
+    return (process_standard_handle(kind, access, mode == Stdio.discard) !>, 0)
+}
+
+// "NAME=value" entries, each ending in a zero, plus the zero that ends the block
+fn process_environment_windows(env: Map[String]) Array[u16] !io.IoError {
+    let out = ByteBuffer.new()
+    each env as value, key {
+        out.write(key)
+        out.write_byte('=')
+        out.write(value)
+        out.write_byte(0)
+    }
+    // An empty block still needs its two zeros
+    if env.length == 0 : out.write_byte(0)
+    return process_utf16(out.into_string()) !>
+}
+
+// Starts the child; returns its process handle and this process's ends of stdin, stdout and
+// stderr (0 where none). `command_line` replaces the line built from `exe` and `args`.
+fn process_spawn_windows(exe: String, args: ?Array[String], command_line: ?String, stdin: Stdio,
+    stdout: Stdio, stderr: Stdio, cwd: ?String, env: ?Map[String]) (ext.HANDLE, ext.HANDLE, ext.HANDLE, ext.HANDLE) !io.IoError {
     @unsafe
     if exe.bytes == 0 : throw .os
     // No application name: CreateProcessW then takes the program from the
     // command line's first (quoted) token and searches PATH for it
-    let command = process_utf16(process_windows_command_line(exe, args)) !>
+    let command = process_utf16(command_line ?? process_windows_command_line(exe, args)) !>
+    let environment: ?Array[u16] = null
+    if isset(env) : environment = process_environment_windows(env) !>
+    let directory: ?Array[u16] = null
+    if isset(cwd) : directory = process_utf16(cwd) !>
 
-    // A child with no standard handles makes console programs such as cmd fail, so stdout and
-    // stderr always get NUL when the output is not forwarded, and stdin this process's own.
-    let stdin_handle = process_standard_handle(0xfffffff6, ext.GENERIC_READ, false) !>
-    let stdout_handle = process_standard_handle(0xfffffff5, ext.GENERIC_WRITE, !print_output) ! {
-        process_close_windows_handle(stdin_handle)
+    let child_in, parent_in = process_stream_windows(stdin, 0xfffffff6, true) !>
+    let child_out, parent_out = process_stream_windows(stdout, 0xfffffff5, false) ! {
+        process_close_windows_handle(child_in)
+        process_close_windows_handle(parent_in)
         throw E
     }
-    let stderr_handle = process_standard_handle(0xfffffff4, ext.GENERIC_WRITE, !print_output) ! {
-        process_close_windows_handle(stdin_handle)
-        process_close_windows_handle(stdout_handle)
+    let child_err, parent_err = process_stream_windows(stderr, 0xfffffff4, false) ! {
+        process_close_windows_handle(child_in)
+        process_close_windows_handle(parent_in)
+        process_close_windows_handle(child_out)
+        process_close_windows_handle(parent_out)
         throw E
     }
 
-    let flags: u32 = print_output ? ext.EXTENDED_STARTUPINFO_PRESENT : ext.EXTENDED_STARTUPINFO_PRESENT | ext.CREATE_NO_WINDOW
-    let pi = process_create_windows(command, stdin_handle, stdout_handle, stderr_handle, flags) ! {
-        process_close_windows_handle(stdin_handle)
-        process_close_windows_handle(stdout_handle)
-        process_close_windows_handle(stderr_handle)
+    // A console window only when the child writes to this process's console
+    let flags: u32 = ext.EXTENDED_STARTUPINFO_PRESENT
+    if stdout != Stdio.inherit && stderr != Stdio.inherit : flags = flags | ext.CREATE_NO_WINDOW
+    let pi = process_create_windows(command, child_in, child_out, child_err, flags, environment, directory) ! {
+        process_close_windows_handle(child_in)
+        process_close_windows_handle(child_out)
+        process_close_windows_handle(child_err)
+        process_close_windows_handle(parent_in)
+        process_close_windows_handle(parent_out)
+        process_close_windows_handle(parent_err)
         throw E
     }
-    process_close_windows_handle(stdin_handle)
-    process_close_windows_handle(stdout_handle)
-    process_close_windows_handle(stderr_handle)
+    process_close_windows_handle(child_in)
+    process_close_windows_handle(child_out)
+    process_close_windows_handle(child_err)
 
     if ext.CloseHandle(pi.hThread) == 0 {
         cleanup_warning("Failed to close process thread handle", __FILE__, __LINE__)
     }
-    return pi.hProcess
+    return (pi.hProcess, parent_in, parent_out, parent_err)
 }
 #end
 
-/// A child process started with `Process.run`.
+/// A child process started with `Process.start`, `Process.run` or `Process.output`.
 ///
 /// Dropping a `Process` does not stop its child. On Linux and macOS a background thread
 /// reaps a dropped child once it exits.
@@ -282,55 +623,89 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     #else
     - pid: i32
     #end
+    #if OS == "linux"
+    // A pidfd, readable once the child exited; opened by the first wait
+    - exit_fd: i32 (-1)
+    - exit_fd_failed: bool (false)
+    #end
     - exited: bool (false)
     - stopped: bool (false)
     - detached: bool (false)
     - status: ?i32 (null)
+    /// The child's stdin when it was started with `stdin: Stdio.pipe`; close it to end the
+    /// child's input.
+    ~ stdin: ProcessPipe
+    /// The child's stdout when it was started with `stdout: Stdio.pipe`.
+    ~ stdout: ProcessPipe
+    /// The child's stderr when it was started with `stderr: Stdio.pipe`.
+    ~ stderr: ProcessPipe
 
     /// Starts `exe` with `args` and returns without waiting for it.
     ///
-    /// Without `print_output` the child's stdout and stderr are discarded; with it the child
-    /// shares this process's standard streams. Throws `os` when the process cannot be created.
+    /// No shell is involved: every argument reaches the program as it is, without quoting.
+    /// Each standard stream is inherited from this process, a pipe (see `stdin`, `stdout`
+    /// and `stderr`) or discarded. `cwd` is the child's working directory. `env` replaces the
+    /// child's environment; start from `env_vars()` to extend this process's own.
     ///
-    /// A bare `exe` name is searched in `PATH`. On Linux and macOS a program that cannot be
-    /// executed still yields a `Process` whose exit code is 127. On Windows `.exe` is added to
-    /// a name without an extension, the directories Windows searches before `PATH` (the
-    /// program's own, the current and the system directories) come first, and the arguments
-    /// are quoted for the standard command-line parser.
+    /// A bare `exe` name is searched in `PATH`, on Linux and macOS in the `PATH` of `env` when
+    /// it is given. On Linux and macOS a program that cannot be executed, or a `cwd` that
+    /// cannot be entered, still yields a `Process` whose exit code is 127. On Windows `.exe`
+    /// is added to a name without an extension, the directories Windows searches before
+    /// `PATH` (the program's own, the current and the system directories) come first, and the
+    /// arguments are quoted for the standard command-line parser. On Linux a piped stdin makes
+    /// the process ignore `SIGPIPE` from then on, so writing to a child that exited throws
+    /// instead of ending this process. Throws `os` when the process or a pipe cannot be
+    /// created.
+    + static fn start(exe: String, args: ?Array[String] (null), stdin: Stdio (Stdio.inherit),
+        stdout: Stdio (Stdio.inherit), stderr: Stdio (Stdio.inherit), cwd: ?String (null),
+        env: ?Map[String] (null)) SELF !io.IoError {
+        return SELF.spawn(exe, args, null, stdin, stdout, stderr, cwd, env) !>
+    }
+
+    /// Starts `exe` with `args` and returns without waiting for it.
+    ///
+    /// Like `start`, with stdin inherited. Without `print_output` the child's stdout and
+    /// stderr are discarded; with it the child shares this process's streams.
     + static fn run(exe: String, args: ?Array[String] (null), print_output: bool (false)) SELF !io.IoError {
+        let output = print_output ? Stdio.inherit : Stdio.discard
+        return SELF.start(exe, args, stdout: output, stderr: output) !>
+    }
+
+    /// Runs `exe` with `args` to its end and returns its exit code, stdout and stderr.
+    ///
+    /// Starts it like `start`, without a shell. `input` is written to the child's stdin,
+    /// which is empty otherwise. The output is read while the child runs, and only the
+    /// current coroutine waits. Throws `os` when the process cannot be started, and `read`
+    /// when its output cannot be read.
+    + static fn output(exe: String, args: ?Array[String] (null), input: ?String (null),
+        cwd: ?String (null), env: ?Map[String] (null)) ProcessOutput !io.IoError {
+        let process = SELF.start(exe, args, stdin: isset(input) ? Stdio.pipe : Stdio.discard,
+            stdout: Stdio.pipe, stderr: Stdio.pipe, cwd: cwd, env: env) !>
+        // Every stream moves at once: a child blocked on a full stderr pipe, or on reading its
+        // input, would never finish writing stdout
+        let errors = co process_read_all(process.stderr)
+        let feeding = co process_feed(process.stdin, input)
+        let out = process.stdout.read_all() !>
+        let err = await errors !>
+        await feeding
+        let code = process.wait() !>
+        return ProcessOutput { code: code, stdout: out, stderr: err }
+    }
+
+    static fn spawn(exe: String, args: ?Array[String], command_line: ?String, stdin: Stdio,
+        stdout: Stdio, stderr: Stdio, cwd: ?String, env: ?Map[String]) SELF !io.IoError {
         #if OS == "win"
-        let pid = process_run_windows(exe, args, print_output) !>
-
+        let pid, parent_in, parent_out, parent_err = process_spawn_windows(exe, args, command_line,
+            stdin, stdout, stderr, cwd, env) !>
         #else
-        let argv_strings = Array[String]{ exe }
-        if isset(args) {
-            each args as arg : argv_strings.append(arg)
-        }
-        let argv = Array[?cstring]{}
-        each argv_strings as arg : argv.append(arg.data_cstring)
-        argv.append(null)
-
-        let pid = ext.fork()
-        if pid == 0 {
-            if !print_output {
-                // A closed fd 1/2 makes every write in the child fail with EBADF
-                @unsafe
-                let devnull = ext.open("/dev/null".data_cstring, ext.O_WRONLY)
-                if devnull < 0 : ext._exit(1)
-                if ext.dup2(devnull, ext.STDOUT_FILENO) < 0 : ext._exit(1)
-                if ext.dup2(devnull, ext.STDERR_FILENO) < 0 : ext._exit(1)
-                if devnull > ext.STDERR_FILENO : ext.close(devnull)
-            }
-            ext.execvp(exe.data_cstring, argv.items().@cast(*?cstring))
-            ext._exit(127)
-        }
-        if pid < 0 : throw .os
-        // Keep every String backing argv live until fork has returned in the parent.
-        if argv_strings.length == 0 : throw .os
+        let pid, parent_in, parent_out, parent_err = process_spawn_unix(exe, args, stdin, stdout,
+            stderr, cwd, env) !>
         #end
-
         return SELF {
             pid: pid
+            stdin: ProcessPipe.new(parent_in)
+            stdout: ProcessPipe.new(parent_out)
+            stderr: ProcessPipe.new(parent_err)
         }
     }
 
@@ -368,24 +743,56 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
         #end
 
         this.exited = true
+        this.close_exit_fd()
         return true
     }
 
     /// Waits for the child to exit and returns its exit code.
     ///
-    /// The wait blocks the thread, not only the coroutine. On Linux and macOS a child killed
-    /// by a signal reports 128 plus the signal number. Throws `closed` after `detach`, and
-    /// `os` when waiting fails.
-    + fn exit_code() i32 !io.IoError {
+    /// Inside a coroutine only the coroutine waits; the thread keeps running the others. With
+    /// a `timeout_ms` above 0 it throws `timeout` when the child still runs after that long,
+    /// and the child keeps running. On Linux and macOS a child killed by a signal reports 128
+    /// plus the signal number. Throws `closed` after `detach`, and `os` when waiting fails.
+    + fn wait(timeout_ms: uint (0)) i32 !io.IoError {
         if this.detached : throw .closed
-        if !this.exited {
-            #if OS == "win"
-            let res = ext.WaitForSingleObject(this.pid, ext.INFINITE)
-            if res == ext.INVALID_HANDLE_VALUE : throw .os
-            let status: u32 = 0
-            if ext.GetExitCodeProcess(this.pid, @ref(status)) == 0 : throw .os
-            this.status = status.to(i32)
-            #else
+        let deadline = time.deadline_ms(timeout_ms)
+        let pause_ms: uint = 1
+        while true {
+            if this.did_exit() !> : break
+            let left: uint = 0
+            if deadline > 0 {
+                let now = time.mono_ms()
+                if now >= deadline : throw .timeout
+                left = deadline - now
+            }
+            if this.wait_for_exit(left) !> : continue
+            // Nothing to wait on: poll, doubling the pause up to 50 ms
+            time.sleep_ms(left > 0 && left < pause_ms ? left : pause_ms)
+            if pause_ms < 50 : pause_ms *= 2
+        }
+        return this.status ?? 0
+    }
+
+    /// Waits for the child to exit and returns its exit code; `wait` without a timeout.
+    + fn exit_code() i32 !io.IoError {
+        return this.wait() !>
+    }
+
+    // Suspends until the child may have exited or `timeout_ms` passed (0: no limit). Returns
+    // false when there is nothing to wait on, and the caller polls.
+    - fn wait_for_exit(timeout_ms: uint) bool !io.IoError {
+        #if OS == "win"
+        if isset(coro.current_coro) {
+            io.await_handle(this.pid, timeout_ms) !>
+            return true
+        }
+        let ms: u32 = timeout_ms == 0 ? ext.INFINITE : (timeout_ms >= 0xffffffff ? 0xfffffffe : timeout_ms.to(u32))
+        if ext.WaitForSingleObject(this.pid, ms) == 0xffffffff : throw .os
+        return true
+        #else
+        if !isset(coro.current_coro) {
+            if timeout_ms > 0 : return false
+            // Nothing else runs on this thread
             let status: i32 = 0
             let ret: i32 = 0
             while true {
@@ -394,13 +801,72 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
             }
             if ret < 0 : throw .os
             this.status = process_status(status)
-            #end
             this.exited = true
+            this.close_exit_fd()
+            return true
         }
-        return this.status ?? 0
+        #if OS == "linux"
+        let fd = this.open_exit_fd()
+        if fd < 0 : return false
+        io.await_fd(fd, true, false, timeout_ms)
+        return true
+        #else
+        return io.await_process_exit(this.pid, timeout_ms)
+        #end
+        #end
     }
 
-    /// Kills the child and waits for it to exit.
+    #if OS == "linux"
+    - fn open_exit_fd() i32 {
+        if this.exit_fd >= 0 || this.exit_fd_failed : return this.exit_fd
+        // pidfd_open, Linux 5.3; the descriptor is close-on-exec
+        let fd = ext.syscall(434, this.pid.to(int), 0)
+        if fd < 0 {
+            this.exit_fd_failed = true
+            return -1
+        }
+        this.exit_fd = fd.to(i32)
+        return this.exit_fd
+    }
+    #end
+
+    - fn close_exit_fd() {
+        #if OS == "linux"
+        if this.exit_fd < 0 : return
+        io.close_cleanup(this.exit_fd, __FILE__, __LINE__)
+        this.exit_fd = -1
+        #end
+    }
+
+    /// Returns the child's process id.
+    + fn id() uint {
+        #if OS == "win"
+        return ext.GetProcessId(this.pid).to(uint)
+        #else
+        return this.pid.to(uint)
+        #end
+    }
+
+    /// Sends `sig` to the child; does nothing once it has exited.
+    ///
+    /// Windows has no signals: `terminate` ends the child at once with exit code 143 there, and
+    /// every other signal throws `os`. Throws `closed` after `detach`, and `os` when the signal
+    /// cannot be sent.
+    + fn signal(sig: signal.Signal) !io.IoError {
+        if this.detached : throw .closed
+        if this.did_exit() !> : return
+        #if OS == "win"
+        if sig != signal.Signal.terminate : throw .os
+        if ext.TerminateProcess(this.pid, 143) == 0 : throw .os
+        #else
+        let number = signal.number(sig) ! throw .os
+        while ext.kill(this.pid, number) != 0 {
+            if ext.get_errno() != ext.EINTR : throw .os
+        }
+        #end
+    }
+
+    /// Kills the child and waits for it to exit; inside a coroutine only the coroutine waits.
     ///
     /// Uses `SIGKILL` on Linux and macOS, and `TerminateProcess` with exit code 137 on Windows.
     /// Does nothing when the child has already exited or was stopped before. Throws `closed`
@@ -435,8 +901,17 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
         #else
         if !process_reaper_add(this.pid) : throw .os
         #end
+        this.close_exit_fd()
         this.detached = true
     }
+
+    #if TEST
+    /// Test hook, only in `TEST` builds: waits up to 1 ms and returns whether the wait used
+    /// a kernel event instead of polling.
+    + fn waits_on_events_for_test() bool {
+        return this.wait_for_exit(1) !? false
+    }
+    #end
 
     #if TEST && OS != "win"
     /// Test hook, only in `TEST` builds on Linux and macOS: the child's process id.
@@ -478,6 +953,7 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
             cleanup_warning("Failed to close process handle", __FILE__, __LINE__)
         }
         #else
+        this.close_exit_fd()
         if !this.detached && !this.exited && !process_reaper_add(this.pid) {
             cleanup_warning("Failed to detach abandoned process", __FILE__, __LINE__)
         }
@@ -485,10 +961,21 @@ fn process_run_windows(exe: String, args: ?Array[String], print_output: bool) ex
     }
 }
 
+fn process_read_all(pipe: ProcessPipe) String !io.IoError {
+    return pipe.read_all() !>
+}
+
+// Writes `input` (if any) to a child's stdin and closes it; a child that stops reading early
+// is not an error
+fn process_feed(pipe: ProcessPipe, input: ?String) {
+    if isset(input) : pipe.write(input) ! {}
+    pipe.close() ! {}
+}
+
 #if OS != "win"
 fn process_status(status: i32) i32 {
-    let signal = status & 0x7f
-    if signal == 0 : return (status >> 8) & 0xff
-    return 128 + signal
+    let number = status & 0x7f
+    if number == 0 : return (status >> 8) & 0xff
+    return 128 + number
 }
 #end
