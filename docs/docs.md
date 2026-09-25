@@ -1482,6 +1482,21 @@ fn print(msg: ?String) {
 }
 ```
 
+`?.` reads through a value that may be null: `user?.address?.city` is null when
+`user` or its `address` is, and a null ends the rest of the chain, so steps that
+cannot be null use a plain `.`. The result is nullable, which combines with
+`??` and `?!`. A call without a result, like `user?.save()`, is skipped when the
+value is null. Values cannot be changed through `?.`.
+
+```rust
+let city = user?.address?.city ?? "unknown"
+let length = user?.name.length // ?uint
+user?.save()
+```
+
+A ternary whose branch starts with `.name` needs a space after the `?`:
+`dark ? .black : .white`.
+
 ## Files
 
 API for [valk.fs](api.md#fs)

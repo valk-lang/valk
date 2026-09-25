@@ -231,6 +231,14 @@ check "member completion includes properties" '"label":"name"' \
 check "member completion tags a deprecated method" '"label":"legacy","tags":[1]' \
     "$(request textDocument/completion member.valk 13 6)"
 
+# `?.` chains through a value that may be null: its members complete, resolve and hover
+check "member completion after '?.'" '"label":"describe"' \
+    "$(request textDocument/completion optional.valk 18 7)"
+check "definition of a method called through '?.'" '"line":2' \
+    "$(request textDocument/definition optional.valk 13 15)"
+check "hover on the value before '?.'" '"value":"```valk\n?Thing\n```"' \
+    "$(request textDocument/hover optional.valk 13 11)"
+
 # `fs.` likewise, and private members of another package must not be offered
 check "namespace completion" '"label":"cwd"' \
     "$(request textDocument/completion namespace.valk 3 7)"

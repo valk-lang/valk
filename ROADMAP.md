@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Optional chaining: `user?.address?.city` is null when a value on the way is, and a null skips the rest of the chain (`user?.name.length`); the result is nullable, so it combines with `??` and `?!`, and `user?.save()` is skipped on null. Nothing can be assigned through `?.`. A ternary branch that starts with `.name` needs a space after the `?` now: `c ? .red : .blue`
 + Comparing a nullable value with `==` or `!=` evaluates each side once: `next() == 3` called `next` twice when it returned a nullable, and a handled call inside a nullable ternary failed to compile when compared
 + Processes: `Process.start(exe, args, stdin:, stdout:, stderr:, cwd:, env:)` without a shell, each stream `.inherit`, `.pipe` or `.discard` (`p.stdin.write`, `p.stdout.read_all`), and `Process.output(exe, args, input:)` runs one to its end and returns its code, stdout and stderr. `wait(timeout_ms)`, `signal(.terminate)` and `id()`. Waiting for a child or its pipes only pauses the current coroutine, so a server on the same thread keeps answering (a child that called it hung before). `core.exec` runs on top of it; on Windows through `cmd.exe /d /s /c`, so a command that starts with a quote keeps it
 + LSP: find references, rename (declarations of the own package, checked names) and workspace symbols
