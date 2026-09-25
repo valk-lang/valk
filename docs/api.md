@@ -2605,6 +2605,12 @@ alias pid_t for i32
 + fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
 // Creates the directory `path`; its parent must already exist.
 + fn create_dir(path: String, permissions: u32 (0c755)) void !io:IoError
+// Creates the directory `path` and every missing parent, like `mkdir -p`.
++ fn create_dir_all(path: String, permissions: u32 (0c755)) void !io:IoError
+// Creates a new, empty directory with a unique name and returns its path.
++ fn create_temp_dir(prefix: String ("tmp-"), dir: ?String (null)) String !io:IoError
+// Creates a new, empty file with a unique name and returns its path.
++ fn create_temp_file(prefix: String ("tmp-"), suffix: String (""), dir: ?String (null)) String !io:IoError
 // Returns the current working directory.
 + fn cwd() String !io:IoError
 // Deletes `path` and, when it is a directory, everything inside it.
@@ -2625,6 +2631,8 @@ alias pid_t for i32
 + fn extension(path: String, with_dot: bool (false)) String
 // Lists the entries of `dir` as full paths, or as names relative to `dir` when `relative` is set.
 + fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), relative: bool (false)) Array[String] !io:IoError
+// Returns the paths that match `pattern`, sorted.
++ fn glob(pattern: String) Array[String]
 // Returns the home directory of the current user: `$HOME`, or `%USERPROFILE%` on Windows.
 + fn home_dir() String !LookupError
 // Returns whether `path` is a directory; a symlink to one counts.
@@ -2653,6 +2661,8 @@ alias pid_t for i32
 + fn read_into(path: String, out: Writer, chunk_size: uint (65536)) uint !io:IoError
 // Returns the absolute path of `path` with symlinks resolved.
 + fn realpath(path: String) String !io:IoError
+// Returns `path` as seen from the directory `base`, such as `../b/c` for `/a/b/c` from `/a/d`.
++ fn relative(path: String, base: String) String
 // Makes `path` absolute and folds `.`, `..` and repeated separators.
 + fn resolve(path: String) String
 // Returns the size in bytes of the entry at `path`, following symlinks.
@@ -2665,6 +2675,8 @@ alias pid_t for i32
 + fn symlink(link: String, target: String, is_directory: bool (false)) void !io:IoError
 // Asks the OS to flush all file system buffers to disk (`sync(2)`).
 + fn sync_all() void
+// Returns the directory for temporary files.
++ fn temp_dir() String
 // Resizes the file at `path` to `length` bytes, cutting it off or padding it with zeros.
 + fn truncate(path: String, length: uint) void !io:IoError
 // Takes the lock only when it is free right now, else returns `null`; see `lock`.

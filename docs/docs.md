@@ -1418,7 +1418,14 @@ while true {
 }
 ```
 
-Use `fs.files_in()` when you want an array of paths or recursive listing.
+Use `fs.files_in()` when you want an array of paths or recursive listing, and
+`fs.glob("src/**/*.valk")` for the paths that match a pattern (`*`, `?`, `[a-z]`
+and `**` for any number of directories), sorted.
+
+`fs.create_dir_all(path)` creates a directory with its missing parents, like
+`mkdir -p`. `fs.create_temp_dir()` and `fs.create_temp_file(prefix, ".json")`
+make a new directory or empty file with a unique name in `fs.temp_dir()` and
+return its path; delete it when you are done.
 
 `OpenOptions.write` defaults to null, which disables writing. Choose
 `fs.WriteMode.preserve` to overwrite bytes without clearing the file,
@@ -1528,6 +1535,9 @@ fn main() {
     println(path) // /var/www/folder1/folder2
 }
 ```
+
+`fs.relative(path, base)` gives the way from one directory to a path:
+`fs.relative("/a/b/c", "/a/d")` is `../b/c`.
 
 ## JSON
 

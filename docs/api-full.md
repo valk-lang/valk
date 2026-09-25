@@ -8780,6 +8780,12 @@ How `open` treats the contents of a file it opens for writing.
 + fn copy(from_path: String, to_path: String, recursive: bool (false)) void !io:IoError
 // Creates the directory `path`; its parent must already exist.
 + fn create_dir(path: String, permissions: u32 (0c755)) void !io:IoError
+// Creates the directory `path` and every missing parent, like `mkdir -p`.
++ fn create_dir_all(path: String, permissions: u32 (0c755)) void !io:IoError
+// Creates a new, empty directory with a unique name and returns its path.
++ fn create_temp_dir(prefix: String ("tmp-"), dir: ?String (null)) String !io:IoError
+// Creates a new, empty file with a unique name and returns its path.
++ fn create_temp_file(prefix: String ("tmp-"), suffix: String (""), dir: ?String (null)) String !io:IoError
 // Returns the current working directory.
 + fn cwd() String !io:IoError
 // Deletes `path` and, when it is a directory, everything inside it.
@@ -8800,6 +8806,8 @@ How `open` treats the contents of a file it opens for writing.
 + fn extension(path: String, with_dot: bool (false)) String
 // Lists the entries of `dir` as full paths, or as names relative to `dir` when `relative` is set.
 + fn files_in(dir: String, recursive: bool (false), files: bool (true), dirs: bool (true), relative: bool (false)) Array[String] !io:IoError
+// Returns the paths that match `pattern`, sorted.
++ fn glob(pattern: String) Array[String]
 // Returns the home directory of the current user: `$HOME`, or `%USERPROFILE%` on Windows.
 + fn home_dir() String !LookupError
 // Returns whether `path` is a directory; a symlink to one counts.
@@ -8828,6 +8836,8 @@ How `open` treats the contents of a file it opens for writing.
 + fn read_into(path: String, out: Writer, chunk_size: uint (65536)) uint !io:IoError
 // Returns the absolute path of `path` with symlinks resolved.
 + fn realpath(path: String) String !io:IoError
+// Returns `path` as seen from the directory `base`, such as `../b/c` for `/a/b/c` from `/a/d`.
++ fn relative(path: String, base: String) String
 // Makes `path` absolute and folds `.`, `..` and repeated separators.
 + fn resolve(path: String) String
 // Returns the size in bytes of the entry at `path`, following symlinks.
@@ -8840,6 +8850,8 @@ How `open` treats the contents of a file it opens for writing.
 + fn symlink(link: String, target: String, is_directory: bool (false)) void !io:IoError
 // Asks the OS to flush all file system buffers to disk (`sync(2)`).
 + fn sync_all() void
+// Returns the directory for temporary files.
++ fn temp_dir() String
 // Resizes the file at `path` to `length` bytes, cutting it off or padding it with zeros.
 + fn truncate(path: String, length: uint) void !io:IoError
 // Takes the lock only when it is free right now, else returns `null`; see `lock`.
@@ -8900,6 +8912,30 @@ Creates the directory `path`; its parent must already exist.
 
 `permissions` applies before the umask and is ignored on Windows. Throws `.exists` when
 something already exists at `path` and `.access` on any other failure.
+
+### create_dir_all
+
+Creates the directory `path` and every missing parent, like `mkdir -p`.
+
+Succeeds when the directory already exists. `permissions` applies to every directory it
+creates, before the umask, and is ignored on Windows. Throws `.exists` when a file is in
+the way and `.access` on any other failure.
+
+### create_temp_dir
+
+Creates a new, empty directory with a unique name and returns its path.
+
+The name is `prefix` followed by random characters, inside `dir` or else `temp_dir()`. On
+Linux and macOS only the current user may enter it (`0c700`). Remove it with `delete_all`
+when done. Throws `.access` when it cannot be created.
+
+### create_temp_file
+
+Creates a new, empty file with a unique name and returns its path.
+
+The name is `prefix`, random characters and `suffix` (such as `.json`), inside `dir` or
+else `temp_dir()`. On Linux and macOS only the current user may read it (`0c600`). Throws
+`.open` when it cannot be created.
 
 ### cwd
 
@@ -8973,6 +9009,19 @@ Lists the entries of `dir` as full paths, or as names relative to `dir` when `re
 each subdirectory, after the subdirectory itself, but does not descend into symlinked
 directories. Full paths start with `resolve(dir)`. The order is the file system's, not
 sorted. Throws `.open` or `.read` when a directory cannot be read.
+
+### glob
+
+Returns the paths that match `pattern`, sorted.
+
+In a pattern `*` matches any run of characters within one name, `?` one character,
+`[abc]`, `[a-z]` and `[!a]` one character of a set, and a `**` segment any number of
+directories, also none: `src/**/*.valk`. A wildcard does not match the leading `.` of a
+hidden name unless the pattern writes the `.`, and `**` does not enter hidden or
+symlinked directories. A relative pattern is taken against `cwd()` and gives relative
+paths. Directories that cannot be read are skipped, so there is no error; a pattern that
+matches nothing gives an empty array. On Windows names match without regard to case and
+either separator may be used.
 
 ### home_dir
 
@@ -9071,6 +9120,14 @@ On Linux and macOS a `path` that does not exist comes back unchanged, so the res
 relative, and a `\` is part of a name there, not a separator. On Windows the path is made
 absolute and normalized, but symlinks are not resolved. Throws `.os` on failure.
 
+### relative
+
+Returns `path` as seen from the directory `base`, such as `../b/c` for `/a/b/c` from `/a/d`.
+
+Both are resolved first, without following symlinks. Gives `.` when they are the same, and
+the resolved `path` when no relative path leads there (another drive on Windows, where
+names compare without regard to case).
+
 ### resolve
 
 Makes `path` absolute and folds `.`, `..` and repeated separators.
@@ -9114,6 +9171,13 @@ Asks the OS to flush all file system buffers to disk (`sync(2)`).
 
 On Windows it calls `FlushFileBuffers` on each fixed and removable volume, which needs
 administrator rights; volumes that cannot be opened are skipped.
+
+### temp_dir
+
+Returns the directory for temporary files.
+
+On Linux and macOS that is `TMPDIR`, or `/tmp` when it is not set; on Windows the user's
+temp directory (`TMP`, `TEMP` or the Windows default).
 
 ### truncate
 
