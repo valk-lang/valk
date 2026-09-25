@@ -473,6 +473,31 @@ if [ -z "$help_targets" ] || [ "$help_targets" != "$invalid_targets" ]; then
     exit 1
 fi
 
+echo "> valk completion prints a script for bash, zsh and fish"
+for shell in bash zsh fish; do
+    script=$("$VALK" completion $shell) || { echo "# valk completion $shell failed"; exit 1; }
+    if [[ "$script" != *"make ls doc fmt"* ]] || [[ "$script" != *"ls --names"* ]]; then
+        echo "# valk completion $shell must complete the commands and the make names"
+        exit 1
+    fi
+done
+if command -v bash >/dev/null && ! "$VALK" completion bash | bash -n; then
+    echo "# The bash completion script has a syntax error"
+    exit 1
+fi
+# Every option of 'valk build -h' is completed
+build_script=$("$VALK" completion bash)
+for option in $("$VALK" build --help | grep -oE '^  (-[a-zA-Z-]+( -[a-zA-Z-]+)*)' ); do
+    if [[ " $build_script " != *" $option "* ]] && [[ "$build_script" != *" $option\""* ]]; then
+        echo "# The completion scripts miss the build option $option"
+        exit 1
+    fi
+done
+if "$VALK" completion nope >/dev/null 2>&1; then
+    echo "# valk completion with an unknown shell must fail"
+    exit 1
+fi
+
 echo "> valk fmt formats files in place"
 printf 'fn main() {\n  let  x = 1\n}\n' > "$workdir/fmt.valk"
 fmt_out=$("$VALK" fmt "$workdir/fmt.valk" 2>&1) || {
@@ -769,6 +794,12 @@ one_out=$(cd "$project" && "$VALK_BIN" ls dev 2>&1)
 if [[ "$one_out" != *"valk build src"* ]] || [[ "$one_out" != *'--def "DEV=1"'* ]]; then
     echo "# 'valk ls {name}' must show what the make command does"
     echo "$one_out"
+    exit 1
+fi
+names_out=$(cd "$project" && "$VALK_BIN" ls --names 2>&1 | tr -d '\r' | tr '\n' ' ')
+if [[ "$names_out" != *"dev greet broken"* ]]; then
+    echo "# 'valk ls --names' must print one make command per line, for shell completion"
+    echo "$names_out"
     exit 1
 fi
 unknown_ls=$(cd "$project" && "$VALK_BIN" ls nope 2>&1)

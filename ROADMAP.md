@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `valk completion bash|zsh|fish` prints a tab-completion script: commands, build options, `--target` values and the make commands of the project (`valk ls --names` lists those one per line)
 + Template expressions compute: `{{ count + 1 }}`, `* / %`, a leading `-` and parentheses; `+` with text joins it, and dividing by zero is a render error
 + `time.Duration`: `of_days` to `of_us`, whole-unit getters, `+`, `-`, comparisons and text like `1h30m`. `later - earlier` on two `DateTime` values gives one (`since`), `DateTime.add` and `subtract` take one, and `time.sleep(duration)` waits one
 + `DateTime.format` and `from_format` know PHP's other `date()` tokens: `y`, `n`, `M`, `F`, `j`, `D`, `l`, `N`, `G`, `h`, `g`, `A`, `a`, `O`, `P`, `T` and `U` (names in English, parsed without regard to case). Those letters were copied as is before; escape one with `\` to keep it literal (`"\\T"` in a string). `from_iso8601` takes a date alone (midnight UTC) and a lowercase `t` and `z`

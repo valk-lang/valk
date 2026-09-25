@@ -153,6 +153,15 @@ valk build -h                               # Every option
 Editors talk to `valk lsp run`, a language server over stdin and stdout. The
 [VS Code extension](https://github.com/valk-lang/valk-vscode) starts it for you.
 
+Tab completion for commands, options, targets and the make commands of a
+project comes from `valk completion`:
+
+```sh
+valk completion bash > /etc/bash_completion.d/valk
+valk completion zsh  > ~/.zfunc/_valk
+valk completion fish > ~/.config/fish/completions/valk.fish
+```
+
 ## Types
 
 Integer types: `int`, `uint`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`
