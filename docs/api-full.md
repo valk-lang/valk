@@ -10866,6 +10866,8 @@ the `Headers{ name => value }` literal.
     + client_key_password: String
     // The limit for connecting plus the TLS handshake, in milliseconds.
     + connect_timeout_ms: uint
+    // Whether the client asks for a gzip-compressed response and decompresses it.
+    + decompress: bool
     // Whether 301, 302, 303, 307 and 308 responses with a `Location` are followed.
     + follow_redirects: bool
     // Extra request headers.
@@ -10950,6 +10952,14 @@ The limit for connecting plus the TLS handshake, in milliseconds.
 
 Zero leaves only `timeout_ms` as the limit.
 
+#### decompress
+
+Whether the client asks for a gzip-compressed response and decompresses it.
+
+The body then arrives decompressed, without `content-encoding` and `content-length`
+headers. Not used when the body goes to `output`, or when `headers` has its own
+`Accept-Encoding`: the body then arrives as the server sent it.
+
 #### follow_redirects
 
 Whether 301, 302, 303, 307 and 308 responses with a `Location` are followed.
@@ -10976,7 +10986,7 @@ The number of redirects to follow before failing with `too_many_redirects`.
 The largest accepted response body in bytes, also when it goes to `output`;
 zero disables the limit.
 
-Exceeding it fails with `response_too_large`.
+Exceeding it fails with `response_too_large`. A decompressed body counts here too.
 
 #### max_response_header_size
 

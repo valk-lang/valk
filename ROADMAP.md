@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP client: asks for gzip and decompresses the body (`Options.decompress`, on by default; not with `output` or an own `Accept-Encoding`)
 + sync: `select(.{ a, b }, timeout_ms)` waits on several channels (of any element types) and returns the ready one; `after(ms)` and `ticker(ms)` channels for deadlines and periodic work; `WaitGroup` (`add`, `done`, `wait`) and `Semaphore` (`acquire`, `try_acquire`, `release`)
 + url: `parse_query` / `parse_query_grouped` and `build_query` / `build_query_grouped` outside HTTP, `Url.to_string()` (also `"%{u}"`), `Url.resolve(reference)` per RFC 3986 section 5 (all its examples are tests) and `remove_dot_segments`. HTTP requests, the client's query data and its redirects use them
 + String: `split(on, limit)` (`"key=a=b".split("=", 2)`, also `utf8.split`), `lines()`, `last_index_of`, `count`, `repeat`. `trim` / `ltrim` / `rtrim` also remove Unicode spaces such as the non-breaking space (U+00A0) and the ideographic space (U+3000), like JS, Python and Go; `limit` counts characters

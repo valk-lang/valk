@@ -3212,6 +3212,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + client_key_password: String
     // The limit for connecting plus the TLS handshake, in milliseconds.
     + connect_timeout_ms: uint
+    // Whether the client asks for a gzip-compressed response and decompresses it.
+    + decompress: bool
     // Whether 301, 302, 303, 307 and 308 responses with a `Location` are followed.
     + follow_redirects: bool
     // Extra request headers.
