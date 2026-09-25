@@ -377,14 +377,24 @@ An operating-system call failed (`failed`) or is not available on this platform
 + fn cleanup_warning(msg: String, file: String, line: uint) void
 // Returns a deep copy of `value`, the same copy `$clone(value)` makes.
 + fn clone_value(value: $T) T
+// Returns the number of physical CPU cores; at least 1.
++ fn cpu_core_count() uint
+// Returns the number of logical CPUs (hardware threads) that are online; at least 1.
++ fn cpu_thread_count() uint
+// Returns every environment variable of this process as a new map from name to value.
++ fn env_vars() Map[String]
 // Runs `cmd` through the shell and returns its exit code and captured output.
 + fn exec(cmd: String, print_output: bool (false), capture_stderr: bool (true)) (i32, String)
 // Ends the process with exit code `code`.
 + fn exit(code: i32) void
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
+// Returns the host name of this machine.
++ fn hostname() String !SystemError
 // Prints `msg` to stderr and ends the process with exit code 1.
 + fn panic(msg: String, location: String ("")) void
+// Returns the id of this process.
++ fn process_id() uint
 // Sends signal `code` to the current process.
 + fn raise(code: i32) void
 // Reads a `bytes`-long big-endian unsigned integer from `from`.
@@ -417,6 +427,23 @@ Classes with a `$clone` hook are copied through that hook; `shared` values are r
 they are. Values that alias raw memory (raw pointers, borrows) without a `$clone` hook are a
 compile error.
 
+### cpu_core_count
+
+Returns the number of physical CPU cores; at least 1.
+
+Cores that run two hardware threads count once, so this is at most `cpu_thread_count()`.
+
+### cpu_thread_count
+
+Returns the number of logical CPUs (hardware threads) that are online; at least 1.
+
+### env_vars
+
+Returns every environment variable of this process as a new map from name to value.
+
+Changes to the map do not change the environment; use `setenv` and `unsetenv` for that.
+Names are case-sensitive except on Windows, where the name keeps the case it was set with.
+
 ### exec
 
 Runs `cmd` through the shell and returns its exit code and captured output.
@@ -443,6 +470,12 @@ Returns the value of the environment variable `var`.
 
 Throws `missing` when it is not set.
 
+### hostname
+
+Returns the host name of this machine.
+
+On Windows it is the DNS host name. Throws `failed` when the system does not report one.
+
 ### panic
 
 Prints `msg` to stderr and ends the process with exit code 1.
@@ -451,6 +484,10 @@ The compiler fills `location` with the panic's source position, relative to the 
 the package it was compiled in, and the output reads `msg at path:line`. A program built
 with `--debug` also prints the stack trace. C exit handlers do not run. Marked `$exit`:
 the compiler knows a call never returns.
+
+### process_id
+
+Returns the id of this process.
 
 ### raise
 

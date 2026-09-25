@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `core.cpu_thread_count()` and `core.cpu_core_count()` are public and work on macOS and Windows too; new `core.process_id()`, `core.hostname()` and `core.env_vars()`. An HTTP server without a `worker_count` now starts one worker per logical CPU on macOS and Windows as well (it used 8 there)
 + `remove_where` and `retain` on `Map`, `HashMap`, `FlatMap` and `HashSet`: remove or keep the entries a function picks, in order, also inside `each` over the map
 + `PublicKey.verify` with `rsa_pss_*` accepts any salt length (like Go), so signatures made with the largest salt (Python's `PSS.MAX_LENGTH`, the `openssl` command) verify; `sign` still uses a salt as long as the hash, as JWT and TLS require
 + HTTP static directories serve `index.html` for a directory path (`/` gives `public/index.html`) and redirect `/docs` to `/docs/` first, like Go, nginx and Caddy; `add_static_dir(path, index: "")` turns it off

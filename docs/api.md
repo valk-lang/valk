@@ -143,14 +143,24 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn cleanup_warning(msg: String, file: String, line: uint) void
 // Returns a deep copy of `value`, the same copy `$clone(value)` makes.
 + fn clone_value(value: $T) T
+// Returns the number of physical CPU cores; at least 1.
++ fn cpu_core_count() uint
+// Returns the number of logical CPUs (hardware threads) that are online; at least 1.
++ fn cpu_thread_count() uint
+// Returns every environment variable of this process as a new map from name to value.
++ fn env_vars() Map[String]
 // Runs `cmd` through the shell and returns its exit code and captured output.
 + fn exec(cmd: String, print_output: bool (false), capture_stderr: bool (true)) (i32, String)
 // Ends the process with exit code `code`.
 + fn exit(code: i32) void
 // Returns the value of the environment variable `var`.
 + fn getenv(var: String) String !LookupError
+// Returns the host name of this machine.
++ fn hostname() String !SystemError
 // Prints `msg` to stderr and ends the process with exit code 1.
 + fn panic(msg: String, location: String ("")) void
+// Returns the id of this process.
++ fn process_id() uint
 // Sends signal `code` to the current process.
 + fn raise(code: i32) void
 // Reads a `bytes`-long big-endian unsigned integer from `from`.

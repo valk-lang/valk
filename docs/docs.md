@@ -1485,6 +1485,10 @@ while true {
 
 Environment variables are read with `core.getenv(name)`, and changed for the
 process and its children with `core.setenv(name, value)` and `core.unsetenv(name)`.
+`core.env_vars()` returns all of them as a map.
+
+About the machine and the process: `core.cpu_thread_count()` (logical CPUs),
+`core.cpu_core_count()` (physical cores), `core.process_id()` and `core.hostname()`.
 
 ### File locks
 
