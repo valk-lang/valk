@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `Array.sort` / `sorted` are stable (a merge sort; equal elements keep their order), and faster on numbers and presorted input: 1M random ints 99 -> 35 ms, sorted input 52 -> 5 ms. New `sort_by(fn(x) { return x.age })` / `sorted_by` with the key computed once per element
 + A named union can contain itself through a container: `union Json : int | String | Array[Json] | Map[Json] {}` (it was 'Recursive union alternatives are not allowed'); containing itself directly or by value is a clear error
 + `defer { ... }` defers a block of statements; like `defer call()` it captures values when the line runs, and it cannot `return` or `throw`
 + Setters: `set name(value: T) { ... }` next to the getter `name` runs for `x.name = v` and for `+=` and the other compound operators (`x` is evaluated once). Assigning to a getter without a setter, and `++` on a getter, are errors now (`++` used to change a temporary copy)

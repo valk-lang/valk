@@ -353,7 +353,10 @@ Use `arr.sort()` for elements that support ordering, or `arr.sorted()` for a
 copy. Other element types require a comparator whose parameters have the
 element type; for an `Array[Array[int]]`:
 `rows.sort(fn(a: Array[int], b: Array[int]) bool { return a[0] > b[0] })`.
-The comparator returns true when `a` should come after `b`.
+The comparator returns true when `a` should come after `b`. Sorting is stable:
+elements that compare equal keep their order. `sort_by` sorts by a key that has an
+order, computed once per element: `users.sort_by(fn(u) { return u.age })`, and
+`sorted_by` returns a sorted copy.
 
 The value of an `each` or a `lock` ends at the keyword that follows it (`skip`, `as`), so a
 literal there needs no parentheses: `each Array[String]{ "a", "b" } as word { ... }`. The value

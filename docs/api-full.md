@@ -824,8 +824,12 @@ the sign, or a value that does not fit.
     + fn shuffled(rng: ?Rng (null)) Array[T]
     // Sorts the elements in place with `func`, which returns true when `a` belongs after `b`.
     + fn sort(func: fn(T, T)(bool)) void
+    // Sorts the elements in place by the value `key` gives for each, ascending.
+    + fn sort_by[K](key: fn(T)(K)) void
     // Returns a copy sorted with `func`; see `sort`.
     + fn sorted(func: fn(T, T)(bool)) Array[T]
+    // Returns a copy sorted by `key`; see `sort_by`.
+    + fn sorted_by[K](key: fn(T)(K)) Array[T]
     // Exchanges the elements at `index_a` and `index_b`; does nothing when either is out of range.
     + fn swap(index_a: uint, index_b: uint) void
     // Removes the element at `index` by moving the last element into its slot.
@@ -1108,12 +1112,23 @@ Returns a copy with the elements in random order; see `shuffle`.
 
 Sorts the elements in place with `func`, which returns true when `a` belongs after `b`.
 
-The element type has no natural order, so `func` is required. The sort is a heap sort:
-it is not stable.
+The element type has no natural order, so `func` is required. The sort is stable:
+elements that compare equal keep their order.
+
+#### sort_by
+
+Sorts the elements in place by the value `key` gives for each, ascending.
+
+`key` runs once per element. The sort is stable, and a null key comes first. Use `sort`
+with a function for another order.
 
 #### sorted
 
 Returns a copy sorted with `func`; see `sort`.
+
+#### sorted_by
+
+Returns a copy sorted by `key`; see `sort_by`.
 
 #### swap
 
