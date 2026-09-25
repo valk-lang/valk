@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ Fix: a list or map literal of a struct with an `$append` / `$set_key` hook (`Bag{ 1, 2, 3 }`) gave the struct without its items; the hooks worked on copies
 + `valk doc http.Server.compress` prints one namespace, declaration or member (stdlib, or `valk doc <dir> <name>` for a package); `core.` is optional and an unknown name suggests close ones
 + Test runner: a failed comparison `assert(a == b)` (and `!=`, `<`, …) shows both sides; the summary counts tests and lists the failed ones; the test binary takes `--filter <text>` at run time
 + Error codes as text: `E.code.name()`, `"failed: " + E.code`, `%{E.code}` and `E.code.to(String)` give the code's name, inherited codes included
