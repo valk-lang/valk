@@ -1,0 +1,180 @@
+use net
+use time
+use core
+
+class IdleConnection {
+    con: net.TcpConnection
+    since_ms: uint
+}
+
+// The connections a `Client` keeps open, per host and connection settings
+class ConnectionPool {
+    idle: Map[Array[IdleConnection]] (.{})
+    max_idle_per_host: uint (4)
+    idle_timeout_ms: uint (60_000)
+
+    // The most recently used connection for `key`; connections idle too long are closed
+    fn take(key: String) ?net.TcpConnection {
+        let list = this.idle.get(key) !? null
+        if !isset(list) : return null
+        let now = time.mono_ms()
+        while list.length > 0 {
+            let entry = list.pop_last() ! break
+            if now - entry.since_ms < this.idle_timeout_ms : return entry.con
+            entry.con.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+        }
+        return null
+    }
+
+    fn give(key: String, con: net.TcpConnection) {
+        let list = this.idle.get(key) !? <{
+            let created = Array[IdleConnection]{}
+            this.idle.set(key, created)
+            return created
+        }
+        list.append(IdleConnection { con: con, since_ms: time.mono_ms() })
+        while list.length > this.max_idle_per_host {
+            let oldest = list.pop_first() ! break
+            oldest.con.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+        }
+    }
+
+    fn close_all() {
+        each this.idle as list {
+            each list as entry {
+                entry.con.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+            }
+        }
+        this.idle.clear()
+    }
+}
+
+// Requests share a connection only with the same host and the same TLS settings
+fn connection_key(scheme: String, host: String, port: u16, options: ?Options) String {
+    let key = scheme + "://" + host.lower() + ":" + port
+    if scheme != "https" || !isset(options) : return key
+    let parts = Array[String]{ key, "" + options.verify_tls_cert, options.min_tls_version.name() }
+    let max_version = options.max_tls_version
+    parts.append(isset(max_version) ? max_version.name() : "")
+    parts.append(options.ca_cert_path ?? "")
+    parts.append(options.client_certificate_file ?? "")
+    parts.append(options.client_key_file ?? "")
+    parts.append(options.certificate_sha256 ?? "")
+    parts.append(options.tls_cipher_list ?? "")
+    parts.append(options.tls_cipher_suites ?? "")
+    let alpn = options.alpn_protocols
+    parts.append(isset(alpn) ? alpn.join(",") : "")
+    return parts.join("|")
+}
+
+/// Sends HTTP requests like `http.request`, keeping connections open and cookies between
+/// them.
+///
+/// A request to a host the client talked to before goes over the same connection when the
+/// server kept it open, which saves the connection and TLS setup. When the server closed a
+/// kept connection in the meantime, the request is sent again on a new one if that is
+/// safe: for `GET`, `HEAD`, `PUT`, `DELETE` and `OPTIONS`, or when nothing was sent yet.
+/// Cookies that servers set, also on redirects, are kept in `cookies` and sent back to
+/// matching URLs. A `Client` belongs to the thread that made it; the coroutines of that
+/// thread can use it at the same time.
+///
+/// ```valk
+/// let client = http.Client.new()
+/// let first = client.get("https://api.example.com/items") !
+/// let second = client.get("https://api.example.com/items/2") ! // same connection
+/// client.close()
+/// ```
++ class Client {
+    /// The cookies servers set, sent back on later requests.
+    ~ cookies: CookieJar (.{})
+    /// How many idle connections are kept per host.
+    + max_idle_per_host: uint (4)
+    /// How long an idle connection is kept, in milliseconds.
+    + idle_timeout_ms: uint (60_000)
+    - pool: ConnectionPool (.{})
+
+    /// Returns a client without cookies or open connections.
+    + static fn new() SELF {
+        return SELF {}
+    }
+
+    /// Sends a request like `http.request`, reusing a connection and sending the cookies
+    /// that match the URL.
+    + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError {
+        let deadline_ms: uint = 0
+        let timeout_ms = isset(options) ? options.timeout_ms : DEFAULT_REQUEST_TIMEOUT_MS
+        if timeout_ms > 0 : deadline_ms = time.deadline_ms(timeout_ms)
+        this.pool.max_idle_per_host = this.max_idle_per_host
+        this.pool.idle_timeout_ms = this.idle_timeout_ms
+        return request_with_deadline(method, url, options, deadline_ms, this) !>
+    }
+
+    /// Sends a GET request; see `request`.
+    + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError {
+        return this.request("GET", url, options) !>
+    }
+
+    /// Sends a HEAD request; see `request`.
+    + fn head(url: String, options: ?Options (null)) ClientResponse !HttpError {
+        return this.request("HEAD", url, options) !>
+    }
+
+    /// Sends a DELETE request; see `request`.
+    + fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError {
+        return this.request("DELETE", url, options) !>
+    }
+
+    /// Sends a POST request with `body`, which is stored in `options.body` like `http.post`.
+    + fn post(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError {
+        return this.request("POST", url, options_with_body(body, options)) !>
+    }
+
+    /// Sends a PUT request with `body`; see `post`.
+    + fn put(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError {
+        return this.request("PUT", url, options_with_body(body, options)) !>
+    }
+
+    /// Sends a PATCH request with `body`; see `post`.
+    + fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError {
+        return this.request("PATCH", url, options_with_body(body, options)) !>
+    }
+
+    /// Closes the connections kept open; the client stays usable and keeps its cookies.
+    + fn close() {
+        this.pool.close_all()
+    }
+
+    fn connections() ConnectionPool {
+        return this.pool
+    }
+}
+
+fn options_with_body(body: String, options: ?Options) Options {
+    let o = options ?? Options {}
+    o.body = body
+    return o
+}
+
+// Methods whose request can be sent twice without a different effect
+fn method_is_idempotent(method: String) bool {
+    let upper = method.upper()
+    return upper == "GET" || upper == "HEAD" || upper == "PUT" || upper == "DELETE" || upper == "OPTIONS" || upper == "TRACE"
+}
+
+// One request without redirects; on a kept connection that the server closed in the
+// meantime it is sent again on a new one when that is safe
+fn send_once(method: String, url: String, options: ?Options, deadline_ms: uint, client: ?Client) ClientResponse !HttpError {
+    let pool: ?ConnectionPool = isset(client) ? client.connections() : null
+    let req = ClientRequest.open(method, url, options, deadline_ms, pool, false) !>
+    while true {
+        let more = req.progress() ! {
+            let stale = req.reused && req.bytes_received == 0 && (req.bytes_sent == 0 || method_is_idempotent(method))
+            if !stale || (!error_is(E.code, read) && !error_is(E.code, write)) : throw E
+            let retry = ClientRequest.open(method, url, options, deadline_ms, pool, true) !>
+            while (retry.progress() !>) {}
+            return retry.response() !>
+        }
+        if !more : break
+    }
+    return req.response() !>
+}

@@ -10336,6 +10336,106 @@ benchmarks.
 ## Classes for 'http'
 
 ```js
+// Sends HTTP requests like `http.request`, keeping connections open and cookies between them.
++ class Client {
+    // The cookies servers set, sent back on later requests.
+    ~ cookies: CookieJar
+    // How long an idle connection is kept, in milliseconds.
+    + idle_timeout_ms: uint
+    // How many idle connections are kept per host.
+    + max_idle_per_host: uint
+
+    // Closes the connections kept open; the client stays usable and keeps its cookies.
+    + fn close() void
+    // Sends a DELETE request; see `request`.
+    + fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a GET request; see `request`.
+    + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a HEAD request; see `request`.
+    + fn head(url: String, options: ?Options (null)) ClientResponse !HttpError
+    // Returns a client without cookies or open connections.
+    + static fn new() Client
+    // Sends a PATCH request with `body`; see `post`.
+    + fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a POST request with `body`, which is stored in `options.body` like `http.post`.
+    + fn post(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a PUT request with `body`; see `post`.
+    + fn put(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a request like `http.request`, reusing a connection and sending the cookies that match the URL.
+    + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
+}
+```
+
+### Client
+
+Sends HTTP requests like `http.request`, keeping connections open and cookies between
+them.
+
+A request to a host the client talked to before goes over the same connection when the
+server kept it open, which saves the connection and TLS setup. When the server closed a
+kept connection in the meantime, the request is sent again on a new one if that is
+safe: for `GET`, `HEAD`, `PUT`, `DELETE` and `OPTIONS`, or when nothing was sent yet.
+Cookies that servers set, also on redirects, are kept in `cookies` and sent back to
+matching URLs. A `Client` belongs to the thread that made it; the coroutines of that
+thread can use it at the same time.
+
+```valk
+let client = http.Client.new()
+let first = client.get("https://api.example.com/items") !
+let second = client.get("https://api.example.com/items/2") ! // same connection
+client.close()
+```
+
+#### cookies
+
+The cookies servers set, sent back on later requests.
+
+#### idle_timeout_ms
+
+How long an idle connection is kept, in milliseconds.
+
+#### max_idle_per_host
+
+How many idle connections are kept per host.
+
+#### close
+
+Closes the connections kept open; the client stays usable and keeps its cookies.
+
+#### delete
+
+Sends a DELETE request; see `request`.
+
+#### get
+
+Sends a GET request; see `request`.
+
+#### head
+
+Sends a HEAD request; see `request`.
+
+#### new
+
+Returns a client without cookies or open connections.
+
+#### patch
+
+Sends a PATCH request with `body`; see `post`.
+
+#### post
+
+Sends a POST request with `body`, which is stored in `options.body` like `http.post`.
+
+#### put
+
+Sends a PUT request with `body`; see `post`.
+
+#### request
+
+Sends a request like `http.request`, reusing a connection and sending the cookies
+that match the URL.
+
+```js
 // A single HTTP/1.1 request on its own connection, sent and received step by step.
 + class ClientRequest {
     // The number of raw response bytes read so far, head included.
@@ -10346,7 +10446,7 @@ benchmarks.
     ~ bytes_to_recv: uint
     // The size of the complete request (head and body) in bytes.
     ~ bytes_to_send: uint
-    // The connection the request is sent on; closed once the request has finished.
+    // The connection the request is sent on; closed once the request has finished, or kept by its `Client` for another request.
     ~ con: TcpConnection
     // The buffer that collects the raw response bytes.
     ~ recv_buffer: ByteBuffer
@@ -10406,7 +10506,8 @@ The size of the complete request (head and body) in bytes.
 
 #### con
 
-The connection the request is sent on; closed once the request has finished.
+The connection the request is sent on; closed once the request has finished, or kept
+by its `Client` for another request.
 
 #### recv_buffer
 
@@ -10761,6 +10862,60 @@ Returns the `Set-Cookie` field value for this cookie.
 
 Attributes left null are not written. An invalid name or value gives an empty
 string, which the server leaves out of the response.
+
+```js
+// The cookies a `Client` received, sent back on later requests as a browser does (RFC 6265).
++ class CookieJar {
+    // Removes every cookie.
+    + fn clear() void
+    // Returns the cookies a request to `url` sends, longest path first.
+    + fn cookies_for(url: String) Array[Cookie]
+    // Returns the `Cookie` header value for a request to `url`; empty when none matches.
+    + fn header_for(url: String) String
+    // The number of cookies that have not expired.
+    + get length: uint
+    // Stores `cookie` as if a response from `url` had set it.
+    + fn set(url: String, cookie: Cookie) void
+    // Stores the cookies of `response`, which answered a request to `url`.
+    + fn store(url: String, response: ClientResponse) void
+}
+```
+
+### CookieJar
+
+The cookies a `Client` received, sent back on later requests as a browser does
+(RFC 6265).
+
+A cookie with a `Domain` goes to that domain and its subdomains, one without it only to
+the host that set it. `Path` limits it to the paths below it, `Secure` to HTTPS, and
+`Max-Age` or `Expires` to a lifetime; a cookie that is set again replaces the earlier one.
+
+#### clear
+
+Removes every cookie.
+
+#### cookies_for
+
+Returns the cookies a request to `url` sends, longest path first.
+
+#### header_for
+
+Returns the `Cookie` header value for a request to `url`; empty when none matches.
+
+#### length
+
+The number of cookies that have not expired.
+
+#### set
+
+Stores `cookie` as if a response from `url` had set it.
+
+Its `path` is used as it is; an empty `domain` makes a cookie for the host of `url`
+only. Its `secure` flag applies too, and `Cookie.new` sets it.
+
+#### store
+
+Stores the cookies of `response`, which answered a request to `url`.
 
 ```js
 // An ordered list of HTTP header fields with case-insensitive names.

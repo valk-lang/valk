@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ `http.Client`: keeps connections open between requests to the same host (200 local HTTPS requests: 640 -> 8 ms) and keeps cookies in a `CookieJar` (RFC 6265 domain, path, Secure and expiry rules; cookies set on a redirect are kept). A kept connection the server closed is retried on a new one when safe. Redirects and downloads now keep the client certificate options
 + HTTP client: `http.Multipart` builds a `multipart/form-data` upload (`add_field`, `add_file`, `apply(options)`)
 + HTTP client: `Options.host` sends another `Host` header, for reaching a virtual host through an IP
 + HTTP client: credentials in the URL (`https://user:pass@host/`) are sent as `Authorization: Basic` (they failed with `invalid_url`), and `Options.basic_auth(user, password)` sets it

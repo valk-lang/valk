@@ -1,6 +1,8 @@
 use valk.http
 use valk.time
 use valk.compress
+use valk.net
+use valk.sync
 
 fn client_feature_handler(req: http.Request) http.Response {
     if req.path == "/gzip" {
@@ -127,6 +129,155 @@ test "HTTP client: Multipart uploads fields and files" {
     tricky.add_field("a\"b", "x")
     assert(tricky.body().contains("name=\"a%22b\""))
 
+    server.shutdown()
+    await running !!
+}
+
+fn client_keepalive_handler(req: http.Request) http.Response {
+    if req.path == "/login" {
+        let res = http.Response.redirect("/home")
+        res.set_header("Set-Cookie", "sid=abc; Path=/; HttpOnly")
+        return res
+    }
+    if req.path == "/cookie" : return http.Response.text(req.headers().get("cookie") !? "-")
+    if req.path == "/home" : return http.Response.text("home " + (req.headers().get("cookie") !? "-"))
+    if req.path == "/close" {
+        let res = http.Response.text("bye")
+        res.set_header("Connection", "close")
+        return res
+    }
+    return http.Response.text("" + req.peer_address.port)
+}
+
+test "HTTP client: Client reuses connections" {
+    let server = http.Server.new("127.0.0.1", 19555, client_keepalive_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let base = "http://127.0.0.1:19555"
+
+    let client = http.Client.new()
+    let first = (client.get(base + "/port") !!).body
+    let second = (client.get(base + "/port") !!).body
+    let third = (client.post(base + "/port", "data") !!).body
+    // The same local port: the same connection
+    assert(first == second && second == third)
+
+    // One-shot requests use a new connection each
+    assert((http.get(base + "/port") !!).body != (http.get(base + "/port") !!).body)
+
+    // A server that closes the connection is not asked again on it
+    assert((client.get(base + "/close") !!).body == "bye")
+    assert((client.get(base + "/port") !!).body != first)
+
+    client.close()
+    server.shutdown()
+    await running !!
+}
+
+test "HTTP client: Client keeps cookies, also from redirects" {
+    let server = http.Server.new("127.0.0.1", 19556, client_keepalive_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let base = "http://127.0.0.1:19556"
+
+    let client = http.Client.new()
+    // The cookie is set on the redirect and sent to the page it leads to
+    assert((client.get(base + "/login") !!).body == "home sid=abc")
+    assert((client.get(base + "/cookie") !!).body == "sid=abc")
+    assert(client.cookies.length == 1)
+    // A one-shot request keeps nothing
+    assert((http.get(base + "/login") !!).body == "home -")
+
+    // An own Cookie header wins
+    let own = http.Options {}
+    own.set_header("Cookie", "mine=1")
+    assert((client.get(base + "/cookie", own) !!).body == "mine=1")
+
+    server.shutdown()
+    await running !!
+}
+
+// A server that answers one request per connection and then closes it, without saying so
+fn stale_server(listener: shared net.TcpServer, connections: shared sync.Channel[uint]) {
+    let count: uint = 0
+    while true {
+        let con = listener.accept(3000) ! return
+        count++
+        connections.send(count) ! {}
+        let buf = [u8]{ 0 x 4096 }
+        con.read(buf) ! {}
+        con.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok") ! {}
+        time.sleep_ms(5)
+        con.close() ! {}
+    }
+}
+
+test "HTTP client: Client sends again when a kept connection was closed" {
+    let listener = net.tcp_server("127.0.0.1", 19557) !!
+    let connections: shared sync.Channel[uint] = sync.Channel[uint].new() !!
+    let serving = co stale_server(listener, connections)
+    let client = http.Client.new()
+    assert((client.get("http://127.0.0.1:19557/") !!).body == "ok")
+    time.sleep_ms(30)
+    // The kept connection is closed by now: the GET goes out again on a new one
+    assert((client.get("http://127.0.0.1:19557/") !!).body == "ok")
+    assert(connections.length == 2)
+    client.close()
+    listener.close() ! {}
+    await serving
+}
+
+test "HTTP client: CookieJar rules" {
+    let jar = http.CookieJar {}
+    let from_api = http.ClientResponse { status: 200 }
+    from_api.headers.append("set-cookie", "a=1; Domain=example.com; Path=/")
+    from_api.headers.append("set-cookie", "b=2")
+    from_api.headers.append("set-cookie", "c=3; Secure; Path=/")
+    from_api.headers.append("set-cookie", "evil=1; Domain=other.com")
+    from_api.headers.append("set-cookie", "gone=1; Max-Age=0")
+    jar.store("http://api.example.com/v1/users", from_api)
+
+    // Domain cookies reach subdomains, host cookies only their host and their directory
+    assert(jar.header_for("http://api.example.com/v1/users/7") == "b=2; a=1")
+    assert(jar.header_for("http://www.example.com/") == "a=1")
+    assert(jar.header_for("http://api.example.com/other") == "a=1")
+    // Secure cookies only over HTTPS
+    assert(jar.header_for("https://api.example.com/") == "a=1; c=3")
+    assert(jar.header_for("http://other.com/") == "")
+    assert(jar.length == 3)
+
+    // Setting a cookie again replaces it; Max-Age=0 removes it
+    let update = http.ClientResponse { status: 200 }
+    update.headers.append("set-cookie", "a=9; Domain=example.com; Path=/")
+    jar.store("http://api.example.com/", update)
+    assert(jar.header_for("http://www.example.com/") == "a=9")
+    let removal = http.ClientResponse { status: 200 }
+    removal.headers.append("set-cookie", "a=0; Domain=example.com; Path=/; Max-Age=0")
+    jar.store("http://api.example.com/", removal)
+    assert(jar.header_for("http://www.example.com/") == "")
+
+    // `Cookie.new` makes a secure cookie
+    jar.set("http://example.com/", http.Cookie.new("manual", "x"))
+    assert(jar.header_for("http://example.com/any") == "")
+    assert(jar.header_for("https://example.com/any") == "manual=x")
+    jar.clear()
+    assert(jar.length == 0)
+}
+
+test "HTTP client: Client reuses TLS connections" {
+    let server = http.Server.new("127.0.0.1", 19558, client_keepalive_handler)
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let options = http.Options { verify_tls_cert: false }
+    let client = http.Client.new()
+    let first = (client.get("https://127.0.0.1:19558/port", options) !!).body
+    let second = (client.get("https://127.0.0.1:19558/port", options) !!).body
+    assert(first == second)
+    // Other TLS settings do not share the connection
+    let pinned = http.Options { verify_tls_cert: false, min_tls_version: net.TlsVersion.tls_1_3 }
+    assert((client.get("https://127.0.0.1:19558/port", pinned) !!).body != first)
+    client.close()
     server.shutdown()
     await running !!
 }

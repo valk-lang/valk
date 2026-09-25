@@ -3048,6 +3048,37 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ## Classes for 'http'
 
 ```js
+// Sends HTTP requests like `http.request`, keeping connections open and cookies between them.
++ class Client {
+    // The cookies servers set, sent back on later requests.
+    ~ cookies: CookieJar
+    // How long an idle connection is kept, in milliseconds.
+    + idle_timeout_ms: uint
+    // How many idle connections are kept per host.
+    + max_idle_per_host: uint
+
+    // Closes the connections kept open; the client stays usable and keeps its cookies.
+    + fn close() void
+    // Sends a DELETE request; see `request`.
+    + fn delete(url: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a GET request; see `request`.
+    + fn get(url: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a HEAD request; see `request`.
+    + fn head(url: String, options: ?Options (null)) ClientResponse !HttpError
+    // Returns a client without cookies or open connections.
+    + static fn new() Client
+    // Sends a PATCH request with `body`; see `post`.
+    + fn patch(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a POST request with `body`, which is stored in `options.body` like `http.post`.
+    + fn post(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a PUT request with `body`; see `post`.
+    + fn put(url: String, body: String, options: ?Options (null)) ClientResponse !HttpError
+    // Sends a request like `http.request`, reusing a connection and sending the cookies that match the URL.
+    + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
+}
+```
+
+```js
 // A single HTTP/1.1 request on its own connection, sent and received step by step.
 + class ClientRequest {
     // The number of raw response bytes read so far, head included.
@@ -3058,7 +3089,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     ~ bytes_to_recv: uint
     // The size of the complete request (head and body) in bytes.
     ~ bytes_to_send: uint
-    // The connection the request is sent on; closed once the request has finished.
+    // The connection the request is sent on; closed once the request has finished, or kept by its `Client` for another request.
     ~ con: TcpConnection
     // The buffer that collects the raw response bytes.
     ~ recv_buffer: ByteBuffer
@@ -3164,6 +3195,24 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + static fn parse(header: String) Cookie !SyntaxError
     // Returns the `Set-Cookie` field value for this cookie.
     + fn to_header() String
+}
+```
+
+```js
+// The cookies a `Client` received, sent back on later requests as a browser does (RFC 6265).
++ class CookieJar {
+    // Removes every cookie.
+    + fn clear() void
+    // Returns the cookies a request to `url` sends, longest path first.
+    + fn cookies_for(url: String) Array[Cookie]
+    // Returns the `Cookie` header value for a request to `url`; empty when none matches.
+    + fn header_for(url: String) String
+    // The number of cookies that have not expired.
+    + get length: uint
+    // Stores `cookie` as if a response from `url` had set it.
+    + fn set(url: String, cookie: Cookie) void
+    // Stores the cookies of `response`, which answered a request to `url`.
+    + fn store(url: String, response: ClientResponse) void
 }
 ```
 

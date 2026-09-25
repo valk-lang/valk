@@ -2400,6 +2400,18 @@ let res = http.request("GET", url, http.Options { headers: headers }) ! panic("R
 let cookies = res.headers.get_all("Set-Cookie")
 ```
 
+Each `http.get` or `http.request` opens a connection of its own. An
+`http.Client` keeps connections open between requests to the same host, which
+saves the connection and TLS setup, and keeps the cookies servers set (also on
+redirects) in `client.cookies`, sending them back to matching URLs:
+
+```rust
+let client = http.Client.new()
+client.post("https://example.com/login", body) ! panic("Login failed")
+let page = client.get("https://example.com/account") ! panic("Request failed") // with the session cookie
+client.close()
+```
+
 The client asks for gzip and decompresses the body unless
 `Options.decompress` is off. Credentials in the URL (`https://user:pass@host/`)
 or `options.basic_auth(user, pass)` send an `Authorization: Basic` header, and

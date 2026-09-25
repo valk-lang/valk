@@ -52,8 +52,14 @@ fn request_header_is_reserved(name: String) bool {
     ~ recv_buffer: ByteBuffer
     - recv_data: mut &[u8]
     - ctx: Context
-    /// The connection the request is sent on; closed once the request has finished.
+    /// The connection the request is sent on; closed once the request has finished, or kept
+    /// by its `Client` for another request.
     ~ con: net.TcpConnection
+    // The `Client` pool the connection came from or goes back to
+    pool: ?ConnectionPool (null)
+    pool_key: String ("")
+    // The connection was kept from an earlier request
+    reused: bool (false)
     - payload: ByteBuffer
     - deadline_ms: uint (0)
     - read_timeout_ms: uint (5000)
@@ -107,6 +113,12 @@ fn request_header_is_reserved(name: String) bool {
     /// with `ssl` when TLS setup, the handshake or the certificate fingerprint check
     /// fails, and with `timeout` or a connection error when connecting fails.
     + static fn new(method: String, url: String, options: ?Options (null), deadline_ms: uint (0)) ClientRequest !HttpError {
+        return SELF.open(method, url, options, deadline_ms, null, false) !>
+    }
+
+    // `new` with a connection kept by a `Client` when `pool` has one for the host, unless
+    // `fresh` asks for a new one
+    static fn open(method: String, url: String, options: ?Options, deadline_ms: uint, pool: ?ConnectionPool, fresh: bool) ClientRequest !HttpError {
         let connect_timeout_ms: uint = 5000
         let read_timeout_ms: uint = 5000
         let write_timeout_ms: uint = 5000
@@ -144,7 +156,19 @@ fn request_header_is_reserved(name: String) bool {
         // including a directly supplied headers map, pass through one boundary.
         let payload = SELF.create_payload(method, u, options) !>
 
-        // Connect
+        // Connect, or take a connection an earlier request of the same `Client` left open
+        let key = isset(pool) ? connection_key(u.scheme, host, port, options) : ""
+        let kept: ?net.TcpConnection = null
+        if isset(pool) && !fresh : kept = pool.take(key)
+        if isset(kept) {
+            kept.set_timeouts(read_timeout_ms, write_timeout_ms)
+            let request = SELF.start(method, options, kept, payload, deadline_ms, read_timeout_ms, write_timeout_ms,
+                max_response_header_size, max_response_body_size)
+            request.pool = pool
+            request.pool_key = key
+            request.reused = true
+            return request
+        }
         let connect_deadline_ms = SELF.operation_deadline(deadline_ms, connect_timeout_ms)
         let con = net.tcp_client(host, port, SELF.remaining_timeout(connect_deadline_ms, 0) !>) !>
         SELF.remaining_timeout(connect_deadline_ms, 0) !>
@@ -177,7 +201,15 @@ fn request_header_is_reserved(name: String) bool {
             }
         }
 
-        // Request
+        let request = SELF.start(method, options, con, payload, deadline_ms, read_timeout_ms, write_timeout_ms,
+            max_response_header_size, max_response_body_size)
+        request.pool = pool
+        request.pool_key = key
+        return request
+    }
+
+    static fn start(method: String, options: ?Options, con: net.TcpConnection, payload: ByteBuffer, deadline_ms: uint,
+        read_timeout_ms: uint, write_timeout_ms: uint, max_response_header_size: uint, max_response_body_size: uint) ClientRequest {
         let recv_buffer = ByteBuffer.new(2048)
         let ctx = Context.new(recv_buffer)
         ctx.response_to_head = method.equals_ignore_ascii_case("HEAD")
@@ -342,8 +374,14 @@ fn request_header_is_reserved(name: String) bool {
     // Run / Progress
     //////////////////////////////
 
-    - fn stop() {
-        this.con.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+    // Ends the request; `keep` hands the connection back to the `Client` instead of closing it
+    - fn stop(keep: bool (false)) {
+        let pool = this.pool
+        if keep && isset(pool) {
+            pool.give(this.pool_key, this.con)
+        } else {
+            this.con.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+        }
         this.ctx.reset()
         this.request_sent = true
         this.response_received = true
@@ -447,7 +485,11 @@ fn request_header_is_reserved(name: String) bool {
             }
         }
 
-        this.stop()
+        // The connection can carry another request when the server keeps it open and
+        // nothing but this response arrived on it
+        let reusable = isset(this.pool) && !context.close_delimited && context.keep_alive
+            && context.status != 101 && !context.response_to_connect && recv_buf.length == context.parsed_index
+        this.stop(reusable)
         this.resp = resp
 
         return false
