@@ -372,32 +372,61 @@ class H2Connection {
         this.sync_body()
     }
 
+    // See `ResponseWriter.file_plan_for`
+    fn file_plan_for(request: Request, status: u16, info: fs.FileInfo, content_type: String, extra: ?Headers) ?FilePlan {
+        if status != 200 : return null
+        let get = request.method == "GET"
+        if !get && request.method != "HEAD" : return null
+        if isset(extra) && (extra.has("etag") || extra.has("last-modified") || extra.has("content-encoding")) : return null
+        let h = request.headers()
+        let range = get ? h.get("range") !? "" : ""
+        return file_plan(info.size, info.modified_time, content_type, this.owner.worker.server.compress, h.get("if-none-match") !? "",
+            h.get("if-modified-since") !? "", range, h.get("if-range") !? "", h.get("accept-encoding") !? "")
+    }
+
     fn respond(stream: H2Stream, request: Request, response: Response) !H2Error {
         let source = response.stream_reader
         let file: ?fs.FileStream = null
-        let size = isset(source) ? response.stream_size : response.body.bytes
+        let body = response.body
+        let size = isset(source) ? response.stream_size : body.bytes
         let content_type = response.content_type
         let status = response.status
+        let extra = response.header_list
+        let plan: ?FilePlan = null
         let path = response.filepath
         if isset(path) {
             file = fs.stream(path) !? null
-            if isset(file) {
+            let info = fs.stat(path) !? null
+            if isset(file) && isset(info) {
                 source = file.to(io.Reader)
-                size = fs.size(path) !? 0
+                size = info.size
                 content_type = fs.mime_type(fs.extension(path))
+                if isset(extra) : content_type = extra.get("content-type") !? content_type
+                plan = this.file_plan_for(request, status, info, content_type, extra)
             } else {
                 status = 404
                 size = 0
             }
         }
         defer h2_close_file(file)
+        if isset(plan) {
+            status = plan.status
+            size = plan.length
+            if isset(file) && plan.start > 0 : file.seek(plan.start.to(int)) ! throw .protocol
+            if plan.gzip && isset(file) {
+                let data = io.read_all(file.to(io.Reader)) ! throw .protocol
+                if data.length != plan.size : throw .protocol
+                source = null
+                body = compress.gzip(data)
+                size = body.bytes
+            }
+            if status == 304 || status == 416 : source = null
+        }
         if status < 200 || status > 599 : status = 500
         let headers = Array[HpackField] { .{ name: ":status", value: status.to_string() } }
-        let extra = response.header_list
         if isset(extra) : content_type = extra.get("content-type") !? content_type
         // `Server.compress`: a body in memory is sent gzip-compressed to a client that takes it
-        let body = response.body
-        if !isset(source) && this.owner.worker.server.compress && status != 204 && status != 304 && body.bytes >= GZIP_MIN_SIZE
+        if !isset(source) && !isset(plan) && this.owner.worker.server.compress && status != 204 && status != 304 && body.bytes >= GZIP_MIN_SIZE
             && response_gzip_type(content_type) && !(isset(extra) && extra.has("content-encoding")) {
             headers.append(.{ name: "vary", value: "Accept-Encoding" })
             if request_accepts_gzip(request.headers().get("accept-encoding") !? "") {
@@ -406,8 +435,18 @@ class H2Connection {
                 headers.append(.{ name: "content-encoding", value: "gzip" })
             }
         }
-        if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
-        if status != 204 : headers.append(.{ name: "content-length", value: size.to_string() })
+        if isset(plan) {
+            if status == 416 {
+                content_type = "text/plain"
+                headers.append(.{ name: "content-range", value: "bytes */" + plan.size })
+            } else {
+                h2_file_plan_fields(headers, plan)
+            }
+        }
+        if status != 304 || !isset(plan) {
+            if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
+            if status != 204 : headers.append(.{ name: "content-length", value: size.to_string() })
+        }
         if isset(extra) {
             each extra as value, name {
                 if response_header_is_framing(name) : continue
@@ -461,5 +500,16 @@ class H2Connection {
             data_offset += count
             if !this.flush_soon() : return
         }
+    }
+}
+
+fn h2_file_plan_fields(headers: Array[HpackField], plan: FilePlan) {
+    headers.append(.{ name: "etag", value: plan.etag })
+    headers.append(.{ name: "last-modified", value: plan.last_modified })
+    if plan.status != 304 : headers.append(.{ name: "accept-ranges", value: "bytes" })
+    if plan.vary : headers.append(.{ name: "vary", value: "Accept-Encoding" })
+    if plan.gzip : headers.append(.{ name: "content-encoding", value: "gzip" })
+    if plan.status == 206 {
+        headers.append(.{ name: "content-range", value: "bytes " + plan.start + "-" + (plan.start + plan.length - 1) + "/" + plan.size })
     }
 }

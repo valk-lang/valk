@@ -3465,7 +3465,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 + class Server {
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
-    // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB.
+    // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
     // How long each read of a request head, and the TLS handshake, may take, in milliseconds.
     + header_timeout_ms: uint

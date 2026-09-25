@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP server: files from static dirs and `Response.file` carry `ETag` / `Last-Modified`, answer `If-None-Match` / `If-Modified-Since` with 304 and one `Range` of bytes with 206 (416 past the end, `If-Range` checked); with `compress` text-like files up to 1 MiB are sent gzipped (HTTP/1.1 and HTTP/2)
 + HTTP server: `compress = true` gzips text-like responses of 1 KiB and more for clients that accept it (HTTP/1.1 and HTTP/2), with `Vary: Accept-Encoding`
 + HTTP router: `route.params(path)` decodes the values (`decode: false` gives them as written; they were always raw before) and returns what `*` matched as `*`; `router.allowed_methods(path)` for 405 answers
 + HTTP server: `add_middleware(fn(req, next) Response)` wraps the handler; the first added runs first

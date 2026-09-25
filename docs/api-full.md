@@ -11554,6 +11554,11 @@ The content type follows from the file extension. With a `filename` the file is
 offered as a download under that name (`Content-Disposition: attachment`). A file
 that cannot be opened results in an empty 404 response.
 
+A 200 answer to `GET` or `HEAD` carries `ETag` and `Last-Modified` and answers
+`If-None-Match` / `If-Modified-Since` with 304 and a single `Range` of bytes with
+206 (416 past the end), unless the response sets its own `ETag`, `Last-Modified` or
+`Content-Encoding`.
+
 #### headers
 
 The extra response headers, created empty on first access.
@@ -11665,6 +11670,10 @@ be opened.
 The content type follows from the file extension, unless `headers` has a
 `Content-Type`. With a `filename` the file is offered as a download under that
 name. The body is left out like `respond` leaves it out.
+
+A 200 response to a `GET` or `HEAD` request carries `ETag` and `Last-Modified`,
+answers 304 when the client's copy is current and 206 for a `Range` of bytes,
+unless `headers` sets its own `ETag`, `Last-Modified` or `Content-Encoding`.
 
 #### send_status
 
@@ -11784,7 +11793,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
 + class Server {
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
-    // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB.
+    // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
     // How long each read of a request head, and the TLS handshake, may take, in milliseconds.
     + header_timeout_ms: uint
@@ -11857,7 +11866,7 @@ How long each read of a request body may take, in milliseconds.
 #### compress
 
 Compresses responses with gzip for clients that accept it: text, HTML, CSS,
-JavaScript, JSON, XML and SVG of at least 1 KiB.
+JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
 
 Adds `Vary: Accept-Encoding`. A response with its own `Content-Encoding` and a
 streamed response are sent as they are.
@@ -11968,6 +11977,9 @@ A path naming a directory that holds an `index` file gets that file, so `/` serv
 `index.html`. Without the trailing slash (`/docs`) the answer is a 301 redirect to
 `/docs/` first, so relative links in the page resolve inside the directory. Pass
 `index: ""` to let directory paths reach the handler.
+
+Files are sent like `Response.file`: with `ETag` and `Last-Modified`, 304 for a
+current copy and 206 for a `Range`.
 
 #### fast
 

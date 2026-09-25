@@ -1,6 +1,7 @@
 @ignore_access
 use valk.http
 use valk.compress
+use valk.fs
 use valk.net
 use valk.time
 
@@ -253,7 +254,11 @@ test "HTTP2: a non-zero request size limit still rejects oversized requests" {
 
 // Like h2_response, also returning the response headers
 fn h2_response_with_headers(socket: net.TcpConnection, input: ByteBuffer, stream: u32) (String, Map[String], String) {
-    let decoder = http.HpackDecoder {}
+    return h2_response_decoded(socket, input, stream, http.HpackDecoder {})
+}
+
+// Responses on one connection share the decoder's dynamic table
+fn h2_response_decoded(socket: net.TcpConnection, input: ByteBuffer, stream: u32, decoder: http.HpackDecoder) (String, Map[String], String) {
     let body = ""
     let status = ""
     let headers = Map[String]{}
@@ -307,4 +312,56 @@ test "HTTP2: compress sends gzip" {
     socket.close() !!
     server.request_shutdown(1000)
     await running !!
+}
+
+test "HTTP2: static files answer 304, ranges and gzip" {
+    let root = fs.create_temp_dir("valk-h2-static-") !!
+    let css = "body { color: red; }\n".repeat(200)
+    fs.write(fs.add(root, "site.css"), css) !!
+    let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        return http.Response.text("handler")
+    }
+    let server = http.Server.new("127.0.0.1", 9197, handler)
+    server.http2 = true
+    server.compress = true
+    server.add_static_dir(root) !!
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let socket = h2_open(9197)
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input, "the server SETTINGS")
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    let decoder = http.HpackDecoder {}
+    let request = fn(stream: u32, name: String, value: String) (String, Map[String], String) {
+        let fields = Array[http.HpackField] {
+            .{ name: ":method", value: "GET" },
+            .{ name: ":scheme", value: "https" },
+            .{ name: ":path", value: "/site.css" },
+            .{ name: ":authority", value: "localhost" }
+        }
+        if name.bytes > 0 : fields.append(.{ name: name, value: value })
+        socket.write(http.H2Frame { kind: 1, flags: 5, stream: stream, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+        return h2_response_decoded(socket, input, stream, decoder)
+    }
+
+    let status, headers, body = request(1, "", "")
+    assert(status == "200" && body == css)
+    assert((headers.get("accept-ranges") !? "") == "bytes" && (headers.get("vary") !? "") == "Accept-Encoding")
+    let etag = headers.get("etag") !? ""
+    let cached_status, cached_headers, cached_body = request(3, "if-none-match", etag)
+    assert(cached_status == "304" && cached_body == "" && !cached_headers.has("content-length"))
+    let part_status, part_headers, part_body = request(5, "range", "bytes=7-11")
+    assert(part_status == "206" && part_body == "color")
+    assert((part_headers.get("content-range") !? "") == "bytes 7-11/" + css.bytes)
+    let past_status, past_headers, past_body = request(7, "range", "bytes=99999-")
+    assert(past_status == "416" && past_body == "")
+    let gz_status, gz_headers, gz_body = request(9, "accept-encoding", "gzip")
+    assert(gz_status == "200" && (gz_headers.get("content-encoding") !? "") == "gzip")
+    assert(compress.gunzip(gz_body) !! == css)
+
+    socket.close() !!
+    server.request_shutdown(1000)
+    await running !!
+    fs.delete_all(root) !!
 }

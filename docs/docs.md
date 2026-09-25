@@ -2455,6 +2455,9 @@ is not JSON; `parse_json()` throws for it instead. Responses come from `Response
 `s.add_static_dir("public")` serves the files in `public` before a request
 reaches the handler. A directory path serves its `index.html`, so `/` shows
 `public/index.html`; pass `index: ""` to leave directory paths to the handler.
+Files (also `Response.file`) carry an `ETag` and `Last-Modified`, answer 304
+when the browser's copy is current, and serve a `Range` of bytes for resumed
+downloads and video.
 
 Cookies are read from the request by name and set on the response:
 
@@ -2507,7 +2510,8 @@ let id = route.params(req.path).get("id") !? ""
 ```
 
 `s.compress = true` sends text, HTML, CSS, JavaScript, JSON, XML and SVG
-responses of 1 KiB and more gzip-compressed to clients that accept it.
+responses of 1 KiB and more (files up to 1 MiB) gzip-compressed to clients that
+accept it.
 
 `start` runs until shutdown. Use `co` to keep doing other work:
 

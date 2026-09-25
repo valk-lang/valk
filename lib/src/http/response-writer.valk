@@ -169,6 +169,10 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     /// The content type follows from the file extension, unless `headers` has a
     /// `Content-Type`. With a `filename` the file is offered as a download under that
     /// name. The body is left out like `respond` leaves it out.
+    ///
+    /// A 200 response to a `GET` or `HEAD` request carries `ETag` and `Last-Modified`,
+    /// answers 304 when the client's copy is current and 206 for a `Range` of bytes,
+    /// unless `headers` sets its own `ETag`, `Last-Modified` or `Content-Encoding`.
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) {
         if this.responded : return
 
@@ -176,14 +180,94 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             this.send("", 404, "text/plain", headers)
             return
         }
-        let fsize = fs.size(path) ! {
+        let info = fs.stat(path) ! {
             stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
             this.send("", 404, "text/plain", headers)
             return
         }
 
+        let content_type = fs.mime_type(fs.extension(path))
+        if isset(headers) : content_type = headers.get("content-type") !? content_type
+        let plan = this.file_plan_for(code, info, content_type, headers)
+        if isset(plan) {
+            if plan.status == 304 || plan.status == 416 {
+                stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
+                this.send_file_status(plan, headers)
+                return
+            }
+            if plan.gzip {
+                let data = io.read_all(stream) !? null
+                stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
+                if !isset(data) || data.length != plan.size {
+                    this.send("", 500, "text/plain", headers)
+                    return
+                }
+                this.send_encoded(compress.gzip(data), 200, content_type, headers, plan)
+                return
+            }
+            if plan.start > 0 {
+                stream.seek(plan.start.to(int)) ! {
+                    stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
+                    this.send("", 500, "text/plain", headers)
+                    return
+                }
+            }
+        }
+
         this.file_response = stream
-        this.send_stream(stream, fsize, fs.mime_type(fs.extension(path)), filename, headers, code)
+        this.stream_response(stream, isset(plan) ? plan.length : info.size, content_type, filename, headers, isset(plan) ? plan.status : code, plan)
+    }
+
+    // The caching and range answer for a file, or null when the response is not a
+    // plain 200 to a GET or HEAD request
+    - fn file_plan_for(code: u16, info: fs.FileInfo, content_type: String, headers: ?Headers) ?FilePlan {
+        if code != 200 : return null
+        let context = this.request_context ?! return null
+        let get = context.method.equals("GET")
+        if !get && !context.method.equals("HEAD") : return null
+        if isset(headers) && (headers.has("etag") || headers.has("last-modified") || headers.has("content-encoding")) : return null
+        let h = context.headers()
+        // Ranges are only defined for GET (RFC 9110 14.2)
+        let range = get ? h.get("range") !? "" : ""
+        return file_plan(info.size, info.modified_time, content_type, this.compress, h.get("if-none-match") !? "",
+            h.get("if-modified-since") !? "", range, h.get("if-range") !? "", h.get("accept-encoding") !? "")
+    }
+
+    // Answers 304 or 416 for a file
+    - fn send_file_status(plan: FilePlan, headers: ?Headers) {
+        this.responded = true
+        let out = this.output
+        this.write_status_line(plan.status)
+        if plan.status == 416 {
+            out.write("Content-Type: text/plain\r\nContent-Length: 0\r\nContent-Range: bytes */")
+            out.write_uint_ascii(plan.size)
+            out.write("\r\n")
+        } else {
+            this.write_file_plan_headers(plan)
+        }
+        this.write_connection_header()
+        this.write_headers(headers)
+        out.write("\r\n")
+    }
+
+    - fn write_file_plan_headers(plan: FilePlan) {
+        let out = this.output
+        out.write("ETag: ")
+        out.write(plan.etag)
+        out.write("\r\nLast-Modified: ")
+        out.write(plan.last_modified)
+        out.write("\r\n")
+        if plan.status != 304 : out.write("Accept-Ranges: bytes\r\n")
+        if plan.vary && !plan.gzip : out.write("Vary: Accept-Encoding\r\n")
+        if plan.status == 206 {
+            out.write("Content-Range: bytes ")
+            out.write_uint_ascii(plan.start)
+            out.write("-")
+            out.write_uint_ascii(plan.start + plan.length - 1)
+            out.write("/")
+            out.write_uint_ascii(plan.size)
+            out.write("\r\n")
+        }
     }
 
     /// Responds with status `code` and a body streamed from `reader`.
@@ -195,6 +279,11 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     /// it out, and then the reader is not read.
     + fn send_stream(reader: io.Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) {
         if this.responded : return
+        if isset(headers) : content_type = headers.get("content-type") !? content_type
+        this.stream_response(reader, size, content_type, filename, headers, code, null)
+    }
+
+    - fn stream_response(reader: io.Reader, size: uint, content_type: String, filename: ?String, headers: ?Headers, code: u16, plan: ?FilePlan) {
         this.responded = true
 
         let out = this.output
@@ -204,14 +293,13 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             this.body_left = size
         }
 
-        if isset(headers) : content_type = headers.get("content-type") !? content_type
-
         this.write_status_line(code)
         out.write("Content-Type: ")
         out.write(response_header_value_is_safe(content_type) ? content_type : "application/octet-stream")
         out.write("\r\n")
         this.write_content_length(code, size)
         this.write_connection_header()
+        if isset(plan) : this.write_file_plan_headers(plan)
 
         let has_disposition = isset(headers) && headers.has("content-disposition")
         if !has_disposition && isset(filename) && response_header_value_is_safe(filename) {
@@ -319,7 +407,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     }
 
     // Sends a gzip-compressed body
-    - fn send_encoded(body: String, code: u16, content_type: String, headers: ?Headers) {
+    - fn send_encoded(body: String, code: u16, content_type: String, headers: ?Headers, plan: ?FilePlan (null)) {
         this.responded = true
         let buf = this.output
         this.write_status_line(code)
@@ -328,6 +416,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         buf.write("\r\nContent-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
         this.write_content_length(code, body.bytes)
         this.write_connection_header()
+        if isset(plan) : this.write_file_plan_headers(plan)
         this.write_headers(headers)
         buf.write("\r\n")
         if !this.head : buf.write(body)

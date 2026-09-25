@@ -1,6 +1,7 @@
 use valk.http
 use valk.time
 use valk.compress
+use valk.fs
 
 fn server_features_handler(req: http.Request) http.Response {
     return http.Response.text("handler " + req.path)
@@ -93,4 +94,102 @@ test "HTTP server: compress sends gzip to clients that take it" {
 
     server.shutdown()
     await running !!
+}
+
+test "HTTP server: file plan answers conditions, ranges and encodings" {
+    let date = "Thu, 01 Jan 2026 00:00:00 GMT"
+    let ns: uint = 1767225600 * 1_000_000_000
+    let etag = "\"100-" + ns + "\""
+    let plan = fn(if_none_match: String, since: String, range: String, if_range: String, accept: String) String {
+        return http.file_plan_for_test(100, ns, "text/plain", false, if_none_match, since, range, if_range, accept)
+    }
+    assert(plan("", "", "", "", "") == "200 0 100 " + etag + " false")
+    // The client's copy is current
+    assert(plan(etag, "", "", "", "").starts_with("304 "))
+    assert(plan("\"other\", W/" + etag, "", "", "", "").starts_with("304 "))
+    assert(plan("*", "", "", "", "").starts_with("304 "))
+    assert(plan("", date, "", "", "").starts_with("304 "))
+    assert(plan("", "Wed, 31 Dec 2025 23:59:59 GMT", "", "", "").starts_with("200 "))
+    // If-None-Match decides alone
+    assert(plan("\"other\"", date, "", "", "").starts_with("200 "))
+    // Ranges
+    assert(plan("", "", "bytes=10-19", "", "").starts_with("206 10 10 "))
+    assert(plan("", "", "bytes=90-", "", "").starts_with("206 90 10 "))
+    assert(plan("", "", "bytes=95-500", "", "").starts_with("206 95 5 "))
+    assert(plan("", "", "bytes=-30", "", "").starts_with("206 70 30 "))
+    assert(plan("", "", "bytes=-500", "", "").starts_with("206 0 100 "))
+    assert(plan("", "", "bytes=100-", "", "").starts_with("416 "))
+    // Invalid, several, or for another version: the whole file
+    assert(plan("", "", "bytes=20-10", "", "").starts_with("200 "))
+    assert(plan("", "", "bytes=0-1,5-6", "", "").starts_with("200 "))
+    assert(plan("", "", "items=0-1", "", "").starts_with("200 "))
+    assert(plan("", "", "bytes=10-19", "\"old\"", "").starts_with("200 "))
+    assert(plan("", "", "bytes=10-19", etag, "").starts_with("206 "))
+    assert(plan("", "", "bytes=10-19", date, "").starts_with("206 "))
+
+    // gzip: only compressible types of 1 KiB to 1 MiB, never for a range
+    let text = http.file_plan_for_test(5000, ns, "text/css", true, "", "", "", "", "gzip")
+    assert(text == "200 0 5000 \"5000-" + ns + "-gzip\" true")
+    assert(http.file_plan_for_test(5000, ns, "image/png", true, "", "", "", "", "gzip").ends_with(" false"))
+    assert(http.file_plan_for_test(500, ns, "text/css", true, "", "", "", "", "gzip").ends_with(" false"))
+    assert(http.file_plan_for_test(2_000_000, ns, "text/css", true, "", "", "", "", "gzip").ends_with(" false"))
+    assert(http.file_plan_for_test(5000, ns, "text/css", true, "", "", "bytes=0-9", "", "gzip").starts_with("206 0 10 \"5000-"))
+    // Either version's tag answers 304
+    assert(http.file_plan_for_test(5000, ns, "text/css", true, "\"5000-" + ns + "-gzip\"", "", "", "", "").starts_with("304 "))
+}
+
+test "HTTP server: static files answer 304, ranges and gzip" {
+    let root = fs.create_temp_dir("valk-http-static-") !!
+    let digits = "0123456789".repeat(10)
+    let css = "body { color: red; }\n".repeat(200)
+    fs.write(fs.add(root, "digits.txt"), digits) !!
+    fs.write(fs.add(root, "site.css"), css) !!
+
+    let server = http.Server.new("127.0.0.1", 19573, server_features_handler)
+    server.compress = true
+    server.add_static_dir(root) !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let base = "http://127.0.0.1:19573"
+
+    let full = http.get(base + "/digits.txt") !!
+    assert(full.status == 200 && full.body == digits)
+    let etag = full.headers.get("etag") !? ""
+    let modified = full.headers.get("last-modified") !? ""
+    assert(etag.bytes > 0 && modified.ends_with(" GMT"))
+    assert((full.headers.get("accept-ranges") !? "") == "bytes")
+
+    let cached = http.get(base + "/digits.txt", http.Options { headers: http.Headers { "If-None-Match" => etag } }) !!
+    assert(cached.status == 304 && cached.body == "")
+    assert((cached.headers.get("etag") !? "") == etag)
+    assert(!cached.headers.has("content-length"))
+    let by_date = http.get(base + "/digits.txt", http.Options { headers: http.Headers { "If-Modified-Since" => modified } }) !!
+    assert(by_date.status == 304)
+    // The body of a HEAD stays out, the validators stay in
+    let head = http.request("HEAD", base + "/digits.txt") !!
+    assert(head.status == 200 && head.body == "" && (head.headers.get("etag") !? "") == etag)
+
+    let part = http.get(base + "/digits.txt", http.Options { headers: http.Headers { "Range" => "bytes=12-15" } }) !!
+    assert(part.status == 206 && part.body == "2345")
+    assert((part.headers.get("content-range") !? "") == "bytes 12-15/100")
+    let tail = http.get(base + "/digits.txt", http.Options { headers: http.Headers { "Range" => "bytes=-3" } }) !!
+    assert(tail.status == 206 && tail.body == "789")
+    let past = http.get(base + "/digits.txt", http.Options { headers: http.Headers { "Range" => "bytes=500-" } }) !!
+    assert(past.status == 416 && (past.headers.get("content-range") !? "") == "bytes */100")
+    // Only GET and HEAD requests get ranges
+    let posted = http.request("POST", base + "/digits.txt", http.Options { headers: http.Headers { "Range" => "bytes=0-1" } }) !!
+    assert(posted.status == 200 && posted.body == digits)
+
+    let raw = http.get(base + "/site.css", http.Options { decompress: false, headers: http.Headers { "Accept-Encoding" => "gzip" } }) !!
+    assert((raw.headers.get("content-encoding") !? "") == "gzip")
+    assert((raw.headers.get("vary") !? "") == "Accept-Encoding")
+    assert((raw.headers.get("etag") !? "").ends_with("-gzip\""))
+    assert(compress.gunzip(raw.body) !! == css)
+    let plain = http.get(base + "/site.css", http.Options { decompress: false }) !!
+    assert(!plain.headers.has("content-encoding") && plain.body == css)
+    assert((plain.headers.get("vary") !? "") == "Accept-Encoding")
+
+    server.shutdown()
+    await running !!
+    fs.delete_all(root) !!
 }
