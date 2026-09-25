@@ -1,7 +1,7 @@
 
 # Documentation
 
-Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [log](#log) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [regex](#regex) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
+Namespaces: [ansi](#ansi) | [compress](#compress) | [core](#core) | [coro](#coro) | [crypto](#crypto) | [ext](#ext) | [fs](#fs) | [gc](#gc) | [html](#html) | [http](#http) | [io](#io) | [json](#json) | [log](#log) | [markdown](#markdown) | [math](#math) | [mem](#mem) | [net](#net) | [random](#random) | [regex](#regex) | [signal](#signal) | [sync](#sync) | [template](#template) | [thread](#thread) | [time](#time) | [url](#url) | [validate](#validate)
 
 ---
 
@@ -324,10 +324,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn set_all(value: T) void
     // Sets the element at `index`, first growing the array to that length with `filler_value` when `index` is past the end.
     + fn set_expand(index: uint, value: T, filler_value: T) void
-    // Puts the elements in random order in place (Fisher-Yates, using the OS secure entropy source).
-    + fn shuffle() void
+    // Puts the elements in random order in place, every order equally likely (Fisher-Yates).
+    + fn shuffle(rng: ?Rng (null)) void
     // Returns a copy with the elements in random order; see `shuffle`.
-    + fn shuffled() Array[T]
+    + fn shuffled(rng: ?Rng (null)) Array[T]
     // Sorts the elements in place with `func`, which returns true when `a` belongs after `b`.
     + fn sort(func: fn(T, T)(bool)) void
     // Returns a copy sorted with `func`; see `sort`.
@@ -4308,6 +4308,49 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn set_send_buffer(bytes: uint) void !NetError
     // Sets the hop limit (TTL) of datagrams sent to a single address.
     + fn set_ttl(hops: u8) void !NetError
+}
+```
+
+# random
+
+## Functions for 'random'
+
+```js
+// Returns a number from 0 up to but not including `n`, each equally likely; 0 when `n` is 0.
++ fn below(n: uint) uint
+// Returns a number from `min` to `max`, both included, each equally likely.
++ fn between(min: int, max: int) int
+// Returns true with probability `p`: never for 0 or less, always for 1 or more.
++ fn chance(p: float) bool
+// Returns a float from 0 up to but not including 1.
++ fn fraction() float
+// Returns the next 64 random bits of this thread's generator.
++ fn next() u64
+// Seeds this thread's generator, so the numbers that follow repeat from run to run.
++ fn seed(value: u64) void
+```
+
+## Classes for 'random'
+
+```js
+// A fast pseudo-random number generator (xoshiro256**) with its own state.
++ class Rng {
+    // Returns a number from 0 up to but not including `n`, each equally likely; 0 when `n` is 0.
+    + fn below(n: uint) uint
+    // Returns a number from `min` to `max`, both included, each equally likely.
+    + fn between(min: int, max: int) int
+    // Returns true with probability `p`: never for 0 or less, always for 1 or more.
+    + fn chance(p: float) bool
+    // Returns a float from 0 up to but not including 1, with 53 random bits.
+    + fn fraction() float
+    // Creates a generator seeded from the operating system's entropy source.
+    + static fn from_entropy() Rng
+    // Creates a generator whose numbers follow from `seed` alone.
+    + static fn new(seed: u64) Rng
+    // Returns the next 64 random bits.
+    + fn next() u64
+    // Restarts the sequence as if the generator was created with `seed`.
+    + fn reseed(seed: u64) void
 }
 ```
 

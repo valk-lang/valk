@@ -57,6 +57,7 @@
 * [DateTime](#datetime)
 * [Time zones](#time-zones)
 * [Logging](#logging)
+* [Random numbers](#random-numbers)
 * [Coroutines](#coroutines)
 * [Threads](#threads)
 * [Channels and cancellation](#channels-and-cancellation)
@@ -1683,6 +1684,29 @@ request.warn("slow query", .{ "ms" => 1250 })
 `log.Logger.new(writer)` makes a logger that writes to any `io.Writer`, and
 `log.parse_level(text)` reads a level name, for example from an environment
 variable.
+
+## Random numbers
+
+API for [valk.random](api.md#random)
+
+`valk.random` makes fast pseudo-random numbers with one generator per thread,
+seeded from the operating system:
+
+```rust
+use valk.random
+
+let roll = random.between(1, 6)   // 1 to 6, both included
+let index = random.below(10)      // 0 to 9
+let f = random.fraction()         // 0 up to but not including 1
+if random.chance(0.25) { }        // true one time in four
+items.shuffle()
+```
+
+For numbers that repeat from run to run, seed the thread's generator with
+`random.seed(42)` or make your own with `random.Rng.new(42)`, which has the same
+methods; `items.shuffle(rng)` takes one too. These numbers are predictable to
+someone who sees enough of them, so use `crypto.random_bytes`, `uint.random()`
+or `String.random` for keys and tokens.
 
 ## Coroutines
 

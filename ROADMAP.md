@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ New `valk.random`: `between(min, max)`, `below(n)`, `fraction()`, `chance(p)` and `seed` on a fast per-thread generator (xoshiro256**), and `random.Rng.new(seed)` for repeatable sequences. `Array.shuffle` uses it (unbiased, no system call per element) and takes an optional `Rng`
 + `core.cpu_thread_count()` and `core.cpu_core_count()` are public and work on macOS and Windows too; new `core.process_id()`, `core.hostname()` and `core.env_vars()`. An HTTP server without a `worker_count` now starts one worker per logical CPU on macOS and Windows as well (it used 8 there)
 + `remove_where` and `retain` on `Map`, `HashMap`, `FlatMap` and `HashSet`: remove or keep the entries a function picks, in order, also inside `each` over the map
 + `PublicKey.verify` with `rsa_pss_*` accepts any salt length (like Go), so signatures made with the largest salt (Python's `PSS.MAX_LENGTH`, the `openssl` command) verify; `sign` still uses a salt as long as the hash, as JWT and TLS require
