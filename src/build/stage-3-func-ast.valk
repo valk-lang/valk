@@ -889,7 +889,7 @@ fn value_from_vscope_return_exp(ctx: Context, scope: Scope, vscope: Scope, exp: 
 
 // `x.name = value` and `x.name op= value` where `name` is a getter with a setter: the setter
 // takes the value, and a compound operator reads the getter first. `x` is evaluated once.
-fn value_from_setter_assign(ctx: Context, scope: Scope, exp: Exp, left: Value, left_exp: Exp, right_exp: Exp, op: ASSIGN_OP) ?Value !Error {
+fn value_from_setter_assign(ctx: Context, scope: Scope, exp: Exp, left: Value, left_exp: Exp, right_exp: Exp, op: ASSIGN_OP, given: ?Value (null)) ?Value !Error {
     if left.type != VAL.call : return null
     let callee = left.value1 ?! return null
     if callee.type != VAL.func : return null
@@ -915,7 +915,7 @@ fn value_from_setter_assign(ctx: Context, scope: Scope, exp: Exp, left: Value, l
 
     let value: ?Value = null
     if op == ASSIGN_OP.set {
-        value = value_from_exp(right_exp, scope, ctx.with_suggested_type(target)) !>
+        value = given ?? (value_from_exp(right_exp, scope, ctx.with_suggested_type(target)) !>)
     } else {
         let get_on = isset(store) ? value_null_op_operand_read(cached) : cached
         let getter_f = func_for_receiver(getter, get_on, exp, ctx.func) !>
@@ -947,6 +947,9 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     if left_exp.type == EXP.value && left_exp.value_kind == VALUE_KIND.optional_chain {
         left_exp.error(OPTIONAL_CHAIN_STORE_ERROR)
     }
+    if left_exp.type == EXP.value && left_exp.value_kind == VALUE_KIND.multi {
+        return value_from_tuple_assign_exp(ctx, scope, exp, left_exp, right_exp) !>
+    }
 
     if left_exp.type == EXP.value && left_exp.value_kind == VALUE_KIND.offset && exp.kind.@cast(ASSIGN_OP) == ASSIGN_OP.set {
         let handled = value_from_offset_assign_exp(ctx, scope, left_exp, right_exp, exp) !>
@@ -966,6 +969,125 @@ fn value_from_assign_exp(ctx: Context, scope: Scope, exp: Exp) Value !Error {
     let set = value_from_setter_assign(ctx, scope, exp, left, left_exp, right_exp, op) !>
     if isset(set) : return set
     return value_assign_to(ctx, scope, exp, left, right_exp, null, op) !>
+}
+
+// `(a, b) = value`: the right side is evaluated completely first, into temporaries, then
+// each target is assigned from left to right like a single assignment
+fn value_from_tuple_assign_exp(ctx: Context, scope: Scope, exp: Exp, left_exp: Exp, right_exp: Exp) Value !Error {
+    let b = ctx.build
+    if exp.kind.@cast(ASSIGN_OP) != ASSIGN_OP.set : exp.error("A tuple of targets can only be assigned with '='")
+    let targets = Array[Exp]{}
+    let i: uint = 0
+    while true {
+        let target = left_exp.get(i) ?! break
+        if target.type == EXP.value && target.value_kind == VALUE_KIND.multi {
+            target.error("A nested tuple cannot be assigned; assign each level separately")
+        }
+        if target.type == EXP.value && target.value_kind == VALUE_KIND.optional_chain : target.error(OPTIONAL_CHAIN_STORE_ERROR)
+        targets.append(target)
+        i++
+    }
+
+    // Variables and properties are resolved first: their types suggest the values' types
+    let lefts = Array[?Value]{}
+    each targets as target {
+        let kind = target.value_kind
+        if target.type != EXP.value || (kind != VALUE_KIND.id && kind != VALUE_KIND.dot) {
+            lefts.append(null)
+            continue
+        }
+        let left_ctx = kind == VALUE_KIND.id ? ctx.for_store_target() : ctx.without_suggested_type()
+        lefts.append(value_from_exp(target, scope, left_ctx) !>)
+    }
+
+    let parts = Array[Value]{}
+    let part_exps = Array[Exp]{}
+    if right_exp.type == EXP.value && right_exp.value_kind == VALUE_KIND.multi {
+        let j: uint = 0
+        while true {
+            let part_exp = right_exp.get(j) ?! break
+            let left = lefts.get(j) !? null
+            let part_ctx = ctx.without_suggested_type()
+            if isset(left) && !left.rett.is_void_type() : part_ctx = ctx.with_suggested_type(left.rett).for_direct_init()
+            let part = value_from_exp(part_exp, scope, part_ctx) !>
+            part.require_result() !>
+            parts.append(part)
+            part_exps.append(part_exp)
+            j++
+        }
+    } else {
+        let whole = value_from_exp(right_exp, scope, ctx.without_suggested_type()) !>
+        whole.require_result() !>
+        if !whole.rett.is_tuple_type() {
+            right_exp.error("Expected a tuple, such as '(x, y)' or a call that returns one, instead of: " + whole.rett.compat_display_name())
+        }
+        each whole.unroll() as part {
+            parts.append(part)
+            part_exps.append(right_exp)
+        }
+    }
+    if parts.length != targets.length {
+        exp.error("Cannot assign " + parts.length + " values to " + targets.length + " targets")
+    }
+
+    // Constants, and variables that are not targets, keep their value while the targets
+    // are assigned; everything else is kept aside first
+    let statements = Array[Value]{}
+    let func = ctx.get_func() !>
+    let givens = Array[Value]{}
+    each parts as part, k {
+        // Publishing to a shared or locked target happens before the value is kept aside,
+        // where it would be a second alias
+        let left = lefts.get(k) !? null
+        if isset(left) {
+            let target_t = left.rett.get_non_nullable()
+            if target_t.is_shared || target_t.is_locked : part = value_try_convert(part, scope, ctx, left.rett) !>
+        }
+        let t = part.type
+        if t == VAL.int || t == VAL.float || t == VAL.bool || t == VAL.string || t == VAL.null || part.rett.is_void_type()
+            || (t == VAL.decl && !tuple_assign_targets_decl(lefts, part)) {
+            givens.append(part)
+            continue
+        }
+        let decl = Decl.new(func, part.rett, false, null)
+        func.all_decls.append(decl)
+        decl_track_value(decl, part) !>
+        statements.append(vgen_assign(vgen_decl(decl), part, ASSIGN_OP.set, b, part.exp ?? exp, ctx))
+        let read = vgen_decl(decl)
+        read.exp = part.exp
+        if part.is_implicit_borrow() : read.mark_implicit_borrow()
+        givens.append(read)
+    }
+
+    each targets as target, k {
+        if target.type == EXP.value && target.value_kind == VALUE_KIND.noop : continue
+        let given = givens.get(k) ! exp.bug("Tuple assignment is missing a value")
+        let part_exp = part_exps.get(k) ! exp.bug("Tuple assignment is missing a value")
+        if target.type == EXP.value && target.value_kind == VALUE_KIND.offset {
+            let handled = value_from_offset_assign_exp(ctx, scope, target, part_exp, target, given) !>
+            if isset(handled) {
+                statements.append(handled)
+                continue
+            }
+        }
+        let left = lefts.get(k) !? null
+        if !isset(left) : left = value_from_exp(target, scope, ctx.without_suggested_type()) !>
+        let set = value_from_setter_assign(ctx, scope, target, left, target, part_exp, ASSIGN_OP.set, given) !>
+        if isset(set) {
+            statements.append(set)
+            continue
+        }
+        statements.append(value_assign_to(ctx, scope, target, left, part_exp, given, ASSIGN_OP.set) !>)
+    }
+    return vgen_block(statements, b, exp)
+}
+
+fn tuple_assign_targets_decl(lefts: Array[?Value], part: Value) bool {
+    let decl = part.decl ?! return true
+    each lefts as left {
+        if isset(left) && left.type == VAL.decl && left.decl == decl : return true
+    }
+    return false
 }
 
 // `left op= right`, with `left` already evaluated. `given` is `right` when that is

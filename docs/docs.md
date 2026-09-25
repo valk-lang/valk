@@ -716,6 +716,15 @@ let s = size()
 println(s[0] + "x" + s[1]) // 640x480
 ```
 
+Existing variables, properties and elements take a tuple with parentheses on
+the left. The right side is evaluated completely first, so this swaps:
+
+```rust
+(a, b) = (b, a)
+(w, h) = size()
+(_, count) = parse(line) // `_` skips a value
+```
+
 Command line arguments are passed to `main` when it declares an `Array[String]` argument (the first item is the program path):
 
 ```rust
