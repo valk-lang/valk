@@ -11483,6 +11483,8 @@ Decoded like `query`.
     + fn clear_cookie(name: String, path: String ("/"), domain: ?String (null)) void
     // Creates a response with an empty body; also backs default construction.
     + static fn empty(code: u16 (200), headers: ?Headers (null)) Response
+    // Creates a Server-Sent Events response (`text/event-stream`): each value received from `channel` is sent as one event, its lines as `data:` lines.
+    + static fn events(channel: shared Channel[String], headers: ?Headers (null)) Response
     // Creates a response that sends the file at `path`.
     + static fn file(path: String, filename: ?String (null)) Response
     // The extra response headers, created empty on first access.
@@ -11502,7 +11504,7 @@ Decoded like `query`.
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
-    + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
+    + static fn stream(reader: Reader, size: ?uint (null), content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
 }
@@ -11545,6 +11547,15 @@ cookie and this one sits next to it.
 #### empty
 
 Creates a response with an empty body; also backs default construction.
+
+#### events
+
+Creates a Server-Sent Events response (`text/event-stream`): each value received
+from `channel` is sent as one event, its lines as `data:` lines.
+
+The stream ends when the channel is closed and empty, and when the server shuts
+down. An idle stream sends a comment every 15 seconds, so proxies keep it open
+and a client that left is noticed.
 
 #### file
 
@@ -11604,8 +11615,10 @@ Sets the header `name` to `value`, replacing earlier values for that name.
 Creates a response whose body is streamed from `reader`.
 
 `size` becomes the `Content-Length` and exactly `size` bytes are read from `reader`;
-a reader that ends early fails the response. With a `filename` the body is offered
-as a download under that name. The reader is not closed.
+a reader that ends early fails the response. Without a `size` the body is sent as
+it is read, until the reader returns 0: chunked over HTTP/1.1, closing the
+connection for an HTTP/1.0 client. With a `filename` the body is offered as a
+download under that name. The reader is not closed.
 
 #### text
 
@@ -11626,7 +11639,7 @@ Creates a `text/plain; charset=utf-8` response.
     // Responds with `status_code` and an empty `text/plain` body.
     + fn send_status(status_code: u16) void
     // Responds with status `code` and a body streamed from `reader`.
-    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
+    + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
     + fn send_websocket(context: Context, handler: fn(WebSocket)()) void
 }
@@ -11684,10 +11697,12 @@ Responds with `status_code` and an empty `text/plain` body.
 Responds with status `code` and a body streamed from `reader`.
 
 `size` becomes the `Content-Length` and exactly `size` bytes are copied from the
-reader; a reader that ends early fails the response and closes the connection. A
-`Content-Type` in `headers` replaces `content_type`. With a `filename` the body is
-offered as a download under that name. The body is left out like `respond` leaves
-it out, and then the reader is not read.
+reader; a reader that ends early fails the response and closes the connection.
+Without a `size` the body is copied until the reader returns 0: chunked, or for an
+HTTP/1.0 client until the connection closes. A `Content-Type` in `headers`
+replaces `content_type`. With a `filename` the body is offered as a download under
+that name. The body is left out like `respond` leaves it out, and then the reader
+is not read.
 
 #### send_websocket
 

@@ -2509,6 +2509,19 @@ let route = router.find(req.method, req.path) ! {
 let id = route.params(req.path).get("id") !? ""
 ```
 
+`Response.stream(reader)` without a size sends the body as it is read, for
+live output of unknown length. `Response.events(channel)` sends Server-Sent
+Events: each value sent into the channel reaches the browser's `EventSource`
+right away, and closing the channel ends the stream:
+
+```rust
+fn handler(req: http.Request) http.Response {
+    let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+    co send_updates(channel) // calls channel.send(...) and finally channel.close()
+    return http.Response.events(channel)
+}
+```
+
 `s.compress = true` sends text, HTML, CSS, JavaScript, JSON, XML and SVG
 responses of 1 KiB and more (files up to 1 MiB) gzip-compressed to clients that
 accept it.

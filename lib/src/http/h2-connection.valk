@@ -388,7 +388,11 @@ class H2Connection {
         let source = response.stream_reader
         let file: ?fs.FileStream = null
         let body = response.body
-        let size = isset(source) ? response.stream_size : body.bytes
+        // A stream without a size is sent until its reader ends
+        let open_body = isset(source) && !isset(response.stream_size)
+        let size: uint = isset(source) ? response.stream_size ?? 0 : body.bytes
+        let events = response.event_reader
+        if isset(events) : events.stop = this.owner.worker.server.stop
         let content_type = response.content_type
         let status = response.status
         let extra = response.header_list
@@ -412,6 +416,7 @@ class H2Connection {
         if isset(plan) {
             status = plan.status
             size = plan.length
+            open_body = false
             if isset(file) && plan.start > 0 : file.seek(plan.start.to(int)) ! throw .protocol
             if plan.gzip && isset(file) {
                 let data = io.read_all(file.to(io.Reader)) ! throw .protocol
@@ -445,7 +450,7 @@ class H2Connection {
         }
         if status != 304 || !isset(plan) {
             if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
-            if status != 204 : headers.append(.{ name: "content-length", value: size.to_string() })
+            if status != 204 && !open_body : headers.append(.{ name: "content-length", value: size.to_string() })
         }
         if isset(extra) {
             each extra as value, name {
@@ -462,34 +467,54 @@ class H2Connection {
             disposition.write("\"")
             headers.append(.{ name: "content-disposition", value: disposition.into_string() })
         }
-        let no_body = request.method == "HEAD" || status == 204 || status == 304 || size == 0
+        let no_body = request.method == "HEAD" || status == 204 || status == 304 || (size == 0 && !open_body)
         this.session.send_headers(stream, headers, no_body) !>
         if no_body {
             this.flush_soon()
             return
         }
         if isset(source) && !this.flush_soon() : return
-        let offset: uint = 0
-        let data = ""
-        let data_offset: uint = 0
-        let last_write = time.mono_ms()
-        while offset < size && !stream.cancelled && !this.closed {
-            if data_offset == data.bytes {
-                let amount = size - offset
-                if amount > 16_384 : amount = 16_384
-                if isset(source) {
-                    let buffer = [u8]{ 0 x amount }
-                    let read = source.read(buffer) ! throw .protocol
-                    if read == 0 || read > amount : throw .protocol
-                    data = buffer.view(0, read).to_string()
-                } else {
-                    data = body.range(offset, amount)
-                }
-                data_offset = 0
+        if open_body && isset(source) {
+            let buffer = [u8]{ 0 x 16_384 }
+            while !stream.cancelled && !this.closed {
+                let read = read_body_piece(source, buffer) ! throw .protocol
+                if !this.send_all_data(stream, buffer.view(0, read).to_string(), read == 0) !> : return
+                if read == 0 : return
             }
-            let count = this.session.send_data(stream, data.range(data_offset, data.bytes - data_offset), offset + data.bytes - data_offset == size) !>
+            return
+        }
+        let offset: uint = 0
+        while offset < size && !stream.cancelled && !this.closed {
+            let amount = size - offset
+            if amount > 16_384 : amount = 16_384
+            let data = ""
+            if isset(source) {
+                let buffer = [u8]{ 0 x amount }
+                let read = source.read(buffer) ! throw .protocol
+                if read == 0 || read > amount : throw .protocol
+                data = buffer.view(0, read).to_string()
+            } else {
+                data = body.range(offset, amount)
+            }
+            if !this.send_all_data(stream, data, offset + data.bytes == size) !> : return
+            offset += data.bytes
+        }
+    }
+
+    // Sends `data` as DATA frames, waiting for flow-control credit; false when the stream
+    // or the connection is gone
+    fn send_all_data(stream: H2Stream, data: String, end_stream: bool) bool !H2Error {
+        if data.bytes == 0 {
+            this.session.send_data(stream, data, end_stream) !>
+            return this.flush_soon()
+        }
+        let offset: uint = 0
+        let last_write = time.mono_ms()
+        while offset < data.bytes {
+            if stream.cancelled || this.closed : return false
+            let count = this.session.send_data(stream, data.range(offset, data.bytes - offset), end_stream) !>
             if count == 0 {
-                if !this.flush() : return
+                if !this.flush() : return false
                 let timeout = this.owner.worker.server.write_timeout_ms
                 if timeout > 0 && time.mono_ms() - last_write >= timeout : throw .limit
                 time.sleep_ms(1)
@@ -497,9 +522,9 @@ class H2Connection {
             }
             last_write = time.mono_ms()
             offset += count
-            data_offset += count
-            if !this.flush_soon() : return
+            if !this.flush_soon() : return false
         }
+        return true
     }
 }
 

@@ -3,6 +3,7 @@ use fs
 use io
 use core
 use compress
+use sync
 
 // Responses smaller than this are sent uncompressed: gzip would save little or nothing
 value GZIP_MIN_SIZE (1024)
@@ -29,6 +30,25 @@ fn request_accepts_gzip(value: String) bool {
         if !refused : return true
     }
     return false
+}
+
+// Reads the next piece of a body of unknown length; `closed` ends it like 0 does
+fn read_body_piece(reader: io.Reader, buf: local mut &[u8]) uint !io.IoError {
+    let count = reader.read(buf) ! {
+        if error_is(E.code, closed) : return 0
+        throw E
+    }
+    if count > buf.length : throw .read
+    return count
+}
+
+fn write_all_to(writer: io.Writer, data: local &[u8]) !HttpError {
+    let view = data
+    while view.length > 0 {
+        let written = writer.write(view) ! throw .write
+        if written == 0 || written > view.length : throw .write
+        view = view.view(written, view.length - written)
+    }
 }
 
 fn response_header_is_framing(name: String) bool {
@@ -84,12 +104,17 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     - output_pos: uint (0)
     // The number of bytes still to copy from `body_reader`
     - body_left: uint (0)
+    // `body_reader` is copied until it ends: chunked, or until the connection closes
+    - body_open: bool (false)
+    - body_chunked: bool (false)
     // Set by a WebSocket upgrade response; the server hands the connection to it
     -+ websocket_handler: ?fn(WebSocket)() (null)
     // `Server.compress`
     -+ compress: bool (false)
     // The request being answered, for the headers that shape the response
     -+ request_context: ?Context (null)
+    // Ends event streams when the server shuts down
+    -+ stop: ?shared sync.CancelToken (null)
 
     -+ fn reset() {
         this.request_context = null
@@ -98,6 +123,8 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         this.output_pos = 0
         this.body_reader = null
         this.body_left = 0
+        this.body_open = false
+        this.body_chunked = false
         this.websocket_handler = null
 
         let file = this.file_response
@@ -121,6 +148,8 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         }
         let reader = resp.stream_reader
         if isset(reader) {
+            let events = resp.event_reader
+            if isset(events) : events.stop = this.stop
             this.send_stream(reader, resp.stream_size, resp.content_type, resp.filename, resp.header_list, resp.status)
             return
         }
@@ -273,31 +302,47 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     /// Responds with status `code` and a body streamed from `reader`.
     ///
     /// `size` becomes the `Content-Length` and exactly `size` bytes are copied from the
-    /// reader; a reader that ends early fails the response and closes the connection. A
-    /// `Content-Type` in `headers` replaces `content_type`. With a `filename` the body is
-    /// offered as a download under that name. The body is left out like `respond` leaves
-    /// it out, and then the reader is not read.
-    + fn send_stream(reader: io.Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) {
+    /// reader; a reader that ends early fails the response and closes the connection.
+    /// Without a `size` the body is copied until the reader returns 0: chunked, or for an
+    /// HTTP/1.0 client until the connection closes. A `Content-Type` in `headers`
+    /// replaces `content_type`. With a `filename` the body is offered as a download under
+    /// that name. The body is left out like `respond` leaves it out, and then the reader
+    /// is not read.
+    + fn send_stream(reader: io.Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) {
         if this.responded : return
         if isset(headers) : content_type = headers.get("content-type") !? content_type
         this.stream_response(reader, size, content_type, filename, headers, code, null)
     }
 
-    - fn stream_response(reader: io.Reader, size: uint, content_type: String, filename: ?String, headers: ?Headers, code: u16, plan: ?FilePlan) {
+    - fn stream_response(reader: io.Reader, size: ?uint, content_type: String, filename: ?String, headers: ?Headers, code: u16, plan: ?FilePlan) {
         this.responded = true
 
         let out = this.output
         let with_body = ResponseWriter.status_has_body(code) && !this.head
-        if with_body && size > 0 {
+        if isset(size) {
+            if with_body && size > 0 {
+                this.body_reader = reader
+                this.body_left = size
+            }
+        } else if with_body {
             this.body_reader = reader
-            this.body_left = size
+            this.body_open = true
+            let context = this.request_context
+            // An HTTP/1.0 client knows no chunks: the end of the body is the end of the connection
+            if isset(context) && context.http10 {
+                this.close = true
+                this.keep_alive = false
+            } else {
+                this.body_chunked = true
+            }
         }
 
         this.write_status_line(code)
         out.write("Content-Type: ")
         out.write(response_header_value_is_safe(content_type) ? content_type : "application/octet-stream")
         out.write("\r\n")
-        this.write_content_length(code, size)
+        if isset(size) : this.write_content_length(code, size)
+        else if this.body_chunked : out.write("Transfer-Encoding: chunked\r\n")
         this.write_connection_header()
         if isset(plan) : this.write_file_plan_headers(plan)
 
@@ -509,6 +554,31 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         }
     }
 
+    // Copies `body_reader` until it ends, sending each piece as soon as it is read
+    - fn copy_open_body(reader: io.Reader, writer: io.Writer) !HttpError {
+        let buf = [u8]{ 0 x 16384 }
+        let chunk = ByteBuffer.new(16400)
+        while true {
+            let count = read_body_piece(reader, buf) ! throw .write
+            if !this.body_chunked {
+                if count == 0 : return
+                write_all_to(writer, buf.view(0, count)) !>
+                continue
+            }
+            chunk.clear()
+            if count > 0 {
+                chunk.write(count.to_hex())
+                chunk.write("\r\n")
+                chunk.write(buf.view(0, count))
+                chunk.write("\r\n")
+            } else {
+                chunk.write("0\r\n\r\n")
+            }
+            write_all_to(writer, chunk.view()) !>
+            if count == 0 : return
+        }
+    }
+
     -+ fn send_bytes(writer: io.Writer) !HttpError {
         let out = this.output
         let reader = this.body_reader
@@ -517,7 +587,8 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             // Headers are flushed before the streamed body
             if isset(reader) {
                 if this.count_bytes_to_send() == 0 {
-                    this.copy_body(reader, writer) !>
+                    if this.body_open : this.copy_open_body(reader, writer) !>
+                    else : this.copy_body(reader, writer) !>
                     this.body_reader = null
                     reader = null
                 }

@@ -3389,6 +3389,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn clear_cookie(name: String, path: String ("/"), domain: ?String (null)) void
     // Creates a response with an empty body; also backs default construction.
     + static fn empty(code: u16 (200), headers: ?Headers (null)) Response
+    // Creates a Server-Sent Events response (`text/event-stream`): each value received from `channel` is sent as one event, its lines as `data:` lines.
+    + static fn events(channel: shared Channel[String], headers: ?Headers (null)) Response
     // Creates a response that sends the file at `path`.
     + static fn file(path: String, filename: ?String (null)) Response
     // The extra response headers, created empty on first access.
@@ -3408,7 +3410,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // Sets the header `name` to `value`, replacing earlier values for that name.
     + fn set_header(name: String, value: String) void
     // Creates a response whose body is streamed from `reader`.
-    + static fn stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null)) Response
+    + static fn stream(reader: Reader, size: ?uint (null), content_type: String ("application/octet-stream"), filename: ?String (null)) Response
     // Creates a `text/plain; charset=utf-8` response.
     + static fn text(body: String, code: u16 (200), headers: ?Headers (null)) Response
 }
@@ -3429,7 +3431,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // Responds with `status_code` and an empty `text/plain` body.
     + fn send_status(status_code: u16) void
     // Responds with status `code` and a body streamed from `reader`.
-    + fn send_stream(reader: Reader, size: uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
+    + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
     + fn send_websocket(context: Context, handler: fn(WebSocket)()) void
 }

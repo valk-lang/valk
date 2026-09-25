@@ -2,6 +2,9 @@ use valk.http
 use valk.time
 use valk.compress
 use valk.fs
+use valk.io
+use valk.net
+use valk.sync
 
 fn server_features_handler(req: http.Request) http.Response {
     return http.Response.text("handler " + req.path)
@@ -192,4 +195,110 @@ test "HTTP server: static files answer 304, ranges and gzip" {
     server.shutdown()
     await running !!
     fs.delete_all(root) !!
+}
+
+// Gives its pieces one read at a time, with a pause before each
+class PieceReader is io.Reader {
+    pieces: Array[String]
+    index: uint (0)
+
+    + fn read(buf: local mut &[u8]) uint !io.IoError {
+        let piece = this.pieces.get(this.index) ! return 0
+        this.index++
+        time.sleep_ms(2)
+        let i: uint = 0
+        while i < piece.bytes {
+            buf[i] = piece[i]
+            i++
+        }
+        return piece.bytes
+    }
+}
+
+fn event_feed(channel: shared sync.Channel[String]) {
+    channel.send("one") !!
+    time.sleep_ms(5)
+    channel.send("two\nlines") !!
+    channel.close()
+}
+
+fn stream_handler(req: http.Request) http.Response {
+    if req.path == "/events" {
+        let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+        co event_feed(channel)
+        return http.Response.events(channel)
+    }
+    if req.path == "/open-events" {
+        // Never closed: only the shutdown ends it
+        let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+        channel.send("hello") !!
+        return http.Response.events(channel)
+    }
+    return http.Response.stream(PieceReader { pieces: .{ "alpha ", "beta ", "gamma" } }, content_type: "text/plain")
+}
+
+test "HTTP server: streams of unknown length and Server-Sent Events" {
+    let server = http.Server.new("127.0.0.1", 19574, stream_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let base = "http://127.0.0.1:19574"
+
+    let res = http.get(base + "/stream") !!
+    assert(res.status == 200 && res.body == "alpha beta gamma")
+    assert((res.headers.get("transfer-encoding") !? "") == "chunked" && !res.headers.has("content-length"))
+    // The chunks as sent, and the connection stays open after the last one
+    let raw = raw_http_exchange(19574, "GET /stream HTTP/1.1\r\nHost: x\r\n\r\nGET /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    let body = "6\r\nalpha \r\n5\r\nbeta \r\n5\r\ngamma\r\n0\r\n\r\n"
+    assert(raw.split("\r\n\r\n6\r\n").length == 3 && raw.ends_with(body))
+    // HTTP/1.0 knows no chunks: the body ends with the connection
+    let old = raw_http_exchange(19574, "GET /stream HTTP/1.0\r\n\r\n")
+    assert(old.contains("Connection: close\r\n") && !old.contains("chunked") && old.ends_with("\r\n\r\nalpha beta gamma"))
+    let head = raw_http_exchange(19574, "HEAD /stream HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert(head.starts_with("HTTP/1.1 200") && head.ends_with("\r\n\r\n"))
+
+    let events = http.get(base + "/events") !!
+    assert((events.headers.get("content-type") !? "") == "text/event-stream")
+    assert((events.headers.get("cache-control") !? "") == "no-cache")
+    assert(events.body == "data: one\n\ndata: two\ndata: lines\n\n")
+
+    // An event stream that never ends by itself ends with the shutdown
+    let socket = net.tcp_client("127.0.0.1", 19574) !!
+    socket.write("GET /open-events HTTP/1.1\r\nHost: x\r\n\r\n") !!
+    let first = ByteBuffer.new()
+    let buf = [u8]{ 0 x 1024 }
+    socket.read_timeout_ms = 2000
+    while !first.to_string().contains("data: hello") {
+        let count = socket.read(buf) !!
+        assert(count > 0)
+        first.write(buf.view(0, count))
+    }
+    let started = time.mono_ms()
+    server.request_shutdown(5000)
+    let rest = raw_http_read_all(socket)
+    socket.close() !!
+    await running !!
+    assert(time.mono_ms() - started < 1000)
+    assert((first.to_string() + rest).ends_with("0\r\n\r\n"))
+}
+
+test "HTTP server: event reader pings, encodes lines and ends" {
+    let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+    let reader = http.event_reader_for_test(channel, 10)
+    let buf = [u8]{ 0 x 64 }
+    let count = reader.read(buf) !!
+    assert(buf.view(0, count).to_string() == ":\n\n")
+    channel.send("a\r\nb\rc") !!
+    count = reader.read(buf) !!
+    assert(buf.view(0, count).to_string() == "data: a\ndata: b\ndata: c\n\n")
+    channel.send("") !!
+    count = reader.read(buf) !!
+    assert(buf.view(0, count).to_string() == "data: \n\n")
+    // A small buffer takes an event in parts
+    channel.send("hello") !!
+    let small = [u8]{ 0 x 4 }
+    assert((reader.read(small) !!) == 4 && small.view(0, 4).to_string() == "data")
+    count = reader.read(buf) !!
+    assert(buf.view(0, count).to_string() == ": hello\n\n")
+    channel.close()
+    assert((reader.read(buf) !!) == 0)
 }

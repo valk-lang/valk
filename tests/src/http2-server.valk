@@ -2,6 +2,7 @@
 use valk.http
 use valk.compress
 use valk.fs
+use valk.sync
 use valk.net
 use valk.time
 
@@ -257,13 +258,15 @@ fn h2_response_with_headers(socket: net.TcpConnection, input: ByteBuffer, stream
     return h2_response_decoded(socket, input, stream, http.HpackDecoder {})
 }
 
-// Responses on one connection share the decoder's dynamic table
-fn h2_response_decoded(socket: net.TcpConnection, input: ByteBuffer, stream: u32, decoder: http.HpackDecoder) (String, Map[String], String) {
+// Responses on one connection share the decoder's dynamic table. With `goaway` a
+// shutdown's GOAWAY may come first.
+fn h2_response_decoded(socket: net.TcpConnection, input: ByteBuffer, stream: u32, decoder: http.HpackDecoder, goaway: bool (false)) (String, Map[String], String) {
     let body = ""
     let status = ""
     let headers = Map[String]{}
     while true {
         let frame = h2_tls_frame(socket, input, "the response on stream " + stream)
+        if goaway && frame.kind == 7 : continue
         if frame.kind == 3 || frame.kind == 7 : panic("HTTP/2 server refused the request")
         if frame.stream != stream : continue
         if frame.kind == 1 {
@@ -321,14 +324,14 @@ test "HTTP2: static files answer 304, ranges and gzip" {
     let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
         return http.Response.text("handler")
     }
-    let server = http.Server.new("127.0.0.1", 9197, handler)
+    let server = http.Server.new("127.0.0.1", 9206, handler)
     server.http2 = true
     server.compress = true
     server.add_static_dir(root) !!
     server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
     let running = co server.start(1)
     time.sleep_ms(20)
-    let socket = h2_open(9197)
+    let socket = h2_open(9206)
     let input = ByteBuffer.new()
     h2_tls_frame(socket, input, "the server SETTINGS")
     socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
@@ -356,6 +359,7 @@ test "HTTP2: static files answer 304, ranges and gzip" {
     assert((part_headers.get("content-range") !? "") == "bytes 7-11/" + css.bytes)
     let past_status, past_headers, past_body = request(7, "range", "bytes=99999-")
     assert(past_status == "416" && past_body == "")
+    assert((past_headers.get("content-range") !? "") == "bytes */" + css.bytes)
     let gz_status, gz_headers, gz_body = request(9, "accept-encoding", "gzip")
     assert(gz_status == "200" && (gz_headers.get("content-encoding") !? "") == "gzip")
     assert(compress.gunzip(gz_body) !! == css)
@@ -364,4 +368,61 @@ test "HTTP2: static files answer 304, ranges and gzip" {
     server.request_shutdown(1000)
     await running !!
     fs.delete_all(root) !!
+}
+
+test "HTTP2: streams of unknown length end with the reader" {
+    let handler: shared fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        if request.path == "/events" {
+            let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+            channel.send("one") !!
+            channel.close()
+            return http.Response.events(channel)
+        }
+        if request.path == "/open-events" {
+            let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+            return http.Response.events(channel)
+        }
+        return http.Response.stream(PieceReader { pieces: .{ "alpha ", "beta ", "gamma" } }, content_type: "text/plain")
+    }
+    let server = http.Server.new("127.0.0.1", 9207, handler)
+    server.http2 = true
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let socket = h2_open(9207)
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input, "the server SETTINGS")
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    let decoder = http.HpackDecoder {}
+    let request = fn(stream: u32, path: String) (String, Map[String], String) {
+        let fields = Array[http.HpackField] {
+            .{ name: ":method", value: "GET" },
+            .{ name: ":scheme", value: "https" },
+            .{ name: ":path", value: path },
+            .{ name: ":authority", value: "localhost" }
+        }
+        socket.write(http.H2Frame { kind: 1, flags: 5, stream: stream, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+        return h2_response_decoded(socket, input, stream, decoder)
+    }
+    let status, headers, body = request(1, "/")
+    assert(status == "200" && body == "alpha beta gamma" && !headers.has("content-length"))
+    let ev_status, ev_headers, ev_body = request(3, "/events")
+    assert(ev_status == "200" && (ev_headers.get("content-type") !? "") == "text/event-stream")
+    assert(ev_body == "data: one\n\n")
+    // The shutdown ends an event stream that would go on forever
+    let open = Array[http.HpackField] {
+        .{ name: ":method", value: "GET" },
+        .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/open-events" },
+        .{ name: ":authority", value: "localhost" }
+    }
+    socket.write(http.H2Frame { kind: 1, flags: 5, stream: 5, payload: http.hpack_encode(open) !! }.encode() !!) !!
+    time.sleep_ms(50)
+    let started = time.mono_ms()
+    server.request_shutdown(5000)
+    let open_status, open_headers, open_body = h2_response_decoded(socket, input, 5, decoder, true)
+    assert(open_status == "200" && open_body == "" && (open_headers.get("cache-control") !? "") == "no-cache")
+    socket.close() !!
+    await running !!
+    assert(time.mono_ms() - started < 1000)
 }
