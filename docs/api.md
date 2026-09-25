@@ -3218,6 +3218,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + follow_redirects: bool
     // Extra request headers.
     + headers: ?Headers
+    // The `Host` header to send instead of the URL's host and port.
+    + host: ?String
     // The number of redirects to follow before failing with `too_many_redirects`.
     + max_redirects: uint
     // The largest accepted response body in bytes, also when it goes to `output`; zero disables the limit.

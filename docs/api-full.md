@@ -10873,6 +10873,8 @@ the `Headers{ name => value }` literal.
     + follow_redirects: bool
     // Extra request headers.
     + headers: ?Headers
+    // The `Host` header to send instead of the URL's host and port.
+    + host: ?String
     // The number of redirects to follow before failing with `too_many_redirects`.
     + max_redirects: uint
     // The largest accepted response body in bytes, also when it goes to `output`; zero disables the limit.
@@ -10976,9 +10978,17 @@ redirect goes to another origin.
 
 Extra request headers.
 
-`Host`, `Content-Length` and `Transfer-Encoding` are set by the client; passing
-any of them, or a name or value with invalid characters, makes the request fail
-with `invalid_request`. A `User-Agent` here replaces the default one.
+`Host`, `Content-Length` and `Transfer-Encoding` are set by the client (use `host`
+for another `Host`); passing any of them, or a name or value with invalid characters,
+makes the request fail with `invalid_request`. A `User-Agent` here replaces the default one.
+
+#### host
+
+The `Host` header to send instead of the URL's host and port.
+
+For reaching a virtual host through another address, such as an IP. The connection
+and the TLS certificate check still use the URL's host. It is not carried over to a
+redirected request.
 
 #### max_redirects
 

@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ HTTP client: `Options.host` sends another `Host` header, for reaching a virtual host through an IP
 + HTTP client: credentials in the URL (`https://user:pass@host/`) are sent as `Authorization: Basic` (they failed with `invalid_url`), and `Options.basic_auth(user, password)` sets it
 + HTTP client: asks for gzip and decompresses the body (`Options.decompress`, on by default; not with `output` or an own `Accept-Encoding`)
 + sync: `select(.{ a, b }, timeout_ms)` waits on several channels (of any element types) and returns the ready one; `after(ms)` and `ticker(ms)` channels for deadlines and periodic work; `WaitGroup` (`add`, `done`, `wait`) and `Semaphore` (`acquire`, `try_acquire`, `release`)
