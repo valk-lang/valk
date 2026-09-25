@@ -3026,6 +3026,8 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
     // Returns a new string holding a copy of the `length` bytes at `data`.
     + static fn copy_from_ptr(data: ptr, length: uint) String
+    // Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
+    + fn count(part: String) uint
     // The bytes as a zero-terminated C string, without copying.
     + get data_cstring: cstring
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
@@ -3068,6 +3070,10 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) bool
     // Returns whether no character in the string has an upper-case mapping.
     + fn is_upper() bool
+    // Returns the byte offset of the last occurrence of `part`.
+    + fn last_index_of(part: String) uint !LookupError
+    // Splits the string into lines at `\n` and `\r\n`, without the line breaks.
+    + fn lines() Array[String]
     // Returns the string with every character mapped to lower case by the Unicode case mappings.
     + fn lower() String
     // Returns whether the string sorts before `cmp`; backs `<`.
@@ -3090,12 +3096,14 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn range(start_index: uint, length: uint) String
     // Returns a `ByteReader` that reads the string's bytes from the start without copying them.
     + fn reader() ByteReader
+    // Returns the string `count` times in a row; an empty string for 0.
+    + fn repeat(count: uint) String
     // Returns a copy with every occurrence of `part` replaced by `with`.
     + fn replace(part: String, with: String) String
     // Removes whitespace, or repeated copies of `part`, from the end of the string.
     + fn rtrim(part: ?String (null), limit: uint (0)) String
     // Splits the string on every occurrence of `on` and returns the parts, empty ones included.
-    + fn split(on: String) Array[String]
+    + fn split(on: String, limit: uint (0)) Array[String]
     // Returns whether the string begins with the bytes of `part`; an empty `part` always matches.
     + fn starts_with(part: String) bool
     // Parses the string as a decimal floating-point number.
@@ -3127,7 +3135,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     // Returns a copy of `length` characters starting at character index `start_index`.
     + fn utf8.range(start_index: uint, length: uint) String
     // Splits the string on every occurrence of `on` that starts on a character boundary.
-    + fn utf8.split(on: String) Array[String]
+    + fn utf8.split(on: String, limit: uint (0)) Array[String]
     // Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
     + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
 }
@@ -3228,6 +3236,10 @@ Returns whether `byte` occurs at or after byte offset `start_index`.
 Returns a new string holding a copy of the `length` bytes at `data`.
 
 `data` must point to at least `length` readable bytes; nothing checks this.
+
+#### count
+
+Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
 
 #### data_cstring
 
@@ -3365,6 +3377,19 @@ Returns whether no character in the string has an upper-case mapping.
 A string without lower-case letters returns true, including an empty string and one
 without any letters.
 
+#### last_index_of
+
+Returns the byte offset of the last occurrence of `part`.
+
+An empty `part` is found at the end. Throws `missing` when `part` does not occur.
+
+#### lines
+
+Splits the string into lines at `\n` and `\r\n`, without the line breaks.
+
+A line break at the end does not start another, empty line, and an empty string has no
+lines.
+
 #### lower
 
 Returns the string with every character mapped to lower case by the Unicode case mappings.
@@ -3388,8 +3413,9 @@ Returns whether the string equals `cmp` or sorts before it in byte order; backs 
 
 Removes whitespace, or repeated copies of `part`, from the start of the string.
 
-`limit` caps how many bytes of whitespace or copies of `part` are removed; 0 removes all
-of them. Returns the string unchanged when `part` is empty or nothing matches.
+Whitespace is as in `trim`. `limit` caps how many whitespace characters or copies of
+`part` are removed; 0 removes all of them. Returns the string unchanged when `part` is
+empty or nothing matches.
 
 #### octal_to_int
 
@@ -3439,6 +3465,10 @@ string. Offsets count bytes, so the copy can cut a UTF-8 character in half.
 
 Returns a `ByteReader` that reads the string's bytes from the start without copying them.
 
+#### repeat
+
+Returns the string `count` times in a row; an empty string for 0.
+
 #### replace
 
 Returns a copy with every occurrence of `part` replaced by `with`.
@@ -3450,8 +3480,9 @@ unchanged.
 
 Removes whitespace, or repeated copies of `part`, from the end of the string.
 
-`limit` caps how many bytes of whitespace or copies of `part` are removed; 0 removes all
-of them. Returns the string unchanged when `part` is empty or nothing matches.
+Whitespace is as in `trim`. `limit` caps how many whitespace characters or copies of
+`part` are removed; 0 removes all of them. Returns the string unchanged when `part` is
+empty or nothing matches.
 
 #### split
 
@@ -3459,7 +3490,8 @@ Splits the string on every occurrence of `on` and returns the parts, empty ones 
 
 With a non-empty `on` the result has at least one part. An empty `on` splits into single
 bytes, which cuts UTF-8 characters apart (and gives no parts for an empty string);
-`utf8.split` keeps characters whole.
+`utf8.split` keeps characters whole. A `limit` above 0 caps the number of parts: the last
+one holds the rest, `"key=a=b".split("=", 2)` gives `key` and `a=b`.
 
 #### starts_with
 
@@ -3506,9 +3538,10 @@ Throws `SyntaxError` for an empty string, any byte other than the digits `0`-`9`
 
 Removes whitespace, or repeated copies of `part`, from both ends of the string.
 
-Whitespace is what `u8.is_whitespace` says: spaces, tabs and line breaks. `limit` caps
-how many bytes of whitespace or copies of `part` are removed from each end; 0 removes
-all of them. Returns the string unchanged when `part` is empty or nothing matches.
+Whitespace is spaces, tabs and line breaks, and the Unicode spaces such as the
+non-breaking space (U+00A0) and the ideographic space (U+3000). `limit` caps how many
+whitespace characters or copies of `part` are removed from each end; 0 removes all of
+them. Returns the string unchanged when `part` is empty or nothing matches.
 
 ```valk
 "  hello \n".trim()   // "hello"
@@ -3568,7 +3601,8 @@ The range is clamped to the string, and a start past the end returns an empty st
 Splits the string on every occurrence of `on` that starts on a character boundary.
 
 Returns the whole string as the only part when `on` is empty or longer than the string.
-Empty parts are included.
+Empty parts are included. A `limit` above 0 caps the number of parts, as in
+`String.split`.
 
 #### view
 

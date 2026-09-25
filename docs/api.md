@@ -927,6 +927,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn contains_byte(byte: u8, start_index: uint (0)) bool
     // Returns a new string holding a copy of the `length` bytes at `data`.
     + static fn copy_from_ptr(data: ptr, length: uint) String
+    // Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
+    + fn count(part: String) uint
     // The bytes as a zero-terminated C string, without copying.
     + get data_cstring: cstring
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
@@ -969,6 +971,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn is_syntax(mask: String, mask_is_exclude: bool (false)) bool
     // Returns whether no character in the string has an upper-case mapping.
     + fn is_upper() bool
+    // Returns the byte offset of the last occurrence of `part`.
+    + fn last_index_of(part: String) uint !LookupError
+    // Splits the string into lines at `\n` and `\r\n`, without the line breaks.
+    + fn lines() Array[String]
     // Returns the string with every character mapped to lower case by the Unicode case mappings.
     + fn lower() String
     // Returns whether the string sorts before `cmp`; backs `<`.
@@ -991,12 +997,14 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn range(start_index: uint, length: uint) String
     // Returns a `ByteReader` that reads the string's bytes from the start without copying them.
     + fn reader() ByteReader
+    // Returns the string `count` times in a row; an empty string for 0.
+    + fn repeat(count: uint) String
     // Returns a copy with every occurrence of `part` replaced by `with`.
     + fn replace(part: String, with: String) String
     // Removes whitespace, or repeated copies of `part`, from the end of the string.
     + fn rtrim(part: ?String (null), limit: uint (0)) String
     // Splits the string on every occurrence of `on` and returns the parts, empty ones included.
-    + fn split(on: String) Array[String]
+    + fn split(on: String, limit: uint (0)) Array[String]
     // Returns whether the string begins with the bytes of `part`; an empty `part` always matches.
     + fn starts_with(part: String) bool
     // Parses the string as a decimal floating-point number.
@@ -1028,7 +1036,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Returns a copy of `length` characters starting at character index `start_index`.
     + fn utf8.range(start_index: uint, length: uint) String
     // Splits the string on every occurrence of `on` that starts on a character boundary.
-    + fn utf8.split(on: String) Array[String]
+    + fn utf8.split(on: String, limit: uint (0)) Array[String]
     // Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
     + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
 }

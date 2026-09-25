@@ -237,7 +237,12 @@ s.starts_with(x) bool
 s.ends_with(x) bool
 s.is_empty() bool
 s.contains(x) bool
-s.trim() String // Without whitespace at both ends; s.trim("-") removes "-" instead
+s.trim() String // Without whitespace (Unicode spaces too) at both ends; s.trim("-") removes "-" instead
+s.split(",") Array[String] // s.split("=", 2) gives at most 2 parts, the last one holds the rest
+s.lines() Array[String] // Split at "\n" and "\r\n"
+s.last_index_of(x) uint // Byte offset of the last x; throws when missing
+s.count(x) uint // How often x occurs
+s.repeat(3) String
 s.lower() String // Convert Unicode text to lowercase
 s.upper() String // Convert Unicode text to uppercase
 s.range(start_index, length) String // Sub string using byte offsets

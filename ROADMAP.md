@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.8
++ String: `split(on, limit)` (`"key=a=b".split("=", 2)`, also `utf8.split`), `lines()`, `last_index_of`, `count`, `repeat`. `trim` / `ltrim` / `rtrim` also remove Unicode spaces such as the non-breaking space (U+00A0) and the ideographic space (U+3000), like JS, Python and Go; `limit` counts characters
 + Array: `insert(index, value)`, `first()` / `last()` (without removing), `binary_search(value)` on a sorted array (found, and the position or where to insert), `min_by(key)` / `max_by(key)`
 + `Array.sort` / `sorted` are stable (a merge sort; equal elements keep their order), and faster on numbers and presorted input: 1M random ints 99 -> 35 ms, sorted input 52 -> 5 ms. New `sort_by(fn(x) { return x.age })` / `sorted_by` with the key computed once per element
 + A named union can contain itself through a container: `union Json : int | String | Array[Json] | Map[Json] {}` (it was 'Recursive union alternatives are not allowed'); containing itself directly or by value is a clear error
