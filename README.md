@@ -81,7 +81,7 @@ make
 
 ✅️ = Available & passes tests | ❌️ = Not available right now
 
-¹ As a target: `valk build --target linux-arm64` from any host. The compiler itself does not run on arm64 Linux yet.
+¹ As a target: `valk build --target linux-arm64` from any host. We have not released a linux-arm64 version of the compiler yet.
 
 ## Benchmarks
 
