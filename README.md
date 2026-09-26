@@ -77,9 +77,11 @@ make
 | OS | Linux | Macos | Windows |
 |--|--|--|--|
 | x64 | ✅ | ✅ | ✅ |
-| arm64 | ❌ | ✅ | ❌ |
+| arm64 | ✅¹ | ✅ | ❌ |
 
 ✅️ = Available & passes tests | ❌️ = Not available right now
+
+¹ As a target: `valk build --target linux-arm64` from any host. The compiler itself does not run on arm64 Linux yet.
 
 ## Benchmarks
 
@@ -150,7 +152,7 @@ When not to use Valk:
 
 - When you need very low-level control. E.g. custom assembly code / register access.
 
-- When your program needs to run on niche infrastructure. We currently only support Linux x64, macOS x64/arm64 and Windows x64.
+- When your program needs to run on niche infrastructure. We currently only support Linux x64/arm64, macOS x64/arm64 and Windows x64.
 
 ## Language design
 
