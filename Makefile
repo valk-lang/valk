@@ -186,11 +186,6 @@ test-linux-arm64-build: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-linux-arm64 --target linux-arm64
 
-# CI builds the tests with this compiler on an arm64 runner
-linux-arm64-compiler: valk
-	mkdir -p ./debug
-	./valk build . -o ./debug/valk-linux-arm64 --target linux-arm64 --static -vv $(FLAGS) $(LINUX_ARM64_LINK)
-
 test-cross-ir: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-x64-ir --target macos-x64 --ir --clean
@@ -329,7 +324,7 @@ clean:
 .PHONY: \
 	valk2 valk3 \
 	asm ci-linux ci-macos ci-win clean dist-all doc install ir \
-	linux-arm64 linux-arm64-compiler linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
+	linux-arm64 linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \

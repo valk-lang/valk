@@ -5,7 +5,7 @@
 
 ```
 - Release 0.7.9
-+ The compiler itself is built for linux-arm64 too (glibc 2.35, like linux-x64): LLVM 22 cross-compiled for arm64 against an Ubuntu 22.04 sysroot; CI cross-builds it and uses it to build and run the test suite on a native arm64 runner. install.sh accepts arm64 Linux once a release has it
++ The compiler itself is built for linux-arm64 too (glibc 2.35, like linux-x64): LLVM 22 cross-compiled for arm64 against an Ubuntu 22.04 sysroot. install.sh accepts arm64 Linux, and CI tests the released arm64 compiler, once a release has it
 - GC: clear the stack at idle points before a thread blocks (task runners, event loops), so stale words in idle threads' frames stop keeping freed objects alive
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
