@@ -16,9 +16,8 @@ EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
 DIST_FLAGS := . --static --release -vv -c
-IR_TARGETS := linux-x64 macos-x64 macos-arm64 win-x64
-# Targets that build programs; the compiler itself is only distributed for IR_TARGETS
-BUILD_TARGETS := $(IR_TARGETS) linux-arm64
+IR_TARGETS := linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64
+BUILD_TARGETS := $(IR_TARGETS)
 HOST_SYSTEM := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
 ifeq ($(HOST_SYSTEM),Darwin)
@@ -187,6 +186,11 @@ test-linux-arm64-build: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-linux-arm64 --target linux-arm64
 
+# CI builds the tests with this compiler on an arm64 runner
+linux-arm64-compiler: valk
+	mkdir -p ./debug
+	./valk build . -o ./debug/valk-linux-arm64 --target linux-arm64 --static -vv $(FLAGS) $(LINUX_ARM64_LINK)
+
 test-cross-ir: valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/test-macos-x64-ir --target macos-x64 --ir --clean
@@ -226,6 +230,12 @@ ci-win: $(COMPILER_DEPS)
 	-L toolchains/libraries/win-llvm-22-x64/lib $(CI_SYSTEM_LIB_FLAGS)
 
 # Distributions
+LINUX_ARM64_LINK := -L "toolchains/toolchains/linux-arm64/usr/lib/gcc/aarch64-linux-gnu/12/" \
+	-L "toolchains/toolchains/linux-arm64/usr/lib/aarch64-linux-gnu" \
+	-L "toolchains/toolchains/linux-arm64/lib/aarch64-linux-gnu" \
+	-L "toolchains/libraries/linux-llvm-22-arm64/lib" \
+	--sysroot toolchains/toolchains/linux-arm64 -l pthread -l dl
+
 linux-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/linux-x64/*
@@ -239,6 +249,14 @@ linux-x64: $(DIST_DEPS)
 	cp -r ./lib ./dist/linux-x64/
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
+linux-arm64: $(DIST_DEPS)
+	vman use
+	rm -rf dist/linux-arm64/*
+	mkdir -p dist/linux-arm64
+	$(DIST_COMP) build -o ./dist/linux-arm64/valk --target linux-arm64 $(FLAGS) $(DIST_FLAGS) $(LINUX_ARM64_LINK)
+	cp -r ./lib ./dist/linux-arm64/
+	cd ./dist/linux-arm64/ && rm -f ../valk-$(VERSION)-linux-arm64.tar.gz
+	cd ./dist/linux-arm64/ && tar -czf  ../valk-$(VERSION)-linux-arm64.tar.gz valk lib
 macos-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/macos-x64/*
@@ -288,7 +306,7 @@ ir: $(DIST_DEPS)
 	cd ./dist/ir/ && rm -f ../valk-$(VERSION)-ir.tar.gz
 	cd ./dist/ir/ && tar -czf ../valk-$(VERSION)-ir.tar.gz *.ll build-* libs
 
-dist-all: win-x64 linux-x64 macos-x64 macos-arm64 ir
+dist-all: win-x64 linux-x64 linux-arm64 macos-x64 macos-arm64 ir
 
 # Toolchains for building distributions
 toolchains:
@@ -311,7 +329,7 @@ clean:
 .PHONY: \
 	valk2 valk3 \
 	asm ci-linux ci-macos ci-win clean dist-all doc install ir \
-	linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
+	linux-arm64 linux-arm64-compiler linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
