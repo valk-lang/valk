@@ -3176,6 +3176,10 @@ a struct copy all of its fields by value. A struct initializer such as `.{}`
 never allocates manual storage. Use `mem.new[T]()` when a struct must live in a
 manual heap allocation, and release it with `mem.free`.
 
+In a struct method `this` is a borrow of the value (`&T`), so `let r = this`
+names the same struct. Where a struct is expected, such as a `T` parameter or
+`let copy: T = this`, a borrow is copied; `this[0]` also gives a copy.
+
 ```rust
 struct MyStruct {
     a: i32

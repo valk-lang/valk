@@ -9,6 +9,7 @@
 + Fix: `markdown.to_html` is linear on long lines: spans, links and escapes rebuilt the line each (a 300 KB line of them took 79 s, now 45 ms). A digit between two backslash escapes (`\[0\[`) no longer leaks placeholder bytes, and a `!` at the end of a disallowed link's label no longer turns the next link into an image
 + Fix: templates: the `round` filter gives a number, so `{{ a + b | round }}` adds instead of joining text (`round(2)` no longer keeps trailing zeros); a whole number literal beyond `int` is a float instead of 0, and `int.$min / -1` no longer panics the render
 + Fix: `sort()` on floats puts NaN last; one NaN left the other numbers unsorted (`binary_search`, `sort_by`, `min_by` and `max_by` use the same order)
++ Fix: a borrowed struct (`this` in a struct method, a `&T` parameter) is copied where the struct itself is expected: `neg(this)` failed with 'An implicit pointer borrow cannot be passed to raw pointer storage', and `let copy: T = this` did not compile
 - GC: clear the stack at idle points before a thread blocks (task runners, event loops), so stale words in idle threads' frames stop keeping freed objects alive
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
