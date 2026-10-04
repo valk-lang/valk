@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.9
++ crypto: MD5, SHA-1, SHA-256 and SHA-512/384 run unrolled rounds on whole blocks in place, with no copy or zeroed schedule per block; release builds: SHA-256 350 -> 418 MiB/s, SHA-512 540 -> 645, SHA-1 500 -> 570, MD5 630 -> 785; default builds: SHA-256 74 -> 164, SHA-512 100 -> 244. BLAKE2b inlines its mixing in default builds (206 -> 279)
 + `compress.crc32` uses slicing-by-16 tables built once (600 MiB/s -> 3.4 GiB/s, also for gzip streams), and `adler32` (zlib streams) adds 16 bytes per step with the modulo deferred per 5552 bytes (4.7 -> 18 GiB/s)
 + The compiler itself is built for linux-arm64 too (glibc 2.35, like linux-x64): LLVM 22 cross-compiled for arm64 against an Ubuntu 22.04 sysroot. install.sh accepts arm64 Linux, and CI tests the released arm64 compiler, once a release has it
 + Fix: `markdown.to_html` is linear on long lines: spans, links and escapes rebuilt the line each (a 300 KB line of them took 79 s, now 45 ms). A digit between two backslash escapes (`\[0\[`) no longer leaks placeholder bytes, and a `!` at the end of a disallowed link's label no longer turns the next link into an image
