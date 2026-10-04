@@ -19,6 +19,7 @@
 + Fix: `http.Client` reuses its connection when a response body goes to `Options.output`; every such request opened a new connection
 + Fix: `defer obj.method()` and `co obj.method()` compiled only when everything the object reaches could be cloned, so an object holding an `http.Client` or a socket failed with 'Cannot clone type SSL_CTX'. Such closures now build, and cloning one panics with the reason
 + Fix: a `shared` object's array property can be passed to a `local &[T]` parameter; the conversion failed inside `Array.view` with 'Expected ?GcPtr, got ?shared GcPtr'
++ `fs.set_modified_time(path, unix_ns)` sets a file's modification time (all platforms), and `fs.read_link(path)` returns a symlink's target
 + GC: idle threads no longer keep freed objects alive through stale words: event loops and task runners clear the stack below them before they wait, a task runner holds no finished task in a register while it waits, and a thread's entry returns null (glibc kept its leftover return register in the thread descriptor, which the next thread on that stack exposed). The shared-leak tests allow no slack anymore
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive

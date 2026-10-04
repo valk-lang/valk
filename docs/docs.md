@@ -1601,6 +1601,8 @@ fs.read_into("big.bin", io.stdout()) ! panic("Cannot copy file")
 It follows symlinks and reports an error if the target cannot be read.
 Permissions use Unix mode bits; on Windows they reflect the read-only attribute
 (`0c444` or `0c666`, plus `0c111` for directories), not ACL permissions.
+`fs.set_modified_time(path, unix_ns)` changes the modification time, and
+`fs.read_link(path)` returns the target a symlink points to.
 
 `fs.read_dir(path)` reads one entry name at a time, without collecting the entire
 directory. It skips `.` and `..`, does not recurse, and returns names in no
