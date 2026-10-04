@@ -28,7 +28,11 @@ LLVM_DIR := toolchains/libraries/macos-llvm-22-x64
 endif
 NATIVE_LINK_FLAGS := -L $(LLVM_DIR)/lib
 else
+ifeq ($(HOST_ARCH),aarch64)
+LLVM_DIR := toolchains/libraries/linux-llvm-22-arm64
+else
 LLVM_DIR := toolchains/libraries/linux-llvm-22-x64
+endif
 GCC_LIB_DIR := $(dir $(shell g++ -print-file-name=libstdc++.a))
 NATIVE_LINK_FLAGS := -L $(LLVM_DIR)/lib -L $(GCC_LIB_DIR)
 endif
