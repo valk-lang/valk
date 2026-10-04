@@ -12165,7 +12165,8 @@ Connects to a `ws://` or `wss://` server and completes the opening handshake.
 TLS settings for `wss://` and the timeouts: `connect_timeout_ms` bounds the
 connection, `timeout_ms` the whole handshake, and `read_timeout_ms` /
 `write_timeout_ms` become the socket timeouts afterwards. Throws `invalid_url`,
-`handshake` when the server answers anything but a matching `101`, and the
+`handshake` when the server answers anything but a matching `101` or picks a
+`Sec-WebSocket-Protocol` or extension the request did not offer, and the
 socket's `timeout`, `closed`, `read` and `write`.
 
 #### is_closed
