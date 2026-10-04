@@ -12156,7 +12156,8 @@ Performs the closing handshake and closes the socket.
 
 Sends a close frame with `code` and `reason` (at most 123 bytes), waits up to
 `timeout_ms` for the peer's close frame, and closes the socket either way. Does
-nothing when the connection is closed already. Throws when sending fails.
+nothing when the connection is closed already. Throws `protocol` for a longer reason
+or a code a close frame may not carry (such as 1005 or 1006), and when sending fails.
 
 #### connect
 
