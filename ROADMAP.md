@@ -23,6 +23,7 @@
 + `fs.set_modified_time(path, unix_ns)` sets a file's modification time (all platforms), and `fs.read_link(path)` returns a symlink's target
 + GC: idle threads no longer keep freed objects alive through stale words: event loops and task runners clear the stack below them before they wait, a task runner holds no finished task in a register while it waits, and a thread's entry returns null (glibc kept its leftover return register in the thread descriptor, which the next thread on that stack exposed). The shared-leak tests allow no slack anymore
 + Fix: WebSocket: a frame with a reserved control opcode (0xB-0xF) was read as a binary message, and a close frame with a code a peer may not send (1005, 1006, 1015, below 1000, 1016-2999, 5000 and up) was echoed back; both now close the connection with 1002
++ Fix: an IPv6 address with an interface name as zone (`fe80::1%eth0`) is numeric: `SocketAddress.parse` threw `invalid_host` and `tcp_client` sent it to a DNS lookup
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
 + LSP: a statement that does not parse or does not check is skipped, so the rest of its function keeps hover, go to definition and completion; diagnostics show one error per broken statement. `x =` or `a +` at the end of a line before a new statement is now "Missing a value after '='" instead of reading the next line's keyword as a name
