@@ -31,6 +31,7 @@
 + Fix: `Request.form()` / `files()`: a multipart part ends only at a delimiter line, so `--boundary` inside a value no longer cuts it; a file part without `Content-Type` is `text/plain` instead of dropped; `Content-Disposition` parameter names ignore case; a urlencoded name without `=` (`a&b=1`) is kept with an empty value
 + Fix: `WebSocket.connect` fails with `handshake` when the server picks a `Sec-WebSocket-Protocol` or an extension (such as `permessage-deflate`) that the request did not offer, as RFC 6455 requires; such a connection was accepted
 + Fix: the `timeout_ms` of a TLS handshake (`Ssl.accept` / `connect`, `ssl_accept`, and the server's `header_timeout_ms`) bounds the whole handshake; it applied to each wait, so a client sending a byte at a time held the handshake open
++ Fix: `Array.prepend_many(items, true)` keeps the order of `items` when some are equal: it prepended them back to front, so the last of equal items won (`{5, 7, 6, 7}` gave `5, 6, 7`). It also inserts them in one move now instead of one shift per item
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
 + LSP: a statement that does not parse or does not check is skipped, so the rest of its function keeps hover, go to definition and completion; diagnostics show one error per broken statement. `x =` or `a +` at the end of a line before a new statement is now "Missing a value after '='" instead of reading the next line's keyword as a name

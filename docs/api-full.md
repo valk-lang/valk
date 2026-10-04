@@ -1088,7 +1088,8 @@ prefer `append` when order allows.
 
 Inserts the elements of `items` at the front, keeping their order.
 
-With `unique`, each one is skipped when an equal item is already present.
+With `unique`, each one is skipped when an equal item is already present, in this
+array or earlier in `items`.
 
 #### range
 
