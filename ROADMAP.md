@@ -14,7 +14,7 @@
 + Fix: `CookieJar` refuses a cookie whose `Domain` is a single label such as `com` (it reached every site under it); `Domain=localhost` on localhost is a host-only cookie
 + Fix: `Multipart.add_file` writes its content type as given; quotes became `%22`, so `charset="utf-8"` was mangled
 + Fix: `http.Client` reuses its connection when a response body goes to `Options.output`; every such request opened a new connection
-- GC: clear the stack at idle points before a thread blocks (task runners, event loops), so stale words in idle threads' frames stop keeping freed objects alive
++ GC: idle threads no longer keep freed objects alive through stale words: event loops and task runners clear the stack below them before they wait, a task runner holds no finished task in a register while it waits, and a thread's entry returns null (glibc kept its leftover return register in the thread descriptor, which the next thread on that stack exposed). The shared-leak tests allow no slack anymore
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
 + LSP: a statement that does not parse or does not check is skipped, so the rest of its function keeps hover, go to definition and completion; diagnostics show one error per broken statement. `x =` or `a +` at the end of a line before a new statement is now "Missing a value after '='" instead of reading the next line's keyword as a name
