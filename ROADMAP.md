@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.9
++ `compress.crc32` uses slicing-by-16 tables built once (600 MiB/s -> 3.4 GiB/s, also for gzip streams), and `adler32` (zlib streams) adds 16 bytes per step with the modulo deferred per 5552 bytes (4.7 -> 18 GiB/s)
 + The compiler itself is built for linux-arm64 too (glibc 2.35, like linux-x64): LLVM 22 cross-compiled for arm64 against an Ubuntu 22.04 sysroot. install.sh accepts arm64 Linux, and CI tests the released arm64 compiler, once a release has it
 + Fix: `markdown.to_html` is linear on long lines: spans, links and escapes rebuilt the line each (a 300 KB line of them took 79 s, now 45 ms). A digit between two backslash escapes (`\[0\[`) no longer leaks placeholder bytes, and a `!` at the end of a disallowed link's label no longer turns the next link into an image
 + Fix: templates: the `round` filter gives a number, so `{{ a + b | round }}` adds instead of joining text (`round(2)` no longer keeps trailing zeros: the new `fixed(2)` writes `12.50`); a whole number literal beyond `int` is a float instead of 0, numbers take an exponent (`1e3`), and `int.$min / -1` no longer panics the render
