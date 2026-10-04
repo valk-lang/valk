@@ -33,6 +33,7 @@
 + Fix: the `timeout_ms` of a TLS handshake (`Ssl.accept` / `connect`, `ssl_accept`, and the server's `header_timeout_ms`) bounds the whole handshake; it applied to each wait, so a client sending a byte at a time held the handshake open
 + Fix: `Array.prepend_many(items, true)` keeps the order of `items` when some are equal: it prepended them back to front, so the last of equal items won (`{5, 7, 6, 7}` gave `5, 6, 7`). It also inserts them in one move now instead of one shift per item
 + Fix: `WebSocket.close(code)` throws `protocol` for a code a close frame may not carry (1005, 1006, 1015, below 1000, ...) instead of sending it
++ HTTP server: a worker holding more than its share of the open connections (plus an eighth) lets the others accept, so a burst of a few long-lived connections spreads over all threads (8 connections on 8 workers: one each, was 6 to 8 threads used)
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
 + LSP: a statement that does not parse or does not check is skipped, so the rest of its function keeps hover, go to definition and completion; diagnostics show one error per broken statement. `x =` or `a +` at the end of a line before a new statement is now "Missing a value after '='" instead of reading the next line's keyword as a name
