@@ -14426,8 +14426,9 @@ The OpenSSL `SSL` handle.
 Runs the server handshake on the socket `fd`.
 
 Makes `fd` non-blocking and, on Linux, makes the process ignore `SIGPIPE`. Throws
-`timeout` after `timeout_ms` (0 waits forever) of waiting, `closed` when the peer goes
-away, `os`, and `ssl` for a failed handshake (see `get_error_message`).
+`timeout` when the handshake takes longer than `timeout_ms` (0 waits forever),
+`closed` when the peer goes away, `os`, and `ssl` for a failed handshake (see
+`get_error_message`).
 
 #### close
 
@@ -14441,8 +14442,9 @@ Does not wait for the peer's reply and does not close the socket. Throws `timeou
 Runs the client handshake on the socket `fd`.
 
 Makes `fd` non-blocking and, on Linux, makes the process ignore `SIGPIPE`. Throws
-`timeout` after `timeout_ms` (0 waits forever) of waiting, `closed` when the peer goes
-away, `os`, and `ssl` for a failed handshake (see `get_error_message`).
+`timeout` when the handshake takes longer than `timeout_ms` (0 waits forever),
+`closed` when the peer goes away, `os`, and `ssl` for a failed handshake (see
+`get_error_message`).
 
 #### custom_error
 
