@@ -77,11 +77,9 @@ make
 | OS | Linux | Macos | Windows |
 |--|--|--|--|
 | x64 | ✅ | ✅ | ✅ |
-| arm64 | ✅¹ | ✅ | ❌ |
+| arm64 | ✅ | ✅ | ❌ |
 
 ✅️ = Available & passes tests | ❌️ = Not available right now
-
-¹ As a target: `valk build --target linux-arm64` from any host. We have not released a linux-arm64 version of the compiler yet.
 
 ## Benchmarks
 
