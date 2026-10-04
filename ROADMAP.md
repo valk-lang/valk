@@ -11,6 +11,8 @@
 + Fix: `sort()` on floats puts NaN last; one NaN left the other numbers unsorted (`binary_search`, `sort_by`, `min_by` and `max_by` use the same order)
 + Fix: a borrowed struct (`this` in a struct method, a `&T` parameter) is copied where the struct itself is expected: `neg(this)` failed with 'An implicit pointer borrow cannot be passed to raw pointer storage', and `let copy: T = this` did not compile
 + Fix: a `Semaphore.acquire`, `Channel.recv` or bounded `send` cancelled right after a release or send woke it kept that wake, so the next waiter slept on while a permit, value or slot was free; the wake now goes on
++ Fix: `CookieJar` refuses a cookie whose `Domain` is a single label such as `com` (it reached every site under it); `Domain=localhost` on localhost is a host-only cookie
++ Fix: `Multipart.add_file` writes its content type as given; quotes became `%22`, so `charset="utf-8"` was mangled
 - GC: clear the stack at idle points before a thread blocks (task runners, event loops), so stale words in idle threads' frames stop keeping freed objects alive
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
