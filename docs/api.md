@@ -2159,7 +2159,7 @@ error KeyError (invalid_input, key, failed)
 
 ```js
 // A streaming MD5 `Hasher`; a literal `Md5 {}` is ready for input.
-+ class Md5 is Hasher {
++ class Md5 is Hasher, KeyedHasher {
     // Returns 64, the MD5 block size in bytes.
     + fn block_size() uint
     // Returns 16, the MD5 digest size in bytes.
@@ -2225,7 +2225,7 @@ error KeyError (invalid_input, key, failed)
 
 ```js
 // A streaming SHA-1 `Hasher`; a literal `Sha1 {}` is ready for input.
-+ class Sha1 is Hasher {
++ class Sha1 is Hasher, KeyedHasher {
     // Returns 64, the SHA-1 block size in bytes.
     + fn block_size() uint
     // Returns 20, the SHA-1 digest size in bytes.
@@ -2241,7 +2241,7 @@ error KeyError (invalid_input, key, failed)
 
 ```js
 // A streaming SHA-256 `Hasher`; a literal `Sha256 {}` is ready for input.
-+ class Sha256 is Hasher {
++ class Sha256 is Hasher, KeyedHasher {
     // Returns 64, the SHA-256 block size in bytes.
     + fn block_size() uint
     // Returns 32, the SHA-256 digest size in bytes.
@@ -2257,7 +2257,7 @@ error KeyError (invalid_input, key, failed)
 
 ```js
 // A streaming SHA-512 or SHA-384 `Hasher`.
-+ class Sha512 is Hasher {
++ class Sha512 is Hasher, KeyedHasher {
     // Returns 128, the SHA-512 block size in bytes.
     + fn block_size() uint
     // Returns the digest size in bytes: 64 for SHA-512, 48 for SHA-384.
@@ -2733,12 +2733,16 @@ alias pid_t for i32
 + fn read_dir(path: String) DirIterator !io:IoError
 // Writes the whole file at `path` to `out` in chunks of `chunk_size` bytes and returns the bytes written; the file is never held in memory as a whole.
 + fn read_into(path: String, out: Writer, chunk_size: uint (65536)) uint !io:IoError
+// Returns the target the symlink `path` points to, as it is stored (often relative to the link's directory). On Windows a junction gives its target too.
++ fn read_link(path: String) String !io:IoError
 // Returns the absolute path of `path` with symlinks resolved.
 + fn realpath(path: String) String !io:IoError
 // Returns `path` as seen from the directory `base`, such as `../b/c` for `/a/b/c` from `/a/d`.
 + fn relative(path: String, base: String) String
 // Makes `path` absolute and folds `.`, `..` and repeated separators.
 + fn resolve(path: String) String
+// Sets the modification time of the entry at `path`, in nanoseconds since the Unix epoch like `modified_time`, following symlinks; the access time is left alone.
++ fn set_modified_time(path: String, unix_ns: uint) void !io:IoError
 // Returns the size in bytes of the entry at `path`, following symlinks.
 + fn size(path: String) uint !io:IoError
 // Returns the metadata of the entry at `path`, following symlinks.
