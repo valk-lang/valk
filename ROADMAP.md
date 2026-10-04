@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.7.10
+
 + Release 0.7.9
 + crypto: `Hmac` keeps the hash state after the padded key, so `reset` and `finish` no longer hash a key block again: `pbkdf2` with 100k iterations 74 -> 32 ms (SHA-256), 94 -> 40 ms (SHA-512). `hash`, `hash_hex`, `hex_encode` and `Hmac.sign` allocate less: `sha256_hex` of 64 bytes 0.44 -> 0.32 us, `Hmac.sign` 1.07 -> 0.78 us
 + crypto: MD5, SHA-1, SHA-256 and SHA-512/384 run unrolled rounds on whole blocks in place, with no copy or zeroed schedule per block; release builds: SHA-256 350 -> 418 MiB/s, SHA-512 540 -> 645, SHA-1 500 -> 570, MD5 630 -> 785; default builds: SHA-256 74 -> 164, SHA-512 100 -> 244. BLAKE2b inlines its mixing in default builds (206 -> 279)
