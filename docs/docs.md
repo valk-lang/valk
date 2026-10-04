@@ -2853,6 +2853,7 @@ such as `@unsafe` in prose, is plain text.
 
 The built-in filters are `upper`, `lower`, `capitalize`, `trim`, `length`,
 `default(x)`, `join(sep)`, `first`, `last`, `reverse`, `round(decimals)`,
+`fixed(decimals)` (text with exactly that many decimals, 2 by default: `12.50`),
 `truncate(n, suffix)`, `replace(from, to)`, `json`, `escape`, `urlencode`
 and `keys`. `views.set_filter(name, fn)` registers your own; the function
 receives the value and the evaluated arguments as `json.Value` and returns

@@ -7,7 +7,7 @@
 - Release 0.7.9
 + The compiler itself is built for linux-arm64 too (glibc 2.35, like linux-x64): LLVM 22 cross-compiled for arm64 against an Ubuntu 22.04 sysroot. install.sh accepts arm64 Linux, and CI tests the released arm64 compiler, once a release has it
 + Fix: `markdown.to_html` is linear on long lines: spans, links and escapes rebuilt the line each (a 300 KB line of them took 79 s, now 45 ms). A digit between two backslash escapes (`\[0\[`) no longer leaks placeholder bytes, and a `!` at the end of a disallowed link's label no longer turns the next link into an image
-+ Fix: templates: the `round` filter gives a number, so `{{ a + b | round }}` adds instead of joining text (`round(2)` no longer keeps trailing zeros); a whole number literal beyond `int` is a float instead of 0, and `int.$min / -1` no longer panics the render
++ Fix: templates: the `round` filter gives a number, so `{{ a + b | round }}` adds instead of joining text (`round(2)` no longer keeps trailing zeros: the new `fixed(2)` writes `12.50`); a whole number literal beyond `int` is a float instead of 0, and `int.$min / -1` no longer panics the render
 + Fix: `sort()` on floats puts NaN last; one NaN left the other numbers unsorted (`binary_search`, `sort_by`, `min_by` and `max_by` use the same order)
 + Fix: a borrowed struct (`this` in a struct method, a `&T` parameter) is copied where the struct itself is expected: `neg(this)` failed with 'An implicit pointer borrow cannot be passed to raw pointer storage', and `let copy: T = this` did not compile
 + Fix: a `Semaphore.acquire`, `Channel.recv` or bounded `send` cancelled right after a release or send woke it kept that wake, so the next waiter slept on while a permit, value or slot was free; the wake now goes on
