@@ -26,6 +26,7 @@
 + Fix: an IPv6 address with an interface name as zone (`fe80::1%eth0`) is numeric: `SocketAddress.parse` threw `invalid_host` and `tcp_client` sent it to a DNS lookup
 + Fix: `log` text records escape control characters (`\x1b` as `\\x1b`) in the message and in quoted field values; they were written raw, so logged input could carry terminal escape sequences
 + Fix: `Ssl.set_host` with an IPv6 address that has a zone (`fe80::1%2`) threw `ssl`; the certificate is checked against the address without its zone
++ Fix: HTTP/1 `Server.header_timeout_ms` bounds the whole request head, as it does for HTTP/2; it applied to each read, so a client sending a byte every few seconds held a connection for hours
 + Release 0.7.8
 + Fix: a thread waiting for a shared collection that another thread ran was scanned from the collector's own frames, whose stale words could keep freed objects alive
 + LSP: a statement that does not parse or does not check is skipped, so the rest of its function keeps hover, go to definition and completion; diagnostics show one error per broken statement. `x =` or `a +` at the end of a line before a new statement is now "Missing a value after '='" instead of reading the next line's keyword as a name

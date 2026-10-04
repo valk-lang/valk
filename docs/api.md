@@ -3473,7 +3473,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + body_timeout_ms: uint
     // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
-    // How long each read of a request head, and the TLS handshake, may take, in milliseconds.
+    // How long a request head may take to arrive once it started, and how long the TLS handshake may take, in milliseconds.
     + header_timeout_ms: uint
     // The address the server listens on.
     ~ host: String
