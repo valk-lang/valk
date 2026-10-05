@@ -3439,7 +3439,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // Responds with status `code` and a body streamed from `reader`.
     + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
-    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: bool (true)) void
+    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: ?bool (null)) void
 }
 ```
 
@@ -3501,7 +3501,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + stop_on_signal: bool
     // How long in-flight requests may take after a stop signal, in milliseconds.
     + stop_on_signal_timeout_ms: uint
-    // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it; `WebSocket.upgrade` can also turn it off per connection.
+    // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it. Off by default: compression saves bandwidth but costs CPU per message. `WebSocket.upgrade` and `send_websocket` can choose per endpoint.
     + websocket_compression: bool
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
@@ -3558,7 +3558,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // Sets the socket timeouts in milliseconds; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
-    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: bool (true)) Response
+    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: ?bool (null)) Response
     // Sends `text` as one text message; the bytes must be UTF-8.
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.

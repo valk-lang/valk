@@ -11667,7 +11667,7 @@ Creates a `text/plain; charset=utf-8` response.
     // Responds with status `code` and a body streamed from `reader`.
     + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
-    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: bool (true)) void
+    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: ?bool (null)) void
 }
 ```
 
@@ -11736,8 +11736,8 @@ Answers with the WebSocket upgrade and runs `handler` on the connection once the
 response is sent; the fast-handler form of `WebSocket.upgrade`.
 
 A request that is not a valid WebSocket upgrade gets a `400` response and the
-handler never runs. `compression: false` declines permessage-deflate, as
-`Server.websocket_compression` does for every connection.
+handler never runs. `compression` accepts or declines permessage-deflate for this
+endpoint; null follows `Server.websocket_compression`.
 
 ```js
 // A route found by `Router.find`: the handler plus the positions of its `@name` parts.
@@ -11863,7 +11863,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + stop_on_signal: bool
     // How long in-flight requests may take after a stop signal, in milliseconds.
     + stop_on_signal_timeout_ms: uint
-    // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it; `WebSocket.upgrade` can also turn it off per connection.
+    // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it. Off by default: compression saves bandwidth but costs CPU per message. `WebSocket.upgrade` and `send_websocket` can choose per endpoint.
     + websocket_compression: bool
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
@@ -11989,7 +11989,8 @@ How long in-flight requests may take after a stop signal, in milliseconds.
 #### websocket_compression
 
 Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the
-client offers it; `WebSocket.upgrade` can also turn it off per connection.
+client offers it. Off by default: compression saves bandwidth but costs CPU per
+message. `WebSocket.upgrade` and `send_websocket` can choose per endpoint.
 
 #### write_timeout_ms
 
@@ -12123,7 +12124,7 @@ cannot be read.
     // Sets the socket timeouts in milliseconds; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
-    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: bool (true)) Response
+    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: ?bool (null)) Response
     // Sends `text` as one text message; the bytes must be UTF-8.
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.
@@ -12238,8 +12239,8 @@ upgrade (RFC 6455 §4.2.1) gets a `400` response instead and the handler never
 runs. `Server.request_shutdown` interrupts the socket, so a blocked `read` then
 fails with `closed`. Not available over HTTP/2.
 
-When the client offers permessage-deflate (RFC 7692) the server accepts it, unless
-`compression` or `Server.websocket_compression` is false.
+When the client offers permessage-deflate (RFC 7692), `compression` accepts or
+declines it for this endpoint; null follows `Server.websocket_compression` (off).
 
 #### write
 
