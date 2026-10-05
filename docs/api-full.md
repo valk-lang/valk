@@ -11139,6 +11139,8 @@ Returns an empty form with a random boundary.
     + tls_cipher_suites: ?String
     // Whether the server's TLS certificate is verified.
     + verify_tls_cert: bool
+    // Whether `WebSocket.connect` offers the permessage-deflate extension (RFC 7692), which compresses messages when the server accepts it.
+    + websocket_compression: bool
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
@@ -11307,6 +11309,11 @@ The OpenSSL cipher suites for TLS 1.3.
 #### verify_tls_cert
 
 Whether the server's TLS certificate is verified.
+
+#### websocket_compression
+
+Whether `WebSocket.connect` offers the permessage-deflate extension (RFC 7692), which
+compresses messages when the server accepts it.
 
 #### write_timeout_ms
 
@@ -11660,7 +11667,7 @@ Creates a `text/plain; charset=utf-8` response.
     // Responds with status `code` and a body streamed from `reader`.
     + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
-    + fn send_websocket(context: Context, handler: fn(WebSocket)()) void
+    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: bool (true)) void
 }
 ```
 
@@ -11729,7 +11736,8 @@ Answers with the WebSocket upgrade and runs `handler` on the connection once the
 response is sent; the fast-handler form of `WebSocket.upgrade`.
 
 A request that is not a valid WebSocket upgrade gets a `400` response and the
-handler never runs.
+handler never runs. `compression: false` declines permessage-deflate, as
+`Server.websocket_compression` does for every connection.
 
 ```js
 // A route found by `Router.find`: the handler plus the positions of its `@name` parts.
@@ -11855,6 +11863,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + stop_on_signal: bool
     // How long in-flight requests may take after a stop signal, in milliseconds.
     + stop_on_signal_timeout_ms: uint
+    // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it; `WebSocket.upgrade` can also turn it off per connection.
+    + websocket_compression: bool
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
 
@@ -11976,6 +11986,11 @@ connections.
 
 How long in-flight requests may take after a stop signal, in milliseconds.
 
+#### websocket_compression
+
+Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the
+client offers it; `WebSocket.upgrade` can also turn it off per connection.
+
 #### write_timeout_ms
 
 How long each socket write may take, in milliseconds.
@@ -12086,7 +12101,7 @@ cannot be read.
     ~ close_code: u16
     // The close reason that came with `close_code`.
     ~ close_reason: String
-    // The largest message accepted, in bytes; a larger one closes the connection with code 1009. Defaults to 16 MB.
+    // The largest message accepted, in bytes (after decompression); a larger one closes the connection with code 1009. Defaults to 16 MB.
     + max_message_size: uint
 
     // Performs the closing handshake and closes the socket.
@@ -12108,7 +12123,7 @@ cannot be read.
     // Sets the socket timeouts in milliseconds; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
-    + static fn upgrade(req: Request, handler: fn(WebSocket)()) Response
+    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: bool (true)) Response
     // Sends `text` as one text message; the bytes must be UTF-8.
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.
@@ -12147,8 +12162,8 @@ The close reason that came with `close_code`.
 
 #### max_message_size
 
-The largest message accepted, in bytes; a larger one closes the connection
-with code 1009. Defaults to 16 MB.
+The largest message accepted, in bytes (after decompression); a larger one closes
+the connection with code 1009. Defaults to 16 MB.
 
 #### close
 
@@ -12169,7 +12184,9 @@ connection, `timeout_ms` the whole handshake, and `read_timeout_ms` /
 `write_timeout_ms` become the socket timeouts afterwards. Throws `invalid_url`,
 `handshake` when the server answers anything but a matching `101` or picks a
 `Sec-WebSocket-Protocol` or extension the request did not offer, and the
-socket's `timeout`, `closed`, `read` and `write`.
+socket's `timeout`, `closed`, `read` and `write`. Messages are compressed with
+permessage-deflate when the server accepts it; `Options.websocket_compression`
+turns the offer off.
 
 #### is_closed
 
@@ -12220,6 +12237,9 @@ the connection is closed when it returns. A request that is not a valid WebSocke
 upgrade (RFC 6455 §4.2.1) gets a `400` response instead and the handler never
 runs. `Server.request_shutdown` interrupts the socket, so a blocked `read` then
 fails with `closed`. Not available over HTTP/2.
+
+When the client offers permessage-deflate (RFC 7692) the server accepts it, unless
+`compression` or `Server.websocket_compression` is false.
 
 #### write
 

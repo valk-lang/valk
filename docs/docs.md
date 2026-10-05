@@ -2654,6 +2654,12 @@ Protocol violations by the peer close the connection with 1002 or 1007 and
 throw `protocol`. `Server.request_shutdown` interrupts open WebSockets. Not
 available over HTTP/2.
 
+Messages are compressed with permessage-deflate when both sides support it,
+as browsers do. It is on by default; turn it off with
+`server.websocket_compression = false`, per endpoint with
+`WebSocket.upgrade(req, handler, false)`, or on the client with
+`http.Options { websocket_compression: false }`.
+
 ## Sockets
 
 API for [valk.net](api.md#net)

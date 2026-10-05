@@ -6,6 +6,7 @@ use url
 use time
 use core
 use sync
+use compress
 
 /// Thrown by `WebSocket` methods.
 ///
@@ -52,6 +53,12 @@ value WS_OP_PONG (10)
 value WS_GUID ("258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
 value WS_READ_SIZE (16384)
 value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
+// permessage-deflate: smaller messages are sent uncompressed
+value WS_COMPRESS_MIN_SIZE (64)
+value WS_COMPRESS_LEVEL (1)
+// Room in front of an outgoing payload for the longest frame header
+value WS_HEADER_ROOM (14)
+value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
 
 /// A WebSocket connection (RFC 6455), on the server or the client side.
 ///
@@ -74,14 +81,21 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
     - con: net.TcpConnection
     - input: ByteBuffer
     - fragments: ByteBuffer (ByteBuffer.new(0))
+    - output: ByteBuffer (ByteBuffer.new(0))
+    // Decompressed messages; with `inflate_takeover` it keeps the last 32 KiB as history
+    - inflated: ByteBuffer (ByteBuffer.new(0))
+    // permessage-deflate (RFC 7692): the window bits for messages sent, 0 when not negotiated
+    - deflate_bits: uint (0)
+    - inflate_takeover: bool (false)
+    - message_compressed: bool (false)
     - fragment_opcode: uint (0)
     - in_fragment: bool (false)
     - is_client: bool
     - writing: bool (false)
     - close_sent: bool (false)
     - closed: bool (false)
-    /// The largest message accepted, in bytes; a larger one closes the connection
-    /// with code 1009. Defaults to 16 MB.
+    /// The largest message accepted, in bytes (after decompression); a larger one closes
+    /// the connection with code 1009. Defaults to 16 MB.
     + max_message_size: uint (WS_DEFAULT_MAX_MESSAGE_SIZE)
     /// The close code received from the peer, or the one sent when this side closed
     /// first; 0 while open, 1006 when the connection dropped without a close frame.
@@ -122,12 +136,16 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
     /// upgrade (RFC 6455 §4.2.1) gets a `400` response instead and the handler never
     /// runs. `Server.request_shutdown` interrupts the socket, so a blocked `read` then
     /// fails with `closed`. Not available over HTTP/2.
-    + static fn upgrade(req: Request, handler: fn(WebSocket)()) Response {
+    ///
+    /// When the client offers permessage-deflate (RFC 7692) the server accepts it, unless
+    /// `compression` or `Server.websocket_compression` is false.
+    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: bool (true)) Response {
         let accept = websocket_accept_key(req.method, req.headers())
         if !isset(accept) : return Response.new("Expected a WebSocket upgrade request", 400)
         let response = Response.new("", 101)
         websocket_upgrade_headers(response.headers, accept)
         response.websocket_handler = handler
+        response.websocket_compression = compression
         return response
     }
 
@@ -139,7 +157,9 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
     /// `write_timeout_ms` become the socket timeouts afterwards. Throws `invalid_url`,
     /// `handshake` when the server answers anything but a matching `101` or picks a
     /// `Sec-WebSocket-Protocol` or extension the request did not offer, and the
-    /// socket's `timeout`, `closed`, `read` and `write`.
+    /// socket's `timeout`, `closed`, `read` and `write`. Messages are compressed with
+    /// permessage-deflate when the server accepts it; `Options.websocket_compression`
+    /// turns the offer off.
     + static fn connect(url: String, options: ?Options (null)) SELF !WebSocketError {
         let u = url.parse(url)
         if u.scheme != "ws" && u.scheme != "wss" : throw .invalid_url
@@ -166,7 +186,8 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
 
         // Build the request before opening a socket, so a bad header costs no connection
         let key = crypto.base64_encode(crypto.random_bytes(16))
-        let request = websocket_client_request(u, port, is_tls, key, options) !>
+        let deflate_offer = websocket_deflate_offer(options)
+        let request = websocket_client_request(u, port, is_tls, key, options, deflate_offer) !>
 
         let connect_deadline_ms = ClientRequest.operation_deadline(deadline_ms, connect_timeout_ms)
         let con = net.tcp_client(u.host, port, websocket_remaining(connect_deadline_ms, 0) !>) !>
@@ -232,12 +253,23 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
             throw .handshake
         }
         let offered_extensions = websocket_offered(options, "sec-websocket-extensions")
+        if deflate_offer.bytes > 0 : offered_extensions = deflate_offer
+        let deflate: ?WebSocketDeflateParams = null
         each headers.get_all("sec-websocket-extensions") as value {
             each value.split(",") as extension {
                 let name = extension.split(";")[0].trim(" ")
                 if name.bytes > 0 && !websocket_extension_offered(offered_extensions, name) {
                     websocket_close_socket(con)
                     throw .handshake
+                }
+                if name.equals_ignore_ascii_case("permessage-deflate") {
+                    // Accepted once, with parameters a response may carry (RFC 7692 §7.1)
+                    let params = websocket_deflate_params(extension)
+                    if isset(deflate) || !isset(params) || (params.client_bits_given && params.client_bits == 0) {
+                        websocket_close_socket(con)
+                        throw .handshake
+                    }
+                    deflate = params
                 }
             }
         }
@@ -246,16 +278,21 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
         let leftover = context.parsed_index
         if leftover < input.length : rest.write(input.view(leftover, input.length - leftover))
         con.set_timeouts(read_timeout_ms, write_timeout_ms)
-        return SELF { con: con, input: rest, is_client: true }
+        let ws = SELF { con: con, input: rest, is_client: true }
+        if isset(deflate) {
+            ws.deflate_bits = deflate.client_bits > 0 ? deflate.client_bits : 15
+            ws.inflate_takeover = !deflate.server_no_takeover
+        }
+        return ws
     }
 
     // Wraps an upgraded server connection; `leftover` holds bytes received after the
-    // request head
-    static fn from_server(con: net.TcpConnection, leftover: local &[u8]) SELF {
+    // request head, `deflate_bits` the negotiated permessage-deflate window (0: none)
+    static fn from_server(con: net.TcpConnection, leftover: local &[u8], deflate_bits: uint) SELF {
         let input = ByteBuffer.new(WS_READ_SIZE)
         input.write(leftover)
         con.set_timeouts(0, 5000)
-        return SELF { con: con, input: input, is_client: false }
+        return SELF { con: con, input: input, is_client: false, deflate_bits: deflate_bits }
     }
 
     // ---- Sending ---------------------------------------------------------------------
@@ -314,42 +351,67 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
 
     - fn send_frame(opcode: uint, data: local &[u8]) !WebSocketError {
         if this.closed : throw .closed
-        let length = data.length
-        let frame = ByteBuffer.new(length + 14)
-        frame.write_byte((0x80 | opcode).to(u8))
-        let mask_bit: u8 = this.is_client ? 0x80 : 0
-        if length < 126 {
-            frame.write_byte(mask_bit | length.to(u8))
-        } else if length < 65536 {
-            frame.write_byte(mask_bit | 126)
-            frame.write_u16_be(length.to(u16))
-        } else {
-            frame.write_byte(mask_bit | 127)
-            frame.write_u64_be(length.to(u64))
-        }
-        if this.is_client {
-            let key = crypto.random_bytes(4)
-            frame.write(key)
-            let start = frame.length
-            frame.write(data)
-            let view = frame.view(start, length)
-            let i: uint = 0
-            while i < length {
-                view[i] = view[i] ^ key[i % 4]
-                i++
-            }
-        } else {
-            frame.write(data)
-        }
-
         // One frame at a time: a second writer waits for the one in progress
         while this.writing : time.sleep_ms(1)
         if this.closed : throw .closed
         this.writing = true
-        this.con.write(frame) ! {
+
+        // The payload goes after room for the header, which is put in front of it
+        let frame = this.output
+        frame.clear()
+        frame.skip(WS_HEADER_ROOM)
+        let first = 0x80 | opcode
+        let length = data.length
+        if this.deflate_bits > 0 && opcode < 8 && length >= WS_COMPRESS_MIN_SIZE {
+            compress.deflate_message(data, frame, WS_COMPRESS_LEVEL, this.deflate_bits)
+            let compressed = frame.length - WS_HEADER_ROOM
+            if compressed < length {
+                length = compressed
+                first = first | 0x40
+            } else {
+                frame.truncate(WS_HEADER_ROOM)
+            }
+        }
+        if (first & 0x40) == 0 : frame.write(data)
+
+        let header: uint = length < 126 ? 2 : (length < 65536 ? 4 : 10)
+        if this.is_client : header += 4
+        let start = WS_HEADER_ROOM - header
+        let head = frame.view(start, header)
+        head[0] = first.to(u8)
+        let mask_bit: u8 = this.is_client ? 0x80 : 0
+        if length < 126 {
+            head[1] = mask_bit | length.to(u8)
+        } else if length < 65536 {
+            head[1] = mask_bit | 126
+            head[2] = (length >> 8).to(u8)
+            head[3] = length.to(u8)
+        } else {
+            head[1] = mask_bit | 127
+            let i: uint = 0
+            while i < 8 {
+                head[2 + i] = (length >> (56 - i * 8)).to(u8)
+                i++
+            }
+        }
+        if this.is_client {
+            let key = crypto.random_bytes(4)
+            let k = header - 4
+            head[k] = key[0]
+            head[k + 1] = key[1]
+            head[k + 2] = key[2]
+            head[k + 3] = key[3]
+            websocket_mask(frame.view(WS_HEADER_ROOM, length), key[0], key[1], key[2], key[3])
+        }
+
+        this.con.write(frame.view(start, header + length)) ! {
             this.writing = false
             this.finish()
             throw E
+        }
+        if frame.length > 65536 {
+            frame.clear()
+            frame.shrink_capacity(4096)
         }
         this.writing = false
     }
@@ -388,7 +450,11 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
         let b1 = input.get(1)
         let fin = (b0 & 0x80) != 0
         let opcode = (b0 & 0x0f).to(uint)
-        if (b0 & 0x70) != 0 : this.fail(1002, "Reserved bits set") !>
+        // RSV1 marks a compressed message, on its first frame only (RFC 7692 §6)
+        let rsv1 = (b0 & 0x40) != 0
+        if (b0 & 0x30) != 0 || (rsv1 && (this.deflate_bits == 0 || opcode == WS_OP_CONTINUATION || opcode >= 8)) {
+            this.fail(1002, "Reserved bits set") !>
+        }
         let masked = (b1 & 0x80) != 0
         // A client must mask, a server must not (RFC 6455 §5.1)
         if masked == this.is_client : this.fail(1002, masked ? "Masked server frame" : "Unmasked client frame") !>
@@ -433,19 +499,7 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
             let k1 = input.get(header - 3)
             let k2 = input.get(header - 2)
             let k3 = input.get(header - 1)
-            let i: uint = 0
-            while i + 4 <= length {
-                payload[i] = payload[i] ^ k0
-                payload[i + 1] = payload[i + 1] ^ k1
-                payload[i + 2] = payload[i + 2] ^ k2
-                payload[i + 3] = payload[i + 3] ^ k3
-                i += 4
-            }
-            while i < length {
-                let k = i % 4 == 0 ? k0 : i % 4 == 1 ? k1 : i % 4 == 2 ? k2 : k3
-                payload[i] = payload[i] ^ k
-                i++
-            }
+            websocket_mask(payload, k0, k1, k2, k3)
         }
 
         let complete = false
@@ -479,35 +533,59 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
             if opcode != WS_OP_CONTINUATION {
                 this.fragment_opcode = opcode
                 this.in_fragment = true
+                this.message_compressed = rsv1
             }
-            if fin {
+            if !fin {
+                this.fragments.write(payload)
+            } else {
                 this.in_fragment = false
                 complete = true
-                if this.fragment_opcode == WS_OP_TEXT {
-                    if this.fragments.length == 0 {
-                        if !websocket_utf8_is_valid(payload) : this.fail(1007, "Invalid UTF-8") !>
-                    } else {
-                        this.fragments.write(payload)
-                        if !websocket_utf8_is_valid(this.fragments) : this.fail(1007, "Invalid UTF-8") !>
+                if this.message_compressed {
+                    this.fragments.write(payload)
+                    // Nobody reads the message during `close`: skip decompressing it
+                    if isset(out) {
+                        let start = this.inflate() !>
+                        let inflated = this.inflated
+                        this.deliver(out, inflated.view(start, inflated.length - start)) !>
+                        if this.inflate_takeover {
+                            if inflated.length > 32768 : inflated.clear_until(inflated.length - 32768)
+                        } else {
+                            inflated.clear()
+                        }
+                        if inflated.size > 65536 : inflated.shrink_capacity(32768)
                     }
-                }
-                if isset(out) {
-                    if this.fragments.length > 0 {
-                        if this.fragment_opcode != WS_OP_TEXT : this.fragments.write(payload)
-                        out.write(this.fragments) ! throw .write
-                    } else {
-                        out.write(payload) ! throw .write
-                    }
+                } else if this.fragments.length > 0 {
+                    this.fragments.write(payload)
+                    this.deliver(out, this.fragments) !>
+                } else {
+                    this.deliver(out, payload) !>
                 }
                 this.fragments.clear()
                 this.fragments.shrink_capacity(0)
-            } else {
-                this.fragments.write(payload)
             }
         }
 
         input.clear_until(header + length)
         return complete
+    }
+
+    // Decompresses the message in `fragments` onto `inflated` and returns where it starts
+    - fn inflate() uint !WebSocketError {
+        let inflated = this.inflated
+        if !this.inflate_takeover : inflated.clear()
+        let start = inflated.length
+        this.fragments.write(WS_DEFLATE_TAIL)
+        compress.inflate_message(this.fragments, inflated, this.max_message_size) ! {
+            if E.code == E.too_large : this.fail(1009, "Message too large") !>
+            this.fail(1007, "Invalid compressed data") !>
+        }
+        return start
+    }
+
+    // Checks a complete message and passes it to `out`
+    - fn deliver(out: ?io.Writer, data: local &[u8]) !WebSocketError {
+        if this.fragment_opcode == WS_OP_TEXT && !websocket_utf8_is_valid(data) : this.fail(1007, "Invalid UTF-8") !>
+        if isset(out) : out.write(data) ! throw .write
     }
 
     // Makes sure `input` holds at least `needed` bytes
@@ -539,6 +617,7 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
         this.closed = true
         this.input.clear()
         this.fragments.clear()
+        this.inflated.clear()
         this.con.close() ! core.cleanup_warning("Failed to close WebSocket connection", __FILE__, __LINE__)
     }
 
@@ -548,6 +627,22 @@ value WS_DEFAULT_MAX_MESSAGE_SIZE (16 * 1024 * 1024)
         this.send_close(1000, "") ! {}
         this.finish()
     }
+}
+
+// XORs `data` with the 4-byte masking key (RFC 6455 §5.3)
+fn websocket_mask(data: local mut &[u8], k0: u8, k1: u8, k2: u8, k3: u8) {
+    let length = data.length
+    let i: uint = 0
+    while i + 4 <= length {
+        data[i] = data[i] ^ k0
+        data[i + 1] = data[i + 1] ^ k1
+        data[i + 2] = data[i + 2] ^ k2
+        data[i + 3] = data[i + 3] ^ k3
+        i += 4
+    }
+    if i < length : data[i] = data[i] ^ k0
+    if i + 1 < length : data[i + 1] = data[i + 1] ^ k1
+    if i + 2 < length : data[i + 2] = data[i + 2] ^ k2
 }
 
 fn websocket_close_socket(con: net.TcpConnection) {
@@ -593,7 +688,7 @@ fn websocket_header_has_token(value: String, token: String) bool {
     return false
 }
 
-fn websocket_client_request(u: url.Url, port: u16, is_tls: bool, key: String, options: ?Options) String !WebSocketError {
+fn websocket_client_request(u: url.Url, port: u16, is_tls: bool, key: String, options: ?Options, deflate_offer: String) String !WebSocketError {
     let out = ByteBuffer.new(512)
     let path = u.path.bytes == 0 ? "/" : u.path
     if u.query.bytes > 0 : path = path + "?" + u.query
@@ -609,6 +704,11 @@ fn websocket_client_request(u: url.Url, port: u16, is_tls: bool, key: String, op
     out.write("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ")
     out.write(key)
     out.write("\r\nSec-WebSocket-Version: 13\r\n")
+    if deflate_offer.bytes > 0 {
+        out.write("Sec-WebSocket-Extensions: ")
+        out.write(deflate_offer)
+        out.write("\r\n")
+    }
     if isset(options) {
         let headers = options.headers
         if isset(headers) {
@@ -697,4 +797,90 @@ fn websocket_utf8_is_valid(data: local &[u8]) bool {
         i += need + 1
     }
     return true
+}
+
+// ---- permessage-deflate (RFC 7692) ---------------------------------------------------
+
+// The parameters of one permessage-deflate offer or response; window bits are 0 when absent
+class WebSocketDeflateParams {
+    server_no_takeover: bool (false)
+    client_no_takeover: bool (false)
+    server_bits: uint (0)
+    client_bits: uint (0)
+    // `client_max_window_bits` appeared, maybe without a value
+    client_bits_given: bool (false)
+}
+
+// Parses `extension` ("permessage-deflate; ..."); null for a repeated, unknown or
+// malformed parameter
+fn websocket_deflate_params(extension: String) ?WebSocketDeflateParams {
+    let params = WebSocketDeflateParams {}
+    each extension.split(";") as part, i {
+        if i == 0 : continue
+        let eq = part.index_of("=") !? part.bytes
+        let name = part.range(0, eq).trim(" ")
+        let has_value = eq < part.bytes
+        let value = has_value ? part.range(eq + 1, part.bytes - eq - 1).trim(" ") : ""
+        if value.bytes >= 2 && value.starts_with("\"") && value.ends_with("\"") : value = value.range(1, value.bytes - 2)
+        if name == "server_no_context_takeover" {
+            if has_value || params.server_no_takeover : return null
+            params.server_no_takeover = true
+        } else if name == "client_no_context_takeover" {
+            if has_value || params.client_no_takeover : return null
+            params.client_no_takeover = true
+        } else if name == "server_max_window_bits" {
+            if params.server_bits > 0 : return null
+            params.server_bits = websocket_window_bits(value)
+            if params.server_bits == 0 : return null
+        } else if name == "client_max_window_bits" {
+            if params.client_bits_given : return null
+            params.client_bits_given = true
+            if has_value {
+                params.client_bits = websocket_window_bits(value)
+                if params.client_bits == 0 : return null
+            }
+        } else {
+            return null
+        }
+    }
+    return params
+}
+
+// A window bits value, 8 to 15 without leading zeros; 0 when invalid
+fn websocket_window_bits(value: String) uint {
+    if value.bytes == 0 || value.bytes > 2 || value.starts_with("0") : return 0
+    let bits = value.to_uint() !? 0
+    return bits >= 8 && bits <= 15 ? bits : 0
+}
+
+// Accepts the first permessage-deflate offer in `request` that can be honoured, adding
+// the answer to `response`; returns the window bits for messages sent, 0 when none fits.
+// The answer asks for no context takeover both ways, so no connection keeps a compression
+// or decompression window
+fn websocket_deflate_accept(request: Headers, response: Headers) uint {
+    each request.get_all("sec-websocket-extensions") as value {
+        each value.split(",") as offer {
+            if !offer.split(";")[0].trim(" ").equals_ignore_ascii_case("permessage-deflate") : continue
+            let params = websocket_deflate_params(offer) ?! continue
+            let answer = "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+            let bits: uint = 15
+            if params.server_bits > 0 {
+                bits = params.server_bits
+                answer += "; server_max_window_bits=" + bits
+            }
+            response.set("Sec-WebSocket-Extensions", answer)
+            return bits
+        }
+    }
+    return 0
+}
+
+// The client's permessage-deflate offer, or "" when it makes none
+fn websocket_deflate_offer(options: ?Options) String {
+    if isset(options) {
+        if !options.websocket_compression : return ""
+        // A request that offers its own extensions is sent as it is
+        if websocket_offered(options, "sec-websocket-extensions").bytes > 0 : return ""
+    }
+    return "permessage-deflate; client_no_context_takeover; client_max_window_bits"
 }

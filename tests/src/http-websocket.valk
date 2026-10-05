@@ -3,6 +3,7 @@ use valk.net
 use valk.time
 use valk.sync
 use valk.crypto
+use valk.compress
 
 global ws_last_close_code: u16 (0)
 global ws_last_close_reason: String ("")
@@ -80,9 +81,9 @@ fn ws_echo_handler(req: http.Request) http.Response {
     return http.Response.text("plain " + req.path)
 }
 
-fn ws_frame(opcode: u8, payload: String, mask: bool, fin: bool (true)) String {
+fn ws_frame(opcode: u8, payload: String, mask: bool, fin: bool (true), rsv: u8 (0)) String {
     let out = ByteBuffer.new(payload.bytes + 8)
-    out.write_byte((fin ? 0x80 : 0) | opcode)
+    out.write_byte((fin ? 0x80 : 0) | rsv | opcode)
     let mask_bit: u8 = mask ? 0x80 : 0
     if payload.bytes < 126 {
         out.write_byte(mask_bit | payload.bytes.to(u8))
@@ -314,6 +315,13 @@ test "WebSocket: fast handler upgrade, handshake failures and shutdown interrupt
     }
     assert(ws.close_code == 1000)
 
+    // The fast handler negotiates compression too
+    let raw = ws_raw_offer(19497, "/ws", "permessage-deflate; client_max_window_bits")
+    assert(ws_header_line(raw.head, "sec-websocket-extensions") == "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
+    raw.con.write(ws_frame(1, compress.deflate("compressed"), true, true, 0x40)) !!
+    assert(ws_raw_frame(raw) == "\x81fast:compressed")
+    raw.con.close() !!
+
     // Not an upgrade: the fast handler answers 400
     let bad = http.get("http://127.0.0.1:19497/ws") !!
     assert(bad.status == 400)
@@ -428,7 +436,15 @@ fn ws_fake_connect(port: u16, extra: String, offered: ?http.Headers) bool {
 test "WebSocket: a client refuses a subprotocol or extension it did not offer" {
     assert(ws_fake_connect(19576, "", null))
     assert(!ws_fake_connect(19577, "Sec-WebSocket-Protocol: chat\r\n", null))
-    assert(!ws_fake_connect(19578, "Sec-WebSocket-Extensions: permessage-deflate\r\n", null))
+    assert(!ws_fake_connect(19578, "Sec-WebSocket-Extensions: x-webkit-deflate-frame\r\n", null))
+    let no_offer = http.Options { websocket_compression: false }
+    let listener = net.tcp_server("127.0.0.1", 19590) !!
+    let serving = co ws_fake_server(listener, "Sec-WebSocket-Extensions: permessage-deflate\r\n")
+    let refused = false
+    http.WebSocket.connect("ws://127.0.0.1:19590/", no_offer) ! { refused = error_is(E.code, handshake) }
+    assert(refused)
+    await serving
+    listener.close() _
     let offered = http.Headers.new()
     offered.set("Sec-WebSocket-Protocol", "superchat, chat")
     assert(ws_fake_connect(19579, "Sec-WebSocket-Protocol: chat\r\n", offered))
@@ -446,4 +462,341 @@ test "WebSocket: close refuses a code a close frame may not carry" {
     ws.close(1000, "", 100) _
     await serving
     listener.close() _
+}
+
+// ---- permessage-deflate ----------------------------------------------------------------
+
+global ws_deflate_server_saw_close: u16 (0)
+
+fn ws_deflate_handler(req: http.Request) http.Response {
+    if req.path == "/off" {
+        return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+            let msg = ws.read() ! return
+            ws.write(msg.data) ! return
+        }, false)
+    }
+    let small = req.path == "/small"
+    return http.WebSocket.upgrade(req, fn(ws: http.WebSocket) {
+        if small : ws.max_message_size = 1000
+        while true {
+            let msg = ws.read() ! {
+                if small : ws_deflate_server_saw_close = ws.close_code
+                break
+            }
+            if msg.is_text : ws.write(msg.data) ! break
+            else : ws.write_binary(msg.data) ! break
+        }
+    })
+}
+
+class WsRaw {
+    con: net.TcpConnection
+    head: String
+    input: ByteBuffer (ByteBuffer.new(256))
+}
+
+// Completes the handshake by hand, offering `extensions` when not empty
+fn ws_raw_offer(port: u16, path: String, extensions: String) WsRaw {
+    let con = net.tcp_client("127.0.0.1", port) !!
+    let offer = extensions.bytes > 0 ? "Sec-WebSocket-Extensions: " + extensions + "\r\n" : ""
+    con.write("GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n" + offer + "\r\n") !!
+    let raw = WsRaw { con: con, head: "" }
+    let buf = [u8]{ 0 x 4096 }
+    while true {
+        let bytes = con.read(buf) !!
+        raw.input.write(buf.view(0, bytes))
+        let end = raw.input.to_string().index_of("\r\n\r\n") ! continue
+        raw.head = raw.input.to_string().range(0, end + 4)
+        raw.input.clear_until(end + 4)
+        break
+    }
+    assert(raw.head.starts_with("HTTP/1.1 101 "))
+    return raw
+}
+
+// Reads one server frame; returns its first byte followed by the payload
+fn ws_raw_frame(raw: WsRaw) String {
+    let buf = [u8]{ 0 x 4096 }
+    while true {
+        let input = raw.input
+        if input.length >= 2 {
+            let length = (input.get(1) & 0x7f).to(uint)
+            let header: uint = 2
+            if length == 126 {
+                length = (input.get(2).to(uint) << 8) | input.get(3).to(uint)
+                header = 4
+            }
+            if input.length >= header + length {
+                let frame = input.range(0, 1) + input.range(header, length)
+                input.clear_until(header + length)
+                return frame
+            }
+        }
+        let bytes = raw.con.read(buf) !!
+        input.write(buf.view(0, bytes))
+    }
+}
+
+fn ws_header_line(head: String, name: String) String {
+    each head.split("\r\n") as line {
+        if line.lower().starts_with(name + ":") : return line.range(name.bytes + 1, line.bytes - name.bytes - 1).trim(" ")
+    }
+    return ""
+}
+
+// A message with a non-final stored block and a sync flush, tail removed
+fn ws_stored_message(text: String) String {
+    let out = ByteBuffer.new(text.bytes + 8)
+    out.write_byte(0)
+    out.write_u16_le(text.bytes.to(u16))
+    out.write_u16_le((text.bytes ^ 0xffff).to(u16))
+    out.write(text)
+    out.write_byte(0)
+    return out.to_string()
+}
+
+test "WebSocket: permessage-deflate between the client and the server" {
+    let server = http.Server.new("127.0.0.1", 19591, ws_deflate_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let repeated = "".pad_right('a', 5000) + "{\"name\":\"value\",\"list\":[1,2,3]}".pad_right('z', 300)
+    let random = crypto.random_bytes(3000)
+    let big = ByteBuffer.new(300_000)
+    while big.length < 300_000 : big.write("line " + big.length + " of a long log message\n")
+
+    // Default on both sides, then off on the client, the endpoint and the server
+    let urls = Array[String]{ "ws://127.0.0.1:19591/echo", "ws://127.0.0.1:19591/echo", "ws://127.0.0.1:19591/off" }
+    each urls as url, i {
+        let options = http.Options { websocket_compression: i != 1 }
+        let ws = http.WebSocket.connect(url, options) !!
+        let rounds: uint = i == 2 ? 1 : 3
+        let r: uint = 0
+        while r < rounds {
+            ws.write(repeated) !!
+            assert((ws.read() !!).data == repeated)
+            if i == 2 : break
+            ws.write("tiny") !!
+            assert((ws.read() !!).data == "tiny")
+            ws.write_binary(random) !!
+            assert((ws.read() !!).data == random)
+            ws.write(big) !!
+            let out = ByteBuffer.new(300_000)
+            ws.read_into(out) !!
+            assert(out.to_string() == big.to_string())
+            ws.write("héllo 🎉 ".pad_right('!', 100)) !!
+            assert((ws.read() !!).data == "héllo 🎉 ".pad_right('!', 100))
+            ws.write("") !!
+            assert((ws.read() !!).data == "")
+            r++
+        }
+        ws.close() !!
+    }
+
+    // A compressed message over the limit closes with 1009 after decompressing 1000 bytes
+    let small = http.WebSocket.connect("ws://127.0.0.1:19591/small") !!
+    small.write("".pad_right('x', 900)) !!
+    assert((small.read() !!).data.bytes == 900)
+    small.write("".pad_right('x', 1_000_000)) !!
+    small.read() ! {
+        assert(error_is(E.code, closed))
+    }
+    assert(small.close_code == 1009)
+    time.sleep_ms(20)
+    assert(ws_deflate_server_saw_close == 1009)
+
+    server.request_shutdown(1000)
+    await running !!
+
+    // Off server-wide
+    let plain = http.Server.new("127.0.0.1", 19592, ws_deflate_handler)
+    plain.websocket_compression = false
+    let plain_running = co plain.start(1)
+    time.sleep_ms(20)
+    let raw = ws_raw_offer(19592, "/echo", "permessage-deflate; client_max_window_bits")
+    assert(ws_header_line(raw.head, "sec-websocket-extensions") == "")
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19592/echo") !!
+    ws.write(repeated) !!
+    assert((ws.read() !!).data == repeated)
+    ws.close() !!
+    raw.con.close() !!
+    plain.request_shutdown(1000)
+    await plain_running !!
+}
+
+test "WebSocket: permessage-deflate negotiation and frames on the wire" {
+    let server = http.Server.new("127.0.0.1", 19593, ws_deflate_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    // The removed tail, then an empty final block so `inflate` sees the end
+    let tail = "\x00\x00\xff\xff\x03\x00"
+
+    // A browser's offer is accepted without context takeover either way
+    let raw = ws_raw_offer(19593, "/echo", "permessage-deflate; client_max_window_bits")
+    assert(ws_header_line(raw.head, "sec-websocket-extensions") == "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
+
+    // Compressed messages: a final block, and a stored block with a sync flush
+    let text = "".pad_right('w', 200) + " compressed"
+    let packed = compress.deflate(text)
+    raw.con.write(ws_frame(1, packed, true, true, 0x40)) !!
+    let frame = ws_raw_frame(raw)
+    assert(frame[0] == 0xc1)
+    assert((compress.inflate(frame.range(1, frame.bytes - 1) + tail) !!) == text)
+    raw.con.write(ws_frame(1, ws_stored_message("stored hello"), true, true, 0x40)) !!
+    frame = ws_raw_frame(raw)
+    // Short replies go uncompressed
+    assert(frame == "\x81stored hello")
+
+    // A fragmented compressed message: RSV1 on the first frame only
+    let sync = ws_stored_message("".pad_right('f', 150))
+    raw.con.write(ws_frame(1, sync.range(0, 10), true, false, 0x40)) !!
+    raw.con.write(ws_frame(0, sync.range(10, 100), true, false)) !!
+    raw.con.write(ws_frame(0, sync.range(110, sync.bytes - 110), true, true)) !!
+    frame = ws_raw_frame(raw)
+    assert(frame[0] == 0xc1)
+    assert((compress.inflate(frame.range(1, frame.bytes - 1) + tail) !!) == "".pad_right('f', 150))
+
+    // Incompressible data goes uncompressed
+    let noise = crypto.random_bytes(500)
+    raw.con.write(ws_frame(2, noise, true)) !!
+    frame = ws_raw_frame(raw)
+    assert(frame[0] == 0x82 && frame.range(1, 500) == noise)
+
+    // Control frames are never compressed
+    raw.con.write(ws_frame(9, "p", true, true, 0x40)) !!
+    assert(ws_read_close_code(raw.con) == 1002)
+    raw.con.close() !!
+
+    // RSV1 on a continuation frame
+    raw = ws_raw_offer(19593, "/echo", "permessage-deflate")
+    raw.con.write(ws_frame(1, sync.range(0, 10), true, false, 0x40)) !!
+    raw.con.write(ws_frame(0, sync.range(10, sync.bytes - 10), true, true, 0x40)) !!
+    assert(ws_read_close_code(raw.con) == 1002)
+    raw.con.close() !!
+
+    // RSV1 without the extension
+    raw = ws_raw_offer(19593, "/echo", "")
+    assert(ws_header_line(raw.head, "sec-websocket-extensions") == "")
+    raw.con.write(ws_frame(1, packed, true, true, 0x40)) !!
+    assert(ws_read_close_code(raw.con) == 1002)
+    raw.con.close() !!
+
+    // Broken compressed data closes with 1007, a decompression bomb with 1009
+    raw = ws_raw_offer(19593, "/echo", "permessage-deflate")
+    raw.con.write(ws_frame(1, "\xff\xff\xff\xff", true, true, 0x40)) !!
+    assert(ws_read_close_code(raw.con) == 1007)
+    raw.con.close() !!
+    raw = ws_raw_offer(19593, "/small", "permessage-deflate")
+    let bomb = compress.deflate("".pad_right('b', 2_000_000), 9)
+    assert(bomb.bytes < 65536)
+    raw.con.write(ws_frame(2, bomb, true, true, 0x40)) !!
+    assert(ws_read_close_code(raw.con) == 1009)
+    raw.con.close() !!
+
+    // A message that refers to an earlier one breaks client_no_context_takeover
+    raw = ws_raw_offer(19593, "/echo", "permessage-deflate")
+    raw.con.write(ws_frame(1, "\x2a\xc9\x48\x55\x28\x2c\xcd\x4c\xce\x56\x48\x2a\xca\x2f\xcf\x53\x48\xcb\xaf\x50\xc8\x2a\xcd\x2d\x28\x56\xc8\x2f\x4b\x2d\x52\x28\xc9\x48\x55\xc8\x49\xac\xaa\x54\x48\xc9\x4f\x07\x00", true, true, 0x40)) !!
+    frame = ws_raw_frame(raw)
+    assert(frame == "\x81the quick brown fox jumps over the lazy dog")
+    raw.con.write(ws_frame(1, "\x02\xb1\x89\x51\x9a\x9c\x58\x02\x00", true, true, 0x40)) !!
+    assert(ws_read_close_code(raw.con) == 1007)
+    raw.con.close() !!
+
+    // Offers: the first acceptable one wins; a window limit is echoed; bad ones are declined
+    raw = ws_raw_offer(19593, "/echo", "permessage-deflate; unknown=1, permessage-deflate; server_max_window_bits=10; server_no_context_takeover")
+    assert(ws_header_line(raw.head, "sec-websocket-extensions") == "permessage-deflate; server_no_context_takeover; client_no_context_takeover; server_max_window_bits=10")
+    let spread = Array[String].new()
+    let i: uint = 0
+    while i < 100 {
+        spread.append("item-" + (i * 7919 % 1000))
+        i++
+    }
+    let wide = spread.join(" ") + " " + spread.join(" ")
+    raw.con.write(ws_frame(1, wide, true)) !!
+    frame = ws_raw_frame(raw)
+    assert(frame[0] == 0xc1)
+    assert((compress.inflate(frame.range(1, frame.bytes - 1) + tail) !!) == wide)
+    raw.con.close() !!
+    each Array[String]{ "permessage-deflate; server_max_window_bits=16", "permessage-deflate; server_max_window_bits", "permessage-deflate; client_max_window_bits=7", "permessage-deflate; server_no_context_takeover; server_no_context_takeover", "x-webkit-deflate-frame" } as offer {
+        raw = ws_raw_offer(19593, "/echo", offer)
+        assert(ws_header_line(raw.head, "sec-websocket-extensions") == "")
+        raw.con.close() !!
+    }
+    // The endpoint can turn it off
+    raw = ws_raw_offer(19593, "/off", "permessage-deflate")
+    assert(ws_header_line(raw.head, "sec-websocket-extensions") == "")
+    raw.con.close() !!
+
+    server.request_shutdown(1000)
+    await running !!
+}
+
+// Accepts permessage-deflate with `params`, sends `frames`, then reads one client frame
+// and answers with its first byte and the decompressed payload as a text frame
+fn ws_deflate_fake_server(listener: shared net.TcpServer, params: String, frames: String) {
+    let con = listener.accept(3000) ! return
+    let input = ByteBuffer.new(1024)
+    let buf = [u8]{ 0 x 2048 }
+    let head_end: uint = 0
+    while true {
+        let n = con.read(buf) ! return
+        if n == 0 : return
+        input.write(buf.view(0, n))
+        head_end = input.to_string().index_of("\r\n\r\n") ! continue
+        break
+    }
+    let request = input.to_string().range(0, head_end)
+    input.clear_until(head_end + 4)
+    let key = ws_header_line(request, "sec-websocket-key")
+    let offer = ws_header_line(request, "sec-websocket-extensions")
+    let accept = crypto.base64_encode(crypto.hash(crypto.HashAlgorithm.sha1, key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+    con.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\nSec-WebSocket-Extensions: permessage-deflate" + params + "\r\n\r\n") _
+    con.write(frames) _
+    // One masked client frame, short length
+    while input.length < 6 || input.length < 6 + (input.get(1) & 0x7f).to(uint) {
+        let n = con.read(buf) ! return
+        if n == 0 : return
+        input.write(buf.view(0, n))
+    }
+    let length = (input.get(1) & 0x7f).to(uint)
+    let payload = ByteBuffer.new(length + 4)
+    let i: uint = 0
+    while i < length {
+        payload.write_byte(input.get(6 + i) ^ input.get(2 + i % 4))
+        i++
+    }
+    payload.write("\x00\x00\xff\xff\x03\x00")
+    let text = compress.inflate(payload) !? "invalid"
+    let reply = (input.get(0) == 0xc1 ? "rsv1 " : "plain ") + offer + " " + text
+    con.write(ws_frame(1, reply, false)) _
+    time.sleep_ms(200)
+    con.close() _
+}
+
+test "WebSocket: the client decompresses with context takeover and compresses its messages" {
+    let listener = net.tcp_server("127.0.0.1", 19594) !!
+    let first = ws_frame(1, "\x2a\xc9\x48\x55\x28\x2c\xcd\x4c\xce\x56\x48\x2a\xca\x2f\xcf\x53\x48\xcb\xaf\x50\xc8\x2a\xcd\x2d\x28\x56\xc8\x2f\x4b\x2d\x52\x28\xc9\x48\x55\xc8\x49\xac\xaa\x54\x48\xc9\x4f\x07\x00", false, true, 0x40)
+    let second = ws_frame(1, "\x02\xb1\x89\x51\x9a\x9c\x58\x02\x00", false, true, 0x40)
+    let serving = co ws_deflate_fake_server(listener, "; client_max_window_bits=9", first + second)
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19594/") !!
+    assert((ws.read() !!).data == "the quick brown fox jumps over the lazy dog")
+    assert((ws.read() !!).data == "the quick brown fox jumps over the lazy cat")
+    let text = "".pad_right('c', 90)
+    ws.write(text) !!
+    assert((ws.read() !!).data == "rsv1 permessage-deflate; client_no_context_takeover; client_max_window_bits " + text)
+    await serving
+    listener.close() _
+
+    // A response with parameters the client cannot accept fails the handshake
+    let bad = Array[String]{ "; client_max_window_bits", "; server_max_window_bits=20", "; mystery", "; server_no_context_takeover=1", ", permessage-deflate" }
+    each bad as params, i {
+        let port = (19595 + i).to(u16)
+        let fake = net.tcp_server("127.0.0.1", port) !!
+        let fake_serving = co ws_deflate_fake_server(fake, params, "")
+        let refused = false
+        http.WebSocket.connect("ws://127.0.0.1:" + port + "/") ! { refused = error_is(E.code, handshake) }
+        assert(refused)
+        await fake_serving
+        fake.close() _
+    }
 }
