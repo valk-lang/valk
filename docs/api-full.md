@@ -11667,7 +11667,7 @@ Creates a `text/plain; charset=utf-8` response.
     // Responds with status `code` and a body streamed from `reader`.
     + fn send_stream(reader: Reader, size: ?uint, content_type: String ("application/octet-stream"), filename: ?String (null), headers: ?Headers (null), code: u16 (200)) void
     // Answers with the WebSocket upgrade and runs `handler` on the connection once the response is sent; the fast-handler form of `WebSocket.upgrade`.
-    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: ?bool (null)) void
+    + fn send_websocket(context: Context, handler: fn(WebSocket)(), compression: ?bool (null), protocol: ?String (null), headers: ?Headers (null)) void
 }
 ```
 
@@ -11737,7 +11737,8 @@ response is sent; the fast-handler form of `WebSocket.upgrade`.
 
 A request that is not a valid WebSocket upgrade gets a `400` response and the
 handler never runs. `compression` accepts or declines permessage-deflate for this
-endpoint; null follows `Server.websocket_compression`.
+endpoint; null follows `Server.websocket_compression`. `protocol` and `headers`
+work as in `WebSocket.upgrade`.
 
 ```js
 // A route found by `Router.find`: the handler plus the positions of its `@name` parts.
@@ -12104,6 +12105,8 @@ cannot be read.
     ~ close_reason: String
     // The largest message accepted, in bytes (after decompression); a larger one closes the connection with code 1009. Defaults to 16 MB.
     + max_message_size: uint
+    // The subprotocol agreed in the handshake (`Sec-WebSocket-Protocol`), or "" for none.
+    ~ protocol: String
 
     // Performs the closing handshake and closes the socket.
     + fn close(code: u16 (1000), reason: String (""), timeout_ms: uint (1000)) void !WebSocketError
@@ -12124,7 +12127,7 @@ cannot be read.
     // Sets the socket timeouts in milliseconds; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
-    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: ?bool (null)) Response
+    + static fn upgrade(req: Request, handler: fn(WebSocket)(), compression: ?bool (null), protocol: ?String (null), headers: ?Headers (null)) Response
     // Sends `text` as one text message; the bytes must be UTF-8.
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.
@@ -12165,6 +12168,10 @@ The close reason that came with `close_code`.
 
 The largest message accepted, in bytes (after decompression); a larger one closes
 the connection with code 1009. Defaults to 16 MB.
+
+#### protocol
+
+The subprotocol agreed in the handshake (`Sec-WebSocket-Protocol`), or "" for none.
 
 #### close
 
@@ -12241,6 +12248,11 @@ fails with `closed`. Not available over HTTP/2.
 
 When the client offers permessage-deflate (RFC 7692), `compression` accepts or
 declines it for this endpoint; null follows `Server.websocket_compression` (off).
+
+`protocol` is the subprotocol to answer with: it is sent back in
+`Sec-WebSocket-Protocol` when the client offered it, and left out otherwise (see
+`WebSocket.protocol`). `headers` adds response fields such as `Set-Cookie`; fields
+the handshake sets itself are ignored there.
 
 #### write
 

@@ -2660,6 +2660,15 @@ or per endpoint with `WebSocket.upgrade(req, handler, true)`. Compression saves
 bandwidth but costs CPU per message, so it is off on the server by default. Turn
 the client's offer off with `http.Options { websocket_compression: false }`.
 
+A server picks a subprotocol with `protocol:`; it is sent back when the client
+offered it (in `Sec-WebSocket-Protocol`), and `ws.protocol` tells both sides
+what was agreed. `headers:` adds response fields such as cookies:
+
+```rust
+return http.WebSocket.upgrade(req, handler, protocol: "chat.v2", headers: http.Headers { "Set-Cookie" => "session=1" })
+res.send_websocket(ctx, handler, protocol: "chat.v2") // the same for fast handlers
+```
+
 ## Sockets
 
 API for [valk.net](api.md#net)
