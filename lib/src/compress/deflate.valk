@@ -2,55 +2,120 @@ use io
 use mem
 
 // DEFLATE encoding (RFC 1951): LZ77 matching over a 32 KiB window with
-// hash chains, then one Huffman block per 64K symbols using whichever of
-// stored, fixed or dynamic codes is smallest
+// hash chains (greedy for levels 1-3, lazy for 4-9 as in zlib), then one
+// Huffman block per block of symbols using whichever of stored, fixed or
+// dynamic codes is smallest
 
 value deflate_window (32768)
+value deflate_window_mask (32767)
 value deflate_hash_bits (15)
-value deflate_hash_size (32768)
-value deflate_min_match (3)
+value deflate_min_match (4)
 value deflate_max_match (258)
 value deflate_block_symbols (65000)
 value deflate_end_of_block (256)
 
-// Per-level search effort: how many chain entries are tried, and the match
-// length at which searching stops early
-global deflate_max_chain: [u16 x 10] ({ 0, 4, 8, 16, 32, 64, 128, 256, 512, 1024 })
-global deflate_nice_length: [u16 x 10] ({ 0, 16, 32, 32, 64, 128, 258, 258, 258, 258 })
+// zlib's per-level search parameters: a match of `good` bytes cuts the chain
+// search to a quarter, matches of `lazy` bytes are not improved on (levels 1-3:
+// longer matches skip hashing their bytes), `nice` stops the search and
+// `chain` limits the chain entries tried
+global deflate_good: [u16 x 10] ({ 0, 4, 4, 4, 4, 8, 8, 8, 32, 32 })
+global deflate_lazy: [u16 x 10] ({ 0, 4, 5, 6, 4, 16, 16, 32, 128, 258 })
+global deflate_nice: [u16 x 10] ({ 0, 8, 16, 32, 16, 32, 128, 128, 258, 258 })
+global deflate_chain: [u16 x 10] ({ 0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096 })
+
+// Symbol of each match length - 3, and of each distance - 1 (below 256) or
+// 256 + ((distance - 1) >> 7)
+global deflate_length_code: [u8 x 256] ({ 0... })
+global deflate_dist_code: [u8 x 512] ({ 0... })
+global deflate_tables_ready: bool (false)
+
+fn deflate_init_tables() {
+    @unsafe
+    let code: uint = 0
+    while code < 29 {
+        let base = length_base[code].to(uint) - 3
+        let n: uint = 1 << length_extra[code].to(uint)
+        let i: uint = 0
+        while i < n && base + i < 256 {
+            deflate_length_code[base + i] = code.to(u8)
+            i++
+        }
+        code++
+    }
+    code = 0
+    while code < 30 {
+        let d = dist_base[code].to(uint) - 1
+        let end = d + (1 << dist_extra[code].to(uint))
+        while d < end {
+            let index = d < 256 ? d : 256 + (d >> 7)
+            deflate_dist_code[index] = code.to(u8)
+            d++
+        }
+        code++
+    }
+    deflate_tables_ready = true
+}
+
+fn deflate_dist_symbol(distance: uint) uint $inline {
+    @unsafe
+    let d = distance - 1
+    if d < 256 : return deflate_dist_code[d].to(uint)
+    return deflate_dist_code[256 + (d >> 7)].to(uint)
+}
+
+// Adds `pos` to its hash chain and returns the previous head (position + 1)
+fn deflate_insert(data: ptr, head: ptr, prev: ptr, shift: uint, pos: uint) uint $inline {
+    @unsafe
+    let h = ((@ptrv(data.@offset(pos), u32).to(uint) * 2654435761) & 0xffffffff) >> shift
+    let first = @ptrv(head, u32, h)
+    // The distance back to the previous position, 0 when none is in reach
+    let d = pos + 1 - first.to(uint)
+    @ptrv(prev, u16, pos & deflate_window_mask) = (first == 0 || d > deflate_window) ? 0 : d.to(u16)
+    @ptrv(head, u32, h) = (pos + 1).to(u32)
+    return first.to(uint)
+}
+
+// Records a match as symbol `n`
+fn deflate_tally_match(symbols: ptr, n: uint, lit_freq: ptr, dist_freq: ptr, length: uint, distance: uint) $inline {
+    @unsafe
+    @ptrv(symbols, u32, n) = ((1 << 31) | (length << 16) | distance).to(u32)
+    let ls = 257 + deflate_length_code[length - 3].to(uint)
+    @ptrv(lit_freq, u32, ls) = @ptrv(lit_freq, u32, ls) + 1
+    let ds = deflate_dist_symbol(distance)
+    @ptrv(dist_freq, u32, ds) = @ptrv(dist_freq, u32, ds) + 1
+}
 
 /// The compression level used when none is given, a balance of speed and size.
 + value COMPRESS_DEFAULT_LEVEL (6)
 
-// Writes bits least significant first into a ByteBuffer
+// Writes bits least significant first into a ByteBuffer; `bit_count` stays
+// below 32 between calls
 struct BitWriter {
     out: ByteBuffer
     bit_buf: uint (0)
     bit_count: uint (0)
 
+    // `value` must fit in `count` bits, at most 32
     fn put_bits(value: uint, count: uint) {
         @unsafe
         this.bit_buf = this.bit_buf | (value << this.bit_count)
         this.bit_count += count
-        while this.bit_count >= 8 {
-            this.out.write_byte((this.bit_buf & 0xff).to(u8))
-            this.bit_buf = this.bit_buf >> 8
-            this.bit_count -= 8
+        if this.bit_count >= 32 {
+            this.out.write_u32_le((this.bit_buf & 0xffffffff).to(u32))
+            this.bit_buf = this.bit_buf >> 32
+            this.bit_count -= 32
         }
     }
 
-    // Huffman codes are stored most significant bit first
-    fn put_code(code: uint, length: uint) {
-        @unsafe
-        this.put_bits(reverse_bits(code, length), length)
-    }
-
+    // Pads to a byte boundary and writes the buffered bytes
     fn flush() {
         @unsafe
-        if this.bit_count > 0 {
+        while this.bit_count > 0 {
             this.out.write_byte((this.bit_buf & 0xff).to(u8))
+            this.bit_buf = this.bit_buf >> 8
+            this.bit_count = this.bit_count > 8 ? this.bit_count - 8 : 0
         }
         this.bit_buf = 0
-        this.bit_count = 0
     }
 }
 
@@ -181,7 +246,8 @@ struct Codes {
         }
     }
 
-    // Canonical codes from the lengths
+    // Canonical codes from the lengths, bit-reversed: the stream stores
+    // Huffman codes most significant bit first
     fn assign_codes(n: uint) {
         @unsafe
         let count = [uint x 16]{ 0... }
@@ -204,7 +270,7 @@ struct Codes {
         while i < n {
             let l = this.lengths[i].to(uint)
             if l != 0 {
-                this.codes[i] = next[l].to(u16)
+                this.codes[i] = reverse_bits(next[l], l).to(u16)
                 next[l] = next[l] + 1
             }
             i++
@@ -212,29 +278,22 @@ struct Codes {
     }
 }
 
-// Length and distance symbols with their extra bits
-fn length_symbol(length: uint) uint {
-    @unsafe
-    let i: uint = 28
-    while length_base[i].to(uint) > length : i--
-    return i
-}
-
-fn dist_symbol(distance: uint) uint {
-    @unsafe
-    let i: uint = 29
-    while dist_base[i].to(uint) > distance : i--
-    return i
-}
-
 // Compresses a buffer whose first `history` bytes were already emitted (they
 // only serve as match sources)
 class Deflater {
     level: uint
-    // Hash chains: head per hash, previous position per window slot (both
-    // store position + 1; 0 is empty)
-    head: ptr (mem.calloc(deflate_hash_size * 4))
-    prev: ptr (mem.calloc(deflate_window * 4))
+    good: uint (0)
+    lazy: uint (0)
+    nice: uint (0)
+    max_chain: uint (0)
+    // Hash chains: the last position + 1 per hash (0 is empty), and per
+    // window slot the u16 distance to the previous position with the same
+    // hash (0 is none). Only the first 1 << (32 - hash_shift) heads are used
+    head: ptr (mem.calloc((1 << deflate_hash_bits) * 4))
+    prev: ptr (mem.calloc(deflate_window * 2))
+    hash_shift: uint (32 - deflate_hash_bits)
+    // Positions before this one are in the hash chains
+    hashed: uint (0)
     // Block symbols: literal < 256, or (1 << 31) | (length << 16) | distance
     symbols: ptr (mem.calloc(deflate_block_symbols * 4))
     symbol_count: uint (0)
@@ -245,14 +304,17 @@ class Deflater {
     writer: BitWriter
     // The farthest a match may reach back
     max_distance: uint (deflate_window)
+    // Distance of the match `longest_match` found
+    match_distance: uint (0)
 
     static fn new(out: ByteBuffer, level: uint) Deflater {
         @unsafe
-        if level > 9 : level = 9
-        return Deflater {
-            level: level
+        let d = Deflater {
+            level: 0
             writer: BitWriter { out: out }
         }
+        d.set_level(level)
+        return d
     }
 
     fn gc_free() {
@@ -264,129 +326,237 @@ class Deflater {
         mem.free(this.dist_freq)
     }
 
-    fn reset_chains() {
+    fn set_level(level: uint) {
         @unsafe
-        mem.clear_bytes(this.head, deflate_hash_size * 4)
-        mem.clear_bytes(this.prev, deflate_window * 4)
+        if level > 9 : level = 9
+        this.level = level
+        this.good = deflate_good[level].to(uint)
+        this.lazy = deflate_lazy[level].to(uint)
+        this.nice = deflate_nice[level].to(uint)
+        this.max_chain = deflate_chain[level].to(uint)
     }
 
-    // Empties the hash chains after data[0..length) was compressed; cheaper than
-    // `reset_chains` for short inputs. Chains start at `head`, so emptying the
-    // heads these positions used is enough
-    fn forget(data: ptr, length: uint) {
+    // Empties the hash chains for new input of `length` bytes (uint.$max when
+    // unknown). Short inputs use fewer heads, so less is cleared and probed.
+    // The previous-position table needs no clearing: chains start at a head
+    // and every entry they reach was written for the current input
+    fn begin(length: uint) {
         @unsafe
-        if length >= 4096 {
-            mem.clear_bytes(this.head, deflate_hash_size * 4)
-            return
+        let bits: uint = 9
+        while bits < deflate_hash_bits && (1 << bits) < length : bits++
+        this.hash_shift = 32 - bits
+        this.hashed = 0
+        if this.level > 0 : mem.clear_bytes(this.head, (1 << bits) * 4)
+    }
+
+    // Moves the hash chains `shift` bytes down, after the caller dropped that
+    // many bytes from the front of its buffer
+    fn slide(shift: uint) {
+        @unsafe
+        let s = shift.to(u32)
+        let i: uint = 0
+        let heads: uint = 1 << (32 - this.hash_shift)
+        let head = this.head
+        while i < heads {
+            let v = @ptrv(head, u32, i)
+            @ptrv(head, u32, i) = v > s ? v - s : 0
+            i++
         }
-        let pos: uint = 0
-        while pos + deflate_min_match <= length {
-            @ptrv(this.head, u32, this.hash(data, pos)) = 0
-            pos++
-        }
+        this.hashed = this.hashed > shift ? this.hashed - shift : 0
     }
 
-    fn hash(data: ptr, pos: uint) uint {
-        @unsafe
-        let v = (@ptrv(data, u8, pos).to(uint) << 16) | (@ptrv(data, u8, pos + 1).to(uint) << 8) | @ptrv(data, u8, pos + 2).to(uint)
-        return ((v * 2654435761) >> (32 - deflate_hash_bits)) & (deflate_hash_size - 1)
-    }
-
-    fn insert(data: ptr, pos: uint) {
-        @unsafe
-        let h = this.hash(data, pos)
-        @ptrv(this.prev, u32, pos & (deflate_window - 1)) = @ptrv(this.head, u32, h)
-        @ptrv(this.head, u32, h) = (pos + 1).to(u32)
-    }
-
-    // Compresses data[start..length) with data[0..start) as history. The
-    // last block is marked final when `final` is set
-    fn compress(data: ptr, length: uint, start: uint, final: bool) {
-        @unsafe
-        if this.level > 0 : this.reset_chains()
-        this.compress_range(data, length, start, final)
-    }
-
-    // `compress` without clearing the hash chains first
+    // Compresses data[start..length) with data[0..start) as history, after
+    // `begin`. The last block is marked final when `final` is set
     fn compress_range(data: ptr, length: uint, start: uint, final: bool) {
         @unsafe
         if this.level == 0 {
             this.write_stored_blocks(data, start, length, final)
             return
         }
-        let max_chain = deflate_max_chain[this.level].to(uint)
-        let nice = deflate_nice_length[this.level].to(uint)
-
+        if !deflate_tables_ready : deflate_init_tables()
         // History positions take part in matching
-        let pos: uint = 0
-        while pos + deflate_min_match <= start {
-            this.insert(data, pos)
+        let pos = this.hashed
+        while pos < start && pos + deflate_min_match <= length {
+            deflate_insert(data, this.head, this.prev, this.hash_shift, pos)
             pos++
         }
-        pos = start
+        if this.level <= 3 : this.compress_fast(data, length, start, final)
+        else : this.compress_lazy(data, length, start, final)
+        this.hashed = length >= deflate_min_match ? length - deflate_min_match + 1 : 0
+    }
+
+    // Greedy matching: each position takes the longest match found there.
+    // The hot loops keep the symbol count and tables in locals
+    fn compress_fast(data: ptr, length: uint, start: uint, final: bool) {
+        @unsafe
+        let pos = start
         let block_start = start
+        let max_insert = this.lazy
+        let head = this.head
+        let prev = this.prev
+        let shift = this.hash_shift
+        let symbols = this.symbols
+        let lit_freq = this.lit_freq
+        let dist_freq = this.dist_freq
+        let n = this.symbol_count
         while pos < length {
-            let best_length: uint = 0
-            let best_distance: uint = 0
-            if pos + deflate_min_match <= length {
-                let h = this.hash(data, pos)
-                let cur = @ptrv(this.head, u32, h).to(uint)
-                let limit = length - pos
-                if limit > deflate_max_match : limit = deflate_max_match
-                let chain = max_chain
-                while cur != 0 && chain > 0 {
-                    let candidate = cur - 1
-                    let distance = pos - candidate
-                    if distance > this.max_distance || distance == 0 : break
-                    // Compare from the end of the best match first: a
-                    // mismatch there rules the candidate out cheaply
-                    if @ptrv(data, u8, candidate + best_length) == @ptrv(data, u8, pos + best_length) {
-                        let n: uint = 0
-                        while n < limit && @ptrv(data, u8, candidate + n) == @ptrv(data, u8, pos + n) : n++
-                        if n > best_length {
-                            best_length = n
-                            best_distance = distance
-                            if n >= nice : break
-                        }
-                    }
-                    cur = @ptrv(this.prev, u32, candidate & (deflate_window - 1)).to(uint)
-                    chain--
-                }
+            let left = length - pos
+            let len: uint = 0
+            if left >= deflate_min_match {
+                let cur = deflate_insert(data, head, prev, shift, pos)
+                if cur != 0 : len = this.longest_match(data, pos, cur, deflate_min_match - 1, left > deflate_max_match ? deflate_max_match : left)
             }
-            if best_length >= deflate_min_match {
-                this.add_match(best_length, best_distance)
-                let end = pos + best_length
-                while pos < end {
-                    if pos + deflate_min_match <= length : this.insert(data, pos)
-                    pos++
+            if len != 0 {
+                deflate_tally_match(symbols, n, lit_freq, dist_freq, len, this.match_distance)
+                n++
+                let end = pos + len
+                pos++
+                if len <= max_insert {
+                    while pos < end && pos + deflate_min_match <= length {
+                        deflate_insert(data, head, prev, shift, pos)
+                        pos++
+                    }
                 }
+                pos = end
             } else {
-                this.add_literal(@ptrv(data, u8, pos))
-                if pos + deflate_min_match <= length : this.insert(data, pos)
+                let byte = @ptrv(data, u8, pos)
+                @ptrv(symbols, u32, n) = byte.to(u32)
+                n++
+                @ptrv(lit_freq, u32, byte) = @ptrv(lit_freq, u32, byte) + 1
                 pos++
             }
-            if this.symbol_count >= deflate_block_symbols {
+            if n >= deflate_block_symbols {
+                this.symbol_count = n
                 this.write_block(data, block_start, pos, false)
+                n = 0
                 block_start = pos
             }
         }
-        this.write_block(data, block_start, pos, final)
+        this.symbol_count = n
+        this.write_block(data, block_start, length, final)
     }
 
-    fn add_literal(byte: u8) {
+    // Lazy matching: a match is only taken when the next position has no
+    // longer one; otherwise its first byte becomes a literal
+    fn compress_lazy(data: ptr, length: uint, start: uint, final: bool) {
         @unsafe
-        @ptrv(this.symbols, u32, this.symbol_count++) = byte.to(u32)
-        let slot = this.lit_freq.@offset(byte.to(uint) * 4)
-        @ptrv(slot, u32) = @ptrv(slot, u32) + 1
+        let pos = start
+        let block_start = start
+        let max_lazy = this.lazy
+        let head = this.head
+        let prev = this.prev
+        let shift = this.hash_shift
+        let symbols = this.symbols
+        let lit_freq = this.lit_freq
+        let dist_freq = this.dist_freq
+        let n = this.symbol_count
+        // The match found at pos - 1, and whether that byte awaits a symbol
+        let prev_length: uint = 0
+        let prev_distance: uint = 0
+        let pending = false
+        while pos < length {
+            let left = length - pos
+            let len: uint = 0
+            if left >= deflate_min_match {
+                let cur = deflate_insert(data, head, prev, shift, pos)
+                if cur != 0 && prev_length < max_lazy {
+                    let limit = left > deflate_max_match ? deflate_max_match : left
+                    let best = prev_length < deflate_min_match ? deflate_min_match - 1 : prev_length
+                    if best < limit : len = this.longest_match(data, pos, cur, best, limit)
+                }
+            }
+            if prev_length != 0 && len == 0 {
+                deflate_tally_match(symbols, n, lit_freq, dist_freq, prev_length, prev_distance)
+                n++
+                // pos is hashed already
+                let end = pos - 1 + prev_length
+                pos++
+                while pos < end && pos + deflate_min_match <= length {
+                    deflate_insert(data, head, prev, shift, pos)
+                    pos++
+                }
+                pos = end
+                prev_length = 0
+                pending = false
+            } else {
+                if pending {
+                    let byte = @ptrv(data, u8, pos - 1)
+                    @ptrv(symbols, u32, n) = byte.to(u32)
+                    n++
+                    @ptrv(lit_freq, u32, byte) = @ptrv(lit_freq, u32, byte) + 1
+                }
+                pending = true
+                prev_length = len
+                prev_distance = this.match_distance
+                pos++
+            }
+            if n >= deflate_block_symbols {
+                let covered = pending ? pos - 1 : pos
+                this.symbol_count = n
+                this.write_block(data, block_start, covered, false)
+                n = 0
+                block_start = covered
+            }
+        }
+        if pending {
+            let byte = @ptrv(data, u8, pos - 1)
+            @ptrv(symbols, u32, n) = byte.to(u32)
+            n++
+            @ptrv(lit_freq, u32, byte) = @ptrv(lit_freq, u32, byte) + 1
+        }
+        this.symbol_count = n
+        this.write_block(data, block_start, length, final)
     }
 
-    fn add_match(length: uint, distance: uint) {
+    // The longest match at `pos` along the chain from `cur` (position + 1)
+    // that is longer than `best` and at most `limit` (> best, >= 4) bytes;
+    // 0 when there is none. Sets `match_distance`
+    fn longest_match(data: ptr, pos: uint, cur: uint, best: uint, limit: uint) uint {
         @unsafe
-        @ptrv(this.symbols, u32, this.symbol_count++) = ((1 << 31) | (length << 16) | distance).to(u32)
-        let ls = this.lit_freq.@offset((257 + length_symbol(length)) * 4)
-        @ptrv(ls, u32) = @ptrv(ls, u32) + 1
-        let ds = this.dist_freq.@offset(dist_symbol(distance) * 4)
-        @ptrv(ds, u32) = @ptrv(ds, u32) + 1
+        let chain = this.max_chain
+        if best >= this.good : chain = chain >> 2
+        let nice = this.nice
+        if nice > limit : nice = limit
+        let max_distance = this.max_distance
+        let prev = this.prev
+        let scan = data.@offset(pos)
+        let first = @ptrv(scan, u32)
+        let found: uint = 0
+        let candidate = cur - 1
+        while true {
+            let distance = pos - candidate
+            if distance > max_distance : break
+            let other = data.@offset(candidate)
+            // Checking the bytes that would make the match longer first
+            // rules most candidates out cheaply
+            if @ptrv(other.@offset(best - 3), u32) == @ptrv(scan.@offset(best - 3), u32) && @ptrv(other, u32) == first {
+                let n: uint = 4
+                while true {
+                    if n + 8 > limit {
+                        while n < limit && @ptrv(other, u8, n) == @ptrv(scan, u8, n) : n++
+                        break
+                    }
+                    let diff = @ptrv(other.@offset(n), u64) ^ @ptrv(scan.@offset(n), u64)
+                    if diff != 0 {
+                        n += diff.trailing_zeros() >> 3
+                        break
+                    }
+                    n += 8
+                }
+                if n > best {
+                    best = n
+                    found = n
+                    this.match_distance = distance
+                    if n >= nice : break
+                }
+            }
+            chain--
+            if chain == 0 : break
+            let back = @ptrv(prev, u16, candidate & deflate_window_mask).to(uint)
+            if back == 0 || back > candidate : break
+            candidate -= back
+        }
+        return found
     }
 
     fn write_stored_blocks(data: ptr, start: uint, end: uint, final: bool) {
@@ -483,28 +653,62 @@ class Deflater {
         return bits
     }
 
+    // Writes the block's symbols: bits gather in a 64-bit buffer that goes out
+    // whole into reserved space (at most 6 bytes per symbol)
     fn write_symbols() {
         @unsafe
         let count = this.symbol_count
+        let out = this.writer.out
+        out.reserve(count * 6 + 16)
+        let dst = out.data.@offset(out.length)
+        let written: uint = 0
+        let bits = this.writer.bit_buf
+        let nbits = this.writer.bit_count
+        let symbols = this.symbols
+        let lit_code = @ref(this.lit_codes.codes).@cast(ptr)
+        let lit_len = @ref(this.lit_codes.lengths).@cast(ptr)
+        let dist_code = @ref(this.dist_codes.codes).@cast(ptr)
+        let dist_len = @ref(this.dist_codes.lengths).@cast(ptr)
         let i: uint = 0
         while i < count {
-            let s = @ptrv(this.symbols, u32, i).to(uint)
+            let s = @ptrv(symbols, u32, i).to(uint)
             if s < 256 {
-                this.writer.put_code(this.lit_codes.codes[s].to(uint), this.lit_codes.lengths[s].to(uint))
+                bits = bits | (@ptrv(lit_code, u16, s).to(uint) << nbits)
+                nbits += @ptrv(lit_len, u8, s).to(uint)
             } else {
                 let length = (s >> 16) & 0x1ff
                 let distance = s & 0xffff
-                let ls = length_symbol(length)
+                let ls = deflate_length_code[length - 3].to(uint)
                 let sym = 257 + ls
-                this.writer.put_code(this.lit_codes.codes[sym].to(uint), this.lit_codes.lengths[sym].to(uint))
-                this.writer.put_bits(length - length_base[ls].to(uint), length_extra[ls].to(uint))
-                let ds = dist_symbol(distance)
-                this.writer.put_code(this.dist_codes.codes[ds].to(uint), this.dist_codes.lengths[ds].to(uint))
-                this.writer.put_bits(distance - dist_base[ds].to(uint), dist_extra[ds].to(uint))
+                bits = bits | (@ptrv(lit_code, u16, sym).to(uint) << nbits)
+                nbits += @ptrv(lit_len, u8, sym).to(uint)
+                bits = bits | ((length - length_base[ls].to(uint)) << nbits)
+                nbits += length_extra[ls].to(uint)
+                // At most 31 + 15 + 5 bits: make room for the distance
+                @ptrv(dst.@offset(written), u64) = bits.to(u64)
+                let bytes = nbits >> 3
+                written += bytes
+                bits = bits >> (bytes << 3)
+                nbits = nbits & 7
+                let ds = deflate_dist_symbol(distance)
+                bits = bits | (@ptrv(dist_code, u16, ds).to(uint) << nbits)
+                nbits += @ptrv(dist_len, u8, ds).to(uint)
+                bits = bits | ((distance - dist_base[ds].to(uint)) << nbits)
+                nbits += dist_extra[ds].to(uint)
+            }
+            if nbits >= 32 {
+                @ptrv(dst.@offset(written), u64) = bits.to(u64)
+                let bytes = nbits >> 3
+                written += bytes
+                bits = bits >> (bytes << 3)
+                nbits = nbits & 7
             }
             i++
         }
-        this.writer.put_code(this.lit_codes.codes[deflate_end_of_block].to(uint), this.lit_codes.lengths[deflate_end_of_block].to(uint))
+        out.skip(written)
+        this.writer.bit_buf = bits
+        this.writer.bit_count = nbits
+        this.writer.put_bits(this.lit_codes.codes[deflate_end_of_block].to(uint), this.lit_codes.lengths[deflate_end_of_block].to(uint))
     }
 
     // The run-length encoded code lengths of both alphabets: symbols 0-15
@@ -632,7 +836,7 @@ class Deflater {
         i = 0
         while i < count {
             let s = symbols[i].to(uint)
-            this.writer.put_code(codes.codes[s].to(uint), codes.lengths[s].to(uint))
+            this.writer.put_bits(codes.codes[s].to(uint), codes.lengths[s].to(uint))
             if s == 16 : this.writer.put_bits(extra[i].to(uint), 2)
             else if s == 17 : this.writer.put_bits(extra[i].to(uint), 3)
             else if s == 18 : this.writer.put_bits(extra[i].to(uint), 7)
