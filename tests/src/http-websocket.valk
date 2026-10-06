@@ -648,7 +648,7 @@ test "WebSocket: permessage-deflate negotiation and frames on the wire" {
     assert(ws_header_line(raw.head, "sec-websocket-extensions") == "permessage-deflate; server_no_context_takeover; client_no_context_takeover")
 
     // Compressed messages: a final block, and a stored block with a sync flush
-    let text = "".pad_right('w', 200) + " compressed"
+    let text = "".pad_right('w', 300) + " compressed"
     let packed = compress.deflate(text)
     raw.con.write(ws_frame(1, packed, true, true, 0x40)) !!
     let frame = ws_raw_frame(raw)
@@ -660,13 +660,13 @@ test "WebSocket: permessage-deflate negotiation and frames on the wire" {
     assert(frame == "\x81stored hello")
 
     // A fragmented compressed message: RSV1 on the first frame only
-    let sync = ws_stored_message("".pad_right('f', 150))
+    let sync = ws_stored_message("".pad_right('f', 300))
     raw.con.write(ws_frame(1, sync.range(0, 10), true, false, 0x40)) !!
     raw.con.write(ws_frame(0, sync.range(10, 100), true, false)) !!
     raw.con.write(ws_frame(0, sync.range(110, sync.bytes - 110), true, true)) !!
     frame = ws_raw_frame(raw)
     assert(frame[0] == 0xc1)
-    assert((compress.inflate(frame.range(1, frame.bytes - 1) + tail) !!) == "".pad_right('f', 150))
+    assert((compress.inflate(frame.range(1, frame.bytes - 1) + tail) !!) == "".pad_right('f', 300))
 
     // Incompressible data goes uncompressed
     let noise = crypto.random_bytes(500)
@@ -793,7 +793,7 @@ test "WebSocket: the client decompresses with context takeover and compresses it
     let ws = http.WebSocket.connect("ws://127.0.0.1:19594/") !!
     assert((ws.read() !!).data == "the quick brown fox jumps over the lazy dog")
     assert((ws.read() !!).data == "the quick brown fox jumps over the lazy cat")
-    let text = "".pad_right('c', 90)
+    let text = "".pad_right('c', 300)
     ws.write(text) !!
     assert((ws.read() !!).data == "rsv1 permessage-deflate; client_no_context_takeover; client_max_window_bits " + text)
     await serving
@@ -1060,4 +1060,90 @@ test "WebSocket: queued writes from several coroutines arrive whole and in order
     assert(ws.close_code == 1000)
     server.request_shutdown(1000)
     await running !!
+}
+
+// Text that compresses differently at level 1 and level 9
+fn ws_level_text() String {
+    let out = ByteBuffer.new(4096)
+    let seed: uint = 7
+    while out.length < 3000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        out.write("<span class=\"w" + (seed % 23) + "\">word " + (seed % 97) + "</span>")
+    }
+    return out.to_string()
+}
+
+shared ws_level_frame: http.WebSocketFrame (http.WebSocketFrame.text(ws_level_text()))
+
+fn ws_level_handler(ctx: http.Context, res: http.ResponseWriter) {
+    res.send_websocket(ctx, fn(ws: http.WebSocket) {
+        ws.write_frame(ws_level_frame) ! return
+        ws.write("".pad_right('s', 100)) ! return
+        ws.read() ! return
+    })
+}
+
+test "WebSocket: compression level and minimum size on the server and the client" {
+    let text = ws_level_text()
+    assert(compress.deflate(text, 1) != compress.deflate(text, 9))
+    let tail = "\x00\x00\xff\xff\x03\x00"
+    let frames = Array[String].new()
+    let ports: Array[u16] = .{ 19616, 19617, 19618 }
+    let levels: Array[uint] = .{ 1, 9, 0 }
+    each ports as port, i {
+        let server = http.Server.new("127.0.0.1", port)
+        server.fast(ws_level_handler)
+        server.websocket_compression = true
+        server.websocket_compression_level = levels.get(i) !? 6
+        server.websocket_compression_min_size = 64
+        let running = co server.start(1)
+        time.sleep_ms(20)
+        let raw = ws_raw_offer(port, "/", "permessage-deflate")
+        let frame = ws_raw_frame(raw)
+        let small = ws_raw_frame(raw)
+        if i < 2 {
+            // Compressed per level from one shared frame, and small messages from 64 bytes
+            assert(frame[0] == 0xc1 && small[0] == 0xc1)
+            assert((compress.inflate(frame.range(1, frame.bytes - 1) + tail) !!) == text)
+            assert((compress.inflate(small.range(1, small.bytes - 1) + tail) !!) == "".pad_right('s', 100))
+        } else {
+            // Level 0 sends everything as it is
+            assert(frame == "\x81" + text)
+            assert(small == "\x81" + "".pad_right('s', 100))
+        }
+        frames.append(frame)
+        raw.con.close() !!
+        server.request_shutdown(1000)
+        await running !!
+    }
+    assert((frames.get(0) !? "") != (frames.get(1) !? ""))
+
+    // The defaults leave a 100-byte message uncompressed
+    let server = http.Server.new("127.0.0.1", 19619)
+    server.fast(ws_level_handler)
+    server.websocket_compression = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let raw = ws_raw_offer(19619, "/", "permessage-deflate")
+    assert(ws_raw_frame(raw)[0] == 0xc1)
+    assert(ws_raw_frame(raw) == "\x81" + "".pad_right('s', 100))
+    raw.con.close() !!
+    server.request_shutdown(1000)
+    await running !!
+
+    // Client options: compressed from 64 bytes, or not at all with level 0
+    let listener = net.tcp_server("127.0.0.1", 19620) !!
+    let message = "".pad_right('c', 100)
+    each Array[uint]{ 6, 0 } as level {
+        let serving = co ws_deflate_fake_server(listener, "", "")
+        let options = http.Options { websocket_compression_level: level, websocket_compression_min_size: 64 }
+        let ws = http.WebSocket.connect("ws://127.0.0.1:19620/", options) !!
+        ws.write(message) !!
+        let reply = (ws.read() !!).data
+        // The fake server only decompresses
+        if level > 0 : assert(reply == "rsv1 permessage-deflate; client_no_context_takeover; client_max_window_bits " + message)
+        else : assert(reply.starts_with("plain "))
+        await serving
+    }
+    listener.close() _
 }

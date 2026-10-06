@@ -3324,6 +3324,10 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + verify_tls_cert: bool
     // Whether `WebSocket.connect` offers the permessage-deflate extension (RFC 7692), which compresses messages when the server accepts it.
     + websocket_compression: bool
+    // The DEFLATE level `WebSocket.connect` compresses messages with, from 1 (fastest) to 9 (smallest); 0 sends them uncompressed. Defaults to 6.
+    + websocket_compression_level: uint
+    // Messages shorter than this many bytes are sent uncompressed. Defaults to 256.
+    + websocket_compression_min_size: uint
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
@@ -3503,6 +3507,10 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + stop_on_signal_timeout_ms: uint
     // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it. Off by default: compression saves bandwidth but costs CPU per message. `WebSocket.upgrade` and `send_websocket` can choose per endpoint.
     + websocket_compression: bool
+    // The DEFLATE level messages are compressed with, from 1 (fastest) to 9 (smallest); 0 sends them uncompressed. Defaults to 6.
+    + websocket_compression_level: uint
+    // Messages shorter than this many bytes are sent uncompressed. Defaults to 256.
+    + websocket_compression_min_size: uint
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
 

@@ -11141,6 +11141,10 @@ Returns an empty form with a random boundary.
     + verify_tls_cert: bool
     // Whether `WebSocket.connect` offers the permessage-deflate extension (RFC 7692), which compresses messages when the server accepts it.
     + websocket_compression: bool
+    // The DEFLATE level `WebSocket.connect` compresses messages with, from 1 (fastest) to 9 (smallest); 0 sends them uncompressed. Defaults to 6.
+    + websocket_compression_level: uint
+    // Messages shorter than this many bytes are sent uncompressed. Defaults to 256.
+    + websocket_compression_min_size: uint
     // The limit for each socket write, in milliseconds; `timeout_ms` still applies.
     + write_timeout_ms: uint
 
@@ -11314,6 +11318,15 @@ Whether the server's TLS certificate is verified.
 
 Whether `WebSocket.connect` offers the permessage-deflate extension (RFC 7692), which
 compresses messages when the server accepts it.
+
+#### websocket_compression_level
+
+The DEFLATE level `WebSocket.connect` compresses messages with, from 1 (fastest) to 9
+(smallest); 0 sends them uncompressed. Defaults to 6.
+
+#### websocket_compression_min_size
+
+Messages shorter than this many bytes are sent uncompressed. Defaults to 256.
 
 #### write_timeout_ms
 
@@ -11866,6 +11879,10 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + stop_on_signal_timeout_ms: uint
     // Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the client offers it. Off by default: compression saves bandwidth but costs CPU per message. `WebSocket.upgrade` and `send_websocket` can choose per endpoint.
     + websocket_compression: bool
+    // The DEFLATE level messages are compressed with, from 1 (fastest) to 9 (smallest); 0 sends them uncompressed. Defaults to 6.
+    + websocket_compression_level: uint
+    // Messages shorter than this many bytes are sent uncompressed. Defaults to 256.
+    + websocket_compression_min_size: uint
     // How long each socket write may take, in milliseconds.
     + write_timeout_ms: uint
 
@@ -11992,6 +12009,15 @@ How long in-flight requests may take after a stop signal, in milliseconds.
 Whether WebSocket upgrades accept the permessage-deflate extension (RFC 7692) when the
 client offers it. Off by default: compression saves bandwidth but costs CPU per
 message. `WebSocket.upgrade` and `send_websocket` can choose per endpoint.
+
+#### websocket_compression_level
+
+The DEFLATE level messages are compressed with, from 1 (fastest) to 9 (smallest);
+0 sends them uncompressed. Defaults to 6.
+
+#### websocket_compression_min_size
+
+Messages shorter than this many bytes are sent uncompressed. Defaults to 256.
 
 #### write_timeout_ms
 
@@ -12292,9 +12318,9 @@ A text or binary message prepared once and sent to many WebSockets with
 `WebSocket.write_frame`.
 
 The frame bytes are built when it is made, and the compressed form the first time a
-connection with permessage-deflate sends it, once per window size; connections without
-compression send the plain bytes. A frame cannot change, so it can be published as
-`shared WebSocketFrame` and sent from coroutines on any thread:
+connection with permessage-deflate sends it, once per window size and level;
+connections without compression send the plain bytes. A frame cannot change, so it can
+be published as `shared WebSocketFrame` and sent from coroutines on any thread:
 
 ```valk
 let frame: shared http.WebSocketFrame = http.WebSocketFrame.text(json)

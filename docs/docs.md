@@ -2660,6 +2660,10 @@ offers it by default; a server accepts it when `server.websocket_compression = t
 or per endpoint with `WebSocket.upgrade(req, handler, true)`. Compression saves
 bandwidth but costs CPU per message, so it is off on the server by default. Turn
 the client's offer off with `http.Options { websocket_compression: false }`.
+Messages are compressed at level 6 from 256 bytes; smaller ones go out as they
+are. `server.websocket_compression_level` / `websocket_compression_min_size`
+change that for a server, and the `http.Options` fields of the same names for
+a client (level 1 is the fastest, 9 the smallest, 0 sends nothing compressed).
 
 A server picks a subprotocol with `protocol:`; it is sent back when the client
 offered it (in `Sec-WebSocket-Protocol`), and `ws.protocol` tells both sides
