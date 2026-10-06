@@ -28,6 +28,8 @@ global deflate_chain: [u16 x 10] ({ 0, 4, 8, 32, 16, 32, 128, 256, 1024, 4096 })
 global deflate_length_code: [u8 x 256] ({ 0... })
 global deflate_dist_code: [u8 x 512] ({ 0... })
 global deflate_tables_ready: bool (false)
+global deflate_fixed_lit: Codes (Codes {})
+global deflate_fixed_dist: Codes (Codes {})
 
 fn deflate_init_tables() {
     @unsafe
@@ -53,6 +55,8 @@ fn deflate_init_tables() {
         }
         code++
     }
+    deflate_fixed_lit.set_fixed(true)
+    deflate_fixed_dist.set_fixed(false)
     deflate_tables_ready = true
 }
 
@@ -120,28 +124,22 @@ struct BitWriter {
 struct Codes {
     lengths: [u8 x 288] ({ 0... })
     codes: [u16 x 288] ({ 0... })
+    // How many codes have each length
+    counts: [u16 x 16] ({ 0... })
 
     // Length-limited Huffman code lengths from symbol frequencies
     fn assign_lengths(freq: ptr, n: uint, max_length: uint) {
         @unsafe
-        let i: uint = 0
-        while i < 288 {
-            this.lengths[i] = 0
-            i++
-        }
-        // Used symbols sorted by frequency (insertion sort: n <= 288)
+        mem.clear_bytes(@ref(this.lengths).@cast(ptr), 288)
+        mem.clear_bytes(@ref(this.counts).@cast(ptr), 32)
+        // Used symbols sorted by frequency, ties by symbol. Frequencies fit
+        // 16 bits: a block has at most 65000 symbols
         let order = [u16 x 288]{ 0... }
         let used: uint = 0
-        i = 0
+        let i: uint = 0
         while i < n {
-            let f = @ptrv(freq, u32, i)
-            if f != 0 {
-                let k = used
-                while k > 0 && @ptrv(freq, u32, order[k - 1].to(uint)) > f {
-                    order[k] = order[k - 1]
-                    k--
-                }
-                order[k] = i.to(u16)
+            if @ptrv(freq, u32, i) != 0 {
+                order[used] = i.to(u16)
                 used++
             }
             i++
@@ -149,7 +147,59 @@ struct Codes {
         if used == 0 : return
         if used == 1 {
             this.lengths[order[0].to(uint)] = 1
+            this.counts[1] = 1
             return
+        }
+        if used <= 32 {
+            // Insertion sort
+            i = 1
+            while i < used {
+                let sym = order[i]
+                let f = @ptrv(freq, u32, sym.to(uint))
+                let k = i
+                while k > 0 && @ptrv(freq, u32, order[k - 1].to(uint)) > f {
+                    order[k] = order[k - 1]
+                    k--
+                }
+                order[k] = sym
+                i++
+            }
+        } else {
+            // Stable radix sort on the low, then the high byte
+            let other = [u16 x 288]{ 0... }
+            let from = @ref(order).@cast(ptr)
+            let to = @ref(other).@cast(ptr)
+            let shift: uint = 0
+            while shift < 16 {
+                let buckets = [u16 x 256]{ 0... }
+                i = 0
+                while i < used {
+                    let b = (@ptrv(freq, u32, @ptrv(from, u16, i).to(uint)).to(uint) >> shift) & 255
+                    buckets[b] = buckets[b] + 1
+                    i++
+                }
+                let sum: u16 = 0
+                i = 0
+                while i < 256 {
+                    let c = buckets[i]
+                    buckets[i] = sum
+                    sum += c
+                    i++
+                }
+                i = 0
+                while i < used {
+                    let sym = @ptrv(from, u16, i)
+                    let b = (@ptrv(freq, u32, sym.to(uint)).to(uint) >> shift) & 255
+                    @ptrv(to, u16, buckets[b].to(uint)) = sym
+                    buckets[b] = buckets[b] + 1
+                    i++
+                }
+                let t = from
+                from = to
+                to = t
+                shift += 8
+            }
+            // Two passes leave the result back in `order`
         }
         // Huffman tree: leaves are items 0..used, internal nodes follow.
         // Both the sorted leaves and the created nodes form queues in
@@ -241,29 +291,47 @@ struct Codes {
             remaining--
             i++
         }
+        i = 1
+        while i <= max_length {
+            this.counts[i] = count[i].to(u16)
+            i++
+        }
+    }
+
+    // The fixed codes of RFC 1951: literal/length when `lit`, else distance
+    fn set_fixed(lit: bool) {
+        @unsafe
+        mem.clear_bytes(@ref(this.counts).@cast(ptr), 32)
+        let i: uint = 0
+        if lit {
+            while i < 144 : this.lengths[i++] = 8
+            while i < 256 : this.lengths[i++] = 9
+            while i < 280 : this.lengths[i++] = 7
+            while i < 288 : this.lengths[i++] = 8
+            this.counts[7] = 24
+            this.counts[8] = 152
+            this.counts[9] = 112
+            this.assign_codes(288)
+            return
+        }
+        while i < 30 : this.lengths[i++] = 5
+        this.counts[5] = 30
+        this.assign_codes(30)
     }
 
     // Canonical codes from the lengths, bit-reversed: the stream stores
     // Huffman codes most significant bit first
     fn assign_codes(n: uint) {
         @unsafe
-        let count = [uint x 16]{ 0... }
-        let i: uint = 0
-        while i < n {
-            let l = this.lengths[i].to(uint)
-            count[l] = count[l] + 1
-            i++
-        }
-        count[0] = 0
         let next = [uint x 16]{ 0... }
         let code: uint = 0
         let len: uint = 1
         while len < 16 {
-            code = (code + count[len - 1]) << 1
+            code = (code + (len > 1 ? this.counts[len - 1].to(uint) : 0)) << 1
             next[len] = code
             len++
         }
-        i = 0
+        let i: uint = 0
         while i < n {
             let l = this.lengths[i].to(uint)
             if l != 0 {
@@ -298,6 +366,12 @@ class Deflater {
     dist_freq: ptr (mem.calloc(32 * 4))
     lit_codes: Codes (Codes {})
     dist_codes: Codes (Codes {})
+    // The planned dynamic header: code length symbols, their extra bits at
+    // offset 320, and their code
+    header_symbols: ptr (mem.calloc(640))
+    header_count: uint (0)
+    header_hclen: uint (0)
+    header_codes: Codes (Codes {})
     writer: BitWriter
     // The farthest a match may reach back
     max_distance: uint (deflate_window)
@@ -321,6 +395,7 @@ class Deflater {
         mem.free(this.symbols)
         mem.free(this.lit_freq)
         mem.free(this.dist_freq)
+        mem.free(this.header_symbols)
     }
 
     fn set_level(level: uint) {
@@ -587,22 +662,21 @@ class Deflater {
         // Dynamic code lengths and their cost
         this.lit_codes.assign_lengths(this.lit_freq, 286, 15)
         this.dist_codes.assign_lengths(this.dist_freq, 30, 15)
-        let dynamic_bits = this.dynamic_header_bits() + this.symbol_bits(false)
-        let fixed_bits = 3 + this.symbol_bits(true)
+        let dynamic_bits = this.plan_dynamic_header() + this.symbol_bits(@ref(this.lit_codes), @ref(this.dist_codes))
+        let fixed_bits = 3 + this.symbol_bits(@ref(deflate_fixed_lit), @ref(deflate_fixed_dist))
         let stored_bits = (end - start) * 8 + 40 * ((end - start) / 65535 + 1)
 
         if stored_bits <= dynamic_bits && stored_bits <= fixed_bits {
             this.write_stored_blocks(data, start, end, final)
         } else if fixed_bits <= dynamic_bits {
-            this.set_fixed_codes()
             this.writer.put_bits(final ? 1 : 0, 1)
             this.writer.put_bits(1, 2)
-            this.write_symbols()
+            this.write_symbols(@ref(deflate_fixed_lit), @ref(deflate_fixed_dist))
         } else {
             this.writer.put_bits(final ? 1 : 0, 1)
             this.writer.put_bits(2, 2)
             this.write_dynamic_header()
-            this.write_symbols()
+            this.write_symbols(@ref(this.lit_codes), @ref(this.dist_codes))
         }
         if final : this.writer.flush()
 
@@ -611,48 +685,31 @@ class Deflater {
         mem.clear_bytes(this.dist_freq, 32 * 4)
     }
 
-    fn set_fixed_codes() {
-        @unsafe
-        let i: uint = 0
-        while i < 144 : this.lit_codes.lengths[i++] = 8
-        while i < 256 : this.lit_codes.lengths[i++] = 9
-        while i < 280 : this.lit_codes.lengths[i++] = 7
-        while i < 288 : this.lit_codes.lengths[i++] = 8
-        this.lit_codes.assign_codes(288)
-        i = 0
-        while i < 30 : this.dist_codes.lengths[i++] = 5
-        this.dist_codes.assign_codes(30)
-    }
-
-    // Bits the symbols take under the current (or the fixed) lengths
-    fn symbol_bits(fixed: bool) uint {
+    // Bits the symbols take with these codes
+    fn symbol_bits(lit: *Codes, dist: *Codes) uint {
         @unsafe
         let bits: uint = 0
+        let lengths = @ref(lit.lengths).@cast(ptr)
         let i: uint = 0
         while i < 286 {
             let f = @ptrv(this.lit_freq, u32, i).to(uint)
             if f != 0 {
-                let l: uint = fixed ? (i < 144 ? 8 : (i < 256 ? 9 : (i < 280 ? 7 : 8))) : this.lit_codes.lengths[i].to(uint)
-                bits += f * l
+                bits += f * @ptrv(lengths, u8, i).to(uint)
                 if i >= 257 : bits += f * length_extra[i - 257].to(uint)
             }
             i++
         }
+        lengths = @ref(dist.lengths).@cast(ptr)
         i = 0
         while i < 30 {
             let f = @ptrv(this.dist_freq, u32, i).to(uint)
-            if f != 0 {
-                let l: uint = fixed ? 5 : this.dist_codes.lengths[i].to(uint)
-                bits += f * (l + dist_extra[i].to(uint))
-            }
+            if f != 0 : bits += f * (@ptrv(lengths, u8, i).to(uint) + dist_extra[i].to(uint))
             i++
         }
         return bits
     }
 
-    // Writes the block's symbols: bits gather in a 64-bit buffer that goes out
-    // whole into reserved space (at most 6 bytes per symbol)
-    fn write_symbols() {
+    fn write_symbols(lit: *Codes, dist: *Codes) {
         @unsafe
         let count = this.symbol_count
         let out = this.writer.out
@@ -662,10 +719,10 @@ class Deflater {
         let bits = this.writer.bit_buf
         let nbits = this.writer.bit_count
         let symbols = this.symbols
-        let lit_code = @ref(this.lit_codes.codes).@cast(ptr)
-        let lit_len = @ref(this.lit_codes.lengths).@cast(ptr)
-        let dist_code = @ref(this.dist_codes.codes).@cast(ptr)
-        let dist_len = @ref(this.dist_codes.lengths).@cast(ptr)
+        let lit_code = @ref(lit.codes).@cast(ptr)
+        let lit_len = @ref(lit.lengths).@cast(ptr)
+        let dist_code = @ref(dist.codes).@cast(ptr)
+        let dist_len = @ref(dist.lengths).@cast(ptr)
         let len_extra = @ref(length_extra).@cast(ptr)
         let d_extra = @ref(dist_extra).@cast(ptr)
         let i: uint = 0
@@ -705,7 +762,7 @@ class Deflater {
         out.skip(written)
         this.writer.bit_buf = bits
         this.writer.bit_count = nbits
-        this.writer.put_bits(this.lit_codes.codes[deflate_end_of_block].to(uint), this.lit_codes.lengths[deflate_end_of_block].to(uint))
+        this.writer.put_bits(@ptrv(lit_code, u16, deflate_end_of_block).to(uint), @ptrv(lit_len, u8, deflate_end_of_block).to(uint))
     }
 
     // The run-length encoded code lengths of both alphabets: symbols 0-15
@@ -772,28 +829,36 @@ class Deflater {
         return n
     }
 
-    fn dynamic_header_bits() uint {
+    // Prepares the dynamic block header: the run-length encoded code lengths
+    // and their code. Returns its size in bits
+    fn plan_dynamic_header() uint {
         @unsafe
-        let symbols = [u8 x 320]{ 0... }
-        let extra = [u8 x 320]{ 0... }
-        let count = this.code_length_symbols(@ref(symbols).@cast(ptr), @ref(extra).@cast(ptr))
+        let symbols = this.header_symbols
+        let extra = symbols.@offset(320)
+        let count = this.code_length_symbols(symbols, extra)
+        this.header_count = count
         let freq = [u32 x 19]{ 0... }
         let i: uint = 0
         while i < count {
-            let s = symbols[i].to(uint)
+            let s = @ptrv(symbols, u8, i).to(uint)
             freq[s] = freq[s] + 1
             i++
         }
-        let codes: Codes = Codes {}
+        let codes = @ref(this.header_codes)
         codes.assign_lengths(@ref(freq).@cast(ptr), 19, 7)
-        let bits: uint = 3 + 5 + 5 + 4 + 19 * 3
+        let hclen: uint = 19
+        while hclen > 4 && codes.lengths[code_length_order[hclen - 1].to(uint)] == 0 : hclen--
+        this.header_hclen = hclen
+        let bits: uint = 3 + 5 + 5 + 4 + hclen * 3
         i = 0
-        while i < count {
-            let s = symbols[i].to(uint)
-            bits += codes.lengths[s].to(uint)
-            if s == 16 : bits += 2
-            else if s == 17 : bits += 3
-            else if s == 18 : bits += 7
+        while i < 19 {
+            let f = freq[i].to(uint)
+            if f != 0 {
+                bits += f * codes.lengths[i].to(uint)
+                if i == 16 : bits += f * 2
+                else if i == 17 : bits += f * 3
+                else if i == 18 : bits += f * 7
+            }
             i++
         }
         return bits
@@ -801,42 +866,33 @@ class Deflater {
 
     fn write_dynamic_header() {
         @unsafe
-        let symbols = [u8 x 320]{ 0... }
-        let extra = [u8 x 320]{ 0... }
-        let count = this.code_length_symbols(@ref(symbols).@cast(ptr), @ref(extra).@cast(ptr))
-        let freq = [u32 x 19]{ 0... }
-        let i: uint = 0
-        while i < count {
-            let s = symbols[i].to(uint)
-            freq[s] = freq[s] + 1
-            i++
-        }
-        let codes: Codes = Codes {}
-        codes.assign_lengths(@ref(freq).@cast(ptr), 19, 7)
+        let codes = @ref(this.header_codes)
         codes.assign_codes(19)
-        let hclen: uint = 19
-        while hclen > 4 && codes.lengths[code_length_order[hclen - 1].to(uint)] == 0 : hclen--
-
         let hlit = this.hlit()
         let hdist = this.hdist()
         this.lit_codes.assign_codes(hlit)
         this.dist_codes.assign_codes(hdist)
 
+        let hclen = this.header_hclen
         this.writer.put_bits(hlit - 257, 5)
         this.writer.put_bits(hdist - 1, 5)
         this.writer.put_bits(hclen - 4, 4)
-        i = 0
+        let i: uint = 0
         while i < hclen {
             this.writer.put_bits(codes.lengths[code_length_order[i].to(uint)].to(uint), 3)
             i++
         }
+        let symbols = this.header_symbols
+        let extra = symbols.@offset(320)
+        let count = this.header_count
         i = 0
         while i < count {
-            let s = symbols[i].to(uint)
+            let s = @ptrv(symbols, u8, i).to(uint)
             this.writer.put_bits(codes.codes[s].to(uint), codes.lengths[s].to(uint))
-            if s == 16 : this.writer.put_bits(extra[i].to(uint), 2)
-            else if s == 17 : this.writer.put_bits(extra[i].to(uint), 3)
-            else if s == 18 : this.writer.put_bits(extra[i].to(uint), 7)
+            let e = @ptrv(extra, u8, i).to(uint)
+            if s == 16 : this.writer.put_bits(e, 2)
+            else if s == 17 : this.writer.put_bits(e, 3)
+            else if s == 18 : this.writer.put_bits(e, 7)
             i++
         }
     }
