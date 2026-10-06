@@ -1092,5 +1092,27 @@ Stack trace:
     fi
 fi
 
+echo ""
+echo "# Test library names with dots link by name"
+link_args() {
+    "$VALK" build "$DIR/link-names.valk" --no-warn -vvv --target "$1" -o "$workdir/link-names" 2>&1 | grep "Full link command" | tr -d '\r'
+}
+linux_link=$(link_args linux-x64)
+for needle in " -lgobject-2.0 " " -lpython3.12 " " -l:libexact.so " " -l:libother.so.3 "; do
+    if [[ "$linux_link" != *"$needle"* ]]; then
+        echo "# The linux link command is missing:$needle"
+        echo "$linux_link"
+        exit 1
+    fi
+done
+win_link=$(link_args win-x64)
+for needle in '"gobject-2.0.lib"' '"python3.12.lib"' '"libexact.so"'; do
+    if [[ "$win_link" != *"$needle"* ]]; then
+        echo "# The windows link command is missing: $needle"
+        echo "$win_link"
+        exit 1
+    fi
+done
+
 echo "# CLI tests passed"
-echo "# Test count: 71"
+echo "# Test count: 72"
