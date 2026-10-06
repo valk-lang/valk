@@ -12160,6 +12160,8 @@ cannot be read.
     + fn write_binary(data: local &[u8]) void !WebSocketError
     // Sends a message prepared with `WebSocketFrame`, for sending one message to many connections.
     + fn write_frame(frame: shared WebSocketFrame) void !WebSocketError
+    // Sends several prepared messages in order, as `write_frame` does one by one.
+    + fn write_frames(frames: local &[shared WebSocketFrame]) void !WebSocketError
 }
 ```
 
@@ -12301,6 +12303,14 @@ connections.
 
 A server connection writes the frame's bytes as they are, compressed when the
 connection negotiated permessage-deflate; a client connection masks a copy.
+
+#### write_frames
+
+Sends several prepared messages in order, as `write_frame` does one by one.
+
+A server connection hands them to the socket together, with one system call for up
+to 64 frames on Linux and macOS, as when a connection's writer finds several
+messages waiting.
 
 ```js
 // A text or binary message prepared once and sent to many WebSockets with `WebSocket.write_frame`.

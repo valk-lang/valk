@@ -2684,6 +2684,9 @@ let frame: shared http.WebSocketFrame = http.WebSocketFrame.text("{\"type\":\"up
 each sockets as ws : ws.write_frame(frame) ! continue
 ```
 
+When several frames wait for one connection, `ws.write_frames(frames)` sends
+them in order with one system call instead of one per frame.
+
 On Linux and macOS, writes without TLS do not wait for a slow peer: what its
 socket cannot take right away is queued and sent in the background, and writes
 made meanwhile go out after it.

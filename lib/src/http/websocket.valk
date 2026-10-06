@@ -60,6 +60,8 @@ value WS_COMPRESS_MIN_SIZE (256)
 value WS_HEADER_ROOM (14)
 // Bytes queued behind a pending write before further writes wait for it
 value WS_MAX_QUEUE (4 * 1024 * 1024)
+// Frames per vectored write: `send_parts_now` takes 64 parts per call
+value WS_MAX_PARTS (64)
 value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
 
 /// A WebSocket connection (RFC 6455), on the server or the client side.
@@ -339,7 +341,7 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         let bytes = frame.bytes_for(this.deflate_bits, this.deflate_level, this.deflate_min_size)
         if this.closed : throw .closed
         if !this.is_client {
-            this.write_out(bytes, "") !>
+            this.write_out(.{ bytes }) !>
             return
         }
         let head = websocket_frame_head_size(bytes)
@@ -348,6 +350,29 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         out.skip(WS_HEADER_ROOM)
         out.write(bytes.view(head, bytes.bytes - head))
         this.finish_frame(bytes.get(0).to(uint), bytes.bytes - head, "") !>
+    }
+
+    /// Sends several prepared messages in order, as `write_frame` does one by one.
+    ///
+    /// A server connection hands them to the socket together, with one system call for up
+    /// to 64 frames on Linux and macOS, as when a connection's writer finds several
+    /// messages waiting.
+    + fn write_frames(frames: local &[shared WebSocketFrame]) !WebSocketError {
+        if this.closed : throw .closed
+        if this.is_client {
+            each frames as frame : this.write_frame(frame) !>
+            return
+        }
+        let parts: [&[u8] x WS_MAX_PARTS] = @undefined
+        let count: uint = 0
+        each frames as frame, i {
+            parts[count] = frame.bytes_for(this.deflate_bits, this.deflate_level, this.deflate_min_size)
+            count++
+            if count == WS_MAX_PARTS || i + 1 == frames.length {
+                this.write_out(&parts[0 .. count]) !>
+                count = 0
+            }
+        }
     }
 
     /// Sends a ping; the peer answers with a pong that `read` consumes.
@@ -392,36 +417,37 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         this.send_frame(WS_OP_CLOSE, payload) !>
     }
 
-    // Sends `head` and `body` as one piece of the stream. A write that the socket cannot
+    // Sends `parts` in order as one piece of the stream. A write that the socket cannot
     // take at once goes on in a coroutine of its own, so a slow peer does not hold up the
     // caller (as when sending to many connections); writes made meanwhile queue behind it.
     // An error there closes the connection, and later calls throw `closed`.
-    - fn write_out(head: local &[u8], body: local &[u8]) !WebSocketError {
+    - fn write_out(parts: local &[local &[u8]]) !WebSocketError {
         if this.closed : throw .closed
         if this.writing {
             while this.writing && this.queue.length >= WS_MAX_QUEUE : time.sleep_ms(1)
             if this.closed : throw .closed
             if this.writing {
-                this.queue.write(head)
-                this.queue.write(body)
+                each parts as part : this.queue.write(part)
                 return
             }
         }
         this.writing = true
-        let total = head.length + body.length
-        let sent = this.con.write_now(.{ head, body }) ! {
+        let sent = this.con.write_now(parts) ! {
             this.writing = false
             this.finish()
             throw E
         }
-        if sent < total {
-            let queue = this.queue
-            if sent < head.length {
-                queue.write(head.view(sent, head.length - sent))
-                queue.write(body)
-            } else {
-                queue.write(body.view(sent - head.length, total - sent))
+        let rest = false
+        each parts as part {
+            if sent >= part.length {
+                sent -= part.length
+                continue
             }
+            this.queue.write(part.view(sent, part.length - sent))
+            sent = 0
+            rest = true
+        }
+        if rest {
             co this.flush()
             return
         }
@@ -507,8 +533,8 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             websocket_mask(frame.view(WS_HEADER_ROOM, length), key[0], key[1], key[2], key[3])
         }
 
-        if body.length > 0 : this.write_out(head, body) !>
-        else : this.write_out(frame.view(start, header + length), "") !>
+        if body.length > 0 : this.write_out(.{ head, body }) !>
+        else : this.write_out(.{ frame.view(start, header + length) }) !>
         if frame.length > 65536 {
             frame.clear()
             frame.shrink_capacity(4096)
