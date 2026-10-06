@@ -740,6 +740,19 @@ if [ "$(printf '%s' "$divergence_out" | grep -c "Unreachable code")" -ne 2 ] || 
     exit 1
 fi
 
+# Array[shared T] of a struct with references builds without -o
+shared_struct_valk="$VALK"
+if [ -e "$VALK" ]; then
+    shared_struct_valk="$(cd "$(dirname "$VALK")" && pwd)/$(basename "$VALK")"
+fi
+cp "$DIR/shared-struct-array.valk" "$workdir/"
+shared_struct_out=$(cd "$workdir" && "$shared_struct_valk" build shared-struct-array.valk --no-warn --run 2>&1)
+if [[ "$shared_struct_out" != *"shared structs ok"* ]]; then
+    echo "# The Array[shared T] struct program failed to build or run without -o"
+    echo "$shared_struct_out"
+    exit 1
+fi
+
 echo ""
 echo "# Test the make commands a project declares"
 
@@ -1115,4 +1128,4 @@ for needle in '"gobject-2.0.lib"' '"python3.12.lib"' '"libexact.so"'; do
 done
 
 echo "# CLI tests passed"
-echo "# Test count: 72"
+echo "# Test count: 73"
