@@ -2734,6 +2734,13 @@ fn main() {
 }
 ```
 
+`write` sends all of its data. `write_many` sends several buffers in order with
+one system call where it can, such as a header and a body that were not joined:
+
+```rust
+con.write_many(.{ header, body }) ! panic("Failed to send")
+```
+
 UDP example
 
 ```rust

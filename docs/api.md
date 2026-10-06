@@ -4391,6 +4391,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + static fn wrap(fd: i32) TcpConnection !NetError
     // Sends all of `data` and returns its length.
     + fn write(data: local &[u8]) uint !io:IoError
+    // Sends all of `parts` one after the other, as if they were one buffer, and returns their total length.
+    + fn write_many(parts: local &[local &[u8]]) uint !io:IoError
 }
 ```
 

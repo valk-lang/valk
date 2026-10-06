@@ -14755,6 +14755,8 @@ the file.
     + static fn wrap(fd: i32) TcpConnection !NetError
     // Sends all of `data` and returns its length.
     + fn write(data: local &[u8]) uint !io:IoError
+    // Sends all of `parts` one after the other, as if they were one buffer, and returns their total length.
+    + fn write_many(parts: local &[local &[u8]]) uint !io:IoError
 }
 ```
 
@@ -14887,6 +14889,17 @@ Sends all of `data` and returns its length.
 
 `write_timeout_ms` bounds each partial send, not the whole call. Throws `closed`,
 `cancelled`, `timeout` or `write`.
+
+#### write_many
+
+Sends all of `parts` one after the other, as if they were one buffer, and returns
+their total length.
+
+On Linux and macOS the parts go out together in one system call (`sendmsg` /
+`writev`), for example a header and a body without joining them first. With TLS and
+on Windows they are joined into one buffer and sent with `write`. `write_timeout_ms`
+bounds each wait for room in the socket buffer. Throws `closed`, `cancelled`,
+`timeout` or `write`.
 
 ```js
 // A listening TCP socket, made by `new` or `net.tcp_server`; `accept` hands out connections.
