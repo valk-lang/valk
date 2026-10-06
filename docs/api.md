@@ -3565,6 +3565,18 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.
     + fn write_binary(data: local &[u8]) void !WebSocketError
+    // Sends a message prepared with `WebSocketFrame`, for sending one message to many connections.
+    + fn write_frame(frame: shared WebSocketFrame) void !WebSocketError
+}
+```
+
+```js
+// A text or binary message prepared once and sent to many WebSockets with `WebSocket.write_frame`.
++ class WebSocketFrame {
+    // Prepares a binary message.
+    + static fn binary(data: local &[u8]) WebSocketFrame
+    // Prepares a text message; `data` must be UTF-8.
+    + static fn text(data: local &[u8]) WebSocketFrame
 }
 ```
 

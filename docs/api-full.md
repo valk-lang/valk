@@ -12132,6 +12132,8 @@ cannot be read.
     + fn write(text: local &[u8]) void !WebSocketError
     // Sends `data` as one binary message.
     + fn write_binary(data: local &[u8]) void !WebSocketError
+    // Sends a message prepared with `WebSocketFrame`, for sending one message to many connections.
+    + fn write_frame(frame: shared WebSocketFrame) void !WebSocketError
 }
 ```
 
@@ -12261,6 +12263,47 @@ Sends `text` as one text message; the bytes must be UTF-8.
 #### write_binary
 
 Sends `data` as one binary message.
+
+#### write_frame
+
+Sends a message prepared with `WebSocketFrame`, for sending one message to many
+connections.
+
+A server connection writes the frame's bytes as they are, compressed when the
+connection negotiated permessage-deflate; a client connection masks a copy.
+
+```js
+// A text or binary message prepared once and sent to many WebSockets with `WebSocket.write_frame`.
++ class WebSocketFrame {
+    // Prepares a binary message.
+    + static fn binary(data: local &[u8]) WebSocketFrame
+    // Prepares a text message; `data` must be UTF-8.
+    + static fn text(data: local &[u8]) WebSocketFrame
+}
+```
+
+### WebSocketFrame
+
+A text or binary message prepared once and sent to many WebSockets with
+`WebSocket.write_frame`.
+
+The frame bytes are built when it is made, and the compressed form the first time a
+connection with permessage-deflate sends it, once per window size; connections without
+compression send the plain bytes. A frame cannot change, so it can be published as
+`shared WebSocketFrame` and sent from coroutines on any thread:
+
+```valk
+let frame: shared http.WebSocketFrame = http.WebSocketFrame.text(json)
+each sockets as ws : ws.write_frame(frame) ! continue
+```
+
+#### binary
+
+Prepares a binary message.
+
+#### text
+
+Prepares a text message; `data` must be UTF-8.
 
 ```js
 // One complete message received over a `WebSocket`.

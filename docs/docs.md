@@ -2669,6 +2669,16 @@ return http.WebSocket.upgrade(req, handler, protocol: "chat.v2", headers: http.H
 res.send_websocket(ctx, handler, protocol: "chat.v2") // the same for fast handlers
 ```
 
+To send one message to many connections, prepare it once with
+`WebSocketFrame.text(data)` or `WebSocketFrame.binary(data)` and send it with
+`ws.write_frame(frame)`. The frame is built once and compressed at most once per
+compression setting, and it can be shared between threads:
+
+```rust
+let frame: shared http.WebSocketFrame = http.WebSocketFrame.text("{\"type\":\"update\"}")
+each sockets as ws : ws.write_frame(frame) ! continue
+```
+
 ## Sockets
 
 API for [valk.net](api.md#net)

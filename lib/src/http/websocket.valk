@@ -315,6 +315,26 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         this.send_frame(WS_OP_BINARY, data) !>
     }
 
+    /// Sends a message prepared with `WebSocketFrame`, for sending one message to many
+    /// connections.
+    ///
+    /// A server connection writes the frame's bytes as they are, compressed when the
+    /// connection negotiated permessage-deflate; a client connection masks a copy.
+    + fn write_frame(frame: shared WebSocketFrame) !WebSocketError {
+        let bytes = frame.bytes_for(this.deflate_bits)
+        this.begin_write() !>
+        if !this.is_client {
+            this.write_out(bytes) !>
+            return
+        }
+        let head = websocket_frame_head_size(bytes)
+        let out = this.output
+        out.clear()
+        out.skip(WS_HEADER_ROOM)
+        out.write(bytes.view(head, bytes.bytes - head))
+        this.finish_frame(bytes.get(0).to(uint), bytes.bytes - head) !>
+    }
+
     /// Sends a ping; the peer answers with a pong that `read` consumes.
     ///
     /// `data` is at most 125 bytes.
@@ -357,12 +377,25 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         this.send_frame(WS_OP_CLOSE, payload) !>
     }
 
-    - fn send_frame(opcode: uint, data: local &[u8]) !WebSocketError {
+    // One frame at a time: a second writer waits for the one in progress
+    - fn begin_write() !WebSocketError {
         if this.closed : throw .closed
-        // One frame at a time: a second writer waits for the one in progress
         while this.writing : time.sleep_ms(1)
         if this.closed : throw .closed
         this.writing = true
+    }
+
+    - fn write_out(bytes: local &[u8]) !WebSocketError {
+        this.con.write(bytes) ! {
+            this.writing = false
+            this.finish()
+            throw E
+        }
+        this.writing = false
+    }
+
+    - fn send_frame(opcode: uint, data: local &[u8]) !WebSocketError {
+        this.begin_write() !>
 
         // The payload goes after room for the header, which is put in front of it
         let frame = this.output
@@ -381,7 +414,12 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             }
         }
         if (first & 0x40) == 0 : frame.write(data)
+        this.finish_frame(first, length) !>
+    }
 
+    // Puts the header in front of the `length` bytes of payload in `output` and sends it
+    - fn finish_frame(first: uint, length: uint) !WebSocketError {
+        let frame = this.output
         let header: uint = length < 126 ? 2 : (length < 65536 ? 4 : 10)
         if this.is_client : header += 4
         let start = WS_HEADER_ROOM - header
@@ -412,16 +450,11 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             websocket_mask(frame.view(WS_HEADER_ROOM, length), key[0], key[1], key[2], key[3])
         }
 
-        this.con.write(frame.view(start, header + length)) ! {
-            this.writing = false
-            this.finish()
-            throw E
-        }
+        this.write_out(frame.view(start, header + length)) !>
         if frame.length > 65536 {
             frame.clear()
             frame.shrink_capacity(4096)
         }
-        this.writing = false
     }
 
     // ---- Receiving -------------------------------------------------------------------
@@ -635,6 +668,90 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         this.send_close(1000, "") ! {}
         this.finish()
     }
+}
+
+// Compressed forms of a `WebSocketFrame`, by window bits (8 to 15); "" until built
+class WebSocketFrameCache {
+    frames: Array[String] (Array[String]{ "" x 8 })
+}
+
+/// A text or binary message prepared once and sent to many WebSockets with
+/// `WebSocket.write_frame`.
+///
+/// The frame bytes are built when it is made, and the compressed form the first time a
+/// connection with permessage-deflate sends it, once per window size; connections without
+/// compression send the plain bytes. A frame cannot change, so it can be published as
+/// `shared WebSocketFrame` and sent from coroutines on any thread:
+///
+/// ```valk
+/// let frame: shared http.WebSocketFrame = http.WebSocketFrame.text(json)
+/// each sockets as ws : ws.write_frame(frame) ! continue
+/// ```
++ class WebSocketFrame {
+    // The unmasked frame as a server sends it: header and payload
+    - plain: String
+    - compressed: shared core.Lock[WebSocketFrameCache]
+
+    /// Prepares a text message; `data` must be UTF-8.
+    + static fn text(data: local &[u8]) SELF {
+        return SELF.make(WS_OP_TEXT, data)
+    }
+
+    /// Prepares a binary message.
+    + static fn binary(data: local &[u8]) SELF {
+        return SELF.make(WS_OP_BINARY, data)
+    }
+
+    - static fn make(opcode: uint, data: local &[u8]) SELF {
+        return SELF {
+            plain: websocket_server_frame(0x80 | opcode, data)
+            compressed: core.Lock[WebSocketFrameCache].new(WebSocketFrameCache {}) !!
+        }
+    }
+
+    // The frame bytes for a connection compressing with `bits` (0: no compression)
+    fn bytes_for(bits: uint) String {
+        let plain = this.plain
+        let head = websocket_frame_head_size(plain)
+        let length = plain.bytes - head
+        if bits < 8 || bits > 15 || length < WS_COMPRESS_MIN_SIZE : return plain
+        lock this.compressed as cache {
+            let known = cache.frames[bits - 8]
+            if known.bytes > 0 : return known
+            let out = ByteBuffer.new(length / 2 + 16)
+            compress.deflate_message(plain.view(head, length), out, WS_COMPRESS_LEVEL, bits)
+            let result = out.length < length ? websocket_server_frame(plain.get(0).to(uint) | 0x40, out) : plain
+            cache.frames.set(bits - 8, result) _
+            return result
+        }
+        return plain
+    }
+}
+
+// An unmasked frame with first byte `first` and `payload`
+fn websocket_server_frame(first: uint, payload: local &[u8]) String {
+    let length = payload.length
+    let out = ByteBuffer.new(length + 10)
+    out.write_byte(first.to(u8))
+    if length < 126 {
+        out.write_byte(length.to(u8))
+    } else if length < 65536 {
+        out.write_byte(126)
+        out.write_u16_be(length.to(u16))
+    } else {
+        out.write_byte(127)
+        out.write_u64_be(length.to(u64))
+    }
+    out.write(payload)
+    return out.into_string()
+}
+
+// The header size of an unmasked frame
+fn websocket_frame_head_size(frame: String) uint {
+    let length = frame.get(1) & 0x7f
+    if length == 126 : return 4
+    if length == 127 : return 10
+    return 2
 }
 
 // XORs `data` with the 4-byte masking key (RFC 6455 §5.3)
