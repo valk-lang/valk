@@ -1,0 +1,90 @@
+@ignore_access
+use valk.http
+use valk.net
+use valk.time
+
+test "HTTP: large response buffers are pooled per thread, not kept by idle connections" {
+    http.output_pool.clear()
+    let res = http.ResponseWriter {}
+    let page = "x".repeat(400 * 1024)
+
+    res.send(page)
+    let first = res.output
+    assert(first.size >= page.bytes)
+    res.reset()
+    res.allow_new_response()
+    // The connection keeps a small buffer; the large one waits in the pool
+    assert(res.output.size == 2048)
+    assert(http.output_pool.length == 1)
+
+    // The next large response takes it back instead of growing a new one
+    res.send(page)
+    assert(res.output == first)
+    assert(http.output_pool.length == 0)
+    assert(res.output.range(res.output.length - 4, 4) == "xxxx")
+    res.reset()
+    res.allow_new_response()
+
+    // Small responses leave the pool alone
+    res.send("small")
+    assert(res.output.size == 2048)
+    res.reset()
+    res.allow_new_response()
+    assert(http.output_pool.length == 1)
+
+    // A buffer above 1 MiB is not pooled
+    res.send("y".repeat(3 * 1024 * 1024))
+    res.reset()
+    assert(http.output_pool.length == 1)
+    assert(res.output.size == 2048)
+    http.output_pool.clear()
+}
+
+fn rw_big_handler(ctx: http.Context, res: http.ResponseWriter) {
+    if ctx.path.equals("/big") : res.send("b".repeat(300 * 1024))
+    else : res.send("small")
+}
+
+// Reads one response with a Content-Length body from `input` and the socket, and returns the body
+fn rw_read_response(con: net.TcpConnection, input: ByteBuffer) String {
+    let buf = [u8]{ 0 x 65536 }
+    while true {
+        let text = input.to_string()
+        text.index_of("\r\n\r\n") -> end: {
+            let head = text.range(0, end)
+            let at = head.lower().index_of("content-length: ") !!
+            let rest = head.range(at + 16, head.bytes - at - 16)
+            let length = rest.index_of("\r\n") !? rest.bytes
+            let size = rest.range(0, length).to_uint() !!
+            if input.length >= end + 4 + size {
+                input.clear_until(end + 4 + size)
+                return text.range(end + 4, size)
+            }
+        }
+        let bytes = con.read(buf) !!
+        input.write(buf.view(0, bytes))
+    }
+    return ""
+}
+
+test "HTTP: pipelined small and large responses share the pooled output buffers" {
+    let server = http.Server.new("127.0.0.1", 19610)
+    server.fast(rw_big_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let con = net.tcp_client("127.0.0.1", 19610) !!
+    let input = ByteBuffer.new(4096)
+    each 0 .. 3 as round {
+        // The small response is still unsent when the large one takes a pooled buffer
+        con.write("GET /small HTTP/1.1\r\nHost: x\r\n\r\nGET /big HTTP/1.1\r\nHost: x\r\n\r\n") !!
+        assert(rw_read_response(con, input) == "small")
+        let big = rw_read_response(con, input)
+        assert(big.bytes == 300 * 1024)
+        assert(big.starts_with("bbbb") && big.ends_with("bbbb"))
+    }
+    con.close() !!
+
+    server.request_shutdown(1000)
+    await running !!
+}
