@@ -1,4 +1,5 @@
 use io
+use mem
 
 /// A compressed data format; all three carry the same DEFLATE data.
 + enum Format {
@@ -71,16 +72,102 @@ fn write_format_header(out: ByteBuffer, format: Format, level: uint) {
 /// so bytes after a gzip member must form another member. For `deflate` and `zlib`, bytes
 /// after the end of the stream are ignored.
 + fn decompress(data: local &[u8], format: Format, max_size: uint (0)) String !CompressError {
-    let reader = Decompressor.new(ByteReader.new(data), format)
+    @unsafe
     let out = ByteBuffer.new(data.length * 3 + 64)
-    let chunk = [u8]{ 0 x 65536 }
-    while true {
-        let count = reader.read_inner(chunk) !>
-        if count == 0 : break
-        if max_size > 0 && out.length + count > max_size : throw .too_large
-        out.write(chunk.view(0, count))
+    let inflater = thread_inflater()
+    inflater.in_data = data.data
+    inflater.in_pos = 0
+    inflater.in_len = data.length
+    inflater.bit_buf = 0
+    inflater.bit_count = 0
+    inflater.out = out
+    inflater.out_pos = 0
+    decompress_all(inflater, format, max_size == 0 ? uint.$max : max_size) ! {
+        inflater.release()
+        throw E
     }
+    inflater.release()
     return out.to_string()
+}
+
+// Decodes the whole fixed input of `inflater` into its `out`, members and
+// trailers included
+fn decompress_all(inflater: Inflater, format: Format, limit: uint) !CompressError {
+    @unsafe
+    while true {
+        let start = inflater.out.length
+        inflater.restart()
+        read_format_header(inflater, format) !>
+        inflater.produce_all(limit) !>
+        if !inflater.finished() : throw .truncated
+        inflater.align()
+        if format == Format.gzip {
+            let crc = read_le32(inflater) !>
+            let size = read_le32(inflater) !>
+            let produced = inflater.out.view(start, inflater.out.length - start)
+            if crc != crc32(produced).to(uint) || size != (produced.length & 0xffffffff) : throw .checksum
+            // Another gzip member may follow
+            if inflater.has_more() !> : continue
+        } else if format == Format.zlib {
+            let b0 = inflater.next_byte() !>
+            let b1 = inflater.next_byte() !>
+            let b2 = inflater.next_byte() !>
+            let b3 = inflater.next_byte() !>
+            let adler = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+            if adler != adler32(inflater.out.view(start, inflater.out.length - start)).to(uint) : throw .checksum
+        }
+        return
+    }
+}
+
+fn read_le32(inflater: Inflater) uint !CompressError {
+    let b0 = inflater.next_byte() !>
+    let b1 = inflater.next_byte() !>
+    let b2 = inflater.next_byte() !>
+    let b3 = inflater.next_byte() !>
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// Reads the zlib or gzip header (nothing for raw DEFLATE)
+fn read_format_header(inflater: Inflater, format: Format) !CompressError {
+    if format == Format.zlib {
+        let cmf = inflater.next_byte() !>
+        let flg = inflater.next_byte() !>
+        if (cmf & 0x0f) != 8 || (cmf >> 4) > 7 : throw .invalid_input
+        if ((cmf << 8) | flg) % 31 != 0 : throw .invalid_input
+        if (flg & 0x20) != 0 : throw .invalid_input // preset dictionaries are not supported
+        return
+    }
+    if format == Format.gzip {
+        if (inflater.next_byte() !>) != 0x1f || (inflater.next_byte() !>) != 0x8b : throw .invalid_input
+        if (inflater.next_byte() !>) != 8 : throw .invalid_input
+        let flags = inflater.next_byte() !>
+        if (flags & 0xe0) != 0 : throw .invalid_input // reserved bits
+        let i: uint = 0
+        while i < 6 {
+            inflater.next_byte() !>
+            i++
+        }
+        if (flags & 4) != 0 {
+            let e0 = inflater.next_byte() !>
+            let e1 = inflater.next_byte() !>
+            let extra = e0 | (e1 << 8)
+            while extra > 0 {
+                inflater.next_byte() !>
+                extra--
+            }
+        }
+        if (flags & 8) != 0 {
+            while (inflater.next_byte() !>) != 0 {}
+        }
+        if (flags & 16) != 0 {
+            while (inflater.next_byte() !>) != 0 {}
+        }
+        if (flags & 2) != 0 {
+            inflater.next_byte() !>
+            inflater.next_byte() !>
+        }
+    }
 }
 
 /// Writes `data` compressed into `format` at `level` to `out` and returns the bytes written.
@@ -369,62 +456,15 @@ class MeteredWriter is io.Writer {
     }
 
     fn read_header() !CompressError {
-        let inflater = this.inflater
-        if this.format == Format.zlib {
-            let cmf = inflater.next_byte() !>
-            let flg = inflater.next_byte() !>
-            if (cmf & 0x0f) != 8 || (cmf >> 4) > 7 : throw .invalid_input
-            if ((cmf << 8) | flg) % 31 != 0 : throw .invalid_input
-            if (flg & 0x20) != 0 : throw .invalid_input // preset dictionaries are not supported
-            return
-        }
-        if this.format == Format.gzip {
-            if (inflater.next_byte() !>) != 0x1f || (inflater.next_byte() !>) != 0x8b : throw .invalid_input
-            if (inflater.next_byte() !>) != 8 : throw .invalid_input
-            let flags = inflater.next_byte() !>
-            if (flags & 0xe0) != 0 : throw .invalid_input // reserved bits
-            let i: uint = 0
-            while i < 6 {
-                inflater.next_byte() !>
-                i++
-            }
-            if (flags & 4) != 0 {
-                let e0 = inflater.next_byte() !>
-                let e1 = inflater.next_byte() !>
-                let extra = e0 | (e1 << 8)
-                while extra > 0 {
-                    inflater.next_byte() !>
-                    extra--
-                }
-            }
-            if (flags & 8) != 0 {
-                while (inflater.next_byte() !>) != 0 {}
-            }
-            if (flags & 16) != 0 {
-                while (inflater.next_byte() !>) != 0 {}
-            }
-            if (flags & 2) != 0 {
-                inflater.next_byte() !>
-                inflater.next_byte() !>
-            }
-        }
-    }
-
-    fn read_le32() uint !CompressError {
-        let inflater = this.inflater
-        let b0 = inflater.next_byte() !>
-        let b1 = inflater.next_byte() !>
-        let b2 = inflater.next_byte() !>
-        let b3 = inflater.next_byte() !>
-        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        read_format_header(this.inflater, this.format) !>
     }
 
     fn read_trailer() !CompressError {
         let inflater = this.inflater
         inflater.align()
         if this.format == Format.gzip {
-            let crc = this.read_le32() !>
-            let size = this.read_le32() !>
+            let crc = read_le32(inflater) !>
+            let size = read_le32(inflater) !>
             if crc != this.crc.to(uint) || size != (this.total & 0xffffffff) : throw .checksum
             return
         }
@@ -440,12 +480,8 @@ class MeteredWriter is io.Writer {
 }
 
 fn mem_copy(from: local &[u8], to: local mut &[u8]) {
-    let i: uint = 0
-    let count = from.length
-    while i < count {
-        to[i] = from[i]
-        i++
-    }
+    @unsafe
+    mem.copy_bytes(from.data, to.data, from.length)
 }
 
 /// Writes `data` compressed as raw DEFLATE to `out`; see `compress_into`.

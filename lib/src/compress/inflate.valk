@@ -8,7 +8,7 @@ use mem
 
 value inflate_window (32768)
 value inflate_input_size (65536)
-value inflate_fast_bits (9)
+value inflate_fast_bits (10)
 value inflate_max_bits (15)
 
 global length_base: [u16 x 29] ({ 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 })
@@ -19,12 +19,15 @@ global dist_extra: [u8 x 30] ({ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 
 global code_length_order: [u8 x 19] ({ 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 })
 
 // A canonical Huffman code: `count[n]` codes of length n, symbols in code
-// order, plus a lookup table for codes of up to inflate_fast_bits bits
+// order, plus a lookup table for codes of up to inflate_fast_bits bits (fewer
+// when no code is that long, so small codes build quickly)
 struct Huffman {
     count: [u16 x 16] ({ 0... })
     symbol: [u16 x 288] ({ 0... })
     // (length << 9) | symbol; 0 when the code is longer than the table
-    fast: [u16 x 512] ({ 0... })
+    fast: [u16 x 1024] ({ 0... })
+    // The table's size - 1
+    mask: uint (1)
 
     // Builds the code from per-symbol lengths (0 = unused). Over-subscribed
     // sets are rejected; incompleteness is handled per `check`
@@ -33,11 +36,6 @@ struct Huffman {
         let i: uint = 0
         while i < 16 {
             this.count[i] = 0
-            i++
-        }
-        i = 0
-        while i < 512 {
-            this.fast[i] = 0
             i++
         }
         let longest: uint = 0
@@ -49,6 +47,11 @@ struct Huffman {
             i++
         }
         this.count[0] = 0
+        let table_bits = longest < inflate_fast_bits ? longest : inflate_fast_bits
+        if table_bits == 0 : table_bits = 1
+        let table_size: uint = 1 << table_bits
+        this.mask = table_size - 1
+        mem.clear_bytes(@ref(this.fast).@cast(ptr), table_size * 2)
         let left: int = 1
         let len: uint = 1
         while len <= inflate_max_bits {
@@ -85,13 +88,13 @@ struct Huffman {
             offsets[l] = offsets[l] + 1
             let c = next[l].to(uint)
             next[l] = next[l] + 1
-            if l <= inflate_fast_bits {
+            if l <= table_bits {
                 // The stream stores codes most significant bit first
                 let reversed = reverse_bits(c, l)
                 let step: uint = 1 << l
                 let entry = ((l << 9) | i).to(u16)
                 let slot = reversed
-                while slot < 512 {
+                while slot < table_size {
                     this.fast[slot] = entry
                     slot += step
                 }
@@ -99,6 +102,26 @@ struct Huffman {
             i++
         }
         return true
+    }
+
+    // Decodes a code longer than the fast table from the low bits of `bits`
+    // (at least 15 valid); (length << 9) | symbol, or 0 for an invalid code
+    fn decode_long(bits: uint) uint {
+        @unsafe
+        let code: uint = 0
+        let first: uint = 0
+        let index: uint = 0
+        let len: uint = 1
+        while len <= inflate_max_bits {
+            code = code | ((bits >> (len - 1)) & 1)
+            let count = this.count[len].to(uint)
+            if code < first + count : return (len << 9) | this.symbol[index + (code - first)].to(uint)
+            index += count
+            first = (first + count) << 1
+            code = code << 1
+            len++
+        }
+        return 0
     }
 }
 
@@ -136,6 +159,8 @@ enum HuffmanCheck {
 class Inflater {
     source: io.Reader
     input: ByteBuffer (ByteBuffer.new(inflate_input_size))
+    // The input bytes: `input`'s, or the caller's with `fixed_input`
+    in_data: ptr (null.@cast(ptr))
     in_pos: uint (0)
     in_len: uint (0)
     bit_buf: uint (0)
@@ -152,6 +177,8 @@ class Inflater {
     lit: Huffman (Huffman {})
     dist: Huffman (Huffman {})
     lengths: ptr (mem.calloc(320))
+    // `lit` and `dist` hold the fixed codes
+    fixed_tables: bool (false)
     // `input` holds all the data; `source` is not read
     fixed_input: bool (false)
 
@@ -160,6 +187,7 @@ class Inflater {
         let inflater = Inflater { source: source }
         // Views of the input buffer need its length, not just its capacity
         inflater.input.resize(inflate_input_size)
+        inflater.in_data = inflater.input.data
         return inflater
     }
 
@@ -188,6 +216,7 @@ class Inflater {
             if error_is(E.code, closed) : return false
             throw E
         }
+        this.in_data = this.input.data
         this.in_pos = 0
         this.in_len = count
         this.consumed += count
@@ -199,7 +228,7 @@ class Inflater {
         if this.in_pos >= this.in_len {
             if !(this.refill() !>) : throw .truncated
         }
-        let b = this.input.get(this.in_pos).to(uint)
+        let b = @ptrv(this.in_data, u8, this.in_pos).to(uint)
         this.in_pos++
         return b
     }
@@ -252,12 +281,12 @@ class Inflater {
                     if !(this.refill() !>) : break
                     continue
                 }
-                this.bit_buf = this.bit_buf | (this.input.get(this.in_pos).to(uint) << this.bit_count)
+                this.bit_buf = this.bit_buf | (@ptrv(this.in_data, u8, this.in_pos).to(uint) << this.bit_count)
                 this.in_pos++
                 this.bit_count += 8
             }
         }
-        let entry = h.fast[this.bit_buf & 511].to(uint)
+        let entry = h.fast[this.bit_buf & h.mask].to(uint)
         if entry != 0 {
             let len = entry >> 9
             if len <= this.bit_count {
@@ -311,6 +340,7 @@ class Inflater {
 
     fn build_fixed() !CompressError {
         @unsafe
+        if this.fixed_tables : return
         let lengths = this.lengths
         let i: uint = 0
         while i < 144 : @ptrv(lengths, u8, i++) = 8
@@ -321,10 +351,12 @@ class Inflater {
         i = 0
         while i < 30 : @ptrv(lengths, u8, i++) = 5
         if !this.dist.build(lengths, 30, HuffmanCheck.any) : throw .invalid_input
+        this.fixed_tables = true
     }
 
     fn read_dynamic() !CompressError {
         @unsafe
+        this.fixed_tables = false
         let nlen = (this.bits(5) !>) + 257
         let ndist = (this.bits(5) !>) + 1
         let ncode = (this.bits(4) !>) + 4
@@ -432,7 +464,9 @@ class Inflater {
             }
             let count = this.in_len - this.in_pos
             if count > this.stored_remaining : count = this.stored_remaining
-            this.out.write(this.input.view(this.in_pos, count))
+            this.out.reserve(count)
+            mem.copy_bytes(this.in_data.@offset(this.in_pos), this.out.data.@offset(this.out.length), count)
+            this.out.skip(count)
             this.in_pos += count
             this.stored_remaining -= count
             this.produced += count
@@ -444,6 +478,11 @@ class Inflater {
         @unsafe
         let out = this.out
         while out.length < target {
+            // Whole symbols straight from the input while 16 bytes are left
+            if this.in_len - this.in_pos >= 16 {
+                if this.decode_fast(target) !> : return
+                continue
+            }
             let symbol = this.decode(@ref(this.lit)) !>
             if symbol < 256 {
                 out.write_byte(symbol.to(u8))
@@ -475,6 +514,120 @@ class Inflater {
         }
     }
 
+    // Decodes symbols with the bit buffer refilled 8 bytes at a time and the
+    // output written in place, until the block ends (returns true), `target`
+    // or the reserved room is reached, or fewer than 8 input bytes are left.
+    // Each loop reads at most 48 bits, which a refill guarantees
+    fn decode_fast(target: uint) bool !CompressError {
+        @unsafe
+        let out = this.out
+        out.reserve(32768 + 266)
+        let base = out.data
+        let start = out.length
+        let olen = start
+        // Room for a whole match plus an 8-byte copy overrun
+        let stop = out.size - 266
+        if target < stop : stop = target
+        let input = this.in_data
+        let ipos = this.in_pos
+        let in_stop = this.in_len - 8
+        let bits = this.bit_buf
+        let nbits = this.bit_count
+        let lit = @ref(this.lit)
+        let dist = @ref(this.dist)
+        let lit_fast = @ref(this.lit.fast).@cast(ptr)
+        let dist_fast = @ref(this.dist.fast).@cast(ptr)
+        let lit_mask = this.lit.mask
+        let dist_mask = this.dist.mask
+        let ended = false
+        let error = false
+        while olen < stop && ipos <= in_stop {
+            bits = bits | (@ptrv(input.@offset(ipos), u64).to(uint) << nbits)
+            ipos += (63 - nbits) >> 3
+            nbits = nbits | 56
+            let entry = @ptrv(lit_fast, u16, bits & lit_mask).to(uint)
+            if entry == 0 {
+                entry = lit.decode_long(bits)
+                if entry == 0 {
+                    error = true
+                    break
+                }
+            }
+            let len = entry >> 9
+            bits = bits >> len
+            nbits -= len
+            let symbol = entry & 511
+            if symbol < 256 {
+                @ptrv(base, u8, olen) = symbol.to(u8)
+                olen++
+                continue
+            }
+            if symbol == 256 {
+                ended = true
+                break
+            }
+            symbol -= 257
+            if symbol >= 29 {
+                error = true
+                break
+            }
+            let extra = length_extra[symbol].to(uint)
+            let length = length_base[symbol].to(uint) + (bits & ((1 << extra) - 1))
+            bits = bits >> extra
+            nbits -= extra
+            entry = @ptrv(dist_fast, u16, bits & dist_mask).to(uint)
+            if entry == 0 {
+                entry = dist.decode_long(bits)
+                if entry == 0 {
+                    error = true
+                    break
+                }
+            }
+            len = entry >> 9
+            bits = bits >> len
+            nbits -= len
+            let dsym = entry & 511
+            if dsym >= 30 {
+                error = true
+                break
+            }
+            extra = dist_extra[dsym].to(uint)
+            let distance = dist_base[dsym].to(uint) + (bits & ((1 << extra) - 1))
+            bits = bits >> extra
+            nbits -= extra
+            if distance > olen {
+                error = true
+                break
+            }
+            let to = base.@offset(olen)
+            let from = base.@offset(olen - distance)
+            if distance >= 8 {
+                // 8 bytes at a time; each read only covers bytes already in place
+                let i: uint = 0
+                while i < length {
+                    @ptrv(to.@offset(i), u64) = @ptrv(from.@offset(i), u64)
+                    i += 8
+                }
+            } else {
+                let i: uint = 0
+                while i < length {
+                    @ptrv(to, u8, i) = @ptrv(from, u8, i)
+                    i++
+                }
+            }
+            olen += length
+        }
+        out.skip(olen - start)
+        this.produced += olen - start
+        this.in_pos = ipos
+        // Bits past `nbits` repeat input bytes not yet consumed: drop them
+        this.bit_buf = bits & ((1 << nbits) - 1)
+        this.bit_count = nbits
+        if error : throw .invalid_input
+        if ended : this.end_block()
+        return ended
+    }
+
     // Forgets delivered output beyond the history window
     fn compact() {
         @unsafe
@@ -495,6 +648,15 @@ class Inflater {
         @unsafe
         if this.bit_count >= 8 || this.in_pos < this.in_len : return true
         return this.refill() !>
+    }
+
+    // Drops the references to a fixed input and its output
+    fn release() {
+        @unsafe
+        this.out = deflater_idle
+        this.in_data = null.@cast(ptr)
+        this.in_pos = 0
+        this.in_len = 0
     }
 
     // Prepares for a new DEFLATE stream in the same source
