@@ -6,6 +6,7 @@
 ```
 - Release 0.7.10
 + WebSocket: permessage-deflate compression (RFC 7692). `WebSocket.connect` offers it by default (`Options.websocket_compression`); a server accepts it with `Server.websocket_compression = true` or per endpoint with `WebSocket.upgrade(req, handler, true)` / `send_websocket(ctx, handler, true)` (off by default, as in Go and Node servers: it costs CPU per message). The server answers without context takeover either way, so a connection keeps no compression window; the client also inflates a server's context takeover. Messages under 64 bytes, or that would not shrink, go uncompressed, and a decompressed message counts against `max_message_size`. Frames are built in a reused buffer and masked 4 bytes at a time (uncompressed 16 KB echo 26.7k -> 32.4k round trips/s)
++ Fix: a `shared` (or locked) `String`, `Array` or `ByteBuffer` passes to a `&[T]` / `local &[T]` parameter; `String` and `ByteBuffer` failed inside the stdlib with `Expected '?GcPtr', got '?shared GcPtr'`. A view literal over shared or locked storage is now a shared or locked view itself
 
 + Release 0.7.9
 + crypto: `Hmac` keeps the hash state after the padded key, so `reset` and `finish` no longer hash a key block again: `pbkdf2` with 100k iterations 74 -> 32 ms (SHA-256), 94 -> 40 ms (SHA-512). `hash`, `hash_hex`, `hex_encode` and `Hmac.sign` allocate less: `sha256_hex` of 64 bytes 0.44 -> 0.32 us, `Hmac.sign` 1.07 -> 0.78 us
