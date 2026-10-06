@@ -58,6 +58,8 @@ value WS_COMPRESS_MIN_SIZE (64)
 value WS_COMPRESS_LEVEL (1)
 // Room in front of an outgoing payload for the longest frame header
 value WS_HEADER_ROOM (14)
+// Bytes queued behind a pending write before further writes wait for it
+value WS_MAX_QUEUE (4 * 1024 * 1024)
 value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
 
 /// A WebSocket connection (RFC 6455), on the server or the client side.
@@ -65,7 +67,11 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
 /// A server gets one from `WebSocket.upgrade`, a client from `WebSocket.connect`. `read`
 /// returns whole messages and answers pings by itself; `write` and `write_binary` send
 /// one message each. Reads and writes may run on different coroutines, so one coroutine
-/// can wait for messages while another sends. `close` performs the closing handshake.
+/// can wait for messages while another sends. On Linux and macOS a write without TLS does
+/// not wait for a slow peer: what the socket cannot take yet is queued and sent in the
+/// background (a write waits once 4 MB are queued); when that fails the connection closes
+/// and later calls throw `closed`.
+/// `close` performs the closing handshake.
 ///
 /// ```valk
 /// fn handler(req: http.Request) http.Response {
@@ -91,7 +97,10 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
     - fragment_opcode: uint (0)
     - in_fragment: bool (false)
     - is_client: bool
+    // A write owns the socket; others append to `queue`, which it sends next
     - writing: bool (false)
+    - queue: ByteBuffer (ByteBuffer.new(0))
+    - sending: ByteBuffer (ByteBuffer.new(0))
     - close_sent: bool (false)
     - closed: bool (false)
     /// The largest message accepted, in bytes (after decompression); a larger one closes
@@ -322,9 +331,9 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
     /// connection negotiated permessage-deflate; a client connection masks a copy.
     + fn write_frame(frame: shared WebSocketFrame) !WebSocketError {
         let bytes = frame.bytes_for(this.deflate_bits)
-        this.begin_write() !>
+        if this.closed : throw .closed
         if !this.is_client {
-            this.write_out(bytes) !>
+            this.write_out(bytes, "") !>
             return
         }
         let head = websocket_frame_head_size(bytes)
@@ -332,7 +341,7 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         out.clear()
         out.skip(WS_HEADER_ROOM)
         out.write(bytes.view(head, bytes.bytes - head))
-        this.finish_frame(bytes.get(0).to(uint), bytes.bytes - head) !>
+        this.finish_frame(bytes.get(0).to(uint), bytes.bytes - head, "") !>
     }
 
     /// Sends a ping; the peer answers with a pong that `read` consumes.
@@ -377,48 +386,90 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         this.send_frame(WS_OP_CLOSE, payload) !>
     }
 
-    // One frame at a time: a second writer waits for the one in progress
-    - fn begin_write() !WebSocketError {
+    // Sends `head` and `body` as one piece of the stream. A write that the socket cannot
+    // take at once goes on in a coroutine of its own, so a slow peer does not hold up the
+    // caller (as when sending to many connections); writes made meanwhile queue behind it.
+    // An error there closes the connection, and later calls throw `closed`.
+    - fn write_out(head: local &[u8], body: local &[u8]) !WebSocketError {
         if this.closed : throw .closed
-        while this.writing : time.sleep_ms(1)
-        if this.closed : throw .closed
+        if this.writing {
+            while this.writing && this.queue.length >= WS_MAX_QUEUE : time.sleep_ms(1)
+            if this.closed : throw .closed
+            if this.writing {
+                this.queue.write(head)
+                this.queue.write(body)
+                return
+            }
+        }
         this.writing = true
-    }
-
-    - fn write_out(bytes: local &[u8]) !WebSocketError {
-        this.con.write(bytes) ! {
+        let total = head.length + body.length
+        let sent = this.con.write_now(.{ head, body }) ! {
             this.writing = false
             this.finish()
             throw E
+        }
+        if sent < total {
+            let queue = this.queue
+            if sent < head.length {
+                queue.write(head.view(sent, head.length - sent))
+                queue.write(body)
+            } else {
+                queue.write(body.view(sent - head.length, total - sent))
+            }
+            co this.flush()
+            return
+        }
+        // With TLS and on Windows the write above could wait while others queued
+        this.flush() !>
+    }
+
+    // Sends the queue; the caller holds `writing`, which this releases
+    - fn flush() !WebSocketError {
+        while this.queue.length > 0 {
+            let out = this.queue
+            this.queue = this.sending
+            this.sending = out
+            this.con.write(out) ! {
+                this.writing = false
+                this.finish()
+                throw E
+            }
+            out.clear()
+            if out.size > 65536 : out.shrink_capacity(4096)
         }
         this.writing = false
     }
 
     - fn send_frame(opcode: uint, data: local &[u8]) !WebSocketError {
-        this.begin_write() !>
+        if this.closed : throw .closed
 
         // The payload goes after room for the header, which is put in front of it
         let frame = this.output
         frame.clear()
         frame.skip(WS_HEADER_ROOM)
         let first = 0x80 | opcode
-        let length = data.length
-        if this.deflate_bits > 0 && opcode < 8 && length >= WS_COMPRESS_MIN_SIZE {
+        if this.deflate_bits > 0 && opcode < 8 && data.length >= WS_COMPRESS_MIN_SIZE {
             compress.deflate_message(data, frame, WS_COMPRESS_LEVEL, this.deflate_bits)
             let compressed = frame.length - WS_HEADER_ROOM
-            if compressed < length {
-                length = compressed
-                first = first | 0x40
-            } else {
-                frame.truncate(WS_HEADER_ROOM)
+            if compressed < data.length {
+                this.finish_frame(first | 0x40, compressed, "") !>
+                return
             }
+            frame.truncate(WS_HEADER_ROOM)
         }
-        if (first & 0x40) == 0 : frame.write(data)
-        this.finish_frame(first, length) !>
+        if this.is_client {
+            // Masked in place
+            frame.write(data)
+            this.finish_frame(first, data.length, "") !>
+            return
+        }
+        this.finish_frame(first, data.length, data) !>
     }
 
-    // Puts the header in front of the `length` bytes of payload in `output` and sends it
-    - fn finish_frame(first: uint, length: uint) !WebSocketError {
+    // Puts the header for `length` bytes of payload in front of `output` and sends it. A
+    // non-empty `body` is the payload itself, sent after the header without a copy;
+    // otherwise the payload follows the header in `output`.
+    - fn finish_frame(first: uint, length: uint, body: local &[u8]) !WebSocketError {
         let frame = this.output
         let header: uint = length < 126 ? 2 : (length < 65536 ? 4 : 10)
         if this.is_client : header += 4
@@ -450,7 +501,8 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             websocket_mask(frame.view(WS_HEADER_ROOM, length), key[0], key[1], key[2], key[3])
         }
 
-        this.write_out(frame.view(start, header + length)) !>
+        if body.length > 0 : this.write_out(head, body) !>
+        else : this.write_out(frame.view(start, header + length), "") !>
         if frame.length > 65536 {
             frame.clear()
             frame.shrink_capacity(4096)
@@ -656,6 +708,9 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
     - fn finish() {
         if this.closed : return
         this.closed = true
+        // A pending write sends what was queued (such as a close frame) first
+        while this.writing : time.sleep_ms(1)
+        this.queue.clear()
         this.input.clear()
         this.fragments.clear()
         this.inflated.clear()

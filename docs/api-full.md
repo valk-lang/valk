@@ -12144,7 +12144,11 @@ A WebSocket connection (RFC 6455), on the server or the client side.
 A server gets one from `WebSocket.upgrade`, a client from `WebSocket.connect`. `read`
 returns whole messages and answers pings by itself; `write` and `write_binary` send
 one message each. Reads and writes may run on different coroutines, so one coroutine
-can wait for messages while another sends. `close` performs the closing handshake.
+can wait for messages while another sends. On Linux and macOS a write without TLS does
+not wait for a slow peer: what the socket cannot take yet is queued and sent in the
+background (a write waits once 4 MB are queued); when that fails the connection closes
+and later calls throw `closed`.
+`close` performs the closing handshake.
 
 ```valk
 fn handler(req: http.Request) http.Response {

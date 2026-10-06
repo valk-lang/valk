@@ -2679,6 +2679,12 @@ let frame: shared http.WebSocketFrame = http.WebSocketFrame.text("{\"type\":\"up
 each sockets as ws : ws.write_frame(frame) ! continue
 ```
 
+On Linux and macOS, writes without TLS do not wait for a slow peer: what its
+socket cannot take right away is queued and sent in the background, and writes
+made meanwhile go out after it.
+Only once 4 MB are queued does a write wait. When a queued write fails, the
+connection closes and later calls throw `closed`.
+
 ## Sockets
 
 API for [valk.net](api.md#net)

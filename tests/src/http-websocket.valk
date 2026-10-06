@@ -967,3 +967,96 @@ test "WebSocket: a prepared frame goes to plain and compressing connections alik
     server.request_shutdown(1000)
     await running !!
 }
+
+global ws_queue_peers: Array[http.WebSocket] (Array[http.WebSocket].new())
+
+// On "go", sends 6 MB to the first connection, which never reads, and reports how many
+// frames went out and how long that took
+fn ws_queue_handler(ctx: http.Context, res: http.ResponseWriter) {
+    res.send_websocket(ctx, fn(ws: http.WebSocket) {
+        ws_queue_peers.append(ws)
+        while true {
+            let msg = ws.read() ! return
+            if msg.data != "go" : continue
+            let stalled = ws_queue_peers.get(0) ! return
+            let big = http.WebSocketFrame.binary("".pad_right('q', 65536))
+            let start = time.mono_ms()
+            let sent: uint = 0
+            each 0 .. 96 as i {
+                stalled.write_frame(big) ! break
+                sent++
+            }
+            ws.write(sent + " " + (time.mono_ms() - start)) ! return
+        }
+    })
+}
+
+// Windows and TLS connections still wait for the peer
+#if OS != "win"
+test "WebSocket: a write to a peer that does not read queues instead of waiting" {
+    let server = http.Server.new("127.0.0.1", 19614)
+    server.fast(ws_queue_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let stalled = ws_raw_offer(19614, "/", "")
+    stalled.con.set_receive_buffer(4096) !!
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19614/") !!
+    ws.write("go") !!
+    let report = (ws.read() !!).data.split(" ")
+    assert((report.get(0) !? "") == "96")
+    assert(((report.get(1) !? "").to_uint() !? 9999) < 2000)
+    ws.close() !!
+    stalled.con.close() !!
+    server.request_shutdown(1000)
+    await running !!
+}
+#end
+
+fn ws_burst(ws: http.WebSocket, tag: String) {
+    each 0 .. 60 as i {
+        ws.write(tag + ":" + i + ":" + "".pad_right('x', 100000)) ! return
+    }
+}
+
+// Two coroutines write 6 MB each at once, then the handler returns
+fn ws_burst_handler(ctx: http.Context, res: http.ResponseWriter) {
+    res.send_websocket(ctx, fn(ws: http.WebSocket) {
+        let a = co ws_burst(ws, "a")
+        let b = co ws_burst(ws, "b")
+        await a
+        await b
+    })
+}
+
+test "WebSocket: queued writes from several coroutines arrive whole and in order before the close" {
+    let server = http.Server.new("127.0.0.1", 19615)
+    server.fast(ws_burst_handler)
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let ws = http.WebSocket.connect("ws://127.0.0.1:19615/", http.Options { websocket_compression: false }) !!
+    ws.set_timeouts(10000, 5000)
+    time.sleep_ms(300)
+    let next_a: uint = 0
+    let next_b: uint = 0
+    each 0 .. 120 as i {
+        let msg = ws.read() !!
+        let parts = msg.data.split(":")
+        assert(parts.length == 3)
+        assert((parts.get(2) !? "").bytes == 100000)
+        let index = (parts.get(1) !? "").to_uint() !? 999
+        if (parts.get(0) !? "") == "a" {
+            assert(index == next_a)
+            next_a++
+        } else {
+            assert(index == next_b)
+            next_b++
+        }
+    }
+    assert(next_a == 60 && next_b == 60)
+    let closed = false
+    ws.read() ! { closed = error_is(E.code, closed) }
+    assert(closed)
+    assert(ws.close_code == 1000)
+    server.request_shutdown(1000)
+    await running !!
+}
