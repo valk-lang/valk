@@ -67,21 +67,14 @@ fn parse_class_properties(class: Class) !Error {
     }
     if class.kind == CLASS_KIND.union : class.get_type() !>
 
-    let exps = parse_class_body_exps(class) !>
-    let state = ParseState.new()
-    each exps as exp {
-        parse_class_body_member(class, state, exp, class.scope) !>
-    }
-    if state.has_open_if() || state.is_skipping() {
-        let body = class.body
-        if isset(body) : body.error("Missing compile macro '#end' in class body")
-        class.ns.build.error("Missing compile macro '#end' in class " + class.name)
-    }
-
-    // Apply `extend Class { ... }` blocks (generic names remapped for specializations)
-    each class.extends as ex {
-        parse_class_extend(class, ex) !>
-    }
+    // Methods, then the rest: a property's type can instantiate a generic that asks about
+    // this class's hooks while it is parsed, such as `Heap[Node]` inside `Node`.
+    // `extend Class { ... }` blocks follow the body in each pass
+    defer queue_unqueued_methods(class)
+    register_class_methods(class) !>
+    parse_class_members(class, class.body_exps ?? Array[Exp]{}, class.scope, MEMBER_PASS.rest) !>
+    each class.extends as ex : parse_class_extend(class, ex, MEMBER_PASS.rest) !>
+    class.body_exps = null
     add_class_trait_funcs(class) !>
     check_class_setters(class) !>
 
@@ -95,6 +88,24 @@ fn parse_class_properties(class: Class) !Error {
     class.union_type_exp = null
     class.slice_type_exp = null
     class.flags = null
+}
+
+// Registers the methods of a class ahead of its properties. Hook queries (`$can_order`,
+// `$has_method`) on a class the pipeline has not reached need them, and parsing all of
+// its properties for that can loop back into the generic being instantiated
+fn register_class_methods(class: Class) !Error {
+    if class.is_generic_base || class.methods_registered : return
+    class.methods_registered = true
+    let exps = parse_class_body_exps(class) !>
+    class.body_exps = exps
+    class.unqueued_methods = Array[Func]{}
+    let state = parse_class_members(class, exps, class.scope, MEMBER_PASS.methods) !>
+    if state.has_open_if() || state.is_skipping() {
+        let body = class.body
+        if isset(body) : body.error("Missing compile macro '#end' in class body")
+        class.ns.build.error("Missing compile macro '#end' in class " + class.name)
+    }
+    each class.extends as ex : parse_class_extend(class, ex, MEMBER_PASS.methods) !>
 }
 
 fn add_builtin_sequence_prop(
@@ -120,8 +131,30 @@ fn add_builtin_sequence_prop(
     return prop
 }
 
+enum MEMBER_PASS : u8 {
+    all
+    methods
+    rest
+}
+
+// Parse the members of one pass. Each pass runs the compile macros; a `#print` prints in the last
+fn parse_class_members(class: Class, exps: Array[Exp], scope: Scope, pass: MEMBER_PASS, extension_pkg: ?Pkg (null)) ParseState !Error {
+    let state = ParseState.new()
+    each exps as exp {
+        if pass != MEMBER_PASS.all {
+            if exp.type == EXP.macro {
+                if pass == MEMBER_PASS.methods && exp.kind.@cast(MACRO_KIND) == MACRO_KIND.print : continue
+            } else if (exp.type == EXP.func || exp.type == EXP.group) != (pass == MEMBER_PASS.methods) {
+                continue
+            }
+        }
+        parse_class_body_member(class, state, exp, scope, null, extension_pkg) !>
+    }
+    return state
+}
+
 // Mix one extend body's members into `class` (used for concrete + specialized classes).
-fn parse_class_extend(class: Class, ex: Extend) !Error {
+fn parse_class_extend(class: Class, ex: Extend, pass: MEMBER_PASS (MEMBER_PASS.all)) !Error {
     let body = ex.body
     if !isset(body) : return
 
@@ -146,10 +179,7 @@ fn parse_class_extend(class: Class, ex: Extend) !Error {
     let p = pos.copy().init_parser()
     let members = read_class_body_exps(p, class.kind == CLASS_KIND.interface) !>
 
-    let state = ParseState.new()
-    each members as mem {
-        parse_class_body_member(class, state, mem, scope, null, ex.ns.pkg) !>
-    }
+    let state = parse_class_members(class, members, scope, pass, ex.ns.pkg) !>
     if state.has_open_if() || state.is_skipping() {
         body.error("Missing compile macro '#end' in extend body")
     }
@@ -298,11 +328,21 @@ fn parse_class_method(class: Class, exp: Exp, scope: Scope, group: ?Group) !Erro
         class.funcs.set(name, f)
     }
 
-    class.unit.functions.append(f)
-    class.ns.build.pipeline.parse_func_types.append(f)
-    if !is_generic_base {
-        class.ns.build.pipeline.parse_func_asts.append(f)
-    }
+    let unqueued = class.unqueued_methods
+    if isset(unqueued) : unqueued.append(f)
+    else : queue_class_method(f)
+}
+
+fn queue_unqueued_methods(class: Class) {
+    let unqueued = class.unqueued_methods ?! return
+    class.unqueued_methods = null
+    each unqueued as func : queue_class_method(func)
+}
+
+fn queue_class_method(f: Func) {
+    f.unit.functions.append(f)
+    f.ns.build.pipeline.parse_func_types.append(f)
+    if !f.is_generic_base : f.ns.build.pipeline.parse_func_asts.append(f)
 }
 
 // `group name { ... }` — parse nested members into the group.
@@ -472,6 +512,11 @@ fn parse_class_prop(class: Class, exp: Exp, scope: Scope, extension_pkg: ?Pkg (n
         // Duplicate names are not allowed among named properties.
         let existing = class.get_prop_by_name(name) !? null
         if isset(existing) : exp.error("Property name already used: " + name)
+        // Methods are registered first
+        let func = class.funcs.get(name) !? null
+        if isset(func) : func.exp.error("Function name is already used for something else in this class: " + name)
+        let group = class.groups.get(name) !? null
+        if isset(group) : group.exp.error("Group name is already used for something else in this class: " + name)
     }
 
     let type_exp = exp.get(PROP_EXP.type)
