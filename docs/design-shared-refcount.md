@@ -194,21 +194,28 @@ and recycling bumps the sequence past every old entry.
 
 ### 6.5 Threads that do not collect
 
-`min_done` waits for the slowest thread. Three rules keep it moving:
+`min_done` waits for the slowest thread. After its own collection a thread
+looks at the threads whose gc lock is free (they block) and are behind it:
 
-- Each pass records the oldest epoch of an entry it had to keep. A thread
-  whose last collection started before it collects at its next idle point
-  (`collect_if_threshold_almost_reached`, called by the event loop), on its
-  own core.
-- After its own collection a thread looks at the threads whose gc lock is
-  free (they block). One that has not run since a collection was last run for
-  it only gets its epoch moved on: it let go of its gc (`release_lock` counts
-  that), so nothing it references changed. One that stayed blocked since the
-  last look and did not collect since our previous collection gets its
-  collection run by us (the existing `gc = other` switch, a try-lock, never a
-  wait).
-- A thread that computes without allocating or blocking delays frees, nothing
-  more.
+- one that has not run since a collection was run for it only gets its epoch
+  moved on: it let go of its gc (`release_lock` counts that), so nothing it
+  references changed;
+- one that did not collect since our previous collection gets its collection
+  run by us (the existing `gc = other` switch, a try-lock, never a wait);
+- threads that keep up with us are left alone, and a thread that computes
+  without allocating or blocking only delays frees.
+
+Tried and dropped (numbers in section 13):
+
+- Rounds triggered like the old shared collection (shared memory doubled plus
+  4 MB, every thread collects once per round): dead chains free one level per
+  round, so under a steady publish rate the dead memory at the end of a round
+  set the next trigger and it ratcheted up (90-100 MB instead of 6 MB on the
+  message benchmark).
+- Threads that hold back the oldest dead region collect at their idle point:
+  moves the work off the busiest thread (+9% instead of +15% wall time), but a
+  thread with many coroutines then collects at almost every event-loop
+  iteration; under Wine the suite ran into network timeouts.
 
 ## 7. Interaction with the local GC, coroutines and threads
 
@@ -315,41 +322,43 @@ last stop-the-world.
 
 ## 13. Results (2026-10-07)
 
-All on linux-x64 (12 cores), release builds, base = the same branch without
-the define. The machine was shared with other jobs; numbers are medians of
-alternating runs, benchmarks pinned to CPUs 4-11.
+All on linux-x64 (12 cores), base = the same branch without the define, the
+final helping policy of 6.5. The machine was shared with other jobs; numbers
+are medians of alternating runs, benchmarks pinned to CPUs 4-11.
 
-| Benchmark | base | SHARED_RC |
+| Benchmark (release) | base | SHARED_RC |
 |---|---|---|
-| 4 threads, 20k shared 20 KB messages (sgc) | 75 ms, 165 shared collections (max 31-44 us), 232 ms CPU, RSS 7-9 MB | 82 ms, 0 shared collections, 265 ms CPU, RSS 4.5-5.5 MB |
+| 4 threads, 20k shared 20 KB messages (sgc) | 74 ms wall, 233 ms CPU, 165 shared collections (max 31-44 us), RSS 7-9 MB | 85 ms wall, 242 ms CPU, 0 shared collections, RSS 5.7-6.1 MB |
 | gc-multi "mt-shared publish/replace" | 9-10 ms, peak 6.1-6.3 MB | 8 ms, peak 2.2 MB |
 | binary-tree 19, binary-tree-multi 19, merkletrees 18, json, objects, gc-overhead | unchanged (±2%) | unchanged |
-| locked HashMap, 200k entries filled then 5x replaced, 1 thread | 21 + 87 ms | 50 + 209 ms (mem_shared 26 MB vs 51 MB, same RSS) |
+| locked HashMap, 200k entries filled then 5x replaced, 1 thread | 22 + 89 ms | 50 + 210 ms (mem_shared 26 MB instead of 51 MB, same RSS) |
 
 Campfire `shared-frames`, `bench/run --quick --apps valk --routes static_css
---upload-reps 0 --cable-clients 100 1000 10000 --deflate 0 1`, 4 runs each:
+--upload-reps 0 --cable-clients 100 1000 10000 --deflate 0 1`, 4 runs each
+(debug builds, as the app's Makefile builds them):
 
-| Cable clients / deflate | base msg/s, p99 | SHARED_RC msg/s, p99 |
+| Cable clients / deflate | base msg/s, p99, paced p99 | SHARED_RC msg/s, p99, paced p99 |
 |---|---|---|
-| 100 / off | 4,216, 3.26 ms | 4,219, 3.20 ms |
-| 100 / on | 2,903, 5.09 ms | 2,869, 5.29 ms |
-| 1,000 / off | 330, 62.8 ms | 328, 60.1 ms |
-| 1,000 / on | 286, 81.0 ms | 287, 66.2 ms |
-| 10,000 / off | 33.4, 586 ms | 33.9, 645 ms |
-| 10,000 / on | 29.0, 717 ms | 28.6, 695 ms |
-| static_css c=16 | 424,673 req/s | 424,892 req/s |
+| 100 / off | 4,218, 3.23 ms, 1.59 ms | 4,270, 3.12 ms, 2.13 ms |
+| 100 / on | 2,900, 5.21 ms, 1.58 ms | 2,905, 5.01 ms, 2.03 ms |
+| 1,000 / off | 332, 59.3 ms, 7.7 ms | 331, 60.7 ms, 7.3 ms |
+| 1,000 / on | 288, 70.6 ms, 9.8 ms | 288, 79.2 ms, 9.6 ms |
+| 10,000 / off | 34.4, 776 ms, 92 ms | 33.5, 584 ms, 89 ms |
+| 10,000 / on | 28.8, 724 ms, 85 ms | 28.6, 763 ms, 89 ms |
+| static_css c=16 | 425,192 req/s | 425,309 req/s |
 
 Shared collections per run: base 88 (about 1 ms each at 100 clients, 10-14 ms
-at 1,000, worst 46-94 ms in the 10,000-client phases); SHARED_RC 1-2 backup
-collections per run (1.3-10 ms). RSS is the same. The end-to-end numbers do
-not move beyond the noise: since the shared trigger became "doubled plus
-4 MB" the stop-the-world pauses are a small part of these latencies.
+at 1,000, worst 46-124 ms in the 10,000-client phases); SHARED_RC 2 backup
+collections per run (1.2-1.9 ms). RSS is the same. Throughput and saturated
+p99 do not move beyond the run-to-run noise (two earlier series with other
+helping policies gave the same picture); paced p99 at 100 clients is about
+0.5 ms worse with SHARED_RC, where workers collect for each other.
 
-Test status: `make test-rc` passes (the only failure, `Https: Client`, needs
-internet inside the network namespace used for the runs); 10/10 soak runs on
-two cores (`taskset -c 0,1`); `make test-win` with the define passed once
-cleanly, two more runs under load ended in network timeouts (IoError.timeout,
-WebSocket closed) and are being compared with base.
+Tests: `make test-rc` passes on Linux (the only failure, `Https: Client`,
+needs internet, which the network namespace used for the runs has not);
+`make test-win` with the define passes 3/3 under Wine; soak on two cores
+(`taskset -c 0,1`): 10/10 and 12/12 with earlier policies, see the branch
+for the final run. The default build (`make test`, no define) passes.
 
 ## 14. Assessment
 
@@ -362,10 +371,11 @@ What reference counting gives:
 
 What it costs:
 
-- CPU: message passing pays the rounds of collections that frees wait for
-  (+14% CPU, +9% wall on the 4-thread microbenchmark); every store into
-  locked data creates and later frees one region per object (2.4x slower on a
-  locked map that is replaced in a loop).
+- CPU: frees wait until every thread collected, so the busiest thread runs
+  the collections of the threads that block (+15% wall, +4% CPU on the
+  4-thread message benchmark); every store into locked data creates and later
+  frees one region per object (2.4x slower on a locked map that is replaced in
+  a loop).
 - Complexity: ~1,000 lines of runtime (regions, deferred freeing, helping,
   orphans, backup), a compiler hook for `Lock` layouts and for stores into
   `shared T` slots, and three policies with tuned behaviour (who collects for
@@ -376,8 +386,11 @@ What it costs:
   `@threadsafe` code must not unlink objects inside a region.
 
 Recommendation: keep the current shared collection. The prototype removes the
-pauses but no workload measured here gets faster, lock-heavy code gets
-slower, and the runtime gets a second set of GC states and invariants. If
+pauses but no workload measured here gets faster (Campfire: same throughput
+and p99, paced p99 slightly worse), message passing and lock-heavy code get
+slower, and the runtime gets a second set of GC states, invariants and
+policies (three helping policies were needed to get the Windows suite and
+the memory numbers right at the same time). If
 shared pauses come back as a measured problem (many threads and coroutines
 and immutable data published at a high rate), the branch is a working
 starting point; the cheaper first step stays parallel marking during the
