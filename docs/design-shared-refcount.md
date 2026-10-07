@@ -357,8 +357,8 @@ helping policies gave the same picture); paced p99 at 100 clients is about
 Tests: `make test-rc` passes on Linux (the only failure, `Https: Client`,
 needs internet, which the network namespace used for the runs has not);
 `make test-win` with the define passes 3/3 under Wine; soak on two cores
-(`taskset -c 0,1`): 10/10 and 12/12 with earlier policies, see the branch
-for the final run. The default build (`make test`, no define) passes.
+(`taskset -c 0,1`): 12/12 with the final policy (10/10 and 12/12 with
+earlier ones). The default build (`make test`, no define) passes.
 
 ## 14. Assessment
 
