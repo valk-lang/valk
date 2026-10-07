@@ -1,0 +1,753 @@
+@unsafe
+
+use mem
+use core
+
+// Reference-counted shared regions (docs/design-shared-refcount.md).
+// One publication is one region. Objects stay in their pool slots and keep
+// the region id in their header's co_count.
+
+#if SHARED_RC
+
+// Region.word: count in bits 0-30, DEAD in bit 31, a sequence in bits 32-63
+// that every decrement bumps
+value rc_dead (0x80000000)
+value rc_count_mask (0x7FFFFFFF)
+value rc_low_mask (0xFFFFFFFF)
+// A decrement: count - 1 and sequence + 1 in one add
+value rc_dec_delta (0xFFFFFFFF)
+value region_chunk_bits (12)
+value region_chunk_size (4096)
+value region_dir_size (65536)
+
+struct Region {
+    word: uint
+    id: uint
+    owner: ?*Gc
+    items: *Bump
+    bytes: uint
+    live: bool
+    // Backup collection
+    mark: bool
+    internal: uint
+    // Retired: the epoch it was retired in
+    epoch: uint
+    // The collection that last took a hold on it
+    stamp: uint
+    // Inbox, retired and free lists
+    next: ?*Region
+}
+
+// Set in regions_init only: global defaults are assigned after the main gc started
+@shared region_dir: ptr (@undefined)
+@shared region_count: uint (@undefined)
+@shared region_lock: uint (@undefined)
+@shared region_free: ?*Region (@undefined)
+@shared region_retired: ?*Region (@undefined)
+// Every zero transition moves it on; a collection remembers the value it started with
+@shared rc_epoch: uint (@undefined)
+// Zero-count table: (region, sequence, epoch) per zero transition
+@shared zct: *Bump (@undefined)
+@shared zct_lock: uint (@undefined)
+// The highest epoch of an entry the last pass kept
+@shared zct_pending_epoch: uint (@undefined)
+// Guards gc_list for readers that are not under shared_lock
+@shared gc_list_lock: uint (@undefined)
+@shared global_store_lock: uint (@undefined)
+@shared orphan_lock: uint (@undefined)
+@shared rc_stamps: uint (@undefined)
+
+// Walk contexts: callbacks of each_ref capture nothing
+global rc_walk_region: ?*Region (null)
+global rc_walk_backup: bool (false)
+global rc_walk_item: ptr (null_ptr())
+
+fn regions_init() {
+    region_dir = mem.calloc(region_dir_size * size_of(ptr))
+    region_count = 0
+    region_lock = 0
+    region_free = null
+    region_retired = null
+    rc_epoch = 1
+    zct = Bump.new(4096)
+    zct_lock = 0
+    zct_pending_epoch = 0
+    gc_list_lock = 0
+    global_store_lock = 0
+    orphan_lock = 0
+    rc_stamps = 0
+}
+
+fn region_lock_take() $inline {
+    while atomic(region_lock | 1) != 0 {}
+}
+fn region_lock_drop() $inline {
+    atomic_store(region_lock, 0)
+}
+fn zct_lock_take() $inline {
+    while atomic(zct_lock | 1) != 0 {}
+}
+fn zct_lock_drop() $inline {
+    atomic_store(zct_lock, 0)
+}
+fn orphan_lock_take() $inline {
+    while atomic(orphan_lock | 1) != 0 {}
+}
+fn orphan_lock_drop() $inline {
+    atomic_store(orphan_lock, 0)
+}
+fn gc_list_lock_take() $inline {
+    while atomic(gc_list_lock | 1) != 0 {}
+}
+fn gc_list_lock_drop() $inline {
+    atomic_store(gc_list_lock, 0)
+}
+
+fn region_by_id(id: uint) *Region $inline {
+    return @ptrv(region_dir, ptr, id >> region_chunk_bits) + (id & (region_chunk_size - 1)) * size_of(Region)
+}
+
+// The region of a shared object; null for static literals
+fn item_region(data: *GcData) ?*Region $inline {
+    let id = data.co_count.to(uint)
+    if id == 0 : return null
+    return region_by_id(id)
+}
+
+fn region_new(owner: *Gc) *Region {
+    region_lock_take()
+    let r = region_free
+    if isset(r) {
+        region_free = r.next
+    } else {
+        let id = ++region_count
+        if id >= region_dir_size * region_chunk_size : panic("Too many shared regions")
+        let chunk_ref: ptr = region_dir + (id >> region_chunk_bits) * size_of(ptr)
+        let chunk = @ptrv(chunk_ref, ?ptr)
+        if !isset(chunk) {
+            let c = mem.calloc(region_chunk_size * size_of(Region))
+            @ptrv(chunk_ref, ptr) = c
+            chunk = c
+        }
+        let nr: *Region = chunk + (id & (region_chunk_size - 1)) * size_of(Region)
+        nr.id = id
+        nr.items = Bump.new(64)
+        nr.word = 0
+        r = nr
+    }
+    let region = r ?! panic("No region")
+    region.owner = owner
+    region.live = true
+    region.mark = false
+    region.bytes = 0
+    region.next = null
+    region_lock_drop()
+    return region
+}
+
+// A heap reference: a field of another region, a co-owned local field, a global slot
+fn region_inc(r: *Region) $inline {
+    let old = atomic(r.word + 1)
+    #if GC_DEBUG
+    if (old & rc_dead) != 0 : panic("GC error: a reference to a freed shared region was counted")
+    if (old & rc_count_mask) == rc_count_mask : panic("GC error: shared region count overflow")
+    #end
+}
+
+fn region_dec(r: *Region) $inline {
+    let old = atomic(r.word + rc_dec_delta)
+    #if GC_DEBUG
+    if (old & rc_dead) != 0 : panic("GC error: a reference to a freed shared region was released")
+    if (old & rc_count_mask) == 0 : panic("GC error: shared region count underflow")
+    #end
+    if (old & rc_low_mask) == 1 : zct_push(r, (old + rc_dec_delta) >> 32)
+}
+
+fn zct_push(r: *Region, seq: uint) {
+    let g = atomic(rc_epoch + 1)
+    zct_lock_take()
+    let adr = zct.get(size_of(ptr) * 3)
+    @ptrv(adr, ptr, 0) = r
+    @ptrv(adr, uint, 1) = seq
+    @ptrv(adr, uint, 2) = g
+    zct_lock_drop()
+}
+
+// Counting from a holder in region `hid` (0: a global slot) to `v`
+fn rc_retain_in(hid: uint, v: ?ptr) {
+    if !isset(v) : return
+    let item: ptr = v & (~prop_mask).to(uint)
+    let data = gcdata(item)
+    if data.offset == 0 : return
+    #if GC_DEBUG
+    if !data.is_shared() : panic("GC error: shared storage received a local object")
+    #end
+    let id = data.co_count.to(uint)
+    if id == hid : return
+    region_inc(region_by_id(id))
+}
+
+fn rc_release_in(hid: uint, v: ?ptr) {
+    if !isset(v) : return
+    let item: ptr = v & (~prop_mask).to(uint)
+    let data = gcdata(item)
+    if data.offset == 0 : return
+    #if GC_DEBUG
+    if !data.is_shared() : panic("GC error: shared storage held a local object")
+    #end
+    let id = data.co_count.to(uint)
+    if id == hid : return
+    region_dec(region_by_id(id))
+}
+
+fn rc_inc_item(data: *GcData) $inline {
+    let r = item_region(data) ?! return
+    region_inc(r)
+}
+
+fn rc_dec_item(data: *GcData) $inline {
+    let r = item_region(data) ?! return
+    region_dec(r)
+}
+
+//////////////////////////
+// Publishing
+//////////////////////////
+
+// Makes the unique local graph at `item` one region. Phase one collects the
+// graph (shmark as visited) and strips its ownership tags, phase two flags it
+// shared: an object's co_count is read only once every slot inside the graph
+// that co-owned it was stripped, so what is left are co-owners outside
+fn rc_share(item: GcItem) {
+    let data = gcdata(item)
+    if data.is_shared() : return
+    if data.offset == 0 {
+        data.set_shared()
+        return
+    }
+    let g = gc
+    let ds = g.dont_stop
+    g.dont_stop = true
+
+    let r = region_new(g)
+    rc_walk_region = r
+    let items = r.items
+    let ml = g.mark_list
+    let start = ml.index
+    data.set_mark()
+    ml.add(item)
+
+    while ml.index > start {
+        let it: GcItem = ml.pop_unchecked()
+        items.add_ptr(it)
+        let layout = gcdata(it).block().layout
+        if isset(layout) {
+            each_ref(it, layout, ml, fn(ref: ptr, list: *Lifo) {
+                @unsafe
+                let sub = @ptrv(ref, ptr)
+                let tag = sub & prop_mask
+                let sub_item: GcItem = (sub - tag).@cast(GcItem)
+                if tag != 0 : @ptrv(ref, ptr) = sub_item
+                let sub_data = gcdata(sub_item)
+                if sub_data.is_shared() {
+                    if sub_data.offset == 0 : return
+                    // A co-owned tag was counted by the local GC already
+                    if tag != prop_co_owned : rc_inc_item(sub_data)
+                    return
+                }
+                if tag == prop_owned : sub_data.set_no_owner()
+                else if tag == prop_co_owned : sub_data.co_count = sub_data.co_count - 1
+                if sub_data.is_marked() : return
+                if sub_data.offset == 0 {
+                    sub_data.set_shared()
+                    return
+                }
+                sub_data.set_mark()
+                list.add(sub_item)
+            })
+        }
+    }
+
+    let id = r.id.to(u32)
+    let adr = items.data
+    let end = adr + items.index
+    let outside: uint = 0
+    while adr < end {
+        let it = @ptrv(adr, GcItem)
+        adr += size_of(ptr)
+        let d = gcdata(it)
+        d.remove_mark()
+        outside += d.co_count.to(uint)
+        d.set_shared()
+        let is_new = d.is_new()
+        if is_new : d.set_no_owner()
+        else if d.is_still_co_owned() {
+            d.remove_still_co_owned()
+            d.set_no_owner()
+        }
+        d.co_count = id
+        let block = d.block()
+        let size = block.isize
+        if is_new {
+            block.slots_used++
+        } else {
+            g.mem_marked -= size
+        }
+        r.bytes += size
+    }
+    atomic(mem_shared + r.bytes)
+    // Co-owners outside the graph release through the region later
+    if outside > 0 : atomic(r.word + outside)
+    zct_push(r, r.word >> 32)
+    rc_walk_region = null
+    g.dont_stop = ds
+}
+
+//////////////////////////
+// Holds: what a thread's roots reference
+//////////////////////////
+
+fn rc_hold(g: *Gc, data: *GcData) {
+    // The word may be stale: its slot can be freed and reused meanwhile
+    let id = data.co_count.to(uint)
+    if id == 0 || id > atomic_load(region_count) : return
+    let r = region_by_id(id)
+    // Taken once per collection; a stamp of another thread just costs a second hold
+    let stamp = g.rc_stamp
+    if atomic_load(r.stamp) == stamp : return
+    let old = atomic(r.word + 1)
+    if (old & rc_dead) != 0 {
+        // A stale word: the region was found dead
+        atomic(r.word - 1)
+        return
+    }
+    atomic_store(r.stamp, stamp)
+    g.rc_holds_new.add_ptr(r)
+}
+
+fn rc_release_holds(g: *Gc) {
+    let list = g.rc_holds
+    let adr = list.data
+    let end = adr + list.index
+    list.reset()
+    while adr < end {
+        let r = @ptrv(adr, *Region)
+        adr += size_of(ptr)
+        let old = atomic(r.word + rc_dec_delta)
+        #if GC_DEBUG
+        if (old & rc_count_mask) == 0 : panic("GC error: shared region hold underflow")
+        #end
+        if (old & rc_low_mask) == 1 : zct_push(r, (old + rc_dec_delta) >> 32)
+    }
+    g.rc_holds = g.rc_holds_new
+    g.rc_holds_new = list
+}
+
+//////////////////////////
+// Freeing
+//////////////////////////
+
+fn rc_min_done() uint {
+    gc_list_lock_take()
+    let min = uint.$max
+    each gc_list as g {
+        let d = atomic_load(g.rc_done)
+        if d < min : min = d
+    }
+    gc_list_lock_drop()
+    return min
+}
+
+// Runs inside the collection of `g` (gc == g): frees the regions others
+// handed to us, then the eligible zero-count entries
+fn rc_collect(g: *Gc) {
+    rc_free_inbox(g)
+    if atomic_load(zct.index) == 0 : return
+
+    let min = rc_min_done()
+    let work = g.rc_zct_work
+    work.reset()
+    zct_lock_take()
+    let n = zct.index
+    if n > 0 {
+        let to = work.get(n)
+        mem.copy_bytes(zct.data, to, n)
+        zct.reset()
+    }
+    zct_lock_drop()
+
+    let keep = g.rc_zct_keep
+    keep.reset()
+    let pending: uint = 0
+    let adr = work.data
+    let end = adr + work.index
+    while adr < end {
+        let r = @ptrv(adr, *Region, 0)
+        let seq = @ptrv(adr, uint, 1)
+        let epoch = @ptrv(adr, uint, 2)
+        adr += size_of(ptr) * 3
+        let w = atomic_load(r.word)
+        if (w & rc_low_mask) != 0 || (w >> 32) != (seq & rc_low_mask) : continue
+        if epoch >= min {
+            let k = keep.get(size_of(ptr) * 3)
+            @ptrv(k, ptr, 0) = r
+            @ptrv(k, uint, 1) = seq
+            @ptrv(k, uint, 2) = epoch
+            if epoch > pending : pending = epoch
+            continue
+        }
+        let old = atomic(r.word | rc_dead)
+        if (old & rc_dead) != 0 : continue
+        rc_handoff(g, r)
+    }
+    if keep.index > 0 {
+        zct_lock_take()
+        let to = zct.get(keep.index)
+        mem.copy_bytes(keep.data, to, keep.index)
+        if pending > zct_pending_epoch : zct_pending_epoch = pending
+        zct_lock_drop()
+    }
+    rc_recycle(min)
+}
+
+// A dead region goes to its owner: only the owner touches its pool blocks
+fn rc_handoff(g: *Gc, r: *Region) {
+    region_lock_take()
+    let owner = r.owner
+    if owner == g.@cast(?*Gc) {
+        region_lock_drop()
+        rc_free_region(r, false)
+        return
+    }
+    if !isset(owner) {
+        region_lock_drop()
+        rc_free_orphan(r)
+        return
+    }
+    r.next = owner.rc_inbox
+    owner.rc_inbox = r
+    region_lock_drop()
+}
+
+fn rc_free_inbox(g: *Gc) {
+    if !isset(g.rc_inbox) : return
+    region_lock_take()
+    let r = g.rc_inbox
+    g.rc_inbox = null
+    region_lock_drop()
+    while isset(r) {
+        let next = r.next
+        rc_free_region(r, false)
+        r = next
+    }
+}
+
+// Orphaned regions live in unused blocks; a thread handing its blocks over
+// holds the same lock (see Gc.shutdown)
+fn rc_free_orphan(r: *Region) {
+    orphan_lock_take()
+    rc_free_region(r, true)
+    orphan_lock_drop()
+}
+
+// Frees every object of a dead region. Runs in the owner's collection (or with
+// the owner gone, under pool_lock). References to other regions are released
+// first: an onfree hook may not see them, and a cycle inside the region is
+// never counted
+fn rc_free_region(r: *Region, orphan: bool) {
+    rc_release_refs(r)
+    rc_free_items(r, orphan)
+}
+
+fn rc_release_refs(r: *Region) {
+    rc_walk_region = r
+    let items = r.items
+    let adr = items.data
+    let end = adr + items.index
+    let ml = gc.mark_list
+    while adr < end {
+        let it = @ptrv(adr, GcItem)
+        adr += size_of(ptr)
+        rc_walk_item = it
+        let layout = gcdata(it).block().layout
+        if isset(layout) {
+            each_ref(it, layout, ml, fn(ref: ptr, list: *Lifo) {
+                @unsafe
+                let v: ptr = @ptrv(ref, ptr) & (~prop_mask).to(uint)
+                let d = gcdata(v)
+                if d.offset == 0 : return
+                #if GC_DEBUG
+                if !d.is_shared() : panic("GC error: a shared region references a local object")
+                #end
+                let id = d.co_count.to(uint)
+                let region = rc_walk_region ?! return
+                if id == region.id : return
+                let target = region_by_id(id)
+                // The backup collection frees cycles whose members are all dead
+                if rc_walk_backup && !target.mark : return
+                #if GC_DEBUG
+                if (atomic_load(target.word) & rc_count_mask) == 0 {
+                    let it = rc_walk_item
+                    let off: uint = ref - it
+                    let tb = d.block()
+                    println("RC underflow: holder isize=" + gcdata(it).block().isize + " slot offset=" + off + " target isize=" + tb.isize + " holder items=" + (region.items.index / 8) + " target items=" + (target.items.index / 8) + " holder id=" + region.id + " target id=" + id)
+                }
+                #end
+                region_dec(target)
+            })
+        }
+    }
+
+    rc_walk_region = null
+    // A thread-local global sits in the thread's stack block: no stale root
+    rc_walk_item = null_ptr()
+}
+
+fn rc_free_items(r: *Region, orphan: bool) {
+    let items = r.items
+    let adr = items.data
+    let end = adr + items.index
+    while adr < end {
+        let it = @ptrv(adr, GcItem)
+        adr += size_of(ptr)
+        let data = gcdata(it)
+        let block = data.block()
+        data.flags = 0
+        data.co_count = 0
+        data.slot_logs = 0
+        block.slots_used--
+        if !orphan : touch_block(block.@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET))
+        let onfree = block.onfree
+        if isset(onfree) : onfree(it)
+    }
+    atomic(mem_shared - r.bytes)
+    items.reset()
+    if items.size > 4096 : items.reduce_size()
+
+    region_lock_take()
+    r.live = false
+    r.owner = null
+    r.epoch = atomic(rc_epoch + 1)
+    r.next = region_retired
+    region_retired = r
+    region_lock_drop()
+}
+
+// Retired headers are reused once every thread collected since and no stale
+// hold is left on them
+fn rc_recycle(min: uint) {
+    if !isset(region_retired) : return
+    region_lock_take()
+    let r = region_retired
+    let kept: ?*Region = null
+    while isset(r) {
+        let next = r.next
+        if r.epoch < min && (atomic_load(r.word) & rc_low_mask) == rc_dead {
+            // Bump the sequence past every old entry, count 0, not dead
+            atomic(r.word + rc_dead)
+            r.epoch = 0
+            r.next = region_free
+            region_free = r
+        } else {
+            r.next = kept
+            kept = r
+        }
+        r = next
+    }
+    region_retired = kept
+    region_lock_drop()
+}
+
+//////////////////////////
+// Helping threads that do not collect
+//////////////////////////
+
+// After our own collection: run the collection of each thread whose last one
+// is older than an entry we wait for, if its gc lock is free (it blocks).
+// Never waits for a lock
+fn rc_help(me: *Gc) {
+    if atomic_load(zct.index) == 0 : return
+    let pending = atomic_load(zct_pending_epoch)
+    let stamp = me.rc_stamp
+    while true {
+        let target: ?*Gc = null
+        gc_list_lock_take()
+        each gc_list as g {
+            if g == me : continue
+            if g.rc_helped == stamp : continue
+            if atomic_load(g.rc_done) > pending : continue
+            g.rc_helped = stamp
+            if g.state != GcState.idle : continue
+            if !g.mutex.try_lock() : continue
+            target = g
+            break
+        }
+        gc_list_lock_drop()
+        let t = target ?! break
+        if t.state == GcState.idle {
+            gc = t
+            t.collect_run(CollectKind.local)
+            gc = me
+        }
+        t.mutex.unlock()
+    }
+}
+
+//////////////////////////
+// Thread exit
+//////////////////////////
+
+// The regions of a gc that leaves: dead ones are freed now, live ones lose
+// their owner and are freed under pool_lock once they die
+fn rc_orphan_regions(g: *Gc) {
+    region_lock_take()
+    let inbox = g.rc_inbox
+    g.rc_inbox = null
+    let id: uint = 1
+    let count = region_count
+    while id <= count {
+        let r = region_by_id(id)
+        if r.owner == g.@cast(?*Gc) : r.owner = null
+        id++
+    }
+    region_lock_drop()
+    let r = inbox
+    while isset(r) {
+        let next = r.next
+        rc_free_region(r, false)
+        r = next
+    }
+}
+
+//////////////////////////
+// Globals
+//////////////////////////
+
+fn rc_global_store(slot: ptr, value: ?ptr) $noinline {
+    rc_retain_in(0, value)
+    while atomic(global_store_lock | 1) != 0 {}
+    let old = @ptrv(slot, ?ptr)
+    @ptrv(slot, ?ptr) = value
+    atomic_store(global_store_lock, 0)
+    rc_release_in(0, old)
+}
+
+//////////////////////////
+// Backup collection: cycles through mutable data
+//////////////////////////
+
+// Every thread is stopped and has just collected, so every count is exact.
+// References from other regions are subtracted; regions with references left
+// are roots, and whatever they do not reach is garbage
+fn rc_backup() {
+    let count = region_count
+    let mygc = gc
+
+    // Regions waiting in an inbox are freed by their owner first
+    each gc_list as g {
+        gc = g
+        rc_free_inbox(g)
+    }
+    gc = mygc
+
+    let id: uint = 1
+    while id <= count {
+        let r = region_by_id(id++)
+        r.internal = 0
+        r.mark = false
+    }
+    id = 1
+    while id <= count {
+        let r = region_by_id(id++)
+        if !r.live : continue
+        rc_walk_region = r
+        rc_each_target(r, fn(ref: ptr, list: *Lifo) {
+            @unsafe
+            let t = rc_target(ref) ?! return
+            t.internal++
+        })
+    }
+    let ml = gc.mark_list
+    id = 1
+    while id <= count {
+        let r = region_by_id(id++)
+        if !r.live : continue
+        let c = atomic_load(r.word) & rc_count_mask
+        #if GC_DEBUG
+        if c < r.internal : panic("GC error: shared region count below the references other regions hold")
+        #end
+        if c > r.internal && !r.mark {
+            r.mark = true
+            ml.add(r)
+        }
+    }
+    while ml.index > 0 {
+        let r: *Region = ml.pop_unchecked()
+        rc_walk_region = r
+        rc_each_target(r, fn(ref: ptr, list: *Lifo) {
+            @unsafe
+            let t = rc_target(ref) ?! return
+            if t.mark : return
+            t.mark = true
+            list.add(t)
+        })
+    }
+
+    // Free the rest: release what they hold on live regions while every dead
+    // object is still intact, then free the objects
+    rc_walk_backup = true
+    id = 1
+    while id <= count {
+        let r = region_by_id(id++)
+        if !r.live || r.mark : continue
+        atomic(r.word | rc_dead)
+        rc_release_refs(r)
+    }
+    rc_walk_backup = false
+    id = 1
+    while id <= count {
+        let r = region_by_id(id++)
+        if !r.live || r.mark : continue
+        let owner = r.owner
+        if isset(owner) {
+            gc = owner
+            rc_free_items(r, false)
+        } else {
+            orphan_lock_take()
+            rc_free_items(r, true)
+            orphan_lock_drop()
+        }
+    }
+    gc = mygc
+    rc_walk_region = null
+}
+
+// Calls `cb` for every managed slot of every object of the walked region
+fn rc_each_target(r: *Region, cb: fnptr(ptr, *Lifo)()) $inline {
+    let items = r.items
+    let adr = items.data
+    let end = adr + items.index
+    let ml = gc.mark_list
+    while adr < end {
+        let it = @ptrv(adr, GcItem)
+        adr += size_of(ptr)
+        let layout = gcdata(it).block().layout
+        if isset(layout) : each_ref(it, layout, ml, cb)
+    }
+}
+
+// The other region a slot of the walked region points to
+fn rc_target(ref: ptr) ?*Region $inline {
+    let v: ptr = @ptrv(ref, ptr) & (~prop_mask).to(uint)
+    let d = gcdata(v)
+    if d.offset == 0 : return null
+    #if GC_DEBUG
+    if !d.is_shared() : panic("GC error: a shared region references a local object")
+    #end
+    let id = d.co_count.to(uint)
+    let region = rc_walk_region ?! return null
+    if id == region.id : return null
+    return region_by_id(id)
+}
+
+#end

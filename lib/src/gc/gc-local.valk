@@ -70,6 +70,19 @@ struct Gc {
     props_removed: *Lifo (Lifo.new())
     // Blocks allocated into or freed from since the last collection
     touched_blocks: *Bump (Bump.new())
+    #if SHARED_RC
+    // Regions our roots referenced at the last collection, and at this one
+    rc_holds: *Bump (Bump.new(256))
+    rc_holds_new: *Bump (Bump.new(256))
+    rc_stamp: uint (0)
+    rc_helped: uint (0)
+    // rc_epoch when our last complete collection started
+    rc_done: uint (0)
+    // Dead regions of ours that other threads found
+    rc_inbox: ?*Region (null)
+    rc_zct_work: *Bump (Bump.new(256))
+    rc_zct_keep: *Bump (Bump.new(256))
+    #end
 
     // Native stacks
     stack_top: ptr (null_ptr())              // Highest address of the thread stack
@@ -164,6 +177,9 @@ struct Gc {
         let g: *Gc = call.gc
         g.live_sp = sp
         g.collect_run(call.kind)
+        #if SHARED_RC
+        if call.kind == CollectKind.local : rc_help(g)
+        #end
     }
 
     // Both assembly entries pass the caller's saved registers and collection kind
@@ -176,6 +192,9 @@ struct Gc {
         if !g.collect_allowed(CollectKind.local) : return
         g.live_sp = sp
         g.collect_run(CollectKind.local)
+        #if SHARED_RC
+        rc_help(g)
+        #end
     }
 
     fn collect_allowed(kind: CollectKind) bool {
@@ -190,6 +209,10 @@ struct Gc {
         this.state = GcState.collecting
 
         let pause_start = time.mono_us()
+        #if SHARED_RC
+        let rc_epoch_start = atomic_load(rc_epoch)
+        this.rc_stamp = atomic(rc_stamps + 1) + 1
+        #end
         let marked_before = this.mem_marked
         let allocated = this.mem_new > marked_before ? this.mem_new - marked_before : 0
         this.unmarked_run = 0
@@ -213,6 +236,12 @@ struct Gc {
 
         this.check_blanks()
 
+        #if SHARED_RC
+        // Every reference our roots and local objects hold is counted now
+        rc_release_holds(this.@cast(*Gc))
+        rc_collect(this.@cast(*Gc))
+        #end
+
         // A shared collection freed items of ours: every block gets settled
         if this.free_epoch != shared_free_epoch {
             this.free_epoch = shared_free_epoch
@@ -225,7 +254,12 @@ struct Gc {
         if verify && !this.did_shutdown : this.leak_check()
 
         // Clear stack items list
+        #if SHARED_RC
+        this.clear_stack_items()
+        if !this.did_shutdown : atomic_store(this.rc_done, rc_epoch_start)
+        #else
         if kind != CollectKind.shared : this.clear_stack_items()
+        #end
 
         // Reset mem_new
         this.mem_new = this.mem_marked
@@ -317,6 +351,10 @@ struct Gc {
                 if item == null : panic("GC error: removed 'owned' property is not a tagged pointer; its memory was reused")
                 #end
                 let data = gcdata(item)
+                #if SHARED_RC
+                // Never write the flags of a shared object: its owner may be freeing it
+                if data.is_shared() : continue
+                #end
                 data.set_no_owner()
                 gc.dis_owned_list.add_ptr(item)
             } else {
@@ -559,11 +597,15 @@ struct Gc {
             let item = @ptrv(adr, GcItem)
             adr = adr.$offset(size_of(ptr))
             let data = gcdata(item)
+            #if SHARED_RC
+            data.co_count = data.co_count - 1
+            #else
             if data.is_shared() {
                 atomic(data.co_count - 1)
             } else {
                 data.co_count = data.co_count - 1
             }
+            #end
             data.remove_on_stack()
         }
     }
@@ -575,6 +617,12 @@ struct Gc {
         }
         #end
         let data = gcdata(item)
+        #if SHARED_RC
+        if data.is_shared() {
+            rc_hold(this.@cast(*Gc), data)
+            return
+        }
+        #end
         if data.is_on_stack() : return
         data.set_on_stack()
         if data.is_shared() {
@@ -765,6 +813,9 @@ struct Gc {
     + fn shutdown() {
         this.did_shutdown = true
         this.collect(CollectKind.shutdown)
+        #if SHARED_RC
+        rc_orphan_regions(this.@cast(*Gc))
+        #end
 
         // Hand our remaining shared items over to the dump. This happens under
         // the shared lock, in the same critical section as our removal from
@@ -773,6 +824,9 @@ struct Gc {
         dump_shared(this.shared_items)
 
         // Free blocks or store them in unused-block-list if they still contain items
+        #if SHARED_RC
+        orphan_lock_take()
+        #end
         pool_lock.lock()
         loop_all_blocks(fn(block: *Block) {
             let alloc_size = block.slots_total * block.isize + POOL_DATA_OFFSET
@@ -788,6 +842,9 @@ struct Gc {
             }
         })
         pool_lock.unlock()
+        #if SHARED_RC
+        orphan_lock_drop()
+        #end
     }
 
     /// Unlocks and frees the gc. Nothing may use it afterwards.
@@ -808,6 +865,12 @@ struct Gc {
         this.shared_items.free()
         this.mark_list.free()
         this.props_removed.free()
+        #if SHARED_RC
+        this.rc_holds.free()
+        this.rc_holds_new.free()
+        this.rc_zct_work.free()
+        this.rc_zct_keep.free()
+        #end
         mem.free(this.blocked_regs)
         mem.free(this)
     }
