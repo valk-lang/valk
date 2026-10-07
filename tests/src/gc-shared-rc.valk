@@ -1,0 +1,273 @@
+@unsafe
+@ignore_access
+
+use valk.gc
+use valk.thread
+use valk.sync
+use valk.time
+use valk.core
+
+// Reference-counted shared regions (docs/design-shared-refcount.md): these
+// check what only reference counting does, frees without a shared collection
+
+#if SHARED_RC
+
+shared rc_item_freed: uint (0)
+shared rc_item_made: uint (0)
+
+class RcItem {
+    value: uint
+    fn gc_free() { atomic(rc_item_freed + 1) }
+}
+
+fn rc_item(value: uint) RcItem {
+    atomic(rc_item_made + 1)
+    return RcItem { value: value }
+}
+
+// Every thread collects (blocked ones are collected for), several times: a
+// region that dies frees what only it held one round later
+fn rc_settle() $noinline {
+    let i = 0
+    while i++ < 8 {
+        gc.collect()
+        time.sleep_ms(1)
+    }
+}
+
+fn rc_send_to_threads() uint $noinline {
+    let a: shared sync.Channel[shared RcItem] = sync.Channel[shared RcItem].new() !!
+    let b: shared sync.Channel[shared RcItem] = sync.Channel[shared RcItem].new() !!
+    let ta = thread.Thread[uint].start(fn() uint {
+        let item = a.recv() ! return 0
+        return item.value
+    }) !!
+    let tb = thread.Thread[uint].start(fn() uint {
+        let item = b.recv() ! return 0
+        return item.value
+    }) !!
+    let item: shared RcItem = rc_item(7)
+    a.send(item) !!
+    b.send(item) !!
+    return ta.await() + tb.await()
+}
+
+synctest "Shared RC: a value sent to other threads is freed without a shared collection" {
+    gc.collect_shared()
+    let marks = gc.mark_count
+    let freed = rc_item_freed
+    assert(rc_send_to_threads() == 14)
+    rc_settle()
+    assert(rc_item_freed == freed + 1)
+    assert(gc.mark_count == marks)
+}
+
+shared rc_slot: ?RcItem (null)
+
+class RcHolder {
+    item: ?shared RcItem (null)
+}
+
+// The holder is new: nothing counts its reference until a collection walks it
+fn rc_hold_locally() RcHolder $noinline {
+    let h = RcHolder {}
+    h.item = rc_slot
+    rc_slot = null
+    return h
+}
+
+fn rc_local_holder_round() uint $noinline {
+    rc_slot = rc_item(11)
+    let h = rc_hold_locally()
+    let freed = rc_item_freed
+    rc_settle()
+    assert(rc_item_freed == freed)
+    return (h.item ?? panic("missing")).value
+}
+
+synctest "Shared RC: a value only a local object holds survives its count reaching 0" {
+    let freed = rc_item_freed
+    assert(rc_local_holder_round() == 11)
+    rc_settle()
+    assert(rc_item_freed == freed + 1)
+}
+
+global rc_coro_loaded: bool (false)
+
+fn rc_coro_reader() uint {
+    let item = rc_slot ?? panic("missing")
+    rc_coro_loaded = true
+    time.sleep_ms(40)
+    return item.value
+}
+
+fn rc_coro_round() uint $noinline {
+    rc_coro_loaded = false
+    rc_slot = rc_item(13)
+    let c = co rc_coro_reader()
+    while !rc_coro_loaded : time.sleep_ms(1)
+    rc_slot = null
+    let freed = rc_item_freed
+    rc_settle()
+    assert(rc_item_freed == freed)
+    return await c
+}
+
+synctest "Shared RC: a value only a suspended coroutine holds survives" {
+    let freed = rc_item_freed
+    assert(rc_coro_round() == 13)
+    rc_settle()
+    assert(rc_item_freed == freed + 1)
+}
+
+fn rc_overwrite_global() $noinline {
+    rc_slot = rc_item(1)
+    rc_slot = rc_item(2)
+    rc_slot = rc_item(3)
+}
+
+synctest "Shared RC: overwriting a shared global frees the old values" {
+    let marks = gc.mark_count
+    let freed = rc_item_freed
+    rc_overwrite_global()
+    rc_settle()
+    assert(rc_item_freed == freed + 2)
+    assert((rc_slot ?? panic("missing")).value == 3)
+    rc_slot = null
+    rc_settle()
+    assert(rc_item_freed == freed + 3)
+    assert(gc.mark_count == marks)
+}
+
+class RcBox {
+    items: Array[RcItem] (.{})
+}
+
+shared rc_box: ?Lock[RcBox] (null)
+
+fn rc_locked_round() uint $noinline {
+    let st: shared Lock[RcBox] = .new(RcBox {}) !!
+    // Published: what is stored under the lock is shared data from now on
+    rc_box = st
+    lock st as s {
+        let i: uint = 0
+        while i < 10 : s.items.append(rc_item(i++))
+    }
+    lock st as s {
+        let i = 0
+        while i++ < 5 : s.items.remove(0)
+    }
+    let freed = rc_item_freed
+    rc_settle()
+    assert(rc_item_freed == freed + 5)
+    let sum: uint = 0
+    lock st as s {
+        each s.items as item : sum += item.value
+    }
+    rc_box = null
+    return sum
+}
+
+synctest "Shared RC: objects removed from locked data are freed, the rest survives" {
+    let marks = gc.mark_count
+    let freed = rc_item_freed
+    assert(rc_locked_round() == 5 + 6 + 7 + 8 + 9)
+    rc_settle()
+    assert(rc_item_freed == freed + 10)
+    assert(gc.mark_count == marks)
+}
+
+shared rc_cycle_freed: uint (0)
+
+class RcCycleBox {
+    nodes: Array[shared RcCycleNode] (.{})
+}
+
+class RcCycleNode {
+    home: shared Lock[RcCycleBox]
+    fn gc_free() { atomic(rc_cycle_freed + 1) }
+}
+
+shared rc_cycle_home: ?Lock[RcCycleBox] (null)
+
+// The lock is published through the global, the node by the store under the
+// lock; the node holds the lock, the lock's data holds the node
+fn rc_make_cycle() $noinline {
+    let home: shared Lock[RcCycleBox] = .new(RcCycleBox {}) !!
+    rc_cycle_home = home
+    let node: shared RcCycleNode = RcCycleNode { home: home }
+    lock home as b : b.nodes.append(node)
+    rc_cycle_home = null
+}
+
+synctest "Shared RC: a cycle through a lock is freed by a shared collection" {
+    let freed = rc_cycle_freed
+    rc_make_cycle()
+    rc_settle()
+    assert(rc_cycle_freed == freed)
+    gc.collect_shared()
+    assert(rc_cycle_freed == freed + 1)
+}
+
+fn rc_publish_and_exit() $noinline {
+    let t = thread.start(fn() {
+        rc_slot = rc_item(21)
+    }) !!
+    t.await()
+}
+
+synctest "Shared RC: a value published by a thread that exited is freed" {
+    let freed = rc_item_freed
+    rc_publish_and_exit()
+    assert((rc_slot ?? panic("missing")).value == 21)
+    rc_slot = null
+    rc_settle()
+    assert(rc_item_freed == freed + 1)
+}
+
+// Values bounce between threads, which keep some in local lists and drop
+// others; every one is freed exactly once
+fn rc_bounce(inbox: shared sync.Channel[shared RcItem], outbox: shared sync.Channel[shared RcItem]) uint {
+    let kept = Array[shared RcItem]{}
+    let sum: uint = 0
+    while true {
+        let item = inbox.recv() ! break
+        sum += item.value
+        kept.append(item)
+        if kept.length > 16 : kept.clear()
+        if item.value % 3 == 0 : outbox.send(item) ! {}
+        let fresh: shared RcItem = rc_item(item.value + 1)
+        outbox.send(fresh) ! {}
+    }
+    outbox.close()
+    return sum
+}
+
+fn rc_bounce_round() $noinline {
+    let a: shared sync.Channel[shared RcItem] = sync.Channel[shared RcItem].new(64) !!
+    let b: shared sync.Channel[shared RcItem] = sync.Channel[shared RcItem].new() !!
+    let c: shared sync.Channel[shared RcItem] = sync.Channel[shared RcItem].new() !!
+    let t1 = thread.Thread[uint].start(fn() uint { return rc_bounce(a, b) }) !!
+    let t2 = thread.Thread[uint].start(fn() uint { return rc_bounce(b, c) }) !!
+    let i: uint = 0
+    while i < 3000 {
+        let item: shared RcItem = rc_item(i)
+        a.send(item) !!
+        i++
+    }
+    a.close()
+    while true : c.recv() ! break
+    t1.await()
+    t2.await()
+}
+
+synctest "Shared RC: values bouncing between threads are each freed once" {
+    let made = rc_item_made
+    let freed = rc_item_freed
+    rc_bounce_round()
+    rc_settle()
+    gc.collect_shared()
+    assert(rc_item_made - made == rc_item_freed - freed)
+}
+
+#end

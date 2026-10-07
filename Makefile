@@ -159,6 +159,12 @@ test-release: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --release -o ./debug/test-release$(EXE_SUFFIX)
 	./debug/test-release$(EXE_SUFFIX)
 
+# The suite with reference-counted shared regions (docs/design-shared-refcount.md)
+test-rc: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) --def SHARED_RC=1 $(FLAGS) -o ./debug/test-rc$(EXE_SUFFIX)
+	./debug/test-rc$(EXE_SUFFIX)
+
 test-gc-shared-stress: valk
 	mkdir -p ./debug
 	./valk build ./tests/src/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress
@@ -331,5 +337,5 @@ clean:
 	linux-arm64 linux-x64 macos-arm64 macos-x64 static toolchains update valkd valkexe \
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
-	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
+	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-rc test-lsp \
 	test-macos-build test-release test-win test-win-build
