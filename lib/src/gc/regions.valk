@@ -49,6 +49,9 @@ struct Region {
 // What threads that exited left: free and retired headers
 @shared orphan_free: ?*Region (@undefined)
 @shared orphan_retired: ?*Region (@undefined)
+// The oldest epoch of an entry the last pass had to keep: a thread whose last
+// collection started before it holds that entry back (see rc_behind)
+@shared rc_wanted: uint (@undefined)
 // The shared zero-count table; each thread moves its own entries here when it collects
 @shared zct: *Bump (@undefined)
 @shared zct_lock: uint (@undefined)
@@ -74,6 +77,7 @@ fn regions_init() {
     orphan_retired = null
     zct = Bump.new(4096)
     zct_lock = 0
+    rc_wanted = 0
     rc_epoch = 1
     gc_list_lock = 0
     global_store_lock = 0
@@ -495,6 +499,8 @@ fn rc_collect(g: *Gc) {
     if work.index > 0 {
         // Frees push new entries into g.rc_zct; kept ones go there too
         let keep = g.rc_zct
+        let wanted: uint = 0
+        let first = true
         let adr = work.data
         let end = adr + work.index
         while adr < end {
@@ -506,6 +512,8 @@ fn rc_collect(g: *Gc) {
             // Counted again, or a later zero transition has its own entry
             if (w & rc_low_mask) != 0 || (w >> 32) != (seq & rc_low_mask) : continue
             if epoch >= min {
+                if first || epoch < wanted : wanted = epoch
+                first = false
                 let k = keep.get(size_of(ptr) * 3)
                 @ptrv(k, ptr, 0) = r
                 @ptrv(k, uint, 1) = seq
@@ -517,6 +525,7 @@ fn rc_collect(g: *Gc) {
             rc_handoff(g, r)
         }
         work.reset()
+        atomic_store(rc_wanted, wanted)
         n = keep.index
         if n > 0 {
             zct_lock_take()
@@ -611,6 +620,9 @@ fn rc_free_items(r: *Region, orphan: bool) {
         let it = @ptrv(adr, GcItem)
         adr += size_of(ptr)
         let data = gcdata(it)
+        #if GC_DEBUG
+        if !data.is_shared() || data.co_count.to(uint) != r.id : panic("GC error: a freed region lists an object that is not its own")
+        #end
         let block = data.block()
         data.flags = 0
         data.co_count = 0
@@ -689,15 +701,22 @@ fn rc_help(me: *Gc) {
     let stamp = me.rc_stamp
     while true {
         let target: ?*Gc = null
+        let target_stayed = false
         gc_list_lock_take()
         each gc_list as g {
             if g == me : continue
             if g.rc_helped == stamp : continue
             g.rc_helped = stamp
             if atomic_load(g.rc_done) >= now : continue
+            // A thread that woke since we last looked collects at its next
+            // idle point (rc_behind); we only collect for one that stays blocked
+            let blocks = atomic_load(g.rc_blocks)
+            let stayed = blocks == g.rc_seen_blocks
+            g.rc_seen_blocks = blocks
             if g.state != GcState.idle : continue
             if !g.mutex.try_lock() : continue
             target = g
+            target_stayed = stayed
             break
         }
         gc_list_lock_drop()
@@ -706,7 +725,7 @@ fn rc_help(me: *Gc) {
             // It did not run since we collected for it: its last collection
             // still holds everything it references
             atomic_store(t.rc_done, rc_epoch_next())
-        } else if atomic_load(t.rc_done) < me.rc_prev_done && t.state == GcState.idle {
+        } else if target_stayed && atomic_load(t.rc_done) < me.rc_prev_done && t.state == GcState.idle {
             // It did not collect since our previous collection: the threads
             // that keep up do not need us
             gc = t
@@ -716,6 +735,12 @@ fn rc_help(me: *Gc) {
         }
         t.mutex.unlock()
     }
+}
+
+// Whether the zero-count table waits for the calling thread's collection
+fn rc_behind() bool {
+    let wanted = atomic_load(rc_wanted)
+    return wanted > 0 && wanted >= gc.rc_done
 }
 
 // Whether any thread has zero-count entries waiting
