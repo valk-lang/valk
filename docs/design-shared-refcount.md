@@ -1,8 +1,9 @@
 # Shared data by reference counting
 
-Status: design + prototype on branch `shared-refcount`, behind `--def SHARED_RC=1`.
-Nothing here changes the language: `shared T`, `Lock[T]`, `locked T`, `shared fn`
-and channels keep their syntax and checks.
+Status: prototype on branch `shared-refcount`, behind `--def SHARED_RC=1`
+(`make test-rc` runs the suite with it). Nothing here changes the language:
+`shared T`, `Lock[T]`, `locked T`, `shared fn` and channels keep their syntax
+and checks. Measurements and the open problems are in section 13.
 
 ## 1. Problem
 
@@ -24,19 +25,20 @@ continuously, even though almost all of that data is acyclic and dies young.
 
 ## 2. Idea
 
-Count references per **publication**, defer the stack part of the count
-(Deutsch-Bobrow deferred reference counting) and free a publication only after
-every thread has looked at its own roots since the count reached zero. No
-thread ever stops another one for this.
+Count references per **region**, defer the stack part of the count
+(Deutsch-Bobrow deferred reference counting) and free a region only after
+every thread has collected since its count reached zero. No thread stops
+another one for this.
 
-- Publishing a unique graph makes it a **region**: the objects stay where they
-  are, and every object of the graph points to one region header with one
-  atomic count.
-- A region is freed as a whole. Cycles inside one publication are fine.
-- Immutable data can only point to regions that existed when it was
-  published, so the region graph of immutable data has no cycles. Cycles
-  between regions need a mutable edge (locked data, `@threadsafe` internals);
-  those are left to a rare backup collection (section 8).
+- Immutable data (what is published as `shared T`) is one region per
+  publication: one count for the whole graph, cycles inside it are fine, and
+  nothing can unlink an object inside it, so it dies as a whole.
+- Mutable shared data (the value of a `Lock`, and everything stored under it)
+  can lose objects while the rest lives on, so each of its objects is a
+  region of its own.
+- Cycles between regions need a store into mutable data. They are left to a
+  backup collection: the old stop-the-world rendezvous, now only for cycles
+  (section 9).
 
 ## 3. Data layout
 
@@ -44,73 +46,64 @@ thread ever stops another one for this.
 
 ```
 struct Region {
-    word: uint          // count (bits 0-30) | DEAD (bit 31) | decrement sequence (bits 32-63)
-    id: u32             // index in the region table
-    owner: ?*Gc         // the publishing thread: its pool blocks hold the items
-    items: inline list  // the region's objects (4 inline, then a Bump)
-    bytes: uint         // slot bytes, for mem_shared
-    flags               // backup-collection mark, retired, has_mutable_edge
+    word      // count (bits 0-30) | DEAD (bit 31) | decrement sequence (bits 32-63)
+    id        // index in the region table; what objects store
+    owner     // the publishing thread's Gc: its pool blocks hold the objects
+    items     // the region's objects
+    bytes     // slot bytes, for mem_shared
+    live, mark, freeable, internal   // backup collection
+    epoch     // when it was retired
+    stamp     // the collection that last took a hold on it
+    next      // inbox / retired / free lists
 }
 ```
 
-Headers are allocated with `mem.alloc` from a type-stable free list and are
-never returned to the system allocator, so a late atomic increment on a
-header whose region was freed never touches foreign memory (section 6.4).
+Headers live in a two-level table (a fixed directory of 4096-entry chunks,
+`regions.valk`) and are never returned to the system allocator, so a late
+atomic on a freed header hits a header, never foreign memory. Each thread
+keeps its own free and retired header lists; a retired header is reused once
+every thread collected since and no stale hold is left on it.
 
 ### Object to region
 
 The 8-byte object header is `co_count: u32 | flags: u8 | slot_logs: u8 | offset: u16`.
-`co_count` of a shared object is no longer a co-owner count: it holds the
-region id. The region table is a two-level array (a fixed directory of
-chunks of 4096 `*Region`), so `id -> Region` is two loads and readers never
-see it move. Ids are recycled through a free list.
+A shared object's `co_count` holds its region id (local objects keep their
+co-owner count there). Stores and the local GC hold the object pointer, so they
+read the header directly; the conservative scan finds the object through the
+block registry as before.
 
-Lookup from an inner pointer stays what the conservative scan already does:
-`find_root` maps a word to its slot through the block registry, then the slot
-header gives the id. Stores and the local GC always hold the object pointer
-itself, so they read the header directly.
-
-Rejected alternatives:
-
-- *Copy the graph into a region arena* (aligned chunks, region found by
-  masking the address). Needs a forwarding walk and a second allocation per
-  publication, and the copy's source still has to be freed by the local GC.
-  Worth revisiting only if region-sized frees turn out to fragment the pools.
-- *Block registry lookup per count operation*: a binary search per store.
+Rejected: copying a publication into its own arena (a forwarding walk and a
+second allocation per publication) and a block-registry lookup per count
+operation.
 
 ### Static string literals
 
-Literals have a zeroed header (`offset == 0`) and live in the binary. They are
-never part of a region, never counted, and every RC path skips `offset == 0`
-like the old collector does.
+Literals have a zeroed header (`offset == 0`). They are never part of a region
+and every count path skips them, as the old collector does.
 
 ## 4. Publishing
 
-`share(root)` (called where the compiler already publishes: stores into
-shared storage, shared globals, `shared fn` environments, thread start)
-walks the unique graph as today and:
+`gc.share(root)` publishes immutable data; a store into shared storage publishes
+the stored value (`rc_share`, four passes over the unique graph):
 
-1. creates a region `R` with count 0, owned by the calling thread;
-2. for every object it reaches that is still local: flags it shared, writes
-   `R.id` into its header, appends it to `R.items`, strips the ownership tags
-   of its fields (as today);
-3. for every field that points to an object of an **older** region `S`:
-   increments `S` once per field. A field that was tagged co-owned by the local
-   GC was already counted (section 5b), so only the tag is stripped;
-4. registers `R` in the zero-count table (section 6) as if its count just
-   dropped to 0, so a publication that is never stored anywhere is still
-   freed.
+1. collect the graph, strip its ownership tags (fixing the local co-owner
+   counts), count each reference to an object of an older region;
+2. mark mutable data: everything when the store goes into a slot that is not
+   declared `shared T` (it is locked data), else what the values of `Lock`
+   objects reach;
+3. flag every object shared, give the immutable part one region and every
+   mutable object a region of its own; local co-owners outside the graph
+   (none in safe code) are added to the count, as they release through it;
+4. count the references between the new regions; a new region with count 0
+   goes to the zero-count table, so a publication nothing stores is freed too.
 
-The store that triggered the publication then increments `R` (or whatever
-region the stored value belongs to).
+The compiler tells the runtime which kind of store it is: a slot declared
+`shared T` stores through `property_update_shared` / `property_set_shared`,
+every other slot through `property_update` / `property_set`; layouts of
+`Lock[T]` instances carry kind 2 instead of 0 (`ir_write_allocator_helpers`).
 
 Objects with `gc_free` (file handles, sockets) are published like any other.
-Their hook runs on the region's owner thread when the region is freed, which
-is a stronger guarantee than today's "any thread performing the shared
-collection".
-
-`share()` cannot start a collection (`dont_stop`), and the region is invisible
-to other threads until the store that follows it.
+Their hook runs on the publishing thread when the region is freed.
 
 ## 5. Counting rules
 
@@ -119,292 +112,199 @@ one thread can read, or that the local GC has already looked at:
 
 | Reference held by | Counted when | Released when |
 |---|---|---|
-| (a) a field of an object of another region | publish (step 3), or a store into a shared object (`property_update`/`property_set` on a shared holder) | overwrite/clear of that field, or the holder's region is freed |
-| (b) a field of a local object | the local GC tags it co-owned (`mark_used_props`, `update_props`, `transfer_refs`) | the tag is removed: holder dies (`dis_own_props`), field overwritten (`loop_props_removed`), holder published (converted to (a), net 0) |
-| (c) a shared global slot (`shared`, `@shared`) | the store, through a runtime helper (`vgen_shared_store`) | the next store to that slot |
-| (d) a thread's roots: native stack, registers, suspended coroutine stacks, thread-local globals | the thread's collection finds it: +1 per distinct region (a "hold") | the thread's next collection, after it took its new holds |
+| (a) a field of an object of another region | publish, or a store into a shared object | overwrite/clear of the field, or the holder's region is freed |
+| (b) a field of a local object | the local GC tags it co-owned (`mark_used_props`, `update_props`, `transfer_refs`) | the tag goes: holder dies (`dis_own_props`), field overwritten (`loop_props_removed`), holder published (it becomes (a)) |
+| (c) a `shared` / `@shared` global | the store (`shared_global_store`, an exchange under a spinlock) | the next store to that global |
+| (d) a thread's roots: native stack, registers, suspended coroutine stacks, thread-local globals | the thread's collection finds it: +1 per region (a "hold") | the thread's next collection, after it took its new holds |
 
-Nothing else is counted:
-
-- **Loads, locals, arguments and returns cost nothing.** That is the point of
-  deferring the stack: no borrow elision is needed because borrows are never
-  counted.
-- **Stores into local objects cost nothing at store time.** The local GC
-  already logs stores into owned objects and walks new objects from the
-  stack; it counts the reference when it walks the holder, which it does at
-  the thread's next collection. Rows (b) are exactly today's atomic
-  `co_count` operations on shared objects, redirected to the region.
-- Internal references (holder and target in the same region) are never
-  counted, so moving data around inside one locked graph is free.
+Nothing else is counted. Loads, locals, arguments and returns cost nothing,
+and so do stores into local objects: the local GC counts them when it walks
+the holder at the thread's next collection. Rows (b) are today's atomic
+`co_count` operations on shared objects, redirected to the region. References
+inside one region are never counted.
 
 The rule behind the table: **every location another thread can read is a
-counted slot** (rows a, c). Locations only the owning thread can read are
-covered by that thread's collection (rows b, d), which is what makes the
-deferred freeing below sound.
+counted slot** (rows a, c). Locations only the owning thread reads are counted
+by that thread's collection (rows b, d), which is what makes deferred freeing
+sound.
 
-Unsafe code that writes a managed pointer into shared storage with raw
-`@ptrv` stores must call `gc.shared_store(slot, value)` instead; `GC_DEBUG`
-builds verify counts against a recount in the backup collection.
-
-### Hot regions
-
-A region referenced by many local objects on many threads (a shared config
-object) sees one atomic per co-own tag and removal, as today. If profiles show
-contention, each thread can keep a small delta table (region -> +/-n) and
-apply it at the end of its collection; zero transitions then only happen at
-flush time, which the protocol below already tolerates.
+Raw writes into shared storage have to keep the counts: `transfer_refs` into
+shared storage counts the copied references (a locked array that grows), and
+raw moves inside one storage (`Array.remove`, `prepend`) are count-neutral.
 
 ## 6. Deferred freeing
 
 ### 6.1 Zero transitions
 
 A decrement is one `atomic(word - 1 + (1 << 32))`: it lowers the count and
-bumps the 32-bit sequence in the same instruction. When the returned value
-says the count reached 0, the thread:
+bumps the sequence in the same instruction. When it reached 0, the thread
+appends `(R, sequence, rc_epoch)` to its own zero-count list (no lock).
+Increments are `atomic(word + 1)`.
 
-1. reads `g = atomic(zct_epoch + 1)` (the old value; the global epoch moves on),
-2. appends `(R, seq, g)` to the zero-count table (a global list behind a
-   spinlock; one push per region death).
+### 6.2 Epochs
 
-Increments are `atomic(word + 1)` and do not touch the sequence.
-
-### 6.2 Thread epochs
-
-Every thread's collection reads `e = zct_epoch` **before** it scans its roots
-and stores `done_epoch = e` when the collection (holds + local GC counting) is
-complete. `min_done` is the minimum over all threads in `gc_list`.
+Every collection starts with `e = atomic(rc_epoch + 1) + 1` and, once its
+holds and co-owner counts are complete, publishes `done_epoch = e`. A zero
+transition that read epoch `g` happened before every collection with
+`done_epoch > g` started. `min_done` is the minimum over `gc_list`.
 
 ### 6.3 Freeing
 
-A table entry `(R, seq, g)` is eligible when
+In each collection a thread moves its own entries to the shared table and
+looks at all of them. An entry is eligible when `g < min_done` and one atomic
+load of `R.word` shows count 0, no DEAD bit and the entry's sequence: it is
+the latest zero transition and nothing was decremented since (a decrement
+needs a count above 0 first). Entries with a count or another sequence are
+dropped; a later zero transition has its own entry. An eligible region gets
+`atomic(word | DEAD)` and goes to its owner: freed on the spot when that is
+the collecting thread or a thread that exited, otherwise put in the owner's
+inbox, which it frees at its next collection.
 
-- `g < min_done`: every live thread completed a collection that started after
-  the zero transition, and
-- one atomic load of `R.word` shows count 0, no DEAD bit and sequence `seq`:
-  this entry is the latest zero transition and nothing was decremented since
-  (a decrement needs a count above 0 first).
-
-Entries with a non-zero count or another sequence are dropped: a later zero
-transition has its own entry. An eligible region gets `atomic(word | DEAD)`
-and is handed to its owner's free inbox (spinlock list on the `Gc`), or freed
-on the spot when the processing thread is the owner or the owner is gone.
-
-The owner frees it inside its collection, after `loop_previous_stack_items`,
-`loop_updates` and `loop_dis_own` (those lists may still name objects of the
-region), before `settle_blocks`:
-
-- for each item, each field pointing to another region: decrement it (may
-  produce new zero transitions);
-- run `onfree`, clear the header, `slots_used--`, `touch_block`, lower
-  `mem_shared`;
-- clear the table entry, put the header on the retired list.
+A region is freed inside its owner's collection, after the local lists that
+may still name its objects were processed and before the allocation windows
+close: references to other regions are released (possibly new zero
+transitions), `onfree` runs, slots are cleared, the header is retired.
 
 ### 6.4 Why this is correct
 
-Claim: when an eligible region is freed at time `tf`, no thread can reach it.
+When an eligible region is freed at time `tf`, no thread can reach it. Let
+`t0` be its latest zero transition, and suppose thread T holds a pointer into
+it at `tf`. Let `ts` be the start of T's last collection before `tf`;
+eligibility says `t0 < ts`.
 
-Let `t0` be the region's latest zero transition (the entry's), and suppose a
-thread T holds a pointer into it at `tf`. Let `ts` be T's last collection
-before `tf`; eligibility says `t0 < ts`.
+- If T had the pointer at `ts` (a root, or a local object reachable from
+  one), that collection counted it: a hold or a co-own tag. That count lasts
+  until T's next collection or until the holder dies; releasing it is a
+  decrement after `t0`, which bumps the sequence. Contradiction.
+- Otherwise T loaded it after `ts`, from a location another thread can write
+  (its own locals were filled from its stack): a field of a shared object or
+  a shared global. Those are counted, so the count was above 0 at the load
+  and fell to 0 again later: a zero transition after `ts > t0`.
+  Contradiction.
 
-- If T already had the pointer at `ts` (stack, register, coroutine stack,
-  thread-local global, or a local object reachable from those), its
-  collection counted it: a hold (d) or a co-own tag (b). That count stays
-  until T's next collection or until the local holder dies, either way after
-  `ts`, and releasing it is a decrement after `t0`, which bumps the sequence.
-  Contradiction with the entry being eligible.
-- Otherwise T loaded the pointer after `ts`. Its own locals cannot be the
-  source (they would have been filled from T's stack, recursing to an earlier
-  load). So T read it from a location another thread can write: a field of a
-  shared object or a shared global slot. Those are counted slots (a, c): the
-  count was above 0 when T read it, so it returned to 0 after `ts > t0`,
-  again a later zero transition. Contradiction.
-- Channels, locks and thread start hand values over through shared objects,
-  so they are the second case.
+A dead region's references are released when it is freed; that zero
+transition starts a new wait (freeing a chain takes one round per level).
 
-Stale words: a conservative scan can still find a word that points into a
-region that is being freed (a dead slot, or an integer that looks like a
-pointer). Its increment is either before the DEAD bit (the region is garbage
-anyway by the argument above; the late hold is released at the scanner's next
-collection) or after it (the scanner sees DEAD in the returned value, undoes
-its increment and ignores the word). Headers are type-stable and a retired
-header is reused only when its word shows DEAD with count 0 and a full epoch
-has passed, so these late operations always hit a header and never
-underflow a live count. Blocks cannot be freed during a scan (the scan holds
-`block_lock`).
+Stale words: a conservative scan may find a word pointing into a region that
+is being freed. Its increment is either before the DEAD bit (the region is
+garbage anyway; the late hold is released at the scanner's next collection)
+or after it (the scanner sees DEAD, undoes its increment and ignores the
+word). Headers are type-stable and reused only with a DEAD word and no hold,
+and recycling bumps the sequence past every old entry.
 
-### 6.5 Liveness: idle and blocked threads
+### 6.5 Threads that do not collect
 
-`min_done` waits for the slowest thread. Threads that allocate collect on
-their own. A thread blocked in a syscall or an idle event loop has released
-its gc lock (that is what lets today's shared collection scan it):
-
-- idle loops already call `collect_if_threshold_almost_reached`; with
-  pending table entries they also run a collection when their `done_epoch`
-  holds the table back;
-- a thread whose table entries wait on a blocked thread `X` takes `X`'s gc
-  lock with a try-lock and runs `X`'s collection on its behalf (the
-  existing `gc = X` switch), one thread at a time. No thread waits for
-  another; a busy thread that never allocates simply delays reclamation.
-
-### 6.6 Explicit collection
-
-`gc.collect_shared()` keeps its meaning ("reclaim shared memory now"): it runs
-the backup collection (section 8), which stops every thread once and frees
-every unreachable region without waiting for epochs. Tests that assert exact
-shared memory keep working.
+`min_done` waits for the slowest thread. After its own collection a thread
+looks for threads that did not collect since its previous one and whose gc
+lock is free (they block), and runs their collection itself (the existing
+`gc = other` switch, a try-lock, never a wait). A thread that has not run
+since the last such collection only gets its epoch moved on: it let go of its
+gc (`release_lock` counts that), so nothing it references changed. A thread
+that computes without allocating or blocking delays frees, nothing more.
 
 ## 7. Interaction with the local GC, coroutines and threads
 
-- **Local objects holding shared references** count through the existing
-  co-own path (5b). When the local GC frees the holder, `dis_own_props`
-  decrements. Local GC code must never write the flags byte of a shared
-  object (the owner may be freeing it concurrently): the owned-tag branch of
-  `dis_own_props` skips `set_no_owner` for shared objects.
-- **Coroutines**: `scan_stacks` already scans the running stack, the main
-  stack while a coroutine runs and every suspended coroutine. Their shared
-  words become holds. Coroutines never move between threads.
-- **Thread exit** (`thread_stop`, under `shared_lock`): final collection,
-  release all holds, mark the regions the thread owns as orphaned
-  (`owner = null`: their blocks become unused blocks without an owner, and
-  orphaned regions are freed by whoever finds them eligible, under
-  `pool_lock`), drain its free inbox, leave `gc_list` so `min_done` stops
-  waiting for it.
-- **Thread start**: the handler closure environment is published with
-  `share_null_check`; the `Thread` object that stores it is published into
-  the `threads` lock, which counts the environment's region (a).
-- **Channels** are `Lock[ChannelState]`: `send` stores into a locked
-  `Deque`, `recv` clears the slot. Both are counted stores; nothing special.
-- **Closures capturing shared values**: a `shared fn` environment is a
-  publication like any other; its captured shared values are counted from it.
-- **`shared` / `@shared` globals**: counted at the store (5c).
-  `vgen_shared_store` emits `gc.shared_global_store(slot, value)` (publish,
-  increment the new value, exchange, decrement the old one) instead of
-  `share_null_check` plus a plain store; the exchange is an atomic swap, which
-  also gives arm64 the release ordering a plain store lacks today. Aggregate
-  globals (structs with managed fields) decrement the old fields before the
-  copy and publish + increment the new ones after it.
+- **Local holders** count through the existing co-own path. The local GC never
+  writes the flags byte of a shared object (its owner may be freeing it).
+- **Coroutines**: `scan_stacks` already scans every suspended coroutine;
+  their shared words become holds. Coroutines never move between threads.
+- **Thread-local globals** sit in the thread's stack block on Linux and are
+  scanned conservatively: runtime walk contexts kept in globals are cleared
+  after use, or they pin a region (found by the leak tests).
+- **Thread exit**: the final collection releases the holds; the thread's live
+  regions lose their owner (freed under `orphan_lock` later), its entries and
+  headers go to the shared lists, its inbox is freed.
+- **Channels** are `Lock[ChannelState]`: `send` stores into locked storage,
+  `recv` clears the slot; both counted. A value sent as `shared T` is one
+  region.
+- **Closures**: a `shared fn` environment is a publication; its captured
+  shared values are counted from it.
+- **Globals**: `vgen_shared_store` calls `gc.shared_global_store(slot, value)`,
+  which publishes, counts the new value, exchanges and releases the old one.
+  It is `$noinline`: inlined, the old value stayed in a callee-saved register
+  of the caller and a later scan held it. Aggregate globals release their old
+  fields before the copy (`GC_WALK.unshare`) and publish + count the new ones
+  after it.
 
-## 8. Locked data and cycles
+## 8. Mutable data
 
-Locked data is mutable but stays in this scheme:
+A store through a `locked T` view publishes the stored graph per object and
+counts it from the holder; the old value is released. Removing an entry from a
+locked map frees it once nothing else holds it, at the price of one region
+header per object of mutable data.
 
-- A store through a `locked T` view publishes the stored unique graph as a
-  new region and counts it from the holder (5a); the old value is
-  decremented. Removing an entry from a locked map frees it once nothing
-  else holds it. One `Lock` therefore owns many small regions. That is the
-  price of per-entry reclamation; merging stored data into the lock's own
-  region would keep every removed entry alive as long as the lock.
-- `Array`/`Deque` internals that move elements with raw copies stay count
-  neutral as long as the moved reference stays inside the same storage, as
-  they do today for the local GC's `moved_elements`. Growth publishes the new
-  storage (counting every element) and drops the old storage (which
-  decrements every element when it is freed).
+Why per object: with one region per stored graph, a store that unlinks an
+object inside a live region (a locked array's storage replaced on growth,
+a deque moving its halves) leaves that object and everything it references
+alive until the whole region dies. Channels did exactly that and kept every
+message alive. `GC_DEBUG` builds panic when a store unlinks an object inside
+a multi-object region, so an `@threadsafe` class that mutates immutable data
+shows up in the tests.
 
-Cycles between regions need an edge from an older region to a newer one,
-which only a mutable store can create. Example: a lock `L` (region `R0`)
-whose locked data stores a fresh object `X` (region `R1`) that holds the
-shared `L`. When the last outside reference to `L` goes, `R0` and `R1` keep
-each other at 1.
+## 9. Cycles: the backup collection
 
-Decision for v1: **keep a stop-the-world backup collection for cycles only**.
+Cycles between regions need an edge created by a store into mutable data. Two
+examples: a lock whose data holds an object that holds the lock; two locked
+objects pointing at each other.
 
-- It runs on an explicit `gc.collect_shared()` and when `mem_shared` passes
-  its trigger (twice the shared memory after the last backup plus 4 MB, as
-  today). Reference counting frees acyclic garbage continuously, so
-  `mem_shared` only grows past the trigger when cycles leak or when frees are
-  held back by a stuck thread.
-- In the stopped world every thread first runs its collection, so all
-  counts are exact. For each live region it computes the references coming
-  from other live regions (one walk over every shared object, the same cost
-  as today's mark), takes the regions whose count exceeds that as roots,
-  marks what they reach over region edges and frees the rest, decrementing
-  the marked regions the dead ones referenced.
-- Stores that create an edge to a newer region set `has_mutable_edge` on the
-  holder's region. The trigger can be limited to programs that have such
-  regions.
+The old rendezvous stays as the cycle collector:
 
-Follow-up (v2): concurrent trial deletion (Bacon-Rajan) over candidate regions
-(those with `has_mutable_edge` whose count was decremented to a non-zero
-value), freeing a garbage cycle through the same epoch rule as a zero count:
-record the cycle with the current epoch and the regions' sequences, free it
-when every thread collected since and no member's sequence moved. That
-removes the last stop-the-world from shared memory.
+- it runs on an explicit `gc.collect_shared()` and when `mem_shared` passes its
+  trigger, `2 x mem_shared + step` after the last backup; the step starts at
+  4 MB and doubles (up to 1 GB) after every backup that found less than an
+  eighth of the shared memory in cycles, so live data that grows and shrinks
+  (queues) does not keep stopping threads;
+- every thread is stopped and has collected, so counts are exact. For each
+  live region it subtracts the references from other live regions (one walk
+  over every shared object, the old mark's cost); regions with references left
+  are roots; what they do not reach is garbage. Garbage with a count of 0 and
+  what only it reaches would have been freed anyway; the rest is cyclic and
+  feeds the step.
 
-## 9. Platforms
+Follow-up: concurrent trial deletion (Bacon-Rajan) over regions of mutable
+data, freeing a garbage cycle through the same epoch rule, would remove the
+last stop-the-world.
 
-- Atomics: increments, decrements, the DEAD `or` and the epoch counter are
-  sequentially consistent read-modify-writes (`atomic()`), on x64 `lock xadd`
-  and `lock or`, on arm64 `ldaddal`/`ldsetal` (LSE) or LL/SC loops.
-- arm64 ordering: the region id and fields are written by the publisher
-  before the store that makes the graph reachable. Channel and lock stores
-  are ordered by the mutex; shared global stores become an atomic exchange
-  (section 7).
-- Windows: scans already include callee-saved xmm registers and fiber
-  stacks; holds come out of the same scan. The free inbox uses the same
-  fetch-or spinlock as `mem_usage_peak_lock`; no new OS primitive.
-- macOS: nothing specific; the try-lock helping in 6.5 uses the existing
-  `MutexStruct`.
+## 10. Platforms
 
-## 10. Expected costs
+- Atomics are sequentially consistent read-modify-writes (`atomic()`): `lock
+  xadd` / `lock cmpxchg` on x64, LSE or LL/SC on arm64.
+- A published object's region id is written before its shared flag; the
+  store that makes the graph reachable follows. Channel and lock stores are
+  ordered by the mutex; shared global stores take a spinlock.
+- Windows: holds come out of the same scan (xmm registers, fiber stacks). The
+  helping try-lock is `WaitForSingleObject(mutex, 0)`. `make test-win` passes
+  under Wine with `--def SHARED_RC=1`.
+- macOS and linux-arm64: nothing specific; not run yet.
 
-- Per publication: one region header (~64 bytes, recycled) and one table
-  entry, plus one atomic per field pointing to an older region.
-- Per store of a shared value into shared storage (channel send, locked
-  store, shared global): one increment, one decrement for the old value.
-- Per thread collection: one increment per distinct region held by roots,
-  one decrement per previously held region, a short spinlock section if the
-  table has entries.
-- Memory: a dead region lives until every thread has collected once since
-  its count reached zero, normally a few local collection intervals. With
-  helping, idle threads do not stretch this.
-- Latency: no stop-the-world for acyclic data. The local collection of a
-  thread gets the work of freeing its own dead regions (proportional to
-  their size, like freeing local garbage).
-- Lock-heavy programs: one region header per stored graph. A solo-object
-  region (most map values, boxed strings) could keep its count in the object
-  header instead (a later optimization; needs a 64-bit atomic header word).
+## 11. Costs
 
-## 11. Migration plan
-
-Every step keeps `make test`, `make test-win` and `make test-gc-shared-stress`
-passing; the new code is behind `--def SHARED_RC=1` until the last step.
-
-1. Region headers, table, publish into regions, counts for rows (a)-(d), the
-   zero-count table and deferred freeing, explicit `collect_shared` doing the
-   backup collection. Start with leaf data: objects without references inside
-   are trivially acyclic and exercise the whole free path.
-2. General graphs: region-to-region counting at publish, counted stores into
-   locked data, free-time decrements.
-3. Shared globals through the counted helper, thread exit hand-over, helping
-   blocked threads.
-4. The backup collection as the cycle collector with its memory trigger; the
-   old shared trace (`update_marks`, `shared_items`, `shared_dump`) removed
-   under the define.
-5. Benchmarks and Campfire; then make it the default, delete the old code.
-6. Later: trial deletion for cycles, solo regions, per-thread delta tables.
+- Per publication of immutable data: one region header (~100 bytes, reused)
+  and one atomic per reference to an older region. Per object of mutable
+  data: one region header.
+- Per store into shared storage: one increment, one decrement for the old value.
+- Per collection: one atomic per distinct region its roots hold, one per region
+  held the time before, two short spinlock sections for the zero-count table,
+  and the collections it runs for blocked threads.
+- A dead region lives until every thread collected once after its count
+  reached 0 (one more round per level of a dead chain).
 
 ## 12. Tests
 
-- Existing: `tests/src/gc-shared.valk` (exact `mem_shared` after
-  `collect_shared`, multi-thread spam, co-ownership across collects, thread
-  suspend, spinning threads, collection run by another thread),
-  `make test-gc-shared-stress`, threads, channels, locks.
-- New, all with exact counts or `gc_free` counters:
-  - a published message dropped by every receiver is freed **without**
-    `collect_shared` once every thread has collected (mark_count unchanged);
-  - a region held only by a local object stored after the holder thread's
-    last collection survives a zero transition elsewhere;
-  - a region held only on a suspended coroutine's stack survives;
-  - a region held only by a blocked thread's registers survives (helping
-    path);
-  - a value moved through a channel to another thread and stored into a
-    local object there survives while the sender drops it;
-  - overwriting and clearing a shared global frees the old value;
-  - locked map: removed entries are freed, kept ones survive;
-  - a cycle through a lock is freed by `collect_shared` and only by it;
-  - a `gc_free` object in a region runs its hook exactly once, on the
-    publishing thread;
-  - a thread that exits leaves its regions freeable (orphan path);
-  - stale-word stress: threads publishing and dropping regions while others
-    scan (the DEAD path), with `GC_DEBUG` recount verification.
+- `tests/src/gc-shared.valk` and the rest of the suite pass with the define
+  (`make test-rc`, `make test-win FLAGS=--def SHARED_RC=1`).
+- `tests/src/gc-shared-rc.valk` (only with the define): a value sent to other
+  threads is freed without a shared collection; a value held only by a new
+  local object, or only by a suspended coroutine, survives its count reaching
+  0; overwriting a shared global frees the old values; objects removed from
+  locked data are freed and the rest survives; a cycle through a lock is freed
+  by `collect_shared` and only by it; a value published by an exited thread is
+  freed; values bouncing between threads are each freed exactly once.
+- `GC_DEBUG` checks: increments or decrements of a dead region, count
+  underflow and overflow, a hold underflow, a shared object referencing a
+  local one, a store unlinking an object inside a multi-object region, and in
+  the backup collection a count below the references other regions hold.
+
+## 13. Results and open problems
+
+See the status report on the branch (filled in from the measurements).
