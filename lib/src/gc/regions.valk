@@ -52,13 +52,6 @@ struct Region {
 // What threads that exited left: free and retired headers
 @shared orphan_free: ?*Region (@undefined)
 @shared orphan_retired: ?*Region (@undefined)
-// Rounds: once shared memory reached rc_round_trigger, every thread collects
-// once (at its idle point, or a thread that blocks gets its collection run by
-// another), a few rounds in a row: a dead chain frees one level per round.
-// rc_round is the epoch of the running round, 0 when none runs
-@shared rc_round: uint (@undefined)
-@shared rc_round_count: uint (@undefined)
-@shared rc_round_trigger: uint (@undefined)
 // The shared zero-count table; each thread moves its own entries here when it collects
 @shared zct: *Bump (@undefined)
 @shared zct_lock: uint (@undefined)
@@ -84,9 +77,6 @@ fn regions_init() {
     orphan_retired = null
     zct = Bump.new(4096)
     zct_lock = 0
-    rc_round = 0
-    rc_round_count = 0
-    rc_round_trigger = mem_shared_minimum_trigger
     rc_epoch = 1
     gc_list_lock = 0
     global_store_lock = 0
@@ -689,50 +679,14 @@ fn rc_recycle(g: *Gc, min: uint) {
 // Helping threads that do not collect
 //////////////////////////
 
-// Rounds per trigger: most dead chains are short (a locked array's storage
-// and what it held)
-value rc_rounds_per_cycle (3)
-
-// After our own collection: starts, ends and drives rounds. During a round,
-// a thread whose gc lock is free (it blocks) and that did not collect since
-// the round started gets its collection run by us; one that did not run since
-// a collection was last run for it only gets its epoch moved on, as nothing
-// it references changed. Never waits for a lock
+// After our own collection. Entries wait until every thread collected, so a
+// thread that let go of its gc (it blocks) gets help: one that did not run
+// since a collection was run for it only gets its epoch moved on, as nothing
+// it references changed; one that did not collect since our previous
+// collection gets its collection run by us. The threads that keep up do not
+// need us. Never waits for a lock
 fn rc_help(me: *Gc) {
-    let round = atomic_load(rc_round)
-    if round == 0 {
-        let mem = atomic_load(mem_shared)
-        let trigger = atomic_load(rc_round_trigger)
-        if mem < trigger {
-            // Follow shared memory down
-            let lower = mem * 2 + mem_shared_minimum_trigger
-            if lower < trigger : atomic_store(rc_round_trigger, lower)
-            rc_help_threads(me, 0)
-            return
-        }
-        round = rc_epoch_next()
-        atomic_store(rc_round, round)
-        atomic_store(rc_round_count, 1)
-    } else if rc_min_done() > round {
-        // Every thread collected since the round started
-        if atomic_load(rc_round_count) < rc_rounds_per_cycle {
-            round = rc_epoch_next()
-            atomic_store(rc_round, round)
-            atomic(rc_round_count + 1)
-        } else {
-            atomic_store(rc_round, 0)
-            atomic_store(rc_round_trigger, atomic_load(mem_shared) * 2 + mem_shared_minimum_trigger)
-            rc_help_threads(me, 0)
-            return
-        }
-    }
-    rc_help_threads(me, round)
-}
-
-// Threads that block: one that did not run since a collection was run for it
-// gets its epoch moved on (it holds nothing new); during a round (`round` > 0)
-// one that did not collect since the round started gets its collection run
-fn rc_help_threads(me: *Gc, round: uint) {
+    if !rc_pending() : return
     let now = me.rc_done
     let stamp = me.rc_stamp
     while true {
@@ -743,8 +697,6 @@ fn rc_help_threads(me: *Gc, round: uint) {
             if g.rc_helped == stamp : continue
             g.rc_helped = stamp
             if atomic_load(g.rc_done) >= now : continue
-            let cheap = g.rc_blocks == g.rc_helped_at && g.rc_zct.index == 0 && !isset(g.rc_inbox)
-            if !cheap && (round == 0 || atomic_load(g.rc_done) > round) : continue
             if g.state != GcState.idle : continue
             if !g.mutex.try_lock() : continue
             target = g
@@ -754,7 +706,7 @@ fn rc_help_threads(me: *Gc, round: uint) {
         let t = target ?! break
         if t.rc_blocks == t.rc_helped_at && t.rc_zct.index == 0 && !isset(t.rc_inbox) {
             atomic_store(t.rc_done, rc_epoch_next())
-        } else if round > 0 && t.state == GcState.idle {
+        } else if atomic_load(t.rc_done) < me.rc_prev_done && t.state == GcState.idle {
             gc = t
             t.collect_run(CollectKind.local)
             gc = me
@@ -764,18 +716,21 @@ fn rc_help_threads(me: *Gc, round: uint) {
     }
 }
 
-#if TEST
-/// Test helper: starts a round of collections now, as if shared memory had reached the trigger.
-+ fn shared_round_for_test() {
-    atomic_store(rc_round_trigger, 0)
+// Whether any thread has zero-count entries waiting
+fn rc_pending() bool {
+    if atomic_load(zct.index) > 0 : return true
+    let found = false
+    gc_list_lock_take()
+    each gc_list as g {
+        if atomic_load(g.rc_zct.index) > 0 {
+            found = true
+            break
+        }
+    }
+    gc_list_lock_drop()
+    return found
 }
-#end
 
-// Whether a round waits for the calling thread's collection
-fn rc_behind() bool {
-    let round = atomic_load(rc_round)
-    return round > 0 && gc.rc_done <= round
-}
 
 
 //////////////////////////
