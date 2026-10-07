@@ -5,6 +5,7 @@
 
 ```
 - Release 0.7.11
++ GC: a shared collection runs once the shared memory has doubled since the last one plus 4 MB (was +30% plus 256 KB), so short-lived shared data such as broadcast messages no longer stops every thread every few hundred KB: 1,420 -> ~150 collections for 20,000 shared 20 KB messages
 
 + Release 0.7.10
 + WebSocket: permessage-deflate compression (RFC 7692). `WebSocket.connect` offers it by default (`Options.websocket_compression`); a server accepts it with `Server.websocket_compression = true` or per endpoint with `WebSocket.upgrade(req, handler, true)` / `send_websocket(ctx, handler, true)` (off by default, as in Go and Node servers: it costs CPU per message). The server answers without context takeover either way, so a connection keeps no compression window; the client also inflates a server's context takeover. Messages under 64 bytes, or that would not shrink, go uncompressed, and a decompressed message counts against `max_message_size`. Frames are built in a reused buffer and masked 4 bytes at a time (uncompressed 16 KB echo 26.7k -> 32.4k round trips/s)
