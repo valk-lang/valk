@@ -26,7 +26,10 @@ struct Region {
     id: uint
     // The publishing thread: its pool blocks hold the objects. Null once it exited
     owner: ?*Gc
-    items: *Bump
+    // Its objects: the first inline (most regions have one), the rest in `more`
+    count: uint
+    first: ptr
+    more: ?*Bump
     bytes: uint
     live: bool
     // Backup collection
@@ -148,7 +151,6 @@ fn region_new(owner: *Gc) *Region {
             }
             let nr: *Region = chunk + (id & (region_chunk_size - 1)) * size_of(Region)
             nr.id = id
-            nr.items = Bump.new(16)
             nr.word = 0
             atomic_store(region_count, id)
             r = nr
@@ -157,6 +159,7 @@ fn region_new(owner: *Gc) *Region {
     }
     let region = r ?! panic("No region")
     region.owner = owner
+    region.count = 0
     region.live = true
     region.mark = false
     region.bytes = 0
@@ -226,7 +229,7 @@ fn rc_check_unlink(hid: uint, v: ?ptr) {
     if !isset(v) || hid == 0 : return
     let d = gcdata(v & (~prop_mask).to(uint))
     if d.offset == 0 || d.co_count.to(uint) != hid : return
-    if region_by_id(hid).items.index > size_of(ptr) : panic("GC error: a store unlinked an object inside a multi-object shared region")
+    if region_by_id(hid).count > 1 : panic("GC error: a store unlinked an object inside a multi-object shared region")
 }
 #end
 
@@ -333,6 +336,7 @@ fn rc_share(item: GcItem, per_object: bool) {
     // 3.
     let fresh = g.rc_new_regions
     fresh.reset()
+    let published: uint = 0
     let region: ?*Region = null
     adr = items.data
     while adr < end {
@@ -345,7 +349,7 @@ fn rc_share(item: GcItem, per_object: bool) {
             fresh.add_ptr(r)
             if !d.has_leak_mark() : region = r
         }
-        r.items.add_ptr(it)
+        rc_add_item(r, it)
         // What is left are co-owners outside the graph: they release through the region
         let outside = d.co_count.to(uint)
         if outside > 0 : atomic(r.word + outside)
@@ -366,8 +370,9 @@ fn rc_share(item: GcItem, per_object: bool) {
             g.mem_marked -= size
         }
         r.bytes += size
-        atomic(mem_shared + size)
+        published += size
     }
+    atomic(mem_shared + published)
 
     // 4.
     adr = items.data
@@ -587,38 +592,25 @@ fn rc_free_region(r: *Region, orphan: bool) {
 
 fn rc_release_refs(r: *Region) {
     rc_walk_region = r
-    let items = r.items
-    let adr = items.data
-    let end = adr + items.index
-    let ml = gc.mark_list
-    while adr < end {
-        let it = @ptrv(adr, GcItem)
-        adr += size_of(ptr)
-        let layout = gcdata(it).block().layout
-        if isset(layout) {
-            each_ref(it, layout, ml, fn(ref: ptr, list: *Lifo) {
-                @unsafe
-                let target = rc_target(ref) ?! return
-                // The backup collection frees cycles whose members are all dead:
-                // their counts only drop to 0, no zero transition
-                if rc_walk_backup && !target.mark {
-                    atomic(target.word - 1)
-                    return
-                }
-                region_dec(target)
-            })
+    rc_each_target(r, fn(ref: ptr, list: *Lifo) {
+        @unsafe
+        let target = rc_target(ref) ?! return
+        // The backup collection frees cycles whose members are all dead:
+        // their counts only drop to 0, no zero transition
+        if rc_walk_backup && !target.mark {
+            atomic(target.word - 1)
+            return
         }
-    }
+        region_dec(target)
+    })
     rc_walk_region = null
 }
 
 fn rc_free_items(r: *Region, orphan: bool) {
-    let items = r.items
-    let adr = items.data
-    let end = adr + items.index
-    while adr < end {
-        let it = @ptrv(adr, GcItem)
-        adr += size_of(ptr)
+    let n = r.count
+    let i: uint = 0
+    while i < n {
+        let it: GcItem = rc_item(r, i++)
         let data = gcdata(it)
         #if GC_DEBUG
         if !data.is_shared() || data.co_count.to(uint) != r.id : panic("GC error: a freed region lists an object that is not its own")
@@ -633,8 +625,12 @@ fn rc_free_items(r: *Region, orphan: bool) {
         if isset(onfree) : onfree(it)
     }
     atomic(mem_shared - r.bytes)
-    items.reset()
-    if items.size > 4096 : items.reduce_size()
+    r.count = 0
+    let more = r.more
+    if isset(more) {
+        more.reset()
+        if more.size > 4096 : more.reduce_size()
+    }
 
     r.live = false
     r.owner = null
@@ -944,16 +940,37 @@ fn rc_update_backup_trigger(cyclic: uint, before: uint) {
 
 // Calls `cb` for every managed slot of every object of the walked region
 fn rc_each_target(r: *Region, cb: fnptr(ptr, *Lifo)()) $inline {
-    let items = r.items
-    let adr = items.data
-    let end = adr + items.index
     let ml = gc.mark_list
-    while adr < end {
-        let it = @ptrv(adr, GcItem)
-        adr += size_of(ptr)
+    let n = r.count
+    let i: uint = 0
+    while i < n {
+        let it = rc_item(r, i++)
         let layout = gcdata(it).block().layout
         if isset(layout) : each_ref(it, layout, ml, cb)
     }
+}
+
+fn rc_item(r: *Region, i: uint) ptr $inline {
+    if i == 0 : return r.first
+    let more = r.more ?! panic("GC error: region object missing")
+    return @ptrv(more.data, ptr, i - 1)
+}
+
+fn rc_add_item(r: *Region, it: ptr) {
+    let n = r.count
+    r.count = n + 1
+    if n == 0 {
+        r.first = it
+        return
+    }
+    let more = r.more
+    if !isset(more) {
+        let b = Bump.new(64)
+        r.more = b
+        more = b
+    }
+    let m = more ?! return
+    m.add_ptr(it)
 }
 
 // The other region a slot of the walked region points to
