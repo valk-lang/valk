@@ -3,7 +3,7 @@
 Status: prototype on branch `shared-refcount`, behind `--def SHARED_RC=1`
 (`make test-rc` runs the suite with it). Nothing here changes the language:
 `shared T`, `Lock[T]`, `locked T`, `shared fn` and channels keep their syntax
-and checks. Measurements and the open problems are in section 13.
+and checks. Measurements are in section 13, the assessment in section 14.
 
 ## 1. Problem
 
@@ -194,13 +194,21 @@ and recycling bumps the sequence past every old entry.
 
 ### 6.5 Threads that do not collect
 
-`min_done` waits for the slowest thread. After its own collection a thread
-looks for threads that did not collect since its previous one and whose gc
-lock is free (they block), and runs their collection itself (the existing
-`gc = other` switch, a try-lock, never a wait). A thread that has not run
-since the last such collection only gets its epoch moved on: it let go of its
-gc (`release_lock` counts that), so nothing it references changed. A thread
-that computes without allocating or blocking delays frees, nothing more.
+`min_done` waits for the slowest thread. Three rules keep it moving:
+
+- Each pass records the oldest epoch of an entry it had to keep. A thread
+  whose last collection started before it collects at its next idle point
+  (`collect_if_threshold_almost_reached`, called by the event loop), on its
+  own core.
+- After its own collection a thread looks at the threads whose gc lock is
+  free (they block). One that has not run since a collection was last run for
+  it only gets its epoch moved on: it let go of its gc (`release_lock` counts
+  that), so nothing it references changed. One that stayed blocked since the
+  last look and did not collect since our previous collection gets its
+  collection run by us (the existing `gc = other` switch, a try-lock, never a
+  wait).
+- A thread that computes without allocating or blocking delays frees, nothing
+  more.
 
 ## 7. Interaction with the local GC, coroutines and threads
 
@@ -305,6 +313,92 @@ last stop-the-world.
   local one, a store unlinking an object inside a multi-object region, and in
   the backup collection a count below the references other regions hold.
 
-## 13. Results and open problems
+## 13. Results (2026-10-07)
 
-See the status report on the branch (filled in from the measurements).
+All on linux-x64 (12 cores), release builds, base = the same branch without
+the define. The machine was shared with other jobs; numbers are medians of
+alternating runs, benchmarks pinned to CPUs 4-11.
+
+| Benchmark | base | SHARED_RC |
+|---|---|---|
+| 4 threads, 20k shared 20 KB messages (sgc) | 75 ms, 165 shared collections (max 31-44 us), 232 ms CPU, RSS 7-9 MB | 82 ms, 0 shared collections, 265 ms CPU, RSS 4.5-5.5 MB |
+| gc-multi "mt-shared publish/replace" | 9-10 ms, peak 6.1-6.3 MB | 8 ms, peak 2.2 MB |
+| binary-tree 19, binary-tree-multi 19, merkletrees 18, json, objects, gc-overhead | unchanged (±2%) | unchanged |
+| locked HashMap, 200k entries filled then 5x replaced, 1 thread | 21 + 87 ms | 50 + 209 ms (mem_shared 26 MB vs 51 MB, same RSS) |
+
+Campfire `shared-frames`, `bench/run --quick --apps valk --routes static_css
+--upload-reps 0 --cable-clients 100 1000 10000 --deflate 0 1`, 4 runs each:
+
+| Cable clients / deflate | base msg/s, p99 | SHARED_RC msg/s, p99 |
+|---|---|---|
+| 100 / off | 4,216, 3.26 ms | 4,219, 3.20 ms |
+| 100 / on | 2,903, 5.09 ms | 2,869, 5.29 ms |
+| 1,000 / off | 330, 62.8 ms | 328, 60.1 ms |
+| 1,000 / on | 286, 81.0 ms | 287, 66.2 ms |
+| 10,000 / off | 33.4, 586 ms | 33.9, 645 ms |
+| 10,000 / on | 29.0, 717 ms | 28.6, 695 ms |
+| static_css c=16 | 424,673 req/s | 424,892 req/s |
+
+Shared collections per run: base 88 (about 1 ms each at 100 clients, 10-14 ms
+at 1,000, worst 46-94 ms in the 10,000-client phases); SHARED_RC 1-2 backup
+collections per run (1.3-10 ms). RSS is the same. The end-to-end numbers do
+not move beyond the noise: since the shared trigger became "doubled plus
+4 MB" the stop-the-world pauses are a small part of these latencies.
+
+Test status: `make test-rc` passes (the only failure, `Https: Client`, needs
+internet inside the network namespace used for the runs); 10/10 soak runs on
+two cores (`taskset -c 0,1`); `make test-win` with the define passed once
+cleanly, two more runs under load ended in network timeouts (IoError.timeout,
+WebSocket closed) and are being compared with base.
+
+## 14. Assessment
+
+What reference counting gives:
+
+- no stop-the-world for acyclic shared data: the shared collection runs 1-2
+  times per Campfire run instead of 88, and only as the cycle collector;
+- lower shared memory for message passing (dead messages go after one round
+  instead of at the next doubling).
+
+What it costs:
+
+- CPU: message passing pays the rounds of collections that frees wait for
+  (+14% CPU, +9% wall on the 4-thread microbenchmark); every store into
+  locked data creates and later frees one region per object (2.4x slower on a
+  locked map that is replaced in a loop).
+- Complexity: ~1,000 lines of runtime (regions, deferred freeing, helping,
+  orphans, backup), a compiler hook for `Lock` layouts and for stores into
+  `shared T` slots, and three policies with tuned behaviour (who collects for
+  whom, when an idle thread collects itself, when the backup runs).
+- New invariants the rest of the stdlib must keep: every raw write into
+  shared storage keeps counts (`transfer_refs` was the first miss), runtime
+  thread-local globals must not keep pointers, mutation of immutable data by
+  `@threadsafe` code must not unlink objects inside a region.
+
+Recommendation: keep the current shared collection. The prototype removes the
+pauses but no workload measured here gets faster, lock-heavy code gets
+slower, and the runtime gets a second set of GC states and invariants. If
+shared pauses come back as a measured problem (many threads and coroutines
+and immutable data published at a high rate), the branch is a working
+starting point; the cheaper first step stays parallel marking during the
+stop.
+
+Found on the way and useful without reference counting (separate commit on
+the branch): `moved_elements` left the storage it worked on in a thread-local
+global; on threads other than main that global lies in the scanned stack
+block, so it kept the last array a raw move touched (and everything in it)
+alive. Test: "GC: Storage whose elements a raw move logged is freed on a
+worker thread".
+
+Open problems if this is continued:
+
+- cascading frees take one round per level of a dead chain; a per-region
+  "last decrement" epoch would allow freeing a chain in one round but needs an
+  atomic maximum;
+- per-object regions make locked data expensive; per-lock tracing (the lock
+  holder traces the locked graph at unlock, strings as regions) would be
+  cheaper but is a third collector;
+- the backup collection still stops the world for cycles through locks;
+  concurrent trial deletion would remove it;
+- macOS and linux-arm64 are untested; shared global stores use a spinlock,
+  not an atomic exchange.
