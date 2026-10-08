@@ -118,6 +118,10 @@ test-library: $(TEST_COMPILER)
 test-extend-access: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
 
+# Every public method of the core collections on plain, shared and locked data
+test-views: $(TEST_COMPILER)
+	@python3 ./tests/views/gen.py --valk $(TEST_COMPILER) --jobs 4
+
 test-doc: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/doc/run.sh
 
@@ -141,7 +145,7 @@ api-baseline: valk
 test-http2: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./tests/http2/run.sh
 
-test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2 test-api-compat
+test-all: test test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2 test-api-compat test-views
 
 # The suites whose outcome depends on the host: the runtime, the linker and
 # the CLI's path handling. The front-end suites (compile errors, formatting,
