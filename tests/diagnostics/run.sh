@@ -70,7 +70,7 @@ fi
 count=$((count + 1))
 echo "> locked receiver error shows the call that needed it"
 locked_out=$("$VALK" build "$DIR/locked-chain.valk" --no-warn 2>&1 | normalize_paths)
-if [[ "$locked_out" != *"# Note: while checking 'sort' for a locked receiver, called here"* ]] || [[ "$locked_out" != *"# At: $DIR/locked-chain.valk:6:9"* ]]; then
+if [[ "$locked_out" != *"# Error: Cannot call 'filter' with locked data"* ]] || [[ "$locked_out" != *"# File: $DIR/locked-chain.valk"* ]] || [[ "$locked_out" != *"# Line: 6 | Col: 19"* ]]; then
     echo "# Missing locked receiver chain"
     echo "$locked_out"
     failed=1
