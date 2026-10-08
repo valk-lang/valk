@@ -46,6 +46,8 @@ struct Park {
     next: ?ptr
     // Monotonic ms after which the waiter gives up, 0 for never
     deadline_ms: uint
+    // An event wait (Waker): its thread polls for the next wake before sleeping
+    poll: bool
 }
 
 struct Home {
@@ -53,6 +55,8 @@ struct Home {
     first: ?ptr
     last: ?ptr
     rung: uint
+    // 1 while the thread polls its inbox before sleeping: wakes then need no doorbell
+    polling: uint
     alive: uint
     // One for the thread, one per Park that names this home
     refs: uint
@@ -67,6 +71,8 @@ struct Home {
 }
 
 global home_ptr: ?ptr (null)
+// The last wait of this thread ended through its inbox: worth polling before the next one
+global home_woken: bool (false)
 // Parks of this thread's coroutines that wait with a deadline
 global timed_parks: Array[ptr] (.new(8))
 
@@ -103,8 +109,9 @@ fn cpu_yield() {
 //////////////////////
 
 // A park for the current coroutine, or for this thread when no coroutine runs
-fn park_new() *Park {
+fn park_new(poll: bool (false)) *Park {
     let p = mem.new[Park]()
+    p.poll = poll
     p.state = 0
     p.refs = 2
     p.next = null
@@ -212,7 +219,7 @@ fn wake_park(p: *Park) bool {
         h.first = p.@cast(ptr)
     }
     h.last = p.@cast(ptr)
-    if h.rung == 0 {
+    if h.rung == 0 && h.polling == 0 {
         h.rung = 1
         // Rung under the guard: the thread closes its doorbell only after marking itself gone
         home_ring(h)
@@ -271,6 +278,7 @@ fn home() *Home {
     h.first = null
     h.last = null
     h.rung = 0
+    h.polling = 0
     h.alive = 1
     h.refs = 1
     home_open(h)
@@ -299,9 +307,39 @@ fn drain_home() {
     while isset(p) {
         let park = p.@cast(*Park)
         p = park.next
+        if park.poll : home_woken = true
         deliver(park)
         park_release(park)
     }
+}
+
+// A thread that runs out of work right after another thread woke it from an event wait is
+// often woken again soon (a channel consumer). Lock waiters sleep: polling adds contention. Waking a sleeping thread costs a system call on each
+// side, so poll the inbox for a few microseconds first.
+fn poll_home() {
+    if !home_woken : return
+    home_woken = false
+    let existing = home_ptr ?! return
+    let h = existing.@cast(*Home)
+    atomic_store(h.polling, 1)
+    let deadline = time.mono_ns() + 20_000
+    let found = false
+    while !found {
+        let spins: uint = 0
+        while spins++ < 64 {
+            if isset(atomic_load(h.first)) {
+                found = true
+                break
+            }
+        }
+        if !found && time.mono_ns() >= deadline : break
+    }
+    // Under the guard: a waker that saw `polling` queued without ringing, so look once more
+    spin_acquire(@ref(h.guard))
+    h.polling = 0
+    found = isset(h.first)
+    spin_release(@ref(h.guard))
+    if found : drain_home()
 }
 
 // The thread ends: no wake can reach it anymore
