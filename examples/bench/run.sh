@@ -17,6 +17,11 @@ all_benchmarks=(
     nsieve
     spectral-norm
     spectral-norm-multi
+    shared-read
+    shared-channel
+    shared-lock
+    shared-cache
+    shared-broadcast
 )
 benchmarks=()
 
@@ -111,6 +116,11 @@ benchmark_args() {
         nsieve)       args=(13) ;;
         spectral-norm) args=(5500) ;;
         spectral-norm-multi) args=(8000 4) ;;
+        shared-read)      args=(200000 5000000) ;;
+        shared-channel)   args=(1000000) ;;
+        shared-lock)      args=(10000 2000000) ;;
+        shared-cache)     args=(100000 2000000) ;;
+        shared-broadcast) args=(500000) ;;
     esac
 }
 
@@ -125,6 +135,11 @@ benchmark_input() {
         nsieve)        printf '13' ;;
         spectral-norm) printf '5500' ;;
         spectral-norm-multi) printf '8000, 4 workers' ;;
+        shared-read)      printf '200k users, 4x5M lookups' ;;
+        shared-channel)   printf '4 pairs, 4x1M messages' ;;
+        shared-lock)      printf '10k keys, 4x2M updates' ;;
+        shared-cache)     printf '100k slots, 4x2M ops' ;;
+        shared-broadcast) printf '500k messages, 4 subscribers' ;;
     esac
 }
 
