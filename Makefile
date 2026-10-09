@@ -118,6 +118,12 @@ test-library: $(TEST_COMPILER)
 test-extend-access: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
 
+# The suite with a collection every 512 allocations: exposes values no root names
+test-gc-stress: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-gc-stress$(EXE_SUFFIX)
+	./debug/test-gc-stress$(EXE_SUFFIX)
+
 # Every public method of the core collections on plain, shared and locked data
 test-views: $(TEST_COMPILER)
 	@python3 ./tests/views/gen.py --valk $(TEST_COMPILER) --jobs 4
