@@ -1127,5 +1127,18 @@ for needle in '"gobject-2.0.lib"' '"python3.12.lib"' '"libexact.so"'; do
     fi
 done
 
+if [[ "$(uname -s)" == "Linux" ]]; then
+    echo ""
+    echo "# Test file reads and writes without an io_uring ring"
+    "$VALK" build "$DIR/no-ring-files.valk" --no-warn -o "$workdir/no-ring-files" > /dev/null || exit 1
+    # Rings count against the locked-memory limit; with none left a file access blocks instead
+    no_ring_out=$(ulimit -l 0 && "$workdir/no-ring-files" "$workdir/no-ring.txt" 2>&1)
+    if [[ "$no_ring_out" != "hello" ]]; then
+        echo "# File access failed without a ring:"
+        echo "$no_ring_out"
+        exit 1
+    fi
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 73"
+echo "# Test count: 74"
