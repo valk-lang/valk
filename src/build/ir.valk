@@ -266,9 +266,14 @@ fn ir_write_func_signature(out: ByteBuffer, func: Func, declare: bool) !Error {
     out.append_text(" @\"")
     out.append_text(func_ir_name(func))
     out.append_text("\"(")
-    if func.is_literal : out.append_text("ptr")
+    let by_pointer = ir_func_rett_by_pointer(func)
+    if by_pointer : out.append_text("ptr")
+    if func.is_literal {
+        if by_pointer : out.append_text(", ")
+        out.append_text("ptr")
+    }
     each func.args as arg, i {
-        if i > 0 || func.is_literal : out.append_text(", ")
+        if i > 0 || func.is_literal || by_pointer : out.append_text(", ")
         out.append_text(ir_type(arg.type) !>)
     }
     if func.infinite_args {
@@ -552,9 +557,14 @@ fn generate_func_ir(func: Func) !Error {
     if isset(c_abi) {
         ir.code.append_text(ir_c_params(func, c_abi, true) !>)
     } else {
-        if func.is_literal : ir.code.append_text("ptr \%closure.data")
+        let by_pointer = ir_func_rett_by_pointer(func)
+        if by_pointer : ir.code.append_text("ptr \%sret.out")
+        if func.is_literal {
+            if by_pointer : ir.code.append_text(", ")
+            ir.code.append_text("ptr \%closure.data")
+        }
         each func.args as arg, i {
-            if i > 0 || func.is_literal : ir.code.append_text(", ")
+            if i > 0 || func.is_literal || by_pointer : ir.code.append_text(", ")
             ir.code.append_text(ir_type(arg.type) !>)
             ir.code.append_text(" \%arg.")
             ir.code.write_uint_ascii(i)
@@ -977,7 +987,24 @@ fn ir_name_prefix(unit: Unit, ns: Namespace, exp: Exp) String {
     return unit.name + "_" + exp.src.id
 }
 
+// A large inline aggregate is returned through a pointer the caller passes first
+// (`ptr %sret.out`): LLVM's code generation is quadratic in the elements of a
+// first-class aggregate. Exports and externs follow the C convention instead.
+value RETT_BY_POINTER_MIN (512)
+
+fn ir_rett_by_pointer(rett: Type, can_error: bool) bool {
+    if can_error : return false
+    if !rett.is_fixed_array_type() && !(rett.is_inline && rett.is_structural_type()) : return false
+    return (rett.byte_size() !? 0).to(uint) >= RETT_BY_POINTER_MIN
+}
+
+fn ir_func_rett_by_pointer(func: Func) bool {
+    if func.is_extern || func.is_export : return false
+    return ir_rett_by_pointer(func.get_rett(), func.can_error)
+}
+
 fn ir_func_rett_type(func: Func) String !Error {
+    if ir_func_rett_by_pointer(func) : return "void"
     if !func.can_error : return ir_type(func.get_rett()) !>
     return ir_error_abi_type(func.get_rett()) !>
 }
@@ -1239,6 +1266,19 @@ fn ir_emit_stmt_code(ir: IRFunc, value: Value) !Error {
                 ir_debug_frame_exit(ir)
                 ir.line("ret void")
             }
+        } else if ir_func_rett_by_pointer(ir.func) && (ir_copies_by_memcpy(retv) !> || (retv.type == VAL.call && ir_call_rett_by_pointer(retv))) {
+            // Storage goes to the caller's slot by memcpy, a by-pointer call writes it there itself
+            if retv.type == VAL.call {
+                ir_emit_call(ir, retv, "\%sret.out") !>
+            } else {
+                let from = ir_emit_address(ir, retv) !>
+                if ir.terminated : return
+                ir_emit_memcpy(ir, "\%sret.out", from, (retv.rett.byte_size() !>).to(uint))
+            }
+            if ir.terminated : return
+            ir_emit_func_cleanup(ir) !>
+            ir_debug_frame_exit(ir)
+            ir.line("ret void")
         } else {
             let rendered = ir_emit_value(ir, retv) !>
             if ir.terminated : return
@@ -1458,6 +1498,11 @@ fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
         let from = ir_emit_address(ir, right) !>
         if ir.terminated : return
         ir_emit_memcpy(ir, address, from, (right.rett.byte_size() !>).to(uint))
+        return
+    }
+    // A by-pointer result is written into the destination by the callee
+    if value.op.@cast(ASSIGN_OP) == ASSIGN_OP.set && right.type == VAL.call && ir_call_rett_by_pointer(right) {
+        ir_emit_call(ir, right, address) !>
         return
     }
     let result = ir_emit_value(ir, right) !>
@@ -3403,6 +3448,9 @@ fn ir_write_interface_thunk(out: ByteBuffer, adapter: Class, requirement: Func, 
 
     let ir = IRFunc { func: implementation }
     let mark = ir.arg_list.length
+    let by_pointer = ir_func_rett_by_pointer(implementation)
+    let result_slot = by_pointer ? ir_emit_alloca(ir, ir_type(rett) !>) : ""
+    if by_pointer : ir.write_arg(mark, "ptr", result_slot)
     each implementation.args as arg, i {
         let type = ir_type(arg.type) !>
         let arg_name = ir_arg_name(build, i)
@@ -3421,6 +3469,7 @@ fn ir_write_interface_thunk(out: ByteBuffer, adapter: Class, requirement: Func, 
     out.append_text(" {\n")
     ir.label("entry")
     let rendered = ir_emit_arg_call(ir, ir_func_rett_type(implementation) !>, ir_func_address(implementation), mark)
+    if by_pointer : rendered = ir_emit_load(ir, ir_type(rett) !>, result_slot)
     ir_emit_error_return(ir, rendered, rett, "0") !>
     out.append_buffer(ir.code)
     out.append_text("}\n")
@@ -3643,10 +3692,15 @@ fn ir_write_adapter_signature(ir: IRFunc, func: Func, name: String, closure_data
     ir.code.append_text(" @\"")
     ir.code.append_text(name)
     ir.code.append_text("\"(")
-    if closure_data : ir.code.append_text("ptr \%closure.data")
+    let by_pointer = ir_func_rett_by_pointer(func)
+    if by_pointer : ir.code.append_text("ptr \%sret.out")
+    if closure_data {
+        if by_pointer : ir.code.append_text(", ")
+        ir.code.append_text("ptr \%closure.data")
+    }
     each func.args as arg, i {
         if skip_receiver && i == 0 : continue
-        if closure_data || i > 0 : ir.code.append_text(", ")
+        if closure_data || i > 0 || by_pointer : ir.code.append_text(", ")
         ir.code.append_text(ir_type(arg.type) !>)
         ir.code.append_text(" \%arg.")
         ir.code.write_uint_ascii(i)
@@ -3656,8 +3710,10 @@ fn ir_write_adapter_signature(ir: IRFunc, func: Func, name: String, closure_data
 }
 
 fn ir_emit_adapter_call(ir: IRFunc, func: Func, target: String, prefix_type: String, prefix: String, receiver: String, receiver_type: String ("")) !Error {
-    let has_result = !func.get_rett().is_void_type() || func.can_error
+    let by_pointer = ir_func_rett_by_pointer(func)
+    let has_result = (!func.get_rett().is_void_type() || func.can_error) && !by_pointer
     let mark = ir.arg_list.length
+    if by_pointer : ir.write_arg(mark, "ptr", "\%sret.out")
     if prefix.length > 0 : ir.write_arg(mark, prefix_type, prefix)
     each func.args as arg, i {
         let value = (i == 0 && receiver.length > 0) ? receiver : ir_arg_name(func.ns.build, i)
@@ -3837,7 +3893,17 @@ fn ir_abandon_call(ir: IRFunc, mark: uint) String {
     return "undef"
 }
 
-fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
+// Whether the call's result comes back through a pointer (see ir_rett_by_pointer)
+fn ir_call_rett_by_pointer(value: Value) bool {
+    let callee = value.value1
+    if !isset(callee) : return false
+    let direct_func : ?Func = callee.type == VAL.func ? callee.func : null
+    if isset(direct_func) : return ir_func_rett_by_pointer(direct_func)
+    return ir_rett_by_pointer(value.rett, value.can_error || isset(value.get_error_type()))
+}
+
+// `into`: the address a by-pointer result is written to directly; the call then renders as ""
+fn ir_emit_call(ir: IRFunc, value: Value, into: String ("")) String !Error {
     let callee = value.value1
     if !isset(callee) : value.bug("IR call is missing its callee")
     let args = value.values
@@ -3846,6 +3912,13 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
     let call_kind = value.op.@cast(CALL_KIND)
     let interface_call = call_kind == CALL_KIND.interface_dispatch
     let closure_call = call_kind == CALL_KIND.closure
+    let fallible = value.can_error || isset(value.get_error_type())
+    let by_pointer = ir_call_rett_by_pointer(value)
+    let result_slot = ""
+    if by_pointer {
+        result_slot = into.length > 0 ? into : ir_emit_alloca(ir, ir_type(value.rett) !>)
+        ir.write_arg(arg_mark, "ptr", result_slot)
+    }
 
     let target = ""
     let target_symbol : ?Func = null
@@ -3914,9 +3987,10 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
             exits = func.must_exit || func.will_exit
             call_type = ir_func_rett_type(func) !>
         }
-    } else if value.can_error || isset(value.get_error_type()) {
+    } else if fallible {
         call_type = ir_error_abi_type(value.rett) !>
     }
+    if by_pointer : call_type = "void"
     if exits : ir_emit_func_cleanup(ir) !>
     let has_result = call_type != "void"
     let out = has_result ? ir.var() : ""
@@ -3936,8 +4010,9 @@ fn ir_emit_call(ir: IRFunc, value: Value) String !Error {
         ir.line("unreachable")
         ir.terminated = true
     }
+    if by_pointer : return into.length > 0 ? "" : ir_emit_load(ir, ir_type(value.rett) !>, result_slot)
     if !has_result : return ""
-    if value.can_error || isset(value.get_error_type()) {
+    if fallible {
         ir.cache_error_result(value, out)
     }
     return out
@@ -4381,12 +4456,20 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
     }
     let raw_result = ""
     let call_type = call.can_error ? (ir_error_abi_type(call.rett) !>) : (ir_type(call.rett) !>)
+    let by_pointer = ir_rett_by_pointer(call.rett, call.can_error)
+    let result_slot = ""
+    if by_pointer {
+        result_slot = ir_emit_alloca(ir, ir_type(call.rett) !>)
+        call_type = "void"
+    }
     let mark = ir.arg_list.length
+    if by_pointer : ir.write_arg(mark, "ptr", result_slot)
     if closure_handler : ir.write_arg(mark, "ptr", handler_environment)
     each rendered_args as rendered, i {
         ir.write_arg(mark, ir_type(arg_types.get(i) !? type_void(value.rett.build)) !>, rendered)
     }
     raw_result = ir_emit_arg_call(ir, call_type, handler, mark)
+    if by_pointer : raw_result = ir_emit_load(ir, ir_type(call.rett) !>, result_slot)
 
     let success = raw_result
     if call.can_error {
