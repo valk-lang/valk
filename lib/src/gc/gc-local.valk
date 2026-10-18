@@ -67,6 +67,15 @@ struct Gc {
     transfer_to: uint (0)
     shared_items: *Bump (Bump.new())
     shared_pending: uint (0)    // Bytes published but not added to mem_shared yet
+    // Items of `shared_items` before this byte offset wait for the sweep of the last shared
+    // collection, which this thread runs itself (see sweep_shared)
+    sweep_end: uint (0)
+    sweep_pending: bool (false)
+    // Waiting in shared_safepoint: it sweeps for itself once it runs again
+    at_safepoint: bool (false)
+    // Unmarked items in other threads' blocks: freed by the next shared collection, while
+    // those threads are stopped
+    foreign_dead: *Bump (Bump.new())
     stress_count: uint (0)      // Allocations since the last forced collection (GC_STRESS)
     mark_list: *Lifo (Lifo.new())
     props_removed: *Lifo (Lifo.new())
@@ -190,6 +199,7 @@ struct Gc {
 
     fn collect_run(kind: CollectKind) {
         this.state = GcState.collecting
+        if this.sweep_pending : this.sweep_shared()
 
         let pause_start = time.mono_us()
         let marked_before = this.mem_marked
@@ -710,48 +720,40 @@ struct Gc {
     // Shared
     //////////////////////////
 
-    fn update_marks() {
-        this.loop_stack_items(fn(item: ptr) {
-            let data = gcdata(item)
-            if data.is_shared() && !data.is_marked() : update_mark(item)
-        })
-        this.clear_stack_items()
-
-        let list = this.shared_items
-        let adr = list.data
-        let end = adr + list.index
-
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-            let data = gcdata(item)
-
-            if !data.is_marked() && (data.is_owned() || data.co_count > 0) {
-                update_mark(item)
-            }
-        }
-    }
-
-    fn clear_shared() {
+    // Frees the items the last shared collection did not mark. It runs after that collection,
+    // on this thread or with it stopped: what was unmarked then can no longer be reached, and
+    // live items are only read. Items shared since then follow the boundary and stay
+    fn sweep_shared() {
+        this.sweep_pending = false
         let list = this.shared_items
         let data = list.data
-        let adr = data
-        let end = adr + list.index
-        list.reset()
+        let read = data
+        let end = data + this.sweep_end
+        let write = data
 
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-            let data = gcdata(item)
-
-            if data.is_marked() {
-                data.remove_mark()
-                list.add_ptr(item)
+        while read < end {
+            let item = @ptrv(read, GcItem)
+            read = read.$offset(size_of(ptr))
+            let item_data = gcdata(item)
+            if item_data.is_marked() {
+                @ptrv(write, GcItem) = item
+                write = write.$offset(size_of(ptr))
                 continue
             }
-
+            // A thread may share an item another thread allocated, such as a thread's result
+            let block = item_data.block().@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET)
+            if @ptrv(block, ?ptr, b_owner) != this.@cast(ptr) {
+                this.foreign_dead.add_ptr(item)
+                continue
+            }
+            touch_block(block)
             free_shared_item(item)
         }
+
+        let tail = list.index - this.sweep_end
+        mem.move_bytes(end, write, tail)
+        list.index = (write - data) + tail
+        this.sweep_end = 0
     }
 
     //////////////////////////
@@ -773,6 +775,7 @@ struct Gc {
         // 'gc_list', so a shared collection can never observe them while they
         // belong to no one.
         dump_shared(this.shared_items)
+        dump_shared(this.foreign_dead)
         this.flush_shared_pending()
 
         // Free blocks or store them in unused-block-list if they still contain items
@@ -787,6 +790,7 @@ struct Gc {
                 mem.free(block)
             } else {
                 release_block_owner(block)
+                block.owner = null
                 add_unused_block(block)
             }
         })
@@ -810,6 +814,7 @@ struct Gc {
         this.updated_slots.free()
         this.blanks.free()
         this.touched_blocks.free()
+        this.foreign_dead.free()
         this.dis_owned_list.free()
         this.re_own_list.free()
         this.adopted.free()

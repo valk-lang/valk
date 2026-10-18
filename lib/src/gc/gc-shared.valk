@@ -53,35 +53,56 @@ fn collect_shared_native(sp: ptr) {
         gcx.flush_shared_pending()
     }
 
+    // Sweeps of the last round that their threads did not get to, then what those sweeps
+    // left in other threads' blocks
+    each gcs as gcx {
+        gc = gcx
+        if gcx.sweep_pending : gcx.sweep_shared()
+    }
+    let foreign_freed = false
+    each gcs as gcx {
+        gc = gcx
+        let list = gcx.foreign_dead
+        let adr = list.data
+        let end = adr + list.index
+        if adr < end : foreign_freed = true
+        while adr < end {
+            free_shared_item(@ptrv(adr, GcItem))
+            adr = adr.$offset(size_of(ptr))
+        }
+        list.reset()
+    }
+    if foreign_freed : atomic(shared_free_epoch + 1)
+
     // Switch the mark after all gcs are locked
     mark_count++
-    // let msb = mem_shared / 1024
+    shmark_now = shmark_now == flag_shmark ? flag_leak : flag_shmark
 
     each gcs as gcx {
         gc = gcx
         if gcx.collect_allowed(CollectKind.shared) : gcx.collect_run(CollectKind.shared)
     }
 
-    // Update marks
+    // Mark, together with the threads waiting at their safepoint (see shared_safepoint)
+    let live = pmark_run(gcs)
     each gcs as gcx {
         gc = gcx
-        gcx.update_marks()
+        gcx.clear_stack_items()
     }
-
-    // We remove all items that have the wrong mark or co_count == 0 & !owned
-    each gcs as gcx {
-        gc = gcx
-        gcx.clear_shared()
-    }
-    // Check if we can clear items from the dump
-    check_shared_dump()
-    free_empty_unused_blocks()
-
-    //
     gc = mygc
 
+    // Each thread frees its own unmarked items once it runs again (sweep_shared)
+    each gcs as gcx {
+        gcx.sweep_end = gcx.shared_items.index
+        gcx.sweep_pending = gcx.sweep_end > 0
+    }
+    // Items of threads that ended are swept here
+    check_shared_dump()
+    free_empty_unused_blocks()
+    // What waits for a sweep is no longer counted
+    atomic_store(mem_shared, live)
+
     update_shared_trigger()
-    // println("mark: %mark | msb: %msb | msa: %msa | freed: %{msb-msa} | tb: %tb | ta: %{mem_shared_trigger / 1024}")
 
     each gcs as gcx {
         gcx.unlock()
@@ -91,22 +112,37 @@ fn collect_shared_native(sp: ptr) {
     shared_pause_last_us = time.mono_us() - pause_start
     if shared_pause_last_us > shared_pause_max_us : shared_pause_max_us = shared_pause_last_us
 
+    // A thread blocked in a call cannot sweep for itself, and its gc is free meanwhile
+    each gcs as gcx {
+        if gcx == mygc || gcx.at_safepoint || !gcx.sweep_pending || !gcx.mutex.try_lock() : continue
+        gc = gcx
+        if gcx.sweep_pending : gcx.sweep_shared()
+        gc = mygc
+        gcx.mutex.unlock()
+    }
+
     shared_lock.unlock()
     gc.lock()
+    if mygc.sweep_pending : mygc.sweep_shared()
     in_collect_shared = false
 }
 
 // A running thread only lets go of its gc when it blocks, and a shared
 // collection needs every gc: the allocator stops here while one waits. The
-// thread's stack and registers are saved as for any blocking call, and it
-// waits on shared_lock, which the collection holds until it is done
+// thread's stack and registers are saved as for any blocking call, it helps
+// mark, and it goes on once the collection lets the gcs go. Its own sweep
+// runs at its next collection
 fn shared_safepoint() {
     let g = gc
     if g.state != GcState.idle || in_collect_shared : return
+    g.at_safepoint = true
     g.unlock()
-    shared_lock.lock()
-    shared_lock.unlock()
+    while shared_stop == 1 {
+        if pmark_active == 1 : pmark_help()
+        else : pmark_yield()
+    }
     g.lock()
+    g.at_safepoint = false
 }
 
 /// Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
@@ -142,17 +178,15 @@ fn free_shared_item(item: GcItem) {
     data.set_new()
     data.co_count = 0
     data.flags = 0
-    data.remove_marks()
 
     #if GC_DEBUG
-    if data.is_marked() || data.has_leak_mark() : panic("GC did not remove marks")
+    if data.flags != 0 : panic("GC did not remove marks")
     #end
 
+    // mem_shared counts the marked items only (see collect_shared_native)
     if data.offset > 0 {
         let block = data.block()
         block.slots_used--
-        shared_free_epoch++
-        atomic(mem_shared - block.isize)
 
         let onfree = block.onfree
         if isset(onfree) : onfree(item)

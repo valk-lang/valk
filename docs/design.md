@@ -916,6 +916,17 @@ hold a reference may keep its object alive until the slot is overwritten or
 the frame returns; code that needs a collection to reclaim an object should
 let the frame that referenced it return first.
 
+Shared memory is collected in rounds that stop every thread. A round runs each
+thread's local collection and then marks the shared objects that thread-local
+data, stacks and globals still reach. The threads that wait at their
+allocation safepoint mark too, claiming objects with an atomic mark bit and
+handing work to each other, so the marking scales with them. Sweeping happens
+after the round: each thread frees its own unmarked shared objects at its next
+collection, and the collecting thread sweeps for threads blocked in a call.
+Rounds alternate between two mark bits, so a sweep only reads the headers of
+live objects that other threads may be updating. Unmarked objects that sit in
+another thread's blocks wait for the next round, when that thread is stopped.
+
 The one lifetime the compiler still guarantees is for objects with a
 `gc_free` hook, and for interface values that may hold one: such receivers,
 arguments and locals stay alive until the function returns, so a raw handle
@@ -924,8 +935,9 @@ taken from them remains valid while the function waits on it.
 The local collector invokes `gc_free` for unreachable local objects on the
 thread that owns that local collector. Once an object has been published as
 shared, only the shared collector may invoke its `gc_free`. The call runs on
-whichever thread performs that shared collection, with the object treated as a
-shared value; code must not depend on a particular finalizer thread. A
+whichever thread sweeps the object, usually the one that published it, with the
+object treated as a shared value; code must not depend on a particular
+finalizer thread. A
 particular object receives at most one `gc_free` call, finalization order is
 unspecified, and program shutdown does not guarantee that every remaining
 object is finalized. Deterministic resource release therefore uses an explicit
