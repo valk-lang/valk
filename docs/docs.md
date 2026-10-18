@@ -2168,6 +2168,24 @@ one, `done()` when it finishes and `wait()` for all of them. A `Semaphore` limit
 how many tasks run at once: `acquire()` takes one of its permits, waiting while
 none is free, and `release()` gives it back.
 
+### Shared maps
+
+`sync.ConcurrentMap[K, V]` is a map that threads change at the same time. Its keys
+are spread over shards with a lock each, so threads working on different keys rarely
+wait for each other, unlike one `Lock[HashMap[K, V]]`. Keys and values are numbers,
+bools, strings or `shared` objects.
+
+```rust
+use valk.sync
+
+let hits: shared sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
+hits.add("home", 1)                     // counters start at 0
+hits.set("about", 10)
+let home = hits.get("home") ?? 0        // null when the key is missing
+hits.update("about", fn(old: ?uint) uint { return (old ?? 0) * 2 })
+each hits.snapshot() as count, page { } // a copy of every entry
+```
+
 ## Signals
 
 API for [valk.signal](api.md#signal)

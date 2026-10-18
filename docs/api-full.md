@@ -16050,6 +16050,85 @@ Throws `full` when the channel is full (on a rendezvous channel: when no receive
 waiting) and `closed` when it is closed.
 
 ```js
+// A map that threads read and change at the same time.
++ class ConcurrentMap[K, V] {
+    // Removes every entry.
+    + fn clear() void
+    // Returns the value of `key`, or `null` when the map does not hold it.
+    + fn get(key: K) ?V
+    // Returns whether the map holds `key`.
+    + fn has(key: K) bool
+    // The number of entries, counted shard by shard.
+    + get length: uint
+    // Returns an empty map with `shards` shards, rounded up to a power of two (64 by default).
+    + static fn new(shards: uint (64)) ConcurrentMap[K, V] !SyncError
+    // Removes `key`; returns whether the map held it.
+    + fn remove(key: K) bool
+    // Stores `value` under `key`, replacing what was there.
+    + fn set(key: K, value: V) void
+    // Returns a copy of the entries, taken shard by shard: changes made while it runs may or may not be in it.
+    + fn snapshot() HashMap[K, V]
+    // Stores what `change` makes of the current value (`null` when there is none), and returns it. `change` runs while the key's shard is locked: it must not use this map.
+    + fn update(key: K, change: fn(?V)(V)) V
+}
+```
+
+### ConcurrentMap
+
+A map that threads read and change at the same time.
+
+The keys are spread over shards that each have their own lock, so threads working on
+different keys rarely wait for each other, unlike one `Lock[HashMap[K, V]]`. Keys and
+values cross threads, so they are numbers, bools, strings or `shared` objects. A call
+works on one key at a time; `snapshot` copies all entries, shard by shard.
+
+```rust
+let hits: shared sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
+hits.add("home", 1)
+let count = hits.get("home") ?? 0
+```
+
+#### clear
+
+Removes every entry.
+
+#### get
+
+Returns the value of `key`, or `null` when the map does not hold it.
+
+#### has
+
+Returns whether the map holds `key`.
+
+#### length
+
+The number of entries, counted shard by shard.
+
+#### new
+
+Returns an empty map with `shards` shards, rounded up to a power of two (64 by default).
+
+Throws `init` when a lock cannot be created.
+
+#### remove
+
+Removes `key`; returns whether the map held it.
+
+#### set
+
+Stores `value` under `key`, replacing what was there.
+
+#### snapshot
+
+Returns a copy of the entries, taken shard by shard: changes made while it runs may or
+may not be in it.
+
+#### update
+
+Stores what `change` makes of the current value (`null` when there is none), and returns
+it. `change` runs while the key's shard is locked: it must not use this map.
+
+```js
 // Something `select` waits on. A `Channel` converts to one where it is expected, so a list of channels of any element types can be passed: `sync.select(.{ jobs, quit })`.
 + class Selectable {
 }

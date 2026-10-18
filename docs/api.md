@@ -4742,6 +4742,30 @@ error SignalError (unsupported, init)
 ```
 
 ```js
+// A map that threads read and change at the same time.
++ class ConcurrentMap[K, V] {
+    // Removes every entry.
+    + fn clear() void
+    // Returns the value of `key`, or `null` when the map does not hold it.
+    + fn get(key: K) ?V
+    // Returns whether the map holds `key`.
+    + fn has(key: K) bool
+    // The number of entries, counted shard by shard.
+    + get length: uint
+    // Returns an empty map with `shards` shards, rounded up to a power of two (64 by default).
+    + static fn new(shards: uint (64)) ConcurrentMap[K, V] !SyncError
+    // Removes `key`; returns whether the map held it.
+    + fn remove(key: K) bool
+    // Stores `value` under `key`, replacing what was there.
+    + fn set(key: K, value: V) void
+    // Returns a copy of the entries, taken shard by shard: changes made while it runs may or may not be in it.
+    + fn snapshot() HashMap[K, V]
+    // Stores what `change` makes of the current value (`null` when there is none), and returns it. `change` runs while the key's shard is locked: it must not use this map.
+    + fn update(key: K, change: fn(?V)(V)) V
+}
+```
+
+```js
 // Something `select` waits on. A `Channel` converts to one where it is expected, so a list of channels of any element types can be passed: `sync.select(.{ jobs, quit })`.
 + class Selectable {
 }
