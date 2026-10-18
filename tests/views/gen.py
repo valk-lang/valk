@@ -8,7 +8,7 @@
 #
 # The outcome of every call is kept in tests/views/expected.txt; `--update` rewrites it.
 
-import argparse, json, os, re, subprocess, sys, tempfile
+import argparse, json, os, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -200,7 +200,7 @@ def build(valk, workdir, key, source):
     path = os.path.join(workdir, re.sub(r"[^A-Za-z0-9]+", "_", key) + ".valk")
     with open(path, "w") as fh:
         fh.write(source)
-    proc = subprocess.run([valk, "build", path, "-o", path[:-5] + ".ll", "--no-warn", "--ir"], capture_output=True, text=True)
+    proc = subprocess.run([valk, "build", path, "-o", path[:-5], "--no-warn"], capture_output=True, text=True)
     out = proc.stdout + proc.stderr
     with open(path[:-5] + ".log", "w") as fh:
         fh.write(out)
@@ -224,10 +224,12 @@ def main():
     ap.add_argument("--update", action="store_true")
     opts = ap.parse_args()
 
-    doc_path = os.path.join(tempfile.mkdtemp(), "stdlib.json")
+    doc_dir = tempfile.mkdtemp()
+    doc_path = os.path.join(doc_dir, "stdlib.json")
     subprocess.run([opts.valk, "doc", os.path.join(ROOT, "lib"), "--stdlib", os.path.join(ROOT, "lib"),
                     "-o", doc_path, "--no-private"], check=True, capture_output=True)
     core = json.load(open(doc_path))["namespaces"]["core"]["classes"]
+    shutil.rmtree(doc_dir, ignore_errors=True)
 
     expected_path = os.path.join(HERE, "expected.txt")
     expected = set(open(expected_path).read().splitlines()) if os.path.exists(expected_path) else set()
@@ -290,9 +292,12 @@ def main():
     for kind, _ in results.values():
         counts[kind] = counts.get(kind, 0) + 1
     print("# %s" % ", ".join("%s %d" % kv for kv in sorted(counts.items())))
-    if not opts.update and not opts.only:
+    failed = bool(bugs or changed)
+    if failed and not opts.update and not opts.only:
         print("# workdir: " + workdir)
-    sys.exit(1 if bugs or changed else 0)
+    else:
+        shutil.rmtree(workdir, ignore_errors=True)
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
