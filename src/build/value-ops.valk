@@ -1,3 +1,5 @@
+use valk.time
+
 ////////////////////////////
 // Flow facts
 ////////////////////////////
@@ -613,7 +615,7 @@ fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Valu
             if isset(param) : value_drop_pending_effect(av, param)
             if isset(destination) : value_transfer_unique_inputs(av, destination)
             else : value_invalidate_unique(av)
-            if locked_target && !av.rett.get_non_nullable().is_locked {
+            if locked_target && !av.rett.get_non_nullable().is_locked && !own_authority() {
                 av.ensure_meta().publishes_graph = true
                 owner.has_publications = true
                 value_consume_published_graph(av) !>
@@ -623,7 +625,7 @@ fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Valu
         let sources = isset(av) ? value_summary_source_args(av, owner) : null
         // A parameter's graph is the caller's to vouch for, when the locked data is the caller's too
         let target_is_param = isset(destination) && isset(func_arg_index(owner, destination))
-        if isset(av) && (!isset(sources) || !target_is_param) && locked_target && !av.rett.get_non_nullable().is_locked && av.rett.has_gc_refs() {
+        if isset(av) && (!isset(sources) || !target_is_param) && locked_target && !av.rett.get_non_nullable().is_locked && av.rett.has_gc_refs() && !own_authority() {
             av.error("Only a provably unique value graph can be stored in locked data; a mutable alias may remain")
         }
         value_absorb_param_sources(target, sources, owner)
@@ -810,9 +812,11 @@ fn value_mark_actual_escape(value: Value, retain: bool (true)) {
     value_invalidate_unique(value)
 }
 
-fn value_publish_unique(value: Value, ctx: Context) !Error {
+fn value_publish_unique(value: Value, ctx: Context, message: ?String (null)) !Error {
     if value.rett.get_non_nullable().is_shared : return
-    value.ensure_meta().publishes_graph = true
+    let meta = value.ensure_meta()
+    meta.publishes_graph = true
+    if isset(message) : meta.publish_message = message
     let func = ctx.func
     if isset(func) : func.has_publications = true
     value_consume_published_graph(value) !>
@@ -1718,11 +1722,11 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
                     enum_pos.error("Cannot call a method that modifies or exposes enum storage; copy its underlying value first")
                 }
                 let shared_borrow_pos = arg.cannot_shared_borrow_pos
-                if (arg.may_escape || arg.invalidates_unique) && isset(shared_borrow_pos) {
+                if (arg.may_escape || arg.invalidates_unique) && isset(shared_borrow_pos) && !own_authority() {
                     shared_borrow_pos.error("Only a provably unique value graph can be converted to '" + arg.type.compat_display_name() + "'; a mutable alias may remain")
                 }
                 let locked_pos = arg.cannot_locked_move_pos
-                if isset(locked_pos) && (arg.may_escape || arg.invalidates_unique || func_receiver_absorbs(func, arg_index)) {
+                if isset(locked_pos) && (arg.may_escape || arg.invalidates_unique || func_receiver_absorbs(func, arg_index)) && !own_authority() {
                     locked_pos.error("Only a provably unique value graph can be handed to a method on locked data; a mutable alias may remain")
                 }
                 let escape_pos = arg.cannot_escape_pos
@@ -1740,15 +1744,29 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
     }
 
     own_analyze(build)
-    own_check_build(build) !>
+    let flow_us: uint = 0
+    let walk_us: uint = 0
+    let own_shadow = !own_authority()
+    let own_checks = !own_shadow || own_shadow_requested()
 
     // Publication flow needs the settled flags; every body is parsed by now
     each build.lists.units as unit {
         each unit.functions as func {
             if (!func.has_publications && !func.has_lends) || func_unique_summary_unavailable_in_lsp(func) : continue
-            func_check_publication_flow(func) !>
+            let t0 = time.mono_us()
+            // Under the ownership analysis the old pass only checks lent frame storage
+            if own_shadow || func.has_lends : func_check_publication_flow(func) !>
+            let t1 = time.mono_us()
+            if own_checks : own_check_func(func, own_shadow) !>
+            walk_us += time.mono_us() - t1
+            flow_us += t1 - t0
             func.body_scope = null
         }
+    }
+    own_print_phase_stats(build, flow_us, walk_us)
+    // The graphs served the checks; the rest of the build does not need them
+    each build.lists.units as unit {
+        each unit.functions as func : func.own_graph = null
     }
 }
 
@@ -1992,10 +2010,9 @@ fn value_try_convert(
         && !result.rett.is_nullable_type() && target_nn.compat(source_nn.locked_storage_type())
     {
         if !allow_shared_unsafe && !allow_shared_borrow {
-            if !(value_require_unique_graph(result) !>) {
-                result.error("Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain")
-            }
-            value_publish_unique(result, ctx) !>
+            let message = "Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain"
+            if !own_authority() && !(value_require_unique_graph(result) !>) : result.error(message)
+            value_publish_unique(result, ctx, message) !>
         }
         return value_shared_view(result, target, allow_shared_unsafe || allow_shared_borrow)
     }
@@ -2019,8 +2036,9 @@ fn value_try_convert(
         && target_nn.get_class_or_null() == source_nn.get_class_or_null()
         && (target.is_nullable_type() || !result.rett.is_nullable_type())
     {
-        if !allow_shared_unsafe && !allow_shared_borrow && !(value_require_unique_graph(result) !>) {
-            result.error("Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain")
+        let message = "Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain"
+        if !allow_shared_unsafe && !allow_shared_borrow && !own_authority() && !(value_require_unique_graph(result) !>) {
+            result.error(message)
         }
         if !allow_shared_unsafe && !allow_shared_borrow {
             // A closure written as a 'shared fn' has its captures checked when
@@ -2040,7 +2058,8 @@ fn value_try_convert(
                     + " a closure whose captured values were never checked for shared use."
                     + " Declare it as a 'shared fn(...)()' so its captures are checked where the closure is created")
             }
-            value_publish_unique(result, ctx) !>
+            value_publish_unique(result, ctx, message) !>
+            if target_nn.is_shared : result.ensure_meta().publish_shared = true
         }
         return value_shared_view(result, target, allow_shared_unsafe || allow_shared_borrow)
     }
