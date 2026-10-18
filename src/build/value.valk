@@ -1773,20 +1773,36 @@ fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
     let clone_source = source
     if type.is_nullable_type() : clone_source = value_force_remove_nullable(source)
     let parts = Array[Value]{}
+    let part_types = Array[Type]{}
+    let retyped = false
     each members as member, i {
         let part = vgen_multi_part(clone_source, i, value.rett.storage_view_of(member), at)
+        let member_nn = member.get_non_nullable()
+        // A borrow owns nothing: the copy shares it, keeping how it was viewed
+        if member_nn.kind == TYPE.ref_of || member_nn.kind == TYPE.ref_slice {
+            parts.append(part)
+            part_types.append(part.rett)
+            if part.rett != member : retyped = true
+            continue
+        }
         let cloned = value_clone(part, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
-        member.compat_check(cloned.rett, at) !>
+        // A copy of locked data is not locked
+        let expected = member.plain_type()
+        expected.compat_check(cloned.rett, at) !>
         parts.append(cloned)
+        part_types.append(expected)
+        if expected != member : retyped = true
     }
-    let cloned = vgen_multi(parts, tuple, at)
+    let result_tuple = retyped ? type_multi(ctx.build, part_types, true) : tuple
+    let result_type = type.is_nullable_type() ? result_tuple.nullable() : result_tuple
+    let cloned = vgen_multi(parts, result_tuple, at)
     let result = cloned
     if type.is_nullable_type() {
         result = vgen_this_or_that(
             vgen_isset_val(source, type_bool(ctx.build)),
             value_make_nullable(cloned),
-            vgen_null(type),
-            type
+            vgen_null(result_type),
+            result_type
         )
     }
     if body.length == 0 : return result
@@ -5739,12 +5755,7 @@ fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
     if name == "$is_gc" : return vgen_bool(t.is_gc_type(), type_bool(b))
     if name == "$has_gc_refs" : return vgen_bool(t.has_gc_refs(), type_bool(b))
     if name == "$is_shared" : return vgen_bool(t.get_non_nullable().is_shared, type_bool(b))
-    if name == "$has_borrows" {
-        // A String owns its bytes even though it is laid out like a borrow
-        let class = t.get_non_nullable().get_class_or_null()
-        let owned = isset(class) && class.immutable
-        return vgen_bool(!owned && (t.has_borrowed_refs() || t.get_non_nullable().is_fat_borrow()), type_bool(b))
-    }
+    if name == "$has_borrows" : return vgen_bool(type_value_holds_borrow(t), type_bool(b))
     if name == "$is_pointer" : return vgen_bool(t.is_pointer(), type_bool(b))
     if name == "$is_raw_pointer" : return vgen_bool(t.is_raw_pointer(), type_bool(b))
     if name == "$is_typed_pointer" {
@@ -6176,7 +6187,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             // A flag that is already set is final; the rest may still flip
             if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver, func_arg_may_retain(func, 0))
             if func.unique_summary_ready && func_arg_invalidates_unique(func, 0) && !value_is_raw_pointer_arg(receiver) : value_invalidate_unique(receiver)
-            else if !(value_absorb_call_args(func, receiver_arg, receiver, args, skip, owner, false) !>) : absorbs_known = false
+            else if !(value_absorb_call_args(func, receiver_arg, receiver, args, skip, owner, false, receiver) !>) : absorbs_known = false
             if !func_arg_summary_settled(func, 0) && isset(receiver_arg) {
                 value_defer_arg_effects(receiver_arg, receiver, at) !>
             }
@@ -6324,7 +6335,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let owner = ctx.get_func() !>
             if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))
             if func.unique_summary_ready && func_arg_invalidates_unique(func, param_i) && !value_is_raw_pointer_arg(av) : value_invalidate_unique(av)
-            else if !(value_absorb_call_args(func, param, av, args, skip, owner, false) !>) : absorbs_known = false
+            else if !(value_absorb_call_args(func, param, av, args, skip, owner, false, receiver) !>) : absorbs_known = false
             if !settled : value_defer_arg_effects(param, av, at, pending_shared_borrow) !>
             let source_kind = av.rett.get_non_nullable().kind
             let target_kind = param.type.get_non_nullable().kind
@@ -6700,4 +6711,30 @@ fn type_has_placeholder(t: Type) bool {
 fn value_generic_base_message(f: Func) String {
     let names = (f.generic_names ?? Array[String]{}).join(", ")
     return "Missing generic arguments for '" + f.name + "': call it as " + f.name + "[" + names + "](...). They follow from the arguments only when an argument's type uses them, such as a function literal that returns a value"
+}
+
+// A borrow in the value itself, nested in tuples, unions, fixed arrays and structs, not behind an
+// object. A String owns its bytes even though it is laid out like a borrow
+fn type_value_holds_borrow(type: Type) bool {
+    let t = type.get_non_nullable()
+    let class = t.get_class_or_null()
+    if isset(class) && class.immutable : return false
+    if t.is_fat_borrow() || t.kind == TYPE.adr_of : return true
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
+        return isset(sub) && type_value_holds_borrow(sub)
+    }
+    if t.kind == TYPE.union || t.is_tuple_type() {
+        let members = t.get_members() ?! return false
+        each members as member {
+            if type_value_holds_borrow(member) : return true
+        }
+        return false
+    }
+    if !t.is_inline : return false
+    let direct = t.get_direct_class_or_null() ?! return false
+    each direct.props as prop {
+        if type_value_holds_borrow(prop.type) : return true
+    }
+    return false
 }
