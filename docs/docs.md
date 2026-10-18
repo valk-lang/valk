@@ -151,6 +151,9 @@ valk fmt ./src --check                      # For CI: list unformatted files, ex
 valk build -h                               # Every option
 ```
 
+Builds keep compiled objects in `~/.valk/cache`, so an unchanged file is not compiled again.
+Cache entries that no build used for five days are removed; `--clean` ignores the cache.
+
 Editors talk to `valk lsp run`, a language server over stdin and stdout. The
 [VS Code extension](https://github.com/valk-lang/valk-vscode) starts it for you.
 Besides diagnostics, it answers hover, go to definition, completion, signature

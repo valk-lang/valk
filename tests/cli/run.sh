@@ -124,6 +124,43 @@ if [ "$(cat "$lock_file")" != 'preserve-cache-lock' ]; then
     exit 1
 fi
 
+echo "> The object cache keeps only the files of the units a build has"
+printf 'x' > "$default_cache/removed_unit_abc.o"
+printf 'x' > "$default_cache/removed_unit_abc.ir-prev"
+prune_out=$(build) || { echo "$prune_out"; exit 1; }
+if [ -e "$default_cache/removed_unit_abc.o" ] || [ -e "$default_cache/removed_unit_abc.ir-prev" ]; then
+    echo "# Files of a unit the build no longer has were kept"
+    exit 1
+fi
+if ls "$default_cache"/*.ir > /dev/null 2>&1; then
+    echo "# The LLVM backend kept a copy of the IR next to its .ir-prev"
+    exit 1
+fi
+if [ ! -f "$default_cache/last-used" ]; then
+    echo "# The build did not stamp its cache directory"
+    exit 1
+fi
+
+echo "> Cache directories no build used for days are removed"
+cache_home="$workdir/cache-home"
+cache_root="$cache_home/.valk/cache"
+mkdir -p "$cache_root/old-dir" "$cache_root/recent-dir"
+printf '1000' > "$cache_root/old-dir/last-used"
+printf '%s' "$(( $(date +%s) * 1000 ))" > "$cache_root/recent-dir/last-used"
+trim_out=$(HOME="$cache_home" USERPROFILE="$cache_home" build) || { echo "$trim_out"; exit 1; }
+if [ -e "$cache_root/old-dir" ] || [ ! -d "$cache_root/recent-dir" ] || [ ! -f "$cache_root/last-trim" ]; then
+    echo "# The cache trim removed the wrong directories"
+    ls -la "$cache_root"
+    exit 1
+fi
+mkdir -p "$cache_root/old-dir"
+printf '1000' > "$cache_root/old-dir/last-used"
+trim_out=$(HOME="$cache_home" USERPROFILE="$cache_home" build) || { echo "$trim_out"; exit 1; }
+if [ ! -d "$cache_root/old-dir" ]; then
+    echo "# The cache was trimmed again within the hour"
+    exit 1
+fi
+
 no_opt_out=$(build --no-opt)
 status=$?
 if [ "$status" -eq 0 ] || [[ "$no_opt_out" != *"Unknown build argument: --no-opt"* ]]; then
@@ -1141,4 +1178,4 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 74"
+echo "# Test count: 76"
