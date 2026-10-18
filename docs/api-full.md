@@ -1244,14 +1244,12 @@ Available on arrays of non-nullable integers and floats.
 ```js
 // A growable byte buffer for building binary or text data in memory.
 + class ByteBuffer is Writer {
-    // Pointer to the first byte of `storage`.
+    // Pointer to the first byte of the buffer's storage.
     ~ data: ptr
     // Number of bytes written.
     ~ length: uint
     // Capacity in bytes.
     ~ size: uint
-    // The `String` whose bytes back the buffer; replaced when the capacity changes.
-    ~ storage: String
 
     // Sets the length to 0; the capacity is kept.
     + fn clear() void
@@ -1299,6 +1297,8 @@ Available on arrays of non-nullable integers and floats.
     + fn skip(amount: uint) void
     // Returns whether the contents at byte `offset` begin with `str`.
     + fn starts_with(str: String, offset: uint (0)) bool
+    // A copy of the bytes the buffer can hold, written or not.
+    + get storage: String $deprecated
     // Returns a copy of the contents as a new `String`.
     + fn to_string() String
     // Removes the bytes for which `filter` returns true from both ends.
@@ -1359,7 +1359,7 @@ implements `io.Writer`.
 
 #### data
 
-Pointer to the first byte of `storage`.
+Pointer to the first byte of the buffer's storage.
 
 #### length
 
@@ -1368,10 +1368,6 @@ Number of bytes written.
 #### size
 
 Capacity in bytes.
-
-#### storage
-
-The `String` whose bytes back the buffer; replaced when the capacity changes.
 
 #### clear
 
@@ -1510,6 +1506,12 @@ filling the region returned by `view_spare`. Panics when the buffer is consumed.
 Returns whether the contents at byte `offset` begin with `str`.
 
 Returns false when `offset` is past the length.
+
+#### storage
+
+A copy of the bytes the buffer can hold, written or not.
+
+Deprecated: use `to_string()` for the written bytes.
 
 #### to_string
 
@@ -2568,6 +2570,7 @@ A binary heap: `pop` returns the item that sorts first.
 By default the smallest item (by `<`) comes first; a `before(a, b)` function that returns
 true when `a` must come out before `b` chooses another order. Items that compare equal
 come out in no particular order, and `each` visits the items in heap order, not sorted.
+A heap can be stored in `Lock` data when its `before` function captures nothing.
 
 #### clear
 

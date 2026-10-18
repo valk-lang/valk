@@ -380,14 +380,12 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // A growable byte buffer for building binary or text data in memory.
 + class ByteBuffer is Writer {
-    // Pointer to the first byte of `storage`.
+    // Pointer to the first byte of the buffer's storage.
     ~ data: ptr
     // Number of bytes written.
     ~ length: uint
     // Capacity in bytes.
     ~ size: uint
-    // The `String` whose bytes back the buffer; replaced when the capacity changes.
-    ~ storage: String
 
     // Sets the length to 0; the capacity is kept.
     + fn clear() void
@@ -435,6 +433,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn skip(amount: uint) void
     // Returns whether the contents at byte `offset` begin with `str`.
     + fn starts_with(str: String, offset: uint (0)) bool
+    // A copy of the bytes the buffer can hold, written or not.
+    + get storage: String $deprecated
     // Returns a copy of the contents as a new `String`.
     + fn to_string() String
     // Removes the bytes for which `filter` returns true from both ends.
