@@ -3213,7 +3213,8 @@ Tokens that start with `@`, such as `@ptrv`, `@ref`, and `@cast`, do not by
 themselves require an unsafe scope. `@ref(x)` is the address of `x`: a `*T`
 when `x` is a `T`, just as `&x` is a `&T`. Both use the type `x` was declared
 with, so a `?T` variable gives `*?T` and `&?T`, also after `isset(x)`. A
-`*T` converts to `ptr` and `*[T]`; for any other type, use `.@cast`:
+`*T` converts to `ptr` and `*[T]`. A `ptr` becomes a `*T` only under `@unsafe`,
+since a `*T` can be written through. For any other type, use `.@cast`:
 
 ```rust
 let n : u32 = 7
