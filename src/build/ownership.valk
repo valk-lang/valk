@@ -1,0 +1,859 @@
+use valk.core
+
+// Ownership analysis: inclusion-based points-to over abstract objects, per function, with
+// summaries applied at calls (after ~/www/vex src/escape.rs). Every lowered value kind is
+// translated into a few constraints; one that is not understood points to GLOBAL, so a
+// missing case makes the analysis stricter, never looser.
+//
+// Objects of a function:
+//   GLOBAL       globals, unknown code and everything they reach
+//   NEW          objects callees made and stored where the caller can see them
+//   P(i), D(i)   what parameter i points to, and everything deeper
+//   slot(d)      the storage of a local or argument variable
+//   site(v)      an allocation in this function: a class, an array or slice block, a closure
+//   call(c)      what the callee of call c made and handed back
+//   lock(l)      the locked data of a `lock` block
+
+value OWN_NONE (0xFFFFFFFF)
+value OWN_GLOBAL (0)
+value OWN_NEW (1)
+
+class OwnSet {
+    words: Array[uint] (.{})
+
+    fn has(i: uint) bool {
+        let w = i / 64
+        if w >= this.words.length : return false
+        return (((this.words.get(w) !? 0) >> (i % 64)) & 1) == 1
+    }
+    fn add(i: uint) bool {
+        let w = i / 64
+        while this.words.length <= w : this.words.append(0)
+        let old = this.words.get(w) !? 0
+        let bit: uint = 1 << (i % 64)
+        if (old & bit) != 0 : return false
+        this.words.set(w, old | bit) _
+        return true
+    }
+    fn add_all(other: OwnSet) bool {
+        let changed = false
+        while this.words.length < other.words.length : this.words.append(0)
+        each other.words as w, i {
+            let old = this.words.get(i) !? 0
+            let joined = old | w
+            if joined != old {
+                this.words.set(i, joined) _
+                changed = true
+            }
+        }
+        return changed
+    }
+    fn intersects(other: OwnSet) bool {
+        each this.words as w, i {
+            if (w & (other.words.get(i) !? 0)) != 0 : return true
+        }
+        return false
+    }
+    fn is_empty() bool {
+        each this.words as w {
+            if w != 0 : return false
+        }
+        return true
+    }
+    fn items() Array[uint] {
+        let result = Array[uint]{}
+        each this.words as w, i {
+            let bits = w
+            let base = i * 64
+            while bits != 0 {
+                let low = bits.trailing_zeros()
+                result.append(base + low)
+                bits = bits & (bits - 1)
+            }
+        }
+        return result
+    }
+    fn copy() OwnSet {
+        return OwnSet { words: this.words.copy() }
+    }
+}
+
+enum OWN_OBJ : u8 {
+    global
+    new
+    param
+    deep
+    slot
+    site
+    call
+    lock
+}
+
+class OwnObj {
+    kind: OWN_OBJ
+    // The parameter index of P(i) and D(i)
+    index: uint (0)
+    decl: ?Decl (null)
+    at: ?Exp (null)
+}
+
+enum OWN_C : u8 {
+    // pts[a] contains object b
+    addr
+    // pts[a] contains pts[b]
+    copy
+    // pts[a] contains the contents of every object in pts[b]
+    load
+    // the contents of every object in pts[a] contain pts[b]
+    store
+    // the contents of object a contain pts[b]
+    store_obj
+    // pts[a] contains the contents of object b
+    load_obj
+    call
+}
+
+class OwnCons {
+    op: OWN_C
+    a: uint (0)
+    b: uint (0)
+    call: ?OwnCall (null)
+}
+
+// A call: `args` holds the receiver first for a method; a null `func` is code the
+// analysis cannot follow (a closure, an interface method)
+class OwnCall {
+    func: ?Func (null)
+    args: Array[uint] (.{})
+    result: uint (OWN_NONE)
+    // The object for what the callee made
+    made: uint (0)
+    at: ?Exp (null)
+}
+
+// How a function moves what its parameters reach, for its callers
+class OwnSummary {
+    // The result may reach what these parameters reach
+    ret_params: Array[uint] (.{})
+    // The result may reach globals, or objects of unknown code
+    ret_global: bool (false)
+    // The result may reach objects the function (or its callees) made
+    ret_new: bool (false)
+    // (from, into): what parameter `from` reaches is stored into what parameter `into` reaches
+    into: Array[uint] (.{})
+    // Parameters whose graph reaches globals or unknown code
+    escapes: Array[uint] (.{})
+    // Parameters written through
+    writes: Array[uint] (.{})
+}
+
+class OwnGraph {
+    func: Func
+    objs: Array[OwnObj] (.{})
+    cons: Array[OwnCons] (.{})
+    nvars: uint (0)
+    // The variable holding what the function returns
+    ret: uint (OWN_NONE)
+    pts: Array[OwnSet] (.{})
+    contents: Array[OwnSet] (.{})
+    // Slots of variables, by decl
+    slot_decls: Array[Decl] (.{})
+    slot_objs: Array[uint] (.{})
+    calls: Array[OwnCall] (.{})
+    // Value scopes being translated: their returns are not the function's
+    vscope_depth: uint (0)
+
+    fn object(kind: OWN_OBJ, at: ?Exp (null)) uint {
+        let id = this.objs.length
+        this.objs.append(OwnObj { kind: kind, at: at })
+        return id
+    }
+    fn var() uint {
+        return this.nvars++
+    }
+    fn emit(op: OWN_C, a: uint, b: uint) {
+        if a == OWN_NONE || b == OWN_NONE : return
+        this.cons.append(OwnCons { op: op, a: a, b: b })
+    }
+    fn slot(decl: Decl) uint {
+        each this.slot_decls as known, i {
+            if known == decl : return this.slot_objs.get(i) !? OWN_NONE
+        }
+        let id = this.object(OWN_OBJ.slot, decl.exp)
+        let obj = this.objs.get(id) !? null
+        if isset(obj) : obj.decl = decl
+        this.slot_decls.append(decl)
+        this.slot_objs.append(id)
+        return id
+    }
+    // A variable that points to exactly `obj`
+    fn points_to(obj: uint) uint {
+        let v = this.var()
+        this.emit(OWN_C.addr, v, obj)
+        return v
+    }
+    // A variable that points to everything `vars` point to
+    fn join(vars: Array[uint]) uint {
+        let v = this.var()
+        each vars as from : this.emit(OWN_C.copy, v, from)
+        return v
+    }
+    fn deep(from: OwnSet) OwnSet {
+        let result = from.copy()
+        let work = from.items()
+        while work.length > 0 {
+            let o = work.pop_last() ! break
+            let inside = this.contents.get(o) ! continue
+            each inside.items() as next {
+                if result.add(next) : work.append(next)
+            }
+        }
+        return result
+    }
+}
+
+////////////////////////////
+// Solving
+////////////////////////////
+
+fn own_solve(g: OwnGraph) {
+    while g.pts.length < g.nvars : g.pts.append(OwnSet{})
+    while g.contents.length < g.objs.length : g.contents.append(OwnSet{})
+    // GLOBAL reaches GLOBAL; a parameter's object reaches its deeper objects
+    let global = g.contents.get(OWN_GLOBAL) !? OwnSet{}
+    global.add(OWN_GLOBAL)
+    each g.objs as obj, id {
+        if obj.kind == OWN_OBJ.param || obj.kind == OWN_OBJ.deep {
+            let deeper = own_param_deep(g, obj.index)
+            if deeper != OWN_NONE : (g.contents.get(id) !? OwnSet{}).add(deeper)
+        }
+    }
+    let changed = true
+    while changed {
+        changed = false
+        each g.cons as c {
+            if own_apply(g, c) : changed = true
+        }
+        // What reaches GLOBAL is reachable by anyone: it reaches GLOBAL back
+        each global.items() as o {
+            let inside = g.contents.get(o) ! continue
+            if inside.add(OWN_GLOBAL) : changed = true
+        }
+    }
+}
+
+fn own_param_deep(g: OwnGraph, index: uint) uint {
+    each g.objs as obj, id {
+        if obj.kind == OWN_OBJ.deep && obj.index == index : return id
+    }
+    return OWN_NONE
+}
+
+fn own_apply(g: OwnGraph, c: OwnCons) bool {
+    let empty = OwnSet{}
+    if c.op == OWN_C.addr : return (g.pts.get(c.a) !? empty).add(c.b)
+    if c.op == OWN_C.copy : return (g.pts.get(c.a) !? empty).add_all(g.pts.get(c.b) !? empty)
+    if c.op == OWN_C.load_obj : return (g.pts.get(c.a) !? empty).add_all(g.contents.get(c.b) !? empty)
+    if c.op == OWN_C.store_obj : return (g.contents.get(c.a) !? empty).add_all(g.pts.get(c.b) !? empty)
+    if c.op == OWN_C.load {
+        let target = g.pts.get(c.a) !? empty
+        let changed = false
+        each (g.pts.get(c.b) !? empty).items() as o {
+            if target.add_all(g.contents.get(o) !? empty) : changed = true
+        }
+        return changed
+    }
+    if c.op == OWN_C.store {
+        let value = g.pts.get(c.b) !? empty
+        let changed = false
+        each (g.pts.get(c.a) !? empty).items() as o {
+            if (g.contents.get(o) !? empty).add_all(value) : changed = true
+        }
+        return changed
+    }
+    let call = c.call ?! return false
+    return own_apply_call(g, call)
+}
+
+// What argument `i` reaches, in the caller
+fn own_arg_reach(g: OwnGraph, call: OwnCall, i: uint) OwnSet {
+    let v = call.args.get(i) !? OWN_NONE
+    if v == OWN_NONE : return OwnSet{}
+    return g.deep(g.pts.get(v) !? OwnSet{})
+}
+
+fn own_apply_call(g: OwnGraph, call: OwnCall) bool {
+    let changed = false
+    let empty = OwnSet{}
+    let result = call.result != OWN_NONE ? (g.pts.get(call.result) !? empty) : empty
+    let f = call.func
+    let summary: ?OwnSummary = isset(f) ? f.own_summary : null
+    if !isset(summary) {
+        // Unknown code keeps every argument and may hand back anything
+        let global = g.contents.get(OWN_GLOBAL) !? empty
+        each call.args as v {
+            if v == OWN_NONE : continue
+            if global.add_all(g.pts.get(v) !? empty) : changed = true
+        }
+        if call.result != OWN_NONE && result.add(OWN_GLOBAL) : changed = true
+        return changed
+    }
+    let made = g.contents.get(call.made) !? empty
+    if call.result != OWN_NONE {
+        if summary.ret_global && result.add(OWN_GLOBAL) : changed = true
+        if summary.ret_new && result.add(call.made) : changed = true
+        each summary.ret_params as i {
+            let v = call.args.get(i) !? OWN_NONE
+            if v == OWN_NONE : continue
+            let pts = g.pts.get(v) !? empty
+            if result.add_all(pts) : changed = true
+            // A new result may hold the argument
+            if summary.ret_new && made.add_all(pts) : changed = true
+        }
+    }
+    let global = g.contents.get(OWN_GLOBAL) !? empty
+    each summary.escapes as i {
+        let v = call.args.get(i) !? OWN_NONE
+        if v != OWN_NONE && global.add_all(g.pts.get(v) !? empty) : changed = true
+    }
+    let pair: uint = 0
+    while pair + 1 < summary.into.length {
+        let from = summary.into.get(pair) !? 0
+        let into = summary.into.get(pair + 1) !? 0
+        pair += 2
+        let v = call.args.get(from) !? OWN_NONE
+        if v == OWN_NONE : continue
+        let stored = g.pts.get(v) !? empty
+        each (own_arg_reach(g, call, into)).items() as o {
+            if (g.contents.get(o) !? empty).add_all(stored) : changed = true
+        }
+    }
+    return changed
+}
+
+////////////////////////////
+// Translation of a function body
+////////////////////////////
+
+global own_round: uint (0)
+
+// Values whose graph matters: references, borrows and raw pointers, which keep the
+// provenance of what they point into. An immutable object can be shared freely.
+fn own_tracks(type: Type) bool {
+    let nn = type.get_non_nullable()
+    let class = nn.get_class_or_null()
+    if isset(class) && class.immutable : return false
+    if type.has_gc_refs() || nn.kind == TYPE.closure : return true
+    return type.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of
+}
+
+// Storage a value lives in, not a reference to elsewhere: its parts are copied with it
+fn own_is_inline_value(type: Type) bool {
+    let nn = type.get_non_nullable()
+    if nn.is_fat_borrow() || nn.is_gc_type() || type.is_raw_pointer() : return false
+    if nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.kind == TYPE.ref_of || nn.kind == TYPE.ref_slice : return false
+    return nn.is_inline || nn.kind == TYPE.union || nn.is_fixed_array_type() || nn.is_tuple_type()
+}
+
+fn own_build(func: Func) ?OwnGraph {
+    let body = func.body_scope ?! return null
+    let g = OwnGraph { func: func }
+    g.object(OWN_OBJ.global)
+    g.object(OWN_OBJ.new)
+    each func.args as arg, i {
+        let p = g.object(OWN_OBJ.param, arg.decl.exp)
+        let d = g.object(OWN_OBJ.deep, arg.decl.exp)
+        let pobj = g.objs.get(p) !? null
+        let dobj = g.objs.get(d) !? null
+        if isset(pobj) : pobj.index = i
+        if isset(dobj) : dobj.index = i
+        g.emit(OWN_C.store_obj, g.slot(arg.decl), g.points_to(p))
+    }
+    g.ret = g.var()
+    own_round++
+    own_values(g, body.values)
+    return g
+}
+
+fn own_values(g: OwnGraph, values: ?Array[Value]) {
+    let list = values ?! return
+    each list as value : own_eval(g, value)
+}
+
+fn own_eval(g: OwnGraph, value: ?Value) uint {
+    let v = value ?! return OWN_NONE
+    let meta = v.meta
+    if isset(meta) && meta.own_round == own_round : return meta.own_var
+    let pre = v.get_pre_value()
+    let pre_var = isset(pre) ? own_eval(g, pre) : OWN_NONE
+    let result = own_eval_kind(g, v, pre_var)
+    // A reference, borrow or pointer the cases cannot place points anywhere
+    if result == OWN_NONE && own_tracks(v.rett) && v.type != VAL.null && v.type != VAL.undefined && v.type != VAL.string {
+        result = g.points_to(OWN_GLOBAL)
+    }
+    if !own_tracks(v.rett) : result = OWN_NONE
+    if isset(meta) {
+        meta.own_round = own_round
+        meta.own_var = result
+    }
+    return result
+}
+
+fn own_eval_kind(g: OwnGraph, v: Value, pre_var: uint) uint {
+    let kind = v.type
+    if kind == VAL.decl {
+        let decl = v.decl ?! return OWN_NONE
+        let r = g.var()
+        g.emit(OWN_C.load_obj, r, g.slot(decl))
+        return r
+    }
+    if kind == VAL.global : return g.points_to(OWN_GLOBAL)
+    if kind == VAL.null || kind == VAL.undefined || kind == VAL.int || kind == VAL.float || kind == VAL.bool
+        || kind == VAL.string || kind == VAL.type || kind == VAL.property_meta {
+        return OWN_NONE
+    }
+    if kind == VAL.func {
+        let receiver = own_eval(g, v.value1)
+        let closure = v.func
+        // A closure keeps what it captured where the function cannot follow it
+        if isset(closure) && !isset(v.value1) {
+            each closure.capture_decls as captured {
+                let held = g.var()
+                g.emit(OWN_C.load_obj, held, g.slot(captured))
+                g.emit(OWN_C.store_obj, OWN_GLOBAL, held)
+            }
+            return OWN_NONE
+        }
+        return receiver
+    }
+    if kind == VAL.cast || kind == VAL.wrap || kind == VAL.interface_wrap || kind == VAL.interface_object
+        || kind == VAL.error_success || kind == VAL.shared_view || kind == VAL.member {
+        return own_eval(g, v.value1)
+    }
+    if kind == VAL.prop {
+        let on = v.value1 ?! return OWN_NONE
+        let from = own_eval(g, on)
+        if !own_tracks(v.rett) : return OWN_NONE
+        let r = g.var()
+        if own_is_inline_value(on.rett) : g.emit(OWN_C.copy, r, from)
+        else : g.emit(OWN_C.load, r, from)
+        return r
+    }
+    if kind == VAL.ptrv {
+        let on = v.value1 ?! return OWN_NONE
+        let from = own_eval(g, on)
+        own_eval(g, v.value2)
+        if !own_tracks(v.rett) : return OWN_NONE
+        let r = g.var()
+        if own_is_inline_value(on.rett) : g.emit(OWN_C.copy, r, from)
+        else : g.emit(OWN_C.load, r, from)
+        return r
+    }
+    if kind == VAL.ptr_offset {
+        let r = own_eval(g, v.value1)
+        own_eval(g, v.value2)
+        return r
+    }
+    if kind == VAL.ptr_of {
+        let on = v.value1 ?! return OWN_NONE
+        return own_addr(g, on)
+    }
+    if kind == VAL.load {
+        let from = own_eval(g, v.value1)
+        let r = g.var()
+        g.emit(OWN_C.load, r, from)
+        return r
+    }
+    if kind == VAL.multi {
+        if isset(v.value1) : return own_eval(g, v.value1)
+        let parts = Array[uint]{}
+        let values = v.values
+        if isset(values) {
+            each values as part : parts.append(own_eval(g, part))
+        }
+        return g.join(parts)
+    }
+    if kind == VAL.class_init {
+        let fields = Array[uint]{}
+        let values = v.values
+        if isset(values) {
+            each values as field : fields.append(own_eval(g, field))
+        }
+        if !v.rett.get_non_nullable().is_gc_type() : return g.join(fields)
+        let site = g.object(OWN_OBJ.site, v.exp)
+        let r = g.points_to(site)
+        each fields as field : g.emit(OWN_C.store_obj, site, field)
+        return r
+    }
+    if kind == VAL.array_init {
+        let parts = Array[uint]{}
+        let values = v.values
+        if isset(values) {
+            each values as part : parts.append(own_eval(g, part))
+        }
+        return g.join(parts)
+    }
+    if kind == VAL.call : return own_call(g, v)
+    if kind == VAL.this_or_that {
+        own_eval(g, v.value1)
+        let parts = Array[uint]{ own_eval(g, v.value2) }
+        let other = v.values
+        if isset(other) {
+            each other as part : parts.append(own_eval(g, part))
+        }
+        return g.join(parts)
+    }
+    if kind == VAL.phi {
+        let parts = Array[uint]{}
+        let values = v.values
+        if isset(values) {
+            each values as part : parts.append(own_eval(g, part))
+        }
+        return g.join(parts)
+    }
+    if kind == VAL.vscope {
+        g.vscope_depth++
+        own_values(g, v.values)
+        g.vscope_depth--
+        return own_eval(g, v.value1)
+    }
+    if kind == VAL.block {
+        own_values(g, v.values)
+        return own_eval(g, v.value1)
+    }
+    if kind == VAL.error_handler {
+        let alternative = own_eval(g, v.value2)
+        own_values(g, v.values)
+        if v.errh_kind == ERRH_KIND.value : return g.join(Array[uint]{ pre_var, alternative })
+        return pre_var
+    }
+    if kind == VAL.assign {
+        own_assign(g, v)
+        return OWN_NONE
+    }
+    if kind == VAL.atomic_store {
+        g.emit(OWN_C.store, own_eval(g, v.value1), own_eval(g, v.value2))
+        return OWN_NONE
+    }
+    if kind == VAL.atomic_load {
+        let r = g.var()
+        g.emit(OWN_C.load, r, own_eval(g, v.value1))
+        return r
+    }
+    if kind == VAL.memcpy {
+        let values = v.values
+        let a = isset(values) ? own_eval(g, values.get(0) !? null) : OWN_NONE
+        let b = isset(values) ? own_eval(g, values.get(1) !? null) : OWN_NONE
+        if isset(values) {
+            each values as part, i {
+                if i > 1 : own_eval(g, part)
+            }
+        }
+        own_copy_contents(g, a, b)
+        own_copy_contents(g, b, a)
+        return OWN_NONE
+    }
+    if kind == VAL.return {
+        let r = own_eval(g, v.value1)
+        own_values(g, v.values)
+        if g.vscope_depth == 0 : g.emit(OWN_C.copy, g.ret, r)
+        return OWN_NONE
+    }
+    if kind == VAL.throw || kind == VAL.error_value {
+        // Error payloads live in globals
+        g.emit(OWN_C.store_obj, OWN_GLOBAL, own_eval(g, v.value1))
+        own_values(g, v.values)
+        return OWN_NONE
+    }
+    if kind == VAL.co {
+        let launched = v.value1
+        own_eval(g, launched)
+        // The coroutine keeps its inputs for as long as it runs
+        if isset(launched) && launched.type == VAL.call {
+            let callee = launched.value1
+            if isset(callee) {
+                let receiver = callee.type == VAL.func ? callee.value1 : callee
+                g.emit(OWN_C.store_obj, OWN_GLOBAL, own_eval(g, receiver))
+            }
+            let args = launched.values
+            if isset(args) {
+                each args as arg : g.emit(OWN_C.store_obj, OWN_GLOBAL, own_eval(g, arg))
+            }
+        }
+        return g.points_to(OWN_GLOBAL)
+    }
+    if kind == VAL.await {
+        own_eval(g, v.value1)
+        return g.points_to(OWN_GLOBAL)
+    }
+    if kind == VAL.match {
+        own_eval(g, v.value1)
+        let parts = Array[uint]{}
+        let cases = v.values
+        if isset(cases) {
+            each cases as branch {
+                own_eval(g, branch.value1)
+                own_values(g, branch.values)
+                parts.append(own_eval(g, branch.value2))
+            }
+        }
+        return g.join(parts)
+    }
+    // Statements and operators: their parts may store or call
+    own_eval(g, v.value1)
+    own_eval(g, v.value2)
+    own_values(g, v.values)
+    return OWN_NONE
+}
+
+// The storage objects an assignable value lives in
+fn own_addr(g: OwnGraph, lv: Value) uint {
+    let kind = lv.type
+    if kind == VAL.decl {
+        let decl = lv.decl ?! return g.points_to(OWN_GLOBAL)
+        return g.points_to(g.slot(decl))
+    }
+    if kind == VAL.global : return g.points_to(OWN_GLOBAL)
+    if kind == VAL.prop || kind == VAL.ptrv {
+        let on = lv.value1 ?! return g.points_to(OWN_GLOBAL)
+        if kind == VAL.ptrv : own_eval(g, lv.value2)
+        if own_is_inline_value(on.rett) : return own_addr(g, on)
+        let r = own_eval(g, on)
+        return r == OWN_NONE ? g.points_to(OWN_GLOBAL) : r
+    }
+    if kind == VAL.multi && isset(lv.value1) {
+        let on = lv.value1 ?! return g.points_to(OWN_GLOBAL)
+        return own_addr(g, on)
+    }
+    if kind == VAL.cast || kind == VAL.wrap {
+        let on = lv.value1 ?! return g.points_to(OWN_GLOBAL)
+        if own_is_inline_value(on.rett) : return own_addr(g, on)
+        let r = own_eval(g, on)
+        return r == OWN_NONE ? g.points_to(OWN_GLOBAL) : r
+    }
+    let r = own_eval(g, lv)
+    return r == OWN_NONE ? g.points_to(OWN_GLOBAL) : r
+}
+
+fn own_assign(g: OwnGraph, a: Value) {
+    let left = a.value1 ?! return
+    let r = own_eval(g, a.value2)
+    if left.type == VAL.decl {
+        let decl = left.decl ?! return
+        g.emit(OWN_C.store_obj, g.slot(decl), r)
+        return
+    }
+    g.emit(OWN_C.store, own_addr(g, left), r)
+}
+
+// Everything the objects of `from` hold, the objects of `to` hold too
+fn own_copy_contents(g: OwnGraph, from: uint, to: uint) {
+    if from == OWN_NONE || to == OWN_NONE : return
+    let held = g.var()
+    g.emit(OWN_C.load, held, from)
+    g.emit(OWN_C.store, to, held)
+}
+
+fn own_call(g: OwnGraph, v: Value) uint {
+    let callee = v.value1 ?! return OWN_NONE
+    let func = callee.resolve_call_func()
+    let args = Array[uint]{}
+    let skip = isset(func) ? call_receiver_skip(callee, func) : 0
+    if skip == 1 : args.append(own_eval(g, callee.value1))
+    else if callee.type == VAL.func && isset(callee.value1) : own_eval(g, callee.value1)
+    else if callee.type != VAL.func {
+        // A closure: its environment goes to the code it runs
+        args.append(own_eval(g, callee))
+    }
+    let values = v.values
+    if isset(values) {
+        each values as arg : args.append(own_eval(g, arg))
+    }
+    let result = own_tracks(v.rett) ? g.var() : OWN_NONE
+    if isset(func) && own_runtime_call(g, func, args, result, v) : return result
+    let f = func
+    let known = isset(f) && !f.is_interface && v.call_kind != CALL_KIND.closure && v.call_kind != CALL_KIND.interface_dispatch
+    if isset(f) && f.is_extern {
+        // Raw pointers handed to C are the unsafe writer's concern
+        each args as arg, i {
+            let param = f.args.get(i) !? null
+            if isset(param) && param.type.is_raw_pointer() : continue
+            g.emit(OWN_C.store_obj, OWN_GLOBAL, arg)
+        }
+        if result != OWN_NONE : g.emit(OWN_C.addr, result, OWN_GLOBAL)
+        return result
+    }
+    let call = OwnCall { func: known ? f : null, args: args, result: result, made: g.object(OWN_OBJ.call, v.exp), at: v.exp }
+    g.calls.append(call)
+    g.cons.append(OwnCons { op: OWN_C.call, call: call })
+    return result
+}
+
+// The runtime's own helpers do bookkeeping the analysis must not see as escapes
+fn own_runtime_call(g: OwnGraph, func: Func, args: Array[uint], result: uint, v: Value) bool {
+    if func.ns.pkg.name != "valk" : return false
+    let ns = func.ns.name
+    let name = func.name
+    if ns == "gc" {
+        if name == "property_set" || name == "property_update" {
+            g.emit(OWN_C.store, args.get(1) !? OWN_NONE, args.get(2) !? OWN_NONE)
+        } else if name == "property_get" {
+            g.emit(OWN_C.load, result, args.get(0) !? OWN_NONE)
+        } else if name == "clone_closure_env" && result != OWN_NONE {
+            let site = g.object(OWN_OBJ.site, v.exp)
+            g.emit(OWN_C.addr, result, site)
+            let held = g.var()
+            g.emit(OWN_C.load, held, args.get(0) !? OWN_NONE)
+            g.emit(OWN_C.store_obj, site, held)
+        } else if result != OWN_NONE {
+            g.emit(OWN_C.addr, result, g.object(OWN_OBJ.site, v.exp))
+        }
+        return true
+    }
+    if ns == "mem" {
+        if name == "copy_bytes" || name == "move_bytes" {
+            own_copy_contents(g, args.get(0) !? OWN_NONE, args.get(1) !? OWN_NONE)
+        } else if result != OWN_NONE {
+            g.emit(OWN_C.addr, result, g.object(OWN_OBJ.site, v.exp))
+        }
+        return true
+    }
+    return false
+}
+
+////////////////////////////
+// Summaries
+////////////////////////////
+
+fn own_summarize(g: OwnGraph) OwnSummary {
+    let s = OwnSummary{}
+    let empty = OwnSet{}
+    let ret = g.deep(g.pts.get(g.ret) !? empty)
+    let escaped = g.deep(g.contents.get(OWN_GLOBAL) !? empty)
+    let reach = Array[OwnSet]{}
+    each g.func.args as arg, i {
+        let p = own_param_obj(g, i)
+        let start = OwnSet{}
+        start.add(p)
+        reach.append(g.deep(start))
+    }
+    each g.func.args as arg, i {
+        let p = own_param_obj(g, i)
+        let d = own_param_deep(g, i)
+        if ret.has(p) || ret.has(d) : s.ret_params.append(i)
+        if escaped.has(p) || escaped.has(d) : s.escapes.append(i)
+        each g.func.args as other, j {
+            if i == j : continue
+            let target = reach.get(j) ! continue
+            let found = false
+            each target.items() as o {
+                let inside = g.contents.get(o) ! continue
+                if inside.has(p) || inside.has(d) { found = true; break }
+            }
+            if found {
+                s.into.append(i)
+                s.into.append(j)
+            }
+        }
+    }
+    s.ret_global = ret.has(OWN_GLOBAL)
+    each ret.items() as o {
+        let obj = g.objs.get(o) ! continue
+        if obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call || obj.kind == OWN_OBJ.new { s.ret_new = true; break }
+    }
+    return s
+}
+
+fn own_param_obj(g: OwnGraph, index: uint) uint {
+    each g.objs as obj, id {
+        if obj.kind == OWN_OBJ.param && obj.index == index : return id
+    }
+    return OWN_NONE
+}
+
+fn own_summary_same(a: ?OwnSummary, b: OwnSummary) bool {
+    let x = a ?! return false
+    return x.ret_global == b.ret_global && x.ret_new == b.ret_new && own_uints_same(x.ret_params, b.ret_params)
+        && own_uints_same(x.escapes, b.escapes) && own_uints_same(x.into, b.into)
+}
+
+fn own_uints_same(a: Array[uint], b: Array[uint]) bool {
+    if a.length != b.length : return false
+    each a as v, i {
+        if v != (b.get(i) !? OWN_NONE) : return false
+    }
+    return true
+}
+
+////////////////////////////
+// The whole build
+////////////////////////////
+
+// Every function starts with an empty summary; solving again with the callees' new
+// summaries only adds flows, so this settles on the least fixed point
+fn own_analyze(build: Build) {
+    let funcs = Array[Func]{}
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if !isset(func.own_graph) : continue
+            func.own_summary = OwnSummary{}
+            funcs.append(func)
+        }
+    }
+    let changed = true
+    while changed {
+        changed = false
+        each funcs as func {
+            let g = func.own_graph ?! continue
+            own_solve(g)
+            let s = own_summarize(g)
+            if own_summary_same(func.own_summary, s) : continue
+            func.own_summary = s
+            changed = true
+        }
+    }
+    let dump = core.getenv("VALK_OWN") !? ""
+    if dump == "stats" {
+        let cons: uint = 0
+        let objs: uint = 0
+        each funcs as func {
+            let g = func.own_graph ?! continue
+            cons += g.cons.length
+            objs += g.objs.length
+        }
+        let total: uint = 0
+        each build.lists.units as unit : total += unit.functions.length
+        let calls: uint = 0
+        let unknown: uint = 0
+        let missing = Array[String]{}
+        each funcs as func {
+            let g = func.own_graph ?! continue
+            each g.calls as call {
+                calls++
+                let f = call.func
+                if !isset(f) || !isset(f.own_summary) {
+                    unknown++
+                    if isset(f) && missing.length < 15 : missing.append(f.ns.name + "." + f.name, true)
+                }
+            }
+        }
+        println("own: " + funcs.length + " of " + total + " functions, " + cons + " constraints, " + objs + " objects, " + unknown + " of " + calls + " calls unknown")
+        println("own missing: " + missing.join(" "))
+        return
+    }
+    if dump.length > 0 {
+        each funcs as func {
+            if dump == "1" && func.ns.pkg.name == "valk" : continue
+            if dump != "1" && !func.name.contains(dump) : continue
+            let s = func.own_summary ?! continue
+            println("own " + func.name + ": ret_params " + own_uints_text(s.ret_params) + " ret_global " + s.ret_global
+                + " ret_new " + s.ret_new + " escapes " + own_uints_text(s.escapes) + " into " + own_uints_text(s.into))
+        }
+    }
+}
+
+fn own_uints_text(list: Array[uint]) String {
+    let parts = Array[String]{}
+    each list as v : parts.append(v.to_string())
+    return "[" + parts.join(",") + "]"
+}
