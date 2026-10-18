@@ -3242,6 +3242,10 @@ In a struct method `this` is a borrow of the value (`&T`), so `let r = this`
 names the same struct. Where a struct is expected, such as a `T` parameter or
 `let copy: T = this`, a borrow is copied; `this[0]` also gives a copy.
 
+The struct may live on the stack, so `this` is a `local` borrow. A borrow made
+through any `local` borrow, like `&this.x`, `&p[i]` or `p.view(..)`, is `local`
+too, and cannot be returned or stored.
+
 ```rust
 struct MyStruct {
     a: i32
