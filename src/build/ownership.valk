@@ -104,8 +104,13 @@ enum OWN_OBJ : u8 {
 
 class OwnObj {
     kind: OWN_OBJ
-    // The parameter index of P(i) and D(i)
+    // A parameter's objects: its index, and the level (OWN_LEVEL_*)
     index: uint (0)
+    level: uint (0)
+    // Data under a lock: which one (a `lock` block's binding or a locked parameter); 0 for none
+    lock_id: uint (0)
+    // When it is made, in evaluation order (0: before the function runs)
+    seq: uint (0)
     decl: ?Decl (null)
     at: ?Exp (null)
 }
@@ -132,6 +137,15 @@ class OwnCons {
     b: uint (0)
     key: uint (0)
     call: ?OwnCall (null)
+    // Where it runs: a write only reaches objects made before it, or in the same loop
+    seq: uint (0)
+    range: ?OwnRange (null)
+}
+
+// The allocations of a loop: a write inside it may reach any of them on a later iteration
+class OwnRange {
+    lo: uint (0)
+    hi: uint (0xFFFFFFFF)
 }
 
 // What an object holds in one field
@@ -149,6 +163,8 @@ fn own_prop_key(prop: ?Prop) uint {
 // A call: `args` holds the receiver first for a method; a null `func` is code the
 // analysis cannot follow (a closure, an interface method)
 class OwnCall {
+    seq: uint (0)
+    range: ?OwnRange (null)
     func: ?Func (null)
     args: Array[uint] (.{})
     result: uint (OWN_NONE)
@@ -157,30 +173,37 @@ class OwnCall {
     at: ?Exp (null)
 }
 
+// Levels of what an argument reaches, after how collections are built: the object it points
+// to, the objects it holds (an array's storage, a map's arrays), what those hold (storage, or
+// items), and everything deeper; for a move's target also an object the callee made and put
+// under the argument
+value OWN_LEVELS (4)
+value OWN_LEVEL_OBJECT (0)
+value OWN_LEVEL_CHILDREN (1)
+value OWN_LEVEL_ITEMS (2)
+value OWN_LEVEL_DEEP (3)
+value OWN_LEVEL_NEW (4)
+
 // How a function moves what its parameters reach, for its callers
 class OwnSummary {
-    // The result may be what these parameters point to (and reach what they reach)
-    ret_params: Array[uint] (.{})
-    // The result may be something these parameters' objects hold, not those objects
-    ret_deep: Array[uint] (.{})
+    // (param, level): the result may be (or hold) those objects of the argument
+    ret: Array[uint] (.{})
     // The result may reach globals, or objects of unknown code
     ret_global: bool (false)
     // The result may reach objects the function (or its callees) made
     ret_new: bool (false)
-    // (from, into): what parameter `from` points to is stored into what parameter `into` reaches
-    into: Array[uint] (.{})
-    // (from, into): only what `from`'s objects hold is
-    into_deep: Array[uint] (.{})
-    // Parameters whose objects reach globals or unknown code
+    // (param, level): those objects reach globals or unknown code
     escapes: Array[uint] (.{})
-    // Parameters of which only what their objects hold does
-    escapes_deep: Array[uint] (.{})
-    // Parameters written through
-    writes: Array[uint] (.{})
+    // (from, from_level, into, into_level): objects of one argument stored under another
+    moves: Array[uint] (.{})
+    // (param, level): the callee puts an object it made under those objects
+    new_under: Array[uint] (.{})
 }
 
 class OwnGraph {
     func: Func
+    // OWN_LEVELS objects per parameter, by index * OWN_LEVELS + level
+    param_objs: Array[uint] (.{})
     env: OwnEnv (OwnEnv{})
     decl_count: uint (0)
     // Per local: a variable holding everything any version of it held
@@ -211,13 +234,25 @@ class OwnGraph {
     needs_check: bool (false)
     // Slots of locals lent as borrows
     lent: OwnSet (OwnSet{})
+    // Allocations so far, and the outermost loop being translated
+    seq: uint (0)
+    range: ?OwnRange (null)
     // What GLOBAL reaches, as of the last solving round
     escaped: OwnSet (OwnSet{})
+    locks: uint (0)
 
     fn object(kind: OWN_OBJ, at: ?Exp (null)) uint {
         let id = this.objs.length
-        this.objs.append(OwnObj { kind: kind, at: at })
+        let made = kind == OWN_OBJ.site || kind == OWN_OBJ.call
+        this.objs.append(OwnObj { kind: kind, at: at, seq: made ? ++this.seq : 0 })
         return id
+    }
+    // Whether a write at `seq` (in `range`) can reach object `o`
+    fn reaches(o: uint, seq: uint, range: ?OwnRange) bool {
+        let obj = this.objs.get(o) ! return true
+        if obj.seq <= seq : return true
+        let r = range ?! return false
+        return obj.seq >= r.lo && obj.seq <= r.hi
     }
     fn var() uint {
         return this.nvars++
@@ -231,7 +266,7 @@ class OwnGraph {
     }
     fn emit(op: OWN_C, a: uint, b: uint, key: uint (0)) {
         if a == OWN_NONE || b == OWN_NONE : return
-        this.cons.append(OwnCons { op: op, a: a, b: b, key: key })
+        this.cons.append(OwnCons { op: op, a: a, b: b, key: key, seq: this.seq, range: this.range })
     }
     fn field(o: uint, key: uint) OwnSet {
         while this.fields.length <= o : this.fields.append(Array[OwnField]{})
@@ -302,14 +337,14 @@ fn own_solve(g: OwnGraph) {
     // GLOBAL reaches GLOBAL; a parameter's object reaches its deeper objects
     let global = g.contents.get(OWN_GLOBAL) !? OwnSet{}
     global.add(OWN_GLOBAL)
-    each g.objs as obj, id {
-        if obj.kind == OWN_OBJ.param || obj.kind == OWN_OBJ.deep {
-            let deeper = own_param_deep(g, obj.index)
-            if deeper == OWN_NONE : continue
-            let one = OwnSet{}
-            one.add(deeper)
-            g.write_field(id, OWN_ANY_FIELD, one)
-        }
+    // A parameter's object holds its children, which hold everything deeper
+    let p: uint = 0
+    while p < g.func.args.length {
+        own_link(g, own_param(g, p, OWN_LEVEL_OBJECT), own_param(g, p, OWN_LEVEL_CHILDREN))
+        own_link(g, own_param(g, p, OWN_LEVEL_CHILDREN), own_param(g, p, OWN_LEVEL_ITEMS))
+        own_link(g, own_param(g, p, OWN_LEVEL_ITEMS), own_param(g, p, OWN_LEVEL_DEEP))
+        own_link(g, own_param(g, p, OWN_LEVEL_DEEP), own_param(g, p, OWN_LEVEL_DEEP))
+        p++
     }
     let changed = true
     while changed {
@@ -322,11 +357,15 @@ fn own_solve(g: OwnGraph) {
     }
 }
 
-fn own_param_deep(g: OwnGraph, index: uint) uint {
-    each g.objs as obj, id {
-        if obj.kind == OWN_OBJ.deep && obj.index == index : return id
-    }
-    return OWN_NONE
+fn own_param(g: OwnGraph, index: uint, level: uint) uint {
+    return g.param_objs.get(index * OWN_LEVELS + level) !? OWN_NONE
+}
+
+fn own_link(g: OwnGraph, from: uint, to: uint) {
+    if from == OWN_NONE || to == OWN_NONE : return
+    let one = OwnSet{}
+    one.add(to)
+    g.write_field(from, OWN_ANY_FIELD, one)
 }
 
 fn own_apply(g: OwnGraph, c: OwnCons) bool {
@@ -339,7 +378,10 @@ fn own_apply(g: OwnGraph, c: OwnCons) bool {
         if g.escaped.has(c.b) && target.add(OWN_GLOBAL) : changed = true
         return changed
     }
-    if c.op == OWN_C.store_obj : return g.write_field(c.a, c.key, g.pts.get(c.b) !? empty)
+    if c.op == OWN_C.store_obj {
+        if !g.reaches(c.a, c.seq, c.range) : return false
+        return g.write_field(c.a, c.key, g.pts.get(c.b) !? empty)
+    }
     if c.op == OWN_C.load {
         let target = g.pts.get(c.a) !? empty
         let changed = false
@@ -353,6 +395,7 @@ fn own_apply(g: OwnGraph, c: OwnCons) bool {
         let value = g.pts.get(c.b) !? empty
         let changed = false
         each (g.pts.get(c.a) !? empty).items() as o {
+            if !g.reaches(o, c.seq, c.range) : continue
             if g.write_field(o, c.key, value) : changed = true
         }
         return changed
@@ -361,39 +404,21 @@ fn own_apply(g: OwnGraph, c: OwnCons) bool {
     return own_apply_call(g, call)
 }
 
-// What argument `i` points to, or with `held` what those objects hold
-fn own_arg_objects(g: OwnGraph, call: OwnCall, i: uint, held: bool) OwnSet {
+// The objects at `level` of what argument `i` points to
+fn own_level_objects(g: OwnGraph, call: OwnCall, i: uint, level: uint) OwnSet {
     let v = call.args.get(i) !? OWN_NONE
     if v == OWN_NONE : return OwnSet{}
     let pts = g.pts.get(v) !? OwnSet{}
-    if !held : return pts
-    // Held at any depth
-    let below = OwnSet{}
-    each pts.items() as o : below.add_all(g.contents.get(o) !? OwnSet{})
-    return g.deep(below)
-}
-
-fn own_apply_into(g: OwnGraph, call: OwnCall, pairs: Array[uint], held: bool) bool {
-    let changed = false
-    let pair: uint = 0
-    while pair + 1 < pairs.length {
-        let from = pairs.get(pair) !? 0
-        let into = pairs.get(pair + 1) !? 0
-        pair += 2
-        let stored = own_arg_objects(g, call, from, held)
-        if stored.is_empty() : continue
-        each (own_arg_reach(g, call, into)).items() as o {
-            if g.write_field(o, OWN_ANY_FIELD, stored) : changed = true
-        }
-    }
-    return changed
-}
-
-// What argument `i` reaches, in the caller
-fn own_arg_reach(g: OwnGraph, call: OwnCall, i: uint) OwnSet {
-    let v = call.args.get(i) !? OWN_NONE
-    if v == OWN_NONE : return OwnSet{}
-    return g.deep(g.pts.get(v) !? OwnSet{})
+    if level == OWN_LEVEL_OBJECT : return pts
+    let children = OwnSet{}
+    each pts.items() as o : children.add_all(g.contents.get(o) !? OwnSet{})
+    if level == OWN_LEVEL_CHILDREN : return children
+    let items = OwnSet{}
+    each children.items() as o : items.add_all(g.contents.get(o) !? OwnSet{})
+    if level == OWN_LEVEL_ITEMS : return items
+    let deeper = OwnSet{}
+    each items.items() as o : deeper.add_all(g.contents.get(o) !? OwnSet{})
+    return g.deep(deeper)
 }
 
 fn own_apply_call(g: OwnGraph, call: OwnCall) bool {
@@ -428,26 +453,47 @@ fn own_apply_summary(g: OwnGraph, call: OwnCall, given: ?OwnSummary) bool {
     if call.result != OWN_NONE {
         if summary.ret_global && result.add(OWN_GLOBAL) : changed = true
         if summary.ret_new && result.add(call.made) : changed = true
-        each summary.ret_params as i {
-            let given = own_arg_objects(g, call, i, false)
-            if result.add_all(given) : changed = true
-            // A new result may hold the argument
-            if summary.ret_new && g.write_field(call.made, OWN_ANY_FIELD, given) : changed = true
-        }
-        each summary.ret_deep as i {
-            let held = own_arg_objects(g, call, i, true)
-            if result.add_all(held) : changed = true
-            if summary.ret_new && g.write_field(call.made, OWN_ANY_FIELD, held) : changed = true
+        let k: uint = 0
+        while k + 1 < summary.ret.length {
+            let given_objects = own_level_objects(g, call, summary.ret.get(k) !? 0, summary.ret.get(k + 1) !? 0)
+            k += 2
+            // The result is, or holds, those objects: either way what reaches it reaches them
+            if result.add_all(given_objects) : changed = true
         }
     }
-    each summary.escapes as i {
-        if g.write_field(OWN_GLOBAL, OWN_ANY_FIELD, own_arg_objects(g, call, i, false)) : changed = true
+    let e: uint = 0
+    while e + 1 < summary.escapes.length {
+        let escaped = own_level_objects(g, call, summary.escapes.get(e) !? 0, summary.escapes.get(e + 1) !? 0)
+        e += 2
+        if g.write_field(OWN_GLOBAL, OWN_ANY_FIELD, escaped) : changed = true
     }
-    each summary.escapes_deep as i {
-        if g.write_field(OWN_GLOBAL, OWN_ANY_FIELD, own_arg_objects(g, call, i, true)) : changed = true
+    let m: uint = 0
+    while m + 3 < summary.moves.length {
+        let stored = own_level_objects(g, call, summary.moves.get(m) !? 0, summary.moves.get(m + 1) !? 0)
+        let into = summary.moves.get(m + 2) !? 0
+        let into_level = summary.moves.get(m + 3) !? 0
+        m += 4
+        if stored.is_empty() : continue
+        if into_level == OWN_LEVEL_NEW {
+            if g.write_field(call.made, OWN_ANY_FIELD, stored) : changed = true
+            continue
+        }
+        each (own_level_objects(g, call, into, into_level)).items() as o {
+            if !g.reaches(o, call.seq, call.range) : continue
+            if g.write_field(o, OWN_ANY_FIELD, stored) : changed = true
+        }
     }
-    if own_apply_into(g, call, summary.into, false) : changed = true
-    if own_apply_into(g, call, summary.into_deep, true) : changed = true
+    let n: uint = 0
+    while n + 1 < summary.new_under.length {
+        let targets = own_level_objects(g, call, summary.new_under.get(n) !? 0, summary.new_under.get(n + 1) !? 0)
+        n += 2
+        let made = OwnSet{}
+        made.add(call.made)
+        each targets.items() as o {
+            if !g.reaches(o, call.seq, call.range) : continue
+            if g.write_field(o, OWN_ANY_FIELD, made) : changed = true
+        }
+    }
     return changed
 }
 
@@ -497,10 +543,32 @@ fn own_is_view_type(type: Type) bool {
     return type.get_non_nullable().is_shared
 }
 
-// What is read out of shared data, like the locked data of a `Lock`: an object of its own
+// What is read out of shared data, like the locked data of a `Lock`: an object of its own,
+// with one for everything it holds; locked data gets a lock of its own
 fn own_view_read(g: OwnGraph, v: Value) uint {
     if !own_tracks(v.rett) : return OWN_NONE
-    return g.points_to(g.object(OWN_OBJ.lock, v.exp))
+    // The same levels as a parameter's (OWN_LEVELS), so a collection read out of it keeps
+    // its storage apart from its items
+    let locked = v.rett.get_non_nullable().is_locked || v.rett.has_locked_refs()
+    let id: uint = locked ? ++g.locks : 0
+    let chain = Array[uint]{}
+    let level: uint = 0
+    while level < OWN_LEVELS {
+        let o = g.object(OWN_OBJ.lock, v.exp)
+        own_set_lock(g, o, id)
+        chain.append(o)
+        level++
+    }
+    each chain as o, i {
+        let next = chain.get(i + 1 < chain.length ? i + 1 : i) !? o
+        g.emit(OWN_C.store_obj, o, g.points_to(next))
+    }
+    return g.points_to(chain.get(0) !? OWN_NONE)
+}
+
+fn own_set_lock(g: OwnGraph, o: uint, id: uint) {
+    let obj = g.objs.get(o) ! return
+    obj.lock_id = id
 }
 
 // A raw pointer keeps the provenance of what it points into for loads and stores through
@@ -537,16 +605,27 @@ fn own_build(func: Func) ?OwnGraph {
     if g.needs_check : func.has_publications = true
     g.memo_all = func.has_publications || func.has_lends
     each func.args as arg, i {
-        let p = g.object(OWN_OBJ.param, arg.decl.exp)
-        let d = g.object(OWN_OBJ.deep, arg.decl.exp)
-        let pobj = g.objs.get(p) !? null
-        let dobj = g.objs.get(d) !? null
-        if isset(pobj) : pobj.index = i
-        if isset(dobj) : dobj.index = i
-        own_write_decl(g, arg.decl, g.points_to(p))
+        // Each locked parameter may be data under a different lock
+        let lock_id: uint = arg.type.get_non_nullable().is_locked ? ++g.locks : 0
+        let level: uint = 0
+        while level < OWN_LEVELS {
+            let o = g.object(level == OWN_LEVEL_OBJECT ? OWN_OBJ.param : OWN_OBJ.deep, arg.decl.exp)
+            let obj = g.objs.get(o) !? null
+            if isset(obj) {
+                obj.index = i
+                obj.level = level
+                obj.lock_id = lock_id
+            }
+            g.param_objs.append(o)
+            level++
+        }
+        own_write_decl(g, arg.decl, g.points_to(own_param(g, i, OWN_LEVEL_OBJECT)))
     }
     g.ret = g.var()
     own_values(g, body.values)
+    if (core.getenv("VALK_OWN_TREE") !? "") == func.name {
+        each body.values as v : own_dump_value(v, 0)
+    }
     return g
 }
 
@@ -757,7 +836,10 @@ fn own_eval_kind(g: OwnGraph, v: Value, pre_var: uint) uint {
         if !own_tracks(v.rett) : return OWN_NONE
         if own_is_view_type(on.rett) : return own_view_read(g, v)
         let r = g.var()
-        if own_is_inline_value(on.rett) : g.emit(OWN_C.copy, r, from)
+        // A borrow's own parts: the storage it points into, and that storage's address
+        let prop = v.prop
+        let part_of_borrow = kind == VAL.prop && on.rett.get_non_nullable().is_fat_borrow() && isset(prop) && (prop.name == "owner" || prop.name == "data")
+        if own_is_inline_value(on.rett) || part_of_borrow : g.emit(OWN_C.copy, r, from)
         else : g.emit(OWN_C.load, r, from, kind == VAL.prop ? own_prop_key(v.prop) : OWN_ELEMENTS)
         return r
     }
@@ -808,13 +890,22 @@ fn own_eval_kind(g: OwnGraph, v: Value, pre_var: uint) uint {
         }
         return g.join(parts)
     }
+    // A literal built by hooks (`Array[T]{ a, b }`): the object, then the calls that fill it
+    if kind == VAL.class_init && isset(v.value1) {
+        let object = own_eval(g, v.value1)
+        own_values(g, v.values)
+        return object
+    }
     if kind == VAL.class_init {
         let fields = Array[uint]{}
         let values = v.values
         if isset(values) {
             each values as field : fields.append(own_eval(g, field))
         }
-        if !v.rett.get_non_nullable().is_gc_type() : return g.join(fields)
+        // A class, an array or slice storage is allocated; a struct is the fields themselves
+        let class = v.get_class_ref()
+        let allocated = v.rett.get_non_nullable().is_gc_type() || (isset(class) && (class.kind == CLASS_KIND.class || class.kind == CLASS_KIND.array || class.kind == CLASS_KIND.slice))
+        if !allocated : return g.join(fields)
         let site = g.object(OWN_OBJ.site, v.exp)
         let r = g.points_to(site)
         each fields as field, i {
@@ -1011,12 +1102,20 @@ fn own_loop(g: OwnGraph, v: Value) {
     g.env = head
     let loop = OwnLoop { depth: g.loops.length }
     g.loops.append(loop)
+    // The outermost loop's allocations: its writes may reach them on a later iteration
+    let outer = g.range
+    let range = OwnRange { lo: g.seq + 1 }
+    if !isset(outer) : g.range = range
     own_eval(g, v.value1)
     let condition = v.value1
     let exits = Array[OwnEnv]{}
     if !isset(condition) || condition.type != VAL.bool || !condition.bool_val : exits.append(g.env.copy())
     own_values(g, v.values)
     g.loops.pop_last() _
+    if !isset(outer) {
+        range.hi = g.seq
+        g.range = null
+    }
     let backs = Array[OwnEnv]{ g.env }
     each loop.continues as env : backs.append(env)
     each backs as back {
@@ -1136,7 +1235,9 @@ fn own_call(g: OwnGraph, v: Value) uint {
         if result != OWN_NONE : g.emit(OWN_C.addr, result, OWN_GLOBAL)
         return result
     }
-    let call = OwnCall { func: known ? f : null, args: args, result: result, made: g.object(OWN_OBJ.call, v.exp), at: v.exp }
+    let made = g.object(OWN_OBJ.call, v.exp)
+    if g.memo_all : v.ensure_meta().own_made = made
+    let call = OwnCall { func: known ? f : null, args: args, result: result, made: made, at: v.exp, seq: g.seq, range: g.range }
     g.calls.append(call)
     g.cons.append(OwnCons { op: OWN_C.call, call: call })
     return result
@@ -1191,38 +1292,31 @@ fn own_summarize(g: OwnGraph) OwnSummary {
     let empty = OwnSet{}
     let ret = g.deep(g.pts.get(g.ret) !? empty)
     let escaped = g.deep(g.contents.get(OWN_GLOBAL) !? empty)
-    let reach = Array[OwnSet]{}
     each g.func.args as arg, i {
-        let p = own_param_obj(g, i)
-        let start = OwnSet{}
-        start.add(p)
-        reach.append(g.deep(start))
+        own_note_level(g, ret, i, s.ret)
+        own_note_level(g, escaped, i, s.escapes)
     }
-    each g.func.args as arg, i {
-        let p = own_param_obj(g, i)
-        let d = own_param_deep(g, i)
-        if ret.has(p) : s.ret_params.append(i)
-        else if ret.has(d) : s.ret_deep.append(i)
-        if escaped.has(p) : s.escapes.append(i)
-        else if escaped.has(d) : s.escapes_deep.append(i)
-        each g.func.args as other, j {
-            if i == j : continue
-            let target = reach.get(j) ! continue
-            let whole = false
-            let held = false
-            each target.items() as o {
-                // The parameter's own structure is not a store
-                if o == p || o == d : continue
-                let inside = g.contents.get(o) ! continue
-                if inside.has(p) : whole = true
-                if inside.has(d) : held = true
+    // Where each parameter's graph got objects of the others, or new ones
+    each g.func.args as arg, j {
+        let start = OwnSet{}
+        start.add(own_param(g, j, OWN_LEVEL_OBJECT))
+        each (g.deep(start)).items() as o {
+            let container = g.objs.get(o) ! continue
+            let into_level = OWN_LEVEL_NEW
+            if container.kind == OWN_OBJ.param || container.kind == OWN_OBJ.deep {
+                // Another parameter's object belongs to that parameter
+                if container.index != j : continue
+                into_level = container.level
             }
-            if whole {
-                s.into.append(i)
-                s.into.append(j)
-            } else if held {
-                s.into_deep.append(i)
-                s.into_deep.append(j)
+            let inside = g.contents.get(o) ! continue
+            each inside.items() as held {
+                let obj = g.objs.get(held) ! continue
+                if obj.kind == OWN_OBJ.param || obj.kind == OWN_OBJ.deep {
+                    if obj.index == j : continue
+                    own_add_unique(s.moves, Array[uint]{ obj.index, obj.level, j, into_level })
+                } else if (obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call || obj.kind == OWN_OBJ.new) && into_level != OWN_LEVEL_NEW {
+                    own_add_unique(s.new_under, Array[uint]{ j, into_level })
+                }
             }
         }
     }
@@ -1234,19 +1328,38 @@ fn own_summarize(g: OwnGraph) OwnSummary {
     return s
 }
 
-fn own_param_obj(g: OwnGraph, index: uint) uint {
-    each g.objs as obj, id {
-        if obj.kind == OWN_OBJ.param && obj.index == index : return id
+// The shallowest level of parameter `i` in `set`, as a (param, level) pair
+fn own_note_level(g: OwnGraph, set: OwnSet, i: uint, into: Array[uint]) {
+    let level: uint = 0
+    while level < OWN_LEVELS {
+        if set.has(own_param(g, i, level)) {
+            into.append(i)
+            into.append(level)
+            return
+        }
+        level++
     }
-    return OWN_NONE
+}
+
+// Appends a tuple of `parts.length` entries once
+fn own_add_unique(list: Array[uint], parts: Array[uint]) {
+    let n = parts.length
+    let at: uint = 0
+    while at + n <= list.length {
+        let same = true
+        each parts as v, k {
+            if (list.get(at + k) !? OWN_NONE) != v { same = false; break }
+        }
+        if same : return
+        at += n
+    }
+    each parts as v : list.append(v)
 }
 
 fn own_summary_same(a: ?OwnSummary, b: OwnSummary) bool {
     let x = a ?! return false
-    return x.ret_global == b.ret_global && x.ret_new == b.ret_new && own_uints_same(x.ret_params, b.ret_params)
-        && own_uints_same(x.ret_deep, b.ret_deep) && own_uints_same(x.escapes, b.escapes)
-        && own_uints_same(x.escapes_deep, b.escapes_deep) && own_uints_same(x.into, b.into)
-        && own_uints_same(x.into_deep, b.into_deep)
+    return x.ret_global == b.ret_global && x.ret_new == b.ret_new && own_uints_same(x.ret, b.ret)
+        && own_uints_same(x.escapes, b.escapes) && own_uints_same(x.moves, b.moves) && own_uints_same(x.new_under, b.new_under)
 }
 
 fn own_uints_same(a: Array[uint], b: Array[uint]) bool {
@@ -1333,6 +1446,35 @@ fn own_analyze(build: Build) {
         println("own missing: " + missing.join(" "))
         return
     }
+    if dump.starts_with("objs:") {
+        let name = dump.range(5, dump.bytes - 5)
+        each funcs as func {
+            if func.name != name : continue
+            let g = func.own_graph ?! continue
+            each g.objs as obj, id {
+                let at = obj.at
+                println("own obj " + id + " kind " + obj.kind.to(uint) + " line " + (isset(at) ? at.src.line_of(at.i.to(u32)).to_string() : "?") + " seq " + obj.seq + " contents " + own_uints_text((g.contents.get(id) !? OwnSet{}).items()))
+            }
+        }
+        return
+    }
+    if dump.starts_with("calls:") {
+        let name = dump.range(6, dump.bytes - 6)
+        each funcs as func {
+            if func.name != name : continue
+            let g = func.own_graph ?! continue
+            each g.calls as call {
+                let f = call.func
+                let s = isset(f) ? f.own_summary : null
+                let result = call.result != OWN_NONE ? (g.pts.get(call.result) !? OwnSet{}) : OwnSet{}
+                let arg0 = call.args.get(0) !? OWN_NONE
+                let arg0_pts = arg0 != OWN_NONE ? (g.pts.get(arg0) !? OwnSet{}) : OwnSet{}
+                println("own call " + (isset(f) ? f.name : "?") + " summary " + isset(s) + (isset(s) ? " ret " + own_uints_text(s.ret) + " moves " + own_uints_text(s.moves) : "")
+                    + " result " + own_uints_text(result.items()) + " arg0 " + own_uints_text(arg0_pts.items()) + " arg0-deep " + own_uints_text(g.deep(arg0_pts).items()))
+            }
+        }
+        return
+    }
     if dump == "unknown" {
         each funcs as func {
             if func.ns.pkg.name == "valk" : continue
@@ -1352,9 +1494,8 @@ fn own_analyze(build: Build) {
             if dump == "1" && func.ns.pkg.name == "valk" : continue
             if dump != "1" && !func.name.contains(dump) : continue
             let s = func.own_summary ?! continue
-            println("own " + func.name + ": ret_params " + own_uints_text(s.ret_params) + " ret_deep " + own_uints_text(s.ret_deep)
-                + " ret_global " + s.ret_global + " ret_new " + s.ret_new + " escapes " + own_uints_text(s.escapes)
-                + " escapes_deep " + own_uints_text(s.escapes_deep) + " into " + own_uints_text(s.into) + " into_deep " + own_uints_text(s.into_deep))
+            println("own " + func.name + ": ret " + own_uints_text(s.ret) + " ret_global " + s.ret_global + " ret_new " + s.ret_new
+                + " escapes " + own_uints_text(s.escapes) + " moves " + own_uints_text(s.moves) + " new_under " + own_uints_text(s.new_under))
         }
     }
 }

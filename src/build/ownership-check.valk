@@ -88,10 +88,16 @@ fn own_check_func(func: Func, shadow: bool) !Error {
     if !g.memo_all : return
     let start = OwnSet{}
     start.add(OWN_GLOBAL)
-    each func.args as arg, i : start.add(own_param_obj(g, i))
+    each func.args as arg, i : start.add(own_param(g, i, OWN_LEVEL_OBJECT))
     let outside = g.deep(start)
     let base = start.copy()
-    each func.args as arg, i : base.add(own_param_deep(g, i))
+    each func.args as arg, i {
+        let level: uint = 1
+        while level < OWN_LEVELS {
+            base.add(own_param(g, i, level))
+            level++
+        }
+    }
     let flow = OwnFlow { g: g, outside: outside, base: base, shadow: shadow }
     own_check_values(body.values, OwnState{}, flow) !>
     own_check_frame(g, flow) !>
@@ -230,6 +236,7 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         own_check_destination(value.value1, state, flow) !>
         own_check_value(value.value2, state, flow) !>
         own_assign_escapes(value, state, flow)
+        own_check_lock_store(value, flow) !>
         // A local that gets a new value no longer holds what was published
         let left = value.value1
         let decl = isset(left) && left.type == VAL.decl ? left.decl : null
@@ -289,15 +296,17 @@ fn own_check_publish(value: Value, state: OwnState, flow: OwnFlow) !Error {
     let reach = own_value_reach(flow.g, value, true)
     let outside = flow.base.copy()
     outside.add_all(state.escaped)
-    if reach.intersects(outside) && (core.getenv("VALK_OWN_DEBUG") !? "") == "1" {
+    // A value built right here is the caller's own: only what went into it is checked
+    let checked = own_fresh_reach(flow.g, value, true)
+    if checked.intersects(outside) && (core.getenv("VALK_OWN_DEBUG") !? "") == "1" {
         let text = "own-debug:"
         each reach.items() as o {
             let obj = flow.g.objs.get(o) ! continue
-            text += " " + o + ":" + obj.kind.to(uint) + (outside.has(o) ? "*" : "") + (state.escaped.has(o) ? "e" : "")
+            text += " " + o + ":" + obj.kind.to(uint) + "@" + own_line(obj.at) + (outside.has(o) ? "*" : "") + (state.escaped.has(o) ? "e" : "")
         }
         println(text)
     }
-    if reach.intersects(outside) {
+    if checked.intersects(outside) {
         own_report(flow, value.exp, "Only a provably unique value graph can be published as shared; a mutable alias may remain") !>
     }
     if reach.intersects(flow.g.lent) {
@@ -308,6 +317,18 @@ fn own_check_publish(value: Value, state: OwnState, flow: OwnFlow) !Error {
     let published = OwnSet{}
     each reach.items() as o {
         if !outside.has(o) : published.add(o)
+    }
+    if (core.getenv("VALK_OWN_DEBUG") !? "") == "1" {
+        let text = "own-debug publish at " + own_line(value.exp) + ":"
+        each reach.items() as o {
+            let obj = flow.g.objs.get(o) ! continue
+            text += " " + o + ":" + obj.kind.to(uint) + "@" + own_line(obj.at)
+        }
+        let consumed = Array[String]{}
+        each flow.g.decl_all as all, index {
+            if flow.g.deep(flow.g.pts.get(all) !? OwnSet{}).intersects(reach) : consumed.append(index.to_string())
+        }
+        println(text + " consumes " + consumed.join(","))
     }
     if published.is_empty() : return
     let g = flow.g
@@ -333,16 +354,6 @@ fn own_dump_value(v: ?Value, depth: uint) {
 }
 
 fn own_check_build(build: Build) !Error {
-    let tree = core.getenv("VALK_OWN_TREE") !? ""
-    if tree.length > 0 {
-        each build.lists.units as unit {
-            each unit.functions as func {
-                if func.name != tree : continue
-                let body = func.body_scope ?! continue
-                each body.values as v : own_dump_value(v, 0)
-            }
-        }
-    }
     if (core.getenv("VALK_OWN_CHECK") !? "") != "1" : return
     each build.lists.units as unit {
         each unit.functions as func {
@@ -396,11 +407,18 @@ fn own_check_call_moves(call: Value, state: OwnState, flow: OwnFlow) !Error {
     let targets_params = true
     each inputs as input, i {
         if !(into_view.get(i) !? false) || !isset(input) : continue
-        if !own_only_params(flow.g, own_value_reach(flow.g, input)) : targets_params = false
+        if !own_holds_params(flow.g, own_value_reach(flow.g, input)) : targets_params = false
     }
     each inputs as input, i {
         let arg = input ?! continue
-        if (into_view.get(i) !? false) || !own_tracks(arg.rett) || own_is_raw(arg.rett) : continue
+        if !own_tracks(arg.rett) || own_is_raw(arg.rett) : continue
+        // Locked data moved into locked data: only within its own lock
+        if (into_view.get(i) !? false) || arg.rett.get_non_nullable().is_locked {
+            if isset(summaries) && own_moves_across_locks(summaries, i, inputs, into_view, flow) {
+                own_report(flow, arg.exp, "Data under one lock cannot be stored under another lock") !>
+            }
+            continue
+        }
         let meta = arg.meta
         let marked = isset(meta) && meta.publishes_graph
         let moved = false
@@ -409,11 +427,14 @@ fn own_check_call_moves(call: Value, state: OwnState, flow: OwnFlow) !Error {
         } else {
             each summaries as s {
                 if !isset(s) { moved = true; break }
-                if own_into_view(s.into, i, into_view) || own_into_view(s.into_deep, i, into_view) : moved = true
+                if own_moves_into_view(s.moves, i, into_view) : moved = true
             }
         }
         if !moved : continue
         if targets_params && own_only_params(flow.g, own_value_reach(flow.g, arg)) : continue
+        if isset(summaries) && own_moves_across_locks(summaries, i, inputs, into_view, flow) {
+            own_report(flow, arg.exp, "Data under one lock cannot be stored under another lock") !>
+        }
         // Published by this call, it may not also be kept anywhere else
         if isset(summaries) && own_call_also_keeps(summaries, i, inputs, into_view, state, flow) {
             own_report(flow, arg.exp, "Only a provably unique value graph can be stored in locked data; the call also keeps it elsewhere") !>
@@ -453,11 +474,11 @@ fn own_check_view_publish(view: Value, state: OwnState, flow: OwnFlow) !Error {
     own_check_publish(inner, state, flow) !>
 }
 
-fn own_into_view(pairs: Array[uint], from: uint, into_view: Array[bool]) bool {
-    let pair: uint = 0
-    while pair + 1 < pairs.length {
-        if (pairs.get(pair) !? OWN_NONE) == from && (into_view.get(pairs.get(pair + 1) !? 0) !? false) : return true
-        pair += 2
+fn own_moves_into_view(moves: Array[uint], from: uint, into_view: Array[bool]) bool {
+    let m: uint = 0
+    while m + 3 < moves.length {
+        if (moves.get(m) !? OWN_NONE) == from && (into_view.get(moves.get(m + 2) !? 0) !? false) : return true
+        m += 4
     }
     return false
 }
@@ -480,7 +501,15 @@ fn own_only_params(g: OwnGraph, set: OwnSet) bool {
 fn own_escape(state: OwnState, flow: OwnFlow, value: ?Value) {
     let v = value ?! return
     if !own_tracks(v.rett) || own_is_raw(v.rett) : return
+    let before = state.escaped.copy()
     own_escape_set(state, flow, own_value_reach(flow.g, v))
+    if (core.getenv("VALK_OWN_DEBUG") !? "") == "2" {
+        let added = Array[uint]{}
+        each state.escaped.items() as o {
+            if !before.has(o) : added.append(o)
+        }
+        if added.length > 0 : println("own-escape in " + flow.g.func.name + " at " + own_line(v.exp) + ": " + own_uints_text(added))
+    }
 }
 
 // Only what exists by now escapes: a later allocation stored into the same place escapes
@@ -547,19 +576,21 @@ fn own_call_escapes(call: Value, state: OwnState, flow: OwnFlow) {
             each inputs as input : own_escape(state, flow, input)
             return
         }
-        each s.escapes as i : own_escape(state, flow, inputs.get(i) !? null)
-        each s.escapes_deep as i : own_escape(state, flow, inputs.get(i) !? null)
-        own_into_escapes(s.into, inputs, state, flow)
-        own_into_escapes(s.into_deep, inputs, state, flow)
+        let e: uint = 0
+        while e + 1 < s.escapes.length {
+            own_escape(state, flow, inputs.get(s.escapes.get(e) !? 0) !? null)
+            e += 2
+        }
+        own_into_escapes(s.moves, inputs, state, flow)
     }
 }
 
-fn own_into_escapes(pairs: Array[uint], inputs: Array[?Value], state: OwnState, flow: OwnFlow) {
-    let pair: uint = 0
-    while pair + 1 < pairs.length {
-        let from = inputs.get(pairs.get(pair) !? 0) !? null
-        let into = inputs.get(pairs.get(pair + 1) !? 0) !? null
-        pair += 2
+fn own_into_escapes(moves: Array[uint], inputs: Array[?Value], state: OwnState, flow: OwnFlow) {
+    let m: uint = 0
+    while m + 3 < moves.length {
+        let from = inputs.get(moves.get(m) !? 0) !? null
+        let into = inputs.get(moves.get(m + 2) !? 0) !? null
+        m += 4
         if !isset(into) : continue
         if own_is_outside(state, flow, own_value_reach(flow.g, into)) : own_escape(state, flow, from)
     }
@@ -582,33 +613,169 @@ fn own_closure_escapes(value: Value, state: OwnState, flow: OwnFlow) {
 fn own_call_also_keeps(summaries: Array[?OwnSummary], i: uint, inputs: Array[?Value], into_view: Array[bool], state: OwnState, flow: OwnFlow) bool {
     each summaries as s {
         let summary = s ?! continue
-        if summary.escapes.contains(i) || summary.escapes_deep.contains(i) : return true
-        if own_into_outside(summary.into, i, inputs, into_view, state, flow) || own_into_outside(summary.into_deep, i, inputs, into_view, state, flow) : return true
+        let e: uint = 0
+        while e + 1 < summary.escapes.length {
+            if (summary.escapes.get(e) !? OWN_NONE) == i : return true
+            e += 2
+        }
+        let m: uint = 0
+        while m + 3 < summary.moves.length {
+            let from = summary.moves.get(m) !? OWN_NONE
+            let to = summary.moves.get(m + 2) !? OWN_NONE
+            m += 4
+            if from != i || (into_view.get(to) !? false) : continue
+            let target = inputs.get(to) !? null
+            if isset(target) && own_is_outside(state, flow, own_value_reach(flow.g, target)) : return true
+        }
     }
     return false
 }
 
-fn own_into_outside(pairs: Array[uint], i: uint, inputs: Array[?Value], into_view: Array[bool], state: OwnState, flow: OwnFlow) bool {
-    let pair: uint = 0
-    while pair + 1 < pairs.length {
-        let from = pairs.get(pair) !? OWN_NONE
-        let to = pairs.get(pair + 1) !? OWN_NONE
-        pair += 2
-        if from != i || (into_view.get(to) !? false) : continue
-        let target = inputs.get(to) !? null
-        if isset(target) && own_is_outside(state, flow, own_value_reach(flow.g, target)) : return true
-    }
-    return false
-}
-
-// The objects an allocation or a call result points to exist from here on
+// What an allocation or a call makes exists from here on
 fn own_note_allocations(value: Value, state: OwnState, flow: OwnFlow) {
     let meta = value.meta ?! return
-    if meta.own_round != flow.g.round || meta.own_inner == OWN_NONE : return
+    if meta.own_round != flow.g.round : return
+    if value.type == VAL.call {
+        if meta.own_made != 0 : state.allocated.add(meta.own_made)
+        return
+    }
+    if meta.own_inner == OWN_NONE : return
     state.allocated.add_all(flow.g.pts.get(meta.own_inner) !? OwnSet{})
 }
 
 fn own_is_inline_decl(value: ?Value) bool {
     let v = value ?! return false
     return v.type == VAL.decl && own_is_inline_value(v.rett)
+}
+
+fn own_line(at: ?Exp) String {
+    let exp = at ?! return "?"
+    return exp.src.line_of(exp.i.to(u32)).to_string()
+}
+
+////////////////////////////
+// Locks
+////////////////////////////
+
+// The locks whose data a set of objects holds
+fn own_locks_of(g: OwnGraph, set: OwnSet) Array[uint] {
+    let ids = Array[uint]{}
+    each set.items() as o {
+        let obj = g.objs.get(o) ! continue
+        if obj.lock_id != 0 : ids.append(obj.lock_id, true)
+    }
+    return ids
+}
+
+// Data of one lock goes only under that same lock: a target that may be either of two
+// locks takes none of it
+fn own_lock_move_ok(g: OwnGraph, moved: OwnSet, target: OwnSet) bool {
+    let from = own_locks_of(g, moved)
+    if from.length == 0 : return true
+    let into = own_locks_of(g, target)
+    if into.length == 0 : return true
+    if into.length > 1 : return false
+    each from as id {
+        if !into.contains(id) : return false
+    }
+    return true
+}
+
+fn own_moves_across_locks(summaries: Array[?OwnSummary], i: uint, inputs: Array[?Value], into_view: Array[bool], flow: OwnFlow) bool {
+    let moved_value = inputs.get(i) !? null
+    if !isset(moved_value) : return false
+    let moved = own_value_reach(flow.g, moved_value)
+    each summaries as s {
+        let summary = s ?! continue
+        if own_pairs_cross(summary.moves, i, inputs, into_view, moved, flow) : return true
+    }
+    return false
+}
+
+fn own_pairs_cross(moves: Array[uint], i: uint, inputs: Array[?Value], into_view: Array[bool], moved: OwnSet, flow: OwnFlow) bool {
+    let m: uint = 0
+    while m + 3 < moves.length {
+        let from = moves.get(m) !? OWN_NONE
+        let to = moves.get(m + 2) !? OWN_NONE
+        m += 4
+        if from != i || !(into_view.get(to) !? false) : continue
+        let target = inputs.get(to) !? null
+        if !isset(target) : continue
+        if !own_lock_move_ok(flow.g, moved, own_value_reach(flow.g, target)) : return true
+    }
+    return false
+}
+
+// A direct store of locked data into locked data
+fn own_check_lock_store(assign: Value, flow: OwnFlow) !Error {
+    let left = assign.value1 ?! return
+    let right = assign.value2 ?! return
+    if left.type == VAL.decl || !own_tracks(right.rett) || own_is_raw(right.rett) : return
+    let container = left.value1 ?! return
+    let moved = own_value_reach(flow.g, right)
+    if own_locks_of(flow.g, moved).length == 0 : return
+    if !own_lock_move_ok(flow.g, moved, own_value_reach(flow.g, container)) {
+        own_report(flow, assign.exp, "Data under one lock cannot be stored under another lock") !>
+    }
+}
+
+// Locked data of a parameter: what the set reaches includes that parameter's objects and no
+// lock this function takes itself
+fn own_holds_params(g: OwnGraph, set: OwnSet) bool {
+    let found = false
+    each set.items() as o {
+        let obj = g.objs.get(o) ! return false
+        if obj.kind == OWN_OBJ.lock : return false
+        if obj.kind == OWN_OBJ.param || obj.kind == OWN_OBJ.deep : found = true
+    }
+    return found
+}
+
+// What a value's uniqueness depends on: a literal's new object is fresh, so only the values
+// put into it count; anything else is everything it reaches
+fn own_fresh_reach(g: OwnGraph, value: Value, inner: bool (false)) OwnSet {
+    let v = value
+    // The same value under another type
+    while (v.type == VAL.cast || v.type == VAL.wrap || v.type == VAL.interface_wrap || v.type == VAL.shared_view) && isset(v.value1) {
+        v = v.value1 ?! break
+    }
+    let kind = v.type
+    if kind == VAL.null || kind == VAL.string || kind == VAL.undefined : return OwnSet{}
+    let result = OwnSet{}
+    if kind == VAL.class_init || kind == VAL.array_init || (kind == VAL.multi && !isset(v.value1)) {
+        // A hook literal: the object, then the calls that fill it with their arguments
+        let base = v.value1
+        if kind == VAL.class_init && isset(base) {
+            let built = base.get_pre_value()
+            if isset(built) && built.type == VAL.assign {
+                let constructed = built.value2
+                if isset(constructed) : result.add_all(own_fresh_reach(g, constructed))
+            } else {
+                result.add_all(own_fresh_reach(g, base))
+            }
+            let hooks = v.values
+            if isset(hooks) {
+                each hooks as hook {
+                    let args = hook.values ?! continue
+                    each args as arg : result.add_all(own_fresh_reach(g, arg))
+                }
+            }
+            return result
+        }
+        let parts = v.values
+        if isset(parts) {
+            each parts as part : result.add_all(own_fresh_reach(g, part))
+        }
+        return result
+    }
+    // A local buffering a value: that value
+    if kind == VAL.decl {
+        let decl = v.decl
+        let pre = v.get_pre_value()
+        if isset(decl) && decl.is_buffer && isset(pre) && pre.type == VAL.assign {
+            let stored = pre.value2
+            if isset(stored) : return own_fresh_reach(g, stored)
+        }
+    }
+    return own_value_reach(g, v, inner)
 }
