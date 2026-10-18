@@ -882,6 +882,14 @@ my_func() _
 let v = my_func() !!
 ```
 
+The alternative after `!?` ends at a comparison, `&&`, `||` or `? :`, the same as the right side
+of `??`. Arithmetic still belongs to it:
+
+```rust
+if count() !? 0 == limit { }   // (count() !? 0) == limit
+let n = count() !? 1 + 2       // count() !? (1 + 2)
+```
+
 An `if`, `while` or `each` may carry a handler on its condition; the `{` that follows opens the
 body, not a class init:
 
@@ -891,9 +899,9 @@ while rows.next() ! panic("Cannot read: %{E.message}") {
 }
 ```
 
-A handler written as a block is the exception: `while value() ! { ... }` reads that block as the
-handler, so a loop that needs a body as well puts the condition in parentheses,
-`while (value() ! { ... }) { ... }`.
+A handler written as a block takes the first block, and the body follows as a second one:
+`while value() ! { ... } { ... }`. In a `while` condition the handler may `break` or `continue`
+the loop.
 
 You can access all error information with the `E` identifier. `E.code` contains the error code that was thrown. `error_is(E.code, name)` compares against one or more bare code names and is the same as `E.code == E.name`:
 
@@ -1562,6 +1570,8 @@ fn print(msg: ?String) {
     println(msg)
 }
 ```
+
+`??` binds tighter than comparisons, `&&`, `||` and `? :`: `a ?? 0 == b` is `(a ?? 0) == b`.
 
 `?.` reads through a value that may be null: `user?.address?.city` is null when
 `user` or its `address` is, and a null ends the rest of the chain, so steps that
