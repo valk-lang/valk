@@ -76,6 +76,10 @@ struct Gc {
     // Unmarked items in other threads' blocks: freed by the next shared collection, while
     // those threads are stopped
     foreign_dead: *Bump (Bump.new())
+    // Slots freed outside a collection inside an open allocation window (see note_window_free)
+    window_freed: *Bump (Bump.new())
+    // Shared items found on the stack only matter to a shared collection's marking
+    scanning_shared: bool (false)
     stress_count: uint (0)      // Allocations since the last forced collection (GC_STRESS)
     mark_list: *Lifo (Lifo.new())
     props_removed: *Lifo (Lifo.new())
@@ -199,6 +203,7 @@ struct Gc {
 
     fn collect_run(kind: CollectKind) {
         this.state = GcState.collecting
+        this.scanning_shared = kind == CollectKind.shared
         if this.sweep_pending : this.sweep_shared()
 
         let pause_start = time.mono_us()
@@ -230,6 +235,8 @@ struct Gc {
             this.free_epoch = shared_free_epoch
             touch_all_blocks(this.alc_list_ptr[0])
         }
+        // The scan is done and the settle closes the windows
+        this.clear_window_freed()
         close_current_alloc_windows(this.alc_list_ptr[0])
         settle_blocks(this.touched_blocks, this.alc_list_ptr[0])
 
@@ -298,7 +305,20 @@ struct Gc {
             if pause_last_us > pause_max_us : pause_max_us = pause_last_us
         }
 
+        this.scanning_shared = false
         this.state = kind == CollectKind.shutdown ? GcState.stopping : GcState.idle
+    }
+
+    fn clear_window_freed() {
+        let list = this.window_freed
+        let adr = list.data
+        let end = adr + list.index
+        while adr < end {
+            let data = @ptrv(adr, *GcData)
+            adr = adr.$offset(size_of(ptr))
+            data.co_count = 0
+        }
+        list.reset()
     }
 
     fn leak_check() {
@@ -587,6 +607,8 @@ struct Gc {
         }
         #end
         let data = gcdata(item)
+        // Another thread may be sweeping it
+        if data.is_shared() && !this.scanning_shared : return
         if data.is_on_stack() : return
         data.set_on_stack()
         if data.is_shared() {
@@ -704,7 +726,7 @@ struct Gc {
         if gcd.is_shared() : return item
         if range.gc != this.@cast(?*Gc) : return null
         if gcd.is_not_new() : return item
-        if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) : return item
+        if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) && gcd.co_count != WINDOW_FREED : return item
         return null
     }
 
@@ -725,6 +747,7 @@ struct Gc {
     // live items are only read. Items shared since then follow the boundary and stay
     fn sweep_shared() {
         this.sweep_pending = false
+        mark_alloc_limits(this.alc_list_ptr[0])
         let list = this.shared_items
         let data = list.data
         let read = data
@@ -741,13 +764,14 @@ struct Gc {
                 continue
             }
             // A thread may share an item another thread allocated, such as a thread's result
-            let block = item_data.block().@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET)
+            let block = shared_item_block(item_data)
             if @ptrv(block, ?ptr, b_owner) != this.@cast(ptr) {
                 this.foreign_dead.add_ptr(item)
                 continue
             }
             touch_block(block)
             free_shared_item(item)
+            note_window_free(item_data, block)
         }
 
         let tail = list.index - this.sweep_end
@@ -815,6 +839,7 @@ struct Gc {
         this.blanks.free()
         this.touched_blocks.free()
         this.foreign_dead.free()
+        this.window_freed.free()
         this.dis_owned_list.free()
         this.re_own_list.free()
         this.adopted.free()
