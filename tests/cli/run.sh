@@ -144,17 +144,37 @@ fi
 echo "> Cache directories no build used for days are removed"
 cache_home="$workdir/cache-home"
 cache_root="$cache_home/.valk/cache"
-mkdir -p "$cache_root/old-dir" "$cache_root/recent-dir"
-printf '1000' > "$cache_root/old-dir/last-used"
-printf '%s' "$(( $(date +%s) * 1000 ))" > "$cache_root/recent-dir/last-used"
+mkdir -p "$cache_root/old-dir/sub" "$cache_root/recent-dir" "$cache_root/stampless-dir" "$cache_root/locked-dir"
+printf 'x' > "$cache_root/old-dir/unit.o"
+printf 'x' > "$cache_root/old-dir/sub/unit.o"
+for dir in old-dir recent-dir locked-dir; do printf 'x' > "$cache_root/$dir/last-used"; done
+# The age is the stamp's modification time, or the directory's when there is no stamp
+touch -t 200001010000 "$cache_root/old-dir/last-used" "$cache_root/stampless-dir" "$cache_root/locked-dir/last-used"
+lock_pid=""
+if command -v flock > /dev/null; then
+    flock "$cache_root/locked-dir/cache.lock" sleep 30 &
+    lock_pid=$!
+    sleep 0.2
+else
+    rm -rf "$cache_root/locked-dir"
+fi
 trim_out=$(HOME="$cache_home" USERPROFILE="$cache_home" build) || { echo "$trim_out"; exit 1; }
-if [ -e "$cache_root/old-dir" ] || [ ! -d "$cache_root/recent-dir" ] || [ ! -f "$cache_root/last-trim" ]; then
+if [ -e "$cache_root/old-dir" ] || [ -e "$cache_root/stampless-dir" ] || [ ! -d "$cache_root/recent-dir" ] || [ ! -f "$cache_root/last-trim" ]; then
     echo "# The cache trim removed the wrong directories"
     ls -la "$cache_root"
     exit 1
 fi
+if [ -n "$lock_pid" ]; then
+    kill "$lock_pid" 2> /dev/null
+    wait "$lock_pid" 2> /dev/null
+    if [ ! -f "$cache_root/locked-dir/last-used" ]; then
+        echo "# The cache trim removed a directory a build holds the lock of"
+        exit 1
+    fi
+fi
 mkdir -p "$cache_root/old-dir"
-printf '1000' > "$cache_root/old-dir/last-used"
+printf 'x' > "$cache_root/old-dir/last-used"
+touch -t 200001010000 "$cache_root/old-dir/last-used"
 trim_out=$(HOME="$cache_home" USERPROFILE="$cache_home" build) || { echo "$trim_out"; exit 1; }
 if [ ! -d "$cache_root/old-dir" ]; then
     echo "# The cache was trimmed again within the hour"
