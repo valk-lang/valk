@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Calls every public method of the core collections on a plain value, a `shared` view and a
-# `locked` view, compiles each call on its own and sorts the results: compiles, refused in
-# the caller (with the message), or failed inside the stdlib, which is always a bug.
+# `locked` view, compiles each call and sorts the results: compiles, refused in the caller
+# (with the message), or failed inside the stdlib, which is always a bug. The calls expected
+# to compile are built together per subject and context, alone again if that fails.
 #
 #   tests/views/gen.py [--valk ./valk] [--jobs 8] [--only Array] [--update]
 #
@@ -158,43 +159,48 @@ class Holder {
 }
 """
 
-BODIES = {
-    "plain": """fn subject(h: Holder) {
+# One function per call; a program holds one call, or every call of a subject and context that
+# is expected to compile, since a program that compiles proves each of its calls does
+SUBJECTS_CODE = {
+    "plain": """fn subject%d(h: Holder) {
     let x = h.p
     %s
 }
-fn main() {
-    subject(Holder {})
-}
 """,
-    "shared": """fn subject(h: shared Holder) {
+    "shared": """fn subject%d(h: shared Holder) {
     let x = h.p
     %s
 }
-fn main() {
-    let h: shared Holder = Holder {}
-    subject(h)
-}
 """,
-    "locked": """fn subject(l: shared Lock[Holder]) {
+    "locked": """fn subject%d(l: shared Lock[Holder]) {
     lock l as h {
         let x = h.p
         %s
     }
 }
-fn main() {
-    let l: shared Lock[Holder] = .new(Holder {}) !!
-    subject(l)
-}
 """,
 }
+
+MAINS = {
+    "plain": ("fn main() {\n", "    subject%d(Holder {})\n"),
+    "shared": ("fn main() {\n    let h: shared Holder = Holder {}\n", "    subject%d(h)\n"),
+    "locked": ("fn main() {\n    let l: shared Lock[Holder] = .new(Holder {}) !!\n", "    subject%d(l)\n"),
+}
+
+
+def program(ptype, default, ctx, codes):
+    default_text = default if default.startswith("(") else "(%s)" % default
+    head, call = MAINS[ctx]
+    return (PRELUDE % (ptype, default_text)
+            + "".join(SUBJECTS_CODE[ctx] % (i, code) for i, code in enumerate(codes))
+            + head + "".join(call % i for i in range(len(codes))) + "}\n")
 
 
 def build(valk, workdir, key, source):
     path = os.path.join(workdir, re.sub(r"[^A-Za-z0-9]+", "_", key) + ".valk")
     with open(path, "w") as fh:
         fh.write(source)
-    proc = subprocess.run([valk, "build", path, "-o", path[:-5], "--no-warn"], capture_output=True, text=True)
+    proc = subprocess.run([valk, "build", path, "-o", path[:-5] + ".ll", "--no-warn", "--ir"], capture_output=True, text=True)
     out = proc.stdout + proc.stderr
     with open(path[:-5] + ".log", "w") as fh:
         fh.write(out)
@@ -223,26 +229,42 @@ def main():
                     "-o", doc_path, "--no-private"], check=True, capture_output=True)
     core = json.load(open(doc_path))["namespaces"]["core"]["classes"]
 
+    expected_path = os.path.join(HERE, "expected.txt")
+    expected = set(open(expected_path).read().splitlines()) if os.path.exists(expected_path) else set()
+    expected_ok = set(l.split(" | ")[0] for l in expected if l.endswith(" | ok"))
+
     jobs = []
+    groups = []
     for label, cls, args, ptype, default in SUBJECTS:
         if opts.only and opts.only not in label:
             continue
-        for name, f in methods(core[cls], cls, args):
-            for ctx in CONTEXTS:
+        for ctx in CONTEXTS:
+            batch = []
+            for name, f in methods(core[cls], cls, args):
                 code = call_code(name, f, args, ctx)
                 key = "%s.%s %s" % (label, name, ctx)
-                if code is None:
-                    jobs.append((key, None))
-                    continue
-                default_text = default if default.startswith("(") else "(%s)" % default
-                jobs.append((key, PRELUDE % (ptype, default_text) + BODIES[ctx] % code))
+                jobs.append((key, None if code is None else program(ptype, default, ctx, [code])))
+                if code is not None and key in expected_ok:
+                    batch.append((key, code))
+            if batch:
+                groups.append((label + " " + ctx, program(ptype, default, ctx, [c for _, c in batch]), [k for k, _ in batch]))
 
     workdir = tempfile.mkdtemp(prefix="valk-views-")
     results = {}
     with ThreadPoolExecutor(opts.jobs) as pool:
-        futures = {key: pool.submit(build, opts.valk, workdir, key, src) for key, src in jobs if src}
+        batches = {name: pool.submit(build, opts.valk, workdir, name, src) for name, src, _ in groups}
+        proven = set()
+        for name, _, keys in groups:
+            if batches[name].result()[0] == "ok":
+                proven.update(keys)
+        futures = {key: pool.submit(build, opts.valk, workdir, key, src) for key, src in jobs if src and key not in proven}
         for key, src in jobs:
-            results[key] = ("skipped", "no argument for a parameter type") if src is None else futures[key].result()
+            if src is None:
+                results[key] = ("skipped", "no argument for a parameter type")
+            elif key in proven:
+                results[key] = ("ok", "")
+            else:
+                results[key] = futures[key].result()
 
     lines = []
     for key in sorted(results):
@@ -250,11 +272,9 @@ def main():
         lines.append("%s | %s%s" % (key, kind, (" | " + message) if message else ""))
     bugs = [l for l in lines if " | stdlib | " in l]
 
-    expected_path = os.path.join(HERE, "expected.txt")
     if opts.update:
         with open(expected_path, "w") as fh:
             fh.write("\n".join(lines) + "\n")
-    expected = set(open(expected_path).read().splitlines()) if os.path.exists(expected_path) else set()
     changed = [l for l in lines if l not in expected and not opts.only] if expected else []
 
     if opts.only:
