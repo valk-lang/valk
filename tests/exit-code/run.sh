@@ -48,7 +48,7 @@ cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-l
 # Panic locations are relative to the package root, or the working directory
 # for loose files; a dependency names its package
 cases="$cases panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:1:tests/exit-code/fixed-array-bounds.valk:4"
-cases="$cases panic-in-library:1:ByteBuffer.valk:124"
+cases="$cases panic-in-library:1:ByteBuffer.valk:130"
 # A `test-` fixture is built with --test: a panic names its test and prints the summary
 cases="$cases test-crash-named:1:panicked"
 # Windows delivers the overflow exception only when it can still push a frame
@@ -110,7 +110,7 @@ run_case() {
         : > "$fail"
     fi
 
-    if [ "$name" = "panic-in-library" ] && [[ "$output" != *"Index out of bounds at src/core/ByteBuffer.valk:124 in package valk"* ]]; then
+    if [ "$name" = "panic-in-library" ] && [[ "$output" != *"Index out of bounds at src/core/ByteBuffer.valk:130 in package valk"* ]]; then
         echo "# Missing library panic location or package name: $output" >> "$log"
         : > "$fail"
     fi
