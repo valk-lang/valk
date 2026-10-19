@@ -129,6 +129,15 @@ if [ "$(uname -s)" = Linux ] && command -v readelf >/dev/null 2>&1; then
     fi
 fi
 
+if "$VALK" build "$input" --no-warn -vv -o "$output" 2>&1 | grep -q "ld.lld (built in)"; then
+    echo "> The built-in linker needs no linker on the PATH"
+    VALK_BIN=$(cd "$(dirname "$VALK")" && pwd)/$(basename "$VALK")
+    if ! env PATH=/nonexistent "$VALK_BIN" build "$input" --no-warn -c -o "$output" >/dev/null 2>&1 || ! "$output"; then
+        echo "# Linking failed without a linker on the PATH"
+        exit 1
+    fi
+fi
+
 echo "> Reopening the object-cache lock preserves its contents"
 lock_file="$default_cache/cache.lock"
 if [ ! -f "$lock_file" ]; then

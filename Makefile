@@ -42,10 +42,25 @@ endif
 TEST_FLAGS := --test --def "DEF_TEST=TestValue" --def "GC_DEBUG=1" --no-warn-deprecated -vv
 BENCH_JSON_ITERATIONS ?= 2000000
 
+# lld inside the compiler, when it is there: the local build compiles the shim against the
+# system's LLVM, a static build takes libvalk-lld.a from the vendored libraries
+ifneq ($(and $(filter Linux,$(HOST_SYSTEM)),$(wildcard /usr/include/lld/Common/Driver.h)),)
+LLD_SHIM := debug/libvalk-lld.a
+LLD_FLAGS := --def "LLD=1" -L debug
+endif
+ifneq ($(wildcard $(LLVM_DIR)/lib/libvalk-lld.a),)
+STATIC_LLD_FLAGS := --def "LLD=1"
+endif
+
 # The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
 # release targets link the vendored static one
-valk: $(COMPILER_DEPS)
-	$(VC) build . -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
+valk: $(COMPILER_DEPS) $(LLD_SHIM)
+	$(VC) build . -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS) $(LLD_FLAGS)
+
+debug/libvalk-lld.a: src/llvm/lld/lld.cpp
+	mkdir -p debug
+	c++ -O2 -fPIC $$(llvm-config --cxxflags) -c $< -o debug/valk-lld.o
+	ar rcs $@ debug/valk-lld.o
 
 valkexe: $(COMPILER_DEPS)
 	$(VC) build . -o ./valk -vv $(FLAGS) --target win-x64 --static \
@@ -63,7 +78,7 @@ valkd: $(COMPILER_DEPS)
 	gdb --args $(VC) build . -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
 
 static: $(COMPILER_DEPS)
-	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
 
 install: valk
 	rm -rf ~/.vman/versions/${VERSION}/
