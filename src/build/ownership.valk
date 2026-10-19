@@ -24,60 +24,83 @@ global own_next_key: uint (2)
 value OWN_GLOBAL (0)
 value OWN_NEW (1)
 
+// Words are read through the storage pointer: Array.get is too slow for the solver
 class OwnSet {
     words: Array[uint] (.{})
 
+    fn word(w: uint) uint {
+        if w >= this.words.length : return 0
+        return @ptrv(this.words.items(), uint, w)
+    }
+    fn grow(length: uint) {
+        while this.words.length < length : this.words.append(0)
+    }
     fn has(i: uint) bool {
-        let w = i / 64
-        if w >= this.words.length : return false
-        return (((this.words.get(w) !? 0) >> (i % 64)) & 1) == 1
+        return ((this.word(i / 64) >> (i % 64)) & 1) == 1
     }
     fn add(i: uint) bool {
         let w = i / 64
-        while this.words.length <= w : this.words.append(0)
-        let old = this.words.get(w) !? 0
+        this.grow(w + 1)
+        let data = this.words.items()
+        let old = @ptrv(data, uint, w)
         let bit: uint = 1 << (i % 64)
         if (old & bit) != 0 : return false
-        this.words.set(w, old | bit) _
+        @ptrv(data, uint, w) = old | bit
         return true
     }
     fn add_all(other: OwnSet) bool {
+        let n = other.words.length
+        this.grow(n)
+        let data = this.words.items()
+        let from = other.words.items()
         let changed = false
-        while this.words.length < other.words.length : this.words.append(0)
-        each other.words as w, i {
-            let old = this.words.get(i) !? 0
-            let joined = old | w
+        let i: uint = 0
+        while i < n {
+            let old = @ptrv(data, uint, i)
+            let joined = old | @ptrv(from, uint, i)
             if joined != old {
-                this.words.set(i, joined) _
+                @ptrv(data, uint, i) = joined
                 changed = true
             }
+            i++
         }
         return changed
     }
     fn intersects(other: OwnSet) bool {
-        each this.words as w, i {
-            if (w & (other.words.get(i) !? 0)) != 0 : return true
+        let n = this.words.length
+        let i: uint = 0
+        while i < n {
+            if (this.word(i) & other.word(i)) != 0 : return true
+            i++
         }
         return false
     }
     fn is_empty() bool {
-        each this.words as w {
-            if w != 0 : return false
-        }
-        return true
+        return this.next(0) == OWN_NONE
     }
     fn items() Array[uint] {
         let result = Array[uint]{}
-        each this.words as w, i {
-            let bits = w
-            let base = i * 64
-            while bits != 0 {
-                let low = bits.trailing_zeros()
-                result.append(base + low)
-                bits = bits & (bits - 1)
-            }
+        let i = this.next(0)
+        while i != OWN_NONE {
+            result.append(i)
+            i = this.next(i + 1)
         }
         return result
+    }
+    // The first member at or after `from`, or OWN_NONE
+    fn next(from: uint) uint {
+        let w = from / 64
+        let n = this.words.length
+        if w >= n : return OWN_NONE
+        let data = this.words.items()
+        let shift = from % 64
+        let bits = (@ptrv(data, uint, w) >> shift) << shift
+        while bits == 0 {
+            w++
+            if w >= n : return OWN_NONE
+            bits = @ptrv(data, uint, w)
+        }
+        return w * 64 + bits.trailing_zeros()
     }
     fn copy() OwnSet {
         return OwnSet { words: this.words.copy() }
@@ -85,14 +108,19 @@ class OwnSet {
     // What this has and `other` does not
     fn without(other: OwnSet) OwnSet {
         let result = OwnSet{}
-        each this.words as w, i : result.words.append(w & ~(other.words.get(i) !? 0))
+        let n = this.words.length
+        let i: uint = 0
+        while i < n {
+            result.words.append(this.word(i) & ~other.word(i))
+            i++
+        }
         return result
     }
     fn remove(i: uint) {
         let w = i / 64
         if w >= this.words.length : return
         let bit: uint = 1 << (i % 64)
-        this.words.set(w, (this.words.get(w) !? 0) & ~bit) _
+        @ptrv(this.words.items(), uint, w) = this.word(w) & ~bit
     }
 }
 
@@ -262,6 +290,8 @@ class OwnGraph {
     obj_watch: Array[OwnSet] (.{})
     applying: uint (0)
     solved: bool (false)
+    // Callees whose summary changed since the last solve
+    changed: Array[Func] (.{})
     // Per object: the callees whose inert new objects it holds (own_apply_summary)
     held_made: Array[?Array[Func]] (.{})
     // After solving: what each variable reaches (the checks ask for the same ones often)
@@ -293,7 +323,11 @@ class OwnGraph {
     }
     fn wake_obj(o: uint) {
         let set = this.obj_watch.get(o) ! return
-        each set.items() as c : this.push(c)
+        let c = set.next(0)
+        while c != OWN_NONE {
+            this.push(c)
+            c = set.next(c + 1)
+        }
     }
     // The constraint being applied reads the contents of `o`
     fn watch_obj(o: uint) {
@@ -384,14 +418,30 @@ class OwnGraph {
     // `local`: not through GLOBAL, whose contents are everything that escapes at any point
     fn deep(from: OwnSet, local: bool (false)) OwnSet {
         let result = from.copy()
-        let work = from.items()
-        while work.length > 0 {
-            let o = work.pop_last() ! break
-            if local && o == OWN_GLOBAL : continue
-            let inside = this.contents.get(o) ! continue
-            each inside.items() as next {
-                if result.add(next) : work.append(next)
+        // Objects whose contents are not added yet
+        let work = from.copy()
+        let o = work.next(0)
+        while o != OWN_NONE {
+            work.remove(o)
+            if !local || o != OWN_GLOBAL {
+                let inside = this.contents.get(o) !? own_empty
+                let n = inside.words.length
+                result.grow(n)
+                work.grow(n)
+                let have = result.words.items()
+                let todo = work.words.items()
+                let add = inside.words.items()
+                let i: uint = 0
+                while i < n {
+                    let fresh = @ptrv(add, uint, i) & ~@ptrv(have, uint, i)
+                    if fresh != 0 {
+                        @ptrv(have, uint, i) = @ptrv(have, uint, i) | fresh
+                        @ptrv(todo, uint, i) = @ptrv(todo, uint, i) | fresh
+                    }
+                    i++
+                }
             }
+            o = work.next(0)
         }
         return result
     }
@@ -433,10 +483,20 @@ fn own_solve(g: OwnGraph) {
             g.push(i)
         }
     } else {
-        // A callee's summary changed: its calls apply again
+        // Calls to a callee whose summary changed apply again
         each g.cons as c, i {
-            if c.op == OWN_C.call : g.push(i)
+            if c.op != OWN_C.call : continue
+            let call = c.call ?! continue
+            let f = call.func ?! continue
+            if g.changed.contains(f) : g.push(i)
+            else {
+                let impls = f.own_impls ?! continue
+                each impls as impl {
+                    if g.changed.contains(impl) { g.push(i); break }
+                }
+            }
         }
+        g.changed.clear()
     }
     while true {
         let at: uint = 0
@@ -485,11 +545,11 @@ fn own_link(g: OwnGraph, from: uint, to: uint) {
 }
 
 fn own_apply(g: OwnGraph, c: OwnCons) bool {
-    let empty = OwnSet{}
-    if c.op == OWN_C.addr : return (g.pts.get(c.a) !? empty).add(c.b)
-    if c.op == OWN_C.copy : return (g.pts.get(c.a) !? empty).add_all(g.pts.get(c.b) !? empty)
+    let empty = own_empty
+    if c.op == OWN_C.addr : return (g.pts.get(c.a) !? OwnSet{}).add(c.b)
+    if c.op == OWN_C.copy : return (g.pts.get(c.a) !? OwnSet{}).add_all(g.pts.get(c.b) !? empty)
     if c.op == OWN_C.load_obj {
-        let target = g.pts.get(c.a) !? empty
+        let target = g.pts.get(c.a) !? OwnSet{}
         let changed = g.read_field(c.b, c.key, target)
         if g.escaped.has(c.b) && target.add(OWN_GLOBAL) : changed = true
         return changed
@@ -499,9 +559,13 @@ fn own_apply(g: OwnGraph, c: OwnCons) bool {
         return g.write_field(c.a, c.key, g.pts.get(c.b) !? empty)
     }
     if c.op == OWN_C.load {
-        let target = g.pts.get(c.a) !? empty
+        let target = g.pts.get(c.a) !? OwnSet{}
         let changed = false
-        each (g.pts.get(c.b) !? empty).items() as o {
+        let from = g.pts.get(c.b) !? empty
+        let at = from.next(0)
+        while at != OWN_NONE {
+            let o = at
+            at = from.next(at + 1)
             g.watch_obj(o)
             if g.read_field(o, c.key, target) : changed = true
             if g.escaped.has(o) && target.add(OWN_GLOBAL) : changed = true
@@ -511,7 +575,11 @@ fn own_apply(g: OwnGraph, c: OwnCons) bool {
     if c.op == OWN_C.store {
         let value = g.pts.get(c.b) !? empty
         let changed = false
-        each (g.pts.get(c.a) !? empty).items() as o {
+        let into = g.pts.get(c.a) !? empty
+        let at = into.next(0)
+        while at != OWN_NONE {
+            let o = at
+            at = into.next(at + 1)
             if !g.reaches(o, c.seq, c.range) : continue
             if g.write_field(o, c.key, value) : changed = true
         }
@@ -534,8 +602,10 @@ fn own_level_objects(g: OwnGraph, call: OwnCall, i: uint, level: uint, cache: ?A
         }
         let deeper = g.deep(own_held_by(g, last).without(own_global_set()), true)
         if last.has(OWN_GLOBAL) : deeper.add(OWN_GLOBAL)
-        each deeper.items() as o {
+        let o = deeper.next(0)
+        while o != OWN_NONE {
             if o != OWN_GLOBAL : g.watch_obj(o)
+            o = deeper.next(o + 1)
         }
         levels.append(deeper)
     }
@@ -546,13 +616,15 @@ fn own_level_objects(g: OwnGraph, call: OwnCall, i: uint, level: uint, cache: ?A
 // being applied reads them
 fn own_held_by(g: OwnGraph, set: OwnSet) OwnSet {
     let held = OwnSet{}
-    each set.items() as o {
+    let o = set.next(0)
+    while o != OWN_NONE {
         if o == OWN_GLOBAL {
             held.add(OWN_GLOBAL)
-            continue
+        } else {
+            g.watch_obj(o)
+            held.add_all(g.contents.get(o) !? own_empty)
         }
-        g.watch_obj(o)
-        held.add_all(g.contents.get(o) !? OwnSet{})
+        o = set.next(o + 1)
     }
     return held
 }
@@ -606,9 +678,9 @@ fn own_apply_call(g: OwnGraph, call: OwnCall) bool {
 
 fn own_apply_summary(g: OwnGraph, call: OwnCall, given: ?OwnSummary) bool {
     let changed = false
-    let empty = OwnSet{}
+    let empty = own_empty
     let cache = Array[?Array[OwnSet]]{}
-    let result = call.result != OWN_NONE ? (g.pts.get(call.result) !? empty) : empty
+    let result = call.result != OWN_NONE ? (g.pts.get(call.result) !? OwnSet{}) : OwnSet{}
     let summary = given
     if !isset(summary) {
         // Unknown code keeps every argument and may hand back anything
@@ -651,9 +723,11 @@ fn own_apply_summary(g: OwnGraph, call: OwnCall, given: ?OwnSummary) bool {
             if g.write_field(made_object, OWN_ANY_FIELD, stored) : changed = true
             continue
         }
-        each (own_level_objects(g, call, into, into_level, cache)).items() as o {
-            if !g.reaches(o, call.seq, call.range) : continue
-            if g.write_field(o, OWN_ANY_FIELD, stored) : changed = true
+        let targets = own_level_objects(g, call, into, into_level, cache)
+        let o = targets.next(0)
+        while o != OWN_NONE {
+            if g.reaches(o, call.seq, call.range) && g.write_field(o, OWN_ANY_FIELD, stored) : changed = true
+            o = targets.next(o + 1)
         }
     }
     if summary.new_escapes {
@@ -669,10 +743,10 @@ fn own_apply_summary(g: OwnGraph, call: OwnCall, given: ?OwnSummary) bool {
         n += 2
         let made = OwnSet{}
         made.add(made_object)
-        each targets.items() as o {
-            if !g.reaches(o, call.seq, call.range) : continue
-            if inert && !g.first_made_of(o, call.func) : continue
-            if g.write_field(o, OWN_ANY_FIELD, made) : changed = true
+        let o = targets.next(0)
+        while o != OWN_NONE {
+            if g.reaches(o, call.seq, call.range) && (!inert || g.first_made_of(o, call.func)) && g.write_field(o, OWN_ANY_FIELD, made) : changed = true
+            o = targets.next(o + 1)
         }
     }
     n = 0
@@ -682,9 +756,10 @@ fn own_apply_summary(g: OwnGraph, call: OwnCall, given: ?OwnSummary) bool {
         n += 2
         let global = OwnSet{}
         global.add(OWN_GLOBAL)
-        each targets.items() as o {
-            if !g.reaches(o, call.seq, call.range) : continue
-            if g.write_field(o, OWN_ANY_FIELD, global) : changed = true
+        let o = targets.next(0)
+        while o != OWN_NONE {
+            if g.reaches(o, call.seq, call.range) && g.write_field(o, OWN_ANY_FIELD, global) : changed = true
+            o = targets.next(o + 1)
         }
     }
     return changed
@@ -789,6 +864,8 @@ fn own_is_inline_value(type: Type) bool {
     return nn.is_inline || nn.kind == TYPE.union || nn.is_fixed_array_type() || nn.is_tuple_type()
 }
 
+// Read-only
+global own_empty: OwnSet (OwnSet{})
 global own_t_build: uint (0)
 fn own_t_add_build(t: uint) { own_t_build += time.mono_us() - t }
 
@@ -1587,7 +1664,14 @@ fn own_summarize(g: OwnGraph) OwnSummary {
     each g.func.args as arg, j {
         let start = OwnSet{}
         start.add(own_param(g, j, OWN_LEVEL_OBJECT))
-        each (g.deep(start)).items() as o {
+        // What GLOBAL holds is in `escapes` and `global_under` already
+        let seen = OwnSet{}
+        let under = g.deep(start, true)
+        let at = under.next(0)
+        while at != OWN_NONE {
+            let o = at
+            at = under.next(at + 1)
+            if o == OWN_GLOBAL : continue
             let container = g.objs.get(o) ! continue
             let into_level = OWN_LEVEL_NEW
             if container.kind == OWN_OBJ.param || container.kind == OWN_OBJ.deep {
@@ -1596,15 +1680,21 @@ fn own_summarize(g: OwnGraph) OwnSummary {
                 into_level = container.level
             }
             let inside = g.contents.get(o) ! continue
-            each inside.items() as held {
+            let next = inside.next(0)
+            while next != OWN_NONE {
+                let held = next
+                next = inside.next(next + 1)
                 let obj = g.objs.get(held) ! continue
-                if obj.kind == OWN_OBJ.param || obj.kind == OWN_OBJ.deep {
-                    if obj.index == j : continue
-                    own_add_unique(s.moves, Array[uint]{ obj.index, obj.level, j, into_level })
-                } else if (obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call || obj.kind == OWN_OBJ.new) && into_level != OWN_LEVEL_NEW {
-                    own_add_unique(s.new_under, Array[uint]{ j, into_level })
-                } else if obj.kind == OWN_OBJ.global && into_level != OWN_LEVEL_NEW {
-                    own_add_unique(s.global_under, Array[uint]{ j, into_level })
+                let kind = obj.kind
+                if kind == OWN_OBJ.param || kind == OWN_OBJ.deep {
+                    if obj.index == j || !seen.add(held * 8 + into_level) : continue
+                    s.moves.append_many(.{ obj.index, obj.level, j, into_level })
+                } else if into_level == OWN_LEVEL_NEW {
+                    continue
+                } else if kind == OWN_OBJ.site || kind == OWN_OBJ.call || kind == OWN_OBJ.new {
+                    if seen.add(into_level) : s.new_under.append_many(.{ j, into_level })
+                } else if kind == OWN_OBJ.global {
+                    if seen.add(OWN_LEVELS + into_level) : s.global_under.append_many(.{ j, into_level })
                 }
             }
         }
@@ -1881,6 +1971,8 @@ fn own_analyze(build: Build) {
         func.own_summary = s
         let list = func.own_callers ?! continue
         each list as caller {
+            let cg = caller.own_graph ?! continue
+            cg.changed.append(func, true)
             if caller.own_queued : continue
             caller.own_queued = true
             pending.push_back(caller)
