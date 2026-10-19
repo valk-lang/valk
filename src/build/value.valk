@@ -103,8 +103,6 @@ class ValueMeta {
     // Original graph before lowering into temporary storage.
     graph_source: ?Value (null)
     publishes_graph: bool (false)
-    // Published only if this parameter turns out to keep it; otherwise a borrow
-    publish_if_kept: ?Arg (null)
     // Reported when the published graph is not unique
     publish_message: ?String (null)
     // Published as shared, not moved into locked data
@@ -119,11 +117,6 @@ class ValueMeta {
     copied_element: bool (false)
     // An element read through a read-only borrow: its slot may not be written
     readonly_element: bool (false)
-    publication_holds: ?Array[?Decl] (null)
-    // Frame storage lent to this call argument; the callee keeps it in an
-    // object (its result or another argument) that must stay in the frame
-    lent_borrow: bool (false)
-    publication_store: ?Value (null)
     init_prop: ?Prop (null)
     implicit_borrow: bool (false)
     reads_storage: bool (false)
@@ -6079,53 +6072,6 @@ fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Erro
     }
 }
 
-// A method on locked data may keep what it is handed: anything the callee
-// stores into its receiver (or lets escape) must be a unique graph, since it
-// is published with the locked data and must not keep an ordinary alias.
-fn value_check_locked_call_arg(func: Func, param_i: uint, av: Value, receiver: Value, ctx: Context, at: Exp) !Error {
-    let nn = av.rett.get_non_nullable()
-    if !av.rett.has_gc_refs() && nn.kind != TYPE.closure : return
-    if nn.is_shared || nn.is_locked : return
-    // Moved around inside the locked graph it already belongs to
-    if value_stays_inside(av, receiver) : return
-    // The ownership walk derives this from the callee's summary
-    if own_authority() : return
-    let string_class = type_string(func.ns.build).get_class_or_null()
-    if isset(string_class) && nn.get_class_or_null() == string_class : return
-    // A variant made for this call has no summary yet: analyze its body now
-    ensure_func_unique_return_summary(func) !>
-    let moves_in = !func.unique_summary_ready
-        || func_arg_may_escape(func, param_i)
-        || func_arg_invalidates_unique(func, param_i)
-    if !moves_in {
-        let receiver_arg = func.args.get(0) !? null
-        if isset(receiver_arg) : decl_resolve_pending_absorbs(receiver_arg.decl) !>
-        let absorbs = isset(receiver_arg) ? receiver_arg.absorbs_args : null
-        moves_in = isset(absorbs) && absorbs.contains(param_i)
-    }
-    // Flags that may still flip are checked again once they settle
-    let param = func.args.get(param_i) !? null
-    if !moves_in && isset(param) && !func_arg_summary_settled(func, param_i) && !isset(param.cannot_locked_move_pos) {
-        let e = av.exp ?? at
-        param.cannot_locked_move_pos = Pos { src: e.src, i: e.i }
-    }
-    if !moves_in : return
-    if !(value_require_unique_graph(av) !>) {
-        // Came in through a parameter of this function: the receiver absorbs
-        // it, and the outer call site proves uniqueness instead.
-        // Only when the locked data is the caller's too: data locked in here is not
-        let owner = ctx.get_func() !>
-        let sources = value_summary_source_args(av, owner)
-        let root = value_root_decl(receiver)
-        if isset(sources) && isset(root) && isset(func_arg_index(owner, root)) {
-            value_mark_summary_absorbs(receiver, sources)
-            return
-        }
-        av.error("Only a provably unique value graph can be handed to a method on locked data; a mutable alias may remain")
-    }
-    value_publish_unique(av, ctx) !>
-}
-
 fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp, check_pointer_args: bool (true), is_coroutine: bool (false)) !Error {
     // Ensure signature types are resolved
     if !func.parsed_types {
@@ -6199,10 +6145,8 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                     at.error("Cannot call '" + func.name + "' on frame storage: the method keeps its receiver beyond the call, and the storage dies with this frame")
                 }
                 let settled = func_arg_summary_settled(func, 0)
-                if absorbed || !settled || (func.returns_unique_graph && func.unique_return_args.contains(0)) {
-                    receiver.ensure_meta().lent_borrow = true
-                    owner.has_lends = true
-                }
+                // The callee may keep the storage in an object that must stay in the frame
+                if absorbed || !settled || (func.returns_unique_graph && func.unique_return_args.contains(0)) : owner.has_lends = true
                 if !settled && !isset(receiver_arg.cannot_escape_pos) : receiver_arg.cannot_escape_pos = Pos { src: at.src, i: at.i }
             }
             // A flag that is already set is final; the rest may still flip
@@ -6269,7 +6213,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             let accepts_stack_borrow = false
             // Storage the callee keeps in its result or in another argument is
             // lent: the object holding it may not leave this frame, which the
-            // publication-flow pass checks once every summary has settled
+            // ownership walk checks once every summary has settled
             let lends_into_holder = false
             if !is_coroutine && param.type.get_non_nullable().is_owned_borrow()
                 && !param.type.get_non_nullable().is_local
@@ -6286,47 +6230,11 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                     param.cannot_escape_pos = Pos { src: at.src, i: at.i }
                 }
             }
-            // Passing an ordinary graph to a shared parameter is either a
-            // borrow or a publish, and only the callee's summary says which.
-            // Settle it here when we can: deferring the decision means no
-            // publish is emitted, and a callee that turns out to store the
-            // value would keep an unpublished object in shared storage.
-            if !func.unique_summary_ready
-                && param.type.get_non_nullable().is_shared
-                && !av.rett.get_non_nullable().is_shared
-            {
-                ensure_func_unique_return_summary(func) !>
-            }
             let settled = func_arg_summary_settled(func, param_i)
-            // A literal has no other owner, so it is published rather than
-            // borrowed: the callee may keep it, whatever its summary says
+            // Lent for the call; the ownership walk publishes it when the callee keeps it. A
+            // literal has no other owner and a coroutine keeps its arguments: those are published
             let fresh_literal = av.type == VAL.class_init || av.type == VAL.array_init
-            // A coroutine keeps its arguments past the call, so a temporary
-            // shared view of ordinary or locked data is not enough
-            let accepts_shared_borrow = !fresh_literal && !is_coroutine && (!func.unique_summary_ready
-                || (!func_arg_may_escape(func, param_i) && !func_arg_invalidates_unique(func, param_i)))
-            // A call result proven unique, the same proof a `let` uses, is
-            // published when the callee's summary cannot decide yet: a
-            // callee that turns out to keep it then holds a published graph
-            if accepts_shared_borrow && !settled
-                && param.type.get_non_nullable().is_shared && !av.rett.get_non_nullable().is_shared
-                && value_can_defer_unique_call(av) && (value_has_unique_graph(av) !>)
-            {
-                accepts_shared_borrow = false
-            }
-            // A unique local is published when the callee turns out to keep
-            // it and borrowed otherwise; the publication-flow pass decides
-            // once the flags settle and consumes the local if published
-            // The ownership walk decides from the callee's summary instead
-            let authority = own_authority()
-            if authority : accepts_shared_borrow = !fresh_literal && !is_coroutine
-            let publish_if_kept = !authority && accepts_shared_borrow && !settled
-                && param.type.get_non_nullable().is_shared && !av.rett.get_non_nullable().is_shared
-                && (value_can_publish_local(av) !>)
-            // A borrow accepted on unsettled flags is re-checked once they settle
-            let pending_shared_borrow = !authority && !settled && accepts_shared_borrow && !publish_if_kept
-                && param.type.get_non_nullable().is_shared
-                && !av.rett.get_non_nullable().is_shared
+            let accepts_shared_borrow = !fresh_literal && !is_coroutine
             // Part of the locked graph handed back to a method on that graph
             // is a rearrangement, not a new view
             if isset(receiver) && receiver.rett.get_non_nullable().is_locked
@@ -6337,36 +6245,20 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             }
             let plain_arg = !av.rett.get_non_nullable().is_shared
             av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow, accepts_stack_borrow) !>
-            if authority && accepts_shared_borrow && plain_arg && av.type == VAL.shared_view {
+            if accepts_shared_borrow && plain_arg && av.type == VAL.shared_view {
                 av.ensure_meta().borrow_param = param
                 let caller = ctx.get_func() !>
                 caller.has_publications = true
             }
-            if publish_if_kept {
-                let published = av.type == VAL.shared_view ? av.value1 : null
-                if isset(published) {
-                    let meta = published.ensure_meta()
-                    meta.publishes_graph = true
-                    meta.publish_if_kept = param
-                    let caller = ctx.get_func() !>
-                    caller.has_publications = true
-                } else {
-                    pending_shared_borrow = true
-                }
-            }
             if lends_into_holder {
-                av.ensure_meta().lent_borrow = true
                 let caller = ctx.get_func() !>
                 caller.has_lends = true
-            }
-            if isset(receiver) && receiver.rett.get_non_nullable().is_locked {
-                value_check_locked_call_arg(func, param_i, av, receiver, ctx, at) !>
             }
             let owner = ctx.get_func() !>
             if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))
             if func.unique_summary_ready && func_arg_invalidates_unique(func, param_i) && !value_is_raw_pointer_arg(av) : value_invalidate_unique(av)
             else if !(value_absorb_call_args(func, param, av, args, skip, owner, false, receiver) !>) : absorbs_known = false
-            if !settled : value_defer_arg_effects(param, av, at, pending_shared_borrow) !>
+            if !settled : value_defer_arg_effects(param, av, at) !>
             let source_kind = av.rett.get_non_nullable().kind
             let target_kind = param.type.get_non_nullable().kind
             let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.adr_of || value_is_borrow_address(av))

@@ -351,19 +351,12 @@ def program(body, type_key, wrap):
     return PRELUDE + top + "\nfn main() {\n" + main + "\n}\n"
 
 
-SHADOW = False
-
-
 def build(valk, workdir, key, source):
     path = os.path.join(workdir, re.sub(r"[^A-Za-z0-9]+", "_", key) + ".valk")
     with open(path, "w") as fh:
         fh.write(source)
-    env = dict(os.environ, VALK_OWN_CHECK="1") if SHADOW else None
-    proc = subprocess.run([valk, "build", path, "-o", path[:-5], "--no-warn"], capture_output=True, text=True, env=env)
+    proc = subprocess.run([valk, "build", path, "-o", path[:-5], "--no-warn"], capture_output=True, text=True)
     out = proc.stdout + proc.stderr
-    shadow = re.search(r"own-check: [^:]*:\d+: (.*)", out)
-    if proc.returncode == 0 and shadow:
-        return False, "shadow: " + shadow.group(1)
     if proc.returncode == 0:
         return True, ""
     error = re.search(r"# Error: (.*)", out)
@@ -377,10 +370,7 @@ def main():
     ap.add_argument("--only")
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--show", action="store_true", help="print every case that is not ok")
-    ap.add_argument("--shadow", action="store_true", help="also count the ownership analysis' findings (VALK_OWN_CHECK)")
     opts = ap.parse_args()
-    global SHADOW
-    SHADOW = opts.shadow
 
     cases = []
     for rule, type_key, safe, unsafe, *rest in RULES:
