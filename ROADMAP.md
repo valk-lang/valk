@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.7.12
+
 + Release 0.7.11
 + Fix: on worker threads, an array whose elements were moved in place (growth, insert, removal) was kept alive by a leftover pointer in a thread-local global, together with everything it held
 + GC: a shared collection runs once the shared memory has doubled since the last one plus 4 MB (was +30% plus 256 KB), so short-lived shared data such as broadcast messages no longer stops every thread every few hundred KB: 1,420 -> ~150 collections for 20,000 shared 20 KB messages
