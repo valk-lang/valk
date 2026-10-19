@@ -8,14 +8,15 @@ use valk.core
 //     a parameter or the result
 
 // The checker keeps each local's current points-to version. A publication marks the
-// declarations whose current version reaches the published graph; a direct assignment
-// starts a new version and clears the old mark. A later allocation is not part of a
-// graph published before it exists.
+// versions that reach the published graph; a direct assignment drops the version it
+// replaces. A later allocation is not part of a graph published before it exists.
 class OwnState {
     live: bool (true)
     // The current version of each local, by its number; OWN_NONE when the branches disagree
     versions: Array[uint] (.{})
-    // Locals whose graph may hold part of a published graph, by their number
+    // Consumed versions, by the local that held them
+    consumed_versions: Array[Array[uint]] (.{})
+    // Locals published while their current version was unknown
     consumed: OwnSet (OwnSet{})
     // Objects that may have an alias outside the function by now
     escaped: OwnSet (OwnSet{})
@@ -47,13 +48,57 @@ class OwnState {
             i++
         }
     }
+    fn consumed_at(index: uint) Array[uint] {
+        return this.consumed_versions.get(index) !? Array[uint]{}
+    }
+    fn add_consumed_version(index: uint, var: uint) {
+        while this.consumed_versions.length <= index : this.consumed_versions.append(Array[uint]{})
+        let list = this.consumed_versions.get(index) !? Array[uint]{}
+        if !list.contains(var) : list.append(var)
+    }
+    fn drop_consumed_version(index: uint, var: uint) {
+        if index >= this.consumed_versions.length : return
+        let list = this.consumed_versions.get(index) !? Array[uint]{}
+        let kept = Array[uint]{}
+        each list as known {
+            if known != var : kept.append(known)
+        }
+        this.consumed_versions.set(index, kept) _
+    }
+    fn clear_consumed_versions(index: uint) {
+        if index < this.consumed_versions.length : this.consumed_versions.set(index, Array[uint]{}) _
+    }
+    fn has_consumed_version(index: uint, var: uint) bool {
+        return this.consumed_at(index).contains(var)
+    }
+    fn has_any_consumed_version(index: uint) bool {
+        return this.consumed_at(index).length > 0
+    }
+    fn merge_consumed_versions(other: Array[Array[uint]]) {
+        let before = this.consumed_versions.length
+        let n = other.length > this.consumed_versions.length ? other.length : this.consumed_versions.length
+        while this.consumed_versions.length < n : this.consumed_versions.append(Array[uint]{})
+        let i: uint = 0
+        while i < n {
+            let theirs = other.get(i) !? Array[uint]{}
+            if i >= before {
+                this.consumed_versions.set(i, theirs.copy()) _
+            } else {
+                each theirs as var : this.add_consumed_version(i, var)
+            }
+            i++
+        }
+    }
     fn copy() OwnState {
-        return .{ live: this.live, versions: this.versions.copy(), consumed: this.consumed.copy(), escaped: this.escaped.copy(), allocated: this.allocated.copy(), published: this.published.copy() }
+        let consumed_versions = Array[Array[uint]]{}
+        each this.consumed_versions as list : consumed_versions.append(list.copy())
+        return .{ live: this.live, versions: this.versions.copy(), consumed_versions: consumed_versions, consumed: this.consumed.copy(), escaped: this.escaped.copy(), allocated: this.allocated.copy(), published: this.published.copy() }
     }
     fn merge(other: OwnState) {
         if !other.live : return
         if !this.live {
             this.versions = Array[uint]{}
+            this.consumed_versions = Array[Array[uint]]{}
             this.consumed = OwnSet{}
             this.escaped = OwnSet{}
             this.allocated = OwnSet{}
@@ -61,6 +106,7 @@ class OwnState {
         }
         this.live = true
         this.merge_versions(other.versions)
+        this.merge_consumed_versions(other.consumed_versions)
         this.consumed.add_all(other.consumed)
         this.escaped.add_all(other.escaped)
         this.allocated.add_all(other.allocated)
@@ -68,7 +114,8 @@ class OwnState {
     }
     fn same(other: OwnState) bool {
         if this.live != other.live : return false
-        return own_uints_same(this.versions, other.versions) && own_uints_same(this.consumed.items(), other.consumed.items())
+        return own_uints_same(this.versions, other.versions) && own_versions_same(this.consumed_versions, other.consumed_versions)
+            && own_uints_same(this.consumed.items(), other.consumed.items())
             && own_uints_same(this.escaped.items(), other.escaped.items())
             && own_uints_same(this.allocated.items(), other.allocated.items()) && own_uints_same(this.published.items(), other.published.items())
     }
@@ -189,6 +236,18 @@ fn own_value_var(value: ?Value) uint {
     let v = value ?! return OWN_NONE
     let meta = v.meta
     return isset(meta) ? meta.own_var : OWN_NONE
+}
+
+fn own_versions_same(a: Array[Array[uint]], b: Array[Array[uint]]) bool {
+    if a.length != b.length : return false
+    each a as list, i {
+        let other = b.get(i) !? null
+        if !isset(other) || list.length != other.length : return false
+        each list as var {
+            if !other.contains(var) : return false
+        }
+    }
+    return true
 }
 
 // Everything a variable may reach, once per variable: the graph does not change while checking
@@ -369,8 +428,15 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         let left = value.value1
         let decl = isset(left) && left.type == VAL.decl ? left.decl : null
         if isset(decl) && value.assign_op == ASSIGN_OP.set && decl.owner == flow.g.func && decl.own_round == flow.g.round {
-            state.set_version(decl.own_index, own_value_var(value.value2))
-            state.consumed.remove(decl.own_index)
+            if own_tracks(decl.type) {
+                let var = own_value_var(value.value2)
+                let old = state.version(decl.own_index)
+                if old != OWN_NONE : state.drop_consumed_version(decl.own_index, old) else : state.clear_consumed_versions(decl.own_index)
+                state.consumed.remove(decl.own_index)
+                state.set_version(decl.own_index, var)
+            } else {
+                state.consumed.remove(decl.own_index)
+            }
         }
         if isset(decl) && decl.is_buffer : flow.mark_buffer(decl, state.published)
     } else if kind == VAL.ptrv && isset(value.value2) {
@@ -598,18 +664,26 @@ fn own_check_use(value: Value, state: OwnState, flow: OwnFlow) !Error {
     let decl = value.decl ?! return
     if decl.is_buffer || decl.owner != flow.g.func || decl.own_round != flow.g.round : return
     let type = value.rett.get_non_nullable()
-    // Views are not ordinary data, and raw pointers are the unsafe writer's concern
-    if type.is_shared || type.is_locked || value.rett.has_locked_refs() || own_is_raw(value.rett) : return
+    // Views are not ordinary data, raw pointers are the unsafe writer's concern,
+    // and a value with no managed graph has nothing to consume
+    if type.is_shared || type.is_locked || value.rett.has_locked_refs() || own_is_raw(value.rett) || !own_tracks(value.rett) : return
     let var = own_value_var(value)
     let known = state.version(decl.own_index)
+    let was_unknown = known == OWN_NONE
     if own_debug() == "4" {
         println("own-use " + flow.g.func.name + " " + (decl.name ?? "?") + " #" + decl.own_index + " at " + own_line(value.exp)
-            + " var " + var + " known " + known + " consumed " + own_uints_text(state.consumed.items()) + " live " + state.live)
+            + " var " + var + " known " + known + " consumed " + own_uints_text(state.consumed.items())
+            + " versions " + own_uints_text(state.consumed_at(decl.own_index)) + " live " + state.live)
     }
-    if state.consumed.has(decl.own_index) {
+    let bad = state.consumed.has(decl.own_index)
+    if !bad {
+        if was_unknown : bad = state.has_any_consumed_version(decl.own_index)
+        else : bad = state.has_consumed_version(decl.own_index, known)
+    }
+    if bad {
         own_report(flow, value.exp, "An ordinary value may be used again after its graph was published as shared") !>
     }
-    if known == OWN_NONE && var != OWN_NONE : state.set_version(decl.own_index, var)
+    if was_unknown && var != OWN_NONE : state.set_version(decl.own_index, var)
 }
 
 // `vouch`: a parameter's graph moved into a parameter's locked data is the caller's to vouch
@@ -679,7 +753,9 @@ fn own_check_publish(value: Value, state: OwnState, flow: OwnFlow, at: ?Exp (nul
     each g.decl_all as all, index {
         let var = state.version(index)
         let reach = var != OWN_NONE ? own_var_local_reach(g, var) : own_var_local_reach(g, all)
-        if reach.intersects(published) : state.consumed.add(index)
+        if reach.intersects(published) {
+            if var != OWN_NONE : state.add_consumed_version(index, var) else : state.consumed.add(index)
+        }
     }
 }
 
@@ -977,7 +1053,7 @@ fn own_check_captures(value: Value, state: OwnState, flow: OwnFlow) !Error {
         if captured.owner != g.func || captured.own_round != g.round || captured.is_buffer : continue
         let type = captured.type.get_non_nullable()
         if type.is_shared || type.is_locked || captured.type.has_locked_refs() || own_is_raw(captured.type) : continue
-        if state.consumed.has(captured.own_index) {
+        if state.consumed.has(captured.own_index) || state.has_any_consumed_version(captured.own_index) {
             own_report(flow, value.exp, "An ordinary value may be used again after its graph was published as shared") !>
         }
     }
