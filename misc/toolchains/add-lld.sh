@@ -9,7 +9,7 @@ LLVM=$(cd "$1" && pwd)
 OUT=$(cd "$2" && pwd)/lib
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
-cp "$LLVM/lib/liblldELF.a" "$LLVM/lib/liblldCommon.a" "$OUT/"
+cp "$LLVM"/lib/liblld{ELF,MachO,COFF,Common}.a "$OUT/"
 c++ -O2 -fPIC -std=c++17 -fno-exceptions -fno-rtti -I"$LLVM/include" \
     -c "$ROOT/src/llvm/lld/lld.cpp" -o "$OUT/valk-lld.o"
 ar rcs "$OUT/libvalk-lld.a" "$OUT/valk-lld.o"

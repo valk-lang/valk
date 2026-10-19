@@ -136,6 +136,18 @@ if "$VALK" build "$input" --no-warn -vv -o "$output" 2>&1 | grep -q "ld.lld (bui
         echo "# Linking failed without a linker on the PATH"
         exit 1
     fi
+    # Every target links in process, and lld-link also makes Windows archives.
+    # The output may get an extension (.exe), so it is found by its prefix.
+    cross_magic() {
+        env PATH=/nonexistent "$VALK_BIN" build "$1" --no-warn --target "$2" ${4:-} -o "$workdir/cross" >/dev/null 2>&1 \
+            && [[ "$(od -An -tx1 -N4 "$workdir"/cross* | tr -d ' \n')" == "$3"* ]] && rm -f "$workdir"/cross*
+    }
+    if ! cross_magic "$input" macos-x64 cffaedfe || ! cross_magic "$input" macos-arm64 cffaedfe \
+        || ! cross_magic "$input" win-x64 4d5a \
+        || ! cross_magic "$DIR/../library/library.valk" win-x64 213c6172 "--lib --static-lib"; then
+        echo "# A macOS or Windows target did not link without a linker on the PATH"
+        exit 1
+    fi
 fi
 
 echo "> Reopening the object-cache lock preserves its contents"
