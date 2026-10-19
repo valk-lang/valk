@@ -1,0 +1,1165 @@
+use valk.core
+
+// Checks over the ownership analysis (ownership.valk), walking a body in evaluation order:
+//   - a graph published as shared or moved into locked data must be unique: nothing a global,
+//     unknown code or a parameter reaches may be part of it
+//   - after that, no ordinary variable whose graph holds part of it may be used
+//   - frame storage lent as a borrow must not become reachable from a global, unknown code,
+//     a parameter or the result
+
+class OwnState {
+    live: bool (true)
+    // Locals whose graph may hold part of a published graph, by their number
+    consumed: OwnSet (OwnSet{})
+    // Objects that may have an alias outside the function by now
+    escaped: OwnSet (OwnSet{})
+    // Allocations of this function (and what calls made) passed so far: a later one cannot
+    // have escaped yet
+    allocated: OwnSet (OwnSet{})
+    // Objects published so far
+    published: OwnSet (OwnSet{})
+
+    fn copy() OwnState {
+        return .{ live: this.live, consumed: this.consumed.copy(), escaped: this.escaped.copy(), allocated: this.allocated.copy(), published: this.published.copy() }
+    }
+    fn merge(other: OwnState) {
+        if !other.live : return
+        if !this.live {
+            this.consumed = OwnSet{}
+            this.escaped = OwnSet{}
+            this.allocated = OwnSet{}
+            this.published = OwnSet{}
+        }
+        this.live = true
+        this.consumed.add_all(other.consumed)
+        this.escaped.add_all(other.escaped)
+        this.allocated.add_all(other.allocated)
+        this.published.add_all(other.published)
+    }
+    fn same(other: OwnState) bool {
+        if this.live != other.live : return false
+        return own_uints_same(this.consumed.items(), other.consumed.items()) && own_uints_same(this.escaped.items(), other.escaped.items())
+            && own_uints_same(this.allocated.items(), other.allocated.items()) && own_uints_same(this.published.items(), other.published.items())
+    }
+}
+
+class OwnFlow {
+    g: OwnGraph
+    // What globals, unknown code and the parameters reach anywhere in the function
+    outside: OwnSet
+    // What is outside from the start: globals and the parameters' objects
+    base: OwnSet
+    // Shared data: published already, never part of an ordinary graph's uniqueness
+    views: OwnSet
+    // Temporaries the lowering filled, with what was published by then
+    buffers: Array[Decl] (.{})
+    buffer_marks: Array[OwnSet] (.{})
+    breaks: ?Array[OwnState] (null)
+    continues: ?Array[OwnState] (null)
+    returns: ?Array[OwnState] (null)
+    match_value: ?Value (null)
+    outer_loop: ?OwnFlow (null)
+
+    fn nested(breaks: ?Array[OwnState], continues: ?Array[OwnState], returns: ?Array[OwnState], match_value: ?Value) OwnFlow {
+        return .{ g: this.g, outside: this.outside, base: this.base, views: this.views, buffers: this.buffers, buffer_marks: this.buffer_marks, breaks: breaks, continues: continues, returns: returns, match_value: match_value, outer_loop: this.outer_loop }
+    }
+    fn mark_buffer(decl: Decl, published: OwnSet) {
+        each this.buffers as known, i {
+            if known == decl {
+                this.buffer_marks.set(i, published.copy()) _
+                return
+            }
+        }
+        this.buffers.append(decl)
+        this.buffer_marks.append(published.copy())
+    }
+    // What was published when a temporary an address is computed from was filled
+    fn buffer_mark(value: ?Value) ?OwnSet {
+        let v = value ?! return null
+        let kind = v.type
+        if kind == VAL.decl {
+            let decl = v.decl ?! return null
+            if !decl.is_buffer : return null
+            each this.buffers as known, i {
+                if known == decl : return this.buffer_marks.get(i) !? null
+            }
+            return null
+        }
+        if kind != VAL.cast && kind != VAL.wrap && kind != VAL.op && kind != VAL.load && kind != VAL.ptr_offset && kind != VAL.ptrv : return null
+        let first = this.buffer_mark(v.value1)
+        if isset(first) || kind != VAL.op : return first
+        return this.buffer_mark(v.value2)
+    }
+    fn loop_at(depth: int) OwnFlow {
+        let flow = this
+        let left = depth
+        while left > 1 {
+            flow = flow.outer_loop ?! return flow
+            left--
+        }
+        return flow
+    }
+}
+
+global own_debug_level: String ("?")
+
+fn own_print_phase_stats(build: Build, walk_us: uint) {
+    if (core.getenv("VALK_OWN") !? "") != "stats" : return
+    let checked: uint = 0
+    let lends: uint = 0
+    each build.lists.units as unit {
+        each unit.functions as func {
+            if func.has_publications : checked++
+            if func.has_lends : lends++
+        }
+    }
+    println("own-stats walk: " + (walk_us / 1000) + " ms, " + checked + " functions publish, " + lends + " lend")
+}
+
+// VALK_OWN_DEBUG: 1 publications, 2 escapes, 3 locks, 4 uses of locals
+fn own_debug() String {
+    if own_debug_level == "?" : own_debug_level = core.getenv("VALK_OWN_DEBUG") !? ""
+    return own_debug_level
+}
+
+fn own_report(flow: OwnFlow, at: ?Exp, message: String) !Error {
+    // Never dropped: without a position of its own it is the function's
+    let exp = at ?? flow.g.func.exp
+    exp.error(message)
+}
+
+// The objects a translated value may be
+fn own_value_points(g: OwnGraph, v: Value) OwnSet {
+    let meta = v.meta
+    if !isset(meta) || meta.own_round != g.round || meta.own_var == OWN_NONE : return OwnSet{}
+    return g.pts.set(meta.own_var)
+}
+
+// The objects a translated value may reach; `inner`: the graph it publishes
+fn own_value_reach(g: OwnGraph, v: Value, inner: bool (false)) OwnSet {
+    let meta = v.meta
+    if !isset(meta) || meta.own_round != g.round : return OwnSet{}
+    let var = inner ? meta.own_inner : meta.own_var
+    if var == OWN_NONE : return OwnSet{}
+    return own_var_reach(g, var)
+}
+
+// The same, not through GLOBAL
+fn own_var_local_reach(g: OwnGraph, var: uint) OwnSet {
+    let known = g.local_cache.get(var) !? null
+    if isset(known) : return known
+    let reach = g.deep(g.pts.set(var), true)
+    while g.local_cache.length <= var : g.local_cache.append(null)
+    g.local_cache.set(var, reach) _
+    return reach
+}
+
+// Everything a variable may reach, once per variable: the graph does not change while checking
+fn own_var_reach(g: OwnGraph, var: uint) OwnSet {
+    let known = g.reach_cache.get(var) !? null
+    if isset(known) : return known
+    let reach = g.deep(g.pts.set(var))
+    while g.reach_cache.length <= var : g.reach_cache.append(null)
+    g.reach_cache.set(var, reach) _
+    return reach
+}
+
+fn own_check_func(func: Func) !Error {
+    let g = func.own_graph ?! return
+    let body = func.body_scope ?! return
+    if !g.memo_all : return
+    let start = OwnSet{}
+    start.add(OWN_GLOBAL)
+    each func.args as arg, i : start.add(own_param(g, i, OWN_LEVEL_OBJECT))
+    let outside = g.deep(start)
+    let base = start.copy()
+    each func.args as arg, i {
+        let level: uint = 1
+        while level < OWN_LEVELS {
+            base.add(own_param(g, i, level))
+            level++
+        }
+    }
+    let views = OwnSet{}
+    each g.objs as obj, o {
+        if obj.kind == OWN_OBJ.view : views.add(o)
+    }
+    each func.args as arg, i {
+        if !own_is_view_type(arg.type) : continue
+        let level: uint = 0
+        while level < OWN_LEVELS {
+            views.add(own_param(g, i, level))
+            level++
+        }
+    }
+    let flow = OwnFlow { g: g, outside: outside, base: base, views: g.deep(views) }
+    own_check_values(body.values, OwnState{}, flow) !>
+}
+
+fn own_check_values(values: ?Array[Value], state: OwnState, flow: OwnFlow) !Error {
+    let list = values ?! return
+    each list as value {
+        if !state.live : break
+        own_check_value(value, state, flow) !>
+    }
+}
+
+fn own_check_branches(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    own_check_value(value.value1, state, flow) !>
+    if !state.live : return
+    let yes = state.copy()
+    let no = state.copy()
+    if value.type == VAL.if {
+        own_check_values(value.values, yes, flow) !>
+        own_check_value(value.value2, no, flow) !>
+    } else {
+        own_check_value(value.value2, yes, flow) !>
+        own_check_values(value.values, no, flow) !>
+    }
+    state.live = false
+    state.merge(yes)
+    state.merge(no)
+}
+
+fn own_check_loop(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let head = state.copy()
+    let seen = Array[OwnState]{ head }
+    let exits = OwnState { live: false }
+    while true {
+        let iteration = head.copy()
+        let breaks = Array[OwnState]{}
+        let continues = Array[OwnState]{}
+        let inner = flow.nested(breaks, continues, flow.returns, flow.match_value)
+        inner.outer_loop = flow
+        own_check_value(value.value1, iteration, inner) !>
+        let condition = value.value1
+        if !isset(condition) || condition.type != VAL.bool || !condition.bool_val : exits.merge(iteration)
+        if isset(condition) && condition.type == VAL.bool && !condition.bool_val : iteration.live = false
+        own_check_values(value.values, iteration, inner) !>
+        each breaks as stopped : exits.merge(stopped)
+        let next = OwnState { live: false }
+        next.merge(iteration)
+        each continues as resumed : next.merge(resumed)
+        if !next.live : break
+        let repeated = false
+        each seen as previous {
+            if next.same(previous) { repeated = true; break }
+        }
+        if repeated : break
+        seen.append(next)
+        head = next
+    }
+    state.live = false
+    state.merge(exits)
+}
+
+fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
+    if !isset(value) || !state.live || value == flow.match_value : return
+    let kind = value.type
+    if kind == VAL.while {
+        own_check_loop(value, state, flow) !>
+        return
+    }
+    if kind == VAL.if || kind == VAL.this_or_that {
+        own_check_branches(value, state, flow) !>
+    } else if kind == VAL.vscope {
+        let returns = Array[OwnState]{}
+        let inner = flow.nested(flow.breaks, flow.continues, returns, flow.match_value)
+        own_check_values(value.values, state, inner) !>
+        each returns as returned : state.merge(returned)
+    } else if kind == VAL.break || kind == VAL.continue {
+        let target = flow.loop_at(value.int_val)
+        let destinations = kind == VAL.break ? target.breaks : target.continues
+        if isset(destinations) : destinations.append(state.copy())
+        state.live = false
+    } else if kind == VAL.return || kind == VAL.throw {
+        own_check_value(value.value1, state, flow) !>
+        own_check_values(value.values, state, flow) !>
+        let returned = value.value1
+        // Only the function's own return: a value scope's `return` stays in the frame
+        if kind == VAL.return && state.live && !isset(flow.returns) && isset(returned) && own_value_reach(flow.g, returned).intersects(flow.g.lent) {
+            own_report(flow, value.exp, "Frame storage lent to a call must not leave this function, but the returned value holds an object holding it; copy the storage into the heap first") !>
+        }
+        if kind == VAL.return && state.live {
+            let returns = flow.returns
+            if isset(returns) : returns.append(state.copy())
+        }
+        state.live = false
+    } else if kind == VAL.error_handler {
+        own_check_value(value.get_pre_value(), state, flow) !>
+        let handled = state.copy()
+        own_check_value(value.value2, handled, flow) !>
+        state.merge(handled)
+    } else if kind == VAL.op && (value.value_op == VALUE_OP.and || value.value_op == VALUE_OP.or) {
+        own_check_value(value.value1, state, flow) !>
+        let right = state.copy()
+        own_check_value(value.value2, right, flow) !>
+        state.merge(right)
+    } else if kind == VAL.match {
+        own_check_value(value.value1, state, flow) !>
+        let inner = flow.nested(flow.breaks, flow.continues, flow.returns, value.value1)
+        let joined = OwnState { live: false }
+        let cases = value.values
+        if isset(cases) {
+            each cases as branch {
+                if !state.live : break
+                if !branch.bool_val : own_check_value(branch.value1, state, inner) !>
+                let arm = state.copy()
+                own_check_values(branch.values, arm, inner) !>
+                own_check_value(branch.value2, arm, inner) !>
+                joined.merge(arm)
+                if branch.bool_val : state.live = false
+            }
+        }
+        state.live = false
+        state.merge(joined)
+    } else if kind == VAL.block || kind == VAL.allocas {
+        own_check_value(value.get_pre_value(), state, flow) !>
+        own_check_values(value.values, state, flow) !>
+        own_check_value(value.value1, state, flow) !>
+    } else if kind == VAL.assign {
+        own_check_value(value.get_pre_value(), state, flow) !>
+        let mark = own_check_destination(value.value1, state, flow) !>
+        let destination = Array[?Value]{ own_store_holder(value.value1) }
+        let marks = Array[OwnSet]{ mark }
+        // What the store itself publishes comes after its destination
+        let held = own_hold_publish(value.value2)
+        own_check_value(value.value2, state, flow) !>
+        own_check_pending(destination, marks, state, flow, "An ordinary assignment destination aliases a graph published while evaluating the assignment", true) !>
+        own_release_publish(held, state, flow) !>
+        own_assign_escapes(value, state, flow) !>
+        own_check_lock_store(value, flow) !>
+        // A local that gets a new value no longer holds what was published
+        let left = value.value1
+        let decl = isset(left) && left.type == VAL.decl ? left.decl : null
+        if isset(decl) && value.assign_op == ASSIGN_OP.set && decl.owner == flow.g.func && decl.own_round == flow.g.round {
+            state.consumed.remove(decl.own_index)
+        }
+        if isset(decl) && decl.is_buffer : flow.mark_buffer(decl, state.published)
+    } else if kind == VAL.ptrv && isset(value.value2) {
+        own_check_value(value.get_pre_value(), state, flow) !>
+        own_check_value(value.value1, state, flow) !>
+        let base = Array[?Value]{ own_inline_holder(value.value1) }
+        let marks = Array[OwnSet]{ state.published.copy() }
+        own_check_value(value.value2, state, flow) !>
+        own_check_values(value.values, state, flow) !>
+        own_check_pending(base, marks, state, flow, "An ordinary read aliases a graph published while evaluating its address", true) !>
+    } else if kind == VAL.call {
+        own_check_value(value.get_pre_value(), state, flow) !>
+        let callee = value.value1
+        own_check_value(callee, state, flow) !>
+        let inputs = Array[?Value]{ isset(callee) && callee.type == VAL.func ? callee.value1 : callee }
+        let marks = Array[OwnSet]{ state.published.copy() }
+        let args = value.values
+        let store = own_is_runtime_store(value)
+        let stored = store && isset(args) ? (args.get(2) !? null) : null
+        let held = own_hold_publish(stored)
+        if isset(args) {
+            each args as arg {
+                own_check_value(arg, state, flow) !>
+                inputs.append(arg)
+                marks.append(state.published.copy())
+            }
+        }
+        own_check_value(value.value2, state, flow) !>
+        if store {
+            // A store through the runtime: the object and slot were evaluated before the value
+            own_check_pending(inputs, marks, state, flow, "An ordinary assignment destination aliases a graph published while evaluating the assignment", true) !>
+            own_release_publish(held, state, flow) !>
+        } else {
+            own_check_pending(inputs, marks, state, flow, "An ordinary call argument or receiver aliases a graph published while evaluating the call") !>
+        }
+        own_note_allocations(value, state, flow)
+        if state.live {
+            own_check_runtime_store(value, flow) !>
+            own_check_shared_args(value, state, flow) !>
+            own_check_call_moves(value, state, flow) !>
+            own_call_escapes(value, state, flow) !>
+        }
+    } else if kind == VAL.multi && isset(value.value1) && !own_tracks(value.rett) && own_is_inline_decl(value.value1) {
+        // A plain part of an inline local is copied out of the local's own storage
+        own_check_value(value.get_pre_value(), state, flow) !>
+    } else {
+        // The launch keeps the inputs: reported before the call they go through
+        if kind == VAL.co : own_co_escapes(value, state, flow) !>
+        own_check_value(value.get_pre_value(), state, flow) !>
+        if kind == VAL.decl : own_check_use(value, state, flow) !>
+        own_check_value(value.value1, state, flow) !>
+        own_check_value(value.value2, state, flow) !>
+        own_check_values(value.values, state, flow) !>
+        if kind == VAL.class_init : own_note_allocations(value, state, flow)
+        if kind == VAL.func {
+            if !isset(value.value1) : own_note_allocations(value, state, flow)
+            own_check_captures(value, state, flow) !>
+            own_closure_escapes(value, state, flow) !>
+        }
+        if kind == VAL.throw || kind == VAL.error_value {
+            own_escape(state, flow, value.value1, "this error") !>
+            let parts = value.values
+            if isset(parts) {
+                each parts as part : own_escape(state, flow, part, "this error") !>
+            }
+        }
+        if kind == VAL.shared_view && state.live : own_check_view_publish(value, state, flow) !>
+        if (kind == VAL.array_init || kind == VAL.class_init || (kind == VAL.multi && !isset(value.value1))) && state.live {
+            own_check_literal_moves(value, state, flow) !>
+        }
+    }
+    let meta = value.meta
+    if !state.live || !isset(meta) || !meta.publishes_graph || meta.own_hold : return
+    own_check_publish(value, state, flow) !>
+}
+
+// What a store publishes, along the views it is stored as: checked after its destination
+fn own_hold_publish(value: ?Value) Array[Value] {
+    let held = Array[Value]{}
+    let at = value
+    while isset(at) {
+        let meta = at.meta
+        if isset(meta) && meta.publishes_graph {
+            meta.own_hold = true
+            held.append(at)
+        }
+        if at.type != VAL.shared_view && at.type != VAL.wrap && at.type != VAL.cast : break
+        at = at.value1
+    }
+    return held
+}
+
+fn own_release_publish(held: Array[Value], state: OwnState, flow: OwnFlow) !Error {
+    each held as v {
+        let meta = v.ensure_meta()
+        meta.own_hold = false
+        if !state.live : continue
+        own_check_publish(v, state, flow) !>
+    }
+}
+
+// Only parameters' objects that did not escape here
+fn own_vouches(flow: OwnFlow, bad: OwnSet, state: OwnState) bool {
+    each bad.items() as o {
+        let obj = flow.g.objs.get(o) ! return false
+        if obj.kind != OWN_OBJ.param && obj.kind != OWN_OBJ.deep : return false
+        if flow.views.has(o) || state.escaped.has(o) : return false
+    }
+    return true
+}
+
+// Inputs evaluated before a later one published part of their graph still alias it
+// `object`: only the object written or read itself counts, not what it holds
+fn own_check_pending(inputs: Array[?Value], marks: Array[OwnSet], state: OwnState, flow: OwnFlow, message: String, object: bool (false)) !Error {
+    if !state.live : return
+    each inputs as input, i {
+        let v = input ?! continue
+        if !own_tracks(v.rett) || (own_is_raw(v.rett) && !object) || own_is_view(v.rett) : continue
+        let before = flow.buffer_mark(v) ?? (marks.get(i) ! continue)
+        let later = state.published.without(before)
+        if later.is_empty() : continue
+        let reach = object ? own_value_points(flow.g, v) : own_value_reach(flow.g, v)
+        if reach.intersects(later) : own_report(flow, v.exp, message) !>
+    }
+}
+
+fn own_check_inputs(values: Array[?Value], state: OwnState, flow: OwnFlow, message: String) !Error {
+    let marks = Array[OwnSet]{}
+    each values as v {
+        own_check_value(v, state, flow) !>
+        marks.append(state.published.copy())
+    }
+    own_check_pending(values, marks, state, flow, message) !>
+}
+
+// An ordinary value lent to a shared parameter is published when the callee keeps it
+fn own_check_shared_args(call: Value, state: OwnState, flow: OwnFlow) !Error {
+    let args = call.values ?! return
+    let callee = call.value1 ?! return
+    let func = callee.resolve_call_func()
+    let skip = isset(func) ? call_receiver_skip(callee, func) : 0
+    let offset: uint = skip == 1 || callee.type != VAL.func ? 1 : 0
+    let summaries: ?Array[?OwnSummary] = null
+    let looked = false
+    each args as arg, i {
+        if arg.type != VAL.shared_view : continue
+        let meta = arg.meta ?! continue
+        let inner = arg.value1 ?! continue
+        if meta.lent_unknown {
+            // Unknown code keeps a locked view only by returning it
+            let back = call.rett.get_non_nullable().is_locked || call.rett.has_locked_refs()
+            if back && own_tracks(inner.rett) && !own_is_raw(inner.rett) {
+                own_check_publish(inner, state, flow, call.exp, "Only a provably unique value graph can be converted to '" + arg.rett.compat_display_name() + "'; a mutable alias may remain") !>
+            }
+            continue
+        }
+        let param = meta.borrow_param ?! continue
+        if !own_tracks(inner.rett) || own_is_raw(inner.rett) || inner.rett.get_non_nullable().is_shared : continue
+        if !looked {
+            summaries = own_call_summaries(func, call)
+            looked = true
+        }
+        if !own_call_keeps(summaries, i + offset) : continue
+        own_check_publish(inner, state, flow, call.exp, "Only a provably unique value graph can be converted to '" + param.type.compat_display_name() + "'; a mutable alias may remain") !>
+    }
+}
+
+// Whether a call may keep input `i` past the call: stored anywhere, escaping or returned
+fn own_call_keeps(summaries: ?Array[?OwnSummary], i: uint) bool {
+    let list = summaries ?! return true
+    each list as s {
+        let summary = s ?! return true
+        if own_pairs_have(summary.escapes, i, 2) || own_pairs_have(summary.ret, i, 2) || own_pairs_have(summary.moves, i, 4) : return true
+    }
+    return false
+}
+
+fn own_pairs_have(list: Array[uint], i: uint, width: uint) bool {
+    let at: uint = 0
+    while at + width - 1 < list.length {
+        if (list.get(at) !? OWN_NONE) == i : return true
+        at += width
+    }
+    return false
+}
+
+// The object a store writes into, past the inline storage on the way
+fn own_store_holder(left: ?Value) ?Value {
+    let l = left ?! return null
+    if l.type == VAL.decl || l.type == VAL.global : return null
+    return own_inline_holder(l.value1)
+}
+
+fn own_inline_holder(value: ?Value) ?Value {
+    let container = value
+    while isset(container) && (container.type == VAL.prop || container.type == VAL.ptrv || container.type == VAL.cast || container.type == VAL.wrap || (container.type == VAL.multi && isset(container.value1))) && own_is_inline_value(container.rett) {
+        container = container.value1
+    }
+    let holder = container ?! return null
+    if holder.type == VAL.decl && own_is_inline_value(holder.rett) : return null
+    return holder
+}
+
+// The variable written is not read, but the parts of its address are; gives what was published
+// once the object written into was evaluated
+fn own_check_destination(value: ?Value, state: OwnState, flow: OwnFlow) OwnSet !Error {
+    let v = value ?! return state.published.copy()
+    if v.type == VAL.decl {
+        own_check_value(v.get_pre_value(), state, flow) !>
+        return state.published.copy()
+    }
+    if v.type == VAL.ptrv && isset(v.value2) {
+        own_check_value(v.get_pre_value(), state, flow) !>
+        own_check_value(v.value1, state, flow) !>
+        let mark = state.published.copy()
+        own_check_value(v.value2, state, flow) !>
+        own_check_values(v.values, state, flow) !>
+        return mark
+    }
+    own_check_value(v, state, flow) !>
+    return state.published.copy()
+}
+
+fn own_check_use(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let decl = value.decl ?! return
+    if decl.is_buffer || decl.owner != flow.g.func || decl.own_round != flow.g.round : return
+    let type = value.rett.get_non_nullable()
+    // Views are not ordinary data, and raw pointers are the unsafe writer's concern
+    if type.is_shared || type.is_locked || value.rett.has_locked_refs() || own_is_raw(value.rett) : return
+    if own_debug() == "4" : println("own-use " + (decl.name ?? "?") + " #" + decl.own_index + " at " + own_line(value.exp) + " consumed " + own_uints_text(state.consumed.items()) + " live " + state.live)
+    if state.consumed.has(decl.own_index) {
+        own_report(flow, value.exp, "An ordinary value may be used again after its graph was published as shared") !>
+    }
+}
+
+// `vouch`: a parameter's graph moved into a parameter's locked data is the caller's to vouch
+// for: the caller sees the move in this function's summary
+fn own_check_publish(value: Value, state: OwnState, flow: OwnFlow, at: ?Exp (null), message: ?String (null), vouch: bool (false)) !Error {
+    let where = value.exp ?? at
+    let meta = value.meta
+    let text = message ?? (isset(meta) ? meta.publish_message : null) ?? "Only a provably unique value graph can be published as shared; a mutable alias may remain"
+    // Locked data belongs to its lock: as shared data every thread could reach it unlocked
+    let locked = value.rett.get_non_nullable().is_locked || value.rett.has_locked_refs()
+    if locked && (isset(message) || (isset(meta) && meta.publish_shared)) {
+        own_report(flow, where, text) !>
+        return
+    }
+    let reach = own_value_reach(flow.g, value, true)
+    let outside = flow.base.copy()
+    outside.add_all(state.escaped)
+    // A value built right here is the caller's own: only what went into it is checked
+    let checked = own_fresh_reach(flow.g, value, true).without(flow.views)
+    if checked.intersects(outside) && own_debug() == "1" {
+        let text = "own-debug:"
+        each reach.items() as o {
+            let obj = flow.g.objs.get(o) ! continue
+            text += " " + o + ":" + obj.kind.to(uint) + "@" + own_line(obj.at) + (outside.has(o) ? "*" : "") + (state.escaped.has(o) ? "e" : "")
+        }
+        println(text)
+    }
+    let vouched = OwnSet{}
+    if checked.intersects(outside) {
+        let bad = OwnSet{}
+        each checked.items() as o {
+            if outside.has(o) : bad.add(o)
+        }
+        if vouch && own_vouches(flow, bad, state) : vouched = bad
+        else : own_report(flow, where, text) !>
+    }
+    if reach.intersects(flow.g.lent) {
+        own_report(flow, where, "Frame storage lent to a call must not leave this function, but publishing this graph as shared would; copy the storage into the heap first") !>
+    }
+    // What already was outside is reported above; every local that may hold the rest is
+    // used up
+    let published = OwnSet{}
+    each reach.items() as o {
+        if !outside.has(o) && !flow.views.has(o) : published.add(o)
+    }
+    // A vouched parameter's graph is used up here as well
+    published.add_all(vouched)
+    if own_debug() == "1" {
+        let text = "own-debug publish in " + flow.g.func.name + " kind " + value.type.to(uint) + " " + value.rett.compat_display_name() + " at " + own_line(value.exp) + ":"
+        each reach.items() as o {
+            let obj = flow.g.objs.get(o) ! continue
+            text += " " + o + ":" + obj.kind.to(uint) + "@" + own_line(obj.at)
+        }
+        let consumed = Array[String]{}
+        each flow.g.decl_all as all, index {
+            if flow.g.deep(flow.g.pts.set(all)).intersects(reach) : consumed.append(index.to_string())
+        }
+        println(text + " consumes " + consumed.join(","))
+    }
+    if own_debug() == "1" : println("own-debug published " + own_uints_text(published.items()) + " views " + own_uints_text(flow.views.items()) + " escaped " + own_uints_text(state.escaped.items()))
+    if published.is_empty() : return
+    state.published.add_all(published)
+    let g = flow.g
+    each g.decl_all as all, index {
+        if own_var_local_reach(g, all).intersects(published) : state.consumed.add(index)
+    }
+}
+
+// Debug dump of a lowered tree (VALK_OWN_TREE)
+fn own_dump_value(v: ?Value, depth: uint) {
+    let value = v ?! return
+    if depth > 14 : return
+    let meta = value.meta
+    let flags = isset(meta) ? (meta.publishes_graph ? " PUB" : "") + (meta.shared_borrow ? " BORROW" : "") + (isset(meta.borrow_param) ? " LENT" : "") : ""
+    println("".pad_right(' ', depth * 2) + value.type.to(uint).to_string() + " " + value.rett.compat_display_name() + flags)
+    own_dump_value(value.get_pre_value(), depth + 1)
+    own_dump_value(value.value1, depth + 1)
+    own_dump_value(value.value2, depth + 1)
+    let values = value.values
+    if isset(values) {
+        each values as child : own_dump_value(child, depth + 1)
+    }
+}
+
+// A literal of shared or locked data holds what it was built from: that is published
+fn own_check_literal_moves(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let type = value.rett.get_non_nullable()
+    if !type.is_shared && !type.is_locked : return
+    let parts = value.values ?! return
+    each parts as part {
+        if !own_tracks(part.rett) || own_is_raw(part.rett) || own_is_view_type(part.rett) : continue
+        let meta = part.meta
+        if isset(meta) && meta.publishes_graph : continue
+        own_check_publish(part, state, flow) !>
+    }
+}
+
+// A call that moves an ordinary argument into shared or locked data publishes it: what the
+// callee's summary says it stores into such an argument, or everything for unknown code
+fn own_check_call_moves(call: Value, state: OwnState, flow: OwnFlow) !Error {
+    let callee = call.value1 ?! return
+    let func = callee.resolve_call_func()
+    if isset(func) && own_is_runtime(func) : return
+    let inputs = Array[?Value]{}
+    let skip = isset(func) ? call_receiver_skip(callee, func) : 0
+    if skip == 1 : inputs.append(callee.value1)
+    // A closure's own environment holds only what it may (a `shared fn` captures shared data)
+    else if callee.type != VAL.func : inputs.append(null)
+    let args = call.values
+    if isset(args) {
+        each args as arg : inputs.append(arg)
+    }
+    // Only data handed over locked can take ordinary data in: storing into a shared view
+    // means locking it, and a function may not store a parameter under its own lock
+    let into_view = Array[bool]{}
+    let any_view = false
+    each inputs as input {
+        let view = isset(input) && input.rett.get_non_nullable().is_locked
+        into_view.append(view)
+        if view : any_view = true
+    }
+    if !any_view : return
+    let summaries = own_call_summaries(func, call)
+    // Locked data of a parameter is the caller's: a parameter's graph moved into it is
+    // published where the caller hands both over (this function's summary says so)
+    let targets_params = true
+    each inputs as input, i {
+        if !(into_view.get(i) !? false) || !isset(input) : continue
+        if !own_holds_params(flow.g, own_value_reach(flow.g, input)) : targets_params = false
+    }
+    each inputs as input, i {
+        let arg = input ?! continue
+        if !own_tracks(arg.rett) || own_is_raw(arg.rett) || own_is_view_type(arg.rett) : continue
+        // Locked data moved into locked data: only within its own lock
+        if (into_view.get(i) !? false) || arg.rett.get_non_nullable().is_locked {
+            if isset(summaries) && own_moves_across_locks(summaries, i, inputs, into_view, flow) {
+                own_report(flow, arg.exp ?? call.exp, "Data under one lock cannot be stored under another lock") !>
+            }
+            continue
+        }
+        let meta = arg.meta
+        let marked = isset(meta) && meta.publishes_graph
+        let moved = false
+        if !isset(summaries) {
+            moved = true
+        } else {
+            each summaries as s {
+                if !isset(s) { moved = true; break }
+                if own_moves_into_view(s.moves, i, into_view) : moved = true
+            }
+        }
+        if !moved : continue
+        if targets_params && own_only_params(flow.g, own_value_reach(flow.g, arg)) : continue
+        // Data already under the target's lock is rearranged, not published
+        if own_under_target_lock(arg, inputs, into_view, flow) {
+            if isset(summaries) && own_moves_across_locks(summaries, i, inputs, into_view, flow) {
+                own_report(flow, arg.exp ?? call.exp, "Data under one lock cannot be stored under another lock") !>
+            }
+            continue
+        }
+        if isset(summaries) && own_moves_across_locks(summaries, i, inputs, into_view, flow) {
+            own_report(flow, arg.exp ?? call.exp, "Data under one lock cannot be stored under another lock") !>
+        }
+        // Published by this call, it may not also be kept anywhere else
+        if isset(summaries) && own_call_also_keeps(summaries, i, inputs, into_view, state, flow) {
+            own_report(flow, arg.exp ?? call.exp, "Only a provably unique value graph can be stored in locked data; the call also keeps it elsewhere") !>
+        }
+        if marked : continue
+        let into_receiver = skip == 1 && i > 0 && (into_view.get(0) !? false)
+        let message = into_receiver ? "Only a provably unique value graph can be handed to a method on locked data; a mutable alias may remain"
+            : "Only a provably unique value graph can be stored in locked data; a mutable alias may remain"
+        // Into a parameter's locked data: the caller sees the move in this function's summary
+        own_check_publish(arg, state, flow, call.exp, message, targets_params) !>
+    }
+}
+
+fn own_is_view(type: Type) bool {
+    let nn = type.get_non_nullable()
+    return nn.is_shared || nn.is_locked
+}
+
+// The summaries a call may apply: null for unknown code, one per implementation of an
+// interface method (a null entry for one without a summary)
+fn own_call_summaries(func: ?Func, call: Value) ?Array[?OwnSummary] {
+    let f = func ?! return null
+    if call.call_kind == CALL_KIND.closure : return null
+    if f.is_interface {
+        let impls = f.own_impls ?! return null
+        let list = Array[?OwnSummary]{}
+        each impls as impl : list.append(impl.own_summary)
+        return list
+    }
+    if f.is_extern : return null
+    return Array[?OwnSummary]{ f.own_summary }
+}
+
+// A view of ordinary data that the lowering made without a publish: it publishes all the same
+fn own_check_view_publish(view: Value, state: OwnState, flow: OwnFlow) !Error {
+    let view_meta = view.meta
+    if isset(view_meta) && view_meta.shared_borrow : return
+    let inner = view.value1 ?! return
+    if !own_tracks(inner.rett) || own_is_raw(inner.rett) || own_is_view_type(inner.rett) : return
+    let meta = inner.meta
+    if isset(meta) && meta.publishes_graph : return
+    own_check_publish(inner, state, flow) !>
+}
+
+fn own_moves_into_view(moves: Array[uint], from: uint, into_view: Array[bool]) bool {
+    let m: uint = 0
+    while m + 3 < moves.length {
+        if (moves.get(m) !? OWN_NONE) == from && (into_view.get(moves.get(m + 2) !? 0) !? false) : return true
+        m += 4
+    }
+    return false
+}
+
+// Every object in `set` is a parameter's (P or D), and there is one
+fn own_only_params(g: OwnGraph, set: OwnSet) bool {
+    let items = set.items()
+    if items.length == 0 : return false
+    each items as o {
+        let obj = g.objs.get(o) ! return false
+        if obj.kind != OWN_OBJ.param && obj.kind != OWN_OBJ.deep : return false
+    }
+    return true
+}
+
+////////////////////////////
+// Escapes, in evaluation order
+////////////////////////////
+
+// `what` keeps the value, for the report when it holds lent frame storage
+fn own_escape(state: OwnState, flow: OwnFlow, value: ?Value, what: String, at: ?Exp (null)) !Error {
+    let v = value ?! return
+    if !own_tracks(v.rett) || own_is_raw(v.rett) : return
+    let before = state.escaped.copy()
+    own_escape_set(state, flow, own_value_reach(flow.g, v), what, at ?? v.exp) !>
+    if own_debug() == "2" {
+        let added = Array[uint]{}
+        each state.escaped.items() as o {
+            if !before.has(o) : added.append(o)
+        }
+        if added.length > 0 : println("own-escape in " + flow.g.func.name + " at " + own_line(v.exp) + ": " + own_uints_text(added))
+    }
+}
+
+// Only what exists by now escapes: a later allocation stored into the same place escapes
+// at that store
+fn own_escape_set(state: OwnState, flow: OwnFlow, reach: OwnSet, what: String, at: ?Exp) !Error {
+    if reach.intersects(flow.g.lent) {
+        own_report(flow, at, "Frame storage lent to a call must not leave this function, but " + what + " keeps an object holding it; copy the storage into the heap first") !>
+    }
+    each reach.items() as o {
+        let obj = flow.g.objs.get(o) ! continue
+        if (obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call) && !state.allocated.has(o) : continue
+        state.escaped.add(o)
+    }
+}
+
+fn own_is_outside(state: OwnState, flow: OwnFlow, set: OwnSet) bool {
+    return set.intersects(flow.base) || set.intersects(state.escaped)
+}
+
+// A store into a global, or into data that is outside already
+fn own_assign_escapes(assign: Value, state: OwnState, flow: OwnFlow) !Error {
+    let left = assign.value1 ?! return
+    if left.type == VAL.decl : return
+    let right = assign.value2
+    if left.type == VAL.global {
+        own_escape(state, flow, right, "this store", assign.exp) !>
+        return
+    }
+    // The object the value is stored into, past the inline storage on the way
+    let container: ?Value = left.value1
+    while isset(container) && (container.type == VAL.prop || container.type == VAL.ptrv || container.type == VAL.cast || container.type == VAL.wrap || (container.type == VAL.multi && isset(container.value1))) && own_is_inline_value(container.rett) {
+        container = container.value1
+    }
+    let holder = container ?! return
+    if holder.type == VAL.decl && own_is_inline_value(holder.rett) : return
+    if holder.type == VAL.global || own_is_outside(state, flow, own_value_points(flow.g, holder)) : own_escape(state, flow, right, "this store", assign.exp) !>
+}
+
+// What a call keeps of its inputs where the function cannot follow it
+fn own_call_escapes(call: Value, state: OwnState, flow: OwnFlow) !Error {
+    let callee = call.value1 ?! return
+    let func = callee.resolve_call_func()
+    if isset(func) && own_is_runtime(func) {
+        // A store helper: the value joins the object the slot is in
+        if func.name == "property_set" || func.name == "property_update" {
+            let args = call.values ?! return
+            let slot = args.get(1) !? null
+            if isset(slot) && own_is_outside(state, flow, own_value_points(flow.g, slot)) : own_escape(state, flow, args.get(2) !? null, "this store", call.exp) !>
+        }
+        return
+    }
+    let inputs = Array[?Value]{}
+    let skip = isset(func) ? call_receiver_skip(callee, func) : 0
+    if skip == 1 : inputs.append(callee.value1)
+    else if callee.type != VAL.func : inputs.append(callee)
+    let args = call.values
+    if isset(args) {
+        each args as arg : inputs.append(arg)
+    }
+    let summaries = own_call_summaries(func, call)
+    if !isset(summaries) {
+        each inputs as input : own_escape(state, flow, input, "this call", call.exp) !>
+        return
+    }
+    each summaries as s {
+        if !isset(s) {
+            each inputs as input : own_escape(state, flow, input, "this call", call.exp) !>
+            return
+        }
+        let e: uint = 0
+        while e + 1 < s.escapes.length {
+            own_escape(state, flow, inputs.get(s.escapes.get(e) !? 0) !? null, "this call", call.exp) !>
+            e += 2
+        }
+        own_into_escapes(s.moves, inputs, state, flow, call.exp) !>
+    }
+}
+
+fn own_into_escapes(moves: Array[uint], inputs: Array[?Value], state: OwnState, flow: OwnFlow, at: ?Exp) !Error {
+    let m: uint = 0
+    while m + 3 < moves.length {
+        let from = inputs.get(moves.get(m) !? 0) !? null
+        let into = inputs.get(moves.get(m + 2) !? 0) !? null
+        let level = moves.get(m + 3) !? 0
+        m += 4
+        if !isset(into) : continue
+        if own_is_outside(state, flow, own_objects_at(flow.g, into, level)) : own_escape(state, flow, from, "this call", at) !>
+    }
+}
+
+// The objects a callee writes into at `level` of an input (OWN_LEVEL_*): the input's own
+// objects, what they hold, and so on; what was written there does not make them outside
+fn own_objects_at(g: OwnGraph, input: Value, level: uint) OwnSet {
+    let set = own_value_points(g, input)
+    if level == OWN_LEVEL_NEW : return OwnSet{}
+    let k: uint = 0
+    while k < level && k < OWN_LEVEL_DEEP {
+        let next = set.copy()
+        each set.items() as o {
+            if o == OWN_GLOBAL : continue
+            g.contents.add_to(o, next)
+        }
+        set = next
+        k++
+    }
+    if level >= OWN_LEVEL_DEEP : return g.deep(set, true)
+    return set
+}
+
+// A closure made after a publish captures what was published
+fn own_check_captures(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let closure = value.func ?! return
+    if isset(value.value1) : return
+    let g = flow.g
+    each closure.capture_decls as captured {
+        if captured.owner != g.func || captured.own_round != g.round || captured.is_buffer : continue
+        let type = captured.type.get_non_nullable()
+        if type.is_shared || type.is_locked || captured.type.has_locked_refs() || own_is_raw(captured.type) : continue
+        if state.consumed.has(captured.own_index) {
+            own_report(flow, value.exp, "An ordinary value may be used again after its graph was published as shared") !>
+        }
+    }
+}
+
+// A coroutine keeps what its call is handed
+fn own_co_escapes(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let launched = value.value1 ?! return
+    if launched.type != VAL.call : return
+    let callee = launched.value1
+    own_escape(state, flow, isset(callee) && callee.type == VAL.func ? callee.value1 : callee, "a coroutine", value.exp) !>
+    each (launched.values ?? Array[Value]{}) as arg : own_escape(state, flow, arg, "a coroutine") !>
+}
+
+// A closure keeps what it captured
+fn own_closure_escapes(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let closure = value.func ?! return
+    if isset(value.value1) : return
+    let g = flow.g
+    each closure.capture_decls as captured {
+        if captured.owner != g.func || captured.own_round != g.round : continue
+        let all = own_decl_all(g, captured.own_index)
+        own_escape_set(state, flow, own_var_reach(g, all), "a closure", value.exp) !>
+    }
+}
+
+// Whether a call that moves input `i` into locked data also lets it escape, or stores it into
+// other data that is outside
+fn own_call_also_keeps(summaries: Array[?OwnSummary], i: uint, inputs: Array[?Value], into_view: Array[bool], state: OwnState, flow: OwnFlow) bool {
+    each summaries as s {
+        let summary = s ?! continue
+        let e: uint = 0
+        while e + 1 < summary.escapes.length {
+            if (summary.escapes.get(e) !? OWN_NONE) == i : return true
+            e += 2
+        }
+        let m: uint = 0
+        while m + 3 < summary.moves.length {
+            let from = summary.moves.get(m) !? OWN_NONE
+            let to = summary.moves.get(m + 2) !? OWN_NONE
+            m += 4
+            if from != i || (into_view.get(to) !? false) : continue
+            let target = inputs.get(to) !? null
+            if isset(target) && own_is_outside(state, flow, own_objects_at(flow.g, target, summary.moves.get(m - 1) !? 0)) : return true
+        }
+    }
+    return false
+}
+
+// What an allocation or a call makes exists from here on
+fn own_note_allocations(value: Value, state: OwnState, flow: OwnFlow) {
+    let meta = value.meta ?! return
+    if meta.own_round != flow.g.round : return
+    if value.type == VAL.call {
+        if meta.own_made != 0 : state.allocated.add(meta.own_made)
+        return
+    }
+    if meta.own_inner == OWN_NONE : return
+    state.allocated.add_all(flow.g.pts.set(meta.own_inner))
+}
+
+fn own_is_inline_decl(value: ?Value) bool {
+    let v = value ?! return false
+    return v.type == VAL.decl && own_is_inline_value(v.rett)
+}
+
+fn own_line(at: ?Exp) String {
+    let exp = at ?! return "?"
+    return exp.src.line_of(exp.i.to(u32)).to_string()
+}
+
+////////////////////////////
+// Locks
+////////////////////////////
+
+// The locks whose data a set of objects holds
+fn own_locks_of(g: OwnGraph, set: OwnSet) Array[uint] {
+    let ids = Array[uint]{}
+    each set.items() as o {
+        let obj = g.objs.get(o) ! continue
+        if obj.lock_id != 0 : ids.append(obj.lock_id, true)
+    }
+    return ids
+}
+
+// Data of one lock goes only under that same lock: a target that may be either of two
+// locks takes none of it
+fn own_lock_move_ok(g: OwnGraph, moved: OwnSet, target: OwnSet) bool {
+    let from = own_locks_of(g, moved)
+    if from.length == 0 : return true
+    let into = own_locks_of(g, target)
+    if into.length == 0 : return true
+    if into.length > 1 : return false
+    each from as id {
+        if !into.contains(id) : return false
+    }
+    return true
+}
+
+fn own_under_target_lock(arg: Value, inputs: Array[?Value], into_view: Array[bool], flow: OwnFlow) bool {
+    let reach = flow.g.deep(own_value_points(flow.g, arg), true)
+    let from = own_locks_of(flow.g, reach)
+    if from.length == 0 : return false
+    each inputs as input, i {
+        if !(into_view.get(i) !? false) : continue
+        let target = input ?! continue
+        let into = own_locks_of(flow.g, own_value_reach(flow.g, target))
+        each from as id {
+            if into.contains(id) : return true
+        }
+    }
+    return false
+}
+
+fn own_moves_across_locks(summaries: Array[?OwnSummary], i: uint, inputs: Array[?Value], into_view: Array[bool], flow: OwnFlow) bool {
+    let moved_value = inputs.get(i) !? null
+    if !isset(moved_value) : return false
+    let moved = own_value_reach(flow.g, moved_value)
+    if own_debug() == "3" : println("own-locks " + flow.g.func.name + " input " + i + " moved " + own_uints_text(moved.items()) + " locks " + own_uints_text(own_locks_of(flow.g, moved)))
+    each summaries as s {
+        let summary = s ?! continue
+        if own_pairs_cross(summary.moves, i, inputs, into_view, moved, flow) : return true
+    }
+    return false
+}
+
+fn own_pairs_cross(moves: Array[uint], i: uint, inputs: Array[?Value], into_view: Array[bool], moved: OwnSet, flow: OwnFlow) bool {
+    let m: uint = 0
+    while m + 3 < moves.length {
+        let from = moves.get(m) !? OWN_NONE
+        let to = moves.get(m + 2) !? OWN_NONE
+        m += 4
+        if from != i || !(into_view.get(to) !? false) : continue
+        let target = inputs.get(to) !? null
+        if !isset(target) : continue
+        if !own_lock_move_ok(flow.g, moved, own_value_reach(flow.g, target)) : return true
+    }
+    return false
+}
+
+// A direct store of locked data into locked data
+fn own_check_lock_store(assign: Value, flow: OwnFlow) !Error {
+    let left = assign.value1 ?! return
+    let right = assign.value2 ?! return
+    if left.type == VAL.decl : return
+    let container = left.value1 ?! return
+    own_check_lock_move(right, container, assign.exp, flow) !>
+}
+
+fn own_is_runtime_store(call: Value) bool {
+    let callee = call.value1 ?! return false
+    let func = callee.resolve_call_func() ?! return false
+    return own_is_runtime(func) && (func.name == "property_set" || func.name == "property_update")
+}
+
+// The same store through the runtime's property helpers: (object, slot, value)
+fn own_check_runtime_store(call: Value, flow: OwnFlow) !Error {
+    if !own_is_runtime_store(call) : return
+    let args = call.values ?! return
+    let slot = args.get(1) ! return
+    let right = args.get(2) ! return
+    own_check_lock_move(right, slot, call.exp, flow) !>
+}
+
+fn own_check_lock_move(right: Value, container: Value, at: ?Exp, flow: OwnFlow) !Error {
+    if !own_tracks(right.rett) || own_is_raw(right.rett) : return
+    let moved = own_value_reach(flow.g, right)
+    if own_locks_of(flow.g, moved).length == 0 : return
+    if !own_lock_move_ok(flow.g, moved, own_value_reach(flow.g, container)) {
+        own_report(flow, right.exp ?? at, "Data under one lock cannot be stored under another lock") !>
+    }
+}
+
+// Locked data of a parameter: what the set reaches includes that parameter's objects and no
+// lock this function takes itself
+fn own_holds_params(g: OwnGraph, set: OwnSet) bool {
+    let found = false
+    each set.items() as o {
+        let obj = g.objs.get(o) ! return false
+        if obj.kind == OWN_OBJ.lock : return false
+        if obj.kind == OWN_OBJ.param || obj.kind == OWN_OBJ.deep : found = true
+    }
+    return found
+}
+
+// What a value's uniqueness depends on: a literal's new object is fresh, so only the values
+// put into it count; anything else is everything it reaches
+fn own_fresh_reach(g: OwnGraph, value: Value, inner: bool (false)) OwnSet {
+    let v = value
+    // The same value under another type
+    while (v.type == VAL.cast || v.type == VAL.wrap || v.type == VAL.interface_wrap || v.type == VAL.shared_view) && isset(v.value1) {
+        v = v.value1 ?! break
+    }
+    let kind = v.type
+    if kind == VAL.null || kind == VAL.string || kind == VAL.undefined : return OwnSet{}
+    let result = OwnSet{}
+    if kind == VAL.class_init || kind == VAL.array_init || (kind == VAL.multi && !isset(v.value1)) {
+        // A hook literal: the object, then the calls that fill it with their arguments
+        let base = v.value1
+        if kind == VAL.class_init && isset(base) {
+            let built = base.get_pre_value()
+            if isset(built) && built.type == VAL.assign {
+                let constructed = built.value2
+                if isset(constructed) : result.add_all(own_fresh_reach(g, constructed))
+            } else {
+                result.add_all(own_fresh_reach(g, base))
+            }
+            let hooks = v.values
+            if isset(hooks) {
+                each hooks as hook {
+                    let args = hook.values ?! continue
+                    each args as arg : result.add_all(own_fresh_reach(g, arg))
+                }
+            }
+            return result
+        }
+        let parts = v.values
+        if isset(parts) {
+            each parts as part : result.add_all(own_fresh_reach(g, part))
+        }
+        return result
+    }
+    // A local buffering a value: that value
+    if kind == VAL.decl {
+        let decl = v.decl
+        let pre = v.get_pre_value()
+        if isset(decl) && decl.is_buffer && isset(pre) && pre.type == VAL.assign {
+            let stored = pre.value2
+            if isset(stored) : return own_fresh_reach(g, stored)
+        }
+    }
+    return own_value_reach(g, v, inner)
+}

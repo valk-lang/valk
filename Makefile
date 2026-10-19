@@ -128,6 +128,10 @@ test-gc-stress: $(TEST_COMPILER)
 test-views: $(TEST_COMPILER)
 	@python3 ./tests/views/gen.py --valk $(TEST_COMPILER) --jobs 4
 
+# Every borrow, shared and lock rule under every syntax wrapper (see tests/probe/gen.py)
+test-probe: $(TEST_COMPILER)
+	@python3 ./tests/probe/gen.py --valk $(TEST_COMPILER) --jobs 4
+
 test-doc: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/doc/run.sh
 
