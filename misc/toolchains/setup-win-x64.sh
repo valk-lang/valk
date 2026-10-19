@@ -19,8 +19,10 @@ if [ ! -d "$WIN_X64" ]; then
 	rm "win-sdk-x64.tar.gz"
 fi
 
-if [ ! -d "$LLVM_WIN_X64" ]; then
+# Older downloads have no lld
+if [ ! -f "$LLVM_WIN_X64/lib/valk-lld.lib" ]; then
 	echo "Download LLVM windows x64"
+	rm -rf "$LLVM_WIN_X64"
 	cd $LIB_DIR
 	wget "https://files.valk-cdn.dev/toolchains/win-llvm-22-x64.tar.gz"
 	tar -xf "win-llvm-22-x64.tar.gz" --checkpoint=.100

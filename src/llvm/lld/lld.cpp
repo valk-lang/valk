@@ -1,6 +1,7 @@
 // lld inside the compiler: linking needs no installed linker
 #include <lld/Common/Driver.h>
 #include <llvm/Support/raw_ostream.h>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -24,6 +25,7 @@ extern "C" int valk_lld(int argc, const char **argv, char **out) {
         {lld::WinLink, &lld::coff::link},
     });
     os.flush();
-    *out = strdup(text.c_str());
+    *out = (char *)malloc(text.size() + 1);
+    memcpy(*out, text.c_str(), text.size() + 1);
     return result.retCode;
 }

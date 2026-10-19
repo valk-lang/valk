@@ -48,9 +48,11 @@ ifneq ($(and $(filter Linux,$(HOST_SYSTEM)),$(wildcard /usr/include/lld/Common/D
 LLD_SHIM := debug/libvalk-lld.a
 LLD_FLAGS := --def "LLD=1" -L debug
 endif
-ifneq ($(wildcard $(LLVM_DIR)/lib/libvalk-lld.a),)
-STATIC_LLD_FLAGS := --def "LLD=1"
-endif
+# A vendored LLVM with lld added (misc/toolchains/add-lld.sh) gives a compiler that links in-process
+lld_flags = $(if $(wildcard $(1)/lib/libvalk-lld.a $(1)/lib/valk-lld.lib),--def "LLD=1")
+STATIC_LLD_FLAGS := $(call lld_flags,$(LLVM_DIR))
+# Windows: with lld in valk.exe, lld-link.exe is no longer shipped
+WIN_LLD_FLAGS := $(call lld_flags,toolchains/libraries/win-llvm-22-x64)
 
 # The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
 # release targets link the vendored static one
@@ -63,7 +65,7 @@ debug/libvalk-lld.a: src/llvm/lld/lld.cpp
 	ar rcs $@ debug/valk-lld.o
 
 valkexe: $(COMPILER_DEPS)
-	$(VC) build . -o ./valk -vv $(FLAGS) --target win-x64 --static \
+	$(VC) build . -o ./valk -vv $(FLAGS) --target win-x64 --static $(WIN_LLD_FLAGS) \
 	-L toolchains/libraries/win-llvm-22-x64/lib
 
 doc: valk
@@ -246,7 +248,7 @@ lint-lib-cross: valk
 # CI commands
 ci-linux: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
@@ -254,7 +256,7 @@ ci-macos: $(COMPILER_DEPS)
 
 ci-win: $(COMPILER_DEPS)
 	~/valk-dev/valk.exe -h || echo ""
-	$$HOME/valk-dev/valk.exe build . -o ./valk -vv -c --static $(FLAGS) \
+	$$HOME/valk-dev/valk.exe build . -o ./valk -vv -c --static $(FLAGS) $(WIN_LLD_FLAGS) \
 	-L toolchains/libraries/win-llvm-22-x64/lib $(CI_SYSTEM_LIB_FLAGS)
 
 # Distributions
@@ -269,6 +271,7 @@ linux-x64: $(DIST_DEPS)
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
 	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(FLAGS) $(DIST_FLAGS) \
+	$(call lld_flags,toolchains/libraries/linux-llvm-22-x64) \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" \
 	-L "toolchains/toolchains/linux-amd64/lib64" \
@@ -281,7 +284,8 @@ linux-arm64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/linux-arm64/*
 	mkdir -p dist/linux-arm64
-	$(DIST_COMP) build -o ./dist/linux-arm64/valk --target linux-arm64 $(FLAGS) $(DIST_FLAGS) $(LINUX_ARM64_LINK)
+	$(DIST_COMP) build -o ./dist/linux-arm64/valk --target linux-arm64 $(FLAGS) $(DIST_FLAGS) $(LINUX_ARM64_LINK) \
+	$(call lld_flags,toolchains/libraries/linux-llvm-22-arm64)
 	cp -r ./lib ./dist/linux-arm64/
 	cd ./dist/linux-arm64/ && rm -f ../valk-$(VERSION)-linux-arm64.tar.gz
 	cd ./dist/linux-arm64/ && tar -czf  ../valk-$(VERSION)-linux-arm64.tar.gz valk lib
@@ -309,16 +313,16 @@ win-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
-	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) \
+	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) $(WIN_LLD_FLAGS) \
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
 	-L toolchains/libraries/win-llvm-22-x64/lib
 	cp -r ./lib ./dist/win-x64/
 # Windows uses LLVM's linker, which also writes archives when called with `/lib`.
-	cp ./toolchains/libraries/win-llvm-22-x64/lld.exe ./dist/win-x64/lld-link.exe
+	$(if $(WIN_LLD_FLAGS),,cp ./toolchains/libraries/win-llvm-22-x64/lld.exe ./dist/win-x64/lld-link.exe)
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
-	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib lld-link.exe
+	cd ./dist/win-x64/ && zip -r ../valk-$(VERSION)-win-x64.zip valk.exe lib $(if $(WIN_LLD_FLAGS),,lld-link.exe)
 
 ir: $(DIST_DEPS)
 	vman use

@@ -11,16 +11,20 @@ LIN_X64="$TC_DIR/linux-amd64"
 LLVM_LIN_X64="$LIB_DIR/linux-llvm-22-x64"
 CURL_LIN_X64="$LIB_DIR/linux-curl-x64"
 
-if [ ! -d "$LIN_X64" ]; then
+# Older downloads have no headers (needed to build LLVM against it)
+if [ ! -f "$LIN_X64/usr/include/stdio.h" ]; then
 	echo "Download linux-x64 toolchain"
+	rm -rf "$LIN_X64"
 	cd $TC_DIR
 	wget "https://files.valk-cdn.dev/toolchains/linux-amd64.tar.gz"
 	tar -xf "linux-amd64.tar.gz" --checkpoint=.100
 	rm "linux-amd64.tar.gz"
 fi
 
-if [ ! -d "$LLVM_LIN_X64" ]; then
+# Older downloads have no lld
+if [ ! -f "$LLVM_LIN_X64/lib/libvalk-lld.a" ]; then
 	echo "Download LLVM linux x64"
+	rm -rf "$LLVM_LIN_X64"
 	cd $LIB_DIR
 	wget "https://files.valk-cdn.dev/toolchains/linux-llvm-22-x64.tar.gz"
 	tar -xf "linux-llvm-22-x64.tar.gz" --checkpoint=.100

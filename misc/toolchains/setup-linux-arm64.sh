@@ -17,8 +17,10 @@ if [ ! -d "$LIN_ARM64" ]; then
 	rm "linux-arm64.tar.gz"
 fi
 
-if [ ! -d "$LLVM_LIN_ARM64" ]; then
+# Older downloads have no lld
+if [ ! -f "$LLVM_LIN_ARM64/lib/libvalk-lld.a" ]; then
 	echo "Download LLVM linux arm64"
+	rm -rf "$LLVM_LIN_ARM64"
 	cd $LIB_DIR
 	wget "https://files.valk-cdn.dev/toolchains/linux-llvm-22-arm64.tar.gz"
 	tar -xf "linux-llvm-22-arm64.tar.gz" --checkpoint=.100
