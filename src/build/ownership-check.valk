@@ -209,19 +209,6 @@ fn own_check_func(func: Func, shadow: bool) !Error {
     }
     let flow = OwnFlow { g: g, outside: outside, base: base, views: g.deep(views), shadow: shadow }
     own_check_values(body.values, OwnState{}, flow) !>
-    own_check_frame(g, flow) !>
-}
-
-// Lent frame storage stays in the frame
-fn own_check_frame(g: OwnGraph, flow: OwnFlow) !Error {
-    if g.lent.is_empty() : return
-    let leaving = flow.outside.copy()
-    leaving.add_all(g.deep(g.pts.set(g.ret)))
-    each g.lent.items() as slot {
-        if !leaving.has(slot) : continue
-        let obj = g.objs.get(slot) ! continue
-        own_report(flow, obj.at, "Frame storage lent to a call must not leave this function; copy the storage into the heap first") !>
-    }
 }
 
 fn own_check_values(values: ?Array[Value], state: OwnState, flow: OwnFlow) !Error {
@@ -303,6 +290,11 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
     } else if kind == VAL.return || kind == VAL.throw {
         own_check_value(value.value1, state, flow) !>
         own_check_values(value.values, state, flow) !>
+        let returned = value.value1
+        // Only the function's own return: a value scope's `return` stays in the frame
+        if kind == VAL.return && state.live && !isset(flow.returns) && isset(returned) && own_value_reach(flow.g, returned).intersects(flow.g.lent) {
+            own_report(flow, value.exp, "Frame storage lent to a call must not leave this function, but the returned value holds an object holding it; copy the storage into the heap first") !>
+        }
         if kind == VAL.return && state.live {
             let returns = flow.returns
             if isset(returns) : returns.append(state.copy())
@@ -350,7 +342,7 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         own_check_value(value.value2, state, flow) !>
         own_check_pending(destination, marks, state, flow, "An ordinary assignment destination aliases a graph published while evaluating the assignment", true) !>
         own_release_publish(held, state, flow) !>
-        own_assign_escapes(value, state, flow)
+        own_assign_escapes(value, state, flow) !>
         own_check_lock_store(value, flow) !>
         // A local that gets a new value no longer holds what was published
         let left = value.value1
@@ -397,12 +389,14 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
             own_check_runtime_store(value, flow) !>
             own_check_shared_args(value, state, flow) !>
             own_check_call_moves(value, state, flow) !>
-            own_call_escapes(value, state, flow)
+            own_call_escapes(value, state, flow) !>
         }
     } else if kind == VAL.multi && isset(value.value1) && !own_tracks(value.rett) && own_is_inline_decl(value.value1) {
         // A plain part of an inline local is copied out of the local's own storage
         own_check_value(value.get_pre_value(), state, flow) !>
     } else {
+        // The launch keeps the inputs: reported before the call they go through
+        if kind == VAL.co : own_co_escapes(value, state, flow) !>
         own_check_value(value.get_pre_value(), state, flow) !>
         if kind == VAL.decl : own_check_use(value, state, flow) !>
         own_check_value(value.value1, state, flow) !>
@@ -412,13 +406,13 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         if kind == VAL.func {
             if !isset(value.value1) : own_note_allocations(value, state, flow)
             own_check_captures(value, state, flow) !>
-            own_closure_escapes(value, state, flow)
+            own_closure_escapes(value, state, flow) !>
         }
         if kind == VAL.throw || kind == VAL.error_value {
-            own_escape(state, flow, value.value1)
+            own_escape(state, flow, value.value1, "this error") !>
             let parts = value.values
             if isset(parts) {
-                each parts as part : own_escape(state, flow, part)
+                each parts as part : own_escape(state, flow, part, "this error") !>
             }
         }
         if kind == VAL.shared_view && state.live : own_check_view_publish(value, state, flow) !>
@@ -823,11 +817,12 @@ fn own_only_params(g: OwnGraph, set: OwnSet) bool {
 // Escapes, in evaluation order
 ////////////////////////////
 
-fn own_escape(state: OwnState, flow: OwnFlow, value: ?Value) {
+// `what` keeps the value, for the report when it holds lent frame storage
+fn own_escape(state: OwnState, flow: OwnFlow, value: ?Value, what: String, at: ?Exp (null)) !Error {
     let v = value ?! return
     if !own_tracks(v.rett) || own_is_raw(v.rett) : return
     let before = state.escaped.copy()
-    own_escape_set(state, flow, own_value_reach(flow.g, v))
+    own_escape_set(state, flow, own_value_reach(flow.g, v), what, at ?? v.exp) !>
     if own_debug() == "2" {
         let added = Array[uint]{}
         each state.escaped.items() as o {
@@ -839,7 +834,10 @@ fn own_escape(state: OwnState, flow: OwnFlow, value: ?Value) {
 
 // Only what exists by now escapes: a later allocation stored into the same place escapes
 // at that store
-fn own_escape_set(state: OwnState, flow: OwnFlow, reach: OwnSet) {
+fn own_escape_set(state: OwnState, flow: OwnFlow, reach: OwnSet, what: String, at: ?Exp) !Error {
+    if reach.intersects(flow.g.lent) {
+        own_report(flow, at, "Frame storage lent to a call must not leave this function, but " + what + " keeps an object holding it; copy the storage into the heap first") !>
+    }
     each reach.items() as o {
         let obj = flow.g.objs.get(o) ! continue
         if (obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call) && !state.allocated.has(o) : continue
@@ -852,12 +850,12 @@ fn own_is_outside(state: OwnState, flow: OwnFlow, set: OwnSet) bool {
 }
 
 // A store into a global, or into data that is outside already
-fn own_assign_escapes(assign: Value, state: OwnState, flow: OwnFlow) {
+fn own_assign_escapes(assign: Value, state: OwnState, flow: OwnFlow) !Error {
     let left = assign.value1 ?! return
     if left.type == VAL.decl : return
     let right = assign.value2
     if left.type == VAL.global {
-        own_escape(state, flow, right)
+        own_escape(state, flow, right, "this store", assign.exp) !>
         return
     }
     // The object the value is stored into, past the inline storage on the way
@@ -867,11 +865,11 @@ fn own_assign_escapes(assign: Value, state: OwnState, flow: OwnFlow) {
     }
     let holder = container ?! return
     if holder.type == VAL.decl && own_is_inline_value(holder.rett) : return
-    if holder.type == VAL.global || own_is_outside(state, flow, own_value_points(flow.g, holder)) : own_escape(state, flow, right)
+    if holder.type == VAL.global || own_is_outside(state, flow, own_value_points(flow.g, holder)) : own_escape(state, flow, right, "this store", assign.exp) !>
 }
 
 // What a call keeps of its inputs where the function cannot follow it
-fn own_call_escapes(call: Value, state: OwnState, flow: OwnFlow) {
+fn own_call_escapes(call: Value, state: OwnState, flow: OwnFlow) !Error {
     let callee = call.value1 ?! return
     let func = callee.resolve_call_func()
     if isset(func) && own_is_runtime(func) {
@@ -879,7 +877,7 @@ fn own_call_escapes(call: Value, state: OwnState, flow: OwnFlow) {
         if func.name == "property_set" || func.name == "property_update" {
             let args = call.values ?! return
             let slot = args.get(1) !? null
-            if isset(slot) && own_is_outside(state, flow, own_value_points(flow.g, slot)) : own_escape(state, flow, args.get(2) !? null)
+            if isset(slot) && own_is_outside(state, flow, own_value_points(flow.g, slot)) : own_escape(state, flow, args.get(2) !? null, "this store", call.exp) !>
         }
         return
     }
@@ -893,24 +891,24 @@ fn own_call_escapes(call: Value, state: OwnState, flow: OwnFlow) {
     }
     let summaries = own_call_summaries(func, call)
     if !isset(summaries) {
-        each inputs as input : own_escape(state, flow, input)
+        each inputs as input : own_escape(state, flow, input, "this call", call.exp) !>
         return
     }
     each summaries as s {
         if !isset(s) {
-            each inputs as input : own_escape(state, flow, input)
+            each inputs as input : own_escape(state, flow, input, "this call", call.exp) !>
             return
         }
         let e: uint = 0
         while e + 1 < s.escapes.length {
-            own_escape(state, flow, inputs.get(s.escapes.get(e) !? 0) !? null)
+            own_escape(state, flow, inputs.get(s.escapes.get(e) !? 0) !? null, "this call", call.exp) !>
             e += 2
         }
-        own_into_escapes(s.moves, inputs, state, flow)
+        own_into_escapes(s.moves, inputs, state, flow, call.exp) !>
     }
 }
 
-fn own_into_escapes(moves: Array[uint], inputs: Array[?Value], state: OwnState, flow: OwnFlow) {
+fn own_into_escapes(moves: Array[uint], inputs: Array[?Value], state: OwnState, flow: OwnFlow, at: ?Exp) !Error {
     let m: uint = 0
     while m + 3 < moves.length {
         let from = inputs.get(moves.get(m) !? 0) !? null
@@ -918,7 +916,7 @@ fn own_into_escapes(moves: Array[uint], inputs: Array[?Value], state: OwnState, 
         let level = moves.get(m + 3) !? 0
         m += 4
         if !isset(into) : continue
-        if own_is_outside(state, flow, own_objects_at(flow.g, into, level)) : own_escape(state, flow, from)
+        if own_is_outside(state, flow, own_objects_at(flow.g, into, level)) : own_escape(state, flow, from, "this call", at) !>
     }
 }
 
@@ -956,15 +954,24 @@ fn own_check_captures(value: Value, state: OwnState, flow: OwnFlow) !Error {
     }
 }
 
+// A coroutine keeps what its call is handed
+fn own_co_escapes(value: Value, state: OwnState, flow: OwnFlow) !Error {
+    let launched = value.value1 ?! return
+    if launched.type != VAL.call : return
+    let callee = launched.value1
+    own_escape(state, flow, isset(callee) && callee.type == VAL.func ? callee.value1 : callee, "a coroutine", value.exp) !>
+    each (launched.values ?? Array[Value]{}) as arg : own_escape(state, flow, arg, "a coroutine") !>
+}
+
 // A closure keeps what it captured
-fn own_closure_escapes(value: Value, state: OwnState, flow: OwnFlow) {
+fn own_closure_escapes(value: Value, state: OwnState, flow: OwnFlow) !Error {
     let closure = value.func ?! return
     if isset(value.value1) : return
     let g = flow.g
     each closure.capture_decls as captured {
         if captured.owner != g.func || captured.own_round != g.round : continue
         let all = own_decl_all(g, captured.own_index)
-        own_escape_set(state, flow, own_var_reach(g, all))
+        own_escape_set(state, flow, own_var_reach(g, all), "a closure", value.exp) !>
     }
 }
 
