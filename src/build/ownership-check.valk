@@ -7,9 +7,16 @@ use valk.core
 //   - frame storage lent as a borrow must not become reachable from a global, unknown code,
 //     a parameter or the result
 
+// The checker keeps each local's current points-to version. A publication marks the
+// versions that reach the published graph; a direct assignment drops the version it
+// replaces. A later allocation is not part of a graph published before it exists.
 class OwnState {
     live: bool (true)
-    // Locals whose graph may hold part of a published graph, by their number
+    // The current version of each local, by its number; OWN_NONE when the branches disagree
+    versions: Array[uint] (.{})
+    // Consumed versions, by the local that held them
+    consumed_versions: Array[Array[uint]] (.{})
+    // Locals published while their current version was unknown
     consumed: OwnSet (OwnSet{})
     // Objects that may have an alias outside the function by now
     escaped: OwnSet (OwnSet{})
@@ -19,18 +26,87 @@ class OwnState {
     // Objects published so far
     published: OwnSet (OwnSet{})
 
+    fn version(index: uint) uint {
+        return this.versions.get(index) !? OWN_NONE
+    }
+    fn set_version(index: uint, var: uint) {
+        while this.versions.length <= index : this.versions.append(OWN_NONE)
+        this.versions.set(index, var) _
+    }
+    fn merge_versions(other: Array[uint]) {
+        let before = this.versions.length
+        let n = other.length > this.versions.length ? other.length : this.versions.length
+        while this.versions.length < n : this.versions.append(OWN_NONE)
+        let i: uint = 0
+        while i < n {
+            let theirs = other.get(i) !? OWN_NONE
+            if i >= before {
+                this.set_version(i, theirs)
+            } else if this.version(i) != theirs {
+                this.set_version(i, OWN_NONE)
+            }
+            i++
+        }
+    }
+    fn consumed_at(index: uint) Array[uint] {
+        return this.consumed_versions.get(index) !? Array[uint]{}
+    }
+    fn add_consumed_version(index: uint, var: uint) {
+        while this.consumed_versions.length <= index : this.consumed_versions.append(Array[uint]{})
+        let list = this.consumed_versions.get(index) !? Array[uint]{}
+        if !list.contains(var) : list.append(var)
+    }
+    fn drop_consumed_version(index: uint, var: uint) {
+        if index >= this.consumed_versions.length : return
+        let list = this.consumed_versions.get(index) !? Array[uint]{}
+        let kept = Array[uint]{}
+        each list as known {
+            if known != var : kept.append(known)
+        }
+        this.consumed_versions.set(index, kept) _
+    }
+    fn clear_consumed_versions(index: uint) {
+        if index < this.consumed_versions.length : this.consumed_versions.set(index, Array[uint]{}) _
+    }
+    fn has_consumed_version(index: uint, var: uint) bool {
+        return this.consumed_at(index).contains(var)
+    }
+    fn has_any_consumed_version(index: uint) bool {
+        return this.consumed_at(index).length > 0
+    }
+    fn merge_consumed_versions(other: Array[Array[uint]]) {
+        let before = this.consumed_versions.length
+        let n = other.length > this.consumed_versions.length ? other.length : this.consumed_versions.length
+        while this.consumed_versions.length < n : this.consumed_versions.append(Array[uint]{})
+        let i: uint = 0
+        while i < n {
+            let theirs = other.get(i) !? Array[uint]{}
+            if i >= before {
+                this.consumed_versions.set(i, theirs.copy()) _
+            } else {
+                each theirs as var : this.add_consumed_version(i, var)
+            }
+            i++
+        }
+    }
     fn copy() OwnState {
-        return .{ live: this.live, consumed: this.consumed.copy(), escaped: this.escaped.copy(), allocated: this.allocated.copy(), published: this.published.copy() }
+        let consumed_versions = Array[Array[uint]]{}
+        each this.consumed_versions as list : consumed_versions.append(list.copy())
+        return .{ live: this.live, versions: this.versions.copy(), consumed_versions: consumed_versions, consumed: this.consumed.copy(), escaped: this.escaped.copy(), allocated: this.allocated.copy(), published: this.published.copy() }
     }
     fn merge(other: OwnState) {
         if !other.live : return
         if !this.live {
+            this.versions = Array[uint]{}
+            this.consumed_versions = Array[Array[uint]]{}
             this.consumed = OwnSet{}
             this.escaped = OwnSet{}
             this.allocated = OwnSet{}
             this.published = OwnSet{}
         }
         this.live = true
+        this.merge_versions(other.versions)
+        this.merge_consumed_versions(other.consumed_versions)
         this.consumed.add_all(other.consumed)
         this.escaped.add_all(other.escaped)
         this.allocated.add_all(other.allocated)
@@ -38,7 +114,9 @@ class OwnState {
     }
     fn same(other: OwnState) bool {
         if this.live != other.live : return false
-        return own_uints_same(this.consumed.items(), other.consumed.items()) && own_uints_same(this.escaped.items(), other.escaped.items())
+        return own_uints_same(this.versions, other.versions) && own_versions_same(this.consumed_versions, other.consumed_versions)
+            && own_uints_same(this.consumed.items(), other.consumed.items())
+            && own_uints_same(this.escaped.items(), other.escaped.items())
             && own_uints_same(this.allocated.items(), other.allocated.items()) && own_uints_same(this.published.items(), other.published.items())
     }
 }
@@ -154,6 +232,24 @@ fn own_var_local_reach(g: OwnGraph, var: uint) OwnSet {
     return reach
 }
 
+fn own_value_var(value: ?Value) uint {
+    let v = value ?! return OWN_NONE
+    let meta = v.meta
+    return isset(meta) ? meta.own_var : OWN_NONE
+}
+
+fn own_versions_same(a: Array[Array[uint]], b: Array[Array[uint]]) bool {
+    if a.length != b.length : return false
+    each a as list, i {
+        let other = b.get(i) !? null
+        if !isset(other) || list.length != other.length : return false
+        each list as var {
+            if !other.contains(var) : return false
+        }
+    }
+    return true
+}
+
 // Everything a variable may reach, once per variable: the graph does not change while checking
 fn own_var_reach(g: OwnGraph, var: uint) OwnSet {
     let known = g.reach_cache.get(var) !? null
@@ -219,13 +315,48 @@ fn own_check_branches(value: Value, state: OwnState, flow: OwnFlow) !Error {
     state.live = false
     state.merge(yes)
     state.merge(no)
+    own_join(state, flow, value, Array[OwnState]{ yes, no })
+}
+
+// After a merge each local holds the translator's join variable; it is used up when the
+// version any incoming state holds was
+fn own_join(state: OwnState, flow: OwnFlow, value: Value, incoming: Array[OwnState], offset: uint (0)) {
+    let meta = value.meta ?! return
+    if !state.live || meta.own_round != flow.g.round || meta.own_join == OWN_NONE : return
+    let env = flow.g.joins.get(meta.own_join + offset) ! return
+    each env.vars as join, i {
+        if join == OWN_NONE : continue
+        let used = false
+        each incoming as s {
+            if !s.live : continue
+            let v = s.version(i)
+            if v == OWN_NONE ? s.has_any_consumed_version(i) : s.has_consumed_version(i, v) {
+                used = true
+                break
+            }
+        }
+        // Older versions are behind the join; a later iteration may reuse their variables
+        state.set_version(i, join)
+        state.clear_consumed_versions(i)
+        if used : state.add_consumed_version(i, join)
+    }
 }
 
 fn own_check_loop(value: Value, state: OwnState, flow: OwnFlow) !Error {
-    let head = state.copy()
-    let seen = Array[OwnState]{ head }
-    let exits = OwnState { live: false }
+    let incoming = Array[OwnState]{ state.copy() }
+    let seen = Array[OwnState]{}
+    let exits = Array[OwnState]{}
     while true {
+        let head = OwnState { live: false }
+        each incoming as entered : head.merge(entered)
+        own_join(head, flow, value, incoming)
+        if !head.live : break
+        let repeated = false
+        each seen as previous {
+            if head.same(previous) { repeated = true; break }
+        }
+        if repeated : break
+        seen.append(head)
         let iteration = head.copy()
         let breaks = Array[OwnState]{}
         let continues = Array[OwnState]{}
@@ -233,24 +364,16 @@ fn own_check_loop(value: Value, state: OwnState, flow: OwnFlow) !Error {
         inner.outer_loop = flow
         own_check_value(value.value1, iteration, inner) !>
         let condition = value.value1
-        if !isset(condition) || condition.type != VAL.bool || !condition.bool_val : exits.merge(iteration)
+        if !isset(condition) || condition.type != VAL.bool || !condition.bool_val : exits.append(iteration.copy())
         if isset(condition) && condition.type == VAL.bool && !condition.bool_val : iteration.live = false
         own_check_values(value.values, iteration, inner) !>
-        each breaks as stopped : exits.merge(stopped)
-        let next = OwnState { live: false }
-        next.merge(iteration)
-        each continues as resumed : next.merge(resumed)
-        if !next.live : break
-        let repeated = false
-        each seen as previous {
-            if next.same(previous) { repeated = true; break }
-        }
-        if repeated : break
-        seen.append(next)
-        head = next
+        each breaks as stopped : exits.append(stopped)
+        incoming = Array[OwnState]{ iteration }
+        each continues as resumed : incoming.append(resumed)
     }
     state.live = false
-    state.merge(exits)
+    each exits as stopped : state.merge(stopped)
+    own_join(state, flow, value, exits, 1)
 }
 
 fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
@@ -266,7 +389,12 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         let returns = Array[OwnState]{}
         let inner = flow.nested(flow.breaks, flow.continues, returns, flow.match_value)
         own_check_values(value.values, state, inner) !>
-        each returns as returned : state.merge(returned)
+        if returns.length > 0 {
+            let incoming = returns.copy()
+            incoming.append(state.copy())
+            each returns as returned : state.merge(returned)
+            own_join(state, flow, value, incoming)
+        }
     } else if kind == VAL.break || kind == VAL.continue {
         let target = flow.loop_at(value.int_val)
         let destinations = kind == VAL.break ? target.breaks : target.continues
@@ -289,16 +417,21 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         own_check_value(value.get_pre_value(), state, flow) !>
         let handled = state.copy()
         own_check_value(value.value2, handled, flow) !>
+        let succeeded = state.copy()
         state.merge(handled)
+        own_join(state, flow, value, Array[OwnState]{ succeeded, handled })
     } else if kind == VAL.op && (value.value_op == VALUE_OP.and || value.value_op == VALUE_OP.or) {
         own_check_value(value.value1, state, flow) !>
         let right = state.copy()
         own_check_value(value.value2, right, flow) !>
+        let skipped = state.copy()
         state.merge(right)
+        own_join(state, flow, value, Array[OwnState]{ skipped, right })
     } else if kind == VAL.match {
         own_check_value(value.value1, state, flow) !>
         let inner = flow.nested(flow.breaks, flow.continues, flow.returns, value.value1)
         let joined = OwnState { live: false }
+        let arms = Array[OwnState]{}
         let cases = value.values
         if isset(cases) {
             each cases as branch {
@@ -308,11 +441,13 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
                 own_check_values(branch.values, arm, inner) !>
                 own_check_value(branch.value2, arm, inner) !>
                 joined.merge(arm)
+                arms.append(arm)
                 if branch.bool_val : state.live = false
             }
         }
         state.live = false
         state.merge(joined)
+        own_join(state, flow, value, arms)
     } else if kind == VAL.block || kind == VAL.allocas {
         own_check_value(value.get_pre_value(), state, flow) !>
         own_check_values(value.values, state, flow) !>
@@ -329,11 +464,18 @@ fn own_check_value(value: ?Value, state: OwnState, flow: OwnFlow) !Error {
         own_release_publish(held, state, flow) !>
         own_assign_escapes(value, state, flow) !>
         own_check_lock_store(value, flow) !>
-        // A local that gets a new value no longer holds what was published
         let left = value.value1
         let decl = isset(left) && left.type == VAL.decl ? left.decl : null
         if isset(decl) && value.assign_op == ASSIGN_OP.set && decl.owner == flow.g.func && decl.own_round == flow.g.round {
-            state.consumed.remove(decl.own_index)
+            if own_tracks(decl.type) {
+                let var = own_value_var(value.value2)
+                let old = state.version(decl.own_index)
+                if old != OWN_NONE : state.drop_consumed_version(decl.own_index, old) else : state.clear_consumed_versions(decl.own_index)
+                state.consumed.remove(decl.own_index)
+                state.set_version(decl.own_index, var)
+            } else {
+                state.consumed.remove(decl.own_index)
+            }
         }
         if isset(decl) && decl.is_buffer : flow.mark_buffer(decl, state.published)
     } else if kind == VAL.ptrv && isset(value.value2) {
@@ -561,12 +703,26 @@ fn own_check_use(value: Value, state: OwnState, flow: OwnFlow) !Error {
     let decl = value.decl ?! return
     if decl.is_buffer || decl.owner != flow.g.func || decl.own_round != flow.g.round : return
     let type = value.rett.get_non_nullable()
-    // Views are not ordinary data, and raw pointers are the unsafe writer's concern
-    if type.is_shared || type.is_locked || value.rett.has_locked_refs() || own_is_raw(value.rett) : return
-    if own_debug() == "4" : println("own-use " + (decl.name ?? "?") + " #" + decl.own_index + " at " + own_line(value.exp) + " consumed " + own_uints_text(state.consumed.items()) + " live " + state.live)
-    if state.consumed.has(decl.own_index) {
+    // Views are not ordinary data, raw pointers are the unsafe writer's concern,
+    // and a value with no managed graph has nothing to consume
+    if type.is_shared || type.is_locked || value.rett.has_locked_refs() || own_is_raw(value.rett) || !own_tracks(value.rett) : return
+    let var = own_value_var(value)
+    let known = state.version(decl.own_index)
+    let was_unknown = known == OWN_NONE
+    if own_debug() == "4" {
+        println("own-use " + flow.g.func.name + " " + (decl.name ?? "?") + " #" + decl.own_index + " at " + own_line(value.exp)
+            + " var " + var + " known " + known + " consumed " + own_uints_text(state.consumed.items())
+            + " versions " + own_uints_text(state.consumed_at(decl.own_index)) + " live " + state.live)
+    }
+    let bad = state.consumed.has(decl.own_index)
+    if !bad {
+        if was_unknown : bad = state.has_any_consumed_version(decl.own_index)
+        else : bad = state.has_consumed_version(decl.own_index, known)
+    }
+    if bad {
         own_report(flow, value.exp, "An ordinary value may be used again after its graph was published as shared") !>
     }
+    if was_unknown && var != OWN_NONE : state.set_version(decl.own_index, var)
 }
 
 // `vouch`: a parameter's graph moved into a parameter's locked data is the caller's to vouch
@@ -614,24 +770,31 @@ fn own_check_publish(value: Value, state: OwnState, flow: OwnFlow, at: ?Exp (nul
     }
     // A vouched parameter's graph is used up here as well
     published.add_all(vouched)
+    // A later allocation cannot be part of the graph published here yet
+    each published.items() as o {
+        let obj = flow.g.objs.get(o) ! continue
+        if (obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call) && !state.allocated.has(o) && !vouched.has(o) {
+            published.remove(o)
+        }
+    }
     if own_debug() == "1" {
         let text = "own-debug publish in " + flow.g.func.name + " kind " + value.type.to(uint) + " " + value.rett.compat_display_name() + " at " + own_line(value.exp) + ":"
         each reach.items() as o {
             let obj = flow.g.objs.get(o) ! continue
             text += " " + o + ":" + obj.kind.to(uint) + "@" + own_line(obj.at)
         }
-        let consumed = Array[String]{}
-        each flow.g.decl_all as all, index {
-            if flow.g.deep(flow.g.pts.set(all)).intersects(reach) : consumed.append(index.to_string())
-        }
-        println(text + " consumes " + consumed.join(","))
+        println(text)
     }
     if own_debug() == "1" : println("own-debug published " + own_uints_text(published.items()) + " views " + own_uints_text(flow.views.items()) + " escaped " + own_uints_text(state.escaped.items()))
     if published.is_empty() : return
     state.published.add_all(published)
     let g = flow.g
     each g.decl_all as all, index {
-        if own_var_local_reach(g, all).intersects(published) : state.consumed.add(index)
+        let var = state.version(index)
+        let reach = var != OWN_NONE ? own_var_local_reach(g, var) : own_var_local_reach(g, all)
+        if reach.intersects(published) {
+            if var != OWN_NONE : state.add_consumed_version(index, var) else : state.consumed.add(index)
+        }
     }
 }
 
@@ -929,7 +1092,7 @@ fn own_check_captures(value: Value, state: OwnState, flow: OwnFlow) !Error {
         if captured.owner != g.func || captured.own_round != g.round || captured.is_buffer : continue
         let type = captured.type.get_non_nullable()
         if type.is_shared || type.is_locked || captured.type.has_locked_refs() || own_is_raw(captured.type) : continue
-        if state.consumed.has(captured.own_index) {
+        if state.consumed.has(captured.own_index) || state.has_any_consumed_version(captured.own_index) {
             own_report(flow, value.exp, "An ordinary value may be used again after its graph was published as shared") !>
         }
     }
