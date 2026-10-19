@@ -48,16 +48,16 @@ checksum.
 ./examples/bench/run.sh shared-read shared-channel shared-lock shared-cache shared-broadcast
 ```
 
-Valk 0.7.11 (dev), Go 1.27.1, Rust 1.97.1 on 12 cores. Median of 5 runs after one
-warm-up, memory is peak RSS.
+Valk 0.7.11, Go 1.27.1, Rust 1.97.1 on an AMD Ryzen 5 7600X (6 cores, 12 threads).
+Median of 3 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
-| shared-read | 200k users, 4x5M lookups | 0.950s (93.6 MB) | 0.430s (94.7 MB) | 0.820s (72.1 MB) |
-| shared-channel | 4 pairs, 4x1M messages | 0.370s (11.2 MB) | 0.160s (13.6 MB) | 0.520s (3.1 MB) |
-| shared-lock | 10k keys, 4x2M updates | 0.640s (4.0 MB) | 0.260s (7.5 MB) | 0.690s (3.7 MB) |
-| shared-cache | 100k slots, 4x2M ops | 1.110s (81.2 MB) | 0.580s (51.1 MB) | 1.150s (29.1 MB) |
-| shared-broadcast | 500k messages, 4 subscribers | 0.320s (8.2 MB) | 0.120s (12.1 MB) | 1.070s (3.0 MB) |
+| shared-read | 200k users, 4x5M lookups | 0.830s (94.1 MB) | 0.350s (94.8 MB) | 0.750s (72.1 MB) |
+| shared-channel | 4 pairs, 4x1M messages | 0.300s (12.8 MB) | 0.170s (13.0 MB) | 0.490s (3.1 MB) |
+| shared-lock | 10k keys, 4x2M updates | 0.630s (5.6 MB) | 0.260s (5.5 MB) | 0.670s (3.6 MB) |
+| shared-cache | 100k slots, 4x2M ops | 0.980s (85.5 MB) | 0.490s (50.9 MB) | 0.900s (29.1 MB) |
+| shared-broadcast | 500k messages, 4 subscribers | 0.350s (9.1 MB) | 0.120s (11.7 MB) | 1.150s (3.0 MB) |
 
 Go's scheduler moves goroutines between a few threads without system calls, which
 helps the lock and hand-off heavy cases. Valk and Rust wake real threads.

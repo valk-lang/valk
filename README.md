@@ -83,19 +83,19 @@ make
 
 ## Benchmarks
 
-Valk 0.7.6 (dev), Go 1.27.1, Rust 1.97.1. Median of 5 runs after one warm-up, memory is peak RSS.
+Valk 0.7.11, Go 1.27.1, Rust 1.97.1 on an AMD Ryzen 5 7600X (6 cores, 12 threads). Median of 3 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
-| binary-tree | 19 | 0.470s (56.0 MB) | 1.340s (56.4 MB) | 2.590s (66.2 MB) |
-| binary-tree-multi | 19 | 0.310s (75.4 MB) | 0.520s (85.7 MB) | 0.720s (66.3 MB) |
-| json | 2000000 | 0.430s (3.2 MB) | 2.090s (12.7 MB) | 0.430s (2.5 MB) |
-| json-serde | sample, 50000 | 0.220s (155.3 MB) | 0.380s (228.6 MB) | 0.230s (119.3 MB) |
-| lru | 1000, 11000000 | 0.360s (4.8 MB) | 0.760s (3.5 MB) | 0.440s (2.6 MB) |
-| merkletrees | 18 | 0.540s (66.6 MB) | 1.170s (70.8 MB) | 1.670s (66.3 MB) |
-| nsieve | 13 | 0.810s (80.4 MB) | 0.870s (141.8 MB) | 0.840s (80.5 MB) |
-| spectral-norm | 5500 | 1.080s (4.5 MB) | 1.110s (5.7 MB) | 1.080s (2.6 MB) |
-| spectral-norm-multi | 8000, 4 workers | 0.650s (4.6 MB) | 0.630s (9.7 MB) | 0.640s (2.8 MB) |
+| binary-tree | 19 | 0.500s (57.6 MB) | 1.340s (58.1 MB) | 2.500s (66.3 MB) |
+| binary-tree-multi | 19 | 0.310s (76.7 MB) | 0.510s (86.3 MB) | 0.680s (66.4 MB) |
+| json | 2000000 | 0.430s (4.9 MB) | 2.100s (11.5 MB) | 0.420s (2.5 MB) |
+| json-serde | sample, 50000 | 0.200s (155.7 MB) | 0.310s (215.1 MB) | 0.230s (119.2 MB) |
+| lru | 1000, 11000000 | 0.360s (4.6 MB) | 0.770s (5.5 MB) | 0.440s (2.6 MB) |
+| merkletrees | 18 | 0.490s (68.4 MB) | 1.210s (70.8 MB) | 1.620s (66.3 MB) |
+| nsieve | 13 | 0.730s (82.1 MB) | 0.830s (141.9 MB) | 0.850s (80.5 MB) |
+| spectral-norm | 5500 | 1.100s (2.4 MB) | 1.120s (5.6 MB) | 1.080s (2.6 MB) |
+| spectral-norm-multi | 8000, 4 workers | 0.630s (7.0 MB) | 0.640s (11.7 MB) | 0.640s (2.8 MB) |
 
 Code: [Link](examples/bench)
 
@@ -103,17 +103,17 @@ Code: [Link](examples/bench)
 
 ### GC benchmarks
 
-Valk 0.7.6 (dev), Go 1.27.1, LDC 1.43.0, .NET 10.0.112. Median of 3 runs.
+Valk 0.7.11, Go 1.27.1, LDC 1.43.0, .NET 10.0.112. Median of 3 runs.
 
 | Scenario | Valk | Go | D | C# |
 |---|---:|---:|---:|---:|
-| short-lived alloc | 9 ms | 74 ms | 131 ms | 78 ms |
-| stable-heap forced collects | 0 ms | 4230 ms | 2626 ms | 2980 ms |
-| build long-lived chain | 51 ms | 61 ms | 138 ms | 216 ms |
-| free long-lived chain | 25 ms | 54 ms | 2 ms | 13 ms |
-| mutate live links | 9 ms | 7 ms | 10 ms | 13 ms |
-| short-lived churn with large live set | 4 ms | 77 ms | 89 ms | 48 ms |
-| tree churn | 40 ms | 121 ms | 251 ms | 123 ms |
+| short-lived alloc | 8 ms | 74 ms | 130 ms | 77 ms |
+| stable-heap forced collects | 0 ms | 4187 ms | 2535 ms | 2909 ms |
+| build long-lived chain | 50 ms | 58 ms | 132 ms | 209 ms |
+| free long-lived chain | 25 ms | 67 ms | 2 ms | 13 ms |
+| mutate live links | 9 ms | 7 ms | 10 ms | 12 ms |
+| short-lived churn with large live set | 4 ms | 77 ms | 87 ms | 48 ms |
+| tree churn | 39 ms | 123 ms | 249 ms | 121 ms |
 
 Code: [Link](examples/bench/gc)
 
@@ -128,13 +128,15 @@ memory our GC has no problem with this.
 
 ### HTTP server benchmark
 
-HTTP hello world. Higher requests per second is better.
+HTTP hello world. Higher requests per second is better. Every server uses all 12 hardware
+threads (its default); wrk runs on the same machine with 8 threads, 900 connections and 16
+pipelined requests. Median of 3 runs of 5 seconds.
 
 | Language | Library | Requests per second |
 |---|---|---:|
-| Valk 0.7.2 | http | 8,302,170 |
-| Rust 1.97.1 | hyper 1.11 on tokio 1.53 | 7,554,694 |
-| Go 1.27.1 | fasthttp 1.73 | 5,282,109 |
+| Valk 0.7.11 | http | 10,215,940 |
+| Rust 1.97.1 | hyper 1.11 on tokio 1.53 | 8,474,162 |
+| Go 1.27.1 | fasthttp 1.73 | 6,034,080 |
 
 Code: [Link](examples/bench/http)
 
