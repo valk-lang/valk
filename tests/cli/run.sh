@@ -111,6 +111,24 @@ if [ "$opt_cache" != "$release_cache" ]; then
     exit 1
 fi
 
+if [ "$(uname -s)" = Linux ] && command -v readelf >/dev/null 2>&1; then
+    echo "> Release builds leave out the symbol table and unused libraries"
+    build --release >/dev/null || exit 1
+    if readelf -S "$output" | grep -q '\.symtab'; then
+        echo "# --release kept the symbol table"
+        exit 1
+    fi
+    if readelf -d "$output" | grep -q 'libm\.so'; then
+        echo "# A program without math still loads libm"
+        exit 1
+    fi
+    build >/dev/null || exit 1
+    if ! readelf -S "$output" | grep -q '\.symtab'; then
+        echo "# A default build lost its symbol table"
+        exit 1
+    fi
+fi
+
 echo "> Reopening the object-cache lock preserves its contents"
 lock_file="$default_cache/cache.lock"
 if [ ! -f "$lock_file" ]; then
