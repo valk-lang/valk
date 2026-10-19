@@ -150,6 +150,14 @@ if "$VALK" build "$input" --no-warn -vv -o "$output" 2>&1 | grep -q "ld.lld (bui
     fi
 fi
 
+if [[ "$(uname -s)" == Darwin* ]] && "$VALK" build "$input" --no-warn -vv --target linux-x64 -o "$workdir/cross" 2>&1 | grep -q "(built in)"; then
+    echo "> Native macOS builds keep Apple's linker"
+    if "$VALK" build "$input" --no-warn -vv -o "$output" 2>&1 | grep -q "(built in)"; then
+        echo "# A native macOS build used the built-in lld"
+        exit 1
+    fi
+fi
+
 echo "> Reopening the object-cache lock preserves its contents"
 lock_file="$default_cache/cache.lock"
 if [ ! -f "$lock_file" ]; then

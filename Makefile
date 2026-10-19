@@ -46,7 +46,8 @@ BENCH_JSON_ITERATIONS ?= 2000000
 # system's LLVM, a static build takes libvalk-lld.a from the vendored libraries
 ifneq ($(and $(filter Linux,$(HOST_SYSTEM)),$(wildcard /usr/include/lld/Common/Driver.h)),)
 LLD_SHIM := debug/libvalk-lld.a
-LLD_FLAGS := --def "LLD=1" -L debug
+# The system's shared lld, not the static one a vendored LLVM may have
+LLD_FLAGS := --def "LLD=1" -L debug -L $(shell llvm-config --libdir)
 endif
 # A vendored LLVM with lld added (misc/toolchains/add-lld.sh) gives a compiler that links in-process
 lld_flags = $(if $(wildcard $(1)/lib/libvalk-lld.a $(1)/lib/valk-lld.lib),--def "LLD=1")
@@ -57,7 +58,7 @@ WIN_LLD_FLAGS := $(call lld_flags,toolchains/libraries/win-llvm-22-x64)
 # The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
 # release targets link the vendored static one
 valk: $(COMPILER_DEPS) $(LLD_SHIM)
-	$(VC) build . -o ./valk -vv $(FLAGS) $(NATIVE_LINK_FLAGS) $(LLD_FLAGS)
+	$(VC) build . -o ./valk -vv $(FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
 
 debug/libvalk-lld.a: src/llvm/lld/lld.cpp
 	mkdir -p debug
@@ -252,7 +253,7 @@ ci-linux: $(COMPILER_DEPS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
 
 ci-win: $(COMPILER_DEPS)
 	~/valk-dev/valk.exe -h || echo ""
@@ -295,7 +296,7 @@ macos-x64: $(DIST_DEPS)
 	mkdir -p dist/macos-x64
 	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/macos-11-3 \
-	-L toolchains/libraries/macos-llvm-22-x64/lib
+	-L toolchains/libraries/macos-llvm-22-x64/lib $(call lld_flags,toolchains/libraries/macos-llvm-22-x64)
 	cp -r ./lib ./dist/macos-x64/
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
@@ -305,7 +306,7 @@ macos-arm64: $(DIST_DEPS)
 	mkdir -p dist/macos-arm64
 	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/macos-11-3 \
-	-L toolchains/libraries/macos-llvm-22-arm64/lib
+	-L toolchains/libraries/macos-llvm-22-arm64/lib $(call lld_flags,toolchains/libraries/macos-llvm-22-arm64)
 	cp -r ./lib ./dist/macos-arm64/
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib

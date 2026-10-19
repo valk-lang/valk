@@ -19,8 +19,10 @@ if [ ! -d "$MAC_ANY" ]; then
 	mv "MacOSX11.3.sdk" "macos-11-3" 
 fi
 
-if [ ! -d "$LLVM_MAC_X64" ]; then
+# Older downloads have no lld
+if [ ! -f "$LLVM_MAC_X64/lib/libvalk-lld.a" ]; then
 	echo "Download LLVM macos x64"
+	rm -rf "$LLVM_MAC_X64"
 	cd $LIB_DIR
 	wget "https://files.valk-cdn.dev/toolchains/macos-llvm-22-x64.tar.gz"
 	tar -xf "macos-llvm-22-x64.tar.gz"
