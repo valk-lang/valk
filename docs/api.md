@@ -930,7 +930,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
     + fn count(part: String) uint
     // The bytes as a zero-terminated C string, without copying.
-    + get data_cstring: cstring
+    + get data_cstring: cstring @unsafe
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
     + fn ends_with(part: String) bool
     // Returns whether both strings hold the same bytes; backs `==`.

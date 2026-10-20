@@ -1440,8 +1440,8 @@ Hands the storage over as a `String` without copying, and leaves the buffer cons
 A consumed buffer is empty for good: every call that needs room (`write*`, `reserve`,
 `ensure_capacity`, `skip`, `fill`, `resize` to a larger length, ...) panics, and `clear`
 does not undo it. Calling `into_string` again returns "". Use `clone` or a new buffer
-to keep writing. Views taken before the call still point at the bytes now owned by the
-returned string.
+to keep writing. When a writable view of the storage was taken, the string is a copy, so
+writes through that view never change it.
 
 #### ltrim
 
@@ -3033,7 +3033,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     // Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
     + fn count(part: String) uint
     // The bytes as a zero-terminated C string, without copying.
-    + get data_cstring: cstring
+    + get data_cstring: cstring @unsafe
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
     + fn ends_with(part: String) bool
     // Returns whether both strings hold the same bytes; backs `==`.
@@ -3249,8 +3249,8 @@ Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
 
 The bytes as a zero-terminated C string, without copying.
 
-The pointer is only valid while the string is alive. A string that contains a zero byte
-looks shorter through it.
+The pointer is only valid while the string is alive, so using it requires `@unsafe`. A
+string that contains a zero byte looks shorter through it.
 
 #### ends_with
 

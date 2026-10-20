@@ -120,6 +120,13 @@ def methods(doc, cls, args):
 
 
 def call_code(name, f, args, ctx):
+    code = call_line(name, f, args, ctx)
+    if code is not None and f.get("unsafe"):
+        code = "@unsafe\n        " + code
+    return code
+
+
+def call_line(name, f, args, ctx):
     if f["is_getter"]:
         return "let r = x.%s" % name
     values = []
