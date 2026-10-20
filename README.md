@@ -1,6 +1,6 @@
 
 <div align="center"><p>
-    <img height="150" style="height: 150px" src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valk.svg">
+    <img height="150" src="misc/valk-logo.png" alt="Valk programming language">
 </p></div>
 
 # Valk
@@ -179,6 +179,6 @@ Either way, you should join our [discord](https://discord.gg/RwEGqdSERA) 😊 Ev
 ---
 
 <div align="center"><p>
-    <img src="https://raw.githubusercontent.com/valk-lang/valk/main/misc/valko-circle.png">
+    <img height="234" src="misc/valk.png" alt="Valk logo">
 </p>
 </div>
