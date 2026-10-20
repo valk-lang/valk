@@ -3250,6 +3250,16 @@ fn first(data: *[u8]) u8 {
 }
 ```
 
+A function marked `@unsafe` can only be called or referenced in an unsafe scope.
+`String.data_cstring` is one: the pointer it returns is only valid while the
+string is alive.
+
+```rust
+fn first_byte(text: String) u8 @unsafe {
+    return text.data_cstring.get(0)
+}
+```
+
 Use `valk build --ignore-unsafe` to allow them for an entire build.
 
 ## Structs
