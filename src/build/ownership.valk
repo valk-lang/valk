@@ -313,7 +313,8 @@ class OwnCall {
     func: ?Func (null)
     args: Array[uint] (.{})
     result: uint (OWN_NONE)
-    // The object for what the callee made
+    // The object for what the callee made; `made + 1 .. made + 3` stand for what it holds
+    // at each deeper level (OWN_LEVELS)
     made: uint (0)
     at: ?Exp (null)
 }
@@ -845,13 +846,31 @@ fn own_apply_summary(g: OwnGraph, call: OwnCall, given: ?OwnSummary) bool {
     }
     if call.result != OWN_NONE {
         if summary.ret_global && g.pts.add(result, OWN_GLOBAL) : changed = true
-        if summary.ret_new && g.pts.add(result, call.made) : changed = true
+        if summary.ret_new {
+            if g.pts.add(result, call.made) : changed = true
+            // What the made object holds, level by level: loads from it find that
+            let level: uint = 0
+            while level < OWN_LEVELS {
+                let inner = OwnSet{}
+                inner.add(call.made + (level + 1 < OWN_LEVELS ? level + 1 : level))
+                if g.write_field(call.made + level, OWN_ANY_FIELD, inner) : changed = true
+                level++
+            }
+        }
         let k: uint = 0
         while k + 1 < summary.ret.length {
             let given_objects = own_level_objects(g, call, summary.ret.get(k) !? 0, summary.ret.get(k + 1) !? 0, cache)
             k += 2
             // The result is, or holds, those objects: either way what reaches it reaches them
             if g.pts.add_set(result, given_objects) : changed = true
+            // Held through what the callee made, at any depth: loads from the result find them
+            if summary.ret_new && !given_objects.is_empty() {
+                let level: uint = 0
+                while level < OWN_LEVELS {
+                    if g.write_field(call.made + level, OWN_ANY_FIELD, given_objects) : changed = true
+                    level++
+                }
+            }
         }
     }
     let made_object = call.made
@@ -1352,6 +1371,19 @@ fn own_element_key(g: OwnGraph, base: Value, var: uint) uint {
     return OWN_ANY_FIELD
 }
 
+// The tracked values integer bits were computed from, through casts and operators
+fn own_bit_sources(g: OwnGraph, v: Value, out: Array[uint]) {
+    if own_tracks(v.rett) {
+        out.append(own_eval(g, v))
+        return
+    }
+    if v.type != VAL.cast && v.type != VAL.op && v.type != VAL.unary : return
+    let a = v.value1
+    let b = v.value2
+    if isset(a) : own_bit_sources(g, a, out)
+    if isset(b) : own_bit_sources(g, b, out)
+}
+
 // A cast of inline storage to a raw pointer: the storage's address
 fn own_is_inline_address(v: Value) bool {
     if v.type != VAL.cast || !v.rett.is_raw_pointer() : return false
@@ -1366,6 +1398,18 @@ fn own_keeps_view_source(v: Value) bool {
     if kind == VAL.cast || kind == VAL.wrap || kind == VAL.interface_wrap || kind == VAL.interface_object || kind == VAL.error_success {
         let on = v.value1 ?! return false
         return own_is_view_type(on.rett)
+    }
+    // Read out of a shared parameter: the summary tells whether the callee keeps that part
+    if kind == VAL.prop || kind == VAL.ptrv || kind == VAL.load || kind == VAL.ptr_offset {
+        let at: ?Value = v.value1
+        while isset(at) {
+            if at.type == VAL.decl {
+                let decl = at.decl ?! return false
+                return decl.is_arg && own_is_view_type(at.rett)
+            }
+            if at.type != VAL.prop && at.type != VAL.ptrv && at.type != VAL.load && at.type != VAL.ptr_offset && at.type != VAL.cast && at.type != VAL.wrap : return false
+            at = at.value1
+        }
     }
     return false
 }
@@ -1413,6 +1457,12 @@ fn own_eval_kind(g: OwnGraph, v: Value, pre_var: uint) uint {
         }
         let r = own_eval(g, on)
         if isset(on) && own_is_view_type(on.rett) && !own_is_view_type(v.rett) : return own_view_read(g, v)
+        // A reference rebuilt from integer bits, like a union payload: what the bits came from
+        if r == OWN_NONE && isset(on) && own_tracks(v.rett) && !own_is_raw(v.rett) {
+            let sources = Array[uint]{}
+            own_bit_sources(g, on, sources)
+            if sources.length > 0 : return g.join(sources)
+        }
         return r
     }
     if kind == VAL.prop || kind == VAL.ptrv {
@@ -1420,7 +1470,8 @@ fn own_eval_kind(g: OwnGraph, v: Value, pre_var: uint) uint {
         let from = own_eval(g, on)
         if kind == VAL.ptrv : own_eval(g, v.value2)
         if !own_tracks(v.rett) : return OWN_NONE
-        if own_is_view_type(on.rett) : return own_view_read(g, v)
+        // Shared data read out of shared data is followed like any load (own_keeps_view_source)
+        if own_is_view_type(on.rett) && !own_is_view_type(v.rett) : return own_view_read(g, v)
         let r = g.var()
         // A borrow's own parts: the storage it points into, and that storage's address
         let prop = v.prop
@@ -1453,7 +1504,7 @@ fn own_eval_kind(g: OwnGraph, v: Value, pre_var: uint) uint {
     if kind == VAL.load {
         let pointer = v.value1
         let from = own_eval(g, pointer)
-        if isset(pointer) && own_is_view_type(pointer.rett) : return own_view_read(g, v)
+        if isset(pointer) && own_is_view_type(pointer.rett) && !own_is_view_type(v.rett) : return own_view_read(g, v)
         let r = g.var()
         g.emit(OWN_C.load, r, from)
         return r
@@ -1862,6 +1913,7 @@ fn own_call(g: OwnGraph, v: Value) uint {
         return result
     }
     let made = g.object(OWN_OBJ.call, v.exp)
+    each 1 .. OWN_LEVELS - 1 as level : g.object(OWN_OBJ.call, v.exp)
     if g.memo_all : v.ensure_meta().own_made = made
     let call = OwnCall { func: known ? f : null, args: args, result: result, made: made, at: v.exp, seq: g.seq, range: g.range }
     g.calls.append(call)
@@ -1967,7 +2019,11 @@ fn own_summarize(g: OwnGraph) OwnSummary {
     s.ret_global = ret.has(OWN_GLOBAL)
     each ret.items() as o {
         let obj = g.objs.get(o) ! continue
-        if obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call || obj.kind == OWN_OBJ.new { s.ret_new = true; break }
+        if obj.kind == OWN_OBJ.site || obj.kind == OWN_OBJ.call || obj.kind == OWN_OBJ.new {
+            s.ret_new = true
+            // Also kept where anything reaches it, like a global registry
+            if escaped.has(o) : s.new_escapes = true
+        }
     }
     own_summary_prune(s, g.func.args.length)
     return s
@@ -2349,7 +2405,7 @@ fn own_analyze(build: Build) {
             if dump != "1" && !func.name.contains(dump) : continue
             let s = func.own_summary ?! continue
             println("own " + func.name + " " + (func.class?.pretty_name() ?? "") + " final " + func.own_final + ": ret " + own_uints_text(s.ret) + " ret_global " + s.ret_global + " ret_new " + s.ret_new
-                + " escapes " + own_uints_text(s.escapes) + " moves " + own_uints_text(s.moves) + " new_under " + own_uints_text(s.new_under) + " global_under " + own_uints_text(s.global_under))
+                + " escapes " + own_uints_text(s.escapes) + " moves " + own_uints_text(s.moves) + " new_under " + own_uints_text(s.new_under) + " global_under " + own_uints_text(s.global_under) + (s.new_escapes ? " new_escapes" : ""))
         }
     }
 }

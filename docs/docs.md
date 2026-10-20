@@ -1371,6 +1371,8 @@ global my_counter : uint (my_start + 1)   // Optional default value
 
 Defaults run before `main`, each after the globals it reads (directly or through the functions it calls), whatever the declaration order; two defaults that read each other are a compile error.
 
+A global without a default starts as zero, so it needs a type where zero is a valid value: numbers, `bool`, nullable types, raw pointers, and structs or fixed arrays made of those. A global of any other type, such as a class, `String` or a closure, needs a default.
+
 A `shared` global is read as `shared T`, so it follows the [data race](#data-races) rules: integers are atomic, objects are read-only views, and mutable state goes in a `Lock`. `@shared` is the unsafe form that reads as plain `T` and is not checked.
 
 ## Aliases
@@ -3528,7 +3530,7 @@ Inside the block `s` is a `locked Stats`: a mutable view that is valid until the
 A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Moving data around inside the locked graph, like `s.items.append(s.first)`, is allowed. Functions can take and return `locked T` views while the originating lock is held. A
 function that stores an argument in locked data it is handed publishes that argument at the
 call, so the caller cannot use it afterwards; one that takes a `shared Lock[T]` and locks it
-itself can only store values it built. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Locked data may hold ordinary closures, like the order function of a `Heap`, since they only run while the lock is held; a closure is a unique graph only when it captures nothing. Such a closure cannot be handed locked objects, so a `Heap` of numbers or strings works under a lock and a `Heap` of objects does not. Data from one lock cannot be stored under another lock. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
+itself can only store values it built. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Locked data may hold ordinary closures, like the order function of a `Heap`, since they only run while the lock is held; a closure is a unique graph only when it captures nothing. Such a closure cannot be handed locked objects, so a `Heap` of numbers or strings works under a lock and a `Heap` of objects does not. Data from one lock cannot be stored under another lock. Locked bytes and numbers can be passed to a `local` borrow parameter such as `local &[u8]` inside the block; a borrow of locked objects stays locked, and `&` cannot borrow a locked view. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
 
 Callbacks of methods on locked data get the elements as locked views, so they cannot keep them past the block:
 
