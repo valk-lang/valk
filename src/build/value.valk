@@ -124,6 +124,8 @@ class ValueMeta {
     reads_storage: bool (false)
     // A struct receiver borrowed out of a closure's captured copy
     captured_receiver: ?Decl (null)
+    // An argument for a `local` parameter that may be frame storage
+    lent_local: bool (false)
     // A literal whose `values` are the calls that write its items
     literal_items: bool (false)
     // Ownership analysis: the variable this value was translated to, in round `own_round`
@@ -6260,15 +6262,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             }
             if isset(receiver_arg) && !is_coroutine && receiver_arg.type.get_non_nullable().is_owned_borrow()
                 && !receiver_arg.type.get_non_nullable().is_local && value_is_stack_borrow_source(receiver_origin) {
-                if !func.unique_summary_ready : ensure_func_unique_return_summary(func, true) !>
-                let absorbed = func_arg_absorbed_into_other(func, 0) !>
-                if !func.unique_summary_ready || (func_arg_may_retain(func, 0) && !absorbed) {
-                    at.error("Cannot call '" + func.name + "' on frame storage: the method keeps its receiver beyond the call, and the storage dies with this frame")
-                }
-                let settled = func_arg_summary_settled(func, 0)
-                // The callee may keep the storage in an object that must stay in the frame
-                if absorbed || !settled || (func.returns_unique_graph && func.unique_return_args.contains(0)) : owner.has_lends = true
-                if !settled && !isset(receiver_arg.cannot_escape_pos) : receiver_arg.cannot_escape_pos = Pos { src: at.src, i: at.i }
+                at.error("Cannot call '" + func.name + "' on frame storage: its receiver is not a 'local' borrow, so the method may keep it")
             }
             // A flag that is already set is final; the rest may still flip
             if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver, func_arg_may_retain(func, 0))
@@ -6331,10 +6325,10 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             // Frame storage lent to an owned-borrow parameter: the ownership walk checks that
             // nothing the callee keeps or returns lets it leave this frame. A coroutine keeps
             // its arguments, so never there
-            let accepts_stack_borrow = !is_coroutine && param.type.get_non_nullable().is_owned_borrow()
-                && !param.type.get_non_nullable().is_local
-                && value_is_stack_borrow_source(av)
-            let lends_into_holder = accepts_stack_borrow
+            if !is_coroutine && param.type.get_non_nullable().is_owned_borrow() && !param.type.get_non_nullable().is_local
+                && value_is_stack_borrow_source(av) {
+                at.error("Frame storage can only be passed to a 'local' borrow parameter; parameter '" + param.name + "' of " + func_user_name(func) + " may keep it")
+            }
             let settled = func_arg_summary_settled(func, param_i)
             // Lent for the call; the ownership walk publishes it when the callee keeps it. A
             // literal has no other owner and a coroutine keeps its arguments: those are published
@@ -6358,15 +6352,13 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 av = vgen_cast(av, av.rett.plain_type())
             }
             let plain_arg = !av.rett.get_non_nullable().is_shared
-            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow, accepts_stack_borrow) !>
+            let lent_local = param.type.is_stack_borrow() && !value_is_owned_storage(av)
+            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow) !>
+            if lent_local : av.ensure_meta().lent_local = true
             if accepts_shared_borrow && plain_arg && av.type == VAL.shared_view {
                 av.ensure_meta().borrow_param = param
                 let caller = ctx.get_func() !>
                 caller.has_publications = true
-            }
-            if lends_into_holder {
-                let caller = ctx.get_func() !>
-                caller.has_lends = true
             }
             let owner = ctx.get_func() !>
             if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))
@@ -6388,20 +6380,10 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             // A closure bound to a frame receiver may be handed to a callee
             // that is known not to keep or return it.
             let frame_closure = av.is_implicit_borrow() && source_kind == TYPE.closure && target_kind == TYPE.closure
-            if frame_closure && !func.unique_summary_ready : ensure_func_unique_return_summary(func, true) !>
-            let accepts_frame_closure = frame_closure
-                && func.unique_summary_ready && !func_arg_may_retain(func, param_i)
-                && !(func.returns_unique_graph && func.unique_return_args.contains(param_i))
-                && !func.borrow_return_args.contains(param_i)
-                && !(func_arg_absorbed_into_other(func, param_i) !>)
-            if frame_closure && !accepts_frame_closure {
-                at.error("A method bound to a stack receiver cannot be passed to " + func_user_name(func) + "; it is kept beyond the call through parameter '" + param.name + "'")
+            if frame_closure {
+                at.error("A method bound to frame storage cannot be passed as a callback; the storage dies with this frame")
             }
-            // A provisional flag may still flip; re-checked once it settles
-            if frame_closure && !func_arg_summary_settled(func, param_i) && !isset(param.cannot_escape_pos) {
-                param.cannot_escape_pos = Pos { src: at.src, i: at.i }
-            }
-            if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !accepts_frame_closure {
+            if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !frame_closure {
                 at.error("An implicit pointer borrow cannot be passed to raw pointer storage: the address would outlive the value")
             }
             args.set(i, av) ! at.bug("value_check_call_args: args.set out of range")
@@ -6722,6 +6704,89 @@ fn value_call_reaches_locked(callee: Value, args: Array[Value], skip: uint) bool
         else if arg.rett.has_gc_refs() : plain = true
     }
     return locked && plain
+}
+
+// A borrow that names its owner, or data that lives on its own: never frame storage
+fn value_is_owned_storage(av: Value) bool {
+    let nn = av.rett.get_non_nullable()
+    if nn.is_fat_borrow() || nn.kind == TYPE.ref_of : return !nn.is_local
+    return !av.rett.is_inline_type()
+}
+
+// Whether a call's `local` result may point into frame storage: some argument it was
+// lent from may be. Otherwise the result has the owners of its arguments
+fn value_call_lends_local(callee: Value, args: Array[Value]) bool {
+    if callee.type == VAL.func {
+        let receiver = callee.value1
+        if isset(receiver) {
+            let origin = receiver
+            while origin.type == VAL.cast || origin.type == VAL.wrap || origin.type == VAL.interface_wrap {
+                origin = origin.value1 ?! break
+            }
+            if !value_is_owned_storage(origin) : return true
+        }
+    }
+    each args as arg {
+        let meta = arg.meta ?! continue
+        if meta.lent_local : return true
+    }
+    return false
+}
+
+// A `local` result must come from what the caller lent: a parameter, or a call that was only
+// lent such storage. Storage of the function's own frame dies with it
+fn value_lent_from_args(v: Value) bool {
+    let nn = v.rett.get_non_nullable()
+    let borrow = nn.is_fat_borrow() || nn.kind == TYPE.ref_of
+    if !v.is_implicit_borrow() && (!borrow || !nn.is_local) : return true
+    let t = v.type
+    if t == VAL.decl : return value_decl_is_lent(v)
+    // A borrow made with '&': where its storage lives
+    if t == VAL.multi {
+        let address = (v.values ?? Array[Value]{}).get(1) ! return false
+        if address.type != VAL.ptr_of : return false
+        let storage = address.value1 ?! return false
+        while true {
+            let narrowed = value_narrowed_owned_borrow_source(storage)
+            if isset(narrowed) {
+                storage = narrowed
+                continue
+            }
+            if storage.type != VAL.prop && storage.type != VAL.ptrv && storage.type != VAL.cast && storage.type != VAL.wrap : break
+            storage = storage.value1 ?! return false
+        }
+        if storage.type == VAL.decl : return value_decl_is_lent(storage)
+        return value_lent_from_args(storage)
+    }
+    if t == VAL.call {
+        let callee = v.value1 ?! return false
+        if callee.type == VAL.func {
+            let receiver = callee.value1
+            if isset(receiver) && !value_lent_from_args(receiver) : return false
+        }
+        let args = v.values ?! return true
+        each args as arg {
+            if !value_lent_from_args(arg) : return false
+        }
+        return true
+    }
+    if t == VAL.cast || t == VAL.wrap || t == VAL.shared_view || t == VAL.prop || t == VAL.ptrv {
+        let inner = v.value1 ?! return false
+        return value_lent_from_args(inner)
+    }
+    if t == VAL.this_or_that {
+        let yes = v.value2 ?! return false
+        let no = (v.values ?? Array[Value]{}).get(0) ! return false
+        return value_lent_from_args(yes) && value_lent_from_args(no)
+    }
+    return false
+}
+
+// A parameter that is itself a borrow: what it points at belongs to the caller
+fn value_decl_is_lent(v: Value) bool {
+    let decl = v.decl ?! return false
+    let nn = decl.type.get_non_nullable()
+    return decl.is_arg && (nn.is_fat_borrow() || nn.kind == TYPE.ref_of)
 }
 
 fn value_is_stack_borrow_source(av: Value) bool {
