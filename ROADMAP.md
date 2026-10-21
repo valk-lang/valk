@@ -5,6 +5,11 @@
 
 ```
 - Release 0.7.12
++ Fix (safety): a method bound to a stack struct, like `p.put`, passed to a function that returns it or stores it in another argument (`g = id(p.put)`) is a compile error; the closure pointed into a dead stack frame
++ Fix (safety): a function flagged `$exit` must end the program on every path and a `$throw` function must throw on every path (and cannot `return`); callers trusted the flag, so a `$exit` function that returned left a null value narrowed to non-null
++ Fix: a closure that uses `E` inside an error handler keeps the error's payload from when it was made; it read whatever error of that type came last, and a captured error code overflowed the closure's memory
++ Fix: comparing an object with a number, like `a > 5`, is a compile error unless a hook of the class answers it; it compared the object's address
++ Fix: `m[key]++` through an `$offset` hook (`Map`, `HashMap`, `Deque`, user classes) is a compile error with a `+= 1` hint; it did nothing. Assigning into a struct a call or an `$offset` hook returned (`items[0].x = 7`, `origin().x++`), or calling a method that changes it and returns nothing, is a compile error; the change was lost with the copy
 
 + Release 0.7.11
 + Fix: on worker threads, an array whose elements were moved in place (growth, insert, removal) was kept alive by a leftover pointer in a thread-local global, together with everything it held
