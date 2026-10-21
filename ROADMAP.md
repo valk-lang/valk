@@ -10,6 +10,13 @@
 + Fix: a closure that uses `E` inside an error handler keeps the error's payload from when it was made; it read whatever error of that type came last, and a captured error code overflowed the closure's memory
 + Fix: comparing an object with a number, like `a > 5`, is a compile error unless a hook of the class answers it; it compared the object's address
 + Fix: `m[key]++` through an `$offset` hook (`Map`, `HashMap`, `Deque`, user classes) is a compile error with a `+= 1` hint; it did nothing. Assigning into a struct a call or an `$offset` hook returned (`items[0].x = 7`, `origin().x++`), or calling a method that changes it and returns nothing, is a compile error; the change was lost with the copy
++ Fix: a deferred call that throws, or suspends while another coroutine throws, no longer replaces the payload of the error the function is returning
++ Fix: an integer `match` range that runs past the type's largest value, like `250 .. 10` on a `u8`, matches up to that value; it matched nothing
++ Fix: an enum whose members are not zero has its first member as default: a missing `Map`/`HashMap` entry read with `m[key]` gives it, and a global of that enum needs a default; both held the value 0, which is no member
++ Release builds and compile times: inline aggregates of 512 bytes or more are passed to functions as the address of a copy, as they are returned (a `[u8 x 65535]` parameter compiled in 23 s; 70 KB and more crashed LLVM). Fixed arrays longer than 8 elements compare and hash in a loop instead of one expression per element, and plain ones clone as one copy, so `Array[[u8 x 100000]]` no longer overflows the compiler's stack
++ Fix: a function with `$T` parameters used as a value (`apply(id, 5)`) is a compile error instead of a compiler bug; a default argument that uses an inferred type (`b: ?T (null)`, `b: Array[T] (.{})`) works
++ Fix: a generic type argument that grows each time it is passed on, like `grow((v, v), n - 1)`, is refused once it has 512 parts; the compiler ran out of memory
++ Fix: two coroutines that await each other end the program with `Coroutines cannot await each other in a cycle` instead of hanging
 
 + Release 0.7.11
 + Fix: on worker threads, an array whose elements were moved in place (growth, insert, removal) was kept alive by a leftover pointer in a thread-local global, together with everything it held
