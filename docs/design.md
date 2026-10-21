@@ -711,36 +711,66 @@ collector for frames.
 
 ### Inferred parameter effects
 
-Borrow compatibility and uniqueness preservation are inferred from function
-bodies rather than requiring developers to repeat effects in every signature.
+Borrow compatibility and uniqueness are inferred from function bodies rather
+than repeated as effects in every signature. Two analyses do this.
 
-For every parameter, the compiler computes and caches:
+**Lowering summaries.** While a body is lowered, every parameter gets flags
+from what the body does with it:
 
-- `escapes`: the function may return, store, capture, publish, or otherwise
-  retain data reachable through the parameter.
-- `invalidates_unique`: the function may insert an external alias into data
-  reachable through the parameter.
+- `may_escape`: data reachable through the parameter may outlive the call,
+  through the result, another argument, an object, a global or a closure.
+- `may_retain`: the stricter half: the function keeps it beyond its result and
+  its other arguments.
+- `invalidates_unique`: the function may give the parameter's graph an alias
+  from outside.
+- `absorbs_args`: which other parameters are moved into this one's graph.
 
-Return summaries distinguish unconditional fresh graphs from graphs whose
-freshness depends on particular arguments also being fresh temporaries.
+Flags start false for an analyzable body and only ever turn true. Calls record
+edges from callee parameters to caller parameters, and flags propagate along
+them until nothing changes. A flag settled inside a recursion cycle while a
+callee's summary was still being computed is `provisional`: callers defer what
+depends on it and check it again once every summary is final. Bodies without
+an analysis (externs, unknown code) are conservative. These flags decide where
+frame storage may be lent as a borrow: a callee that neither keeps nor returns
+it may take it, and one that returns it or stores it in another argument makes
+the caller's holder subject to the check below.
 
-For an analyzable body, both parameter effects start as false. Direct operations
-may only change them from false to true, and direct calls record dependency edges
-from callee parameters to the corresponding caller parameters. After the bodies
-have been analyzed, effects propagate along those edges until no value changes.
-This computes the least fixed point for recursive call groups and does not depend
-on body-analysis order. Functions without an analyzable body and calls through
-unknown code are conservative. Generic functions cache effects per
-specialization; rebuilding a changed body recomputes its summary.
+**Ownership analysis.** After all bodies are lowered, `own_analyze`
+(`ownership.valk`) solves an inclusion-based points-to problem per function
+over abstract objects: `GLOBAL` (globals, unknown code and what they reach),
+what each parameter points to, the slots of locals, each allocation site, what
+each call made, and each `lock` block's data. Every lowered value kind adds a
+few constraints; a kind the analysis does not model points to `GLOBAL`, so a
+missing case makes it stricter, never looser. Calls apply the callee's summary,
+interface methods use every implementation, and functions are solved callees
+first and re-solved until no summary changes. That is a least fixed point,
+independent of the order bodies were lowered in.
 
-Suspension is inferred by the same monotone fixed-point process. Direct
-coroutine suspension seeds the effect, direct calls propagate it to callers,
-and indirect or unknown Valk calls are conservative. This effect controls
-whether address-taken inline locals use native or stable storage.
+`ownership-check.valk` then walks each body in evaluation order, with a
+points-to version per local, and enforces:
 
-Return-graph freshness is a separate summary. A return whose freshness depends
-on a recursive return summary that is still being computed is treated as not
-fresh.
+1. A graph converted to `shared T`, sent across threads, or moved into locked
+   data is unique: nothing reachable from `GLOBAL`, unknown code, a parameter
+   or another live local is part of it.
+2. Once published, no ordinary local whose graph held part of it may be used,
+   along every path that follows.
+3. Frame storage lent as a borrow never becomes reachable from `GLOBAL`, unknown
+   code, a parameter or the function's result.
+4. A locked view never leaves its `lock` block.
+
+The type rules above (stack, owned and `local` borrows, read-only views,
+`shared` and `locked` types) are what these checks rely on: everything that is
+not proven by a type is proven by the points-to graph, or refused.
+
+Both kinds of summary are in-memory compiler metadata, recomputed from the
+source of every package; they are not annotations or library artifacts.
+
+**What checks the checks.** `tests/probe/gen.py` runs every rule as a safe and an
+unsafe program under every syntax form an expression can take (value scopes,
+ternaries, tuples, `??`, calls, generics, handlers, structs, classes, loops,
+`match`, interface calls, recursion, coroutines, nested forms); the safe one must
+build and the unsafe one must not. In `GC_DEBUG` builds the shared collector
+panics when shared data refers to an object that is not shared.
 
 A package is identified by its directory, not by the alias that refers to it.
 Two dependencies that share an alias but resolve to different directories are
@@ -752,18 +782,6 @@ keeps the emitted IR independent of where the project is checked out.
 A dependency alias that shares its name with a namespace of the using package
 is a compile error: the `use` names the dependency, so the local namespace
 would be silently unreachable.
-
-All Valk package source is available to the compiler and is reanalysed when
-needed. Effect summaries are compiler-owned in-memory metadata, not source
-annotations or library artifacts.
-
-- A borrowed argument is accepted when the target parameter does not escape.
-- For an indirect call, the callable carries the combined effects of its
-  possible targets; an unknown target is treated conservatively.
-- Extern calls have no analyzable body and form an explicit unsafe boundary.
-
-This inference is a semantic pass after identifiers and call targets are
-resolved. It does not affect syntax parsing.
 
 ### Raw pointers
 
