@@ -102,17 +102,6 @@ class ValueMeta {
     checked_read: ?Value (null)
     // Original graph before lowering into temporary storage.
     graph_source: ?Value (null)
-    publishes_graph: bool (false)
-    // Reported when the published graph is not unique
-    publish_message: ?String (null)
-    // Published as shared, not moved into locked data
-    publish_shared: bool (false)
-    // A shared view lent to this parameter: published if the callee keeps it
-    borrow_param: ?Arg (null)
-    // A locked view lent to unknown code: published only if the call can hand it back
-    lent_unknown: bool (false)
-    // Ownership walk: a store's own publish, checked after its destination
-    own_hold: bool (false)
     // An Array element read out by value: writes into it are lost
     copied_element: bool (false)
     // Inline storage a call returned; a write into it is lost
@@ -128,17 +117,6 @@ class ValueMeta {
     lent_local: bool (false)
     // A literal whose `values` are the calls that write its items
     literal_items: bool (false)
-    // Ownership analysis: the variable this value was translated to, in round `own_round`
-    own_round: uint (0)
-    own_var: uint (0)
-    // Before a publication: the graph that is published
-    own_inner: uint (0)
-    // A merge: its entry in OwnGraph.joins (a loop's head, then its exit)
-    own_join: uint (OWN_NONE)
-    // A shared view that publishes nothing (value_shared_view)
-    shared_borrow: bool (false)
-    // A call: the object for what its callee made
-    own_made: uint (0)
 }
 
 class Value {
@@ -1044,8 +1022,6 @@ fn value_check_co_lock_escape(call: Value, callee: Value, at: Exp) !Error {
     if callee.type != VAL.func {
         // A bound stack method reached through a variable or a parameter
         value_check_co_arg(callee, at) !>
-        // The coroutine keeps the callable past the call
-        value_mark_actual_escape(callee)
     }
     let args = call.values
     if !isset(args) : return
@@ -1178,7 +1154,6 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
         at.error("A locked view cannot be captured by a closure; it is only valid inside its lock block")
     }
     source.is_captured = true
-    value_mark_actual_escape(vgen_decl(source))
     if source.implicit_borrow {
         at.error("An implicit pointer borrow cannot be captured: the address would outlive the value")
     }
@@ -1800,7 +1775,7 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     arg_scope.func = clone_func
     append_func_arg(clone_func, "value", type)
     bind_func_arg_decls(clone_func) !>
-    func_begin_unique_summary(clone_func)
+    func_begin_effects(clone_func)
 
     let body_scope = arg_scope.sub_scope()
     body_scope.func = clone_func
@@ -1870,10 +1845,7 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
         body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope))
         body_scope.append_value(vgen_return(vgen_decl(result), b, at))
     }
-    // A clone hands back a graph of its own
-    clone_func.unique_summary_saw_return = true
-    clone_func.returns_unique_graph = true
-    func_finish_unique_summary(clone_func) !>
+    func_finish_effects(clone_func)
     body_scope.did_return = true
 
     owner.unit.functions.append(clone_func)
@@ -2293,7 +2265,7 @@ fn native_sequence_helper_base(owner: Func, name: String, key: String, on_type: 
 }
 
 fn native_sequence_helper_finish(func: Func) !Error {
-    func_finish_unique_summary(func) !>
+    func_finish_effects(func)
     let owner_unit = func.unit
     owner_unit.functions.append(func)
     func_finish_ast(func) !>
@@ -2311,7 +2283,7 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let func = native_sequence_helper_base(owner, "get", key, on_type, rett, at) !>
     ctx.build.cache.sequence_get_funcs.set(key, func)
     bind_func_arg_decls(func) !>
-    func_begin_unique_summary(func)
+    func_begin_effects(func)
 
     let body_scope = func.arg_scope.sub_scope()
     body_scope.func = func
@@ -2330,9 +2302,6 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     body_scope.append_value(vgen_if(past_end, Array[Value]{ panic_call }, null, ctx.build, at))
     let result = value_native_sequence_item(sequence, index, body_scope, inner_ctx, at) !>
     result.rett = rett
-    func.unique_summary_saw_return = true
-    func.returns_unique_graph = value_summary_graph_is_unique(result, func, func.unique_return_args) !>
-    if !func.returns_unique_graph : value_mark_summary_escape(result, false)
     body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
 
@@ -2352,7 +2321,7 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     append_func_arg(func, "value", element)
     ctx.build.cache.sequence_set_funcs.set(key, func)
     bind_func_arg_decls(func) !>
-    func_begin_unique_summary(func)
+    func_begin_effects(func)
 
     let body_scope = func.arg_scope.sub_scope()
     body_scope.func = func
@@ -2500,7 +2469,7 @@ fn func_mutates_receiver(func: Func) bool !Error {
     if func.threadsafe : return false
     if func.mutates_receiver : return true
     if func.checking_mutation : return false
-    ensure_func_unique_return_summary(func) !>
+    ensure_func_effects_parsed(func) !>
     if func.mutates_receiver : return true
     let calls = func.this_calls ?! return false
     func.checking_mutation = true
@@ -2518,10 +2487,10 @@ fn func_mutates_receiver(func: Func) bool !Error {
 
 // Whether the method stores into its receiver, atomic words included
 fn func_writes_receiver(func: Func) bool !Error {
-    ensure_func_unique_return_summary(func) !>
+    ensure_func_effects_parsed(func) !>
     // A body the LSP did not load, or one still being analyzed, is not
-    // known to write; only a settled summary reports
-    if !func.unique_summary_ready || func_unique_summary_unavailable_in_lsp(func) : return false
+    // known to write; only settled effects report
+    if !func.effects_ready || func_effects_unavailable_in_lsp(func) : return false
     let receiver = func.args.get(0) ! return false
     return receiver.may_write
 }
@@ -4500,8 +4469,6 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if isset(gens) : exp.error("Unexpected type arguments on variable: " + name)
         let d = idf.decl
         if !isset(d) : exp.bug("Decl idf is missing decl")
-        // Reads after a publish are checked path-sensitively at the end
-        if !ctx.is_store_target : decl_invalidate_unique_dependents(d)
         d.is_used = true
         if !ctx.is_store_target : d.is_read = true
         let current = ctx.func
@@ -5740,7 +5707,6 @@ fn value_complete_error_payload(value: Value, scope: Scope, ctx: Context, at: Ex
     // A payload travels with the error, beyond anything this body can see
     each values as field {
         provided.set(field.get_name(), true)
-        value_mark_actual_escape(field)
     }
 
     let caught_type: ?ErrorType = null
@@ -6274,7 +6240,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     if !func.parsed_types {
         parse_func_types(func) !>
     }
-    ensure_func_unique_summary(func) !>
+    ensure_func_effects(func) !>
 
     let params = func.args
     // Instance methods have `this` as first arg; call args are the remaining ones
@@ -6286,11 +6252,7 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         }
     }
 
-    // What the callee moves into locked data is published, so that is settled at the call
-    if !func.unique_summary_ready && value_call_reaches_locked(callee, args, skip) : ensure_func_unique_return_summary(func, true) !>
-
     let receiver: ?Value = null
-    let absorbs_known = true
     if skip == 1 {
         receiver = callee.value1
         if isset(receiver) {
@@ -6331,11 +6293,8 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             }
             let receiver_arg = params.get(0) !? null
             let owner = ctx.get_func() !>
-            // Frame storage as the receiver of a slice method lends its storage the
-            // way an argument does: the callee may not keep it, and an object it
-            // keeps it in (its result, another argument) must stay in this frame
-            // The receiver was retyped to the method's class on the way here; the
-            // storage it came from is behind the wrappers
+            // Frame storage as a receiver goes only to a `local` receiver. The receiver was
+            // retyped to the method's class on the way here; the storage is behind the wrappers
             let receiver_origin = receiver
             while receiver_origin.type == VAL.cast || receiver_origin.type == VAL.wrap || receiver_origin.type == VAL.interface_wrap {
                 receiver_origin = receiver_origin.value1 ?! break
@@ -6343,13 +6302,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             if isset(receiver_arg) && !is_coroutine && receiver_arg.type.get_non_nullable().is_owned_borrow()
                 && !receiver_arg.type.get_non_nullable().is_local && value_is_stack_borrow_source(receiver_origin) {
                 at.error("Cannot call '" + func.name + "' on frame storage: its receiver is not a 'local' borrow, so the method may keep it")
-            }
-            // A flag that is already set is final; the rest may still flip
-            if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver, func_arg_may_retain(func, 0))
-            if func.unique_summary_ready && func_arg_invalidates_unique(func, 0) && !value_is_raw_pointer_arg(receiver) : value_invalidate_unique(receiver)
-            else if !(value_absorb_call_args(func, receiver_arg, receiver, args, skip, owner, false, receiver) !>) : absorbs_known = false
-            if !func_arg_summary_settled(func, 0) && isset(receiver_arg) {
-                value_defer_arg_effects(receiver_arg, receiver, at) !>
             }
         }
     }
@@ -6416,7 +6368,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 && value_is_stack_borrow_source(av) {
                 at.error("Frame storage can only be passed to a 'local' borrow parameter; parameter '" + param.name + "' of " + func_user_name(func) + " may keep it")
             }
-            let settled = func_arg_summary_settled(func, param_i)
             // Locked plain data lent for the call: a `local` borrow cannot outlive it, and
             // elements without references have nothing to take out of the lock
             let param_nn = param.type.get_non_nullable()
@@ -6441,25 +6392,15 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                     if copied != av : av = value_shared_view(copied, param.type)
                 }
             }
-            let owner = ctx.get_func() !>
-            if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))
-            if func.unique_summary_ready && func_arg_invalidates_unique(func, param_i) && !value_is_raw_pointer_arg(av) : value_invalidate_unique(av)
-            else if !(value_absorb_call_args(func, param, av, args, skip, owner, false, receiver) !>) : absorbs_known = false
-            if !settled : value_defer_arg_effects(param, av, at) !>
             let source_kind = av.rett.get_non_nullable().kind
             let target_kind = param.type.get_non_nullable().kind
             let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.adr_of || value_is_borrow_address(av))
                 && (target_kind == TYPE.ptr_of || param.type.is_raw_pointer())
+            // The callee may keep the address: what it does with it is unsafe code's concern
             if av.is_implicit_borrow() && accepts_reference_pointer && !accepts_borrow {
-                // A flag that is already set is final
-                if func.unique_summary_ready && param.may_escape {
-                    require_unsafe(at, scope, "Passing an implicit pointer borrow to escaping pointer storage") !>
-                } else if !func_arg_summary_settled(func, param_i) && !scope.mark_unsafe_used() && !ctx.build.options.ignore_unsafe {
-                    if !isset(param.cannot_escape_pos) : param.cannot_escape_pos = Pos { src: at.src, i: at.i }
-                }
+                require_unsafe(at, scope, "Passing an implicit pointer borrow to pointer storage") !>
             }
-            // A closure bound to a frame receiver may be handed to a callee
-            // that is known not to keep or return it.
+            // A closure bound to frame storage would carry its address along
             let frame_closure = av.is_implicit_borrow() && source_kind == TYPE.closure && target_kind == TYPE.closure
             if frame_closure {
                 at.error("A method bound to frame storage cannot be passed as a callback; the storage dies with this frame")
@@ -6483,7 +6424,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         }
         i++
     }
-    if !absorbs_known : value_defer_call_absorbs(func, receiver, args, skip, ctx.get_func() !>)
     // Native indexing helpers implement storage access, not a source-level call.
     require_unsafe_func(func, scope, at) !>
     if check_pointer_args : require_void_pointer_call(func, callee, args, scope, at) !>
@@ -6772,19 +6712,6 @@ fn type_refs_all_shared(type: Type) bool {
         if !type_refs_all_shared(prop.type) : return false
     }
     return true
-}
-
-// A call that hands locked data and an ordinary graph to the same function as arguments
-fn value_call_reaches_locked(callee: Value, args: Array[Value], skip: uint) bool {
-    let locked = false
-    let plain = false
-    let receiver = skip == 1 ? callee.value1 : null
-    if isset(receiver) && !receiver.rett.get_non_nullable().is_locked && receiver.rett.has_gc_refs() : plain = true
-    each args as arg {
-        if arg.rett.get_non_nullable().is_locked : locked = true
-        else if arg.rett.has_gc_refs() : plain = true
-    }
-    return locked && plain
 }
 
 // A borrow that names its owner, or data that lives on its own: never frame storage
