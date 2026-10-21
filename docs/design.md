@@ -28,9 +28,8 @@ The compiler separates syntax from semantic resolution:
 3. Register named declarations, aliases, errors, traits, and extensions.
 4. Resolve types and finalize aggregate layouts.
 5. Parse and type-check function bodies when required.
-6. Infer and cache per-parameter write effects.
-7. Determine reachability and lower required functions to IR.
-8. Generate objects and link only when the selected command requires them.
+6. Determine reachability and lower required functions to IR.
+7. Generate objects and link only when the selected command requires them.
 
 Syntax parsing may use grammar context, but never the resolved meaning of an
 identifier. Semantic stages may resolve identifiers and specialize generics.
@@ -716,16 +715,19 @@ heap at the moment it escapes is rejected: raw pointers and existing borrows
 may already hold the frame address, and rewriting them would require a moving
 collector for frames.
 
-### Inferred parameter effects
+### Checked variants
 
-Whether a function writes through a parameter (`may_write`) is read from its
-body: a store reached through the parameter, or a call that writes through the
-argument it was given. Calls record edges from callee parameters to caller
-parameters and the flag propagates along them until nothing changes; interface
-methods take the flags of every implementation. The flag decides whether a
-method may be called on read-only storage or an enum value. It is the only
-effect inferred across functions: lending and sharing are type rules, and the
-compiler keeps no ownership or uniqueness analysis.
+The compiler infers no effects across functions. When a call needs to know what
+a method does with its receiver, the method's body is type-checked again with
+the receiver as the call sees it: as a `shared` or `locked` view, or read-only
+for a struct or slice method called on read-only storage, an element copied out
+of an array, a temporary, a captured variable or an enum value. A store in that
+variant, or in a method it calls on the same receiver, is an error reported at
+the call. A read-only variant is only checked, never emitted; the call runs the
+ordinary method. Hooks that store through raw memory (`$offset_assign`,
+`$append`, `$set_key`) are marked as mutating and never run on a view. Lending
+and sharing are type rules, and the compiler keeps no ownership or uniqueness
+analysis.
 
 **What checks the checks.** `tests/probe/gen.py` runs every rule under every
 syntax form an expression can take (value scopes, ternaries, tuples, `??`, calls,

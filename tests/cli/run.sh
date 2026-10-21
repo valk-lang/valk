@@ -758,7 +758,7 @@ for form in paren block call index ternary; do
     fi
 done
 
-echo "> File LOC and Parse LOC count generic instances and function reparses"
+echo "> File LOC and Parse LOC count generic instances"
 loc_dir="$workdir/loc"
 mkdir -p "$loc_dir"
 loc_base=$("$VALK" build "$DIR/loc-generics.valk" --lint --no-warn -v 2>&1) || { echo "$loc_base"; exit 1; }
@@ -795,19 +795,6 @@ for kind in class function ordinary; do
         exit 1
     fi
 done
-
-loc_base=$("$VALK" build "$DIR/loc-reparse.valk" --no-warn -v -o "$loc_dir/reparse$EXE_SUFFIX" 2>&1) || { echo "$loc_base"; exit 1; }
-awk '/^        return this.value/ { print "" } { print }' "$DIR/loc-reparse.valk" > "$loc_dir/reparse.valk"
-loc_out=$("$VALK" build "$loc_dir/reparse.valk" --no-warn -v -o "$loc_dir/reparse$EXE_SUFFIX" 2>&1) || { echo "$loc_out"; exit 1; }
-check_stats "$loc_base"
-check_stats "$loc_out"
-if [ "$(loc_value "$loc_out" File)" -ne "$(( $(loc_value "$loc_base" File) + 1 ))" ] \
-    || [ "$(loc_value "$loc_out" Parse)" -ne "$(( $(loc_value "$loc_base" Parse) + 2 ))" ]; then
-    echo "# Function reparses must add their declaration LOC again"
-    echo "$loc_base"
-    echo "$loc_out"
-    exit 1
-fi
 
 deprecated_out=$("$VALK" build "$DIR/deprecated.valk" --lint 2>&1) || {
     echo "# --lint rejected a call to a deprecated function"

@@ -775,11 +775,6 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if value_is_call_result_copy(operand) : exp.error(CALL_RESULT_COPY_ERROR)
         if value_in_readonly_view(operand, ctx) : exp.error("Cannot change storage through a read-only borrow; " + value_readonly_hint(operand, ctx))
         value_check_captured_write(operand, exp) !>
-        value_mark_summary_write(operand)
-        if operand.type == VAL.prop || operand.type == VAL.ptrv {
-            let owner = operand.value1
-            if isset(owner) && !operand.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
-        }
         act_check_assign(operand, exp, scope) !>
         value_mark_mutable(operand)
         value_check_shared_store(operand, exp) !>
@@ -1775,7 +1770,6 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     arg_scope.func = clone_func
     append_func_arg(clone_func, "value", type)
     bind_func_arg_decls(clone_func) !>
-    func_begin_effects(clone_func)
 
     let body_scope = arg_scope.sub_scope()
     body_scope.func = clone_func
@@ -1845,7 +1839,6 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
         body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope))
         body_scope.append_value(vgen_return(vgen_decl(result), b, at))
     }
-    func_finish_effects(clone_func)
     body_scope.did_return = true
 
     owner.unit.functions.append(clone_func)
@@ -2265,7 +2258,6 @@ fn native_sequence_helper_base(owner: Func, name: String, key: String, on_type: 
 }
 
 fn native_sequence_helper_finish(func: Func) !Error {
-    func_finish_effects(func)
     let owner_unit = func.unit
     owner_unit.functions.append(func)
     func_finish_ast(func) !>
@@ -2283,7 +2275,6 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let func = native_sequence_helper_base(owner, "get", key, on_type, rett, at) !>
     ctx.build.cache.sequence_get_funcs.set(key, func)
     bind_func_arg_decls(func) !>
-    func_begin_effects(func)
 
     let body_scope = func.arg_scope.sub_scope()
     body_scope.func = func
@@ -2321,7 +2312,6 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     append_func_arg(func, "value", element)
     ctx.build.cache.sequence_set_funcs.set(key, func)
     bind_func_arg_decls(func) !>
-    func_begin_effects(func)
 
     let body_scope = func.arg_scope.sub_scope()
     body_scope.func = func
@@ -2418,9 +2408,11 @@ fn func_for_receiver(func: Func, on: Value, at: Exp, from: ?Func (null)) Func !E
     if func.has_generic_args || func.is_generic_base : return func
     if !func.is_static && value_is_enum_storage(on) {
         let receiver = func.args.get(0) !? null
-        if !func.is_generic_base && !func.has_generic_args && isset(receiver)
-            && receiver.type.is_stack_borrow() && !isset(receiver.enum_receiver_pos) {
-            receiver.enum_receiver_pos = Pos { src: at.src, i: at.i }
+        if isset(receiver) && receiver.type.is_stack_borrow() {
+            // Enum storage is constant: a method may neither change it nor lend it out
+            let msg = "Cannot call a method that modifies or exposes enum storage; copy its underlying value first"
+            if func.get_rett().is_stack_borrow() : at.error(msg)
+            func_check_readonly_receiver(func, msg, at, from) !>
         }
     }
     if func.is_static || func.threadsafe : return func
@@ -2447,7 +2439,7 @@ fn func_for_receiver(func: Func, on: Value, at: Exp, from: ?Func (null)) Func !E
         return get_func_locked_receiver(func, at, from) !>
     }
     if !shared : return func
-    if func_mutates_receiver(func) !> {
+    if func.mutates_receiver {
         at.error("Cannot call mutating method '" + func.name + "' on shared data of type '" + on.rett.compat_display_name() + "'")
     }
     // A concrete method gets one shared-receiver variant, built on demand and
@@ -2463,64 +2455,24 @@ fn func_for_receiver(func: Func, on: Value, at: Exp, from: ?Func (null)) Func !E
     return get_func_shared_receiver(target, at, from) !>
 }
 
-// Whether a method changes anything reachable from its receiver beyond
-// atomic words: found in its own body, or in a method it calls on that data
-fn func_mutates_receiver(func: Func) bool !Error {
-    if func.threadsafe : return false
-    if func.mutates_receiver : return true
-    if func.checking_mutation : return false
-    ensure_func_effects_parsed(func) !>
-    if func.mutates_receiver : return true
-    let calls = func.this_calls ?! return false
-    func.checking_mutation = true
-    let found = false
-    each calls as callee {
-        if func_mutates_receiver(callee) !> {
-            found = true
-            break
-        }
+// A call on storage the method may not change: its body is checked again with `this`
+// read-only, and a store in it, or in a method it calls on `this`, reports `headline` here
+fn func_check_readonly_receiver(func: Func, headline: String, at: Exp, from: ?Func) !Error {
+    if func.is_static || func.threadsafe || func.is_readonly_receiver : return
+    if func.mutates_receiver : at.error(headline)
+    // An `$immutable` class never changes its values outside itself
+    let owner = func.class ?! return
+    if owner.representation_class().immutable || !isset(func.body) : return
+    let variants = func.readonly_variants ?? <{
+        let created = Map[Func]{}
+        func.readonly_variants = created
+        return created
     }
-    func.checking_mutation = false
-    if found : func.mutates_receiver = true
-    return found
-}
-
-// Whether the method stores into its receiver, atomic words included
-fn func_writes_receiver(func: Func) bool !Error {
-    ensure_func_effects_parsed(func) !>
-    // A body the LSP did not load, or one still being analyzed, is not
-    // known to write; only settled effects report
-    if !func.effects_ready || func_effects_unavailable_in_lsp(func) : return false
-    let receiver = func.args.get(0) ! return false
-    return receiver.may_write
-}
-
-// True when 'value' is, or was read out of, the current method's receiver
-fn value_reaches_receiver(value: Value, ctx: Context) bool {
-    let func = ctx.func ?? (ctx.get_func() !? null) ?! return false
-    if !isset(func.class) || func.is_static : return false
-    let this_arg = func.args.get(0) !? null
-    if !isset(this_arg) : return false
-    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
-        if origin == this_arg.decl : return true
-    }
-    // A struct receiver is a borrow whose storage chain names it directly
-    let current: ?Value = value
-    while isset(current) {
-        if current.type == VAL.decl : return current.decl == this_arg.decl
-        let kind = current.type
-        if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : break
-        current = current.value1
-    }
-    return false
-}
-
-// A store into 'owner' that is not an atomic word: the enclosing method
-// mutates its receiver when 'owner' comes from it
-fn value_note_receiver_mutation(owner: Value, ctx: Context) {
-    let func = ctx.func ?? (ctx.get_func() !? null) ?! return
-    if func.mutates_receiver || func_is_view_variant(func) : return
-    if value_reaches_receiver(owner, ctx) : func.mutates_receiver = true
+    if variants.has(headline) : return
+    let variant = get_func_view_variant(func, 3, 0, at, from) !>
+    variant.view_headline = headline
+    variant.check_required = true
+    variants.set(headline, variant)
 }
 
 fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -6261,8 +6213,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     if !func.parsed_types {
         parse_func_types(func) !>
     }
-    ensure_func_effects(func) !>
-
     let params = func.args
     // Instance methods have `this` as first arg; call args are the remaining ones
     let skip: uint = 0
@@ -6278,40 +6228,26 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         receiver = callee.value1
         if isset(receiver) {
             let receiver_param = params.get(0) !? null
-            if isset(receiver_param) && receiver_param.type.is_stack_borrow() && value_is_copied_element(receiver)
-                && (func_writes_receiver(func) !>)
-            {
-                at.error("Cannot call a method that changes its receiver on an element copied out of an Array; borrow it with '&arr[i]' or store the element back with '.set'")
-            }
-            // A method that returns nothing would only change the copy
-            if isset(receiver_param) && receiver_param.type.is_stack_borrow() && value_is_call_result_copy(receiver)
-                && func.get_rett().is_void_type() && (func_writes_receiver(func) !>)
-            {
-                at.error(CALL_RESULT_COPY_ERROR)
-            }
+            let borrowed = isset(receiver_param) && receiver_param.type.is_stack_borrow()
             // A struct receiver lives inside the borrow and a slice method
             // writes the slice's storage; a class or interface method works
             // on the object the slot refers to
             let func_class = func.class
-            let storage_receiver = (isset(receiver_param) && receiver_param.type.is_stack_borrow())
-                || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
-            if storage_receiver && value_is_readonly_storage(receiver, ctx) && (func_writes_receiver(func) !>) {
-                at.error("Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx))
-            }
+            let storage_receiver = borrowed || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
             let receiver_meta = receiver.meta
             let captured = isset(receiver_meta) ? receiver_meta.captured_receiver : null
-            if isset(captured) && storage_receiver && (func_writes_receiver(func) !>) {
-                at.error("Cannot call a method that changes captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead")
+            let readonly: ?String = null
+            if borrowed && value_is_copied_element(receiver) {
+                readonly = "Cannot call a method that changes its receiver on an element copied out of an Array; borrow it with '&arr[i]' or store the element back with '.set'"
+            } else if borrowed && value_is_call_result_copy(receiver) && func.get_rett().is_void_type() {
+                // A method that returns nothing would only change the copy
+                readonly = CALL_RESULT_COPY_ERROR
+            } else if storage_receiver && value_is_readonly_storage(receiver, ctx) {
+                readonly = "Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx)
+            } else if isset(captured) && storage_receiver {
+                readonly = "Cannot call a method that changes captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead"
             }
-            let current = ctx.func
-            if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {
-                let calls = current.this_calls
-                if !isset(calls) {
-                    calls = Array[Func]{}
-                    current.this_calls = calls
-                }
-                calls.append(func, true)
-            }
+            if isset(readonly) : func_check_readonly_receiver(func, readonly, at, ctx.func) !>
             let receiver_arg = params.get(0) !? null
             let owner = ctx.get_func() !>
             // Frame storage as a receiver goes only to a `local` receiver. The receiver was

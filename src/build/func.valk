@@ -15,10 +15,6 @@ class Arg {
     // Type expression with `$G` parameters, inferred from the call-site value
     is_generic: bool (false)
     generic_exp: ?Exp (null)
-    // Body-derived effect: the function writes to storage reached through this argument
-    may_write: bool (true)
-    write_dependents: ?Array[Arg] (null)
-    enum_receiver_pos: ?Pos (null)
 }
 
 class FuncGenerated {
@@ -104,9 +100,9 @@ class Func {
     threadsafe: bool (false)
     unsafe_call: bool (false) // @unsafe: callers need an unsafe scope
     skip_ast: bool (false)    // generic-arg bases (and similar) skip body parse until specialized
-    // A caller needs this body's write effects for a decision that would
-    // otherwise be an error: the LSP parses it even from an unopened file
-    summary_required: bool (false)
+    // Only checked, never called (a read-only receiver variant): parsed also in a
+    // dependency package, and by the LSP from an unopened file
+    check_required: bool (false)
     is_test: bool (false)
     // `synctest` functions run only after all previously-started tests finish.
     is_sync: bool (false)
@@ -120,13 +116,8 @@ class Func {
     is_getter: bool (false) // `get name: Type { ... }`
     is_setter: bool (false) // `set name(value: Type) { ... }`, kept in Class.setters
     is_defer: bool (false) // the closure a `defer` runs
+    // A hook that stores through raw memory ($offset_assign, $append, ...): never on shared data
     mutates_receiver: bool (false)
-    // Methods this one calls on its own receiver (or data reached from it);
-    // a mutation in any of them makes this one mutating too
-    this_calls: ?Array[Func] (null)
-    checking_mutation: bool (false)
-    effects_ready: bool (false)
-    computing_effects: bool (false)
     is_shared_receiver: bool (false)
     shared_receiver_func: ?Func (null)
     // Variant whose `this` is a locked view: mutation allowed, results stay locked
@@ -138,8 +129,13 @@ class Func {
     // comparison hook called with a view on its right
     args_view: u8 (0)
     args_view_funcs: ?Map[Func] (null)
+    // Variant whose `this` is read-only, checked for a call on storage it may not change
+    is_readonly_receiver: bool (false)
+    readonly_variants: ?Map[Func] (null)
     // The call that first needed a shared/locked receiver variant
     view_variant_at: ?Exp (null)
+    // The error a read-only variant reports at that call
+    view_headline: String ("")
     // The shared/locked variant whose body made this one, if any
     view_variant_from: ?Func (null)
     is_clone_hook: bool (false)
@@ -153,7 +149,6 @@ class Func {
     literal_owner: ?Func (null)
     // ---- Function body AST (parse_func_asts) ----
     parsed_ast: bool (false)
-    body_parsed_once: bool (false)
     // Body scope: parent = arg_scope; holds locals + body Values
     body_scope: ?Scope (null)
     alloca_scope: ?Scope (null)
@@ -365,11 +360,13 @@ fn parse_func_types(func: Func) !Error {
         } else if is_struct {
             // A struct method receives its storage as a writable stack borrow,
             // so a store through `this` knows the allocation that owns it
-            this_type = this_type.local_ref().mut_type()
+            this_type = this_type.local_ref()
+            if !func.is_readonly_receiver : this_type = this_type.mut_type()
         } else if owner.representation_class().kind == CLASS_KIND.slice && !owner.representation_class().immutable
-            && !(func.flags ?? Array[String]{}).contains("$owned") {
+            && !((func.view_base ?? func).flags ?? Array[String]{}).contains("$owned") {
             // A slice method borrows its receiver for the call: it may be frame storage
             this_type = this_type.local_type()
+            if func.is_readonly_receiver : this_type = this_type.plain_type()
         }
         append_func_arg(func, "this", this_type)
     }
@@ -672,11 +669,12 @@ fn type_lock_callback_params(type: Type, elements: Array[Type]) Type {
 
 fn func_view_suffix(view: u8, tail: String) String {
     if view == 0 : return ""
+    if view == 3 : return "__readonly" + tail
     return (view == 2 ? "__locked" : "__shared") + tail
 }
 
 fn func_is_view_variant(func: Func) bool {
-    return func.is_locked_receiver || func.is_shared_receiver || func.args_view > 0
+    return func.is_locked_receiver || func.is_shared_receiver || func.is_readonly_receiver || func.args_view > 0
 }
 
 // The classes a value of some type can reach; `any` when an interface or closure may reach
@@ -801,6 +799,7 @@ fn get_func_view_variant(base: Func, receiver_view: u8, args_view: u8, at: Exp, 
         interface_slot: base.interface_slot
         is_shared_receiver: receiver_view == 1
         is_locked_receiver: receiver_view == 2
+        is_readonly_receiver: receiver_view == 3
         args_view: args_view
         view_variant_at: at
         view_variant_from: isset(from) && func_is_view_variant(from) ? from : null
@@ -825,7 +824,7 @@ fn get_func_view_variant(base: Func, receiver_view: u8, args_view: u8, at: Exp, 
     // A clone hook's body is checked against a plain result, so it cannot return the data
     let rett = func.rett
     let rett_view = receiver_view > 0 ? receiver_view : args_view
-    if isset(rett) && !base.is_clone_hook && func_result_reaches_views(func, rett) {
+    if isset(rett) && rett_view < 3 && !base.is_clone_hook && func_result_reaches_views(func, rett) {
         // A writable borrow of shared storage is read-only, also when its elements are plain
         // numbers that need no view of their own
         if rett_view == 1 && rett.get_non_nullable().is_mut : rett = rett.plain_type()
@@ -1680,7 +1679,11 @@ fn func_push_instantiations(func: Func) uint {
     // the mismatch is found in a helper the method called.
     let origin = func_view_variant_origin(func)
     let view_at = origin.view_variant_at
-    if isset(view_at) {
+    if isset(view_at) && origin.is_readonly_receiver {
+        let name = origin.name.replace("__readonly", "")
+        b.push_instantiation(view_at, "while checking '" + name + "' for a read-only receiver, called here", name, "read-only", origin.view_headline)
+        pushed++
+    } else if isset(view_at) {
         let receiver = origin.is_locked_receiver || origin.is_shared_receiver
         let locked = receiver ? origin.is_locked_receiver : origin.args_view == 2
         let view = locked ? "locked" : "shared"
