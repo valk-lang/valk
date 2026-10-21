@@ -1584,19 +1584,39 @@ fn value_hash_method(value: Value, method: Func, ctx: Context, scope: Scope, at:
 
 // `copy_shared`: a shared value is copied into a plain one, for a `$clone` whose result is not
 // shared; otherwise shared data is returned as it is, since nobody can change it
-fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool (true), allow_pointer_alias: bool (false), copy_shared: bool (false)) Value !Error {
+fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool (true), allow_pointer_alias: bool (false), copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett
     let nn = type.get_non_nullable()
     if nn.is_shared && !copy_shared : return value
-    if nn.kind == TYPE.closure : return value_fn_clone(value, ctx, scope, at) !>
+    if nn.kind == TYPE.closure {
+        // An ordinary closure read through a view: its copy is ordinary again
+        if (nn.is_shared || nn.is_locked) && copy_shared {
+            let plain = vgen_cast(value, type.plain_type())
+            plain.exp = value.exp
+            return value_fn_clone(plain, ctx, scope, at) !>
+        }
+        return value_fn_clone(value, ctx, scope, at) !>
+    }
     if allow_pointer_alias && !isset(nn.class)
         && (nn.is_bare_borrow() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of) : return value
     let class = value_member_class(nn)
     if isset(class) {
         let method = class.get_clone_hook()
         if isset(method) && (!check_access || act_allows(at, method.act, method.exp, false)) {
-            return value_clone_method(value, method, ctx, scope, at, check_access) !>
+            return value_clone_method(value, method, ctx, scope, at, check_access, view_hooks) !>
         }
+    }
+    // A slice borrow is copied into storage of its own by the `&[T]` clone hook
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local && !allow_pointer_alias {
+        let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
+        let slice_class = bare_slice_class(ctx.build, element, at) !>
+        let method = slice_class.get_clone_hook() ?! at.bug("Bare slice class has no '$clone' hook")
+        let slice_type = slice_class.get_type() !>
+        let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
+        as_slice.exp = value.exp
+        let cloned = value_clone_method(as_slice, method, ctx, scope, at, false, view_hooks) !>
+        let plain = type.plain_type()
+        return value_retype_bare_slice(cloned, plain.get_non_nullable().mut_type(), at)
     }
     if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow()) && !allow_pointer_alias {
         at.error("Cannot clone type '" + nn.compat_display_name() + "' because it aliases memory and has no accessible '$clone' function")
@@ -1604,14 +1624,14 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
     if nn.is_fixed_array_type() {
         // Plain data copies as a whole instead of element by element
         if type_clones_by_copy(nn) : return value
-        return value_clone_array(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+        return value_clone_array(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     }
     if nn.kind == TYPE.struct && nn.is_inline && !isset(nn.class) && nn.has_gc_refs() {
-        return value_clone_tuple(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+        return value_clone_tuple(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     }
-    if nn.kind == TYPE.union : return value_clone_union(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+    if nn.kind == TYPE.union : return value_clone_union(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     if isset(class) && nn.is_structural_type() {
-        return value_clone_object(value, class, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+        return value_clone_object(value, class, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     }
     return value
 }
@@ -1656,6 +1676,10 @@ fn type_can_clone(type: Type, allow_pointer_alias: bool, seen: Array[Class]) boo
             return true
         }
     }
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local {
+        let element = nn.get_sub_type() ?! return true
+        return type_can_clone(element, allow_pointer_alias, seen)
+    }
     if nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow() : return false
     if nn.is_fixed_array_type() {
         let sub = nn.get_sub_type() ?! return true
@@ -1670,6 +1694,8 @@ fn type_can_clone(type: Type, allow_pointer_alias: bool, seen: Array[Class]) boo
         return true
     }
     if isset(class) && nn.is_structural_type() {
+        // A copy would share the resource its finalizer releases
+        if isset(class.get_func("gc_free")) : return false
         seen.append(class)
         each class.props as prop {
             if !type_can_clone(prop.type, allow_pointer_alias, seen) : return false
@@ -1684,16 +1710,21 @@ fn clone_copies_shared(copy_shared: bool, declared: Type) bool {
     return copy_shared && !declared.get_non_nullable().is_shared
 }
 
-fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp, check_access: bool) Value !Error {
+fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp, check_access: bool, view_hooks: bool (false)) Value !Error {
     if !method.parsed_types : parse_func_types(method) !>
 
     let body = Array[Value]{}
     let source = value_bind_once(value, ctx, at, body)
     let receiver = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
     receiver = value_read_borrowed_receiver(receiver, scope, ctx, at) !>
+    // A copy made for publishing runs the hook as on shared data: it cannot hand back the original
+    let receiver_nn = receiver.rett.get_non_nullable()
+    if view_hooks && !receiver_nn.is_shared && !receiver_nn.is_locked {
+        receiver = vgen_cast(receiver, receiver.rett.shared_type())
+    }
     let result = receiver
     if receiver.rett.is_nullable_type() {
-        result = value_clone_method(receiver, method, ctx, scope, at, check_access) !>
+        result = value_clone_method(receiver, method, ctx, scope, at, check_access, view_hooks) !>
     } else {
         method = get_func_clone_variant(method, at, check_access) !>
         method = func_for_receiver(method, receiver, at, ctx.func) !>
@@ -1723,14 +1754,14 @@ fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     if check_access {
         each class.props as prop : act_check(at, prop.act, prop.exp, true, "property") !>
     }
     let body = Array[Value]{}
     let source = value_bind_once(value, ctx, at, body)
     let clone_source = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
-    let clone_func = value_clone_func(value.rett.get_non_nullable(), class, ctx, at, check_access, allow_pointer_alias, copy_shared) !>
+    let clone_func = value_clone_func(value.rett.get_non_nullable(), class, ctx, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     let cloned = vgen_call(ctx, vgen_func(clone_func), Array[Value]{ clone_source }, clone_func.get_rett(), scope)
     cloned.exp = at
     let result = cloned
@@ -1747,9 +1778,9 @@ fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Func !Error {
+fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Func !Error {
     let source = access_root_source(at.src)
-    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared
+    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared + ":" + view_hooks
     ctx.build.cache.clone_funcs.get(key) -> cached : return cached
 
     let owner = ctx.get_func() !>
@@ -1778,22 +1809,71 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     clone_func.defer_scope = body_scope.sub_scope()
     let inner_ctx = Context.for_func(clone_func)
     let value_arg = clone_func.args.get(0) ! at.bug("Clone helper is missing its value")
-    let source_value = vgen_decl(value_arg.decl)
-    let fields = HashMap[Prop, Value]{}
-    each class.props as prop {
-        let field = vgen_prop(prop, source_value, inner_ctx)
-        field.rett = type.storage_view_of(prop.type)
-        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type)) !>
-        prop.type.compat_check(cloned.rett, at) !>
-        fields.set(prop, cloned)
+    let b = ctx.build
+    let plain = type.plain_type()
+    if !plain.is_gc_type() {
+        // A struct is copied by value: it has no identity to keep
+        let fields = HashMap[Prop, Value]{}
+        each class.props as prop {
+            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+            field.rett = type.storage_view_of(prop.type)
+            let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+            prop.type.compat_check(cloned.rett, at) !>
+            fields.set(prop, cloned)
+        }
+        let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
+        body_scope.append_value(vgen_return(result, b, at))
+    } else {
+        // An object copied before in this clone is that copy again, so cycles and parts reached
+        // twice keep their shape. The copy is noted before its fields are copied
+        let ptr_t = type_ptr(b)
+        let begin_f = value_get_valk_func(b, "core", "clone_begin", at) !>
+        let end_f = value_get_valk_func(b, "core", "clone_end", at) !>
+        let find_f = value_get_valk_func(b, "core", "clone_find", at) !>
+        let note_f = value_get_valk_func(b, "core", "clone_note", at) !>
+        each Array[Func]{ begin_f, end_f, find_f, note_f } as helper_f {
+            if !helper_f.parsed_types : parse_func_types(helper_f) !>
+        }
+        body_scope.append_value(vgen_call(inner_ctx, vgen_func(begin_f), Array[Value]{}, begin_f.get_rett(), body_scope))
+        let found = Decl.new(clone_func, find_f.get_rett(), false, "found")
+        found.exp = at
+        body_scope.add_decl(found)
+        let find = vgen_call(inner_ctx, vgen_func(find_f), Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t) }, find_f.get_rett(), body_scope)
+        body_scope.append_value(vgen_assign(vgen_decl(found), find, ASSIGN_OP.set, b, at))
+        let again = Array[Value]{
+            vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope)
+            vgen_return(vgen_cast(value_force_remove_nullable(vgen_decl(found)), plain), b, at)
+        }
+        body_scope.append_value(vgen_if(vgen_isset_val(vgen_decl(found), type_bool(b)), again, null, b, at))
+
+        let shallow = HashMap[Prop, Value]{}
+        each class.props as prop {
+            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+            shallow.set(prop, vgen_cast(field, prop.type))
+        }
+        let result = Decl.new(clone_func, plain, false, "result")
+        result.is_mut = true
+        result.exp = at
+        body_scope.add_decl(result)
+        body_scope.append_value(vgen_assign(vgen_decl(result), vgen_class_init(inner_ctx, class, shallow, plain, at) !>, ASSIGN_OP.set, b, at))
+        let note_args = Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t), vgen_cast(vgen_decl(result), ptr_t) }
+        body_scope.append_value(vgen_call(inner_ctx, vgen_func(note_f), note_args, note_f.get_rett(), body_scope))
+        each class.props as prop {
+            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+            field.rett = type.storage_view_of(prop.type)
+            let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+            if cloned == field : continue
+            prop.type.compat_check(cloned.rett, at) !>
+            let slot = vgen_prop(prop, vgen_decl(result), inner_ctx)
+            body_scope.append_value(vgen_store(slot, cloned, ASSIGN_OP.set, inner_ctx, body_scope, at) !>)
+        }
+        body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope))
+        body_scope.append_value(vgen_return(vgen_decl(result), b, at))
     }
-    let result = vgen_class_init(inner_ctx, class, fields, type.plain_type(), at) !>
-    // Generated bodies need the same freshness proof as source functions.
+    // A clone hands back a graph of its own
     clone_func.unique_summary_saw_return = true
-    clone_func.returns_unique_graph = value_summary_graph_is_unique(result, clone_func, clone_func.unique_return_args) !>
-    if !clone_func.returns_unique_graph : value_mark_summary_escape(result, false)
+    clone_func.returns_unique_graph = true
     func_finish_unique_summary(clone_func) !>
-    body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
 
     owner.unit.functions.append(clone_func)
@@ -1819,7 +1899,7 @@ fn value_bind_once(value: Value, ctx: Context, at: Exp, body: Array[Value], snap
     return slot
 }
 
-fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett.plain_type()
     let array = type.get_non_nullable()
     let sub = array.get_sub_type() ?! at.bug("Fixed-array clone has no element type")
@@ -1831,7 +1911,7 @@ fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
     let i: uint = 0
     while i < array.length {
         let element = vgen_multi_part(clone_source, i, value.rett.storage_view_of(sub), at)
-        let cloned = value_clone(element, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, sub)) !>
+        let cloned = value_clone(element, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, sub), view_hooks) !>
         sub.compat_check(cloned.rett, at) !>
         elements.append(cloned)
         i++
@@ -1851,7 +1931,7 @@ fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
 }
 
 // A tuple is copied part by part, like a fixed array
-fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett.plain_type()
     let tuple = type.get_non_nullable()
     let members = tuple.get_members() ?! at.bug("Tuple clone has no member types")
@@ -1872,7 +1952,7 @@ fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
             if part.rett != member : retyped = true
             continue
         }
-        let cloned = value_clone(part, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member)) !>
+        let cloned = value_clone(part, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member), view_hooks) !>
         // A copy of locked data is not locked
         let expected = member.plain_type()
         expected.compat_check(cloned.rett, at) !>
@@ -1896,7 +1976,7 @@ fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett.plain_type()
     let union = type.get_non_nullable()
     let members = union.get_members() ?! at.bug("Tagged-union clone has no alternatives")
@@ -1913,7 +1993,7 @@ fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
         }
         let extracted = vgen_union_extract(source, member, ctx, at) !>
         extracted.rett = value.rett.storage_view_of(member)
-        let cloned = value_clone(extracted, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member)) !>
+        let cloned = value_clone(extracted, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member), view_hooks) !>
         member.compat_check(cloned.rett, at) !>
         let wrapped = vgen_union_wrap(cloned, type, i, ctx) ?! at.bug("Failed to rebuild cloned tagged union")
         result = vgen_this_or_that(vgen_union_is(source, i, at), wrapped, result, type)
@@ -6291,6 +6371,13 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         at.error("Too many arguments for '" + func.name + "' (expected at most " + max_params + ", got " + args.length + ")")
     }
 
+    // The lock of the call's locked inputs, from the receiver or the first locked argument
+    let call_lock_root: ?Decl = null
+    let call_lock_known = false
+    if isset(receiver) && receiver.rett.has_locked_refs() && isset(ctx.func) {
+        call_lock_root = value_lock_root(receiver, ctx.get_func() !>)
+        call_lock_known = true
+    }
     let i: uint = 0
     while i < args.length {
         let param_i = skip + i
@@ -6330,18 +6417,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
                 at.error("Frame storage can only be passed to a 'local' borrow parameter; parameter '" + param.name + "' of " + func_user_name(func) + " may keep it")
             }
             let settled = func_arg_summary_settled(func, param_i)
-            // Lent for the call; the ownership walk publishes it when the callee keeps it. A
-            // literal has no other owner and a coroutine keeps its arguments: those are published
-            let fresh_literal = av.type == VAL.class_init || av.type == VAL.array_init
-            let accepts_shared_borrow = !fresh_literal && !is_coroutine
-            // Part of the locked graph handed back to a method on that graph
-            // is a rearrangement, not a new view
-            if isset(receiver) && receiver.rett.get_non_nullable().is_locked
-                && av.rett.get_non_nullable().is_locked && !param.type.get_non_nullable().is_locked
-                && value_stays_inside(av, receiver)
-            {
-                av = vgen_cast(av, av.rett.plain_type())
-            }
             // Locked plain data lent for the call: a `local` borrow cannot outlive it, and
             // elements without references have nothing to take out of the lock
             let param_nn = param.type.get_non_nullable()
@@ -6351,14 +6426,20 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             {
                 av = vgen_cast(av, av.rett.plain_type())
             }
-            let plain_arg = !av.rett.get_non_nullable().is_shared
             let lent_local = param.type.is_stack_borrow() && !value_is_owned_storage(av)
-            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow) !>
+            let was_locked = av.rett.has_locked_refs()
+            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow) !>
             if lent_local : av.ensure_meta().lent_local = true
-            if accepts_shared_borrow && plain_arg && av.type == VAL.shared_view {
-                av.ensure_meta().borrow_param = param
-                let caller = ctx.get_func() !>
-                caller.has_publications = true
+            // One call gets its locked data from one lock: data from another is copied
+            if was_locked && param.type.has_locked_refs() {
+                let root = value_lock_root(av, ctx.get_func() !>)
+                if !isset(call_lock_root) && !call_lock_known {
+                    call_lock_root = root
+                    call_lock_known = true
+                } else if !isset(root) || root != call_lock_root {
+                    let copied = value_publish_copy(av, ctx, scope, param.type) !>
+                    if copied != av : av = value_shared_view(copied, param.type)
+                }
             }
             let owner = ctx.get_func() !>
             if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))

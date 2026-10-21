@@ -432,11 +432,15 @@ fn parse_func_types(func: Func) !Error {
             parse_func_args_body(func, args_body) !>
         }
     }
-    if func.args_view > 0 {
+    // A method on locked data takes its reference arguments as part of that data: a plain
+    // value is copied in by the call, one from the same lock moves. Callbacks only run
+    let lock_args = func.is_locked_receiver && func.args_view == 0
+    if func.args_view > 0 || lock_args {
         let first = isset(owner) && !func.is_static ? 1 : 0
         each func.args as arg, i {
             if i < first : continue
-            arg.type = arg.type.storage_view_type(func.args_view == 2)
+            if lock_args && arg.type.get_non_nullable().kind == TYPE.closure : continue
+            arg.type = arg.type.storage_view_type(func.args_view == 2 || lock_args)
             arg.decl.type = arg.type
         }
     }
@@ -501,6 +505,10 @@ fn parse_func_types(func: Func) !Error {
         }
     } else {
         func.rett = type_from_exp(rett_exp, func.arg_scope) !>
+        // A shared global's default comes out of its init function shared
+        let init_global = func.global_init
+        let rett = func.rett
+        if isset(init_global) && isset(rett) && init_global.shared && !init_global.allow_unsafe : func.rett = rett.shared_type()
     }
     let main_rett = func.rett
     if isset(main_rett) && func.ns.build.main_func == func && !main_rett.is_void_type() && !main_rett.is_integer_type() {
@@ -733,6 +741,68 @@ fn func_is_view_variant(func: Func) bool {
     return func.is_locked_receiver || func.is_shared_receiver || func.args_view > 0
 }
 
+// The classes a value of some type can reach; `any` when an interface or closure may reach
+// objects of any class
+class TypeReach {
+    classes: Array[Class] (.{})
+    any: bool (false)
+}
+
+fn type_collect_reach(type: Type, reach: TypeReach) {
+    if reach.any : return
+    let nn = type.get_non_nullable()
+    let kind = nn.kind
+    if kind == TYPE.closure || kind == TYPE.interface || kind == TYPE.any {
+        reach.any = true
+        return
+    }
+    if !nn.has_gc_refs() && !nn.is_fat_borrow() && kind != TYPE.ref_of : return
+    let members = nn.get_members()
+    if isset(members) {
+        each members as member : type_collect_reach(member, reach)
+    }
+    if kind == TYPE.ref_of || kind == TYPE.ref_slice || nn.is_fixed_array_type() {
+        let sub = nn.get_sub_type()
+        if isset(sub) : type_collect_reach(sub, reach)
+    }
+    let class = nn.get_class_or_null() ?! return
+    // Strings never change, so reaching one shares nothing
+    if class.representation_class().immutable : return
+    if reach.classes.contains(class) : return
+    reach.classes.append(class)
+    let generics = class.generic_types
+    if isset(generics) {
+        each generics as generic : type_collect_reach(generic, reach)
+    }
+    each class.props as prop : type_collect_reach(prop.type, reach)
+}
+
+// Whether a variant's result may reach the shared or locked data it was given: only then
+// does the result keep the view. Decided from the types alone
+fn func_result_reaches_views(func: Func, rett: Type) bool {
+    // A borrow may point into the viewed storage itself, whatever its elements are
+    let nn = rett.get_non_nullable()
+    let named = nn.class
+    let immutable = isset(named) && named.representation_class().immutable
+    if (nn.kind == TYPE.ref_of || nn.kind == TYPE.ref_slice || nn.kind == TYPE.adr_of) && !immutable : return true
+    if rett.has_borrowed_refs() : return true
+    let result = TypeReach{}
+    type_collect_reach(rett, result)
+    if !result.any && result.classes.length == 0 : return false
+    let inputs = TypeReach{}
+    each func.args as arg {
+        // A struct receiver is a borrow of the viewed struct
+        let t = arg.type.storage_view_type_of()
+        if !t.is_shared && !t.is_locked && !arg.type.has_locked_refs() : continue
+        type_collect_reach(arg.type, inputs)
+    }
+    if result.any || inputs.any : return true
+    each result.classes as class {
+        if inputs.classes.contains(class) : return true
+    }
+    return false
+}
+
 fn get_func_view_variant(base: Func, receiver_view: u8, args_view: u8, at: Exp, from: ?Func (null)) Func !Error {
     let scope = Scope.new(base.arg_scope.parent)
     // Declaration syntax is read, never rewritten, and a function body is a
@@ -810,14 +880,12 @@ fn get_func_view_variant(base: Func, receiver_view: u8, args_view: u8, at: Exp, 
 
     parse_func_types(func) !>
     if receiver_view == 2 : func_lock_callback_elements(func)
-    // What a method hands back from shared data stays shared, unless the
-    // function is proven to build a brand new graph that the receiver cannot
-    // reach. Without this, 'get', 'copy' and '_next' launder a shared view
-    // into an ordinary mutable one. An unavailable summary means "not proven",
-    // so the shared view is kept.
+    // What a method hands back from shared or locked data keeps the view when it can reach
+    // that data, or 'get', 'copy' and '_next' would launder it into an ordinary mutable value.
+    // A clone hook's body is checked against a plain result, so it cannot return the data
     let rett = func.rett
     let rett_view = receiver_view > 0 ? receiver_view : args_view
-    if isset(rett) && !func_returns_fresh_graph(base) {
+    if isset(rett) && !base.is_clone_hook && func_result_reaches_views(func, rett) {
         // A writable borrow of shared storage is read-only, also when its elements are plain
         // numbers that need no view of their own
         if rett_view == 1 && rett.get_non_nullable().is_mut : rett = rett.plain_type()
@@ -829,6 +897,8 @@ fn get_func_view_variant(base: Func, receiver_view: u8, args_view: u8, at: Exp, 
 }
 
 fn get_func_clone_variant(base: Func, at: Exp, check_access: bool) Func !Error {
+    // Already a clone variant, or a view variant of one
+    if isset(base.clone_at) : return base
     let key = at.src.id + ":" + at.i + ":" + check_access
     let variants = base.clone_variants ?? <{
         let created = Map[Func]{}
@@ -1675,6 +1745,9 @@ fn func_push_instantiations(func: Func) uint {
         let locked = receiver ? origin.is_locked_receiver : origin.args_view == 2
         let view = locked ? "locked" : "shared"
         let name = origin.name.replace("__locked_args", "").replace("__shared_args", "").replace("__" + view, "")
+        // A clone variant is named after the hook it was made from
+        let clone_at = name.index_of("__clone_") !? name.bytes
+        name = name.range(0, clone_at)
         b.push_instantiation(view_at, "while checking '" + name + "' for a " + view + (receiver ? " receiver" : " argument") + ", called here", name, view)
         pushed++
     }

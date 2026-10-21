@@ -802,6 +802,104 @@ fn value_mark_actual_escape(value: Value, retain: bool (true)) {
     value_invalidate_unique(value)
 }
 
+// The lock a locked value belongs to in this function: a `lock` block's binding, or the
+// function's own locked receiver and arguments, which a call takes from one lock. Null when
+// it cannot be named
+fn value_lock_root(value: Value, func: Func) ?Decl {
+    let origins = value_escape_origins(value)
+    let root: ?Decl = null
+    each origins as origin {
+        let found: ?Decl = null
+        if isset(origin.lock_scope) : found = origin
+        else if isset(decl_escape_arg(origin)) {
+            let first = func.args.get(0) ! return null
+            found = first.decl
+        }
+        if !isset(found) : return null
+        if isset(root) && root != found : return null
+        root = found
+    }
+    return root
+}
+
+// Locked data moves within its own lock; data from another lock is copied in
+fn value_lock_store(owner: Value, right: Value, target: Type, ctx: Context, scope: Scope) Value !Error {
+    if !right.rett.has_locked_refs() : return right
+    // Converted into the view just now: copied already when it needed to be
+    if right.type == VAL.shared_view : return right
+    if !owner.rett.get_non_nullable().is_locked && !owner.rett.has_locked_refs() : return right
+    let func = ctx.get_func() !>
+    let from = value_lock_root(right, func)
+    if isset(from) && from == value_lock_root(owner, func) : return right
+    let copied = value_publish_copy(right, ctx, scope, target) !>
+    if copied == right : return right
+    return value_shared_view(copied, target)
+}
+
+// What becomes shared or moves into locked data is copied, so nothing else can name it. A
+// literal is its own already: only the parts it was given from elsewhere are copied
+fn value_publish_copy(value: Value, ctx: Context, scope: Scope, target: Type) Value !Error {
+    if value_publish_needs_no_copy(value) : return value
+    let t = value.type
+    if t == VAL.class_init || t == VAL.array_init {
+        let values = value.values ?? Array[Value]{}
+        each values as part, i {
+            let copied = value_publish_copy(part, ctx, scope, target) !>
+            if copied != part {
+                let prop = part.get_init_prop()
+                if isset(prop) : copied.set_init_prop(prop)
+                values.set(i, copied) _
+            }
+        }
+        return value
+    }
+    // A literal's part waiting in a buffer: copy what is stored into the buffer
+    let pre = t == VAL.decl ? value.get_pre_value() : null
+    if isset(pre) && pre.type == VAL.assign {
+        let stored = pre.value2
+        if isset(stored) : pre.value2 = value_publish_copy(stored, ctx, scope, target) !>
+        return value
+    }
+    if t == VAL.this_or_that {
+        let yes = value.value2
+        if isset(yes) : value.value2 = value_publish_copy(yes, ctx, scope, target) !>
+        let values = value.values ?? Array[Value]{}
+        each values as no, i : values.set(i, value_publish_copy(no, ctx, scope, target) !>) _
+        return value
+    }
+    let func = ctx.get_func() !>
+    let at = value.exp ?? func.exp
+    if !type_can_clone(value.rett, false, Array[Class]{}) {
+        at.error("Cannot copy '" + value.rett.compat_display_name() + "' into '" + target.compat_display_name()
+            + "': it holds raw memory or a resource released by 'gc_free', and has no '$clone' function to copy it")
+    }
+    // `$clone` hooks run as on shared data, so they cannot hand back the original's parts
+    return value_clone(value, ctx, scope, at, false, false, true, true) !>
+}
+
+// Data that is already safe to hand out: plain words, strings, shared data, or a fresh copy
+fn value_publish_needs_no_copy(value: Value) bool {
+    let nn = value.rett.get_non_nullable()
+    if nn.is_shared : return true
+    if !value.rett.has_gc_refs() && nn.kind != TYPE.closure : return true
+    let t = value.type
+    if t == VAL.null || t == VAL.string : return true
+    let string_class = type_string(nn.build).get_class_or_null()
+    if isset(string_class) && nn.get_class_or_null() == string_class : return true
+    if t == VAL.call {
+        let callee = value.value1 ?! return false
+        let func = callee.resolve_call_func() ?! return false
+        return func.is_clone_hook || func.name.starts_with("<clone.")
+    }
+    // An object made from a raw pointer is unsafe code's own claim
+    if t == VAL.cast {
+        let inner = value.value1 ?! return false
+        let inner_nn = inner.rett.get_non_nullable()
+        return inner_nn.is_raw_pointer() || inner_nn.kind == TYPE.ptr_of
+    }
+    return false
+}
+
 fn value_publish_unique(value: Value, ctx: Context, message: ?String (null)) !Error {
     if value.rett.get_non_nullable().is_shared : return
     let meta = value.ensure_meta()
@@ -1682,23 +1780,6 @@ fn resolve_deferred_unique_effects(build: Build) !Error {
         }
     }
 
-    own_analyze(build)
-    let walk_us: uint = 0
-    // The checks need the settled summaries; every body is parsed by now
-    each build.lists.units as unit {
-        each unit.functions as func {
-            if (!func.has_publications && !func.has_lends) || func_unique_summary_unavailable_in_lsp(func) : continue
-            let t = time.mono_us()
-            own_check_func(func) !>
-            walk_us += time.mono_us() - t
-            func.body_scope = null
-        }
-    }
-    own_print_phase_stats(build, walk_us)
-    // The graphs served the checks; the rest of the build does not need them
-    each build.lists.units as unit {
-        each unit.functions as func : func.own_graph = null
-    }
 }
 
 fn fixed_array_pointer_compat(source: Type, target: Type) bool {
@@ -1941,8 +2022,7 @@ fn value_try_convert(
         && !result.rett.is_nullable_type() && target_nn.compat(source_nn.locked_storage_type())
     {
         if !allow_shared_unsafe && !allow_shared_borrow {
-            let message = "Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain"
-            value_publish_unique(result, ctx, message) !>
+            result = value_publish_copy(result, ctx, scope, target) !>
         }
         return value_shared_view(result, target, allow_shared_unsafe || allow_shared_borrow)
     }
@@ -1966,7 +2046,6 @@ fn value_try_convert(
         && target_nn.get_class_or_null() == source_nn.get_class_or_null()
         && (target.is_nullable_type() || !result.rett.is_nullable_type())
     {
-        let message = "Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain"
         if !allow_shared_unsafe && !allow_shared_borrow {
             // A closure written as a 'shared fn' has its captures checked when
             // it is created. One that only becomes shared because the object
@@ -1985,8 +2064,7 @@ fn value_try_convert(
                     + " a closure whose captured values were never checked for shared use."
                     + " Declare it as a 'shared fn(...)()' so its captures are checked where the closure is created")
             }
-            value_publish_unique(result, ctx, message) !>
-            if target_nn.is_shared : result.ensure_meta().publish_shared = true
+            result = value_publish_copy(result, ctx, scope, target) !>
         }
         return value_shared_view(result, target, allow_shared_unsafe || allow_shared_borrow)
     }
