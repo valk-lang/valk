@@ -52,6 +52,28 @@ fn fails_slice(x: &[int]) &[int] !ProbeFail {
     return x
 }
 fn gid[T](x: T) T { return x }
+fn rec_item(x: Item, n: int) Item {
+    if n == 0 : return x
+    return rec_item(x, n - 1)
+}
+fn rec_ref(x: &Item, n: int) &Item {
+    if n == 0 : return x
+    return rec_ref(x, n - 1)
+}
+fn rec_slice(x: &[int], n: int) &[int] {
+    if n == 0 : return x
+    return rec_slice(x, n - 1)
+}
+interface ProbeIds {
+    fn item(x: Item) Item;
+    fn ref(x: &Item) &Item;
+    fn slice(x: &[int]) &[int];
+}
+class ProbeImpl is ProbeIds {
+    fn item(x: Item) Item { return x }
+    fn ref(x: &Item) &Item { return x }
+    fn slice(x: &[int]) &[int] { return x }
+}
 fn stash(x: Item) { keep = x }
 fn view2(p: &[int]) &[int] { return p.view(0, 2) }
 """
@@ -86,11 +108,24 @@ def wrappers():
                                   "if probe_flag { w%d = %s } else { w%d = %s }" % (n, e, n, e)],
                                  "(w%d ?! panic(\"probe\"))" % n)),
         "array": W(lambda e, t, n: ([], "(Array[%s]{ %s }.get(0) !? %s)" % (TYPES[t][0], e, TYPES[t][1]))),
+        "while": W(lambda e, t, n: (["let w%d: ?%s = null" % (n, TYPES[t][0]),
+                                     "let i%d = 0" % n,
+                                     "while i%d < 1 { w%d = %s; i%d++ }" % (n, n, e, n)],
+                                    "(w%d ?! panic(\"probe\"))" % n)),
+        "each": W(lambda e, t, n: (["let w%d: ?%s = null" % (n, TYPES[t][0]),
+                                    "each Array[int]{ 1 } as _ { w%d = %s }" % (n, e)],
+                                   "(w%d ?! panic(\"probe\"))" % n)),
+        "match": W(lambda e, t, n: ([], "(match probe_flag : %s { true => %s default => %s })" % (TYPES[t][0], e, e))),
+        "interface": W(lambda e, t, n: (["let pi%d: ProbeIds = ProbeImpl{}" % n], "pi%d.%s(%s)" % (n, TYPES[t][2], e))),
+        "recursive": W(lambda e, t, n: ([], "rec_%s(%s, 2)" % (TYPES[t][2], e))),
+        "co": W(lambda e, t, n: None if t != "item" else ([], "(await co id_item(%s))" % e)),
+        "nested-vscope-call": W(lambda e, t, n: ([], "<{ return id_%s(%s) }" % (TYPES[t][2], e))),
+        "nested-ternary-tuple": W(lambda e, t, n: (["let t%d = (probe_flag ? %s : %s, 1)" % (n, e, e)], "t%d[0]" % n)),
     }
 
 
 # A borrow of a local may not be stored: these wrappers refuse it by type, whatever the rule
-LOCAL_BORROW_SKIP = ("struct", "class", "closure", "if", "array")
+LOCAL_BORROW_SKIP = ("struct", "class", "closure", "if", "array", "while", "each")
 
 # A rule: the type of the marked expression, then the safe and unsafe bodies of `probe_main`.
 # `@W(...)` marks the expression the wrappers rewrite; `SETUP` lines come first.
@@ -380,6 +415,9 @@ def main():
             if wname in skip:
                 continue
             if opts.only and opts.only not in key:
+                continue
+            # A wrapper that does not apply to this value type
+            if wrap("x", type_key, 0) is None:
                 continue
             cases.append((key, program(safe, type_key, wrap), program(unsafe, type_key, wrap)))
 
