@@ -17,6 +17,11 @@
 + Fix: a function with `$T` parameters used as a value (`apply(id, 5)`) is a compile error instead of a compiler bug; a default argument that uses an inferred type (`b: ?T (null)`, `b: Array[T] (.{})`) works
 + Fix: a generic type argument that grows each time it is passed on, like `grow((v, v), n - 1)`, is refused once it has 512 parts; the compiler ran out of memory
 + Fix: two coroutines that await each other end the program with `Coroutines cannot await each other in a cycle` instead of hanging
++ Generic classes: a method may return a deeper specialization of its own class, like `fn chunks(n: uint) List[List[T]]` inside `List[T]`; methods of specializations nested more than 16 deep are parsed when they are used. It failed with `Generic instantiation is nested too deep` even when nothing called the method
++ Diagnostics: a non-ASCII character outside strings and comments, a generic `main`, and flags after a callable return type (`fn make() fn()(int) $noinline`, which now works) get clear messages; types compare with `==` and `!=` in `#if`, like `#if T == String`; an unknown name is no longer matched to compiler-made names such as `&`
++ Compiler: frame storage lent to a call is accepted or refused by the ownership analysis alone, after every body is known, instead of by per-parameter summaries computed while bodies are lowered, which depended on the order functions were reached
++ GC: `GC_DEBUG` builds (such as `make test`) check during shared collections that shared data refers to shared objects only
++ Tests: the borrow, shared and lock probe matrix covers loops, `each`, `match`, interface calls, recursion, coroutines and nested forms, and runs in `make test-all`
 
 + Release 0.7.11
 + Fix: on worker threads, an array whose elements were moved in place (growth, insert, removal) was kept alive by a leftover pointer in a thread-local global, together with everything it held
