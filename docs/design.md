@@ -778,9 +778,19 @@ reference for as long as the raw pointer is used.
 
 `shared T` is a transitive view for data published across threads. No safe
 conversion turns it back into ordinary mutable `T`; `value.@cast(T)` is the
-explicit unsafe way back. Data-race-unsafe properties cannot be
-mutated through a shared view; supported integer operations use atomic access,
-and explicitly synchronized low-level code uses the shared-unsafe mechanisms.
+explicit unsafe way back. Through a shared view, a property not marked `-` or
+`~` can be assigned when it is one word: a number, bool, enum or object
+reference. Numbers use atomic access. A reference store is a release store of a
+value that is copied first unless it is already shared, and reference loads
+through the view are acquire loads. Properties of more than one word (strings,
+slices, borrows, interfaces, closures, structs, tuples, unions) cannot be
+reassigned, since a reader could see half of the old value and half of the new
+one. Their slice and borrow elements can be assigned under the same one-word
+rule, because the view never changes their length. Fields marked `-` or `~` are
+read-only through the view, since they can be part of an invariant of their
+class, like an array's length and storage. A `@threadsafe` method synchronizes
+on its own and is not checked; other explicitly synchronized low-level code uses
+the shared-unsafe mechanisms.
 
 Language-level atomic reads use acquire ordering, atomic writes use release
 ordering, and atomic read-modify-write operations are sequentially consistent.
