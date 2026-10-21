@@ -51,6 +51,7 @@ cases="$cases panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:
 cases="$cases panic-in-library:1:ByteBuffer.valk:135"
 # A `test-` fixture is built with --test: a panic names its test and prints the summary
 cases="$cases test-crash-named:1:panicked"
+cases="$cases await-cycle:1"
 # Windows delivers the overflow exception only when it can still push a frame
 if [ -z "$EXE_SUFFIX" ]; then
     cases="$cases stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"
@@ -97,6 +98,11 @@ run_case() {
 
     if [ "$name" = "unhandled-error" ] && [[ "$output" != *"Unhandled error 'Failure.failed' at tests/exit-code/unhandled-error.valk:8"* ]]; then
         echo "# Missing unhandled error name or source location: $output" >> "$log"
+        : > "$fail"
+    fi
+
+    if [ "$name" = "await-cycle" ] && [[ "$output" != *"Coroutines cannot await each other in a cycle"* ]]; then
+        echo "# Missing await cycle message: $output" >> "$log"
         : > "$fail"
     fi
 
