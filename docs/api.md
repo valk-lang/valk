@@ -197,6 +197,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~+ owner: ?GcPtr
 
+    // Returns a copy in its own storage holding a `$clone` of every element.
+    + fn clone() mut &[T]
     // Returns the element at `index`.
     + fn get(index: uint) T !LookupError
     // Returns a copy of `length` elements starting at `offset`; backs `s[offset .. length]`.
@@ -1051,6 +1053,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
 + class SyncMutex {
+    // Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+    + fn clone() SyncMutex
     // Takes the mutex, blocking the thread until it is free.
     + fn lock() void
     // Creates an unlocked mutex; panics when the OS cannot create one.
@@ -4351,7 +4355,7 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     // Returns a new server session using `context`, for one connection.
     + static fn connection(context: shared SslServerContext) Ssl
     // Loads the PEM `certificate_file` and `private_key_file` and checks that they match.
-    + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) SslServerContext !NetError
+    + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) shared SslServerContext !NetError
     // Asks every client for a certificate that leads to a CA in the PEM file `ca_file` (mutual TLS), and tells clients which CAs those are.
     + fn set_client_ca(ca_file: String, required: bool (true)) void !NetError
 }
@@ -4705,11 +4709,11 @@ error SignalError (unsupported, init)
     // Cancels the token after `ms` milliseconds.
     + fn cancel_after(ms: uint) void
     // Returns a new token that is cancelled when this one is, or right away when it already is.
-    + fn child() CancelToken !SyncError
+    + fn child() shared CancelToken !SyncError
     // Returns true once the token was cancelled.
     + fn is_cancelled() bool
     // Returns a token that is not cancelled; throws `init` when its lock cannot be created.
-    + static fn new() CancelToken !SyncError
+    + static fn new() shared CancelToken !SyncError
     // Runs `callback` on the cancelling thread when cancelled; right away when already cancelled.
     + fn on_cancel(callback: shared fn()()) void
     // Waits until the token is cancelled; returns false when `timeout_ms` (0 = forever) ran out.
@@ -4727,7 +4731,7 @@ error SignalError (unsupported, init)
     // The number of values currently queued; on a rendezvous channel, those of waiting senders.
     + get length: uint
     // Returns an empty channel holding at most `capacity` values; without one it is unbounded.
-    + static fn new(capacity: ?uint (null)) Channel[T] !SyncError
+    + static fn new(capacity: ?uint (null)) shared Channel[T] !SyncError
     // Returns the next value, waiting for one.
     + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
     // Backs `select`: a channel converts to a `Selectable` where one is expected.
@@ -4753,7 +4757,7 @@ error SignalError (unsupported, init)
     // The number of entries, counted shard by shard.
     + get length: uint
     // Returns an empty map with `shards` shards, rounded up to a power of two (64 by default).
-    + static fn new(shards: uint (64)) ConcurrentMap[K, V] !SyncError
+    + static fn new(shards: uint (64)) shared ConcurrentMap[K, V] !SyncError
     // Removes `key`; returns whether the map held it.
     + fn remove(key: K) bool
     // Stores `value` under `key`, replacing what was there.
@@ -4779,7 +4783,7 @@ error SignalError (unsupported, init)
     // The number of free permits.
     + get available: uint
     // Returns a semaphore with `permits` free permits; throws `init` when its lock cannot be created.
-    + static fn new(permits: uint) Semaphore !SyncError
+    + static fn new(permits: uint) shared Semaphore !SyncError
     // Gives a permit back and wakes one waiting `acquire`.
     + fn release() void
     // Takes a permit when one is free, without waiting; returns whether it did.
@@ -4808,7 +4812,7 @@ error SignalError (unsupported, init)
     // Marks one task done, and wakes the waiters when it was the last. A `done` without a task left to count is ignored.
     + fn done() void
     // Returns a group with a count of 0; throws `init` when its lock cannot be created.
-    + static fn new() WaitGroup !SyncError
+    + static fn new() shared WaitGroup !SyncError
     // Waits until the count is 0; returns at once when it already is.
     + fn wait(timeout_ms: uint (0)) void !SyncError
 }
@@ -4818,7 +4822,7 @@ error SignalError (unsupported, init)
 // A wakeup for the coroutine or thread that waits on it; `wake` may be called from any thread.
 + class Waker {
     // Returns a new waker.
-    + static fn new() Waker !SyncError
+    + static fn new() shared Waker !SyncError
     // Waits for a wake; returns false when `timeout_ms` (0 = forever) ran out first.
     + fn wait(timeout_ms: uint (0)) bool
     // Wakes the waiter; safe from any thread, and kept for the next `wait` when nobody waits.
@@ -4954,6 +4958,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ```js
 // A condition variable that blocks OS threads until another thread calls `signal`.
 + class ThreadSuspendGate {
+    // Returns this same gate, so clones of an object that holds it share it (`$clone`).
+    + fn clone() ThreadSuspendGate
     // Returns a new gate; panics when the OS mutex or condition cannot be created.
     + static fn new() ThreadSuspendGate
     // Wakes one thread blocked in `wait` so it re-checks its condition.

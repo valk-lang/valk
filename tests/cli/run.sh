@@ -797,7 +797,7 @@ for kind in class function ordinary; do
 done
 
 loc_base=$("$VALK" build "$DIR/loc-reparse.valk" --no-warn -v -o "$loc_dir/reparse$EXE_SUFFIX" 2>&1) || { echo "$loc_base"; exit 1; }
-awk '/^    return Item/ { print "" } { print }' "$DIR/loc-reparse.valk" > "$loc_dir/reparse.valk"
+awk '/^        return this.value/ { print "" } { print }' "$DIR/loc-reparse.valk" > "$loc_dir/reparse.valk"
 loc_out=$("$VALK" build "$loc_dir/reparse.valk" --no-warn -v -o "$loc_dir/reparse$EXE_SUFFIX" 2>&1) || { echo "$loc_out"; exit 1; }
 check_stats "$loc_base"
 check_stats "$loc_out"
