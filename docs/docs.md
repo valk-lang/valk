@@ -936,7 +936,7 @@ An error code turns into its name as text, like an enum: `E.code.name()`,
 
 ### Throw functions
 
-Throw functions centralize repeated error construction. They are ordinary error-returning functions marked with `$throw`, which lets callers invoke them where a `throw` statement is required.
+Throw functions centralize repeated error construction. They are ordinary error-returning functions marked with `$throw`, which lets callers invoke them where a `throw` statement is required. Every path through a throw function must throw; it cannot `return`.
 
 Example
 
@@ -964,7 +964,7 @@ fn parse() !ParseError {
 
 ### Exit functions
 
-Calling a function that's flagged with `$exit` tells the compiler that the function will exit the program. E.g. the `panic` function. This mechanic is used for certain null-checking or error-handling features.
+Calling a function that's flagged with `$exit` tells the compiler that the function will exit the program. E.g. the `panic` function. This mechanic is used for certain null-checking or error-handling features. Every path through an exit function must end the program, by calling another exit function such as `exit` or `panic`, or by never leaving a loop.
 
 `panic(msg)` prints the message followed by the file and line it was called from, relative to the root of the package, then exits the process with status 1. Runtime checks report the same way: an index out of bounds, a division by zero, or an error left unhandled by `!!` names the line in your code where it happened.
 
