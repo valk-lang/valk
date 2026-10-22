@@ -148,7 +148,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // Writes `Warning: msg @ file:line` to stderr without allocating.
 + fn cleanup_warning(msg: String, file: String, line: uint) void
-// Returns a deep copy of `value`, the same copy `$clone(value)` makes.
+// Returns a deep copy of `value`, the same copy `clone value` makes.
 + fn clone_value(value: $T) T
 // Returns the number of physical CPU cores; at least 1.
 + fn cpu_core_count() uint
@@ -197,8 +197,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~+ owner: ?GcPtr
 
-    // Returns a copy in its own storage holding a `$clone` of every element.
+    // Returns a copy in its own storage holding a clone of every element.
     + fn clone() mut &[T]
+    // Returns a copy in its own storage holding the same elements; backs `copy s`.
+    + fn copy() mut &[T]
     // Returns the element at `index`.
     + fn get(index: uint) T !LookupError
     // Returns a copy of `length` elements starting at `offset`; backs `s[offset .. length]`.
@@ -265,7 +267,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn binary_search(value: T, func: fn(T, T)(bool)) (bool, uint)
     // Removes every element.
     + fn clear(reduce_size: bool (false)) void
-    // Returns a deep copy: a new array holding a `$clone` of every element.
+    // Returns a deep copy: a new array holding a clone of every element.
     + fn clone() Array[T]
     // Returns whether an element equal to `value` is present (a linear scan using `==`).
     + fn contains(value: T) bool
@@ -568,7 +570,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class Deque[T] {
     // Removes every item.
     + fn clear() void
-    // Returns a deep copy in which every item is cloned as well (`$clone`).
+    // Returns a deep copy in which every item is cloned as well.
     + fn clone() Deque[T]
     // Returns true when an item equals `value` (compared with `==`), in linear time.
     + fn contains(value: T) bool
@@ -608,7 +610,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class FlatMap[K, T] {
     // Removes every entry.
     + fn clear() void
-    // Returns a deep copy: every key and value is cloned with `$clone`.
+    // Returns a deep copy: every key and value is cloned.
     + fn clone() FlatMap[K, T]
     // Returns a shallow copy: a new map holding the same keys and values.
     + fn copy() FlatMap[K, T]
@@ -650,7 +652,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class HashMap[K, T] {
     // Removes every entry.
     + fn clear() void
-    // Returns a deep copy: every key and value is cloned with `$clone`.
+    // Returns a deep copy: every key and value is cloned.
     + fn clone() HashMap[K, T]
     // Returns a shallow copy: a new map holding the same keys and values.
     + fn copy() HashMap[K, T]
@@ -714,7 +716,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn add_all(values: Array[T]) void
     // Removes every value.
     + fn clear() void
-    // Returns a deep copy in which every value is cloned as well (`$clone`).
+    // Returns a deep copy in which every value is cloned as well.
     + fn clone() HashSet[T]
     // Returns a shallow copy: a new set holding the same values.
     + fn copy() HashSet[T]
@@ -756,6 +758,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class Heap[T] {
     // Removes every item.
     + fn clear() void
+    // Returns a deep copy: every item is cloned, the order function is shared.
+    + fn clone() Heap[T]
     // Returns a shallow copy with the same items and the same order function.
     + fn copy() Heap[T]
     // Removes every item and returns them sorted, first item first.
@@ -790,7 +794,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // A `HashMap` with `String` keys, compatible with `HashMap[String, T]` in both directions.
 + mode Map[T] for HashMap[String, T] {
-    // Returns a deep copy as a `Map`: every key and value is cloned with `$clone`.
+    // Returns a deep copy as a `Map`: every key and value is cloned.
     + fn clone() Map[T]
     // Creates an empty map.
     + static fn new() Map[T]
@@ -802,7 +806,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class Mutex {
     // Waits until the mutex is unlocked, without keeping it locked.
     + fn await_unlock() void
-    // Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+    // Returns this same mutex, so clones of an object that holds it share it.
     + fn clone() Mutex
     // Takes the mutex, waiting while it is locked.
     + fn lock() void
@@ -921,7 +925,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn ansi.yellow(bold: bool (false)) String
     // The number of bytes in the string, not counting the zero terminator.
     + get bytes: uint
-    // Returns a copy of the string in new storage; the `$clone` hook.
+    // Returns a copy of the string in new storage.
     + fn clone() String
     // Returns whether `part` occurs at or after byte offset `start_index`.
     + fn contains(part: String, start_index: uint (0)) bool
@@ -1053,7 +1057,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
 + class SyncMutex {
-    // Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+    // Returns this same mutex, so clones of an object that holds it share it.
     + fn clone() SyncMutex
     // Takes the mutex, blocking the thread until it is free.
     + fn lock() void
@@ -2854,6 +2858,8 @@ alias pid_t for i32
     // The client's MIME type for an HTTP upload; `application/octet-stream` otherwise.
     ~ mime_type: String
 
+    // Returns an independent copy with its own bytes.
+    + fn clone() InMemoryFile
     // Reads the whole file at `path` into memory.
     + static fn from_file(path: String) InMemoryFile !io:IoError
     // Creates a file that holds a private copy of `data`.
@@ -3211,6 +3217,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 + class CookieJar {
     // Removes every cookie.
     + fn clear() void
+    // Returns an independent copy holding the same cookies.
+    + fn clone() CookieJar
     // Returns the cookies a request to `url` sends, longest path first.
     + fn cookies_for(url: String) Array[Cookie]
     // Returns the `Cookie` header value for a request to `url`; empty when none matches.
@@ -3231,6 +3239,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn append(name: String, value: String) void
     // Removes every field.
     + fn clear() void
+    // Returns an independent copy with the same headers.
+    + fn clone() Headers
     // Returns an independent copy of the list.
     + fn copy() Headers
     // Returns the value of the first field named `name`; also backs `headers[name]`.
@@ -3264,6 +3274,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn apply(options: Options) void
     // Returns the complete body.
     + fn body() String
+    // Returns an independent copy with the parts added so far.
+    + fn clone() Multipart
     // The `Content-Type` header for this form: `multipart/form-data` with its boundary.
     + fn content_type() String
     // Returns an empty form with a random boundary.
@@ -3457,6 +3469,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // The value registered with `Router.add`.
     + handler: T
 
+    // Returns an independent copy of the route.
+    + fn clone() Route[T]
     // Returns the values of the route's `@name` parts, taken from `path`, and the rest of the path matched by a `*` part under the name `*`.
     + fn params(path: String, decode: bool (true)) Map[String]
 }
@@ -3469,6 +3483,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn add(method: String, url: String, handler: T) void
     // Returns the methods with a route for the path `url`, sorted.
     + fn allowed_methods(url: String) Array[String]
+    // Returns an independent copy of the router and its routes.
+    + fn clone() Router[T]
     // Returns the route that matches `method` and the path `url`.
     + fn find(method: String, url: String) Route[T] !LookupError
     // Creates an empty router; also backs `Router[T]{}` and default construction.
@@ -3578,9 +3594,9 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // Sends `data` as one binary message.
     + fn write_binary(data: local &[u8]) void !WebSocketError
     // Sends a message prepared with `WebSocketFrame`, for sending one message to many connections.
-    + fn write_frame(frame: atomic WebSocketFrame) void !WebSocketError
+    + fn write_frame(frame: WebSocketFrame) void !WebSocketError
     // Sends several prepared messages in order, as `write_frame` does one by one.
-    + fn write_frames(frames: local &[atomic WebSocketFrame]) void !WebSocketError
+    + fn write_frames(frames: local &[WebSocketFrame]) void !WebSocketError
 }
 ```
 
@@ -4553,6 +4569,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     + fn between(min: int, max: int) int
     // Returns true with probability `p`: never for 0 or less, always for 1 or more.
     + fn chance(p: float) bool
+    // Returns a generator in the same state: both produce the same numbers from here on.
+    + fn clone() Rng
     // Returns a float from 0 up to but not including 1, with 53 random bits.
     + fn fraction() float
     // Creates a generator seeded from the operating system's entropy source.
@@ -4592,6 +4610,8 @@ error RegexError (syntax, unsupported, too_large) payload { message: String, pos
     // The text that was searched, not only the matched part.
     + text: String
 
+    // Returns an independent copy of the match and its pattern.
+    + fn clone() Match
     // Returns the number of groups including the whole match.
     + fn count() uint
     // Byte offset in `text` just past the end of the whole match.
@@ -4617,6 +4637,8 @@ error RegexError (syntax, unsupported, too_large) payload { message: String, pos
     // The source pattern the regex was compiled from.
     + pattern: String
 
+    // Returns an independent copy of the compiled pattern; its match caches start empty.
+    + fn clone() Regex
     // Returns the leftmost match that starts at or after byte offset `start`, or `null`.
     + fn find(text: String, start: uint (0)) ?Match
     // Returns every non-overlapping match from left to right, at most `limit` (0 means all).
@@ -4958,7 +4980,7 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ```js
 // A condition variable that blocks OS threads until another thread calls `signal`.
 + class ThreadSuspendGate {
-    // Returns this same gate, so clones of an object that holds it share it (`$clone`).
+    // Returns this same gate, so clones of an object that holds it share it.
     + fn clone() ThreadSuspendGate
     // Returns a new gate; panics when the OS mutex or condition cannot be created.
     + static fn new() ThreadSuspendGate
@@ -5237,6 +5259,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 
     // Returns the abbreviation in use at the instant `unix_seconds`, such as `CET` or `CEST`.
     + fn abbreviation_at(unix_seconds: int) String
+    // Returns an independent copy of the zone and its rules.
+    + fn clone() Zone
     // Returns whether daylight saving time is in effect at the instant `unix_seconds`.
     + fn is_dst_at(unix_seconds: int) bool
     // Returns the offset from UTC in seconds at the instant `unix_seconds`, positive east of Greenwich: 3600 for CET, -18000 for EST.

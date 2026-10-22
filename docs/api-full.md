@@ -386,7 +386,7 @@ How `Process.start` connects one standard stream of a child.
 ```js
 // Writes `Warning: msg @ file:line` to stderr without allocating.
 + fn cleanup_warning(msg: String, file: String, line: uint) void
-// Returns a deep copy of `value`, the same copy `$clone(value)` makes.
+// Returns a deep copy of `value`, the same copy `clone value` makes.
 + fn clone_value(value: $T) T
 // Returns the number of physical CPU cores; at least 1.
 + fn cpu_core_count() uint
@@ -432,11 +432,11 @@ Meant for failures in `gc_free` and other cleanup code that cannot throw.
 
 ### clone_value
 
-Returns a deep copy of `value`, the same copy `$clone(value)` makes.
+Returns a deep copy of `value`, the same copy `clone value` makes.
 
-Classes with a `$clone` hook are copied through that hook; `atomic` values are returned as
-they are. Values that alias raw memory (raw pointers, borrows) without a `$clone` hook are a
-compile error.
+Classes with a `clone` method are copied through it; `atomic` values are returned as
+they are. Values that alias raw memory (raw pointers, borrows) without a `clone` method
+are a compile error.
 
 ### cpu_core_count
 
@@ -562,8 +562,10 @@ Higher bytes of `v` are dropped. No bounds are checked.
     // The allocation that keeps the elements alive; null for storage nobody owns, such as a literal or unsafe memory.
     ~+ owner: ?GcPtr
 
-    // Returns a copy in its own storage holding a `$clone` of every element.
+    // Returns a copy in its own storage holding a clone of every element.
     + fn clone() mut &[T]
+    // Returns a copy in its own storage holding the same elements; backs `copy s`.
+    + fn copy() mut &[T]
     // Returns the element at `index`.
     + fn get(index: uint) T !LookupError
     // Returns a copy of `length` elements starting at `offset`; backs `s[offset .. length]`.
@@ -591,9 +593,11 @@ The allocation that keeps the elements alive; null for storage nobody owns, such
 
 #### clone
 
-Returns a copy in its own storage holding a `$clone` of every element.
+Returns a copy in its own storage holding a clone of every element.
 
-Marked `$clone`: an object that holds a slice copies it this way.
+#### copy
+
+Returns a copy in its own storage holding the same elements; backs `copy s`.
 
 #### get
 
@@ -760,7 +764,7 @@ the sign, or a value that does not fit.
     + fn binary_search(value: T, func: fn(T, T)(bool)) (bool, uint)
     // Removes every element.
     + fn clear(reduce_size: bool (false)) void
-    // Returns a deep copy: a new array holding a `$clone` of every element.
+    // Returns a deep copy: a new array holding a clone of every element.
     + fn clone() Array[T]
     // Returns whether an element equal to `value` is present (a linear scan using `==`).
     + fn contains(value: T) bool
@@ -919,9 +923,7 @@ two-slot block.
 
 #### clone
 
-Returns a deep copy: a new array holding a `$clone` of every element.
-
-Marked `$clone`: backs `$clone(arr)`.
+Returns a deep copy: a new array holding a clone of every element.
 
 #### contains
 
@@ -1939,7 +1941,7 @@ Advances the position by `amount` bytes, stopping at the end.
 + class Deque[T] {
     // Removes every item.
     + fn clear() void
-    // Returns a deep copy in which every item is cloned as well (`$clone`).
+    // Returns a deep copy in which every item is cloned as well.
     + fn clone() Deque[T]
     // Returns true when an item equals `value` (compared with `==`), in linear time.
     + fn contains(value: T) bool
@@ -1986,7 +1988,7 @@ Removes every item.
 
 #### clone
 
-Returns a deep copy in which every item is cloned as well (`$clone`).
+Returns a deep copy in which every item is cloned as well.
 
 #### contains
 
@@ -2073,7 +2075,7 @@ Returns a new array with the items from front to back.
 + class FlatMap[K, T] {
     // Removes every entry.
     + fn clear() void
-    // Returns a deep copy: every key and value is cloned with `$clone`.
+    // Returns a deep copy: every key and value is cloned.
     + fn clone() FlatMap[K, T]
     // Returns a shallow copy: a new map holding the same keys and values.
     + fn copy() FlatMap[K, T]
@@ -2125,9 +2127,7 @@ Removes every entry.
 
 #### clone
 
-Returns a deep copy: every key and value is cloned with `$clone`.
-
-Marked `$clone`: backs `$clone(map)`.
+Returns a deep copy: every key and value is cloned.
 
 #### copy
 
@@ -2212,7 +2212,7 @@ Returns a new array of the values, in entry order.
 + class HashMap[K, T] {
     // Removes every entry.
     + fn clear() void
-    // Returns a deep copy: every key and value is cloned with `$clone`.
+    // Returns a deep copy: every key and value is cloned.
     + fn clone() HashMap[K, T]
     // Returns a shallow copy: a new map holding the same keys and values.
     + fn copy() HashMap[K, T]
@@ -2269,9 +2269,7 @@ earlier size, or to the capacity passed to `new`, does not rehash.
 
 #### clone
 
-Returns a deep copy: every key and value is cloned with `$clone`.
-
-Marked `$clone`: backs `$clone(map)`.
+Returns a deep copy: every key and value is cloned.
 
 #### copy
 
@@ -2411,7 +2409,7 @@ Reorders the entries so iteration, `keys` and `values` follow ascending key orde
     + fn add_all(values: Array[T]) void
     // Removes every value.
     + fn clear() void
-    // Returns a deep copy in which every value is cloned as well (`$clone`).
+    // Returns a deep copy in which every value is cloned as well.
     + fn clone() HashSet[T]
     // Returns a shallow copy: a new set holding the same values.
     + fn copy() HashSet[T]
@@ -2471,7 +2469,7 @@ Removes every value.
 
 #### clone
 
-Returns a deep copy in which every value is cloned as well (`$clone`).
+Returns a deep copy in which every value is cloned as well.
 
 #### copy
 
@@ -2550,6 +2548,8 @@ Returns a new set with the values in this set or in `other`; backs `a + b` (`$ad
 + class Heap[T] {
     // Removes every item.
     + fn clear() void
+    // Returns a deep copy: every item is cloned, the order function is shared.
+    + fn clone() Heap[T]
     // Returns a shallow copy with the same items and the same order function.
     + fn copy() Heap[T]
     // Removes every item and returns them sorted, first item first.
@@ -2585,6 +2585,10 @@ A heap can be stored in `Lock` data when its `before` function captures nothing.
 #### clear
 
 Removes every item.
+
+#### clone
+
+Returns a deep copy: every item is cloned, the order function is shared.
 
 #### copy
 
@@ -2667,7 +2671,7 @@ Throws `init` when the underlying `Mutex` cannot be created.
 ```js
 // A `HashMap` with `String` keys, compatible with `HashMap[String, T]` in both directions.
 + mode Map[T] for HashMap[String, T] {
-    // Returns a deep copy as a `Map`: every key and value is cloned with `$clone`.
+    // Returns a deep copy as a `Map`: every key and value is cloned.
     + fn clone() Map[T]
     // Creates an empty map.
     + static fn new() Map[T]
@@ -2682,7 +2686,7 @@ Build one with `Map[T]{ "k" => v }`; every `HashMap` method applies.
 
 #### clone
 
-Returns a deep copy as a `Map`: every key and value is cloned with `$clone`.
+Returns a deep copy as a `Map`: every key and value is cloned.
 
 #### new
 
@@ -2695,7 +2699,7 @@ Marked `$default`: it also provides the type's default value.
 + class Mutex {
     // Waits until the mutex is unlocked, without keeping it locked.
     + fn await_unlock() void
-    // Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+    // Returns this same mutex, so clones of an object that holds it share it.
     + fn clone() Mutex
     // Takes the mutex, waiting while it is locked.
     + fn lock() void
@@ -2721,7 +2725,7 @@ Waits until the mutex is unlocked, without keeping it locked.
 
 #### clone
 
-Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+Returns this same mutex, so clones of an object that holds it share it.
 
 #### lock
 
@@ -3032,7 +3036,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn ansi.yellow(bold: bool (false)) String
     // The number of bytes in the string, not counting the zero terminator.
     + get bytes: uint
-    // Returns a copy of the string in new storage; the `$clone` hook.
+    // Returns a copy of the string in new storage.
     + fn clone() String
     // Returns whether `part` occurs at or after byte offset `start_index`.
     + fn contains(part: String, start_index: uint (0)) bool
@@ -3235,7 +3239,7 @@ The number of bytes in the string, not counting the zero terminator.
 
 #### clone
 
-Returns a copy of the string in new storage; the `$clone` hook.
+Returns a copy of the string in new storage.
 
 #### contains
 
@@ -3644,7 +3648,7 @@ it, so an invalid sequence never swallows the character after it.
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
 + class SyncMutex {
-    // Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+    // Returns this same mutex, so clones of an object that holds it share it.
     + fn clone() SyncMutex
     // Takes the mutex, blocking the thread until it is free.
     + fn lock() void
@@ -3665,7 +3669,7 @@ elsewhere locking it twice from one thread deadlocks.
 
 #### clone
 
-Returns this same mutex, so clones of an object that holds it share it (`$clone`).
+Returns this same mutex, so clones of an object that holds it share it.
 
 #### lock
 
@@ -9731,6 +9735,8 @@ stream was not opened for writing or the OS fails, and `.closed` when it is clos
     // The client's MIME type for an HTTP upload; `application/octet-stream` otherwise.
     ~ mime_type: String
 
+    // Returns an independent copy with its own bytes.
+    + fn clone() InMemoryFile
     // Reads the whole file at `path` into memory.
     + static fn from_file(path: String) InMemoryFile !io:IoError
     // Creates a file that holds a private copy of `data`.
@@ -9761,6 +9767,10 @@ The client's file name for an HTTP upload; empty otherwise.
 #### mime_type
 
 The client's MIME type for an HTTP upload; `application/octet-stream` otherwise.
+
+#### clone
+
+Returns an independent copy with its own bytes.
 
 #### from_file
 
@@ -10906,6 +10916,8 @@ string, which the server leaves out of the response.
 + class CookieJar {
     // Removes every cookie.
     + fn clear() void
+    // Returns an independent copy holding the same cookies.
+    + fn clone() CookieJar
     // Returns the cookies a request to `url` sends, longest path first.
     + fn cookies_for(url: String) Array[Cookie]
     // Returns the `Cookie` header value for a request to `url`; empty when none matches.
@@ -10931,6 +10943,10 @@ the host that set it. `Path` limits it to the paths below it, `Secure` to HTTPS,
 #### clear
 
 Removes every cookie.
+
+#### clone
+
+Returns an independent copy holding the same cookies.
 
 #### cookies_for
 
@@ -10962,6 +10978,8 @@ Stores the cookies of `response`, which answered a request to `url`.
     + fn append(name: String, value: String) void
     // Removes every field.
     + fn clear() void
+    // Returns an independent copy with the same headers.
+    + fn clone() Headers
     // Returns an independent copy of the list.
     + fn copy() Headers
     // Returns the value of the first field named `name`; also backs `headers[name]`.
@@ -11002,6 +11020,10 @@ Adds a field at the end, keeping existing fields with the same name.
 #### clear
 
 Removes every field.
+
+#### clone
+
+Returns an independent copy with the same headers.
 
 #### copy
 
@@ -11055,6 +11077,8 @@ the `Headers{ name => value }` literal.
     + fn apply(options: Options) void
     // Returns the complete body.
     + fn body() String
+    // Returns an independent copy with the parts added so far.
+    + fn clone() Multipart
     // The `Content-Type` header for this form: `multipart/form-data` with its boundary.
     + fn content_type() String
     // Returns an empty form with a random boundary.
@@ -11094,6 +11118,10 @@ Sets `options.body` to this form and its `Content-Type` header.
 #### body
 
 Returns the complete body.
+
+#### clone
+
+Returns an independent copy with the parts added so far.
 
 #### content_type
 
@@ -11778,6 +11806,8 @@ work as in `WebSocket.upgrade`.
     // The value registered with `Router.add`.
     + handler: T
 
+    // Returns an independent copy of the route.
+    + fn clone() Route[T]
     // Returns the values of the route's `@name` parts, taken from `path`, and the rest of the path matched by a `*` part under the name `*`.
     + fn params(path: String, decode: bool (true)) Map[String]
 }
@@ -11790,6 +11820,10 @@ A route found by `Router.find`: the handler plus the positions of its `@name` pa
 #### handler
 
 The value registered with `Router.add`.
+
+#### clone
+
+Returns an independent copy of the route.
 
 #### params
 
@@ -11808,6 +11842,8 @@ missing leading `/` do not shift the values; missing parts are left out.
     + fn add(method: String, url: String, handler: T) void
     // Returns the methods with a route for the path `url`, sorted.
     + fn allowed_methods(url: String) Array[String]
+    // Returns an independent copy of the router and its routes.
+    + fn clone() Router[T]
     // Returns the route that matches `method` and the path `url`.
     + fn find(method: String, url: String) Route[T] !LookupError
     // Creates an empty router; also backs `Router[T]{}` and default construction.
@@ -11852,6 +11888,10 @@ else 405 with these methods in its `Allow` header.
 let allowed = router.allowed_methods(req.path)
 if allowed.length > 0 : return http.Response.empty(405, http.Headers { "Allow" => allowed.join(", ") })
 ```
+
+#### clone
+
+Returns an independent copy of the router and its routes.
 
 #### find
 
@@ -12178,9 +12218,9 @@ cannot be read.
     // Sends `data` as one binary message.
     + fn write_binary(data: local &[u8]) void !WebSocketError
     // Sends a message prepared with `WebSocketFrame`, for sending one message to many connections.
-    + fn write_frame(frame: atomic WebSocketFrame) void !WebSocketError
+    + fn write_frame(frame: WebSocketFrame) void !WebSocketError
     // Sends several prepared messages in order, as `write_frame` does one by one.
-    + fn write_frames(frames: local &[atomic WebSocketFrame]) void !WebSocketError
+    + fn write_frames(frames: local &[WebSocketFrame]) void !WebSocketError
 }
 ```
 
@@ -12348,11 +12388,11 @@ A text or binary message prepared once and sent to many WebSockets with
 
 The frame bytes are built when it is made, and the compressed form the first time a
 connection with permessage-deflate sends it, once per window size and level;
-connections without compression send the plain bytes. A frame cannot change, so it can
-be published as `atomic WebSocketFrame` and sent from coroutines on any thread:
+connections without compression send the plain bytes. A frame cannot change, so it is
+atomic and can be sent from coroutines on any thread:
 
 ```valk
-let frame: shared http.WebSocketFrame = http.WebSocketFrame.text(json)
+let frame = http.WebSocketFrame.text(json)
 each sockets as ws : ws.write_frame(frame) ! continue
 ```
 
@@ -15450,6 +15490,8 @@ Seeds this thread's generator, so the numbers that follow repeat from run to run
     + fn between(min: int, max: int) int
     // Returns true with probability `p`: never for 0 or less, always for 1 or more.
     + fn chance(p: float) bool
+    // Returns a generator in the same state: both produce the same numbers from here on.
+    + fn clone() Rng
     // Returns a float from 0 up to but not including 1, with 53 random bits.
     + fn fraction() float
     // Creates a generator seeded from the operating system's entropy source.
@@ -15485,6 +15527,10 @@ The bounds may be given in either order.
 #### chance
 
 Returns true with probability `p`: never for 0 or less, always for 1 or more.
+
+#### clone
+
+Returns a generator in the same state: both produce the same numbers from here on.
 
 #### fraction
 
@@ -15554,6 +15600,8 @@ Throws `RegexError` when the pattern does not compile; see `Regex.new`.
     // The text that was searched, not only the matched part.
     + text: String
 
+    // Returns an independent copy of the match and its pattern.
+    + fn clone() Match
     // Returns the number of groups including the whole match.
     + fn count() uint
     // Byte offset in `text` just past the end of the whole match.
@@ -15580,6 +15628,10 @@ One match of a `Regex` in a text; group 0 is the whole match.
 #### text
 
 The text that was searched, not only the matched part.
+
+#### clone
+
+Returns an independent copy of the match and its pattern.
 
 #### count
 
@@ -15631,6 +15683,8 @@ Returns the text of the whole match.
     // The source pattern the regex was compiled from.
     + pattern: String
 
+    // Returns an independent copy of the compiled pattern; its match caches start empty.
+    + fn clone() Regex
     // Returns the leftmost match that starts at or after byte offset `start`, or `null`.
     + fn find(text: String, start: uint (0)) ?Match
     // Returns every non-overlapping match from left to right, at most `limit` (0 means all).
@@ -15676,6 +15730,10 @@ println(m.named("host") ?? "") // example.com
 #### pattern
 
 The source pattern the regex was compiled from.
+
+#### clone
+
+Returns an independent copy of the compiled pattern; its match caches start empty.
 
 #### find
 
@@ -16737,7 +16795,7 @@ Throws `init` when the thread cannot be started.
 ```js
 // A condition variable that blocks OS threads until another thread calls `signal`.
 + class ThreadSuspendGate {
-    // Returns this same gate, so clones of an object that holds it share it (`$clone`).
+    // Returns this same gate, so clones of an object that holds it share it.
     + fn clone() ThreadSuspendGate
     // Returns a new gate; panics when the OS mutex or condition cannot be created.
     + static fn new() ThreadSuspendGate
@@ -16756,7 +16814,7 @@ Waiting releases the thread's GC lock, so other threads can collect meanwhile.
 
 #### clone
 
-Returns this same gate, so clones of an object that holds it share it (`$clone`).
+Returns this same gate, so clones of an object that holds it share it.
 
 #### new
 
@@ -17663,6 +17721,8 @@ Units that are zero are left out; seconds carry their fraction.
 
     // Returns the abbreviation in use at the instant `unix_seconds`, such as `CET` or `CEST`.
     + fn abbreviation_at(unix_seconds: int) String
+    // Returns an independent copy of the zone and its rules.
+    + fn clone() Zone
     // Returns whether daylight saving time is in effect at the instant `unix_seconds`.
     + fn is_dst_at(unix_seconds: int) bool
     // Returns the offset from UTC in seconds at the instant `unix_seconds`, positive east of Greenwich: 3600 for CET, -18000 for EST.
@@ -17688,6 +17748,10 @@ The name, such as `Europe/Amsterdam`, `UTC` or `+02:00`.
 Returns the abbreviation in use at the instant `unix_seconds`, such as `CET` or `CEST`.
 
 Zones without a customary abbreviation use their offset, such as `+04`.
+
+#### clone
+
+Returns an independent copy of the zone and its rules.
 
 #### is_dst_at
 

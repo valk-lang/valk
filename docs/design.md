@@ -821,17 +821,18 @@ shared collector. GC publication occurs only at an actual cross-thread transfer
 or shared-storage boundary.
 
 An ordinary value becomes `atomic T` as a copy, so no alias of the shared graph
-can remain. The copy is the one `$clone` makes, with two differences: `$clone`
-hooks run through their atomic-receiver variant, so a hook's body is checked
+can remain. The copy is the one `clone` makes, with two differences: `clone`
+methods run through their atomic-receiver variant, so a method's body is checked
 against a read-only `this` and cannot hand back the original's parts (a
-`@threadsafe` hook, like `Mutex.clone` returning itself, is trusted); and every
+`@threadsafe` one, like `Mutex.clone` returning itself, is trusted); and every
 generated object copy notes what it copied in a per-thread table, so cycles and
 objects reached twice keep their shape. Parts already `atomic` are kept by
 reference. A literal written in place is not copied, only the values it was
 given; a collection literal is copied as a whole. A value made from a raw pointer
 with `.@cast` is unsafe code's own claim and is not copied. Types that hold raw
-memory or have a `gc_free` finalizer and no `$clone` hook cannot be copied, so
-publishing one is an error; such objects are created atomic, like the values of
+memory, have a `gc_free` finalizer or have properties marked `-` or `~`, and no
+`clone` method, cannot be copied, so publishing one is an error; such objects
+are created atomic, like the values of
 `Channel.new` and `CancelToken.new`. Inline aggregates follow the same rule, and
 strings and other immutable values are never copied. The same copy happens for
 a `shared` global's store and default, an `atomic T` parameter, and a store into

@@ -32,6 +32,7 @@
    * [Exit functions](#exit-functions)
    * [Closures](#closures)
 * [Classes](#classes)
+* [Copy and clone](#copy-and-clone)
 * [Interfaces](#interfaces)
 * [Generics](#generics)
 * [Modes](#modes)
@@ -1096,6 +1097,23 @@ let t = Temperature { celsius: 0.0 }
 t.fahrenheit = 212.0 // t.celsius is 100
 t.fahrenheit -= 18.0 // t.celsius is 90
 ```
+
+## Copy and clone
+
+`copy x` makes a shallow copy: a new object holding the same values, so objects it refers to are shared with the original. `clone x` makes a deep copy: everything it refers to is copied too.
+
+```rust
+class Team {
+    name: String
+    members: Array[String] (.{})
+}
+
+let a = Team { name: "red" }
+let b = copy a   // b.members is the same array as a.members
+let c = clone a  // c.members is a new array
+```
+
+A class decides how it is copied by having a method named `copy` or `clone`, which takes no arguments and returns `SELF`; the collections do this, so `copy list` gives a new list with the same items. Without such a method the fields are copied one by one, which only works when every field is public: a class with fields marked `-` or `~` needs its own `copy` or `clone` method. `clone` also gives an ordinary copy of `atomic` data; `copy` of atomic data only works when the copy holds no references, or for a collection, whose copy is a plain collection of the same atomic items. `copy` and `clone` stay usable as names: they only copy when a name follows them.
 
 ## Interfaces
 
@@ -2710,7 +2728,7 @@ To send one message to many connections, prepare it once with
 compression setting, and it can be shared between threads:
 
 ```rust
-let frame: atomic http.WebSocketFrame = http.WebSocketFrame.text("{\"type\":\"update\"}")
+let frame = http.WebSocketFrame.text("{\"type\":\"update\"}")
 each sockets as ws : ws.write_frame(frame) ! continue
 ```
 
@@ -3512,7 +3530,7 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-`atomic T` is a view used to pass data across threads. Through it you can assign properties that hold a number, bool, enum or object, unless they are marked `-` or `~`. Numbers are assigned atomically, and an object is copied in the way an `atomic` conversion copies it. Strings, slices, borrows, structs and other properties of more than one word cannot be reassigned through the view, but the elements of a slice property can, under the same rules. Every other store, and every method that performs one on data reached from its receiver, is rejected. The view carries over to everything read through it, including struct properties, their methods, and the elements of slice properties. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of an atomic array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `atomic T` makes a copy of the value, the way `$clone` does: the original stays usable, and nothing it changes later is seen through the view. Cycles and objects reached twice keep their shape in the copy, and parts that are already `atomic` are kept as they are. A literal written in place, like `let s: atomic User = User { name: "Ada" }`, is not copied, only the values it was given from elsewhere are. Objects that hold raw memory or a resource released by `gc_free`, like a socket, cannot be copied unless they have a `$clone` hook; they are made atomic from the start, which is why `Channel.new`, `CancelToken.new`, `Waker.new` and similar constructors return `atomic` objects. An interface method cannot be called on an atomic or locked interface value, since its implementation is not known where it is called; call it through the concrete type. An atomic view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch, and `$clone` or `.clone()` makes an ordinary copy. What a method returns from atomic data stays atomic when its type could reach what that data holds, like `list.get(0)`; a new result is ordinary data, so `items.copy()` or `items.sorted()` on an `atomic Array[User]` is an `Array[atomic User]` that can be changed, with the same atomic elements. A struct, tuple or fixed array that carries references is copied the same way.
+`atomic T` is a view used to pass data across threads. Through it you can assign properties that hold a number, bool, enum or object, unless they are marked `-` or `~`. Numbers are assigned atomically, and an object is copied in the way an `atomic` conversion copies it. Strings, slices, borrows, structs and other properties of more than one word cannot be reassigned through the view, but the elements of a slice property can, under the same rules. Every other store, and every method that performs one on data reached from its receiver, is rejected. The view carries over to everything read through it, including struct properties, their methods, and the elements of slice properties. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of an atomic array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `atomic T` makes a copy of the value, the way `clone` does: the original stays usable, and nothing it changes later is seen through the view. Cycles and objects reached twice keep their shape in the copy, and parts that are already `atomic` are kept as they are. A literal written in place, like `let s: atomic User = User { name: "Ada" }`, is not copied, only the values it was given from elsewhere are. Objects that hold raw memory or a resource released by `gc_free`, like a socket, cannot be copied unless they have a `clone` method; they are made atomic from the start, which is why `Channel.new`, `CancelToken.new`, `Waker.new` and similar constructors return `atomic` objects. An interface method cannot be called on an atomic or locked interface value, since its implementation is not known where it is called; call it through the concrete type. An atomic view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch, and `clone x` makes an ordinary copy. What a method returns from atomic data stays atomic when its type could reach what that data holds, like `list.get(0)`; a new result is ordinary data, so `items.copy()` or `items.sorted()` on an `atomic Array[User]` is an `Array[atomic User]` that can be changed, with the same atomic elements. A struct, tuple or fixed array that carries references is copied the same way.
 
 ### Mutable atomic data
 
@@ -3534,7 +3552,7 @@ lock stats as s {
 
 Inside the block `s` is a `locked Stats`: a mutable view that is valid until the block ends. Anything read through it, like `s.names`, is a locked view too. The block releases the lock on every exit, including `return`, `throw` and `!>`. `break` and `continue` cannot leave a lock block.
 
-A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Data moves around inside one lock as it is, like `s.items.append(s.first)`. Anything stored into locked data from elsewhere is copied in, as for an `atomic` conversion: a plain object stored with `s.items.append(user)` is a copy, and so is data taken from another lock. A method called on locked data takes its object arguments as locked data, so those are copied at the call too. Functions can take and return `locked T` views while the originating lock is held. Locked data may hold ordinary closures, like the order function of a `Heap`, since they only run while the lock is held. Such a closure cannot be handed locked objects, so a `Heap` of numbers or strings works under a lock and a `Heap` of objects does not. Locked bytes and numbers can be passed to a `local` borrow parameter such as `local &[u8]` inside the block; a borrow of locked objects stays locked, and `&` cannot borrow a locked view. Independent copies made with `$clone` or `.clone()` may leave the block; a `$clone` hook used on locked or atomic data cannot hand back the original.
+A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Data moves around inside one lock as it is, like `s.items.append(s.first)`. Anything stored into locked data from elsewhere is copied in, as for an `atomic` conversion: a plain object stored with `s.items.append(user)` is a copy, and so is data taken from another lock. A method called on locked data takes its object arguments as locked data, so those are copied at the call too. Functions can take and return `locked T` views while the originating lock is held. Locked data may hold ordinary closures, like the order function of a `Heap`, since they only run while the lock is held. Such a closure cannot be handed locked objects, so a `Heap` of numbers or strings works under a lock and a `Heap` of objects does not. Locked bytes and numbers can be passed to a `local` borrow parameter such as `local &[u8]` inside the block; a borrow of locked objects stays locked, and `&` cannot borrow a locked view. Independent copies made with `clone` may leave the block; a `clone` method used on locked or atomic data cannot hand back the original.
 
 Callbacks of methods on locked data get the elements as locked views, so they cannot keep them past the block:
 

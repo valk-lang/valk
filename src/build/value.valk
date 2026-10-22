@@ -481,6 +481,9 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if kind == VALUE_KIND.clone {
         return value_from_clone_exp(exp, scope, ctx) !>
     }
+    if kind == VALUE_KIND.copy {
+        return value_from_copy_exp(exp, scope, ctx) !>
+    }
     if kind == VALUE_KIND.hash {
         return value_from_hash_exp(exp, scope, ctx) !>
     }
@@ -1377,11 +1380,154 @@ fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
 
 // `$clone(value)` — deep-copy intrinsic.
 fn value_from_clone_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    if exp.bool1 : warn_deprecated_spelling(exp, "'$clone(x)' is deprecated: write 'clone x'")
     let arg_exp = exp.get(VALUE_EXP.left)
-    if !isset(arg_exp) : exp.bug("$clone is missing its argument")
+    if !isset(arg_exp) : exp.bug("clone is missing its value")
     let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
     let at = ctx.clone_at ?? exp
     return value_clone(arg, ctx, scope, at, isset(ctx.clone_at) ? ctx.clone_check_access : true, false, clone_wants_plain(ctx)) !>
+}
+
+fn value_from_copy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = exp.get(VALUE_EXP.left)
+    if !isset(arg_exp) : exp.bug("copy is missing its value")
+    let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    return value_copy(arg, ctx, scope, exp) !>
+}
+
+// A property marked `-` or `~` can hold an invariant of its class, so only the class's own
+// hook may duplicate it
+fn class_guarded_prop(class: Class) ?Prop {
+    each class.props as prop {
+        if prop.act != ACT.public && prop.act != ACT.undefined : return prop
+    }
+    return null
+}
+
+// `what`: "copy" or "clone", the method that would make the copy instead
+fn class_check_generated_copy(class: Class, what: String, at: Exp) !Error {
+    // `@ignore_access` is the unsafe way past it
+    if at.src.ignore_access : return
+    let guarded = class_guarded_prop(class) ?! return
+    at.error("Cannot " + what + " '" + class.pretty_name() + "': property '" + (guarded.name ?? "?")
+        + "' is marked '-' or '~', so only a '" + what + "' method of the class can copy it")
+}
+
+// `copy value`: a new value holding the same parts. A class copies through its `$copy`
+// function, or field by field when all of its fields are public
+fn value_copy(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let type = value.rett
+    let nn = type.get_non_nullable()
+    let view = nn.is_shared || nn.is_locked
+    let class = value_member_class(nn)
+    if isset(class) {
+        let hook = class.get_copy_hook()
+        if isset(hook) : return value_copy_method(value, hook, ctx, scope, at) !>
+    }
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) {
+        let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
+        let slice_class = bare_slice_class(ctx.build, element, at) !>
+        let hook = slice_class.get_copy_hook() ?! at.bug("Bare slice class has no '$copy' hook")
+        let slice_type = slice_class.get_type() !>
+        let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
+        as_slice.exp = value.exp
+        let copied = value_copy_method(as_slice, hook, ctx, scope, at) !>
+        return value_retype_bare_slice(copied, type.plain_type().get_non_nullable().mut_type(), at)
+    }
+    let string_class = type_string(ctx.build).get_class_or_null()
+    if nn.kind == TYPE.closure || (isset(class) && class == string_class) : return value
+    if view && type.has_gc_refs() {
+        at.error("Cannot copy '" + nn.compat_display_name() + "': the copy would still refer to its " + (nn.is_shared ? "atomic" : "locked")
+            + " parts as ordinary data; use 'clone' for an independent copy")
+    }
+    if !nn.is_gc_type() || nn.is_inline {
+        if nn.kind == TYPE.interface || nn.is_raw_pointer() : at.error("Cannot copy a value of type '" + nn.compat_display_name() + "'")
+        // An inline value is copied by assigning it
+        return view ? vgen_cast(value, type.plain_type()) : value
+    }
+    if !isset(class) || !nn.is_structural_type() : at.error("Cannot copy a value of type '" + nn.compat_display_name() + "'")
+    class_check_generated_copy(class, "copy", at) !>
+    if isset(class.get_func("gc_free")) {
+        at.error("Cannot copy '" + class.pretty_name() + "': both copies would release the resource its 'gc_free' releases")
+    }
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let copy_source = type.is_nullable_type() ? value_force_remove_nullable(source) : source
+    let copy_func = value_copy_func(nn, class, ctx, at) !>
+    let copied = vgen_call(ctx, vgen_func(copy_func), Array[Value]{ copy_source }, copy_func.get_rett(), scope)
+    copied.exp = at
+    let result = copied
+    if type.is_nullable_type() {
+        let nullable = copy_func.get_rett().nullable()
+        result = vgen_this_or_that(vgen_isset_val(source, type_bool(ctx.build)), value_make_nullable(copied), vgen_null(nullable), nullable)
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_copy_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    act_check(at, method.act, method.exp, false, "function '" + method.name + "'") !>
+    if !method.parsed_types : parse_func_types(method) !>
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let receiver = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    receiver = value_read_borrowed_receiver(receiver, scope, ctx, at) !>
+    let target = func_for_receiver(method, receiver, at, ctx.func) !>
+    let callee = vgen_func(target, receiver)
+    let args = Array[Value]{}
+    value_check_call_args(target, callee, args, scope, ctx, at) !>
+    let copied = vgen_call(ctx, callee, args, target.get_rett(), scope)
+    copied.exp = at
+    let result = copied
+    if value.rett.is_nullable_type() {
+        let nullable = copied.rett.nullable()
+        result = vgen_this_or_that(vgen_isset_val(source, type_bool(ctx.build)), value_make_nullable(copied), vgen_null(nullable), nullable)
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+// `fn(value: T) T`: a new object holding the same field values
+fn value_copy_func(type: Type, class: Class, ctx: Context, at: Exp) Func !Error {
+    let key = "copy:" + type_identity_key(type)
+    ctx.build.cache.clone_funcs.get(key) -> cached : return cached
+    let owner = ctx.get_func() !>
+    let arg_scope = Scope.new(owner.ns.scope)
+    let plain = type.plain_type()
+    let copy_func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<copy." + class.name + "." + helper.ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: plain
+    }
+    ctx.build.cache.clone_funcs.set(key, copy_func)
+    arg_scope.func = copy_func
+    append_func_arg(copy_func, "value", type)
+    bind_func_arg_decls(copy_func) !>
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = copy_func
+    copy_func.body_scope = body_scope
+    copy_func.alloca_scope = body_scope.sub_scope()
+    copy_func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(copy_func)
+    let value_arg = copy_func.args.get(0) ! at.bug("Copy helper is missing its value")
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        fields.set(prop, vgen_cast(field, prop.type))
+    }
+    let b = ctx.build
+    body_scope.append_value(vgen_return(vgen_class_init(inner_ctx, class, fields, plain, at) !>, b, at))
+    body_scope.did_return = true
+    owner.unit.functions.append(copy_func)
+    func_finish_ast(copy_func) !>
+    if !isset(b.options.lsp) : generate_func_ir(copy_func) !>
+    return copy_func
 }
 
 // A `$clone` of shared data copies it unless a shared result is expected, like an element of
@@ -1580,7 +1726,7 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
     if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local && !allow_pointer_alias {
         let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
         let slice_class = bare_slice_class(ctx.build, element, at) !>
-        let method = slice_class.get_clone_hook() ?! at.bug("Bare slice class has no '$clone' hook")
+        let method = slice_class.get_clone_hook() ?! at.bug("Bare slice class has no 'clone' method")
         let slice_type = slice_class.get_type() !>
         let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
         as_slice.exp = value.exp
@@ -1589,7 +1735,7 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
         return value_retype_bare_slice(cloned, plain.get_non_nullable().mut_type(), at)
     }
     if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow()) && !allow_pointer_alias {
-        at.error("Cannot clone type '" + nn.compat_display_name() + "' because it aliases memory and has no accessible '$clone' function")
+        at.error("Cannot clone type '" + nn.compat_display_name() + "' because it aliases memory and has no accessible 'clone' method")
     }
     if nn.is_fixed_array_type() {
         // Plain data copies as a whole instead of element by element
@@ -1665,7 +1811,7 @@ fn type_can_clone(type: Type, allow_pointer_alias: bool, seen: Array[Class]) boo
     }
     if isset(class) && nn.is_structural_type() {
         // A copy would share the resource its finalizer releases
-        if isset(class.get_func("gc_free")) : return false
+        if isset(class.get_func("gc_free")) || isset(class_guarded_prop(class)) : return false
         seen.append(class)
         each class.props as prop {
             if !type_can_clone(prop.type, allow_pointer_alias, seen) : return false
@@ -1725,9 +1871,7 @@ fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at
 }
 
 fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
-    if check_access {
-        each class.props as prop : act_check(at, prop.act, prop.exp, true, "property") !>
-    }
+    class_check_generated_copy(class, "clone", at) !>
     let body = Array[Value]{}
     let source = value_bind_once(value, ctx, at, body)
     let clone_source = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
