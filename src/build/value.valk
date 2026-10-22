@@ -1433,7 +1433,8 @@ fn value_copy(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
         let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
         as_slice.exp = value.exp
         let copied = value_copy_method(as_slice, hook, ctx, scope, at) !>
-        return value_retype_bare_slice(copied, type.plain_type().get_non_nullable().mut_type(), at)
+        // The copy has storage of its own, also when the original was only lent
+        return value_retype_bare_slice(copied, type.plain_type().owned_type().get_non_nullable().mut_type(), at)
     }
     let string_class = type_string(ctx.build).get_class_or_null()
     if nn.kind == TYPE.closure || (isset(class) && class == string_class) : return value
@@ -1726,7 +1727,7 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
         }
     }
     // A slice borrow is copied into storage of its own by the `&[T]` clone hook
-    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local && !allow_pointer_alias {
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !allow_pointer_alias {
         let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
         let slice_class = bare_slice_class(ctx.build, element, at) !>
         let method = slice_class.get_clone_hook() ?! at.bug("Bare slice class has no 'clone' method")
@@ -1734,7 +1735,7 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
         let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
         as_slice.exp = value.exp
         let cloned = value_clone_method(as_slice, method, ctx, scope, at, false, view_hooks) !>
-        let plain = type.plain_type()
+        let plain = type.plain_type().owned_type()
         return value_retype_bare_slice(cloned, plain.get_non_nullable().mut_type(), at)
     }
     if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow()) && !allow_pointer_alias {
@@ -6933,14 +6934,17 @@ fn value_call_lends_local(callee: Value, args: Array[Value]) bool {
 
 // A `local` result must come from what the caller lent: a parameter, or a call that was only
 // lent such storage. Storage of the function's own frame dies with it
-fn value_lent_from_args(v: Value) bool {
+fn value_lent_from_args(v: Value, lent: ?Array[Decl] (null)) bool {
     let nn = v.rett.get_non_nullable()
     let borrow = nn.is_fat_borrow() || nn.kind == TYPE.ref_of
     if !v.is_implicit_borrow() && (!borrow || !nn.is_local) : return true
     let t = v.type
-    if t == VAL.decl : return value_decl_is_lent(v)
+    if t == VAL.decl : return value_decl_is_lent(v, lent)
     // A borrow made with '&': where its storage lives
     if t == VAL.multi {
+        // A part of a borrow, like its data pointer: lent when the borrow is
+        let whole = v.value1
+        if isset(whole) && !isset(v.values) : return whole.type == VAL.decl ? value_decl_is_lent(whole, lent) : value_lent_from_args(whole, lent)
         let address = (v.values ?? Array[Value]{}).get(1) ! return false
         if address.type != VAL.ptr_of : return false
         let storage = address.value1 ?! return false
@@ -6953,36 +6957,52 @@ fn value_lent_from_args(v: Value) bool {
             if storage.type != VAL.prop && storage.type != VAL.ptrv && storage.type != VAL.cast && storage.type != VAL.wrap : break
             storage = storage.value1 ?! return false
         }
-        if storage.type == VAL.decl : return value_decl_is_lent(storage)
-        return value_lent_from_args(storage)
+        if storage.type == VAL.decl : return value_decl_is_lent(storage, lent)
+        return value_lent_from_args(storage, lent)
     }
     if t == VAL.call {
         let callee = v.value1 ?! return false
         if callee.type == VAL.func {
             let receiver = callee.value1
-            if isset(receiver) && !value_lent_from_args(receiver) : return false
+            if isset(receiver) && !value_lent_from_args(receiver, lent) : return false
         }
         let args = v.values ?! return true
         each args as arg {
-            if !value_lent_from_args(arg) : return false
+            if !value_lent_from_args(arg, lent) : return false
         }
         return true
     }
     if t == VAL.cast || t == VAL.wrap || t == VAL.shared_view || t == VAL.prop || t == VAL.ptrv {
         let inner = v.value1 ?! return false
-        return value_lent_from_args(inner)
+        return value_lent_from_args(inner, lent)
+    }
+    // A value computed after some setup, like a bounds check
+    if t == VAL.block {
+        let result = v.value1 ?! return false
+        // Temporaries the setup fills from lent values are lent too
+        let inner_lent = Array[Decl]{}
+        if isset(lent) : inner_lent.append_many(lent)
+        each (v.values ?? Array[Value]{}) as step {
+            if step.type != VAL.assign : continue
+            let target = step.value1 ?! continue
+            let source = step.value2 ?! continue
+            let decl = target.decl ?! continue
+            if target.type == VAL.decl && value_lent_from_args(source, inner_lent) : inner_lent.append(decl)
+        }
+        return value_lent_from_args(result, inner_lent)
     }
     if t == VAL.this_or_that {
         let yes = v.value2 ?! return false
         let no = (v.values ?? Array[Value]{}).get(0) ! return false
-        return value_lent_from_args(yes) && value_lent_from_args(no)
+        return value_lent_from_args(yes, lent) && value_lent_from_args(no, lent)
     }
     return false
 }
 
 // A parameter that is itself a borrow: what it points at belongs to the caller
-fn value_decl_is_lent(v: Value) bool {
+fn value_decl_is_lent(v: Value, lent: ?Array[Decl] (null)) bool {
     let decl = v.decl ?! return false
+    if isset(lent) && lent.contains(decl) : return true
     let nn = decl.type.get_non_nullable()
     return decl.is_arg && (nn.is_fat_borrow() || nn.kind == TYPE.ref_of)
 }
