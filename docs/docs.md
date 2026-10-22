@@ -2092,8 +2092,8 @@ class Job {
 }
 
 fn main() {
-    let jobs: atomic sync.Channel[atomic Job] = sync.Channel[atomic Job].new(16) ! panic("init")
-    let results: atomic sync.Channel[uint] = sync.Channel[uint].new() ! panic("init")
+    let jobs: sync.Channel[atomic Job] = sync.Channel[atomic Job].new(16) ! panic("init")
+    let results: sync.Channel[uint] = sync.Channel[uint].new() ! panic("init")
 
     let worker = thread.start(fn() {
         each jobs as job {
@@ -2122,7 +2122,7 @@ given to `on_cancel`. `cancel_after(ms)` cancels from a timer on the calling
 thread. A blocked `send` or `recv` given the token ends with `cancelled`:
 
 ```rust
-let stop: atomic sync.CancelToken = sync.CancelToken.new() ! panic("init")
+let stop: sync.CancelToken = sync.CancelToken.new() ! panic("init")
 stop.cancel_after(500)
 let value = queue.recv(0, stop) ! {
     if error_is(E.code, cancelled) : println("gave up")
@@ -2177,7 +2177,7 @@ bools, strings or `atomic` objects.
 ```rust
 use valk.sync
 
-let hits: atomic sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
+let hits: sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
 hits.add("home", 1)                     // counters start at 0
 hits.set("about", 10)
 let home = hits.get("home") ?? 0        // null when the key is missing
@@ -2202,7 +2202,7 @@ use valk.sync
 use valk.http
 
 fn main() {
-    let stop: atomic sync.CancelToken = sync.CancelToken.new() ! panic("init")
+    let stop: sync.CancelToken = sync.CancelToken.new() ! panic("init")
     signal.cancel_on_shutdown(stop) ! panic("signals")
 
     let server = http.Server.new("127.0.0.1", 8080, handler)
@@ -2581,7 +2581,7 @@ right away, and closing the channel ends the stream:
 
 ```rust
 fn handler(req: http.Request) http.Response {
-    let channel: atomic sync.Channel[String] = sync.Channel[String].new() !!
+    let channel: sync.Channel[String] = sync.Channel[String].new() !!
     co send_updates(channel) // calls channel.send(...) and finally channel.close()
     return http.Response.events(channel)
 }
@@ -3516,7 +3516,7 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ### Mutable atomic data
 
-`Lock[T]` holds a value that threads may change. The value is only reachable inside a `lock` block, which holds the lock's mutex until the block ends:
+`Lock[T]` holds a value that threads may change. The value is only reachable inside a `lock` block, which holds the lock's mutex until the block ends. A `Lock` is always atomic, so `Lock[Stats]` needs no `atomic` in front; the same goes for `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore` and `ConcurrentMap`. A class of your own does this with the `$atomic` flag, as in `class Counter $atomic { ... }`: its methods see `this` as atomic data, except `@threadsafe` ones.
 
 ```rust
 class Stats {
@@ -3524,7 +3524,7 @@ class Stats {
     names: Array[String] (.{})
 }
 
-let stats: atomic Lock[Stats] = .new(Stats {}) !!
+let stats: Lock[Stats] = .new(Stats {}) !!
 
 lock stats as s {
     s.count++

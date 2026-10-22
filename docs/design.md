@@ -854,6 +854,12 @@ into it in place (`view.pair.n++`) or a struct method called on it in place
 still hits the view's storage, so it follows the view's rules: integer stores
 are atomic and the method gets the atomic or locked receiver variant, with its
 `this` typed as a borrow of the viewed struct.
+A class declared `$atomic` is only ever reached through its view: naming
+`X` means `atomic X`, and its methods see `this` as atomic data, except
+`@threadsafe` ones, which synchronize on their own and see it plainly. Such an
+object is never copied on publication, since no plain alias of it can exist.
+`Lock`, `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore` and
+`ConcurrentMap` are declared this way.
 A `shared` global reads as `atomic T`, so it is governed by the same rules.
 `@shared` globals are the explicit unsafe override when an external protocol
 guarantees synchronization and lifetime safety. Within an expression,
@@ -862,7 +868,7 @@ guarantees synchronization and lifetime safety. Within an expression,
 ### `locked T`
 
 `locked T` is the mutable counterpart of `atomic T`, produced only by a
-`lock` block over an `atomic Lock[T]`. The block holds the lock's mutex
+`lock` block over an `Lock[T]`. The block holds the lock's mutex
 and releases it on every exit through the function cleanup path. Reads through
 a locked view keep the view, and integer fields use atomic access. A value
 stored into locked data from elsewhere is copied in, as for an `atomic`
