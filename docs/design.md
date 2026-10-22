@@ -838,10 +838,14 @@ a `shared` global's store and default, an `atomic T` parameter, and a store into
 locked data.
 
 What a method returns through an atomic or locked receiver keeps the view when
-its type could reach data of the receiver: a borrow always does, and so does a
-result whose reachable classes overlap the receiver's, or that reaches an
-interface or closure. A result of unrelated types is ordinary data. This is
-decided from the types alone; a clone hook's result is always ordinary.
+its type could reach what the receiver holds: a borrow always does, and so does
+a result whose reachable classes overlap those of the receiver's properties and
+type arguments, or that reaches an interface or closure. Parts of the result
+already typed as views do not count, and neither does the receiver's own class,
+so `copy()` on an `atomic Array[T]` returns an ordinary `Array[atomic T]`. A
+method that returns its receiver itself as ordinary data fails the variant's
+type check instead. This is decided from the types alone; a clone hook's result
+is always ordinary.
 
 Everything read out of a view keeps it: properties, array and map elements,
 elements of `&[T]` and `mut &[T]` properties, and copies made with a bracket
