@@ -1897,101 +1897,184 @@ fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at
 
 fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Func !Error {
     let source = access_root_source(at.src)
-    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared + ":" + view_hooks
-    ctx.build.cache.clone_funcs.get(key) -> cached : return cached
-
     let owner = ctx.get_func() !>
+    // Inside a fill, objects are only made and queued; elsewhere a clone fills its whole graph
+    let defers = owner.clone_defers
+    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared + ":" + view_hooks
+    let plain = type.plain_type()
+    if plain.is_gc_type() {
+        let make = value_clone_make_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+        if defers : return make
+        return value_clone_top_func(key, type, make, owner, at) !>
+    }
+
+    // A struct is copied by value: it has no identity to keep
+    let struct_key = key + ":" + defers
+    ctx.build.cache.clone_funcs.get(struct_key) -> cached : return cached
+    let clone_func = value_clone_helper(owner, "<clone." + class.name + "." + helper.ctxhash(struct_key) + ">", plain, at)
+    clone_func.clone_defers = defers
+    ctx.build.cache.clone_funcs.set(struct_key, clone_func)
+    append_func_arg(clone_func, "value", type)
+    bind_func_arg_decls(clone_func) !>
+    let body_scope = clone_func.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(clone_func)
+    let value_arg = clone_func.args.get(0) ! at.bug("Clone helper is missing its value")
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        field.rett = type.storage_view_of(prop.type)
+        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+        prop.type.compat_check(cloned.rett, at) !>
+        fields.set(prop, cloned)
+    }
+    let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
+    body_scope.append_value(vgen_return(result, ctx.build, at))
+    value_clone_helper_finish(owner, clone_func) !>
+    return clone_func
+}
+
+fn value_clone_helper(owner: Func, name: String, rett: Type, at: Exp) Func {
     let arg_scope = Scope.new(owner.ns.scope)
-    let clone_func = Func {
+    let func = Func {
         unit: owner.unit
         ns: owner.ns
-        name: "<clone." + class.name + "." + helper.ctxhash(key) + ">"
+        name: name
         act: ACT.private
         exp: at
         arg_scope: arg_scope
         parsed_types: true
         parsed_ast: true
-        rett: type.plain_type()
+        rett: rett
     }
-    ctx.build.cache.clone_funcs.set(key, clone_func)
-    arg_scope.func = clone_func
-    append_func_arg(clone_func, "value", type)
-    bind_func_arg_decls(clone_func) !>
-
+    arg_scope.func = func
     let body_scope = arg_scope.sub_scope()
-    body_scope.func = clone_func
-    clone_func.body_scope = body_scope
-    clone_func.alloca_scope = body_scope.sub_scope()
-    clone_func.defer_scope = body_scope.sub_scope()
-    let inner_ctx = Context.for_func(clone_func)
-    let value_arg = clone_func.args.get(0) ! at.bug("Clone helper is missing its value")
-    let b = ctx.build
+    body_scope.func = func
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    return func
+}
+
+fn value_clone_helper_finish(owner: Func, func: Func) !Error {
+    let body_scope = func.body_scope
+    if isset(body_scope) : body_scope.did_return = true
+    owner.unit.functions.append(func)
+    func_finish_ast(func) !>
+    if !isset(owner.ns.build.options.lsp) : generate_func_ir(func) !>
+}
+
+fn value_clone_core_func(b: Build, name: String, at: Exp) Func !Error {
+    let func = value_get_valk_func(b, "core", name, at) !>
+    if !func.parsed_types : parse_func_types(func) !>
+    return func
+}
+
+// Makes the copy of one object: the copy made before in this clone, or a shallow copy whose
+// fields a fill clones later. An object copied before keeps cycles and shared parts in shape
+fn value_clone_make_func(key: String, type: Type, class: Class, owner: Func, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool, view_hooks: bool) Func !Error {
+    let b = owner.ns.build
+    let make_key = key + ":make"
+    b.cache.clone_funcs.get(make_key) -> cached : return cached
     let plain = type.plain_type()
-    if !plain.is_gc_type() {
-        // A struct is copied by value: it has no identity to keep
-        let fields = HashMap[Prop, Value]{}
-        each class.props as prop {
-            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
-            field.rett = type.storage_view_of(prop.type)
-            let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
-            prop.type.compat_check(cloned.rett, at) !>
-            fields.set(prop, cloned)
-        }
-        let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
-        body_scope.append_value(vgen_return(result, b, at))
-    } else {
-        // An object copied before in this clone is that copy again, so cycles and parts reached
-        // twice keep their shape. The copy is noted before its fields are copied
-        let ptr_t = type_ptr(b)
-        let begin_f = value_get_valk_func(b, "core", "clone_begin", at) !>
-        let end_f = value_get_valk_func(b, "core", "clone_end", at) !>
-        let find_f = value_get_valk_func(b, "core", "clone_find", at) !>
-        let note_f = value_get_valk_func(b, "core", "clone_note", at) !>
-        each Array[Func]{ begin_f, end_f, find_f, note_f } as helper_f {
-            if !helper_f.parsed_types : parse_func_types(helper_f) !>
-        }
-        body_scope.append_value(vgen_call(inner_ctx, vgen_func(begin_f), Array[Value]{}, begin_f.get_rett(), body_scope))
-        let found = Decl.new(clone_func, find_f.get_rett(), false, "found")
-        found.exp = at
-        body_scope.add_decl(found)
-        let find = vgen_call(inner_ctx, vgen_func(find_f), Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t) }, find_f.get_rett(), body_scope)
-        body_scope.append_value(vgen_assign(vgen_decl(found), find, ASSIGN_OP.set, b, at))
-        let again = Array[Value]{
-            vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope)
-            vgen_return(vgen_cast(value_force_remove_nullable(vgen_decl(found)), plain), b, at)
-        }
-        body_scope.append_value(vgen_if(vgen_isset_val(vgen_decl(found), type_bool(b)), again, null, b, at))
+    let make = value_clone_helper(owner, "<clone." + class.name + "." + helper.ctxhash(make_key) + ">", plain, at)
+    b.cache.clone_funcs.set(make_key, make)
+    append_func_arg(make, "value", type)
+    bind_func_arg_decls(make) !>
+    let fill = value_clone_fill_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
 
-        let shallow = HashMap[Prop, Value]{}
-        each class.props as prop {
-            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
-            shallow.set(prop, vgen_cast(field, prop.type))
-        }
-        let result = Decl.new(clone_func, plain, false, "result")
-        result.is_mut = true
-        result.exp = at
-        body_scope.add_decl(result)
-        body_scope.append_value(vgen_assign(vgen_decl(result), vgen_class_init(inner_ctx, class, shallow, plain, at) !>, ASSIGN_OP.set, b, at))
-        let note_args = Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t), vgen_cast(vgen_decl(result), ptr_t) }
-        body_scope.append_value(vgen_call(inner_ctx, vgen_func(note_f), note_args, note_f.get_rett(), body_scope))
-        each class.props as prop {
-            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
-            field.rett = type.storage_view_of(prop.type)
-            let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
-            if cloned == field : continue
-            prop.type.compat_check(cloned.rett, at) !>
-            let slot = vgen_prop(prop, vgen_decl(result), inner_ctx)
-            body_scope.append_value(vgen_store(slot, cloned, ASSIGN_OP.set, inner_ctx, body_scope, at) !>)
-        }
-        body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope))
-        body_scope.append_value(vgen_return(vgen_decl(result), b, at))
+    let body_scope = make.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(make)
+    let value_arg = make.args.get(0) ! at.bug("Clone helper is missing its value")
+    let ptr_t = type_ptr(b)
+    let find_f = value_clone_core_func(b, "clone_find", at) !>
+    let note_f = value_clone_core_func(b, "clone_note", at) !>
+    let defer_f = value_clone_core_func(b, "clone_defer", at) !>
+
+    let found = Decl.new(make, find_f.get_rett(), false, "found")
+    found.exp = at
+    body_scope.add_decl(found)
+    let find = vgen_call(inner_ctx, vgen_func(find_f), Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t) }, find_f.get_rett(), body_scope)
+    body_scope.append_value(vgen_assign(vgen_decl(found), find, ASSIGN_OP.set, b, at))
+    let again = Array[Value]{ vgen_return(vgen_cast(value_force_remove_nullable(vgen_decl(found)), plain), b, at) }
+    body_scope.append_value(vgen_if(vgen_isset_val(vgen_decl(found), type_bool(b)), again, null, b, at))
+
+    let shallow = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        shallow.set(prop, vgen_cast(field, prop.type))
     }
-    body_scope.did_return = true
+    let result = Decl.new(make, plain, false, "result")
+    result.is_mut = true
+    result.exp = at
+    body_scope.add_decl(result)
+    body_scope.append_value(vgen_assign(vgen_decl(result), vgen_class_init(inner_ctx, class, shallow, plain, at) !>, ASSIGN_OP.set, b, at))
+    let source_ptr = vgen_cast(vgen_decl(value_arg.decl), ptr_t)
+    let copy_ptr = vgen_cast(vgen_decl(result), ptr_t)
+    body_scope.append_value(vgen_call(inner_ctx, vgen_func(note_f), Array[Value]{ source_ptr, copy_ptr }, note_f.get_rett(), body_scope))
+    let fill_ref = value_retype_function(vgen_func(fill), TYPE.fnptr)
+    body_scope.append_value(vgen_call(inner_ctx, vgen_func(defer_f), Array[Value]{ source_ptr, copy_ptr, fill_ref }, defer_f.get_rett(), body_scope))
+    body_scope.append_value(vgen_return(vgen_decl(result), b, at))
+    value_clone_helper_finish(owner, make) !>
+    return make
+}
 
-    owner.unit.functions.append(clone_func)
-    func_finish_ast(clone_func) !>
-    if !isset(ctx.build.options.lsp) : generate_func_ir(clone_func) !>
-    return clone_func
+// Clones the fields of a copy the make function queued
+fn value_clone_fill_func(key: String, type: Type, class: Class, owner: Func, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool, view_hooks: bool) Func !Error {
+    let b = owner.ns.build
+    let ptr_t = type_ptr(b)
+    let fill = value_clone_helper(owner, "<clone_fill." + class.name + "." + helper.ctxhash(key) + ">", type_void(b), at)
+    fill.clone_defers = true
+    append_func_arg(fill, "source", ptr_t)
+    append_func_arg(fill, "copy", ptr_t)
+    bind_func_arg_decls(fill) !>
+    let body_scope = fill.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(fill)
+    let source_arg = fill.args.get(0) ! at.bug("Clone helper is missing its source")
+    let copy_arg = fill.args.get(1) ! at.bug("Clone helper is missing its copy")
+    let plain = type.plain_type()
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_cast(vgen_decl(source_arg.decl), type), inner_ctx)
+        field.rett = type.storage_view_of(prop.type)
+        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+        if cloned == field : continue
+        prop.type.compat_check(cloned.rett, at) !>
+        let slot = vgen_prop(prop, vgen_cast(vgen_decl(copy_arg.decl), plain), inner_ctx)
+        body_scope.append_value(vgen_store(slot, cloned, ASSIGN_OP.set, inner_ctx, body_scope, at) !>)
+    }
+    body_scope.append_value(vgen_return(null, b, at))
+    value_clone_helper_finish(owner, fill) !>
+    return fill
+}
+
+// A clone outside a fill: makes the copy, then fills everything it queued
+fn value_clone_top_func(key: String, type: Type, make: Func, owner: Func, at: Exp) Func !Error {
+    let b = owner.ns.build
+    let top_key = key + ":top"
+    b.cache.clone_funcs.get(top_key) -> cached : return cached
+    let plain = type.plain_type()
+    let top = value_clone_helper(owner, "<clone_top." + helper.ctxhash(top_key) + ">", plain, at)
+    b.cache.clone_funcs.set(top_key, top)
+    append_func_arg(top, "value", type)
+    bind_func_arg_decls(top) !>
+    let body_scope = top.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(top)
+    let value_arg = top.args.get(0) ! at.bug("Clone helper is missing its value")
+    let begin_f = value_clone_core_func(b, "clone_begin", at) !>
+    let end_f = value_clone_core_func(b, "clone_end", at) !>
+
+    let mark = Decl.new(top, begin_f.get_rett(), false, "mark")
+    mark.exp = at
+    body_scope.add_decl(mark)
+    body_scope.append_value(vgen_assign(vgen_decl(mark), vgen_call(inner_ctx, vgen_func(begin_f), Array[Value]{}, begin_f.get_rett(), body_scope), ASSIGN_OP.set, b, at))
+    let result = Decl.new(top, plain, false, "result")
+    result.exp = at
+    body_scope.add_decl(result)
+    let made = vgen_call(inner_ctx, vgen_func(make), Array[Value]{ vgen_decl(value_arg.decl) }, plain, body_scope)
+    body_scope.append_value(vgen_assign(vgen_decl(result), made, ASSIGN_OP.set, b, at))
+    body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{ vgen_decl(mark) }, end_f.get_rett(), body_scope))
+    body_scope.append_value(vgen_return(vgen_decl(result), b, at))
+    value_clone_helper_finish(owner, top) !>
+    return top
 }
 
 fn value_bind_once(value: Value, ctx: Context, at: Exp, body: Array[Value], snapshot: bool (false)) Value {
