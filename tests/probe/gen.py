@@ -145,62 +145,62 @@ RULES = [
     ("copy", "alias-then-publish", "item",
      """let o = Item{}
 let a = @W(o)
-let s: shared Item = o
+let s: atomic Item = o
 a.n = 5
 println(s.n)""", "0"),
     ("copy", "publish-escaped", "item",
      """let o = Item{}
 keep = o
-let s: shared Item = @W(o)
+let s: atomic Item = @W(o)
 set_kept(5)
 println(s.n)""", "0"),
     ("copy", "publish-then-reuse", "item",
      """let o = Item{}
-let s: shared Item = @W(o)
+let s: atomic Item = @W(o)
 o.n = 5
 println(s.n)""", "0"),
     ("copy", "borrow-then-publish", "ref",
      """let o = Item{}
 let r = @W(&o)
-let s: shared Item = o
+let s: atomic Item = o
 r.n = 5
 println(s.n)""", "0", LOCAL_BORROW_SKIP),
     ("copy", "stash-then-publish", "item",
      """let o = Item{}
 stash(@W(o))
-let s: shared Item = o
+let s: atomic Item = o
 set_kept(5)
 println(s.n)""", "0"),
     ("copy", "alias-then-lock-store", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 let a = @W(x)
 lock st as s { s.list.append(x) }
 a.n = 5
 lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "lock-store-escaped", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 keep = x
 lock st as s { s.list.append(@W(x)) }
 set_kept(5)
 lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "lock-store-then-reuse", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 lock st as s { s.list.append(@W(x)) }
 x.n = 5
 lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "attach-then-reuse", "item",
      """FN fn attach_xs(x: Item, s: locked Store) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
+let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 lock st as s { attach_xs(@W(x), s) }
 x.n = 5
 lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "attach-swapped-then-reuse", "item",
      """FN fn attach_sx(s: locked Store, x: Item) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
+let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 lock st as s { attach_sx(s, @W(x)) }
 x.n = 5
@@ -210,13 +210,13 @@ lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     s.list.append(x)
     keep = x
 }
-let st: shared Lock[Store] = .new(Store{}) !!
+let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 lock st as s { attach_keep(s, @W(x)) }
 set_kept(5)
 lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "closure-lock-store-then-reuse", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 lock st as s {
     let put = fn(t: locked Store, v: Item) { t.list.append(v) }
@@ -226,17 +226,17 @@ x.n = 5
 lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "shared-fixed-array-then-reuse", "item",
      """let x = Item{}
-let s: shared [Item x 1] = { @W(x) }
+let s: atomic [Item x 1] = { @W(x) }
 x.n = 5
 println(s[0].n)""", "0"),
     ("copy", "shared-list-literal-then-reuse", "item",
      """let x = Item{}
-let s: shared Array[Item] = .{ @W(x) }
+let s: atomic Array[Item] = .{ @W(x) }
 x.n = 5
 println((s.get(0) !? null)?.n ?? -1)""", "0"),
     ("copy", "two-locks", "item",
-     """let a: shared Lock[Store] = .new(Store{}) !!
-let b: shared Lock[Store] = .new(Store{}) !!
+     """let a: atomic Lock[Store] = .new(Store{}) !!
+let b: atomic Lock[Store] = .new(Store{}) !!
 lock a as x {
     x.list.append(Item{})
     lock b as y { y.list.append(@W(x.list.get(0) ! return)) }
@@ -245,8 +245,8 @@ lock a as x {
 }
 lock b as y { println((y.list.get(0) !? null)?.n ?? -1) }""", "0"),
     ("copy", "picked-lock", "item",
-     """let a: shared Lock[Store] = .new(Store{}) !!
-let b: shared Lock[Store] = .new(Store{}) !!
+     """let a: atomic Lock[Store] = .new(Store{}) !!
+let b: atomic Lock[Store] = .new(Store{}) !!
 lock a as x {
     x.list.append(Item{})
     lock b as y {
@@ -285,14 +285,14 @@ FN fn probe_lend(d: local &[int]) local &[int] { return d.view(1, 2) }
 let a: [int x 4] = { 1, 2, 3, 4 }
 probe_lent = @W(probe_lend(a))"""),
     ("refuse", "locked-escape", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let out: ?Item = null
 lock st as s {
     s.list.append(Item{})
     let v = s.list.get(0) ! return
     out = @W($clone(v))
 }""",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let out: ?Item = null
 lock st as s {
     s.list.append(Item{})

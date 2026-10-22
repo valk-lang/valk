@@ -819,6 +819,18 @@ if [[ "$quiet_deprecated_out" == *"is deprecated"* ]] || [[ "$quiet_deprecated_o
     exit 1
 fi
 
+# `shared T` is the old spelling of `atomic T`: it still builds and warns once
+spelling_out=$("$VALK" build "$DIR/shared-spelling.valk" -o "$output" --run 2>&1) || {
+    echo "# The old 'shared T' spelling failed to build or run"
+    echo "$spelling_out"
+    exit 1
+}
+if [ "$(printf '%s' "$spelling_out" | grep -c "'shared T' is deprecated: write 'atomic T'")" -ne 1 ] || [[ "$spelling_out" != *"7"* ]]; then
+    echo "# 'shared T' must warn once and mean 'atomic T'"
+    echo "$spelling_out"
+    exit 1
+fi
+
 # An unreachable break or continue is reported, and must not change the divergence analysis
 divergence_out=$("$VALK" build "$DIR/divergence.valk" -o "$output" --run 2>&1) || {
     echo "# The divergence program failed to build or run"

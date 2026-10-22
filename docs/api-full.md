@@ -434,7 +434,7 @@ Meant for failures in `gc_free` and other cleanup code that cannot throw.
 
 Returns a deep copy of `value`, the same copy `$clone(value)` makes.
 
-Classes with a `$clone` hook are copied through that hook; `shared` values are returned as
+Classes with a `$clone` hook are copied through that hook; `atomic` values are returned as
 they are. Values that alias raw memory (raw pointers, borrows) without a `$clone` hook are a
 compile error.
 
@@ -10282,9 +10282,9 @@ The kind of a WebSocket message.
 // Sends a request and returns the final response, following redirects.
 + fn request(method: String, url: String, options: ?Options (null)) ClientResponse !HttpError
 // Creates a `Server` with default settings for `handler` and runs it; see `Server.start`.
-+ fn serve(host: String, port: u16, handler: shared fn(Request)(Response), worker_count: uint (0)) void !HttpError
++ fn serve(host: String, port: u16, handler: atomic fn(Request)(Response), worker_count: uint (0)) void !HttpError
 // Like `serve`, with a fast handler that writes straight to a `ResponseWriter`.
-+ fn serve_fast(host: String, port: u16, handler: shared fn(Context, ResponseWriter)(), worker_count: uint (0)) void !HttpError
++ fn serve_fast(host: String, port: u16, handler: atomic fn(Context, ResponseWriter)(), worker_count: uint (0)) void !HttpError
 ```
 
 ### create_request
@@ -11542,7 +11542,7 @@ Decoded like `query`.
     // Creates a response with an empty body; also backs default construction.
     + static fn empty(code: u16 (200), headers: ?Headers (null)) Response
     // Creates a Server-Sent Events response (`text/event-stream`): each value received from `channel` is sent as one event, its lines as `data:` lines.
-    + static fn events(channel: shared Channel[String], headers: ?Headers (null)) Response
+    + static fn events(channel: atomic Channel[String], headers: ?Headers (null)) Response
     // Creates a response that sends the file at `path`.
     + static fn file(path: String, filename: ?String (null)) Response
     // The extra response headers, created empty on first access.
@@ -11906,15 +11906,15 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + write_timeout_ms: uint
 
     // Wraps the handler in `middleware`, which runs for every request that reaches the handler.
-    + fn add_middleware(middleware: shared fn(Request, shared fn(Request)(Response))(Response)) void
+    + fn add_middleware(middleware: atomic fn(Request, atomic fn(Request)(Response))(Response)) void
     // Serves files from the directory `path` before a request reaches the handler.
     + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
-    + fn fast(handler: shared fn(Context, ResponseWriter)()) void
+    + fn fast(handler: atomic fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.
-    + fn handle(handler: shared fn(Request)(Response)) void
+    + fn handle(handler: atomic fn(Request)(Response)) void
     // Creates a server for `host` and `port`; nothing is opened until `start`.
-    + static fn new(host: String, port: u16, handler: shared fn(Request)(Response) (handler_default)) Server
+    + static fn new(host: String, port: u16, handler: atomic fn(Request)(Response) (handler_default)) Server
     // Stops accepting connections and gives in-flight requests `timeout_ms` to finish.
     + fn request_shutdown(timeout_ms: uint (5000)) void
     // Calls `request_shutdown` and waits for the workers to finish.
@@ -12168,7 +12168,7 @@ cannot be read.
     // Like `read`, but writes the payload to `out` and returns the message type.
     + fn read_into(out: Writer) WebSocketMessageType !WebSocketError
     // Makes a blocked `read` or `write` fail with `cancelled` when `token` is cancelled.
-    + fn set_cancel(token: shared CancelToken) void
+    + fn set_cancel(token: atomic CancelToken) void
     // Sets the socket timeouts in milliseconds; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Answers a server request with the WebSocket upgrade, then runs `handler` on the connection.
@@ -12178,9 +12178,9 @@ cannot be read.
     // Sends `data` as one binary message.
     + fn write_binary(data: local &[u8]) void !WebSocketError
     // Sends a message prepared with `WebSocketFrame`, for sending one message to many connections.
-    + fn write_frame(frame: shared WebSocketFrame) void !WebSocketError
+    + fn write_frame(frame: atomic WebSocketFrame) void !WebSocketError
     // Sends several prepared messages in order, as `write_frame` does one by one.
-    + fn write_frames(frames: local &[shared WebSocketFrame]) void !WebSocketError
+    + fn write_frames(frames: local &[atomic WebSocketFrame]) void !WebSocketError
 }
 ```
 
@@ -12349,7 +12349,7 @@ A text or binary message prepared once and sent to many WebSockets with
 The frame bytes are built when it is made, and the compressed form the first time a
 connection with permessage-deflate sends it, once per window size and level;
 connections without compression send the plain bytes. A frame cannot change, so it can
-be published as `shared WebSocketFrame` and sent from coroutines on any thread:
+be published as `atomic WebSocketFrame` and sent from coroutines on any thread:
 
 ```valk
 let frame: shared http.WebSocketFrame = http.WebSocketFrame.text(json)
@@ -14257,7 +14257,7 @@ A TLS protocol version, for the minimum and maximum version settings.
 // Connects to a TCP server; the same as `TcpConnection.new`.
 + fn tcp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) TcpConnection !NetError
 // Opens a listening TCP socket; the same as `TcpServer.new`.
-+ fn tcp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) shared TcpServer !NetError
++ fn tcp_server(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic TcpServer !NetError
 // Opens a UDP socket that talks to one server; the same as `UdpClient.new`.
 + fn udp_client(host: String, port: u16, timeout_ms: uint (5000), local_port: u16 (0), local_host: String ("")) UdpClient !NetError
 // Binds a UDP socket to your own address; the same as `UdpServer.new`.
@@ -14726,9 +14726,9 @@ and `write`.
     ~ ctx: SSL_CTX
 
     // Returns a new server session using `context`, for one connection.
-    + static fn connection(context: shared SslServerContext) Ssl
+    + static fn connection(context: atomic SslServerContext) Ssl
     // Loads the PEM `certificate_file` and `private_key_file` and checks that they match.
-    + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) shared SslServerContext !NetError
+    + static fn new(certificate_file: String, private_key_file: String, min_version: TlsVersion (TlsVersion.tls_1_2), cipher_list: ?String (null), cipher_suites: ?String (null)) atomic SslServerContext !NetError
     // Asks every client for a certificate that leads to a CA in the PEM file `ca_file` (mutual TLS), and tells clients which CAs those are.
     + fn set_client_ca(ca_file: String, required: bool (true)) void !NetError
 }
@@ -14797,7 +14797,7 @@ the file.
     // Reads up to `buf.length` bytes into `buf` and returns the count.
     + fn read(buf: local mut &[u8]) uint !io:IoError
     // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
-    + fn set_cancel(token: shared CancelToken) void
+    + fn set_cancel(token: atomic CancelToken) void
     // Whether small writes are sent right away. On by default: with it off (Nagle's algorithm) a write that follows another write waits for the peer's acknowledgement, which can add about 40 ms per response.
     + fn set_no_delay(enabled: bool) void !NetError
     // Asks the system for a receive buffer of `bytes`; it may round or cap the size.
@@ -14807,7 +14807,7 @@ the file.
     // Sets `read_timeout_ms` and `write_timeout_ms`; 0 waits forever.
     + fn set_timeouts(read_timeout_ms: uint, write_timeout_ms: uint) void
     // Runs the TLS server handshake over this connection with a session from `context`.
-    + fn ssl_accept(context: shared SslServerContext, timeout_ms: uint (5000)) void !NetError
+    + fn ssl_accept(context: atomic SslServerContext, timeout_ms: uint (5000)) void !NetError
     // Runs the TLS client handshake over this connection with `ssl`.
     + fn ssl_connect(ssl: Ssl, timeout_ms: uint (5000)) void !NetError
     // Wraps an already connected socket descriptor and takes ownership of it.
@@ -14977,7 +14977,7 @@ bounds each wait for room in the socket buffer. Throws `closed`, `cancelled`,
     // Returns the address the server listens on.
     + fn local_address() SocketAddress !NetError
     // Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
-    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) shared TcpServer !NetError
+    + static fn new(host: String, port: u16, timeout_ms: uint (5000), reuse_port: bool (false)) atomic TcpServer !NetError
 }
 ```
 
@@ -15053,7 +15053,7 @@ listening fails for another reason.
     // Allows sending to a broadcast address such as `255.255.255.255`.
     + fn set_broadcast(enabled: bool) void !NetError
     // Makes pending and later reads and writes throw `cancelled` once `token` is cancelled.
-    + fn set_cancel(token: shared CancelToken) void
+    + fn set_cancel(token: atomic CancelToken) void
     // Sends multicast datagrams through the interface with the IPv4 address `interface_ip` (IPv4 sockets) instead of the default route.
     + fn set_multicast_interface_v4(interface_ip: String) void !NetError
     // Sends multicast datagrams through interface `interface_index` (IPv6 sockets); 0 is the default route.
@@ -15226,7 +15226,7 @@ Throws `write` when the send fails (such as a datagram too large for the network
     // Allows sending to a broadcast address such as `255.255.255.255`.
     + fn set_broadcast(enabled: bool) void !NetError
     // Makes pending and later `recv_from` and `send_to` calls throw `cancelled` once `token` is cancelled.
-    + fn set_cancel(token: shared CancelToken) void
+    + fn set_cancel(token: atomic CancelToken) void
     // Sends multicast datagrams through the interface with the IPv4 address `interface_ip` (IPv4 sockets) instead of the default route.
     + fn set_multicast_interface_v4(interface_ip: String) void !NetError
     // Sends multicast datagrams through interface `interface_index` (IPv6 sockets); 0 is the default route.
@@ -15781,15 +15781,15 @@ throws `unsupported` for them there.
 
 ```js
 // Cancels `token` when `sig` arrives; several tokens may watch one signal.
-+ fn cancel_on(sig: Signal, token: shared CancelToken) void !SignalError
++ fn cancel_on(sig: Signal, token: atomic CancelToken) void !SignalError
 // Cancels `token` on `SIGINT` or `SIGTERM`, and `SIGHUP` where it exists.
-+ fn cancel_on_shutdown(token: shared CancelToken) void !SignalError
++ fn cancel_on_shutdown(token: atomic CancelToken) void !SignalError
 // Makes the process ignore `sig` and drops the tokens, callbacks and waiters registered for it.
 + fn ignore(sig: Signal) void !SignalError
 // Returns the OS signal number of `sig`; throws `unsupported` when the platform lacks it.
 + fn number(sig: Signal) i32 !SignalError
 // Runs `callback` on the dispatcher thread each time `sig` arrives.
-+ fn on(sig: Signal, callback: shared fn()()) void !SignalError
++ fn on(sig: Signal, callback: atomic fn()()) void !SignalError
 // Sends `sig` to this process through C `raise`; throws `unsupported` when the platform lacks it.
 + fn raise(sig: Signal) void !SignalError
 // Restores the default action of `sig` and drops what was registered for it.
@@ -15871,9 +15871,9 @@ created.
 
 ```js
 // Returns a channel that receives `true` once, `ms` milliseconds from now.
-+ fn after(ms: uint) shared Channel[bool] !SyncError
++ fn after(ms: uint) atomic Channel[bool] !SyncError
 // Waits until one of `channels` has a value to receive or is closed, and returns its index.
-+ fn select(channels: Array[Selectable], timeout_ms: uint (0), cancel: ?shared CancelToken (null)) uint !SyncError
++ fn select(channels: Array[Selectable], timeout_ms: uint (0), cancel: ?atomic CancelToken (null)) uint !SyncError
 // Returns a `Ticker` whose channel receives every `interval_ms` milliseconds until `stop`.
 + fn ticker(interval_ms: uint) Ticker !SyncError
 ```
@@ -15917,13 +15917,13 @@ channel cannot be created.
     // Cancels the token after `ms` milliseconds.
     + fn cancel_after(ms: uint) void
     // Returns a new token that is cancelled when this one is, or right away when it already is.
-    + fn child() shared CancelToken !SyncError
+    + fn child() atomic CancelToken !SyncError
     // Returns true once the token was cancelled.
     + fn is_cancelled() bool
     // Returns a token that is not cancelled; throws `init` when its lock cannot be created.
-    + static fn new() shared CancelToken !SyncError
+    + static fn new() atomic CancelToken !SyncError
     // Runs `callback` on the cancelling thread when cancelled; right away when already cancelled.
-    + fn on_cancel(callback: shared fn()()) void
+    + fn on_cancel(callback: atomic fn()()) void
     // Waits until the token is cancelled; returns false when `timeout_ms` (0 = forever) ran out.
     + fn wait(timeout_ms: uint (0)) bool
 }
@@ -15986,13 +15986,13 @@ Parks the current coroutine, or blocks a native thread outside one.
     // The number of values currently queued; on a rendezvous channel, those of waiting senders.
     + get length: uint
     // Returns an empty channel holding at most `capacity` values; without one it is unbounded.
-    + static fn new(capacity: ?uint (null)) shared Channel[T] !SyncError
+    + static fn new(capacity: ?uint (null)) atomic Channel[T] !SyncError
     // Returns the next value, waiting for one.
-    + fn recv(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) T !SyncError
+    + fn recv(timeout_ms: uint (0), cancel: ?atomic CancelToken (null)) T !SyncError
     // Backs `select`: a channel converts to a `Selectable` where one is expected.
     + fn selectable() Selectable
     // Queues `value`, waiting while the channel is full; on a rendezvous channel, waiting until a receiver took it.
-    + fn send(value: T, timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
+    + fn send(value: T, timeout_ms: uint (0), cancel: ?atomic CancelToken (null)) void !SyncError
     // Returns the next value without waiting; throws `empty` when none is queued.
     + fn try_recv() T !SyncError
     // Queues `value` without waiting.
@@ -16006,7 +16006,7 @@ A first-in first-out queue of values between coroutines, on one thread or across
 
 With a capacity, `send` waits while the channel is full; without one it never waits.
 A capacity of 0 makes a rendezvous channel: `send` waits until a receiver took the value.
-Class objects must be `shared` to travel: `Channel[shared Message]`. Closing a channel
+Class objects must be `atomic` to travel: `Channel[atomic Message]`. Closing a channel
 fails later sends and ends waiting receivers once the remaining values are drained.
 `each channel as value` receives until a receive fails, normally because the channel
 was closed.
@@ -16077,7 +16077,7 @@ waiting) and `closed` when it is closed.
     // The number of entries, counted shard by shard.
     + get length: uint
     // Returns an empty map with `shards` shards, rounded up to a power of two (64 by default).
-    + static fn new(shards: uint (64)) shared ConcurrentMap[K, V] !SyncError
+    + static fn new(shards: uint (64)) atomic ConcurrentMap[K, V] !SyncError
     // Removes `key`; returns whether the map held it.
     + fn remove(key: K) bool
     // Stores `value` under `key`, replacing what was there.
@@ -16095,7 +16095,7 @@ A map that threads read and change at the same time.
 
 The keys are spread over shards that each have their own lock, so threads working on
 different keys rarely wait for each other, unlike one `Lock[HashMap[K, V]]`. Keys and
-values cross threads, so they are numbers, bools, strings or `shared` objects. A call
+values cross threads, so they are numbers, bools, strings or `atomic` objects. A call
 works on one key at a time; `snapshot` copies all entries, shard by shard.
 
 ```rust
@@ -16159,11 +16159,11 @@ of channels of any element types can be passed: `sync.select(.{ jobs, quit })`.
 // Limits how many tasks do something at once: `acquire` takes a permit, waiting while none is free, and `release` gives it back.
 + class Semaphore {
     // Takes a permit, waiting while none is free.
-    + fn acquire(timeout_ms: uint (0), cancel: ?shared CancelToken (null)) void !SyncError
+    + fn acquire(timeout_ms: uint (0), cancel: ?atomic CancelToken (null)) void !SyncError
     // The number of free permits.
     + get available: uint
     // Returns a semaphore with `permits` free permits; throws `init` when its lock cannot be created.
-    + static fn new(permits: uint) shared Semaphore !SyncError
+    + static fn new(permits: uint) atomic Semaphore !SyncError
     // Gives a permit back and wakes one waiting `acquire`.
     + fn release() void
     // Takes a permit when one is free, without waiting; returns whether it did.
@@ -16210,7 +16210,7 @@ Takes a permit when one is free, without waiting; returns whether it did.
 // A clock that sends the tick number (1, 2, ...) to `channel` every interval, from `ticker`.
 + class Ticker {
     // Receives the tick numbers; closed by `stop`.
-    ~ channel: shared Channel[uint]
+    ~ channel: atomic Channel[uint]
 
     // Stops the ticker and closes its channel; a second call does nothing.
     + fn stop() void
@@ -16242,7 +16242,7 @@ Stops the ticker and closes its channel; a second call does nothing.
     // Marks one task done, and wakes the waiters when it was the last. A `done` without a task left to count is ignored.
     + fn done() void
     // Returns a group with a count of 0; throws `init` when its lock cannot be created.
-    + static fn new() shared WaitGroup !SyncError
+    + static fn new() atomic WaitGroup !SyncError
     // Waits until the count is 0; returns at once when it already is.
     + fn wait(timeout_ms: uint (0)) void !SyncError
 }
@@ -16253,7 +16253,7 @@ Stops the ticker and closes its channel; a second call does nothing.
 Counts running tasks so another task can wait until all of them are done.
 
 Call `add` before starting a task and `done` when it finishes; `wait` returns once the
-count is back to 0. Share it across threads as `shared WaitGroup`. It holds no results:
+count is back to 0. Share it across threads as `atomic WaitGroup`. It holds no results:
 use `await` or a `Channel` for those.
 
 ```valk
@@ -16293,7 +16293,7 @@ waits.
 // A wakeup for the coroutine or thread that waits on it; `wake` may be called from any thread.
 + class Waker {
     // Returns a new waker.
-    + static fn new() shared Waker !SyncError
+    + static fn new() atomic Waker !SyncError
     // Waits for a wake; returns false when `timeout_ms` (0 = forever) ran out first.
     + fn wait(timeout_ms: uint (0)) bool
     // Wakes the waiter; safe from any thread, and kept for the next `wait` when nobody waits.
@@ -16594,13 +16594,13 @@ alike: `0` allows no includes, `1` allows includes that include nothing further.
 
 ```js
 // Starts an OS thread that runs `func`; the same as `Thread[void].start`.
-+ fn start(func: shared fn()()) Thread[void] !InitError
++ fn start(func: atomic fn()()) Thread[void] !InitError
 // Blocks the whole OS thread, with every coroutine on it, for `ms` milliseconds.
 + fn suspend_ms(ms: uint) void
 // Blocks the whole OS thread, with every coroutine on it, for `ns` nanoseconds.
 + fn suspend_ns(ns: uint) void
 // Runs `handler` on a pool of up to 8 reused task threads; await the returned `Task` for it.
-+ fn task(handler: shared fn()()) Task !InitError
++ fn task(handler: atomic fn()()) Task !InitError
 ```
 
 ### start
@@ -16659,7 +16659,7 @@ Parks the current coroutine, or blocks the thread outside one.
     // Waits until the handler has returned and returns its result.
     + fn await() T
     // Starts an OS thread that runs `func` inside a coroutine, and returns its handle.
-    + static fn start(func: shared fn()(T)) Thread[T] !InitError
+    + static fn start(func: atomic fn()(T)) Thread[T] !InitError
 }
 ```
 
@@ -16668,8 +16668,8 @@ Parks the current coroutine, or blocks the thread outside one.
 An OS thread running one handler that returns a `T`.
 
 The thread has its own GC heap, scheduler and copy of every non-`shared` global, reset
-to its declared default; only `shared` data crosses threads. The OS thread is detached;
-`await` waits for the handler's result.
+to its declared default; only `atomic` data and `shared` globals cross threads. The OS
+thread is detached; `await` waits for the handler's result.
 
 #### await
 
@@ -16682,7 +16682,7 @@ once.
 
 Starts an OS thread that runs `func` inside a coroutine, and returns its handle.
 
-`func` must be a `shared` closure: what it captures is reachable from two threads.
+`func` must be an `atomic` closure: what it captures is reachable from two threads.
 Throws `init` when the thread cannot be created.
 
 ```js
@@ -16695,7 +16695,7 @@ Throws `init` when the thread cannot be created.
     // Returns an empty group. Tagged `$default`, so it also supplies the group's default value.
     + static fn new() ThreadGroup[T]
     // Starts a new thread that runs `handler` and returns the index of this start (0, 1, ...).
-    + fn start(handler: shared fn()(T)) uint !InitError
+    + fn start(handler: atomic fn()(T)) uint !InitError
 }
 ```
 

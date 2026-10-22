@@ -379,12 +379,12 @@ borrow of it (`&` yields a read-only borrow of a capture), passing it to a
 `mut &` or `local mut &` parameter, and calling
 a method that writes its receiver on it. Read-only borrows and reads remain
 allowed. Writes through a captured reference (`obj.count++`) reach the shared
-object and are allowed. A shared closure cannot capture non-shared managed
-data, so a `shared fn` never carries a private copy of mutable state that
+object and are allowed. An atomic closure cannot capture non-atomic managed
+data, so an `atomic fn` never carries a private copy of mutable state that
 looks shared.
 
 A capture is a use of the variable. Capturing a variable whose graph was
-already published as `shared` is rejected like any other use after
+already published as `atomic` is rejected like any other use after
 publication, and capturing links the variable's graph to the world so it cannot
 be published afterwards.
 
@@ -651,7 +651,7 @@ named slices are `&[T]` with a class, so the conversion is a retype.
 
 An owned borrow is an alias into `owner`, and its owner word is part of the
 borrow value, so it keeps `owner` alive wherever it is stored. Borrowing
-`shared T` data remains an error.
+`atomic T` data remains an error.
 
 #### Null owner
 
@@ -719,7 +719,7 @@ collector for frames.
 
 The compiler infers no effects across functions. When a call needs to know what
 a method does with its receiver, the method's body is type-checked again with
-the receiver as the call sees it: as a `shared` or `locked` view, or read-only
+the receiver as the call sees it: as an `atomic` or `locked` view, or read-only
 for a struct or slice method called on read-only storage, an element copied out
 of an array, a temporary, a captured variable or an enum value. A store in that
 variant, or in a method it calls on the same receiver, is an error reported at
@@ -774,13 +774,13 @@ The GC never walks arbitrary raw pointers. Converting a GC reference to a raw
 pointer does not keep the object alive; safe code must retain the owning GC
 reference for as long as the raw pointer is used.
 
-## Shared views
+## Atomic views
 
-### `shared T`
+### `atomic T`
 
-`shared T` is a transitive view for data published across threads. No safe
+`atomic T` is a transitive view for data published across threads. No safe
 conversion turns it back into ordinary mutable `T`; `value.@cast(T)` is the
-explicit unsafe way back. Through a shared view, a property not marked `-` or
+explicit unsafe way back. Through an atomic view, a property not marked `-` or
 `~` can be assigned when it is one word: a number, bool, enum or object
 reference. Numbers use atomic access. A reference store is a release store of a
 value that is copied first unless it is already shared, and reference loads
@@ -816,28 +816,28 @@ nothing. Defaults that call code the compiler cannot follow (closures,
 interface calls) run after every default with known dependencies. Ties keep the
 declaration order, and a dependency cycle between defaults is a compile error.
 
-Creating a `shared T` view does not by itself move its reachable GC graph to the
+Creating an `atomic T` view does not by itself move its reachable GC graph to the
 shared collector. GC publication occurs only at an actual cross-thread transfer
 or shared-storage boundary.
 
-An ordinary value becomes `shared T` as a copy, so no alias of the shared graph
+An ordinary value becomes `atomic T` as a copy, so no alias of the shared graph
 can remain. The copy is the one `$clone` makes, with two differences: `$clone`
-hooks run through their shared-receiver variant, so a hook's body is checked
+hooks run through their atomic-receiver variant, so a hook's body is checked
 against a read-only `this` and cannot hand back the original's parts (a
 `@threadsafe` hook, like `Mutex.clone` returning itself, is trusted); and every
 generated object copy notes what it copied in a per-thread table, so cycles and
-objects reached twice keep their shape. Parts already `shared` are kept by
+objects reached twice keep their shape. Parts already `atomic` are kept by
 reference. A literal written in place is not copied, only the values it was
 given; a collection literal is copied as a whole. A value made from a raw pointer
 with `.@cast` is unsafe code's own claim and is not copied. Types that hold raw
 memory or have a `gc_free` finalizer and no `$clone` hook cannot be copied, so
-publishing one is an error; such objects are created shared, like the values of
+publishing one is an error; such objects are created atomic, like the values of
 `Channel.new` and `CancelToken.new`. Inline aggregates follow the same rule, and
 strings and other immutable values are never copied. The same copy happens for
-a `shared` global's store and default, a `shared T` parameter, and a store into
+a `shared` global's store and default, an `atomic T` parameter, and a store into
 locked data.
 
-What a method returns through a shared or locked receiver keeps the view when
+What a method returns through an atomic or locked receiver keeps the view when
 its type could reach data of the receiver: a borrow always does, and so does a
 result whose reachable classes overlap the receiver's, or that reaches an
 interface or closure. A result of unrelated types is ordinary data. This is
@@ -848,20 +848,20 @@ elements of `&[T]` and `mut &[T]` properties, and copies made with a bracket
 range. A struct of plain words reads out as an ordinary copy, but a store
 into it in place (`view.pair.n++`) or a struct method called on it in place
 still hits the view's storage, so it follows the view's rules: integer stores
-are atomic and the method gets the shared or locked receiver variant, with its
+are atomic and the method gets the atomic or locked receiver variant, with its
 `this` typed as a borrow of the viewed struct.
-A `shared` global reads as `shared T`, so it is governed by the same rules.
+A `shared` global reads as `atomic T`, so it is governed by the same rules.
 `@shared` globals are the explicit unsafe override when an external protocol
 guarantees synchronization and lifetime safety. Within an expression,
-`value.@cast(shared T)` is the corresponding explicit unsafe conversion.
+`value.@cast(atomic T)` is the corresponding explicit unsafe conversion.
 
 ### `locked T`
 
-`locked T` is the mutable counterpart of `shared T`, produced only by a
-`lock` block over a `shared Lock[T]`. The block holds the lock's mutex
+`locked T` is the mutable counterpart of `atomic T`, produced only by a
+`lock` block over an `atomic Lock[T]`. The block holds the lock's mutex
 and releases it on every exit through the function cleanup path. Reads through
 a locked view keep the view, and integer fields use atomic access. A value
-stored into locked data from elsewhere is copied in, as for a `shared`
+stored into locked data from elsewhere is copied in, as for an `atomic`
 conversion. Locked data moves without a copy only within one lock: inside a
 function, every locked value traces back to a `lock` block's binding or to the
 function's own locked receiver and arguments, and one call takes all of its
@@ -869,12 +869,12 @@ locked inputs from one lock; an argument from another lock is copied. Methods
 called on a locked receiver get a `__locked` variant whose `this` is locked and
 whose object parameters are locked too, so plain arguments are copied in at the
 call; callbacks keep their plain types and get the elements as locked views.
-Unlike the shared variant, mutating methods are allowed. Struct methods get the
+Unlike the atomic variant, mutating methods are allowed. Struct methods get the
 same variants as class methods. A `mut &[T]` property keeps its mutability
 through the view: the slice can be reassigned and its elements stored; the
 elements read back as `locked T`. A locked view cannot be returned as ordinary
 data, captured, stored in a property, global or generic type argument, assigned
-to a variable declared outside its block, or converted to `shared`. Raw stores
+to a variable declared outside its block, or converted to `atomic`. Raw stores
 in unsafe code may take a locked value only into storage of the same locked
 data.
 

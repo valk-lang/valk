@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Calls every public method of the core collections on a plain value, a `shared` view and a
+# Calls every public method of the core collections on a plain value, an `atomic` view and a
 # `locked` view, compiles each call and sorts the results: compiles, refused in the caller
 # (with the message), or failed inside the stdlib, which is always a bug. The calls expected
 # to compile are built together per subject and context, alone again if that fails.
@@ -34,7 +34,7 @@ SUBJECTS = [
     ("String", "String", {}, "String", '("abc")'),
 ]
 
-CONTEXTS = ["plain", "shared", "locked"]
+CONTEXTS = ["plain", "atomic", "locked"]
 
 SCALARS = {
     "int": "1", "uint": "0", "u8": "65", "u16": "1", "u32": "1", "u64": "1", "i64": "1",
@@ -75,7 +75,7 @@ def value_for(t, args, view=""):
         params = split_top(m.group(1))
         ret = m.group(2).strip()
         names = ["a%d" % i for i in range(len(params))]
-        # A shared receiver hands its callbacks shared elements
+        # An atomic receiver hands its callbacks atomic elements
         if view:
             params = [view + " " + p if p == "Item" else p for p in params]
         sig = ", ".join("%s: %s" % (n, p) for n, p in zip(names, params))
@@ -174,12 +174,12 @@ SUBJECTS_CODE = {
     %s
 }
 """,
-    "shared": """fn subject%d(h: shared Holder) {
+    "atomic": """fn subject%d(h: atomic Holder) {
     let x = h.p
     %s
 }
 """,
-    "locked": """fn subject%d(l: shared Lock[Holder]) {
+    "locked": """fn subject%d(l: atomic Lock[Holder]) {
     lock l as h {
         let x = h.p
         %s
@@ -190,8 +190,8 @@ SUBJECTS_CODE = {
 
 MAINS = {
     "plain": ("fn main() {\n", "    subject%d(Holder {})\n"),
-    "shared": ("fn main() {\n    let h: shared Holder = Holder {}\n", "    subject%d(h)\n"),
-    "locked": ("fn main() {\n    let l: shared Lock[Holder] = .new(Holder {}) !!\n", "    subject%d(l)\n"),
+    "atomic": ("fn main() {\n    let h: atomic Holder = Holder {}\n", "    subject%d(h)\n"),
+    "locked": ("fn main() {\n    let l: atomic Lock[Holder] = .new(Holder {}) !!\n", "    subject%d(l)\n"),
 }
 
 
