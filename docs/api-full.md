@@ -758,7 +758,7 @@ the sign, or a value that does not fit.
     + fn any(func: fn(T)(bool)) bool
     // Appends `item` to the end, growing the storage when it is full.
     + fn append(item: T, unique: bool (false)) void
-    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and `$hash` types).
+    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and types with `hash`).
     + fn append_many(items: Array[T], unique: bool (false)) void
     // Searches this array, sorted with `func`, for `value` in O(log n).
     + fn binary_search(value: T, func: fn(T, T)(bool)) (bool, uint)
@@ -904,7 +904,7 @@ Marked `$append`: backs the list literal `Array[T]{ a, b, c }`.
 #### append_many
 
 Appends every element of `items` in order; with `unique`, each one is skipped when an
-equal item is already present (tracked in a set for integers and `$hash` types).
+equal item is already present (tracked in a set for integers and types with `hash`).
 
 #### binary_search
 
@@ -1125,7 +1125,7 @@ order does not matter.
 
 Removes every element equal to an earlier one, keeping first occurrences in order.
 
-Compares with `==` (so `$eq` applies). From 128 items, integers and types with `$hash`
+Compares with `==` (so `$eq` applies). From 128 items, integers and types with `hash`
 (such as `String`) are tracked in a set, which costs O(n); otherwise it costs O(n²).
 
 #### remove_value
@@ -2253,7 +2253,7 @@ Returns a new array of the values, in entry order.
 
 A hash table from keys of type `K` to values of type `T`.
 
-Keys hash with their `$hash` method, otherwise integers by value and pointers by
+Keys hash with their `hash` method, otherwise integers by value and pointers by
 address; keys are compared with `==`, so equal keys must hash the same. Entries keep
 insertion order for `each`, `keys` and `values`, except that removing an entry moves
 the last entry into its place. Removing entries inside `each` is safe: the loop still
@@ -3062,7 +3062,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn gt(cmp: String) bool
     // Returns whether the string equals `cmp` or sorts after it in byte order; backs `>=`.
     + fn gte(cmp: String) bool
-    // Returns a hash of the bytes; the `$hash` hook that `HashMap` and `HashSet` keys use.
+    // Returns a hash of the bytes; what `HashMap` and `HashSet` keys use.
     + fn hash() uint
     // Parses the string as a hexadecimal signed integer: optional `-` or `+`, optional `0x`, digits.
     + fn hex_to_int() int !SyntaxError
@@ -3304,7 +3304,7 @@ Returns whether the string equals `cmp` or sorts after it in byte order; backs `
 
 #### hash
 
-Returns a hash of the bytes; the `$hash` hook that `HashMap` and `HashSet` keys use.
+Returns a hash of the bytes; what `HashMap` and `HashSet` keys use.
 
 Strings shorter than 8 bytes hash every byte. Longer strings hash their length and the
 first and last 8 bytes, plus 8 bytes from the middle past 16 bytes, so long keys that
@@ -17049,7 +17049,7 @@ Throws `invalid` when the data is malformed.
     + static fn from_unix_us(timestamp: int) DateTime !LookupError
     // Returns whether this value is later than `other`; backs the `>` operator (`$gt`).
     + fn greater_than(other: DateTime) bool
-    // Returns a hash of the instant; `$hash` lets `DateTime` be a `HashMap` key.
+    // Returns a hash of the instant; it lets `DateTime` be a `HashMap` key.
     + fn hash() uint
     // Returns the hour, 0 to 23.
     + fn hour() uint
@@ -17313,7 +17313,7 @@ Returns whether this value is later than `other`; backs the `>` operator (`$gt`)
 
 #### hash
 
-Returns a hash of the instant; `$hash` lets `DateTime` be a `HashMap` key.
+Returns a hash of the instant; it lets `DateTime` be a `HashMap` key.
 
 #### hour
 

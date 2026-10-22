@@ -261,7 +261,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn any(func: fn(T)(bool)) bool
     // Appends `item` to the end, growing the storage when it is full.
     + fn append(item: T, unique: bool (false)) void
-    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and `$hash` types).
+    // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and types with `hash`).
     + fn append_many(items: Array[T], unique: bool (false)) void
     // Searches this array, sorted with `func`, for `value` in O(log n).
     + fn binary_search(value: T, func: fn(T, T)(bool)) (bool, uint)
@@ -951,7 +951,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn gt(cmp: String) bool
     // Returns whether the string equals `cmp` or sorts after it in byte order; backs `>=`.
     + fn gte(cmp: String) bool
-    // Returns a hash of the bytes; the `$hash` hook that `HashMap` and `HashSet` keys use.
+    // Returns a hash of the bytes; what `HashMap` and `HashSet` keys use.
     + fn hash() uint
     // Parses the string as a hexadecimal signed integer: optional `-` or `+`, optional `0x`, digits.
     + fn hex_to_int() int !SyntaxError
@@ -5096,7 +5096,7 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
     + static fn from_unix_us(timestamp: int) DateTime !LookupError
     // Returns whether this value is later than `other`; backs the `>` operator (`$gt`).
     + fn greater_than(other: DateTime) bool
-    // Returns a hash of the instant; `$hash` lets `DateTime` be a `HashMap` key.
+    // Returns a hash of the instant; it lets `DateTime` be a `HashMap` key.
     + fn hash() uint
     // Returns the hour, 0 to 23.
     + fn hour() uint

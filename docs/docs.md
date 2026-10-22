@@ -521,10 +521,10 @@ let b : HashMap[String, uint] = a
 let c : Map[uint] = b
 ```
 
-Keys are integers, pointers, types with a `$hash` method (such as `String`), or
+Keys are integers, pointers, types with a `hash` method (such as `String`), or
 structs, tuples and fixed arrays made of those: they hash their parts the way `==`
 compares them, so `HashMap[(int, int), T]` and a `struct Point` key need no code.
-A part that is a float, or a struct with its own `$eq`, needs a `$hash` of your own.
+A part that is a float, or a struct with its own `$eq`, needs a `hash` method of your own.
 
 Full `HashMap` API: [core](api.md#core)
 
@@ -1275,7 +1275,7 @@ mode LowerCaseString for String {
     fn equals(cmp: LowerCaseString) bool $eq {
         return this.lower() == cmp.lower()
     }
-    fn hash() uint $hash {
+    fn hash() uint {
         return this.lower().hash()
     }
 }
@@ -1288,7 +1288,7 @@ fn main() {
 }
 ```
 
-`$add`, `$sub`, `$mul` and `$div` customize `+`, `-`, `*` and `/` (and `+=`, `-=`, `*=`, `/=`) for a class; the method takes the right-hand value and returns the result, and a class can have one per right-hand type. `$eq` customizes `==`. `$lt`, `$gt`, `$lte` and `$gte` order a class for `<`, `>`, `<=` and `>=`; one of them is enough, the others follow from it, and `arr.sort()` then works without a comparator. Objects without one compare only with `==`. Types used as `HashMap` keys must also define `$hash`, and equal values must produce the same hash. `Array.unique()` / `Array.remove_duplicates()` already honour `$eq`; without `$hash`, a map would bucket by the built-in hash and break that invariant.
+`$add`, `$sub`, `$mul` and `$div` customize `+`, `-`, `*` and `/` (and `+=`, `-=`, `*=`, `/=`) for a class; the method takes the right-hand value and returns the result, and a class can have one per right-hand type. `$eq` customizes `==`. `$lt`, `$gt`, `$lte` and `$gte` order a class for `<`, `>`, `<=` and `>=`; one of them is enough, the others follow from it, and `arr.sort()` then works without a comparator. Objects without one compare only with `==`. Types used as `HashMap` keys must also have a `hash` method, which takes no arguments and returns `uint`, and equal values must produce the same hash. `Array.unique()` / `Array.remove_duplicates()` already honour `$eq`; without a `hash` method, a map would bucket by the built-in hash and break that invariant.
 
 Generic specializations remain distinct and invariant even when their type
 arguments are a compatible mode/base pair. For example, `Array[LowerCaseString]`
@@ -2272,9 +2272,9 @@ class Config {
 `-` is source-private rather than class-private: other code in the same file
 can still access the declaration.
 
-Hooks (`$add`, `$eq`, `$hash`, `$to`, `$offset`, ...) follow the same markers
+Hooks (`$add`, `$eq`, `$to`, `$offset`, ..., and the `hash`, `copy` and `clone` methods) follow the same markers
 as regular functions when they are called: `x + y` and
-`HashMap[K, V]{}.set(k, v)` check the access of `$add` and `$hash`/`$eq`.
+`HashMap[K, V]{}.set(k, v)` check the access of `$add` and `hash`/`$eq`.
 Generic library code performs those calls from its own package, so a hook that
 a generic container uses must be reachable from it — mark such hooks `+`.
 
