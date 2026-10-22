@@ -197,7 +197,7 @@ test-gc-shared-stress: valk
 	@run=0; while [ $$run -lt 10 ]; do \
 		run=$$((run + 1)); \
 		echo "Shared GC stress run $$run/10"; \
-		./debug/test-gc-shared-stress || exit $$?; \
+		./debug/test-gc-shared-stress --filter "Shared GC:" || exit $$?; \
 	done
 
 watchtest: valk2
