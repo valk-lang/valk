@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Metamorphic probe of the borrow, shared and lock rules. Each wrapper (value scope, ternary,
-# tuple, `??`, call, closure, ...) rewrites one marked expression, which must not change the
+# tuple, union, `??`, call, closure, ...) rewrites one marked expression, which must not change the
 # verdict. A `refuse` rule has a safe and an unsafe program:
 #   hole:     the unsafe program compiles
 #   refused:  the safe program does not (a false positive, or a wrapper invalid there)
@@ -31,6 +31,9 @@ struct WrapRef { v: &Item }
 class BoxRef { v: &Item }
 struct WrapSlice { v: &[int] }
 class BoxSlice { v: &[int] }
+union UnionItem : Item | int {}
+union UnionRef : &Item | int {}
+union UnionSlice : &[int] | int {}
 global probe_flag: bool (true)
 global probe_item: Item (Item{})
 global probe_ints: [int x 2] ({ 1, 2 })
@@ -124,6 +127,8 @@ def wrappers():
                                     "each Array[int]{ 1 } as _ { w%d = %s }" % (n, e)],
                                    "(w%d ?! panic(\"probe\"))" % n)),
         "match": W(lambda e, t, n: ([], "(match probe_flag : %s { true => %s default => %s })" % (TYPES[t][0], e, e))),
+        "union": W(lambda e, t, n: (["let u%d: Union%s = %s" % (n, TYPES[t][2].capitalize(), e)],
+                                    "(match u%d : %s { %s as v%d => v%d default => %s })" % (n, TYPES[t][0], TYPES[t][0], n, n, TYPES[t][1]))),
         "interface": W(lambda e, t, n: (["let pi%d: ProbeIds = ProbeImpl{}" % n], "pi%d.%s(%s)" % (n, TYPES[t][2], e))),
         "recursive": W(lambda e, t, n: ([], "rec_%s(%s, 2)" % (TYPES[t][2], e))),
         "co": W(lambda e, t, n: None if t != "item" else ([], "(await co id_item(%s))" % e)),
@@ -133,7 +138,7 @@ def wrappers():
 
 
 # A borrow of a local may not be stored: these wrappers refuse it by type, whatever the rule
-LOCAL_BORROW_SKIP = ("struct", "class", "closure", "if", "array", "while", "each")
+LOCAL_BORROW_SKIP = ("struct", "class", "closure", "if", "array", "while", "each", "union")
 
 # A rule: the type of the marked expression, then the safe and unsafe bodies of `probe_main`.
 # `@W(...)` marks the expression the wrappers rewrite; `SETUP` lines come first.
