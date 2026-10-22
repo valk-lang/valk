@@ -102,17 +102,6 @@ class ValueMeta {
     checked_read: ?Value (null)
     // Original graph before lowering into temporary storage.
     graph_source: ?Value (null)
-    publishes_graph: bool (false)
-    // Reported when the published graph is not unique
-    publish_message: ?String (null)
-    // Published as shared, not moved into locked data
-    publish_shared: bool (false)
-    // A shared view lent to this parameter: published if the callee keeps it
-    borrow_param: ?Arg (null)
-    // A locked view lent to unknown code: published only if the call can hand it back
-    lent_unknown: bool (false)
-    // Ownership walk: a store's own publish, checked after its destination
-    own_hold: bool (false)
     // An Array element read out by value: writes into it are lost
     copied_element: bool (false)
     // Inline storage a call returned; a write into it is lost
@@ -124,19 +113,10 @@ class ValueMeta {
     reads_storage: bool (false)
     // A struct receiver borrowed out of a closure's captured copy
     captured_receiver: ?Decl (null)
+    // An argument for a `local` parameter that may be frame storage
+    lent_local: bool (false)
     // A literal whose `values` are the calls that write its items
     literal_items: bool (false)
-    // Ownership analysis: the variable this value was translated to, in round `own_round`
-    own_round: uint (0)
-    own_var: uint (0)
-    // Before a publication: the graph that is published
-    own_inner: uint (0)
-    // A merge: its entry in OwnGraph.joins (a loop's head, then its exit)
-    own_join: uint (OWN_NONE)
-    // A shared view that publishes nothing (value_shared_view)
-    shared_borrow: bool (false)
-    // A call: the object for what its callee made
-    own_made: uint (0)
 }
 
 class Value {
@@ -795,11 +775,6 @@ fn value_from_exp_inner(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if value_is_call_result_copy(operand) : exp.error(CALL_RESULT_COPY_ERROR)
         if value_in_readonly_view(operand, ctx) : exp.error("Cannot change storage through a read-only borrow; " + value_readonly_hint(operand, ctx))
         value_check_captured_write(operand, exp) !>
-        value_mark_summary_write(operand)
-        if operand.type == VAL.prop || operand.type == VAL.ptrv {
-            let owner = operand.value1
-            if isset(owner) && !operand.rett.is_shared_writable() : value_note_receiver_mutation(owner, ctx)
-        }
         act_check_assign(operand, exp, scope) !>
         value_mark_mutable(operand)
         value_check_shared_store(operand, exp) !>
@@ -1042,8 +1017,6 @@ fn value_check_co_lock_escape(call: Value, callee: Value, at: Exp) !Error {
     if callee.type != VAL.func {
         // A bound stack method reached through a variable or a parameter
         value_check_co_arg(callee, at) !>
-        // The coroutine keeps the callable past the call
-        value_mark_actual_escape(callee)
     }
     let args = call.values
     if !isset(args) : return
@@ -1176,7 +1149,6 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
         at.error("A locked view cannot be captured by a closure; it is only valid inside its lock block")
     }
     source.is_captured = true
-    value_mark_actual_escape(vgen_decl(source))
     if source.implicit_borrow {
         at.error("An implicit pointer borrow cannot be captured: the address would outlive the value")
     }
@@ -1196,7 +1168,7 @@ fn func_capture_decl(func: Func, decl: Decl, name: String, at: Exp) Decl !Error 
     if func.is_shared && (source.type.has_gc_refs() || source.type.get_non_nullable().kind == TYPE.closure)
         && !type_refs_all_shared(source.type)
     {
-        at.error("A shared function cannot capture non-shared data of type '" + source.type.compat_display_name() + "'; a mutable alias remains")
+        at.error("An atomic function cannot capture non-atomic data of type '" + source.type.compat_display_name() + "'; a mutable alias remains")
     }
     let captured = Decl.new(func, captured_type, true, name)
     captured.exp = source.exp
@@ -1269,7 +1241,7 @@ fn value_from_func_lit_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     if shared {
         let thread_bound = type_has_coroutine_handle(f.get_rett(), Array[Class]{})
         each f.args as a : if type_has_coroutine_handle(a.type, Array[Class]{}) : thread_bound = true
-        if thread_bound : exp.error("A shared function cannot take or return a coroutine handle; it is bound to the thread that created it")
+        if thread_bound : exp.error("An atomic function cannot take or return a coroutine handle; it is bound to the thread that created it")
     }
     parse_func_ast(f) !>
     if !f.capture_free : enclosing.note_gc_allocation()
@@ -1582,19 +1554,39 @@ fn value_hash_method(value: Value, method: Func, ctx: Context, scope: Scope, at:
 
 // `copy_shared`: a shared value is copied into a plain one, for a `$clone` whose result is not
 // shared; otherwise shared data is returned as it is, since nobody can change it
-fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool (true), allow_pointer_alias: bool (false), copy_shared: bool (false)) Value !Error {
+fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool (true), allow_pointer_alias: bool (false), copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett
     let nn = type.get_non_nullable()
     if nn.is_shared && !copy_shared : return value
-    if nn.kind == TYPE.closure : return value_fn_clone(value, ctx, scope, at) !>
+    if nn.kind == TYPE.closure {
+        // An ordinary closure read through a view: its copy is ordinary again
+        if (nn.is_shared || nn.is_locked) && copy_shared {
+            let plain = vgen_cast(value, type.plain_type())
+            plain.exp = value.exp
+            return value_fn_clone(plain, ctx, scope, at) !>
+        }
+        return value_fn_clone(value, ctx, scope, at) !>
+    }
     if allow_pointer_alias && !isset(nn.class)
         && (nn.is_bare_borrow() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of) : return value
     let class = value_member_class(nn)
     if isset(class) {
         let method = class.get_clone_hook()
         if isset(method) && (!check_access || act_allows(at, method.act, method.exp, false)) {
-            return value_clone_method(value, method, ctx, scope, at, check_access) !>
+            return value_clone_method(value, method, ctx, scope, at, check_access, view_hooks) !>
         }
+    }
+    // A slice borrow is copied into storage of its own by the `&[T]` clone hook
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local && !allow_pointer_alias {
+        let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
+        let slice_class = bare_slice_class(ctx.build, element, at) !>
+        let method = slice_class.get_clone_hook() ?! at.bug("Bare slice class has no '$clone' hook")
+        let slice_type = slice_class.get_type() !>
+        let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
+        as_slice.exp = value.exp
+        let cloned = value_clone_method(as_slice, method, ctx, scope, at, false, view_hooks) !>
+        let plain = type.plain_type()
+        return value_retype_bare_slice(cloned, plain.get_non_nullable().mut_type(), at)
     }
     if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow()) && !allow_pointer_alias {
         at.error("Cannot clone type '" + nn.compat_display_name() + "' because it aliases memory and has no accessible '$clone' function")
@@ -1602,14 +1594,14 @@ fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: 
     if nn.is_fixed_array_type() {
         // Plain data copies as a whole instead of element by element
         if type_clones_by_copy(nn) : return value
-        return value_clone_array(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+        return value_clone_array(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     }
     if nn.kind == TYPE.struct && nn.is_inline && !isset(nn.class) && nn.has_gc_refs() {
-        return value_clone_tuple(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+        return value_clone_tuple(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     }
-    if nn.kind == TYPE.union : return value_clone_union(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+    if nn.kind == TYPE.union : return value_clone_union(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     if isset(class) && nn.is_structural_type() {
-        return value_clone_object(value, class, ctx, scope, at, check_access, allow_pointer_alias, copy_shared) !>
+        return value_clone_object(value, class, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     }
     return value
 }
@@ -1654,6 +1646,10 @@ fn type_can_clone(type: Type, allow_pointer_alias: bool, seen: Array[Class]) boo
             return true
         }
     }
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local {
+        let element = nn.get_sub_type() ?! return true
+        return type_can_clone(element, allow_pointer_alias, seen)
+    }
     if nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow() : return false
     if nn.is_fixed_array_type() {
         let sub = nn.get_sub_type() ?! return true
@@ -1668,6 +1664,8 @@ fn type_can_clone(type: Type, allow_pointer_alias: bool, seen: Array[Class]) boo
         return true
     }
     if isset(class) && nn.is_structural_type() {
+        // A copy would share the resource its finalizer releases
+        if isset(class.get_func("gc_free")) : return false
         seen.append(class)
         each class.props as prop {
             if !type_can_clone(prop.type, allow_pointer_alias, seen) : return false
@@ -1682,16 +1680,21 @@ fn clone_copies_shared(copy_shared: bool, declared: Type) bool {
     return copy_shared && !declared.get_non_nullable().is_shared
 }
 
-fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp, check_access: bool) Value !Error {
+fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp, check_access: bool, view_hooks: bool (false)) Value !Error {
     if !method.parsed_types : parse_func_types(method) !>
 
     let body = Array[Value]{}
     let source = value_bind_once(value, ctx, at, body)
     let receiver = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
     receiver = value_read_borrowed_receiver(receiver, scope, ctx, at) !>
+    // A copy made for publishing runs the hook as on shared data: it cannot hand back the original
+    let receiver_nn = receiver.rett.get_non_nullable()
+    if view_hooks && !receiver_nn.is_shared && !receiver_nn.is_locked {
+        receiver = vgen_cast(receiver, receiver.rett.shared_type())
+    }
     let result = receiver
     if receiver.rett.is_nullable_type() {
-        result = value_clone_method(receiver, method, ctx, scope, at, check_access) !>
+        result = value_clone_method(receiver, method, ctx, scope, at, check_access, view_hooks) !>
     } else {
         method = get_func_clone_variant(method, at, check_access) !>
         method = func_for_receiver(method, receiver, at, ctx.func) !>
@@ -1721,14 +1724,14 @@ fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     if check_access {
         each class.props as prop : act_check(at, prop.act, prop.exp, true, "property") !>
     }
     let body = Array[Value]{}
     let source = value_bind_once(value, ctx, at, body)
     let clone_source = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
-    let clone_func = value_clone_func(value.rett.get_non_nullable(), class, ctx, at, check_access, allow_pointer_alias, copy_shared) !>
+    let clone_func = value_clone_func(value.rett.get_non_nullable(), class, ctx, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
     let cloned = vgen_call(ctx, vgen_func(clone_func), Array[Value]{ clone_source }, clone_func.get_rett(), scope)
     cloned.exp = at
     let result = cloned
@@ -1745,9 +1748,9 @@ fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Func !Error {
+fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Func !Error {
     let source = access_root_source(at.src)
-    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared
+    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared + ":" + view_hooks
     ctx.build.cache.clone_funcs.get(key) -> cached : return cached
 
     let owner = ctx.get_func() !>
@@ -1767,7 +1770,6 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     arg_scope.func = clone_func
     append_func_arg(clone_func, "value", type)
     bind_func_arg_decls(clone_func) !>
-    func_begin_unique_summary(clone_func)
 
     let body_scope = arg_scope.sub_scope()
     body_scope.func = clone_func
@@ -1776,22 +1778,67 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     clone_func.defer_scope = body_scope.sub_scope()
     let inner_ctx = Context.for_func(clone_func)
     let value_arg = clone_func.args.get(0) ! at.bug("Clone helper is missing its value")
-    let source_value = vgen_decl(value_arg.decl)
-    let fields = HashMap[Prop, Value]{}
-    each class.props as prop {
-        let field = vgen_prop(prop, source_value, inner_ctx)
-        field.rett = type.storage_view_of(prop.type)
-        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type)) !>
-        prop.type.compat_check(cloned.rett, at) !>
-        fields.set(prop, cloned)
+    let b = ctx.build
+    let plain = type.plain_type()
+    if !plain.is_gc_type() {
+        // A struct is copied by value: it has no identity to keep
+        let fields = HashMap[Prop, Value]{}
+        each class.props as prop {
+            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+            field.rett = type.storage_view_of(prop.type)
+            let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+            prop.type.compat_check(cloned.rett, at) !>
+            fields.set(prop, cloned)
+        }
+        let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
+        body_scope.append_value(vgen_return(result, b, at))
+    } else {
+        // An object copied before in this clone is that copy again, so cycles and parts reached
+        // twice keep their shape. The copy is noted before its fields are copied
+        let ptr_t = type_ptr(b)
+        let begin_f = value_get_valk_func(b, "core", "clone_begin", at) !>
+        let end_f = value_get_valk_func(b, "core", "clone_end", at) !>
+        let find_f = value_get_valk_func(b, "core", "clone_find", at) !>
+        let note_f = value_get_valk_func(b, "core", "clone_note", at) !>
+        each Array[Func]{ begin_f, end_f, find_f, note_f } as helper_f {
+            if !helper_f.parsed_types : parse_func_types(helper_f) !>
+        }
+        body_scope.append_value(vgen_call(inner_ctx, vgen_func(begin_f), Array[Value]{}, begin_f.get_rett(), body_scope))
+        let found = Decl.new(clone_func, find_f.get_rett(), false, "found")
+        found.exp = at
+        body_scope.add_decl(found)
+        let find = vgen_call(inner_ctx, vgen_func(find_f), Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t) }, find_f.get_rett(), body_scope)
+        body_scope.append_value(vgen_assign(vgen_decl(found), find, ASSIGN_OP.set, b, at))
+        let again = Array[Value]{
+            vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope)
+            vgen_return(vgen_cast(value_force_remove_nullable(vgen_decl(found)), plain), b, at)
+        }
+        body_scope.append_value(vgen_if(vgen_isset_val(vgen_decl(found), type_bool(b)), again, null, b, at))
+
+        let shallow = HashMap[Prop, Value]{}
+        each class.props as prop {
+            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+            shallow.set(prop, vgen_cast(field, prop.type))
+        }
+        let result = Decl.new(clone_func, plain, false, "result")
+        result.is_mut = true
+        result.exp = at
+        body_scope.add_decl(result)
+        body_scope.append_value(vgen_assign(vgen_decl(result), vgen_class_init(inner_ctx, class, shallow, plain, at) !>, ASSIGN_OP.set, b, at))
+        let note_args = Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t), vgen_cast(vgen_decl(result), ptr_t) }
+        body_scope.append_value(vgen_call(inner_ctx, vgen_func(note_f), note_args, note_f.get_rett(), body_scope))
+        each class.props as prop {
+            let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+            field.rett = type.storage_view_of(prop.type)
+            let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+            if cloned == field : continue
+            prop.type.compat_check(cloned.rett, at) !>
+            let slot = vgen_prop(prop, vgen_decl(result), inner_ctx)
+            body_scope.append_value(vgen_store(slot, cloned, ASSIGN_OP.set, inner_ctx, body_scope, at) !>)
+        }
+        body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{}, end_f.get_rett(), body_scope))
+        body_scope.append_value(vgen_return(vgen_decl(result), b, at))
     }
-    let result = vgen_class_init(inner_ctx, class, fields, type.plain_type(), at) !>
-    // Generated bodies need the same freshness proof as source functions.
-    clone_func.unique_summary_saw_return = true
-    clone_func.returns_unique_graph = value_summary_graph_is_unique(result, clone_func, clone_func.unique_return_args) !>
-    if !clone_func.returns_unique_graph : value_mark_summary_escape(result, false)
-    func_finish_unique_summary(clone_func) !>
-    body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
 
     owner.unit.functions.append(clone_func)
@@ -1817,7 +1864,7 @@ fn value_bind_once(value: Value, ctx: Context, at: Exp, body: Array[Value], snap
     return slot
 }
 
-fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett.plain_type()
     let array = type.get_non_nullable()
     let sub = array.get_sub_type() ?! at.bug("Fixed-array clone has no element type")
@@ -1829,7 +1876,7 @@ fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
     let i: uint = 0
     while i < array.length {
         let element = vgen_multi_part(clone_source, i, value.rett.storage_view_of(sub), at)
-        let cloned = value_clone(element, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, sub)) !>
+        let cloned = value_clone(element, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, sub), view_hooks) !>
         sub.compat_check(cloned.rett, at) !>
         elements.append(cloned)
         i++
@@ -1849,7 +1896,7 @@ fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
 }
 
 // A tuple is copied part by part, like a fixed array
-fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett.plain_type()
     let tuple = type.get_non_nullable()
     let members = tuple.get_members() ?! at.bug("Tuple clone has no member types")
@@ -1870,7 +1917,7 @@ fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
             if part.rett != member : retyped = true
             continue
         }
-        let cloned = value_clone(part, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member)) !>
+        let cloned = value_clone(part, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member), view_hooks) !>
         // A copy of locked data is not locked
         let expected = member.plain_type()
         expected.compat_check(cloned.rett, at) !>
@@ -1894,7 +1941,7 @@ fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
     return vgen_scoped_value(body, result, at)
 }
 
-fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false)) Value !Error {
+fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
     let type = value.rett.plain_type()
     let union = type.get_non_nullable()
     let members = union.get_members() ?! at.bug("Tagged-union clone has no alternatives")
@@ -1911,7 +1958,7 @@ fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_ac
         }
         let extracted = vgen_union_extract(source, member, ctx, at) !>
         extracted.rett = value.rett.storage_view_of(member)
-        let cloned = value_clone(extracted, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member)) !>
+        let cloned = value_clone(extracted, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member), view_hooks) !>
         member.compat_check(cloned.rett, at) !>
         let wrapped = vgen_union_wrap(cloned, type, i, ctx) ?! at.bug("Failed to rebuild cloned tagged union")
         result = vgen_this_or_that(vgen_union_is(source, i, at), wrapped, result, type)
@@ -2211,7 +2258,6 @@ fn native_sequence_helper_base(owner: Func, name: String, key: String, on_type: 
 }
 
 fn native_sequence_helper_finish(func: Func) !Error {
-    func_finish_unique_summary(func) !>
     let owner_unit = func.unit
     owner_unit.functions.append(func)
     func_finish_ast(func) !>
@@ -2229,7 +2275,6 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let func = native_sequence_helper_base(owner, "get", key, on_type, rett, at) !>
     ctx.build.cache.sequence_get_funcs.set(key, func)
     bind_func_arg_decls(func) !>
-    func_begin_unique_summary(func)
 
     let body_scope = func.arg_scope.sub_scope()
     body_scope.func = func
@@ -2248,9 +2293,6 @@ fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     body_scope.append_value(vgen_if(past_end, Array[Value]{ panic_call }, null, ctx.build, at))
     let result = value_native_sequence_item(sequence, index, body_scope, inner_ctx, at) !>
     result.rett = rett
-    func.unique_summary_saw_return = true
-    func.returns_unique_graph = value_summary_graph_is_unique(result, func, func.unique_return_args) !>
-    if !func.returns_unique_graph : value_mark_summary_escape(result, false)
     body_scope.append_value(vgen_return(result, ctx.build, at))
     body_scope.did_return = true
 
@@ -2270,7 +2312,6 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     append_func_arg(func, "value", element)
     ctx.build.cache.sequence_set_funcs.set(key, func)
     bind_func_arg_decls(func) !>
-    func_begin_unique_summary(func)
 
     let body_scope = func.arg_scope.sub_scope()
     body_scope.func = func
@@ -2367,9 +2408,11 @@ fn func_for_receiver(func: Func, on: Value, at: Exp, from: ?Func (null)) Func !E
     if func.has_generic_args || func.is_generic_base : return func
     if !func.is_static && value_is_enum_storage(on) {
         let receiver = func.args.get(0) !? null
-        if !func.is_generic_base && !func.has_generic_args && isset(receiver)
-            && receiver.type.is_stack_borrow() && !isset(receiver.enum_receiver_pos) {
-            receiver.enum_receiver_pos = Pos { src: at.src, i: at.i }
+        if isset(receiver) && receiver.type.is_stack_borrow() {
+            // Enum storage is constant: a method may neither change it nor lend it out
+            let msg = "Cannot call a method that modifies or exposes enum storage; copy its underlying value first"
+            if func.get_rett().is_stack_borrow() : at.error(msg)
+            func_check_readonly_receiver(func, msg, at, from) !>
         }
     }
     if func.is_static || func.threadsafe : return func
@@ -2396,80 +2439,40 @@ fn func_for_receiver(func: Func, on: Value, at: Exp, from: ?Func (null)) Func !E
         return get_func_locked_receiver(func, at, from) !>
     }
     if !shared : return func
-    if func_mutates_receiver(func) !> {
-        at.error("Cannot call mutating method '" + func.name + "' on shared data of type '" + on.rett.compat_display_name() + "'")
+    if func.mutates_receiver {
+        at.error("Cannot call mutating method '" + func.name + "' on atomic data of type '" + on.rett.compat_display_name() + "'")
     }
     // A concrete method gets one shared-receiver variant, built on demand and
     // cached on the base (see get_func_shared_receiver). An interface call has
     // no single body to build it from and its implementations are open, so
     // there is nothing here to prove the call safe.
     if func.is_interface {
-        at.error("Cannot call interface method '" + func.name + "' on shared data of type '"
+        at.error("Cannot call interface method '" + func.name + "' on atomic data of type '"
             + on.rett.compat_display_name()
-            + "'. The implementation is not known here, so it cannot be checked against the shared rules. Call it through its concrete type instead")
+            + "'. The implementation is not known here, so it cannot be checked against the atomic rules. Call it through its concrete type instead")
     }
     let target = func_on_shared_elements(func, at) !>
     return get_func_shared_receiver(target, at, from) !>
 }
 
-// Whether a method changes anything reachable from its receiver beyond
-// atomic words: found in its own body, or in a method it calls on that data
-fn func_mutates_receiver(func: Func) bool !Error {
-    if func.threadsafe : return false
-    if func.mutates_receiver : return true
-    if func.checking_mutation : return false
-    ensure_func_unique_return_summary(func) !>
-    if func.mutates_receiver : return true
-    let calls = func.this_calls ?! return false
-    func.checking_mutation = true
-    let found = false
-    each calls as callee {
-        if func_mutates_receiver(callee) !> {
-            found = true
-            break
-        }
+// A call on storage the method may not change: its body is checked again with `this`
+// read-only, and a store in it, or in a method it calls on `this`, reports `headline` here
+fn func_check_readonly_receiver(func: Func, headline: String, at: Exp, from: ?Func) !Error {
+    if func.is_static || func.threadsafe || func.is_readonly_receiver : return
+    if func.mutates_receiver : at.error(headline)
+    // An `$immutable` class never changes its values outside itself
+    let owner = func.class ?! return
+    if owner.representation_class().immutable || !isset(func.body) : return
+    let variants = func.readonly_variants ?? <{
+        let created = Map[Func]{}
+        func.readonly_variants = created
+        return created
     }
-    func.checking_mutation = false
-    if found : func.mutates_receiver = true
-    return found
-}
-
-// Whether the method stores into its receiver, atomic words included
-fn func_writes_receiver(func: Func) bool !Error {
-    ensure_func_unique_return_summary(func) !>
-    // A body the LSP did not load, or one still being analyzed, is not
-    // known to write; only a settled summary reports
-    if !func.unique_summary_ready || func_unique_summary_unavailable_in_lsp(func) : return false
-    let receiver = func.args.get(0) ! return false
-    return receiver.may_write
-}
-
-// True when 'value' is, or was read out of, the current method's receiver
-fn value_reaches_receiver(value: Value, ctx: Context) bool {
-    let func = ctx.func ?? (ctx.get_func() !? null) ?! return false
-    if !isset(func.class) || func.is_static : return false
-    let this_arg = func.args.get(0) !? null
-    if !isset(this_arg) : return false
-    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
-        if origin == this_arg.decl : return true
-    }
-    // A struct receiver is a borrow whose storage chain names it directly
-    let current: ?Value = value
-    while isset(current) {
-        if current.type == VAL.decl : return current.decl == this_arg.decl
-        let kind = current.type
-        if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : break
-        current = current.value1
-    }
-    return false
-}
-
-// A store into 'owner' that is not an atomic word: the enclosing method
-// mutates its receiver when 'owner' comes from it
-fn value_note_receiver_mutation(owner: Value, ctx: Context) {
-    let func = ctx.func ?? (ctx.get_func() !? null) ?! return
-    if func.mutates_receiver || func_is_view_variant(func) : return
-    if value_reaches_receiver(owner, ctx) : func.mutates_receiver = true
+    if variants.has(headline) : return
+    let variant = get_func_view_variant(func, 3, 0, at, from) !>
+    variant.view_headline = headline
+    variant.check_required = true
+    variants.set(headline, variant)
 }
 
 fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
@@ -2863,9 +2866,9 @@ fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right
         if !isset(element) : left_exp.bug("Sequence type has no element type")
         // A plain element is one word: stored atomically, it is race safe.
         // Managed references follow the property rules instead.
-        let plain_element = element.is_shared_writable()
+        let plain_element = element.is_shared_plain_word()
         if type_native_sequence(on.rett).is_shared && !plain_element {
-            left_exp.error("Cannot call mutating method 'set' on shared data of type '" + on.rett.compat_display_name() + "'")
+            left_exp.error("Cannot call mutating method 'set' on atomic data of type '" + on.rett.compat_display_name() + "'")
         }
         if type_native_sequence(on.rett).is_locked && !plain_element {
             left_exp.error("Cannot assign elements holding managed references through a locked view; use '.set(index, value)'")
@@ -3222,6 +3225,13 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     let suggested = ctx.suggested_type
     if !isset(left_exp) && isset(suggested) {
         let suggested_nn = suggested.get_non_nullable()
+        // A literal for shared or locked data is built as ordinary data and then converted,
+        // which copies what it was given from elsewhere
+        let plain = suggested.plain_type()
+        if (suggested_nn.is_shared || suggested_nn.is_locked) && plain != suggested && suggested.has_gc_refs() {
+            let built = value_from_class_init_exp(exp, scope, ctx.with_suggested_type(plain)) !>
+            return value_try_convert(built, scope, ctx, suggested) !>
+        }
         // `.{ a, b }` for a `local &[T]` destination (an argument, usually): the
         // elements fill an inline `[T x N]` that the frame lends for the call
         if suggested_nn.kind == TYPE.ref_slice && suggested_nn.is_local {
@@ -3362,6 +3372,8 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
     // Field-only (or empty) structural / default construct
     if !has_elems && !has_pairs {
         let fvals = HashMap[Prop, Value]{}
+        // An object built from shared or locked parts is a view of those parts: 1 shared, 2 locked
+        let literal_view: u8 = 0
         each field_exps as fexp, field_i {
             let field_scope = expanded.field_scopes.get(field_i) ! exp.bug("Missing class-init field scope")
             let fname = fexp.str1
@@ -3392,6 +3404,14 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             if !isset(vexp) : fexp.bug("class_init field is missing value")
             let field_type = prop.type
             let fv = value_from_exp(vexp, field_scope, ctx.with_suggested_type(field_type).for_direct_init()) !>
+            let given = fv.rett.get_non_nullable()
+            let given_view: u8 = given.is_locked || fv.rett.has_locked_refs() ? 2 : (given.is_shared ? 1 : 0)
+            if given_view > 0 && rett.is_gc_type() && !field_type.get_non_nullable().is_shared && !field_type.get_non_nullable().is_locked
+                && field_type.storage_view_type(given_view == 2).compat(fv.rett) {
+                if given_view > literal_view : literal_view = given_view
+                fv = vgen_cast(fv, field_type)
+                fv.exp = vexp
+            }
             if fv.type != VAL.undefined {
                 fv = value_try_convert(fv, field_scope, ctx, field_type) !>
                 value_compat_check(field_type, fv, vexp) !>
@@ -3402,7 +3422,9 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             fvals.set(prop, fv)
         }
 
-        return class_init_construct(init_class, rett, fvals, scope, ctx, exp) !>
+        let built = class_init_construct(init_class, rett, fvals, scope, ctx, exp) !>
+        if literal_view == 0 : return built
+        return value_shared_view(built, rett.view_type(literal_view == 2))
     }
 
     // `Type{ v x n }`: the class's static `fill(count, value)`
@@ -4418,8 +4440,6 @@ fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
         if isset(gens) : exp.error("Unexpected type arguments on variable: " + name)
         let d = idf.decl
         if !isset(d) : exp.bug("Decl idf is missing decl")
-        // Reads after a publish are checked path-sensitively at the end
-        if !ctx.is_store_target : decl_invalidate_unique_dependents(d)
         d.is_used = true
         if !ctx.is_store_target : d.is_read = true
         let current = ctx.func
@@ -5334,6 +5354,9 @@ fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value 
         let call_copy = value_is_call_result_copy(receiver)
         let readonly = value_is_readonly_storage(receiver, ctx)
         let captured = receiver.rett.is_fat_borrow() ? null[?Decl] : value_captured_decl(receiver)
+        // Bound to a struct inside an object, the method keeps that object alive
+        let origin = value_borrow_origin(receiver)
+        frame_bound = origin.kind == BORROW_ORIGIN.stack || origin.kind == BORROW_ORIGIN.borrowed
         // A generic body's receiver is converted once its inferred args are concrete
         if !func.is_generic_base && !func.has_generic_args {
             receiver = value_struct_receiver(receiver, receiver_arg.type, ctx)
@@ -5342,7 +5365,6 @@ fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value 
         if call_copy : receiver.ensure_meta().call_result_copy = true
         if readonly : receiver.ensure_meta().readonly_element = true
         if isset(captured) : receiver.ensure_meta().captured_receiver = captured
-        frame_bound = true
     }
     let value = vgen_func(func, receiver)
     value.exp = at
@@ -5658,7 +5680,6 @@ fn value_complete_error_payload(value: Value, scope: Scope, ctx: Context, at: Ex
     // A payload travels with the error, beyond anything this body can see
     each values as field {
         provided.set(field.get_name(), true)
-        value_mark_actual_escape(field)
     }
 
     let caught_type: ?ErrorType = null
@@ -6192,8 +6213,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
     if !func.parsed_types {
         parse_func_types(func) !>
     }
-    ensure_func_unique_summary(func) !>
-
     let params = func.args
     // Instance methods have `this` as first arg; call args are the remaining ones
     let skip: uint = 0
@@ -6204,78 +6223,42 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         }
     }
 
-    // What the callee moves into locked data is published, so that is settled at the call
-    if !func.unique_summary_ready && value_call_reaches_locked(callee, args, skip) : ensure_func_unique_return_summary(func, true) !>
-
     let receiver: ?Value = null
-    let absorbs_known = true
     if skip == 1 {
         receiver = callee.value1
         if isset(receiver) {
             let receiver_param = params.get(0) !? null
-            if isset(receiver_param) && receiver_param.type.is_stack_borrow() && value_is_copied_element(receiver)
-                && (func_writes_receiver(func) !>)
-            {
-                at.error("Cannot call a method that changes its receiver on an element copied out of an Array; borrow it with '&arr[i]' or store the element back with '.set'")
-            }
-            // A method that returns nothing would only change the copy
-            if isset(receiver_param) && receiver_param.type.is_stack_borrow() && value_is_call_result_copy(receiver)
-                && func.get_rett().is_void_type() && (func_writes_receiver(func) !>)
-            {
-                at.error(CALL_RESULT_COPY_ERROR)
-            }
+            let borrowed = isset(receiver_param) && receiver_param.type.is_stack_borrow()
             // A struct receiver lives inside the borrow and a slice method
             // writes the slice's storage; a class or interface method works
             // on the object the slot refers to
             let func_class = func.class
-            let storage_receiver = (isset(receiver_param) && receiver_param.type.is_stack_borrow())
-                || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
-            if storage_receiver && value_is_readonly_storage(receiver, ctx) && (func_writes_receiver(func) !>) {
-                at.error("Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx))
-            }
+            let storage_receiver = borrowed || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
             let receiver_meta = receiver.meta
             let captured = isset(receiver_meta) ? receiver_meta.captured_receiver : null
-            if isset(captured) && storage_receiver && (func_writes_receiver(func) !>) {
-                at.error("Cannot call a method that changes captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead")
+            let readonly: ?String = null
+            if borrowed && value_is_copied_element(receiver) {
+                readonly = "Cannot call a method that changes its receiver on an element copied out of an Array; borrow it with '&arr[i]' or store the element back with '.set'"
+            } else if borrowed && value_is_call_result_copy(receiver) && func.get_rett().is_void_type() {
+                // A method that returns nothing would only change the copy
+                readonly = CALL_RESULT_COPY_ERROR
+            } else if storage_receiver && value_is_readonly_storage(receiver, ctx) {
+                readonly = "Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx)
+            } else if isset(captured) && storage_receiver {
+                readonly = "Cannot call a method that changes captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead"
             }
-            let current = ctx.func
-            if isset(current) && !func.is_static && value_reaches_receiver(receiver, ctx) {
-                let calls = current.this_calls
-                if !isset(calls) {
-                    calls = Array[Func]{}
-                    current.this_calls = calls
-                }
-                calls.append(func, true)
-            }
+            if isset(readonly) : func_check_readonly_receiver(func, readonly, at, ctx.func) !>
             let receiver_arg = params.get(0) !? null
             let owner = ctx.get_func() !>
-            // Frame storage as the receiver of a slice method lends its storage the
-            // way an argument does: the callee may not keep it, and an object it
-            // keeps it in (its result, another argument) must stay in this frame
-            // The receiver was retyped to the method's class on the way here; the
-            // storage it came from is behind the wrappers
+            // Frame storage as a receiver goes only to a `local` receiver. The receiver was
+            // retyped to the method's class on the way here; the storage is behind the wrappers
             let receiver_origin = receiver
             while receiver_origin.type == VAL.cast || receiver_origin.type == VAL.wrap || receiver_origin.type == VAL.interface_wrap {
                 receiver_origin = receiver_origin.value1 ?! break
             }
             if isset(receiver_arg) && !is_coroutine && receiver_arg.type.get_non_nullable().is_owned_borrow()
                 && !receiver_arg.type.get_non_nullable().is_local && value_is_stack_borrow_source(receiver_origin) {
-                if !func.unique_summary_ready : ensure_func_unique_return_summary(func, true) !>
-                let absorbed = func_arg_absorbed_into_other(func, 0) !>
-                if !func.unique_summary_ready || (func_arg_may_retain(func, 0) && !absorbed) {
-                    at.error("Cannot call '" + func.name + "' on frame storage: the method keeps its receiver beyond the call, and the storage dies with this frame")
-                }
-                let settled = func_arg_summary_settled(func, 0)
-                // The callee may keep the storage in an object that must stay in the frame
-                if absorbed || !settled || (func.returns_unique_graph && func.unique_return_args.contains(0)) : owner.has_lends = true
-                if !settled && !isset(receiver_arg.cannot_escape_pos) : receiver_arg.cannot_escape_pos = Pos { src: at.src, i: at.i }
-            }
-            // A flag that is already set is final; the rest may still flip
-            if func.unique_summary_ready && func_arg_may_escape(func, 0) : value_mark_actual_escape(receiver, func_arg_may_retain(func, 0))
-            if func.unique_summary_ready && func_arg_invalidates_unique(func, 0) && !value_is_raw_pointer_arg(receiver) : value_invalidate_unique(receiver)
-            else if !(value_absorb_call_args(func, receiver_arg, receiver, args, skip, owner, false, receiver) !>) : absorbs_known = false
-            if !func_arg_summary_settled(func, 0) && isset(receiver_arg) {
-                value_defer_arg_effects(receiver_arg, receiver, at) !>
+                at.error("Cannot call '" + func.name + "' on frame storage: its receiver is not a 'local' borrow, so the method may keep it")
             }
         }
     }
@@ -6297,6 +6280,13 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         at.error("Too many arguments for '" + func.name + "' (expected at most " + max_params + ", got " + args.length + ")")
     }
 
+    // The lock of the call's locked inputs, from the receiver or the first locked argument
+    let call_lock_root: ?Decl = null
+    let call_lock_known = false
+    if isset(receiver) && receiver.rett.has_locked_refs() && isset(ctx.func) {
+        call_lock_root = value_lock_root(receiver, ctx.get_func() !>)
+        call_lock_known = true
+    }
     let i: uint = 0
     while i < args.length {
         let param_i = skip + i
@@ -6331,22 +6321,9 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             // Frame storage lent to an owned-borrow parameter: the ownership walk checks that
             // nothing the callee keeps or returns lets it leave this frame. A coroutine keeps
             // its arguments, so never there
-            let accepts_stack_borrow = !is_coroutine && param.type.get_non_nullable().is_owned_borrow()
-                && !param.type.get_non_nullable().is_local
-                && value_is_stack_borrow_source(av)
-            let lends_into_holder = accepts_stack_borrow
-            let settled = func_arg_summary_settled(func, param_i)
-            // Lent for the call; the ownership walk publishes it when the callee keeps it. A
-            // literal has no other owner and a coroutine keeps its arguments: those are published
-            let fresh_literal = av.type == VAL.class_init || av.type == VAL.array_init
-            let accepts_shared_borrow = !fresh_literal && !is_coroutine
-            // Part of the locked graph handed back to a method on that graph
-            // is a rearrangement, not a new view
-            if isset(receiver) && receiver.rett.get_non_nullable().is_locked
-                && av.rett.get_non_nullable().is_locked && !param.type.get_non_nullable().is_locked
-                && value_stays_inside(av, receiver)
-            {
-                av = vgen_cast(av, av.rett.plain_type())
+            if !is_coroutine && param.type.get_non_nullable().is_owned_borrow() && !param.type.get_non_nullable().is_local
+                && value_is_stack_borrow_source(av) {
+                at.error("Frame storage can only be passed to a 'local' borrow parameter; parameter '" + param.name + "' of " + func_user_name(func) + " may keep it")
             }
             // Locked plain data lent for the call: a `local` borrow cannot outlive it, and
             // elements without references have nothing to take out of the lock
@@ -6357,51 +6334,35 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
             {
                 av = vgen_cast(av, av.rett.plain_type())
             }
-            let plain_arg = !av.rett.get_non_nullable().is_shared
-            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow, false, accepts_shared_borrow, accepts_stack_borrow) !>
-            if accepts_shared_borrow && plain_arg && av.type == VAL.shared_view {
-                av.ensure_meta().borrow_param = param
-                let caller = ctx.get_func() !>
-                caller.has_publications = true
+            let lent_local = param.type.is_stack_borrow() && !value_is_owned_storage(av)
+            let was_locked = av.rett.has_locked_refs()
+            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow) !>
+            if lent_local : av.ensure_meta().lent_local = true
+            // One call gets its locked data from one lock: data from another is copied
+            if was_locked && param.type.has_locked_refs() {
+                let root = value_lock_root(av, ctx.get_func() !>)
+                if !isset(call_lock_root) && !call_lock_known {
+                    call_lock_root = root
+                    call_lock_known = true
+                } else if !isset(root) || root != call_lock_root {
+                    let copied = value_publish_copy(av, ctx, scope, param.type) !>
+                    if copied != av : av = value_shared_view(copied, param.type)
+                }
             }
-            if lends_into_holder {
-                let caller = ctx.get_func() !>
-                caller.has_lends = true
-            }
-            let owner = ctx.get_func() !>
-            if func.unique_summary_ready && func_arg_may_escape(func, param_i) : value_mark_actual_escape(av, func_arg_may_retain(func, param_i))
-            if func.unique_summary_ready && func_arg_invalidates_unique(func, param_i) && !value_is_raw_pointer_arg(av) : value_invalidate_unique(av)
-            else if !(value_absorb_call_args(func, param, av, args, skip, owner, false, receiver) !>) : absorbs_known = false
-            if !settled : value_defer_arg_effects(param, av, at) !>
             let source_kind = av.rett.get_non_nullable().kind
             let target_kind = param.type.get_non_nullable().kind
             let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.adr_of || value_is_borrow_address(av))
                 && (target_kind == TYPE.ptr_of || param.type.is_raw_pointer())
+            // The callee may keep the address: what it does with it is unsafe code's concern
             if av.is_implicit_borrow() && accepts_reference_pointer && !accepts_borrow {
-                // A flag that is already set is final
-                if func.unique_summary_ready && param.may_escape {
-                    require_unsafe(at, scope, "Passing an implicit pointer borrow to escaping pointer storage") !>
-                } else if !func_arg_summary_settled(func, param_i) && !scope.mark_unsafe_used() && !ctx.build.options.ignore_unsafe {
-                    if !isset(param.cannot_escape_pos) : param.cannot_escape_pos = Pos { src: at.src, i: at.i }
-                }
+                require_unsafe(at, scope, "Passing an implicit pointer borrow to pointer storage") !>
             }
-            // A closure bound to a frame receiver may be handed to a callee
-            // that is known not to keep or return it.
+            // A closure bound to frame storage would carry its address along
             let frame_closure = av.is_implicit_borrow() && source_kind == TYPE.closure && target_kind == TYPE.closure
-            if frame_closure && !func.unique_summary_ready : ensure_func_unique_return_summary(func, true) !>
-            let accepts_frame_closure = frame_closure
-                && func.unique_summary_ready && !func_arg_may_retain(func, param_i)
-                && !(func.returns_unique_graph && func.unique_return_args.contains(param_i))
-                && !func.borrow_return_args.contains(param_i)
-                && !(func_arg_absorbed_into_other(func, param_i) !>)
-            if frame_closure && !accepts_frame_closure {
-                at.error("A method bound to a stack receiver cannot be passed to " + func_user_name(func) + "; it is kept beyond the call through parameter '" + param.name + "'")
+            if frame_closure {
+                at.error("A method bound to frame storage cannot be passed as a callback; the storage dies with this frame")
             }
-            // A provisional flag may still flip; re-checked once it settles
-            if frame_closure && !func_arg_summary_settled(func, param_i) && !isset(param.cannot_escape_pos) {
-                param.cannot_escape_pos = Pos { src: at.src, i: at.i }
-            }
-            if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !accepts_frame_closure {
+            if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !frame_closure {
                 at.error("An implicit pointer borrow cannot be passed to raw pointer storage: the address would outlive the value")
             }
             args.set(i, av) ! at.bug("value_check_call_args: args.set out of range")
@@ -6420,7 +6381,6 @@ fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: S
         }
         i++
     }
-    if !absorbs_known : value_defer_call_absorbs(func, receiver, args, skip, ctx.get_func() !>)
     // Native indexing helpers implement storage access, not a source-level call.
     require_unsafe_func(func, scope, at) !>
     if check_pointer_args : require_void_pointer_call(func, callee, args, scope, at) !>
@@ -6685,7 +6645,7 @@ fn char_literal_byte(s: String) int {
 // A `local &` borrow, or inline frame storage (and storage reached through a
 // local borrow) that an owned-borrow parameter would otherwise refuse
 // Whether every reference a value of this type carries is shared, so copying it to another
-// thread leaves no mutable alias: a shared view, or an inline value made of them
+// thread leaves no mutable alias: a atomic view, or an inline value made of them
 fn type_refs_all_shared(type: Type) bool {
     let t = type.get_non_nullable()
     if t.is_shared : return true
@@ -6711,17 +6671,87 @@ fn type_refs_all_shared(type: Type) bool {
     return true
 }
 
-// A call that hands locked data and an ordinary graph to the same function as arguments
-fn value_call_reaches_locked(callee: Value, args: Array[Value], skip: uint) bool {
-    let locked = false
-    let plain = false
-    let receiver = skip == 1 ? callee.value1 : null
-    if isset(receiver) && !receiver.rett.get_non_nullable().is_locked && receiver.rett.has_gc_refs() : plain = true
-    each args as arg {
-        if arg.rett.get_non_nullable().is_locked : locked = true
-        else if arg.rett.has_gc_refs() : plain = true
+// A borrow that names its owner, or data that lives on its own: never frame storage
+fn value_is_owned_storage(av: Value) bool {
+    let nn = av.rett.get_non_nullable()
+    if nn.is_fat_borrow() || nn.kind == TYPE.ref_of : return !nn.is_local
+    return !av.rett.is_inline_type()
+}
+
+// Whether a call's `local` result may point into frame storage: some argument it was
+// lent from may be. Otherwise the result has the owners of its arguments
+fn value_call_lends_local(callee: Value, args: Array[Value]) bool {
+    if callee.type == VAL.func {
+        let receiver = callee.value1
+        if isset(receiver) {
+            let origin = receiver
+            while origin.type == VAL.cast || origin.type == VAL.wrap || origin.type == VAL.interface_wrap {
+                origin = origin.value1 ?! break
+            }
+            if !value_is_owned_storage(origin) : return true
+        }
     }
-    return locked && plain
+    each args as arg {
+        let meta = arg.meta ?! continue
+        if meta.lent_local : return true
+    }
+    return false
+}
+
+// A `local` result must come from what the caller lent: a parameter, or a call that was only
+// lent such storage. Storage of the function's own frame dies with it
+fn value_lent_from_args(v: Value) bool {
+    let nn = v.rett.get_non_nullable()
+    let borrow = nn.is_fat_borrow() || nn.kind == TYPE.ref_of
+    if !v.is_implicit_borrow() && (!borrow || !nn.is_local) : return true
+    let t = v.type
+    if t == VAL.decl : return value_decl_is_lent(v)
+    // A borrow made with '&': where its storage lives
+    if t == VAL.multi {
+        let address = (v.values ?? Array[Value]{}).get(1) ! return false
+        if address.type != VAL.ptr_of : return false
+        let storage = address.value1 ?! return false
+        while true {
+            let narrowed = value_narrowed_owned_borrow_source(storage)
+            if isset(narrowed) {
+                storage = narrowed
+                continue
+            }
+            if storage.type != VAL.prop && storage.type != VAL.ptrv && storage.type != VAL.cast && storage.type != VAL.wrap : break
+            storage = storage.value1 ?! return false
+        }
+        if storage.type == VAL.decl : return value_decl_is_lent(storage)
+        return value_lent_from_args(storage)
+    }
+    if t == VAL.call {
+        let callee = v.value1 ?! return false
+        if callee.type == VAL.func {
+            let receiver = callee.value1
+            if isset(receiver) && !value_lent_from_args(receiver) : return false
+        }
+        let args = v.values ?! return true
+        each args as arg {
+            if !value_lent_from_args(arg) : return false
+        }
+        return true
+    }
+    if t == VAL.cast || t == VAL.wrap || t == VAL.shared_view || t == VAL.prop || t == VAL.ptrv {
+        let inner = v.value1 ?! return false
+        return value_lent_from_args(inner)
+    }
+    if t == VAL.this_or_that {
+        let yes = v.value2 ?! return false
+        let no = (v.values ?? Array[Value]{}).get(0) ! return false
+        return value_lent_from_args(yes) && value_lent_from_args(no)
+    }
+    return false
+}
+
+// A parameter that is itself a borrow: what it points at belongs to the caller
+fn value_decl_is_lent(v: Value) bool {
+    let decl = v.decl ?! return false
+    let nn = decl.type.get_non_nullable()
+    return decl.is_arg && (nn.is_fat_borrow() || nn.kind == TYPE.ref_of)
 }
 
 fn value_is_stack_borrow_source(av: Value) bool {

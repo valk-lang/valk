@@ -403,27 +403,24 @@ A named slice such as `String` or your own `slice Bytes of u8 {}` converts to
 the bare forms, never the other way around, and two different names never
 convert to each other: a name is a promise only its own class can keep.
 
-A fixed array on the stack, such as `let key: [u8 x 4] = { 1, 2, 3, 4 }`,
-also converts to `&[T]` or `&T` when passed to a function. The compiler
-follows what the callee does with it: a callee that only reads or passes the
-borrow on is fine, and so is one that hands it back or keeps it in an object
-it returns or in another argument, such as `ByteReader.new(key)`, as long as
-that object stays in the caller's frame. The storage dies with the frame, so
-the object holding it may not be stored in a global or in an object that
-leaves the function, returned, captured by a closure, handed to a coroutine,
-or published as shared; each of those is reported where it happens. The same
-applies to a `local &T` borrow. A callee that hands the borrow to a place the
-caller cannot follow gets "Argument passed here must not escape" at the call.
-Storage that must outlive the frame belongs in a class property, a global, or
-a heap slice such as `[u8]{ 0 x 4 }`.
+A fixed array on the stack, such as `let key: [u8 x 4] = { 1, 2, 3, 4 }`, and
+other storage of the current frame can be lent to a function whose parameter is
+`local &T`, `local &[T]` or `local mut &[T]`. Such a parameter cannot be stored,
+captured or returned, so the storage cannot outlive the frame. A parameter
+without `local`, like `ByteReader.new(source: &[u8])`, may keep what it gets and
+only takes storage that lives elsewhere: a class property, a global, or a heap
+slice such as `[u8]{ 0 x 4 }`. A `.{ 1, 2, 3 }` literal passed to a `local`
+parameter fills an inline array that the frame lends for the call:
+`crypto.hex_encode(.{ 0xab, 0xcd })`. The standard library declares its byte
+inputs that way (`io.Writer.write`, hashing, encoding, compression).
 
-A parameter declared `local &[T]` or `local mut &[T]` says up front that the
-callee keeps nothing, so it takes any of these without a proof, and a
-`.{ 1, 2, 3 }` literal passed to it fills an inline array that the frame lends
-for the call: `crypto.hex_encode(.{ 0xab, 0xcd })`. The standard library
-declares its byte inputs that way (`io.Writer.write`, hashing, encoding,
-compression), while a function that stores its input, such as
-`ByteReader.new`, keeps the plain `&[u8]`.
+A function can hand back part of what it was lent by declaring a `local`
+result: `fn tail(data: local &[u8]) local &[u8] { return data.view(1, 2) }`. The
+result may only come from the parameters. At the call it is `local` again when
+frame storage went in, and an ordinary `&[u8]` when the arguments were owned, so
+`tail(heap_bytes)` can be stored. Methods of `&[T]` take their receiver this way;
+`view()` returns a `local` result. A slice method that keeps its receiver is
+marked `$owned`, like `bytes.reader()`, and cannot be called on frame storage.
 
 A fixed array `[T x N]` stores `N` elements inline. Its length cannot change, and indexes are checked at compile time when they are known.
 
@@ -998,7 +995,7 @@ You can create anonymous functions using the `fn` keyword. A function literal th
 
 A raw function pointer can convert to a closure with a compatible signature. Use `fn` for callbacks that accept both raw function pointers and closures.
 
-`object.method` binds the object as its receiver and requires a `fn` callback. It cannot convert to `fnptr`. `Type.method` leaves the receiver as the first argument and can be used as either kind of callback. A shared callback can bind a shared receiver.
+`object.method` binds the object as its receiver and requires a `fn` callback. It cannot convert to `fnptr`. `Type.method` leaves the receiver as the first argument and can be used as either kind of callback. An atomic callback can bind an atomic receiver.
 
 Where the function type is known, such as an argument or a typed variable, a
 literal can leave out its parameter types and its return type:
@@ -1373,7 +1370,7 @@ Defaults run before `main`, each after the globals it reads (directly or through
 
 A global without a default starts as zero, so it needs a type where zero is a valid value: numbers, `bool`, nullable types, raw pointers, and structs or fixed arrays made of those. A global of any other type, such as a class, `String` or a closure, needs a default.
 
-A `shared` global is read as `shared T`, so it follows the [data race](#data-races) rules: integers are atomic, objects are read-only views, and mutable state goes in a `Lock`. `@shared` is the unsafe form that reads as plain `T` and is not checked.
+A `shared` global is read as `atomic T`, so it follows the [data race](#data-races) rules: integers are atomic, objects are read-only views, and mutable state goes in a `Lock`. `@shared` is the unsafe form that reads as plain `T` and is not checked.
 
 ## Aliases
 
@@ -2069,9 +2066,9 @@ while group.has_pending() {
 println(total) // 14
 ```
 
-A closure that runs on another thread is a `shared fn`: it may capture numbers
-and `shared` values, so an object or string it needs is published first, as in
-`let name: shared String = "Ada" + "!"`. See [Data races](#data-races) for the
+A closure that runs on another thread is an `atomic fn`: it may capture numbers
+and `atomic` values, so an object or string it needs is published first, as in
+`let name: atomic String = "Ada" + "!"`. See [Data races](#data-races) for the
 rules and `Lock[T]` for mutable state.
 
 ## Channels and cancellation
@@ -2082,9 +2079,9 @@ A `Channel` moves values between coroutines, on one thread or across threads.
 `send` waits while a bounded channel is full, `recv` waits for a value, and
 both take an optional timeout and cancellation token. Closing a channel lets
 receivers drain what is queued and then fail with `closed`; `each` receives
-until then. Class values must be `shared` to travel: a literal or a local
-whose graph is unique is published when passed to `send`, and the local cannot
-be used afterwards.
+until then. Class values must be `atomic` to travel: a value passed to `send`
+becomes atomic as a copy, so the original stays usable and later changes to it
+are not sent.
 
 ```rust
 use valk.sync
@@ -2095,8 +2092,8 @@ class Job {
 }
 
 fn main() {
-    let jobs: shared sync.Channel[shared Job] = sync.Channel[shared Job].new(16) ! panic("init")
-    let results: shared sync.Channel[uint] = sync.Channel[uint].new() ! panic("init")
+    let jobs: atomic sync.Channel[atomic Job] = sync.Channel[atomic Job].new(16) ! panic("init")
+    let results: atomic sync.Channel[uint] = sync.Channel[uint].new() ! panic("init")
 
     let worker = thread.start(fn() {
         each jobs as job {
@@ -2125,7 +2122,7 @@ given to `on_cancel`. `cancel_after(ms)` cancels from a timer on the calling
 thread. A blocked `send` or `recv` given the token ends with `cancelled`:
 
 ```rust
-let stop: shared sync.CancelToken = sync.CancelToken.new() ! panic("init")
+let stop: atomic sync.CancelToken = sync.CancelToken.new() ! panic("init")
 stop.cancel_after(500)
 let value = queue.recv(0, stop) ! {
     if error_is(E.code, cancelled) : println("gave up")
@@ -2175,12 +2172,12 @@ none is free, and `release()` gives it back.
 `sync.ConcurrentMap[K, V]` is a map that threads change at the same time. Its keys
 are spread over shards with a lock each, so threads working on different keys rarely
 wait for each other, unlike one `Lock[HashMap[K, V]]`. Keys and values are numbers,
-bools, strings or `shared` objects.
+bools, strings or `atomic` objects.
 
 ```rust
 use valk.sync
 
-let hits: shared sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
+let hits: atomic sync.ConcurrentMap[String, uint] = sync.ConcurrentMap[String, uint].new() !!
 hits.add("home", 1)                     // counters start at 0
 hits.set("about", 10)
 let home = hits.get("home") ?? 0        // null when the key is missing
@@ -2205,7 +2202,7 @@ use valk.sync
 use valk.http
 
 fn main() {
-    let stop: shared sync.CancelToken = sync.CancelToken.new() ! panic("init")
+    let stop: atomic sync.CancelToken = sync.CancelToken.new() ! panic("init")
     signal.cancel_on_shutdown(stop) ! panic("signals")
 
     let server = http.Server.new("127.0.0.1", 8080, handler)
@@ -2330,7 +2327,7 @@ fn main() {
 
 ## Atomics
 
-We can do atomic operations on integers and floats by placing our operation inside an `atomic()` token. This also works on number properties of `shared` data.
+We can do atomic operations on integers and floats by placing our operation inside an `atomic()` token. This also works on number properties of `atomic` data.
 
 ```rust
 // {value-before-updating} = atomic( {variable} {op} {value} )
@@ -2552,7 +2549,7 @@ middleware gets the request and `next`, and answers by itself or through `next`.
 Middleware added first runs first:
 
 ```rust
-s.add_middleware(fn(req: http.Request, next: shared fn(http.Request)(http.Response)) http.Response {
+s.add_middleware(fn(req: http.Request, next: atomic fn(http.Request)(http.Response)) http.Response {
     let start = time.mono_ms()
     let res = next(req)
     log.info(req.method + " " + req.path + " " + res.status + " " + (time.mono_ms() - start) + "ms")
@@ -2584,7 +2581,7 @@ right away, and closing the channel ends the stream:
 
 ```rust
 fn handler(req: http.Request) http.Response {
-    let channel: shared sync.Channel[String] = sync.Channel[String].new() !!
+    let channel: atomic sync.Channel[String] = sync.Channel[String].new() !!
     co send_updates(channel) // calls channel.send(...) and finally channel.close()
     return http.Response.events(channel)
 }
@@ -2713,7 +2710,7 @@ To send one message to many connections, prepare it once with
 compression setting, and it can be shared between threads:
 
 ```rust
-let frame: shared http.WebSocketFrame = http.WebSocketFrame.text("{\"type\":\"update\"}")
+let frame: atomic http.WebSocketFrame = http.WebSocketFrame.text("{\"type\":\"update\"}")
 each sockets as ws : ws.write_frame(frame) ! continue
 ```
 
@@ -3515,9 +3512,9 @@ Project: [Link](https://github.com/valk-lang/vman)
 
 ## Data races
 
-`shared T` is a read-only view used to pass data across threads. Only number and bool properties can be changed through that view, integers with atomic access; every other store, and every method that performs one on data reached from its receiver, is rejected. The view carries over to everything read through it, including struct properties, their methods, and the elements of slice properties. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of a shared array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `shared T` requires its complete reachable object graph to be unique: nothing else may still name any part of it, including values that were moved into it earlier with a store, an initializer or a call such as `append`. Creating the view consumes that uniqueness, and every ordinary variable that named part of the graph is unusable afterwards; the check follows control flow, so a value published on one path stays usable on paths where it was not, and loops are checked for aliases made in an earlier iteration. Publishing the result of a call consumes the arguments it was built from. A unique local passed to a `shared T` parameter that keeps it is published the same way; when the function only reads it, it stays a borrow and the local remains usable. An interface method cannot be called on a shared or locked interface value, since its implementation is not known where it is called; call it through the concrete type. A shared view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch, and `$clone` or `.clone()` makes an ordinary copy. Methods on a shared collection hand out shared elements: `items.copy()` on a `shared Array[User]` is an `Array[shared User]`, and its callbacks take `shared User`. A struct, tuple or fixed array that carries references is published the same way: the aggregate is copied and the references it reaches are what the view makes read-only.
+`atomic T` is a view used to pass data across threads. Through it you can assign properties that hold a number, bool, enum or object, unless they are marked `-` or `~`. Numbers are assigned atomically, and an object is copied in the way an `atomic` conversion copies it. Strings, slices, borrows, structs and other properties of more than one word cannot be reassigned through the view, but the elements of a slice property can, under the same rules. Every other store, and every method that performs one on data reached from its receiver, is rejected. The view carries over to everything read through it, including struct properties, their methods, and the elements of slice properties. A method marked `@threadsafe` opts out of that check because it synchronizes on its own, like `Mutex.lock()`. Elements of an atomic array of plain values can be assigned with `values[i] = x`, which is an atomic store; the array cannot grow or shrink through the view. Converting `T` to `atomic T` makes a copy of the value, the way `$clone` does: the original stays usable, and nothing it changes later is seen through the view. Cycles and objects reached twice keep their shape in the copy, and parts that are already `atomic` are kept as they are. A literal written in place, like `let s: atomic User = User { name: "Ada" }`, is not copied, only the values it was given from elsewhere are. Objects that hold raw memory or a resource released by `gc_free`, like a socket, cannot be copied unless they have a `$clone` hook; they are made atomic from the start, which is why `Channel.new`, `CancelToken.new`, `Waker.new` and similar constructors return `atomic` objects. An interface method cannot be called on an atomic or locked interface value, since its implementation is not known where it is called; call it through the concrete type. An atomic view cannot be converted back to `T`; `.@cast(T)` is the unsafe escape hatch, and `$clone` or `.clone()` makes an ordinary copy. What a method returns from atomic data stays atomic when its type could reach that data, so `items.copy()` on an `atomic Array[User]` is an `atomic Array[User]`; a result of unrelated types, like a JSON value built from it, is ordinary data. A struct, tuple or fixed array that carries references is copied the same way.
 
-### Mutable shared data
+### Mutable atomic data
 
 `Lock[T]` holds a value that threads may change. The value is only reachable inside a `lock` block, which holds the lock's mutex until the block ends:
 
@@ -3527,7 +3524,7 @@ class Stats {
     names: Array[String] (.{})
 }
 
-let stats: shared Lock[Stats] = .new(Stats {}) !!
+let stats: atomic Lock[Stats] = .new(Stats {}) !!
 
 lock stats as s {
     s.count++
@@ -3537,10 +3534,7 @@ lock stats as s {
 
 Inside the block `s` is a `locked Stats`: a mutable view that is valid until the block ends. Anything read through it, like `s.names`, is a locked view too. The block releases the lock on every exit, including `return`, `throw` and `!>`. `break` and `continue` cannot leave a lock block.
 
-A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Moving data around inside the locked graph, like `s.items.append(s.first)`, is allowed. Functions can take and return `locked T` views while the originating lock is held. A
-function that stores an argument in locked data it is handed publishes that argument at the
-call, so the caller cannot use it afterwards; one that takes a `shared Lock[T]` and locks it
-itself can only store values it built. Data stored into locked data must be a unique graph, the same rule as for `shared` conversions, and it is published with the lock. Locked data may hold ordinary closures, like the order function of a `Heap`, since they only run while the lock is held; a closure is a unique graph only when it captures nothing. Such a closure cannot be handed locked objects, so a `Heap` of numbers or strings works under a lock and a `Heap` of objects does not. Data from one lock cannot be stored under another lock. Locked bytes and numbers can be passed to a `local` borrow parameter such as `local &[u8]` inside the block; a borrow of locked objects stays locked, and `&` cannot borrow a locked view. Independent copies made with `$clone` or `.clone()` may leave the block. A custom clone hook that returns the original data keeps its result locked.
+A locked view cannot escape the block: it cannot be returned past the block, captured by a closure, handed to a coroutine, stored in a property or global, or assigned to a variable declared outside the block. Data moves around inside one lock as it is, like `s.items.append(s.first)`. Anything stored into locked data from elsewhere is copied in, as for an `atomic` conversion: a plain object stored with `s.items.append(user)` is a copy, and so is data taken from another lock. A method called on locked data takes its object arguments as locked data, so those are copied at the call too. Functions can take and return `locked T` views while the originating lock is held. Locked data may hold ordinary closures, like the order function of a `Heap`, since they only run while the lock is held. Such a closure cannot be handed locked objects, so a `Heap` of numbers or strings works under a lock and a `Heap` of objects does not. Locked bytes and numbers can be passed to a `local` borrow parameter such as `local &[u8]` inside the block; a borrow of locked objects stays locked, and `&` cannot borrow a locked view. Independent copies made with `$clone` or `.clone()` may leave the block; a `$clone` hook used on locked or atomic data cannot hand back the original.
 
 Callbacks of methods on locked data get the elements as locked views, so they cannot keep them past the block:
 
@@ -3551,6 +3545,6 @@ lock stats as s {
 }
 ```
 
-Methods that put the elements in a new container or return a view of them, like `copy`, `filter`, `sorted`, `values` or `view()` on a locked collection of objects, cannot be called on locked data: the new container could keep an element past the block. The error points at the call, with a note at the line inside the method. Loop over the elements inside the block, or take an independent copy with `.clone()`.
+Methods that put the elements in a new container or return a view of them, like `copy`, `filter`, `sorted`, `values` or `view()`, return locked data on a locked collection of objects, so their results stay in the block. Take an independent copy with `.clone()` to keep elements past it.
 
 `T` must be a class type. Waiting for the lock yields to other coroutines on the thread, like `core.Mutex`. Taking a free lock is a single atomic operation, and locks, channels and cancel tokens hold no file descriptors, so a program can create as many as it likes. The lock is not reentrant: locking the same `Lock` again inside its own `lock` block deadlocks. Another coroutine on the same thread that locks it just waits until the block ends, as a coroutine on another thread would. Reading the value outside a `lock` block is not possible; every reader takes the lock too. A thread whose entry function returns while one of its coroutines is still inside a `lock` block keeps running its coroutines until that block ends.

@@ -232,15 +232,13 @@ fn value_try_union_convert(v: Value, scope: Scope, ctx: Context, target: Type, i
 
 // `borrowed`: a temporary view for a callee that keeps nothing, or an explicit unsafe one;
 // every other view of ordinary data publishes it
-fn value_shared_view(v: Value, target: Type, borrowed: bool (false)) Value {
-    let view = Value {
+fn value_shared_view(v: Value, target: Type) Value {
+    return Value {
         type: VAL.shared_view
         value1: v
         rett: target
         exp: v.exp
     }
-    if borrowed : view.ensure_meta().shared_borrow = true
-    return view
 }
 
 fn decl_escape_arg(decl: Decl) ?Arg {
@@ -254,12 +252,6 @@ fn decl_escape_arg(decl: Decl) ?Arg {
 // A bare raw pointer, as opposed to a typed '*T' or '@ref' address
 fn type_is_bare_raw_pointer(type: Type) bool {
     return type.is_raw_pointer() && type.kind != TYPE.ptr_of && type.kind != TYPE.adr_of
-}
-
-// A call argument that is a bare raw pointer taken from managed data: what
-// the callee keeps or aliases through it is the unsafe writer's concern
-fn value_is_raw_pointer_arg(value: Value) bool {
-    return value.type != VAL.decl && type_is_bare_raw_pointer(value.rett.get_non_nullable())
 }
 
 // With 'into_managed' false the walk does not step from a bare raw pointer
@@ -358,356 +350,6 @@ fn value_escape_origins(value: Value) Array[Decl] {
     return origins
 }
 
-// Same list in reused storage; only valid until the next scratch walk.
-fn value_scratch_escape_origins(value: Value, origins: Array[Decl]) Array[Decl] {
-    origins.clear()
-    value_collect_escape_origins(value, origins)
-    return origins
-}
-
-// True when every part of 'value' already comes from the graph 'owner' names,
-// so storing it there moves nothing out of that graph. Re-linking a structure
-// through its own fields is a rearrangement, not an escape.
-// Like value_stays_inside, but `owner` must name one graph: picked from two locks it may be either
-fn value_stays_inside_one(value: Value, owner: Value) bool {
-    let dest = value_scratch_escape_origins(owner, value.rett.build.cache.origins_buf_other)
-    if dest.length != 1 : return false
-    return value_stays_inside(value, owner)
-}
-
-fn value_stays_inside(value: Value, owner: Value) bool {
-    let cache = value.rett.build.cache
-    let sources = value_scratch_escape_origins(value, cache.origins_buf)
-    if sources.length == 0 : return false
-    let dest = value_scratch_escape_origins(owner, cache.origins_buf_other)
-    if dest.length == 0 : return false
-    each sources as source {
-        if !dest.contains(source) : return false
-    }
-    return true
-}
-
-// A local borrow of storage without managed elements cannot be kept by the
-// callee: the type forbids storing it, and its elements are plain bytes. A
-// raw pointer to it handed to unsafe code is the writer's concern.
-fn arg_cannot_retain(arg: Arg) bool {
-    let nn = arg.type.get_non_nullable()
-    if !nn.is_local || !nn.is_fat_borrow() : return false
-    let sub = nn.get_sub_type()
-    return !isset(sub) || !sub.has_gc_refs()
-}
-
-// `retain`: the value is kept somewhere the caller cannot follow; a return
-// only hands an alias back into the caller's frame
-fn value_mark_summary_escape(value: Value, retain: bool (true)) {
-    let origins = value.rett.build.cache.origins_buf
-    origins.clear()
-    value_collect_escape_origins(value, origins, false)
-    each origins as origin {
-        let arg = decl_escape_arg(origin)
-        if isset(arg) {
-            arg.may_escape = true
-            if retain && !arg_cannot_retain(arg) : arg.may_retain = true
-        }
-    }
-}
-
-fn value_mark_summary_unique_invalidation(value: Value) {
-    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
-        let arg = decl_escape_arg(origin)
-        if isset(arg) : arg.invalidates_unique = true
-    }
-}
-
-// Writes to inline subobjects reach the storage owner, not a copied scalar.
-fn value_mark_summary_write(value: Value) {
-    if value.type != VAL.prop && value.type != VAL.ptrv : return
-    let owner = value.value1 ?! return
-    if owner.rett.is_inline_type() && !owner.rett.get_non_nullable().is_fat_borrow() {
-        value_mark_summary_write(owner)
-        return
-    }
-    each (value_scratch_escape_origins(owner, owner.rett.build.cache.origins_buf)) as origin {
-        let arg = decl_escape_arg(origin)
-        if isset(arg) : arg.may_write = true
-    }
-}
-
-fn value_note_call_write(value: Value, param: ?Arg) {
-    // A raw pointer handed to a callee is unsafe territory, not a write to
-    // the storage it was read from
-    let nn = value.rett.get_non_nullable()
-    if nn.is_raw_pointer() || nn.kind == TYPE.ptr_of : return
-    each (value_scratch_escape_origins(value, value.rett.build.cache.origins_buf)) as origin {
-        let source = decl_escape_arg(origin) ?! continue
-        if !isset(param) {
-            source.may_write = true
-            continue
-        }
-        let dependents = param.write_dependents ?? <{
-            let created = Array[Arg]{}
-            param.write_dependents = created
-            return created
-        }
-        dependents.append(source, true)
-    }
-}
-
-fn value_note_call_writes(callee: Value, args: Array[Value]) {
-    let func = callee.resolve_call_func()
-    let skip: uint = 0
-    if isset(func) && !func.is_static && isset(func.class) {
-        let receiver = callee.value1
-        if isset(receiver) && receiver.type != VAL.type {
-            skip = 1
-            value_note_call_write(receiver, func.args.get(0) !? null)
-        }
-    }
-    if !isset(func) : value_note_call_write(callee, null)
-    let i: uint = 0
-    each args as arg {
-        let param: ?Arg = isset(func) ? (func.args.get(i + skip) !? null) : null
-        value_note_call_write(arg, param)
-        i++
-    }
-}
-
-// Parameter indices this value's graph comes from, or null when any part of it
-// comes from somewhere this call's caller does not control.
-fn value_summary_source_args(value: Value, owner: Func) ?Array[uint] {
-    let origins = value_escape_origins(value)
-    if origins.length == 0 : return null
-    let indexes = Array[uint]{}
-    each origins as origin {
-        let index = func_arg_index(owner, origin)
-        if !isset(index) : return null
-        indexes.append(index, true)
-    }
-    return indexes
-}
-
-// Record that 'on' absorbs data coming from the given parameters, instead of
-// declaring outright that it gains an external alias.
-fn value_mark_summary_absorbs(on: Value, sources: Array[uint]) {
-    each (value_scratch_escape_origins(on, on.rett.build.cache.origins_buf)) as origin {
-        let arg = decl_escape_arg(origin)
-        if !isset(arg) : continue
-        let list = arg.absorbs_args
-        if !isset(list) {
-            list = Array[uint]{}
-            arg.absorbs_args = list
-        }
-        each sources as index : list.append(index, true)
-    }
-}
-
-// A call whose callee summary was not ready yet: which arguments it moves
-// into which is settled once one of the involved graphs must be unique.
-class PendingAbsorb {
-    func: Func
-    receiver: ?Value
-    args: Array[Value]
-    skip: uint
-    owner: Func
-    resolved: bool (false)
-}
-
-fn value_attach_pending_absorb(value: Value, pending: PendingAbsorb) {
-    let decl = value_root_decl(value)
-    if isset(decl) {
-        let list = decl.pending_absorbs ?? <{
-            let created = Array[PendingAbsorb]{}
-            decl.pending_absorbs = created
-            return created
-        }
-        list.append(pending)
-        return
-    }
-    if value.type != VAL.class_init && value.type != VAL.array_init : return
-    let values = value.values ?! return
-    each values as item : value_attach_pending_absorb(item, pending)
-}
-
-// Nothing can move between the values of a call with fewer than two of them
-fn value_defer_call_absorbs(func: Func, receiver: ?Value, args: Array[Value], skip: uint, owner: Func) {
-    let tracked: uint = 0
-    if isset(receiver) && value_tracks_unique_effects(receiver) : tracked++
-    each args as av {
-        if value_tracks_unique_effects(av) : tracked++
-    }
-    if tracked < 2 : return
-    let pending = PendingAbsorb { func: func, receiver: receiver, args: args, skip: skip, owner: owner }
-    if isset(receiver) : value_attach_pending_absorb(receiver, pending)
-    each args as av {
-        if value_tracks_unique_effects(av) : value_attach_pending_absorb(av, pending)
-    }
-}
-
-fn pending_absorb_param(pending: PendingAbsorb, index: uint) ?Arg {
-    let params = pending.func.args
-    if index < params.length : return params.get(index) !? null
-    if pending.func.infinite_args && params.length > 0 : return params.get(params.length - 1) !? null
-    return null
-}
-
-fn pending_absorb_apply(pending: PendingAbsorb) !Error {
-    let receiver = pending.receiver
-    if isset(receiver) {
-        value_absorb_call_args(pending.func, pending_absorb_param(pending, 0), receiver, pending.args, pending.skip, pending.owner, true, receiver) !>
-    }
-    each pending.args as av, i {
-        value_absorb_call_args(pending.func, pending_absorb_param(pending, i + pending.skip), av, pending.args, pending.skip, pending.owner, true, receiver) !>
-    }
-}
-
-// A cycle left the callee unknown: nothing handed to it can be relied on
-fn pending_absorb_give_up(pending: PendingAbsorb) {
-    let receiver = pending.receiver
-    if isset(receiver) {
-        value_mark_summary_unique_invalidation(receiver)
-        value_invalidate_unique(receiver)
-    }
-    each pending.args as av {
-        value_mark_summary_unique_invalidation(av)
-        value_invalidate_unique(av)
-    }
-}
-
-// Callee bodies are analyzed on demand from here, like any uniqueness query
-fn decl_resolve_pending_absorbs(decl: Decl) !Error {
-    let list = decl.pending_absorbs ?! return
-    decl.pending_absorbs = null
-    each list as pending {
-        if pending.resolved : continue
-        pending.resolved = true
-        ensure_func_unique_return_summary(pending.func) !>
-        if pending.func.unique_summary_ready : pending_absorb_apply(pending) !>
-        else : pending_absorb_give_up(pending)
-    }
-}
-
-// The callee stores values it was handed into 'target'. A unique value simply
-// moves in and becomes part of the target's graph; anything else leaves an
-// alias behind, unless it came in through a parameter of this function, in
-// which case the outer call site decides. False when what the callee absorbs
-// is not known yet; forced, its own calls are settled first.
-fn value_absorb_call_args(func: Func, arg: ?Arg, target: Value, args: Array[Value], skip: uint, owner: Func, force: bool, receiver: ?Value (null)) bool !Error {
-    if !isset(arg) : return true
-    if !func.unique_summary_ready : return false
-    // What moves into locked data is published with the lock, so that is settled here; a
-    // method on locked data checks its arguments itself (value_check_locked_call_arg)
-    let first: ?Arg = func.args.get(0) !? null
-    let is_receiver = skip == 1 && first == arg
-    let locked_target = !is_receiver && target.rett.get_non_nullable().is_locked
-    if force || locked_target : decl_resolve_pending_absorbs(arg.decl) !>
-    else if isset(arg.decl.pending_absorbs) : return false
-    let absorbs = arg.absorbs_args ?! return true
-    let destination = value_root_decl(target)
-    each absorbs as index {
-        // The receiver too, when it moves into locked data
-        let av = index >= skip ? (args.get(index - skip) !? null) : (locked_target ? receiver : null)
-        // A bare raw pointer moves no graph in: what it points at is the
-        // unsafe writer's concern
-        if isset(av) && value_is_raw_pointer_arg(av) : continue
-        if isset(av) && (value_graph_is_unique(av, true) !>) {
-            // Being kept by the callee is what moving in means, not an escape
-            let param = func.args.get(index) !? null
-            if isset(param) : value_drop_pending_effect(av, param)
-            if isset(destination) : value_transfer_unique_inputs(av, destination)
-            else : value_invalidate_unique(av)
-            continue
-        }
-        let sources = isset(av) ? value_summary_source_args(av, owner) : null
-        value_absorb_param_sources(target, sources, owner)
-    }
-    return true
-}
-
-// Something that was not unique moved into 'target'. When it came in through
-// a parameter the call site decides whether that cost the target its
-// uniqueness; anything else leaves an alias behind. A local that took in a
-// parameter's graph now has that parameter among its origins.
-fn value_absorb_param_sources(target: Value, sources: ?Array[uint], owner: Func) {
-    if isset(sources) {
-        value_mark_summary_absorbs(target, sources)
-        let destination = value_root_decl(target)
-        if isset(destination) && !isset(func_arg_index(owner, destination)) {
-            let origins = destination.escape_origins ?? <{
-                let created = Array[Decl]{ destination }
-                destination.escape_origins = created
-                return created
-            }
-            each sources as index {
-                let param = owner.args.get(index) ! continue
-                origins.append(param.decl, true)
-            }
-        }
-    } else {
-        value_mark_summary_unique_invalidation(target)
-    }
-    value_invalidate_unique(target)
-}
-
-// Whether every input of this graph is the method's receiver or local data
-// built inside the method: a view of the receiver, not a new publication
-fn value_built_from_receiver(value: Value, func: Func) bool !Error {
-    // A static method has no receiver to be built from
-    if func.args.length == 0 : return false
-    // Calls that moved data into this graph settle its origins first
-    let root = value_root_decl(value)
-    if isset(root) : decl_resolve_pending_absorbs(root) !>
-    let origins = value_escape_origins(value)
-    // Nothing flowed in from anywhere the method can name: a local that was
-    // built here counts, a global or a fresh temporary does not
-    if origins.length == 0 : return isset(root) && !isset(func_arg_index(func, root))
-    each origins as origin {
-        let index = func_arg_index(func, origin)
-        if isset(index) && index != 0 : return false
-    }
-    return true
-}
-
-// A unique value stored into another graph becomes part of that graph
-fn value_link_stored_graph(value: Value, owner: Value) {
-    let destination = value_root_decl(owner) ?! return
-    value_transfer_unique_inputs(value, destination)
-}
-
-fn value_drop_pending_effect(value: Value, param: Arg) {
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) {
-        value_drop_pending_effect(graph_source, param)
-        return
-    }
-    if value.type == VAL.decl {
-        let decl = value.decl ?! return
-        if decl.is_buffer {
-            let pre = value.get_pre_value()
-            if isset(pre) : value_drop_pending_effect(pre, param)
-            return
-        }
-        let args = decl.pending_effect_args ?! return
-        let positions = decl.pending_effect_positions ?! return
-        let i: uint = args.length
-        while i > 0 {
-            i--
-            let arg = args.get(i) ! break
-            if arg != param : continue
-            args.remove(i)
-            positions.remove(i)
-        }
-        return
-    }
-    let inner = value.value1
-    if isset(inner) : value_drop_pending_effect(inner, param)
-    let other = value.value2
-    if isset(other) : value_drop_pending_effect(other, param)
-    let values = value.values
-    if isset(values) {
-        each values as item : value_drop_pending_effect(item, param)
-    }
-}
-
 // The variable whose graph holds this value, when there is one
 fn value_root_decl(value: Value) ?Decl {
     let graph_source = value.get_graph_source()
@@ -728,456 +370,117 @@ fn value_root_decl(value: Value) ?Decl {
     return null
 }
 
-// A call that hands back one of its arguments makes the result an alias of that
-// argument. Binding the result therefore consumes the argument's uniqueness,
-// which is what keeps the return itself from counting as an escape.
-fn value_consume_call_return_sources(value: Value) !Error {
-    let v = value
-    let graph_source = v.get_graph_source()
-    if isset(graph_source) {
-        value_consume_call_return_sources(graph_source) !>
-        return
+// The lock a locked value belongs to in this function: a `lock` block's binding, or the
+// function's own locked receiver and arguments, which a call takes from one lock. Null when
+// it cannot be named
+fn value_lock_root(value: Value, func: Func) ?Decl {
+    let origins = value_escape_origins(value)
+    let root: ?Decl = null
+    each origins as origin {
+        let found: ?Decl = null
+        if isset(origin.lock_scope) : found = origin
+        else if isset(decl_escape_arg(origin)) {
+            let first = func.args.get(0) ! return null
+            found = first.decl
+        }
+        if !isset(found) : return null
+        if isset(root) && root != found : return null
+        root = found
     }
-    while v.type == VAL.wrap || v.type == VAL.cast || v.type == VAL.interface_wrap || v.type == VAL.error_success || v.type == VAL.block {
-        let inner = v.value1
-        if !isset(inner) : return
-        v = inner
-    }
-    if v.type == VAL.error_handler {
-        let pre = v.get_pre_value()
-        if isset(pre) : value_consume_call_return_sources(pre) !>
-        return
-    }
-    if v.type != VAL.call : return
-    let callee = v.value1
-    if !isset(callee) : return
-    let func = callee.resolve_call_func()
-    if !isset(func) : return
-    ensure_func_unique_return_summary(func) !>
-    if !func.unique_summary_ready : return
-    each func.unique_return_args as index {
-        let arg = value_call_argument(v, func, index)
-        if isset(arg) : value_invalidate_unique(arg)
-    }
+    return root
 }
 
-fn func_unique_summary_unavailable_in_lsp(func: Func) bool {
-    let options = func.ns.build.options
-    return !func.unique_summary_ready
-        && (isset(options.lsp) || options.is_fmt)
-        && !lsp_should_parse_func_ast(func)
+// Locked data moves within its own lock; data from another lock is copied in
+fn value_lock_store(owner: Value, right: Value, target: Type, ctx: Context, scope: Scope) Value !Error {
+    if !right.rett.has_locked_refs() : return right
+    // Converted into the view just now: copied already when it needed to be
+    if right.type == VAL.shared_view : return right
+    if !owner.rett.get_non_nullable().is_locked && !owner.rett.has_locked_refs() : return right
+    let func = ctx.get_func() !>
+    let from = value_lock_root(right, func)
+    if isset(from) && from == value_lock_root(owner, func) : return right
+    let copied = value_publish_copy(right, ctx, scope, target) !>
+    if copied == right : return right
+    return value_shared_view(copied, target)
 }
 
-fn value_invalidate_unique(value: Value) {
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) {
-        value_invalidate_unique(graph_source)
-        return
-    }
-    if value.type == VAL.decl {
-        let decl = value.decl
-        if isset(decl) {
-            if decl.is_buffer {
-                let pre = value.get_pre_value()
-                let source = isset(pre) ? pre.value2 : null
-                if isset(source) : value_invalidate_unique(source)
+// What becomes shared or moves into locked data is copied, so nothing else can name it. A
+// literal is its own already: only the parts it was given from elsewhere are copied
+fn value_publish_copy(value: Value, ctx: Context, scope: Scope, target: Type) Value !Error {
+    if value_publish_needs_no_copy(value) : return value
+    let t = value.type
+    if (t == VAL.class_init && value_init_sets_fields(value)) || t == VAL.array_init {
+        let values = value.values ?? Array[Value]{}
+        each values as part, i {
+            let copied = value_publish_copy(part, ctx, scope, target) !>
+            if copied != part {
+                let prop = part.get_init_prop()
+                if isset(prop) : copied.set_init_prop(prop)
+                values.set(i, copied) _
             }
-            decl.unique_graph = false
-            decl.unique_source = null
         }
-        return
+        return value
     }
-    let inner = value.value1
-    if isset(inner) : value_invalidate_unique(inner)
-    let other = value.value2
-    if isset(other) : value_invalidate_unique(other)
-    let values = value.values
-    if isset(values) {
-        each values as item : value_invalidate_unique(item)
+    // A literal's part waiting in a buffer: copy what is stored into the buffer
+    let pre = t == VAL.decl ? value.get_pre_value() : null
+    if isset(pre) && pre.type == VAL.assign {
+        let stored = pre.value2
+        if isset(stored) : pre.value2 = value_publish_copy(stored, ctx, scope, target) !>
+        return value
     }
+    if t == VAL.this_or_that {
+        let yes = value.value2
+        if isset(yes) : value.value2 = value_publish_copy(yes, ctx, scope, target) !>
+        let values = value.values ?? Array[Value]{}
+        each values as no, i : values.set(i, value_publish_copy(no, ctx, scope, target) !>) _
+        return value
+    }
+    let func = ctx.get_func() !>
+    let at = value.exp ?? func.exp
+    if !type_can_clone(value.rett, false, Array[Class]{}) {
+        at.error("Cannot copy '" + value.rett.compat_display_name() + "' into '" + target.compat_display_name()
+            + "': it holds raw memory or a resource released by 'gc_free', and has no '$clone' function to copy it")
+    }
+    // `$clone` hooks run as on shared data, so they cannot hand back the original's parts
+    return value_clone(value, ctx, scope, at, false, false, true, true) !>
 }
 
-fn value_mark_actual_escape(value: Value, retain: bool (true)) {
-    value_mark_summary_escape(value, retain)
-    value_invalidate_unique(value)
+// A class literal whose values are its fields, not the calls a collection literal makes
+fn value_init_sets_fields(value: Value) bool {
+    let values = value.values ?! return true
+    each values as part {
+        if !isset(part.get_init_prop()) : return false
+    }
+    return true
 }
 
-fn value_publish_unique(value: Value, ctx: Context, message: ?String (null)) !Error {
-    if value.rett.get_non_nullable().is_shared : return
-    let meta = value.ensure_meta()
-    meta.publishes_graph = true
-    if isset(message) : meta.publish_message = message
-    let func = ctx.func
-    if isset(func) : func.has_publications = true
-    value_consume_published_graph(value) !>
-}
-
-fn value_consume_published_graph(value: Value) !Error {
-    if value.rett.get_non_nullable().is_shared : return
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) {
-        value_consume_published_graph(graph_source) !>
-        return
+// Data that is already safe to hand out: plain words, strings, shared data, or a fresh copy
+fn value_publish_needs_no_copy(value: Value) bool {
+    let nn = value.rett.get_non_nullable()
+    if nn.is_shared : return true
+    if !value.rett.has_gc_refs() && nn.kind != TYPE.closure : return true
+    let t = value.type
+    if t == VAL.null || t == VAL.string : return true
+    let string_class = type_string(nn.build).get_class_or_null()
+    if isset(string_class) && nn.get_class_or_null() == string_class : return true
+    if t == VAL.call {
+        let callee = value.value1 ?! return false
+        let func = callee.resolve_call_func() ?! return false
+        return func.is_clone_hook || func.name.starts_with("<clone.")
     }
-    // A call that hands back part of an argument publishes that argument too
-    if value.type == VAL.call {
-        let callee = value.value1 ?! return
-        let func = callee.resolve_call_func() ?! return
-        ensure_func_unique_return_summary(func) !>
-        if !func.unique_summary_ready : return
-        each func.unique_return_args as index {
-            let arg = value_call_argument(value, func, index)
-            if isset(arg) : value_consume_published_graph(arg) !>
-        }
-        return
-    }
-    if value.type == VAL.error_handler {
-        let call = value.get_pre_value()
-        if isset(call) : value_consume_published_graph(call) !>
-        let alternative = value.value2
-        if value.errh_kind == ERRH_KIND.value && isset(alternative) : value_consume_published_graph(alternative) !>
-        return
-    }
-    if value.type == VAL.error_success || value.type == VAL.block {
-        let inner = value.value1
-        if isset(inner) : value_consume_published_graph(inner) !>
-        return
-    }
-    // Only managed, mutable data changes hands when it is published
-    let type = value.rett.get_non_nullable()
-    if !value.rett.has_gc_refs() && type.kind != TYPE.closure : return
-    let string_class = type_string(type.build).get_class_or_null()
-    if isset(string_class) && type.get_class_or_null() == string_class : return
-    if value.type == VAL.decl {
-        let decl = value.decl
-        if isset(decl) {
-            if decl.is_buffer {
-                let pre = value.get_pre_value()
-                let source = isset(pre) ? pre.value2 : null
-                if isset(source) : value_consume_published_graph(source) !>
-                return
-            }
-            decl.unique_graph = false
-            decl.unique_source = null
-            decl.unique_published = true
-        }
-        return
-    }
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.array_init
-        || value.type == VAL.class_init || value.type == VAL.this_or_that || value.type == VAL.phi
-    {
-        let inner = value.value1
-        if isset(inner) : value_consume_published_graph(inner) !>
-        let other = value.value2
-        if isset(other) : value_consume_published_graph(other) !>
-        let values = value.values
-        if isset(values) {
-            each values as item : value_consume_published_graph(item) !>
-        }
-    }
-}
-
-fn value_can_transfer_unique_inputs(value: Value) bool {
-    if value.type == VAL.class_init || value.type == VAL.array_init : return true
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap {
-        let inner = value.value1
-        return isset(inner) && value_can_transfer_unique_inputs(inner)
+    // An object made from a raw pointer is unsafe code's own claim
+    if t == VAL.cast {
+        let inner = value.value1 ?! return false
+        let inner_nn = inner.rett.get_non_nullable()
+        return inner_nn.is_raw_pointer() || inner_nn.kind == TYPE.ptr_of
     }
     return false
-}
-
-fn value_can_defer_unique_call(value: Value) bool {
-    if value.type == VAL.call : return true
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.error_success {
-        let inner = value.value1
-        return isset(inner) && value_can_defer_unique_call(inner)
-    }
-    if value.type == VAL.error_handler {
-        let call = value.get_pre_value()
-        return isset(call) && value_can_defer_unique_call(call)
-    }
-    return false
-}
-
-fn decl_append_pending_effect(decl: Decl, arg: Arg, pos: Pos) {
-    let args = decl.pending_effect_args
-    let positions = decl.pending_effect_positions
-    if !isset(args) {
-        args = Array[Arg]{}
-        decl.pending_effect_args = args
-    }
-    if !isset(positions) {
-        positions = Array[Pos]{}
-        decl.pending_effect_positions = positions
-    }
-    args.append(arg)
-    positions.append(pos)
-}
-
-fn arg_append_dependent(param: Arg, dependent: Arg) {
-    dependent.provisional = true
-    let escape = param.escape_dependents
-    if !isset(escape) {
-        escape = Array[Arg]{}
-        param.escape_dependents = escape
-    }
-    escape.append(dependent, true)
-
-    let unique = param.unique_dependents
-    if !isset(unique) {
-        unique = Array[Arg]{}
-        param.unique_dependents = unique
-    }
-    unique.append(dependent, true)
-}
-
-fn value_transfer_unique_inputs(value: Value, destination: Decl) {
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) {
-        value_transfer_unique_inputs(graph_source, destination)
-        return
-    }
-    if value.type == VAL.decl {
-        let decl = value.decl
-        if isset(decl) {
-            if decl.is_buffer {
-                let pre = value.get_pre_value()
-                if isset(pre) : value_transfer_unique_inputs(pre, destination)
-                return
-            }
-            // Stored into its own graph: a rearrangement, not a new input
-            if decl == destination : return
-            let type = decl.type.get_non_nullable()
-            let string_class = type_string(type.build).get_class_or_null()
-            if (!decl.type.has_gc_refs() && type.kind != TYPE.closure)
-                || (isset(string_class) && type.get_class_or_null() == string_class) : return
-            decl.unique_graph = false
-            decl.unique_source = null
-            let dependents = decl.unique_dependents ?? <{
-                let a = Array[Decl]{}
-                decl.unique_dependents = a
-                return a
-            }
-            dependents.append(destination, true)
-            let pending = decl.pending_effect_args
-            let positions = decl.pending_effect_positions
-            if isset(pending) && isset(positions) {
-                each pending as arg, index {
-                    let pos = positions.get(index) !? null
-                    if isset(pos) : decl_append_pending_effect(destination, arg, pos)
-                }
-            }
-        }
-        return
-    }
-    let inner = value.value1
-    if isset(inner) : value_transfer_unique_inputs(inner, destination)
-    let other = value.value2
-    if isset(other) : value_transfer_unique_inputs(other, destination)
-    let values = value.values
-    if isset(values) {
-        each values as item : value_transfer_unique_inputs(item, destination)
-    }
-}
-
-fn decl_invalidate_unique_dependents(decl: Decl) {
-    let dependents = decl.unique_dependents ?! return
-    decl.unique_dependents = null
-    each dependents as dependent {
-        dependent.unique_graph = false
-        dependent.unique_source = null
-        decl_invalidate_unique_dependents(dependent)
-    }
-}
-
-fn value_call_argument(call: Value, func: Func, index: uint) ?Value {
-    let callee = call.value1
-    if !isset(callee) : return null
-    let skip: uint = 0
-    if isset(func.class) && !func.is_static && isset(callee.value1) : skip = 1
-    if skip == 1 && index == 0 : return callee.value1
-    if index < skip : return null
-    let args = call.values
-    return isset(args) ? (args.get(index - skip) !? null) : null
-}
-
-fn decl_require_unique_effects(decl: Decl) {
-    let pending = decl.pending_effect_args
-    let positions = decl.pending_effect_positions
-    if !isset(pending) || !isset(positions) : return
-    each pending as arg, index {
-        let pos = positions.get(index) !? null
-        if !isset(pos) : continue
-        if !isset(arg.cannot_escape_pos) : arg.cannot_escape_pos = pos
-        if !isset(arg.cannot_invalidate_unique_pos) {
-            arg.cannot_invalidate_unique_pos = pos
-        }
-    }
 }
 
 fn value_is_capture_free_func(value: Value) bool {
     if value.type != VAL.func || isset(value.value1) : return false
     let func = value.func
     return isset(func) && func.capture_free
-}
-
-fn value_graph_is_unique(value: Value, allow_named: bool, require: bool (false)) bool !Error {
-    // Read out of existing storage, so whatever aliases that storage aliases
-    // this too. It travels through a raw pointer on the way out, which would
-    // otherwise erase its provenance and make it look freshly built.
-    if value.reads_storage() : return false
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) : return value_graph_is_unique(graph_source, allow_named, require) !>
-    let type = value.rett.get_non_nullable()
-    if type.is_shared : return true
-    // A view made from a graph that was proven unique when it was converted
-    if value.type == VAL.shared_view : return true
-    if value.type == VAL.global {
-        let global = value.global
-        return isset(global) && global.shared
-    }
-    if value.type == VAL.null || value.type == VAL.string || value_is_capture_free_func(value) : return true
-
-    let string_class = type_string(type.build).get_class_or_null()
-    if isset(string_class) && type.get_class_or_null() == string_class : return true
-
-    // Ownership covers the managed graph. Raw-pointer lifetime and aliasing remain
-    // under the language's explicit unsafe-pointer rules.
-    if type.is_raw_pointer() || type.kind == TYPE.ptr_of || type.kind == TYPE.adr_of : return true
-    if !type.has_gc_refs() && type.kind != TYPE.closure : return true
-
-    if value.type == VAL.decl {
-        let decl = value.decl
-        if !isset(decl) : return false
-        if !decl.is_buffer {
-            if !allow_named : return false
-            let unique = decl.unique_graph && !decl.unique_published
-            let source = decl.unique_source
-            if !unique && !decl.unique_published && isset(source) {
-                if decl.computing_unique_source : return false
-                decl.computing_unique_source = true
-                unique = value_graph_is_unique(source, false, require) !>
-                decl.computing_unique_source = false
-                if unique {
-                    decl.unique_graph = true
-                    decl.unique_source = null
-                }
-            }
-            if unique && isset(decl.pending_absorbs) {
-                decl_resolve_pending_absorbs(decl) !>
-                unique = decl.unique_graph && !decl.unique_published
-            }
-            if unique && require : decl_require_unique_effects(decl)
-            return unique
-        }
-        let pre = value.get_pre_value()
-        if !isset(pre) || pre.type != VAL.assign : return false
-        let source = pre.value2
-        return isset(source) && (value_graph_is_unique(source, allow_named, require) !>)
-    }
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.block || value.type == VAL.vscope {
-        let inner = value.value1
-        return isset(inner) && (value_graph_is_unique(inner, allow_named, require) !>)
-    }
-    if value.type == VAL.error_handler {
-        let call = value.get_pre_value()
-        if !isset(call) || !(value_graph_is_unique(call, allow_named, require) !>) : return false
-        // `call() !? alternative` is either one
-        let alternative = value.value2
-        if value.errh_kind == ERRH_KIND.value && isset(alternative) && !alternative.never_returns {
-            return value_graph_is_unique(alternative, allow_named, require) !>
-        }
-        return true
-    }
-    if value.type == VAL.error_success {
-        let call = value.value1
-        return isset(call) && (value_graph_is_unique(call, allow_named, require) !>)
-    }
-    if value.type == VAL.call {
-        let callee = value.value1
-        if !isset(callee) : return false
-        let func = callee.resolve_call_func()
-        if !isset(func) : return false
-        ensure_func_unique_return_summary(func) !>
-        if func_unique_summary_unavailable_in_lsp(func) : return true
-        if !func.unique_summary_ready || !func.returns_unique_graph : return false
-        // Publishing the result consumes the arguments it is built from
-        each func.unique_return_args as index {
-            let arg = value_call_argument(value, func, index)
-            if !isset(arg) || !(value_graph_is_unique(arg, allow_named, require) !>) : return false
-        }
-        return true
-    }
-    if value.type == VAL.array_init || (value.type == VAL.multi && isset(value.values)) {
-        let elements = value.values
-        if !isset(elements) : return true
-        each elements as element {
-            if !(value_graph_is_unique(element, allow_named, require) !>) : return false
-        }
-        return true
-    }
-    if value.type == VAL.class_init {
-        let hook_init = isset(value.value1)
-        let fields = value.values
-        if !isset(fields) : return true
-        each fields as field {
-            if hook_init && field.type == VAL.call {
-                // A hook that keeps only what it was handed leaves the
-                // fresh object unique
-                let callee = field.value1 ?! return false
-                let func = callee.resolve_call_func() ?! return false
-                ensure_func_unique_return_summary(func) !>
-                if !func.unique_summary_ready || func_arg_may_escape(func, 0) || func_arg_invalidates_unique(func, 0) : return false
-                let args = field.values
-                if !isset(args) : continue
-                each args as arg {
-                    if !(value_graph_is_unique(arg, allow_named, require) !>) : return false
-                }
-            } else if !(value_graph_is_unique(field, allow_named, require) !>) {
-                return false
-            }
-        }
-        return true
-    }
-    if value.type == VAL.this_or_that {
-        let yes = value.value2
-        let alternatives = value.values
-        if !isset(alternatives) : return false
-        let no = alternatives.get(0) !? null
-        if !isset(yes) || !isset(no) : return false
-        // An arm that never produces a value, like a panic, adds nothing
-        return (yes.never_returns || (value_graph_is_unique(yes, allow_named, require) !>))
-            && (no.never_returns || (value_graph_is_unique(no, allow_named, require) !>))
-    }
-    if value.type == VAL.phi {
-        let alternatives = value.values
-        if !isset(alternatives) : return false
-        each alternatives as alternative {
-            if !(value_graph_is_unique(alternative, allow_named, require) !>) : return false
-        }
-        return true
-    }
-    return false
-}
-
-fn value_has_unique_graph(value: Value) bool !Error {
-    return value_graph_is_unique(value, true) !>
-}
-
-fn value_has_fresh_graph(value: Value) bool !Error {
-    return value_graph_is_unique(value, false) !>
-}
-
-fn decl_summary_pending_effects_safe(decl: Decl) bool !Error {
-    let pending = decl.pending_effect_args
-    if !isset(pending) : return true
-    each pending as arg {
-        ensure_func_unique_return_summary(arg.decl.owner) !>
-        if func_unique_summary_unavailable_in_lsp(arg.decl.owner) : continue
-        if !arg.decl.owner.unique_summary_ready : return false
-        if arg.may_escape || arg.invalidates_unique : return false
-    }
-    return true
 }
 
 fn func_arg_index(func: Func, decl: Decl) ?uint {
@@ -1187,518 +490,21 @@ fn func_arg_index(func: Func, decl: Decl) ?uint {
     return null
 }
 
-fn value_summary_graph_is_unique(value: Value, owner: Func, dependencies: Array[uint]) bool !Error {
-    // Read out of existing storage, so whatever aliases that storage aliases
-    // this too. It travels through a raw pointer on the way out, which would
-    // otherwise erase its provenance and make it look freshly built.
-    if value.reads_storage() : return false
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) : return value_summary_graph_is_unique(graph_source, owner, dependencies) !>
-    let type = value.rett.get_non_nullable()
-    if type.is_shared || value.type == VAL.null || value.type == VAL.string || value_is_capture_free_func(value) : return true
-    let string_class = type_string(type.build).get_class_or_null()
-    if isset(string_class) && type.get_class_or_null() == string_class : return true
-    if type.is_raw_pointer() || type.kind == TYPE.ptr_of || type.kind == TYPE.adr_of : return true
-    if !type.has_gc_refs() && type.kind != TYPE.closure : return true
-
-    if value.type == VAL.decl {
-        let decl = value.decl
-        if !isset(decl) : return false
-        let index = func_arg_index(owner, decl)
-        if isset(index) {
-            dependencies.append(index, true)
-            return true
-        }
-        // Settle only effects that can reach the returned graph; ordinary calls
-        // stay deferred on their Arg dependency edges.
-        let source = decl.unique_source
-        if !decl.unique_published && isset(source) {
-            if decl.computing_unique_source : return false
-            decl.computing_unique_source = true
-            let unique = value_summary_graph_is_unique(source, owner, dependencies) !>
-            decl.computing_unique_source = false
-            if unique && isset(decl.pending_absorbs) {
-                decl_resolve_pending_absorbs(decl) !>
-                unique = decl.unique_graph || isset(decl.unique_source)
-            }
-            return unique
-        }
-        if decl.unique_graph && !decl.unique_published {
-            decl_resolve_pending_absorbs(decl) !>
-            if !decl.unique_graph : return false
-            return decl_summary_pending_effects_safe(decl) !>
-        }
-        let found = false
-        let decl_origins = decl.escape_origins
-        if isset(decl_origins) {
-            each decl_origins as origin {
-                index = func_arg_index(owner, origin)
-                if !isset(index) : return false
-                dependencies.append(index, true)
-                found = true
-            }
-        }
-        if found : return true
-        if decl.is_buffer {
-            let pre = value.get_pre_value()
-            if !isset(pre) || pre.type != VAL.assign : return false
-            let source = pre.value2
-            return isset(source) && (value_summary_graph_is_unique(source, owner, dependencies) !>)
-        }
-        return false
-    }
-    if value.type == VAL.wrap || value.type == VAL.cast || value.type == VAL.interface_wrap || value.type == VAL.error_success || value.type == VAL.block {
-        let inner = value.value1
-        if !isset(inner) : return false
-        return value_summary_graph_is_unique(inner, owner, dependencies) !>
-    }
-    if value.type == VAL.error_handler {
-        let call = value.get_pre_value()
-        return isset(call) && (value_summary_graph_is_unique(call, owner, dependencies) !>)
-    }
-    if value.type == VAL.call {
-        let callee = value.value1
-        if !isset(callee) : return false
-        let func = callee.resolve_call_func()
-        if !isset(func) : return false
-        ensure_func_unique_return_summary(func) !>
-        if func_unique_summary_unavailable_in_lsp(func) : return true
-        if !func.unique_summary_ready || !func.returns_unique_graph : return false
-        each func.unique_return_args as index {
-            let arg = value_call_argument(value, func, index)
-            if !isset(arg) || !(value_summary_graph_is_unique(arg, owner, dependencies) !>) : return false
-        }
-        return true
-    }
-    if value.type == VAL.class_init && (value_summary_hook_chain_is_unique(value, owner, dependencies) !>) : return true
-    if value.type == VAL.array_init || value.type == VAL.class_init || value.type == VAL.phi
-        || (value.type == VAL.multi && isset(value.values)) {
-        let values = value.values
-        if !isset(values) : return true
-        each values as item {
-            if !(value_summary_graph_is_unique(item, owner, dependencies) !>) : return false
-        }
-        return true
-    }
-    if value.type == VAL.this_or_that {
-        let yes = value.value2
-        let alternatives = value.values
-        if !isset(yes) || !isset(alternatives) : return false
-        let no = alternatives.get(0) !? null
-        return isset(no) && (value_summary_graph_is_unique(yes, owner, dependencies) !>)
-            && (value_summary_graph_is_unique(no, owner, dependencies) !>)
-    }
-    return false
-}
-
-// A hook-style initializer whose fresh construct is rooted in a frame buffer
-// (see class_init_hook_base). Every hook reads that buffer as its receiver,
-// so the graph is unique when the construct is and each hook's other
-// returned inputs are. An unbuffered chain nests its calls and takes the
-// regular path.
-fn value_summary_hook_chain_is_unique(value: Value, owner: Func, dependencies: Array[uint]) bool !Error {
-    let base = value.value1 ?! return false
-    let hooks = value.values ?! return false
-    if base.type != VAL.decl : return false
-    let decl = base.decl ?! return false
-    if !decl.is_buffer : return false
-    let pre = base.get_pre_value() ?! return false
-    if pre.type != VAL.assign : return false
-    let construct = pre.value2 ?! return false
-    if !(value_summary_graph_is_unique(construct, owner, dependencies) !>) : return false
-
-    each hooks as hook {
-        if hook.type != VAL.call {
-            if !(value_summary_graph_is_unique(hook, owner, dependencies) !>) : return false
-            continue
-        }
-        let callee = hook.value1 ?! return false
-        let func = callee.resolve_call_func() ?! return false
-        ensure_func_unique_return_summary(func) !>
-        if func_unique_summary_unavailable_in_lsp(func) : continue
-        if !func.unique_summary_ready || !func.returns_unique_graph : return false
-        each func.unique_return_args as index {
-            let arg = value_call_argument(hook, func, index) ?! return false
-            if arg.type == VAL.decl && arg.decl == decl : continue
-            if !(value_summary_graph_is_unique(arg, owner, dependencies) !>) : return false
-        }
+// Whether every input of this graph is the method's receiver or local data
+// built inside the method: a view of the receiver, not a new publication
+fn value_built_from_receiver(value: Value, func: Func) bool {
+    // A static method has no receiver to be built from
+    if func.args.length == 0 : return false
+    let root = value_root_decl(value)
+    let origins = value_escape_origins(value)
+    // Nothing flowed in from anywhere the method can name: a local that was
+    // built here counts, a global or a fresh temporary does not
+    if origins.length == 0 : return isset(root) && !isset(func_arg_index(func, root))
+    each origins as origin {
+        let index = func_arg_index(func, origin)
+        if isset(index) && index != 0 : return false
     }
     return true
-}
-
-fn func_unique_summary_conservative(func: Func) {
-    each func.args as arg {
-        arg.may_escape = true
-        arg.may_retain = true
-        arg.invalidates_unique = true
-        arg.may_write = true
-    }
-    func.returns_unique_graph = false
-    func.unique_return_args.clear()
-    func.returns_receiver_borrow = true
-    func.unique_summary_saw_return = false
-    func.computing_unique_summary = false
-    func.unique_summary_ready = true
-}
-
-fn func_begin_unique_summary(func: Func) {
-    each func.args as arg {
-        arg.may_escape = false
-        arg.may_retain = false
-        arg.invalidates_unique = false
-        arg.may_write = false
-        arg.absorbs_args = null
-    }
-    func.pending_return_escapes = .{}
-    func.returns_unique_graph = true
-    func.unique_return_args.clear()
-    func.borrow_return_args.clear()
-    func.returns_receiver_borrow = false
-    func.unique_summary_saw_return = false
-    func.computing_unique_summary = true
-}
-
-fn func_finish_unique_summary(func: Func) !Error {
-    // Calls to bodies still unknown may yet cost a parameter its uniqueness
-    each func.args as arg {
-        if isset(arg.decl.pending_absorbs) : arg.provisional = true
-    }
-    if !func.unique_summary_saw_return : func.returns_unique_graph = false
-    // A return that hands back an argument's graph only stays alias-free while
-    // the summary says the return is unique. Once it does not, those returns
-    // are ordinary escapes.
-    if !func.returns_unique_graph {
-        each func.pending_return_escapes as retv : value_mark_summary_escape(retv, false)
-    }
-    func.pending_return_escapes = .{}
-    func.computing_unique_summary = false
-    func.unique_summary_ready = true
-}
-
-fn ensure_func_unique_summary(func: Func) !Error {
-    if func.unique_summary_ready || func.computing_unique_summary : return
-    if func.is_interface {
-        func_unique_summary_open(func)
-        return
-    }
-    if func.is_extern || !isset(func.body) {
-        func_unique_summary_conservative(func)
-    }
-}
-
-// An interface method has no body of its own: its flags start clear and
-// provisional, and `link_interface_summaries` makes them dependents of every
-// implementation at the end of the build, so a flag set in any implementation
-// flips the interface's and, through it, its callers'. Until then callers
-// defer their decisions the way they do for a recursion cycle.
-fn func_unique_summary_open(func: Func) {
-    each func.args as arg {
-        arg.may_escape = false
-        arg.may_retain = false
-        arg.invalidates_unique = false
-        arg.may_write = false
-        arg.provisional = true
-    }
-    func.returns_unique_graph = false
-    func.unique_return_args.clear()
-    func.returns_receiver_borrow = true
-    func.unique_summary_saw_return = false
-    func.computing_unique_summary = false
-    func.unique_summary_ready = true
-}
-
-// A call site whose callee has no summary yet defers to it through a dependency edge
-// and leaves the body to the pipeline. Dependency code that nothing reaches is never
-// queued for parsing, though, and an interface implementation parsed late for its
-// summary can defer to such a body: its parameters would keep their conservative
-// defaults and flip every caller up the chain as if it kept everything it was handed.
-// Those bodies are parsed here, and again for whatever they defer to in turn.
-fn parse_deferred_callees(build: Build) !Error {
-    while true {
-        let found = false
-        each build.lists.units as unit {
-            each unit.functions as func {
-                if func.unique_summary_ready || func.computing_unique_summary || func.summary_required : continue
-                if !func_has_summary_dependents(func) : continue
-                func.summary_required = true
-                ensure_func_unique_return_summary(func, true) !>
-                found = true
-            }
-        }
-        if !found : break
-    }
-}
-
-fn func_has_summary_dependents(func: Func) bool {
-    each func.args as arg {
-        if isset(arg.escape_dependents) || isset(arg.unique_dependents) || isset(arg.write_dependents) : return true
-    }
-    return false
-}
-
-// Every implementation's parameter feeds the interface method's parameter
-fn link_interface_summaries(build: Build) !Error {
-    each build.lists.classes as class {
-        each class.interfaces as interface {
-            let slot: uint = 0
-            while slot < interface.interface_method_count {
-                let requirement = interface_method_at(interface, slot)
-                slot++
-                if !isset(requirement) : continue
-                let implementation = class.get_func(requirement.name) ?! continue
-                if func_unique_summary_unavailable_in_lsp(implementation) : continue
-                ensure_func_unique_return_summary(implementation) !>
-                ensure_func_unique_summary(requirement) !>
-                each requirement.args as target, index {
-                    let source = implementation.args.get(index) ! continue
-                    arg_append_dependent(source, target)
-                    let writes = source.write_dependents ?? <{
-                        let created = Array[Arg]{}
-                        source.write_dependents = created
-                        return created
-                    }
-                    writes.append(target, true)
-                }
-            }
-        }
-    }
-}
-
-// `required`: a call site cannot decide without the summary (it would report an
-// error), so the body is parsed for it even where the LSP otherwise reads only
-// declarations. Errors in such a body belong to its own file and are not raised here.
-fn ensure_func_unique_return_summary(func: Func, required: bool (false)) !Error {
-    ensure_func_unique_summary(func) !>
-    if func.unique_summary_ready || func.computing_unique_summary : return
-
-    let saved_body = func.body
-    let summary_only = func.ns.build.options.needs_ir() && !func.info_used
-    let forced = required && !lsp_should_parse_func_ast(func)
-    if forced : func.summary_required = true
-    parse_func_ast(func) ! {
-        if !forced : throw E
-        func_unique_summary_conservative(func)
-        return
-    }
-    if !func.unique_summary_ready {
-        // The LSP deliberately skips bodies from unopened files.
-        if func_unique_summary_unavailable_in_lsp(func) : return
-        func_unique_summary_conservative(func)
-        return
-    }
-    if summary_only && func.parsed_ast {
-        prepare_func_reparse(func)
-        func.body = saved_body
-    }
-}
-
-fn func_arg_may_escape(func: Func, index: uint) bool {
-    if !func.unique_summary_ready : return true
-    let arg = func.args.get(index) !? null
-    return !isset(arg) || arg.may_escape
-}
-
-fn func_arg_may_retain(func: Func, index: uint) bool {
-    if !func.unique_summary_ready : return true
-    let arg = func.args.get(index) !? null
-    return !isset(arg) || arg.may_retain
-}
-
-// Whether the callee moves argument `index` into another argument's graph
-// (`arr.append(item)`), which the caller can follow, unlike a real escape
-fn func_arg_absorbed_into_other(func: Func, index: uint) bool !Error {
-    if !func.unique_summary_ready : return false
-    each func.args as target, target_index {
-        if target_index == index : continue
-        decl_resolve_pending_absorbs(target.decl) !>
-        let absorbs = target.absorbs_args ?! continue
-        if absorbs.contains(index) : return true
-    }
-    return false
-}
-
-fn func_arg_invalidates_unique(func: Func, index: uint) bool {
-    if !func.unique_summary_ready : return true
-    let arg = func.args.get(index) !? null
-    return !isset(arg) || arg.invalidates_unique
-}
-
-// A settled summary whose argument flags may still flip is used like an
-// unsettled one: effects are deferred to the end-of-build resolution
-fn func_arg_summary_settled(func: Func, index: uint) bool {
-    if !func.unique_summary_ready : return false
-    let arg = func.args.get(index) !? null
-    if !isset(arg) : return true
-    return !arg.provisional || (arg.may_escape && arg.invalidates_unique)
-}
-
-fn value_tracks_unique_effects(value: Value) bool {
-    let type = value.rett.get_non_nullable()
-    let raw_address = type.is_raw_pointer() || type.kind == TYPE.ptr_of || type.kind == TYPE.adr_of
-    if !value.rett.has_gc_refs() && type.kind != TYPE.closure && !raw_address : return false
-    let string_class = type_string(type.build).get_class_or_null()
-    return !isset(string_class) || type.get_class_or_null() != string_class
-}
-
-fn value_defer_unique_effect(value: Value, param: Arg, pos: Pos, force: bool (false)) {
-    // What a callee keeps of a bare raw pointer is the unsafe writer's concern,
-    // not an effect on the managed graph it was taken from
-    if value_is_raw_pointer_arg(value) {
-        let inner = value.value1
-        if isset(inner) && !inner.rett.has_gc_refs() : value_defer_unique_effect(inner, param, pos, force)
-        return
-    }
-    let graph_source = value.get_graph_source()
-    if isset(graph_source) {
-        value_defer_unique_effect(graph_source, param, pos, force)
-        return
-    }
-    if value.type == VAL.decl {
-        let decl = value.decl
-        if !isset(decl) : return
-        if decl.is_buffer {
-            let pre = value.get_pre_value()
-            let source = isset(pre) ? pre.value2 : null
-            if isset(source) : value_defer_unique_effect(source, param, pos, force)
-            return
-        }
-        if force || ((decl.unique_graph || isset(decl.unique_source)) && !decl.unique_published) {
-            decl_append_pending_effect(decl, param, pos)
-        }
-        return
-    }
-    let inner = value.value1
-    if isset(inner) : value_defer_unique_effect(inner, param, pos, force)
-    let other = value.value2
-    if isset(other) : value_defer_unique_effect(other, param, pos, force)
-    let values = value.values
-    if isset(values) {
-        each values as item : value_defer_unique_effect(item, param, pos, force)
-    }
-}
-
-fn value_defer_arg_effects(param: Arg, value: Value, at: Exp) !Error {
-    if !value_tracks_unique_effects(value) : return
-
-    // Same boundary as value_mark_summary_escape: a kept raw pointer does
-    // not make the graph it was read from depend on the callee
-    let origins = value.rett.build.cache.origins_buf
-    origins.clear()
-    value_collect_escape_origins(value, origins, false)
-    each origins as origin {
-        let source = decl_escape_arg(origin)
-        if !isset(source) : continue
-        arg_append_dependent(param, source)
-    }
-
-    value_defer_unique_effect(value, param, Pos { src: at.src, i: at.i })
-}
-
-fn resolve_deferred_unique_effects(build: Build) !Error {
-    link_interface_summaries(build) !>
-    parse_deferred_callees(build) !>
-    each build.lists.units as unit {
-        each unit.functions as func {
-            if func_unique_summary_unavailable_in_lsp(func) : continue
-            each func.args as arg : decl_resolve_pending_absorbs(arg.decl) !>
-        }
-    }
-    let escape = Array[Arg]{}
-    let retain = Array[Arg]{}
-    let invalidate = Array[Arg]{}
-    let writes = Array[Arg]{}
-    each build.lists.units as unit {
-        each unit.functions as func {
-            if func_unique_summary_unavailable_in_lsp(func) : continue
-            each func.args as arg {
-                if arg.may_escape : escape.append(arg)
-                if arg.may_retain : retain.append(arg)
-                if arg.invalidates_unique : invalidate.append(arg)
-                if arg.may_write : writes.append(arg)
-            }
-        }
-    }
-
-    while true {
-        let arg = escape.pop_last() ! break
-        let dependents = arg.escape_dependents
-        if !isset(dependents) : continue
-        each dependents as dependent {
-            if dependent.may_escape : continue
-            dependent.may_escape = true
-            escape.append(dependent)
-        }
-    }
-    while true {
-        let arg = retain.pop_last() ! break
-        let dependents = arg.escape_dependents
-        if !isset(dependents) : continue
-        each dependents as dependent {
-            if dependent.may_retain || arg_cannot_retain(dependent) : continue
-            dependent.may_retain = true
-            retain.append(dependent)
-        }
-    }
-    while true {
-        let arg = invalidate.pop_last() ! break
-        let dependents = arg.unique_dependents
-        if !isset(dependents) : continue
-        each dependents as dependent {
-            if dependent.invalidates_unique : continue
-            dependent.invalidates_unique = true
-            invalidate.append(dependent)
-        }
-    }
-
-    while true {
-        let arg = writes.pop_last() ! break
-        let dependents = arg.write_dependents ?! continue
-        each dependents as dependent {
-            if dependent.may_write : continue
-            dependent.may_write = true
-            writes.append(dependent)
-        }
-    }
-
-    each build.lists.units as unit {
-        each unit.functions as func {
-            if func_unique_summary_unavailable_in_lsp(func) : continue
-            each func.args as arg, arg_index {
-                let enum_pos = arg.enum_receiver_pos
-                if isset(enum_pos) && (arg.may_write || arg.may_escape) {
-                    enum_pos.error("Cannot call a method that modifies or exposes enum storage; copy its underlying value first")
-                }
-                let escape_pos = arg.cannot_escape_pos
-                if arg.may_retain && isset(escape_pos) && !(func_arg_absorbed_into_other(func, arg_index) !>) {
-                    escape_pos.error("Argument passed here must not escape through " + func_user_name(func)
-                        + ", but it is kept beyond the call through parameter '" + arg.name + "'")
-                }
-                let unique_pos = arg.cannot_invalidate_unique_pos
-                if arg.invalidates_unique && isset(unique_pos) {
-                    unique_pos.error("Argument passed here must not gain a mutable alias through '" + func.name
-                        + "', but one is added through parameter '" + arg.name + "'")
-                }
-            }
-        }
-    }
-
-    own_analyze(build)
-    let walk_us: uint = 0
-    // The checks need the settled summaries; every body is parsed by now
-    each build.lists.units as unit {
-        each unit.functions as func {
-            if (!func.has_publications && !func.has_lends) || func_unique_summary_unavailable_in_lsp(func) : continue
-            let t = time.mono_us()
-            own_check_func(func) !>
-            walk_us += time.mono_us() - t
-            func.body_scope = null
-        }
-    }
-    own_print_phase_stats(build, walk_us)
-    // The graphs served the checks; the rest of the build does not need them
-    each build.lists.units as unit {
-        each unit.functions as func : func.own_graph = null
-    }
 }
 
 fn fixed_array_pointer_compat(source: Type, target: Type) bool {
@@ -1842,8 +648,7 @@ fn value_try_convert(
     is_auto: bool (true),
     allow_inline_borrow: bool (false),
     allow_shared_unsafe: bool (false),
-    allow_shared_borrow: bool (false),
-    allow_stack_owned: bool (false)
+    allow_shared_borrow: bool (false)
 ) Value !Error {
     if target.is_void_type() : return v
     let result = v
@@ -1900,7 +705,7 @@ fn value_try_convert(
             let source_view = result.rett.get_non_nullable()
             if (target_view.is_shared || target_view.is_locked) && !source_view.is_shared && !source_view.is_locked {
                 let wrapped = vgen_interface_wrap(result, target.plain_type(), adapter, ctx)
-                return value_try_convert(wrapped, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow, allow_stack_owned) !>
+                return value_try_convert(wrapped, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow) !>
             }
             return vgen_interface_wrap(result, target, adapter, ctx)
         }
@@ -1941,10 +746,9 @@ fn value_try_convert(
         && !result.rett.is_nullable_type() && target_nn.compat(source_nn.locked_storage_type())
     {
         if !allow_shared_unsafe && !allow_shared_borrow {
-            let message = "Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain"
-            value_publish_unique(result, ctx, message) !>
+            result = value_publish_copy(result, ctx, scope, target) !>
         }
-        return value_shared_view(result, target, allow_shared_unsafe || allow_shared_borrow)
+        return value_shared_view(result, target)
     }
     // A class becomes a shared or locked interface or union in two steps, so the
     // publish below sees the value the plain conversion made
@@ -1952,9 +756,9 @@ fn value_try_convert(
         && target_nn.get_class_or_null() != source_nn.get_class_or_null() {
         let plain = target.plain_type()
         if plain != target {
-            let converted = value_try_convert(result, scope, ctx, plain, is_auto, allow_inline_borrow, false, false, allow_stack_owned) !>
+            let converted = value_try_convert(result, scope, ctx, plain, is_auto, allow_inline_borrow, false, false) !>
             if plain.compat(converted.rett) && converted.rett.get_non_nullable().get_class_or_null() == target_nn.get_class_or_null() {
-                return value_try_convert(converted, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow, allow_stack_owned) !>
+                return value_try_convert(converted, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow) !>
             }
         }
     }
@@ -1966,7 +770,6 @@ fn value_try_convert(
         && target_nn.get_class_or_null() == source_nn.get_class_or_null()
         && (target.is_nullable_type() || !result.rett.is_nullable_type())
     {
-        let message = "Only a provably unique value graph can be converted to '" + target.compat_display_name() + "'; a mutable alias may remain"
         if !allow_shared_unsafe && !allow_shared_borrow {
             // A closure written as a 'shared fn' has its captures checked when
             // it is created. One that only becomes shared because the object
@@ -1974,21 +777,20 @@ fn value_try_convert(
             // values could still be mutated from another thread. Locked data
             // runs its closures under the lock only.
             if type_has_coroutine_handle(source_nn, Array[Class]{}) {
-                result.error("Cannot publish '" + target.compat_display_name() + "' as shared: it reaches a coroutine handle, which is bound to the thread that created it")
+                result.error("Cannot publish '" + target.compat_display_name() + "' as atomic: it reaches a coroutine handle, which is bound to the thread that created it")
             }
             if !target_nn.is_locked && type_has_unpublishable_closure(source_nn, Array[Class]{}) {
                 let closure_prop = type_find_unpublishable_closure(source_nn, Array[Class]{})
                 let where = isset(closure_prop)
                     ? "property '" + closure_prop.class.name + "." + (closure_prop.name ?? "?") + "' reaches"
                     : "it reaches"
-                result.error("Cannot publish '" + target.compat_display_name() + "' as shared: " + where
-                    + " a closure whose captured values were never checked for shared use."
-                    + " Declare it as a 'shared fn(...)()' so its captures are checked where the closure is created")
+                result.error("Cannot publish '" + target.compat_display_name() + "' as atomic: " + where
+                    + " a closure whose captured values were never checked for atomic use."
+                    + " Declare it as an 'atomic fn(...)()' so its captures are checked where the closure is created")
             }
-            value_publish_unique(result, ctx, message) !>
-            if target_nn.is_shared : result.ensure_meta().publish_shared = true
+            result = value_publish_copy(result, ctx, scope, target) !>
         }
-        return value_shared_view(result, target, allow_shared_unsafe || allow_shared_borrow)
+        return value_shared_view(result, target)
     }
 
     let union_value = value_try_union_convert(result, scope, ctx, target, is_auto) !>
@@ -2034,8 +836,8 @@ fn value_try_convert(
         let then_v = result.value2
         let else_v = result.values?.get(0) !? null
         if isset(cond) && isset(then_v) && isset(else_v) {
-            let then_b = value_try_convert(then_v, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow, allow_stack_owned) !>
-            let else_b = value_try_convert(else_v, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow, allow_stack_owned) !>
+            let then_b = value_try_convert(then_v, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow) !>
+            let else_b = value_try_convert(else_v, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow) !>
             if target.compat(then_b.rett) && target.compat(else_b.rett) {
                 let picked = vgen_this_or_that(cond, then_b, else_b, target)
                 picked.exp = result.exp
@@ -2044,7 +846,7 @@ fn value_try_convert(
         }
     }
     if result_nn.is_fat_borrow() || target_nn.is_fat_borrow() {
-        let borrowed = value_convert_borrow(result, scope, ctx, target, allow_inline_borrow, allow_stack_owned) !>
+        let borrowed = value_convert_borrow(result, scope, ctx, target, allow_inline_borrow) !>
         if isset(borrowed) : return borrowed
     }
     if target_nn.kind == TYPE.adr_of
@@ -2167,7 +969,7 @@ fn value_try_convert(
             let through = value_through_borrow(result, ctx)
             let zero = vgen_int(0, type_from_core(ctx.build, "uint") !>)
             let copied = value_sequence_element_read(vgen_ptrv(through, zero, pointed, at), scope, ctx, at) !>
-            return value_try_convert(copied, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow, allow_stack_owned) !>
+            return value_try_convert(copied, scope, ctx, target, is_auto, allow_inline_borrow, allow_shared_unsafe, allow_shared_borrow) !>
         }
     }
 

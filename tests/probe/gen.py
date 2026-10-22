@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-# Metamorphic probe of the borrow, shared and lock rules. Every rule has a safe and an unsafe
-# program around one marked expression; each wrapper (value scope, ternary, tuple, `??`, call,
-# closure, ...) rewrites that expression, which must not change the verdict:
+# Metamorphic probe of the borrow, shared and lock rules. Each wrapper (value scope, ternary,
+# tuple, `??`, call, closure, ...) rewrites one marked expression, which must not change the
+# verdict. A `refuse` rule has a safe and an unsafe program:
 #   hole:     the unsafe program compiles
 #   refused:  the safe program does not (a false positive, or a wrapper invalid there)
+# A `copy` rule has one program that must build and print the expected output: data that
+# becomes shared or moves into locked data is a copy, so a later change to the original is
+# not seen. A different output or a crash is a hole.
 #
 #   tests/probe/gen.py [--valk ./valk] [--jobs 8] [--only text] [--update] [--show]
 #
@@ -34,16 +37,16 @@ global probe_ints: [int x 2] ({ 1, 2 })
 global keep: ?Item (null)
 global keep_ref: ?&Item (null)
 fn id_item(x: Item) Item { return x }
-fn id_ref(x: &Item) &Item { return x }
+fn id_ref(x: local &Item) local &Item { return x }
 fn id_slice(x: &[int]) &[int] { return x }
 fn opt_item(x: Item) ?Item { return x }
-fn opt_ref(x: &Item) ?&Item { return x }
+fn opt_ref(x: local &Item) ?local &Item { return x }
 fn opt_slice(x: &[int]) ?&[int] { return x }
 fn fails_item(x: Item) Item !ProbeFail {
     if !probe_flag : throw .no
     return x
 }
-fn fails_ref(x: &Item) &Item !ProbeFail {
+fn fails_ref(x: local &Item) local &Item !ProbeFail {
     if !probe_flag : throw .no
     return x
 }
@@ -56,7 +59,7 @@ fn rec_item(x: Item, n: int) Item {
     if n == 0 : return x
     return rec_item(x, n - 1)
 }
-fn rec_ref(x: &Item, n: int) &Item {
+fn rec_ref(x: local &Item, n: int) local &Item {
     if n == 0 : return x
     return rec_ref(x, n - 1)
 }
@@ -66,15 +69,20 @@ fn rec_slice(x: &[int], n: int) &[int] {
 }
 interface ProbeIds {
     fn item(x: Item) Item;
-    fn ref(x: &Item) &Item;
+    fn ref(x: local &Item) local &Item;
     fn slice(x: &[int]) &[int];
 }
 class ProbeImpl is ProbeIds {
     fn item(x: Item) Item { return x }
-    fn ref(x: &Item) &Item { return x }
+    fn ref(x: local &Item) local &Item { return x }
     fn slice(x: &[int]) &[int] { return x }
 }
 fn stash(x: Item) { keep = x }
+fn kept_n() int { return keep?.n ?? -1 }
+fn set_kept(n: int) {
+    let k = keep ?! return
+    k.n = n
+}
 fn view2(p: &[int]) &[int] { return p.view(0, 2) }
 """
 
@@ -129,82 +137,127 @@ LOCAL_BORROW_SKIP = ("struct", "class", "closure", "if", "array", "while", "each
 
 # A rule: the type of the marked expression, then the safe and unsafe bodies of `probe_main`.
 # `@W(...)` marks the expression the wrappers rewrite; `SETUP` lines come first.
+# A rule: its kind, the type of the marked expression, then the bodies of `main`. `@W(...)`
+# marks the expression the wrappers rewrite; `FN` lines go above `main`.
+#   ("copy", name, type, body, expected output)
+#   ("refuse", name, type, safe body, unsafe body[, skipped wrappers])
 RULES = [
-    ("alias-then-publish", "item",
-     """let o = Item{}
-let a = @W(Item{})
-let s: shared Item = o
-a.n = 5
-println(s.n)""",
+    ("copy", "alias-then-publish", "item",
      """let o = Item{}
 let a = @W(o)
-let s: shared Item = o
+let s: atomic Item = o
 a.n = 5
-println(s.n)"""),
-    ("publish-escaped", "item",
-     """let o = Item{}
-let s: shared Item = @W(o)
-println(s.n)""",
+println(s.n)""", "0"),
+    ("copy", "publish-escaped", "item",
      """let o = Item{}
 keep = o
-let s: shared Item = @W(o)
-println(s.n)"""),
-    ("publish-then-reuse", "item",
+let s: atomic Item = @W(o)
+set_kept(5)
+println(s.n)""", "0"),
+    ("copy", "publish-then-reuse", "item",
      """let o = Item{}
-let s: shared Item = @W(o)
-println(s.n)""",
-     """let o = Item{}
-let s: shared Item = @W(o)
+let s: atomic Item = @W(o)
 o.n = 5
-println(s.n)"""),
-    ("borrow-then-publish", "ref",
-     """let o = Item{}
-let o2 = Item{}
-let r = @W(&o2)
-let s: shared Item = o
-println(r.n + s.n)""",
+println(s.n)""", "0"),
+    ("copy", "borrow-then-publish", "ref",
      """let o = Item{}
 let r = @W(&o)
-let s: shared Item = o
-println(r.n + s.n)""", LOCAL_BORROW_SKIP),
-    ("stash-then-publish", "item",
-     """let o = Item{}
-stash(@W(Item{}))
-let s: shared Item = o
-println(s.n)""",
+let s: atomic Item = o
+r.n = 5
+println(s.n)""", "0", LOCAL_BORROW_SKIP),
+    ("copy", "stash-then-publish", "item",
      """let o = Item{}
 stash(@W(o))
-let s: shared Item = o
-println(s.n)"""),
-    ("alias-then-lock-store", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-let a = @W(Item{})
-lock st as s { s.list.append(x) }
-a.n = 5""",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+let s: atomic Item = o
+set_kept(5)
+println(s.n)""", "0"),
+    ("copy", "alias-then-lock-store", "item",
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 let a = @W(x)
 lock st as s { s.list.append(x) }
-a.n = 5"""),
-    ("lock-store-escaped", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { s.list.append(@W(x)) }""",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+a.n = 5
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "lock-store-escaped", "item",
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 keep = x
-lock st as s { s.list.append(@W(x)) }"""),
-    ("lock-store-then-reuse", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+lock st as s { s.list.append(@W(x)) }
+set_kept(5)
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "lock-store-then-reuse", "item",
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
 lock st as s { s.list.append(@W(x)) }
-println("stored")""",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+x.n = 5
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "attach-then-reuse", "item",
+     """FN fn attach_xs(x: Item, s: locked Store) { s.list.append(x) }
+let st: atomic Lock[Store] = .new(Store{}) !!
 let x = Item{}
-lock st as s { s.list.append(@W(x)) }
-x.n = 5"""),
-    ("frame-storage-returned", "slice",
+lock st as s { attach_xs(@W(x), s) }
+x.n = 5
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "attach-swapped-then-reuse", "item",
+     """FN fn attach_sx(s: locked Store, x: Item) { s.list.append(x) }
+let st: atomic Lock[Store] = .new(Store{}) !!
+let x = Item{}
+lock st as s { attach_sx(s, @W(x)) }
+x.n = 5
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "attach-also-global", "item",
+     """FN fn attach_keep(s: locked Store, x: Item) {
+    s.list.append(x)
+    keep = x
+}
+let st: atomic Lock[Store] = .new(Store{}) !!
+let x = Item{}
+lock st as s { attach_keep(s, @W(x)) }
+set_kept(5)
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "closure-lock-store-then-reuse", "item",
+     """let st: atomic Lock[Store] = .new(Store{}) !!
+let x = Item{}
+lock st as s {
+    let put = fn(t: locked Store, v: Item) { t.list.append(v) }
+    put(s, @W(x))
+}
+x.n = 5
+lock st as s { println((s.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "shared-fixed-array-then-reuse", "item",
+     """let x = Item{}
+let s: atomic [Item x 1] = { @W(x) }
+x.n = 5
+println(s[0].n)""", "0"),
+    ("copy", "shared-list-literal-then-reuse", "item",
+     """let x = Item{}
+let s: atomic Array[Item] = .{ @W(x) }
+x.n = 5
+println((s.get(0) !? null)?.n ?? -1)""", "0"),
+    ("copy", "two-locks", "item",
+     """let a: atomic Lock[Store] = .new(Store{}) !!
+let b: atomic Lock[Store] = .new(Store{}) !!
+lock a as x {
+    x.list.append(Item{})
+    lock b as y { y.list.append(@W(x.list.get(0) ! return)) }
+    let first = x.list.get(0) ! return
+    first.n = 5
+}
+lock b as y { println((y.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("copy", "picked-lock", "item",
+     """let a: atomic Lock[Store] = .new(Store{}) !!
+let b: atomic Lock[Store] = .new(Store{}) !!
+lock a as x {
+    x.list.append(Item{})
+    lock b as y {
+        let t = probe_flag ? y.list : x.list
+        t.append(@W(x.list.get(0) ! return))
+    }
+    let first = x.list.get(0) ! return
+    first.n = 5
+}
+lock b as y { println((y.list.get(0) !? null)?.n ?? -1) }""", "0"),
+    ("refuse", "frame-storage-returned", "slice",
      """FN fn probe_make() &[int] {
     let a = [int]{ 1, 2, 3, 4 }
     return @W(view2(a))
@@ -215,116 +268,36 @@ println(probe_make()[0])""",
     return @W(view2(a))
 }
 println(probe_make()[0])"""),
-    ("frame-storage-kept", "slice",
+    ("refuse", "frame-storage-kept", "slice",
      """FN global probe_kept: ?&[int] (null)
 let a = [int]{ 1, 2, 3, 4 }
 probe_kept = @W(view2(a))""",
      """FN global probe_kept: ?&[int] (null)
 let a: [int x 4] = { 1, 2, 3, 4 }
 probe_kept = @W(view2(a))"""),
-    ("attach-then-reuse", "item",
-     """FN fn attach_xs(x: Item, s: locked Store) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { attach_xs(@W(x), s) }
-println("attached")""",
-     """FN fn attach_xs(x: Item, s: locked Store) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { attach_xs(@W(x), s) }
-x.n = 5"""),
-    ("attach-swapped-then-reuse", "item",
-     """FN fn attach_sx(s: locked Store, x: Item) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { attach_sx(s, @W(x)) }
-println("attached")""",
-     """FN fn attach_sx(s: locked Store, x: Item) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { attach_sx(s, @W(x)) }
-x.n = 5"""),
-    ("attach-also-global", "item",
-     """FN fn attach_keep(s: locked Store, x: Item) { s.list.append(x) }
-let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { attach_keep(s, @W(x)) }""",
-     """FN fn attach_keep(s: locked Store, x: Item) {
-    s.list.append(x)
-    keep = x
-}
-let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s { attach_keep(s, @W(x)) }"""),
-    ("closure-lock-store-then-reuse", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s {
-    let put = fn(t: locked Store, v: Item) { t.list.append(v) }
-    put(s, @W(x))
-}
-println("stored")""",
-     """let st: shared Lock[Store] = .new(Store{}) !!
-let x = Item{}
-lock st as s {
-    let put = fn(t: locked Store, v: Item) { t.list.append(v) }
-    put(s, @W(x))
-}
-x.n = 5"""),
-    ("shared-fixed-array-then-reuse", "item",
-     """let x = Item{}
-let s: shared [Item x 1] = { @W(x) }
-println(s[0].n)""",
-     """let x = Item{}
-let s: shared [Item x 1] = { @W(x) }
-x.n = 5
-println(s[0].n)"""),
-    ("locked-escape", "item",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+    ("refuse", "lent-view-kept", "slice",
+     """FN global probe_lent: ?&[int] (null)
+FN fn probe_lend(d: local &[int]) local &[int] { return d.view(1, 2) }
+let a = [int]{ 1, 2, 3, 4 }
+probe_lent = @W(probe_lend(a))""",
+     """FN global probe_lent: ?&[int] (null)
+FN fn probe_lend(d: local &[int]) local &[int] { return d.view(1, 2) }
+let a: [int x 4] = { 1, 2, 3, 4 }
+probe_lent = @W(probe_lend(a))"""),
+    ("refuse", "locked-escape", "item",
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let out: ?Item = null
 lock st as s {
     s.list.append(Item{})
     let v = s.list.get(0) ! return
     out = @W($clone(v))
 }""",
-     """let st: shared Lock[Store] = .new(Store{}) !!
+     """let st: atomic Lock[Store] = .new(Store{}) !!
 let out: ?Item = null
 lock st as s {
     s.list.append(Item{})
     let v = s.list.get(0) ! return
     out = @W(v)
-}"""),
-    ("two-locks", "item",
-     """let a: shared Lock[Store] = .new(Store{}) !!
-let b: shared Lock[Store] = .new(Store{}) !!
-lock a as x {
-    x.list.append(Item{})
-    lock b as y { y.list.append(@W(Item{})) }
-}""",
-     """let a: shared Lock[Store] = .new(Store{}) !!
-let b: shared Lock[Store] = .new(Store{}) !!
-lock a as x {
-    x.list.append(Item{})
-    lock b as y { y.list.append(@W(x.list.get(0) ! return)) }
-}"""),
-    ("picked-lock", "item",
-     """let a: shared Lock[Store] = .new(Store{}) !!
-let b: shared Lock[Store] = .new(Store{}) !!
-lock a as x {
-    x.list.append(Item{})
-    lock b as y {
-        let t = probe_flag ? y.list : x.list
-        t.append(@W(Item{}))
-    }
-}""",
-     """let a: shared Lock[Store] = .new(Store{}) !!
-let b: shared Lock[Store] = .new(Store{}) !!
-lock a as x {
-    x.list.append(Item{})
-    lock b as y {
-        let t = probe_flag ? y.list : x.list
-        t.append(@W(x.list.get(0) ! return))
-    }
 }"""),
 ]
 
@@ -386,16 +359,21 @@ def program(body, type_key, wrap):
     return PRELUDE + top + "\nfn main() {\n" + main + "\n}\n"
 
 
-def build(valk, workdir, key, source):
+def build(valk, workdir, key, source, run=False):
     path = os.path.join(workdir, re.sub(r"[^A-Za-z0-9]+", "_", key) + ".valk")
     with open(path, "w") as fh:
         fh.write(source)
     proc = subprocess.run([valk, "build", path, "-o", path[:-5], "--no-warn"], capture_output=True, text=True)
     out = proc.stdout + proc.stderr
-    if proc.returncode == 0:
-        return True, ""
-    error = re.search(r"# Error: (.*)", out)
-    return False, (error.group(1).strip() if error else (out.strip().splitlines() or ["?"])[-1])
+    if proc.returncode != 0:
+        error = re.search(r"# Error: (.*)", out)
+        return False, (error.group(1).strip() if error else (out.strip().splitlines() or ["?"])[-1]), None
+    if not run:
+        return True, "", None
+    ran = subprocess.run([path[:-5]], capture_output=True, text=True, timeout=60)
+    if ran.returncode != 0:
+        return True, "", "exit %d: %s" % (ran.returncode, (ran.stdout + ran.stderr).strip()[-200:])
+    return True, "", ran.stdout.strip()
 
 
 def main():
@@ -408,8 +386,14 @@ def main():
     opts = ap.parse_args()
 
     cases = []
-    for rule, type_key, safe, unsafe, *rest in RULES:
-        skip = rest[0] if rest else ()
+    for kind, rule, type_key, *rest in RULES:
+        skip = ()
+        if kind == "copy":
+            body, expected_out = rest[0], rest[1]
+            if len(rest) > 2 : skip = rest[2]
+        else:
+            body, unsafe = rest[0], rest[1]
+            if len(rest) > 2 : skip = rest[2]
         for wname, wrap in wrappers().items():
             key = "%s %s" % (rule, wname)
             if wname in skip:
@@ -419,18 +403,33 @@ def main():
             # A wrapper that does not apply to this value type
             if wrap("x", type_key, 0) is None:
                 continue
-            cases.append((key, program(safe, type_key, wrap), program(unsafe, type_key, wrap)))
+            if kind == "copy":
+                cases.append((key, program(body, type_key, wrap), None, expected_out))
+            else:
+                cases.append((key, program(body, type_key, wrap), program(unsafe, type_key, wrap), None))
 
     workdir = tempfile.mkdtemp(prefix="valk-probe-")
     results = {}
     with ThreadPoolExecutor(opts.jobs) as pool:
         futures = {}
-        for key, safe, unsafe in cases:
-            futures[key] = (pool.submit(build, opts.valk, workdir, key + " safe", safe),
-                            pool.submit(build, opts.valk, workdir, key + " unsafe", unsafe))
-        for key, (fs, fu) in futures.items():
-            safe_ok, safe_err = fs.result()
-            unsafe_ok, _ = fu.result()
+        for key, safe, unsafe, expected_out in cases:
+            if unsafe is None:
+                futures[key] = (pool.submit(build, opts.valk, workdir, key + " copy", safe, True), None, expected_out)
+            else:
+                futures[key] = (pool.submit(build, opts.valk, workdir, key + " safe", safe),
+                                pool.submit(build, opts.valk, workdir, key + " unsafe", unsafe), None)
+        for key, (fs, fu, expected_out) in futures.items():
+            if fu is None:
+                built, err, output = fs.result()
+                if not built:
+                    results[key] = ("refused", err)
+                elif output != expected_out:
+                    results[key] = ("hole", "printed " + str(output) + ", expected " + expected_out)
+                else:
+                    results[key] = ("ok", "")
+                continue
+            safe_ok, safe_err, _ = fs.result()
+            unsafe_ok, _, _ = fu.result()
             if unsafe_ok and safe_ok:
                 results[key] = ("hole", "")
             elif unsafe_ok:

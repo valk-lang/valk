@@ -6,8 +6,8 @@ is not a collection of independent syntax experiments.
 
 Valk distinguishes value aggregates from reference objects. Structs and fixed
 arrays are copied values, while classes are references. The language defines
-its own syntax, GC, tagged unions, error handling, modes, and inferred borrow
-and uniqueness effects.
+its own syntax, GC, tagged unions, error handling, modes, `local` borrows, and
+shared data that is copied when it is published.
 
 ## Goals
 
@@ -28,9 +28,8 @@ The compiler separates syntax from semantic resolution:
 3. Register named declarations, aliases, errors, traits, and extensions.
 4. Resolve types and finalize aggregate layouts.
 5. Parse and type-check function bodies when required.
-6. Infer and cache per-parameter escape and uniqueness effects.
-7. Determine reachability and lower required functions to IR.
-8. Generate objects and link only when the selected command requires them.
+6. Determine reachability and lower required functions to IR.
+7. Generate objects and link only when the selected command requires them.
 
 Syntax parsing may use grammar context, but never the resolved meaning of an
 identifier. Semantic stages may resolve identifiers and specialize generics.
@@ -380,12 +379,12 @@ borrow of it (`&` yields a read-only borrow of a capture), passing it to a
 `mut &` or `local mut &` parameter, and calling
 a method that writes its receiver on it. Read-only borrows and reads remain
 allowed. Writes through a captured reference (`obj.count++`) reach the shared
-object and are allowed. A shared closure cannot capture non-shared managed
-data, so a `shared fn` never carries a private copy of mutable state that
+object and are allowed. An atomic closure cannot capture non-atomic managed
+data, so an `atomic fn` never carries a private copy of mutable state that
 looks shared.
 
 A capture is a use of the variable. Capturing a variable whose graph was
-already published as `shared` is rejected like any other use after
+already published as `atomic` is rejected like any other use after
 publication, and capturing links the variable's graph to the world so it cannot
 be published afterwards.
 
@@ -588,10 +587,21 @@ GC object. `&local` produces it with a null owner; `&ref.prop` through a
 `local &T` produces it with that borrow's owner word. A stack borrow follows
 the frame rules:
 
-- May be stored only in local variables and non-escaping parameters.
+- May be stored only in local variables and passed only to `local` parameters.
 - Cannot be stored in a class, array, map, global, interface adapter, or closure.
-- Cannot be returned.
-- Cannot be converted implicitly to persistent raw-pointer storage.
+- Cannot be returned, except as a `local` result made from the parameters.
+- Is handed to a raw-pointer parameter only under `@unsafe`: the callee may keep it.
+
+A function with a `local` result (`fn tail(d: local &[u8]) local &[u8]`) hands
+back part of what it was lent. Its body may only return storage reached through
+its parameters, checked at each `return`. At the call the result is `local` when
+any argument for a `local` parameter (the receiver included) may be frame
+storage, and the owned type otherwise: the borrow carries the owner words of
+the arguments it came from. Methods of mutable slices take their receiver as a
+`local` borrow; one marked `$owned` keeps the owned receiver and cannot be
+called on frame storage. A struct method bound as a closure to frame storage
+cannot be passed on; bound to a struct inside an object, it carries that
+object's owner word.
 - May cross a coroutine suspension point when its stabilized storage is
   retained in the coroutine frame.
 
@@ -640,12 +650,8 @@ array inside an owner, and from any `String` or other named slice value: the
 named slices are `&[T]` with a class, so the conversion is a retype.
 
 An owned borrow is an alias into `owner`, and its owner word is part of the
-borrow value. The owner's graph therefore stops being uniquely held exactly
-when the borrow escapes: stored in an object or global, returned, captured,
-bound to a local, or passed to a parameter the callee keeps. A borrow that
-only lives through a call, such as `read(&owner.payload)` with a callee that
-does not keep it, leaves `owner` publishable as `shared`. Borrowing
-`shared T` data remains an error.
+borrow value, so it keeps `owner` alive wherever it is stored. Borrowing
+`atomic T` data remains an error.
 
 #### Null owner
 
@@ -709,67 +715,26 @@ heap at the moment it escapes is rejected: raw pointers and existing borrows
 may already hold the frame address, and rewriting them would require a moving
 collector for frames.
 
-### Inferred parameter effects
+### Checked variants
 
-Borrow compatibility and uniqueness are inferred from function bodies rather
-than repeated as effects in every signature. Two analyses do this.
+The compiler infers no effects across functions. When a call needs to know what
+a method does with its receiver, the method's body is type-checked again with
+the receiver as the call sees it: as an `atomic` or `locked` view, or read-only
+for a struct or slice method called on read-only storage, an element copied out
+of an array, a temporary, a captured variable or an enum value. A store in that
+variant, or in a method it calls on the same receiver, is an error reported at
+the call. A read-only variant is only checked, never emitted; the call runs the
+ordinary method. Hooks that store through raw memory (`$offset_assign`,
+`$append`, `$set_key`) are marked as mutating and never run on a view. Lending
+and sharing are type rules, and the compiler keeps no ownership or uniqueness
+analysis.
 
-**Lowering summaries.** While a body is lowered, every parameter gets flags
-from what the body does with it:
-
-- `may_escape`: data reachable through the parameter may outlive the call,
-  through the result, another argument, an object, a global or a closure.
-- `may_retain`: the stricter half: the function keeps it beyond its result and
-  its other arguments.
-- `invalidates_unique`: the function may give the parameter's graph an alias
-  from outside.
-- `absorbs_args`: which other parameters are moved into this one's graph.
-
-Flags start false for an analyzable body and only ever turn true. Calls record
-edges from callee parameters to caller parameters, and flags propagate along
-them until nothing changes. A flag settled inside a recursion cycle while a
-callee's summary was still being computed is `provisional`: callers defer what
-depends on it and check it again once every summary is final. Bodies without
-an analysis (externs, unknown code) are conservative. These flags decide where
-frame storage may be lent as a borrow: a callee that neither keeps nor returns
-it may take it, and one that returns it or stores it in another argument makes
-the caller's holder subject to the check below.
-
-**Ownership analysis.** After all bodies are lowered, `own_analyze`
-(`ownership.valk`) solves an inclusion-based points-to problem per function
-over abstract objects: `GLOBAL` (globals, unknown code and what they reach),
-what each parameter points to, the slots of locals, each allocation site, what
-each call made, and each `lock` block's data. Every lowered value kind adds a
-few constraints; a kind the analysis does not model points to `GLOBAL`, so a
-missing case makes it stricter, never looser. Calls apply the callee's summary,
-interface methods use every implementation, and functions are solved callees
-first and re-solved until no summary changes. That is a least fixed point,
-independent of the order bodies were lowered in.
-
-`ownership-check.valk` then walks each body in evaluation order, with a
-points-to version per local, and enforces:
-
-1. A graph converted to `shared T`, sent across threads, or moved into locked
-   data is unique: nothing reachable from `GLOBAL`, unknown code, a parameter
-   or another live local is part of it.
-2. Once published, no ordinary local whose graph held part of it may be used,
-   along every path that follows.
-3. Frame storage lent as a borrow never becomes reachable from `GLOBAL`, unknown
-   code, a parameter or the function's result.
-4. A locked view never leaves its `lock` block.
-
-The type rules above (stack, owned and `local` borrows, read-only views,
-`shared` and `locked` types) are what these checks rely on: everything that is
-not proven by a type is proven by the points-to graph, or refused.
-
-Both kinds of summary are in-memory compiler metadata, recomputed from the
-source of every package; they are not annotations or library artifacts.
-
-**What checks the checks.** `tests/probe/gen.py` runs every rule as a safe and an
-unsafe program under every syntax form an expression can take (value scopes,
-ternaries, tuples, `??`, calls, generics, handlers, structs, classes, loops,
-`match`, interface calls, recursion, coroutines, nested forms); the safe one must
-build and the unsafe one must not. In `GC_DEBUG` builds the shared collector
+**What checks the checks.** `tests/probe/gen.py` runs every rule under every
+syntax form an expression can take (value scopes, ternaries, tuples, `??`, calls,
+generics, handlers, structs, classes, loops, `match`, interface calls,
+recursion, coroutines, nested forms). A refusal rule's safe program must build
+and its unsafe one must not; a copy rule's program must build and print the
+value that shows the copy was made. In `GC_DEBUG` builds the shared collector
 panics when shared data refers to an object that is not shared.
 
 A package is identified by its directory, not by the alias that refers to it.
@@ -809,15 +774,25 @@ The GC never walks arbitrary raw pointers. Converting a GC reference to a raw
 pointer does not keep the object alive; safe code must retain the owning GC
 reference for as long as the raw pointer is used.
 
-## Shared views
+## Atomic views
 
-### `shared T`
+### `atomic T`
 
-`shared T` is a transitive view for data published across threads. No safe
+`atomic T` is a transitive view for data published across threads. No safe
 conversion turns it back into ordinary mutable `T`; `value.@cast(T)` is the
-explicit unsafe way back. Data-race-unsafe properties cannot be
-mutated through a shared view; supported integer operations use atomic access,
-and explicitly synchronized low-level code uses the shared-unsafe mechanisms.
+explicit unsafe way back. Through an atomic view, a property not marked `-` or
+`~` can be assigned when it is one word: a number, bool, enum or object
+reference. Numbers use atomic access. A reference store is a release store of a
+value that is copied first unless it is already shared, and reference loads
+through the view are acquire loads. Properties of more than one word (strings,
+slices, borrows, interfaces, closures, structs, tuples, unions) cannot be
+reassigned, since a reader could see half of the old value and half of the new
+one. Their slice and borrow elements can be assigned under the same one-word
+rule, because the view never changes their length. Fields marked `-` or `~` are
+read-only through the view, since they can be part of an invariant of their
+class, like an array's length and storage. A `@threadsafe` method synchronizes
+on its own and is not checked; other explicitly synchronized low-level code uses
+the shared-unsafe mechanisms.
 
 Language-level atomic reads use acquire ordering, atomic writes use release
 ordering, and atomic read-modify-write operations are sequentially consistent.
@@ -841,63 +816,67 @@ nothing. Defaults that call code the compiler cannot follow (closures,
 interface calls) run after every default with known dependencies. Ties keep the
 declaration order, and a dependency cycle between defaults is a compile error.
 
-Creating a `shared T` view does not by itself move its reachable GC graph to the
+Creating an `atomic T` view does not by itself move its reachable GC graph to the
 shared collector. GC publication occurs only at an actual cross-thread transfer
-or shared-storage boundary. The compiler tracks uniqueness as internal value
-provenance; it is not part of source-level types. Fresh construction and
-functions proven to return fresh graphs produce unique values. Nonescaping calls
-preserve uniqueness, while aliasing, capture, persistent storage, and calls
-through unknown code remove it.
+or shared-storage boundary.
 
-An ordinary value may become `shared T` only when its complete reachable managed
-graph is still provably unique. Inline aggregates follow the same rule: a
-struct, tuple or fixed array that carries managed references is published by
-copying the aggregate and taking the view over those references. Creating the view consumes that internal
-capability; using another mutable alias is rejected. Strings and other immutable
-values are always compatible. Function argument escape and fresh-return
-summaries are inferred from bodies and cached, so APIs do not need ownership
-annotations.
-An ordinary graph may receive a temporary `shared` view for a parameter proven
-not to escape or introduce aliases; this does not publish the graph or consume
-its uniqueness.
-When a fresh local is placed into a fresh aggregate, dependent provenance keeps
-the aggregate unique only while the source local is not read again. Ordinary
-aliasing remains ordinary aliasing; it never silently consumes a value.
+An ordinary value becomes `atomic T` as a copy, so no alias of the shared graph
+can remain. The copy is the one `$clone` makes, with two differences: `$clone`
+hooks run through their atomic-receiver variant, so a hook's body is checked
+against a read-only `this` and cannot hand back the original's parts (a
+`@threadsafe` hook, like `Mutex.clone` returning itself, is trusted); and every
+generated object copy notes what it copied in a per-thread table, so cycles and
+objects reached twice keep their shape. Parts already `atomic` are kept by
+reference. A literal written in place is not copied, only the values it was
+given; a collection literal is copied as a whole. A value made from a raw pointer
+with `.@cast` is unsafe code's own claim and is not copied. Types that hold raw
+memory or have a `gc_free` finalizer and no `$clone` hook cannot be copied, so
+publishing one is an error; such objects are created atomic, like the values of
+`Channel.new` and `CancelToken.new`. Inline aggregates follow the same rule, and
+strings and other immutable values are never copied. The same copy happens for
+a `shared` global's store and default, an `atomic T` parameter, and a store into
+locked data.
 
-Ownership provenance covers managed references; raw pointers retain their
-separate explicit unsafe lifetime and aliasing rules.
+What a method returns through an atomic or locked receiver keeps the view when
+its type could reach data of the receiver: a borrow always does, and so does a
+result whose reachable classes overlap the receiver's, or that reaches an
+interface or closure. A result of unrelated types is ordinary data. This is
+decided from the types alone; a clone hook's result is always ordinary.
+
 Everything read out of a view keeps it: properties, array and map elements,
 elements of `&[T]` and `mut &[T]` properties, and copies made with a bracket
 range. A struct of plain words reads out as an ordinary copy, but a store
 into it in place (`view.pair.n++`) or a struct method called on it in place
 still hits the view's storage, so it follows the view's rules: integer stores
-are atomic and the method gets the shared or locked receiver variant, with its
+are atomic and the method gets the atomic or locked receiver variant, with its
 `this` typed as a borrow of the viewed struct.
-A `shared` global reads as `shared T`, so it is governed by the same rules.
+A `shared` global reads as `atomic T`, so it is governed by the same rules.
 `@shared` globals are the explicit unsafe override when an external protocol
 guarantees synchronization and lifetime safety. Within an expression,
-`value.@cast(shared T)` is the corresponding explicit unsafe conversion.
+`value.@cast(atomic T)` is the corresponding explicit unsafe conversion.
 
 ### `locked T`
 
-`locked T` is the mutable counterpart of `shared T`, produced only by a
-`lock` block over a `shared Lock[T]`. The block holds the lock's mutex
+`locked T` is the mutable counterpart of `atomic T`, produced only by a
+`lock` block over an `atomic Lock[T]`. The block holds the lock's mutex
 and releases it on every exit through the function cleanup path. Reads through
-a locked view keep the view; stores through it follow the shared storage
-rules: the stored graph must be provably unique and is published with the
-locked data, and integer fields use atomic access. Methods called on a locked
-receiver get a `__locked` variant whose `this` is locked and whose non-fresh
-results stay locked; unlike the shared variant, mutating methods are allowed,
-and arguments the callee absorbs into its receiver must be unique at the call
-site. Struct methods get the same variants as class methods. A `mut &[T]`
-property keeps its mutability through the view: the slice can be reassigned
-and its elements stored, each store following the unique-graph rule; the
-elements read back as `locked T`. A locked view cannot be returned as
-ordinary data, captured, stored in a
-property, global or generic type argument, assigned to a variable declared
-outside its block, converted to `shared`, or stored under another lock. Escape
-provenance makes the block's binding its own origin, so rearranging data inside
-one locked graph is not an escape.
+a locked view keep the view, and integer fields use atomic access. A value
+stored into locked data from elsewhere is copied in, as for an `atomic`
+conversion. Locked data moves without a copy only within one lock: inside a
+function, every locked value traces back to a `lock` block's binding or to the
+function's own locked receiver and arguments, and one call takes all of its
+locked inputs from one lock; an argument from another lock is copied. Methods
+called on a locked receiver get a `__locked` variant whose `this` is locked and
+whose object parameters are locked too, so plain arguments are copied in at the
+call; callbacks keep their plain types and get the elements as locked views.
+Unlike the atomic variant, mutating methods are allowed. Struct methods get the
+same variants as class methods. A `mut &[T]` property keeps its mutability
+through the view: the slice can be reassigned and its elements stored; the
+elements read back as `locked T`. A locked view cannot be returned as ordinary
+data, captured, stored in a property, global or generic type argument, assigned
+to a variable declared outside its block, or converted to `atomic`. Raw stores
+in unsafe code may take a locked value only into storage of the same locked
+data.
 
 ## GC and lifetime model
 
