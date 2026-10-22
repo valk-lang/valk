@@ -414,6 +414,8 @@ slice such as `[u8]{ 0 x 4 }`. A `.{ 1, 2, 3 }` literal passed to a `local`
 parameter fills an inline array that the frame lends for the call:
 `crypto.hex_encode(.{ 0xab, 0xcd })`. The standard library declares its byte
 inputs that way (`io.Writer.write`, hashing, encoding, compression).
+The compiler reports a borrow parameter that the body never keeps, with the
+`local` spelling to write.
 
 A function can hand back part of what it was lent by declaring a `local`
 result: `fn tail(data: local &[u8]) local &[u8] { return data.view(1, 2) }`. The

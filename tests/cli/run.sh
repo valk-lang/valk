@@ -819,6 +819,29 @@ if [[ "$quiet_deprecated_out" == *"is deprecated"* ]] || [[ "$quiet_deprecated_o
     exit 1
 fi
 
+# A borrow parameter the body never keeps is reported with its `local` spelling
+hint_out=$("$VALK" build "$DIR/local-hint.valk" -o "$output" --run 2>&1) || {
+    echo "# The local-hint program failed to build or run"
+    echo "$hint_out"
+    exit 1
+}
+hint_lines=$(printf '%s' "$hint_out" | grep "is never kept" | sed 's/.*local-hint.valk://' | cut -d: -f1 | sort -n | tr '\n' ' ')
+if [ "$hint_lines" != "13 18 19 20 21 " ] || [[ "$hint_out" != *"write 'local mut &[u8]'"* ]] || [[ "$hint_out" != *"write '?local &[u8]'"* ]]; then
+    echo "# Expected local hints for hint_sum, hint_maybe, hint_pt, hint_lend and hint_mut only"
+    echo "$hint_out"
+    exit 1
+fi
+hint_error_out=$("$VALK" build "$DIR/local-hint-error.valk" -o "$output" 2>&1) && {
+    echo "# Frame storage into an owned borrow parameter must fail"
+    echo "$hint_error_out"
+    exit 1
+}
+if [[ "$hint_error_out" != *"parameter 'p' of 'hint_pt' may keep it"* ]] || [[ "$hint_error_out" != *"'p' is never kept: write 'local &HintPt'"* ]]; then
+    echo "# The frame-storage error must say that 'local' would do"
+    echo "$hint_error_out"
+    exit 1
+fi
+
 # `shared T` is the old spelling of `atomic T`: it still builds and warns once
 spelling_out=$("$VALK" build "$DIR/shared-spelling.valk" -o "$output" --run 2>&1) || {
     echo "# The old 'shared T' spelling failed to build or run"
