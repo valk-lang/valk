@@ -1286,26 +1286,26 @@ if [[ "$ossl_out" != *"vman install github.com/valk-lang/openssl-$ossl_target"* 
     echo "$ossl_out"
     exit 1
 fi
-if [[ "$ossl_out" != *"--allow-libs"* ]]; then
+if [[ "$ossl_out" != *"--libs"* ]]; then
     echo "# The missing OpenSSL error must say how to allow the package's libraries"
     echo "$ossl_out"
     exit 1
 fi
 cp "$DIR/../../lib/libs/$ossl_target/libcrypto.$ossl_ext" "$DIR/../../lib/libs/$ossl_target/libssl.$ossl_ext" "$ossl_dir/pkg/libs/$ossl_target/"
 echo '{ "name": "openssl" }' > "$ossl_dir/pkg/valk.json"
-# A dependency that ships libraries needs "allow-libs": true on its entry
+# A dependency that ships libraries needs "libs": true on its entry
 echo '{ "dependencies": { "openssl": { "src": "../pkg" } } }' > "$ossl_dir/app/valk.json"
 ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --target "$ossl_target" --no-warn -o "$ossl_dir/app/out" 2>&1) && {
-    echo "# A dependency shipping libraries must be refused without allow-libs"
+    echo "# A dependency shipping libraries must be refused without libs"
     echo "$ossl_out"
     exit 1
 }
-if [[ "$ossl_out" != *"Dependency 'openssl' ships libraries (libs/$ossl_target): set \"allow-libs\": true"* ]]; then
+if [[ "$ossl_out" != *"Dependency 'openssl' ships libraries (libs/$ossl_target): set \"libs\": true"* ]]; then
     echo "# The refused dependency must name the setting"
     echo "$ossl_out"
     exit 1
 fi
-echo '{ "dependencies": { "openssl": { "src": "../pkg", "allow-libs": true } } }' > "$ossl_dir/app/valk.json"
+echo '{ "dependencies": { "openssl": { "src": "../pkg", "libs": true } } }' > "$ossl_dir/app/valk.json"
 ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --target "$ossl_target" --no-warn -o "$ossl_dir/app/out" 2>&1) || {
     echo "# A dependency holding libs/$ossl_target must provide OpenSSL to the cross build"
     echo "$ossl_out"
@@ -1313,7 +1313,7 @@ ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --targe
 }
 # Deeper in the tree the permission is not inherited: the project has to list the package itself
 mkdir -p "$ossl_dir/mid/src"
-echo '{ "name": "mid", "dependencies": { "openssl": { "src": "../pkg", "allow-libs": true } } }' > "$ossl_dir/mid/valk.json"
+echo '{ "name": "mid", "dependencies": { "openssl": { "src": "../pkg", "libs": true } } }' > "$ossl_dir/mid/valk.json"
 printf 'fn mid_value() int {\n    return 7\n}\n' > "$ossl_dir/mid/src/mid.valk"
 echo '{ "dependencies": { "mid": { "src": "../mid" } } }' > "$ossl_dir/app/valk.json"
 ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --target "$ossl_target" --no-warn -o "$ossl_dir/app/out" 2>&1) && {
@@ -1326,9 +1326,9 @@ if [[ "$ossl_out" != *"Package 'openssl' ships libraries (libs/$ossl_target) and
     echo "$ossl_out"
     exit 1
 fi
-echo '{ "dependencies": { "mid": { "src": "../mid" }, "openssl": { "src": "../pkg", "allow-libs": true } } }' > "$ossl_dir/app/valk.json"
+echo '{ "dependencies": { "mid": { "src": "../mid" }, "openssl": { "src": "../pkg", "libs": true } } }' > "$ossl_dir/app/valk.json"
 ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --target "$ossl_target" --no-warn -o "$ossl_dir/app/out" 2>&1) || {
-    echo "# Listing the nested package in the project with allow-libs must link"
+    echo "# Listing the nested package in the project with libs must link"
     echo "$ossl_out"
     exit 1
 }

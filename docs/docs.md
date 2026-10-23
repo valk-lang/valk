@@ -157,7 +157,7 @@ Cache entries that no build used for five days are removed; `--clean` ignores th
 
 Cross compiling needs nothing extra, except OpenSSL: a release ships it for its own platform only.
 A program that uses `valk.crypto` or TLS and targets another platform adds that platform's OpenSSL
-as a dependency, for example `vman install github.com/valk-lang/openssl-win-x64 --allow-libs`; the
+as a dependency, for example `vman install github.com/valk-lang/openssl-win-x64 --libs`; the
 other packages are `openssl-linux-x64`, `openssl-linux-arm64`, `openssl-macos-x64` and `openssl-macos-arm64`.
 
 Editors talk to `valk lsp run`, a language server over stdin and stdout. The
@@ -3246,14 +3246,14 @@ you pass `--ignore-min`.
 
 A package can ship compiled libraries in `libs/<target>/`, or name directories
 of them under `"targets": { "<target>": { "link-dirs": [...] } }`. Linking code
-you never read needs your permission: set `"allow-libs": true` on the entry
+you never read needs your permission: set `"libs": true` on the entry
 that names the dependency, or the build stops and says so. `vman install <pkg>
---allow-libs` writes it for you.
+--libs` writes it for you.
 
 ```json
 {
     "dependencies": {
-        "openssl": { "src": "github.com/valk-lang/openssl-win-x64", "version": "1.x", "allow-libs": true }
+        "openssl": { "src": "github.com/valk-lang/openssl-win-x64", "version": "1.x", "libs": true }
     }
 }
 ```
