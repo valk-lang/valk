@@ -12443,7 +12443,13 @@ Whether this is a text message.
 
 ```js
 alias Fd for i32
+// The descriptor value of no descriptor: -1.
++ value INVALID_FD (-1)
 ```
+
+### INVALID_FD
+
+The descriptor value of no descriptor: -1.
 
 ## Errors for 'io'
 

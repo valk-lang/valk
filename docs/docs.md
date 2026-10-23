@@ -209,7 +209,9 @@ intentionally forging an address. A raw `ptr` converts implicitly to `uint`.
 
 `uint` becomes `u32` or `u64` based on the compile target
 
-Every integer type exposes its range as `T.$max` and `T.$min`, e.g. `u8.$max` is `255`
+Every integer type exposes its range as `T.$max` and `T.$min`, e.g. `u8.$max` is `255`.
+A negative constant never converts to an unsigned type: `let n: uint = -1` and `n == -1` are
+compile errors, write `uint.$max`
 
 Integers count bits with `x.leading_zeros()`, `x.trailing_zeros()` and `x.count_ones()`.
 `a.mul_wide(b)` on `u64`/`uint` returns the full 128-bit product as `(high, low)`

@@ -3629,6 +3629,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 
 ```js
 alias Fd for i32
+// The descriptor value of no descriptor: -1.
++ value INVALID_FD (-1)
 ```
 
 ## Errors for 'io'
