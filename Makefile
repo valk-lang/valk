@@ -353,6 +353,10 @@ asm:
 	clang-22 -c ./misc/asm/coro/arm64.s --target=arm64-apple-darwin -o ./lib/libs/macos-arm64/valk-stack-swap.o
 	clang-22 -c ./misc/asm/coro/arm64-linux.s --target=aarch64-linux-gnu -o ./lib/libs/linux-arm64/valk-stack-swap.o
 
+# Drops CodeView debug info from the Windows static libraries (60 MB -> 23 MB); run after replacing them
+strip-win-libs:
+	for f in ./lib/libs/win-x64/lib*.lib; do llvm-objcopy --strip-debug "$$f" "$$f.tmp" && mv "$$f.tmp" "$$f"; done
+
 # Misc
 clean:
 	rm -f ./valk
