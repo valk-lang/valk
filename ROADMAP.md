@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.1
+
 + Release 0.8.0
 + Breaking: `shared T` is spelled `atomic T`; `shared` globals stay, and the old spelling still parses with a deprecation warning. A class flagged `$atomic` is always atomic data, so `Lock`, `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore` and `ConcurrentMap` need no `atomic` in front
 + Breaking: frame storage (stack structs, inline arrays, `.{}` literals, locals) is lent only to `local` borrow parameters such as `local &[u8]`, and a `local` result is lent from the arguments; whether a call accepts it follows from the signature alone, with no analysis across functions. A borrow parameter that could be `local` gets a warning, and frame-storage errors say so
