@@ -8,8 +8,13 @@ use time
 value READ_SIZE (32000)
 // Request heads are read into a buffer of this size, which is all an idle connection holds
 value HEAD_READ_SIZE (2048)
+// A connection parks between requests once the client paused at least this long before
+// its last request; clients that keep requests coming stay on their coroutine
+value PARK_GAP_MS (5)
 
-/// One accepted client connection of a `Server`, served on its own coroutine.
+/// One accepted client connection of a `Server`, served on a coroutine while a request is
+/// in flight. On Linux a plain connection waiting for its next request holds no coroutine:
+/// it is parked in the worker's epoll set and served again when data arrives.
 ///
 /// The server creates and manages these; handlers never receive one.
 class Connection {
@@ -25,14 +30,28 @@ class Connection {
     ~+ client_subject: String ("")
     ~+ client_certificate_sha256: String ("")
     - reserved_body_size: uint (0)
+    // The request bytes received so far, the parse state and the response under construction
+    input: ByteBuffer
+    context: Context
+    res: ResponseWriter (ResponseWriter {})
     // When the current request head started arriving (`time.mono_ms`), 0 between requests
     head_started: uint (0)
-    // When the read in progress must have returned (`Worker.now` time), 0 for none
+    // When the read in progress, or the parked wait, must have ended (`Worker.now` time), 0 for none
     deadline_ms: uint (0)
     // The response writer holds an answer that `read_more` sends before it reads
     answer_pending: bool (false)
     // Since when the connection waits for its next request (`time.mono_ms`), 0 while busy
     idle_since: uint (0)
+    // How long the client paused before its last request; unknown until the second one
+    last_gap_ms: uint (uint.$max)
+    // A request was answered on this connection: the wait before the next one is a client pause
+    served: bool (false)
+    // Waiting for its next request in the worker's epoll set, without a coroutine
+    parked: bool (false)
+    // Taken out of the epoll set by the worker: `serve` starts with a read
+    woken: bool (false)
+    // Registered in the worker's epoll set (parked at least once)
+    polled: bool (false)
     active: bool (false)
     rejected: bool (false)
     prev: ?Connection
@@ -43,9 +62,6 @@ class Connection {
         // Settings
         let worker = this.worker
         let server = worker.server
-
-        let handler = server.handler
-        let fast_handler = server.fast_handler
 
         let tls_context = server.tls_context
         if isset(tls_context) {
@@ -73,11 +89,10 @@ class Connection {
             return
         }
 
-        let input = ByteBuffer.new(HEAD_READ_SIZE)
-        let context = Context.new(input)
+        let context = this.context
         this.peer_address = this.netcon.peer_address() !? net.SocketAddress {}
         context.peer_address = this.peer_address
-        let res = ResponseWriter {}
+        let res = this.res
         res.compress = server.compress
         res.websocket_compression = server.websocket_compression
         res.stop = server.stop
@@ -86,6 +101,33 @@ class Connection {
             this.send_error(503, res)
             this.finish()
             return
+        }
+
+        this.serve()
+    }
+
+    // Serves requests until the connection ends, or until it parks between two requests;
+    // the worker calls it again when data arrives for a parked connection
+    fn serve() {
+        let worker = this.worker
+        let server = worker.server
+        let handler = server.handler
+        let fast_handler = server.fast_handler
+        let input = this.input
+        let context = this.context
+        let res = this.res
+
+        if this.woken {
+            // Woken by the worker: the next request, or the end of the connection, is readable
+            this.woken = false
+            let bytes = this.read_more(input, context, res) ! {
+                this.finish()
+                return
+            }
+            if bytes == 0 {
+                this.finish()
+                return
+            }
         }
 
         while true {
@@ -106,6 +148,15 @@ class Connection {
                     if context.stage == 2 && context.expect_continue && !context.continue_sent && !context.http10 {
                         context.continue_sent = true
                         this.netcon.write("HTTP/1.1 100 Continue\r\n\r\n") ! break
+                    }
+                    // Between two requests: wait without a coroutine where the worker can
+                    if input.length == 0 && this.can_park() {
+                        if this.answer_pending {
+                            this.answer_pending = false
+                            res.send_bytes(this.netcon) ! break
+                            res.reset()
+                        }
+                        if this.park() : return
                     }
                     let bytes = this.read_more(input, context, res) ! break
                     if bytes == 0 : break
@@ -226,6 +277,7 @@ class Connection {
             //
             res.allow_new_response()
             this.active = false
+            this.served = true
         }
 
         res.reset()
@@ -233,6 +285,35 @@ class Connection {
         input.clear()
 
         this.finish()
+    }
+
+    // Whether the wait for the next request can happen without a coroutine: a plain
+    // connection on a worker with an epoll set, while the server runs
+    fn can_park() bool {
+        #if OS == "linux"
+        return this.last_gap_ms >= PARK_GAP_MS && !isset(this.netcon.ssl) && this.worker.server.stopping == 0 && this.worker.epoll_fd >= 0
+        #else
+        return false
+        #end
+    }
+
+    // Parks the connection in the worker's epoll set; the coroutine then returns. False when
+    // the set refused the descriptor, so the caller reads with the coroutine instead
+    fn park() bool {
+        let worker = this.worker
+        let now = time.mono_ms()
+        worker.now = now
+        this.head_started = 0
+        this.idle_since = now
+        let timeout = worker.server.idle_timeout_ms
+        this.deadline_ms = timeout == 0 ? 0 : now.checked_add(timeout) !? uint.$max
+        this.active = false
+        this.parked = true
+        if worker.park(this) : return true
+        this.parked = false
+        this.deadline_ms = 0
+        this.idle_since = 0
+        return false
     }
 
     fn finish() {
@@ -294,7 +375,10 @@ class Connection {
             }
         }
         this.deadline_ms = 0
-        this.idle_since = 0
+        if this.idle_since > 0 {
+            if bytes > 0 && this.served : this.last_gap_ms = time.mono_ms() - this.idle_since
+            this.idle_since = 0
+        }
         if settings.stopping != 0 && !this.active : throw .closed
         if bytes > 0 : this.active = true
         buffer.skip(bytes)

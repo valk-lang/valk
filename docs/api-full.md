@@ -2380,15 +2380,15 @@ not an object or a member cannot be converted to the value type.
 Reorders the entries so iteration, `keys` and `values` follow ascending key order.
 
 ```js
-+ extend HashMap[u32, T] {
++ extend HashMap[i32, T] {
     // Builds a map from a JSON object whose member names are integers, converting each member with `to_type`.
-    + static fn from_json_value_auto[X](value: X) HashMap[u32, T] !LookupError
+    + static fn from_json_value_auto[X](value: X) HashMap[i32, T] !LookupError
     // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
     + fn sort_keys() void
 }
 ```
 
-#### HashMap[u32, T].from_json_value_auto
+#### HashMap[i32, T].from_json_value_auto
 
 Builds a map from a JSON object whose member names are integers, converting each
 member with `to_type`.
@@ -2396,7 +2396,7 @@ member with `to_type`.
 Throws `.missing` when `value` is not an object, a name is not an integer of the key
 type, or a member cannot be converted to the value type.
 
-#### HashMap[u32, T].sort_keys
+#### HashMap[i32, T].sort_keys
 
 Reorders the entries so iteration, `keys` and `values` follow ascending key order.
 

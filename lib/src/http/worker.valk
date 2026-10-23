@@ -2,6 +2,9 @@
 use core
 use time
 use net
+use io
+use mem
+use ext
 
 // How often an idle acceptor checks whether the server is stopping
 value ACCEPT_POLL_MS (20)
@@ -9,12 +12,33 @@ value ACCEPT_POLL_MS (20)
 value DRAIN_POLL_MS (10)
 // How often read deadlines are checked; a read past its deadline is interrupted
 value SWEEP_MS (25)
+// How long the watcher of parked connections waits before it checks whether the worker ended
+value WATCH_POLL_MS (100)
+// Parked connections woken per epoll_wait
+value WATCH_BATCH (256)
+
+#if OS == "linux"
+value EPOLL_CTL_ADD (1)
+value EPOLL_CTL_MOD (3)
+value EPOLLIN (1)
+value EPOLLERR (8)
+value EPOLLHUP (16)
+value EPOLLRDHUP (8192)
+value EPOLLONESHOT (1 << 30)
+// A C `struct epoll_event`: u32 events, then 8 bytes of user data, packed
+value EPOLL_EVENT_SIZE (12)
+#end
 
 fn worker(server: atomic ServerWorkerData) {
     let worker = Worker {
         server: server
         now: time.mono_ms()
     }
+    #if OS == "linux"
+    // Connections waiting for their next request park here, without a coroutine
+    worker.epoll_fd = ext.epoll_create(1)
+    if worker.epoll_fd >= 0 : co worker.watch_parked()
+    #end
 
     let sock = server.socket
     while server.stopping == 0 {
@@ -50,6 +74,7 @@ fn worker(server: atomic ServerWorkerData) {
         sock.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
     }
     worker.drain()
+    worker.ended = true
     if --server.workers == 0 : server.done.unlock()
 }
 
@@ -67,6 +92,11 @@ class Worker {
     last_sweep: uint (0)
     // Doubly linked so that `remove_client` is O(1)
     clients: ?Connection
+    // The epoll set parked connections wait in, -1 without one; parked connections by descriptor
+    epoll_fd: Fd (-1)
+    parked: HashMap[Fd, Connection] (.new())
+    // Set once the worker drained: the watcher of parked connections ends
+    ended: bool (false)
 
     fn handle(netcon: net.TcpConnection) {
         let server = this.server
@@ -92,11 +122,14 @@ class Worker {
             println("[+] New connection: " + fd)
         }
 
+        let input = ByteBuffer.new(HEAD_READ_SIZE)
         let http_con = Connection {
             worker: this,
             netcon: netcon,
             fd: fd,
             rejected: rejected,
+            input: input,
+            context: Context.new(input),
         }
         this.add_client(http_con)
 
@@ -105,7 +138,8 @@ class Worker {
         co http_con.handle()
     }
 
-    // Updates the clock and, every SWEEP_MS, interrupts connections whose read deadline passed
+    // Updates the clock and, every SWEEP_MS, ends the wait of connections whose deadline passed:
+    // a read is interrupted, a parked connection closed
     fn tick() {
         let now = time.mono_ms()
         this.now = now
@@ -113,9 +147,13 @@ class Worker {
         this.last_sweep = now
         let connection = this.clients
         while isset(connection) {
+            let next = connection.next
             let deadline = connection.deadline_ms
-            if deadline > 0 && now >= deadline : connection.netcon.interrupt()
-            connection = connection.next
+            if deadline > 0 && now >= deadline {
+                if connection.parked : this.close_parked(connection)
+                else : connection.netcon.interrupt()
+            }
+            connection = next
         }
     }
 
@@ -131,8 +169,71 @@ class Worker {
         }
         let found = victim ?! return false
         found.idle_since = 0
-        found.netcon.interrupt()
+        if found.parked : this.close_parked(found)
+        else : found.netcon.interrupt()
         return true
+    }
+
+    #if OS == "linux"
+    // Registers a parked connection for one readiness event; false when epoll refuses it
+    fn park(connection: Connection) bool {
+        @unsafe
+        let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
+        let events: u32 = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP | EPOLLONESHOT
+        let fd = connection.fd
+        mem.copy_bytes(@ref(events), @ref(event[0]), 4)
+        mem.copy_bytes(@ref(fd), @ref(event[4]), 4)
+        let op: i32 = connection.polled ? EPOLL_CTL_MOD : EPOLL_CTL_ADD
+        if ext.epoll_ctl(this.epoll_fd, op, fd, @ref(event[0])) != 0 : return false
+        connection.polled = true
+        this.parked.set(fd, connection)
+        return true
+    }
+
+    // Wakes parked connections as their descriptors become readable, on its own coroutine;
+    // the parked connections hold none
+    fn watch_parked() {
+        @unsafe
+        let buffer: [u8 x (EPOLL_EVENT_SIZE * WATCH_BATCH)] = @undefined
+        let base = @ref(buffer[0]).@cast(ptr)
+        while !this.ended {
+            let ready = io.await_fd(this.epoll_fd, true, false, WATCH_POLL_MS)
+            if ready.is_timeout() : continue
+            if !ready.is_readable() : continue
+            let count = ext.epoll_wait(this.epoll_fd, base, WATCH_BATCH, 0)
+            let now = time.mono_ms()
+            let i = 0
+            while i < count {
+                let fd: Fd = @ptrv(base + i * EPOLL_EVENT_SIZE + 4, i32)
+                i++
+                let connection = this.parked.get(fd) ! continue
+                this.parked.remove(fd)
+                // Busy again from here, so the sweep leaves it to its coroutine
+                connection.parked = false
+                connection.woken = true
+                connection.deadline_ms = 0
+                if connection.served : connection.last_gap_ms = now - connection.idle_since
+                connection.idle_since = 0
+                // Data, or the end of the connection: the coroutine reads it either way
+                co connection.serve()
+            }
+        }
+        io.close(this.epoll_fd) ! {}
+        this.epoll_fd = -1
+    }
+    #else
+    fn park(connection: Connection) bool {
+        return false
+    }
+    #end
+
+    // Ends a parked connection from the worker: nothing else holds its descriptor
+    fn close_parked(connection: Connection) {
+        this.parked.remove(connection.fd)
+        connection.parked = false
+        connection.deadline_ms = 0
+        connection.idle_since = 0
+        connection.finish()
     }
 
     fn add_client(client: Connection) {
@@ -154,7 +255,7 @@ class Worker {
         this.connections--
     }
 
-    // Runs once the server is stopping: idle connections are interrupted right
+    // Runs once the server is stopping: idle connections are closed or interrupted right
     // away, in-flight requests may finish until the deadline, after which their
     // sockets are interrupted too. Returns when every connection is gone.
     fn drain() {
@@ -165,10 +266,12 @@ class Worker {
             let expired = now >= deadline
             let connection = this.clients
             while isset(connection) {
+                let next = connection.next
                 let h2 = connection.h2
                 if isset(h2) : h2.request_shutdown()
-                if expired || (!isset(h2) && !connection.active) : connection.netcon.interrupt()
-                connection = connection.next
+                if connection.parked : this.close_parked(connection)
+                else if expired || (!isset(h2) && !connection.active) : connection.netcon.interrupt()
+                connection = next
             }
             let wait_ms: uint = DRAIN_POLL_MS
             if !expired && deadline - now < wait_ms : wait_ms = deadline - now
