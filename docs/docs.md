@@ -157,8 +157,8 @@ Cache entries that no build used for five days are removed; `--clean` ignores th
 
 Cross compiling needs nothing extra, except OpenSSL: a release ships it for its own platform only.
 A program that uses `valk.crypto` or TLS and targets another platform adds that platform's OpenSSL
-as a dependency, for example `vman install github.com/valk-lang/openssl-win-x64`; the other packages
-are `openssl-linux-x64`, `openssl-linux-arm64`, `openssl-macos-x64` and `openssl-macos-arm64`.
+as a dependency, for example `vman install github.com/valk-lang/openssl-win-x64 --allow-libs`; the
+other packages are `openssl-linux-x64`, `openssl-linux-arm64`, `openssl-macos-x64` and `openssl-macos-arm64`.
 
 Editors talk to `valk lsp run`, a language server over stdin and stdout. The
 [VS Code extension](https://github.com/valk-lang/valk-vscode) starts it for you.
@@ -3243,6 +3243,26 @@ A package names the oldest valk it works with under `require`:
 A build with an older compiler warns and still builds; when it fails, the
 warning is shown with the error. `vman` does not install such a package unless
 you pass `--ignore-min`.
+
+A package can ship compiled libraries in `libs/<target>/`, or name directories
+of them under `"targets": { "<target>": { "link-dirs": [...] } }`. Linking code
+you never read needs your permission: set `"allow-libs": true` on the entry
+that names the dependency, or the build stops and says so. `vman install <pkg>
+--allow-libs` writes it for you.
+
+```json
+{
+    "dependencies": {
+        "openssl": { "src": "github.com/valk-lang/openssl-win-x64", "version": "1.x", "allow-libs": true }
+    }
+}
+```
+
+The linker searches directories in this order: `-L` flags, the system
+directories when building for the machine itself, the project's own
+`libs/<target>`, dependencies in `valk.json` order followed by their own
+dependencies, and last the libraries bundled with valk. A dependency can
+therefore replace a bundled library, such as OpenSSL, by shipping it.
 
 ## Unsafe
 

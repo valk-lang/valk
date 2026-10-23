@@ -14,7 +14,7 @@ fn link_unit_objects(build: Build) !Error {
     else : output = link_output_path(build) !>
 
     let root = target_sysroot(build)
-    let dirs = target_link_dirs(build, root)
+    let dirs = target_link_dirs(build, root) !>
     let missing = Array[String]{}
     let args = ByteBuffer.new(16384)
     if target.os == "win" {
@@ -147,7 +147,7 @@ fn archive_unit_objects(build: Build) !Error {
         }
         if build.options.static_link_deps() {
             let root = target_sysroot(build)
-            let dirs = target_link_dirs(build, root)
+            let dirs = target_link_dirs(build, root) !>
             let inputs = static_library_dependency_inputs(build, dirs) !>
             if target.os == "macos" {
                 each static_library_archive_objects(build, inputs) as path : objects.append(path, true)
@@ -185,7 +185,7 @@ fn link_static_library_dependencies(build: Build) String !Error {
     if target.os != "linux" : build.error("Unsupported static library target: " + target.target)
     let output = helper.add(object_output_dir(build) !>, "library-static-deps.o")
     let root = target_sysroot(build)
-    let dirs = target_link_dirs(build, root)
+    let dirs = target_link_dirs(build, root) !>
     let args = ByteBuffer.new(16384)
 
     args.append_text("-r -o \"")
@@ -413,7 +413,7 @@ fn target_sysroot(build: Build) String {
     return "/"
 }
 
-fn target_link_dirs(build: Build, root: String) Array[String] {
+fn target_link_dirs(build: Build, root: String) Array[String] !Error {
     let dirs = Array[String]{}
     each build.options.link_dirs as dir : dirs.append(helper.resolve(dir), true)
 
@@ -439,29 +439,80 @@ fn target_link_dirs(build: Build, root: String) Array[String] {
         }
     }
 
-    // Dependencies that only carry libraries, like openssl-<target>, are never loaded by a `use`
+    // The project's own libraries, then its dependencies in valk.json order, then valk's
     let main = build.main_pkg
-    let main_config = isset(main) ? main.config : null
-    if isset(main_config) {
-        each main_config.json.get("dependencies").object.values as dep, name {
-            let pkgdir = main_config.get_package_dir(name) ! continue
-            let libs = helper.add(helper.add(pkgdir, "libs"), build.options.target.target)
-            if fs.is_dir(libs) : dirs.append(helper.resolve(libs), true)
-        }
+    if isset(main) {
+        let main_dir = main.dir
+        if isset(main_dir) : link_dirs_add_pkg(dirs, main_dir, main.config, target)
+        let config = main.config
+        if isset(config) : link_dirs_add_dependencies(build, config, config, dirs, Map[bool]{}) !>
     }
-
-    // valk/lib is a package, so this loop contributes Valk's own libs too.
     each build.cache.package_dirs as pkg, pkgdir {
-        dirs.append(helper.add(helper.add(pkgdir, "libs"), build.options.target.target), true)
-        let config = pkg.config
-        if !isset(config) : continue
-        let configured = config.json.get("targets").get(build.options.target.target).get("link-dirs").array.values
-        each configured as item {
-            let dir = item.string_value() !? ""
-            if dir.length > 0 : dirs.append(helper.resolve(helper.add(pkgdir, dir)), true)
-        }
+        if pkg.name == "valk" : link_dirs_add_pkg(dirs, pkgdir, pkg.config, target)
     }
     return dirs
+}
+
+fn link_dirs_add_pkg(dirs: Array[String], pkgdir: String, config: ?helper.Config, target: Target) {
+    let libs = helper.add(helper.add(pkgdir, "libs"), target.target)
+    if fs.is_dir(libs) : dirs.append(helper.resolve(libs), true)
+    each link_dirs_configured(pkgdir, config, target) as dir : dirs.append(dir, true)
+}
+
+// The `targets.<target>.link-dirs` of a package's valk.json, resolved
+fn link_dirs_configured(pkgdir: String, config: ?helper.Config, target: Target) Array[String] {
+    let dirs = Array[String]{}
+    if !isset(config) : return dirs
+    let configured = config.json.get("targets").get(target.target).get("link-dirs").array.values
+    each configured as item {
+        let dir = item.string_value() !? ""
+        if dir.length > 0 : dirs.append(helper.resolve(helper.add(pkgdir, dir)), true)
+    }
+    return dirs
+}
+
+// A dependency that ships libraries (libs/<target> or configured link-dirs) is linked only with
+// "allow-libs": true on its entry in the project's own valk.json: `root`. Deeper in the tree the
+// same package has to be listed there too; the project's copy then provides the libraries.
+fn link_dirs_add_dependencies(build: Build, root: helper.Config, config: helper.Config, dirs: Array[String], seen: Map[bool]) !Error {
+    let target = build.options.target
+    let is_root = config.path == root.path
+    // This level first, so the project's own entry wins over the same package deeper down
+    let nested = Array[helper.Config]{}
+    each config.json.get("dependencies").object.values as dep, name {
+        if name == "valk" : continue
+        let pkgdir = helper.resolve(config.get_package_dir(name) ! continue)
+        if seen.has(pkgdir) : continue
+        seen.set(pkgdir, true)
+        if !fs.is_dir(pkgdir) : continue
+        let dep_config = helper.Config.load(helper.add(pkgdir, "valk.json")) !? null
+        if isset(dep_config) : nested.append(dep_config)
+        let libs = helper.add("libs", target.target)
+        let ships = fs.is_dir(helper.add(pkgdir, libs)) ? libs : (link_dirs_configured(pkgdir, dep_config, target).length > 0 ? "targets." + target.target + ".link-dirs" : "")
+        if ships.length > 0 {
+            let src = dep.get("src").string_value() !? ""
+            if is_root {
+                let allowed = dep.get("allow-libs").bool_value() !? false
+                if !allowed : build.error("Dependency '" + name + "' ships libraries (" + ships + "): set \"allow-libs\": true on its entry in " + config.path + " to link them, or install it with `vman install " + src + " --allow-libs`")
+                link_dirs_add_pkg(dirs, pkgdir, dep_config, target)
+            } else if !link_dirs_root_allows(root, src, pkgdir) {
+                build.error("Package '" + name + "' ships libraries (" + ships + ") and is a dependency of a dependency: libraries that deep are linked only when the package is in your own " + root.path + " with \"allow-libs\": true, so install it with `vman install " + src + " --allow-libs`")
+            }
+        }
+    }
+    each nested as dep_config : link_dirs_add_dependencies(build, root, dep_config, dirs, seen) !>
+}
+
+// Whether the project's valk.json names the same package with "allow-libs": true
+fn link_dirs_root_allows(root: helper.Config, src: String, pkgdir: String) bool {
+    each root.json.get("dependencies").object.values as dep, name {
+        if !(dep.get("allow-libs").bool_value() !? false) : continue
+        let root_src = dep.get("src").string_value() !? ""
+        if root_src.length > 0 && root_src == src : return true
+        let dir = root.get_package_dir(name) ! continue
+        if helper.resolve(dir) == pkgdir : return true
+    }
+    return false
 }
 
 fn linker_write_lib(out: ByteBuffer, raw_name: String, static: bool, dirs: Array[String], missing: Array[String], target: Target) {
@@ -531,7 +582,7 @@ fn linker_check_openssl(build: Build, raw_name: String, dirs: Array[String], tar
     if name != "crypto" && name != "ssl" : return
     let filename = target.os == "win" ? "lib" + name + ".lib" : "lib" + name + ".a"
     if isset(linker_find_lib(filename, dirs)) : return
-    build.error("Cannot find " + filename + " for target '" + target.target + "': OpenSSL ships with valk for its own platform only. Add the package for this target to your dependencies: vman install github.com/valk-lang/openssl-" + target.target)
+    build.error("Cannot find " + filename + " for target '" + target.target + "': OpenSSL ships with valk for its own platform only. Add the package for this target to your dependencies: vman install github.com/valk-lang/openssl-" + target.target + " --allow-libs")
 }
 
 fn linker_find_lib(name: String, dirs: Array[String]) ?String {
