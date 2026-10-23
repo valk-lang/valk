@@ -769,7 +769,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     // The number of items.
     + get length: uint
     // Creates an empty heap ordered by `before`.
-    + static fn new(before: fn(T, T)(bool)) Heap[T]
+    + static fn new(before: atomic fn(T, T)(bool)) Heap[T]
     // Returns the first item without removing it.
     + fn peek() T !LookupError
     // Removes and returns the first item, in O(log n).

@@ -2559,7 +2559,7 @@ Returns a new set with the values in this set or in `other`; backs `a + b` (`$ad
     // The number of items.
     + get length: uint
     // Creates an empty heap ordered by `before`.
-    + static fn new(before: fn(T, T)(bool)) Heap[T]
+    + static fn new(before: atomic fn(T, T)(bool)) Heap[T]
     // Returns the first item without removing it.
     + fn peek() T !LookupError
     // Removes and returns the first item, in O(log n).
@@ -9427,7 +9427,7 @@ names compare without regard to case).
 Makes `path` absolute and folds `.`, `..` and repeated separators.
 
 The file system is not consulted, so symlinks are not followed; `realpath` follows them. A
-relative path is taken against `cwd()`, and it panics when that fails. On Windows either
+relative path is taken against `cwd()`, or the root when that fails. On Windows either
 separator is accepted and becomes `\`, and a path whose second byte is `:` is absolute (a
 drive); on Linux and macOS only `/` separates and `\` and `:` are ordinary name bytes.
 Trailing separators are dropped, except at the root: `..` at the root stays at the root,
