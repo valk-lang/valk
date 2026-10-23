@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.8.0
++ Release 0.8.0
 + Breaking: `shared T` is spelled `atomic T`; `shared` globals stay, and the old spelling still parses with a deprecation warning. A class flagged `$atomic` is always atomic data, so `Lock`, `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore` and `ConcurrentMap` need no `atomic` in front
 + Breaking: frame storage (stack structs, inline arrays, `.{}` literals, locals) is lent only to `local` borrow parameters such as `local &[u8]`, and a `local` result is lent from the arguments; whether a call accepts it follows from the signature alone, with no analysis across functions. A borrow parameter that could be `local` gets a warning, and frame-storage errors say so
 + Breaking: publishing copies. A non-literal value converted to `atomic`, stored into locked data, placed in an `$atomic` literal or passed to `Lock.new` is copied instead of having to be a provably unique graph; results keep views by their type, and `copy`/`sorted` on an atomic collection return a plain one. Public one-word fields and slice elements change through atomic views, fields marked `-` or `~` do not, and a method is accepted on a view when it type-checks with a read-only receiver, instead of by inferred write effects
