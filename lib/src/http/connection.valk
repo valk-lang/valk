@@ -4,7 +4,10 @@ use fs
 use core
 use time
 
+// Bodies are read in pieces of this size
 value READ_SIZE (32000)
+// Request heads are read into a buffer of this size, which is all an idle connection holds
+value HEAD_READ_SIZE (2048)
 
 /// One accepted client connection of a `Server`, served on its own coroutine.
 ///
@@ -28,6 +31,8 @@ class Connection {
     deadline_ms: uint (0)
     // The response writer holds an answer that `read_more` sends before it reads
     answer_pending: bool (false)
+    // Since when the connection waits for its next request (`time.mono_ms`), 0 while busy
+    idle_since: uint (0)
     active: bool (false)
     rejected: bool (false)
     prev: ?Connection
@@ -68,7 +73,7 @@ class Connection {
             return
         }
 
-        let input = ByteBuffer.new(2048)
+        let input = ByteBuffer.new(HEAD_READ_SIZE)
         let context = Context.new(input)
         this.peer_address = this.netcon.peer_address() !? net.SocketAddress {}
         context.peer_address = this.peer_address
@@ -199,12 +204,12 @@ class Connection {
             let reached_end = context.parsed_index >= input.length
             if reached_end {
                 input.clear()
-                input.shrink_capacity(READ_SIZE + 1024)
+                input.shrink_capacity(HEAD_READ_SIZE)
                 context.parsed_index = 0
             } else if context.parsed_index > 1024 {
                 input.clear_until(context.parsed_index)
                 context.parsed_index = 0
-                input.shrink_capacity(READ_SIZE + 1024)
+                input.shrink_capacity(HEAD_READ_SIZE)
             }
 
             // Flush output. A small answer to everything the client sent goes out with the
@@ -245,11 +250,20 @@ class Connection {
         let now = time.mono_ms()
         worker.now = now
         let timeout: uint = 0
+        // Heads are read into the small buffer; a body in pieces of READ_SIZE, or what is
+        // left of it when its length is known. An idle connection then holds the small buffer
+        let size: uint = HEAD_READ_SIZE
         if request.stage >= 2 {
             this.head_started = 0
             timeout = settings.body_timeout_ms
+            size = READ_SIZE
+            if request.has_content_length && !request.chunked && request.content_length > request.body_received {
+                let left = request.content_length - request.body_received
+                if left < size : size = left > HEAD_READ_SIZE ? left : HEAD_READ_SIZE
+            }
         } else if buffer.length == 0 {
             this.head_started = 0
+            this.idle_since = now
             timeout = settings.idle_timeout_ms
         } else {
             // The whole head must arrive in time, not each read of it, or a client that
@@ -262,22 +276,25 @@ class Connection {
         }
         this.deadline_ms = timeout == 0 ? 0 : now.checked_add(timeout) !? uint.$max
         // Read straight into the spare capacity instead of through a bounce buffer
-        buffer.reserve(READ_SIZE)
+        buffer.reserve(size)
         let bytes: uint = 0
         if this.answer_pending {
             this.answer_pending = false
-            bytes = this.netcon.write_then_read(res.unsent_output(), buffer.view_spare(READ_SIZE)) ! {
+            bytes = this.netcon.write_then_read(res.unsent_output(), buffer.view_spare(size)) ! {
                 this.deadline_ms = 0
+                this.idle_since = 0
                 throw E
             }
             res.reset()
         } else {
-            bytes = this.netcon.read(buffer.view_spare(READ_SIZE)) ! {
+            bytes = this.netcon.read(buffer.view_spare(size)) ! {
                 this.deadline_ms = 0
+                this.idle_since = 0
                 throw E
             }
         }
         this.deadline_ms = 0
+        this.idle_since = 0
         if settings.stopping != 0 && !this.active : throw .closed
         if bytes > 0 : this.active = true
         buffer.skip(bytes)

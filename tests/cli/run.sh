@@ -1333,5 +1333,22 @@ ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --targe
     exit 1
 }
 
+if [[ "$(uname -s)" == "Linux" ]]; then
+    echo ""
+    echo "# Test the HTTP server making room for new connections when out of file descriptors"
+    "$VALK" build "$DIR/evict-idle.valk" --no-warn -o "$workdir/evict-idle" > /dev/null || exit 1
+    # Some 15 connections fit under this limit; the connection idle the longest is closed for each new one
+    (ulimit -n 24 && exec "$workdir/evict-idle" server 19633 > "$workdir/evict-idle.log" 2>&1) &
+    evict_pid=$!
+    evict_out=$("$workdir/evict-idle" client 19633 60 2>&1)
+    kill "$evict_pid" 2> /dev/null
+    if [[ "$evict_out" != "served 60" ]]; then
+        echo "# Expected every connection to be served:"
+        echo "$evict_out"
+        cat "$workdir/evict-idle.log"
+        exit 1
+    fi
+fi
+
 echo "# CLI tests passed"
-echo "# Test count: 82"
+echo "# Test count: 83"

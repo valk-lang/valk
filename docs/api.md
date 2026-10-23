@@ -3505,9 +3505,9 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     ~ host: String
     // Enables experimental HTTP/2, negotiated through ALPN with HTTP/1.1 as fallback.
     + http2: bool
-    // How long a connection may wait for the next request, in milliseconds.
+    // How long a connection may wait for the next request, in milliseconds. Defaults to 75 seconds: an idle connection costs little, and a client that comes back within a minute keeps its connection.
     + idle_timeout_ms: uint
-    // The number of open connections allowed; 0 means no limit. Defaults to 10000.
+    // The number of open connections allowed; 0 means no limit, which is the default.
     + max_connections: uint
     // The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
     + max_request_body_size: uint

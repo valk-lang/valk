@@ -11916,9 +11916,9 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     ~ host: String
     // Enables experimental HTTP/2, negotiated through ALPN with HTTP/1.1 as fallback.
     + http2: bool
-    // How long a connection may wait for the next request, in milliseconds.
+    // How long a connection may wait for the next request, in milliseconds. Defaults to 75 seconds: an idle connection costs little, and a client that comes back within a minute keeps its connection.
     + idle_timeout_ms: uint
-    // The number of open connections allowed; 0 means no limit. Defaults to 10000.
+    // The number of open connections allowed; 0 means no limit, which is the default.
     + max_connections: uint
     // The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
     + max_request_body_size: uint
@@ -12009,13 +12009,17 @@ Requires `tls` and the regular handler; `start` fails with `init` otherwise.
 
 #### idle_timeout_ms
 
-How long a connection may wait for the next request, in milliseconds.
+How long a connection may wait for the next request, in milliseconds. Defaults to
+75 seconds: an idle connection costs little, and a client that comes back within a
+minute keeps its connection.
 
 #### max_connections
 
-The number of open connections allowed; 0 means no limit. Defaults to 10000.
+The number of open connections allowed; 0 means no limit, which is the default.
 
-Connections beyond it are answered with 503 and closed.
+At the limit, and when the process runs out of file descriptors, the connection that
+has waited longest for its next request is closed to make room. Without an idle
+connection to close, a connection beyond the limit is answered with 503 and closed.
 
 #### max_request_body_size
 
