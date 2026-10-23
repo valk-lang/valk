@@ -3247,10 +3247,11 @@ warning is shown with the error. `vman` does not install such a package unless
 you pass `--ignore-min`.
 
 A package can ship compiled libraries in `libs/<target>/`, or name directories
-of them under `"targets": { "<target>": { "link-dirs": [...] } }`. Linking code
-you never read needs your permission: set `"libs": true` on the entry
-that names the dependency, or the build stops and says so. `vman install <pkg>
---libs` writes it for you.
+of them under `"targets": { "<target>": { "link-dirs": [...] } }`. Such
+libraries are linked only when the entry that names the dependency has
+`"libs": true`, so a package cannot add binaries to your executable without
+you opting in; otherwise the build stops and says so. `vman install <pkg>
+--libs` writes the entry for you.
 
 ```json
 {
