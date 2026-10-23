@@ -3253,7 +3253,7 @@ that names the dependency, or the build stops and says so. `vman install <pkg>
 ```json
 {
     "dependencies": {
-        "openssl": { "src": "github.com/valk-lang/openssl-win-x64", "version": "1.x", "libs": true }
+        "openssl": { "src": "github.com/valk-lang/openssl-win-x64", "version": "3.5.x", "libs": true }
     }
 }
 ```
