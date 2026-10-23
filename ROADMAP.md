@@ -5,6 +5,7 @@
 
 ```
 - Release 0.8.1
++ Fix: `--lint` and `valk doc` on a package whose source directory is its root no longer load the packages vendored inside it, which failed with duplicate declarations
 
 + Release 0.8.0
 + Breaking: `shared T` is spelled `atomic T`; `shared` globals stay, and the old spelling still parses with a deprecation warning. A class flagged `$atomic` is always atomic data, so `Lock`, `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore` and `ConcurrentMap` need no `atomic` in front

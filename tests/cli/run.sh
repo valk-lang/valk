@@ -327,6 +327,17 @@ if [[ "$lint_package_out" != *"lint-package"* ]] || [[ "$lint_package_out" != *"
     exit 1
 fi
 
+lint_vendor_out=$("$VALK" build "$DIR/lint-vendor" --lint 2>&1) || {
+    echo "# --lint checked a package vendored inside the source directory"
+    echo "$lint_vendor_out"
+    exit 1
+}
+if [[ "$lint_vendor_out" != *"Lint passed"* ]]; then
+    echo "# --lint did not pass for a package with a vendor directory in its source directory"
+    echo "$lint_vendor_out"
+    exit 1
+fi
+
 lint_output_out=$("$VALK" build "$lint_input" --lint -o "$output" 2>&1)
 status=$?
 if [ "$status" -eq 0 ] || [[ "$lint_output_out" != *"'--lint' cannot produce, run, or watch an output"* ]]; then
