@@ -1266,5 +1266,34 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     fi
 fi
 
+# OpenSSL for another target comes from a dependency package; without one the error names it
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64) ossl_target=win-x64; ossl_ext=lib ;;
+    *) ossl_target=linux-x64; ossl_ext=a ;;
+esac
+ossl_dir="$workdir/openssl"
+mkdir -p "$ossl_dir/app/src" "$ossl_dir/stdlib" "$ossl_dir/pkg/libs/$ossl_target"
+cp -r "$DIR/../../lib/." "$ossl_dir/stdlib/"
+rm -f "$ossl_dir/stdlib/libs/$ossl_target/libcrypto."* "$ossl_dir/stdlib/libs/$ossl_target/libssl."*
+printf 'use valk.crypto\n\nfn main() {\n    println(crypto.sha256_hex("x"))\n}\n' > "$ossl_dir/app/src/main.valk"
+ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --target "$ossl_target" --no-warn -o "$ossl_dir/app/out" 2>&1) && {
+    echo "# A cross build using crypto must fail without the target's OpenSSL"
+    echo "$ossl_out"
+    exit 1
+}
+if [[ "$ossl_out" != *"vman install github.com/valk-lang/openssl-$ossl_target"* ]]; then
+    echo "# The missing OpenSSL error must name the package"
+    echo "$ossl_out"
+    exit 1
+fi
+cp "$DIR/../../lib/libs/$ossl_target/libcrypto.$ossl_ext" "$DIR/../../lib/libs/$ossl_target/libssl.$ossl_ext" "$ossl_dir/pkg/libs/$ossl_target/"
+echo '{ "name": "openssl" }' > "$ossl_dir/pkg/valk.json"
+echo '{ "dependencies": { "openssl": { "src": "../pkg" } } }' > "$ossl_dir/app/valk.json"
+ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --target "$ossl_target" --no-warn -o "$ossl_dir/app/out" 2>&1) || {
+    echo "# A dependency holding libs/$ossl_target must provide OpenSSL to the cross build"
+    echo "$ossl_out"
+    exit 1
+}
+
 echo "# CLI tests passed"
-echo "# Test count: 76"
+echo "# Test count: 78"

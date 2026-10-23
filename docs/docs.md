@@ -155,6 +155,11 @@ valk build -h                               # Every option
 Builds keep compiled objects in `~/.valk/cache`, so an unchanged file is not compiled again.
 Cache entries that no build used for five days are removed; `--clean` ignores the cache.
 
+Cross compiling needs nothing extra, except OpenSSL: a release ships it for its own platform only.
+A program that uses `valk.crypto` or TLS and targets another platform adds that platform's OpenSSL
+as a dependency, for example `vman install github.com/valk-lang/openssl-win-x64`; the other packages
+are `openssl-linux-x64`, `openssl-linux-arm64`, `openssl-macos-x64` and `openssl-macos-arm64`.
+
 Editors talk to `valk lsp run`, a language server over stdin and stdout. The
 [VS Code extension](https://github.com/valk-lang/valk-vscode) starts it for you.
 Besides diagnostics, it answers hover, go to definition, completion, signature

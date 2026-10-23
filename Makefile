@@ -261,6 +261,10 @@ ci-win: $(COMPILER_DEPS)
 	-L toolchains/libraries/win-llvm-22-x64/lib $(CI_SYSTEM_LIB_FLAGS)
 
 # Distributions
+# A release carries OpenSSL for its own platform only; the openssl-<target> packages hold the others
+define keep_own_openssl
+for t in $(IR_TARGETS); do [ "$$t" = "$(1)" ] || rm -f ./dist/$(1)/lib/libs/$$t/libcrypto.* ./dist/$(1)/lib/libs/$$t/libssl.*; done
+endef
 LINUX_ARM64_LINK := -L "toolchains/toolchains/linux-arm64/usr/lib/gcc/aarch64-linux-gnu/12/" \
 	-L "toolchains/toolchains/linux-arm64/usr/lib/aarch64-linux-gnu" \
 	-L "toolchains/toolchains/linux-arm64/lib/aarch64-linux-gnu" \
@@ -279,6 +283,7 @@ linux-x64: $(DIST_DEPS)
 	-L "toolchains/libraries/linux-llvm-22-x64/lib" \
 	--sysroot toolchains/toolchains/linux-amd64 -l pthread -l dl
 	cp -r ./lib ./dist/linux-x64/
+	$(call keep_own_openssl,linux-x64)
 	cd ./dist/linux-x64/ && rm -f ../valk-$(VERSION)-linux-x64.tar.gz
 	cd ./dist/linux-x64/ && tar -czf  ../valk-$(VERSION)-linux-x64.tar.gz valk lib
 linux-arm64: $(DIST_DEPS)
@@ -288,6 +293,7 @@ linux-arm64: $(DIST_DEPS)
 	$(DIST_COMP) build -o ./dist/linux-arm64/valk --target linux-arm64 $(FLAGS) $(DIST_FLAGS) $(LINUX_ARM64_LINK) \
 	$(call lld_flags,toolchains/libraries/linux-llvm-22-arm64)
 	cp -r ./lib ./dist/linux-arm64/
+	$(call keep_own_openssl,linux-arm64)
 	cd ./dist/linux-arm64/ && rm -f ../valk-$(VERSION)-linux-arm64.tar.gz
 	cd ./dist/linux-arm64/ && tar -czf  ../valk-$(VERSION)-linux-arm64.tar.gz valk lib
 macos-x64: $(DIST_DEPS)
@@ -298,6 +304,7 @@ macos-x64: $(DIST_DEPS)
 	--sysroot toolchains/toolchains/macos-11-3 \
 	-L toolchains/libraries/macos-llvm-22-x64/lib $(call lld_flags,toolchains/libraries/macos-llvm-22-x64)
 	cp -r ./lib ./dist/macos-x64/
+	$(call keep_own_openssl,macos-x64)
 	cd ./dist/macos-x64/ && rm -f ../valk-$(VERSION)-macos-x64.tar.gz
 	cd ./dist/macos-x64/ && tar -czf  ../valk-$(VERSION)-macos-x64.tar.gz valk lib
 macos-arm64: $(DIST_DEPS)
@@ -308,6 +315,7 @@ macos-arm64: $(DIST_DEPS)
 	--sysroot toolchains/toolchains/macos-11-3 \
 	-L toolchains/libraries/macos-llvm-22-arm64/lib $(call lld_flags,toolchains/libraries/macos-llvm-22-arm64)
 	cp -r ./lib ./dist/macos-arm64/
+	$(call keep_own_openssl,macos-arm64)
 	cd ./dist/macos-arm64/ && rm -f ../valk-$(VERSION)-macos-arm64.tar.gz
 	cd ./dist/macos-arm64/ && tar -czf  ../valk-$(VERSION)-macos-arm64.tar.gz valk lib
 win-x64: $(DIST_DEPS)
@@ -320,6 +328,7 @@ win-x64: $(DIST_DEPS)
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
 	-L toolchains/libraries/win-llvm-22-x64/lib
 	cp -r ./lib ./dist/win-x64/
+	$(call keep_own_openssl,win-x64)
 # Windows uses LLVM's linker, which also writes archives when called with `/lib`.
 	$(if $(WIN_LLD_FLAGS),,cp ./toolchains/libraries/win-llvm-22-x64/lld.exe ./dist/win-x64/lld-link.exe)
 	cd ./dist/win-x64/ && rm -f  ../valk-$(VERSION)-win-x64.zip
