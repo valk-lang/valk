@@ -5,6 +5,7 @@ use net
 use io
 use mem
 use ext
+use sync
 
 // How often an idle acceptor checks whether the server is stopping
 value ACCEPT_POLL_MS (20)
@@ -12,10 +13,16 @@ value ACCEPT_POLL_MS (20)
 value DRAIN_POLL_MS (10)
 // How often read deadlines are checked; a read past its deadline is interrupted
 value SWEEP_MS (25)
+// How often the idle deadlines of parked connections are checked
+value PARKED_SWEEP_MS (1000)
 // How long the watcher of parked connections waits before it checks whether the worker ended
 value WATCH_POLL_MS (100)
 // Parked connections woken per epoll_wait
 value WATCH_BATCH (256)
+// Serving coroutines kept per worker: each drains the ready queue, then waits on its waker for
+// the next batch. When all are busy, up to SERVE_EXTRA temporary ones per batch help out
+value SERVE_POOL_MAX (256)
+value SERVE_EXTRA (8)
 
 #if OS == "linux"
 value EPOLL_CTL_ADD (1)
@@ -90,11 +97,20 @@ class Worker {
     // The worker's clock (`time.mono_ms`), updated by `tick`; reads use it for deadlines
     now: uint
     last_sweep: uint (0)
-    // Doubly linked so that `remove_client` is O(1)
+    last_parked_sweep: uint (0)
+    // Connections with a coroutine, and parked ones; doubly linked so that moving and
+    // `remove_client` are O(1). The frequent sweep walks only the first list
     clients: ?Connection
+    parked_clients: ?Connection
     // The epoll set parked connections wait in, -1 without one; parked connections by descriptor
+    // (descriptors are small dense numbers, and one array slot per connection logs little for the GC)
     epoll_fd: Fd (-1)
-    parked: HashMap[Fd, Connection] (.new())
+    parked: Array[?Connection] (.{})
+    // Woken connections waiting for a serving coroutine
+    ready: Deque[Connection] (.new())
+    // Wakers of the serving coroutines that wait for work, and how many serving coroutines exist
+    idle_servers: Array[sync.Waker] (.{})
+    servers: uint (0)
     // Set once the worker drained: the watcher of parked connections ends
     ended: bool (false)
 
@@ -138,8 +154,8 @@ class Worker {
         co http_con.handle()
     }
 
-    // Updates the clock and, every SWEEP_MS, ends the wait of connections whose deadline passed:
-    // a read is interrupted, a parked connection closed
+    // Updates the clock and, every SWEEP_MS, interrupts reads whose deadline passed; parked
+    // connections past their idle deadline are closed every PARKED_SWEEP_MS
     fn tick() {
         let now = time.mono_ms()
         this.now = now
@@ -147,31 +163,42 @@ class Worker {
         this.last_sweep = now
         let connection = this.clients
         while isset(connection) {
+            let deadline = connection.deadline_ms
+            if deadline > 0 && now >= deadline : connection.netcon.interrupt()
+            connection = connection.next
+        }
+        if now - this.last_parked_sweep < PARKED_SWEEP_MS : return
+        this.last_parked_sweep = now
+        connection = this.parked_clients
+        while isset(connection) {
             let next = connection.next
             let deadline = connection.deadline_ms
-            if deadline > 0 && now >= deadline {
-                if connection.parked : this.close_parked(connection)
-                else : connection.netcon.interrupt()
-            }
+            if deadline > 0 && now >= deadline : this.close_parked(connection)
             connection = next
         }
     }
 
-    // Interrupts the connection that has waited longest for its next request; false
-    // when every connection is busy
+    // Closes the connection that has waited longest for its next request; false when every
+    // connection is busy. Parked connections first: those on a coroutine are busier
     fn evict_idle() bool {
-        let victim: ?Connection = null
-        let connection = this.clients
-        while isset(connection) {
-            let since = connection.idle_since
-            if since > 0 && (!isset(victim) || since < victim.idle_since) : victim = connection
-            connection = connection.next
-        }
+        let victim = this.longest_idle(this.parked_clients)
+        if !isset(victim) : victim = this.longest_idle(this.clients)
         let found = victim ?! return false
         found.idle_since = 0
         if found.parked : this.close_parked(found)
         else : found.netcon.interrupt()
         return true
+    }
+
+    fn longest_idle(list: ?Connection) ?Connection {
+        let victim: ?Connection = null
+        let connection = list
+        while isset(connection) {
+            let since = connection.idle_since
+            if since > 0 && (!isset(victim) || since < victim.idle_since) : victim = connection
+            connection = connection.next
+        }
+        return victim
     }
 
     #if OS == "linux"
@@ -186,7 +213,11 @@ class Worker {
         let op: i32 = connection.polled ? EPOLL_CTL_MOD : EPOLL_CTL_ADD
         if ext.epoll_ctl(this.epoll_fd, op, fd, @ref(event[0])) != 0 : return false
         connection.polled = true
-        this.parked.set(fd, connection)
+        let index = fd.to(uint)
+        while this.parked.length <= index : this.parked.append(null)
+        this.parked.set(index, connection) _
+        this.unlink(connection)
+        this.link(connection, true)
         return true
     }
 
@@ -206,20 +237,62 @@ class Worker {
             while i < count {
                 let fd: Fd = @ptrv(base + i * EPOLL_EVENT_SIZE + 4, i32)
                 i++
-                let connection = this.parked.get(fd) ! continue
-                this.parked.remove(fd)
+                let connection = (this.parked.get(fd.to(uint)) !? null) ?! continue
+                this.parked.set(fd.to(uint), null) _
                 // Busy again from here, so the sweep leaves it to its coroutine
                 connection.parked = false
+                this.unlink(connection)
+                this.link(connection, false)
                 connection.woken = true
                 connection.deadline_ms = 0
                 if connection.served : connection.last_gap_ms = now - connection.idle_since
                 connection.idle_since = 0
-                // Data, or the end of the connection: the coroutine reads it either way
-                co connection.serve()
+                this.ready.push_back(connection)
             }
+            // Serving coroutines that wait get the work; without enough of them more are started,
+            // so no coroutine is created per request
+            let pending = this.ready.length
+            while pending > 0 {
+                let waker = this.idle_servers.pop_last() ! break
+                waker.wake()
+                pending--
+            }
+            while pending > 0 && this.servers < SERVE_POOL_MAX {
+                pending--
+                let waker = sync.Waker.new() ! break
+                this.servers++
+                co this.serve_loop(waker)
+            }
+            if pending > SERVE_EXTRA : pending = SERVE_EXTRA
+            while pending-- > 0 : co this.serve_ready()
         }
         io.close(this.epoll_fd) ! {}
         this.epoll_fd = -1
+        // The worker ended: the waiting serving coroutines end too
+        while true {
+            let waker = this.idle_servers.pop_last() ! break
+            waker.wake()
+        }
+    }
+
+    // A serving coroutine: drains the ready queue, then waits for the watcher's wake
+    fn serve_loop(waker: sync.Waker) {
+        while true {
+            this.serve_ready()
+            if this.ended : break
+            this.idle_servers.append(waker)
+            waker.wait()
+        }
+        this.servers--
+    }
+
+    // Serves woken connections until the queue is empty. Data, or the end of the connection,
+    // is readable for each of them: `serve` reads it either way
+    fn serve_ready() {
+        while true {
+            let connection = this.ready.pop_front() ! break
+            connection.serve()
+        }
     }
     #else
     fn park(connection: Connection) bool {
@@ -229,7 +302,7 @@ class Worker {
 
     // Ends a parked connection from the worker: nothing else holds its descriptor
     fn close_parked(connection: Connection) {
-        this.parked.remove(connection.fd)
+        this.parked.set(connection.fd.to(uint), null) _
         connection.parked = false
         connection.deadline_ms = 0
         connection.idle_since = 0
@@ -237,22 +310,34 @@ class Worker {
     }
 
     fn add_client(client: Connection) {
-        let head = this.clients
-        client.next = head
-        if isset(head) : head.prev = client
-        this.clients = client
+        this.link(client, false)
         this.connections++
     }
 
     fn remove_client(client: Connection) {
+        this.unlink(client)
+        this.connections--
+    }
+
+    fn link(client: Connection, parked: bool) {
+        let head = parked ? this.parked_clients : this.clients
+        client.next = head
+        if isset(head) : head.prev = client
+        if parked : this.parked_clients = client
+        else : this.clients = client
+        client.in_parked_list = parked
+    }
+
+    fn unlink(client: Connection) {
         let prev = client.prev
         let next = client.next
         if isset(prev) : prev.next = next
-        else if this.clients == client : this.clients = next
+        else if client.in_parked_list {
+            if this.parked_clients == client : this.parked_clients = next
+        } else if this.clients == client : this.clients = next
         if isset(next) : next.prev = prev
         client.prev = null
         client.next = null
-        this.connections--
     }
 
     // Runs once the server is stopping: idle connections are closed or interrupted right
@@ -264,14 +349,18 @@ class Worker {
             let now = this.now
             let deadline = this.server.deadline_ms
             let expired = now >= deadline
-            let connection = this.clients
+            let connection = this.parked_clients
             while isset(connection) {
                 let next = connection.next
+                this.close_parked(connection)
+                connection = next
+            }
+            connection = this.clients
+            while isset(connection) {
                 let h2 = connection.h2
                 if isset(h2) : h2.request_shutdown()
-                if connection.parked : this.close_parked(connection)
-                else if expired || (!isset(h2) && !connection.active) : connection.netcon.interrupt()
-                connection = next
+                if expired || (!isset(h2) && !connection.active) : connection.netcon.interrupt()
+                connection = connection.next
             }
             let wait_ms: uint = DRAIN_POLL_MS
             if !expired && deadline - now < wait_ms : wait_ms = deadline - now
