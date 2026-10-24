@@ -44,6 +44,7 @@ queue_ir "$workdir/native-address.ll" "$DIR/native-address.valk" --ir --no-warn
 queue_ir "$workdir/windows-coro-stack.ll" "$DIR/native-address.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --no-warn
 queue_ir "$workdir/atomic-alignment.ll" "$DIR/atomic-alignment.valk" --ir --no-warn
+queue_ir "$workdir/vectors.ll" "$DIR/vectors.valk" --ir --no-warn
 queue_ir "$workdir/pointer-integer-compare.ll" "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/windows-bool.ll" "$DIR/windows-bool.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/tagged-union-scalars.ll" "$DIR/tagged-union-scalars.valk" --ir --no-warn
@@ -269,6 +270,41 @@ if [[ "$atomic_body" != *"load atomic i8"*"align 1"* ]] \
     || [[ "$atomic_body" != *"load atomic i32"*"align 4"* ]]; then
     echo "# Atomic property access overstated its alignment"
     echo "$atomic_body"
+    exit 1
+fi
+
+echo "> Vector types lower to LLVM vectors with element alignment"
+
+vectors_ir="$workdir/vectors.ll"
+out=$(ir_result "$vectors_ir")
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build vectors IR fixture"
+    echo "$out"
+    exit 1
+fi
+
+vectors_body=$(sed -n '/^define .*__vector_ops__/,/^}/p' "$vectors_ir")
+if [[ "$vectors_body" != *"add <16 x i8>"* ]] \
+    || [[ "$vectors_body" != *"icmp ugt <16 x i8>"* ]] \
+    || [[ "$vectors_body" != *"sext <16 x i1>"*"to <16 x i8>"* ]] \
+    || [[ "$vectors_body" != *"shufflevector <16 x i8>"*"<16 x i32> <i32 16, i32 1,"* ]] \
+    || [[ "$vectors_body" != *"select <16 x i1>"* ]] \
+    || [[ "$vectors_body" != *"call i8 @llvm.vector.reduce.add.v16i8(<16 x i8>"* ]] \
+    || [[ "$vectors_body" != *"bitcast <16 x i1>"*"to i16"* ]]; then
+    echo "# Vector operations did not lower to LLVM vector instructions"
+    echo "$vectors_body"
+    exit 1
+fi
+# Every vector load and store from Valk storage states the element alignment, never the
+# natural vector alignment
+if grep -E "(load|store) <16 x i8>" "$vectors_ir" | grep -qv "align 1"; then
+    echo "# A vector load or store assumed the natural vector alignment"
+    grep -E "(load|store) <16 x i8>" "$vectors_ir"
+    exit 1
+fi
+if ! grep -q "^declare i8 @llvm.vector.reduce.add.v16i8(<16 x i8>)" "$vectors_ir"; then
+    echo "# Missing the vector reduce intrinsic declaration"
     exit 1
 fi
 
@@ -1213,5 +1249,5 @@ check_c_abi win-x64 \
     'declare i32 @"tex_sum"(ptr, i64, i32)'
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 47"
+echo "# Test count: 48"
 echo ""

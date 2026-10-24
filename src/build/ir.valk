@@ -40,6 +40,10 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
         out.append_text("declare " + bits_type + " @llvm.ctpop." + bits_type + "(" + bits_type + ")\n")
     }
     if build.options.debug : out.append_text("declare void @llvm.dbg.declare(metadata, metadata, metadata)\n")
+    each unit.llvm_declares as used, declare {
+        out.append_text(declare)
+        out.append_text("\n")
+    }
     let int_types = Array[String]{ "i8", "i16", "i32", "i64" }
     let float_types = Array[String]{ "float", "double" }
     let convs = Array[String]{ "fptosi", "fptoui" }
@@ -1162,6 +1166,11 @@ fn ir_type_uncached(type: Type) String !Error {
         if size == 8 : return "double"
         type.build.error("Unsupported LLVM float size: " + size)
     }
+    if t.is_vector_type() {
+        let sub = t.get_sub_type()
+        if !isset(sub) : type.build.bug("Vector type is missing its element type during IR generation")
+        return "<" + t.length + " x " + (ir_type(sub) !>) + ">"
+    }
     if t.is_fixed_array_type() {
         let sub = t.get_sub_type()
         if !isset(sub) : type.build.bug("Array type is missing its element type during IR generation")
@@ -1623,6 +1632,7 @@ fn ir_emit_load(ir: IRFunc, type: String, address: String) String {
     ir.write(type)
     ir.write(", ptr ")
     ir.write(address)
+    ir.write(ir_vector_align(type))
     ir.line_end()
     return out
 }
@@ -1635,7 +1645,19 @@ fn ir_emit_store(ir: IRFunc, type: String, value: String, address: String) {
     ir.write(value)
     ir.write(", ptr ")
     ir.write(address)
+    ir.write(ir_vector_align(type))
     ir.line_end()
+}
+
+// A vector in Valk storage is aligned like its element, not to its size as LLVM would
+// assume; an aggregate holding one gets the alignment that is always true
+fn ir_vector_align(type: String) String {
+    if type.bytes == 0 : return ""
+    if type[0] != '<' : return type.contains("<") ? ", align 1" : ""
+    if type.ends_with("x i8>") : return ", align 1"
+    if type.ends_with("x i16>") : return ", align 2"
+    if type.ends_with("x i32>") || type.ends_with("x float>") : return ", align 4"
+    return ", align 8"
 }
 
 fn ir_emit_aligned_load(ir: IRFunc, type: String, address: String, alignment: u32) String {
@@ -1807,6 +1829,7 @@ fn ir_emit_memset(ir: IRFunc, address: String, byte: uint, size: uint) {
 
 // The bit counts become llvm.ctlz/cttz/ctpop, and $mul_wide an i128 multiply
 fn ir_emit_intrinsic(ir: IRFunc, value: Value) String !Error {
+    if is_vector_intrinsic(value.get_string()) : return ir_emit_vector_intrinsic(ir, value) !>
     let args = value.values ?! value.bug("Intrinsic has no arguments")
     let rendered = Array[String]{}
     each args as arg {
@@ -2262,12 +2285,16 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
         if op == VALUE_OP.not : return ir_emit_binary_instruction(ir, "xor", "i1", val, "true")
         if op == VALUE_OP.neg {
             let type = ir_type(inner.rett) !>
-            if inner.rett.is_float_type() {
+            if inner.rett.vector_element().is_float_type() {
                 let out = ir.var()
                 ir.line4(out, " = fneg ", type, " " + val)
                 return out
             }
-            return ir_emit_binary_instruction(ir, "sub", type, "0", val)
+            return ir_emit_binary_instruction(ir, "sub", type, inner.rett.is_vector_type() ? "zeroinitializer" : "0", val)
+        }
+        if inner.rett.is_vector_type() {
+            let ones = "splat (" + (ir_type(inner.rett.vector_element()) !>) + " -1)"
+            return ir_emit_binary_instruction(ir, "xor", ir_type(inner.rett) !>, val, ones)
         }
         return ir_emit_binary_instruction(ir, "xor", ir_type(inner.rett) !>, val, "-1")
     }
@@ -4919,6 +4946,19 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     if type.is_pointer() && op != VALUE_OP.eq && op != VALUE_OP.ne && op != VALUE_OP.lt && op != VALUE_OP.gt && op != VALUE_OP.lte && op != VALUE_OP.gte {
         type.build.bug("Pointer/class operator reached native IR lowering for type '" + type.compat_display_name() + "': " + op)
     }
+    // A vector takes the instruction of its element; the result of a compare is a mask
+    if type.is_vector_type() {
+        let whole = type
+        type = type.vector_element()
+        let select = ir_vector_binary_instruction(op, type)
+        if op == VALUE_OP.eq || op == VALUE_OP.ne {
+            // Equal when every lane is: the lane bits packed into one integer are all ones
+            let lanes = ir_emit_binary_instruction(ir, ir_vector_binary_instruction(VALUE_OP.eq, type), irt, left, right)
+            let packed = ir_emit_convert(ir, "bitcast", "<" + whole.length + " x i1>", lanes, "i" + whole.length)
+            return ir_emit_binary_instruction(ir, op == VALUE_OP.eq ? "icmp eq" : "icmp ne", "i" + whole.length, packed, "-1")
+        }
+        return ir_emit_binary_instruction(ir, select, irt, left, right)
+    }
 
     if op == VALUE_OP.eq {
         inst = type.is_float_type() ? "fcmp oeq" : "icmp eq"
@@ -4952,6 +4992,29 @@ fn ir_emit_binary(ir: IRFunc, left: String, right: String, op: VALUE_OP, type: T
     else : inst = "add"
 
     return ir_emit_binary_instruction(ir, inst, irt, left, right)
+}
+
+// The LLVM instruction of a lane-wise vector operation, chosen by the element type
+fn ir_vector_binary_instruction(op: VALUE_OP, element: Type) String {
+    let is_float = element.is_float_type()
+    let signed = element.is_signed_type()
+    if op == VALUE_OP.eq : return is_float ? "fcmp oeq" : "icmp eq"
+    if op == VALUE_OP.ne : return is_float ? "fcmp une" : "icmp ne"
+    if op == VALUE_OP.lt : return is_float ? "fcmp olt" : (signed ? "icmp slt" : "icmp ult")
+    if op == VALUE_OP.gt : return is_float ? "fcmp ogt" : (signed ? "icmp sgt" : "icmp ugt")
+    if op == VALUE_OP.lte : return is_float ? "fcmp ole" : (signed ? "icmp sle" : "icmp ule")
+    if op == VALUE_OP.gte : return is_float ? "fcmp oge" : (signed ? "icmp sge" : "icmp uge")
+    if op == VALUE_OP.add : return is_float ? "fadd" : "add"
+    if op == VALUE_OP.sub : return is_float ? "fsub" : "sub"
+    if op == VALUE_OP.mul : return is_float ? "fmul" : "mul"
+    if op == VALUE_OP.div : return "fdiv"
+    if op == VALUE_OP.mod : return "frem"
+    if op == VALUE_OP.bit_and : return "and"
+    if op == VALUE_OP.bit_or : return "or"
+    if op == VALUE_OP.bit_xor : return "xor"
+    if op == VALUE_OP.shl : return "shl"
+    if op == VALUE_OP.shr : return signed ? "ashr" : "lshr"
+    return "add"
 }
 
 // Error codes are the 32-bit hash of their name. The ABI uses 0 as the

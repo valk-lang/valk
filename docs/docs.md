@@ -448,6 +448,47 @@ to the end. An entry is one element, as in `Array[T]`, so a tuple element is
 written as it is and never spread: `[(u8, u64) x 1] = { pair() }`, and
 `[u8 x 2] = { two_bytes() }` is rejected because a `(u8, u8)` is not a `u8`.
 
+### Vectors
+
+A vector type such as `u8x16`, `i32x4` or `f64x2` holds that many lanes of a number type in
+one 64 to 512 bit value (`u8x32`, `f32x8` and `i64x8` are the wider forms). Operators work
+per lane: `+ - *` on every vector, `/` on float vectors, `& | ^ ~` on integer vectors, and
+`<< >>` by a constant count. `==` and `!=` compare whole vectors. The compiler turns them into
+the SIMD instructions of the target, or plain instructions where the CPU lacks them; use
+`--cpu` to allow wider ones.
+
+```rust
+fn count_spaces(text: local &[u8]) uint {
+    let spaces = $splat[u8x16](' ')
+    let total: uint = 0
+    let i: uint = 0
+    while i + 16 <= text.length {
+        let chunk = $load[u8x16](text, i)
+        total += $count_ones($mask_bits($eq(chunk, spaces)))
+        i += 16
+    }
+    while i < text.length {
+        if text[i] == ' ' : total++
+        i++
+    }
+    return total
+}
+```
+
+Builtins (the type goes in `[...]` where it cannot be inferred):
+
+- `$splat[T](x)`: every lane `x`. `$load[T](view, offset)` and `$store(view, offset, v)` read
+  and write a vector at byte offset `offset` of a `&[u8]`, `Array`, `String` or any other view
+  of the element type; the access is bounds-checked and needs no alignment.
+- `$extract(v, i)`, `$insert(v, i, x)`: one lane; `$shuffle(a, b, i0, i1, ...)` picks lanes
+  from two vectors by constant index (`0..lanes-1` from `a`, `lanes..` from `b`).
+- `$eq $ne $lt $gt $lte $gte(a, b)`: per-lane compares, giving a mask: a signed integer vector
+  of the same lane width with all bits set where the compare holds. `$select(mask, a, b)`
+  takes `a` where the mask is set, `$mask_bits(mask)` packs one bit per lane into a `uint`.
+- `$reduce_add $reduce_min $reduce_max(v)` on any vector, `$reduce_and $reduce_or
+  $reduce_xor(v)` on integer vectors, give one lane value. `$bitcast[T](v)` reinterprets the
+  bytes as another vector type of the same size.
+
 Every range in Valk is a start offset and a length, never a start and an end,
 so there is no inclusive or exclusive bound to remember. `value[start .. length]`
 and `value.range(start, length)` return a copy. `&value[start .. length]` and

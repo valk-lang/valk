@@ -10,6 +10,7 @@ enum TYPE : u8 {
     union      // A | B (inline tagged value)
     array
     fixed_array
+    vector     // u8x16, f32x4, ...: `length` lanes of the element type, an LLVM <N x T>
     struct
     voidptr
     gcptr
@@ -61,6 +62,7 @@ class TypeCache {
     cached_union_layout: ?UnionLayout (null)
     cached_display_name: ?String (null)
     cached_identity_key: ?String (null)
+    vectors: ?HashMap[uint, Type] (null)
     cached_ir_type: ?String (null)
     cached_error_abi_type: ?String (null)
     ptr_of: ?Type (null)
@@ -486,6 +488,11 @@ class Type {
             }
             return element_size * this.length.to(u32)
         }
+        if this.is_vector_type() {
+            let sub = this.get_sub_type()
+            if !isset(sub) : this.build.bug("Vector is missing its element type")
+            return (sub.byte_size() !>) * this.length.to(u32)
+        }
 
         // Class-backed types (class / int / float / bool / pointer / …)
         let c = this.class
@@ -556,6 +563,9 @@ class Type {
             if !isset(sub) : return 1
             return sub.ir_alignment() !>
         }
+        // LLVM lays a vector out at its size inside its aggregates; in Valk storage it only
+        // needs its element's alignment, and every load and store of one says so
+        if t.is_vector_type() : return t.byte_size() !>
         if t.kind == TYPE.struct && t.is_inline && !isset(t.class) {
             let members = t.get_members()
             if !isset(members) : return 1
@@ -597,6 +607,7 @@ class Type {
             if !isset(sub) : return 1
             return sub.storage_alignment() !>
         }
+        if t.is_vector_type() : return t.vector_element().storage_alignment() !>
         if t.is_inline && isset(t.class) {
             let class = t.get_class_or_null()
             if !isset(class) : return 1
@@ -752,6 +763,16 @@ class Type {
 
     fn is_fixed_array_type() bool {
         return this.kind == TYPE.fixed_array
+    }
+
+    fn is_vector_type() bool {
+        return this.kind == TYPE.vector
+    }
+
+    // The element type of a vector; the type itself for anything else
+    fn vector_element() Type {
+        if this.kind != TYPE.vector : return this
+        return this.get_sub_type() ?? this
     }
 
     fn is_bounded_pointer() bool {
@@ -1216,6 +1237,7 @@ class Type {
         if t == TYPE.ptr_of || t == TYPE.adr_of || t == TYPE.ref_of : return this.compat_pointer(other)
         if t == TYPE.nullable : return this.compat_inner(other)
         if t == TYPE.fixed_array : return this.length == other.length && this.compat_inner(other)
+        if t == TYPE.vector : return this.length == other.length && type_identity_key(this.vector_element()) == type_identity_key(other.vector_element())
         if t == TYPE.struct && this.is_inline && !isset(this.class) : return this.compat_multi(other)
         if t == TYPE.closure || t == TYPE.fnptr : return this.compat_callable(other)
         if t == TYPE.co : return this.compat_callable(other)
@@ -1417,6 +1439,7 @@ class Type {
             let sub = this.get_sub_type()
             return isset(sub) ? prefix + "[" + sub.compat_display_name() + " x " + this.length + "]" : prefix + "[]"
         }
+        if this.kind == TYPE.vector : return prefix + this.vector_element().compat_display_name() + "x" + this.length
         if this.kind == TYPE.array {
             let sub = this.get_sub_type()
             return isset(sub) ? "$array[" + sub.compat_display_name() + "]" : "$array[]"
@@ -1753,6 +1776,27 @@ class Type {
         }
     }
 
+    // The vector of `lanes` elements of this number type; one Type per lane count
+    fn vector(lanes: uint) Type {
+        let cache = this.get_cache()
+        let vectors = cache.vectors
+        if !isset(vectors) {
+            vectors = HashMap[uint, Type]{}
+            cache.vectors = vectors
+        }
+        let cached = vectors.get(lanes) !? null
+        if isset(cached) : return cached
+        let t = Type {
+            build: this.build
+            kind: TYPE.vector
+            info: UnaryTypeInfo { sub: this }
+            length: lanes
+            is_inline: true
+        }
+        vectors.set(lanes, t)
+        return t
+    }
+
     fn union_member_index(other: Type) uint !LookupError {
         let t = this.get_non_nullable()
         if t.kind != TYPE.union : throw .missing
@@ -1954,6 +1998,7 @@ fn type_union(b: Build, input: Array[Type], at: Exp, owner: ?Class (null)) Type 
         } else {
             if member.is_void_type() && !member.is_null_alt() : at.error("A union cannot contain void")
             if member.kind == TYPE.any : at.error("A union cannot contain any")
+            if member.is_vector_type() : at.error("A union cannot contain a vector")
             members.append(member)
         }
     }
@@ -2730,7 +2775,11 @@ fn type_from_named_exp(exp: Exp, scope: Scope) Type !Error {
         lsp_complete_scope(id, scope) !>
         idf = scope.get_idf(name)
         if !isset(idf) && (resolve_pending_alias(id.src.build, name, scope, id) !>) : idf = scope.get_idf(name)
-        if !isset(idf) : exp.error("Unknown type: " + name)
+        if !isset(idf) {
+            let vector = type_vector_from_name(id.src.build, name) !>
+            if isset(vector) : return vector
+            exp.error("Unknown type: " + name)
+        }
     }
 
     let resolved = idf
@@ -2882,4 +2931,46 @@ fn warn_deprecated_spelling(exp: Exp, msg: String) {
     let ns = exp.src.ns ?! return
     if ns.pkg != b.main_pkg : return
     exp.warn(msg)
+}
+
+////////////////////////////
+// Vector types
+////////////////////////////
+
+// `u8x16`, `i32x4`, `f64x2`, ...: a sized number name, `x`, a lane count. The whole vector
+// is 64 to 512 bits. Null for any other name
+fn type_vector_from_name(b: Build, name: String) ?Type !Error {
+    let x = name.index_of("x") ! return null
+    if x < 2 || x + 1 >= name.bytes : return null
+    let element_name = name.range(0, x)
+    let first = element_name[0]
+    if first != 'u' && first != 'i' && first != 'f' : return null
+    let bits_text = element_name.range(1, x - 1)
+    if !type_vector_digits(bits_text) : return null
+    let bits = bits_text.to_uint() ! return null
+    if bits != 8 && bits != 16 && bits != 32 && bits != 64 : return null
+    if first == 'f' && bits < 32 : return null
+    let lanes_text = name.range(x + 1, name.bytes - x - 1)
+    if !type_vector_digits(lanes_text) : return null
+    let lanes = lanes_text.to_uint() ! return null
+    let total = bits * lanes
+    if total != 64 && total != 128 && total != 256 && total != 512 : return null
+    let element = type_from_core_or_null(b, element_name) ?! return null
+    return element.vector(lanes)
+}
+
+fn type_vector_digits(text: String) bool {
+    if text.bytes == 0 || text[0] == '0' : return false
+    each text as ch {
+        if !ch.is_number() : return false
+    }
+    return true
+}
+
+// The mask a comparison of `vector` values gives: signed integers of the element width
+fn type_vector_mask(vector: Type) Type !Error {
+    let element = vector.vector_element()
+    let bits = (element.byte_size() !>).to(uint) * 8
+    let mask_element = type_from_core(vector.build, "i" + bits) !>
+    return mask_element.vector(vector.length)
 }

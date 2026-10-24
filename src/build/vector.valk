@@ -1,0 +1,431 @@
+// Vector types (`u8x16`, `f32x4`, ...): the `$` builtins that create and take apart
+// vectors, and the operator rules for vector operands. The operators themselves lower
+// through ir_emit_binary like numbers; LLVM picks the instructions per target.
+
+fn is_vector_intrinsic(name: String) bool {
+    return name == "splat" || name == "load" || name == "store" || name == "extract" || name == "insert"
+        || name == "shuffle" || name == "select" || name == "mask_bits" || name == "bitcast"
+        || name == "reduce_add" || name == "reduce_min" || name == "reduce_max"
+        || name == "reduce_and" || name == "reduce_or" || name == "reduce_xor"
+        || isset(vector_compare_op(name))
+}
+
+// `$eq(a, b)` ... `$gte(a, b)`: the lane-wise compares that give a mask
+fn vector_compare_op(name: String) ?VALUE_OP {
+    if name == "eq" : return VALUE_OP.eq
+    if name == "ne" : return VALUE_OP.ne
+    if name == "lt" : return VALUE_OP.lt
+    if name == "gt" : return VALUE_OP.gt
+    if name == "lte" : return VALUE_OP.lte
+    if name == "gte" : return VALUE_OP.gte
+    return null
+}
+
+////////////////////////////
+// Typing
+////////////////////////////
+
+fn value_from_vector_intrinsic(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let name = exp.str1
+    let b = ctx.build
+    let body = exp.get(VALUE_EXP.right) ?! exp.bug("$" + name + " is missing its argument body")
+    let arg_exps = parse_body_as_value_list(body) !>
+    let type_exp = exp.get(VALUE_EXP.left)
+    let explicit: ?Type = null
+    if isset(type_exp) {
+        let t = type_from_exp(type_exp, scope) !>
+        if !t.is_vector_type() : type_exp.error("$" + name + " expects a vector type such as u8x16, got: " + t.compat_display_name())
+        explicit = t
+    }
+    let values = Array[Value]{}
+    let rett = type_void(b)
+
+    let compare = vector_compare_op(name)
+    if isset(compare) {
+        vector_arg_count(exp, name, arg_exps, 2) !>
+        let a = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        let second = vector_arg(arg_exps, 1, name, scope, ctx) !>
+        a.rett.compat_check(second.rett, arg_exps.get(1) ! exp.bug("Missing compare argument")) !>
+        values.append(a)
+        values.append(second)
+        rett = type_vector_mask(a.rett) !>
+    } else if name == "splat" {
+        let target = vector_target_type(exp, name, explicit, ctx) !>
+        vector_arg_count(exp, name, arg_exps, 1) !>
+        values.append(vector_arg_as(arg_exps, 0, target.vector_element(), scope, ctx) !>)
+        rett = target
+    } else if name == "load" {
+        let target = vector_target_type(exp, name, explicit, ctx) !>
+        vector_arg_count(exp, name, arg_exps, 2) !>
+        values.append(vector_view_arg(arg_exps, 0, target, false, scope, ctx) !>)
+        values.append(vector_arg_as(arg_exps, 1, type_ptr_uint(b), scope, ctx) !>)
+        rett = target
+    } else if name == "store" {
+        vector_arg_count(exp, name, arg_exps, 3) !>
+        let v = vector_arg(arg_exps, 2, name, scope, ctx) !>
+        values.append(vector_view_arg(arg_exps, 0, v.rett, true, scope, ctx) !>)
+        values.append(vector_arg_as(arg_exps, 1, type_ptr_uint(b), scope, ctx) !>)
+        values.append(v)
+    } else if name == "extract" {
+        vector_arg_count(exp, name, arg_exps, 2) !>
+        let v = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        values.append(v)
+        values.append(vector_lane_arg(arg_exps, 1, v.rett, scope, ctx) !>)
+        rett = v.rett.vector_element()
+    } else if name == "insert" {
+        vector_arg_count(exp, name, arg_exps, 3) !>
+        let v = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        values.append(v)
+        values.append(vector_lane_arg(arg_exps, 1, v.rett, scope, ctx) !>)
+        values.append(vector_arg_as(arg_exps, 2, v.rett.vector_element(), scope, ctx) !>)
+        rett = v.rett
+    } else if name == "shuffle" {
+        let a = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        let second = vector_arg(arg_exps, 1, name, scope, ctx) !>
+        a.rett.compat_check(second.rett, arg_exps.get(1) ! exp.bug("Missing shuffle argument")) !>
+        let lanes = a.rett.length
+        if arg_exps.length != lanes + 2 {
+            exp.error("$shuffle of " + a.rett.compat_display_name() + " takes two vectors and " + lanes + " lane indexes, got " + arg_exps.length + " arguments")
+        }
+        values.append(a)
+        values.append(second)
+        let i: uint = 2
+        while i < arg_exps.length {
+            let index_exp = arg_exps.get(i) ! exp.bug("Missing shuffle index")
+            let index = value_from_exp(index_exp, scope, ctx.with_suggested_type(type_ptr_uint(b))) !>
+            if index.type != VAL.int : index_exp.error("$shuffle lane indexes must be constants")
+            if index.int_val < 0 || index.int_val >= (lanes * 2).to(int) {
+                index_exp.error("$shuffle lane index out of range: lanes 0.." + (lanes - 1) + " are the first vector, " + lanes + ".." + (lanes * 2 - 1) + " the second")
+            }
+            values.append(vgen_int(index.int_val, type_ptr_uint(b)))
+            i++
+        }
+        rett = a.rett
+    } else if name == "select" {
+        vector_arg_count(exp, name, arg_exps, 3) !>
+        let mask = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        let a = vector_arg(arg_exps, 1, name, scope, ctx) !>
+        let second = vector_arg(arg_exps, 2, name, scope, ctx) !>
+        a.rett.compat_check(second.rett, arg_exps.get(2) ! exp.bug("Missing select argument")) !>
+        vector_check_mask(mask, a.rett, arg_exps.get(0) ! exp.bug("Missing select mask")) !>
+        values.append(mask)
+        values.append(a)
+        values.append(second)
+        rett = a.rett
+    } else if name == "mask_bits" {
+        vector_arg_count(exp, name, arg_exps, 1) !>
+        let mask = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        if !mask.rett.vector_element().is_integer_type() : exp.error("$mask_bits expects an integer mask vector, got: " + mask.rett.compat_display_name())
+        values.append(mask)
+        rett = type_ptr_uint(b)
+    } else if name == "bitcast" {
+        let target = explicit ?! exp.error("$bitcast needs its target type: $bitcast[u32x4](v)")
+        vector_arg_count(exp, name, arg_exps, 1) !>
+        let v = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        if (v.rett.byte_size() !>) != (target.byte_size() !>) {
+            exp.error("$bitcast needs vectors of the same size: '" + v.rett.compat_display_name() + "' to '" + target.compat_display_name() + "'")
+        }
+        values.append(v)
+        rett = target
+    } else {
+        // reduce_*
+        vector_arg_count(exp, name, arg_exps, 1) !>
+        let v = vector_arg(arg_exps, 0, name, scope, ctx) !>
+        let element = v.rett.vector_element()
+        let bitwise = name == "reduce_and" || name == "reduce_or" || name == "reduce_xor"
+        if bitwise && !element.is_integer_type() : exp.error("$" + name + " expects an integer vector, got: " + v.rett.compat_display_name())
+        values.append(v)
+        rett = element
+    }
+
+    let result = Value {
+        type: VAL.intrinsic
+        values: values
+        rett: rett
+        exp: exp
+    }
+    result.set_string(name)
+    return result
+}
+
+// The vector type a builtin produces: written as `$name[T]`, or the type the value is used as
+fn vector_target_type(exp: Exp, name: String, explicit: ?Type, ctx: Context) Type !Error {
+    if isset(explicit) : return explicit
+    let suggested = ctx.suggested_type
+    if isset(suggested) && suggested.get_non_nullable().is_vector_type() : return suggested.get_non_nullable()
+    exp.error("$" + name + " needs its vector type here, like $" + name + "[u8x16](...)")
+}
+
+fn vector_arg_count(exp: Exp, name: String, arg_exps: Array[Exp], count: uint) !Error {
+    if arg_exps.length != count {
+        exp.error("$" + name + " expects " + count + (count == 1 ? " argument" : " arguments") + ", got " + arg_exps.length)
+    }
+}
+
+fn vector_arg_as(arg_exps: Array[Exp], index: uint, type: Type, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = arg_exps.get(index) ! ctx.build.bug("Missing vector builtin argument")
+    let v = value_from_exp(arg_exp, scope, ctx.with_suggested_type(type)) !>
+    v.require_result() !>
+    v = value_try_convert(v, scope, ctx, type) !>
+    type.compat_check(v.rett, arg_exp) !>
+    return v
+}
+
+// A vector argument of any vector type
+fn vector_arg(arg_exps: Array[Exp], index: uint, name: String, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = arg_exps.get(index) ! ctx.build.bug("Missing vector builtin argument")
+    let v = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    v.require_result() !>
+    v = value_try_remove_nullable(v, scope, ctx) !>
+    if !v.rett.is_vector_type() : arg_exp.error("$" + name + " expects a vector, got: " + v.rett.compat_display_name())
+    return v
+}
+
+// A lane index: a constant is checked here, a runtime value before the access
+fn vector_lane_arg(arg_exps: Array[Exp], index: uint, vector: Type, scope: Scope, ctx: Context) Value !Error {
+    let lane = vector_arg_as(arg_exps, index, type_ptr_uint(ctx.build), scope, ctx) !>
+    if lane.type == VAL.int && (lane.int_val < 0 || lane.int_val >= vector.length.to(int)) {
+        let arg_exp = arg_exps.get(index) ! ctx.build.bug("Missing lane index")
+        arg_exp.error("Lane " + lane.int_val + " is out of range for " + vector.compat_display_name())
+    }
+    return lane
+}
+
+// The storage a vector is loaded from or stored to: a `local &[T]` of the element type,
+// writable for a store
+fn vector_view_arg(arg_exps: Array[Exp], index: uint, vector: Type, writable: bool, scope: Scope, ctx: Context) Value !Error {
+    let view_type = vector.vector_element().local_ref_slice()
+    if writable : view_type = view_type.mut_type()
+    return vector_arg_as(arg_exps, index, view_type, scope, ctx) !>
+}
+
+fn vector_check_mask(mask: Value, vector: Type, at: Exp) !Error {
+    let element = mask.rett.vector_element()
+    if !element.is_integer_type() || mask.rett.length != vector.length {
+        at.error("Expected a mask of " + vector.length + " integer lanes for " + vector.compat_display_name() + ", got: " + mask.rett.compat_display_name())
+    }
+}
+
+////////////////////////////
+// Operators
+////////////////////////////
+
+fn vgen_vector_splat(x: Value, vector: Type, at: Exp) Value {
+    let v = Value {
+        type: VAL.intrinsic
+        values: Array[Value]{ x }
+        rett: vector
+        exp: at
+    }
+    v.set_string("splat")
+    return v
+}
+
+// `a + b`, `a & b`, `a << 3`, ...: both sides the same vector type, or a constant shift count
+fn value_vector_op(left: Value, right: Value, op: VALUE_OP, exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    if !left.rett.is_vector_type() {
+        exp.error("Cannot combine '" + left.rett.compat_display_name() + "' with a vector; make a vector of it with $splat")
+    }
+    let element = left.rett.vector_element()
+    if op == VALUE_OP.shl || op == VALUE_OP.shr {
+        if !element.is_integer_type() : exp.error("Shifts need an integer vector, got: " + left.rett.compat_display_name())
+        if right.rett.is_vector_type() || right.type != VAL.int {
+            exp.error("A vector is shifted by a constant count, like 'v >> 4'")
+        }
+        let bits = (element.number_byte_size() * 8).to(int)
+        if right.int_val < 0 || right.int_val >= bits : exp.error("Shift count out of range for " + element.compat_display_name())
+        right = vgen_vector_splat(vgen_int(right.int_val, element), left.rett, exp)
+    } else {
+        if !right.rett.is_vector_type() {
+            exp.error("Cannot combine a vector with '" + right.rett.compat_display_name() + "'; make a vector of it with $splat")
+        }
+        left.rett.compat_check(right.rett, exp) !>
+        if (op == VALUE_OP.div || op == VALUE_OP.mod) && !element.is_float_type() {
+            exp.error("Integer vectors do not support '/' and '%'")
+        }
+        if (op == VALUE_OP.bit_and || op == VALUE_OP.bit_or || op == VALUE_OP.bit_xor) && element.is_float_type() {
+            exp.error("Bit operations need an integer vector; $bitcast a float vector first")
+        }
+    }
+    let v = vgen_op(left, right, op, left.rett)
+    v.exp = exp
+    return v
+}
+
+// `a == b` and `a != b` compare whole vectors to a bool; the lane-wise compares that give a
+// mask are `$eq(a, b)`, `$lt(a, b)`, ...
+fn value_vector_compare(left: Value, right: Value, op: VALUE_OP, exp: Exp, ctx: Context) Value !Error {
+    if !left.rett.is_vector_type() || !right.rett.is_vector_type() {
+        exp.error("A vector only compares with a vector of the same type: '" + left.rett.compat_display_name() + "' <> '" + right.rett.compat_display_name() + "'")
+    }
+    left.rett.compat_check(right.rett, exp) !>
+    if op != VALUE_OP.eq && op != VALUE_OP.ne {
+        exp.error("Vectors have no order; compare the lanes with $lt, $gt, $lte or $gte, which give a mask")
+    }
+    let v = vgen_op(left, right, op, type_bool(ctx.build))
+    v.exp = exp
+    return v
+}
+
+////////////////////////////
+// IR
+////////////////////////////
+
+fn ir_emit_vector_intrinsic(ir: IRFunc, value: Value) String !Error {
+    let name = value.get_string()
+    let args = value.values ?! value.bug("Vector builtin has no arguments")
+    let rendered = Array[String]{}
+    each args as arg {
+        rendered.append(ir_emit_value(ir, arg) !>)
+        if ir.terminated : return "undef"
+    }
+    let first = args.get(0) ! value.bug("Vector builtin lost its argument")
+    let first_text = rendered.get(0) ! value.bug("Vector builtin lost its argument")
+
+    let compare = vector_compare_op(name)
+    if isset(compare) {
+        let second = rendered.get(1) ! value.bug("Compare lost its second vector")
+        let select = ir_vector_binary_instruction(compare, first.rett.vector_element())
+        let bits = ir_emit_binary_instruction(ir, select, ir_type(first.rett) !>, first_text, second)
+        return ir_emit_convert(ir, "sext", "<" + first.rett.length + " x i1>", bits, ir_type(value.rett) !>)
+    }
+    if name == "splat" {
+        let vt = ir_type(value.rett) !>
+        let et = ir_type(value.rett.vector_element()) !>
+        let one = ir.var()
+        ir.line4(one, " = insertelement " + vt + " poison, ", et + " " + first_text, ", i64 0")
+        let out = ir.var()
+        ir.line4(out, " = shufflevector " + vt + " ", one, ", " + vt + " poison, <" + value.rett.length + " x i32> zeroinitializer")
+        return out
+    }
+    if name == "load" || name == "store" {
+        let vector = name == "load" ? value.rett : (args.get(2) ! value.bug("Store lost its vector")).rett
+        let vt = ir_type(vector) !>
+        let et = ir_type(vector.vector_element()) !>
+        let offset = rendered.get(1) ! value.bug("Vector access lost its offset")
+        let address = ir_emit_vector_address(ir, first_text, offset, vector, et, value) !>
+        if ir.terminated : return "undef"
+        if name == "load" {
+            let out = ir.var()
+            ir.line4(out, " = load " + vt + ", ptr ", address, ", align 1")
+            return out
+        }
+        let v = rendered.get(2) ! value.bug("Store lost its vector")
+        ir.line4("store " + vt + " ", v, ", ptr " + address, ", align 1")
+        return "undef"
+    }
+    if name == "extract" || name == "insert" {
+        let vt = ir_type(first.rett) !>
+        let et = ir_type(first.rett.vector_element()) !>
+        let lane_value = args.get(1) ! value.bug("Lane access lost its index")
+        let lane = rendered.get(1) ! value.bug("Lane access lost its index")
+        if lane_value.type != VAL.int : ir_emit_vector_lane_guard(ir, lane, first.rett, value) !>
+        if ir.terminated : return "undef"
+        let out = ir.var()
+        if name == "extract" {
+            ir.line4(out, " = extractelement " + vt + " ", first_text, ", i64 " + lane)
+            return out
+        }
+        let x = rendered.get(2) ! value.bug("Insert lost its value")
+        ir.line4(out, " = insertelement " + vt + " ", first_text, ", " + et + " " + x + ", i64 " + lane)
+        return out
+    }
+    if name == "shuffle" {
+        let vt = ir_type(first.rett) !>
+        let second = rendered.get(1) ! value.bug("Shuffle lost its second vector")
+        let mask = ByteBuffer.new()
+        mask.append_text("<" + first.rett.length + " x i32> <")
+        let i: uint = 2
+        while i < args.length {
+            if i > 2 : mask.append_text(", ")
+            let index = args.get(i) ! value.bug("Shuffle lost a lane index")
+            mask.append_text("i32 " + index.int_val)
+            i++
+        }
+        mask.append_text(">")
+        let out = ir.var()
+        ir.line4(out, " = shufflevector " + vt + " ", first_text, ", " + vt + " " + second + ", " + mask.to_string())
+        return out
+    }
+    if name == "select" {
+        let mask_type = ir_type(first.rett) !>
+        let vt = ir_type(value.rett) !>
+        let a = rendered.get(1) ! value.bug("Select lost its first vector")
+        let second = rendered.get(2) ! value.bug("Select lost its second vector")
+        let bits = ir_emit_binary_instruction(ir, "icmp ne", mask_type, first_text, "zeroinitializer")
+        let out = ir.var()
+        ir.line4(out, " = select <" + first.rett.length + " x i1> ", bits, ", " + vt + " " + a + ", " + vt + " " + second)
+        return out
+    }
+    if name == "mask_bits" {
+        let mask_type = ir_type(first.rett) !>
+        let lanes = first.rett.length
+        let bits = ir_emit_binary_instruction(ir, "icmp slt", mask_type, first_text, "zeroinitializer")
+        let packed = ir_emit_convert(ir, "bitcast", "<" + lanes + " x i1>", bits, "i" + lanes)
+        return ir_emit_convert(ir, "zext", "i" + lanes, packed, "i64")
+    }
+    if name == "bitcast" {
+        return ir_emit_convert(ir, "bitcast", ir_type(first.rett) !>, first_text, ir_type(value.rett) !>)
+    }
+    return ir_emit_vector_reduce(ir, name, first, first_text) !>
+}
+
+// The element address of a view access, after the bounds check `offset + lanes <= length`
+fn ir_emit_vector_address(ir: IRFunc, view: String, offset: String, vector: Type, element_type: String, at: Value) String !Error {
+    let adr = ir_emit_extract(ir, "{ ptr, ptr, i64 }", view, 1)
+    let length = ir_emit_extract(ir, "{ ptr, ptr, i64 }", view, 2)
+    let end = ir_emit_binary_instruction(ir, "add", "i64", offset, vector.length.to_string())
+    let bad = ir_emit_binary_instruction(ir, "icmp ugt", "i64", end, length)
+    let failed = ir.block("vector.range.invalid")
+    let valid = ir.block("vector.range.valid")
+    ir.cond_jump(bad, failed, valid)
+    ir.label(failed)
+    let panic_call = value_panic_call(Context.for_func(ir.func), "Vector access out of range", at.exp ?? ir.func.exp) !>
+    ir_emit_stmt(ir, panic_call) !>
+    ir.jump(valid)
+    ir.label(valid)
+    let address = ir.var()
+    ir.line4(address, " = getelementptr " + element_type + ", ptr ", adr, ", i64 " + offset)
+    return address
+}
+
+fn ir_emit_vector_lane_guard(ir: IRFunc, lane: String, vector: Type, at: Value) !Error {
+    let bad = ir_emit_binary_instruction(ir, "icmp uge", "i64", lane, vector.length.to_string())
+    let failed = ir.block("vector.lane.invalid")
+    let valid = ir.block("vector.lane.valid")
+    ir.cond_jump(bad, failed, valid)
+    ir.label(failed)
+    let panic_call = value_panic_call(Context.for_func(ir.func), "Vector lane out of range", at.exp ?? ir.func.exp) !>
+    ir_emit_stmt(ir, panic_call) !>
+    ir.jump(valid)
+    ir.label(valid)
+}
+
+// llvm.vector.reduce.*: the intrinsic suffix names the vector, like v16i8 or v4f32
+fn ir_emit_vector_reduce(ir: IRFunc, name: String, vector: Value, rendered: String) String !Error {
+    let element = vector.rett.vector_element()
+    let et = ir_type(element) !>
+    let vt = ir_type(vector.rett) !>
+    let is_float = element.is_float_type()
+    let op = name.range(7, name.bytes - 7)
+    if is_float {
+        if op == "add" : op = "fadd"
+        else if op == "min" : op = "fmin"
+        else if op == "max" : op = "fmax"
+    } else if op == "min" || op == "max" {
+        op = (element.is_signed_type() ? "s" : "u") + op
+    }
+    let suffix = "v" + vector.rett.length + (is_float ? "f" : "i") + (element.byte_size() !>).to(uint) * 8
+    let intrinsic = "@llvm.vector.reduce." + op + "." + suffix
+    let with_start = op == "fadd"
+    let declare = "declare " + et + " " + intrinsic + "(" + (with_start ? et + ", " : "") + vt + ")"
+    ir.func.unit.llvm_declares.set(declare, true)
+    let out = ir.var()
+    if with_start {
+        // The start value is the sum's identity; reassoc lets LLVM add the lanes as a tree
+        ir.line4(out, " = call reassoc " + et + " " + intrinsic + "(", et + " -0.0, " + vt + " " + rendered, ")")
+        return out
+    }
+    ir.line4(out, " = call " + et + " " + intrinsic + "(", vt + " " + rendered, ")")
+    return out
+}
