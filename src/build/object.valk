@@ -18,6 +18,12 @@ class ObjectTask {
     optimize: bool
     // --debug: locals stay in their stack slots, where a debugger finds them
     debug: bool
+    // Objects to emit in parallel after the one optimization pass (1 = whole unit at once)
+    parts_wanted: uint (1)
+    // Objects actually written: `path_o`, then `object_part_path(path_o, 1..)`
+    parts: uint (1)
+    optimize_us: uint (0)
+    emit_us: uint (0)
     // The IR cache could not be updated; the next build redoes this unit.
     cache_skipped: bool (false)
 
@@ -163,11 +169,21 @@ fn emit_unit_objects(build: Build) !Error {
             clang_command: command
             optimize: build.options.optimize
             debug: build.options.debug
+            parts_wanted: object_parts_wanted(build)
         })
         units.append(unit)
     }
 
     run_object_tasks(build, tasks, units) !>
+}
+
+// A release unit is one module, optimized once as a whole; its machine code is then generated
+// in parallel, one object per part. Debug builds keep one object per unit
+fn object_parts_wanted(build: Build) uint {
+    if !build.options.optimize || build.options.debug || build.options.use_clang : return 1
+    let threads = core.cpu_thread_count()
+    if threads < 2 : return 1
+    return threads > 16 ? 16 : threads
 }
 
 fn run_object_tasks(build: Build, tasks: Array[shared ObjectTask], units: Array[Unit]) !Error {
@@ -198,6 +214,9 @@ fn run_object_tasks(build: Build, tasks: Array[shared ObjectTask], units: Array[
         } else {
             let unit = units.get(index) ! build.error("Missing object generation unit (bug)")
             unit.ir_code = ""
+            unit.object_parts = task.parts
+            object_parts_record(unit, task.parts)
+            if task.parts > 1 : build.print_verbose(3, "> Unit '" + unit.name + "' emitted as " + task.parts + " objects; optimize " + (task.optimize_us / 1000) + "ms, emit " + (task.emit_us / 1000) + "ms")
         }
 
         if !stopped && next < tasks.length {
@@ -239,6 +258,7 @@ fn prepare_unit_object(build: Build, unit: Unit) bool !Error {
     let unchanged = !build.options.is_clean_build
         && fs.exists(unit.path_o)
         && helper.file_has_same_content(path_prev, unit.ir_code)
+        && object_parts_cached(unit)
     if unchanged {
         unit.ir_code = ""
         return true
@@ -247,6 +267,32 @@ fn prepare_unit_object(build: Build, unit: Unit) bool !Error {
     // clang reads the IR from disk; the LLVM backend only writes it when emitting fails
     if build.options.use_clang : fs.write(unit.path_ir, unit.ir_code) ! build.error("Failed to write IR: " + unit.path_ir)
     return false
+}
+
+// The number of objects a cached unit was emitted as lives next to it in `unit.o-parts`;
+// without it the object may be an incomplete part of an interrupted build
+fn object_parts_cached(unit: Unit) bool {
+    let text = fs.read(unit.path_o + "-parts") ! return false
+    let parts = text.trim().to_uint() ! return false
+    if parts == 0 : return false
+    let i: uint = 1
+    while i < parts {
+        if !fs.exists(object_part_path(unit.path_o, i)) : return false
+        i++
+    }
+    unit.object_parts = parts
+    return true
+}
+
+fn object_parts_record(unit: Unit, parts: uint) {
+    let manifest = unit.path_o + "-parts"
+    fs.write(manifest, parts.to_string()) _
+    // Objects of an earlier build with more parts would be stale
+    let i = parts > 1 ? parts : 1
+    while fs.exists(object_part_path(unit.path_o, i)) {
+        fs.delete_file(object_part_path(unit.path_o, i)) _
+        i++
+    }
 }
 
 fn object_output_dir(build: Build) String !Error {
@@ -314,6 +360,13 @@ fn prune_unit_cache(build: Build) {
         keep.add(unit.name + ".o")
         keep.add(unit.name + ".ir-prev")
         if build.options.use_clang : keep.add(unit.name + ".ir")
+        // The parts of a unit emitted in parallel, and their count
+        keep.add(unit.name + ".o-parts")
+        let i: uint = 1
+        while i < unit.object_parts {
+            keep.add(unit.name + "." + i + ".o")
+            i++
+        }
     }
     let names = fs.files_in(dir, false, true, false, true) ! return
     each names as name {
@@ -381,16 +434,17 @@ fn remove_cache_dir(path: String, now: uint) bool {
     return true
 }
 
-fn llvm_emit_object(task: shared ObjectTask) ?String {
+// The target machine for a task, or an error message
+fn llvm_create_machine(task: shared ObjectTask) (?llvm.LLVMTargetMachineRef, ?String) {
     @unsafe
     let target: ?llvm.LLVMTargetRef = null
     let message: ?cstring = null
     if llvm.LLVMGetTargetFromTriple(task.llvm_triple.data_cstring, @ref(target), @ref(message)) {
         let detail = llvm_message_text(message)
         if isset(message) : llvm.LLVMDisposeMessage(message)
-        return "LLVM could not select target '" + task.llvm_triple + "': " + detail
+        return (null, "LLVM could not select target '" + task.llvm_triple + "': " + detail)
     }
-    if !isset(target) : return "LLVM did not create a target for: " + task.llvm_triple
+    if !isset(target) : return (null, "LLVM did not create a target for: " + task.llvm_triple)
 
     // "native" asks LLVM for the compiling machine's CPU and features
     let cpu = task.cpu
@@ -405,7 +459,15 @@ fn llvm_emit_object(task: shared ObjectTask) ?String {
     }
     let level: i32 = task.optimize ? llvm.LLVMCodeGenLevelAggressive : (task.debug ? llvm.LLVMCodeGenLevelNone : llvm.LLVMCodeGenLevelDefault)
     let machine = llvm.LLVMCreateTargetMachine(target, task.llvm_triple.data_cstring, cpu.data_cstring, features.data_cstring, level, llvm.LLVMRelocPIC, llvm.LLVMCodeModelDefault)
-    if !isset(machine) : return "LLVM failed to create a target machine for: " + task.llvm_triple
+    if !isset(machine) : return (null, "LLVM failed to create a target machine for: " + task.llvm_triple)
+    return (machine, null)
+}
+
+fn llvm_emit_object(task: shared ObjectTask) ?String {
+    @unsafe
+    let machine, machine_error = llvm_create_machine(task)
+    if !isset(machine) : return machine_error ?? "LLVM failed to create a target machine"
+    let message: ?cstring = null
 
     let context = llvm.LLVMContextCreate()
     let name = task.unit_name + ".ll"
@@ -441,12 +503,33 @@ fn llvm_emit_object(task: shared ObjectTask) ?String {
     }
 
     llvm_configure_object_module(module, machine, task.llvm_triple)
+    let optimize_start = time.mono_us()
     let opt_error = llvm_optimize_object_module(module, machine, task.optimize, task.debug)
     if isset(opt_error) {
         llvm.LLVMDisposeModule(module)
         llvm.LLVMContextDispose(context)
         llvm.LLVMDisposeTargetMachine(machine)
         return "LLVM optimization failed for unit '" + task.unit_name + "':\n" + opt_error
+    }
+    task.optimize_us = time.mono_us() - optimize_start
+
+    let emit_start = time.mono_us()
+    if task.parts_wanted > 1 {
+        let assignment = llvm_partition_module(module, task.parts_wanted)
+        if assignment.parts > 1 {
+            // The optimized module as bitcode, which every part's thread reads on its own
+            let bitcode_buffer = llvm.LLVMWriteBitcodeToMemoryBuffer(module)
+            let bitcode = [u8]{ owner: null, data: llvm.LLVMGetBufferStart(bitcode_buffer).@cast(*[u8]), length: llvm.LLVMGetBufferSize(bitcode_buffer) }.to_string()
+            llvm.LLVMDisposeMemoryBuffer(bitcode_buffer)
+            llvm.LLVMDisposeModule(module)
+            llvm.LLVMContextDispose(context)
+            llvm.LLVMDisposeTargetMachine(machine)
+            let error = llvm_emit_partitions(task, bitcode, assignment)
+            task.emit_us = time.mono_us() - emit_start
+            if isset(error) : return error
+            task.parts = assignment.parts
+            return null
+        }
     }
 
     if llvm.LLVMTargetMachineEmitToFile(machine, module, task.path_o.data_cstring, llvm.LLVMObjectFile, @ref(message)) {
@@ -462,7 +545,190 @@ fn llvm_emit_object(task: shared ObjectTask) ?String {
     llvm.LLVMDisposeModule(module)
     llvm.LLVMContextDispose(context)
     llvm.LLVMDisposeTargetMachine(machine)
+    task.emit_us = time.mono_us() - emit_start
     return null
+}
+
+// Which part emits each function of the module, in module order (one byte per function);
+// `parts` is 1 when the module is better emitted whole
+class ObjectPartition {
+    parts: uint (1)
+    functions: String ("")
+}
+
+// At least this many defined functions before splitting the code generation
+value OBJECT_PARTITION_MIN_FUNCTIONS (64)
+
+// Prepares the optimized module for emission in parts. Every defined function and global
+// gets a linkage that another object can refer to (hidden visibility keeps calls direct),
+// and the functions are dealt to the parts by their size
+fn llvm_partition_module(module: llvm.LLVMModuleRef, parts_wanted: uint) ObjectPartition {
+    @unsafe
+    let result = ObjectPartition {}
+    // An alias must point at a definition in its own object; none are emitted, but be safe
+    if isset(llvm.LLVMGetFirstGlobalAlias(module)) : return result
+    let weights = Array[uint]{}
+    let func = llvm.LLVMGetFirstFunction(module)
+    while isset(func) {
+        if llvm.LLVMIsDeclaration(func) {
+            weights.append(0)
+        } else {
+            weights.append(llvm.LLVMCountBasicBlocks(func).to(uint) + 1)
+            llvm_externalize(func)
+        }
+        func = llvm.LLVMGetNextFunction(func)
+    }
+    let defined: uint = 0
+    each weights as w : if w > 0 : defined++
+    if defined < OBJECT_PARTITION_MIN_FUNCTIONS : return result
+    let parts = parts_wanted
+    if parts > defined / 16 : parts = defined / 16
+    if parts < 2 : return result
+
+    let global = llvm.LLVMGetFirstGlobal(module)
+    while isset(global) {
+        if !llvm.LLVMIsDeclaration(global) && llvm.LLVMGetLinkage(global) != llvm.LLVMAppendingLinkage : llvm_externalize(global)
+        global = llvm.LLVMGetNextGlobal(global)
+    }
+
+    // Greedy: each function goes to the part with the least weight so far
+    let loads = Array[uint]{ 0 x parts }
+    let assignment = ByteBuffer.new(weights.length)
+    each weights as w {
+        let lightest: uint = 0
+        let i: uint = 1
+        while i < parts {
+            if loads[i] < loads[lightest] : lightest = i
+            i++
+        }
+        loads[lightest] += w
+        assignment.write_byte(lightest.to(u8))
+    }
+    result.parts = parts
+    result.functions = assignment.to_string()
+    return result
+}
+
+fn llvm_externalize(global: llvm.LLVMValueRef) {
+    @unsafe
+    let linkage = llvm.LLVMGetLinkage(global)
+    if linkage != llvm.LLVMInternalLinkage && linkage != llvm.LLVMPrivateLinkage : return
+    llvm.LLVMSetLinkage(global, llvm.LLVMExternalLinkage)
+    llvm.LLVMSetVisibility(global, llvm.LLVMHiddenVisibility)
+}
+
+class ObjectPartTask {
+    task: shared ObjectTask
+    bitcode: String
+    assignment: String
+    part: uint
+}
+
+// Emits every part: the others on their own threads, part 0 on this one
+fn llvm_emit_partitions(task: shared ObjectTask, bitcode: String, assignment: ObjectPartition) ?String {
+    let workers = Array[thread.Thread[?String]]{}
+    let i: uint = 1
+    while i < assignment.parts {
+        let part: shared ObjectPartTask = ObjectPartTask { task: task, bitcode: bitcode, assignment: assignment.functions, part: i }
+        let worker = thread.Thread[?String].start(fn() ?String {
+            return llvm_emit_part(part)
+        }) ! return "Failed to start a code generation thread"
+        workers.append(worker)
+        i++
+    }
+    let first: shared ObjectPartTask = ObjectPartTask { task: task, bitcode: bitcode, assignment: assignment.functions, part: 0 }
+    let error = llvm_emit_part(first)
+    each workers as worker {
+        let result = worker.await()
+        if isset(result) && !isset(error) : error = result
+    }
+    return error
+}
+
+// One part: the whole optimized module, with the functions and globals of the other parts
+// marked `available_externally`, which the code generator does not emit
+fn llvm_emit_part(part: shared ObjectPartTask) ?String {
+    @unsafe
+    let task = part.task
+    let machine, machine_error = llvm_create_machine(task)
+    if !isset(machine) : return machine_error ?? "LLVM failed to create a target machine"
+    let context = llvm.LLVMContextCreate()
+    let name = task.unit_name + ".bc"
+    let buffer = llvm.LLVMCreateMemoryBufferWithMemoryRangeCopy(part.bitcode.data, part.bitcode.bytes, name.data_cstring)
+    let module: ?llvm.LLVMModuleRef = null
+    if llvm.LLVMParseBitcodeInContext2(context, buffer, @ref(module)) || !isset(module) {
+        llvm.LLVMDisposeMemoryBuffer(buffer)
+        llvm.LLVMContextDispose(context)
+        llvm.LLVMDisposeTargetMachine(machine)
+        return "LLVM could not read back the optimized unit '" + task.unit_name + "' for part " + part.part
+    }
+    // The other parts' functions become declarations: a body would still go through the
+    // IR passes of code generation, which was most of a part's time
+    let assignment = part.assignment
+    let index: uint = 0
+    let func = llvm.LLVMGetFirstFunction(module)
+    while isset(func) {
+        let next = llvm.LLVMGetNextFunction(func)
+        if !llvm.LLVMIsDeclaration(func) && assignment[index].to(uint) != part.part : llvm_strip_body(module, func)
+        index++
+        func = next
+    }
+    if part.part != 0 {
+        // Globals are emitted by part 0; the appending ones (constructor lists) only exist there
+        let global = llvm.LLVMGetFirstGlobal(module)
+        while isset(global) {
+            let next = llvm.LLVMGetNextGlobal(global)
+            if !llvm.LLVMIsDeclaration(global) {
+                if llvm.LLVMGetLinkage(global) == llvm.LLVMAppendingLinkage : llvm.LLVMDeleteGlobal(global)
+                else : llvm.LLVMSetLinkage(global, llvm.LLVMAvailableExternallyLinkage)
+            }
+            global = next
+        }
+    }
+    let path = object_part_path(task.path_o, part.part)
+    let message: ?cstring = null
+    let error: ?String = null
+    if llvm.LLVMTargetMachineEmitToFile(machine, module, path.data_cstring, llvm.LLVMObjectFile, @ref(message)) {
+        error = "LLVM failed to emit object part " + part.part + " of unit '" + task.unit_name + "':\n" + llvm_message_text(message)
+    }
+    if isset(message) : llvm.LLVMDisposeMessage(message)
+    llvm.LLVMDisposeModule(module)
+    llvm.LLVMDisposeMemoryBuffer(buffer)
+    llvm.LLVMContextDispose(context)
+    llvm.LLVMDisposeTargetMachine(machine)
+    return error
+}
+
+// Replaces a defined function by a declaration with the same name, type, calling convention,
+// attributes and visibility, so calls to it keep their ABI and resolve to the other part
+fn llvm_strip_body(module: llvm.LLVMModuleRef, func: llvm.LLVMValueRef) {
+    @unsafe
+    let name_length: uint = 0
+    let name_data = llvm.LLVMGetValueName2(func, @ref(name_length))
+    let name = [u8]{ owner: null, data: name_data.@cast(*[u8]), length: name_length }.to_string()
+    let decl = llvm.LLVMAddFunction(module, "".data_cstring, llvm.LLVMGlobalGetValueType(func))
+    llvm.LLVMSetFunctionCallConv(decl, llvm.LLVMGetFunctionCallConv(func))
+    llvm.LLVMSetVisibility(decl, llvm.LLVMGetVisibility(func))
+    let params = llvm.LLVMCountParams(func)
+    let index: u32 = 0
+    while index <= params + 1 {
+        // Function attributes, then the return value, then each parameter
+        let at: u32 = index == 0 ? llvm.LLVMAttributeFunctionIndex : index - 1
+        let count = llvm.LLVMGetAttributeCountAtIndex(func, at)
+        if count > 0 {
+            let attrs = Array[llvm.LLVMAttributeRef].new(count.to(uint))
+            llvm.LLVMGetAttributesAtIndex(func, at, attrs.items().@cast(ptr))
+            let i: uint = 0
+            while i < count.to(uint) {
+                llvm.LLVMAddAttributeAtIndex(decl, at, @ptrv(attrs.items(), llvm.LLVMAttributeRef, i))
+                i++
+            }
+        }
+        index++
+    }
+    llvm.LLVMReplaceAllUsesWith(func, decl)
+    llvm.LLVMDeleteFunction(func)
+    llvm.LLVMSetValueName2(decl, name.data, name.bytes)
 }
 
 // A CPU name LLVM does not know ends in a fatal error on x86, deep inside code
