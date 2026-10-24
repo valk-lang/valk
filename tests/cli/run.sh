@@ -804,7 +804,7 @@ for form in paren block call index ternary; do
     fi
 done
 
-echo "> File LOC and Parse LOC count generic instances"
+echo "> File LOC and Parse LOC count generic function instances"
 loc_dir="$workdir/loc"
 mkdir -p "$loc_dir"
 loc_base=$("$VALK" build "$DIR/loc-generics.valk" --lint --no-warn -v 2>&1) || { echo "$loc_base"; exit 1; }
@@ -826,7 +826,8 @@ for ending in crlf no-final-newline; do
 done
 for kind in class function ordinary; do
     case "$kind" in
-        class) pattern='    value: T'; extra=3 ;;
+        # A class instantiation reads only the declarations; its methods count when specialized
+        class) pattern='    value: T'; extra=1 ;;
         function) pattern='    return value'; extra=3 ;;
         ordinary) pattern='    let a'; extra=1 ;;
     esac

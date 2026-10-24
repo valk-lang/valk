@@ -139,6 +139,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ## Enums for 'core'
 
 ```js
+// A CPU feature that `cpu_has` checks at run time, for code with a `$target_` variant.
++ enum CpuFeature { ssse3, sse41, avx2 }
 // How `Process.start` connects one standard stream of a child.
 + enum Stdio { inherit, pipe, discard }
 ```
@@ -152,6 +154,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn clone_value(value: $T) T
 // Returns the number of physical CPU cores; at least 1.
 + fn cpu_core_count() uint
+// Returns whether the CPU this program runs on has `feature`.
++ fn cpu_has(feature: CpuFeature) bool
 // Returns the number of logical CPUs (hardware threads) that are online; at least 1.
 + fn cpu_thread_count() uint
 // Returns every environment variable of this process as a new map from name to value.
@@ -2934,6 +2938,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn collect_if_threshold_reached() void
 // Collects shared memory when its usage reached the shared trigger and the GC is idle.
 + fn collect_shared_if_threshold_reached() void
+// Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
++ fn fit_count(prefix: uint, item: uint, count: uint) uint
 // Takes the calling thread's GC lock again after `unlock`.
 + fn lock() void
 // Returns the bytes held by the GC pool blocks of all threads, including free slots.
@@ -3782,10 +3788,10 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 ## Functions for 'json'
 
 ```js
-// Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
-+ fn decode(json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
+// Parses JSON text into a `Value`.
++ fn decode(json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
 // Parses JSON text directly into `T`, without building an intermediate `Value`.
-+ fn decode_to[T](json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
++ fn decode_to[T](json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 // Returns the empty value of a kind: `null`, `""`, `false`, `0`, `0.0`, `[]` or `{}`.
 + fn default_value(kind: Kind) Value
 // Returns `data` encoded as JSON text; `pretty` adds newlines and four-space indentation.

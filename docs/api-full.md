@@ -373,9 +373,15 @@ An operating-system call failed (`failed`) or is not available on this platform
 ## Enums for 'core'
 
 ```js
+// A CPU feature that `cpu_has` checks at run time, for code with a `$target_` variant.
++ enum CpuFeature { ssse3, sse41, avx2 }
 // How `Process.start` connects one standard stream of a child.
 + enum Stdio { inherit, pipe, discard }
 ```
+
+### CpuFeature
+
+A CPU feature that `cpu_has` checks at run time, for code with a `$target_` variant.
 
 ### Stdio
 
@@ -390,6 +396,8 @@ How `Process.start` connects one standard stream of a child.
 + fn clone_value(value: $T) T
 // Returns the number of physical CPU cores; at least 1.
 + fn cpu_core_count() uint
+// Returns whether the CPU this program runs on has `feature`.
++ fn cpu_has(feature: CpuFeature) bool
 // Returns the number of logical CPUs (hardware threads) that are online; at least 1.
 + fn cpu_thread_count() uint
 // Returns every environment variable of this process as a new map from name to value.
@@ -443,6 +451,17 @@ are a compile error.
 Returns the number of physical CPU cores; at least 1.
 
 Cores that run two hardware threads count once, so this is at most `cpu_thread_count()`.
+
+### cpu_has
+
+Returns whether the CPU this program runs on has `feature`.
+
+Features belong to one architecture: on other architectures the answer is false. Use it to
+choose a function marked with the matching `$target_` flag:
+
+```valk
+if core.cpu_has(.avx2) : sum_avx2(data) else : sum(data)
+```
 
 ### cpu_thread_count
 
@@ -9929,6 +9948,8 @@ one waited for the shared lock.
 + fn collect_if_threshold_reached() void
 // Collects shared memory when its usage reached the shared trigger and the GC is idle.
 + fn collect_shared_if_threshold_reached() void
+// Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
++ fn fit_count(prefix: uint, item: uint, count: uint) uint
 // Takes the calling thread's GC lock again after `unlock`.
 + fn lock() void
 // Returns the bytes held by the GC pool blocks of all threads, including free slots.
@@ -9980,6 +10001,14 @@ Does nothing while a collection is running or the GC is not idle.
 ### collect_shared_if_threshold_reached
 
 Collects shared memory when its usage reached the shared trigger and the GC is idle.
+
+### fit_count
+
+Returns the largest count of `item`-byte elements, at least `count`, whose storage of
+`prefix` bytes plus the elements still fits the GC size class that `count` of them need.
+
+Growing storage uses it to fill its class: sizes above 128 bytes are rounded up to a power
+of two, so a capacity just past one would leave almost half of the class unused.
 
 ### lock
 
@@ -12893,10 +12922,10 @@ The type of a JSON value, as reported by `Value.kind`.
 ## Functions for 'json'
 
 ```js
-// Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
-+ fn decode(json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
+// Parses JSON text into a `Value`.
++ fn decode(json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) Value !ParseError
 // Parses JSON text directly into `T`, without building an intermediate `Value`.
-+ fn decode_to[T](json: &[u8], max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
++ fn decode_to[T](json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) T !DecodeError
 // Returns the empty value of a kind: `null`, `""`, `false`, `0`, `0.0`, `[]` or `{}`.
 + fn default_value(kind: Kind) Value
 // Returns `data` encoded as JSON text; `pretty` adds newlines and four-space indentation.
@@ -12923,7 +12952,7 @@ The type of a JSON value, as reported by `Value.kind`.
 
 ### decode
 
-Parses JSON text into a `Value`; `json` is any byte storage: a string, a `ByteBuffer` or a slice.
+Parses JSON text into a `Value`.
 
 Throws `.invalid` on a syntax error, invalid UTF-8 in a string, trailing non-whitespace
 or a number outside the range of `float`; `.too_deep` when containers nest deeper
@@ -12936,6 +12965,9 @@ A number is an integer unless it has a fraction or an exponent, or lies outside 
 of `int`: then it becomes the nearest float, as in JavaScript (`decode_to` into a `u64`
 field reads such a number exactly). When an object repeats
 a key, the last value wins. An unpaired `\u` surrogate escape decodes to U+FFFD.
+
+The strings and keys without escapes in the result are views of `json` rather than
+copies, so the input stays in memory while any of them is kept.
 
 ### decode_to
 
