@@ -378,6 +378,41 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
     exit 1
 }
 
+# --cpu: this machine's CPU builds and runs; native refuses a cross target; an unknown
+# name is reported once, before any unit is compiled
+cpu_out=$("$VALK" build "$input" --no-warn -c --release --cpu native -o "$output" 2>&1) || {
+    echo "# --cpu native failed to build"
+    echo "$cpu_out"
+    exit 1
+}
+"$output" || exit 1
+case "$(uname -m)" in
+    x86_64|amd64) cross_target=linux-arm64 ;;
+    *) cross_target=linux-x64 ;;
+esac
+cpu_out=$("$VALK" build "$input" --no-warn -c --cpu native --target "$cross_target" -o "$output" 2>&1) && {
+    echo "# --cpu native accepted a cross target"
+    exit 1
+}
+if [[ "$cpu_out" != *"'--cpu native' only applies to this machine's target"* ]]; then
+    echo "# Unexpected --cpu native cross target error"
+    echo "$cpu_out"
+    exit 1
+fi
+case "$(uname -m)" in
+    x86_64|amd64)
+        cpu_out=$("$VALK" build "$input" --no-warn -c --cpu no-such-cpu -o "$output" 2>&1) && {
+            echo "# --cpu accepted an unknown CPU name"
+            exit 1
+        }
+        if [[ "$cpu_out" != *"LLVM cannot compile for CPU 'no-such-cpu'"* ]]; then
+            echo "# Unexpected unknown CPU error"
+            echo "$cpu_out"
+            exit 1
+        fi
+        ;;
+esac
+
 for filter in clone other; do
     clone_out=$("$VALK" build "$DIR/clone-summary.valk" --test --filter "$filter" --no-warn -o "$output" 2>&1) || {
         echo "# Clone freshness changed with test selection: $filter"
