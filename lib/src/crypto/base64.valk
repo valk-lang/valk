@@ -1,3 +1,4 @@
+use core
 use io
 use coro
 
@@ -138,6 +139,12 @@ fn internal_base64_encode(in: *[u8], out: *[u8], len: uint) uint {
     let full_len = len / 3 * 3
     let i: uint = 0
     let o: uint = 0
+    #if ARCH == "x64"
+    if len >= 32 && core.cpu_has(.avx2) {
+        o = base64_encode_avx2(in, out, len)
+        i = o / 4 * 3
+    }
+    #end
     // 12 input bytes per 16-byte block: the 6-bit indexes come out of shifts on the
     // 16-bit lanes of the regrouped bytes, the characters out of range compares
     if len >= 16 {
@@ -216,6 +223,12 @@ fn internal_base64_decode(in: *[u8], out: *[u8], len: uint, final_block: bool (t
     let full_len = data_len - left_over
     let i: uint = 0
     let o: uint = 0
+    #if ARCH == "x64"
+    if full_len >= 32 && core.cpu_has(.avx2) {
+        o = base64_decode_avx2(in, out, len, full_len)
+        i = o / 3 * 4
+    }
+    #end
     // 16 characters per block while every one is in the alphabet: range compares give
     // the 6-bit values, shifts on the 32-bit lanes pack them, 64-bit shifts drop the fourth byte
     // of every group. The block writes 16 bytes for its 12, so it stays inside the output
@@ -272,6 +285,99 @@ fn internal_base64_decode(in: *[u8], out: *[u8], len: uint, final_block: bool (t
 
     return o
 }
+
+#if ARCH == "x64"
+
+// Character offset per index range, looked up by the range number the kernel computes:
+// 0 for 26..51 ('a'), 1..10 for 52..61 ('0'), 11 for '+', 12 for '/', 13 for 0..25 ('A')
+global encode_offsets: [i8 x 32] ({
+    71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 65, 0, 0,
+    71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 65, 0, 0
+})
+// A character is in the alphabet when the class bits of its low and high nibble share no bit
+global decode_low_classes: [u8 x 32] ({
+    0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1A, 0x1B, 0x1B, 0x1B, 0x1A,
+    0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1A, 0x1B, 0x1B, 0x1B, 0x1A
+})
+global decode_high_classes: [u8 x 32] ({
+    0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+    0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10
+})
+// What to add to a character for its 6-bit value, by high nibble ('/' uses entry 1)
+global decode_rolls: [u8 x 32] ({
+    0, 16, 19, 4, 191, 191, 185, 185, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 16, 19, 4, 191, 191, 185, 185, 0, 0, 0, 0, 0, 0, 0, 0
+})
+
+// 24 input bytes per 32-byte block, 12 in each 128-bit half at bytes 4..15 and 16..27: the
+// blocks after the first are loaded 4 bytes early, the first is shifted into that layout.
+// Returns the characters written; always whole quads
+fn base64_encode_avx2(in: *[u8], out: *[u8], len: uint) uint $target_avx2 {
+    @unsafe
+    let input = [u8]{ owner: null, data: in, length: len }
+    let output = [u8]{ owner: null, data: out, length: base64_encoded_size(len) }
+    let offsets = $load[i8x32](&encode_offsets, 0)
+    let even_lanes = $bitcast[i16x16]($splat[u32x8](0x0000FFFF))
+    let words = $bitcast[u32x8]($load[u8x32](input, 0))
+    let block = $bitcast[u8x32]($shuffle(words, words, 0, 0, 1, 2, 3, 4, 5, 6))
+    let i: uint = 0
+    let o: uint = 0
+    while true {
+        // Every 3-byte group as the 16-bit lanes [b1 b0] [b2 b1]
+        let grouped = $bitcast[u16x16]($shuffle(block, block,
+            5, 4, 6, 5, 8, 7, 9, 8, 11, 10, 12, 11, 14, 13, 15, 14,
+            17, 16, 18, 17, 20, 19, 21, 20, 23, 22, 24, 23, 26, 25, 27, 26))
+        let evens = ((grouped >> 10) & $splat[u16x16](0x003F)) | ((grouped << 4) & $splat[u16x16](0x3F00))
+        let odds = ((grouped >> 6) & $splat[u16x16](0x003F)) | ((grouped << 8) & $splat[u16x16](0x3F00))
+        let indexes = $bitcast[i8x32]($select(even_lanes, evens, odds))
+        // The range number: index - 51 above 51, 13 below 26, 0 in between
+        let range = ((indexes - $splat[i8x32](51)) & $gt(indexes, $splat[i8x32](51))) | ($lt(indexes, $splat[i8x32](26)) & $splat[i8x32](13))
+        $store(output, o, $bitcast[u8x32](indexes + $lookup(offsets, range)))
+        i += 24
+        o += 32
+        if i + 28 > len : break
+        block = $load[u8x32](input, i - 4)
+    }
+    return o
+}
+
+// 32 characters per block while every one is in the alphabet, 24 bytes out (the store is
+// 32 wide, so the block stays inside the output). Returns the bytes written; always whole
+// 3-byte groups
+fn base64_decode_avx2(in: *[u8], out: *[u8], len: uint, full_len: uint) uint $target_avx2 {
+    @unsafe
+    let input = [u8]{ owner: null, data: in, length: len }
+    let output = [u8]{ owner: null, data: out, length: base64_decoded_size(len) }
+    let low_classes = $load[u8x32](&decode_low_classes, 0)
+    let high_classes = $load[u8x32](&decode_high_classes, 0)
+    let rolls = $load[u8x32](&decode_rolls, 0)
+    let i: uint = 0
+    let o: uint = 0
+    while i + 32 <= full_len && o + 32 <= output.length {
+        let chars = $load[u8x32](input, i)
+        let high = $bitcast[u8x32]($bitcast[u16x16](chars) >> 4) & $splat[u8x32](0x0F)
+        let low = chars & $splat[u8x32](0x0F)
+        let classes = $lookup(low_classes, low) & $lookup(high_classes, high)
+        if $mask_bits($ne(classes, $splat[u8x32](0))) != 0 : break
+        let slash = $bitcast[u8x32]($eq(chars, $splat[u8x32]('/')))
+        let values = chars + $lookup(rolls, high + slash)
+        // c0 c1 and c2 c3 as 12 bits on the 16-bit lanes, then c0..c3 as 24 bits per group;
+        // its 3 bytes come out big end first, the fourth is dropped
+        let pairs = $bitcast[u16x16](values)
+        pairs = ((pairs & $splat[u16x16](0x00FF)) << 6) | (pairs >> 8)
+        let groups = $bitcast[u32x8](pairs)
+        let bytes = $bitcast[u8x32]((groups << 12) | (groups >> 16))
+        let packed = $bitcast[u32x8]($shuffle(bytes, bytes,
+            2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 0, 0, 0, 0,
+            18, 17, 16, 22, 21, 20, 26, 25, 24, 30, 29, 28, 16, 16, 16, 16))
+        $store(output, o, $bitcast[u8x32]($shuffle(packed, packed, 0, 1, 2, 4, 5, 6, 6, 6)))
+        i += 32
+        o += 24
+    }
+    return o
+}
+
+#end
 
 /// Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT,
 /// JWK and WebAuthn use.
