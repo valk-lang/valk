@@ -12902,7 +12902,7 @@ The type of a JSON value, as reported by `Value.kind`.
 // Converts `data` to a JSON value.
 + fn from(data: $T) Value
 // Returns a JSON array holding `values`, or an empty array when `values` is `null`.
-+ fn new_array(values: ?Array[Value] (null)) ArrayValue
++ fn new_array(values: ?Array[Value] (null)) Array[Value]
 // Returns `value` as a JSON boolean.
 + fn new_bool(value: bool) Value
 // Returns `value` as a JSON number with a float representation.
@@ -12912,7 +12912,7 @@ The type of a JSON value, as reported by `Value.kind`.
 // Returns the JSON `null` value.
 + fn new_null() Value
 // Returns a JSON object holding `values`, or an empty object when `values` is `null`.
-+ fn new_object(values: ?Map[Value] (null)) ObjectValue
++ fn new_object(values: ?Map[Value] (null)) Map[Value]
 // Returns `value` as a JSON string.
 + fn new_string(value: String) Value
 ```
@@ -13015,133 +13015,8 @@ Returns `value` as a JSON string.
 ## Classes for 'json'
 
 ```js
-// A JSON array: an ordered list of `Value` items.
-+ class ArrayValue {
-    // The items, in order. Changes to this array change the JSON array.
-    + values: Array[Value]
-
-    // Appends `value` to the end.
-    + fn append(value: Value) void
-    // Returns the array encoded as JSON text; see `json.encode`.
-    + fn encode(pretty: bool (false)) String
-    // Writes the array encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
-    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
-    // Returns the item at `index`.
-    + fn get(index: uint) Value !LookupError
-    // Returns the number of items.
-    + get length: uint
-    // Inserts `value` at the start, moving the existing items up.
-    + fn prepend(value: Value) void
-    // Removes the item at `index`, moving later items down; does nothing when out of range.
-    + fn remove(index: uint) void
-}
-```
-
-### ArrayValue
-
-A JSON array: an ordered list of `Value` items.
-
-#### values
-
-The items, in order. Changes to this array change the JSON array.
-
-#### append
-
-Appends `value` to the end.
-
-#### encode
-
-Returns the array encoded as JSON text; see `json.encode`.
-
-#### encode_into
-
-Writes the array encoded as JSON to `out` and returns the bytes written; see
-`json.encode_into`.
-
-#### get
-
-Returns the item at `index`.
-
-Throws `.missing` when `index` is out of range.
-
-#### length
-
-Returns the number of items.
-
-#### prepend
-
-Inserts `value` at the start, moving the existing items up.
-
-#### remove
-
-Removes the item at `index`, moving later items down; does nothing when out of range.
-
-```js
-// A JSON object: `Value` members keyed by string, kept in insertion order.
-+ class ObjectValue {
-    // The members. Changes to this map change the JSON object.
-    + values: Map[Value]
-
-    // Returns the object encoded as JSON text; see `json.encode`.
-    + fn encode(pretty: bool (false)) String
-    // Writes the object encoded as JSON to `out` and returns the bytes written; see `json.encode_into`.
-    + fn encode_into(out: Writer, pretty: bool (false)) uint !io:IoError
-    // Returns the member named `key`.
-    + fn get(key: String) Value !LookupError
-    // Returns whether a member named `key` exists.
-    + fn has(key: String) bool
-    // Returns the number of members.
-    + get length: uint
-    // Removes the member `key`; does nothing when it does not exist. The other members keep their order.
-    + fn remove(key: String) void
-    // Sets the member `key` to `value`; an existing member keeps its position.
-    + fn set(key: String, value: Value) void
-}
-```
-
-### ObjectValue
-
-A JSON object: `Value` members keyed by string, kept in insertion order.
-
-#### values
-
-The members. Changes to this map change the JSON object.
-
-#### encode
-
-Returns the object encoded as JSON text; see `json.encode`.
-
-#### encode_into
-
-Writes the object encoded as JSON to `out` and returns the bytes written; see
-`json.encode_into`.
-
-#### get
-
-Returns the member named `key`.
-
-Throws `.missing` when there is no such member.
-
-#### has
-
-Returns whether a member named `key` exists.
-
-#### length
-
-Returns the number of members.
-
-#### remove
-
-Removes the member `key`; does nothing when it does not exist. The other members keep
-their order.
-
-#### set
-
-Sets the member `key` to `value`; an existing member keeps its position.
-
-```js
 // A JSON value: `null`, a string, an integer, a float, a bool, an array or an object.
-+ union Value : String | bool | float | int | ArrayValue | ObjectValue | null {
++ union Value : String | Array[Value] | Map[Value] | bool | float | int | null {
     // Appends `value` to the array and returns it.
     + fn append(value: Value) Value
     // Appends a bool; see `append` for what is returned.
@@ -13155,9 +13030,9 @@ Sets the member `key` to `value`; an existing member keeps its position.
     // Appends a string; see `append` for what is returned.
     + fn append_string(value: String) Value
     // Returns the array held, or a new empty array when the value is not an array.
-    + get array: ArrayValue
+    + get array: Array[Value]
     // Returns the array held.
-    + fn array_value() ArrayValue !LookupError
+    + fn array_value() Array[Value] !LookupError
     // Returns the bool held, or `false` when the value is not a bool.
     + get bool: bool
     // Returns the bool held.
@@ -13173,7 +13048,7 @@ Sets the member `key` to `value`; an existing member keeps its position.
     // Returns the object member named `key` or the array item at index `key`.
     + fn get(key: String | uint) Value
     // Returns the array at `key`.
-    + fn get_array(key: String | uint) ArrayValue !LookupError
+    + fn get_array(key: String | uint) Array[Value] !LookupError
     // Returns the bool at `key`.
     + fn get_bool(key: String | uint) bool !LookupError
     // Returns the number at `key` as a float; an integer is converted.
@@ -13181,7 +13056,7 @@ Sets the member `key` to `value`; an existing member keeps its position.
     // Returns the integer at `key`; a whole float counts as its integer.
     + fn get_int(key: String | uint) int !LookupError
     // Returns the object at `key`.
-    + fn get_object(key: String | uint) ObjectValue !LookupError
+    + fn get_object(key: String | uint) Map[Value] !LookupError
     // Returns the object member named `key` or the array item at index `key`.
     + fn get_required(key: String | uint) Value !LookupError
     // Returns the string at `key`.
@@ -13229,9 +13104,9 @@ Sets the member `key` to `value`; an existing member keeps its position.
     // Returns the number of items or members, the byte length of a string, or `0` otherwise.
     + get length: uint
     // Returns the object held, or a new empty object when the value is not an object.
-    + get object: ObjectValue
+    + get object: Map[Value]
     // Returns the object held.
-    + fn object_value() ObjectValue !LookupError
+    + fn object_value() Map[Value] !LookupError
     // Inserts `value` at the start of the array and returns it.
     + fn prepend(value: Value) Value
     // Removes the object member named `key` or the array item at index `key`, and returns the container.
@@ -13261,7 +13136,7 @@ Sets the member `key` to `value`; an existing member keeps its position.
 
 A JSON value: `null`, a string, an integer, a float, a bool, an array or an object.
 
-Arrays and objects are references: copying a `Value` shares the container. `x[key]`
+Arrays are `Array[Value]` and objects `Map[Value]`: copying a `Value` shares the container. `x[key]`
 reads a member or item and yields `null` when it is absent. `each value as item, key`
 walks array items (the key is the index) or object members (the key is the name);
 other kinds yield nothing.
