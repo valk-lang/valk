@@ -202,6 +202,7 @@ if [ "$status" -ne 1 ]; then
     combined_ok=0
 else
     while IFS= read -r line; do
+        line="${line//\\//}"
         if [[ "$line" =~ /src/([ct][0-9]+)/[^:]*:[0-9]+:[0-9]+:\ error:\ (.*)$ ]]; then
             echo "${BASH_REMATCH[2]}" >> "$workdir/errs/${BASH_REMATCH[1]}"
         fi
