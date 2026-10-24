@@ -1,0 +1,329 @@
+use core
+
+// What a search may skip past: the ways text that cannot begin a match is told apart
+// from text that can, computed once per pattern
+
+class StartFilter {
+    // The bytes a match can begin with (256 flags), or empty when any byte can
+    first: Array[u8]
+    // Those bytes when there are at most 3, for the vector scan
+    first_few: Array[u8] (.{})
+    // The ASCII literal every match begins with
+    prefix: ?String (null)
+    // Two-byte buckets, when the machine can scan for them
+    pairs: ?PairFilter (null)
+    inner: ?InnerLiteral (null)
+
+    static fn build(node: Node, program: Array[Inst]) SELF {
+        let first = first_bytes(program)
+        let filter = SELF { first: first, first_few: first_few_bytes(first) }
+        filter.prefix = literal_prefix(node)
+        if !isset(filter.prefix) {
+            if pair_scan_supported() : filter.pairs = PairFilter.build(program)
+            filter.inner = InnerLiteral.find(node)
+        }
+        return filter
+    }
+
+    // A copy whose caches start empty
+    fn clone() SELF {
+        let inner = this.inner
+        let pairs = this.pairs
+        return SELF {
+            first: this.first.clone()
+            first_few: this.first_few.clone()
+            prefix: this.prefix
+            pairs: isset(pairs) ? PairFilter { low1: pairs.low1, high1: pairs.high1, low2: pairs.low2, high2: pairs.high2 } : null
+            inner: isset(inner) ? InnerLiteral { literal: inner.literal, program: inner.program.clone() } : null
+        }
+    }
+}
+
+// The set bytes of the first-byte table when there are at most 3 of them, else empty
+fn first_few_bytes(first: Array[u8]) Array[u8] {
+    let few = Array[u8]{}
+    if first.length == 0 : return few
+    each 0..256 as b {
+        if first[b] == 0 : continue
+        if few.length == 3 : return Array[u8]{}
+        few.append(b.to(u8))
+    }
+    return few
+}
+
+// The literal every match must start with, or null
+fn literal_prefix(node: Node) ?String {
+    let buf = ByteBuffer.new(16)
+    let n = node
+    while n.kind == NODE_GROUP : n = n.children[0]
+    // ASCII only: an invalid byte in the text reads as the code point of
+    // its value, which a UTF-8 encoded prefix would not find
+    if n.kind == NODE_CHAR {
+        if (n.flags & FLAG_CASELESS) != 0 || n.code >= 0x80 : return null
+        buf.write_byte(n.code.to(u8))
+    } else if n.kind == NODE_CONCAT {
+        each n.children as child {
+            let c = child
+            while c.kind == NODE_GROUP : c = c.children[0]
+            if c.kind == NODE_ASSERT && buf.length == 0 : continue
+            if c.kind != NODE_CHAR || (c.flags & FLAG_CASELESS) != 0 || c.code >= 0x80 : break
+            buf.write_byte(c.code.to(u8))
+        }
+    }
+    if buf.length == 0 : return null
+    return buf.to_string()
+}
+
+////////////////////////////
+// Two-byte buckets
+////////////////////////////
+
+// Every match begins with two bytes of one of up to 8 buckets: a byte of the bucket's first
+// set followed by one of its second set. A set is kept as two nibble tables of bucket bits,
+// so a byte is in it when the entries of its low and high nibble share a bit; the vector
+// scan looks up 16 positions at once
+class PairFilter {
+    low1: [u8 x 16] ({ 0... })
+    high1: [u8 x 16] ({ 0... })
+    low2: [u8 x 16] ({ 0... })
+    high2: [u8 x 16] ({ 0... })
+
+    // Null when a match can be shorter than two bytes or begin with any character
+    static fn build(program: Array[Inst]) ?SELF {
+        let starts = consuming_after(program, 0) ?! return null
+        let firsts = Array[Array[u8]]{}
+        let seconds = Array[Array[u8]]{}
+        each starts as pc {
+            let first = accepted_bytes(program[pc]) ?! return null
+            let second = Array[u8]{ 0 x 256 }
+            let nexts = consuming_after(program, pc + 1) ?! return null
+            each nexts as next {
+                let bytes = accepted_bytes(program[next]) ?! return null
+                or_flags(second, bytes)
+            }
+            // After a non-ASCII first character comes one of its continuation bytes
+            if first[128] == 1 : mark_high(second)
+            let bucket = firsts.length
+            each firsts as existing, index {
+                if same_flags(existing, first) && same_flags(seconds[index], second) {
+                    bucket = index
+                    break
+                }
+            }
+            if bucket < firsts.length : continue
+            if bucket == 8 {
+                // Past 8 buckets the rest share the last one
+                or_flags(firsts[7], first)
+                or_flags(seconds[7], second)
+                continue
+            }
+            firsts.append(first)
+            seconds.append(second)
+        }
+        if firsts.length == 0 : return null
+        let filter = SELF {}
+        each firsts as first, bucket {
+            let bit = (1 << bucket).to(u8)
+            let second = seconds[bucket]
+            each 0..256 as b {
+                if first[b] == 1 {
+                    filter.low1[b & 15] = filter.low1[b & 15] | bit
+                    filter.high1[b >> 4] = filter.high1[b >> 4] | bit
+                }
+                if second[b] == 1 {
+                    filter.low2[b & 15] = filter.low2[b & 15] | bit
+                    filter.high2[b >> 4] = filter.high2[b >> 4] | bit
+                }
+            }
+        }
+        return filter
+    }
+}
+
+fn pair_scan_supported() bool {
+    #if ARCH == "x64"
+    return core.cpu_has(.ssse3)
+    #elif ARCH == "arm64"
+    return true
+    #else
+    return false
+    #end
+}
+
+// The consuming instructions reachable from `pc` without consuming, in priority order;
+// null when a match can end there
+fn consuming_after(program: Array[Inst], pc: uint) ?Array[uint] {
+    let found = Array[uint]{}
+    let visited = Array[u8]{ 0 x program.length }
+    let stack = Array[uint]{ pc }
+    while stack.length > 0 {
+        let at = stack.pop_last() ! break
+        if visited[at] == 1 : continue
+        visited[at] = 1
+        let inst = program[at]
+        let op = inst.op
+        if op == OP_JMP {
+            stack.append(inst.x)
+        } else if op == OP_SPLIT {
+            stack.append(inst.y)
+            stack.append(inst.x)
+        } else if op == OP_SAVE || op == OP_ASSERT {
+            stack.append(at + 1)
+        } else if op == OP_MATCH {
+            return null
+        } else {
+            found.append(at)
+        }
+    }
+    return found
+}
+
+// The bytes a character `inst` accepts can begin with, as 256 flags: every byte from 0x80
+// when it may accept a non-ASCII character. Null for any character
+fn accepted_bytes(inst: Inst) ?Array[u8] {
+    let flags = Array[u8]{ 0 x 256 }
+    if inst.op == OP_CHAR {
+        if inst.code < 128 : flags[inst.code.to(uint)] = 1
+        else : mark_high(flags)
+        return flags
+    }
+    if inst.op != OP_SET : return null
+    let set = inst.set ?! return null
+    each 0..128 as b : flags[b] = set.ascii[b]
+    if set.negated || set.ranges.length == 0 || set.ranges[set.ranges.length - 1] >= 128 : mark_high(flags)
+    return flags
+}
+
+fn or_flags(into: Array[u8], from: Array[u8]) {
+    each 0..256 as b {
+        if from[b] == 1 : into[b] = 1
+    }
+}
+
+fn same_flags(a: Array[u8], b: Array[u8]) bool {
+    each 0..256 as i {
+        if a[i] != b[i] : return false
+    }
+    return true
+}
+
+// Skips 16 bytes at a time while no position holds a bucket's first byte followed by one
+// of its second bytes; the byte loop of the caller finishes the tail. The same function
+// twice: byte lookups need SSSE3 on x86-64, which the build does not assume
+#if ARCH == "x64"
+fn skip_to_pair(text: String, pos: uint, filter: PairFilter) uint $target_ssse3 {
+    let length = text.bytes
+    let low1 = $load[u8x16](&filter.low1, 0)
+    let high1 = $load[u8x16](&filter.high1, 0)
+    let low2 = $load[u8x16](&filter.low2, 0)
+    let high2 = $load[u8x16](&filter.high2, 0)
+    let nibble = $splat[u8x16](0x0F)
+    let zero = $splat[u8x16](0)
+    let i = pos
+    while i + 17 <= length {
+        let a = $load[u8x16](text, i)
+        let b = $load[u8x16](text, i + 1)
+        let hits = $lookup(low1, a & nibble) & $lookup(high1, a >> 4) & $lookup(low2, b & nibble) & $lookup(high2, b >> 4)
+        let mask = $mask_bits($ne(hits, zero))
+        if mask != 0 : return i + mask.trailing_zeros()
+        i += 16
+    }
+    return i
+}
+#else
+fn skip_to_pair(text: String, pos: uint, filter: PairFilter) uint {
+    let length = text.bytes
+    let low1 = $load[u8x16](&filter.low1, 0)
+    let high1 = $load[u8x16](&filter.high1, 0)
+    let low2 = $load[u8x16](&filter.low2, 0)
+    let high2 = $load[u8x16](&filter.high2, 0)
+    let nibble = $splat[u8x16](0x0F)
+    let zero = $splat[u8x16](0)
+    let i = pos
+    while i + 17 <= length {
+        let a = $load[u8x16](text, i)
+        let b = $load[u8x16](text, i + 1)
+        let hits = $lookup(low1, a & nibble) & $lookup(high1, a >> 4) & $lookup(low2, b & nibble) & $lookup(high2, b >> 4)
+        let mask = $mask_bits($ne(hits, zero))
+        if mask != 0 : return i + mask.trailing_zeros()
+        i += 16
+    }
+    return i
+}
+#end
+
+////////////////////////////
+// Inner literal
+////////////////////////////
+
+// A literal every match contains, after a prefix that cannot consume any of its bytes: no
+// prefix match crosses an occurrence, so the search jumps from occurrence to occurrence,
+// runs the prefix backwards from each and confirms forwards from the start it finds
+class InnerLiteral {
+    literal: String
+    // The prefix, reversed
+    program: Array[Inst]
+    dfa: ?Dfa (null)
+
+    static fn find(node: Node) ?SELF {
+        let n = node
+        while n.kind == NODE_GROUP : n = n.children[0]
+        if n.kind != NODE_CONCAT : return null
+        let children = n.children
+        // The longest run of plain ASCII characters that does not begin the pattern
+        let best_at: uint = 0
+        let best_len: uint = 0
+        let i: uint = 0
+        while i < children.length {
+            let run: uint = 0
+            while i + run < children.length && is_plain_char(children[i + run]) : run++
+            if run > best_len && i > 0 {
+                best_at = i
+                best_len = run
+            }
+            i += run + 1
+        }
+        if best_len == 0 : return null
+        let buf = ByteBuffer.new(best_len)
+        each 0..best_len as k : buf.write_byte(plain_char(children[best_at + k]).code.to(u8))
+        let literal = buf.to_string()
+        // Jumping between the occurrences of one common byte costs more than the scan it saves
+        if literal.bytes == 1 && common_byte(literal[0]) : return null
+        let prefix = Node { kind: NODE_CONCAT, children: children.range(0, best_at) }
+        let program = Compiler.compile_reverse(prefix) ! return null
+        // Every byte the compiled prefix can consume, case folding included
+        each program as inst {
+            if inst.op > OP_ANY_NL : continue
+            if inst.op == OP_ANY || inst.op == OP_ANY_NL : return null
+            let k: uint = 0
+            while k < literal.bytes {
+                if inst_accepts(inst, literal[k].to(u32)) : return null
+                k++
+            }
+        }
+        return SELF { literal: literal, program: program }
+    }
+
+    fn get_dfa() Dfa {
+        let dfa = this.dfa
+        if isset(dfa) : return dfa
+        dfa = Dfa.new(this.program, true)
+        this.dfa = dfa
+        return dfa
+    }
+}
+
+fn plain_char(node: Node) Node {
+    let n = node
+    while n.kind == NODE_GROUP && n.children.length == 1 : n = n.children[0]
+    return n
+}
+
+fn is_plain_char(node: Node) bool {
+    let n = plain_char(node)
+    return n.kind == NODE_CHAR && n.code < 0x80 && (n.flags & FLAG_CASELESS) == 0
+}
+
+fn common_byte(b: u8) bool {
+    return b.is_alpha_numeric() || " .,-_/:;'\"\n\t()".contains_byte(b)
+}

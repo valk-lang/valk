@@ -20,6 +20,8 @@ value DFA_STATE_LIMIT (4096)
 value DFA_RESET_LIMIT (16)
 value DFA_NONE (uint.$max)
 value DFA_FAIL (uint.$max - 1)
+// The inner-literal search gave up: run the plain search
+value DFA_RETRY (uint.$max - 2)
 // Transitions on non-ASCII characters, cached by (state, code point), direct-mapped
 value DFA_HIGH_CACHE (4096)
 
@@ -61,16 +63,19 @@ class Dfa {
     program: Array[Inst]
     // The longest match instead of the leftmost-first one (the reverse search)
     longest: bool
-    // ASCII bytes that no instruction or assertion tells apart share a class
-    classes: [u8 x 128] ({ 0... })
+    // ASCII bytes that no instruction or assertion tells apart share a class; bytes from
+    // 0x80 take one more column that is never filled in, so they reach the slow path
+    classes: [u8 x 256] ({ 0... })
     class_count: uint (0)
+    // Columns per state row: the classes and the non-ASCII column
+    stride: uint (0)
     class_flags: Array[uint] (.{})
     class_codes: Array[u32] (.{})
     states: Array[DfaState] (.{})
     // Unanchored start states, where the search may skip bytes that cannot begin a match
     start_marks: Array[u8] (.{})
     // Per state and class: 0 unknown, else next state's row << 3 | 4 | it is an unanchored
-    // start state << 1 | a match ends before the byte, a row being state × class_count
+    // start state << 1 | a match ends before the byte, a row being state × stride
     table: Array[u32] (.{})
     lookup: HashMap[String, uint] (.{})
     // Start states per flag, anchored and unanchored; 0 unknown
@@ -85,6 +90,8 @@ class Dfa {
     skip_gain: uint (0)
     reset_happened: bool (false)
     failed: bool (false)
+    // Where the last forward search stopped reading: the dead state or the end of the text
+    stop: uint (0)
     mark: Array[uint]
     epoch: uint (0)
     stack: Array[uint]
@@ -141,6 +148,12 @@ class Dfa {
             b++
         }
         this.class_count = next_count
+        b = 128
+        while b < 256 {
+            this.classes[b] = next_count.to(u8)
+            b++
+        }
+        this.stride = next_count + 1
     }
 
     fn reset() {
@@ -162,7 +175,7 @@ class Dfa {
         this.states.append(DfaState { seeds: Array[uint]{}, prev: DFA_FLAG_NONE })
         this.start_marks.append(0)
         i = 0
-        while i < this.class_count {
+        while i < this.stride {
             this.table.append(0)
             i++
         }
@@ -187,7 +200,7 @@ class Dfa {
         this.states.append(DfaState { seeds: seeds.copy(), prev: prev })
         this.start_marks.append(seeds.length == 1 && seeds[0] == DFA_RESTART ? 1 : 0)
         let i: uint = 0
-        while i < this.class_count {
+        while i < this.stride {
             this.table.append(0)
             i++
         }
@@ -270,7 +283,7 @@ class Dfa {
 
     fn entry(target: uint, matched: bool) u32 {
         let start = this.start_marks[target].to(uint)
-        return ((target * this.class_count) << 3 | 4 | start << 1 | (matched ? 1 : 0)).to(u32)
+        return ((target * this.stride) << 3 | 4 | start << 1 | (matched ? 1 : 0)).to(u32)
     }
 
     fn compute(state: uint, class: uint) u32 {
@@ -278,7 +291,7 @@ class Dfa {
         let target, matched = this.advance(state, this.class_flags[class], this.class_codes[class])
         let entry = this.entry(target, matched)
         // A reset renumbered the states: only the new target is valid
-        if !this.reset_happened : this.table[state * this.class_count + class] = entry
+        if !this.reset_happened : this.table[state * this.stride + class] = entry
         return entry
     }
 
@@ -309,78 +322,100 @@ class Dfa {
     // The end of the leftmost-first match at or after `start` (with `earliest`, the first
     // position where any match ends); DFA_NONE without a match, DFA_FAIL when the cache
     // thrashes and the VM should search instead
-    fn find_end(text: String, start: uint, anchored: bool, earliest: bool, first: Array[u8], first_few: Array[u8], prefix: ?String) uint {
+    fn find_end(text: String, start: uint, anchored: bool, earliest: bool, filter: StartFilter) uint {
         @unsafe
         if this.failed : return DFA_FAIL
         let length = text.bytes
         let data = text.data
-        let stride = this.class_count
+        let stride = this.stride
         let pos = start
         let state = this.start_state(start == 0 ? DFA_FLAG_NONE : dfa_flag(text[start - 1]), !anchored)
         let row = state * stride
         // After the start state: adding a state can move the table
         let cells = this.table.items()
-        let at_start = !anchored
         // Decided once per search, so the start-state test is predictable when skipping is off
-        let can_skip = isset(prefix) || (first.length > 0 && (this.skip_tries < 64 || this.skip_gain >= this.skip_tries * 4))
-        let last = DFA_NONE
-        while pos < length {
-            if can_skip && at_start {
-                // Nothing alive yet: skip to the next byte that can begin a match
-                let skip = pos
-                if isset(prefix) {
-                    skip = text.index_of(prefix, pos) ! return last
-                } else {
-                    if first_few.length > 0 : skip = skip_to_first_few(text, skip, first_few)
-                    while skip < length && first[@ptrv(data, u8, skip).to(uint)] == 0 : skip++
-                    this.skip_gain += skip - pos
-                    if ++this.skip_tries >= 4096 {
-                        // Forget old texts slowly
-                        this.skip_tries = this.skip_tries / 2
-                        this.skip_gain = this.skip_gain / 2
-                    }
-                    if skip >= length : break
-                }
-                if skip != pos {
-                    pos = skip
+        let can_skip = !anchored && (isset(filter.prefix) || (filter.first.length > 0 && (this.skip_tries < 64 || this.skip_gain >= this.skip_tries * 4)))
+        if can_skip {
+            let skip = this.skip_ahead(text, pos, filter)
+            if skip != pos {
+                pos = skip
+                if pos < length {
                     row = this.start_state(dfa_flag(@ptrv(data, u8, pos - 1)), true) * stride
                     cells = this.table.items()
                 }
             }
+        }
+        // Entries that leave the fast path: a match, the dead state (row 0), an unknown
+        // transition and, when skipping, an unanchored start state
+        let special: u32 = can_skip ? 3 : 1
+        let last = DFA_NONE
+        while pos < length {
             let b = @ptrv(data, u8, pos)
-            if b < 0x80 {
-                let class = this.classes[b.to(uint)].to(uint)
-                let entry = @ptrv(cells, u32, row + class)
-                if entry == 0 {
-                    entry = this.compute(row / stride, class)
-                    if this.failed : return DFA_FAIL
-                    cells = this.table.items()
-                }
-                if (entry & 1) != 0 {
-                    last = pos
-                    if earliest : return pos
-                }
-                at_start = (entry & 2) != 0
+            let class = this.classes[b.to(uint)].to(uint)
+            let entry = @ptrv(cells, u32, row + class)
+            if (entry & special) == 0 && entry >= 8 {
                 row = (entry >> 3).to(uint)
                 pos++
-                if row == 0 : return last
                 continue
             }
-            let ch = core.unicode_read(text, pos)
-            let entry = this.high(row / stride, ch.code)
-            if this.failed : return DFA_FAIL
-            cells = this.table.items()
+            let width: uint = 1
+            if b >= 0x80 {
+                let ch = core.unicode_read(text, pos)
+                entry = this.high(row / stride, ch.code)
+                if this.failed : return DFA_FAIL
+                cells = this.table.items()
+                width = ch.count
+            } else if entry == 0 {
+                entry = this.compute(row / stride, class)
+                if this.failed : return DFA_FAIL
+                cells = this.table.items()
+            }
             if (entry & 1) != 0 {
                 last = pos
                 if earliest : return pos
             }
-            at_start = (entry & 2) != 0
             row = (entry >> 3).to(uint)
-            pos += ch.count
-            if row == 0 : return last
+            pos += width
+            if row == 0 {
+                this.stop = pos
+                return last
+            }
+            if (entry & special & 2) != 0 && pos < length {
+                // Nothing alive but the restart: skip to the next byte that can begin a match
+                let skip = this.skip_ahead(text, pos, filter)
+                if skip != pos {
+                    pos = skip
+                    if pos >= length : break
+                    row = this.start_state(dfa_flag(@ptrv(data, u8, pos - 1)), true) * stride
+                    cells = this.table.items()
+                }
+            }
         }
+        this.stop = length
         if this.final_match(row / stride, DFA_FLAG_NONE) : last = length
         return last
+    }
+
+    // The first position at or after `pos` whose bytes can begin a match, or the text length
+    fn skip_ahead(text: String, pos: uint, filter: StartFilter) uint {
+        @unsafe
+        let length = text.bytes
+        let prefix = filter.prefix
+        if isset(prefix) : return text.index_of(prefix, pos) ! return length
+        let data = text.data
+        let skip = pos
+        let pairs = filter.pairs
+        if isset(pairs) : skip = skip_to_pair(text, skip, pairs)
+        else if filter.first_few.length > 0 : skip = skip_to_first_few(text, skip, filter.first_few)
+        let first = filter.first
+        while skip < length && first[@ptrv(data, u8, skip).to(uint)] == 0 : skip++
+        this.skip_gain += skip - pos
+        if ++this.skip_tries >= 4096 {
+            // Forget old texts slowly
+            this.skip_tries = this.skip_tries / 2
+            this.skip_gain = this.skip_gain / 2
+        }
+        return skip
     }
 
     // Runs the reversed program backwards from `end`, not below `bound`, and returns the
@@ -390,7 +425,7 @@ class Dfa {
         if this.failed : return DFA_FAIL
         let length = text.bytes
         let data = text.data
-        let stride = this.class_count
+        let stride = this.stride
         let pos = end
         let row = this.start_state(end >= length ? DFA_FLAG_NONE : dfa_flag(text[end]), false) * stride
         // After the start state: adding a state can move the table
@@ -398,35 +433,36 @@ class Dfa {
         let last = DFA_NONE
         while pos > bound {
             let b = @ptrv(data, u8, pos - 1)
-            if b < 0x80 {
-                let class = this.classes[b.to(uint)].to(uint)
-                let entry = @ptrv(cells, u32, row + class)
-                if entry == 0 {
-                    entry = this.compute(row / stride, class)
-                    if this.failed : return DFA_FAIL
-                    cells = this.table.items()
-                }
-                if (entry & 1) != 0 : last = pos
+            let class = this.classes[b.to(uint)].to(uint)
+            let entry = @ptrv(cells, u32, row + class)
+            if (entry & 1) == 0 && entry >= 8 {
                 row = (entry >> 3).to(uint)
                 pos--
-                if row == 0 : return last
                 continue
             }
-            // The character that ends at `pos`; anything but valid UTF-8 is left to the VM
-            let lead = pos - 1
-            let back: uint = 0
-            while lead > bound && back < 3 && (@ptrv(data, u8, lead) & 0xC0) == 0x80 {
-                lead--
-                back++
+            let next = pos - 1
+            if b >= 0x80 {
+                // The character that ends at `pos`; anything but valid UTF-8 is left to the VM
+                let lead = pos - 1
+                let back: uint = 0
+                while lead > bound && back < 3 && (@ptrv(data, u8, lead) & 0xC0) == 0x80 {
+                    lead--
+                    back++
+                }
+                let ch = core.unicode_read(text, lead)
+                if !ch.valid || lead + ch.count != pos : return DFA_FAIL
+                entry = this.high(row / stride, ch.code)
+                if this.failed : return DFA_FAIL
+                cells = this.table.items()
+                next = lead
+            } else if entry == 0 {
+                entry = this.compute(row / stride, class)
+                if this.failed : return DFA_FAIL
+                cells = this.table.items()
             }
-            let ch = core.unicode_read(text, lead)
-            if !ch.valid || lead + ch.count != pos : return DFA_FAIL
-            let entry = this.high(row / stride, ch.code)
-            if this.failed : return DFA_FAIL
-            cells = this.table.items()
             if (entry & 1) != 0 : last = pos
             row = (entry >> 3).to(uint)
-            pos = lead
+            pos = next
             if row == 0 : return last
         }
         let next = bound == 0 ? DFA_FLAG_NONE : dfa_flag(text[bound - 1])
