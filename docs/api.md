@@ -566,9 +566,9 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
-// A double-ended queue: pushes and pops at both ends in amortized constant time.
+// A double-ended queue: pushes and pops at both ends in constant time.
 + class Deque[T] {
-    // Removes every item.
+    // Removes every item; the storage is kept.
     + fn clear() void
     // Returns a deep copy in which every item is cloned as well.
     + fn clone() Deque[T]
@@ -584,7 +584,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn is_empty() bool
     // The number of items.
     + get length: uint
-    // Creates an empty deque with room for `capacity` items pushed at the back.
+    // Creates an empty deque with room for `capacity` items.
     + static fn new(capacity: uint (0)) Deque[T]
     // Returns the item at the back without removing it.
     + fn peek_back() T !LookupError
@@ -892,7 +892,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
-// An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+// An immutable string of bytes, normally UTF-8: a view of `length` bytes that `owner` keeps alive, with no terminator.
 + slice String of u8 {
     // The address of the first element.
     ~ data: *[u8]
@@ -903,7 +903,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 
     // Returns a new string with the bytes of `add` after this one; backs the `+` operator.
     + fn add(add: String) String
-    // Allocates a string of `length` bytes plus the zero terminator, to fill in `@unsafe` code.
+    // Allocates a string of `length` zero bytes, to fill in `@unsafe` code.
     + static fn alloc(length: uint) String
     // Returns the string colored black with ANSI codes, then a reset; `bold` makes it bold.
     + fn ansi.black(bold: bool (false)) String
@@ -923,7 +923,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn ansi.white(bold: bool (false)) String
     // Returns the string colored yellow with ANSI codes, then a reset; `bold` makes it bold.
     + fn ansi.yellow(bold: bool (false)) String
-    // The number of bytes in the string, not counting the zero terminator.
+    // The number of bytes in the string.
     + get bytes: uint
     // Returns a copy of the string in new storage.
     + fn clone() String
@@ -935,7 +935,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + static fn copy_from_ptr(data: ptr, length: uint) String
     // Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
     + fn count(part: String) uint
-    // The bytes as a zero-terminated C string, without copying.
+    // The bytes as a zero-terminated C string, in a buffer that belongs to the thread.
     + get data_cstring: cstring @unsafe
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
     + fn ends_with(part: String) bool

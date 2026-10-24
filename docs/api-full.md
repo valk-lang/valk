@@ -1937,9 +1937,9 @@ Sets the position to `index`, clamped to the source length.
 Advances the position by `amount` bytes, stopping at the end.
 
 ```js
-// A double-ended queue: pushes and pops at both ends in amortized constant time.
+// A double-ended queue: pushes and pops at both ends in constant time.
 + class Deque[T] {
-    // Removes every item.
+    // Removes every item; the storage is kept.
     + fn clear() void
     // Returns a deep copy in which every item is cloned as well.
     + fn clone() Deque[T]
@@ -1955,7 +1955,7 @@ Advances the position by `amount` bytes, stopping at the end.
     + fn is_empty() bool
     // The number of items.
     + get length: uint
-    // Creates an empty deque with room for `capacity` items pushed at the back.
+    // Creates an empty deque with room for `capacity` items.
     + static fn new(capacity: uint (0)) Deque[T]
     // Returns the item at the back without removing it.
     + fn peek_back() T !LookupError
@@ -1978,13 +1978,13 @@ Advances the position by `amount` bytes, stopping at the end.
 
 ### Deque
 
-A double-ended queue: pushes and pops at both ends in amortized constant time.
+A double-ended queue: pushes and pops at both ends in constant time.
 
 Items are indexed from the front, and `each` visits them from front to back.
 
 #### clear
 
-Removes every item.
+Removes every item; the storage is kept.
 
 #### clone
 
@@ -2021,7 +2021,7 @@ The number of items.
 
 #### new
 
-Creates an empty deque with room for `capacity` items pushed at the back.
+Creates an empty deque with room for `capacity` items.
 
 Marked `$default`: it also provides `Deque[T].$default_value`.
 
@@ -3003,7 +3003,7 @@ Throws `write` when the child closed its end, for example because it exited, and
 `closed` after `close` or when the stream is not a pipe.
 
 ```js
-// An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+// An immutable string of bytes, normally UTF-8: a view of `length` bytes that `owner` keeps alive, with no terminator.
 + slice String of u8 {
     // The address of the first element.
     ~ data: *[u8]
@@ -3014,7 +3014,7 @@ Throws `write` when the child closed its end, for example because it exited, and
 
     // Returns a new string with the bytes of `add` after this one; backs the `+` operator.
     + fn add(add: String) String
-    // Allocates a string of `length` bytes plus the zero terminator, to fill in `@unsafe` code.
+    // Allocates a string of `length` zero bytes, to fill in `@unsafe` code.
     + static fn alloc(length: uint) String
     // Returns the string colored black with ANSI codes, then a reset; `bold` makes it bold.
     + fn ansi.black(bold: bool (false)) String
@@ -3034,7 +3034,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn ansi.white(bold: bool (false)) String
     // Returns the string colored yellow with ANSI codes, then a reset; `bold` makes it bold.
     + fn ansi.yellow(bold: bool (false)) String
-    // The number of bytes in the string, not counting the zero terminator.
+    // The number of bytes in the string.
     + get bytes: uint
     // Returns a copy of the string in new storage.
     + fn clone() String
@@ -3046,7 +3046,7 @@ Throws `write` when the child closed its end, for example because it exited, and
     + static fn copy_from_ptr(data: ptr, length: uint) String
     // Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
     + fn count(part: String) uint
-    // The bytes as a zero-terminated C string, without copying.
+    // The bytes as a zero-terminated C string, in a buffer that belongs to the thread.
     + get data_cstring: cstring @unsafe
     // Returns whether the string ends with the bytes of `part`; an empty `part` always matches.
     + fn ends_with(part: String) bool
@@ -3161,12 +3161,14 @@ Throws `write` when the child closed its end, for example because it exited, and
 
 ### String
 
-An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+An immutable string of bytes, normally UTF-8: a view of `length` bytes that `owner` keeps
+alive, with no terminator.
 
 Indexes, lengths and ranges count bytes; the `utf8` group works in characters. The
-content is not validated as UTF-8 and may contain zero bytes. `$global` makes the name
-available in every namespace, and `$immutable` makes the bytes read-only outside this
-class.
+content is not validated as UTF-8 and may contain zero bytes. A range of a string is a view
+of the same bytes, so taking one allocates nothing and keeps the whole string alive.
+`$global` makes the name available in every namespace, and `$immutable` makes the bytes
+read-only outside this class.
 
 #### data
 
@@ -3188,10 +3190,9 @@ Panics when the combined length does not fit in `uint`.
 
 #### alloc
 
-Allocates a string of `length` bytes plus the zero terminator, to fill in `@unsafe` code.
+Allocates a string of `length` zero bytes, to fill in `@unsafe` code.
 
-A `length` of 0 returns the shared empty literal, which must not be written. Panics when
-`length + 1` overflows.
+A `length` of 0 returns the shared empty literal, which must not be written.
 
 #### ansi.black
 
@@ -3235,7 +3236,7 @@ Returns the string colored yellow with ANSI codes, then a reset; `bold` makes it
 
 #### bytes
 
-The number of bytes in the string, not counting the zero terminator.
+The number of bytes in the string.
 
 #### clone
 
@@ -3261,10 +3262,13 @@ Returns how many times `part` occurs, without overlaps; 0 for an empty `part`.
 
 #### data_cstring
 
-The bytes as a zero-terminated C string, without copying.
+The bytes as a zero-terminated C string, in a buffer that belongs to the thread.
 
-The pointer is only valid while the string is alive, so using it requires `@unsafe`. A
-string that contains a zero byte looks shorter through it.
+The string has no terminator, so the bytes are copied. Each thread keeps `CSTRING_BUFFERS`
+buffers in turn: the pointer stays valid until this thread converts that many more
+strings, long enough for the arguments of one call into C, which is why using it requires
+`@unsafe`. A C function that keeps the pointer needs its own copy. A string that contains
+a zero byte looks shorter through it.
 
 #### ends_with
 
@@ -3627,8 +3631,8 @@ Empty parts are included. A `limit` above 0 caps the number of parts, as in
 Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
 
 Backs `&str[start .. length]`, and `$auto` lets a `String` pass where a `&[u8]` is
-expected. The range is clamped to the string, a `start_index` past the end gives an
-empty view, and the view never includes the zero terminator.
+expected. The range is clamped to the string, and a `start_index` past the end gives an
+empty view.
 
 ```js
 // An iterator over the UTF-8 characters of a string, returned by `str.utf8.chars()`.

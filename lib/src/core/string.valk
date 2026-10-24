@@ -1,23 +1,47 @@
 use mem
 use gc
 
-/// An immutable string of bytes, normally UTF-8, always followed by a zero byte in memory.
+// C strings handed to externs: per-thread buffers used in turn, see String.data_cstring
+value CSTRING_BUFFERS (8)
+global cstring_buffers: [ptr x 8]
+global cstring_sizes: [uint x 8]
+global cstring_next: uint
+
+/// An immutable string of bytes, normally UTF-8: a view of `length` bytes that `owner` keeps
+/// alive, with no terminator.
 ///
 /// Indexes, lengths and ranges count bytes; the `utf8` group works in characters. The
-/// content is not validated as UTF-8 and may contain zero bytes. `$global` makes the name
-/// available in every namespace, and `$immutable` makes the bytes read-only outside this
-/// class.
+/// content is not validated as UTF-8 and may contain zero bytes. A range of a string is a view
+/// of the same bytes, so taking one allocates nothing and keeps the whole string alive.
+/// `$global` makes the name available in every namespace, and `$immutable` makes the bytes
+/// read-only outside this class.
 + slice String of u8 $global $immutable {
-    /// The number of bytes in the string, not counting the zero terminator.
+    /// The number of bytes in the string.
     + get bytes: uint {
         return this.length
     }
-    /// The bytes as a zero-terminated C string, without copying.
+    /// The bytes as a zero-terminated C string, in a buffer that belongs to the thread.
     ///
-    /// The pointer is only valid while the string is alive, so using it requires `@unsafe`. A
-    /// string that contains a zero byte looks shorter through it.
+    /// The string has no terminator, so the bytes are copied. Each thread keeps `CSTRING_BUFFERS`
+    /// buffers in turn: the pointer stays valid until this thread converts that many more
+    /// strings, long enough for the arguments of one call into C, which is why using it requires
+    /// `@unsafe`. A C function that keeps the pointer needs its own copy. A string that contains
+    /// a zero byte looks shorter through it.
     + get data_cstring: cstring @unsafe {
-        return this.data
+        let slot = cstring_next
+        cstring_next = (slot + 1) % CSTRING_BUFFERS
+        let needed = this.length + 1
+        let buffer = cstring_buffers[slot]
+        if needed > cstring_sizes[slot] {
+            let size = needed < 256 ? 256 : needed
+            let address: uint = buffer
+            buffer = address == 0 ? mem.alloc(size) : mem.resize(buffer, cstring_sizes[slot], size)
+            cstring_buffers[slot] = buffer
+            cstring_sizes[slot] = size
+        }
+        mem.copy_bytes(this.data, buffer, this.length)
+        @ptrv(buffer, u8, this.length) = 0
+        return buffer.@cast(cstring)
     }
 
     /////////////////////
@@ -265,8 +289,7 @@ use gc
         let s = SELF.alloc(len)
         let data = s.data
         mem.copy_bytes(this.data, data, this_len)
-        let copy_len = add_len.checked_add(1) ! panic("String length is too large")
-        mem.copy_bytes(add.data, data.@offset(this_len), copy_len) // Includes the zero byte.
+        mem.copy_bytes(add.data, data.@offset(this_len), add_len)
         return s
     }
 
@@ -362,31 +385,20 @@ use gc
         return SELF.copy_from_ptr(this.data, this.bytes)
     }
 
-    /// Allocates a string of `length` bytes plus the zero terminator, to fill in `@unsafe` code.
+    /// Allocates a string of `length` zero bytes, to fill in `@unsafe` code.
     ///
-    /// A `length` of 0 returns the shared empty literal, which must not be written. Panics when
-    /// `length + 1` overflows.
+    /// A `length` of 0 returns the shared empty literal, which must not be written.
     + static fn alloc(length: uint) SELF {
         @unsafe
         if length == 0 : return "".to(SELF)
-        let storage_length = length.checked_add(1) ! panic("String length is too large")
-        let result = SELF { length: storage_length }
-        result.length = length
-        return result
+        return SELF { length: length }
     }
 
-    // Takes over a string allocated by 'alloc' as a shorter string, without
-    // copying. 'alloc' reserves one byte past the length for the terminator,
-    // so the new terminator is always in bounds, and writing it here is what
-    // keeps the zero-termination invariant: no caller can forget it.
-    // Namespace-internal, and never valid on a string literal, whose bytes are
-    // read only. 'ByteBuffer.into_string' is the only caller
+    // Takes over storage as a string of `length` bytes without copying. Namespace-internal;
+    // 'ByteBuffer.into_string' is the only caller
     -+ static fn adopt_storage(storage: SELF, length: uint) SELF {
         @unsafe
-        // An empty string is the shared literal, whose bytes are read only
-        if storage.length == 0 : return storage
         if length > storage.length : length = storage.length
-        @ptrv(storage.data, u8, length) = 0
         storage.length = length
         return storage
     }
@@ -508,10 +520,14 @@ use gc
         let remain = this_bytes - start_index
         if length > remain : length = remain
         if length == 0 : return ""
-        let from = this.data.@offset(start_index)
-        let res = String.alloc(length)
-        mem.copy_bytes(from, res.data, length)
-        return res
+        return SELF.slice_of(this, start_index, length)
+    }
+
+    // A view of `length` bytes of `source` from `start`: the owner keeps them alive. The
+    // caller checks the bounds
+    -+ static fn slice_of(source: SELF, start: uint, length: uint) SELF {
+        @unsafe
+        return SELF { owner: source.owner, data: @ref(@ptrv(source.data, u8, start)), length: length }
     }
 
     /// Returns a `ByteReader` that reads the string's bytes from the start without copying them.
@@ -522,8 +538,8 @@ use gc
     /// Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
     ///
     /// Backs `&str[start .. length]`, and `$auto` lets a `String` pass where a `&[u8]` is
-    /// expected. The range is clamped to the string, a `start_index` past the end gives an
-    /// empty view, and the view never includes the zero terminator.
+    /// expected. The range is clamped to the string, and a `start_index` past the end gives an
+    /// empty view.
     + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8] $view $auto $inline {
         @unsafe
         if start_index > this.bytes {
@@ -978,7 +994,8 @@ use gc
                 if offset >= this_bytes : break
             }
             if offset > this_bytes : offset = this_bytes
-            return String.copy_from_ptr(data.@offset(start), offset - start)
+            if offset == start : return ""
+            return String.slice_of(this, start, offset - start)
         }
 
         /// Splits the string on every occurrence of `on` that starts on a character boundary.
