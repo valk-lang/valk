@@ -777,6 +777,10 @@ let s = size()
 println(s[0] + "x" + s[1]) // 640x480
 ```
 
+Tuples compare with `==`, and when every member can be ordered also with `<`, `>`, `<=`
+and `>=`: member by member from the first, so `(1, 9) < (2, 0)`. A `Heap[(int, uint)]`
+or `Array[(int, String)].sort()` therefore needs no comparison function.
+
 Existing variables, properties and elements take a tuple with parentheses on
 the left. The right side is evaluated completely first, so this swaps:
 
