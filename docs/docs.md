@@ -343,6 +343,13 @@ each pairs as name, count, index {}
 each pairs into pair, index {}
 ```
 
+For a grid, one array indexed by `x + y * width` is faster than an array of rows:
+
+```rust
+let cells = Array[u8]{ 0 x width * height }
+cells[x + y * width] = 1
+```
+
 Full `Array` API: [core](api.md#core)
 
 Callbacks cover the common searches and transforms: `any`, `all` and `find`
