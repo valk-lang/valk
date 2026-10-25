@@ -1261,8 +1261,9 @@ raw_body=$(sed -n '/^define .*__raw_store__/,/^}/p' "$alias_ir")
 if ! grep -q 'store double .*, !tbaa !7$' <<< "$set_body" \
     || ! grep -q 'load i64, ptr .*, !tbaa !6$' <<< "$set_body" \
     || grep -q 'tbaa' <<< "$raw_body" \
-    || ! grep -q '^!7 = !{!5, !5, i64 0}$' "$alias_ir"; then
-    echo "# Alias tags are missing or on raw pointer access"
+    || ! grep -q '^!7 = !{!5, !5, i64 0}$' "$alias_ir" \
+    || ! grep -q '^define .*__get_typed_pool__.* noinline ' "$alias_ir"; then
+    echo "# Alias tags are missing or on raw pointer access, or get_typed_pool can be inlined"
     echo "$set_body"
     echo "$raw_body"
     exit 1
