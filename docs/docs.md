@@ -263,6 +263,7 @@ let middle = s[1 .. 3] // Same as s.range(1, 3): three bytes starting at byte of
 s.utf8.length // Length in Unicode characters
 s.utf8.range(start_index, length) String // Sub string using character offsets
 each s.utf8.chars() as ch { } // Iterate Unicode characters (each `ch` is a String)
+each s.words() as word { } // Iterate the parts between whitespace, without allocating
 each s as byte { } // Iterate bytes (u8)
 ```
 
@@ -585,6 +586,14 @@ Keys are integers, pointers, types with a `hash` method (such as `String`), or
 structs, tuples and fixed arrays made of those: they hash their parts the way `==`
 compares them, so `HashMap[(int, int), T]` and a `struct Point` key need no code.
 A part that is a float, or a struct with its own `$eq`, needs a `hash` method of your own.
+
+`add` counts with one lookup, and `update` changes a value through a closure:
+
+```rust
+let counts = HashMap[String, uint]{}
+each "a b a".words() as word : counts.add(word, 1) // a => 2, b => 1
+counts.update("c", fn(old: ?uint) uint { return (old ?? 0) + 10 })
+```
 
 Full `HashMap` API: [core](api.md#core)
 
@@ -2146,6 +2155,15 @@ while group.has_pending() {
     total += result
 }
 println(total) // 14
+```
+
+`thread.parallel_for(count, fn(i: uint) { ... })` calls the closure for every
+index below `count`, spread over one thread per CPU (or the number given as the
+third argument), and returns when all calls are done:
+
+```rust
+let squares: atomic Array[uint] = Array[uint]{ 0 x 100 }
+thread.parallel_for(squares.length, fn(i: uint) { squares[i] = i * i })
 ```
 
 A closure that runs on another thread is an `atomic fn`: it may capture numbers

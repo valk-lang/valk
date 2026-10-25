@@ -2263,6 +2263,8 @@ Returns a new array of the values, in entry order.
     + fn set(key: K, value: T) void
     // Adds a new entry for `key`.
     + fn set_unique(key: K, value: T) void !LookupError
+    // Stores what `change` makes of the current value (`null` when there is none), and returns it.
+    + fn update(key: K, change: fn(?T)(T)) T
     // Returns a new array of the values, in entry order.
     + fn values() Array[T]
 }
@@ -2374,9 +2376,27 @@ Adds a new entry for `key`.
 
 Throws `exists`, leaving the map unchanged, when `key` is already present.
 
+#### update
+
+Stores what `change` makes of the current value (`null` when there is none), and returns
+it.
+
 #### values
 
 Returns a new array of the values, in entry order.
+
+```js
++ extend HashMap[K, uint] {
+    // Adds `amount` to the value of `key`, which starts at 0, and returns the new value.
+    + fn add(key: K, amount: uint) uint
+}
+```
+
+#### HashMap[K, uint].add
+
+Adds `amount` to the value of `key`, which starts at 0, and returns the new value.
+
+Probes for `key` once: `counts.add(word, 1)` counts occurrences.
 
 ```js
 + extend HashMap[String, T] {
@@ -3175,6 +3195,8 @@ Throws `write` when the child closed its end, for example because it exited, and
     + fn utf8.split(on: String, limit: uint (0)) Array[String]
     // Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
     + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
+    // Returns an iterator over the words, for `each`: the parts between ASCII whitespace, empty ones skipped. Unlike `split`, nothing is allocated.
+    + fn words() StringWords
 }
 ```
 
@@ -3653,6 +3675,13 @@ Backs `&str[start .. length]`, and `$auto` lets a `String` pass where a `&[u8]` 
 expected. The range is clamped to the string, and a `start_index` past the end gives an
 empty view.
 
+#### words
+
+Returns an iterator over the words, for `each`: the parts between ASCII whitespace,
+empty ones skipped. Unlike `split`, nothing is allocated.
+
+`each "a  b\tc".words() as word` yields `a`, `b` and `c`.
+
 ```js
 // An iterator over the UTF-8 characters of a string, returned by `str.utf8.chars()`.
 + struct StringChars {
@@ -3667,6 +3696,19 @@ An iterator over the UTF-8 characters of a string, returned by `str.utf8.chars()
 delimited by their lead byte; a stray continuation byte or an invalid lead byte is
 yielded as a one-byte string, and a sequence ends early at a byte that cannot continue
 it, so an invalid sequence never swallows the character after it.
+
+```js
+// An iterator over the words of a string, returned by `str.words()`.
++ struct StringWords {
+}
+```
+
+### StringWords
+
+An iterator over the words of a string, returned by `str.words()`.
+
+Words are the runs of bytes between ASCII whitespace (`u8.is_whitespace`); each is a view
+into the string, nothing is copied.
 
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
@@ -16572,6 +16614,8 @@ alike: `0` allows no includes, `1` allows includes that include nothing further.
 ## Functions for 'thread'
 
 ```js
+// Calls `handler` once for every index in `0 .. count`, spread over `threads` OS threads, and returns when all calls finished.
++ fn parallel_for(count: uint, handler: atomic fn(uint)(), threads: uint (0)) void
 // Starts an OS thread that runs `func`; the same as `Thread[void].start`.
 + fn start(func: atomic fn()()) Thread[void] !InitError
 // Blocks the whole OS thread, with every coroutine on it, for `ms` milliseconds.
@@ -16580,6 +16624,21 @@ alike: `0` allows no includes, `1` allows includes that include nothing further.
 + fn suspend_ns(ns: uint) void
 // Runs `handler` on a pool of up to 8 reused task threads; await the returned `Task` for it.
 + fn task(handler: atomic fn()()) Task !InitError
+```
+
+### parallel_for
+
+Calls `handler` once for every index in `0 .. count`, spread over `threads` OS threads,
+and returns when all calls finished.
+
+Indexes are handed out one at a time, so uneven work balances out. The calling thread
+takes part; `threads` 0 means one per logical CPU. When a thread cannot be started, the
+threads already running do the remaining work. Like `Thread.start`, `handler` only reaches
+`atomic` data.
+
+```valk
+let rows: atomic Array[uint] = Array[uint]{ 0 x 100 }
+thread.parallel_for(rows.length, fn(i: uint) { rows[i] = i * i })
 ```
 
 ### start

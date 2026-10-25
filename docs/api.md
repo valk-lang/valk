@@ -688,8 +688,17 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn set(key: K, value: T) void
     // Adds a new entry for `key`.
     + fn set_unique(key: K, value: T) void !LookupError
+    // Stores what `change` makes of the current value (`null` when there is none), and returns it.
+    + fn update(key: K, change: fn(?T)(T)) T
     // Returns a new array of the values, in entry order.
     + fn values() Array[T]
+}
+```
+
+```js
++ extend HashMap[K, uint] {
+    // Adds `amount` to the value of `key`, which starts at 0, and returns the new value.
+    + fn add(key: K, amount: uint) uint
 }
 ```
 
@@ -1049,12 +1058,20 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn utf8.split(on: String, limit: uint (0)) Array[String]
     // Returns a read-only view of `length` bytes from `start_index`, sharing the storage.
     + fn view(start_index: uint (0), length: uint (uint.$max)) &[u8]
+    // Returns an iterator over the words, for `each`: the parts between ASCII whitespace, empty ones skipped. Unlike `split`, nothing is allocated.
+    + fn words() StringWords
 }
 ```
 
 ```js
 // An iterator over the UTF-8 characters of a string, returned by `str.utf8.chars()`.
 + struct StringChars {
+}
+```
+
+```js
+// An iterator over the words of a string, returned by `str.words()`.
++ struct StringWords {
 }
 ```
 
@@ -4895,6 +4912,8 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ## Functions for 'thread'
 
 ```js
+// Calls `handler` once for every index in `0 .. count`, spread over `threads` OS threads, and returns when all calls finished.
++ fn parallel_for(count: uint, handler: atomic fn(uint)(), threads: uint (0)) void
 // Starts an OS thread that runs `func`; the same as `Thread[void].start`.
 + fn start(func: atomic fn()()) Thread[void] !InitError
 // Blocks the whole OS thread, with every coroutine on it, for `ms` milliseconds.
