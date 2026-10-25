@@ -43,6 +43,7 @@ queue_ir "$workdir/buffer-roots.ll" "$DIR/buffer-roots.valk" --ir --no-warn
 queue_ir "$workdir/native-address.ll" "$DIR/native-address.valk" --ir --no-warn
 queue_ir "$workdir/windows-coro-stack.ll" "$DIR/native-address.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --no-warn
+queue_ir "$workdir/alias-tags.ll" "$DIR/alias-tags.valk" --ir --no-warn
 queue_ir "$workdir/atomic-alignment.ll" "$DIR/atomic-alignment.valk" --ir --no-warn
 queue_ir "$workdir/vectors.ll" "$DIR/vectors.valk" --ir --no-warn
 queue_ir "$workdir/pointer-integer-compare.ll" "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn
@@ -1248,6 +1249,25 @@ check_c_abi win-x64 \
     'declare i32 @"s3_sum"(ptr)' \
     'declare i32 @"tex_sum"(ptr, i64, i32)'
 
+echo "> Tag Array fields and element slots for alias analysis, never raw pointer access"
+alias_ir="$workdir/alias-tags.ll"
+if ! out=$(ir_result "$alias_ir"); then
+    echo "# Failed to build alias tag fixture"
+    echo "$out"
+    exit 1
+fi
+set_body=$(sed -n '/^define .*sequence\.set/,/^}/p' "$alias_ir")
+raw_body=$(sed -n '/^define .*__raw_store__/,/^}/p' "$alias_ir")
+if ! grep -q 'store double .*, !tbaa !7$' <<< "$set_body" \
+    || ! grep -q 'load i64, ptr .*, !tbaa !6$' <<< "$set_body" \
+    || grep -q 'tbaa' <<< "$raw_body" \
+    || ! grep -q '^!7 = !{!5, !5, i64 0}$' "$alias_ir"; then
+    echo "# Alias tags are missing or on raw pointer access"
+    echo "$set_body"
+    echo "$raw_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 48"
+echo "# Test count: 49"
 echo ""
