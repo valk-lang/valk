@@ -1380,6 +1380,16 @@ ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --targe
     exit 1
 }
 
+# x64 release builds start innermost loops on 32 bytes
+if [[ "$(uname -m)" == "x86_64" ]] && command -v objdump > /dev/null; then
+    "$VALK" build "$DIR/loop-align.valk" --release -d --no-warn -o "$workdir/loop-align" > /dev/null || exit 1
+    loop_target=$(objdump -d --no-show-raw-insn "$workdir/loop-align" | awk '/<[^>]*__fill__[^>]*>:$/{p=1;next} p&&/^$/{exit} p&&/\tj[a-z]+ +[0-9a-f]+ </{print $3}' | head -1)
+    if [[ -z "$loop_target" ]] || (( 0x$loop_target % 32 != 0 )); then
+        echo "# Expected the loop in fill to start on 32 bytes, got: '$loop_target'"
+        exit 1
+    fi
+fi
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     echo ""
     echo "# Test the HTTP server making room for new connections when out of file descriptors"
@@ -1398,4 +1408,4 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 83"
+echo "# Test count: 84"
