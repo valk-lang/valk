@@ -2947,6 +2947,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn alloc(size: uint) GcPtr
 // Allocates `size` bytes of GC memory whose references are traced through `layout`.
 + fn alloc_typed(size: uint, layout: ?ptr) GcPtr
+// Allocates `size` zeroed bytes of GC memory whose references are traced through `layout`.
++ fn alloc_typed_zeroed(size: uint, layout: ?ptr) GcPtr
 // Clones a closure environment; used by the compiler when a closure value is copied.
 + fn clone_closure_env(env: ?ptr) ?ptr
 // Collects like `collect_if_threshold_reached`, but at three quarters of the way to the trigger.
