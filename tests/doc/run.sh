@@ -145,6 +145,8 @@ if [[ "$markdown" != *'+ class Box[T]'* ]] \
     || [[ "$markdown" != *'+ extend Slot[u8, V] {'* ]] \
     || [[ "$markdown" == *'+ extend Slot[uint'* ]] \
     || [[ "$markdown" == *'+ extend Slot[String, uint]'* ]] \
+    || [[ "$markdown" != *'+ extend Slot[K, uint] {'* ]] \
+    || [[ "$markdown" != *'+ fn count() uint'* ]] \
     || [[ "$markdown" == *'+ extend Slot[String, bool]'* ]]; then
     echo "# Markdown sorting did not preserve class declarations"
     echo "$markdown"
@@ -239,6 +241,8 @@ if [[ "$stdlib_markdown" != *'+ extend &[T] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend &[u8] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn has_ascii_control(allow_tab: bool (false)) bool'* ]] \
     || [[ "$stdlib_markdown" != *'+ extend HashMap[String, T] {'* ]] \
+    || [[ "$stdlib_markdown" != *'+ extend HashMap[u32, T] {'* ]] \
+    || [[ "$stdlib_markdown" != *'+ extend HashMap[K, uint] {'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn utf8.chars() StringChars'* ]] \
     || [[ "$stdlib_markdown" != *'+ get utf8.length: uint'* ]] \
     || [[ "$stdlib_markdown" != *'+ fn ansi.red(bold: bool (false)) String'* ]] \
