@@ -51,6 +51,7 @@ queue_ir "$workdir/windows-bool.ll" "$DIR/windows-bool.valk" --target win-x64 --
 queue_ir "$workdir/tagged-union-scalars.ll" "$DIR/tagged-union-scalars.valk" --ir --no-warn
 queue_ir "$workdir/export.ll" "$DIR/export.valk" --ir --no-warn
 queue_ir "$workdir/shared-pool.ll" "$DIR/shared-pool.valk" --ir --no-warn
+for grove in 0 1; do queue_ir "$workdir/grove-is-shared-$grove.ll" "$DIR/grove-is-shared.valk" --target linux-x64 --ir --no-warn --def "GROVE=$grove"; done
 queue_ir "$workdir/fixed-array-bounds.ll" "$DIR/fixed-array-bounds.valk" --ir --no-warn
 queue_ir "$workdir/fixed-array-fills.ll" "$DIR/fixed-array-fills.valk" --ir --no-warn
 queue_ir "$workdir/direct-initializer.ll" "$DIR/direct-initializer.valk" --ir --no-warn
@@ -1269,6 +1270,27 @@ if ! grep -q 'store double .*, !tbaa !7$' <<< "$set_body" \
     exit 1
 fi
 
+echo "> Lower \$is_shared to a constant in GROVE builds, a header read otherwise"
+for grove in 0 1; do
+    is_shared_ir="$workdir/grove-is-shared-$grove.ll"
+    if ! out=$(ir_result "$is_shared_ir"); then
+        echo "# Failed to build grove-is-shared IR fixture (GROVE=$grove)"
+        echo "$out"
+        exit 1
+    fi
+    is_shared_body=$(sed -n '/^define .*__shared_flag__/,/^}/p' "$is_shared_ir")
+    if [ "$grove" = 1 ]; then
+        ok=$([[ "$is_shared_body" == *"ret i1 0"* && "$is_shared_body" != *"i64 -4"* ]] && echo 1)
+    else
+        ok=$([[ "$is_shared_body" == *"i64 -4"* && "$is_shared_body" == *"and i8"* ]] && echo 1)
+    fi
+    if [ -z "$ok" ]; then
+        echo "# \$is_shared lowering is wrong for GROVE=$grove"
+        echo "$is_shared_body"
+        exit 1
+    fi
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 49"
+echo "# Test count: 50"
 echo ""
