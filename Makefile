@@ -158,6 +158,12 @@ test-grove-stress: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-grove-stress$(EXE_SUFFIX)
 	./debug/test-grove-stress$(EXE_SUFFIX)
 
+# Grove with co-edge counts capped at 2, so the overflow map is used everywhere
+test-grove-small-caps: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_SMALL_CAPS=1" $(FLAGS) -o ./debug/test-grove-small-caps$(EXE_SUFFIX)
+	./debug/test-grove-small-caps$(EXE_SUFFIX)
+
 # The compiler built with Grove (and with Grove's checks) must give the same compiler and
 # test binary as the compiler on Valk's collector
 grove-compiler-check: valk
@@ -417,4 +423,4 @@ clean:
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
 	test-macos-build test-release test-win test-win-build \
-	test-grove test-grove-stress grove-compiler-check
+	test-grove test-grove-stress test-grove-small-caps grove-compiler-check

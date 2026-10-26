@@ -1,0 +1,195 @@
+@unsafe
+
+#if GROVE
+#if GC_DEBUG
+
+use mem
+
+// D-6, the recount, before a scheduled stress collection. From the reference words of the
+// old objects (and of new storage that took over tagged words, see transfer_refs), the
+// pending removals and the stack owners of the last collection: an owned object has exactly
+// one source of ownership, a co-owned root none, every count equals the co words naming the
+// object plus its pending co removals, and the overflow map holds only capped counts.
+// Stack presence is counted only inside a collection, so it adds nothing here
+
+// (object, owner sources | co sources << 32) pairs
+@shared rc_map: ptr
+@shared rc_cap: uint
+@shared rc_len: uint
+
+fn rc_find(key: uint) uint {
+    let mask = rc_cap - 1
+    let i = cnt_map_home(key) & mask
+    while true {
+        let k = @ptrv(rc_map, uint, i * 2)
+        if k == key || k == 0 : return i
+        i = (i + 1) & mask
+    }
+    return 0
+}
+
+fn rc_add(item: ptr, owners: uint, co_words: uint) {
+    if (rc_len + 1) * 2 > rc_cap {
+        let old = rc_map
+        let old_cap = rc_cap
+        rc_cap = old_cap == 0 ? 1024 : old_cap * 2
+        rc_map = mem.calloc(rc_cap * 2 * size_of(uint))
+        let i: uint = 0
+        while i < old_cap {
+            let k = @ptrv(old, uint, i * 2)
+            if k != 0 {
+                let at = rc_find(k)
+                @ptrv(rc_map, uint, at * 2) = k
+                @ptrv(rc_map, uint, at * 2 + 1) = @ptrv(old, uint, i * 2 + 1)
+            }
+            i++
+        }
+        if old_cap != 0 : mem.free(old)
+    }
+    let key: uint = item
+    let i = rc_find(key)
+    if @ptrv(rc_map, uint, i * 2) == 0 {
+        @ptrv(rc_map, uint, i * 2) = key
+        rc_len++
+    }
+    @ptrv(rc_map, uint, i * 2 + 1) = @ptrv(rc_map, uint, i * 2 + 1) + owners + (co_words << 32)
+}
+
+fn rc_get(item: ptr) uint {
+    if rc_len == 0 : return 0
+    let key: uint = item
+    let i = rc_find(key)
+    if @ptrv(rc_map, uint, i * 2) != key : return 0
+    return @ptrv(rc_map, uint, i * 2 + 1)
+}
+
+// A tagged word or record: its target is an old object in the heap
+fn rc_count(v: uint) {
+    let tag = v & prop_mask
+    if tag == 0 : return
+    let target: ptr = (v - tag).@cast(ptr)
+    if tag == prop_mask : panic("GC error (recount): a reference word holds both tags")
+    if !in_heap(target) : panic("GC error (recount): a tagged word names an object outside the heap")
+    if gcdata(target).is_new() : panic("GC error (recount): a tagged word names a new object")
+    if tag == prop_owned : rc_add(target, 1, 0)
+    else : rc_add(target, 0, 1)
+}
+
+fn rc_scan(item: ptr) {
+    let layout = desc_of(item).layout ?! return
+    each_ref(item, layout, gc.mark_list, fn(ref: ptr, list: *Lifo) {
+        @unsafe
+        rc_count(@ptrv(ref, uint))
+    })
+}
+
+// Calls `cb` with every object of every block of the thread's pools
+fn rc_each_object(cb: fnptr(ptr)()) {
+    let adr = alc_list.data
+    let end = adr + alc_list.index
+    while adr < end {
+        let alc = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        let block = alc.first
+        while isset(block) {
+            let isize = block.isize
+            let base = block.first
+            let last = base + block.slots_total * isize
+            while base < last {
+                cb(base + 8)
+                base += isize
+            }
+            block = block.next
+        }
+    }
+}
+
+// Every stress collection while the heap is below 8 MiB; on a larger heap one in
+// heap / 8 MiB, so the O(heap) recount stays a bounded share of the run
+@shared rc_skipped: uint
+
+fn recount_scheduled() {
+    let every = heap_used / (8 * 1024 * 1024)
+    if rc_skipped < every {
+        rc_skipped++
+        return
+    }
+    rc_skipped = 0
+    recount_check()
+}
+
+fn recount_check() {
+    let g = gc
+    rc_len = 0
+    if rc_cap != 0 : mem.clear_bytes(rc_map, rc_cap * 2 * size_of(uint))
+
+    rc_each_object(fn(item: ptr) {
+        if gcdata(item).is_not_new() : rc_scan(item)
+    })
+    let adr = g.adopted.data
+    let end = adr + g.adopted.index
+    while adr < end {
+        let item = @ptrv(adr, ptr)
+        adr += size_of(ptr)
+        if gcdata(item).is_new() : rc_scan(item)
+    }
+    let removed = g.props_removed
+    let i: uint = 0
+    while i < removed.index {
+        rc_count(@ptrv(removed.data, uint, i))
+        i++
+    }
+    adr = g.prev_stack_items.data
+    end = adr + g.prev_stack_items.index
+    while adr < end {
+        rc_add(@ptrv(adr, ptr), 1, 0)
+        adr += size_of(ptr)
+    }
+
+    rc_each_object(fn(item: ptr) {
+        let data = gcdata(item)
+        let counts = rc_get(item)
+        let owners = counts & 0xFFFFFFFF
+        let co_words = counts >> 32
+        let state = data.state()
+        if state == 0 {
+            if counts != 0 : panic("GC error (recount): a new object is named by a tagged word")
+            if data.bits != 0 || cnt_byte1(item) != 0 || cnt_map_has(item) : panic("GC error (recount): a new object has a count or flags")
+            return
+        }
+        if state == st_no_owner : panic("GC error (recount): an object without owner outside a collection")
+        if state == st_owned && owners != 1 : rc_fail(item, "an owned object does not have exactly one owner", owners)
+        if state == st_co_root && owners != 0 : rc_fail(item, "a co-owned root also has an owner", owners)
+        if data.is_on_stack() : panic("GC error (recount): an on-stack mark outside a collection")
+        if data.co_count() != co_words : rc_fail(item, "a co-edge count differs from the co words", co_words)
+    })
+
+    // The map holds exactly the capped counts
+    let n: uint = 0
+    let k: uint = 0
+    while k < cnt_map_cap {
+        let key = @ptrv(cnt_map, uint, k * 2)
+        k++
+        if key == 0 : continue
+        n++
+        let item: ptr = key.@cast(ptr)
+        if !in_heap(item) || gcdata(item).is_new() : panic("GC error (recount): an overflow entry outlives its object")
+        let wide = cnt_wide(item)
+        if gcdata(item).inline_count(wide) != cnt_marker(wide) : panic("GC error (recount): an overflow entry for an inline count")
+        if @ptrv(cnt_map, uint, k * 2 - 1) < cnt_marker(wide) : panic("GC error (recount): an overflow entry below the cap")
+    }
+    if n != cnt_map_len : panic("GC error (recount): the overflow map's length is wrong")
+}
+
+fn rc_fail(item: ptr, what: String, found: uint) $exit {
+    print_item_info(item)
+    print("counted: ")
+    found.print(10)
+    print(", inline count: ")
+    gcdata(item).co_count().print(10)
+    print("\n")
+    panic("GC error (recount): " + what)
+}
+
+#end
+#end

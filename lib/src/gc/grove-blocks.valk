@@ -21,6 +21,8 @@ value BLOCK_PAGES_MAX (8)
 value LARGE_SLOT (8192 + 8)
 // The first chunks keep 4 KiB pages, so a small program stays small
 value SMALL_CHUNKS (4)
+// The shadow is committed in steps of this size
+value SHADOW_STEP (2 * 1024 * 1024)
 // Free chunks kept for reuse before idle ones go back to the OS
 value RETAIN_MIN (4 * 1024 * 1024)
 
@@ -87,6 +89,7 @@ struct FreeRun {
 @shared heap_size: uint         // R: bytes reserved
 @shared heap_top: uint          // bytes of the chunks taken
 @shared heap_used: uint         // bytes of the blocks and large objects
+@shared shadow_top: uint        // bytes of the shadow committed
 @shared page_table: ptr         // ?*Desc per page
 @shared chunk_states: ptr       // u8 per chunk
 @shared free_runs: *Bump (@undefined) // FreeRun records, ordered by address
@@ -152,7 +155,7 @@ fn heap_take_chunks(count: uint) {
     if heap_top + size > heap_size : panic("Grove's heap is full")
     let at = HEAP_BASE + heap_top
     heap_commit(at, size)
-    heap_commit(at >> 3, size >> 3)
+    heap_commit_shadow(heap_top + size)
     heap_commit(page_table + (heap_top >> 9), size >> 9)
     let chunk = heap_top >> CHUNK_SHIFT
     let end = chunk + count
@@ -165,6 +168,19 @@ fn heap_take_chunks(count: uint) {
     let first_page = heap_top >> PAGE_SHIFT
     heap_top += size
     free_insert(first_page, count * CHUNK_PAGES, true)
+}
+
+// The shadow is committed in 2 MiB steps (16 MiB of heap), so beyond the first step, whose
+// pages stay small, it can have huge pages
+fn heap_commit_shadow(heap_end: uint) {
+    let need = heap_end >> 3
+    if need <= shadow_top : return
+    let top = (need + SHADOW_STEP - 1) & (~(SHADOW_STEP - 1)).to(uint)
+    if top > heap_size >> 3 : top = heap_size >> 3
+    let at = (HEAP_BASE >> 3) + shadow_top
+    heap_commit(at, top - shadow_top)
+    if shadow_top > 0 && thp_wants_madvise() : ext.madvise(at.@cast(ptr), top - shadow_top, MADV_HUGEPAGE)
+    shadow_top = top
 }
 
 // Under `enabled = always` huge pages come without asking. Under `madvise` they are asked
@@ -239,6 +255,15 @@ fn heap_release(desc: *Desc) {
         page++
     }
     heap_used -= pages * PAGE_SIZE
+    #if GC_DEBUG
+    // Free pages have a zero shadow
+    let sh: ptr = (a >> 3).@cast(ptr)
+    let i: uint = 0
+    while i < (pages * PAGE_SIZE) >> 3 {
+        if @ptrv(sh, u64, i / 8) != 0 : panic("GC error: freed pages have a non-zero shadow")
+        i += 8
+    }
+    #end
     free_insert(start, pages, false)
     desc.next = descs_free
     descs_free = desc
@@ -418,9 +443,7 @@ fn heap_return_idle(retain: uint) {
 fn heap_return_chunk(chunk: uint) {
     let at = HEAP_BASE + chunk * CHUNK_SIZE
     ext.madvise(at.@cast(ptr), CHUNK_SIZE, MADV_DONTNEED)
-    let shadow = (at >> 3).@cast(ptr)
-    ext.madvise(shadow, CHUNK_SIZE >> 3, MADV_DONTNEED)
-    ext.madvise(shadow, CHUNK_SIZE >> 3, MADV_NOHUGEPAGE)
+    heap_return_shadow(chunk)
     // Only the chunk's part of its free run is zero now
     let start = chunk * CHUNK_PAGES
     let count = free_count()
@@ -446,6 +469,28 @@ fn heap_return_chunk(chunk: uint) {
         i++
     }
     panic("GC error: a returned chunk is not in a free run")
+}
+
+// The shadow of a free chunk is zero. The first shadow step has small pages and goes back
+// with each chunk; a later one, which may be a huge page, only once all its chunks went back
+fn heap_return_shadow(chunk: uint) {
+    let per_step = SHADOW_STEP / (CHUNK_SIZE >> 3)
+    let first = chunk - chunk % per_step
+    if first == 0 {
+        ext.madvise(((HEAP_BASE + chunk * CHUNK_SIZE) >> 3).@cast(ptr), CHUNK_SIZE >> 3, MADV_DONTNEED)
+        return
+    }
+    let chunks = heap_top >> CHUNK_SHIFT
+    let c = first
+    while c < first + per_step && c < chunks {
+        if c != chunk && (@ptrv(chunk_states, u8, c) & chunk_returned) == 0 : return
+        c++
+    }
+    let shadow = (HEAP_BASE + first * CHUNK_SIZE) >> 3
+    let end = shadow_top + (HEAP_BASE >> 3)
+    let size = SHADOW_STEP
+    if shadow + size > end : size = end - shadow
+    ext.madvise(shadow.@cast(ptr), size, MADV_DONTNEED)
 }
 
 // Touched blocks are listed once per collection

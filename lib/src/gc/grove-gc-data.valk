@@ -1,75 +1,347 @@
+@unsafe
+
 #if GROVE
 
-value flag_own_state (3)
-value flag_owned (1)
-value flag_no_owner (2)
+use mem
 
-value flag_on_stack (8)
-value flag_still_co_owned (16)
+// An object's state lives in its shadow byte SH(a) = a >> 3, keyed to the object start
+// (the pointer Pool.get returns), never to the header:
+//   bits 0-1  state: 0 new (free or young), 1 owned, 2 lost its owner (inside a
+//             collection only), 3 owned by its co-edges (still co-owned)
+//   bit  2    leak check mark (debug)
+//   bit  3    on the stack (during a collection)
+//   bits 4-7  the co-edge count, low bits
+// An object whose body is 16 bytes or more also has shadow byte 1 for the count's high bits
+// (count up to 4094); an 8-byte body has no byte 1, it belongs to the next object (count up
+// to 14). A larger count lives in the overflow map and the inline field holds the marker
+value sh_state (3)
+value st_owned (1)
+value st_no_owner (2)
+value st_co_root (3)
+value sh_leak (4)
+value sh_on_stack (8)
+value cnt_one (16)
+
+#if GC_SMALL_CAPS
+value cnt_marker_narrow (3)
+#else
+value cnt_marker_narrow (15)
+#end
+value cnt_marker_wide (4095)
+// Inline counts below this change without knowing the format
+value cnt_fast ((cnt_marker_narrow - 1))
+// Slots (header included) whose body has room for shadow byte 1
+value cnt_wide_slot (24)
+
+// The header flag that is left: the object is in the update log
 value flag_in_updates (32)
-value flag_leak (128)
 
 value prop_owned (1)
 value prop_co_owned (2)
 value prop_mask (3)
 
-fn gcdata(v1: ptr) *GcData {
+fn gcdata(item: ptr) *GcData $inline {
     @unsafe
-    return v1.$offset(-8)
+    #if GC_DEBUG
+    if !in_heap(item) : panic("GC error: shadow state of an object outside the heap")
+    #end
+    let a: uint = item
+    return (a >> 3).@cast(ptr)
 }
 
-value leakmask ((0xFF - flag_leak))
+fn gcheader(item: ptr) *GcHeader $inline {
+    @unsafe
+    return item.$offset(-8)
+}
 
-struct GcData {
-    co_count: u32
+// The 8-byte header in front of each object keeps the update log state only
+struct GcHeader {
+    unused: u32
     flags: u8
     // Slots of a sequence logged since the last collection (see log_update)
     slot_logs: u8
     // Unused: the block of an object is found through the page table
     offset: u16
-    //
-    fn item() GcItem { return this.$offset(8) }
 
-    fn has_leak_mark() bool { return (this.flags & flag_leak) == flag_leak }
-    fn set_leak_mark() { this.flags = this.flags | flag_leak }
-    fn remove_leak_mark() { this.flags = this.flags & leakmask }
-
-    // Flags
-    fn set_new() { this.flags = this.flags & (255 - flag_owned - flag_no_owner) }
-    fn set_owned() { this.flags = (this.flags & (255 - flag_no_owner)) | flag_owned }
-    fn set_no_owner() { this.flags = (this.flags & (255 - flag_owned)) | flag_no_owner }
-    //
-    fn is_new() bool { return (this.flags & flag_own_state) == 0 }
-    fn is_not_new() bool { return (this.flags & flag_own_state) != 0 }
-    fn is_owned() bool { return (this.flags & flag_owned) == flag_owned }
-    fn is_not_owned() bool { return (this.flags & flag_owned) == 0 }
-    fn is_no_owner() bool { return (this.flags & flag_no_owner) == flag_no_owner }
-
-    fn is_on_stack() bool { return (this.flags & flag_on_stack) != 0 }
-    fn set_on_stack() { this.flags = this.flags | flag_on_stack }
-    fn remove_on_stack() { this.flags = this.flags & (255 - flag_on_stack) }
-    //
-    fn is_still_co_owned() bool { return (this.flags & flag_still_co_owned) != 0 }
-    fn set_still_co_owned() { this.flags = this.flags | flag_still_co_owned }
-    fn remove_still_co_owned() { this.flags = this.flags & (255 - flag_still_co_owned) }
-    //
     fn is_in_updates() bool { return (this.flags & flag_in_updates) != 0 }
     fn set_in_updates() { this.flags = this.flags | flag_in_updates }
     fn remove_in_updates() { this.flags = this.flags & (255 - flag_in_updates) }
+}
+
+// Shadow byte 0 of an object
+struct GcData {
+    bits: u8
+
+    fn item() GcItem {
+        @unsafe
+        let a: uint = this.@cast(ptr)
+        return (a << 3).@cast(ptr)
+    }
+
+    fn state() uint $inline { return this.bits.to(uint) & sh_state }
+
+    fn has_leak_mark() bool { return (this.bits & sh_leak) != 0 }
+    fn set_leak_mark() { this.bits = this.bits | sh_leak }
+    fn remove_leak_mark() { this.bits = this.bits & (255 - sh_leak) }
+
+    // States
+    fn set_new() {
+        #if GC_DEBUG
+        if this.state() == st_co_root : panic("GC error: a co-owned root becomes new")
+        #end
+        this.bits = this.bits & (255 - sh_state)
+    }
+    // An object that is not owned (new or without owner) becomes owned
+    fn own() $inline {
+        #if GC_DEBUG
+        if this.is_owned() : panic("GC error: an owned object is owned again")
+        #end
+        this.bits = (this.bits & (255 - sh_state)) | st_owned
+    }
+    fn set_owned() {
+        if this.state() != st_co_root : this.bits = (this.bits & (255 - sh_state)) | st_owned
+    }
+    fn set_no_owner() {
+        #if GC_DEBUG
+        if this.state() == st_co_root : panic("GC error: a co-owned root loses an owner")
+        #end
+        this.bits = (this.bits & (255 - sh_state)) | st_no_owner
+    }
     //
-    fn co_own() {
-        this.co_count = this.co_count + 1
+    fn is_new() bool $inline { return (this.bits & sh_state) == 0 }
+    fn is_not_new() bool $inline { return (this.bits & sh_state) != 0 }
+    fn is_owned() bool $inline { return (this.bits & st_owned) != 0 }
+    fn is_not_owned() bool $inline { return (this.bits & st_owned) == 0 }
+    fn is_no_owner() bool { return this.state() == st_no_owner }
+
+    fn is_on_stack() bool { return (this.bits & sh_on_stack) != 0 }
+    fn set_on_stack() { this.bits = this.bits | sh_on_stack }
+    fn remove_on_stack() { this.bits = this.bits & (255 - sh_on_stack) }
+    //
+    fn is_still_co_owned() bool { return this.state() == st_co_root }
+    fn set_still_co_owned() {
+        #if GC_DEBUG
+        if this.state() != st_owned : panic("GC error: a co-owned root that is not owned")
+        #end
+        this.bits = this.bits | st_co_root
+    }
+    fn remove_still_co_owned() { this.bits = (this.bits & (255 - sh_state)) | st_owned }
+
+    // Co-edge counts (stack presence counts one during a collection)
+    fn co_count() uint {
+        @unsafe
+        let item = this.item()
+        let wide = cnt_wide(item)
+        let v = this.inline_count(wide)
+        if v == cnt_marker(wide) : return cnt_map_get(item)
+        return v
+    }
+
+    fn has_co() bool $inline {
+        if this.bits >= cnt_one : return true
+        return this.co_count() != 0
+    }
+
+    // has_co for an object in slots of `isize` bytes: no page table lookup
+    fn has_co_in(isize: uint) bool $inline {
+        @unsafe
+        #if !GC_SMALL_CAPS
+        // Bytes 0 and 1 in one load: the state bits are below cnt_one
+        if isize >= cnt_wide_slot : return @ptrv(this, u16) >= cnt_one
+        #end
+        return this.bits >= cnt_one
+    }
+
+    fn co_own() $inline {
+        // The low count bits are below cnt_fast: no carry, no marker
+        if this.bits < cnt_fast * cnt_one {
+            this.bits = this.bits + cnt_one
+            return
+        }
+        this.set_count(this.co_count() + 1)
+    }
+
+    fn co_unown() $inline {
+        // The low count bits are 1 to cnt_fast: no borrow, no marker
+        if this.bits.to(uint) - cnt_one < cnt_fast * cnt_one {
+            this.bits = this.bits - cnt_one
+            return
+        }
+        let count = this.co_count()
+        if count == 0 : panic("GC error: co-edge count underflow")
+        this.set_count(count - 1)
+    }
+
+    fn inline_count(wide: bool) uint {
+        @unsafe
+        let v = this.bits.to(uint) >> 4
+        if wide : v = v | (@ptrv(this, u8, 1).to(uint) << 4)
+        return v
+    }
+
+    // Writes an exact count: inline below the marker, else into the overflow map (R-06)
+    fn set_count(count: uint) {
+        @unsafe
+        let item = this.item()
+        let wide = cnt_wide(item)
+        let marker = cnt_marker(wide)
+        let inline = this.inline_count(wide)
+        if count >= marker {
+            cnt_map_put(item, count)
+            if inline != marker : this.store_count(wide, marker)
+            return
+        }
+        if inline == marker : cnt_map_delete(item)
+        this.store_count(wide, count)
+    }
+
+    fn store_count(wide: bool, v: uint) {
+        @unsafe
+        this.bits = ((this.bits.to(uint) & 15) | ((v & 15) << 4)).to(u8)
+        if wide {
+            #if GC_DEBUG
+            // Byte 1 must lie inside the object's own body, not in the next slot's shadow
+            let item = this.item()
+            let desc = desc_of(item)
+            let a: uint = item
+            let first: uint = desc.first
+            let slot_end = first + ((a - first) / desc.isize + 1) * desc.isize
+            if a + 16 > slot_end : panic("GC error: a count write reaches the next slot's shadow")
+            #end
+            @ptrv(this, u8, 1) = (v >> 4).to(u8)
+        }
     }
 
     fn dis_co_own() {
         @unsafe
-        this.co_count = this.co_count - 1
+        this.co_unown()
         if this.is_still_co_owned() {
             this.remove_still_co_owned()
             this.set_no_owner()
             gc.dis_owned_list.add_ptr(this.item())
         }
     }
+}
+
+// Whether the object's count has shadow byte 1: its body is 16 bytes or more
+fn cnt_wide(item: ptr) bool $inline {
+    #if GC_SMALL_CAPS
+    return false
+    #else
+    return desc_of(item).isize >= cnt_wide_slot
+    #end
+}
+
+// Shadow byte 1 of an object whose count has it, else 0
+fn cnt_byte1(item: ptr) uint {
+    @unsafe
+    if !cnt_wide(item) : return 0
+    return @ptrv(gcdata(item), u8, 1).to(uint)
+}
+
+fn cnt_marker(wide: bool) uint $inline {
+    return wide ? cnt_marker_wide : cnt_marker_narrow
+}
+
+//////////////////////////
+// The overflow map
+//////////////////////////
+
+// Exact counts of the objects whose inline count holds the marker. Open addressing over
+// (object, count) word pairs in malloc'd memory; the collector is its only user
+@shared cnt_map: ptr
+@shared cnt_map_cap: uint
+@shared cnt_map_len: uint
+
+fn cnt_map_home(key: uint) uint $inline {
+    return ((key >> 3) * 0x9E3779B97F4A7C15) >> 32
+}
+
+// The index of `key`, or of the empty entry where it would go
+fn cnt_map_find(key: uint) uint {
+    @unsafe
+    let mask = cnt_map_cap - 1
+    let i = cnt_map_home(key) & mask
+    while true {
+        let k = @ptrv(cnt_map, uint, i * 2)
+        if k == key || k == 0 : return i
+        i = (i + 1) & mask
+    }
+    return 0
+}
+
+fn cnt_map_get(item: ptr) uint {
+    @unsafe
+    let key: uint = item
+    if cnt_map_cap != 0 {
+        let i = cnt_map_find(key)
+        if @ptrv(cnt_map, uint, i * 2) == key : return @ptrv(cnt_map, uint, i * 2 + 1)
+    }
+    panic("GC error: a capped count has no overflow map entry")
+}
+
+fn cnt_map_put(item: ptr, count: uint) {
+    @unsafe
+    if (cnt_map_len + 1) * 2 > cnt_map_cap : cnt_map_grow()
+    let key: uint = item
+    let i = cnt_map_find(key)
+    if @ptrv(cnt_map, uint, i * 2) == 0 {
+        @ptrv(cnt_map, uint, i * 2) = key
+        cnt_map_len++
+    }
+    @ptrv(cnt_map, uint, i * 2 + 1) = count
+}
+
+fn cnt_map_delete(item: ptr) {
+    @unsafe
+    let key: uint = item
+    let mask = cnt_map_cap - 1
+    let i = cnt_map_find(key)
+    if cnt_map_cap == 0 || @ptrv(cnt_map, uint, i * 2) != key : panic("GC error: a capped count has no overflow map entry")
+    // Later entries of the cluster move into the hole when their home allows it
+    let j = i
+    while true {
+        j = (j + 1) & mask
+        let k = @ptrv(cnt_map, uint, j * 2)
+        if k == 0 : break
+        let home = cnt_map_home(k) & mask
+        if ((j - home) & mask) >= ((j - i) & mask) {
+            @ptrv(cnt_map, uint, i * 2) = k
+            @ptrv(cnt_map, uint, i * 2 + 1) = @ptrv(cnt_map, uint, j * 2 + 1)
+            i = j
+        }
+    }
+    @ptrv(cnt_map, uint, i * 2) = 0
+    @ptrv(cnt_map, uint, i * 2 + 1) = 0
+    cnt_map_len--
+}
+
+fn cnt_map_grow() {
+    @unsafe
+    let old = cnt_map
+    let old_cap = cnt_map_cap
+    let cap = old_cap == 0 ? 64 : old_cap * 2
+    cnt_map = mem.calloc(cap * 2 * size_of(uint))
+    cnt_map_cap = cap
+    let i: uint = 0
+    while i < old_cap {
+        let k = @ptrv(old, uint, i * 2)
+        if k != 0 {
+            let at = cnt_map_find(k)
+            @ptrv(cnt_map, uint, at * 2) = k
+            @ptrv(cnt_map, uint, at * 2 + 1) = @ptrv(old, uint, i * 2 + 1)
+        }
+        i++
+    }
+    if old_cap != 0 : mem.free(old)
+}
+
+// Whether the map holds an entry for the object
+fn cnt_map_has(item: ptr) bool {
+    @unsafe
+    if cnt_map_len == 0 : return false
+    let key: uint = item
+    return @ptrv(cnt_map, uint, cnt_map_find(key) * 2) == key
 }
 
 pointer GcItem {
@@ -86,7 +358,7 @@ fn print_item_info(item: ptr) {
     println("NEW: " + data.is_new())
     println("OWNED: " + data.is_owned())
     println("HAS LEAK MARK: " + data.has_leak_mark())
-    println("FLAGS: " + data.flags)
+    println("SHADOW: " + data.bits)
     println("---------------------")
 }
 
