@@ -1,0 +1,194 @@
+#if GROVE
+
+use mem
+use core
+use ext
+
+// Also when the logs of changed references grow long: a collection works
+// through them in one stop, so this bounds the pause on a large heap. The log may grow
+// with the live heap: marking that heap is the bulk of the pause anyway, and a server that
+// changes a few references per request on a large set of connections would otherwise
+// collect, and mark everything, every few thousand requests
+value trigger_reached (gc.mem_new >= gc.mem_trigger || log_full)
+value log_full (gc.updated_list.index / size_of(ptr) + gc.updated_slots.index / (size_of(ptr) * 2) + gc.props_removed.index >= log_trigger)
+value log_trigger (gc.mem_marked / 128 > 131072 ? gc.mem_marked / 128 : 131072)
+// Three quarters of the way from the live heap to the trigger, so a large
+// stable heap does not collect on every event loop iteration
+value trigger_almost_reached (gc.mem_new >= gc.mem_marked + (gc.mem_trigger - gc.mem_marked) / 4 * 3)
+value shared_trigger_reached (mem_shared >= mem_shared_trigger)
+value shared_trigger_almost_reached (mem_shared >= mem_shared_trigger / 4 * 3)
+
+/// Bytes currently held by the GC pool blocks of all threads, including free slots.
+~+ shared mem_usage_shared: uint
+/// Highest value `mem_usage_shared` has reached since the program started, in bytes.
+~+ shared mem_usage_peak: uint
+/// Whether each collection runs a leak check over the reachable objects.
+///
+/// Set at startup: `true` in `GC_DEBUG` builds (such as `make test`), `false` otherwise.
++ shared verify: bool (@undefined)
+/// Duration of this thread's last local collection, in microseconds.
++ global pause_last_us: uint (0)
+/// Longest local collection on this thread since the last reset, in microseconds.
++ global pause_max_us: uint (0)
+/// Duration of the last shared-memory collection, in microseconds.
++ shared shared_pause_last_us: uint (0)
+/// Longest shared-memory collection since the last reset, in microseconds.
++ shared shared_pause_max_us: uint (0)
+
+// A direct call into the runtime's assembly entry: no frame of ours sits
+// between the caller and the stack scan, so only the caller's own live
+// words can keep objects alive
+/// Runs a garbage collection of the calling thread's memory now.
+///
+/// Does nothing while the thread's GC is not enabled yet or is shutting down. Roots are
+/// globals and the words still live on the caller's stack and registers.
++ value collect (ext.valk_gc_collect)
+/// Runs a collection of shared memory, stopping every thread's GC while it marks.
+///
+/// Returns without collecting when another thread completed a shared collection while this
+/// one waited for the shared lock.
++ value collect_shared (ext.valk_gc_collect_shared)
+
+/// Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
++ fn reset_pause_durations() {
+    pause_last_us = 0
+    pause_max_us = 0
+}
+
+/// Returns the bytes held by the GC pool blocks of all threads, including free slots.
++ fn mem_usage() uint {
+    return mem_usage_shared
+}
+
+/// Returns the largest count of `item`-byte elements, at least `count`, whose storage of
+/// `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
+///
+/// Growing storage uses it to fill its class: sizes above 128 bytes are rounded up to a power
+/// of two, so a capacity just past one would leave almost half of the class unused.
++ fn fit_count(prefix: uint, item: uint, count: uint) uint {
+    if item == 0 : return count
+    let bytes = prefix + count * item
+    let index, class_size = get_pool_slot(bytes)
+    if class_size <= prefix : return count
+    let fitted = (class_size - prefix) / item
+    return fitted > count ? fitted : count
+}
+
+/// Takes the calling thread's GC lock again after `unlock`.
++ fn lock() {
+    gc.lock()
+}
+/// Releases the calling thread's GC lock so other threads can collect for it while it blocks.
+///
+/// Call it before a blocking operation and `lock` right after. The current stack pointer and
+/// registers are saved for those collections; do not touch GC memory in between.
++ fn unlock() $undefined {
+    gc.unlock()
+}
+
+/// Collects the thread's memory when allocation since the last collection reached the trigger.
+///
+/// After a local collection it also collects shared memory when that has reached its trigger.
+/// Does nothing while a collection is running or the GC is not idle.
++ fn collect_if_threshold_reached() {
+    if trigger_reached {
+        if gc.state != GcState.idle : return
+        if in_collect_shared : return
+        gc.collect()
+        if shared_trigger_reached {
+            collect_shared()
+        }
+    }
+}
+/// Collects like `collect_if_threshold_reached`, but at three quarters of the way to the trigger.
+///
+/// Useful at idle points such as an event loop iteration, so the collection happens before
+/// an allocation forces it.
++ fn collect_if_threshold_almost_reached() {
+    if trigger_almost_reached {
+        if gc.state != GcState.idle : return
+        if in_collect_shared : return
+        gc.collect()
+        if shared_trigger_almost_reached {
+            collect_shared()
+        }
+    }
+}
+
+// Keeps the clearing stores of clear_stack: the buffer's address escapes
+global stack_clear_sink: uint (0)
+
+// Zeroes 8 KiB of stack below the caller. Idle loops call it before they block, so the
+// frames of the wait are built over zeros instead of stale words that other threads'
+// conservative scans would take for roots.
+fn clear_stack() $noinline {
+    let words: [uint x 1024] = @undefined
+    let adr = @ref(words).@cast(ptr)
+    let i: uint = 0
+    while i < 1024 {
+        @ptrv(adr, uint, i) = 0
+        i++
+    }
+    stack_clear_sink = adr.@cast(uint)
+}
+
+/// Collects shared memory when its usage reached the shared trigger and the GC is idle.
++ fn collect_shared_if_threshold_reached() {
+    if shared_trigger_reached {
+        if gc.state != GcState.idle : return
+        collect_shared()
+    }
+}
+
+/// Allocates `size` bytes of GC memory whose contents are not scanned for references.
+///
+/// A `size` of 0 still returns a valid, distinct allocation (of the smallest size).
++ fn alloc(size: uint) GcPtr {
+    if size == 0 : size = 1
+    let pool = get_pool_for_size(size)
+    let item = pool.get()
+    return item.@cast(GcPtr)
+}
+
+/// Allocates `size` bytes of GC memory whose references are traced through `layout`.
+///
+/// `layout` is a compiler-generated reference layout; `null` means nothing is traced.
+/// A `size` of 0 still returns a valid, distinct allocation (of the smallest size).
++ fn alloc_typed(size: uint, layout: ?ptr) GcPtr {
+    @unsafe
+    if size == 0 : size = 1
+    let pool = get_typed_pool(size, layout)
+    return pool.get().@cast(GcPtr)
+}
+
+/// Allocates `size` zeroed bytes of GC memory whose references are traced through `layout`.
+///
+/// The compiler uses it for slice storage. A large item that gets a fresh block of its own
+/// comes zeroed from `calloc` and is not cleared again.
++ fn alloc_typed_zeroed(size: uint, layout: ?ptr) GcPtr {
+    @unsafe
+    if size == 0 : size = 1
+    let pool = get_typed_pool(size, layout)
+    let first = pool.first
+    let item = pool.get()
+    // A collection inside `get` could prune blocks and change `first`
+    #if !GC_DEBUG && !GC_STRESS
+    if pool.first != first && pool.fresh_slot(item) : return item.@cast(GcPtr)
+    #end
+    mem.clear_bytes(item, size)
+    return item.@cast(GcPtr)
+}
+
+/// Clones a closure environment; used by the compiler when a closure value is copied.
+///
+/// An environment allocated for captures is cloned through its pool's hook. A bare receiver
+/// object is shared, not copied, and `null` returns `null`.
++ fn clone_closure_env(env: ?ptr) ?ptr {
+    @unsafe
+    if !isset(env) : return null
+    let clone = gcdata(env).block().env_clone
+    if !isset(clone) : return env
+    return clone(env)
+}
+
+#end

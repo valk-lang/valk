@@ -1,0 +1,876 @@
+@unsafe
+
+#if GROVE
+
+use coro
+use core
+use mem
+use time
+use ext
+
+value mem_minimum_trigger (256 * 1024)
+// A collection marks what survived of the allocations since the last one.
+// The step between collections is sized so that is about this much: 8 MiB
+// when everything survives, more when most of it dies first, up to the live
+// heap and 8x this
+value mark_step_max (8 * 1024 * 1024)
+
+// Core
+/// The collector of the running thread.
+///
+/// Collecting shared memory temporarily points it at each thread's gc in turn.
+~+ global gc: *Gc (@undefined)
+// The gc of this thread; `gc` is switched while collecting shared memory
+global thread_gc: *Gc (@undefined)
+shared gc_nr: uint (@undefined)
+
+// Bytes of pushed registers to keep from the point where the gc lock was released
+value blocked_regs_size (320)
+struct CollectCall {
+    gc: ptr
+    kind: CollectKind
+}
+
+enum GcState {
+    disabled
+    idle
+    collecting
+    stopping
+}
+
+enum CollectKind {
+    local
+    shared
+    shutdown
+}
+
+struct ConditionalGlobalRoot {
+    ref: ptr
+    tag_ref: ptr
+    tag: uint
+}
+
+struct Gc {
+    nr: uint (atomic(gc_nr + 1))
+    mutex: *core.MutexStruct[void] (core.MutexStruct[void].new())
+    // Lists
+    globals: *Bump (Bump.new())
+    conditional_globals: *Bump (Bump.new())
+    stack_items: *Bump (Bump.new())
+    prev_stack_items: *Bump (Bump.new())
+    updated_list: *Bump (Bump.new())
+    // Sequence slots that received a reference: (item, slot) pairs
+    updated_slots: *Bump (Bump.new())
+    blanks: *Bump (Bump.new())
+    dis_owned_list: *Bump (Bump.new())
+    re_own_list: *Bump (Bump.new())
+    adopted: *Bump (Bump.new()) // New storage that received ownership through transfer_refs()
+    transfer_from: uint (0)     // Blocks of the running transfer_refs()
+    transfer_to: uint (0)
+    shared_items: *Bump (Bump.new())
+    shared_pending: uint (0)    // Bytes published but not added to mem_shared yet
+    // Items of `shared_items` before this byte offset wait for the sweep of the last shared
+    // collection, which this thread runs itself (see sweep_shared)
+    sweep_end: uint (0)
+    sweep_pending: bool (false)
+    // Waiting in shared_safepoint: it sweeps for itself once it runs again
+    at_safepoint: bool (false)
+    // Unmarked items in other threads' blocks: freed by the next shared collection, while
+    // those threads are stopped
+    foreign_dead: *Bump (Bump.new())
+    // Slots freed outside a collection inside an open allocation window (see note_window_free)
+    window_freed: *Bump (Bump.new())
+    // Shared items found on the stack only matter to a shared collection's marking
+    scanning_shared: bool (false)
+    stress_count: uint (0)      // Allocations since the last forced collection (GC_STRESS)
+    mark_list: *Lifo (Lifo.new())
+    props_removed: *Lifo (Lifo.new())
+    // Blocks allocated into or freed from since the last collection
+    touched_blocks: *Bump (Bump.new())
+
+    // Native stacks
+    stack_top: ptr (null_ptr())              // Highest address of the thread stack
+    live_sp: ptr (null_ptr())                // Stack pointer of the running collection
+    blocked_sp: ?ptr (null)                  // Stack pointer when the gc lock was last released
+    blocked_regs: ptr (mem.alloc(blocked_regs_size))
+    scan_min: ptr (null_ptr())
+    scan_max: ptr (null_ptr())
+    scan_hint: uint (0) // Last block-registry hit while scanning stacks
+
+    // Refs
+    #if OS == "win"
+    main_sp: ptr (@ref(coro.main_saved_sp))
+    #else
+    main_sp: ptr (@ref(coro.main_state))
+    #end
+    current_coro: ptr (@ref(coro.current_coro))
+
+    coros_ptr: *Array[?coro.Coro] (@ref(coro.g_coros))
+    alc_list_ptr: **Bump (@ref(alc_list))
+    //
+    mark_shared: bool (false)
+    dont_stop: bool (false)
+    state: GcState (GcState.disabled)
+    did_shutdown: bool (false)
+    free_epoch: uint (0) // The shared_free_epoch this thread's blocks were settled for
+    // Counts
+    dis_own_count: uint (0)
+    // Marking and dis-owning use the prefetch window when the last dis-own ran at
+    // cache-miss speed; a heap that fits the cache is faster without it (see mark_used)
+    mark_window_on: bool (false)
+    collect_count: uint (0)
+    // Allocation allowed between collections, from the last one's survival
+    step_max: uint (mark_step_max)
+    // Marked bytes a running collection released
+    unmarked_run: uint (0)
+    trigger_list: [uint x 5] ({ 0... })
+    dis_own_list: [uint x 5] ({ 0... })
+    // Info
+    marked_max_reset_at: uint (0)
+    marked_max: uint (0)
+    marked_max_next: uint (0)
+    /// Bytes of objects marked live, as counted by the last collection.
+    ~+ mem_marked: uint (0)
+    /// A collection is due once `mem_new` reaches this many bytes.
+    ///
+    /// Adjusted after each collection from the live size and recent history; never below 64 KiB.
+    ~+ mem_trigger: uint (mem_minimum_trigger)
+    /// Bytes marked live at the last collection plus the bytes allocated since then.
+    ~+ mem_new: uint (0)
+    /// Bytes of pool blocks this thread's allocators hold, including free slots.
+    ~+ mem_usage_thread: uint (0)
+    /// Allocates a new collector with empty lists; it stays disabled until the thread enables it.
+    + static fn init() *Gc {
+        let value = mem.new[Gc]()
+        return value
+    }
+
+    fn lock() {
+        this.mutex.lock()
+    }
+    // Releasing our own lock lets other threads collect for us while we
+    // block, so leave them our stack pointer and registers
+    fn unlock() {
+        if this.@cast(ptr) == thread_gc.@cast(ptr) {
+            ext.valk_gc_scan_stack(Gc.release_lock.@cast(ptr), this.@cast(ptr))
+        } else {
+            this.mutex.unlock()
+        }
+    }
+    static fn release_lock(sp: ptr, gcp: ptr) {
+        let g: *Gc = gcp
+        g.blocked_sp = sp
+        // The pushed registers sit just above sp, which may be near the top
+        // of a coroutine stack
+        let current = @ptrv(g.current_coro, ?coro.Coro)
+        let top = isset(current) ? current.stack_top : g.stack_top
+        let size: uint = top - sp
+        if size > blocked_regs_size : size = blocked_regs_size
+        mem.copy_bytes(sp, g.blocked_regs, size)
+        mem.clear_bytes(g.blocked_regs + size, blocked_regs_size - size)
+        g.mutex.unlock()
+    }
+
+    // Runs the collection below a helper that pushes the caller's registers,
+    // so the native stack scan sees every live register
+    fn collect(kind: CollectKind (CollectKind.local)) {
+        if !this.collect_allowed(kind) : return
+        let call = CollectCall { gc: this.@cast(ptr), kind: kind }
+        ext.valk_gc_scan_stack(Gc.collect_entry.@cast(ptr), @ref(call))
+    }
+
+    static fn collect_entry(sp: ptr, ctx: ptr) {
+        let call = @ptrv(ctx, CollectCall)
+        let g: *Gc = call.gc
+        g.live_sp = sp
+        g.collect_run(call.kind)
+    }
+
+    // Both assembly entries pass the caller's saved registers and collection kind
+    static fn collect_native(sp: ptr, kind: CollectKind) {
+        if kind == CollectKind.shared {
+            collect_shared_native(sp)
+            return
+        }
+        let g = thread_gc
+        if !g.collect_allowed(CollectKind.local) : return
+        g.live_sp = sp
+        g.collect_run(CollectKind.local)
+    }
+
+    fn collect_allowed(kind: CollectKind) bool {
+        if this.dont_stop : panic("Started GC while adding shared memory (bug)")
+        if this.state == GcState.collecting : panic("GC is already running (bug)")
+        if this.state == GcState.disabled : return false
+        if this.state == GcState.stopping && kind != CollectKind.shutdown : return false
+        return true
+    }
+
+    fn collect_run(kind: CollectKind) {
+        this.state = GcState.collecting
+        this.scanning_shared = kind == CollectKind.shared
+        if this.sweep_pending : this.sweep_shared()
+
+        let pause_start = time.mono_us()
+        let marked_before = this.mem_marked
+        let allocated = this.mem_new > marked_before ? this.mem_new - marked_before : 0
+        this.unmarked_run = 0
+
+        // 
+        if !this.did_shutdown : this.collect_stack_items()
+
+        // Check if items have dissapeared from the stack
+        this.loop_previous_stack_items()
+        this.loop_props_removed()
+
+        // Mark stack items
+        if !this.did_shutdown : this.loop_stack_items(Gc.mark_stack_item)
+
+        //
+        let dis_own_start = time.mono_us()
+        this.loop_dis_own()
+        if this.dis_own_count >= 4096 {
+            this.mark_window_on = (time.mono_us() - dis_own_start) * 1000 >= this.dis_own_count * mark_window_ns
+        }
+        #if GC_DEBUG
+        // Both forms of the loops get exercised
+        this.mark_window_on = this.collect_count % 2 == 0
+        #end
+        if !this.did_shutdown : this.loop_updates()
+        else : this.clean_updates()
+        this.loop_adopted()
+        if !this.did_shutdown : this.loop_re_own()
+
+        this.check_blanks()
+
+        // A shared collection freed items of ours: every block gets settled
+        if this.free_epoch != shared_free_epoch {
+            this.free_epoch = shared_free_epoch
+            touch_all_blocks(this.alc_list_ptr[0])
+        }
+        // The scan is done and the settle closes the windows
+        this.clear_window_freed()
+        close_current_alloc_windows(this.alc_list_ptr[0])
+        settle_blocks(this.touched_blocks, this.alc_list_ptr[0])
+
+        // Leak check
+        if verify && !this.did_shutdown : this.leak_check()
+
+        // Clear stack items list
+        if kind != CollectKind.shared : this.clear_stack_items()
+
+        // Reset mem_new
+        this.mem_new = this.mem_marked
+        if this.mem_marked > this.marked_max_next : this.marked_max_next = this.mem_marked
+        if this.mem_marked > this.marked_max : this.marked_max = this.mem_marked
+        let time = time.mono_us()
+        if time > this.marked_max_reset_at {
+            this.marked_max_reset_at = time + 200 * 1000 // 200ms
+            this.marked_max_next = 0
+            this.marked_max = this.marked_max_next
+        }
+
+        // Learn from the past
+        this.trigger_list[this.collect_count % 5] = this.mem_trigger
+        this.dis_own_list[this.collect_count % 5] = this.dis_own_count
+        this.collect_count++
+
+        // Update trigger point
+        let high = this.mem_marked / 100 * 120 + 1024
+        let high2 = high / 100 * 150
+        let low = this.mem_trigger / 100 * 95
+        if low > high : high = low
+        if low > high2 : high2 = low
+        this.mem_trigger = high
+
+        // Check for best match in the past
+        let bar: uint = 2_999_999
+        let i = 5
+        while i-- > 0 {
+            let t = this.trigger_list[i]
+            if t == 0 : continue
+            let d = this.dis_own_list[i]
+            if d < bar && t >= high && t <= high2 {
+                this.mem_trigger = t
+                bar = d
+            }
+        }
+
+        //
+        if this.mem_trigger < this.marked_max : this.mem_trigger = this.marked_max
+        if this.mem_trigger < mem_minimum_trigger : this.mem_trigger = mem_minimum_trigger
+        // Size the next step from how much of this one survived (at least 1/64)
+        if allocated >= mark_step_max / 8 {
+            let kept = this.mem_marked + this.unmarked_run
+            let survived = kept > marked_before ? kept - marked_before : 0
+            if survived < allocated / 64 : survived = allocated / 64
+            let step = mark_step_max / 16 * (allocated * 16 / survived)
+            // Never more than the live heap, so memory at most doubles
+            let limit = this.mem_marked < mark_step_max * 8 ? this.mem_marked : mark_step_max * 8
+            if step > limit : step = limit
+            this.step_max = step < mark_step_max ? mark_step_max : step
+        }
+        if this.mem_trigger > this.mem_marked + this.step_max : this.mem_trigger = this.mem_marked + this.step_max
+
+        // Stay closed until the last allocating call is done
+        if kind == CollectKind.local {
+            pause_last_us = time.mono_us() - pause_start
+            if pause_last_us > pause_max_us : pause_max_us = pause_last_us
+        }
+
+        this.scanning_shared = false
+        this.state = kind == CollectKind.shutdown ? GcState.stopping : GcState.idle
+    }
+
+    fn clear_window_freed() {
+        let list = this.window_freed
+        let adr = list.data
+        let end = adr + list.index
+        while adr < end {
+            let data = @ptrv(adr, *GcData)
+            adr = adr.$offset(size_of(ptr))
+            data.co_count = 0
+        }
+        list.reset()
+    }
+
+    fn leak_check() {
+        this.loop_stack_items(fn(item: ptr) { mark_leak_rec(item, true) })
+        leak_check_pools(this.alc_list_ptr[0])
+        this.loop_stack_items(fn(item: ptr) { mark_leak_rec(item, false) })
+    }
+
+    static fn mark_stack_item(item: ptr) {
+        let data: *GcData = item.$offset(-8)
+        if data.is_shared() : return // Prevent race conditions
+        if data.is_not_owned() {
+            mark_used(item)
+            gc.prev_stack_items.add_ptr(item)
+        } else if data.is_still_co_owned() {
+            data.remove_still_co_owned()
+            gc.prev_stack_items.add_ptr(item)
+        }
+    }
+
+    fn loop_props_removed() {
+        let list = this.props_removed
+        while true {
+            let v = list.pop() ! break
+            if v & prop_owned == prop_owned {
+                let item: ptr = v - prop_owned
+                #if GC_DEBUG
+                if item == null : panic("GC error: removed 'owned' property is not a tagged pointer; its memory was reused")
+                #end
+                let data = gcdata(item)
+                data.set_no_owner()
+                gc.dis_owned_list.add_ptr(item)
+            } else {
+                #if GC_DEBUG
+                if v & prop_mask != prop_co_owned : panic("GC error: removed property has no ownership tag")
+                #end
+                let item: ptr = v - prop_co_owned
+                #if GC_DEBUG
+                if item == null : panic("GC error: removed 'co-owned' property is not a tagged pointer; its memory was reused")
+                #end
+                let data = gcdata(item)
+                data.dis_co_own()
+            }
+        }
+    }
+
+    fn loop_previous_stack_items() {
+        let discs = this.dis_owned_list
+        let list = this.prev_stack_items
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.reset()
+
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            let data: *GcData = item.$offset(-8)
+            adr = adr.$offset(size_of(ptr))
+
+            #if GC_DEBUG
+            if item == null : panic("Invalid previous stack item (value is null)")
+            #end
+
+            // A stack item can become shared
+            if data.is_shared() {
+                data.set_no_owner()
+                continue
+            }
+
+            if data.is_on_stack() {
+                let adr = list.get(size_of(ptr))
+                @ptrv(adr, ptr) = item
+            } else {
+                let adr = discs.get(size_of(ptr))
+                @ptrv(adr, ptr) = item
+                data.set_no_owner()
+            }
+        }
+    }
+
+    fn loop_dis_own() {
+        let list = this.dis_owned_list
+        let i: uint = 0
+        let disowned: uint = 0
+        let unmarked_bytes: uint = 0
+
+        // The dis-own list can grow while running this code
+        while i < list.index {
+            let item = @ptrv(list.data, ptr, i / size_of(ptr))
+            i += size_of(ptr)
+
+            #if GC_DEBUG
+            if item == null : panic("Dis own list contains a null value")
+            #end
+
+            let data: *GcData = item.$offset(-8)
+
+            // A dis-owned item can become shared, so we need to make sure it's ignored
+            if data.is_no_owner_not_shared() {
+                let count, bytes = dis_own_rec(item)
+                disowned += count
+                unmarked_bytes += bytes
+            }
+        }
+
+        list.reset()
+        this.dis_own_count = disowned
+        if unmarked_bytes > this.mem_marked : panic("GC marked-memory accounting underflow")
+        this.mem_marked -= unmarked_bytes
+        this.unmarked_run += unmarked_bytes
+    }
+
+    fn loop_re_own() {
+        let list = this.re_own_list
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.reset()
+
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            let data: *GcData = item.$offset(-8)
+            adr = adr.$offset(size_of(ptr))
+
+            // if data.is_shared() : panic("Shared re-own item")
+
+            if data.is_new() && data.co_count > 0 {
+                mark_used(item)
+                // Co ownership can be from stack or an object
+                if data.is_on_stack() : this.prev_stack_items.add_ptr(item)
+                else : data.set_still_co_owned()
+            }
+        }
+    }
+
+    // Storage that took over references while it was new: everything that is
+    // reachable is owned by now, so storage still new holds references on
+    // behalf of nobody and gives them up
+    fn loop_adopted() {
+        let list = this.adopted
+        let adr = list.data
+        let end = adr + list.index
+        list.reset()
+
+        let disowned: uint = 0
+        let unmarked_bytes: uint = 0
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            let data = gcdata(item)
+            if data.is_new() && !data.is_shared() {
+                let count, bytes = dis_own_children(item)
+                disowned += count
+                unmarked_bytes += bytes
+            }
+        }
+        this.dis_own_count += disowned
+        if unmarked_bytes > this.mem_marked : panic("GC marked-memory accounting underflow")
+        this.mem_marked -= unmarked_bytes
+        this.unmarked_run += unmarked_bytes
+    }
+
+    fn loop_updates() {
+        let list = this.updated_list
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.reset()
+
+        let ml = this.mark_list
+
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+
+            let data = gcdata(item)
+            data.remove_in_updates()
+            data.slot_logs = 0
+            if data.offset == 0 : continue
+
+            if data.is_owned_not_shared() {
+                let layout = data.block().layout
+                if isset(layout) {
+                    each_ref(item, layout, ml, update_props)
+                }
+            }
+        }
+
+        // Slots of sequences: only the ones that received a reference
+        let slots = this.updated_slots
+        adr = slots.data
+        end = adr + slots.index
+        slots.reset()
+        while adr < end {
+            let item = @ptrv(adr, GcItem, 0)
+            let ref = @ptrv(adr, ptr, 1)
+            adr = adr.$offset(size_of(ptr) * 2)
+            let data = gcdata(item)
+            data.slot_logs = 0
+            if data.is_owned_not_shared() : update_props(ref, ml)
+        }
+
+        mark_used(null)
+    }
+
+    fn clean_updates() {
+        let list = this.updated_list
+        let adr = list.data
+        let end = adr + list.index
+        list.reset()
+
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            let data = gcdata(item)
+            data.remove_in_updates()
+            data.slot_logs = 0
+        }
+        let slots = this.updated_slots
+        adr = slots.data
+        end = adr + slots.index
+        slots.reset()
+        while adr < end {
+            gcdata(@ptrv(adr, ptr, 0)).slot_logs = 0
+            adr = adr.$offset(size_of(ptr) * 2)
+        }
+    }
+
+    fn check_blanks() {
+        let list = this.blanks
+        let data = list.data
+        let adr = data
+        let end = adr + list.index
+        list.reset()
+
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+
+            let data = gcdata(item)
+            if data.is_not_new() : continue
+
+            free_blank(item)
+        }
+    }
+
+    //////////////////////////
+    // Loop stack
+    //////////////////////////
+
+    fn loop_stack_items(func: fnptr(ptr)()) {
+        let list = this.stack_items
+        let adr = list.data
+        let end = adr + list.index
+
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            func(item)
+        }
+    }
+
+    fn clear_stack_items() {
+        let list = this.stack_items
+        let adr = list.data
+        let end = adr + list.index
+        list.reset()
+
+        while adr < end {
+            let item = @ptrv(adr, GcItem)
+            adr = adr.$offset(size_of(ptr))
+            let data = gcdata(item)
+            if data.is_shared() {
+                atomic(data.co_count - 1)
+            } else {
+                data.co_count = data.co_count - 1
+            }
+            data.remove_on_stack()
+        }
+    }
+    fn collect_stack_item(item: ptr) {
+        #if GC_DEBUG
+        if item & 7 > 0 {
+            let address: uint = item
+            panic("GC error: misaligned root: " + address.to_base(16))
+        }
+        #end
+        let data = gcdata(item)
+        // Another thread may be sweeping it
+        if data.is_shared() && !this.scanning_shared : return
+        if data.is_on_stack() : return
+        data.set_on_stack()
+        if data.is_shared() {
+            atomic(data.co_count + 1)
+        } else {
+            data.co_count = data.co_count + 1
+        }
+        this.stack_items.add_ptr(item)
+    }
+    fn collect_stack_items() {
+        // Globals
+        let g_adr = this.globals.data
+        let g_end_adr: ptr = g_adr + this.globals.index
+        while g_adr < g_end_adr {
+            let ref = @ptrv(g_adr, ptr)
+            let item = @ptrv(ref, ?ptr)
+            if isset(item) : this.collect_stack_item(item)
+            g_adr = g_adr.$offset(size_of(ptr))
+        }
+
+        let c_adr = this.conditional_globals.data
+        let c_end_adr: ptr = c_adr + this.conditional_globals.index
+        while c_adr < c_end_adr {
+            let root = @ptrv(c_adr, ConditionalGlobalRoot)
+            if @ptrv(root.tag_ref, uint) == root.tag {
+                let item = @ptrv(root.ref, ?ptr)
+                if isset(item) : this.collect_stack_item(item)
+            }
+            c_adr = c_adr.$offset(size_of(ConditionalGlobalRoot))
+        }
+
+        // Native stacks
+        if this.@cast(ptr) == thread_gc.@cast(ptr) {
+            this.scan_stacks(this.live_sp)
+        } else {
+            let sp = this.blocked_sp
+            if isset(sp) {
+                this.scan_stacks(sp)
+                this.scan_words(this.blocked_regs, this.blocked_regs + blocked_regs_size)
+            }
+        }
+    }
+
+    // Every native stack of the thread: the running one from sp, the main
+    // stack while a coroutine runs, and each suspended coroutine
+    fn scan_stacks(sp: ptr) {
+        mark_alloc_limits(this.alc_list_ptr[0])
+        block_lock.lock()
+        sort_block_ranges()
+        let count = block_range_count()
+        if count > 0 {
+            let base = block_ranges.data
+            this.scan_min = @ptrv(base, BlockRange, 0).start
+            this.scan_max = @ptrv(base, BlockRange, count - 1).end
+            let current = @ptrv(this.current_coro, ?coro.Coro)
+            if isset(current) {
+                this.scan_words(sp, current.stack_top)
+                let main_sp = @ptrv(this.main_sp, ?ptr)
+                if isset(main_sp) : this.scan_words(main_sp, this.stack_top)
+            } else {
+                this.scan_words(sp, this.stack_top)
+            }
+            let coros = this.coros_ptr[0]
+            each coros as coro_item {
+                if !isset(coro_item) : continue
+                if coro_item.started && !coro_item.active && !coro_item.done {
+                    this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
+                }
+            }
+        }
+        block_lock.unlock()
+    }
+
+    fn scan_words(low: ptr, high: ptr) {
+        let min = this.scan_min
+        let max = this.scan_max
+        let adr: ptr = low & (~7).to(uint)
+        while adr < high {
+            let word = @ptrv(adr, ptr)
+            adr += size_of(ptr)
+            if word < min || word >= max : continue
+            let item = this.find_root(word)
+            if isset(item) : this.collect_stack_item(item)
+        }
+    }
+
+    // The item a native stack word may point into. Accepts any allocated
+    // slot of our own blocks and shared items of any block; a stale word
+    // pointing at a free slot is rejected so garbage is never resurrected
+    // MRU cache over the block registry: consecutive stack words usually land
+    // in the same block, so recheck the last hit before binary searching
+    fn find_root_range(word: ptr) ?*BlockRange {
+        let base = block_ranges.data
+        let count = block_range_count()
+        let hint = this.scan_hint
+        if hint < count {
+            let cached: *BlockRange = base + hint * size_of(BlockRange)
+            if word >= cached.start && word < cached.end : return cached
+        }
+        let range = find_block_range(word) ?! return null
+        this.scan_hint = (range.@cast(ptr) - base) / size_of(BlockRange)
+        return range
+    }
+
+    fn find_root(word: ptr) ?ptr {
+        let range = this.find_root_range(word) ?! return null
+        let block = range.start
+        let data = block + POOL_DATA_OFFSET
+        if word < data : return null
+        let isize = @ptrv(block, uint, b_isize)
+        let rel: uint = word - data
+        let slot: ptr = data + (rel - rel % isize)
+        let gcd: *GcData = slot
+        let item: ptr = slot + 8
+        // A sequence's first word is its length, so no reference points into it: a word
+        // just past the start is a stale copy of a tagged slot (ownership tags are the low
+        // bits). Such a word kept old Array storage alive, and with it, as co-owner, every
+        // element it ever held
+        let tag = word - item
+        if tag > 0 && tag < 8 && tag & prop_mask == tag {
+            let layout = @ptrv(block, ?ptr, b_layout)
+            if isset(layout) && @ptrv(layout, uint, layout_kind) == 1 : return null
+        }
+        if gcd.is_shared() : return item
+        if range.gc != this.@cast(?*Gc) : return null
+        if gcd.is_not_new() : return item
+        if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) && gcd.co_count != WINDOW_FREED : return item
+        return null
+    }
+
+    fn add_conditional_global(ref: ptr, tag_ref: ptr, tag: uint) {
+        let address = this.conditional_globals.get(size_of(ConditionalGlobalRoot))
+        @ptrv(address, ConditionalGlobalRoot) = ConditionalGlobalRoot {
+            ref: ref
+            tag_ref: tag_ref
+            tag: tag
+        }
+    }
+    //////////////////////////
+    // Shared
+    //////////////////////////
+
+    // Frees the items the last shared collection did not mark. It runs after that collection,
+    // on this thread or with it stopped: what was unmarked then can no longer be reached, and
+    // live items are only read. Items shared since then follow the boundary and stay
+    fn sweep_shared() {
+        this.sweep_pending = false
+        mark_alloc_limits(this.alc_list_ptr[0])
+        let list = this.shared_items
+        let data = list.data
+        let read = data
+        let end = data + this.sweep_end
+        let write = data
+
+        while read < end {
+            let item = @ptrv(read, GcItem)
+            read = read.$offset(size_of(ptr))
+            let item_data = gcdata(item)
+            if item_data.is_marked() {
+                @ptrv(write, GcItem) = item
+                write = write.$offset(size_of(ptr))
+                continue
+            }
+            // A thread may share an item another thread allocated, such as a thread's result
+            let block = shared_item_block(item_data)
+            if @ptrv(block, ?ptr, b_owner) != this.@cast(ptr) {
+                this.foreign_dead.add_ptr(item)
+                continue
+            }
+            touch_block(block)
+            free_shared_item(item)
+            note_window_free(item_data, block)
+        }
+
+        let tail = list.index - this.sweep_end
+        mem.move_bytes(end, write, tail)
+        list.index = (write - data) + tail
+        this.sweep_end = 0
+    }
+
+    //////////////////////////
+    // Shutdown
+    //////////////////////////
+
+    /// Runs the final collection of a terminating thread and hands its memory over.
+    ///
+    /// Called by the thread teardown with this gc's lock and the shared lock held, and with
+    /// the gc already removed from the gc list. Remaining shared items move to the shared dump;
+    /// empty blocks are freed and blocks that still hold items become unused blocks. Leaves
+    /// the gc locked so the thread can notify its waiters before `free`.
+    + fn shutdown() {
+        this.did_shutdown = true
+        this.collect(CollectKind.shutdown)
+
+        // Hand our remaining shared items over to the dump. This happens under
+        // the shared lock, in the same critical section as our removal from
+        // 'gc_list', so a shared collection can never observe them while they
+        // belong to no one.
+        dump_shared(this.shared_items)
+        dump_shared(this.foreign_dead)
+        this.flush_shared_pending()
+
+        // Free blocks or store them in unused-block-list if they still contain items
+        pool_lock.lock()
+        loop_all_blocks(fn(block: *Block) {
+            let alloc_size = block.slots_total * block.isize + POOL_DATA_OFFSET
+            if alloc_size > gc.mem_usage_thread : panic("GC pool accounting underflow during thread shutdown")
+            gc.mem_usage_thread -= alloc_size
+            if block.slots_used == 0 {
+                atomic(mem_usage_shared - alloc_size)
+                unregister_block(block)
+                mem.free(block)
+            } else {
+                release_block_owner(block)
+                block.owner = null
+                add_unused_block(block)
+            }
+        })
+        pool_lock.unlock()
+    }
+
+    fn flush_shared_pending() {
+        atomic(mem_shared + this.shared_pending)
+        this.shared_pending = 0
+    }
+
+    /// Unlocks and frees the gc. Nothing may use it afterwards.
+    + fn free() {
+        this.unlock()
+        this.mutex.free()
+        this.globals.free()
+        this.conditional_globals.free()
+        this.stack_items.free()
+        this.prev_stack_items.free()
+        this.updated_list.free()
+        this.updated_slots.free()
+        this.blanks.free()
+        this.touched_blocks.free()
+        this.foreign_dead.free()
+        this.window_freed.free()
+        this.dis_owned_list.free()
+        this.re_own_list.free()
+        this.adopted.free()
+        this.shared_items.free()
+        this.mark_list.free()
+        this.props_removed.free()
+        mem.free(this.blocked_regs)
+        mem.free(this)
+    }
+}
+
+#end

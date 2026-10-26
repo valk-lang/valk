@@ -1,0 +1,593 @@
+#if GROVE
+
+// Marking and dis-owning walk the graph through the mark list. Two forms: the direct one
+// touches an object's header when its slot is reached and pushes the object; the window
+// form pushes the slot address, prefetches the object's header when the entry leaves the
+// list and processes it mark_window entries later, so the cache misses of several
+// objects overlap. The window costs instructions, so it is only used when the last
+// dis-own ran at cache-miss speed (Gc.mark_window_on)
+value mark_window (8)
+// Nanoseconds per dis-owned object above which the window is used
+value mark_window_ns (16)
+
+fn mark_used(item: ?GcItem) $hot {
+    @unsafe
+    if gc.mark_window_on : mark_used_window(item)
+    else : mark_used_direct(item)
+}
+
+fn mark_used_direct(item: ?GcItem) $hot {
+    @unsafe
+    let ml = gc.mark_list
+    if isset(item) {
+        let data = gcdata(item)
+        let is_new = data.is_new()
+
+        #if GC_DEBUG
+        if data.is_still_co_owned() : panic("double ownership")
+        #end
+
+        data.set_owned()
+        if data.offset > 0 && is_new {
+            let block = data.block()
+            block.slots_used++
+            gc.mem_marked += block.isize
+        }
+        ml.add(item)
+    }
+
+    while ml.index > 0 {
+        let item = ml.pop_unchecked()
+        let data = gcdata(item)
+        if data.offset == 0 : continue
+
+        let block = data.block()
+        let layout = block.layout
+        if isset(layout) {
+            // Room for every word of the object, so the pushes need no capacity check
+            ml.reserve(block.isize / size_of(ptr))
+            each_ref(item, layout, ml, mark_used_props_direct)
+        }
+    }
+}
+
+fn mark_used_props_direct(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    let sub = @ptrv(ref, ?ptr)
+    if !isset(sub) : return
+    if sub & prop_mask == 0 {
+        let sub_data = gcdata(sub)
+        if sub_data.is_not_owned_not_shared() {
+            @ptrv(ref, ptr) = sub | prop_owned
+            let is_new = sub_data.is_new()
+            sub_data.set_owned()
+            if is_new && sub_data.offset > 0 {
+                let sub_block = sub_data.block()
+                sub_block.slots_used++
+                gc.mem_marked += sub_block.isize
+            }
+            list.add_unchecked(sub)
+        } else {
+            @ptrv(ref, ptr) = sub | prop_co_owned
+            sub_data.co_own()
+        }
+    }
+}
+
+fn mark_used_window(item: ?GcItem) $hot {
+    @unsafe
+    let g = gc
+    let ml = g.mark_list
+    let marked_bytes: uint = 0
+    if isset(item) {
+        let data = gcdata(item)
+        #if GC_DEBUG
+        if data.is_still_co_owned() : panic("double ownership")
+        #end
+        let is_new = data.is_new()
+        data.set_owned()
+        if data.offset > 0 {
+            let block = data.block()
+            if is_new {
+                block.slots_used++
+                marked_bytes += block.isize
+            }
+            let layout = block.layout
+            if isset(layout) {
+                ml.reserve(block.isize / size_of(ptr))
+                each_ref(item, layout, ml, mark_push_ref)
+            }
+        }
+    }
+
+    // Slots leave the list through a window of mark_window entries: an entry's header is
+    // prefetched when it enters and touched when it leaves. One in, one out, so the
+    // branches stay predictable
+    let window: [ptr x mark_window] = @undefined
+    let head: uint = 0
+    let count: uint = 0
+    let fill: uint = g.mark_window_on ? mark_window - 1 : 0
+    while true {
+        let ref: ptr = null_ptr()
+        if ml.index > 0 {
+            let entered = ml.pop_unchecked()
+            $prefetch(((@ptrv(entered, uint) & (~prop_mask).to(uint)) - 8).@cast(ptr))
+            window[(head + count) & (mark_window - 1)] = entered
+            if count < fill {
+                count++
+                continue
+            }
+        } else {
+            if count == 0 : break
+            count--
+        }
+        ref = window[head]
+        head = (head + 1) & (mark_window - 1)
+
+        let sub = @ptrv(ref, ?ptr)
+        // A slot logged twice was processed already
+        if !isset(sub) || sub & prop_mask != 0 : continue
+        let sub_data = gcdata(sub)
+        if sub_data.is_not_owned_not_shared() {
+            @ptrv(ref, ptr) = sub | prop_owned
+            let is_new = sub_data.is_new()
+            sub_data.set_owned()
+            if sub_data.offset == 0 : continue
+            let block = sub_data.block()
+            if is_new {
+                block.slots_used++
+                marked_bytes += block.isize
+            }
+            let layout = block.layout
+            if isset(layout) {
+                ml.reserve(block.isize / size_of(ptr))
+                each_ref(sub, layout, ml, mark_push_ref)
+            }
+        } else {
+            @ptrv(ref, ptr) = sub | prop_co_owned
+            sub_data.co_own()
+        }
+    }
+    g.mem_marked += marked_bytes
+}
+
+// Queues a slot that holds an untagged reference; mark_used_window decides between owning and
+// co-owning when it reaches the slot
+fn mark_push_ref(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    let sub = @ptrv(ref, ?ptr)
+    if !isset(sub) || sub & prop_mask != 0 : return
+    list.add_unchecked(ref)
+}
+
+// An updated object hands ownership to the fields it received since the
+// last collection; drained by mark_used(null)
+fn update_props(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    // No reserve precedes these pushes
+    list.reserve(1)
+    if gc.mark_window_on : mark_push_ref(ref, list)
+    else : mark_used_props_direct(ref, list)
+}
+
+fn free_blank(item: ptr) $hot {
+    @unsafe
+    let data = gcdata(item)
+    if data.is_not_new() : return
+
+    // Call gc_free
+    let block = data.block()
+    let onfree = block.onfree
+    if isset(onfree) : onfree(item)
+
+    #if GC_DEBUG
+    if data.co_count != 0 : panic("co_count not 0 before free")
+    if data.flags != 0 {
+        print("Flags: ")
+        data.flags.print(10)
+        print("\n")
+        panic("GC error: Flags not 0 before free")
+    }
+    #end
+}
+
+fn preserve_stack_owner(item: GcItem) {
+    @unsafe
+    gcdata(item).set_owned()
+    gc.prev_stack_items.add_ptr(item)
+}
+
+fn should_dis_own(item: GcItem) bool $inline {
+    @unsafe
+    let data = gcdata(item)
+
+    #if GC_DEBUG
+    if data.is_shared() : panic("removing ownership from shared item")
+    if data.is_new() : panic("double ownership removal")
+    if data.is_still_co_owned() : panic("unexpected ownership removal")
+    #end
+
+    if data.offset == 0 : return false
+    if data.is_on_stack() {
+        preserve_stack_owner(item)
+        return false
+    }
+
+    return true
+}
+
+fn queue_dis_owned(item: GcItem, list: *Lifo) $inline {
+    @unsafe
+    if should_dis_own(item) : list.add_unchecked(item)
+}
+
+fn dis_own_rec(item: ptr) (uint, uint) {
+    @unsafe
+    if !should_dis_own(item) : return (0, 0)
+    return dis_own_loop(item, false)
+}
+
+// Removes ownership from everything a dead item owns while the item itself
+// keeps its state: used for storage that received ownership tags through
+// transfer_refs() but never became owned itself
+fn dis_own_children(item: ptr) (uint, uint) {
+    @unsafe
+    return dis_own_loop(item, true)
+}
+
+fn dis_own_loop(item: ptr, children_only: bool) (uint, uint) {
+    @unsafe
+    if gc.mark_window_on : return dis_own_loop_window(item, children_only)
+    return dis_own_loop_direct(item, children_only)
+}
+
+fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
+    @unsafe
+    let ml = gc.mark_list
+    let disowned: uint = 0
+    let unmarked_bytes: uint = 0
+
+    while true {
+        let data = gcdata(item)
+        let block = data.block()
+
+        if children_only {
+            children_only = false
+        } else {
+            disowned++
+            data.set_new()
+            if data.co_count > 0 : gc.re_own_list.add_ptr(item)
+
+            block.slots_used--
+            unmarked_bytes += block.isize
+            touch_block(block.@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET))
+
+            let onfree = block.onfree
+            if isset(onfree) : gc.blanks.add_ptr(item)
+        }
+
+        let layout = block.layout
+        if isset(layout) {
+            ml.reserve(block.isize / size_of(ptr))
+            each_ref(item, layout, ml, dis_own_props_direct)
+        }
+
+        if ml.index == 0 : break
+        item = ml.pop_unchecked()
+    }
+    return (disowned, unmarked_bytes)
+}
+
+fn dis_own_loop_window(item: ptr, children_only: bool) (uint, uint) {
+    @unsafe
+    let g = gc
+    let ml = g.mark_list
+    let disowned: uint = 0
+    let unmarked_bytes: uint = 0
+
+    if children_only {
+        let block = gcdata(item).block()
+        let layout = block.layout
+        if isset(layout) {
+            ml.reserve(block.isize / size_of(ptr))
+            each_ref(item, layout, ml, dis_own_push_ref)
+        }
+    } else {
+        disowned++
+        unmarked_bytes += dis_own_item(item, ml)
+    }
+
+    // Slots leave the list through a window of mark_window entries: an entry's header is
+    // prefetched when it enters and touched when it leaves. One in, one out, so the
+    // branches stay predictable
+    let window: [ptr x mark_window] = @undefined
+    let head: uint = 0
+    let count: uint = 0
+    let fill: uint = g.mark_window_on ? mark_window - 1 : 0
+    while true {
+        let ref: ptr = null_ptr()
+        if ml.index > 0 {
+            let entered = ml.pop_unchecked()
+            $prefetch(((@ptrv(entered, uint) & (~prop_mask).to(uint)) - 8).@cast(ptr))
+            window[(head + count) & (mark_window - 1)] = entered
+            if count < fill {
+                count++
+                continue
+            }
+        } else {
+            if count == 0 : break
+            count--
+        }
+        ref = window[head]
+        head = (head + 1) & (mark_window - 1)
+
+        let dead = dis_own_ref(ref) ?! continue
+        disowned++
+        unmarked_bytes += dis_own_item(dead, ml)
+    }
+    return (disowned, unmarked_bytes)
+}
+
+// Frees the slot of a dead item and queues the tagged slots it holds; returns its bytes
+fn dis_own_item(item: ptr, ml: *Lifo) uint $hot $inline {
+    @unsafe
+    let data = gcdata(item)
+    let block = data.block()
+    data.set_new()
+    if data.co_count > 0 : gc.re_own_list.add_ptr(item)
+
+    block.slots_used--
+    touch_block(block.@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET))
+
+    let onfree = block.onfree
+    if isset(onfree) : gc.blanks.add_ptr(item)
+
+    let layout = block.layout
+    if isset(layout) {
+        ml.reserve(block.isize / size_of(ptr))
+        each_ref(item, layout, ml, dis_own_push_ref)
+    }
+    return block.isize
+}
+
+// Releases the ownership a dead item's slot held; returns the item that dies with it
+fn dis_own_ref(ref: ptr) ?ptr $hot $inline {
+    @unsafe
+    let sub = @ptrv(ref, ptr)
+    if sub & prop_owned == prop_owned {
+        let sub_item = sub - prop_owned
+        #if GC_DEBUG
+        if sub_item == null : panic("GC error: 'owned' property slot is not a tagged pointer; its memory was reused")
+        #end
+        @ptrv(ref, ptr) = sub_item
+        let sub_data = gcdata(sub_item)
+        sub_data.set_no_owner()
+        if sub_data.is_shared() : return null
+        if !should_dis_own(sub_item) : return null
+        return sub_item
+    }
+    if sub & prop_co_owned == prop_co_owned {
+        let sub_item = sub - prop_co_owned
+        #if GC_DEBUG
+        if sub_item == null : panic("GC error: 'co-owned' property slot is not a tagged pointer; its memory was reused")
+        #end
+        @ptrv(ref, ptr) = sub_item
+        let sub_data = gcdata(sub_item)
+        if sub_data.is_shared() {
+            atomic(sub_data.co_count - 1)
+        } else {
+            sub_data.co_count = sub_data.co_count - 1
+        }
+        if sub_data.is_still_co_owned() {
+            sub_data.remove_still_co_owned()
+            // Lets pretend we were the owner
+            if should_dis_own(sub_item) : return sub_item
+        }
+    }
+    return null
+}
+
+// Ownership moves along: the tags of 'from' move to 'to' and 'from' keeps plain
+// references, so no element header is touched now or when 'from' dies. 'from' lost its
+// owner slot, so the next collection takes it for dead; when a view still uses it, that
+// collection marks it from the stack or re-owns it, which walks its slots and counts them
+// again. 'to' is new, so it is checked at the next collection: if nothing owns it by then,
+// the ownership it received is removed again (see Gc.loop_adopted)
+/// Moves the references held by `from` into the identically laid out GC allocation `to`.
+///
+/// The other bytes must already be copied. Used when a growing container moves its
+/// elements to a new block: ownership of the elements moves to `to` without re-marking
+/// them. Does nothing when `from` has no reference layout.
++ fn transfer_refs(from: ptr, to: ptr) {
+    @unsafe
+    let layout = gcdata(from).block().layout
+    if !isset(layout) : return
+    // The callback captures nothing: an environment allocation could start a
+    // collection halfway through the transfer
+    let g = gc
+    g.transfer_from = from
+    g.transfer_to = to
+    if gcdata(from).is_shared() {
+        // Other threads may read shared storage: it keeps counted references
+        each_ref(from, layout, g.mark_list, fn(ref: ptr, list: *Lifo) {
+            let v = @ptrv(ref, ?ptr)
+            if !isset(v) : return
+            let to_ref: ptr = ((ref.@cast(uint) - gc.transfer_from) + gc.transfer_to).@cast(ptr)
+            let tag = v & prop_mask
+            @ptrv(to_ref, ptr) = v
+            if tag == prop_owned {
+                let item: ptr = v - prop_owned
+                @ptrv(ref, ptr) = item | prop_co_owned
+                gcdata(item).co_own()
+            } else if tag == prop_co_owned {
+                gcdata(v - prop_co_owned).co_own()
+            }
+        })
+    } else {
+        each_ref(from, layout, g.mark_list, fn(ref: ptr, list: *Lifo) {
+            let v = @ptrv(ref, ?ptr)
+            if !isset(v) : return
+            let to_ref: ptr = ((ref.@cast(uint) - gc.transfer_from) + gc.transfer_to).@cast(ptr)
+            @ptrv(to_ref, ptr) = v
+            @ptrv(ref, ptr) = v & (~prop_mask).to(uint)
+        })
+    }
+    if gcdata(to).is_new() : gc.adopted.add_ptr(to)
+}
+
+fn dis_own_props_direct(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    let sub = @ptrv(ref, ?ptr)
+    if !isset(sub) : return
+    if sub & prop_owned == prop_owned {
+        let sub_item = sub - prop_owned
+        #if GC_DEBUG
+        if sub_item == null : panic("GC error: 'owned' property slot is not a tagged pointer; its memory was reused")
+        #end
+        @ptrv(ref, ptr) = sub_item
+        let sub_data = gcdata(sub_item)
+        sub_data.set_no_owner()
+        if sub_data.is_shared() : return
+        queue_dis_owned(sub_item, list)
+    } else if sub & prop_co_owned == prop_co_owned {
+        let sub_item = sub - prop_co_owned
+        #if GC_DEBUG
+        if sub_item == null : panic("GC error: 'co-owned' property slot is not a tagged pointer; its memory was reused")
+        #end
+        @ptrv(ref, ptr) = sub_item
+        let sub_data = gcdata(sub_item)
+        if sub_data.is_shared() {
+            atomic(sub_data.co_count - 1)
+        } else {
+            sub_data.co_count = sub_data.co_count - 1
+        }
+        if sub_data.is_still_co_owned() {
+            sub_data.remove_still_co_owned()
+            // Lets pretend we were the owner
+            queue_dis_owned(sub_item, list)
+        }
+    }
+}
+
+// Queues a slot of a dead item that carries an ownership tag
+fn dis_own_push_ref(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    if @ptrv(ref, uint) & prop_mask != 0 : list.add_unchecked(ref)
+}
+
+fn share_null_check(item: ?ptr) {
+    @unsafe
+    if isset(item) {
+        share(item)
+    }
+}
+
+fn share(item: GcItem) {
+    @unsafe
+    let ds = gc.dont_stop
+    gc.dont_stop = true
+
+    let ml = gc.mark_list
+    let start = ml.index
+    let added : uint = 0
+    ml.add(item)
+
+    while ml.index > start {
+        let item: GcItem = ml.pop_unchecked()
+        let data = gcdata(item)
+
+        if data.is_shared() : continue
+        data.set_shared()
+
+        let is_new = data.is_new()
+        if is_new : data.set_no_owner()
+        else if data.is_still_co_owned() {
+            data.remove_still_co_owned()
+            data.set_no_owner()
+        }
+
+        if data.offset == 0 : continue
+        gc.shared_items.add_ptr(item)
+
+        let block = data.block()
+        let size = block.isize
+        if is_new {
+            block.slots_used++
+        } else {
+            gc.mem_marked -= size
+        }
+        added += size
+
+        let layout = block.layout
+        if isset(layout) {
+            each_ref(item, layout, ml, fn(ref: ptr, list: *Lifo) {
+                let sub = @ptrv(ref, ?ptr)
+                if !isset(sub) : return
+                let sub_item: GcItem = sub & (~prop_mask).to(uint)
+                let sub_data = gcdata(sub_item)
+                if sub & prop_owned == prop_owned {
+                    // Remove ownership
+                    @ptrv(ref, ?GcItem) = sub_item
+                    sub_data.set_no_owner()
+                } else if sub & prop_co_owned == prop_co_owned {
+                    // Remove co ownership
+                    @ptrv(ref, ?GcItem) = sub_item
+                    if sub_data.is_shared() {
+                        atomic(sub_data.co_count - 1)
+                    } else {
+                        sub_data.co_count = sub_data.co_count - 1
+                    }
+                }
+
+                if sub_data.is_shared() : return
+                list.add(sub_item)
+            })
+        }
+    }
+
+    // Batched per thread: threads publishing at once contend on the global counter.
+    // A shared collection and the thread shutdown add what is left
+    if added > 0 {
+        let pending = gc.shared_pending + added
+        if pending >= 65536 {
+            atomic(mem_shared + pending)
+            pending = 0
+        }
+        gc.shared_pending = pending
+    }
+    gc.dont_stop = ds
+}
+
+fn mark_leak_rec(item: GcItem, on: bool) {
+    @unsafe
+    let ml = gc.mark_list
+    ml.add(item)
+
+    while ml.index > 0 {
+        let item: GcItem = ml.pop_unchecked()
+        let data = gcdata(item)
+        if data.is_shared() : continue
+        if on {
+            if data.has_leak_mark() : continue
+            data.set_leak_mark()
+        } else {
+            if !data.has_leak_mark() : continue
+            data.remove_leak_mark()
+        }
+
+        if data.offset == 0 : continue
+
+        let layout = data.block().layout
+        if isset(layout) {
+            each_ref(item, layout, ml, fn(ref: ptr, list: *Lifo) {
+                @unsafe
+                let sub = @ptrv(ref, ?ptr)
+                if !isset(sub) : return
+                let sub_item: ptr = sub & (~prop_mask).to(uint)
+                list.add(sub_item)
+            })
+        }
+    }
+}
+
+#end
