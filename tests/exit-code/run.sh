@@ -202,6 +202,41 @@ else
     fi
 fi
 
+# Grove reserves its heap at start-up: under a small address-space limit the program
+# stops with a clear message instead of failing later
+if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+    count=$((count + 1))
+    input="$DIR/grove-heap-limit.valk"
+    exe="$workdir/grove-heap-limit"
+    echo "> Run: a Grove program under a small RLIMIT_AS"
+    set +e
+    out=$("$VALK" build "$input" --def "GROVE=1" --no-warn -o "$exe" 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo "# Build failed"
+        echo "- File: $input"
+        echo "- Output:"
+        echo "$out"
+        failed=1
+    else
+        set +e
+        out=$( (ulimit -v 12000; "$exe") 2>&1 )
+        got=$?
+        normal=$("$exe" 2>&1)
+        normal_status=$?
+        set -e
+        if [ "$got" -ne 1 ] || [[ "$out" != *"Grove cannot reserve its heap"* ]]; then
+            echo "# Expected exit 1 with the heap reservation message, got $got: $out"
+            failed=1
+        fi
+        if [ "$normal_status" -ne 0 ] || [ "$normal" != "started" ]; then
+            echo "# Without the limit the program should run, got $normal_status: $normal"
+            failed=1
+        fi
+    fi
+fi
+
 if [ "$count" -eq 0 ]; then
     echo "# No exit-code fixtures found in $DIR"
     exit 1
