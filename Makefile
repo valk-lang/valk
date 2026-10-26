@@ -173,7 +173,8 @@ grove-compiler-check: valk
 		cmp ./debug/out-$$c ./debug/valk-ref; \
 		./debug/$$c build ./tests $(TEST_FLAGS) $(FLAGS) --stdlib $(CURDIR)/lib -o ./debug/tests-$$c --clean; \
 		cmp ./debug/tests-$$c ./debug/tests-ref; \
-		./debug/$$c build ./examples/bench/json/main.valk --release --stdlib $(CURDIR)/lib -o ./debug/release-$$c --clean; \
+		./debug/$$c build ./examples/bench/json/main.valk --release --stdlib $(CURDIR)/lib -o ./debug/release-$$c --clean -vvv > ./debug/release-$$c.log; \
+		grep "emitted as" ./debug/release-$$c.log || { echo "# The serial llvm_emit_partitions did not run"; exit 1; }; \
 		cmp ./debug/release-$$c ./debug/release-ref; \
 	done
 	@echo "Grove compiler check: outputs are identical"

@@ -1395,7 +1395,8 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
     "$VALK" build "$input" --def GROVE=1 --no-warn -c -o "$output" > /dev/null 2>&1 || { echo "# GROVE=1 failed to build a program without threads"; exit 1; }
     "$output" || { echo "# A GROVE=1 program without threads failed"; exit 1; }
 fi
-grove_out=$("$VALK" build "$DIR/grove-thread.valk" --def GROVE=1 --no-warn -c -o "$output" 2>&1) && {
+# The error comes before linking, so this check works on every host
+grove_out=$("$VALK" build "$DIR/grove-thread.valk" --def GROVE=1 --target linux-x64 --no-warn -c -o "$output" 2>&1) && {
     echo "# GROVE=1 accepted a program that starts a thread"
     exit 1
 }
