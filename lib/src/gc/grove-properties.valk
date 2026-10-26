@@ -1,12 +1,20 @@
 #if GROVE
 
-// The barrier. A store into a young holder is plain. A store into an old holder records
-// a counted old word (B2) and makes the card of a stored reference dirty: a clean card is
-// set and logged once per collection (B5), then the log's cap is tested (B6). Card bytes
-// and the card log are read by the next collection (Gc.loop_cards)
+use mem
 
-fn property_update_slow(on_object: ptr, property_ref: ptr, new_value: ?ptr, old: ptr) {
+// The barrier reads no holder. B1: a store over a counted old word takes the removal slow
+// path B2; any other store is plain, then the card of a stored reference is tested: a clean
+// card is set and logged once per collection (B5), then the log's cap is tested (B6). Card
+// bytes and the card log are read by the next collection (Gc.loop_cards)
+
+// B2
+fn store_slow(property_ref: ptr, new_value: ?ptr, old: ptr) {
     @unsafe
+    // The same value: the counted word keeps its tag
+    if old & (~prop_mask).to(uint) == new_value : return
+    #if GC_DEBUG
+    slow_path_check(property_ref, old)
+    #end
     gc.props_removed.add(old)
     @ptrv(property_ref, ?ptr) = new_value
     // The card before the cap test: a collection there must see the stored value
@@ -16,27 +24,22 @@ fn property_update_slow(on_object: ptr, property_ref: ptr, new_value: ?ptr, old:
 
 fn property_update(on_object: ptr, property_ref: ptr, new_value: ?ptr) $inline {
     @unsafe
-    if gcdata(on_object).is_not_new() {
-        let old = @ptrv(property_ref, ptr)
-        if old & prop_mask > 0 {
-            property_update_slow(on_object, property_ref, new_value, old)
-            return
-        }
-        @ptrv(property_ref, ?ptr) = new_value
-        if isset(new_value) && @ptrv(card_of(property_ref), u8) == 0 : card_slow(property_ref)
+    let old = @ptrv(property_ref, ptr)
+    if old & prop_mask > 0 {
+        store_slow(property_ref, new_value, old)
         return
     }
     @ptrv(property_ref, ?ptr) = new_value
+    if isset(new_value) && @ptrv(card_of(property_ref), u8) == 0 : card_slow(property_ref)
 }
 
-// A card test without a cap test: the log may pass its cap by these stores until the next
-// operation that tests it
+// The set walk of a union or aggregate store (B4): the word holds the new value already,
+// stripped by the caller. A card test without a cap test: the store's caller tests the cap
+// once after its last word (cap_test)
 fn property_set(on_object: ptr, property_ref: ptr, value: ?ptr) $inline {
     @unsafe
     @ptrv(property_ref, ?ptr) = value
-    if isset(value) && gcdata(on_object).is_not_new() && @ptrv(card_of(property_ref), u8) == 0 {
-        card_log_add(property_ref)
-    }
+    if isset(value) && @ptrv(card_of(property_ref), u8) == 0 : card_log_add(property_ref)
 }
 
 fn property_get(property_ref: ptr) ptr {
@@ -48,10 +51,20 @@ fn property_remove_slow(value: ptr) {
     gc.props_removed.add(value)
 }
 
+// The remove walk of a union or aggregate store (B4): records a counted word, writes nothing
 fn property_remove(on_object: ptr, property_ref: ptr) $inline {
     @unsafe
     let value = @ptrv(property_ref, ptr)
     if value & prop_mask > 0 : property_remove_slow(value)
+}
+
+// R1 for one reference word: records it when it is counted and writes 0. The caller tests
+// the cap once after the slot's last word (cap_test)
+fn property_release(on_object: ptr, property_ref: ptr) $inline {
+    @unsafe
+    let value = @ptrv(property_ref, ptr)
+    if value & prop_mask > 0 : property_remove_slow(value)
+    @ptrv(property_ref, uint) = 0
 }
 
 fn card_slow(property_ref: ptr) {
@@ -65,6 +78,7 @@ fn card_log_add(property_ref: ptr) {
     @unsafe
     let card = card_of(property_ref)
     #if GC_DEBUG
+    if !in_heap(property_ref) : panic("GC error: a card test outside the heap")
     if @ptrv(card, u8) != 0 : panic("GC error: a dirty card is logged again")
     #end
     @ptrv(card, u8) = 1
@@ -75,6 +89,11 @@ fn card_log_add(property_ref: ptr) {
 // soft cap runs at once, like one at the hard cap
 fn log_cap_test() $inline {
     if log_full : log_collect()
+}
+
+// B6 for the compiler's stores and the library's move sites
+fn cap_test() $inline {
+    log_cap_test()
 }
 
 fn log_collect() {
@@ -93,8 +112,6 @@ value range_switch (64)
 fn moved_elements(item: ptr, first: uint, count: uint) {
     @unsafe
     if count == 0 : return
-    // New storage is walked whole when a collection finds it
-    if !in_heap(item) || gcdata(item).is_new() : return
     let layout = desc_of(item).layout ?! return
     let stride = @ptrv(layout, uint, layout_stride)
     let adr: ptr = item + @ptrv(layout, uint, layout_data_offset) + first * stride
@@ -120,6 +137,44 @@ fn moved_elements(item: ptr, first: uint, count: uint) {
         })
         adr += stride
     }
+}
+
+// R3. Moves `count` elements of the sequence `item` from index `src` to index `dst`. First
+// the counted words of the destination elements that are no source elements are recorded
+// (a right shift past the length may overwrite a word a view stored there); then the move,
+// R4 over the destinations, zero bytes over the vacated elements (R2) and one cap test.
+// Nothing in between can collect
+fn gc_move(item: ptr, dst: uint, src: uint, count: uint) {
+    @unsafe
+    if count == 0 || dst == src : return
+    let layout = desc_of(item).layout ?! panic("gc_move: the storage has no reference layout")
+    let stride = @ptrv(layout, uint, layout_stride)
+    let base: ptr = item + @ptrv(layout, uint, layout_data_offset)
+    let g = gc
+    // Destinations that are no sources
+    let lo = dst
+    let hi = dst + count
+    if dst > src && dst < src + count : lo = src + count
+    if dst < src && hi > src : hi = src
+    let adr = base + lo * stride
+    while lo < hi {
+        each_field_ref(adr, layout, g.mark_list, fn(ref: ptr, list: *Lifo) {
+            @unsafe
+            let v = @ptrv(ref, uint)
+            if v & prop_mask != 0 : gc.props_removed.add(v.@cast(ptr))
+        })
+        adr += stride
+        lo++
+    }
+    mem.move_bytes(base + src * stride, base + dst * stride, count * stride)
+    moved_elements(item, dst, count)
+    // Sources that are no destinations
+    let v_lo = src
+    let v_hi = src + count
+    if dst > src && dst < v_hi : v_hi = dst
+    if dst < src && dst + count > src : v_lo = dst + count
+    mem.clear_bytes(base + v_lo * stride, (v_hi - v_lo) * stride)
+    log_cap_test()
 }
 
 #end

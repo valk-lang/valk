@@ -222,24 +222,16 @@ fn queue_dis_owned(item: GcItem, list: *Lifo) $inline {
 fn dis_own_rec(item: ptr) (uint, uint) {
     @unsafe
     if !should_dis_own(item) : return (0, 0)
-    return dis_own_loop(item, false)
+    return dis_own_loop(item)
 }
 
-// Removes ownership from everything a dead item owns while the item itself
-// keeps its state: used for storage that received ownership tags through
-// transfer_refs() but never became owned itself
-fn dis_own_children(item: ptr) (uint, uint) {
+fn dis_own_loop(item: ptr) (uint, uint) {
     @unsafe
-    return dis_own_loop(item, true)
+    if gc.mark_window_on : return dis_own_loop_window(item)
+    return dis_own_loop_direct(item)
 }
 
-fn dis_own_loop(item: ptr, children_only: bool) (uint, uint) {
-    @unsafe
-    if gc.mark_window_on : return dis_own_loop_window(item, children_only)
-    return dis_own_loop_direct(item, children_only)
-}
-
-fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
+fn dis_own_loop_direct(item: ptr) (uint, uint) {
     @unsafe
     let ml = gc.mark_list
     let disowned: uint = 0
@@ -249,20 +241,16 @@ fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
         let data = gcdata(item)
         let block = desc_of(item)
 
-        if children_only {
-            children_only = false
-        } else {
-            disowned++
-            data.set_new()
-            if data.has_co_in(block.isize) : gc.re_own_list.add_ptr(item)
+        disowned++
+        data.set_new()
+        if data.has_co_in(block.isize) : gc.re_own_list.add_ptr(item)
 
-            block.slots_used--
-            unmarked_bytes += block.isize
-            touch_block(block)
+        block.slots_used--
+        unmarked_bytes += block.isize
+        touch_block(block)
 
-            let onfree = block.onfree
-            if isset(onfree) : gc.blanks.add_ptr(item)
-        }
+        let onfree = block.onfree
+        if isset(onfree) : gc.blanks.add_ptr(item)
 
         let layout = block.layout
         if isset(layout) {
@@ -276,24 +264,12 @@ fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
     return (disowned, unmarked_bytes)
 }
 
-fn dis_own_loop_window(item: ptr, children_only: bool) (uint, uint) {
+fn dis_own_loop_window(item: ptr) (uint, uint) {
     @unsafe
     let g = gc
     let ml = g.mark_list
-    let disowned: uint = 0
-    let unmarked_bytes: uint = 0
-
-    if children_only {
-        let block = desc_of(item)
-        let layout = block.layout
-        if isset(layout) {
-            ml.reserve(block.isize / size_of(ptr))
-            each_ref(item, layout, ml, dis_own_push_ref)
-        }
-    } else {
-        disowned++
-        unmarked_bytes += dis_own_item(item, ml)
-    }
+    let disowned: uint = 1
+    let unmarked_bytes = dis_own_item(item, ml)
 
     // Slots leave the list through a window of mark_window entries: an entry's shadow byte and
     // object are prefetched when it enters and touched when it leaves. One in, one out, so the
@@ -381,40 +357,58 @@ fn dis_own_ref(ref: ptr) ?ptr $hot $inline {
     return null
 }
 
-// Ownership moves along: the tags of 'from' move to 'to' and 'from' keeps plain
-// references, so no element header is touched now or when 'from' dies. 'from' lost its
-// owner slot, so the next collection takes it for dead; when a view still uses it, that
-// collection marks it from the stack or re-owns it, which walks its slots and counts them
-// again. 'to' is new, so it is checked at the next collection: if nothing owns it by then,
-// the ownership it received is removed again (see Gc.loop_adopted)
-/// Moves the references held by `from` into the identically laid out GC allocation `to`.
-///
-/// The other bytes must already be copied. Used when a growing container moves its
-/// elements to a new block: ownership of the elements moves to `to` without re-marking
-/// them. Does nothing when `from` has no reference layout.
-+ fn transfer_refs(from: ptr, to: ptr) {
+// The growth of a sequence's storage (THEORY 5.5.9): `data_ref` is the container's storage
+// word, whose storage holds `count` elements; the new storage has room for `size`. It is
+// allocated first, the last point that can collect before the storage word is read. When
+// the container owns its storage, the new storage is claimed at once: the counted words move
+// to it with their tags, the old storage keeps plain words and is recorded as removed, and
+// every card of the new storage is dirty and covered by one range entry. Otherwise the
+// elements are copied stripped and the storage word is stored through the barrier
+fn gc_grow(data_ref: ptr, count: uint, size: uint) {
     @unsafe
-    let layout = desc_of(from).layout
-    if !isset(layout) : return
-    // The callback captures nothing: an environment allocation could start a
-    // collection halfway through the transfer
+    let first: ptr = (@ptrv(data_ref, uint) & (~prop_mask).to(uint)).@cast(ptr)
+    let layout = desc_of(first).layout ?! panic("gc_grow: the storage has no reference layout")
+    let stride = @ptrv(layout, uint, layout_stride)
+    let offset = @ptrv(layout, uint, layout_data_offset)
+    let bytes = offset + size * stride
+    let pool = get_typed_pool(bytes, layout)
+    let to = pool.large ? pool.get_large(bytes) : pool.get()
+    let zeroed = pool.zeroed
+    let w = @ptrv(data_ref, uint)
+    let from: ptr = (w & (~prop_mask).to(uint)).@cast(ptr)
     let g = gc
-    g.transfer_from = from
-    g.transfer_to = to
-    // 'from' stays owned when its owner tag was elsewhere (a view reached it first): the
-    // next collection scans its cards, so its plain references co-own the elements
-    g.transfer_cards = gcdata(from).is_not_new()
-    each_ref(from, layout, g.mark_list, fn(ref: ptr, list: *Lifo) {
-        let v = @ptrv(ref, ?ptr)
-        if !isset(v) : return
-        let to_ref: ptr = ((ref.@cast(uint) - gc.transfer_from) + gc.transfer_to).@cast(ptr)
-        @ptrv(to_ref, ptr) = v
-        @ptrv(ref, ptr) = v & (~prop_mask).to(uint)
-        if gc.transfer_cards : @ptrv(card_of(ref), u8) = 1
-    })
-    // One range entry covers the dirty cards; no cap test, as in moved_elements
-    if g.transfer_cards : g.card_log.add_ptr(from + 1)
-    if gcdata(to).is_new() : gc.adopted.add_ptr(to)
+    @ptrv(to, uint) = size
+    let src = from + offset
+    let dst = to + offset
+    if w & prop_mask == prop_owned {
+        mem.copy_bytes(src, dst, count * stride)
+        let adr = src
+        let end = src + count * stride
+        while adr < end {
+            each_field_ref(adr, layout, g.mark_list, fn(ref: ptr, list: *Lifo) {
+                @unsafe
+                @ptrv(ref, uint) = @ptrv(ref, uint) & (~prop_mask).to(uint)
+            })
+            adr += stride
+        }
+        if !zeroed : mem.clear_bytes(dst + count * stride, (size - count) * stride)
+        let desc = desc_of(to)
+        gcdata(to).own()
+        desc.slots_used++
+        g.mem_marked += desc.isize
+        @ptrv(data_ref, uint) = to | prop_owned
+        g.props_removed.add(from | prop_owned)
+        #if GC_DEBUG
+        g.growth_sources.add_ptr(from)
+        #end
+        cards_set(to, to + desc.isize)
+        g.card_log.add_ptr(to + 1)
+    } else {
+        copy_strip(src, dst, count, to)
+        if !zeroed : mem.clear_bytes(dst + count * stride, (size - count) * stride)
+        property_update(data_ref, data_ref, to)
+    }
+    log_cap_test()
 }
 
 /// Copies `count` elements from `from` to `to` with the ownership tags of their references
@@ -425,6 +419,10 @@ fn dis_own_ref(ref: ptr) ?ptr $hot $inline {
 + fn copy_strip(from: ptr, to: ptr, count: uint, storage: ptr) {
     @unsafe
     if count == 0 : return
+    #if GC_DEBUG
+    // R5 writes only into new storage
+    if gcdata(storage).is_not_new() : panic("GC error: copy_strip into an old storage")
+    #end
     let layout = desc_of(storage).layout ?! panic("copy_strip: the storage has no reference layout")
     let stride = @ptrv(layout, uint, layout_stride)
     mem.copy_bytes(from, to, count * stride)
