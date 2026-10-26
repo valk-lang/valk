@@ -2957,6 +2957,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn collect_if_threshold_reached() void
 // Collects shared memory when its usage reached the shared trigger and the GC is idle.
 + fn collect_shared_if_threshold_reached() void
+// Copies `count` elements from `from` to `to` with the ownership tags of their references removed, so the copy owns nothing until a collection walks it.
++ fn copy_strip(from: ptr, to: ptr, count: uint, storage: ptr) void
 // Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
 + fn fit_count(prefix: uint, item: uint, count: uint) uint
 // Takes the calling thread's GC lock again after `unlock`.

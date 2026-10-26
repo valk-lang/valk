@@ -9992,6 +9992,8 @@ one waited for the shared lock.
 + fn collect_if_threshold_reached() void
 // Collects shared memory when its usage reached the shared trigger and the GC is idle.
 + fn collect_shared_if_threshold_reached() void
+// Copies `count` elements from `from` to `to` with the ownership tags of their references removed, so the copy owns nothing until a collection walks it.
++ fn copy_strip(from: ptr, to: ptr, count: uint, storage: ptr) void
 // Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
 + fn fit_count(prefix: uint, item: uint, count: uint) uint
 // Takes the calling thread's GC lock again after `unlock`.
@@ -10053,6 +10055,14 @@ Does nothing while a collection is running or the GC is not idle.
 
 Collects shared memory when its usage reached the shared trigger and the GC is idle.
 
+### copy_strip
+
+Copies `count` elements from `from` to `to` with the ownership tags of their references
+removed, so the copy owns nothing until a collection walks it.
+
+Both point at elements of sequences laid out like `storage`, the GC allocation that
+holds `to`. Used to fill fresh storage from elements another storage owns.
+
 ### fit_count
 
 Returns the largest count of `item`-byte elements, at least `count`, whose storage of
@@ -10082,9 +10092,8 @@ Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared
 Moves the references held by `from` into the identically laid out GC allocation `to`.
 
 The other bytes must already be copied. Used when a growing container moves its
-elements to a new block: ownership of the elements moves to `to` without re-marking them,
-and `from` keeps its references only as co-owner. Does nothing when `from` has no
-reference layout.
+elements to a new block: ownership of the elements moves to `to` without re-marking
+them. Does nothing when `from` has no reference layout.
 
 ### unlock
 
