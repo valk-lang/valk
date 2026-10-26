@@ -11,10 +11,6 @@ global typed_pools: *Bump (@undefined)
 // Recently used typed pools, keyed by layout and size class
 global typed_pool_cache: [?*Pool x 128]
 
-value POOL_DATA_OFFSET ((size_of(ptr) * 12.to(uint)))
-// Distance from a slot's BlockMini to the block start
-value POOL_PUBLIC_OFFSET ((POOL_DATA_OFFSET - size_of(ptr) * 3))
-
 fn null_ptr() ptr {
     return null.@cast(ptr)
 }
@@ -92,7 +88,7 @@ fn find_typed_pool(index: uint, isize: uint, layout: ?ptr) *Pool {
             let slot = record + (index + 1) * size_of(ptr)
             let pool = @ptrv(slot, ?*Pool)
             if isset(pool) : return pool
-            pool = Pool.init(isize, layout, null)
+            pool = Pool.init_sequence(isize, layout)
             @ptrv(slot, *Pool) = pool
             return pool
         }
@@ -101,7 +97,7 @@ fn find_typed_pool(index: uint, isize: uint, layout: ?ptr) *Pool {
     record = typed_pools.get(record_size)
     mem.clear_bytes(record, record_size)
     @ptrv(record, ?ptr) = layout
-    let pool = Pool.init(isize, layout, null)
+    let pool = Pool.init_sequence(isize, layout)
     @ptrv(record + (index + 1) * size_of(ptr), *Pool) = pool
     return pool
 }
@@ -110,7 +106,7 @@ fn get_pool(i: uint, size: uint) *Pool {
     @unsafe
     let pool = @ptrv(pools, ?*Pool, i)
     if isset(pool) : return pool
-    pool = Pool.init(size, null, null)
+    pool = Pool.init_sequence(size, null)
     @ptrv(pools, *Pool, i) = pool
     return pool
 }
@@ -123,7 +119,7 @@ fn mark_alloc_limits(list: *Bump) {
         let alc = @ptrv(adr, *Pool)
         adr += size_of(ptr)
         let block = alc.block
-        if isset(block) : @ptrv(block, ptr, b_alloc_limit) = alc.item
+        if isset(block) : block.alloc_limit = alc.item
     }
 }
 
@@ -137,25 +133,7 @@ fn close_current_alloc_windows(list: *Bump) {
         let alc = @ptrv(adr, *Pool)
         adr += size_of(ptr)
         let block = alc.block
-        if isset(block) {
-            @ptrv(block, ptr, b_alloc_start) = @ptrv(block, ptr, b_alloc_limit)
-        }
-    }
-}
-
-// After a collection without a pool reset: nothing allocated so far belongs
-// to the next cycle
-fn close_alloc_windows(list: *Bump) {
-    let adr = list.data
-    let end = adr + list.index
-    while adr < end {
-        let alc = @ptrv(adr, *Pool)
-        adr += size_of(ptr)
-        let block = alc.first
-        while isset(block) {
-            @ptrv(block, ptr, b_alloc_start) = @ptrv(block, ptr, b_alloc_limit)
-            block = @ptrv(block, ?ptr, b_next)
-        }
+        if isset(block) : block.alloc_start = block.alloc_limit
     }
 }
 
@@ -164,6 +142,9 @@ fn close_alloc_windows(list: *Bump) {
 // reuse queue, unless it is empty and the pool keeps enough empty blocks
 fn settle_blocks(list: *Bump, pools: *Bump) {
     @unsafe
+    #if GC_DEBUG
+    heap_check(list)
+    #end
     // Between collections a reuse queue only shrinks: what is left in it was
     // not needed for a whole cycle, and the empty blocks among it are freed
     let adr = pools.data
@@ -178,7 +159,7 @@ fn settle_blocks(list: *Bump, pools: *Bump) {
     end = adr + list.index
     list.reset()
     while adr < end {
-        let block = @ptrv(adr, ptr)
+        let block = @ptrv(adr, *Desc)
         adr += size_of(ptr)
         settle_block(block)
     }
@@ -194,43 +175,57 @@ fn settle_blocks(list: *Bump, pools: *Bump) {
         let current = alc.block
         if isset(current) : touch_block(current)
     }
+    heap_note_usage()
 }
 
-fn settle_block(block: ptr) {
+fn settle_block(block: *Desc) {
     @unsafe
-    let state = @ptrv(block, uint, b_state) - bs_touched
-    @ptrv(block, ptr, b_alloc_start) = @ptrv(block, ptr, b_alloc_limit)
+    let state = block.state - bs_touched
+    block.alloc_start = block.alloc_limit
 
     #if GC_DEBUG
-    let isize = @ptrv(block, uint, b_isize)
-    let base = block + POOL_DATA_OFFSET
-    let last = base + @ptrv(block, uint, b_slots_total) * isize
+    let isize = block.isize
+    let base = block.first
+    let last = base + block.slots_total * isize
+    let live: uint = 0
     while base < last {
         let data: *GcData = base
         if data.is_new() {
             if data.co_count != 0 : panic("GC error: item with state 'new' has a co_count > 0")
             if data.flags != 0 : panic("GC error: item with state 'new' contains 'flag' bits")
             poison_slot(base, isize)
+        } else {
+            live++
         }
         base += isize
     }
+    if live != block.slots_used : panic("GC error: a block's live count differs from its slots")
     #end
 
     // Marked for freeing already: stays that way until a prune frees it
     if (state & bs_free) != 0 {
-        @ptrv(block, uint, b_state) = state
+        block.state = state
         return
     }
-    let pool = @ptrv(block, *Pool, b_pool)
-    let used = @ptrv(block, uint, b_slots_used)
-    let total = @ptrv(block, uint, b_slots_total)
+    let pool: *Pool = block.pool
+    let used = block.slots_used
+    // A large object is freed at the settle that finds it dead
+    if (block.kind & desc_large) != 0 {
+        if used == 0 {
+            state = state | bs_free
+            pool.prune = true
+        }
+        block.state = state
+        return
+    }
+    let total = block.slots_total
     // The current block is settled once the allocator left it
     if (state & bs_queued) != 0 || pool.block == block || used * 100 / total > 95 {
-        @ptrv(block, uint, b_state) = state
+        block.state = state
         return
     }
     if used == 0 && pool.empty_queued >= pool.entered + 4 {
-        @ptrv(block, uint, b_state) = state | bs_free
+        block.state = state | bs_free
         pool.prune = true
         return
     }
@@ -239,7 +234,7 @@ fn settle_block(block: ptr) {
         state = state | bs_empty
         pool.empty_queued++
     }
-    @ptrv(block, uint, b_state) = state
+    block.state = state
     pool.reuse.add_ptr(block)
 }
 
@@ -254,16 +249,17 @@ fn leak_check_pools(list: *Bump) {
 }
 
 struct Pool {
-    blockc: uint
-    first: ?ptr
-    block: ?ptr
+    // Pages of the next block: 1, doubling up to 8
+    pages: uint (1)
+    first: ?*Desc
+    block: ?*Desc
     item: ptr (null_ptr())
     last: ptr (null_ptr())
     layout: ?ptr
     onfree: ?fnptr(ptr)()
     env_clone: ?EnvCloneFn
     isize: uint (0)
-    // Blocks with room, filled by the collections, taken before a new block
+    // Reuse queue: blocks with room, filled by the collections, taken before a new block
     reuse: *Bump (Bump.new())
     // Empty blocks among them
     empty_queued: uint (0)
@@ -272,6 +268,13 @@ struct Pool {
     entered: uint (0)
     // Blocks marked bs_free wait in the block list
     prune: bool (false)
+    // Each item is a large object with its own page run
+    large: bool (false)
+    // Runtime-sized storage (see desc_seq)
+    sequence: bool (false)
+    // The slots the cursor has not reached are zero: the current block came from pre-zeroed
+    // pages, or the last large object did
+    zeroed: bool (false)
 
     /// Creates a pool for items of `size` bytes and registers it with the thread's allocators.
     ///
@@ -285,14 +288,21 @@ struct Pool {
             isize: size + 8
             first: null
             block: null
-            blockc: size < 512 ? 4 : 1
             layout: layout
             onfree: onfree
             env_clone: env_clone
+            large: size + 8 > LARGE_SLOT
         })
         alc_list.add_ptr(p)
 
         return p
+    }
+
+    static fn init_sequence(size: uint, layout: ?ptr) *Pool {
+        @unsafe
+        let pool = Pool.init(size, layout, null)
+        pool.sequence = true
+        return pool
     }
 
     fn free() {
@@ -301,62 +311,79 @@ struct Pool {
         mem.free(this)
     }
 
-    static fn create_block(size: uint, isize: uint, layout: ?ptr, onfree: ?fnptr(ptr)(), env_clone: ?EnvCloneFn, pool: ptr) ptr {
+    // A block of 1-8 pages, at least one slot
+    fn new_block() *Desc {
         @unsafe
-        let max: uint = 65000 / isize
-        if max > 256 : max = 256
-        if size > max : size = max
-        if size == 0 : size = 1
-        let alloc_size: uint = size * isize + POOL_DATA_OFFSET
-        // A one-slot block holds a large item: calloc gets pages that are zero already
-        // from the OS, so `alloc_typed_zeroed` can skip clearing it (see `fresh_slot`)
-        let b = size == 1 ? ext.calloc(1, alloc_size) : ext.malloc(alloc_size)
-        let address: uint = b
-        if address == 0 : panic("Memory allocation failed")
-        // Settings
-        @ptrv(b, ?ptr, b_next) = null
-        @ptrv(b, uint, b_slots_total) = size
-        @ptrv(b, uint, b_isize) = isize
-        @ptrv(b, uint, b_slots_used) = 0
-        @ptrv(b, ?ptr, b_layout) = layout
-        @ptrv(b, ?ptr, b_onfree) = onfree.@cast(?ptr)
-        @ptrv(b, ?ptr, b_env_clone) = env_clone.@cast(?ptr)
-        @ptrv(b, ptr, b_alloc_start) = b + POOL_DATA_OFFSET
-        @ptrv(b, ptr, b_alloc_limit) = b + POOL_DATA_OFFSET
-        @ptrv(b, uint, b_state) = 0
-        @ptrv(b, ptr, b_pool) = pool
-        register_block(b, alloc_size)
+        let isize = this.isize
+        let pages = this.pages
+        let min = (isize + PAGE_SIZE - 1) / PAGE_SIZE
+        if pages < min : pages = min
+        if this.pages < BLOCK_PAGES_MAX : this.pages = this.pages * 2
+        let first, zeroed = heap_carve(pages)
+        let block = this.new_desc(first, pages, isize)
+        block.slots_total = pages * PAGE_SIZE / isize
+        block.recip = ((1.to(uint) << 32) + isize - 1) / isize
+        block.fresh = zeroed
+        heap_map(block)
+        block.next = this.first
+        this.first = block
 
-        // Set offsets
-        let data = b + POOL_DATA_OFFSET
         let i: uint = 0
-        while i < size {
-            let offset = i * isize
-            let item: ptr = data + offset
-            @ptrv(item, u64) = 0
-            let data: *GcData = item
-            data.offset = offset.to(u16) + POOL_PUBLIC_OFFSET.to(u16)
+        let item = first
+        while i < block.slots_total {
+            if !zeroed : @ptrv(item, u64) = 0
             #if GC_DEBUG
             poison_fill(item, isize)
             #end
+            item += isize
             i++
         }
-        // Track memory usage
-        gc.mem_usage_thread += alloc_size
-        let usage = mem_usage_shared + alloc_size
-        mem_usage_shared = usage
-        if usage > mem_usage_peak : mem_usage_peak = usage
-        //
-        return b
+        heap_note_usage()
+        return block
     }
 
-    // Whether `item` is the only slot of the block this pool created last, which `create_block`
-    // allocated with calloc; callers check that the block was created by their own `get`
-    fn fresh_slot(item: ptr) bool {
+    fn new_desc(first: ptr, pages: uint, isize: uint) *Desc {
         @unsafe
-        let block = this.first ?! return false
-        if @ptrv(block, uint, b_slots_total) != 1 : return false
-        return item == block + POOL_DATA_OFFSET + 8
+        let desc = desc_new()
+        desc.first = first
+        desc.pages = pages
+        desc.isize = isize
+        desc.layout = this.layout
+        desc.onfree = this.onfree
+        desc.env_clone = this.env_clone
+        desc.alloc_start = first
+        desc.alloc_limit = first
+        desc.pool = this.@cast(ptr)
+        desc.kind = this.sequence ? desc_seq : 0
+        return desc
+    }
+
+    // One item with a page run of its own. Pacing comes first: a collection here runs
+    // before the object exists
+    fn get_large() ptr {
+        @unsafe
+        let isize = this.isize
+        collect_for(isize)
+        gc.mem_new += isize
+        let pages = (isize + PAGE_SIZE - 1) / PAGE_SIZE
+        let first, zeroed = heap_carve(pages)
+        let desc = this.new_desc(first, pages, isize)
+        desc.slots_total = 1
+        desc.kind = desc.kind | desc_large
+        // Young until the next collection
+        desc.alloc_limit = first + isize
+        heap_map(desc)
+        desc.next = this.first
+        this.first = desc
+        touch_block(desc)
+        if !zeroed : @ptrv(first, u64) = 0
+        #if GC_DEBUG
+        poison_fill(first, isize)
+        poison_verify(first, isize, 2)
+        #end
+        this.zeroed = zeroed
+        heap_note_usage()
+        return first + 8
     }
 
     fn get_vtable() ptr $hot {
@@ -390,11 +417,10 @@ struct Pool {
 
     fn get_slow() ptr $hot {
         @unsafe
+        if this.large : return this.get_large()
         let isize = this.isize
         if this.block == null {
-            let block = Pool.create_block(this.blockc * 2, isize, this.layout, this.onfree, this.env_clone, this.@cast(ptr))
-            this.first = block
-            this.enter_block(block)
+            this.enter_block(this.new_block())
         }
 
         let item = this.item
@@ -435,34 +461,28 @@ struct Pool {
         panic("Failed to allocate memory")
     }
 
-    fn set_next_block(block: ptr) {
+    fn set_next_block(block: *Desc) {
         @unsafe
         // Every slot of the block we leave was handed out this cycle
-        @ptrv(block, ptr, b_alloc_limit) = this.last
+        block.alloc_limit = this.last
         // A block a collection found room in, or a new one. One allocated
         // into this cycle waits for the next collection to settle it: its
         // window must not cover the slots it frees
         let reuse = this.reuse
-        let next: ?ptr = null
+        let next: ?*Desc = null
         while reuse.index > 0 {
             reuse.index -= size_of(ptr)
-            let b = @ptrv(reuse.data + reuse.index, ptr)
-            let state = @ptrv(b, uint, b_state)
+            let b = @ptrv(reuse.data + reuse.index, *Desc)
+            let state = b.state
             if (state & bs_empty) != 0 : this.empty_queued--
             state = state & (bs_touched | bs_free)
-            @ptrv(b, uint, b_state) = state
+            b.state = state
             if (state & (bs_touched | bs_free)) != 0 : continue
-            if @ptrv(b, uint, b_slots_used) * 100 / @ptrv(b, uint, b_slots_total) > 95 : continue
+            if b.slots_used * 100 / b.slots_total > 95 : continue
             next = b
             break
         }
-        if !isset(next) {
-            let blockc = ++this.blockc
-            let new = Pool.create_block(blockc * blockc, this.isize, this.layout, this.onfree, this.env_clone, this.@cast(ptr))
-            @ptrv(new, ?ptr, b_next) = this.first
-            this.first = new
-            next = new
-        }
+        if !isset(next) : next = this.new_block()
         this.enter_block(next ?! panic("Pool has no next block"))
 
         // GC check
@@ -471,21 +491,22 @@ struct Pool {
 
     // A block the allocator starts on: nothing in it was allocated this cycle,
     // so its window opens at its first slot
-    fn enter_block(block: ptr) {
+    fn enter_block(block: *Desc) {
         @unsafe
-        let data = block + POOL_DATA_OFFSET
-        @ptrv(block, ptr, b_alloc_start) = data
-        @ptrv(block, ptr, b_alloc_limit) = data
+        block.alloc_start = block.first
+        block.alloc_limit = block.first
         touch_block(block)
         this.entered++
+        this.zeroed = block.fresh
+        block.fresh = false
         this.set_block(block)
     }
 
-    fn set_block(block: ?ptr) {
+    fn set_block(block: ?*Desc) {
         this.block = block
         if isset(block) {
-            this.item = block + POOL_DATA_OFFSET
-            this.last = block + POOL_DATA_OFFSET + @ptrv(block, uint, b_slots_total) * this.isize
+            this.item = block.first
+            this.last = block.first + block.slots_total * this.isize
         } else {
             // The cursor must not point into a block that was just released
             this.item = null.@cast(ptr)
@@ -502,40 +523,36 @@ struct Pool {
         let kept: uint = 0
         let i: uint = 0
         while i < count {
-            let b = @ptrv(base, ptr, i)
+            let b = @ptrv(base, *Desc, i)
             i++
-            let state = @ptrv(b, uint, b_state)
+            let state = b.state
             // One freed from in this collection is settled later
-            if @ptrv(b, uint, b_slots_used) == 0 && (state & bs_touched) == 0 {
+            if b.slots_used == 0 && (state & bs_touched) == 0 {
                 if (state & bs_empty) != 0 : this.empty_queued--
-                @ptrv(b, uint, b_state) = state - (state & (bs_queued | bs_empty)) + bs_free
+                b.state = state - (state & (bs_queued | bs_empty)) + bs_free
                 this.prune = true
                 continue
             }
-            @ptrv(base, ptr, kept) = b
+            @ptrv(base, *Desc, kept) = b
             kept++
         }
         reuse.index = kept * size_of(ptr)
     }
 
-    // Frees the blocks a collection marked bs_free: empty, and not needed in
-    // the last cycle or with enough empty ones queued already
+    // Gives the pages of the blocks a collection marked bs_free back to the heap: empty
+    // blocks not needed in the last cycle or with enough empty ones queued already, and
+    // dead large objects
     fn prune_blocks() {
         @unsafe
         this.prune = false
-        let prev: ?ptr = null
+        let prev: ?*Desc = null
         let block = this.first
         while isset(block) {
-            let next = @ptrv(block, ?ptr, b_next)
-            if (@ptrv(block, uint, b_state) & bs_free) != 0 {
-                if isset(prev) : @ptrv(prev, ?ptr, b_next) = next
+            let next = block.next
+            if (block.state & bs_free) != 0 {
+                if isset(prev) : prev.next = next
                 else : this.first = next
-                let alloc_size = @ptrv(block, uint, b_slots_total) * this.isize + POOL_DATA_OFFSET
-                gc.mem_usage_thread -= alloc_size
-                mem_usage_shared -= alloc_size
-                unregister_block(block)
-                mem.free(block)
-                this.blockc--
+                heap_release(block)
             } else {
                 prev = block
             }
@@ -545,18 +562,11 @@ struct Pool {
 
     fn leak_check() {
         @unsafe
-        let block = this.first
-        if block == null : return
-
         let isize = this.isize
-
-        while block != null {
-            let b = block ?! break
-            let next = @ptrv(b, ?ptr, b_next)
-            let total = @ptrv(b, uint, b_slots_total)
-
-            let base = b + POOL_DATA_OFFSET
-            let end = base + total * isize
+        let block = this.first
+        while isset(block) {
+            let base = block.first
+            let end = base + block.slots_total * isize
             while base < end {
                 let data: *GcData = base
                 if data.is_new() {
@@ -573,8 +583,7 @@ struct Pool {
                 }
                 base += isize
             }
-
-            block = next
+            block = block.next
         }
     }
 }
@@ -658,8 +667,7 @@ fn poison_verify(item: ptr, isize: uint, where: uint) {
     print(" bad_words=")
     bad.print(10)
     print(" layout=0x")
-    let block = gcdata(p).block()
-    let lay: uint = block.layout.@cast(uint)
+    let lay: uint = desc_of(p).layout.@cast(uint)
     lay.print(16)
     print("\n")
     let start: uint = first > 64 ? first - 64 : 0

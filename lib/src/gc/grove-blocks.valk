@@ -2,24 +2,47 @@
 
 #if GROVE
 
+use ext
 use mem
 
-value b_next (0)
-value b_slots_total (1)
-// Word 2 is unused (the owning thread in Valk's collector)
-value b_isize (3)
-value b_slots_used (4)
-value b_layout (5)
-value b_onfree (6)
-value b_env_clone (7)
-// Slots allocated since the last collection: [alloc_start, alloc_limit)
-value b_alloc_start (8)
-value b_alloc_limit (9)
-// Bits below, and the pool the block belongs to
-value b_state (10)
-value b_pool (11)
+// Grove's heap. One reservation at a fixed address holds the heap, its shadow (a >> 3) and
+// its card table ((a >> 7) + 0x800). 2 MiB chunks are made writable in address order.
+// Blocks (1-8 pages) and large objects are page runs; the page table names the descriptor
+// of every page in use, so a word resolves to its slot without a search
+value HEAP_BASE (0x200000000000)
+value HEAP_MAX (64 * 1024 * 1024 * 1024)
+value PAGE_SIZE (4096)
+value PAGE_SHIFT (12)
+value CHUNK_SIZE (2 * 1024 * 1024)
+value CHUNK_PAGES (512)
+value CHUNK_SHIFT (21)
+value BLOCK_PAGES_MAX (8)
+// A slot (item and header) above this size is a large object with a page run of its own
+value LARGE_SLOT (8192 + 8)
+// The first chunks keep 4 KiB pages, so a small program stays small
+value SMALL_CHUNKS (4)
+// Free chunks kept for reuse before idle ones go back to the OS
+value RETAIN_MIN (4 * 1024 * 1024)
 
-// Listed in the thread's touched blocks: allocated into or freed from since
+value MAP_FLAGS (0x2 | 0x20 | 0x4000) // private, anonymous, no reserve
+value MAP_FIXED_NOREPLACE (0x100000)
+value MADV_DONTNEED (4)
+value MADV_HUGEPAGE (14)
+value MADV_NOHUGEPAGE (15)
+value RLIMIT_AS (9)
+
+// Chunk states: collections the chunk was wholly free for (0-3), and flags
+value chunk_idle_mask (3)
+value chunk_free_now (64)
+value chunk_returned (128)
+
+// Descriptor kinds
+value desc_large (1)
+// Runtime-sized storage: a word at a slot start also names the slot before it
+value desc_seq (2)
+
+// Block states
+// Listed in the touched blocks: allocated into or freed from since
 // the last collection, which settles only those blocks
 value bs_touched (1)
 // In its pool's reuse queue
@@ -32,223 +55,477 @@ value bs_free (8)
 /// A pool callback that clones a closure environment allocated from that pool.
 type EnvCloneFn (fnptr(ptr)(ptr))
 
-struct Block {
-    next: ?ptr
+// A block or a large object
+struct Desc {
+    first: ptr          // first slot, page-aligned
+    isize: uint         // slot size, header included
+    recip: uint         // ceil(2^32 / isize): slot index = offset * recip >> 32
     slots_total: uint
-    unused: ?ptr
-    // Mini
-    isize: uint
-    slots_used: uint
+    slots_used: uint    // slots whose header is not new
     layout: ?ptr
     onfree: ?fnptr(ptr)()
     env_clone: ?EnvCloneFn
+    // Slots allocated since the last collection: [alloc_start, alloc_limit)
     alloc_start: ptr
     alloc_limit: ptr
     state: uint
     pool: ptr
+    next: ?*Desc        // the pool's blocks
+    pages: uint
+    kind: uint
+    fresh: bool         // pre-zeroed pages, never allocated from
 }
 
-struct BlockMini {
-    isize: uint
-    slots_used: uint
-    layout: ?ptr
-    onfree: ?fnptr(ptr)()
-    env_clone: ?EnvCloneFn
-    alloc_start: ptr
-    alloc_limit: ptr
-    state: uint
-    pool: ptr
+// A run of free pages, counted from HEAP_BASE
+struct FreeRun {
+    start: uint
+    pages: uint
+    zeroed: bool
 }
 
-// Lists the block in the thread's touched blocks, once per collection
-fn touch_block(block: ptr) $inline {
-    @unsafe
-    let state = @ptrv(block, uint, b_state)
+// Set in heap_init only: the program assigns global initial values after the gc started
+@shared heap_size: uint         // R: bytes reserved
+@shared heap_top: uint          // bytes of the chunks taken
+@shared heap_used: uint         // bytes of the blocks and large objects
+@shared page_table: ptr         // ?*Desc per page
+@shared chunk_states: ptr       // u8 per chunk
+@shared free_runs: *Bump (@undefined) // FreeRun records, ordered by address
+@shared descs_free: ?*Desc
+@shared descs_slab: ptr
+@shared descs_slab_left: uint
+@shared thp_madvise: u8         // 0 unknown, 1 madvise huge pages, 2 leave them to the kernel
+
+fn heap_init() {
+    let size: uint = HEAP_MAX
+    let limit: [uint x 2] = @undefined
+    if ext.getrlimit(RLIMIT_AS, @ref(limit)) == 0 && limit[0] != (~0).to(uint) {
+        // Half of the address space limit, the rest stays for the program
+        let half = (limit[0] / 2) & (~(CHUNK_SIZE - 1)).to(uint)
+        if half < size : size = half
+    }
+    if size < SMALL_CHUNKS * CHUNK_SIZE : heap_fail()
+    heap_reserve(HEAP_BASE, size)
+    heap_reserve(HEAP_BASE >> 3, size >> 3)
+    heap_reserve(HEAP_BASE >> 7, (size >> 7) + 0x1000)
+    let table = ext.mmap(null, size >> 9, 0, MAP_FLAGS, -1, 0)
+    let address: uint = table
+    if address == (~0).to(uint) : heap_fail()
+    page_table = table
+    chunk_states = ext.calloc(size >> CHUNK_SHIFT, 1)
+    free_runs = Bump.new(64 * size_of(FreeRun))
+    heap_size = size
+    // The shadow of the first 16 MiB of heap keeps 4 KiB pages
+    ext.madvise((HEAP_BASE >> 3).@cast(ptr), CHUNK_SIZE, MADV_NOHUGEPAGE)
+}
+
+fn heap_reserve(at: uint, size: uint) {
+    let p = ext.mmap(at.@cast(ptr), size, 0, MAP_FLAGS | MAP_FIXED_NOREPLACE, -1, 0)
+    let got: uint = p
+    if got == at : return
+    // A kernel without MAP_FIXED_NOREPLACE takes the address as a hint
+    if got != (~0).to(uint) : ext.munmap(p, size)
+    heap_fail()
+}
+
+fn heap_fail() $exit {
+    panic("Grove cannot reserve its heap at 0x200000000000: the address space limit (RLIMIT_AS) is too small or the range is in use")
+}
+
+fn heap_commit(at: uint, size: uint) {
+    if ext.mprotect(at.@cast(ptr), size, 0x1 | 0x2) != 0 : panic("Grove cannot commit heap memory")
+}
+
+// Whether a word points below the chunks taken: only those pages have page table entries
+fn in_heap(item: ptr) bool $inline {
+    let a: uint = item
+    return a - HEAP_BASE < heap_top
+}
+
+// The descriptor of an object in the heap
+fn desc_of(item: ptr) *Desc $inline {
+    let a: uint = item
+    return @ptrv(page_table, *Desc, (a - HEAP_BASE) >> PAGE_SHIFT)
+}
+
+fn heap_take_chunks(count: uint) {
+    let size = count * CHUNK_SIZE
+    if heap_top + size > heap_size : panic("Grove's heap is full")
+    let at = HEAP_BASE + heap_top
+    heap_commit(at, size)
+    heap_commit(at >> 3, size >> 3)
+    heap_commit(page_table + (heap_top >> 9), size >> 9)
+    let chunk = heap_top >> CHUNK_SHIFT
+    let end = chunk + count
+    while chunk < end {
+        let adr = (HEAP_BASE + chunk * CHUNK_SIZE).@cast(ptr)
+        if chunk < SMALL_CHUNKS : ext.madvise(adr, CHUNK_SIZE, MADV_NOHUGEPAGE)
+        else if thp_wants_madvise() : ext.madvise(adr, CHUNK_SIZE, MADV_HUGEPAGE)
+        chunk++
+    }
+    let first_page = heap_top >> PAGE_SHIFT
+    heap_top += size
+    free_insert(first_page, count * CHUNK_PAGES, true)
+}
+
+// Under `enabled = always` huge pages come without asking. Under `madvise` they are asked
+// for only when `defrag` does not stall on them (defer or never)
+fn thp_wants_madvise() bool {
+    if thp_madvise == 0 {
+        thp_madvise = 2
+        if thp_setting_has("/sys/kernel/mm/transparent_hugepage/enabled", "[madvise]") {
+            let defrag = "/sys/kernel/mm/transparent_hugepage/defrag"
+            if thp_setting_has(defrag, "[defer]") || thp_setting_has(defrag, "[never]") : thp_madvise = 1
+        }
+    }
+    return thp_madvise == 1
+}
+
+fn thp_setting_has(path: String, word: String) bool {
+    let fd = ext.open(path.data_cstring, 0)
+    if fd < 0 : return false
+    let buf: [u8 x 128] = @undefined
+    let len = ext.read(fd, @ref(buf), 128)
+    ext.close(fd)
+    if len <= 0 : return false
+    let n: uint = len.to(uint)
+    let i: uint = 0
+    while i + word.bytes <= n {
+        if mem.equals_bytes(@ref(buf) + i, word.data, word.bytes) : return true
+        i++
+    }
+    return false
+}
+
+// Takes `pages` free pages, the lowest that fit, and whether they are zero
+fn heap_carve(pages: uint) (ptr, bool) {
+    let start, zeroed = free_take(pages)
+    if start == (~0).to(uint) {
+        heap_take_chunks((pages + CHUNK_PAGES - 1) / CHUNK_PAGES)
+        let again, again_zeroed = free_take(pages)
+        if again == (~0).to(uint) : panic("Grove: no free pages after taking chunks (bug)")
+        start = again
+        zeroed = again_zeroed
+    }
+    // The chunks are in use again
+    let chunk = start >> (CHUNK_SHIFT - PAGE_SHIFT)
+    let last = (start + pages - 1) >> (CHUNK_SHIFT - PAGE_SHIFT)
+    while chunk <= last {
+        @ptrv(chunk_states, u8, chunk) = 0
+        chunk++
+    }
+    heap_used += pages * PAGE_SIZE
+    return ((HEAP_BASE + start * PAGE_SIZE).@cast(ptr), zeroed)
+}
+
+// Makes every page of the descriptor's run name it
+fn heap_map(desc: *Desc) {
+    let a: uint = desc.first
+    let page = (a - HEAP_BASE) >> PAGE_SHIFT
+    let end = page + desc.pages
+    while page < end {
+        @ptrv(page_table, *Desc, page) = desc
+        page++
+    }
+}
+
+// Gives a descriptor's pages back to the free runs and releases the descriptor
+fn heap_release(desc: *Desc) {
+    let a: uint = desc.first
+    let start = (a - HEAP_BASE) >> PAGE_SHIFT
+    let pages = desc.pages
+    let page = start
+    while page < start + pages {
+        @ptrv(page_table, ?*Desc, page) = null
+        page++
+    }
+    heap_used -= pages * PAGE_SIZE
+    free_insert(start, pages, false)
+    desc.next = descs_free
+    descs_free = desc
+}
+
+fn heap_note_usage() {
+    let used = heap_used
+    mem_usage_shared = used
+    if used > mem_usage_peak : mem_usage_peak = used
+    gc.mem_usage_thread = used
+}
+
+fn desc_new() *Desc {
+    let desc = descs_free
+    if isset(desc) {
+        descs_free = desc.next
+        mem.clear_bytes(desc, size_of(Desc))
+        return desc
+    }
+    if descs_slab_left == 0 {
+        descs_slab = mem.calloc(64 * size_of(Desc))
+        descs_slab_left = 64
+    }
+    let slot: *Desc = descs_slab
+    descs_slab += size_of(Desc)
+    descs_slab_left--
+    return slot
+}
+
+//////////////////////////
+// Free page runs
+//////////////////////////
+
+fn free_count() uint $inline {
+    return free_runs.index / size_of(FreeRun)
+}
+
+fn free_run(i: uint) *FreeRun $inline {
+    return free_runs.data + i * size_of(FreeRun)
+}
+
+fn free_insert_at(i: uint, start: uint, pages: uint, zeroed: bool) {
+    let count = free_count()
+    free_runs.get(size_of(FreeRun))
+    if i < count : mem.move_bytes(free_run(i), free_run(i + 1), (count - i) * size_of(FreeRun))
+    @ptrv(free_run(i), FreeRun) = FreeRun { start: start, pages: pages, zeroed: zeroed }
+}
+
+fn free_remove(i: uint, n: uint) {
+    let count = free_count()
+    if i + n < count : mem.move_bytes(free_run(i + n), free_run(i), (count - i - n) * size_of(FreeRun))
+    free_runs.index -= n * size_of(FreeRun)
+}
+
+// Adds a run, coalesced with its free neighbours; a coalesced run is zero only if both were
+fn free_insert(start: uint, pages: uint, zeroed: bool) {
+    let count = free_count()
+    let lo: uint = 0
+    let hi = count
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if free_run(mid).start < start : lo = mid + 1
+        else : hi = mid
+    }
+    let i = lo
+    #if GC_DEBUG
+    if i > 0 && free_run(i - 1).start + free_run(i - 1).pages > start : panic("GC error: freed pages overlap a free run")
+    if i < count && start + pages > free_run(i).start : panic("GC error: freed pages overlap a free run")
+    #end
+    if i > 0 {
+        let prev = free_run(i - 1)
+        if prev.start + prev.pages == start {
+            prev.pages += pages
+            prev.zeroed = prev.zeroed && zeroed
+            if i < count {
+                let next = free_run(i)
+                if start + pages == next.start {
+                    prev.pages += next.pages
+                    prev.zeroed = prev.zeroed && next.zeroed
+                    free_remove(i, 1)
+                }
+            }
+            free_coalesce(i - 1)
+            return
+        }
+    }
+    if i < count {
+        let next = free_run(i)
+        if start + pages == next.start {
+            next.start = start
+            next.pages += pages
+            next.zeroed = next.zeroed && zeroed
+            free_coalesce(i)
+            return
+        }
+    }
+    free_insert_at(i, start, pages, zeroed)
+}
+
+// Touching runs differ in their zero flag. A merge can clear the flag of run i, so it may
+// now match a neighbour's
+fn free_coalesce(i: uint) {
+    let run = free_run(i)
+    if i + 1 < free_count() {
+        let next = free_run(i + 1)
+        if run.start + run.pages == next.start && run.zeroed == next.zeroed {
+            run.pages += next.pages
+            free_remove(i + 1, 1)
+        }
+    }
+    if i > 0 {
+        let prev = free_run(i - 1)
+        if prev.start + prev.pages == run.start && prev.zeroed == run.zeroed {
+            prev.pages += run.pages
+            free_remove(i, 1)
+        }
+    }
+}
+
+// First fit by address. Runs that touch (split by a returned chunk) are taken together.
+// Returns the first page, or ~0 when nothing fits
+fn free_take(pages: uint) (uint, bool) {
+    let count = free_count()
+    let i: uint = 0
+    while i < count {
+        let span = free_run(i).pages
+        let j = i
+        while span < pages && j + 1 < count && free_run(j).start + free_run(j).pages == free_run(j + 1).start {
+            j++
+            span += free_run(j).pages
+        }
+        if span < pages {
+            i = j + 1
+            continue
+        }
+        let start = free_run(i).start
+        let zeroed = true
+        let left = pages
+        let k = i
+        while left > 0 {
+            let run = free_run(k)
+            zeroed = zeroed && run.zeroed
+            if run.pages <= left {
+                left -= run.pages
+                k++
+            } else {
+                run.start += left
+                run.pages -= left
+                left = 0
+            }
+        }
+        if k > i : free_remove(i, k - i)
+        return (start, zeroed)
+    }
+    return ((~0).to(uint), false)
+}
+
+//////////////////////////
+// Chunks back to the OS
+//////////////////////////
+
+// After a collection: a chunk that lay wholly in free pages for 2 collections goes back to
+// the OS, with its shadow, once more than `retain` bytes of free chunks are kept
+fn heap_return_idle(retain: uint) {
+    let chunks = heap_top >> CHUNK_SHIFT
+    let count = free_count()
+    let i: uint = 0
+    while i < count {
+        let run = free_run(i)
+        let chunk = (run.start + CHUNK_PAGES - 1) / CHUNK_PAGES
+        let end = (run.start + run.pages) / CHUNK_PAGES
+        while chunk < end {
+            @ptrv(chunk_states, u8, chunk) = @ptrv(chunk_states, u8, chunk) | chunk_free_now
+            chunk++
+        }
+        i++
+    }
+    let kept: uint = 0
+    let chunk: uint = 0
+    while chunk < chunks {
+        let state = @ptrv(chunk_states, u8, chunk).to(uint)
+        if (state & chunk_free_now) == 0 {
+            @ptrv(chunk_states, u8, chunk) = 0
+            chunk++
+            continue
+        }
+        state = state - chunk_free_now
+        if (state & chunk_returned) == 0 {
+            let idle = state & chunk_idle_mask
+            if idle < chunk_idle_mask : idle++
+            state = idle
+            kept += CHUNK_SIZE
+            if kept > retain && idle >= 2 {
+                heap_return_chunk(chunk)
+                kept -= CHUNK_SIZE
+                state = chunk_returned
+            }
+        }
+        @ptrv(chunk_states, u8, chunk) = state.to(u8)
+        chunk++
+    }
+}
+
+fn heap_return_chunk(chunk: uint) {
+    let at = HEAP_BASE + chunk * CHUNK_SIZE
+    ext.madvise(at.@cast(ptr), CHUNK_SIZE, MADV_DONTNEED)
+    let shadow = (at >> 3).@cast(ptr)
+    ext.madvise(shadow, CHUNK_SIZE >> 3, MADV_DONTNEED)
+    ext.madvise(shadow, CHUNK_SIZE >> 3, MADV_NOHUGEPAGE)
+    // Only the chunk's part of its free run is zero now
+    let start = chunk * CHUNK_PAGES
+    let count = free_count()
+    let i: uint = 0
+    while i < count {
+        let run = free_run(i)
+        if run.start <= start && start < run.start + run.pages {
+            if run.zeroed : return
+            let run_start = run.start
+            let run_end = run.start + run.pages
+            free_remove(i, 1)
+            let at_index = i
+            if run_start < start {
+                free_insert_at(at_index, run_start, start - run_start, false)
+                at_index++
+            }
+            free_insert_at(at_index, start, CHUNK_PAGES, true)
+            if start + CHUNK_PAGES < run_end : free_insert_at(at_index + 1, start + CHUNK_PAGES, run_end - start - CHUNK_PAGES, false)
+            // A returned neighbour is zero too
+            free_coalesce(at_index)
+            return
+        }
+        i++
+    }
+    panic("GC error: a returned chunk is not in a free run")
+}
+
+// Touched blocks are listed once per collection
+fn touch_block(block: *Desc) $inline {
+    let state = block.state
     if (state & bs_touched) != 0 : return
-    @ptrv(block, uint, b_state) = state | bs_touched
+    block.state = state | bs_touched
     gc.touched_blocks.add_ptr(block)
 }
 
-//////////////////////////
-// Block registry
-//////////////////////////
-
-// Every pool block, so a word found on a native stack can be resolved to the
-// slot it points into. Registering appends and unregistering leaves a hole
-// (start == end); the array is sorted and compacted before a lookup, so block
-// churn costs little per block
-struct BlockRange {
-    start: ptr
-    end: ptr
-}
-
-// Set in blocks_init only: the program assigns global initial values after the main thread's
-// gc started, and blocks are registered by then
-@shared block_ranges: *Bump (@undefined)
-// Appended since the last sort; a hole keeps the order, so lookups stay binary
-@shared block_ranges_unsorted: bool (@undefined)
-@shared block_ranges_holes: bool (@undefined)
-// The ranges before this index are in order; the appended ones follow
-@shared block_ranges_sorted: uint (@undefined)
-
-fn blocks_init() {
-    block_ranges = Bump.new(256 * size_of(BlockRange))
-    block_ranges_unsorted = false
-    block_ranges_holes = false
-    block_ranges_sorted = 0
-}
-
-fn block_range_count() uint $inline {
-    return block_ranges.index / size_of(BlockRange)
-}
-
-fn register_block(block: ptr, alloc_size: uint) {
-    if !block_ranges_unsorted {
-        block_ranges_sorted = block_range_count()
-        block_ranges_unsorted = true
+#if GC_DEBUG
+// Each touched descriptor is named by the page table for each of its pages; free runs are
+// in order, apart, and coalesced unless their zero flags differ
+fn heap_check(touched: *Bump) {
+    let adr = touched.data
+    let end = adr + touched.index
+    while adr < end {
+        let desc = @ptrv(adr, *Desc)
+        adr += size_of(ptr)
+        desc_check(desc)
     }
-    let adr = block_ranges.get(size_of(BlockRange))
-    @ptrv(adr, BlockRange) = BlockRange {
-        start: block
-        end: block + alloc_size
-    }
-}
-
-fn unregister_block(block: ptr) {
-    // Holes keep the lookup binary; appended blocks need a sort
-    if block_ranges_unsorted : sort_block_ranges()
-    let range = find_block_range(block)
-    if isset(range) {
-        range.end = range.start
-        block_ranges_holes = true
-    }
-}
-
-// Drops the holes, sorts the appended ranges on
-// their own and merges them into the sorted ones from the back
-fn sort_block_ranges() {
-    @unsafe
-    if !block_ranges_unsorted && !block_ranges_holes : return
-    let size = size_of(BlockRange)
-    let base = block_ranges.data
-    let count = block_range_count()
-    let sorted = block_ranges_unsorted ? block_ranges_sorted : count
-    let kept: uint = 0
-    let kept_sorted: uint = 0
+    let count = free_count()
     let i: uint = 0
     while i < count {
-        let range: *BlockRange = base + i * size
-        if range.start != range.end {
-            if kept != i : @ptrv(base, BlockRange, kept) = @ptrv(range, BlockRange)
-            kept++
-            if i < sorted : kept_sorted = kept
+        let run = free_run(i)
+        if run.pages == 0 : panic("GC error: an empty free page run")
+        if @ptrv(page_table, ?ptr, run.start) != null || @ptrv(page_table, ?ptr, run.start + run.pages - 1) != null {
+            panic("GC error: a free page run is named by the page table")
         }
-        i++
-    }
-    block_ranges.index = kept * size
-    block_ranges_holes = false
-    if block_ranges_unsorted {
-        block_ranges_unsorted = false
-        let tail = kept - kept_sorted
-        sort_block_ranges_rec(base + kept_sorted * size, 0, tail)
-        if kept_sorted > 0 && tail > 0 {
-            let temp = mem.alloc(tail * size)
-            mem.copy_bytes(base + kept_sorted * size, temp, tail * size)
-            let a = kept_sorted
-            let b = tail
-            let w = kept
-            while b > 0 {
-                w--
-                if a > 0 && @ptrv(base, BlockRange, a - 1).start > @ptrv(temp, BlockRange, b - 1).start {
-                    a--
-                    @ptrv(base, BlockRange, w) = @ptrv(base, BlockRange, a)
-                } else {
-                    b--
-                    @ptrv(base, BlockRange, w) = @ptrv(temp, BlockRange, b)
-                }
-            }
-            mem.free(temp)
+        if i + 1 < count {
+            let next = free_run(i + 1)
+            if run.start + run.pages > next.start : panic("GC error: free page runs overlap")
+            if run.start + run.pages == next.start && run.zeroed == next.zeroed : panic("GC error: free page runs are not coalesced")
         }
-    }
-    block_ranges_sorted = kept
-}
-
-fn sort_block_ranges_rec(base: ptr, lo: uint, hi: uint) {
-    while hi - lo > 16 {
-        let pivot = @ptrv(base, BlockRange, (lo + hi) / 2).start
-        let i = lo
-        let j = hi - 1
-        while i <= j {
-            while @ptrv(base, BlockRange, i).start < pivot : i++
-            while @ptrv(base, BlockRange, j).start > pivot : j--
-            if i <= j {
-                let tmp = @ptrv(base, BlockRange, i)
-                @ptrv(base, BlockRange, i) = @ptrv(base, BlockRange, j)
-                @ptrv(base, BlockRange, j) = tmp
-                i++
-                j--
-            }
-        }
-        // Recurse into the smaller half, loop over the larger
-        if j + 1 - lo < hi - i {
-            sort_block_ranges_rec(base, lo, j + 1)
-            lo = i
-        } else {
-            sort_block_ranges_rec(base, i, hi)
-            hi = j + 1
-        }
-    }
-    // Insertion sort for the small ranges
-    let i = lo + 1
-    while i < hi {
-        let v = @ptrv(base, BlockRange, i)
-        let j = i
-        while j > lo && @ptrv(base, BlockRange, j - 1).start > v.start {
-            @ptrv(base, BlockRange, j) = @ptrv(base, BlockRange, j - 1)
-            j--
-        }
-        @ptrv(base, BlockRange, j) = v
         i++
     }
 }
+#end
 
-// A binary search over the sorted ranges, and a
-// linear one over the ones appended since
-fn find_block_range(adr: ptr) ?*BlockRange {
-    let base = block_ranges.data
-    let count = block_range_count()
-    let sorted = block_ranges_unsorted ? block_ranges_sorted : count
-    let lo: uint = 0
-    let hi = sorted
-    while lo < hi {
-        let mid = (lo + hi) / 2
-        let range: *BlockRange = base + mid * size_of(BlockRange)
-        if adr < range.start : hi = mid
-        else if adr >= range.end : lo = mid + 1
-        else : return range
+fn desc_check(desc: *Desc) {
+    let a: uint = desc.first
+    let page = (a - HEAP_BASE) >> PAGE_SHIFT
+    let end = page + desc.pages
+    if desc.slots_total * desc.isize > desc.pages * PAGE_SIZE : panic("GC error: a block's slots exceed its pages")
+    while page < end {
+        if @ptrv(page_table, ptr, page) != desc.@cast(ptr) : panic("GC error: the page table does not name a block's descriptor")
+        page++
     }
-    let i = sorted
-    while i < count {
-        let range: *BlockRange = base + i * size_of(BlockRange)
-        if adr >= range.start && adr < range.end : return range
-        i++
-    }
-    return null
 }
 
 #if TEST
-/// Test helper: whether the block registry is in order after a sort and finds every block of
-/// the calling thread's pools.
+/// Test helper: whether the page table names the descriptor of every block of the thread's pools.
 + fn block_registry_ok_for_test() bool {
-    sort_block_ranges()
-    let ok = true
-    let base = block_ranges.data
-    let count = block_range_count()
-    let i: uint = 1
-    while i < count {
-        if @ptrv(base, BlockRange, i - 1).start >= @ptrv(base, BlockRange, i).start : ok = false
-        i++
-    }
     let adr = alc_list.data
     let end = adr + alc_list.index
     while adr < end {
@@ -256,11 +533,12 @@ fn find_block_range(adr: ptr) ?*BlockRange {
         adr += size_of(ptr)
         let block = alc.first
         while isset(block) {
-            if !isset(find_block_range(block)) : ok = false
-            block = @ptrv(block, ?ptr, b_next)
+            desc_check(block)
+            if !in_heap(block.first) : return false
+            block = block.next
         }
     }
-    return ok
+    return true
 }
 #end
 

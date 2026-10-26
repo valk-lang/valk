@@ -57,9 +57,6 @@ struct Gc {
     // Native stacks
     stack_top: ptr (null_ptr())              // Highest address of the thread stack
     live_sp: ptr (null_ptr())                // Stack pointer of the running collection
-    scan_min: ptr (null_ptr())
-    scan_max: ptr (null_ptr())
-    scan_hint: uint (0) // Last block-registry hit while scanning stacks
 
     // Refs
     #if OS == "win"
@@ -172,6 +169,10 @@ struct Gc {
 
         // Leak check
         if verify : this.leak_check()
+
+        // Free chunks beyond twice the allocation budget go back to the OS
+        let budget = this.mem_trigger > this.mem_marked ? (this.mem_trigger - this.mem_marked) * 2 : 0
+        heap_return_idle(budget > RETAIN_MIN ? budget : RETAIN_MIN)
 
         // Clear stack items list
         this.clear_stack_items()
@@ -401,10 +402,10 @@ struct Gc {
             let data = gcdata(item)
             data.remove_in_updates()
             data.slot_logs = 0
-            if data.offset == 0 : continue
+            if !in_heap(item) : continue
 
             if data.is_owned() {
-                let layout = data.block().layout
+                let layout = desc_of(item).layout
                 if isset(layout) {
                     each_ref(item, layout, ml, update_props)
                 }
@@ -525,85 +526,79 @@ struct Gc {
     // stack while a coroutine runs, and each suspended coroutine
     fn scan_stacks(sp: ptr) {
         mark_alloc_limits(this.alc_list_ptr[0])
-        sort_block_ranges()
-        let count = block_range_count()
-        if count > 0 {
-            let base = block_ranges.data
-            this.scan_min = @ptrv(base, BlockRange, 0).start
-            this.scan_max = @ptrv(base, BlockRange, count - 1).end
-            let current = @ptrv(this.current_coro, ?coro.Coro)
-            if isset(current) {
-                this.scan_words(sp, current.stack_top)
-                let main_sp = @ptrv(this.main_sp, ?ptr)
-                if isset(main_sp) : this.scan_words(main_sp, this.stack_top)
-            } else {
-                this.scan_words(sp, this.stack_top)
-            }
-            let coros = this.coros_ptr[0]
-            each coros as coro_item {
-                if !isset(coro_item) : continue
-                if coro_item.started && !coro_item.active && !coro_item.done {
-                    this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
-                    let keep = @ref(coro_item.io_keep).@cast(ptr)
-                    this.scan_words(keep, keep + 2 * size_of(ptr))
-                }
+        if heap_top == 0 : return
+        let current = @ptrv(this.current_coro, ?coro.Coro)
+        if isset(current) {
+            this.scan_words(sp, current.stack_top)
+            let main_sp = @ptrv(this.main_sp, ?ptr)
+            if isset(main_sp) : this.scan_words(main_sp, this.stack_top)
+        } else {
+            this.scan_words(sp, this.stack_top)
+        }
+        let coros = this.coros_ptr[0]
+        each coros as coro_item {
+            if !isset(coro_item) : continue
+            if coro_item.started && !coro_item.active && !coro_item.done {
+                this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
+                let keep = @ref(coro_item.io_keep).@cast(ptr)
+                this.scan_words(keep, keep + 2 * size_of(ptr))
             }
         }
     }
 
     fn scan_words(low: ptr, high: ptr) {
-        let min = this.scan_min
-        let max = this.scan_max
+        let top = heap_top
         let adr: ptr = low & (~7).to(uint)
         while adr < high {
-            let word = @ptrv(adr, ptr)
+            let word = @ptrv(adr, uint)
             adr += size_of(ptr)
-            if word < min || word >= max : continue
-            let item = this.find_root(word)
-            if isset(item) : this.collect_stack_item(item)
+            if word - HEAP_BASE >= top : continue
+            this.resolve(word)
         }
     }
 
-    // The item a native stack word may point into. Accepts any allocated
-    // slot; a stale word pointing at a free slot is rejected so garbage is
-    // never resurrected
-    // MRU cache over the block registry: consecutive stack words usually land
-    // in the same block, so recheck the last hit before binary searching
-    fn find_root_range(word: ptr) ?*BlockRange {
-        let base = block_ranges.data
-        let count = block_range_count()
-        let hint = this.scan_hint
-        if hint < count {
-            let cached: *BlockRange = base + hint * size_of(BlockRange)
-            if word >= cached.start && word < cached.end : return cached
+    // The slot a native stack word may point into: page table, descriptor, then the slot by
+    // the reciprocal. Accepts any allocated slot; a stale word pointing at a free slot or
+    // free pages is rejected so garbage is never resurrected
+    fn resolve(word: uint) {
+        let desc = @ptrv(page_table, ?*Desc, (word - HEAP_BASE) >> PAGE_SHIFT) ?! return
+        let first: uint = desc.first
+        let off = word - first
+        let isize = desc.isize
+        let total = desc.slots_total
+        let index: uint = 0
+        if total == 1 {
+            index = off < isize ? 0 : 1
+        } else {
+            index = (off * desc.recip) >> 32
+            #if GC_DEBUG
+            if index != off / isize : panic("GC error: the slot reciprocal is not exact")
+            #end
         }
-        let range = find_block_range(word) ?! return null
-        this.scan_hint = (range.@cast(ptr) - base) / size_of(BlockRange)
-        return range
-    }
-
-    fn find_root(word: ptr) ?ptr {
-        let range = this.find_root_range(word) ?! return null
-        let block = range.start
-        let data = block + POOL_DATA_OFFSET
-        if word < data : return null
-        let isize = @ptrv(block, uint, b_isize)
-        let rel: uint = word - data
-        let slot: ptr = data + (rel - rel % isize)
-        let gcd: *GcData = slot
-        let item: ptr = slot + 8
+        let slot = first + index * isize
+        // One past the end of a sequence that fills its slot is the next slot's start
+        if word == slot && index > 0 && index <= total && (desc.kind & desc_seq) != 0 {
+            this.accept(desc, slot - isize)
+        }
+        if index >= total : return
         // A sequence's first word is its length, so no reference points into it: a word
         // just past the start is a stale copy of a tagged slot (ownership tags are the low
         // bits). Such a word kept old Array storage alive, and with it, as co-owner, every
         // element it ever held
-        let tag = word - item
+        let tag = word - slot - 8
         if tag > 0 && tag < 8 && tag & prop_mask == tag {
-            let layout = @ptrv(block, ?ptr, b_layout)
-            if isset(layout) && @ptrv(layout, uint, layout_kind) == 1 : return null
+            let layout = desc.layout
+            if isset(layout) && @ptrv(layout, uint, layout_kind) == 1 : return
         }
-        if gcd.is_not_new() : return item
-        if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) : return item
-        return null
+        this.accept(desc, slot)
+    }
+
+    // A slot whose header is not new, or one allocated since the last collection
+    fn accept(desc: *Desc, slot: uint) {
+        let gcd: *GcData = slot.@cast(ptr)
+        let start: uint = desc.alloc_start
+        let limit: uint = desc.alloc_limit
+        if gcd.is_not_new() || (slot >= start && slot < limit) : this.collect_stack_item((slot + 8).@cast(ptr))
     }
 
     fn add_conditional_global(ref: ptr, tag_ref: ptr, tag: uint, more: uint) {
