@@ -1,0 +1,223 @@
+@unsafe
+
+#if GROVE
+
+use valk.gc
+
+// Reads the shadow state, the card log and the log's cap
+@ignore_access
+
+global grove_barrier_freed: uint
+
+class GroveItem {
+    value: uint
+    fn gc_free() { grove_barrier_freed++ }
+}
+
+// Garbage of earlier tests is freed first
+fn grove_barrier_reset() {
+    gc.collect()
+    gc.collect()
+    grove_barrier_freed = 0
+}
+
+fn grove_item(value: uint) GroveItem $noinline {
+    return GroveItem { value: value }
+}
+
+fn grove_items(count: uint, base: uint) Array[GroveItem] $noinline {
+    let list = Array[GroveItem].new(count)
+    let i: uint = 0
+    while i < count {
+        list.append(grove_item(base + i))
+        i++
+    }
+    return list
+}
+
+// The number of elements that differ from `base`, `base + 1`, ...
+fn grove_wrong(list: Array[GroveItem], base: uint) uint $noinline {
+    let wrong: uint = 0
+    each list as item, i {
+        if item.value != base + i : wrong++
+    }
+    return wrong
+}
+
+fn grove_old(item: ptr) bool {
+    return gc.gcdata(item).is_not_new()
+}
+
+// A view writes a fresh item past the length; a collection counts its word
+fn grove_view_store_past_length(list: Array[GroveItem], value: uint) $noinline {
+    let view = list.view()
+    list.pop_last() !!
+    view.set(view.length - 1, grove_item(value)) !!
+}
+
+synctest "Grove: a right shift records the counted word a view stored past the length" {
+    grove_barrier_reset()
+    let list = grove_items(8, 0)
+    let i: uint = 0
+    while i < 20 {
+        grove_view_store_past_length(list, 1000 + i)
+        gc.collect()
+        // The shift moves element length - 1 over the word past the length
+        list.insert(0, grove_item(i)) !!
+        gc.collect()
+        i++
+    }
+    gc.collect()
+    // Every popped item and every item stored past the length is freed (the leak check
+    // of each collection finds any that stays owned)
+    assert(grove_barrier_freed == 40)
+    assert(list.length == 8)
+}
+
+synctest "Grove: prepend_many in a loop keeps every element" {
+    grove_barrier_reset()
+    let list = grove_items(3, 100)
+    gc.collect()
+    let i: uint = 0
+    while i < 30 {
+        let front = grove_items(3, 100 - 3 * (i + 1))
+        list.prepend_many(front)
+        if i % 4 == 0 : gc.collect()
+        i++
+    }
+    gc.collect()
+    assert(list.length == 93)
+    assert(grove_wrong(list, 10) == 0)
+    // From itself: the items are copied before the move
+    list.prepend_many(list)
+    gc.collect()
+    assert(list.length == 186)
+    assert(grove_wrong(list.range(93, 93), 10) == 0)
+    list.clear()
+    gc.collect()
+    gc.collect()
+    assert(grove_barrier_freed == 93)
+}
+
+synctest "Grove: prepend into an emptied old array" {
+    grove_barrier_reset()
+    let list = grove_items(16, 0)
+    gc.collect()
+    list.clear()
+    gc.collect()
+    assert(grove_barrier_freed == 16)
+    list.prepend(grove_item(7))
+    list.prepend(grove_item(6))
+    gc.collect()
+    gc.collect()
+    assert(grove_wrong(list, 6) == 0)
+    assert(grove_barrier_freed == 16)
+}
+
+synctest "Grove: R1 that reaches the soft cap collects before the raw move" {
+    grove_barrier_reset()
+    let list = grove_items(64, 0)
+    gc.collect()
+    let before = gc.gc.collect_count
+    // The removal of element 0 is the log's last entry before the cap
+    gc.gc.e_soft = gc.log_entries + 1
+    list.remove(0)
+    assert(gc.gc.collect_count == before + 1)
+    assert(grove_wrong(list, 1) == 0)
+    gc.gc.e_soft = gc.log_entries + 1
+    list.swap_remove(0)
+    assert(gc.gc.collect_count == before + 2)
+    gc.collect()
+    assert(grove_barrier_freed == 2)
+    assert(list.length == 62)
+    assert((list.get(0) !!).value == 63)
+    assert(grove_wrong(list.range(1, 61), 2) == 0)
+}
+
+fn grove_storage(list: Array[GroveItem]) ptr {
+    return list.data.@cast(ptr)
+}
+
+synctest "Grove: an old array that owns its storage claims the new storage when it grows" {
+    grove_barrier_reset()
+    let list = grove_items(4, 0)
+    gc.collect()
+    let from = grove_storage(list)
+    assert(grove_old(from))
+    let size = list.size
+    let before = gc.gc.collect_count
+    let i: uint = 4
+    while i <= size : list.append(grove_item(i++))
+    let to = grove_storage(list)
+    assert(to != from)
+    if gc.gc.collect_count == before {
+        // Old at once, every card dirty and covered by one range entry
+        assert(grove_old(to))
+        assert(grove_logged(to.@cast(uint) | 1))
+        assert(@ptrv(gc.card_of(to.@cast(uint)), u8) != 0)
+    }
+    gc.collect()
+    gc.collect()
+    assert(grove_wrong(list, 0) == 0)
+    assert(grove_barrier_freed == 0)
+    list.clear()
+    gc.collect()
+    gc.collect()
+    assert(grove_barrier_freed == size + 1)
+}
+
+synctest "Grove: a young array grows by a stripped copy" {
+    grove_barrier_reset()
+    let list = Array[GroveItem].new(2)
+    let i: uint = 0
+    while i < 300 : list.append(grove_item(i++))
+    assert(!grove_old(grove_storage(list)))
+    gc.collect()
+    assert(grove_wrong(list, 0) == 0)
+    assert(grove_barrier_freed == 0)
+    list.clear()
+    gc.collect()
+    gc.collect()
+    assert(grove_barrier_freed == 300)
+}
+
+// A second array over the same storage: whichever a collection reaches second names the
+// storage with a co-owner word
+fn grove_share_storage(owner: Array[GroveItem]) Array[GroveItem] $noinline {
+    let other = Array[GroveItem].new()
+    other.data = owner.data
+    other.size = owner.size
+    other.length = owner.length
+    return other
+}
+
+synctest "Grove: an array whose storage is co-owned grows by a stripped copy" {
+    grove_barrier_reset()
+    let owner = grove_items(8, 0)
+    gc.collect()
+    let other = grove_share_storage(owner)
+    gc.collect()
+    let shared = grove_storage(owner)
+    assert(grove_storage(other) == shared)
+    let i: uint = 8
+    while i < 40 : other.append(grove_item(i++))
+    assert(grove_storage(other) != shared)
+    assert(grove_storage(owner) == shared)
+    gc.collect()
+    gc.collect()
+    assert(grove_wrong(owner, 0) == 0)
+    assert(grove_wrong(other, 0) == 0)
+    assert(grove_barrier_freed == 0)
+    // The elements stay alive through either array
+    owner.clear(true)
+    gc.collect()
+    gc.collect()
+    assert(grove_wrong(other, 0) == 0)
+    assert(grove_barrier_freed == 0)
+    other.clear()
+    gc.collect()
+    gc.collect()
+    assert(grove_barrier_freed == 40)
+}
+
+#end
