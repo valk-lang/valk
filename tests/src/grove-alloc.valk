@@ -1,0 +1,284 @@
+@unsafe
+
+#if GROVE
+
+use valk.gc
+
+// Reads runs, descriptors, cards and the size classes
+@ignore_access
+
+global grove_alloc_freed: uint
+
+// A 64-byte body: blocks of 1, 2, 4 and 8 pages hold exactly 64, 128, 256 and 512 of them
+class GroveHole {
+    value: uint
+    a1: uint (0)
+    a2: uint (0)
+    a3: uint (0)
+    a4: uint (0)
+    a5: uint (0)
+    a6: uint (0)
+    a7: uint (0)
+}
+
+class GroveMarkLeaf {
+    value: uint
+    fn gc_free() { grove_alloc_freed++ }
+}
+
+class GroveMarkBox {
+    leaf: ?GroveMarkLeaf (null)
+}
+
+fn grove_holes(count: uint) Array[?GroveHole] $noinline {
+    let list = Array[?GroveHole].new(count)
+    let i: uint = 0
+    while i < count {
+        list.append(GroveHole { value: i })
+        i++
+    }
+    return list
+}
+
+fn grove_drop_odd(list: Array[?GroveHole]) $noinline {
+    let i: uint = 1
+    while i < list.length {
+        list.set(i, null) ! panic("set failed")
+        i += 2
+    }
+}
+
+// The lowest and highest address of the items
+fn grove_span(list: Array[?GroveHole]) (uint, uint) $noinline {
+    let lo: uint = (~0).to(uint)
+    let hi: uint = 0
+    each list as h {
+        let item = h ?! continue
+        let a: uint = item.@cast(ptr)
+        if a < lo : lo = a
+        if a > hi : hi = a
+    }
+    return (lo, hi)
+}
+
+fn grove_fill_holes(into: Array[?GroveHole], count: uint, lo: uint, hi: uint) uint $noinline {
+    let inside: uint = 0
+    let i: uint = 0
+    while i < count {
+        let item = GroveHole { value: 100_000 + i }
+        let a: uint = item.@cast(ptr)
+        if a >= lo && a <= hi : inside++
+        into.append(item)
+        i++
+    }
+    return inside
+}
+
+fn grove_odd_kept(list: Array[?GroveHole]) bool $noinline {
+    each list as h, i {
+        if i % 2 == 1 : continue
+        let item = h ?! return false
+        if item.value != i : return false
+    }
+    return true
+}
+
+synctest "Grove: the holes a collection leaves are reused" {
+    gc.collect()
+    // Six blocks of 64-byte slots, each filled to its end
+    let list = grove_holes(1984)
+    gc.collect()
+    grove_drop_odd(list)
+    gc.collect()
+    gc.collect()
+    let lo, hi = grove_span(list)
+    let into = Array[?GroveHole].new(700)
+    // The five blocks the allocator left are PARTIAL and hold 736 holes
+    let inside = grove_fill_holes(into, 700, lo, hi)
+    assert(inside >= 650)
+    assert(grove_odd_kept(list))
+    gc.collect()
+    assert(grove_odd_kept(list))
+    each into as h, i : assert((h ?! panic("hole item missing")).value == 100_000 + i)
+}
+
+fn grove_alloc_dirty(address: uint) bool {
+    return @ptrv(gc.card_of(address), u8) != 0
+}
+
+fn grove_alloc_logged(card: uint) bool {
+    let log = gc.gc.card_log
+    let i: uint = 0
+    while i < log.index / size_of(ptr) {
+        if @ptrv(log.data, uint, i) == card : return true
+        i++
+    }
+    return false
+}
+
+fn grove_card_of_box(box: GroveMarkBox) uint {
+    let a: uint = @ref(box.leaf).@cast(ptr)
+    return a & (~(gc.CARD_SIZE - 1)).to(uint)
+}
+
+// A young box whose card is pre-marked: dirty, but not in the log
+fn grove_premarked_box() ?GroveMarkBox $noinline {
+    let i: uint = 0
+    while i < 256 {
+        let box = GroveMarkBox {}
+        let card = grove_card_of_box(box)
+        if grove_alloc_dirty(card) && !grove_alloc_logged(card) : return box
+        i++
+    }
+    return null
+}
+
+fn grove_mark_leaf(value: uint) GroveMarkLeaf $noinline {
+    return GroveMarkLeaf { value: value }
+}
+
+fn grove_box_value(box: GroveMarkBox) uint $noinline {
+    let leaf = box.leaf ?! return 0
+    return leaf.value
+}
+
+synctest "Grove: a store into a young object in a pre-marked card, then a collection that claims it" {
+    gc.collect()
+    gc.collect()
+    grove_alloc_freed = 0
+    let box = grove_premarked_box() ?! panic("no pre-marked card")
+    let card = grove_card_of_box(box)
+    let entries = gc.gc.card_log.index
+    // A young holder: a plain store, nothing is logged
+    box.leaf = grove_mark_leaf(7)
+    assert(gc.gc.card_log.index == entries)
+    // The box is claimed from the stack and its leaf through it; P10 cleans the window's cards
+    gc.collect()
+    assert(!grove_alloc_dirty(card))
+    gc.collect()
+    assert(grove_box_value(box) == 7)
+    assert(grove_alloc_freed == 0)
+    // Old now: the next store logs the card
+    box.leaf = grove_mark_leaf(8)
+    assert(grove_alloc_dirty(card) && grove_alloc_logged(card))
+    gc.collect()
+    assert(grove_box_value(box) == 8)
+}
+
+fn grove_large_mix(sizes: Array[uint]) Array[gc.GcPtr] $noinline {
+    let list = Array[gc.GcPtr].new(sizes.length)
+    each sizes as size, i {
+        let item = gc.alloc(size)
+        let p: ptr = item
+        @ptrv(p, u8, 0) = i.to(u8)
+        @ptrv(p, u8, size - 1) = (i + 100).to(u8)
+        list.append(item)
+    }
+    return list
+}
+
+fn grove_large_check(list: Array[gc.GcPtr], sizes: Array[uint]) bool $noinline {
+    each list as item, i {
+        let p: ptr = item
+        let size = sizes.get(i) !? 0
+        let desc = gc.desc_of(p)
+        if (desc.kind & gc.desc_large) == 0 || desc.first != p : return false
+        if desc.isize != (size + 7) / 8 * 8 || desc.pages != (desc.isize + 4095) / 4096 : return false
+        if @ptrv(p, u8, 0) != i.to(u8) || @ptrv(p, u8, size - 1) != (i + 100).to(u8) : return false
+    }
+    return true
+}
+
+fn grove_large_drop(list: Array[gc.GcPtr]) $noinline {
+    while list.length > 0 : list.pop_last() ! panic("pop failed")
+}
+
+fn grove_boxes_storage(count: uint) Array[?GroveMarkBox] $noinline {
+    return Array[?GroveMarkBox].new(count)
+}
+
+synctest "Grove: large objects of mixed sizes take exact page runs" {
+    gc.collect()
+    let sizes = Array[uint]{ 8193, 8200, 12288, 12289, 65536, 100_003, 1_048_577, 9000 }
+    let before = gc.mem_usage()
+    let list = grove_large_mix(sizes)
+    let total: uint = 0
+    each sizes as size : total += (size + 4095) / 4096 * 4096
+    assert(gc.mem_usage() >= before + total)
+    assert(grove_large_check(list, sizes))
+    gc.collect()
+    assert(grove_large_check(list, sizes))
+    grove_large_drop(list)
+    gc.collect()
+    gc.collect()
+    assert(gc.mem_usage() < before + total / 2)
+
+    // A young large storage of a kind with references has every card it overlaps set
+    let boxes = grove_boxes_storage(3000)
+    let storage: uint = boxes.data.@cast(ptr)
+    let desc = gc.desc_of(storage.@cast(ptr))
+    assert((desc.kind & gc.desc_large) != 0)
+    let end = storage + desc.isize
+    assert(grove_alloc_dirty(storage) && grove_alloc_dirty(end - 1))
+    let slack = (end + gc.CARD_SIZE - 1) / gc.CARD_SIZE * gc.CARD_SIZE
+    if slack < storage + desc.pages * 4096 : assert(!grove_alloc_dirty(slack))
+    gc.collect()
+    assert(!grove_alloc_dirty(storage) && !grove_alloc_dirty(end - 1))
+}
+
+synctest "Grove: fit_count fills the size class" {
+    let items = Array[uint]{ 8, 24, 40 }
+    each items as item {
+        let count: uint = 1
+        while count < 3000 {
+            let n = gc.fit_count(16, item, count)
+            let class = gc.slot_size(16 + count * item)
+            assert(n >= count)
+            assert(16 + n * item <= class)
+            assert(16 + (n + 1) * item > class)
+            count += 7
+        }
+    }
+    // The classes: 8-byte steps up to 128 bytes, at most 25 % rounding up to 8 KiB, pages above
+    let size: uint = 1
+    while size < 20_000 {
+        let class = gc.slot_size(size)
+        assert(class >= size && class % 8 == 0)
+        if size <= 128 : assert(class - size < 8)
+        else if size <= gc.LARGE_SLOT : assert(class * 4 <= size * 5 + 32)
+        else : assert(class % 4096 == 0 && class - size < 4096)
+        // An allocation of that size takes a slot of exactly the class
+        if size % 97 == 1 {
+            let p: ptr = gc.alloc(size)
+            let desc = gc.desc_of(p)
+            if size <= gc.LARGE_SLOT : assert(desc.isize == class)
+            else : assert(desc.pages * 4096 == class)
+        }
+        size += 13
+    }
+}
+
+#if OS == "linux"
+fn grove_preallocate(count: uint) Array[uint] $noinline {
+    return Array[uint].new(count)
+}
+
+synctest "Grove: capacity preallocated from pre-zeroed pages is not resident" {
+    let mib: uint = 1024 * 1024
+    gc.collect()
+    gc.collect()
+    gc.collect()
+    let before = grove_rss()
+    let list = grove_preallocate(8 * mib)
+    let fresh = gc.get_typed_pool(gc.LARGE_SLOT + 1, null).zeroed
+    let now = grove_rss()
+    let grown = now > before ? now - before : 0
+    // A run that is not pre-zeroed is cleared in full and becomes resident (THEORY Risk 7)
+    if fresh : assert(grown < 16 * mib)
+    else : assert(grown >= 32 * mib)
+    list.append(5)
+    assert((list.get(0) !? 0) == 5)
+}
+#end
+
+#end
