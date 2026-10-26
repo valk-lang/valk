@@ -15,6 +15,8 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
+# The compiler's own sources test GROVE, which older compilers do not define
+SELF_FLAGS := $(FLAGS) --def "GROVE=0"
 DIST_FLAGS := . --static --release -vv -c
 IR_TARGETS := linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64
 BUILD_TARGETS := $(IR_TARGETS)
@@ -58,7 +60,7 @@ WIN_LLD_FLAGS := $(call lld_flags,toolchains/libraries/win-llvm-22-x64)
 # The local compiler links the system's shared LLVM (libLLVM.so.22); `make static` and the
 # release targets link the vendored static one
 valk: $(COMPILER_DEPS) $(LLD_SHIM)
-	$(VC) build . -o ./valk -vv $(FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk -vv $(SELF_FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
 
 debug/libvalk-lld.a: src/llvm/lld/lld.cpp
 	mkdir -p debug
@@ -66,7 +68,7 @@ debug/libvalk-lld.a: src/llvm/lld/lld.cpp
 	ar rcs $@ debug/valk-lld.o
 
 valkexe: $(COMPILER_DEPS)
-	$(VC) build . -o ./valk -vv $(FLAGS) --target win-x64 --static $(WIN_LLD_FLAGS) \
+	$(VC) build . -o ./valk -vv $(SELF_FLAGS) --target win-x64 --static $(WIN_LLD_FLAGS) \
 	-L toolchains/libraries/win-llvm-22-x64/lib
 
 doc: valk
@@ -75,13 +77,13 @@ doc: valk
 
 valk-profile: $(COMPILER_DEPS)
 	valgrind --tool=callgrind --dump-instr=yes --simulate-cache=yes --collect-jumps=yes \
-	$(VC) build . -o ./valk3 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
+	$(VC) build . -o ./valk3 -vv $(SELF_FLAGS) $(NATIVE_LINK_FLAGS)
 
 valkd: $(COMPILER_DEPS)
-	gdb --args $(VC) build . -o ./valk2 -vv $(FLAGS) $(NATIVE_LINK_FLAGS)
+	gdb --args $(VC) build . -o ./valk2 -vv $(SELF_FLAGS) $(NATIVE_LINK_FLAGS)
 
 static: $(COMPILER_DEPS)
-	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(SELF_FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
 
 install: valk
 	rm -rf ~/.vman/versions/${VERSION}/
@@ -249,15 +251,15 @@ lint-lib-cross: valk
 # CI commands
 ci-linux: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(SELF_FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
 
 ci-macos: $(COMPILER_DEPS)
 	valk -h || true
-	$(VC) build . -o ./valk -vv --static $(FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
+	$(VC) build . -o ./valk -vv --static $(SELF_FLAGS) $(NATIVE_LINK_FLAGS) $(STATIC_LLD_FLAGS)
 
 ci-win: $(COMPILER_DEPS)
 	~/valk-dev/valk.exe -h || echo ""
-	$$HOME/valk-dev/valk.exe build . -o ./valk -vv -c --static $(FLAGS) $(WIN_LLD_FLAGS) \
+	$$HOME/valk-dev/valk.exe build . -o ./valk -vv -c --static $(SELF_FLAGS) $(WIN_LLD_FLAGS) \
 	-L toolchains/libraries/win-llvm-22-x64/lib $(CI_SYSTEM_LIB_FLAGS)
 
 # Distributions
@@ -275,7 +277,7 @@ linux-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/linux-x64/*
 	mkdir -p dist/linux-x64
-	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(FLAGS) $(DIST_FLAGS) \
+	$(DIST_COMP) build -o ./dist/linux-x64/valk --target linux-x64 $(SELF_FLAGS) $(DIST_FLAGS) \
 	$(call lld_flags,toolchains/libraries/linux-llvm-22-x64) \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/gcc/x86_64-linux-gnu/12/" \
 	-L "toolchains/toolchains/linux-amd64/usr/lib/x86_64-linux-gnu" \
@@ -290,7 +292,7 @@ linux-arm64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/linux-arm64/*
 	mkdir -p dist/linux-arm64
-	$(DIST_COMP) build -o ./dist/linux-arm64/valk --target linux-arm64 $(FLAGS) $(DIST_FLAGS) $(LINUX_ARM64_LINK) \
+	$(DIST_COMP) build -o ./dist/linux-arm64/valk --target linux-arm64 $(SELF_FLAGS) $(DIST_FLAGS) $(LINUX_ARM64_LINK) \
 	$(call lld_flags,toolchains/libraries/linux-llvm-22-arm64)
 	cp -r ./lib ./dist/linux-arm64/
 	$(call keep_own_openssl,linux-arm64)
@@ -300,7 +302,7 @@ macos-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/macos-x64/*
 	mkdir -p dist/macos-x64
-	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(FLAGS) $(DIST_FLAGS) \
+	$(DIST_COMP) build -o ./dist/macos-x64/valk --target macos-x64 $(SELF_FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/macos-11-3 \
 	-L toolchains/libraries/macos-llvm-22-x64/lib $(call lld_flags,toolchains/libraries/macos-llvm-22-x64)
 	cp -r ./lib ./dist/macos-x64/
@@ -311,7 +313,7 @@ macos-arm64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/macos-arm64/*
 	mkdir -p dist/macos-arm64
-	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(FLAGS) $(DIST_FLAGS) \
+	$(DIST_COMP) build -o ./dist/macos-arm64/valk --target macos-arm64 $(SELF_FLAGS) $(DIST_FLAGS) \
 	--sysroot toolchains/toolchains/macos-11-3 \
 	-L toolchains/libraries/macos-llvm-22-arm64/lib $(call lld_flags,toolchains/libraries/macos-llvm-22-arm64)
 	cp -r ./lib ./dist/macos-arm64/
@@ -322,7 +324,7 @@ win-x64: $(DIST_DEPS)
 	vman use
 	rm -rf dist/win-x64/*
 	mkdir -p dist/win-x64
-	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(FLAGS) $(DIST_FLAGS) $(WIN_LLD_FLAGS) \
+	$(DIST_COMP) build -o ./dist/win-x64/valk --target win-x64 $(SELF_FLAGS) $(DIST_FLAGS) $(WIN_LLD_FLAGS) \
 	--sysroot toolchains/toolchains/win-sdk-x64 \
 	-L toolchains/toolchains/win-sdk-x64/Lib/10.0.22621.0/um/x64 \
 	-L toolchains/toolchains/win-sdk-x64/MSVC/14.36.32532/lib/x64 \
@@ -340,7 +342,7 @@ ir: $(DIST_DEPS)
 	mkdir -p $(addprefix dist/ir/libs/,$(IR_TARGETS))
 	@for target in $(IR_TARGETS); do \
 		$(DIST_COMP) build -o ./dist/ir/valk-$$target.ll --target $$target \
-			$(FLAGS) $(DIST_FLAGS) --ir || exit $$?; \
+			$(SELF_FLAGS) $(DIST_FLAGS) --ir || exit $$?; \
 		cp ./lib/libs/$$target/valk-stack-swap.o ./dist/ir/libs/$$target/ || exit $$?; \
 	done
 	cp ./misc/dist/ir/build-* ./dist/ir/
