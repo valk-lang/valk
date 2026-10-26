@@ -144,6 +144,40 @@ test-gc-stress: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-gc-stress$(EXE_SUFFIX)
 	./debug/test-gc-stress$(EXE_SUFFIX)
 
+# Grove: the suite without its thread tests, built with the Grove collector
+GROVE_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "TEST_ST_ONLY=1"
+GROVE_COMPILER_FLAGS := $(FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
+
+test-grove: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) $(FLAGS) -o ./debug/test-grove$(EXE_SUFFIX)
+	./debug/test-grove$(EXE_SUFFIX)
+
+test-grove-stress: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-grove-stress$(EXE_SUFFIX)
+	./debug/test-grove-stress$(EXE_SUFFIX)
+
+# The compiler built with Grove (and with Grove's checks) must give the same compiler and
+# test binary as the compiler on Valk's collector
+grove-compiler-check: valk
+	mkdir -p ./debug
+	./valk build . -o ./debug/valk-ref -vv $(GROVE_COMPILER_FLAGS) --clean
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/tests-ref --clean
+	./valk build ./examples/bench/json/main.valk --release -o ./debug/release-ref --clean
+	./valk build . -o ./debug/valk-g -vv $(GROVE_COMPILER_FLAGS) --def "GROVE=1" --clean
+	./valk build . -o ./debug/valk-gd -vv $(GROVE_COMPILER_FLAGS) --def "GROVE=1" --def "GC_DEBUG=1" --clean
+	@set -e; for c in valk-g valk-gd; do \
+		echo "# $$c"; \
+		./debug/$$c build . -o ./debug/out-$$c -vv $(GROVE_COMPILER_FLAGS) --stdlib $(CURDIR)/lib --clean; \
+		cmp ./debug/out-$$c ./debug/valk-ref; \
+		./debug/$$c build ./tests $(TEST_FLAGS) $(FLAGS) --stdlib $(CURDIR)/lib -o ./debug/tests-$$c --clean; \
+		cmp ./debug/tests-$$c ./debug/tests-ref; \
+		./debug/$$c build ./examples/bench/json/main.valk --release --stdlib $(CURDIR)/lib -o ./debug/release-$$c --clean; \
+		cmp ./debug/release-$$c ./debug/release-ref; \
+	done
+	@echo "Grove compiler check: outputs are identical"
+
 # Every public method of the core collections on plain, shared and locked data
 test-views: $(TEST_COMPILER)
 	@python3 ./tests/views/gen.py --valk $(TEST_COMPILER) --jobs 4
@@ -381,4 +415,5 @@ clean:
 	valk-profile valkvg watchtest win-x64 \
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
-	test-macos-build test-release test-win test-win-build
+	test-macos-build test-release test-win test-win-build \
+	test-grove test-grove-stress grove-compiler-check
