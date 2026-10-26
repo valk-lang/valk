@@ -3,15 +3,10 @@
 #if GROVE
 
 use mem
-use core
-
-@shared unused_blocks: [ptr x 128]
-shared pool_lock: core.SyncMutex (core.SyncMutex.new())
 
 value b_next (0)
 value b_slots_total (1)
-// The gc of the thread whose allocator owns the block; null once that thread is gone
-value b_owner (2)
+// Word 2 is unused (the owning thread in Valk's collector)
 value b_isize (3)
 value b_slots_used (4)
 value b_layout (5)
@@ -40,7 +35,7 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 struct Block {
     next: ?ptr
     slots_total: uint
-    owner: ?ptr
+    unused: ?ptr
     // Mini
     isize: uint
     slots_used: uint
@@ -74,77 +69,22 @@ fn touch_block(block: ptr) $inline {
     gc.touched_blocks.add_ptr(block)
 }
 
-fn loop_all_blocks(func: fnptr(*Block)()) {
-    let adr = alc_list.data
-    let end = adr + alc_list.index
-    while adr < end {
-        let alc = @ptrv(adr, *Pool)
-        adr += size_of(ptr)
-        let block: ?*Block = alc.first
-        while isset(block) {
-            let next: ?*Block = block.next
-            func(block)
-            block = next
-        }
-    }
-}
-
-fn add_unused_block(block: *Block) {
-    block.next = null
-    let index = get_pool_index_for_size(block.isize)
-    let list = @ptrv(unused_blocks, ?*Bump, index)
-    if !isset(list) {
-        list = Bump.new(32)
-        @ptrv(unused_blocks, ?*Bump, index) = list
-    }
-    list.add_ptr(block)
-}
-
-fn free_empty_unused_blocks() {
-    pool_lock.lock()
-    let i: uint = 0
-    while i < 128 {
-        let list = @ptrv(unused_blocks, ?*Bump, i++)
-        if !isset(list) : continue
-        let start = list.data
-        let end = list.data.$offset(list.index)
-        list.reset()
-        while start < end {
-            let block = @ptrv(start, *Block)
-            if block.slots_used == 0 {
-                let alloc_size = block.slots_total * block.isize + POOL_DATA_OFFSET
-                atomic(mem_usage_shared - alloc_size)
-                unregister_block(block)
-                mem.free(block)
-            } else {
-                list.add_ptr(block)
-            }
-            start = start.$offset(size_of(ptr))
-        }
-    }
-    pool_lock.unlock()
-}
-
 //////////////////////////
 // Block registry
 //////////////////////////
 
-// Every pool block of every thread, so a word found on a native stack can be
-// resolved to the slot it points into. Guarded by block_lock, which is never
-// held while waiting on anything else. Registering appends and unregistering
-// leaves a hole (start == end); the array is sorted and compacted before a
-// lookup, so block churn costs little per block
+// Every pool block, so a word found on a native stack can be resolved to the
+// slot it points into. Registering appends and unregistering leaves a hole
+// (start == end); the array is sorted and compacted before a lookup, so block
+// churn costs little per block
 struct BlockRange {
     start: ptr
     end: ptr
-    // Owning thread's gc; null once the thread is gone
-    gc: ?*Gc
 }
 
 // Set in blocks_init only: the program assigns global initial values after the main thread's
 // gc started, and blocks are registered by then
 @shared block_ranges: *Bump (@undefined)
-@shared block_lock: *core.MutexStruct[void] (@undefined)
 // Appended since the last sort; a hole keeps the order, so lookups stay binary
 @shared block_ranges_unsorted: bool (@undefined)
 @shared block_ranges_holes: bool (@undefined)
@@ -153,7 +93,6 @@ struct BlockRange {
 
 fn blocks_init() {
     block_ranges = Bump.new(256 * size_of(BlockRange))
-    block_lock = core.MutexStruct[void].new()
     block_ranges_unsorted = false
     block_ranges_holes = false
     block_ranges_sorted = 0
@@ -164,7 +103,6 @@ fn block_range_count() uint $inline {
 }
 
 fn register_block(block: ptr, alloc_size: uint) {
-    block_lock.lock()
     if !block_ranges_unsorted {
         block_ranges_sorted = block_range_count()
         block_ranges_unsorted = true
@@ -173,13 +111,10 @@ fn register_block(block: ptr, alloc_size: uint) {
     @ptrv(adr, BlockRange) = BlockRange {
         start: block
         end: block + alloc_size
-        gc: gc
     }
-    block_lock.unlock()
 }
 
 fn unregister_block(block: ptr) {
-    block_lock.lock()
     // Holes keep the lookup binary; appended blocks need a sort
     if block_ranges_unsorted : sort_block_ranges()
     let range = find_block_range(block)
@@ -187,19 +122,9 @@ fn unregister_block(block: ptr) {
         range.end = range.start
         block_ranges_holes = true
     }
-    block_lock.unlock()
 }
 
-fn release_block_owner(block: ptr) {
-    block_lock.lock()
-    // Holes keep the lookup binary; appended blocks need a sort
-    if block_ranges_unsorted : sort_block_ranges()
-    let range = find_block_range(block)
-    if isset(range) : range.gc = null
-    block_lock.unlock()
-}
-
-// Callers hold block_lock. Drops the holes, sorts the appended ranges on
+// Drops the holes, sorts the appended ranges on
 // their own and merges them into the sorted ones from the back
 fn sort_block_ranges() {
     @unsafe
@@ -287,7 +212,7 @@ fn sort_block_ranges_rec(base: ptr, lo: uint, hi: uint) {
     }
 }
 
-// Callers hold block_lock. A binary search over the sorted ranges, and a
+// A binary search over the sorted ranges, and a
 // linear one over the ones appended since
 fn find_block_range(adr: ptr) ?*BlockRange {
     let base = block_ranges.data
@@ -315,7 +240,6 @@ fn find_block_range(adr: ptr) ?*BlockRange {
 /// Test helper: whether the block registry is in order after a sort and finds every block of
 /// the calling thread's pools.
 + fn block_registry_ok_for_test() bool {
-    block_lock.lock()
     sort_block_ranges()
     let ok = true
     let base = block_ranges.data
@@ -336,7 +260,6 @@ fn find_block_range(adr: ptr) ?*BlockRange {
             block = @ptrv(block, ?ptr, b_next)
         }
     }
-    block_lock.unlock()
     return ok
 }
 #end
