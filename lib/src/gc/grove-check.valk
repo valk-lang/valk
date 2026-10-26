@@ -96,7 +96,7 @@ fn rc_each_object(cb: fnptr(ptr)()) {
             let base = block.first
             let last = base + block.slots_total * isize
             while base < last {
-                cb(base + 8)
+                cb(base)
                 base += isize
             }
             block = block.next
@@ -206,29 +206,84 @@ fn covered_build() {
 }
 
 fn covered(c: uint) bool {
-    return rc_get(c.@cast(ptr)) != 0
+    return (rc_get(c.@cast(ptr)) & 0xFFFFFFFF) != 0
 }
 
-// D-2, the card check, before a scheduled stress collection: every uncounted reference word
-// of an old object lies in a covered card, and a dirty card that is not covered holds only
-// free and young slots
+// D-1 and D-2, the W-C and card checks, before a scheduled stress collection: every uncounted
+// reference word of an old object lies in a covered card; a young object holds no counted word
+// (W1), except new storage that took over tagged words (see transfer_refs); no word holds both
+// tags, and every word into the heap names an allocated object's start (WD). A dirty card that
+// is not covered holds only free and young slots
+@shared wc_adopted: bool
+
 fn card_check() {
     covered_build()
+    let adr = gc.adopted.data
+    let end = adr + gc.adopted.index
+    while adr < end {
+        rc_add(@ptrv(adr, ptr), 0, 1)
+        adr += size_of(ptr)
+    }
     rc_each_object(fn(item: ptr) {
-        if gcdata(item).is_new() : return
-        let layout = desc_of(item).layout ?! return
+        let desc = desc_of(item)
+        let layout = desc.layout ?! return
+        if gcdata(item).is_not_new() {
+            each_ref(item, layout, gc.mark_list, fn(ref: ptr, list: *Lifo) {
+                @unsafe
+                let v = @ptrv(ref, uint)
+                word_target_check(ref, v)
+                if v & prop_mask != 0 || !in_heap(v.@cast(ptr)) : return
+                let c: uint = ref & (~(CARD_SIZE - 1)).to(uint)
+                if @ptrv(card_of(c), u8) == 0 || !covered(c) {
+                    print_word_address(ref)
+                    panic("GC error (cards): an uncounted reference lies in a card the log does not cover")
+                }
+            })
+            return
+        }
+        // A free slot holds no object
+        let slot: uint = item
+        if !in_window(desc, slot, desc.aw_hi) : return
+        wc_adopted = (rc_get(item) >> 32) != 0
         each_ref(item, layout, gc.mark_list, fn(ref: ptr, list: *Lifo) {
             @unsafe
             let v = @ptrv(ref, uint)
-            if v & prop_mask != 0 || !in_heap(v.@cast(ptr)) : return
-            let c: uint = ref & (~(CARD_SIZE - 1)).to(uint)
-            if @ptrv(card_of(c), u8) == 0 || !covered(c) {
+            word_target_check(ref, v)
+            if v & prop_mask != 0 && !wc_adopted {
                 print_word_address(ref)
-                panic("GC error (cards): an uncounted reference lies in a card the log does not cover")
+                panic("GC error (W1): a young object holds a counted reference")
             }
         })
     })
     dirty_cards_check()
+}
+
+// WD: a reference word holds at most one tag, and a word into the heap names an allocated
+// object's start
+fn word_target_check(ref: ptr, v: uint) {
+    let tag = v & prop_mask
+    let target = v - tag
+    if tag == prop_mask {
+        print_word_address(ref)
+        panic("GC error (W-C): a reference word holds both tags")
+    }
+    if !in_heap(target.@cast(ptr)) {
+        if tag == 0 : return
+        print_word_address(ref)
+        panic("GC error (W-C): a tagged word names an address outside the heap (poison?)")
+    }
+    if !allocated_start(target) {
+        print_word_address(ref)
+        panic("GC error (W-C): a reference word does not name an allocated object")
+    }
+}
+
+fn allocated_start(t: uint) bool {
+    let desc = @ptrv(page_table, ?*Desc, (t - HEAP_BASE) >> PAGE_SHIFT) ?! return false
+    let first: uint = desc.first
+    let off = t - first
+    if off % desc.isize != 0 || off / desc.isize >= desc.slots_total : return false
+    return gcdata(t.@cast(ptr)).is_not_new() || in_window(desc, t, desc.aw_hi)
 }
 
 // Every dirty card is covered, or its slots are free or young
@@ -246,7 +301,7 @@ fn dirty_cards_check() {
             let first: uint = desc.first
             let slot = first
             while slot < c + CARD_SIZE && slot < first + desc.slots_total * desc.isize {
-                if slot + desc.isize > c && gcdata((slot + 8).@cast(ptr)).is_not_new() {
+                if slot + desc.isize > c && gcdata(slot.@cast(ptr)).is_not_new() {
                     panic("GC error (cards): a dirty card the log does not cover holds an old object")
                 }
                 slot += desc.isize
@@ -273,24 +328,44 @@ fn word_check() {
     })
 }
 
-// D-12 after P10, at every collection: the cards are clean, except those that the log of
-// the next collection covers (stores of finalizers)
+// D-3 and D-12 after P10, at every collection: a dirty card is covered by the log of the next
+// collection (stores of finalizers), or it is pre-marked: it holds at least one slot, and every
+// slot it holds is free in the current run, or young in the new epoch (allocated by a finalizer)
 fn settled_cards_check() {
-    if gc.card_log.index == 0 {
-        let c: uint = card_of(HEAP_BASE)
-        let end: uint = card_of(HEAP_BASE + heap_top)
-        while c < end {
-            if @ptrv(c.@cast(ptr), u64) != 0 : panic("GC error (cards): a dirty card after the settle")
-            c += 8
-        }
-        return
-    }
     covered_build()
     let c: uint = HEAP_BASE
     let end = HEAP_BASE + heap_top
     while c < end {
-        if @ptrv(card_of(c), u8) != 0 && !covered(c) : panic("GC error (cards): a dirty card after the settle")
+        let card = card_of(c)
+        if (card.@cast(uint) & 7) == 0 && @ptrv(card, u64) == 0 {
+            c += 8 * CARD_SIZE
+            continue
+        }
+        if @ptrv(card, u8) != 0 && !covered(c) : premarked_check(c)
         c += CARD_SIZE
+    }
+}
+
+fn premarked_check(c: uint) {
+    let desc = card_desc(c) ?! panic("GC error (cards): a dirty card in free pages after the settle")
+    let pool: *Pool = desc.pool
+    let first: uint = desc.first
+    let isize = desc.isize
+    let slots_end = first + desc.slots_total * isize
+    if c >= slots_end : panic("GC error (cards): a dirty card holds no slot")
+    let current = pool.block == desc
+    let cursor: uint = pool.cursor
+    let limit: uint = pool.limit
+    let hi = current ? cursor : desc.aw_hi
+    let slot = first
+    if c > first && desc.slots_total > 1 : slot = first + (((c - first) * desc.recip) >> 32) * isize
+    while slot < c + CARD_SIZE && slot < slots_end {
+        let in_run = current && slot >= cursor && slot < limit
+        if gcdata(slot.@cast(ptr)).is_not_new() || !(in_run || in_window(desc, slot, hi)) {
+            print_word_address(c.@cast(ptr))
+            panic("GC error (cards): a dirty card after the settle holds a slot outside the current run")
+        }
+        slot += isize
     }
 }
 
