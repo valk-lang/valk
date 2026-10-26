@@ -14,6 +14,9 @@ value mem_minimum_trigger (256 * 1024)
 // when everything survives, more when most of it dies first, up to the live
 // heap and 8x this
 value mark_step_max (8 * 1024 * 1024)
+// The soft cap of the log in entries: one per KiB of the live heap, within these
+value log_cap_min (16 * 1024)
+value log_cap_max (256 * 1024)
 
 // Core
 /// The collector of the running thread.
@@ -39,15 +42,20 @@ struct Gc {
     conditional_globals: *Bump (Bump.new())
     stack_items: *Bump (Bump.new())
     prev_stack_items: *Bump (Bump.new())
-    updated_list: *Bump (Bump.new())
-    // Sequence slots that received a reference: (item, slot) pairs
-    updated_slots: *Bump (Bump.new())
+    // Card entries (a card's first address) and range entries (storage | 1), in log order
+    card_log: *Bump (Bump.new())
     blanks: *Bump (Bump.new())
     dis_owned_list: *Bump (Bump.new())
     re_own_list: *Bump (Bump.new())
     adopted: *Bump (Bump.new()) // New storage that received ownership through transfer_refs()
     transfer_from: uint (0)     // Blocks of the running transfer_refs()
     transfer_to: uint (0)
+    transfer_cards: bool (false)
+    r4_storage: uint (0)        // The storage of the running moved_elements() and its logged cards
+    r4_cards: uint (0)
+    // The log's caps: removal records plus card log entries
+    e_soft: uint (log_cap_min)
+    e_hard: uint (log_cap_min * 2)
     stress_count: uint (0)      // Allocations since the last forced collection (GC_STRESS)
     stress_check: bool (false)  // The running collection is a scheduled stress collection
     mark_list: *Lifo (Lifo.new())
@@ -140,7 +148,11 @@ struct Gc {
         this.unmarked_run = 0
 
         #if GC_DEBUG && GC_STRESS
-        if this.stress_check : recount_scheduled()
+        let checks = this.stress_check && checks_scheduled()
+        if checks {
+            recount_check()
+            card_check()
+        }
         this.stress_check = false
         #end
 
@@ -163,10 +175,16 @@ struct Gc {
         // Both forms of the loops get exercised
         this.mark_window_on = this.collect_count % 2 == 0
         #end
-        this.loop_updates()
+        this.loop_cards()
         this.loop_adopted()
         this.loop_re_own()
+        #if GC_DEBUG && GC_STRESS
+        if checks : word_check()
+        #end
 
+        // Cards are cleared before the finalizers run: what they store is logged for the next
+        // collection
+        this.clear_cards()
         this.check_blanks()
 
         // The scan is done and the settle closes the windows
@@ -175,6 +193,9 @@ struct Gc {
 
         // Leak check
         if verify : this.leak_check()
+        #if GC_DEBUG
+        settled_cards_check()
+        #end
 
         // Free chunks beyond twice the allocation budget go back to the OS
         let budget = this.mem_trigger > this.mem_marked ? (this.mem_trigger - this.mem_marked) * 2 : 0
@@ -235,6 +256,7 @@ struct Gc {
             this.step_max = step < mark_step_max ? mark_step_max : step
         }
         if this.mem_trigger > this.mem_marked + this.step_max : this.mem_trigger = this.mem_marked + this.step_max
+        this.set_log_caps()
 
         pause_last_us = time.mono_us() - pause_start
         if pause_last_us > pause_max_us : pause_max_us = pause_last_us
@@ -392,46 +414,69 @@ struct Gc {
         this.unmarked_run += unmarked_bytes
     }
 
-    fn loop_updates() {
-        let list = this.updated_list
-        let data = list.data
-        let adr = data
-        let end = adr + list.index
-        list.reset()
-
+    // P6. The cards that stores into old objects made dirty: every reference word in them
+    // that the collection has not counted yet is marked. Cards of objects first, then
+    // sequence cards and range entries, in log order: Valk's claim order at card granularity
+    fn loop_cards() {
+        let log = this.card_log
+        let count = log.index / size_of(ptr)
+        if count == 0 : return
         let ml = this.mark_list
-
-        while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-
-            let header = gcheader(item)
-            header.remove_in_updates()
-            header.slot_logs = 0
-            if !in_heap(item) : continue
-
-            if gcdata(item).is_owned() {
-                let layout = desc_of(item).layout
-                if isset(layout) {
-                    each_ref(item, layout, ml, update_props)
-                }
+        #if GC_DEBUG
+        let expect = cards_expected(log)
+        cards_scanned = 0
+        #end
+        let i: uint = 0
+        while i < count {
+            let entry = @ptrv(log.data, uint, i)
+            i++
+            if entry & 1 == 0 && (desc_of(entry.@cast(ptr)).kind & desc_seq) == 0 : scan_card(entry, ml)
+        }
+        i = 0
+        while i < count {
+            let entry = @ptrv(log.data, uint, i)
+            i++
+            if entry & 1 == 0 {
+                if (desc_of(entry.@cast(ptr)).kind & desc_seq) != 0 : scan_card(entry, ml)
+                continue
             }
+            // A storage logged as a range is scanned once, however often it was logged
+            let storage = entry - 1
+            if ranges_add(storage) : scan_range(storage, ml)
         }
-
-        // Slots of sequences: only the ones that received a reference
-        let slots = this.updated_slots
-        adr = slots.data
-        end = adr + slots.index
-        slots.reset()
-        while adr < end {
-            let item = @ptrv(adr, GcItem, 0)
-            let ref = @ptrv(adr, ptr, 1)
-            adr = adr.$offset(size_of(ptr) * 2)
-            gcheader(item).slot_logs = 0
-            if gcdata(item).is_owned() : update_props(ref, ml)
-        }
-
+        #if GC_DEBUG
+        if cards_scanned != expect : panic("GC error: P6 did not scan every logged card")
+        #end
         mark_used(null)
+    }
+
+    // P10's card part: the cards of the card entries and of each range become clean, and the
+    // log is empty
+    fn clear_cards() {
+        let log = this.card_log
+        let adr = log.data
+        let end = adr + log.index
+        log.reset()
+        while adr < end {
+            let entry = @ptrv(adr, uint)
+            adr += size_of(ptr)
+            if entry & 1 == 0 : @ptrv(card_of(entry), u8) = 0
+        }
+        ranges_clear()
+        if log.size > 64 * 1024 : log.reduce_size()
+    }
+
+    // The log's caps follow the live heap
+    fn set_log_caps() {
+        let cap = this.mem_marked / 1024
+        if cap < log_cap_min : cap = log_cap_min
+        if cap > log_cap_max : cap = log_cap_max
+        #if GC_STRESS
+        // Small caps in one collection out of 8: the operations that end in a cap test collect
+        cap = small_log_cap(this.collect_count, cap)
+        #end
+        this.e_soft = cap
+        this.e_hard = cap * 2
     }
 
     fn check_blanks() {
