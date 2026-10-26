@@ -40,6 +40,7 @@ ir_result() {
 for target in linux-x64 linux-arm64 macos-arm64 win-x64; do queue_ir "$workdir/c-abi-$target.ll" "$DIR/../library/c-abi.valk" --target "$target" --ir --no-warn; done
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do queue_ir "$workdir/gc-direct-entry-$target.ll" "$DIR/gc-direct-entry.valk" --target "$target" --ir --no-warn; done
 queue_ir "$workdir/buffer-roots.ll" "$DIR/buffer-roots.valk" --ir --no-warn
+queue_ir "$workdir/coro-args.ll" "$DIR/coro-args.valk" --target linux-x64 --ir --no-warn
 queue_ir "$workdir/native-address.ll" "$DIR/native-address.valk" --ir --no-warn
 queue_ir "$workdir/windows-coro-stack.ll" "$DIR/native-address.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --no-warn
@@ -1291,6 +1292,38 @@ for grove in 0 1; do
     fi
 done
 
+echo "> Copy large coroutine arguments into frames before their roots are released"
+
+ir="$workdir/coro-args.ll"
+out=$(ir_result "$ir")
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build IR fixture"
+    echo "$out"
+    exit 1
+fi
+# The helper copies the 520-byte argument into an alloca before it pops its roots (pop_first),
+# and the call receives the copy
+helper=$(awk '/^define internal void @"valk\.coro\./ { body = "" } /^define/ { keep = /@"valk\.coro\./ } keep { body = body $0 "\n" } keep && /^}/ { if (body ~ /i64 520/) { printf "%s", body; exit } }' "$ir")
+copy=$(grep -o 'memcpy[^(]*(ptr %[.0-9a-z]*, ptr %[.0-9a-z]*, i64 520' <<< "$helper" | head -1)
+copy_dst=$(sed -E 's/.*\(ptr (%[.0-9a-z]+),.*/\1/' <<< "$copy")
+copy_line=$(grep -n 'memcpy.*i64 520' <<< "$helper" | head -1 | cut -d: -f1)
+pop_line=$(grep -n '__pop_first__' <<< "$helper" | head -1 | cut -d: -f1)
+if [ -z "$copy" ] || ! grep -q "^  $copy_dst = alloca" <<< "$helper" || [ -z "$pop_line" ] \
+    || [ "$copy_line" -ge "$pop_line" ] || ! grep -q "call i64 %.*, ptr $copy_dst)" <<< "$helper"; then
+    echo "# Coroutine helper does not pass a frame copy of its large argument"
+    echo "$helper"
+    exit 1
+fi
+# The launch appends the argument's root from a frame copy, not from Coro.args
+main_body=$(sed -n '/^define dso_local [a-z0-9]* @"[^"]*__main__[0-9]*"(/,/^}/p' "$ir")
+root_base=$(sed -n '/Coro__new__/,/__append__/p' <<< "$main_body" | grep -o 'getelementptr i8, ptr %[.0-9a-z]*' | tail -1 | sed 's/.* //')
+if [ -z "$root_base" ] || ! grep -q "^  $root_base = alloca" <<< "$main_body"; then
+    echo "# Coroutine launch appends its argument roots from Coro.args"
+    echo "$main_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 50"
+echo "# Test count: 51"
 echo ""

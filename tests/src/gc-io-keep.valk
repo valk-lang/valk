@@ -5,12 +5,17 @@ use valk.coro
 use valk.ext
 use valk.gc
 use valk.io
+use valk.net
 
 // A read whose buffer only the kernel names: the reader keeps no reference of its own (the
 // address is hidden from the stack scan), parks, and the launcher collects before any data
 // arrives. The buffer must stay alive until the read's completion
 
 global io_keep_freed: bool
+// The coroutine that submitted the operation, and the words it must keep (hidden)
+global io_keep_owner: ?coro.Coro (null)
+global io_keep_expect: uint
+global io_keep_expect_2: uint
 
 class IoKeepBuffer {
     bytes: [u8 x 64]
@@ -24,14 +29,32 @@ class IoKeepBuffer {
 value IO_KEEP_HIDE (0x5A5A_5A5A_5A5A_5A58)
 
 fn io_keep_hidden_buffer() uint $noinline {
-    @unsafe
     let buf = IoKeepBuffer { kept: true }
     return buf.@cast(ptr).@cast(uint) ^ IO_KEEP_HIDE
+}
+
+fn io_keep_note(hidden: uint, hidden_2: uint) {
+    io_keep_owner = coro.current_coro
+    io_keep_expect = hidden
+    io_keep_expect_2 = hidden_2
+}
+
+// Called while the submitter is parked, then after it woke
+fn io_keep_assert_kept() {
+    let owner = io_keep_owner ?! panic("no owner")
+    assert(owner.io_keep[0] == io_keep_expect ^ IO_KEEP_HIDE)
+    assert(owner.io_keep[1] == (io_keep_expect_2 == 0 ? 0 : io_keep_expect_2 ^ IO_KEEP_HIDE))
+}
+fn io_keep_assert_released() {
+    let owner = io_keep_owner ?! panic("no owner")
+    assert(owner.io_keep[0] == 0 && owner.io_keep[1] == 0)
+    io_keep_owner = null
 }
 
 fn io_keep_read(fd: i32) String $noinline {
     @unsafe
     let hidden = io_keep_hidden_buffer()
+    io_keep_note(hidden, 0)
     let n = io.read_bytes(fd, (hidden ^ IO_KEEP_HIDE).@cast(ptr), 64, uint.$max) ! return "read failed"
     let at = (hidden ^ IO_KEEP_HIDE).@cast(ptr)
     if n != 5 : return "read " + n
@@ -77,11 +100,62 @@ synctest "GC: a buffer only a pending read names survives collections" {
     io_keep_freed = false
     // The reader runs until its read is queued and it parks
     let task = co io_keep_read(fds[0])
+    io_keep_assert_kept()
     io_keep_churn()
     assert(!io_keep_freed)
     let text = "hello"
     assert(ext.write(fds[1], text.data, 5) == 5)
     assert(await task == "ok")
+    io_keep_assert_released()
+    ext.close(fds[0])
+    ext.close(fds[1])
+}
+
+fn io_keep_write(fd: i32) $noinline {
+    @unsafe
+    let hidden = io_keep_hidden_buffer()
+    io_keep_note(hidden, 0)
+    let n = io.write_bytes(fd, (hidden ^ IO_KEEP_HIDE).@cast(ptr), 8) ! panic("write failed")
+    assert(n == 8)
+}
+
+fn io_keep_recv(fd: i32) $noinline {
+    @unsafe
+    let hidden = io_keep_hidden_buffer()
+    io_keep_note(hidden, 0)
+    // A pipe is no socket: the receive fails, but only after it was queued
+    let _ = net.recv_bytes(fd, (hidden ^ IO_KEEP_HIDE).@cast(ptr), 8) ! return
+}
+
+fn io_keep_send_then_recv(fd: i32) $noinline {
+    let data = IoKeepBuffer {}
+    let buf = IoKeepBuffer {}
+    io_keep_note(data.@cast(ptr).@cast(uint) ^ IO_KEEP_HIDE, buf.@cast(ptr).@cast(uint) ^ IO_KEEP_HIDE)
+    let _ = net.send_then_recv(fd, data.bytes, buf.bytes) ! return
+}
+
+// Each submitter names its buffers while parked and releases them once woken
+synctest "GC: write, recv and send_then_recv keep their buffers while parked" {
+    io.uring() ! return
+    let fds: [i32 x 2] = @undefined
+    assert(ext.pipe(@ref(fds)) == 0)
+
+    let write = co io_keep_write(fds[1])
+    io_keep_assert_kept()
+    await write
+    io_keep_assert_released()
+
+    let recv = co io_keep_recv(fds[0])
+    io_keep_assert_kept()
+    await recv
+    io_keep_assert_released()
+
+    if io.uring_links_full_sends() {
+        let pair = co io_keep_send_then_recv(fds[0])
+        io_keep_assert_kept()
+        await pair
+        io_keep_assert_released()
+    }
     ext.close(fds[0])
     ext.close(fds[1])
 }
