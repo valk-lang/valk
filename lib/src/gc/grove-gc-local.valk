@@ -8,12 +8,12 @@ use mem
 use time
 use ext
 
-value mem_minimum_trigger (256 * 1024)
-// A collection marks what survived of the allocations since the last one.
-// The step between collections is sized so that is about this much: 8 MiB
-// when everything survives, more when most of it dies first, up to the live
-// heap and 8x this
-value mark_step_max (8 * 1024 * 1024)
+// Pacing (THEORY 5.5.6, R-50): from the live bytes L and the survival ratio s of the last
+// cycle, the young budget B = clamp(min(L / 2, 1 MiB / s), 512 KiB, 8 MiB) and the hard limit
+// H = 1.5 B when s >= 0.5, else clamp(1.25 L, 2 B + 32 KiB, 64 MiB). No clock is read
+value budget_min (512 * 1024)
+value budget_max (8 * 1024 * 1024)
+value limit_max (64 * 1024 * 1024)
 // The soft cap of the log in entries: one per KiB of the live heap, within these
 value log_cap_min (16 * 1024)
 value log_cap_max (256 * 1024)
@@ -40,12 +40,17 @@ struct Gc {
     // Lists
     globals: *Bump (Bump.new())
     conditional_globals: *Bump (Bump.new())
+    // S: the root objects of the running collection, in scan order
     stack_items: *Bump (Bump.new())
-    prev_stack_items: *Bump (Bump.new())
+    // The root list of the ROOT_OWNED objects (ROOT_prev); ROOT_now is built by a collection
+    roots_prev: *Bump (Bump.new())
+    roots_now: *Bump (Bump.new())
     // Card entries (a card's first address) and range entries (storage | 1), in log order
     card_log: *Bump (Bump.new())
+    // The finalizer list: finalizable objects allocated in this epoch, and the walked ones
     blanks: *Bump (Bump.new())
-    dis_owned_list: *Bump (Bump.new())
+    cut_list: *Bump (Bump.new())
+    // RL: walked objects whose count was not 0
     re_own_list: *Bump (Bump.new())
     // Debug: storage that a growth left with plain words until the next collection cuts it
     growth_sources: *Bump (Bump.new())
@@ -56,7 +61,10 @@ struct Gc {
     e_hard: uint (log_cap_min * 2)
     stress_count: uint (0)      // Allocations since the last forced collection (GC_STRESS)
     stress_check: bool (false)  // The running collection is a scheduled stress collection
+    // The mark and walk stack; the debug traces use their own
     mark_list: *Lifo (Lifo.new())
+    trace_list: *Lifo (Lifo.new())
+    // The removal buffer
     props_removed: *Lifo (Lifo.new())
     // Blocks allocated into or freed from since the last collection
     touched_blocks: *Bump (Bump.new())
@@ -75,31 +83,26 @@ struct Gc {
 
     coros_ptr: *Array[?coro.Coro] (@ref(coro.g_coros))
     alc_list_ptr: **Bump (@ref(alc_list))
-    //
+    // `collecting` is the in_collection flag
     state: GcState (GcState.disabled)
-    // Counts
+    // Objects the last collection walked
     dis_own_count: uint (0)
-    // Marking and dis-owning use the prefetch window when the last dis-own ran at
-    // cache-miss speed; a heap that fits the cache is faster without it (see mark_used)
+    // Marking and the walk use the prefetch window (see mark)
     mark_window_on: bool (false)
     collect_count: uint (0)
-    // Allocation allowed between collections, from the last one's survival
-    step_max: uint (mark_step_max)
-    // Marked bytes a running collection released
-    unmarked_run: uint (0)
-    trigger_list: [uint x 5] ({ 0... })
-    dis_own_list: [uint x 5] ({ 0... })
-    // Info
-    marked_max_reset_at: uint (0)
-    marked_max: uint (0)
-    marked_max_next: uint (0)
-    /// Bytes of objects marked live, as counted by the last collection.
+    // Bytes claimed in this epoch's windows, the growths' claims included: the survivors of
+    // the young cycle, for the survival ratio
+    young_marked: uint (0)
+    /// H: bytes of allocation since the last collection beyond which a collection cannot wait.
+    ~+ mem_limit: uint (budget_min * 2 + 32 * 1024)
+    /// L: bytes of the objects the last collection found live, plus those claimed since.
     ~+ mem_marked: uint (0)
-    /// A collection is due once `mem_new` reaches this many bytes.
+    /// B: a collection is due once `mem_new` reaches this many bytes.
     ///
-    /// Adjusted after each collection from the live size and recent history; never below 64 KiB.
-    ~+ mem_trigger: uint (mem_minimum_trigger)
-    /// Bytes marked live at the last collection plus the bytes allocated since then.
+    /// Set at each collection from the live bytes and from the share of the young bytes that
+    /// survived: between 512 KiB and 8 MiB.
+    ~+ mem_trigger: uint (budget_min)
+    /// Bytes allocated since the last collection, counted per closed run and per large object.
     ~+ mem_new: uint (0)
     /// Bytes of pool blocks this thread's allocators hold, including free slots.
     ~+ mem_usage_thread: uint (0)
@@ -132,23 +135,26 @@ struct Gc {
         g.collect_run()
     }
 
+    // R-27: a running collection is not entered again; collect() returns at once
     fn collect_allowed() bool {
-        if this.state == GcState.collecting : panic("GC is already running (bug)")
         return this.state == GcState.idle
     }
 
+    // One collection (THEORY 5.5.2): P0 to P10, P7 deleted (K-01)
     fn collect_run() {
+        // P0: in_collection; the runs close at their cursors, so `allocated` and the windows
+        // are exact
         this.state = GcState.collecting
-
         let pause_start = time.mono_us()
-        // P0: the runs close at their cursors, so `allocated` and the windows are exact
         close_runs(this.alc_list_ptr[0])
-        let marked_before = this.mem_marked
-        let allocated = this.mem_new > marked_before ? this.mem_new - marked_before : 0
-        this.unmarked_run = 0
+        let allocated = this.mem_new
 
+        #if GC_DEBUG
+        // D-5 before P2's cuts
+        removal_check(this.props_removed)
+        #end
         #if GC_DEBUG && GC_STRESS
-        let checks = this.stress_check && checks_scheduled()
+        let checks = this.stress_check
         if checks {
             recount_check()
             card_check()
@@ -156,105 +162,44 @@ struct Gc {
         this.stress_check = false
         #end
 
-        this.collect_stack_items()
-
-        // Check if items have dissapeared from the stack
-        this.loop_previous_stack_items()
-        this.loop_props_removed()
-
-        // Mark stack items
-        this.loop_stack_items(Gc.mark_stack_item)
-
-        //
-        let dis_own_start = time.mono_us()
-        this.loop_dis_own()
-        if this.dis_own_count >= 4096 {
-            this.mark_window_on = (time.mono_us() - dis_own_start) * 1000 >= this.dis_own_count * mark_window_ns
-        }
+        this.collect_stack_items()      // P1
+        this.loop_roots_prev()          // P2
+        this.loop_props_removed()       // P3
+        this.claim_stack_items()        // P4
+        this.loop_cuts()                // P5
         #if GC_DEBUG
         // Both forms of the loops get exercised
         this.mark_window_on = this.collect_count % 2 == 0
         #end
-        this.loop_cards()
-        this.loop_re_own()
+        this.loop_cards()               // P6
+        this.loop_re_own()              // P8
         #if GC_DEBUG && GC_STRESS
         if checks : word_check()
         #end
 
-        // Cards are cleared before the finalizers run: what they store is logged for the next
-        // collection. Then the new epoch opens the current blocks' windows at their cursors
+        // P10's card clears run before the finalizers: what they store is logged for the
+        // next collection. The new epoch opens the current blocks' windows at their cursors
+        // before P9 too, so objects a finalizer allocates are young in it
         this.clear_cards()
         open_windows(this.alc_list_ptr[0])
-        this.check_blanks()
+        this.check_blanks()             // P9
 
+        // P10
         settle_blocks(this.touched_blocks, this.alc_list_ptr[0])
-
-        // Leak check
-        if verify : this.leak_check()
         #if GC_DEBUG
         settled_cards_check()
         #end
-
-        // Free chunks beyond twice the allocation budget go back to the OS
-        let budget = this.mem_trigger > this.mem_marked ? (this.mem_trigger - this.mem_marked) * 2 : 0
-        heap_return_idle(budget > RETAIN_MIN ? budget : RETAIN_MIN)
-
-        // Clear stack items list
+        let roots = this.roots_prev
+        this.roots_prev = this.roots_now
+        this.roots_now = roots
+        if verify : this.leak_check()
         this.clear_stack_items()
 
-        // Reset mem_new
-        this.mem_new = this.mem_marked
-        if this.mem_marked > this.marked_max_next : this.marked_max_next = this.mem_marked
-        if this.mem_marked > this.marked_max : this.marked_max = this.mem_marked
-        let time = time.mono_us()
-        if time > this.marked_max_reset_at {
-            this.marked_max_reset_at = time + 200 * 1000 // 200ms
-            this.marked_max_next = 0
-            this.marked_max = this.marked_max_next
-        }
-
-        // Learn from the past
-        this.trigger_list[this.collect_count % 5] = this.mem_trigger
-        this.dis_own_list[this.collect_count % 5] = this.dis_own_count
+        this.pace(allocated)
+        // Free chunks beyond twice the young budget go back to the OS
+        let retain = this.mem_trigger * 2
+        heap_return_idle(retain > RETAIN_MIN ? retain : RETAIN_MIN)
         this.collect_count++
-
-        // Update trigger point
-        let high = this.mem_marked / 100 * 120 + 1024
-        let high2 = high / 100 * 150
-        let low = this.mem_trigger / 100 * 95
-        if low > high : high = low
-        if low > high2 : high2 = low
-        this.mem_trigger = high
-
-        // Check for best match in the past
-        let bar: uint = 2_999_999
-        let i = 5
-        while i-- > 0 {
-            let t = this.trigger_list[i]
-            if t == 0 : continue
-            let d = this.dis_own_list[i]
-            if d < bar && t >= high && t <= high2 {
-                this.mem_trigger = t
-                bar = d
-            }
-        }
-
-        //
-        if this.mem_trigger < this.marked_max : this.mem_trigger = this.marked_max
-        if this.mem_trigger < mem_minimum_trigger : this.mem_trigger = mem_minimum_trigger
-        // Size the next step from how much of this one survived (at least 1/64)
-        if allocated >= mark_step_max / 8 {
-            let kept = this.mem_marked + this.unmarked_run
-            let survived = kept > marked_before ? kept - marked_before : 0
-            if survived < allocated / 64 : survived = allocated / 64
-            let step = mark_step_max / 16 * (allocated * 16 / survived)
-            // Never more than the live heap, so memory at most doubles
-            let limit = this.mem_marked < mark_step_max * 8 ? this.mem_marked : mark_step_max * 8
-            if step > limit : step = limit
-            this.step_max = step < mark_step_max ? mark_step_max : step
-        }
-        if this.mem_trigger > this.mem_marked + this.step_max : this.mem_trigger = this.mem_marked + this.step_max
-        this.set_log_caps()
 
         pause_last_us = time.mono_us() - pause_start
         if pause_last_us > pause_max_us : pause_max_us = pause_last_us
@@ -262,131 +207,139 @@ struct Gc {
         this.state = GcState.idle
     }
 
+    // R-50: B, H and the log's caps of the next cycle; `allocated` bytes were allocated in
+    // the one that ends
+    fn pace(allocated: uint) {
+        let b, h = pacing(this.mem_marked, this.young_marked, allocated)
+        this.mem_trigger = b
+        this.mem_limit = h
+        this.mem_new = 0
+        this.young_marked = 0
+        this.set_log_caps()
+    }
+
+    // D-11 and I7 after P10: a full trace from the root objects S over every reference word
+    // reaches exactly the old objects (an old object not reached is a leak, a reached STATE-0
+    // object a premature free); the support traversal from the root list, along OWN words and
+    // along CO words into CO_ROOTs, reaches exactly them too (I12); the root list holds the
+    // ROOT_OWNED objects
     fn leak_check() {
-        this.loop_stack_items(fn(item: ptr) { mark_leak_rec(item, true) })
-        leak_check_pools(this.alc_list_ptr[0])
-        this.loop_stack_items(fn(item: ptr) { mark_leak_rec(item, false) })
-    }
-
-    static fn mark_stack_item(item: ptr) {
-        let data = gcdata(item)
-        if data.is_not_owned() {
-            mark_used(item)
-            gc.prev_stack_items.add_ptr(item)
-        } else if data.is_still_co_owned() {
-            data.remove_still_co_owned()
-            gc.prev_stack_items.add_ptr(item)
+        this.loop_stack_items(fn(item: ptr) { trace_from(item, false) })
+        let roots = leak_check_pools(this.alc_list_ptr[0])
+        let list = this.roots_prev
+        if roots != list.index / size_of(ptr) : panic("GC error: the root list does not hold the ROOT_OWNED objects")
+        let adr = list.data
+        let end = adr + list.index
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            adr += size_of(ptr)
+            if gcdata(item).state() != st_root_owned : panic("GC error: an object on the root list is not ROOT_OWNED")
+            trace_from(item, true)
         }
+        leak_check_pools(this.alc_list_ptr[0])
     }
 
+    // P2 (K-04): an object on the root list that is no root object any more is cut
+    fn loop_roots_prev() {
+        let list = this.roots_prev
+        let adr = list.data
+        let end = adr + list.index
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            adr += size_of(ptr)
+            let data = gcdata(item)
+            #if GC_DEBUG
+            if data.state() != st_root_owned : panic("GC error: an object on the root list is not ROOT_OWNED")
+            #end
+            if !data.is_on_stack() : this.cut(item, data)
+        }
+        list.reset()
+    }
+
+    // cut(u) (K-06): an object that is not STATE 0 is dropped and listed for P5
+    fn cut(item: ptr, data: *GcData) $inline {
+        if data.is_new() : return
+        drop(item, data)
+        this.cut_list.add_ptr(item)
+    }
+
+    // P3 (K-05): an OWN record cuts its target; a CO record lowers its target's count and cuts
+    // it when it is a CO_ROOT
     fn loop_props_removed() {
         let list = this.props_removed
-        #if GC_DEBUG
-        removal_check(list)
-        #end
         this.growth_sources.reset()
-        while true {
-            let v = list.pop() ! break
-            if v & prop_owned == prop_owned {
-                let item: ptr = v - prop_owned
-                #if GC_DEBUG
-                if item == null : panic("GC error: removed 'owned' property is not a tagged pointer; its memory was reused")
-                #end
-                let data = gcdata(item)
-                data.set_no_owner()
-                gc.dis_owned_list.add_ptr(item)
-            } else {
-                #if GC_DEBUG
-                if v & prop_mask != prop_co_owned : panic("GC error: removed property has no ownership tag")
-                #end
-                let item: ptr = v - prop_co_owned
-                #if GC_DEBUG
-                if item == null : panic("GC error: removed 'co-owned' property is not a tagged pointer; its memory was reused")
-                #end
-                let data = gcdata(item)
-                data.dis_co_own()
+        while list.index > 0 {
+            let v: uint = list.pop_unchecked()
+            let tag = v & prop_mask
+            let item: ptr = (v - tag).@cast(ptr)
+            let data = gcdata(item)
+            if tag == prop_owned {
+                this.cut(item, data)
+                continue
             }
+            data.co_unown()
+            if data.state() == st_co_root : this.cut(item, data)
         }
     }
 
-    fn loop_previous_stack_items() {
-        let discs = this.dis_owned_list
-        let list = this.prev_stack_items
-        let data = list.data
-        let adr = data
+    // P4 (K-07): a STATE-0 root object (young, or cut in P2 or P3) is claimed ROOT_OWNED and
+    // marked; a ROOT_OWNED one stays on the root list. An on-stack OWNED object needs nothing,
+    // an on-stack CO_ROOT stays a CO_ROOT
+    fn claim_stack_items() {
+        let list = this.stack_items
+        let adr = list.data
         let end = adr + list.index
-        list.reset()
-
+        let roots = this.roots_now
         while adr < end {
             let item = @ptrv(adr, ptr)
-            adr = adr.$offset(size_of(ptr))
-
-            #if GC_DEBUG
-            if item == null : panic("Invalid previous stack item (value is null)")
-            #end
-            let data = gcdata(item)
-
-            if data.is_on_stack() {
-                let adr = list.get(size_of(ptr))
-                @ptrv(adr, ptr) = item
-            } else {
-                let adr = discs.get(size_of(ptr))
-                @ptrv(adr, ptr) = item
-                data.set_no_owner()
+            adr += size_of(ptr)
+            let st = gcdata(item).state()
+            if st == 0 {
+                claim(item, st_root_owned)
+                roots.add_ptr(item)
+                mark(item)
+            } else if st == st_root_owned {
+                roots.add_ptr(item)
             }
         }
     }
 
-    fn loop_dis_own() {
-        let list = this.dis_owned_list
-        let i: uint = 0
-        let disowned: uint = 0
-        let unmarked_bytes: uint = 0
-
-        // The dis-own list can grow while running this code
-        while i < list.index {
-            let item = @ptrv(list.data, ptr, i / size_of(ptr))
-            i += size_of(ptr)
-
-            #if GC_DEBUG
-            if item == null : panic("Dis own list contains a null value")
-            #end
-
-            let data = gcdata(item)
-
-            if data.is_no_owner() {
-                let count, bytes = dis_own_rec(item)
-                disowned += count
-                unmarked_bytes += bytes
-            }
+    // P5 (K-08): each cut object that is still STATE 0 is dead and walked; the walk frees in
+    // place. The walk's size switches the prefetch window on or off
+    fn loop_cuts() {
+        let list = this.cut_list
+        let walked: uint = 0
+        let adr = list.data
+        let end = adr + list.index
+        while adr < end {
+            let item = @ptrv(adr, ptr)
+            adr += size_of(ptr)
+            if gcdata(item).is_new() : walked += walk(item)
         }
-
         list.reset()
-        this.dis_own_count = disowned
-        if unmarked_bytes > this.mem_marked : panic("GC marked-memory accounting underflow")
-        this.mem_marked -= unmarked_bytes
-        this.unmarked_run += unmarked_bytes
+        this.dis_own_count = walked
+        this.mark_window_on = walked >= window_objects && this.mem_marked >= window_heap
     }
 
+    // P8 (K-15): a walked object whose count is still above 0 is reachable through holders
+    // that were not walked: it is claimed as a CO_ROOT and marked
     fn loop_re_own() {
         let list = this.re_own_list
-        let data = list.data
-        let adr = data
+        let adr = list.data
         let end = adr + list.index
-        list.reset()
-
         while adr < end {
             let item = @ptrv(adr, ptr)
+            adr += size_of(ptr)
             let data = gcdata(item)
-            adr = adr.$offset(size_of(ptr))
-
             if data.is_new() && data.has_co() {
-                mark_used(item)
-                // Co ownership can be from stack or an object
-                if data.is_on_stack() : this.prev_stack_items.add_ptr(item)
-                else : data.set_still_co_owned()
+                #if GC_DEBUG
+                if data.is_on_stack() : panic("GC error: a walked object is a root object")
+                #end
+                claim(item, st_co_root)
+                mark(item)
             }
         }
+        list.reset()
     }
 
     // P6. The cards that stores into old objects made dirty: every reference word in them
@@ -422,7 +375,7 @@ struct Gc {
         #if GC_DEBUG
         if cards_scanned != expect : panic("GC error: P6 did not scan every logged card")
         #end
-        mark_used(null)
+        mark(null)
     }
 
     // P10's card part: the cards of the card entries, of each range and of this epoch's windows
@@ -455,22 +408,27 @@ struct Gc {
         this.e_hard = cap * 2
     }
 
+    // P9 (K-16): the finalizer of each distinct dead object on the list runs once. ON_STACK,
+    // which no dead object carries, marks the objects done and is cleared again
     fn check_blanks() {
         let list = this.blanks
-        let data = list.data
-        let adr = data
+        let adr = list.data
         let end = adr + list.index
-        list.reset()
-
         while adr < end {
-            let item = @ptrv(adr, GcItem)
-            adr = adr.$offset(size_of(ptr))
-
+            let item = @ptrv(adr, ptr)
+            adr += size_of(ptr)
             let data = gcdata(item)
-            if data.is_not_new() : continue
-
+            if data.is_not_new() || data.is_on_stack() : continue
             free_blank(item)
+            data.set_on_stack()
         }
+        adr = list.data
+        while adr < end {
+            let data = gcdata(@ptrv(adr, ptr))
+            adr += size_of(ptr)
+            if data.is_new() : data.remove_on_stack()
+        }
+        list.reset()
     }
 
     //////////////////////////
@@ -498,11 +456,11 @@ struct Gc {
         while adr < end {
             let item = @ptrv(adr, GcItem)
             adr = adr.$offset(size_of(ptr))
-            let data = gcdata(item)
-            data.co_unown()
-            data.remove_on_stack()
+            gcdata(item).remove_on_stack()
         }
     }
+    // P1 (K-03): a root object is marked ON_STACK once and listed in S, in scan order; its
+    // presence is not counted
     fn collect_stack_item(item: ptr) {
         #if GC_DEBUG
         if item & 7 > 0 {
@@ -515,7 +473,6 @@ struct Gc {
         let data = gcdata(item)
         if data.is_on_stack() : return
         data.set_on_stack()
-        data.co_own()
         this.stack_items.add_ptr(item)
     }
     fn collect_stack_items() {
@@ -641,6 +598,25 @@ struct Gc {
             more: more
         }
     }
+}
+
+// B and H of the cycle after one that ended with `live` bytes live and in which `young` of
+// the `allocated` bytes survived (THEORY 5.5.6)
+fn pacing(live: uint, young: uint, allocated: uint) (uint, uint) {
+    let b = live / 2
+    if young > 0 {
+        // 1 MiB / s
+        let by_survival = allocated < (1.to(uint) << 43) ? (allocated << 20) / young : (allocated / young) << 20
+        if by_survival < b : b = by_survival
+    }
+    if b < budget_min : b = budget_min
+    if b > budget_max : b = budget_max
+    // s >= 0.5: waiting cannot reduce the survivors
+    if allocated > 0 && young * 2 >= allocated : return (b, b / 2 * 3)
+    let h = live / 4 * 5
+    if h < b * 2 + 32 * 1024 : h = b * 2 + 32 * 1024
+    if h > limit_max : h = limit_max
+    return (b, h)
 }
 
 #end

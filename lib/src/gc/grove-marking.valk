@@ -1,120 +1,125 @@
+@unsafe
+
 #if GROVE
 
 use mem
 
-// Marking and dis-owning walk the graph through the mark list. Two forms: the direct one
-// touches an object's shadow byte when its slot is reached and pushes the object; the window
-// form pushes the slot address, prefetches the object and its shadow byte when the entry
-// leaves the list and processes it mark_window entries later, so the cache misses of several
-// objects overlap. The window costs instructions, so it is only used when the last
-// dis-own ran at cache-miss speed (Gc.mark_window_on)
+// The collector's graph loops (THEORY 5.4.5): marking claims what it reaches, the walk frees
+// in place what lost its owner. Both run over the mark list in work items of at most 256
+// words (K-21). Two forms: the direct one processes an object when it leaves the list; the
+// window form pushes slot addresses and prefetches each target and its shadow byte
+// mark_window entries before it is processed, so the cache misses of several objects overlap.
+// The window costs instructions, so it is used only after a walk of many objects in a large
+// heap: an object count, not a time (Gc.mark_window_on)
 value mark_window (8)
-// Nanoseconds per dis-owned object above which the window is used
-value mark_window_ns (16)
+value window_objects (4096)
+value window_heap (16 * 1024 * 1024)
 
-fn mark_used(item: ?GcItem) $hot {
+// claim(u, st) without the push (K-13): STATE := st, the block's live count and L grow, and a
+// young object (in its block's window of this epoch) adds its bytes to young_marked
+fn claim(item: ptr, st: uint) *Desc $inline {
     @unsafe
-    if gc.mark_window_on : mark_used_window(item)
-    else : mark_used_direct(item)
+    gcdata(item).set_state(st)
+    let desc = desc_of(item)
+    let size = desc.isize
+    desc.slots_used++
+    let g = gc
+    g.mem_marked += size
+    if in_window(desc, item, desc.aw_hi) : g.young_marked += size
+    return desc
 }
 
-fn mark_used_direct(item: ?GcItem) $hot {
+// drop(u) (K-06): STATE 0, the block's live count and L shrink
+fn drop(item: ptr, data: *GcData) $inline {
+    @unsafe
+    data.set_state(0)
+    let desc = desc_of(item)
+    desc.slots_used--
+    #if GC_DEBUG
+    if desc.isize > gc.mem_marked : panic("GC marked-memory accounting underflow")
+    #end
+    gc.mem_marked -= desc.isize
+}
+
+//////////////////////////
+// Marking
+//////////////////////////
+
+// The drain (K-14): marks the object `item` that the caller claimed, if any, then every
+// object the mark list holds
+fn mark(item: ?ptr) $hot {
+    if gc.mark_window_on : mark_window_loop(item)
+    else : mark_direct(item)
+}
+
+fn mark_direct(item: ?ptr) $hot {
     @unsafe
     let ml = gc.mark_list
-    if isset(item) {
-        let data = gcdata(item)
-        let is_new = data.is_new()
-
-        #if GC_DEBUG
-        if data.is_still_co_owned() : panic("double ownership")
-        #end
-
-        data.own()
-        if is_new {
-            let block = desc_of(item)
-            block.slots_used++
-            gc.mem_marked += block.isize
-        }
-        ml.add(item)
-    }
-
-    // Only objects in the heap are marked
+    if isset(item) : ml.add(item)
     while ml.index > 0 {
-        let item = ml.pop_unchecked()
-        let block = desc_of(item)
-        let layout = block.layout
-        if isset(layout) {
-            // Room for every word of the object, so the pushes need no capacity check
-            ml.reserve(block.isize / size_of(ptr))
-            each_ref(item, layout, ml, mark_used_props_direct)
+        let e = ml.pop_unchecked()
+        let from: uint = 0
+        if e & 1 != 0 {
+            e = e - 1
+            from = ml.pop_unchecked()
         }
+        let desc = desc_of(e)
+        let layout = desc.layout ?! continue
+        each_ref_work(e, layout, desc.isize, from, ml, mark_ref)
     }
 }
 
-fn mark_used_props_direct(ref: ptr, list: *Lifo) $hot $inline {
+// The mark rule (K-12) for one non-null reference word of a claimed object: a counted word is
+// skipped; an untagged word claims a STATE-0 target as OWNED and tags the word OWN, else it
+// counts the target and tags the word CO
+fn mark_ref(ref: ptr, list: *Lifo) $hot $inline {
     @unsafe
-    let sub = @ptrv(ref, ?ptr)
-    if !isset(sub) : return
-    // Objects outside the heap (static strings) have no state and are never tagged
-    if sub & prop_mask == 0 && in_heap(sub) {
-        let sub_data = gcdata(sub)
-        if sub_data.is_not_owned() {
-            @ptrv(ref, ptr) = sub | prop_owned
-            let is_new = sub_data.is_new()
-            sub_data.own()
-            if is_new {
-                let sub_block = desc_of(sub)
-                sub_block.slots_used++
-                gc.mem_marked += sub_block.isize
-            }
-            list.add_unchecked(sub)
-        } else {
-            @ptrv(ref, ptr) = sub | prop_co_owned
-            sub_data.co_own()
-        }
-    }
-}
-
-fn mark_used_window(item: ?GcItem) $hot {
-    @unsafe
-    let g = gc
-    let ml = g.mark_list
-    let marked_bytes: uint = 0
-    if isset(item) {
-        let data = gcdata(item)
+    let w = @ptrv(ref, uint)
+    if w & prop_mask != 0 {
         #if GC_DEBUG
-        if data.is_still_co_owned() : panic("double ownership")
+        mark_word_check(ref, w)
         #end
-        let is_new = data.is_new()
-        data.own()
-        let block = desc_of(item)
-        if is_new {
-            block.slots_used++
-            marked_bytes += block.isize
-        }
-        let layout = block.layout
-        if isset(layout) {
-            ml.reserve(block.isize / size_of(ptr))
-            each_ref(item, layout, ml, mark_push_ref)
-        }
+        return
     }
+    let sub: ptr = w.@cast(ptr)
+    // Objects outside the heap (static strings) have no state and are never tagged
+    if !in_heap(sub) : return
+    let data = gcdata(sub)
+    if data.is_new() {
+        claim(sub, st_owned)
+        @ptrv(ref, uint) = w | prop_owned
+        list.add_unchecked(sub)
+        return
+    }
+    data.co_own()
+    @ptrv(ref, uint) = w | prop_co_owned
+}
+
+fn mark_window_loop(item: ?ptr) $hot {
+    @unsafe
+    let ml = gc.mark_list
+    if isset(item) : mark_expand(item, 0, ml)
 
     // Slots leave the list through a window of mark_window entries: an entry's shadow byte and
-    // object are prefetched when it enters and touched when it leaves. One in, one out, so the
-    // branches stay predictable
+    // object are prefetched when it enters and processed when it leaves. One in, one out, so
+    // the branches stay predictable
     let window: [ptr x mark_window] = @undefined
     let head: uint = 0
     let count: uint = 0
-    let fill: uint = g.mark_window_on ? mark_window - 1 : 0
     while true {
-        let ref: ptr = null_ptr()
         if ml.index > 0 {
             let entered = ml.pop_unchecked()
+            if entered & 1 != 0 {
+                // The rest of a work item
+                let from: uint = ml.pop_unchecked()
+                mark_expand(entered - 1, from, ml)
+                continue
+            }
             let target = @ptrv(entered, uint) & (~prop_mask).to(uint)
             $prefetch((target >> 3).@cast(ptr))
             $prefetch(target.@cast(ptr))
             window[(head + count) & (mark_window - 1)] = entered
-            if count < fill {
+            if count < mark_window - 1 {
                 count++
                 continue
             }
@@ -122,60 +127,209 @@ fn mark_used_window(item: ?GcItem) $hot {
             if count == 0 : break
             count--
         }
-        ref = window[head]
+        let ref = window[head]
         head = (head + 1) & (mark_window - 1)
 
-        let sub = @ptrv(ref, ?ptr)
-        // A slot logged twice was processed already
-        if !isset(sub) || sub & prop_mask != 0 || !in_heap(sub) : continue
-        let sub_data = gcdata(sub)
-        if sub_data.is_not_owned() {
-            @ptrv(ref, ptr) = sub | prop_owned
-            let is_new = sub_data.is_new()
-            sub_data.own()
-            let block = desc_of(sub)
-            if is_new {
-                block.slots_used++
-                marked_bytes += block.isize
-            }
-            let layout = block.layout
-            if isset(layout) {
-                ml.reserve(block.isize / size_of(ptr))
-                each_ref(sub, layout, ml, mark_push_ref)
-            }
+        let w = @ptrv(ref, uint)
+        // A slot pushed twice was processed already
+        if w & prop_mask != 0 : continue
+        let sub: ptr = w.@cast(ptr)
+        let data = gcdata(sub)
+        if data.is_new() {
+            claim(sub, st_owned)
+            @ptrv(ref, uint) = w | prop_owned
+            mark_expand(sub, 0, ml)
         } else {
-            @ptrv(ref, ptr) = sub | prop_co_owned
-            sub_data.co_own()
+            data.co_own()
+            @ptrv(ref, uint) = w | prop_co_owned
         }
     }
-    g.mem_marked += marked_bytes
 }
 
-// Queues a slot that holds an untagged reference; mark_used_window decides between owning and
-// co-owning when it reaches the slot
+// Pushes the slots of a claimed object's work item that hold an untagged reference into the
+// heap; mark_window_loop applies the mark rule when it reaches them
+fn mark_expand(item: ptr, from: uint, ml: *Lifo) $inline {
+    @unsafe
+    let desc = desc_of(item)
+    let layout = desc.layout ?! return
+    each_ref_work(item, layout, desc.isize, from, ml, mark_push_ref)
+}
+
 fn mark_push_ref(ref: ptr, list: *Lifo) $hot $inline {
     @unsafe
-    let sub = @ptrv(ref, ?ptr)
-    if !isset(sub) || sub & prop_mask != 0 || !in_heap(sub) : return
+    let w = @ptrv(ref, uint)
+    if w & prop_mask != 0 {
+        #if GC_DEBUG
+        mark_word_check(ref, w)
+        #end
+        return
+    }
+    if !in_heap(w.@cast(ptr)) : return
     list.add_unchecked(ref)
 }
 
-// An updated object hands ownership to the fields it received since the
-// last collection; drained by mark_used(null)
+// P6: the mark rule for one word of a logged card; drained by mark(null)
 fn update_props(ref: ptr, list: *Lifo) $hot $inline {
     @unsafe
     // No reserve precedes these pushes
     list.reserve(1)
     if gc.mark_window_on : mark_push_ref(ref, list)
-    else : mark_used_props_direct(ref, list)
+    else : mark_ref(ref, list)
 }
 
+#if GC_DEBUG
+// Debug mark_T rejects a word with both tags and the poison of a free slot
+fn mark_word_check(ref: ptr, w: uint) {
+    if w & prop_mask == prop_mask || w == POISON_U64 {
+        print_word_address(ref)
+        panic("GC error: marking found a word with both tags or the poison")
+    }
+}
+#end
+
+//////////////////////////
+// The walk
+//////////////////////////
+
+// P5's walk (K-08) from `item`, which has STATE 0 and was cut: it and every object the walk
+// drops are dead (K-09), and their words are walked. Returns the number of objects walked
+fn walk(item: ptr) uint {
+    @unsafe
+    if gc.mark_window_on : return walk_window(item)
+    return walk_direct(item)
+}
+
+fn walk_direct(item: ptr) uint $hot {
+    @unsafe
+    let ml = gc.mark_list
+    let walked: uint = 0
+    let from: uint = 0
+    while true {
+        let desc = desc_of(item)
+        if from == 0 {
+            walked++
+            dead(item, desc)
+        }
+        let layout = desc.layout
+        if isset(layout) : each_ref_work(item, layout, desc.isize, from, ml, walk_ref)
+        if ml.index == 0 : break
+        item = ml.pop_unchecked()
+        from = 0
+        if item & 1 != 0 {
+            item = item - 1
+            from = ml.pop_unchecked()
+        }
+    }
+    return walked
+}
+
+fn walk_window(item: ptr) uint $hot {
+    @unsafe
+    let ml = gc.mark_list
+    let walked: uint = 1
+    walk_expand(item, 0, ml)
+
+    // The window of mark_window_loop
+    let window: [ptr x mark_window] = @undefined
+    let head: uint = 0
+    let count: uint = 0
+    while true {
+        if ml.index > 0 {
+            let entered = ml.pop_unchecked()
+            if entered & 1 != 0 {
+                let from: uint = ml.pop_unchecked()
+                walk_expand(entered - 1, from, ml)
+                continue
+            }
+            let target = @ptrv(entered, uint) & (~prop_mask).to(uint)
+            $prefetch((target >> 3).@cast(ptr))
+            $prefetch(target.@cast(ptr))
+            window[(head + count) & (mark_window - 1)] = entered
+            if count < mark_window - 1 {
+                count++
+                continue
+            }
+        } else {
+            if count == 0 : break
+            count--
+        }
+        let ref = window[head]
+        head = (head + 1) & (mark_window - 1)
+
+        let sub = walk_word(ref) ?! continue
+        walked++
+        walk_expand(sub, 0, ml)
+    }
+    return walked
+}
+
+// A dropped object (from 0), or the rest of a work item: its counted words are pushed
+fn walk_expand(item: ptr, from: uint, ml: *Lifo) $inline {
+    @unsafe
+    let desc = desc_of(item)
+    if from == 0 : dead(item, desc)
+    let layout = desc.layout ?! return
+    each_ref_work(item, layout, desc.isize, from, ml, walk_push_ref)
+}
+
+fn walk_push_ref(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    if @ptrv(ref, uint) & prop_mask != 0 : list.add_unchecked(ref)
+}
+
+// dead(c) (K-09): a remaining count puts it on RL for P8, a finalizable object joins the
+// finalizer list, and its block is touched. The free is in place: STATE is 0 already, the
+// count stays for P8, no card byte is written
+fn dead(item: ptr, desc: *Desc) $inline {
+    @unsafe
+    let g = gc
+    if gcdata(item).has_co_in(desc.isize) : g.re_own_list.add_ptr(item)
+    if isset(desc.onfree) : g.blanks.add_ptr(item)
+    touch_block(desc)
+}
+
+fn walk_ref(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    let sub = walk_word(ref) ?! return
+    list.add_unchecked(sub)
+}
+
+// The walk rule (K-08) for one reference word of a walked object: a counted word is
+// stripped. Its OWN target, or a CO target that is a CO_ROOT (after the count falls by one),
+// is dropped and returned to be walked, unless it is a root object of this collection, which
+// becomes ROOT_OWNED and joins the root list instead
+fn walk_word(ref: ptr) ?ptr $hot $inline {
+    @unsafe
+    let w = @ptrv(ref, uint)
+    let tag = w & prop_mask
+    if tag == 0 : return null
+    let sub: ptr = (w - tag).@cast(ptr)
+    let data = gcdata(sub)
+    #if GC_DEBUG
+    if tag == prop_mask || sub == null : panic("GC error: the walk found a word with both tags or a tagged null")
+    if tag == prop_owned && data.state() != st_owned {
+        print_word_address(ref)
+        panic("GC error: the walk found an OWN word whose target is not OWNED")
+    }
+    #end
+    @ptrv(ref, uint) = sub
+    if tag == prop_co_owned {
+        data.co_unown()
+        if data.state() != st_co_root : return null
+    }
+    if data.is_on_stack() {
+        data.set_state(st_root_owned)
+        gc.roots_now.add_ptr(sub)
+        return null
+    }
+    drop(sub, data)
+    return sub
+}
+
+// P9: runs the finalizer of a dead object
 fn free_blank(item: ptr) $hot {
     @unsafe
     let data = gcdata(item)
-    if data.is_not_new() : return
-
-    // Call gc_free
     let onfree = desc_of(item).onfree
     if isset(onfree) : onfree(item)
 
@@ -188,173 +342,6 @@ fn free_blank(item: ptr) $hot {
         panic("GC error: shadow not 0 before free")
     }
     #end
-}
-
-fn preserve_stack_owner(item: GcItem) {
-    @unsafe
-    gcdata(item).set_owned()
-    gc.prev_stack_items.add_ptr(item)
-}
-
-fn should_dis_own(item: GcItem) bool $inline {
-    @unsafe
-    if !in_heap(item) : return false
-    let data = gcdata(item)
-
-    #if GC_DEBUG
-    if data.is_new() : panic("double ownership removal")
-    if data.is_still_co_owned() : panic("unexpected ownership removal")
-    #end
-
-    if data.is_on_stack() {
-        preserve_stack_owner(item)
-        return false
-    }
-
-    return true
-}
-
-fn queue_dis_owned(item: GcItem, list: *Lifo) $inline {
-    @unsafe
-    if should_dis_own(item) : list.add_unchecked(item)
-}
-
-fn dis_own_rec(item: ptr) (uint, uint) {
-    @unsafe
-    if !should_dis_own(item) : return (0, 0)
-    return dis_own_loop(item)
-}
-
-fn dis_own_loop(item: ptr) (uint, uint) {
-    @unsafe
-    if gc.mark_window_on : return dis_own_loop_window(item)
-    return dis_own_loop_direct(item)
-}
-
-fn dis_own_loop_direct(item: ptr) (uint, uint) {
-    @unsafe
-    let ml = gc.mark_list
-    let disowned: uint = 0
-    let unmarked_bytes: uint = 0
-
-    while true {
-        let data = gcdata(item)
-        let block = desc_of(item)
-
-        disowned++
-        data.set_new()
-        if data.has_co_in(block.isize) : gc.re_own_list.add_ptr(item)
-
-        block.slots_used--
-        unmarked_bytes += block.isize
-        touch_block(block)
-
-        let onfree = block.onfree
-        if isset(onfree) : gc.blanks.add_ptr(item)
-
-        let layout = block.layout
-        if isset(layout) {
-            ml.reserve(block.isize / size_of(ptr))
-            each_ref(item, layout, ml, dis_own_props_direct)
-        }
-
-        if ml.index == 0 : break
-        item = ml.pop_unchecked()
-    }
-    return (disowned, unmarked_bytes)
-}
-
-fn dis_own_loop_window(item: ptr) (uint, uint) {
-    @unsafe
-    let g = gc
-    let ml = g.mark_list
-    let disowned: uint = 1
-    let unmarked_bytes = dis_own_item(item, ml)
-
-    // Slots leave the list through a window of mark_window entries: an entry's shadow byte and
-    // object are prefetched when it enters and touched when it leaves. One in, one out, so the
-    // branches stay predictable
-    let window: [ptr x mark_window] = @undefined
-    let head: uint = 0
-    let count: uint = 0
-    let fill: uint = g.mark_window_on ? mark_window - 1 : 0
-    while true {
-        let ref: ptr = null_ptr()
-        if ml.index > 0 {
-            let entered = ml.pop_unchecked()
-            let target = @ptrv(entered, uint) & (~prop_mask).to(uint)
-            $prefetch((target >> 3).@cast(ptr))
-            $prefetch(target.@cast(ptr))
-            window[(head + count) & (mark_window - 1)] = entered
-            if count < fill {
-                count++
-                continue
-            }
-        } else {
-            if count == 0 : break
-            count--
-        }
-        ref = window[head]
-        head = (head + 1) & (mark_window - 1)
-
-        let dead = dis_own_ref(ref) ?! continue
-        disowned++
-        unmarked_bytes += dis_own_item(dead, ml)
-    }
-    return (disowned, unmarked_bytes)
-}
-
-// Frees the slot of a dead item and queues the tagged slots it holds; returns its bytes
-fn dis_own_item(item: ptr, ml: *Lifo) uint $hot $inline {
-    @unsafe
-    let data = gcdata(item)
-    let block = desc_of(item)
-    data.set_new()
-    if data.has_co_in(block.isize) : gc.re_own_list.add_ptr(item)
-
-    block.slots_used--
-    touch_block(block)
-
-    let onfree = block.onfree
-    if isset(onfree) : gc.blanks.add_ptr(item)
-
-    let layout = block.layout
-    if isset(layout) {
-        ml.reserve(block.isize / size_of(ptr))
-        each_ref(item, layout, ml, dis_own_push_ref)
-    }
-    return block.isize
-}
-
-// Releases the ownership a dead item's slot held; returns the item that dies with it
-fn dis_own_ref(ref: ptr) ?ptr $hot $inline {
-    @unsafe
-    let sub = @ptrv(ref, ptr)
-    if sub & prop_owned == prop_owned {
-        let sub_item = sub - prop_owned
-        #if GC_DEBUG
-        if sub_item == null : panic("GC error: 'owned' property slot is not a tagged pointer; its memory was reused")
-        #end
-        @ptrv(ref, ptr) = sub_item
-        gcdata(sub_item).set_no_owner()
-        if !should_dis_own(sub_item) : return null
-        return sub_item
-    }
-    if sub & prop_co_owned == prop_co_owned {
-        let sub_item = sub - prop_co_owned
-        #if GC_DEBUG
-        if sub_item == null : panic("GC error: 'co-owned' property slot is not a tagged pointer; its memory was reused")
-        #end
-        @ptrv(ref, ptr) = sub_item
-        let sub_data = gcdata(sub_item)
-        sub_data.co_unown()
-        if sub_data.is_still_co_owned() {
-            sub_data.remove_still_co_owned()
-            // Lets pretend we were the owner
-            if should_dis_own(sub_item) : return sub_item
-        }
-    }
-    return null
 }
 
 // The growth of a sequence's storage (THEORY 5.5.9): `data_ref` is the container's storage
@@ -392,10 +379,12 @@ fn gc_grow(data_ref: ptr, count: uint, size: uint) {
             adr += stride
         }
         if !zeroed : mem.clear_bytes(dst + count * stride, (size - count) * stride)
+        // Claimed at once: OWNED, live, and young bytes for the survival ratio
         let desc = desc_of(to)
-        gcdata(to).own()
+        gcdata(to).set_state(st_owned)
         desc.slots_used++
         g.mem_marked += desc.isize
+        g.young_marked += desc.isize
         @ptrv(data_ref, uint) = to | prop_owned
         g.props_removed.add(from | prop_owned)
         #if GC_DEBUG
@@ -437,40 +426,6 @@ fn gc_grow(data_ref: ptr, count: uint, size: uint) {
     }
 }
 
-fn dis_own_props_direct(ref: ptr, list: *Lifo) $hot $inline {
-    @unsafe
-    let sub = @ptrv(ref, ?ptr)
-    if !isset(sub) : return
-    if sub & prop_owned == prop_owned {
-        let sub_item = sub - prop_owned
-        #if GC_DEBUG
-        if sub_item == null : panic("GC error: 'owned' property slot is not a tagged pointer; its memory was reused")
-        #end
-        @ptrv(ref, ptr) = sub_item
-        gcdata(sub_item).set_no_owner()
-        queue_dis_owned(sub_item, list)
-    } else if sub & prop_co_owned == prop_co_owned {
-        let sub_item = sub - prop_co_owned
-        #if GC_DEBUG
-        if sub_item == null : panic("GC error: 'co-owned' property slot is not a tagged pointer; its memory was reused")
-        #end
-        @ptrv(ref, ptr) = sub_item
-        let sub_data = gcdata(sub_item)
-        sub_data.co_unown()
-        if sub_data.is_still_co_owned() {
-            sub_data.remove_still_co_owned()
-            // Lets pretend we were the owner
-            queue_dis_owned(sub_item, list)
-        }
-    }
-}
-
-// Queues a slot of a dead item that carries an ownership tag
-fn dis_own_push_ref(ref: ptr, list: *Lifo) $hot $inline {
-    @unsafe
-    if @ptrv(ref, uint) & prop_mask != 0 : list.add_unchecked(ref)
-}
-
 // Single-threaded: nothing is ever shared, and shared globals are ordinary roots
 fn share_null_check(item: ?ptr) $inline {
 }
@@ -478,9 +433,11 @@ fn share_null_check(item: ?ptr) $inline {
 fn share(item: GcItem) $inline {
 }
 
-fn mark_leak_rec(item: GcItem, on: bool) {
+// The traces of the debug checks (D-11): with `support` false along every reference word,
+// else along OWN words and along CO words into CO_ROOTs only. Reached objects get the leak mark
+fn trace_from(item: GcItem, support: bool) {
     @unsafe
-    let ml = gc.mark_list
+    let ml = gc.trace_list
     ml.add(item)
 
     while ml.index > 0 {
@@ -488,24 +445,24 @@ fn mark_leak_rec(item: GcItem, on: bool) {
         // Objects outside the heap (static strings) hold no references
         if !in_heap(item) : continue
         let data = gcdata(item)
-        if on {
-            if data.has_leak_mark() : continue
-            data.set_leak_mark()
-        } else {
-            if !data.has_leak_mark() : continue
-            data.remove_leak_mark()
-        }
+        if data.has_leak_mark() : continue
+        data.set_leak_mark()
 
-        let layout = desc_of(item).layout
-        if isset(layout) {
+        let layout = desc_of(item).layout ?! continue
+        if support {
             each_ref(item, layout, ml, fn(ref: ptr, list: *Lifo) {
                 @unsafe
-                let sub = @ptrv(ref, ?ptr)
-                if !isset(sub) : return
-                let sub_item: ptr = sub & (~prop_mask).to(uint)
-                list.add(sub_item)
+                let w = @ptrv(ref, uint)
+                let tag = w & prop_mask
+                let sub: ptr = (w - tag).@cast(ptr)
+                if tag == prop_owned || (tag == prop_co_owned && gcdata(sub).state() == st_co_root) : list.add(sub)
             })
+            continue
         }
+        each_ref(item, layout, ml, fn(ref: ptr, list: *Lifo) {
+            @unsafe
+            list.add((@ptrv(ref, uint) & (~prop_mask).to(uint)).@cast(ptr))
+        })
     }
 }
 
