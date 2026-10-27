@@ -1,0 +1,342 @@
+use valk.core
+use valk.gc
+use valk.sync
+use valk.thread
+use valk.time
+
+// The rules for shared data of Grove-MT v6 (MT3), which hold under both collectors: release
+// stores and acquire loads of shared references, locks, `shared` globals, `$atomic` runtime
+// classes. Each test is one of v6's probes or an MT3 workload.
+
+class SrNode {
+    value: uint (0)
+}
+
+class SrHolder {
+    node: SrNode
+}
+
+class SrState {
+    count: uint (0)
+}
+
+shared sr_global: SrNode (SrNode { value: 1 })
+
+test "Shared rules: reference stores into atomic data and a shared global inside an unrelated lock block" {
+    // v6 probes `lockstore` and `globalstore`
+    let h: atomic SrHolder = SrHolder { node: SrNode { value: 1 } }
+    let l: Lock[SrState] = .new(SrState {}) !!
+    lock l as s {
+        s.count++
+        h.node = SrNode { value: 2 }
+        sr_global = SrNode { value: 3 }
+    }
+    assert(h.node.value + sr_global.value == 5)
+    sr_global = SrNode { value: 4 }
+    assert(sr_global.value == 4)
+}
+
+class SrRule {
+    id: uint
+    hits: uint (0)
+}
+
+class SrRules {
+    rules: Array[SrRule]
+}
+
+class SrSnap {
+    rule: atomic SrRule
+    pad: Array[uint]
+}
+
+test "Shared rules: a part already atomic is kept by reference" {
+    // v6 probe `identity`
+    let rules = Array[SrRule]{}
+    each 0 .. 100 as i : rules.append(SrRule { id: i })
+    let cfg: atomic SrRules = SrRules { rules: rules }
+    let r5 = cfg.rules.get(5) !!
+    let pad = Array[uint]{}
+    each 0 .. 1000 as j : pad.append(j)
+    let snap: atomic SrSnap = SrSnap { rule: r5, pad: pad }
+    r5.hits = 7
+    assert(snap.rule.hits == 7)
+    assert(snap.rule.id == 5)
+}
+
+class SrAccount {
+    m: core.Mutex (.new() !!)
+    balance: uint (0)
+}
+
+test "Shared rules: runtime classes are atomic, so copies share them" {
+    let a = SrAccount {}
+    let b = clone a
+    let shared_a: atomic SrAccount = a
+    assert(a.m.@cast(ptr) == b.m.@cast(ptr))
+    assert(a.m.@cast(ptr) == shared_a.m.@cast(ptr))
+    #if GROVE_MT
+    // S1: their objects are made in the shared heap
+    @unsafe
+    assert(gc.in_shared(a.m.@cast(ptr)))
+    let gate = thread.ThreadSuspendGate.new()
+    assert(gc.in_shared(gate.@cast(ptr)))
+    #end
+}
+
+#if !TEST_ST_ONLY
+class SrConfig {
+    generation: uint (0)
+    rows: Array[uint] (.{})
+}
+
+shared sr_config: ?atomic SrConfig (null)
+shared sr_stop: uint (0)
+shared sr_bad: uint (0)
+shared sr_reads: uint (0)
+
+fn sr_config_build(generation: uint) atomic SrConfig $noinline {
+    let c = SrConfig { generation: generation }
+    each 0 .. 8 as i : c.rows.append(generation * 8 + i)
+    let published: atomic SrConfig = c
+    return published
+}
+
+// A reader sees either version whole: every row matches the generation it read
+fn sr_config_read() $noinline {
+    let c = sr_config ?! return
+    let generation = c.generation
+    if c.rows.length != 8 : atomic(sr_bad + 1)
+    each c.rows as row, i {
+        if row != generation * 8 + i : atomic(sr_bad + 1)
+    }
+    atomic(sr_reads + 1)
+}
+
+fn sr_config_replace(count: uint) $noinline {
+    each 0 .. count as generation : sr_config = sr_config_build(generation)
+}
+
+test "Shared rules: a shared configuration is replaced while other threads read it" {
+    atomic_store(sr_stop, 0)
+    atomic_store(sr_bad, 0)
+    atomic_store(sr_reads, 0)
+    sr_config = sr_config_build(0)
+    let readers = Array[thread.Thread[void]]{}
+    each 0 .. 2 as _ {
+        readers.append(thread.start(fn() {
+            while atomic_load(sr_stop) == 0 : sr_config_read()
+        }) !!)
+    }
+    #if GROVE_MT
+    gc.collect_shared()
+    let before = gc.shared_live_for_test()
+    #end
+    sr_config_replace(1000)
+    atomic_store(sr_stop, 1)
+    each readers as t : t.await()
+    assert(sr_bad == 0)
+    assert(sr_reads > 0)
+    let last = sr_config ?! panic("no configuration")
+    assert(last.generation == 999)
+    #if GROVE_MT
+    // The 999 old versions were freed by rounds: S holds about one version more than before
+    gc.collect_shared()
+    assert(gc.shared_live_for_test() < before + 4096)
+    #end
+    sr_config = null
+}
+
+class SrSlot {
+    value: uint (0)
+}
+
+class SrBoard {
+    current: ?atomic SrSlot (null)
+}
+
+test "Shared rules: a one-word field assigned through an atomic view from several threads" {
+    let board: atomic SrBoard = SrBoard {}
+    let workers = Array[thread.Thread[uint]]{}
+    each 0 .. 4 as id {
+        workers.append(thread.Thread[uint].start(fn() uint {
+            let seen: uint = 0
+            each 0 .. 1000 as i {
+                board.current = SrSlot { value: id * 1000 + i }
+                let now = board.current
+                if isset(now) && now.value < 4000 : seen++
+            }
+            return seen
+        }) !!)
+    }
+    each workers as t : assert(t.await() == 1000)
+    let last = board.current ?! panic("no slot")
+    assert(last.value % 1000 == 999)
+}
+
+// Each await in a function of its own: a second await of one handle in one function is a warning
+fn sr_await_list(t: thread.Thread[Array[uint]]) Array[uint] $noinline {
+    return t.await()
+}
+
+test "Shared rules: await of a plain result" {
+    // v6 probe `await2`: Grove-MT gives each await its own copy (L4); Valk shares the result
+    let t = thread.Thread[Array[uint]].start(fn() Array[uint] { return Array[uint]{ 1, 2, 3 } }) !!
+    let a = sr_await_list(t)
+    a.append(4)
+    let b = sr_await_list(t)
+    assert(a.length == 4)
+    #if GROVE_MT
+    assert(b.length == 3)
+    #else
+    assert(b.length == 4)
+    #end
+}
+
+class SrUser {
+    id: uint
+    name: String
+}
+
+shared sr_users: ?atomic Array[SrUser] (null)
+shared sr_users_lock: core.SyncMutex (core.SyncMutex.new())
+
+test "Shared rules: a copy-on-write list republished through a shared global" {
+    // v6 probe MT-1 `cow`
+    let first: atomic Array[SrUser] = Array[SrUser]{ SrUser { id: 0, name: "u0" } }
+    sr_users = first
+    each 1 .. 4 as i {
+        sr_users_lock.lock()
+        let cur = sr_users
+        if isset(cur) {
+            let next = cur.copy()
+            next.append(SrUser { id: i, name: "u" + i })
+            let published: atomic Array[atomic SrUser] = next
+            sr_users = published
+        }
+        sr_users_lock.unlock()
+    }
+    let acct = SrAccount {}
+    let shared_acct: atomic SrAccount = acct
+    let t = thread.start(fn() {
+        shared_acct.m.lock()
+        atomic(shared_acct.balance + 1)
+        shared_acct.m.unlock()
+    }) !!
+    t.await()
+    let stop = sync.CancelToken.new() !!
+    let child = stop.child() !!
+    stop.cancel()
+    assert(child.is_cancelled())
+    assert(shared_acct.balance == 1)
+    let users = sr_users ?! panic("no users")
+    assert(users.length == 5)
+    let u4 = users.get(4) !!
+    assert(u4.name == "u4")
+    sr_users = null
+}
+
+class SrPeerState {
+    other: ?atomic SrPeer (null)
+    buf: Array[uint] (.{})
+}
+
+class SrPeer {
+    state: core.Lock[SrPeerState]
+}
+
+fn sr_peer() atomic SrPeer {
+    let p: atomic SrPeer = SrPeer { state: core.Lock[SrPeerState].new(SrPeerState {}) !! }
+    return p
+}
+
+test "Shared rules: two locks whose data hold each other" {
+    // v6 probe MT-2 `p2`, smaller
+    let total: uint = 0
+    each 0 .. 3 as _ {
+        let a = sr_peer()
+        let b = sr_peer()
+        lock a.state as s {
+            s.other = b
+            each 0 .. 10000 as i : s.buf.append(i)
+        }
+        lock b.state as s {
+            s.other = a
+            each 0 .. 10000 as i : s.buf.append(i)
+        }
+        let t = thread.Thread[uint].start(fn() uint {
+            let n: uint = 0
+            lock a.state as s { n = s.buf.length }
+            return n
+        }) !!
+        total += t.await()
+    }
+    assert(total == 30000)
+}
+
+class SrRows {
+    rows: Array[String] (.{})
+}
+
+class SrCurrent {
+    cur: ?atomic SrRows (null)
+}
+
+shared sr_rows: core.Lock[SrCurrent] (.new(SrCurrent {}) !!)
+
+fn sr_rows_build(generation: uint) atomic SrRows $noinline {
+    let c = SrRows {}
+    each 0 .. 2000 as i : c.rows.append("row-" + generation + "-" + i)
+    let published: atomic SrRows = c
+    return published
+}
+
+test "Shared rules: a lock's atomic value replaced many times" {
+    // v6 probe MT-2 `p3`, smaller
+    each 0 .. 20 as generation {
+        let next = sr_rows_build(generation)
+        lock sr_rows as c { c.cur = next }
+    }
+    let t = thread.Thread[uint].start(fn() uint {
+        let n: uint = 0
+        lock sr_rows as c {
+            let cur = c.cur
+            if isset(cur) : n = cur.rows.length
+        }
+        return n
+    }) !!
+    assert(t.await() == 2000)
+    lock sr_rows as c { c.cur = null }
+}
+
+// v6 probe MT-2 `ts` rewritten as L8's hint says: the mutable list is a Lock field
+class SrLog $atomic {
+    lines: Lock[Array[String]] (.new(.{}) !!)
+
+    + fn add(line: String) @threadsafe {
+        lock this.lines as l : l.append(line)
+    }
+
+    + fn size() uint @threadsafe {
+        lock this.lines as l : return l.length
+    }
+}
+
+test "Shared rules: a $atomic class keeps its mutable list in a Lock field" {
+    let log = SrLog {}
+    let group = thread.ThreadGroup[uint].new()
+    each 0 .. 4 as id {
+        group.start(fn() uint {
+            each 0 .. 500 as i : log.add("thread " + id + " line " + (i % 50))
+            return 500
+        }) !!
+    }
+    let total: uint = 0
+    while group.has_pending() {
+        let _, r = group.await_next() !!
+        total += r
+    }
+    assert(total == 2000)
+    assert(log.size() == 2000)
+}
+#end
