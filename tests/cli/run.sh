@@ -1398,6 +1398,32 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] && command -v obj
     fi
 fi
 
+# --opt emits each large unit in parts, which makes its local symbols global: two units must
+# not both define valk.str.0
+parts_dir="$workdir/opt-parts"
+mkdir -p "$parts_dir/src/na" "$parts_dir/src/nb"
+echo '{}' > "$parts_dir/valk.json"
+for ns in na nb; do
+    {
+        total=""
+        for i in $(seq 1 80); do
+            printf 'fn %s_%d(n: uint) String $noinline {\n    if n > %d : return "%s%d-" + n\n    return "%s"\n}\n' "$ns" "$i" "$i" "$ns" "$i" "$ns"
+            total="$total + ${ns}_$i(n).bytes"
+        done
+        printf '+ fn %s_all(n: uint) uint {\n    return 0%s\n}\n' "$ns" "$total"
+    } > "$parts_dir/src/$ns/$ns.valk"
+done
+printf 'use na\nuse nb\n\nfn main() {\n    println(na.na_all(3) + nb.nb_all(5))\n}\n' > "$parts_dir/src/main.valk"
+parts_out=$("$VALK" build "$parts_dir" --opt --no-warn -o "$parts_dir/out" 2>&1) || {
+    echo "# An --opt build of two large units failed"
+    echo "$parts_out"
+    exit 1
+}
+if [[ "$("$parts_dir/out")" != "338" ]]; then
+    echo "# The --opt build of two large units printed the wrong result"
+    exit 1
+fi
+
 # A program that can start a thread is built in Grove's multi-threaded mode (GROVE_MT)
 grove_out=$("$VALK" build "$DIR/grove-thread.valk" --no-warn -c -o "$output" 2>&1) || {
     echo "# Failed to build a program that starts a thread"
