@@ -164,6 +164,20 @@ test-grove-small-caps: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_SMALL_CAPS=1" $(FLAGS) -o ./debug/test-grove-small-caps$(EXE_SUFFIX)
 	./debug/test-grove-small-caps$(EXE_SUFFIX)
 
+# D-15: a deterministic workload built with each collector must hold the same objects at
+# every gc.oracle_checkpoint()
+test-gc-oracle: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) bash ./misc/gc-oracle.sh ./tests/gc-oracle/workload.valk
+
+# D-16: Grove's checks together on mixed workloads: the suite under stress and with small caps,
+# the oracle, and the compiler built on Grove with GC_STRESS, whose test binary must match
+test-grove-ci: test-grove-stress test-grove-small-caps test-gc-oracle valk
+	mkdir -p ./debug
+	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/tests-ref --clean
+	./valk build . -o ./debug/valk-gs -vv $(GROVE_COMPILER_FLAGS) --def "GROVE=1" --def "GC_DEBUG=1" --def "GC_STRESS=1" --clean
+	./debug/valk-gs build ./tests $(TEST_FLAGS) $(FLAGS) --stdlib $(CURDIR)/lib -o ./debug/tests-gs --clean
+	cmp ./debug/tests-gs ./debug/tests-ref
+
 # The compiler built with Grove (and with Grove's checks) must give the same compiler and
 # test binary as the compiler on Valk's collector
 grove-compiler-check: valk

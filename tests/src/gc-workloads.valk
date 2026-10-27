@@ -1,0 +1,234 @@
+use valk.gc
+
+// D-16: mixed workloads, several container operations and collections in one epoch, each
+// checked against a plain model of the values. A premature free shows as a wrong value or a
+// GC_DEBUG panic, a leak as a count of live objects that stays too high
+
+global wl_alive: uint
+global wl_seed: uint (77)
+global wl_keep: ?WlHolder (null)
+
+class WlBox {
+    id: uint
+    next: ?WlBox (null)
+
+    fn gc_free() {
+        wl_alive--
+        // A finalizer may store into its own object
+        this.next = null
+    }
+}
+
+union WlItem : WlBox | uint {}
+
+struct WlPair {
+    a: WlBox
+    b: ?WlBox
+}
+
+class WlHolder {
+    boxes: Array[WlBox] (.{})
+    items: Array[WlItem] (.{})
+    pairs: Array[?WlPair] (.{})
+}
+
+fn wl_box(id: uint) WlBox {
+    wl_alive++
+    return WlBox { id: id }
+}
+
+fn wl_rand(n: uint) uint {
+    wl_seed = wl_seed * 6364136223846793005 + 1442695040888963407
+    return (wl_seed >> 33) % n
+}
+
+fn wl_settle() uint {
+    gc.collect()
+    gc.collect()
+    return wl_alive
+}
+
+fn wl_item_id(item: WlItem) uint {
+    return match item : uint {
+        WlBox as b => b.id
+        uint as n => n
+    }
+}
+
+// One round on an old holder: growth, inserts, removals, swaps and drops, the same steps on
+// the model; a collection in the middle
+fn wl_round(h: WlHolder, model: Array[uint], round: uint) $noinline {
+    let i: uint = 0
+    while i < 64 {
+        let id = round * 1000 + i
+        let pick = wl_rand(7)
+        if pick == 0 {
+            h.boxes.prepend(wl_box(id))
+            model.prepend(id)
+        } else if pick == 1 && model.length > 0 {
+            let at = wl_rand(model.length)
+            h.boxes.remove(at)
+            model.remove(at)
+        } else if pick == 2 && model.length > 1 {
+            let a = wl_rand(model.length)
+            let b = wl_rand(model.length)
+            h.boxes.swap(a, b)
+            model.swap(a, b)
+        } else if pick == 3 {
+            let at = wl_rand(model.length + 1)
+            h.boxes.insert(at, wl_box(id)) ! panic("insert")
+            model.insert(at, id) ! panic("insert")
+        } else if pick == 4 && model.length > 0 {
+            h.boxes.swap_remove(0)
+            model.swap_remove(0)
+        } else {
+            h.boxes.append(wl_box(id))
+            model.append(id)
+        }
+        // Unions and nullable inline values next to it
+        if i % 3 == 0 : h.items.append(wl_box(id))
+        else : h.items.append(id)
+        if i % 4 == 0 : h.pairs.append(null)
+        else : h.pairs.append(WlPair { a: wl_box(id), b: i % 2 == 0 ? wl_box(id + 1) : null })
+        if i == 32 : gc.collect()
+        i++
+    }
+    // Valk's collector (on main too) crashes when removals shift a union array that mixes
+    // references and integers
+    #if GROVE
+    if h.items.length > 40 : h.items.remove(5)
+    #end
+    if h.pairs.length > 40 : h.pairs.pop_first() ! {}
+}
+
+fn wl_check(h: WlHolder, model: Array[uint]) bool {
+    if h.boxes.length != model.length : return false
+    each h.boxes as b, i {
+        if b.id != (model.get(i) !? 0) : return false
+    }
+    return true
+}
+
+fn wl_epoch() bool $noinline {
+    let h = WlHolder {}
+    wl_keep = h
+    let model = Array[uint]{}
+    let ok = true
+    let round: uint = 1
+    while round <= 4 {
+        wl_round(h, model, round)
+        gc.collect()
+        ok = ok && wl_check(h, model)
+        round++
+    }
+    // The function says whether `a` sorts after `b`
+    h.boxes.sort(fn(a: WlBox, b: WlBox) bool { return a.id > b.id })
+    model.sort()
+    gc.collect()
+    ok = ok && wl_check(h, model)
+    each h.items as item {
+        ok = ok && wl_item_id(item) % 1000 < 64
+    }
+    each h.pairs as pair {
+        let p = pair ?! continue
+        ok = ok && p.a.id % 1000 < 64
+    }
+    h.boxes.clear()
+    h.items.clear()
+    h.pairs.clear()
+    wl_keep = null
+    return ok
+}
+
+synctest "GC workloads: growth, inserts, removals and swaps in one epoch, with unions and nullable inline values" {
+    let base = wl_settle()
+    // The epoch runs in its own frame: what it leaves on the stack is not a root here
+    assert(wl_epoch())
+    assert(wl_settle() == base)
+}
+
+// A view stores past a shrunk length, a collection, then one of the operations that write
+// the slots again
+fn wl_view_case(op: uint) String $noinline {
+    let items = Array[WlBox]{ wl_box(0), wl_box(1), wl_box(2) }
+    let view = items.view()
+    items.pop_last() ! panic("pop")
+    items.pop_last() ! panic("pop")
+    view[2] = wl_box(9)
+    view[1] = wl_box(8)
+    gc.collect()
+    if op == 0 : items.insert(0, wl_box(3)) ! panic("insert")
+    else if op == 1 : items.prepend(wl_box(3))
+    else if op == 2 : items.prepend_many(Array[WlBox]{ wl_box(3), wl_box(4), wl_box(5) })
+    else if op == 3 : items.append(wl_box(3))
+    else : items.set_expand(2, wl_box(3), wl_box(4))
+    gc.collect()
+    return items.map(fn(b: WlBox) String { return b.id.to_string() }).join(",")
+}
+
+synctest "GC workloads: a view stores past a shrunk length, then the array is written again" {
+    // Valk's collector (on main too) reports a leak here: only Grove's stores release what a
+    // view wrote past the length in every one of these cases
+    #if !GROVE
+    return
+    #end
+    let base = wl_settle()
+    assert(wl_view_case(0) == "3,0")
+    assert(wl_view_case(1) == "3,0")
+    assert(wl_view_case(2) == "3,4,5,0")
+    assert(wl_view_case(3) == "0,3")
+    assert(wl_view_case(4) == "0,4,3")
+    assert(wl_settle() == base)
+}
+
+// Stores into an old object between two collections, and appends right after a growth
+fn wl_old_stores() String $noinline {
+    let h = WlHolder {}
+    wl_keep = h
+    h.boxes.append(wl_box(1))
+    gc.collect()
+    let i: uint = 0
+    while i < 40 {
+        let b = wl_box(100 + i)
+        b.next = wl_box(200 + i)
+        h.boxes.append(b)
+        if i == 15 : gc.collect()
+        i++
+    }
+    gc.collect()
+    let sum: uint = 0
+    each h.boxes as b {
+        sum += b.id
+        let n = b.next
+        if isset(n) : sum += n.id
+    }
+    return sum.to_string()
+}
+
+synctest "GC workloads: stores into an old holder and appends after a growth" {
+    let base = wl_settle()
+    // 1 + (100..139) + (200..239)
+    assert(wl_old_stores() == "13561")
+    wl_keep = null
+    assert(wl_settle() == base)
+}
+
+// Objects whose finalizers store into them, dropped in a chain
+fn wl_chain(count: uint) $noinline {
+    let first = wl_box(0)
+    let at = first
+    let i: uint = 1
+    while i < count {
+        let b = wl_box(i)
+        at.next = b
+        at = b
+        i++
+    }
+    at.next = first
+}
+
+synctest "GC workloads: a dropped cycle whose finalizers store into their objects" {
+    let base = wl_settle()
+    wl_chain(50)
+    assert(wl_settle() == base)
+}
