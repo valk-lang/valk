@@ -1383,7 +1383,15 @@ ossl_out=$("$VALK" build "$ossl_dir/app/src" --stdlib "$ossl_dir/stdlib" --targe
 # x64 release builds start innermost loops on 32 bytes
 if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] && command -v objdump > /dev/null; then
     "$VALK" build "$DIR/loop-align.valk" --release -d --no-warn -o "$workdir/loop-align" > /dev/null || exit 1
-    loop_target=$(objdump -d --no-show-raw-insn "$workdir/loop-align" | awk '/<[^>]*__fill__[^>]*>:$/{p=1;next} p&&/^$/{exit} p&&/\tj[a-z]+ +[0-9a-f]+ </{print $3}' | head -1)
+    # The loop starts at the target of its back edge (a jump to a lower address); an entry
+    # jump may come first, into the middle of a rotated loop
+    loop_target=""
+    while read -r jump_at jump_to; do
+        if (( 0x$jump_to < 0x$jump_at )); then
+            loop_target=$jump_to
+            break
+        fi
+    done < <(objdump -d --no-show-raw-insn "$workdir/loop-align" | awk '/<[^>]*__fill__[^>]*>:$/{p=1;next} p&&/^$/{exit} p&&/\tj[a-z]+ +[0-9a-f]+ </{sub(":", "", $1); print $1, $3}')
     if [[ -z "$loop_target" ]] || (( 0x$loop_target % 32 != 0 )); then
         echo "# Expected the loop in fill to start on 32 bytes, got: '$loop_target'"
         exit 1
