@@ -9945,7 +9945,7 @@ Returns the absolute, normalized form of this path; see `fs.resolve`.
 type EnvCloneFn (fnptr(ptr)(ptr))
 // Runs a garbage collection of the calling thread's memory now.
 + value collect (ext.valk_gc_collect)
-// Runs a collection of shared memory, stopping every thread's GC while it marks.
+// Runs a round over the shared memory: stops every other thread at a safepoint or holds it in native code, marks the shared heap from every thread's roots, frees what is unreachable and releases the threads. Does nothing in a program that cannot start threads, which has no shared memory.
 + value collect_shared (ext.valk_gc_collect_shared)
 ```
 
@@ -9953,15 +9953,18 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 
 Runs a garbage collection of the calling thread's memory now.
 
-Does nothing while the thread's GC is not enabled yet or is shutting down. Roots are
-globals and the words still live on the caller's stack and registers.
+Does nothing while the GC is not enabled yet. Roots are globals and the words still live
+on the caller's stack and registers.
 
 ### collect_shared
 
-Runs a collection of shared memory, stopping every thread's GC while it marks.
+Runs a round over the shared memory: stops every other thread at a safepoint or holds it
+in native code, marks the shared heap from every thread's roots, frees what is unreachable
+and releases the threads. Does nothing in a program that cannot start threads, which has no
+shared memory.
 
-Returns without collecting when another thread completed a shared collection while this
-one waited for the shared lock.
+Returns once a round that started after the call has ended. Like `collect`, a direct call
+into the runtime's assembly entry, so only the caller's own live words are its roots.
 
 ## Functions for 'gc'
 
@@ -9974,29 +9977,29 @@ one waited for the shared lock.
 + fn alloc_typed_zeroed(size: uint, layout: ?ptr) GcPtr
 // Clones a closure environment; used by the compiler when a closure value is copied.
 + fn clone_closure_env(env: ?ptr) ?ptr
-// Collects like `collect_if_threshold_reached`, but at three quarters of the way to the trigger.
+// Collects like `collect_if_threshold_reached`, but at three quarters of the trigger.
 + fn collect_if_threshold_almost_reached() void
 // Collects the thread's memory when allocation since the last collection reached the trigger.
 + fn collect_if_threshold_reached() void
-// Collects shared memory when its usage reached the shared trigger and the GC is idle.
+// Does nothing: rounds over the shared memory start by themselves.
 + fn collect_shared_if_threshold_reached() void
 // Copies `count` elements from `from` to `to` with the ownership tags of their references removed, so the copy owns nothing until a collection walks it.
 + fn copy_strip(from: ptr, to: ptr, count: uint, storage: ptr) void
 // Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
 + fn fit_count(prefix: uint, item: uint, count: uint) uint
-// Takes the calling thread's GC lock again after `unlock`.
+// Does nothing: the thread's state changes at each call into native code.
 + fn lock() void
-// Returns the bytes held by the GC pool blocks of all threads, including free slots.
+// Returns the bytes of the GC blocks and large objects in use, including free slots.
 + fn mem_usage() uint
 // In a `--def GC_ORACLE=1` build: collects, then writes the number of allocations so far and the allocation serial numbers of the objects that are still allocated to the file named by the environment variable `VALK_GC_ORACLE`. Does nothing in other builds.
 + fn oracle_checkpoint() void
 // Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
 + fn reset_pause_durations() void
-// Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
+// Resets `shared_pause_last_us` and `shared_pause_max_us` to zero.
 + fn reset_shared_pause_durations() void
-// Moves the references held by `from` into the identically laid out GC allocation `to`.
+// Does nothing: the store barrier records the references of a block that moves. Kept for compatibility.
 + fn transfer_refs(from: ptr, to: ptr) void
-// Releases the calling thread's GC lock so other threads can collect for it while it blocks.
+// Does nothing in a program that cannot start threads.
 + fn unlock() void
 ```
 
@@ -10017,8 +10020,8 @@ A `size` of 0 still returns a valid, distinct allocation (of the smallest size).
 
 Allocates `size` zeroed bytes of GC memory whose references are traced through `layout`.
 
-The compiler uses it for slice storage. A large item that gets a fresh block of its own
-comes zeroed from `calloc` and is not cleared again.
+The compiler uses it for slice storage. Memory that comes zeroed from the OS, never
+allocated from since, is not cleared again.
 
 ### clone_closure_env
 
@@ -10029,7 +10032,7 @@ object is shared, not copied, and `null` returns `null`.
 
 ### collect_if_threshold_almost_reached
 
-Collects like `collect_if_threshold_reached`, but at three quarters of the way to the trigger.
+Collects like `collect_if_threshold_reached`, but at three quarters of the trigger.
 
 Useful at idle points such as an event loop iteration, so the collection happens before
 an allocation forces it.
@@ -10038,12 +10041,11 @@ an allocation forces it.
 
 Collects the thread's memory when allocation since the last collection reached the trigger.
 
-After a local collection it also collects shared memory when that has reached its trigger.
 Does nothing while a collection is running or the GC is not idle.
 
 ### collect_shared_if_threshold_reached
 
-Collects shared memory when its usage reached the shared trigger and the GC is idle.
+Does nothing: rounds over the shared memory start by themselves.
 
 ### copy_strip
 
@@ -10058,16 +10060,16 @@ holds `to`. Used to fill fresh storage from elements another storage owns.
 Returns the largest count of `item`-byte elements, at least `count`, whose storage of
 `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
 
-Growing storage uses it to fill its class: sizes above 128 bytes are rounded up to a power
-of two, so a capacity just past one would leave almost half of the class unused.
+Growing storage uses it to fill its class: sizes above 128 bytes are rounded up to the next
+of four classes per doubling, and above 8 KiB to whole pages.
 
 ### lock
 
-Takes the calling thread's GC lock again after `unlock`.
+Does nothing: the thread's state changes at each call into native code.
 
 ### mem_usage
 
-Returns the bytes held by the GC pool blocks of all threads, including free slots.
+Returns the bytes of the GC blocks and large objects in use, including free slots.
 
 ### oracle_checkpoint
 
@@ -10081,22 +10083,16 @@ Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
 
 ### reset_shared_pause_durations
 
-Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
+Resets `shared_pause_last_us` and `shared_pause_max_us` to zero.
 
 ### transfer_refs
 
-Moves the references held by `from` into the identically laid out GC allocation `to`.
-
-The other bytes must already be copied. Used when a growing container moves its
-elements to a new block: ownership of the elements moves to `to` without re-marking
-them. Does nothing when `from` has no reference layout.
+Does nothing: the store barrier records the references of a block that moves. Kept for
+compatibility.
 
 ### unlock
 
-Releases the calling thread's GC lock so other threads can collect for it while it blocks.
-
-Call it before a blocking operation and `lock` right after. The current stack pointer and
-registers are saved for those collections; do not touch GC memory in between.
+Does nothing in a program that cannot start threads.
 
 ## Globals for 'gc'
 
@@ -10105,15 +10101,15 @@ registers are saved for those collections; do not touch GC memory in between.
 ~+ global gc : *Gc
 // Highest value `mem_usage_shared` has reached since the program started, in bytes.
 ~+ shared mem_usage_peak : uint
-// Bytes currently held by the GC pool blocks of all threads, including free slots.
+// Bytes of the GC blocks and large objects in use, including free slots.
 ~+ shared mem_usage_shared : uint
 // Duration of this thread's last local collection, in microseconds.
 + global pause_last_us : uint
 // Longest local collection on this thread since the last reset, in microseconds.
 + global pause_max_us : uint
-// Duration of the last shared-memory collection, in microseconds.
+// Duration of the last round over the shared memory, in microseconds (at a coarse clock's resolution); 0 in a program that cannot start threads.
 + shared shared_pause_last_us : uint
-// Longest shared-memory collection since the last reset, in microseconds.
+// Longest round over the shared memory since the last reset, in microseconds.
 + shared shared_pause_max_us : uint
 // Whether each collection runs a leak check over the reachable objects.
 + shared verify : bool
@@ -10123,15 +10119,13 @@ registers are saved for those collections; do not touch GC memory in between.
 
 The collector of the running thread.
 
-Collecting shared memory temporarily points it at each thread's gc in turn.
-
 ### mem_usage_peak
 
 Highest value `mem_usage_shared` has reached since the program started, in bytes.
 
 ### mem_usage_shared
 
-Bytes currently held by the GC pool blocks of all threads, including free slots.
+Bytes of the GC blocks and large objects in use, including free slots.
 
 ### pause_last_us
 
@@ -10143,11 +10137,12 @@ Longest local collection on this thread since the last reset, in microseconds.
 
 ### shared_pause_last_us
 
-Duration of the last shared-memory collection, in microseconds.
+Duration of the last round over the shared memory, in microseconds (at a coarse clock's
+resolution); 0 in a program that cannot start threads.
 
 ### shared_pause_max_us
 
-Longest shared-memory collection since the last reset, in microseconds.
+Longest round over the shared memory since the last reset, in microseconds.
 
 ### verify
 

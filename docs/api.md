@@ -2932,7 +2932,7 @@ alias pid_t for i32
 type EnvCloneFn (fnptr(ptr)(ptr))
 // Runs a garbage collection of the calling thread's memory now.
 + value collect (ext.valk_gc_collect)
-// Runs a collection of shared memory, stopping every thread's GC while it marks.
+// Runs a round over the shared memory: stops every other thread at a safepoint or holds it in native code, marks the shared heap from every thread's roots, frees what is unreachable and releases the threads. Does nothing in a program that cannot start threads, which has no shared memory.
 + value collect_shared (ext.valk_gc_collect_shared)
 ```
 
@@ -2947,29 +2947,29 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn alloc_typed_zeroed(size: uint, layout: ?ptr) GcPtr
 // Clones a closure environment; used by the compiler when a closure value is copied.
 + fn clone_closure_env(env: ?ptr) ?ptr
-// Collects like `collect_if_threshold_reached`, but at three quarters of the way to the trigger.
+// Collects like `collect_if_threshold_reached`, but at three quarters of the trigger.
 + fn collect_if_threshold_almost_reached() void
 // Collects the thread's memory when allocation since the last collection reached the trigger.
 + fn collect_if_threshold_reached() void
-// Collects shared memory when its usage reached the shared trigger and the GC is idle.
+// Does nothing: rounds over the shared memory start by themselves.
 + fn collect_shared_if_threshold_reached() void
 // Copies `count` elements from `from` to `to` with the ownership tags of their references removed, so the copy owns nothing until a collection walks it.
 + fn copy_strip(from: ptr, to: ptr, count: uint, storage: ptr) void
 // Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
 + fn fit_count(prefix: uint, item: uint, count: uint) uint
-// Takes the calling thread's GC lock again after `unlock`.
+// Does nothing: the thread's state changes at each call into native code.
 + fn lock() void
-// Returns the bytes held by the GC pool blocks of all threads, including free slots.
+// Returns the bytes of the GC blocks and large objects in use, including free slots.
 + fn mem_usage() uint
 // In a `--def GC_ORACLE=1` build: collects, then writes the number of allocations so far and the allocation serial numbers of the objects that are still allocated to the file named by the environment variable `VALK_GC_ORACLE`. Does nothing in other builds.
 + fn oracle_checkpoint() void
 // Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
 + fn reset_pause_durations() void
-// Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
+// Resets `shared_pause_last_us` and `shared_pause_max_us` to zero.
 + fn reset_shared_pause_durations() void
-// Moves the references held by `from` into the identically laid out GC allocation `to`.
+// Does nothing: the store barrier records the references of a block that moves. Kept for compatibility.
 + fn transfer_refs(from: ptr, to: ptr) void
-// Releases the calling thread's GC lock so other threads can collect for it while it blocks.
+// Does nothing in a program that cannot start threads.
 + fn unlock() void
 ```
 
@@ -2980,15 +2980,15 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 ~+ global gc : *Gc
 // Highest value `mem_usage_shared` has reached since the program started, in bytes.
 ~+ shared mem_usage_peak : uint
-// Bytes currently held by the GC pool blocks of all threads, including free slots.
+// Bytes of the GC blocks and large objects in use, including free slots.
 ~+ shared mem_usage_shared : uint
 // Duration of this thread's last local collection, in microseconds.
 + global pause_last_us : uint
 // Longest local collection on this thread since the last reset, in microseconds.
 + global pause_max_us : uint
-// Duration of the last shared-memory collection, in microseconds.
+// Duration of the last round over the shared memory, in microseconds (at a coarse clock's resolution); 0 in a program that cannot start threads.
 + shared shared_pause_last_us : uint
-// Longest shared-memory collection since the last reset, in microseconds.
+// Longest round over the shared memory since the last reset, in microseconds.
 + shared shared_pause_max_us : uint
 // Whether each collection runs a leak check over the reachable objects.
 + shared verify : bool
