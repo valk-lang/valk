@@ -280,6 +280,17 @@ struct Kind {
     layout: ?ptr
     onfree: ?fnptr(ptr)()
     env_clone: ?EnvCloneFn
+    // C-01: the reference words of an object, and the generated routines (THEORY 5.4.5),
+    // each the mark rule, the walk rule or a push applied to every non-null reference word:
+    // mark_T, the mark window's push, disown_T, the walk window's push, and scan_T, which
+    // visits only the words inside [lo, hi). Null (and never called) for a kind without
+    // reference words
+    words: uint
+    mark: fnptr(ptr, *Lifo)()
+    expand: fnptr(ptr, *Lifo)()
+    walk: fnptr(ptr, *Lifo)()
+    walk_expand: fnptr(ptr, *Lifo)()
+    scan: fnptr(ptr, ptr, ptr, *Lifo)()
 }
 
 struct Pool {
@@ -300,6 +311,8 @@ struct Pool {
     layout: ?ptr
     onfree: ?fnptr(ptr)()
     env_clone: ?EnvCloneFn
+    // The generated routines of a compiler kind with reference words
+    routines: ?*Kind
     // Blocks marked bs_free wait in the block list
     prune: bool (false)
     // Each item is a large object with its own page run
@@ -348,7 +361,11 @@ struct Pool {
         pool.partial = Bump.new()
         pool.pages = 1
         pool.large = isize > LARGE_SLOT
+        if kind.words > 0 : pool.routines = kind
         alc_list.add_ptr(pool)
+        #if GC_DEBUG
+        if kind.words > 0 : kind_check(kind)
+        #end
     }
 
     static fn init_sequence(size: uint, layout: ?ptr) *Pool {
@@ -483,11 +500,9 @@ struct Pool {
         @unsafe
         let isize = this.isize
         let end = block.first + block.slots_total * isize
-        let slot = from
-        while slot < end && gcdata(slot).is_not_new() : slot += isize
+        let slot = hole_scan(from, end, isize, false)
         if slot >= end : return false
-        let hi = slot + isize
-        while hi < end && gcdata(hi).is_new() : hi += isize
+        let hi = hole_scan(slot + isize, end, isize, true)
         this.cursor = slot
         this.limit = hi
         this.run = slot
@@ -565,6 +580,7 @@ struct Pool {
         desc.layout = this.layout
         desc.onfree = this.onfree
         desc.env_clone = this.env_clone
+        desc.routines = this.routines
         desc.pool = this.@cast(ptr)
         desc.kind = this.sequence ? desc_seq : 0
         return desc
@@ -671,6 +687,40 @@ struct Pool {
     }
 }
 
+// The refill's hole scan (THEORY 5.3.2): the first slot in [from, end) that is free (`free`
+// false) or that is not (`free` true), else `end`. Slots of 8 to 64 bytes are tested eight
+// shadow bytes at a time: one load covers 64 bytes of slots
+fn hole_scan(from: ptr, end: ptr, isize: uint, free: bool) ptr {
+    @unsafe
+    let slot = from
+    if isize <= 64 && (isize & (isize - 1)) == 0 {
+        // Bit 0 of each slot's shadow byte in a word
+        let ones: uint = 0
+        let b: uint = 0
+        while b < 64 {
+            ones = ones | (1.to(uint) << b)
+            b += isize
+        }
+        while slot < end && (slot.@cast(uint) & 63) != 0 {
+            if gcdata(slot).is_new() != free : return slot
+            slot += isize
+        }
+        while slot + 64 <= end {
+            let w = @ptrv(gcdata(slot), uint)
+            // Bit 0 of a slot's byte: its STATE is not 0
+            let used = (w | (w >> 1)) & ones
+            let hits = free ? used : ones & ~used
+            if hits != 0 : return slot + hits.trailing_zeros()
+            slot += 64
+        }
+    }
+    while slot < end {
+        if gcdata(slot).is_new() != free : return slot
+        slot += isize
+    }
+    return end
+}
+
 // R-10: the cards that overlap the run [lo, hi) and hold no slot outside it become dirty. Slack
 // after the block's last slot (at `slots_end`) holds no slot; a card wholly in it stays clean
 fn premark(block: *Desc, lo: uint, hi: uint, slots_end: uint) {
@@ -743,6 +793,38 @@ fn stress_collect() $noinline {
 #end
 
 #if GC_DEBUG
+// D-18, the descriptor cross-check: the generated walk push visits exactly the words the layout
+// table lists, in its order, on an object whose every byte is 1 (each word tagged, each tag
+// byte 1). Marking with the routines is checked against the table at every collection by D-11
+fn kind_check(kind: *Kind) {
+    @unsafe
+    let layout = kind.layout ?! panic("GC error: a kind with routines has no layout")
+    if @ptrv(layout, uint, layout_kind) != 0 : panic("GC error: a kind with routines is a sequence")
+    if layout_words(layout) != kind.words : panic("GC error: a kind's word count differs from its layout")
+    let item = mem.alloc(kind.isize)
+    let w: uint = 0
+    while w < kind.isize / 8 {
+        @ptrv(item, u64, w) = 0x0101010101010101
+        w++
+    }
+    let generated = Lifo.new()
+    let table = Lifo.new()
+    generated.reserve(kind.words)
+    kind.walk_expand(item, generated)
+    each_ref_work(item, layout, kind.isize, 0, table, walk_push_ref)
+    if generated.index != table.index : panic("GC error: a kind's routines visit other words than its layout")
+    let i: uint = 0
+    while i < table.index {
+        if @ptrv(generated.data, ptr, i) != @ptrv(table.data, ptr, i) : panic("GC error: a kind's routines visit other words than its layout")
+        i++
+    }
+    mem.free(generated.data)
+    mem.free(generated)
+    mem.free(table.data)
+    mem.free(table)
+    mem.free(item)
+}
+
 // Free slots are filled with a pattern that is checked when the slot is handed out or settled
 // again: a write into freed memory fails right there instead of corrupting a later object. Its
 // low bits are an owner tag and it lies outside the heap, so a barrier, a removal record or a

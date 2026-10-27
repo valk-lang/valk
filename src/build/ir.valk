@@ -161,6 +161,12 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
                 unit.extern_functions.append(env_clone, true)
             }
         }
+        // The runtime functions Grove's generated routines call
+        if build.grove_mode() {
+            each (allocator_routine_callees(build) !>) as callee {
+                if callee.unit != unit : unit.extern_functions.append(callee, true)
+            }
+        }
     }
 }
 
@@ -187,16 +193,81 @@ fn ir_allocator_kind_name(site: AllocatorInitSite, index: uint) String {
     return "valk.allocator.kind." + site.value.int_val + "." + index
 }
 
-// Grove's static kind descriptor (gc.Kind): slot size, layout, finalizer, closure clone
-fn ir_write_kind_constant(out: ByteBuffer, name: String, allocator: Allocator, layout: ?String) {
+// Grove's static kind descriptor (gc.Kind): slot size, layout, finalizer, closure clone, the
+// number of reference words and the generated routines
+fn ir_write_kind_constant(out: ByteBuffer, name: String, allocator: Allocator, layout: ?String, routines: Array[String]) {
     let onfree = allocator.onfree
     let env_clone = allocator.env_clone
-    out.append_text("@\"" + name + "\" = internal constant { i64, ptr, ptr, ptr } { i64 ")
+    out.append_text("@\"" + name + "\" = internal constant { i64, ptr, ptr, ptr, i64, ptr, ptr, ptr, ptr, ptr } { i64 ")
     out.write_uint_ascii(allocator.size.to(uint))
     out.append_text(", ptr " + (isset(layout) ? ir_symbol_address(layout) : "null"))
     out.append_text(", ptr " + (isset(onfree) ? ir_func_address(onfree) : "null"))
     out.append_text(", ptr " + (isset(env_clone) ? ir_func_address(env_clone) : "null"))
+    out.append_text(", i64 ")
+    out.write_uint_ascii(allocator.props.length)
+    let i: uint = 0
+    while i < 5 {
+        let routine = routines.get(i) !? ""
+        out.append_text(", ptr " + (routine.length > 0 ? ir_symbol_address(routine) : "null"))
+        i++
+    }
     out.append_text(" }\n\n")
+}
+
+// C-01, THEORY 5.4.5: a routine that calls `callee(slot, list)` for each non-null reference
+// word of an object of the kind, in the layout's order; a union member's words only while its
+// tag bytes match. `bounded` (scan_T) visits only the words inside [lo, hi)
+fn ir_write_kind_routine(out: ByteBuffer, name: String, callee: Func, props: Array[AllocatorProp], bounded: bool) {
+    out.append_text("define internal void @\"" + name + "\"(ptr \%item, ")
+    if bounded : out.append_text("ptr \%lo, ptr \%hi, ")
+    out.append_text("ptr \%list) {\nentry:\n")
+    let target = ir_func_address(callee)
+    each props as prop, k {
+        let n = "" + k
+        out.append_text("  \%s" + n + " = getelementptr i8, ptr \%item, i64 " + prop.offset + "\n")
+        out.append_text("  \%w" + n + " = load i64, ptr \%s" + n + "\n")
+        out.append_text("  \%go" + n + ".0 = icmp ne i64 \%w" + n + ", 0\n")
+        let go = "\%go" + n + ".0"
+        let part: uint = 1
+        if bounded {
+            out.append_text("  \%ge" + n + " = icmp uge ptr \%s" + n + ", \%lo\n")
+            out.append_text("  \%lt" + n + " = icmp ult ptr \%s" + n + ", \%hi\n")
+            out.append_text("  \%in" + n + " = and i1 \%ge" + n + ", \%lt" + n + "\n")
+            out.append_text("  \%go" + n + "." + part + " = and i1 " + go + ", \%in" + n + "\n")
+            go = "\%go" + n + "." + part
+            part++
+        }
+        each prop.conditions as condition, c {
+            let t = n + "." + c
+            out.append_text("  \%ta" + t + " = getelementptr i8, ptr \%item, i64 " + condition.offset + "\n")
+            out.append_text("  \%tb" + t + " = load i8, ptr \%ta" + t + "\n")
+            out.append_text("  \%tc" + t + " = icmp eq i8 \%tb" + t + ", " + condition.tag + "\n")
+            out.append_text("  \%go" + n + "." + part + " = and i1 " + go + ", \%tc" + t + "\n")
+            go = "\%go" + n + "." + part
+            part++
+        }
+        out.append_text("  br i1 " + go + ", label \%visit" + n + ", label \%next" + n + "\n")
+        out.append_text("visit" + n + ":\n  call void " + target + "(ptr \%s" + n + ", ptr \%list)\n  br label \%next" + n + "\n")
+        out.append_text("next" + n + ":\n")
+    }
+    out.append_text("  ret void\n}\n\n")
+}
+
+fn ir_allocator_routine_name(site: AllocatorInitSite, index: uint, routine: uint) String {
+    return "valk.allocator.routine." + site.value.int_val + "." + index + "." + routine
+}
+
+// The five routines of a class kind with reference words, by name
+fn ir_write_kind_routines(out: ByteBuffer, build: Build, site: AllocatorInitSite, index: uint, allocator: Allocator) Array[String] !Error {
+    let names = Array[String]{}
+    if allocator.props.length == 0 : return names
+    let props = allocator_visit_order(allocator.props)
+    each (allocator_routine_callees(build) !>) as callee, r {
+        let name = ir_allocator_routine_name(site, index, r)
+        ir_write_kind_routine(out, name, callee, props, r == 4)
+        names.append(name)
+    }
+    return names
 }
 
 fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error {
@@ -210,7 +281,10 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             if !allocator.global.is_used : continue
             let layout = allocator.props.length > 0 ? ir_allocator_layout_name(site, i) : null
             if isset(layout) : ir_write_layout_constant(out, layout, allocator_layout_words(allocator.props, 0, 0, 0))
-            if grove : ir_write_kind_constant(out, ir_allocator_kind_name(site, i), allocator, layout)
+            if grove {
+                let routines = ir_write_kind_routines(out, build, site, i, allocator) !>
+                ir_write_kind_constant(out, ir_allocator_kind_name(site, i), allocator, layout, routines)
+            }
         }
 
         let ir = IRFunc {func: owner}
