@@ -146,6 +146,13 @@ jmp Lvalk_gc_collect
 .global valk_gc_collect_shared
 valk_gc_collect_shared:
 movl $1, %edx
+jmp Lvalk_gc_collect
+
+# valk_gc_poll(): Grove-MT's loop poll, whose word fired: a round waits for the thread, or a
+# collection is pending
+.global valk_gc_poll
+valk_gc_poll:
+movl $2, %edx
 
 Lvalk_gc_collect:
 movq $0, 0x08(%rsp)
@@ -198,4 +205,62 @@ popq %rsi
 popq %rdi
 popq %rbx
 popq %rbp
+retq
+
+# Grove-MT native regions (v6 C7, RT6). The control block starts with the thread's state
+# (0 RUN, 1 NAT, 2 HELD, 3 SAFE), its NAT save area (the caller's stack pointer at 8 and its
+# callee-saved registers rbx, rbp, rdi, rsi, r12-r15 at 16..72) and its count of NAT exits (104)
+
+# valk_gc_native_enter(ctl): RUN -> NAT before a call into native code. A null ctl is a thread
+# that is not registered
+.global valk_gc_native_enter
+valk_gc_native_enter:
+testq %rcx, %rcx
+jz 1f
+leaq 8(%rsp), %rax
+movq %rax, 8(%rcx)
+movq %rbx, 16(%rcx)
+movq %rbp, 24(%rcx)
+movq %rdi, 32(%rcx)
+movq %rsi, 40(%rcx)
+movq %r12, 48(%rcx)
+movq %r13, 56(%rcx)
+movq %r14, 64(%rcx)
+movq %r15, 72(%rcx)
+movq $1, %rax
+xchgq %rax, (%rcx)
+1:
+retq
+
+# valk_gc_native_leave(ctl): NAT -> RUN by a compare-and-swap; while a round holds the thread
+# (HELD) the installed slow path waits for its release
+.global valk_gc_native_leave
+valk_gc_native_leave:
+testq %rcx, %rcx
+jz 1f
+incq 104(%rcx)
+movq $1, %rax
+xorl %edx, %edx
+lock cmpxchgq %rdx, (%rcx)
+jne 2f
+1:
+retq
+2:
+jmp *valk_gc_leave_slow(%rip)
+
+.data
+valk_gc_leave_slow:
+.quad 0
+.text
+
+.global valk_gc_set_leave_slow
+valk_gc_set_leave_slow:
+movq %rcx, valk_gc_leave_slow(%rip)
+retq
+
+# valk_gc_cas(address, expected, desired): returns the old value
+.global valk_gc_cas
+valk_gc_cas:
+movq %rdx, %rax
+lock cmpxchgq %r8, (%rcx)
 retq

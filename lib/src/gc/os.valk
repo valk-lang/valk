@@ -1,0 +1,192 @@
+@unsafe
+
+use ext
+use mem
+
+// The system calls of Grove's heaps, per target. The heaps reserve address ranges at fixed
+// addresses with no access, commit them in steps, and give pages back to the system, after
+// which they read as zero. Grove's pages are 4 KiB; on a system with larger pages a commit
+// covers the whole system pages and a give-back zeroes the parts it cannot return
+
+#if OS == "win"
+value MEM_COMMIT (0x1000)
+value MEM_RESERVE (0x2000)
+value MEM_DECOMMIT (0x4000)
+value PAGE_NOACCESS (0x01)
+value PAGE_READWRITE (0x04)
+#elif OS == "macos"
+value MAP_FLAGS (0x2 | 0x1000 | 0x40) // private, anonymous, no reserve
+value MAP_FIXED (0x10)
+value RLIMIT_AS (5)
+#else
+value MAP_FLAGS (0x2 | 0x20 | 0x4000) // private, anonymous, no reserve
+value MAP_FIXED_NOREPLACE (0x100000)
+value MADV_DONTNEED (4)
+value MADV_HUGEPAGE (14)
+value MADV_NOHUGEPAGE (15)
+value RLIMIT_AS (9)
+#end
+
+// The system's page size, read at the first reservation
+@shared os_page: uint
+
+fn os_page_size() uint $inline {
+    if os_page == 0 {
+        #if OS == "linux"
+        let n = ext.sysconf(30)
+        os_page = n > 0 ? n.to(uint) : 4096
+        #elif OS == "macos"
+        let n = ext.getpagesize()
+        os_page = n > 0 ? n.to(uint) : 4096
+        #else
+        os_page = 4096
+        #end
+    }
+    return os_page
+}
+
+// The address space limit (RLIMIT_AS), or ~0 without one
+fn os_address_limit() uint {
+    #if OS == "win"
+    return (~0).to(uint)
+    #else
+    let limit: [uint x 2] = @undefined
+    if ext.getrlimit(RLIMIT_AS, @ref(limit)) == 0 : return limit[0]
+    return (~0).to(uint)
+    #end
+}
+
+// Reserves [at, at + size) with no access; false when the range cannot be had there
+fn os_reserve(at: uint, size: uint) bool {
+    os_page_size()
+    #if OS == "win"
+    let p = ext.VirtualAlloc(at.@cast(ptr), size, MEM_RESERVE, PAGE_NOACCESS)
+    return isset(p) && p.@cast(uint) == at
+    #else
+    #if OS == "macos"
+    // No MAP_FIXED_NOREPLACE: the address is a hint, and anything else is given back
+    let p = ext.mmap(at.@cast(ptr), size, 0, MAP_FLAGS, -1, 0)
+    #else
+    let p = ext.mmap(at.@cast(ptr), size, 0, MAP_FLAGS | MAP_FIXED_NOREPLACE, -1, 0)
+    #end
+    let got: uint = p
+    if got == at : return true
+    // A kernel without MAP_FIXED_NOREPLACE takes the address as a hint
+    if got != (~0).to(uint) : ext.munmap(p, size)
+    return false
+    #end
+}
+
+// Reserves `size` bytes anywhere, with no access; null when it fails
+fn os_reserve_any(size: uint) ?ptr {
+    os_page_size()
+    #if OS == "win"
+    return ext.VirtualAlloc(null, size, MEM_RESERVE, PAGE_NOACCESS)
+    #else
+    let p = ext.mmap(null, size, 0, MAP_FLAGS, -1, 0)
+    let got: uint = p
+    if got == (~0).to(uint) : return null
+    return p
+    #end
+}
+
+// Makes reserved memory readable and writable; whole system pages
+fn os_commit(at: uint, size: uint) bool {
+    let page = os_page_size()
+    let lo = at & (~(page - 1)).to(uint)
+    let hi = (at + size + page - 1) & (~(page - 1)).to(uint)
+    #if OS == "win"
+    return isset(ext.VirtualAlloc(lo.@cast(ptr), hi - lo, MEM_COMMIT, PAGE_READWRITE))
+    #else
+    return ext.mprotect(lo.@cast(ptr), hi - lo, 0x1 | 0x2) == 0
+    #end
+}
+
+// Gives committed pages back to the system; they stay usable and read as zero. The parts of
+// system pages at either end are zeroed instead
+fn os_discard(at: uint, size: uint) {
+    let page = os_page_size()
+    let end = at + size
+    let lo = (at + page - 1) & (~(page - 1)).to(uint)
+    let hi = end & (~(page - 1)).to(uint)
+    if hi <= lo {
+        mem.clear_bytes(at.@cast(ptr), size)
+        return
+    }
+    if lo > at : mem.clear_bytes(at.@cast(ptr), lo - at)
+    if end > hi : mem.clear_bytes(hi.@cast(ptr), end - hi)
+    #if OS == "win"
+    ext.VirtualFree(lo.@cast(ptr), hi - lo, MEM_DECOMMIT)
+    if !isset(ext.VirtualAlloc(lo.@cast(ptr), hi - lo, MEM_COMMIT, PAGE_READWRITE)) : panic("Grove cannot commit heap memory")
+    #elif OS == "macos"
+    // MADV_DONTNEED keeps the contents on macOS: fresh pages replace them
+    let p = ext.mmap(lo.@cast(ptr), hi - lo, 0x1 | 0x2, MAP_FLAGS | MAP_FIXED, -1, 0)
+    let got: uint = p
+    if got != lo : panic("Grove cannot commit heap memory")
+    #else
+    ext.madvise(lo.@cast(ptr), hi - lo, MADV_DONTNEED)
+    #end
+}
+
+// Linux's transparent huge pages for a range: asked for, or kept out
+fn os_huge(at: uint, size: uint, huge: bool) {
+    #if OS == "linux"
+    ext.madvise(at.@cast(ptr), size, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE)
+    #end
+}
+
+// GC code: an unbracketed yield of the processor
+fn os_yield() $inline {
+    #if OS == "win"
+    ext.SwitchToThread()
+    #else
+    ext.sched_yield()
+    #end
+}
+
+// Waits while the 32-bit word at `address` holds `expected`, `ms` milliseconds at most; it may
+// return early. Linux sleeps on the futex; the other systems check the word every millisecond
+fn os_wait(address: *uint, expected: uint, ms: uint) {
+    #if OS == "linux"
+    let ts = ext.libc_timespec { tv_sec: (ms / 1000).to(int), tv_nsec: ((ms % 1000) * 1_000_000).to(int) }
+    ext.syscall(SYS_FUTEX, address.@cast(ptr), 128, (expected & 0xFFFFFFFF).to(i32), @ref(ts).@cast(ptr))
+    #else
+    let waited: uint = 0
+    while waited < ms && (atomic_load(address[0]) & 0xFFFFFFFF) == (expected & 0xFFFFFFFF) {
+        #if OS == "win"
+        ext.Sleep(1)
+        #else
+        let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: 1_000_000 }
+        ext.nanosleep(@ref(ts), @ref(ts))
+        #end
+        waited++
+    }
+    #end
+}
+
+// Wakes every waiter of the word at `address`
+fn os_wake_all(address: *uint) {
+    #if OS == "linux"
+    ext.syscall(SYS_FUTEX, address.@cast(ptr), 129, 0x7FFFFFFF)
+    #end
+}
+
+#if OS == "linux"
+#if ARCH == "arm64"
+value SYS_FUTEX (98)
+#else
+value SYS_FUTEX (202)
+#end
+#end
+
+// A monotonic clock at a coarse resolution, in microseconds
+fn os_coarse_us() uint {
+    #if OS == "win"
+    return ext.GetTickCount64().to(uint) * 1000
+    #else
+    let value: ext.libc_timespec = @undefined
+    // 6: CLOCK_MONOTONIC_COARSE on Linux, CLOCK_MONOTONIC on macOS
+    ext.clock_gettime(6, @ref(value))
+    return value.tv_sec.to(uint) * 1_000_000 + value.tv_nsec.to(uint) / 1000
+    #end
+}

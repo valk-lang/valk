@@ -119,7 +119,7 @@ retq
 
 # Grove-MT native regions (v6 C7, RT6). The control block starts with the thread's state
 # (0 RUN, 1 NAT, 2 HELD, 3 SAFE), its NAT save area (the caller's stack pointer and its
-# callee-saved registers, at 8..56) and its count of NAT exits (64)
+# callee-saved registers, at 8..96) and its count of NAT exits (104)
 
 # valk_gc_native_enter(ctl): RUN -> NAT before a call into native code. A null ctl is a thread
 # that is not registered
@@ -150,7 +150,7 @@ _valk_gc_native_leave:
 valk_gc_native_leave:
 testq %rdi, %rdi
 jz 1f
-incq 64(%rdi)
+incq 104(%rdi)
 movq $1, %rax
 xorl %ecx, %ecx
 lock cmpxchgq %rcx, (%rdi)

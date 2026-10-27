@@ -1421,6 +1421,16 @@ gc_mode_check() {
 gc_mode_check grove gc-mode.valk
 gc_mode_check grove-mt gc-mode-thread.valk
 gc_mode_check grove-mt gc-mode.valk --def GROVE_MT=1
+# Grove builds for every target, in both modes
+for target in linux-arm64 macos-x64 macos-arm64 win-x64; do
+    for file in gc-mode.valk gc-mode-thread.valk; do
+        "$VALK" build "$DIR/$file" --target "$target" --ir --no-warn -o "$workdir/gc-mode-$target.ll" > "$workdir/gc-mode.log" 2>&1 || {
+            echo "# Failed to build $file for $target"
+            cat "$workdir/gc-mode.log"
+            exit 1
+        }
+    done
+done
 gc_out=$("$VALK" build "$DIR/gc-mode-thread.valk" --def GROVE_MT=0 --no-warn -o "$output" 2>&1) && {
     echo "# GROVE_MT=0 built a program that can start a thread"
     exit 1

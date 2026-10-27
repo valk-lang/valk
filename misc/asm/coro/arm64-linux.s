@@ -110,6 +110,15 @@ _valk_gc_collect_shared:
 .global valk_gc_collect_shared
 valk_gc_collect_shared:
 mov x1, 1
+b .Lvalk_gc_collect
+
+# valk_gc_poll(): Grove-MT's loop poll, whose word fired: a round waits for the thread, or a
+# collection is pending
+.global _valk_gc_poll
+_valk_gc_poll:
+.global valk_gc_poll
+valk_gc_poll:
+mov x1, 2
 
 .Lvalk_gc_collect:
 sub sp, sp, 0xa0
@@ -137,4 +146,97 @@ ldp x25, x26, [sp, 0x70]
 ldp x27, x28, [sp, 0x80]
 ldp fp,   lr, [sp, 0x90]
 add sp, sp, 0xa0
+ret
+
+# Grove-MT native regions (v6 C7, RT6). The control block starts with the thread's state
+# (0 RUN, 1 NAT, 2 HELD, 3 SAFE), its NAT save area (the caller's stack pointer at 8 and its
+# callee-saved registers x19-x29 at 16..96) and its count of NAT exits (104)
+
+# valk_gc_native_enter(ctl): RUN -> NAT before a call into native code. A null ctl is a thread
+# that is not registered
+.global _valk_gc_native_enter
+_valk_gc_native_enter:
+.global valk_gc_native_enter
+valk_gc_native_enter:
+cbz x0, 1f
+mov x9, sp
+str x9, [x0, 8]
+stp x19, x20, [x0, 16]
+stp x21, x22, [x0, 32]
+stp x23, x24, [x0, 48]
+stp x25, x26, [x0, 64]
+stp x27, x28, [x0, 80]
+str x29, [x0, 96]
+mov x9, 1
+dmb ish
+2:
+ldaxr x10, [x0]
+stlxr w11, x9, [x0]
+cbnz w11, 2b
+dmb ish
+1:
+ret
+
+# valk_gc_native_leave(ctl): NAT -> RUN by a compare-and-swap; while a round holds the thread
+# (HELD) the installed slow path waits for its release
+.global _valk_gc_native_leave
+_valk_gc_native_leave:
+.global valk_gc_native_leave
+valk_gc_native_leave:
+cbz x0, 1f
+ldr x9, [x0, 104]
+add x9, x9, 1
+str x9, [x0, 104]
+dmb ish
+2:
+ldaxr x9, [x0]
+cmp x9, 1
+b.ne 3f
+stlxr w10, xzr, [x0]
+cbnz w10, 2b
+dmb ish
+1:
+ret
+3:
+clrex
+dmb ish
+adrp x9, valk_gc_leave_slow
+add x9, x9, :lo12:valk_gc_leave_slow
+ldr x9, [x9]
+br x9
+
+.data
+.p2align 3
+valk_gc_leave_slow:
+.quad 0
+.text
+
+.global _valk_gc_set_leave_slow
+_valk_gc_set_leave_slow:
+.global valk_gc_set_leave_slow
+valk_gc_set_leave_slow:
+adrp x9, valk_gc_leave_slow
+add x9, x9, :lo12:valk_gc_leave_slow
+str x0, [x9]
+ret
+
+# valk_gc_cas(address, expected, desired): returns the old value
+.global _valk_gc_cas
+_valk_gc_cas:
+.global valk_gc_cas
+valk_gc_cas:
+dmb ish
+2:
+ldaxr x9, [x0]
+cmp x9, x1
+b.ne 3f
+stlxr w10, x2, [x0]
+cbnz w10, 2b
+dmb ish
+mov x0, x9
+ret
+3:
+clrex
+dmb ish
+mov x0, x9
 ret

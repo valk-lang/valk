@@ -31,13 +31,6 @@ value CARD_SHIFT (7)
 value CARD_SIZE (128)
 value CARD_OFFSET (0x800)
 
-value MAP_FLAGS (0x2 | 0x20 | 0x4000) // private, anonymous, no reserve
-value MAP_FIXED_NOREPLACE (0x100000)
-value MADV_DONTNEED (4)
-value MADV_HUGEPAGE (14)
-value MADV_NOHUGEPAGE (15)
-value RLIMIT_AS (9)
-
 // Chunk states: collections the chunk was wholly free for (0-3), and flags
 value chunk_idle_mask (3)
 value chunk_free_now (64)
@@ -144,20 +137,17 @@ global heap_tid: uint
 
 fn heap_init() {
     let size: uint = HEAP_MAX
-    let limit: [uint x 2] = @undefined
-    if ext.getrlimit(RLIMIT_AS, @ref(limit)) == 0 && limit[0] != (~0).to(uint) {
+    let limit = os_address_limit()
+    if limit != (~0).to(uint) {
         // Half of the address space limit, the rest stays for the program
-        let half = (limit[0] / 2) & (~(CHUNK_SIZE - 1)).to(uint)
+        let half = (limit / 2) & (~(CHUNK_SIZE - 1)).to(uint)
         if half < size : size = half
     }
     if size < SMALL_CHUNKS * CHUNK_SIZE : heap_fail()
     heap_reserve(HEAP_BASE, size)
     heap_reserve(HEAP_BASE >> 3, size >> 3)
     heap_reserve(HEAP_BASE >> 7, (size >> 7) + 0x1000)
-    let table = ext.mmap(null, size >> 9, 0, MAP_FLAGS, -1, 0)
-    let address: uint = table
-    if address == (~0).to(uint) : heap_fail()
-    page_table = table
+    page_table = os_reserve_any(size >> 9) ?! heap_fail()
     chunk_states = ext.calloc(size >> CHUNK_SHIFT, 1)
     #if GROVE_MT
     owner_table = ext.calloc(size >> GRANULE_SHIFT, 4)
@@ -169,24 +159,19 @@ fn heap_init() {
     #end
     heap_size = size
     // The shadow of the first 16 MiB of heap keeps 4 KiB pages
-    ext.madvise((HEAP_BASE >> 3).@cast(ptr), CHUNK_SIZE, MADV_NOHUGEPAGE)
+    os_huge(HEAP_BASE >> 3, CHUNK_SIZE, false)
 }
 
 fn heap_reserve(at: uint, size: uint) {
-    let p = ext.mmap(at.@cast(ptr), size, 0, MAP_FLAGS | MAP_FIXED_NOREPLACE, -1, 0)
-    let got: uint = p
-    if got == at : return
-    // A kernel without MAP_FIXED_NOREPLACE takes the address as a hint
-    if got != (~0).to(uint) : ext.munmap(p, size)
-    heap_fail()
+    if !os_reserve(at, size) : heap_fail()
 }
 
 fn heap_fail() $exit {
-    panic("Grove cannot reserve its heap at 0x200000000000: the address space limit (RLIMIT_AS) is too small or the range is in use")
+    panic("Grove cannot reserve its heap at 0x200000000000: the address space limit (RLIMIT_AS) is too small, the address space has fewer than 47 bits or the range is in use")
 }
 
 fn heap_commit(at: uint, size: uint) {
-    if ext.mprotect(at.@cast(ptr), size, 0x1 | 0x2) != 0 : panic("Grove cannot commit heap memory")
+    if !os_commit(at, size) : panic("Grove cannot commit heap memory")
 }
 
 // Whether a word points below the chunks taken: only those pages have page table entries
@@ -222,8 +207,8 @@ fn heap_take_chunks(count: uint) {
     let end = chunk + count
     while chunk < end {
         let adr = (HEAP_BASE + chunk * CHUNK_SIZE).@cast(ptr)
-        if chunk < SMALL_CHUNKS : ext.madvise(adr, CHUNK_SIZE, MADV_NOHUGEPAGE)
-        else if thp_wants_madvise() : ext.madvise(adr, CHUNK_SIZE, MADV_HUGEPAGE)
+        if chunk < SMALL_CHUNKS : os_huge(adr, CHUNK_SIZE, false)
+        else if thp_wants_madvise() : os_huge(adr, CHUNK_SIZE, true)
         chunk++
     }
     let first_page = heap_top >> PAGE_SHIFT
@@ -246,7 +231,7 @@ fn heap_thread_init(tid: uint) {
 
 fn pool_lock_take() $inline {
     while atomic(pool_lock | 1) != 0 {
-        while atomic_load(pool_lock) != 0 : ext.sched_yield()
+        while atomic_load(pool_lock) != 0 : os_yield()
     }
 }
 
@@ -293,8 +278,8 @@ fn heap_give_granule(g: uint, to_os: bool) {
     mem.clear_bytes(page_table + g * GRANULE_PAGES * size_of(ptr), GRANULE_PAGES * size_of(ptr))
     let zeroed = to_os || atomic_load(pool_kept) >= POOL_RETAIN
     if zeroed {
-        ext.madvise(at.@cast(ptr), GRANULE_SIZE, MADV_DONTNEED)
-        ext.madvise((at >> 3).@cast(ptr), GRANULE_SIZE >> 3, MADV_DONTNEED)
+        os_discard(at, GRANULE_SIZE)
+        os_discard(at >> 3, GRANULE_SIZE >> 3)
     }
     pool_lock_take()
     #if GC_DEBUG
@@ -402,13 +387,14 @@ fn heap_commit_shadow(heap_end: uint) {
     if top > heap_size >> 3 : top = heap_size >> 3
     let at = (HEAP_BASE >> 3) + shadow_top
     heap_commit(at, top - shadow_top)
-    if shadow_top > 0 && thp_wants_madvise() : ext.madvise(at.@cast(ptr), top - shadow_top, MADV_HUGEPAGE)
+    if shadow_top > 0 && thp_wants_madvise() : os_huge(at, top - shadow_top, true)
     shadow_top = top
 }
 
 // Under `enabled = always` huge pages come without asking. Under `madvise` they are asked
 // for only when `defrag` does not stall on them (defer or never)
 fn thp_wants_madvise() bool {
+    #if OS == "linux"
     if thp_madvise == 0 {
         thp_madvise = 2
         if thp_setting_has("/sys/kernel/mm/transparent_hugepage/enabled", "[madvise]") {
@@ -417,8 +403,12 @@ fn thp_wants_madvise() bool {
         }
     }
     return thp_madvise == 1
+    #else
+    return false
+    #end
 }
 
+#if OS == "linux"
 fn thp_setting_has(path: String, word: String) bool {
     let fd = ext.open(path.data_cstring, 0)
     if fd < 0 : return false
@@ -434,6 +424,7 @@ fn thp_setting_has(path: String, word: String) bool {
     }
     return false
 }
+#end
 
 // Takes `pages` free pages, the lowest that fit, and whether they are zero
 fn heap_carve(pages: uint) (ptr, bool) {
@@ -706,7 +697,7 @@ fn heap_return_idle(retain: uint) {
 
 fn heap_return_chunk(chunk: uint) {
     let at = HEAP_BASE + chunk * CHUNK_SIZE
-    ext.madvise(at.@cast(ptr), CHUNK_SIZE, MADV_DONTNEED)
+    os_discard(at, CHUNK_SIZE)
     heap_return_shadow(chunk)
     heap_return_cards(chunk)
     // The chunk becomes one pre-zeroed run; the runs it cuts keep their flags outside it
@@ -738,7 +729,7 @@ fn heap_return_shadow(chunk: uint) {
     let per_step = SHADOW_STEP / (CHUNK_SIZE >> 3)
     let first = chunk - chunk % per_step
     if first == 0 {
-        ext.madvise(((HEAP_BASE + chunk * CHUNK_SIZE) >> 3).@cast(ptr), CHUNK_SIZE >> 3, MADV_DONTNEED)
+        os_discard((HEAP_BASE + chunk * CHUNK_SIZE) >> 3, CHUNK_SIZE >> 3)
         return
     }
     let chunks = heap_top >> CHUNK_SHIFT
@@ -751,7 +742,7 @@ fn heap_return_shadow(chunk: uint) {
     let end = shadow_top + (HEAP_BASE >> 3)
     let size = SHADOW_STEP
     if shadow + size > end : size = end - shadow
-    ext.madvise(shadow.@cast(ptr), size, MADV_DONTNEED)
+    os_discard(shadow, size)
 }
 
 // A chunk's card bytes start 0x800 into a page, so its first and last card pages are shared
@@ -771,7 +762,7 @@ fn heap_return_cards(chunk: uint) {
     let end = (hi + PAGE_SIZE - 1) & (~(PAGE_SIZE - 1)).to(uint)
     if start != lo && chunk > 0 && !chunk_gone(chunk - 1) : start += PAGE_SIZE
     if end != hi && !chunk_gone(chunk + 1) : end -= PAGE_SIZE
-    if end > start : ext.madvise(start.@cast(ptr), end - start, MADV_DONTNEED)
+    if end > start : os_discard(start, end - start)
 }
 
 // A chunk that is returned or not taken yet: its card bytes are zero and unused
