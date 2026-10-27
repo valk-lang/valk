@@ -15,8 +15,7 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
-# The compiler's own sources test GROVE and GC_AUTO, which older compilers do not define
-SELF_FLAGS := $(FLAGS) --def "GROVE=0" --def "GC_AUTO=0"
+SELF_FLAGS := $(FLAGS)
 DIST_FLAGS := . --static --release -vv -c
 IR_TARGETS := linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64
 BUILD_TARGETS := $(IR_TARGETS)
@@ -138,38 +137,26 @@ test-library: $(TEST_COMPILER)
 test-extend-access: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
 
-# The suite with a collection every 512 allocations: exposes values no root names
+# The suite (Grove-MT: it starts threads) with forced collections: exposes values no root
+# names. In MT mode GC_STRESS also runs a round at every 64th S refill and at every copy poll
 test-gc-stress: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-gc-stress$(EXE_SUFFIX)
 	./debug/test-gc-stress$(EXE_SUFFIX)
 
-# Grove: the suite without its thread tests, built with the Grove collector
-GROVE_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "TEST_ST_ONLY=1"
+# Grove's single-threaded mode: the suite without its thread tests
+GROVE_TEST_FLAGS := $(TEST_FLAGS) --def "TEST_ST_ONLY=1"
 GROVE_COMPILER_FLAGS := $(FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
 
-# Grove-MT: the suite in forced multi-threaded mode
-GROVE_MT_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "GROVE_MT=1"
-
-test-grove: test-grove-st test-grove-mt
-
-test-grove-st: $(TEST_COMPILER)
+test-grove: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) $(FLAGS) -o ./debug/test-grove$(EXE_SUFFIX)
 	./debug/test-grove$(EXE_SUFFIX)
 
-test-grove-mt: $(TEST_COMPILER)
-	mkdir -p ./debug
-	$(TEST_COMPILER) build ./tests $(GROVE_MT_TEST_FLAGS) $(FLAGS) -o ./debug/test-grove-mt$(EXE_SUFFIX)
-	./debug/test-grove-mt$(EXE_SUFFIX)
-
-# GC_STRESS in MT mode also runs a round at every 64th S refill and at every copy poll
 test-grove-stress: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-grove-stress$(EXE_SUFFIX)
 	./debug/test-grove-stress$(EXE_SUFFIX)
-	$(TEST_COMPILER) build ./tests $(GROVE_MT_TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-grove-mt-stress$(EXE_SUFFIX)
-	./debug/test-grove-mt-stress$(EXE_SUFFIX)
 
 # Grove with co-edge counts capped at 2, so the overflow map is used everywhere
 test-grove-small-caps: $(TEST_COMPILER)
@@ -177,8 +164,9 @@ test-grove-small-caps: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_SMALL_CAPS=1" $(FLAGS) -o ./debug/test-grove-small-caps$(EXE_SUFFIX)
 	./debug/test-grove-small-caps$(EXE_SUFFIX)
 
-# D-15: a deterministic workload built with each collector must hold the same objects at
-# every gc.oracle_checkpoint()
+# D-15: a deterministic workload must hold the same objects at every gc.oracle_checkpoint()
+# in single-threaded and in forced multi-threaded mode, and the same as Valk's former
+# collector did (tests/gc-oracle/workload.live)
 test-gc-oracle: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./misc/gc-oracle.sh ./tests/gc-oracle/workload.valk
 
@@ -187,27 +175,26 @@ test-gc-oracle: $(TEST_COMPILER)
 test-grove-ci: test-grove-stress test-grove-small-caps test-gc-oracle valk
 	mkdir -p ./debug
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/tests-ref --clean
-	./valk build . -o ./debug/valk-gs -vv $(GROVE_COMPILER_FLAGS) --def "GROVE=1" --def "GC_DEBUG=1" --def "GC_STRESS=1" --clean
+	./valk build . -o ./debug/valk-gs -vv $(GROVE_COMPILER_FLAGS) --def "GC_DEBUG=1" --def "GC_STRESS=1" --clean
 	./debug/valk-gs build ./tests $(TEST_FLAGS) $(FLAGS) --stdlib $(CURDIR)/lib -o ./debug/tests-gs --clean
 	cmp ./debug/tests-gs ./debug/tests-ref
 
-# The compiler built with Grove (and with Grove's checks) must give the same compiler and
-# test binary as the compiler on Valk's collector
+# The self-build fixed point on Grove: the compiler built by ./valk (stage 2, on Grove-MT) and
+# the same with Grove's checks must build the same compiler, test binary and release program
+# as ./valk (on the stable compiler's library) does
 grove-compiler-check: valk
 	mkdir -p ./debug
 	./valk build . -o ./debug/valk-ref -vv $(GROVE_COMPILER_FLAGS) --clean
 	./valk build ./tests $(TEST_FLAGS) $(FLAGS) -o ./debug/tests-ref --clean
 	./valk build ./examples/bench/json/main.valk --release -o ./debug/release-ref --clean
-	./valk build . -o ./debug/valk-g -vv $(GROVE_COMPILER_FLAGS) --def "GROVE=1" --clean
-	./valk build . -o ./debug/valk-gd -vv $(GROVE_COMPILER_FLAGS) --def "GROVE=1" --def "GC_DEBUG=1" --clean
-	@set -e; for c in valk-g valk-gd; do \
+	./valk build . -o ./debug/valk-gd -vv $(GROVE_COMPILER_FLAGS) --def "GC_DEBUG=1" --clean
+	@set -e; for c in valk-ref valk-gd; do \
 		echo "# $$c"; \
 		./debug/$$c build . -o ./debug/out-$$c -vv $(GROVE_COMPILER_FLAGS) --stdlib $(CURDIR)/lib --clean; \
 		cmp ./debug/out-$$c ./debug/valk-ref; \
 		./debug/$$c build ./tests $(TEST_FLAGS) $(FLAGS) --stdlib $(CURDIR)/lib -o ./debug/tests-$$c --clean; \
 		cmp ./debug/tests-$$c ./debug/tests-ref; \
-		./debug/$$c build ./examples/bench/json/main.valk --release --stdlib $(CURDIR)/lib -o ./debug/release-$$c --clean -vvv > ./debug/release-$$c.log; \
-		grep "emitted as" ./debug/release-$$c.log || { echo "# The serial llvm_emit_partitions did not run"; exit 1; }; \
+		./debug/$$c build ./examples/bench/json/main.valk --release --stdlib $(CURDIR)/lib -o ./debug/release-$$c --clean; \
 		cmp ./debug/release-$$c ./debug/release-ref; \
 	done
 	@echo "Grove compiler check: outputs are identical"
@@ -261,13 +248,14 @@ test-release: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --release -o ./debug/test-release$(EXE_SUFFIX)
 	./debug/test-release$(EXE_SUFFIX)
 
+# Grove-MT's rounds over the shared heap, ten times
 test-gc-shared-stress: valk
 	mkdir -p ./debug
-	./valk build ./tests/src/gc-shared.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress
+	./valk build ./tests/src/grove-mt-rounds.valk $(TEST_FLAGS) $(FLAGS) -o ./debug/test-gc-shared-stress
 	@run=0; while [ $$run -lt 10 ]; do \
 		run=$$((run + 1)); \
-		echo "Shared GC stress run $$run/10"; \
-		./debug/test-gc-shared-stress --filter "Shared GC:" || exit $$?; \
+		echo "Grove-MT rounds stress run $$run/10"; \
+		./debug/test-gc-shared-stress --filter "Grove-MT rounds:" || exit $$?; \
 	done
 
 watchtest: valk2
@@ -450,4 +438,4 @@ clean:
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
 	test-macos-build test-release test-win test-win-build \
-	test-grove test-grove-st test-grove-mt test-grove-stress test-grove-small-caps grove-compiler-check
+	test-grove test-grove-stress test-grove-small-caps test-grove-ci test-gc-oracle grove-compiler-check

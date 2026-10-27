@@ -1390,35 +1390,19 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] && command -v obj
     fi
 fi
 
-# GROVE=1 builds a linux-x64 program without threads
-if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
-    "$VALK" build "$input" --def GROVE=1 --no-warn -c -o "$output" > /dev/null 2>&1 || { echo "# GROVE=1 failed to build a program without threads"; exit 1; }
-    "$output" || { echo "# A GROVE=1 program without threads failed"; exit 1; }
-fi
-# GROVE=1 builds a program that can start a thread in Grove's multi-threaded mode (GROVE_MT)
-if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
-    grove_out=$("$VALK" build "$DIR/grove-thread.valk" --def GROVE=1 --no-warn -c -o "$output" 2>&1) || {
-        echo "# GROVE=1 failed to build a program that starts a thread"
-        echo "$grove_out"
-        exit 1
-    }
-    if [[ "$("$output")" != "worker" ]]; then
-        echo "# A GROVE=1 program with a thread failed"
-        exit 1
-    fi
-fi
-grove_out=$("$VALK" build "$input" --def GROVE=1 --target win-x64 --no-warn -c -o "$output" 2>&1) && {
-    echo "# GROVE=1 accepted a target other than linux-x64"
+# A program that can start a thread is built in Grove's multi-threaded mode (GROVE_MT)
+grove_out=$("$VALK" build "$DIR/grove-thread.valk" --no-warn -c -o "$output" 2>&1) || {
+    echo "# Failed to build a program that starts a thread"
+    echo "$grove_out"
     exit 1
 }
-if [[ "$grove_out" != *"Grove supports only the linux-x64 target"* ]]; then
-    echo "# Unexpected GROVE=1 target error"
-    echo "$grove_out"
+if [[ "$("$output")" != "worker" ]]; then
+    echo "# A program with a thread failed"
     exit 1
 fi
 
-# --gc auto (the default) builds a linux-x64 program with Grove, in its multi-threaded mode when
-# the program can start a thread; --gc and --def GROVE choose one
+# Grove's single-threaded mode for a program without a thread start, its multi-threaded mode
+# for one that can start a thread or with --def GROVE_MT=1
 gc_mode_check() {
     local expected="$1" file="$2"
     shift 2
@@ -1430,28 +1414,19 @@ gc_mode_check() {
     local got
     got=$("$output") || { echo "# $file built with '$*' failed"; exit 1; }
     if [[ "$got" != "$expected" ]]; then
-        echo "# Expected $file built with '$*' on $expected's collector, got: $got"
+        echo "# Expected $file built with '$*' in mode $expected, got: $got"
         exit 1
     fi
 }
-if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
-    gc_mode_check grove gc-mode.valk
-    gc_mode_check valk gc-mode.valk --gc valk
-    gc_mode_check grove gc-mode.valk --gc grove
-    gc_mode_check valk gc-mode.valk --def GROVE=0
-    gc_mode_check grove-mt gc-mode-thread.valk
-    gc_mode_check valk gc-mode-thread.valk --gc valk
-    gc_mode_check grove-mt gc-mode-thread.valk --gc grove
-    gc_mode_check grove-mt gc-mode.valk --def GROVE_MT=1
-else
-    gc_mode_check valk gc-mode.valk
-fi
-gc_out=$("$VALK" build "$input" --gc other --no-warn -o "$output" 2>&1) && {
-    echo "# --gc accepted an unknown collector"
+gc_mode_check grove gc-mode.valk
+gc_mode_check grove-mt gc-mode-thread.valk
+gc_mode_check grove-mt gc-mode.valk --def GROVE_MT=1
+gc_out=$("$VALK" build "$DIR/gc-mode-thread.valk" --def GROVE_MT=0 --no-warn -o "$output" 2>&1) && {
+    echo "# GROVE_MT=0 built a program that can start a thread"
     exit 1
 }
-if [[ "$gc_out" != *"'--gc' expects auto, grove or valk"* ]]; then
-    echo "# Unexpected --gc error"
+if [[ "$gc_out" != *"Grove's single-threaded mode (GROVE_MT=0) cannot build this program"* ]]; then
+    echo "# Unexpected GROVE_MT=0 error"
     echo "$gc_out"
     exit 1
 fi

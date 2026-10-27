@@ -210,7 +210,7 @@ if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
     exe="$workdir/grove-heap-limit"
     echo "> Run: a Grove program under a small RLIMIT_AS"
     set +e
-    out=$("$VALK" build "$input" --def "GROVE=1" --no-warn -o "$exe" 2>&1)
+    out=$("$VALK" build "$input" --no-warn -o "$exe" 2>&1)
     status=$?
     set -e
     if [ "$status" -ne 0 ]; then

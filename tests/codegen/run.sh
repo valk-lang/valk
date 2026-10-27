@@ -18,14 +18,10 @@ trap 'rm -rf "$workdir"' EXIT
 # Every IR fixture is built up front, in parallel; the checks below read the
 # saved output and status of their build.
 export VALK DIR workdir
-# The fixtures check the IR of Valk's collector unless they choose one: `--gc auto` would give
-# single-threaded linux-x64 programs Grove's polls, cap tests and inline allocation
 ir_build() {
     local path="$1"
     shift
-    local gc=(--gc valk)
-    [[ " $* " == *" --gc "* || " $* " == *"GROVE="* ]] && gc=()
-    "$VALK" build "$@" "${gc[@]}" -o "$path" > "$path.log" 2>&1
+    "$VALK" build "$@" -o "$path" > "$path.log" 2>&1
     echo "$?" > "$path.status"
 }
 export -f ir_build
@@ -56,9 +52,8 @@ queue_ir "$workdir/windows-bool.ll" "$DIR/windows-bool.valk" --target win-x64 --
 queue_ir "$workdir/tagged-union-scalars.ll" "$DIR/tagged-union-scalars.valk" --ir --no-warn
 queue_ir "$workdir/export.ll" "$DIR/export.valk" --ir --no-warn
 queue_ir "$workdir/shared-pool.ll" "$DIR/shared-pool.valk" --ir --no-warn
-for grove in 0 1; do queue_ir "$workdir/grove-is-shared-$grove.ll" "$DIR/grove-is-shared.valk" --target linux-x64 --ir --no-warn --def "GROVE=$grove"; done
-for gc in auto valk; do queue_ir "$workdir/gc-auto-$gc.ll" "$DIR/gc-auto.valk" --target linux-x64 --ir --no-warn --gc "$gc"; done
-queue_ir "$workdir/grove-poll-gates.ll" "$DIR/grove-poll-gates.valk" --target linux-x64 --ir --no-warn --gc grove
+queue_ir "$workdir/gc-auto.ll" "$DIR/gc-auto.valk" --target linux-x64 --ir --no-warn
+queue_ir "$workdir/grove-poll-gates.ll" "$DIR/grove-poll-gates.valk" --target linux-x64 --ir --no-warn
 queue_ir "$workdir/fixed-array-bounds.ll" "$DIR/fixed-array-bounds.valk" --ir --no-warn
 queue_ir "$workdir/fixed-array-fills.ll" "$DIR/fixed-array-fills.valk" --ir --no-warn
 queue_ir "$workdir/direct-initializer.ll" "$DIR/direct-initializer.valk" --ir --no-warn
@@ -1277,43 +1272,19 @@ if ! grep -q 'store double .*, !tbaa !7$' <<< "$set_body" \
     exit 1
 fi
 
-echo "> Lower \$is_shared to a constant in GROVE builds, a header read otherwise"
-for grove in 0 1; do
-    is_shared_ir="$workdir/grove-is-shared-$grove.ll"
-    if ! out=$(ir_result "$is_shared_ir"); then
-        echo "# Failed to build grove-is-shared IR fixture (GROVE=$grove)"
-        echo "$out"
-        exit 1
-    fi
-    is_shared_body=$(sed -n '/^define .*__shared_flag__/,/^}/p' "$is_shared_ir")
-    if [ "$grove" = 1 ]; then
-        ok=$([[ "$is_shared_body" == *"ret i1 0"* && "$is_shared_body" != *"i64 -4"* ]] && echo 1)
-    else
-        ok=$([[ "$is_shared_body" == *"i64 -4"* && "$is_shared_body" == *"and i8"* ]] && echo 1)
-    fi
-    if [ -z "$ok" ]; then
-        echo "# \$is_shared lowering is wrong for GROVE=$grove"
-        echo "$is_shared_body"
-        exit 1
-    fi
-done
-
-echo "> --gc auto gives a single-threaded linux-x64 program Grove's loop polls"
-for gc in auto valk; do
-    gc_auto_ir="$workdir/gc-auto-$gc.ll"
-    if ! out=$(ir_result "$gc_auto_ir"); then
-        echo "# Failed to build gc-auto IR fixture (--gc $gc)"
-        echo "$out"
-        exit 1
-    fi
-    loop_body=$(sed -n '/^define .*__gc_auto_loop__/,/^}/p' "$gc_auto_ir")
-    polls=$(grep -c "__poll_inv" <<< "$loop_body")
-    if [[ -z "$loop_body" || ( "$gc" == auto && "$polls" -eq 0 ) || ( "$gc" == valk && "$polls" -ne 0 ) ]]; then
-        echo "# Wrong loop polls for --gc $gc"
-        echo "$loop_body"
-        exit 1
-    fi
-done
+echo "> A single-threaded program's loop with a call polls"
+gc_auto_ir="$workdir/gc-auto.ll"
+if ! out=$(ir_result "$gc_auto_ir"); then
+    echo "# Failed to build gc-auto IR fixture"
+    echo "$out"
+    exit 1
+fi
+loop_body=$(sed -n '/^define .*__gc_auto_loop__/,/^}/p' "$gc_auto_ir")
+if [[ -z "$loop_body" ]] || ! grep -q "__poll_inv" <<< "$loop_body"; then
+    echo "# The loop does not poll"
+    echo "$loop_body"
+    exit 1
+fi
 
 echo "> Grove: loops whose calls reach no GC work have a false poll gate"
 
