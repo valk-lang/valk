@@ -33,6 +33,33 @@ struct ThreadCtl {
     // The thread's POLL_SP word (poll_word), which an initiator sets to stop it at its next poll
     poll_ref: *uint
     is_main: bool
+    // What a round reads of the thread while it is stopped: its collector, its epoch and its S
+    // buffers (which the round retires)
+    heap: ?*Gc
+    epoch_ref: *uint
+    s_cursor_ref: *uint
+    s_limit_ref: *uint
+    s_buf_size_ref: *uint
+    s_ov_cursor_ref: *uint
+    s_ov_limit_ref: *uint
+    // RT8: the round whose join stopped the thread (SAFE), and the roots it gathered: exact words
+    // and conservative ones
+    safe_epoch: uint
+    roots_exact: *Bump
+    roots_cons: *Bump
+    // K10: local collections, and their number at the last round's release
+    collects: uint
+    collects_seen: uint
+    want_local: uint
+    // K11: whether the round chose the thread as a marker (1 SAFE, 2 rung from its event wait),
+    // its mark stack and K6 queue, whether its roots are gathered, its count of NAT exits when a
+    // marker last gathered them while held, and the doorbell of the event wait it is in (or -1)
+    marker: uint
+    mark_list: ?*Lifo
+    fin_queue: *Bump
+    roots_done: uint
+    nat_seen: uint
+    idle_efd: i32
 }
 
 /// The control block of the running thread; null on a thread the GC does not know.
@@ -120,7 +147,22 @@ fn ctl_new(tid: uint, is_main: bool) *ThreadCtl {
     return mem.new[ThreadCtl](.{
         state: TS_RUN, sp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, nat_exits: 0, in_gc: 0
         tid: tid, poll_ref: @ref(poll_word), is_main: is_main
+        heap: gc, epoch_ref: @ref(epoch)
+        s_cursor_ref: @ref(s_cursor), s_limit_ref: @ref(s_limit), s_buf_size_ref: @ref(s_buf_size)
+        s_ov_cursor_ref: @ref(s_ov_cursor), s_ov_limit_ref: @ref(s_ov_limit)
+        safe_epoch: 0, roots_exact: Bump.new(256), roots_cons: Bump.new(1024)
+        collects: 0, collects_seen: 0, want_local: 0
+        marker: 0, mark_list: null, fin_queue: Bump.new(64), roots_done: 0, nat_seen: (~0).to(uint), idle_efd: -1
     })
+}
+
+fn ctl_free(c: *ThreadCtl) {
+    c.roots_exact.free()
+    c.roots_cons.free()
+    c.fin_queue.free()
+    let list = c.mark_list
+    if isset(list) : list.free()
+    mem.free(c)
 }
 
 // The number of registered threads: n of LC3
@@ -173,7 +215,13 @@ fn thread_unregister(c: *ThreadCtl) {
 fn poll_sync() $inline {
     atomic(poll_word & 0)
     atomic(poll_word | poll_inv)
-    if atomic_load(round_req) != 0 : atomic(poll_word | (~0).to(uint))
+    if atomic_load(round_req) != 0 || local_wanted() : atomic(poll_word | (~0).to(uint))
+}
+
+// K10: a round asked this thread for a local collection
+fn local_wanted() bool $inline {
+    let c = ctl ?! return false
+    return c.want_local != 0
 }
 
 // The routine valk_gc_native_leave jumps to when its compare-and-swap fails: a round holds the
@@ -183,6 +231,8 @@ fn native_leave_slow(c: *ThreadCtl) {
         let epoch = atomic_load(round_epoch)
         let state = atomic_load(c.state)
         if state == TS_HELD {
+            // K11: rung from its event wait, the thread marks while it is held
+            held_marker(c)
             futex_wait(@ref(round_epoch), epoch)
             continue
         }
@@ -198,110 +248,6 @@ fn native_leave_slow(c: *ThreadCtl) {
     }
 }
 
-// RT8 (MT1b: the stop steps only): the thread stops at a safepoint while a round runs. `sp` is
-// where its callee-saved registers were pushed
-fn join(sp: ptr) {
-    let c = ctl ?! return
-    if gc_dead != 0 : ext._exit(127)
-    #if GC_DEBUG
-    if c.in_gc != 0 {
-        c.in_gc = 0
-        panic("GC error: a thread joined a round inside local GC code (NJ, D4)")
-    }
-    #end
-    c.sp = sp
-    let epoch = atomic_load(round_epoch)
-    atomic(c.state | TS_SAFE)
-    while atomic_load(round_req) != 0 && atomic_load(round_epoch) == epoch : futex_wait(@ref(round_epoch), epoch)
-    atomic(c.state & 0)
-    poll_sync()
-}
-
-// A join from Valk code: the registers are pushed first, so the stack from `sp` holds them
-fn join_now() {
-    let c = ctl ?! return
-    ext.valk_gc_scan_stack(join_entry.@cast(ptr), c.@cast(ptr))
-}
-
-fn join_entry(sp: ptr, c: ptr) {
-    join(sp)
-}
-
-// A safepoint's test: joins a requested round
-fn join_if_requested() $inline {
-    if atomic_load(round_req) != 0 : join_now()
-}
-
-// K2 and K9 of a round that marks nothing yet (MT1b): every other registered thread is stopped
-// at a safepoint or held in native code, then released. MT2 adds the mark and sweep of S
-fn round() {
-    let c = ctl ?! return
-    if gc_dead != 0 : ext._exit(127)
-    // RT7: a thread whose try-lock fails joins the running round, or retries
-    while atomic(round_lock | 1) != 0 {
-        if atomic_load(round_req) != 0 {
-            join_now()
-        } else {
-            ext.sched_yield()
-        }
-    }
-    spin_take(@ref(reg_lock))
-    atomic(round_req | 1)
-    let count = registry_len
-    let i: uint = 0
-    while i < count {
-        let u = @ptrv(registry, *ThreadCtl, i)
-        i++
-        if u != c : atomic(u.poll_ref[0] | (~0).to(uint))
-    }
-    // K2: hold the threads in native code; wait for the others to stop
-    while true {
-        let stopped = true
-        i = 0
-        while i < count {
-            let u = @ptrv(registry, *ThreadCtl, i)
-            i++
-            if u == c : continue
-            if atomic_load(u.state) == TS_NAT : cas(@ref(u.state), TS_NAT, TS_HELD)
-            let s = atomic_load(u.state)
-            if s != TS_HELD && s != TS_SAFE : stopped = false
-        }
-        if stopped : break
-        ext.sched_yield()
-    }
-    #if GC_DEBUG
-    round_check(c, count)
-    #end
-    // K9: release
-    atomic(round_req & 0)
-    atomic(round_epoch + 1)
-    i = 0
-    while i < count {
-        let u = @ptrv(registry, *ThreadCtl, i)
-        i++
-        if u != c : cas(@ref(u.state), TS_HELD, TS_NAT)
-    }
-    futex_wake_all(@ref(round_epoch))
-    spin_drop(@ref(reg_lock))
-    atomic(round_lock & 0)
-    atomic(rounds_done + 1)
-    poll_sync()
-}
-
-#if GC_DEBUG
-// D5: while the round holds the registry, every other thread is held or stopped
-fn round_check(initiator: *ThreadCtl, count: uint) {
-    let i: uint = 0
-    while i < count {
-        let u = @ptrv(registry, *ThreadCtl, i)
-        i++
-        if u == initiator : continue
-        let s = atomic_load(u.state)
-        if s != TS_HELD && s != TS_SAFE : panic("GC error: a thread runs during a round (D5)")
-    }
-}
-#end
-
 // RT6, D12: the child of a fork starts with one thread, whose control block says it is in the
 // fork call. Locks taken by threads that do not exist in the child are free again. The child
 // may not run the GC: Valk's process code only calls into C before exec
@@ -313,6 +259,7 @@ fn fork_child() $entrance {
     reg_lock = 0
     s_lock = 0
     pool_lock = 0
+    mark_lock = 0
     gc_dead = 1
     poll_word = poll_inv
 }
@@ -330,6 +277,12 @@ fn callback_enter() bool {
 fn callback_leave(was_native: bool) {
     if !was_native : return
     ext.valk_gc_native_enter(ctl.@cast(?ptr))
+}
+
+// K11: the thread waits in the runtime's event wait, whose doorbell is `efd` (-1: it left it)
+fn idle_wait(efd: i32) {
+    let c = ctl ?! return
+    c.idle_efd = efd
 }
 
 // D4's NJ half: local GC code makes no bracketed call

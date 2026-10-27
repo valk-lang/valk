@@ -6,26 +6,47 @@ use ext
 use mem
 
 // Grove-MT's shared heap S (v6 RT2). One reservation outside the thread heaps, made of 64 KiB
-// blocks of 128-byte lines and 16-byte granules. Objects are headerless and untagged, in the
-// layout of their kind. The kind map holds a 2-byte kind at each object's first granule and 0
-// elsewhere; a large object (above 8 KiB) takes a page run, recorded in the run table. Small
-// objects are bumped from the thread's S buffer. Until rounds collect S (MT2), S is an arena:
-// nothing in it is freed or reused, so its memory is fresh and zero
+// line blocks (128-byte lines, 16-byte granules) for objects up to 8 KiB and of page runs for
+// larger ones. Objects are headerless and untagged, in the layout of their kind. Side tables:
+// the kind map (2 bytes per granule: the kind id at each allocated object's start, 0 elsewhere,
+// and the finalized and finalizer-done bits), the run table (u32 per page: a run's pages at its
+// first page, the distance back on the others), a mark byte per granule, a line byte per line
+// and a byte per block (what the block holds, and whether it holds finalizable objects).
+// Rounds mark S and sweep it (grove-round.valk); a line no live object covers is reused.
+// Between rounds a line byte says whether the line was live at the last sweep: holes are
+// handed out in address order, so no line is handed out twice
 value S_BASE (0x300000000000)
 value S_MAX (64 * 1024 * 1024 * 1024)
 value S_BLOCK (65536)
+value S_BLOCK_SHIFT (16)
+value S_LINE (128)
+value S_LINE_SHIFT (7)
+value S_LINES (512)
 value S_GRANULE (16)
+value S_GRANULES (4096)
 value S_LARGE (8192)
 value S_PAGE (4096)
 value S_CHUNK (2 * 1024 * 1024)
-// The S buffer: 1 KiB after a thread start, doubling at each refill up to 16 KiB; objects above
-// 128 bytes that do not fit its rest go to the overflow buffer
+// The S buffer: 1 KiB after a thread start or a round, doubling at each refill up to 16 KiB;
+// objects above 128 bytes that do not fit its rest go to the overflow buffer
 value S_BUF_FIRST (1024)
 value S_BUF_MAX (16384)
 value S_SMALL (128)
 value S_OVERFLOW (16384)
-// A run-table entry of a large object's later page: the distance back to its first page
+// Run-table entries: a large object's later pages hold the distance back to its first page
 value S_RUN_BACK (0x80000000)
+value S_RUN_FIN (0x40000000)
+value S_RUN_PAGES (0x3FFFFFFF)
+// Kind-map entries: the kind id and two bits (K6)
+value S_KIND_ID (0x3FFF)
+value S_FINALIZED (0x4000)
+value S_FIN_DONE (0x8000)
+// Block-table bytes
+value SB_LINES (1)
+value SB_RUNS (2)
+value SB_FIN (4)
+// K8: B_S = max(8 MiB, L_S / 2, L_S - 32 MiB)
+value S_BUDGET_MIN (8 * 1024 * 1024)
 #if GC_DEBUG
 // A runaway test stops here instead of filling the machine
 value S_DEBUG_CAP (1024 * 1024 * 1024)
@@ -35,12 +56,35 @@ value S_DEBUG_CAP (1024 * 1024 * 1024)
 @shared s_size: uint            // bytes reserved for objects
 @shared s_kinds: uint           // the kind map: u16 per granule, (a - S_BASE) >> 3 past it
 @shared s_runs: uint            // the run table: u32 per page
+@shared s_marks: uint           // mark bytes, one per granule
+@shared s_lines: uint           // line bytes, one per line
+@shared s_btab: uint            // block bytes, one per block
 // Under s_lock (v6's shared_heap_lock: a spin lock, no safepoint or bracket inside)
 @shared s_lock: uint
-@shared s_top: uint             // bytes handed out, in address order
+@shared s_top: uint             // bytes handed out at the frontier, in address order
 @shared s_committed: uint
-// S_alloc: bytes of the buffers and runs taken (K1's trigger, MT2)
+// Line blocks in use, empty blocks, blocks with free lines (filed by the last sweep, taken in
+// order: s_recycle_at), large objects and free page runs ((start, pages), by address)
+@shared s_used: *Bump (@undefined)
+@shared s_free_blocks: *Bump (@undefined)
+@shared s_recycle: *Bump (@undefined)
+@shared s_recycle_at: uint
+@shared s_large: *Bump (@undefined)
+@shared s_free_runs: *Bump (@undefined)
+// K6's finalize list: S objects whose finalizer waits, each a root of every round. No FIN duty
+// runs them yet (MT4): the list only grows
+@shared s_fin_list: *Bump (@undefined)
+// The block whose holes are handed out, and where the next search starts
+@shared s_hole_block: uint
+@shared s_hole_at: uint
+// The empty block whose lines are handed out in order
+@shared s_bump_at: uint
+@shared s_bump_end: uint
+@shared s_bump_dirty: bool
+// K1: S_alloc (bytes of the buffers and runs taken since the last round) and B_S; L_S
 @shared s_alloc_bytes: uint
+@shared s_budget: uint
+@shared s_live: uint
 // Kind records (SKind), id - 1 is the index
 @shared s_kind_list: ptr
 @shared s_kind_count: uint
@@ -51,10 +95,13 @@ struct SKind {
     // The slot size; 0 for large objects, which the run table sizes
     size: uint
     onfree: ?fnptr(ptr)()
+    // Runtime-sized storage: a word one past its end also names it (R-46)
+    seq: bool
 }
 
 // Per thread: the S buffer [s_cursor, s_limit), its next size, the overflow buffer and a cache
-// of kind ids. Globals without a default are zero on a new thread
+// of kind ids. Globals without a default are zero on a new thread. A round retires the buffers
+// of every thread (its control block names these)
 global s_cursor: uint
 global s_limit: uint
 global s_buf_lo: uint
@@ -64,20 +111,26 @@ global s_ov_limit: uint
 global s_kcache: ptr
 global s_kcache_cap: uint
 global s_kcache_len: uint
+#if GC_STRESS
+global s_stress_refills: uint
+#end
 
 fn s_init() {
     let size: uint = S_MAX
     let limit: [uint x 2] = @undefined
     if ext.getrlimit(RLIMIT_AS, @ref(limit)) == 0 && limit[0] != (~0).to(uint) {
-        // The heap takes half of the address space limit; S a quarter
-        let quarter = (limit[0] / 4) & (~(S_CHUNK - 1)).to(uint)
+        // The heap takes half of the address space limit; S and its tables a quarter
+        let quarter = (limit[0] / 5) & (~(S_CHUNK - 1)).to(uint)
         if quarter < size : size = quarter
     }
     if size < S_CHUNK * 4 : s_fail()
     s_size = size
     s_kinds = S_BASE + size
     s_runs = s_kinds + size / 8
-    let total = size + size / 8 + size / 1024
+    s_marks = s_runs + size / 1024
+    s_lines = s_marks + size / 16
+    s_btab = s_lines + size / 128
+    let total = s_btab + size / S_BLOCK - S_BASE
     let p = ext.mmap(S_BASE.@cast(ptr), total, 0, MAP_FLAGS | MAP_FIXED_NOREPLACE, -1, 0)
     let got: uint = p
     if got != S_BASE {
@@ -86,6 +139,13 @@ fn s_init() {
     }
     s_kind_cap = 256
     s_kind_list = mem.calloc(s_kind_cap * size_of(SKind))
+    s_used = Bump.new(256)
+    s_free_blocks = Bump.new(64)
+    s_recycle = Bump.new(256)
+    s_large = Bump.new(256)
+    s_free_runs = Bump.new(64)
+    s_fin_list = Bump.new(64)
+    s_budget = S_BUDGET_MIN
 }
 
 fn s_fail() $exit {
@@ -109,26 +169,28 @@ fn s_lock_drop() $inline {
     atomic(s_lock & 0)
 }
 
-// Takes `bytes` of fresh S at the frontier, aligned to `align`; a small buffer (`whole_block`)
-// never crosses a block. Under s_lock
-fn s_take(bytes: uint, align: uint, whole_block: bool) uint {
+// Takes `bytes` of fresh S at the frontier, aligned to `align`. Under s_lock
+fn s_take(bytes: uint, align: uint) uint {
     let a = (s_top + align - 1) & (~(align - 1)).to(uint)
-    if whole_block {
-        let block_end = (a | (S_BLOCK - 1)) + 1
-        if a + bytes > block_end : a = block_end
-    }
     let top = a + bytes
-    if top > s_size : panic("Grove's shared heap is full")
+    if top > s_size {
+        s_lock_drop()
+        panic("Grove's shared heap is full")
+    }
     #if GC_DEBUG
-    if top > S_DEBUG_CAP : panic("Grove's shared heap grew past its debug cap of 1 GiB (GC_DEBUG)")
+    if top > S_DEBUG_CAP {
+        s_lock_drop()
+        panic("Grove's shared heap grew past its debug cap of 1 GiB (GC_DEBUG)")
+    }
     #end
     if top > s_committed : s_commit(top)
+    // The pages skipped to align a block go to the free page runs
+    if a > s_top && (s_top & (S_PAGE - 1)) == 0 : s_runs_free(S_BASE + s_top, (a - s_top) / S_PAGE, false)
     s_top = top
-    s_alloc_bytes += bytes
     return S_BASE + a
 }
 
-// Commits chunks of S and the kind map and run table pages that cover them
+// Commits chunks of S and the side-table pages that cover them
 fn s_commit(top: uint) {
     let to = (top + S_CHUNK - 1) & (~(S_CHUNK - 1)).to(uint)
     if to > s_size : to = s_size
@@ -136,6 +198,9 @@ fn s_commit(top: uint) {
     if ext.mprotect((S_BASE + from).@cast(ptr), to - from, 0x1 | 0x2) != 0 : panic("Grove cannot commit shared heap memory")
     s_commit_side(s_kinds, from / 8, to / 8)
     s_commit_side(s_runs, from / 1024, to / 1024)
+    s_commit_side(s_marks, from / 16, to / 16)
+    s_commit_side(s_lines, from / 128, to / 128)
+    s_commit_side(s_btab, from / S_BLOCK, to / S_BLOCK)
     s_committed = to
 }
 
@@ -162,24 +227,42 @@ fn s_run_entry(a: uint) *u32 $inline {
     return (s_runs + ((a - S_BASE) >> 12) * 4).@cast(*u32)
 }
 
+fn s_mark_byte(a: uint) *u8 $inline {
+    return (s_marks + ((a - S_BASE) >> 4)).@cast(*u8)
+}
+
+fn s_line_byte(a: uint) *u8 $inline {
+    return (s_lines + ((a - S_BASE) >> S_LINE_SHIFT)).@cast(*u8)
+}
+
+fn s_block_byte(a: uint) *u8 $inline {
+    return (s_btab + ((a - S_BASE) >> S_BLOCK_SHIFT)).@cast(*u8)
+}
+
+fn s_kind_record(id: uint) *SKind $inline {
+    return (s_kind_list + (id - 1) * size_of(SKind)).@cast(*SKind)
+}
+
 // The kind record of an S object start, or null
 fn s_kind_of(item: ptr) ?*SKind {
-    let id = @ptrv(s_kind_entry(item), u16).to(uint)
+    let id = @ptrv(s_kind_entry(item), u16).to(uint) & S_KIND_ID
     if id == 0 : return null
-    return (s_kind_list + (id - 1) * size_of(SKind)).@cast(*SKind)
+    return s_kind_record(id)
 }
 
 // The bytes of the S object that starts at `item`
 fn s_object_size(item: ptr, kind: *SKind) uint {
     if kind.size != 0 : return kind.size
-    return @ptrv(s_run_entry(item), u32).to(uint) * S_PAGE
+    return (@ptrv(s_run_entry(item), u32).to(uint) & S_RUN_PAGES) * S_PAGE
 }
 
-// The id of the kind (layout, slot size, finalizer): from the thread's cache, else from the
-// records under s_lock
-fn s_kind_id(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)()) uint {
+// The id of the kind (layout, slot size, finalizer, storage or not): from the thread's cache,
+// else from the records under s_lock
+fn s_kind_id(layout: ?ptr, slot: uint, onfree: ?fnptr(ptr)(), seq: bool) uint {
     let l: uint = layout.@cast(uint)
     let f: uint = onfree.@cast(uint)
+    // Slot sizes are multiples of 16: bit 0 of the key says storage
+    let size = slot | (seq ? 1 : 0)
     let cap = s_kcache_cap
     if cap != 0 {
         let mask = cap - 1
@@ -192,7 +275,7 @@ fn s_kind_id(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)()) uint {
             i = (i + 1) & mask
         }
     }
-    let id = s_kind_register(layout, size, onfree)
+    let id = s_kind_register(layout, slot, onfree, seq)
     s_kcache_put(l, size, f, id)
     return id
 }
@@ -227,20 +310,20 @@ fn s_kcache_put(l: uint, size: uint, f: uint, id: uint) {
     s_kcache_len++
 }
 
-fn s_kind_register(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)()) uint {
+fn s_kind_register(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)(), seq: bool) uint {
     s_lock_take()
     let i: uint = 0
     while i < s_kind_count {
-        let k = (s_kind_list + i * size_of(SKind)).@cast(*SKind)
-        if k.layout == layout && k.size == size && k.onfree == onfree {
+        let k = s_kind_record(i + 1)
+        if k.layout == layout && k.size == size && k.onfree == onfree && k.seq == seq {
             s_lock_drop()
             return i + 1
         }
         i++
     }
-    if s_kind_count == 65535 {
+    if s_kind_count == S_KIND_ID {
         s_lock_drop()
-        panic("Grove's shared heap has more than 65535 kinds")
+        panic("Grove's shared heap has more than 16383 kinds")
     }
     if s_kind_count == s_kind_cap {
         // Kinds are read without the lock: the old list stays valid for readers
@@ -253,17 +336,19 @@ fn s_kind_register(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)()) uint {
     k.layout = layout
     k.size = size
     k.onfree = onfree
+    k.seq = seq
     s_kind_count++
     let id = s_kind_count
     s_lock_drop()
     return id
 }
 
-// RT9 step 9: an ending thread allocates nothing in S any more; its buffers' rest stays unused
-// until rounds reuse lines (MT2)
+// RT9 step 9: an ending thread allocates nothing in S any more; the next round frees the rest
+// of its buffers
 fn s_retire_buffers() {
     s_cursor = 0
     s_limit = 0
+    s_buf_size = 0
     s_ov_cursor = 0
     s_ov_limit = 0
     #if GC_DEBUG
@@ -291,33 +376,36 @@ fn s_alloc(size: uint, kind: uint) ptr $inline {
     return item.@cast(ptr)
 }
 
+// A refill or a large object. K1 first: the refill joins a requested round, or initiates one
+// once S_alloc reached B_S; a round retires every thread's buffers
 fn s_alloc_slow(size: uint, kind: uint) ptr $noinline {
+    s_pace()
     let item: uint = 0
     if size > S_LARGE {
-        item = s_take_buffer(size, false)
-        let pages = size / S_PAGE
-        @ptrv(s_run_entry(item), u32) = pages.to(u32)
-        let i: uint = 1
-        while i < pages {
-            @ptrv(s_run_entry(item + i * S_PAGE), u32) = (S_RUN_BACK | i).to(u32)
-            i++
-        }
+        item = s_take_large(size)
     } else if size > S_SMALL {
         if s_ov_cursor + size > s_ov_limit {
-            s_ov_cursor = s_take_buffer(S_OVERFLOW, true)
-            s_ov_limit = s_ov_cursor + S_OVERFLOW
+            s_lock_take()
+            let lo, hi, dirty = s_take_bump(S_OVERFLOW)
+            s_lock_drop()
+            s_buffer_taken(lo, hi, dirty)
+            s_ov_cursor = lo
+            s_ov_limit = hi
         }
         item = s_ov_cursor
         s_ov_cursor += size
     } else {
         let want = s_buf_size
         if want == 0 : want = S_BUF_FIRST
-        let buf = s_take_buffer(want, true)
+        s_lock_take()
+        let lo, hi, dirty = s_take_hole(want)
+        s_lock_drop()
+        s_buffer_taken(lo, hi, dirty)
         if want < S_BUF_MAX : s_buf_size = want * 2
-        s_buf_lo = buf
-        s_cursor = buf + size
-        s_limit = buf + want
-        item = buf
+        s_buf_lo = lo
+        s_cursor = lo + size
+        s_limit = hi
+        item = lo
     }
     @ptrv(s_kind_entry(item), u16) = kind.to(u16)
     #if GC_DEBUG
@@ -326,31 +414,204 @@ fn s_alloc_slow(size: uint, kind: uint) ptr $noinline {
     return item.@cast(ptr)
 }
 
-fn s_take_buffer(bytes: uint, whole_block: bool) uint {
-    s_lock_take()
-    let at = s_take(bytes, whole_block ? S_GRANULE : S_PAGE, whole_block)
-    s_lock_drop()
+// After a buffer was taken, outside s_lock: reused lines are zeroed, so every traced word of
+// a new S object is 0 until it is written (WS)
+fn s_buffer_taken(lo: uint, hi: uint, dirty: bool) {
+    if dirty : mem.clear_bytes(lo.@cast(ptr), hi - lo)
+    atomic(s_alloc_bytes + (hi - lo))
     #if GC_DEBUG
-    s_note_range(at, at + bytes)
+    s_note_range(lo, hi)
     #end
+}
+
+// K1 at a refill or a large S allocation, before shared_heap_lock is taken. A thread whose
+// collector is not enabled yet (main before it registered its globals as roots) neither joins
+// nor initiates; it joins at its next safepoint after
+fn s_pace() {
+    if gc_dead != 0 : ext._exit(127)
+    if !isset(ctl) || gc.state == GcState.disabled : return
+    if atomic_load(round_req) != 0 : join_now()
+    #if GC_STRESS
+    // Stress: a round at every 64th refill
+    s_stress_refills++
+    if s_stress_refills % 64 == 0 {
+        round(true)
+        return
+    }
+    #end
+    if atomic_load(s_alloc_bytes) >= atomic_load(s_budget) : round(false)
+}
+
+// A run of free lines for a small buffer, at most `want` bytes: the next hole of a block the
+// last sweep left with free lines, else the lines of an empty block. Under s_lock. Returns the
+// run and whether it must be zeroed
+fn s_take_hole(want: uint) (uint, uint, bool) {
+    while true {
+        let b = s_hole_block
+        if b != 0 {
+            let end = b + S_BLOCK
+            let at = s_hole_at
+            while at < end && @ptrv(s_line_byte(at), u8) != 0 : at += S_LINE
+            if at < end {
+                let hi = at + S_LINE
+                let max = at + want
+                while hi < end && hi < max && @ptrv(s_line_byte(hi), u8) == 0 : hi += S_LINE
+                s_hole_at = hi
+                return (at, hi, true)
+            }
+            s_hole_block = 0
+        }
+        if s_recycle_at >= s_recycle.index : break
+        b = @ptrv(s_recycle.data + s_recycle_at, uint)
+        s_recycle_at += size_of(ptr)
+        s_hole_block = b
+        s_hole_at = b
+    }
+    return s_take_bump(want)
+}
+
+// `bytes` of the empty block whose lines are handed out in order; a new one when it is used
+// up. Under s_lock
+fn s_take_bump(bytes: uint) (uint, uint, bool) {
+    if s_bump_at + bytes > s_bump_end {
+        let dirty = false
+        let b: uint = 0
+        if s_free_blocks.index > 0 {
+            s_free_blocks.index -= size_of(ptr)
+            b = @ptrv(s_free_blocks.data + s_free_blocks.index, uint)
+            dirty = true
+        } else {
+            b = s_take(S_BLOCK, S_BLOCK)
+        }
+        @ptrv(s_block_byte(b), u8) = SB_LINES
+        s_used.add_ptr(b.@cast(ptr))
+        s_bump_at = b
+        s_bump_end = b + S_BLOCK
+        s_bump_dirty = dirty
+    }
+    let lo = s_bump_at
+    s_bump_at = lo + bytes
+    return (lo, lo + bytes, s_bump_dirty)
+}
+
+// A page run for a large object (the first free run that fits, else the frontier), recorded
+// in the run table. Zero: freed runs are given back to the OS
+fn s_take_large(bytes: uint) uint {
+    let pages = bytes / S_PAGE
+    s_lock_take()
+    let at: uint = 0
+    let runs = s_free_runs
+    let count = runs.index / 16
+    let i: uint = 0
+    while i < count {
+        let e = runs.data + i * 16
+        let n = @ptrv(e, uint, 1)
+        if n >= pages {
+            at = @ptrv(e, uint)
+            if n == pages {
+                mem.move_bytes(e + 16, e, (count - i - 1) * 16)
+                runs.index -= 16
+            } else {
+                @ptrv(e, uint) = at + bytes
+                @ptrv(e, uint, 1) = n - pages
+            }
+            break
+        }
+        i++
+    }
+    if at == 0 {
+        at = s_take(bytes, S_PAGE)
+        let b = at & (~(S_BLOCK - 1)).to(uint)
+        while b < at + bytes {
+            @ptrv(s_block_byte(b), u8) = SB_RUNS
+            b += S_BLOCK
+        }
+    }
+    @ptrv(s_run_entry(at), u32) = pages.to(u32)
+    let p: uint = 1
+    while p < pages {
+        @ptrv(s_run_entry(at + p * S_PAGE), u32) = (S_RUN_BACK | p).to(u32)
+        p++
+    }
+    s_large.add_ptr(at.@cast(ptr))
+    s_lock_drop()
+    atomic(s_alloc_bytes + bytes)
     return at
 }
 
-// C1: an object of a compiler class kind in S, from the class's pool (its kind descriptor)
+// A page run becomes free: run-table entries cleared, merged with its neighbours. A freed
+// object's pages go back to the OS, so a reuse finds them zero. Under s_lock
+fn s_runs_free(start: uint, pages: uint, used: bool) {
+    let p: uint = 0
+    while p < pages {
+        @ptrv(s_run_entry(start + p * S_PAGE), u32) = 0
+        p++
+    }
+    if used : ext.madvise(start.@cast(ptr), pages * S_PAGE, MADV_DONTNEED)
+    let runs = s_free_runs
+    let count = runs.index / 16
+    // The first run above
+    let i: uint = 0
+    while i < count && @ptrv(runs.data + i * 16, uint) < start : i++
+    if i > 0 {
+        let prev = runs.data + (i - 1) * 16
+        if @ptrv(prev, uint) + @ptrv(prev, uint, 1) * S_PAGE == start {
+            @ptrv(prev, uint, 1) = @ptrv(prev, uint, 1) + pages
+            if i < count {
+                let next = runs.data + i * 16
+                if start + pages * S_PAGE == @ptrv(next, uint) {
+                    @ptrv(prev, uint, 1) = @ptrv(prev, uint, 1) + @ptrv(next, uint, 1)
+                    mem.move_bytes(next + 16, next, (count - i - 1) * 16)
+                    runs.index -= 16
+                }
+            }
+            return
+        }
+    }
+    if i < count {
+        let next = runs.data + i * 16
+        if start + pages * S_PAGE == @ptrv(next, uint) {
+            @ptrv(next, uint) = start
+            @ptrv(next, uint, 1) = @ptrv(next, uint, 1) + pages
+            return
+        }
+    }
+    runs.get(16)
+    let at = runs.data + i * 16
+    mem.move_bytes(at, at + 16, (count - i) * 16)
+    @ptrv(at, uint) = start
+    @ptrv(at, uint, 1) = pages
+}
+
+// C1: an object of a compiler class kind in S, from the class's pool (its kind descriptor). A
+// finalizable kind flags its block or run for K6
 fn s_alloc_pool(pool: *Pool) ptr {
     let kind = pool.s_kind
     if kind == 0 {
-        kind = s_kind_id(pool.layout, s_slot_size(pool.isize), pool.onfree)
+        kind = s_kind_id(pool.layout, s_slot_size(pool.isize), pool.onfree, false)
         pool.s_kind = kind
     }
-    let k = (s_kind_list + (kind - 1) * size_of(SKind)).@cast(*SKind)
-    return s_alloc(k.size, kind)
+    let k = s_kind_record(kind)
+    let item = s_alloc(k.size, kind)
+    if isset(pool.onfree) : s_flag_finalizable(item)
+    return item
 }
 
-// C1: sequence storage of `size` bytes in S. Fresh S memory is zero
+fn s_flag_finalizable(item: ptr) {
+    let b = s_block_byte(item)
+    if (@ptrv(b, u8) & SB_FIN) != 0 : return
+    if (@ptrv(b, u8) & SB_RUNS) != 0 {
+        let e = s_run_entry(item)
+        atomic(e[0] | S_RUN_FIN.to(u32))
+        return
+    }
+    atomic(b[0] | SB_FIN.to(u8))
+}
+
+// C1: sequence storage of `size` bytes in S. New S memory is zero
 fn s_alloc_seq(size: uint, layout: ?ptr) ptr {
     let slot = s_slot_size(size)
-    let kind = s_kind_id(layout, slot > S_LARGE ? 0 : slot, null)
+    let kind = s_kind_id(layout, slot > S_LARGE ? 0 : slot, null, true)
     return s_alloc(slot, kind)
 }
 
@@ -375,6 +636,8 @@ fn s_grow(data_ref: ptr, count: uint, size: uint) {
     let stride = @ptrv(lay, uint, layout_stride)
     let offset = @ptrv(lay, uint, layout_data_offset)
     let to = s_alloc_seq(offset + size * stride, lay)
+    // The allocation may run a round: the storage word is read again
+    from = @ptrv(data_ref, ptr)
     @ptrv(to, uint) = size
     mem.copy_bytes(from + offset, to + offset, count * stride)
     @ptrv(data_ref, ptr) = to
@@ -411,10 +674,293 @@ fn s_copy_in(from: ptr, to: ptr, count: uint, storage: ptr) {
     pub_end()
 }
 
+//////////////////////////
+// Rounds: resolution, marking and the sweep (K4, K5, K6, K7, K8)
+//////////////////////////
+
+// K4: the allocated S object that contains the conservative word `w`, or 0. In a line block
+// the kind map is read backwards from w's granule (an object is at most 512 granules); a
+// large object is found through the run table
+fn s_resolve(w: uint) uint {
+    let at = w - S_BASE
+    if at >= s_top : return 0
+    let bt = @ptrv(s_block_byte(w), u8).to(uint)
+    if (bt & SB_LINES) != 0 {
+        let block = w & (~(S_BLOCK - 1)).to(uint)
+        let g = w & (~(S_GRANULE - 1)).to(uint)
+        let low = block
+        if g - block > S_LARGE : low = g - S_LARGE
+        while true {
+            let e = @ptrv(s_kind_entry(g), u16).to(uint) & S_KIND_ID
+            if e != 0 {
+                if w < g + s_kind_record(e).size : return g
+                return 0
+            }
+            if g == low : return 0
+            g -= S_GRANULE
+        }
+    }
+    if (bt & SB_RUNS) == 0 : return 0
+    let page = w & (~(S_PAGE - 1)).to(uint)
+    let r = @ptrv(s_run_entry(page), u32).to(uint)
+    if r == 0 : return 0
+    if (r & S_RUN_BACK) != 0 {
+        page -= (r & S_RUN_PAGES) * S_PAGE
+        r = @ptrv(s_run_entry(page), u32).to(uint)
+    }
+    if (@ptrv(s_kind_entry(page), u16).to(uint) & S_KIND_ID) == 0 : return 0
+    if w >= page + (r & S_RUN_PAGES) * S_PAGE : return 0
+    return page
+}
+
+// Whether the S object at `a` is runtime-sized storage whose slot ends at `w`
+fn s_sequence_ends_at(a: uint, w: uint) bool {
+    let kind = s_kind_of(a.@cast(ptr)) ?! return false
+    return kind.seq && a + s_object_size(a.@cast(ptr), kind) == w
+}
+
+// K5's mark of one object start: its mark byte and the line bytes of its lines, then pushed
+// unless its kind holds no reference. A word that is no allocated start marks nothing
+fn s_mark(a: uint, list: *Lifo) $inline {
+    if a - S_BASE >= s_top || (a & (S_GRANULE - 1)) != 0 : return
+    let e = @ptrv(s_kind_entry(a), u16).to(uint) & S_KIND_ID
+    if e == 0 : return
+    let m = s_mark_byte(a)
+    if @ptrv(m, u8) != 0 : return
+    @ptrv(m, u8) = 1
+    let kind = s_kind_record(e)
+    let size = kind.size
+    if size != 0 && size <= S_LARGE {
+        let l = s_line_byte(a)
+        let last = s_line_byte(a + size - 1)
+        while l <= last {
+            @ptrv(l, u8) = 1
+            l += 1
+        }
+    }
+    if isset(kind.layout) {
+        list.reserve(1)
+        list.add_unchecked(a.@cast(ptr))
+    }
+}
+
+// The drain: every reference word of every pushed object, by its kind's layout, in work items
+// of at most 256 words
+fn s_drain(list: *Lifo) {
+    while list.index > 0 {
+        let e: uint = list.pop_unchecked()
+        let from: uint = 0
+        if e & 1 != 0 {
+            e = e - 1
+            from = list.pop_unchecked()
+        }
+        let kind = s_kind_record(@ptrv(s_kind_entry(e), u16).to(uint) & S_KIND_ID)
+        let layout = kind.layout ?! continue
+        list.reserve(2)
+        each_ref_work(e.@cast(ptr), layout, s_object_size(e.@cast(ptr), kind), from, list, s_mark_word)
+    }
+}
+
+fn s_mark_word(ref: ptr, list: *Lifo) $inline {
+    s_mark(@ptrv(ref, uint) & (~prop_mask).to(uint), list)
+}
+
+// K6 pass 1, one line block: every unmarked object of a finalizable kind without the finalized
+// bit gets it and is queued; pass 2 marks the queue
+fn s_find_finalizable(b: uint, queue: *Bump) {
+    if (@ptrv(s_block_byte(b), u8) & SB_FIN) == 0 : return
+    let g = b
+    let end = b + S_BLOCK
+    while g < end {
+        let e = @ptrv(s_kind_entry(g), u16).to(uint)
+        if e == 0 {
+            g += S_GRANULE
+            continue
+        }
+        let kind = s_kind_record(e & S_KIND_ID)
+        s_queue_finalizable(g, e, kind, queue)
+        g += kind.size
+    }
+}
+
+// K6 pass 1 over the large objects
+fn s_find_finalizable_large(queue: *Bump) {
+    let large = s_large
+    let i: uint = 0
+    while i < large.index {
+        let a = @ptrv(large.data + i, uint)
+        i += size_of(ptr)
+        if (@ptrv(s_run_entry(a), u32).to(uint) & S_RUN_FIN) == 0 : continue
+        let e = @ptrv(s_kind_entry(a), u16).to(uint)
+        s_queue_finalizable(a, e, s_kind_record(e & S_KIND_ID), queue)
+    }
+}
+
+fn s_queue_finalizable(a: uint, e: uint, kind: *SKind, queue: *Bump) $inline {
+    if !isset(kind.onfree) || (e & S_FINALIZED) != 0 || @ptrv(s_mark_byte(a), u8) != 0 : return
+    @ptrv(s_kind_entry(a), u16) = (e | S_FINALIZED).to(u16)
+    queue.add_ptr(a.@cast(ptr))
+}
+
+// K7 is split by block: each line block is swept by one marker, which writes its marked bytes
+// (and whether it has free lines) into s_sweep_out; the initiator files the blocks after
+@shared s_sweep_out: ptr
+@shared s_sweep_cap: uint
+value S_SWEEP_FREE (0x8000000000000000)
+
+// The number of line blocks to sweep; the result table has room for them
+fn s_sweep_prepare() uint {
+    let n = s_used.index / size_of(ptr)
+    if n > s_sweep_cap {
+        if s_sweep_cap != 0 : mem.free(s_sweep_out)
+        s_sweep_cap = n * 2
+        s_sweep_out = mem.alloc(s_sweep_cap * size_of(uint))
+    }
+    return n
+}
+
+// Sweeps the line blocks [from, to) of s_used
+fn s_sweep_range(from: uint, to: uint) {
+    let i = from
+    while i < to {
+        let b = @ptrv(s_used.data, uint, i)
+        let live = s_sweep_block(b)
+        if live != 0 && s_free_lines(b) : live = live | S_SWEEP_FREE
+        @ptrv(s_sweep_out, uint, i) = live
+        i++
+    }
+}
+
+// K7's filing and K8's input: empty blocks become free, blocks with free lines are recycled in
+// address order, dead large objects give their pages back. Returns L_S, the marked bytes
+fn s_sweep_file(n: uint) uint {
+    let live: uint = 0
+    let used = s_used
+    s_recycle.reset()
+    s_recycle_at = 0
+    s_hole_block = 0
+    s_bump_at = 0
+    s_bump_end = 0
+    let kept: uint = 0
+    let i: uint = 0
+    while i < n {
+        let b = @ptrv(used.data, uint, i)
+        let out = @ptrv(s_sweep_out, uint, i)
+        i++
+        let bytes = out & (~S_SWEEP_FREE).to(uint)
+        live += bytes
+        if bytes == 0 {
+            @ptrv(s_block_byte(b), u8) = 0
+            s_free_blocks.add_ptr(b.@cast(ptr))
+            continue
+        }
+        @ptrv(used.data, uint, kept) = b
+        kept++
+        if (out & S_SWEEP_FREE) != 0 : s_recycle.add_ptr(b.@cast(ptr))
+    }
+    used.index = kept * size_of(ptr)
+    let large = s_large
+    kept = 0
+    i = 0
+    while i < large.index {
+        let a = @ptrv(large.data + i, uint)
+        i += size_of(ptr)
+        let m = s_mark_byte(a)
+        let r = @ptrv(s_run_entry(a), u32).to(uint)
+        let pages = r & S_RUN_PAGES
+        if @ptrv(m, u8) != 0 {
+            @ptrv(m, u8) = 0
+            live += pages * S_PAGE
+            @ptrv(large.data + kept, uint) = a
+            kept += size_of(ptr)
+            continue
+        }
+        let e = @ptrv(s_kind_entry(a), u16).to(uint)
+        if (e & S_FINALIZED) != 0 && (e & S_FIN_DONE) == 0 : panic("GC error: a shared object waiting for its finalizer was not marked (D3)")
+        @ptrv(s_kind_entry(a), u16) = 0
+        s_runs_free(a, pages, true)
+    }
+    large.index = kept
+    return live
+}
+
+// One line block: returns the bytes of its marked objects; clears the block's finalizable flag
+// when none of them is finalizable
+fn s_sweep_block(b: uint) uint {
+    let live: uint = 0
+    let fin = false
+    let g = b
+    let end = b + S_BLOCK
+    while g < end {
+        // Four kind entries at once
+        let k = s_kind_entry(g)
+        if (g & 63) == 0 && g + 64 <= end && @ptrv(k, u64) == 0 {
+            g += 64
+            continue
+        }
+        let e = @ptrv(k, u16).to(uint)
+        if e == 0 {
+            g += S_GRANULE
+            continue
+        }
+        let kind = s_kind_record(e & S_KIND_ID)
+        let size = kind.size
+        if size == 0 : panic("GC error: a large kind in a line block")
+        let m = s_mark_byte(g)
+        if @ptrv(m, u8) != 0 {
+            @ptrv(m, u8) = 0
+            live += size
+            if isset(kind.onfree) : fin = true
+        } else {
+            if (e & S_FINALIZED) != 0 && (e & S_FIN_DONE) == 0 : panic("GC error: a shared object waiting for its finalizer was not marked (D3)")
+            @ptrv(k, u16) = 0
+            #if GC_DEBUG
+            poison_fill(g.@cast(ptr), size)
+            #end
+        }
+        g += size
+    }
+    if !fin : @ptrv(s_block_byte(b), u8) = SB_LINES
+    return live
+}
+
+fn s_free_lines(b: uint) bool {
+    let l = s_line_byte(b)
+    let end = l + S_LINES
+    while l < end {
+        if @ptrv(l, u64) != 0x0101010101010101 : return true
+        l += 8
+    }
+    return false
+}
+
+// Before a round marks: line bytes of the line blocks become 0, marking sets those of live lines
+fn s_lines_clear() {
+    let used = s_used
+    let i: uint = 0
+    while i < used.index {
+        let b = @ptrv(used.data + i, uint)
+        i += size_of(ptr)
+        mem.clear_bytes(s_line_byte(b), S_LINES)
+    }
+}
+
+// K8: B_S from L_S, S_alloc from 0
+fn s_settle(live: uint) {
+    s_live = live
+    let budget = live / 2
+    if live > 32 * 1024 * 1024 && live - 32 * 1024 * 1024 > budget : budget = live - 32 * 1024 * 1024
+    if budget < S_BUDGET_MIN : budget = S_BUDGET_MIN
+    atomic_store(s_budget, budget)
+    atomic_store(s_alloc_bytes, 0)
+}
+
 #if GC_DEBUG
 // D1's single-thread clause: no reference word of an S object names a thread heap. Checked at
-// each local collection over the S memory the thread took since its previous one
+// each local collection over the S memory the thread took since its previous one, unless a
+// round ran since: lines then may have gone to another thread
 global s_ranges: ?*Bump
+global s_ranges_epoch: uint
 
 fn s_note_range(lo: uint, hi: uint) {
     let list = s_ranges ?? <{
@@ -422,12 +968,21 @@ fn s_note_range(lo: uint, hi: uint) {
         s_ranges = created
         return created
     }
+    let epoch = atomic_load(round_epoch)
+    if s_ranges_epoch != epoch {
+        list.reset()
+        s_ranges_epoch = epoch
+    }
     list.add_ptr(lo.@cast(ptr))
     list.add_ptr(hi.@cast(ptr))
 }
 
 fn s_check_ranges() {
     let list = s_ranges ?! return
+    if s_ranges_epoch != atomic_load(round_epoch) {
+        list.reset()
+        return
+    }
     let i: uint = 0
     while i < list.index {
         let lo = @ptrv(list.data + i, uint)
@@ -456,7 +1011,8 @@ fn s_check_ranges() {
     if s_ov_limit > 0 : s_note_range(s_ov_limit - S_OVERFLOW, s_ov_limit)
 }
 
-// Until rounds reuse S memory, every S allocation is fresh and zero
+// A new S object's memory is zero: fresh, given back to the OS, or zeroed when its lines were
+// taken again
 fn s_zero_check(item: ptr, size: uint) {
     let len = size > 4096 ? 4096 : size
     let i: uint = 0
@@ -468,9 +1024,21 @@ fn s_zero_check(item: ptr, size: uint) {
 #end
 
 #if TEST
-/// Test helper: the bytes of the shared heap handed out so far.
+/// Test helper: the bytes of the shared heap handed out at its frontier so far.
 + fn shared_heap_top_for_test() uint {
     return s_top
+}
+
+/// Test helper: the bytes of the shared objects the last round found live (L_S).
++ fn shared_live_for_test() uint {
+    return s_live
+}
+
+/// Test helper: whether `item` is an allocated object of the shared heap.
++ fn shared_allocated_for_test(item: ?ptr) bool {
+    let a: uint = item.@cast(uint)
+    if !in_shared(item) || a - S_BASE >= s_top : return false
+    return s_resolve(a) == a
 }
 #end
 

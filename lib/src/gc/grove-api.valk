@@ -47,12 +47,12 @@ value pending (poll_inv != 0)
 + value collect (ext.valk_gc_collect)
 #if GROVE_MT
 /// Runs a round over the shared memory: stops every other thread at a safepoint or holds it
-/// in native code, then releases it.
+/// in native code, marks the shared heap from every thread's roots, frees what is unreachable
+/// and releases the threads.
 ///
-/// Returns once a round that started after the call has ended.
-+ fn collect_shared() {
-    round()
-}
+/// Returns once a round that started after the call has ended. Like `collect`, a direct call
+/// into the runtime's assembly entry, so only the caller's own live words are its roots.
++ value collect_shared (ext.valk_gc_collect_shared)
 #else
 /// Does nothing: a Grove program is single-threaded and has no shared memory.
 + fn collect_shared() {
@@ -88,12 +88,20 @@ value pending (poll_inv != 0)
     return fitted > count ? fitted : count
 }
 
-/// Does nothing: no other thread collects for a Grove program while it blocks.
+/// Does nothing: the thread's state changes at each call into native code.
 + fn lock() $inline {
 }
+#if GROVE_MT
+/// Marks a point where the thread is about to block: it may collect its own memory first, so
+/// it stops naming shared data it dropped (at most once per millisecond).
++ fn unlock() {
+    preblock(true)
+}
+#else
 /// Does nothing: no other thread collects for a Grove program while it blocks.
 + fn unlock() $inline {
 }
+#end
 
 /// Collects the thread's memory when allocation since the last collection reached the trigger.
 ///
@@ -108,6 +116,87 @@ value pending (poll_inv != 0)
 + fn collect_if_threshold_almost_reached() {
     if trigger_almost_reached : collect_now()
 }
+
+#if GROVE_MT
+// RT5: when the last collection ran and when a skipped one is due (CLOCK_MONOTONIC_COARSE, us)
+global preblock_last_us: uint
+global preblock_due_us: uint
+
+fn coarse_us() uint {
+    let value: ext.libc_timespec = @undefined
+    ext.clock_gettime(6, @ref(value))
+    return value.tv_sec.to(uint) * 1_000_000 + value.tv_nsec.to(uint) / 1000
+}
+
+// RT5, pre-block collections: before the thread blocks (a gc.unlock() bracket: an event wait,
+// a park, a native mutex) and at the enter-native of a call outside the library, it collects
+// its heap when that may drop counted or covered words into S: X_t, its young windows or its
+// log are not empty, and it allocated or logged since its last collection, or its stack is
+// shallower than then, or that collection ran on another coroutine's stack. At most once per
+// millisecond and once per 20 pauses of the last collection, unless a round asked for it (K10);
+// a skipped collection is due then, and the event wait waits no longer (preblock_wait_ms)
+fn preblock(at_block: bool) {
+    let c = ctl ?! return
+    let g = gc
+    if g.state != GcState.idle {
+        preblock_due_us = 0
+        return
+    }
+    if c.want_local == 0 {
+        let now = coarse_us()
+        // Once per millisecond, and at most about 5 % of the thread's time
+        let gap = pause_last_us * 20
+        if gap < 1000 : gap = 1000
+        if now - preblock_last_us < gap {
+            if at_block && preblock_due_us == 0 && preblock_due(g) : preblock_due_us = preblock_last_us + gap
+            return
+        }
+        if !preblock_due(g) {
+            preblock_due_us = 0
+            return
+        }
+        preblock_last_us = now
+    }
+    preblock_due_us = 0
+    collect_now()
+}
+
+fn preblock_due(g: *Gc) bool {
+    let active = log_entries > 0 || g.mem_new > 0 || runs_open()
+    if active : return true
+    if g.xt_len == 0 : return false
+    return stack_pointer() > g.last_sp || @ptrv(g.current_coro, ?ptr) != g.last_coro
+}
+
+// Whether a pool's current run holds objects allocated since the last collection
+fn runs_open() bool {
+    let list = alc_list
+    let adr = list.data
+    let end = adr + list.index
+    while adr < end {
+        let pool = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        if pool.cursor != pool.run : return true
+    }
+    return false
+}
+
+// The enter-native of a bracketed call made outside the library (C7, RT5)
+fn preblock_native() {
+    preblock(false)
+}
+
+/// Milliseconds until a pre-block collection that was skipped is due; `uint.$max` when none is.
+///
+/// The event loop waits no longer than this, so the collection runs on its timeout.
++ fn preblock_wait_ms() uint {
+    let due = preblock_due_us
+    if due == 0 : return uint.$max
+    let now = coarse_us()
+    if now >= due : return 0
+    return (due - now + 999) / 1000
+}
+#end
 
 // R-49: a coroutine switch collects while a collection is pending
 fn collect_if_pending() {

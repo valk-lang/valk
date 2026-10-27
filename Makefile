@@ -163,10 +163,13 @@ test-grove-mt: $(TEST_COMPILER)
 	$(TEST_COMPILER) build ./tests $(GROVE_MT_TEST_FLAGS) $(FLAGS) -o ./debug/test-grove-mt$(EXE_SUFFIX)
 	./debug/test-grove-mt$(EXE_SUFFIX)
 
+# GC_STRESS in MT mode also runs a round at every 64th S refill and at every copy poll
 test-grove-stress: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-grove-stress$(EXE_SUFFIX)
 	./debug/test-grove-stress$(EXE_SUFFIX)
+	$(TEST_COMPILER) build ./tests $(GROVE_MT_TEST_FLAGS) --def "GC_STRESS=1" $(FLAGS) -o ./debug/test-grove-mt-stress$(EXE_SUFFIX)
+	./debug/test-grove-mt-stress$(EXE_SUFFIX)
 
 # Grove with co-edge counts capped at 2, so the overflow map is used everywhere
 test-grove-small-caps: $(TEST_COMPILER)

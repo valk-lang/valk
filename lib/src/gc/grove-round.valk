@@ -1,0 +1,1136 @@
+@unsafe
+
+#if GROVE_MT
+
+use ext
+use mem
+use coro
+
+// Rounds (v6 2.10): the initiator stops every other registered thread at a safepoint (SAFE) or
+// holds it in native code (HELD), marks S from every thread's roots, sweeps S and releases the
+// threads. A thread heap names S through counted words (X_t, LC1) and through the words of
+// its young objects and logged cards, which the join scan reads (RT8). A round writes nothing
+// of a thread heap but its S buffer words, and no local collection reads S
+
+//////////////////////////
+// X_t (RT3, LC1): the thread heap's counted words into S
+//////////////////////////
+
+// Open addressing from S address to count, in malloc'd memory: (key, count) pairs. Only the
+// thread's local collector changes it
+value XT_MIN (256)
+
+fn xt_inc(g: *Gc, key: uint) $noinline {
+    if (g.xt_len + 1) * 2 > g.xt_cap : xt_resize(g, g.xt_cap == 0 ? XT_MIN : g.xt_cap * 2)
+    let map = g.xt_map
+    let mask = g.xt_cap - 1
+    let i = cnt_map_home(key) & mask
+    while true {
+        let k = @ptrv(map, uint, i * 2)
+        if k == key {
+            @ptrv(map, uint, i * 2 + 1) = @ptrv(map, uint, i * 2 + 1) + 1
+            return
+        }
+        if k == 0 {
+            @ptrv(map, uint, i * 2) = key
+            @ptrv(map, uint, i * 2 + 1) = 1
+            g.xt_len++
+            return
+        }
+        i = (i + 1) & mask
+    }
+}
+
+fn xt_dec(g: *Gc, key: uint) {
+    let map = g.xt_map
+    if g.xt_cap == 0 : panic("GC error: X_t has no entry for a counted word")
+    let mask = g.xt_cap - 1
+    let i = cnt_map_home(key) & mask
+    while true {
+        let k = @ptrv(map, uint, i * 2)
+        if k == key : break
+        if k == 0 : panic("GC error: X_t has no entry for a counted word")
+        i = (i + 1) & mask
+    }
+    let count = @ptrv(map, uint, i * 2 + 1)
+    if count > 1 {
+        @ptrv(map, uint, i * 2 + 1) = count - 1
+        return
+    }
+    // Backward-shift deletion: later keys of the probe chain move into the hole
+    let j = i
+    while true {
+        j = (j + 1) & mask
+        let k = @ptrv(map, uint, j * 2)
+        if k == 0 : break
+        let home = cnt_map_home(k) & mask
+        // The key may fill the hole when its home does not lie cyclically in (i, j]
+        let between = i <= j ? (home > i && home <= j) : (home > i || home <= j)
+        if between : continue
+        @ptrv(map, uint, i * 2) = k
+        @ptrv(map, uint, i * 2 + 1) = @ptrv(map, uint, j * 2 + 1)
+        i = j
+    }
+    @ptrv(map, uint, i * 2) = 0
+    @ptrv(map, uint, i * 2 + 1) = 0
+    g.xt_len--
+}
+
+fn xt_get(g: *Gc, key: uint) uint {
+    if g.xt_cap == 0 : return 0
+    let map = g.xt_map
+    let mask = g.xt_cap - 1
+    let i = cnt_map_home(key) & mask
+    while true {
+        let k = @ptrv(map, uint, i * 2)
+        if k == key : return @ptrv(map, uint, i * 2 + 1)
+        if k == 0 : return 0
+        i = (i + 1) & mask
+    }
+    return 0
+}
+
+fn xt_resize(g: *Gc, cap: uint) {
+    let old = g.xt_map
+    let old_cap = g.xt_cap
+    g.xt_map = mem.calloc(cap * 2 * size_of(uint))
+    g.xt_cap = cap
+    let mask = cap - 1
+    let i: uint = 0
+    while i < old_cap {
+        let k = @ptrv(old, uint, i * 2)
+        if k != 0 {
+            let j = cnt_map_home(k) & mask
+            while @ptrv(g.xt_map, uint, j * 2) != 0 : j = (j + 1) & mask
+            @ptrv(g.xt_map, uint, j * 2) = k
+            @ptrv(g.xt_map, uint, j * 2 + 1) = @ptrv(old, uint, i * 2 + 1)
+        }
+        i++
+    }
+    if old_cap != 0 : mem.free(old)
+}
+
+// P10: the walk's decrements, after P9's finalizers; the table halves while below load 1/8
+fn xt_settle(g: *Gc) {
+    let pending = g.xt_pending
+    let adr = pending.data
+    let end = adr + pending.index
+    while adr < end {
+        xt_dec(g, @ptrv(adr, uint))
+        adr += size_of(ptr)
+    }
+    pending.reset()
+    pending.shrink_idle()
+    let cap = g.xt_cap
+    while cap > XT_MIN && g.xt_len * 8 < cap : cap = cap / 2
+    if cap != g.xt_cap : xt_resize(g, cap)
+}
+
+fn xt_free(g: *Gc) {
+    if g.xt_cap != 0 : mem.free(g.xt_map)
+    g.xt_cap = 0
+    g.xt_len = 0
+    g.xt_pending.free()
+}
+
+//////////////////////////
+// Joins and the root set of a thread (RT8, K3)
+//////////////////////////
+
+// RT8: the thread stops at a safepoint while a round runs. `sp` is where its callee-saved
+// registers were pushed. It gathers its root set before it says SAFE
+fn join(sp: ptr) {
+    let c = ctl ?! return
+    if gc_dead != 0 : ext._exit(127)
+    #if GC_DEBUG
+    if c.in_gc != 0 {
+        c.in_gc = 0
+        panic("GC error: a thread joined a round inside local GC code (NJ, D4)")
+    }
+    #end
+    c.sp = sp
+    let epoch = atomic_load(round_epoch)
+    gather_roots(c)
+    c.safe_epoch = epoch
+    atomic(c.state | TS_SAFE)
+    // K11: once the previous round marked at least par_live, the round may choose this thread
+    // as a marker; it learns that when marking starts
+    if s_live >= par_live {
+        while atomic_load(round_req) != 0 && atomic_load(round_epoch) == epoch && atomic_load(round_phase) == 0 : ext.sched_yield()
+        if c.marker == 1 && atomic_load(round_epoch) == epoch : marker_run(c, epoch, false)
+    }
+    while atomic_load(round_req) != 0 && atomic_load(round_epoch) == epoch : futex_wait(@ref(round_epoch), epoch)
+    atomic(c.state & 0)
+    poll_sync()
+}
+
+// A join from Valk code: the registers are pushed first, so the stack from `sp` holds them
+fn join_now() {
+    let c = ctl ?! return
+    ext.valk_gc_scan_stack(join_entry.@cast(ptr), c.@cast(ptr))
+}
+
+fn join_entry(sp: ptr, c: ptr) {
+    join(sp)
+}
+
+// A safepoint's test: joins a requested round
+fn join_if_requested() $inline {
+    if atomic_load(round_req) != 0 : join_now()
+}
+
+// The output of the gathering in progress on this thread
+global gather_to: ?*Bump
+
+// The thread's root set (RT8 step 3-4): stacks, the NAT save area, parked coroutines, its
+// globals, keys(X_t) and the join scan. Exact words name object starts; conservative ones are
+// resolved by the marker (K4). Words outside S are dropped here
+fn gather_roots(u: *ThreadCtl) {
+    let exact = u.roots_exact
+    let cons = u.roots_cons
+    exact.reset()
+    cons.reset()
+    let g = u.heap ?! return
+    if atomic_load(u.state) == TS_HELD {
+        // The callee-saved registers saved at the enter-native
+        gather_words(cons, @ref(u.rbx).@cast(ptr), @ref(u.nat_exits).@cast(ptr))
+    }
+    let sp: ptr = u.sp.@cast(ptr)
+    let current = @ptrv(g.current_coro, ?coro.Coro)
+    if isset(current) {
+        gather_words(cons, sp, current.stack_top)
+        let main_sp = @ptrv(g.main_sp, ?ptr)
+        if isset(main_sp) : gather_words(cons, main_sp, g.stack_top)
+    } else {
+        gather_words(cons, sp, g.stack_top)
+    }
+    // Parked coroutines and what they keep for the kernel. A thread that registered and has
+    // not run INIT GLOBALS yet has no coroutine list
+    let coros = @ptrv(g.coros_ptr, ?Array[?coro.Coro])
+    if isset(coros) {
+        let count = coros.length
+        let i: uint = 0
+        while i < count {
+            let item = coros.get(i) !? null
+            i++
+            if isset(item) && is_parked(item) {
+                gather_words(cons, item.saved_sp(), item.stack_top)
+                let keep = @ref(item.io_keep).@cast(ptr)
+                gather_words(cons, keep, keep + 2 * size_of(ptr))
+            }
+        }
+    }
+    gather_rest(u, g, exact, cons)
+}
+
+fn gather_rest(u: *ThreadCtl, g: *Gc, exact: *Bump, cons: *Bump) {
+    gather_globals(g, exact)
+    // keys(X_t)
+    let map = g.xt_map
+    let i: uint = 0
+    while i < g.xt_cap {
+        let k = @ptrv(map, uint, i * 2)
+        i++
+        if k != 0 : exact.add_ptr(k.@cast(ptr))
+    }
+    if g.state == GcState.collecting {
+        // Inside P9 the windows and the log of the closing cycle are gone already: every word of
+        // the heap is read instead, dead objects included
+        gather_heap(g, cons)
+        return
+    }
+    join_scan(g, u.epoch_ref[0], exact, cons)
+}
+
+// Every word of [lo, hi) that lies in S
+fn gather_words(list: *Bump, lo: ptr, hi: ptr) {
+    let top = S_BASE + s_top
+    let adr: ptr = lo & (~7).to(uint)
+    while adr < hi {
+        let w = @ptrv(adr, uint)
+        adr += size_of(ptr)
+        if w >= S_BASE && w < top : list.add_ptr(w.@cast(ptr))
+    }
+}
+
+fn gather_globals(g: *Gc, exact: *Bump) {
+    let adr = g.globals.data
+    let end: ptr = adr + g.globals.index
+    while adr < end {
+        let ref = @ptrv(adr, ptr)
+        adr += size_of(ptr)
+        gather_word(exact, @ptrv(ref, uint))
+    }
+    adr = g.conditional_globals.data
+    end = adr + g.conditional_globals.index
+    while adr < end {
+        let root = @ptrv(adr, ConditionalGlobalRoot)
+        let root_end = adr + (root.more + 1) * size_of(ConditionalGlobalRoot)
+        let active = true
+        while adr < root_end {
+            let cond = @ptrv(adr, ConditionalGlobalRoot)
+            if @ptrv(cond.tag_ref, u8).to(uint) != cond.tag : active = false
+            adr += size_of(ConditionalGlobalRoot)
+        }
+        if active : gather_word(exact, @ptrv(root.ref, uint))
+    }
+}
+
+fn gather_word(list: *Bump, v: uint) $inline {
+    let w = v & (~prop_mask).to(uint)
+    if w - S_BASE < s_top : list.add_ptr(w.@cast(ptr))
+}
+
+// RT8's join scan (Lemma COV): every reference word of the young objects of this epoch, by
+// the kind's layout (exact), and every word of the logged cards, of the dirty cards of the
+// logged ranges and of the growth sources, the targets of OWN removal records (conservative: a
+// card may hold free slots with stale words, a source may be read through a view still)
+fn join_scan(g: *Gc, epoch_now: uint, exact: *Bump, cons: *Bump) {
+    gather_to = exact
+    let list = g.touched_blocks
+    let adr = list.data
+    let end = adr + list.index
+    while adr < end {
+        let desc = @ptrv(adr, *Desc)
+        adr += size_of(ptr)
+        if desc.epoch != epoch_now : continue
+        let layout = desc.layout ?! continue
+        let pool: *Pool = desc.pool
+        let isize = desc.isize
+        if (desc.kind & desc_large) != 0 {
+            if gcdata(desc.first).is_new() : gather_object(desc.first, layout, isize)
+            continue
+        }
+        let hi: ptr = pool.block == desc ? pool.cursor : desc.aw_hi
+        let slot: ptr = desc.aw_lo
+        while slot < hi {
+            if gcdata(slot).is_new() : gather_object(slot, layout, isize)
+            slot += isize
+        }
+    }
+    gather_to = null
+    let log = g.card_log
+    let count = log.index / size_of(ptr)
+    let i: uint = 0
+    while i < count {
+        let entry = @ptrv(log.data, uint, i)
+        i++
+        if entry & 1 == 0 {
+            gather_words(cons, entry.@cast(ptr), (entry + CARD_SIZE).@cast(ptr))
+            continue
+        }
+        let c, last = range_of(entry - 1)
+        while c < last {
+            if @ptrv(card_of(c), u8) != 0 : gather_words(cons, c.@cast(ptr), (c + CARD_SIZE).@cast(ptr))
+            c += CARD_SIZE
+        }
+    }
+    let removed = g.props_removed
+    i = 0
+    while i < removed.index {
+        let v = @ptrv(removed.data, uint, i)
+        i++
+        if v & prop_mask != prop_owned : continue
+        let source: ptr = (v - prop_owned).@cast(ptr)
+        gather_words(cons, source, source + desc_of(source).isize)
+    }
+}
+
+// The reference words of one young object; a sequence's length is bounded by its slot
+fn gather_object(item: ptr, layout: ptr, isize: uint) {
+    let ml = gc.mark_list
+    if @ptrv(layout, uint, layout_kind) == 0 {
+        each_field_ref(item, layout, ml, gather_ref)
+        return
+    }
+    let stride = @ptrv(layout, uint, layout_stride)
+    let offset = @ptrv(layout, uint, layout_data_offset)
+    if stride == 0 || offset >= isize : return
+    let length = @ptrv(item, uint)
+    let max = (isize - offset) / stride
+    if length > max : length = max
+    let at: ptr = item + offset
+    let end: ptr = at + length * stride
+    while at < end {
+        each_field_ref(at, layout, ml, gather_ref)
+        at += stride
+    }
+}
+
+fn gather_ref(ref: ptr, list: *Lifo) {
+    let to = gather_to ?! return
+    gather_word(to, @ptrv(ref, uint))
+}
+
+// Every word of every block and large object of the heap
+fn gather_heap(g: *Gc, cons: *Bump) {
+    let pools = g.alc_list_ptr[0]
+    let adr = pools.data
+    let end = adr + pools.index
+    while adr < end {
+        let pool = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        let block = pool.first
+        while isset(block) {
+            gather_words(cons, block.first, block.first + block.slots_total * block.isize)
+            block = block.next
+        }
+    }
+}
+
+//////////////////////////
+// The round (K2-K10)
+//////////////////////////
+
+// A round, run by the calling thread. `forced` (gc.collect_shared): a round that starts after
+// the call; otherwise (K1) only while S_alloc is at B_S. A thread whose try-lock fails joins
+// the running round, or retries (RT7). `entry_sp`: where the caller's registers were pushed
+// by the runtime's assembly entry; else the initiator's stack is read from round's own frame
+fn round(forced: bool, entry_sp: ptr (null_ptr())) {
+    let c = ctl ?! return
+    if gc_dead != 0 : ext._exit(127)
+    while true {
+        if !forced && atomic_load(s_alloc_bytes) < atomic_load(s_budget) : return
+        if atomic(round_lock | 1) == 0 : break
+        if atomic_load(round_req) != 0 {
+            join_now()
+        } else {
+            ext.sched_yield()
+        }
+    }
+    spin_take(@ref(reg_lock))
+    atomic(round_req | 1)
+    let epoch = atomic_load(round_epoch)
+    let count = registry_len
+    let i: uint = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        if u != c : atomic(u.poll_ref[0] | (~0).to(uint))
+    }
+    // K2: hold the threads in native code; wait for the others to stop in this round
+    while true {
+        let stopped = true
+        i = 0
+        while i < count {
+            let u = @ptrv(registry, *ThreadCtl, i)
+            i++
+            if u == c : continue
+            if atomic_load(u.state) == TS_NAT : cas(@ref(u.state), TS_NAT, TS_HELD)
+            if !thread_stopped(u, epoch) : stopped = false
+        }
+        if stopped : break
+        ext.sched_yield()
+    }
+    #if GC_DEBUG
+    round_check(c, count, epoch)
+    #end
+    // K3-K8, with the initiator's registers on its stack
+    round_epoch_now = epoch
+    if entry_sp != null_ptr() {
+        c.sp = entry_sp
+        round_collect(c, epoch)
+    } else {
+        ext.valk_gc_scan_stack(round_entry.@cast(ptr), c.@cast(ptr))
+    }
+    // K10: a thread that did not collect since the previous round collects at its next poll
+    i = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        if u.collects == u.collects_seen {
+            u.want_local = 1
+            if u != c : atomic(u.poll_ref[0] | (~0).to(uint))
+        }
+        u.collects_seen = u.collects
+    }
+    // K9: release
+    atomic_store(round_phase, 0)
+    atomic(round_req & 0)
+    atomic(round_epoch + 1)
+    i = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        u.marker = 0
+        if u != c : cas(@ref(u.state), TS_HELD, TS_NAT)
+    }
+    futex_wake_all(@ref(round_epoch))
+    spin_drop(@ref(reg_lock))
+    atomic(round_lock & 0)
+    atomic(rounds_done + 1)
+    poll_sync()
+}
+
+// Held in native code, or stopped at a safepoint by this round's join
+fn thread_stopped(u: *ThreadCtl, epoch: uint) bool $inline {
+    let s = atomic_load(u.state)
+    return s == TS_HELD || (s == TS_SAFE && u.safe_epoch == epoch)
+}
+
+// The epoch of the running round, for round_entry
+@shared round_epoch_now: uint
+
+fn round_entry(sp: ptr, cp: ptr) {
+    let c: *ThreadCtl = cp
+    c.sp = sp
+    round_collect(c, round_epoch_now)
+}
+
+//////////////////////////
+// Parallel marking (K11)
+//////////////////////////
+
+// Markers: the initiator; every SAFE thread when the previous L_S is at least par_live; and,
+// from bell_live on, held threads in the runtime's event wait, whose doorbell the initiator
+// rings. Work moves between markers in packets of at most 256 words through one pool under
+// mark_lock, a GC spin lock. busy counts the markers that hold work; the one that takes it to 0
+// with the pool empty sets mark_done. The phases after marking (K6's two passes and K7) are
+// driven by the initiator, which waits for every marker at each step
+value PACKET_WORDS (256)
+value PHASE_MARK (1)
+value PHASE_FIND (2)
+value PHASE_MARK2 (3)
+value PHASE_SWEEP (4)
+value PHASE_DONE (5)
+value SWEEP_CHUNK (8)
+
+@shared par_live: uint (4 * 1024 * 1024)
+@shared bell_live: uint (64 * 1024 * 1024)
+@shared mark_lock: uint
+@shared mark_ready: bool
+// Packets waiting (each [count, words...], malloc'd), free packets, and their number in all
+@shared mark_pool: *Bump (@undefined)
+@shared mark_spare: *Bump (@undefined)
+@shared mark_packets: uint
+@shared mark_packets_max: uint
+// Work units: threads whose roots a marker gathers (HELD) or marks (SAFE non-markers)
+@shared mark_units: *Bump (@undefined)
+// Items in the pool (packets and units), read without the lock by idle markers
+@shared mark_avail: uint
+@shared mark_busy: uint
+@shared mark_done: uint
+@shared round_phase: uint
+@shared phase_count: uint
+@shared sweep_next: uint
+@shared sweep_blocks: uint
+// The markers of the running round, and of the last one (statistics, tests)
+@shared markers_now: uint
+/// Markers of the last round.
+~+ shared round_markers: uint (0)
+@shared cpu_count: uint
+
+fn markers_setup() {
+    if cpu_count == 0 {
+        let n = ext.sysconf(84)
+        cpu_count = n > 0 ? n.to(uint) : 1
+    }
+    if !mark_ready {
+        mark_pool = Bump.new(64 * size_of(ptr))
+        mark_spare = Bump.new(64 * size_of(ptr))
+        mark_units = Bump.new(16 * size_of(ptr))
+        mark_ready = true
+    }
+    // 1 MiB of packets per logical CPU once marking is parallel; their pages are touched on use
+    mark_packets_max = s_live >= par_live ? cpu_count * 512 : 64
+}
+
+fn marker_list(u: *ThreadCtl) *Lifo $inline {
+    return u.mark_list ?? <{
+        let created = Lifo.new()
+        u.mark_list = created
+        return created
+    }
+}
+
+// Moves the top 256 words of a large local stack into a packet of the pool, when one can be had.
+// A pair (from, item | 1) never splits: items are S addresses, `from` is an element count
+fn share_work(list: *Lifo) {
+    if list.index < PACKET_WORDS * 2 || atomic_load(mark_avail) > 0 : return
+    spin_take(@ref(mark_lock))
+    let spare = mark_spare
+    let packet: uint = 0
+    if spare.index > 0 {
+        spare.index -= size_of(ptr)
+        packet = @ptrv(spare.data + spare.index, uint)
+    } else if mark_packets < mark_packets_max {
+        mark_packets++
+        packet = mem.alloc((PACKET_WORDS + 2) * size_of(ptr)).@cast(uint)
+    }
+    if packet != 0 {
+        let n: uint = PACKET_WORDS
+        let w = @ptrv(list.data, uint, list.index - n)
+        if (w & 1) != 0 && w >= S_BASE : n++
+        let from = list.index - n
+        mem.copy_bytes(list.data + from * size_of(ptr), (packet + size_of(ptr)).@cast(ptr), n * size_of(ptr))
+        @ptrv(packet.@cast(ptr), uint) = n
+        list.index = from
+        mark_pool.add_ptr(packet.@cast(ptr))
+        atomic(mark_avail + 1)
+    }
+    spin_drop(@ref(mark_lock))
+}
+
+// Under mark_lock: a packet's words onto the local stack, or a unit; null when the pool is empty
+fn take_work(list: *Lifo) ?*ThreadCtl {
+    let units = mark_units
+    if units.index > 0 {
+        units.index -= size_of(ptr)
+        atomic(mark_avail - 1)
+        return @ptrv(units.data + units.index, *ThreadCtl)
+    }
+    let pool = mark_pool
+    if pool.index == 0 : return null
+    pool.index -= size_of(ptr)
+    let packet = @ptrv(pool.data + pool.index, ptr)
+    atomic(mark_avail - 1)
+    let n = @ptrv(packet, uint)
+    list.reserve(n)
+    mem.copy_bytes(packet + size_of(ptr), list.data + list.index * size_of(ptr), n * size_of(ptr))
+    list.index += n
+    mark_spare.add_ptr(packet)
+    return null
+}
+
+// Whether the pool holds work
+fn pool_has_work() bool $inline {
+    return atomic_load(mark_avail) > 0
+}
+
+// A work unit: a held thread's roots are gathered first, unless the buffers of the previous
+// round are still valid (K3: its count of NAT exits did not change); then marked
+fn run_unit(u: *ThreadCtl, list: *Lifo) {
+    if u.roots_done == 0 {
+        if atomic_load(u.state) == TS_HELD {
+            if u.nat_seen != u.nat_exits : gather_roots(u)
+            u.nat_seen = u.nat_exits
+        }
+        atomic_store(u.roots_done, 1)
+    }
+    mark_roots(u, list)
+}
+
+// The drain of one marker with K11's termination
+fn mark_loop(c: *ThreadCtl, dynamic: bool) {
+    let list = marker_list(c)
+    if dynamic {
+        // A woken held thread joins while marking runs, and only then
+        spin_take(@ref(mark_lock))
+        if atomic_load(mark_done) != 0 {
+            spin_drop(@ref(mark_lock))
+            return
+        }
+        mark_busy++
+        spin_drop(@ref(mark_lock))
+    }
+    while true {
+        s_drain_shared(list)
+        spin_take(@ref(mark_lock))
+        if pool_has_work() {
+            let unit = take_work(list)
+            spin_drop(@ref(mark_lock))
+            if isset(unit) : run_unit(unit, list)
+            continue
+        }
+        mark_busy--
+        if mark_busy == 0 {
+            atomic_store(mark_done, 1)
+            spin_drop(@ref(mark_lock))
+            return
+        }
+        spin_drop(@ref(mark_lock))
+        // Idle: wait for work or the end
+        while true {
+            if atomic_load(mark_done) != 0 : return
+            if pool_has_work() {
+                spin_take(@ref(mark_lock))
+                if atomic_load(mark_done) != 0 {
+                    spin_drop(@ref(mark_lock))
+                    return
+                }
+                if pool_has_work() {
+                    mark_busy++
+                    let unit = take_work(list)
+                    spin_drop(@ref(mark_lock))
+                    if isset(unit) : run_unit(unit, list)
+                    break
+                }
+                spin_drop(@ref(mark_lock))
+            }
+            ext.sched_yield()
+        }
+    }
+}
+
+// s_drain, handing work to idle markers while the stack is large
+fn s_drain_shared(list: *Lifo) {
+    let n: uint = 0
+    while list.index > 0 {
+        let e: uint = list.pop_unchecked()
+        let from: uint = 0
+        if e & 1 != 0 {
+            e = e - 1
+            from = list.pop_unchecked()
+        }
+        let kind = s_kind_record(@ptrv(s_kind_entry(e), u16).to(uint) & S_KIND_ID)
+        let layout = kind.layout ?! continue
+        list.reserve(2)
+        each_ref_work(e.@cast(ptr), layout, s_object_size(e.@cast(ptr), kind), from, list, s_mark_word)
+        n++
+        if (n & 63) == 0 && markers_now > 1 : share_work(list)
+    }
+}
+
+// K6 pass 1 and K7 over chunks of the line blocks, taken by an atomic counter
+fn find_work(c: *ThreadCtl) {
+    let queue = c.fin_queue
+    while true {
+        let i = atomic(sweep_next + SWEEP_CHUNK)
+        if i >= sweep_blocks : return
+        let to = i + SWEEP_CHUNK
+        if to > sweep_blocks : to = sweep_blocks
+        while i < to {
+            s_find_finalizable(@ptrv(s_used.data, uint, i), queue)
+            i++
+        }
+    }
+}
+
+fn sweep_work() {
+    while true {
+        let i = atomic(sweep_next + SWEEP_CHUNK)
+        if i >= sweep_blocks : return
+        let to = i + SWEEP_CHUNK
+        if to > sweep_blocks : to = sweep_blocks
+        s_sweep_range(i, to)
+    }
+}
+
+// Pass 2 of K6: the marker's queue is marked as roots
+fn mark_queue(c: *ThreadCtl) {
+    let list = marker_list(c)
+    let queue = c.fin_queue
+    let adr = queue.data
+    let end = adr + queue.index
+    while adr < end {
+        s_mark(@ptrv(adr, uint), list)
+        adr += size_of(ptr)
+    }
+}
+
+// The steps of a marker other than the initiator, from the SAFE state of its join (`dynamic`
+// false) or from a held thread's event wait (true: marking only)
+fn marker_run(c: *ThreadCtl, epoch: uint, dynamic: bool) {
+    if !phase_wait(PHASE_MARK, epoch) : return
+    if !dynamic : mark_roots(c, marker_list(c))
+    mark_loop(c, dynamic)
+    if dynamic : return
+    if !phase_wait(PHASE_FIND, epoch) : return
+    find_work(c)
+    atomic(phase_count + 1)
+    if !phase_wait(PHASE_MARK2, epoch) : return
+    mark_queue(c)
+    mark_loop(c, false)
+    if !phase_wait(PHASE_SWEEP, epoch) : return
+    sweep_work()
+    atomic(phase_count + 1)
+}
+
+// Waits until the round reaches `phase`; false when the round ended
+fn phase_wait(phase: uint, epoch: uint) bool {
+    while atomic_load(round_phase) < phase {
+        if atomic_load(round_epoch) != epoch : return false
+        ext.sched_yield()
+    }
+    return atomic_load(round_epoch) == epoch
+}
+
+// The initiator waits until the other markers finished a step
+fn phase_join(others: uint) {
+    while atomic_load(phase_count) < others : ext.sched_yield()
+    atomic_store(phase_count, 0)
+}
+
+// K3-K8: roots, marking (K11), finalizable discovery (K6), the sweep (K7) and the settle (K8)
+fn round_collect(c: *ThreadCtl, epoch: uint) {
+    let count = registry_len
+    markers_setup()
+    // K11: who marks
+    let markers: uint = 1
+    let parallel = s_live >= par_live
+    let bell = s_live >= bell_live
+    let i: uint = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        retire_buffers(u)
+        u.marker = 0
+        u.roots_done = 0
+        if u == c : continue
+        let state = atomic_load(u.state)
+        if parallel && state == TS_SAFE && markers < cpu_count {
+            u.marker = 1
+            markers++
+        } else if bell && state == TS_HELD && u.idle_efd >= 0 {
+            // Rung from its event wait, it joins the marking (dynamic)
+            u.marker = 2
+        }
+    }
+    markers_now = markers
+    round_markers = markers
+    s_lines_clear()
+    // K3: work units for the held threads and the SAFE threads that do not mark
+    let units = mark_units
+    units.reset()
+    i = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        if u == c || u.marker == 1 : continue
+        if atomic_load(u.state) == TS_SAFE {
+            // Gathered at its join
+            u.roots_done = 1
+            u.nat_seen = (~0).to(uint)
+        }
+        units.add_ptr(u)
+    }
+    atomic_store(mark_avail, units.index / size_of(ptr))
+    mark_busy = markers
+    atomic_store(mark_done, 0)
+    atomic_store(phase_count, 0)
+    atomic_store(round_phase, PHASE_MARK)
+    if bell : ring_markers(count)
+    // K4, K5: the initiator's own roots and the finalize list, then the pool
+    gather_roots(c)
+    c.nat_seen = (~0).to(uint)
+    let list = marker_list(c)
+    let fin = s_fin_list
+    let adr = fin.data
+    let end = adr + fin.index
+    while adr < end {
+        s_mark(@ptrv(adr, uint), list)
+        adr += size_of(ptr)
+    }
+    mark_roots(c, list)
+    mark_loop(c, false)
+    #if GC_DEBUG
+    if atomic_load(mark_avail) != 0 || mark_busy != 0 : panic("GC error: work was left in the pool after marking ended (D10)")
+    #end
+    let others = markers - 1
+    // K6 pass 1, split by block, and its barrier
+    c.fin_queue.reset()
+    sweep_blocks = s_used.index / size_of(ptr)
+    atomic_store(sweep_next, 0)
+    atomic_store(round_phase, PHASE_FIND)
+    find_work(c)
+    s_find_finalizable_large(c.fin_queue)
+    phase_join(others)
+    // Pass 2: every queue is marked, with a new termination
+    mark_busy = markers
+    atomic_store(mark_done, 0)
+    atomic_store(round_phase, PHASE_MARK2)
+    mark_queue(c)
+    mark_loop(c, false)
+    // The queues join the finalize list
+    i = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        if u != c && u.marker != 1 : continue
+        let queue = u.fin_queue
+        adr = queue.data
+        end = adr + queue.index
+        while adr < end {
+            fin.add_ptr(@ptrv(adr, ptr))
+            adr += size_of(ptr)
+        }
+        queue.reset()
+    }
+    #if GC_DEBUG
+    marked_check()
+    cover_check(count)
+    #end
+    // K7, split by block, then K8
+    sweep_blocks = s_sweep_prepare()
+    atomic_store(sweep_next, 0)
+    atomic_store(round_phase, PHASE_SWEEP)
+    sweep_work()
+    phase_join(others)
+    s_settle(s_sweep_file(sweep_blocks))
+    atomic_store(round_phase, PHASE_DONE)
+    list.shrink_idle()
+    #if GC_DEBUG
+    swept_check()
+    #end
+}
+
+// Whether a round may ring threads in their event wait (the last L_S reached bell_live)
+fn bell_possible() bool $inline {
+    return s_live >= bell_live
+}
+
+// K11: the doorbell of every held thread in the runtime's event wait that marks
+fn ring_markers(count: uint) {
+    let one: u64 = 1
+    let i: uint = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        if u.marker == 2 : ext.write(u.idle_efd, @ref(one), 8)
+    }
+}
+
+// A held thread whose event wait returned during a round marks, once its roots are gathered
+fn held_marker(c: *ThreadCtl) {
+    if c.marker != 2 : return
+    let epoch = atomic_load(round_epoch)
+    if atomic_load(round_req) == 0 : return
+    c.marker = 0
+    while atomic_load(c.roots_done) == 0 {
+        if atomic_load(round_epoch) != epoch : return
+        ext.sched_yield()
+    }
+    atomic(rung_markers + 1)
+    marker_run(c, epoch, true)
+}
+
+// Held threads that marked after their doorbell rang, since the program started
+@shared rung_markers: uint
+
+// A thread's S buffers end; its free lines are filed by the sweep
+fn retire_buffers(u: *ThreadCtl) {
+    u.s_cursor_ref[0] = 0
+    u.s_limit_ref[0] = 0
+    u.s_buf_size_ref[0] = 0
+    u.s_ov_cursor_ref[0] = 0
+    u.s_ov_limit_ref[0] = 0
+}
+
+fn mark_roots(u: *ThreadCtl, list: *Lifo) {
+    let exact = u.roots_exact
+    let adr = exact.data
+    let end = adr + exact.index
+    while adr < end {
+        let w = @ptrv(adr, uint)
+        adr += size_of(ptr)
+        #if GC_DEBUG
+        if s_resolve(w) != w {
+            nj_off()
+            print("\nGC error: the exact root 0x")
+            w.print(16)
+            print(" names no shared object\n")
+            panic("GC error: an exact root of a round names no allocated shared object (D1)")
+        }
+        #end
+        s_mark(w, list)
+    }
+    let cons = u.roots_cons
+    adr = cons.data
+    end = adr + cons.index
+    while adr < end {
+        let w = @ptrv(adr, uint)
+        adr += size_of(ptr)
+        let a = s_resolve(w)
+        if a != 0 : s_mark(a, list)
+        // R-46: one past the end of a sequence whose slot ends at w
+        if (w & (S_GRANULE - 1)) == 0 && w > S_BASE {
+            let b = s_resolve(w - 1)
+            if b != 0 && s_sequence_ends_at(b, w) : s_mark(b, list)
+        }
+    }
+}
+
+#if GC_DEBUG
+// D5: while the round holds the registry, every other thread is held or stopped
+fn round_check(initiator: *ThreadCtl, count: uint, epoch: uint) {
+    let i: uint = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        if u == initiator : continue
+        if !thread_stopped(u, epoch) : panic("GC error: a thread runs during a round (D5)")
+    }
+}
+
+// D10 and D1's S clause, after marking: every reference word of a marked S object is 0, names
+// no S memory or names a marked, allocated S object
+fn marked_check() {
+    let used = s_used
+    let i: uint = 0
+    while i < used.index {
+        let b = @ptrv(used.data + i, uint)
+        i += size_of(ptr)
+        let g = b
+        while g < b + S_BLOCK {
+            let kind = s_kind_of(g.@cast(ptr))
+            if !isset(kind) {
+                g += S_GRANULE
+                continue
+            }
+            if @ptrv(s_mark_byte(g), u8) != 0 : marked_targets_check(g, kind)
+            g += kind.size
+        }
+    }
+    let large = s_large
+    i = 0
+    while i < large.index {
+        let a = @ptrv(large.data + i, uint)
+        i += size_of(ptr)
+        let kind = s_kind_of(a.@cast(ptr)) ?! panic("GC error: a large shared object has no kind")
+        if @ptrv(s_mark_byte(a), u8) != 0 : marked_targets_check(a, kind)
+    }
+}
+
+fn marked_targets_check(a: uint, kind: *SKind) {
+    let layout = kind.layout ?! return
+    each_ref(a.@cast(ptr), layout, gc.mark_list, fn(ref: ptr, list: *Lifo) {
+        @unsafe
+        let w = @ptrv(ref, uint)
+        if w - S_BASE >= s_size : return
+        if w & prop_mask != 0 || s_resolve(w) != w || @ptrv(s_mark_byte(w), u8) == 0 {
+            nj_off()
+            print("\nGC error: the shared word at 0x")
+            let at: uint = ref
+            at.print(16)
+            print(" holds 0x")
+            w.print(16)
+            print("\n")
+            panic("GC error: a marked shared object names an unmarked or unallocated one (D10)")
+        }
+    })
+}
+
+// D1's cover clause (Lemma COV), after marking: every reference word of every allocated object
+// of every thread heap (old, or young in its window) that names S names a marked object
+fn cover_check(count: uint) {
+    let i: uint = 0
+    while i < count {
+        let u = @ptrv(registry, *ThreadCtl, i)
+        i++
+        let g = u.heap ?! continue
+        if g.state == GcState.collecting : continue
+        let now = u.epoch_ref[0]
+        let pools = g.alc_list_ptr[0]
+        let adr = pools.data
+        let end = adr + pools.index
+        while adr < end {
+            let pool = @ptrv(adr, *Pool)
+            adr += size_of(ptr)
+            let block = pool.first
+            while isset(block) {
+                let layout = block.layout
+                if isset(layout) {
+                    let hi: ptr = pool.block == block ? pool.cursor : block.aw_hi
+                    let slot = block.first
+                    let last = slot + block.slots_total * block.isize
+                    while slot < last {
+                        let young = block.epoch == now && slot >= block.aw_lo && slot < hi
+                        if gcdata(slot).is_not_new() || young : cover_object(slot, layout, block.isize)
+                        slot += block.isize
+                    }
+                }
+                block = block.next
+            }
+        }
+    }
+}
+
+fn cover_object(item: ptr, layout: ptr, isize: uint) {
+    let ml = gc.mark_list
+    if @ptrv(layout, uint, layout_kind) == 0 {
+        each_field_ref(item, layout, ml, cover_ref)
+        return
+    }
+    let stride = @ptrv(layout, uint, layout_stride)
+    let offset = @ptrv(layout, uint, layout_data_offset)
+    if stride == 0 || offset >= isize : return
+    let length = @ptrv(item, uint)
+    let max = (isize - offset) / stride
+    if length > max : length = max
+    let at: ptr = item + offset
+    let end: ptr = at + length * stride
+    while at < end {
+        each_field_ref(at, layout, ml, cover_ref)
+        at += stride
+    }
+}
+
+fn cover_ref(ref: ptr, list: *Lifo) {
+    let w = @ptrv(ref, uint) & (~prop_mask).to(uint)
+    if w - S_BASE >= s_size : return
+    if s_resolve(w) == w && @ptrv(s_mark_byte(w), u8) != 0 : return
+    nj_off()
+    print("\nGC error: the thread-heap word at 0x")
+    let at: uint = ref
+    at.print(16)
+    print(" names the unmarked shared address 0x")
+    w.print(16)
+    print(" (tag ")
+    (@ptrv(ref, uint) & prop_mask).print(10)
+    print(", holder layout 0x")
+    let lay: uint = desc_of(ref).layout.@cast(uint)
+    lay.print(16)
+    print(", slot size ")
+    desc_of(ref).isize.print(10)
+    print(")\n")
+    panic("GC error: a thread-heap word into S is neither counted nor covered (D1, Lemma COV)")
+}
+
+// D2, after the sweep: no mark byte is left, every object's lines are live, empty blocks hold
+// no object
+fn swept_check() {
+    let used = s_used
+    let i: uint = 0
+    while i < used.index {
+        let b = @ptrv(used.data + i, uint)
+        i += size_of(ptr)
+        let g = b
+        while g < b + S_BLOCK {
+            if @ptrv(s_mark_byte(g), u8) != 0 : panic("GC error: a mark byte survived the sweep (D2)")
+            let kind = s_kind_of(g.@cast(ptr))
+            if !isset(kind) {
+                g += S_GRANULE
+                continue
+            }
+            if @ptrv(s_line_byte(g), u8) == 0 || @ptrv(s_line_byte(g + kind.size - 1), u8) == 0 : panic("GC error: a live shared object lies in a free line (D2)")
+            g += kind.size
+        }
+    }
+    let free = s_free_blocks
+    i = 0
+    while i < free.index {
+        let b = @ptrv(free.data + i, uint)
+        i += size_of(ptr)
+        let g = b
+        while g < b + S_BLOCK {
+            if @ptrv(s_kind_entry(g), u64) != 0 : panic("GC error: an empty shared block holds an object (D2)")
+            g += 64
+        }
+    }
+}
+#end
+
+#if TEST
+/// Test helper: sets the L_S from which SAFE threads mark and held threads are rung (K11).
++ fn round_thresholds_for_test(parallel: uint, bell: uint) {
+    par_live = parallel
+    bell_live = bell
+}
+
+/// Test helper: held threads that marked after a round rang their doorbell.
++ fn rung_markers_for_test() uint {
+    return atomic_load(rung_markers)
+}
+
+/// Test helper: shared objects queued for a finalizer that has not run yet.
++ fn shared_finalize_pending_for_test() uint {
+    return s_fin_list.index / size_of(ptr)
+}
+
+/// Test helper: the running thread's count of counted words that name `item` in S (X_t).
++ fn shared_counted_for_test(item: ?ptr) uint {
+    return xt_get(gc, item.@cast(uint))
+}
+#end
+
+#end
