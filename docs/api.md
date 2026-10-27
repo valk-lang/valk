@@ -4713,7 +4713,7 @@ error SignalError (unsupported, init)
     + fn cancel_after(ms: uint) void
     // Returns a new token that is cancelled when this one is, or right away when it already is.
     + fn child() CancelToken !SyncError
-    // Returns true once the token was cancelled.
+    // Returns true once the token or one of its ancestors was cancelled.
     + fn is_cancelled() bool
     // Returns a token that is not cancelled; throws `init` when its lock cannot be created.
     + static fn new() CancelToken !SyncError
