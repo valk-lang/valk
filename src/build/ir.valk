@@ -148,8 +148,8 @@ fn ir_prepare_allocator_helpers(build: Build, unit: Unit) !Error {
             if global.unit != unit : unit.extern_globals.append(global, true)
             let pool_class = (global.get_type() !>).get_class_or_null()
             if !isset(pool_class) : build.bug("Generated allocator global is not a Pool")
-            let init = pool_class.get_func("init")
-            if !isset(init) : build.bug("gc.Pool.init is missing")
+            let init = pool_class.get_func(allocator_setup_name(build))
+            if !isset(init) : build.bug("gc.Pool's setup function is missing")
             if !init.parsed_types : parse_func_types(init) !>
             if init.unit != unit || init.is_extern : unit.extern_functions.append(init, true)
             let onfree = allocator.onfree
@@ -183,7 +183,24 @@ fn ir_allocator_layout_name(site: AllocatorInitSite, index: uint) String {
     return "valk.allocator.layout." + site.value.int_val + "." + index
 }
 
+fn ir_allocator_kind_name(site: AllocatorInitSite, index: uint) String {
+    return "valk.allocator.kind." + site.value.int_val + "." + index
+}
+
+// Grove's static kind descriptor (gc.Kind): slot size, layout, finalizer, closure clone
+fn ir_write_kind_constant(out: ByteBuffer, name: String, allocator: Allocator, layout: ?String) {
+    let onfree = allocator.onfree
+    let env_clone = allocator.env_clone
+    out.append_text("@\"" + name + "\" = internal constant { i64, ptr, ptr, ptr } { i64 ")
+    out.write_uint_ascii(allocator.size.to(uint))
+    out.append_text(", ptr " + (isset(layout) ? ir_symbol_address(layout) : "null"))
+    out.append_text(", ptr " + (isset(onfree) ? ir_func_address(onfree) : "null"))
+    out.append_text(", ptr " + (isset(env_clone) ? ir_func_address(env_clone) : "null"))
+    out.append_text(" }\n\n")
+}
+
 fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error {
+    let grove = build.grove_mode()
     each build.lists.allocator_init_sites as site {
         let owner = site.ctx.func
         if !isset(owner) : continue
@@ -191,8 +208,9 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
 
         each build.lists.allocators as allocator, i {
             if !allocator.global.is_used : continue
-            if allocator.props.length == 0 : continue
-            ir_write_layout_constant(out, ir_allocator_layout_name(site, i), allocator_layout_words(allocator.props, 0, 0, 0))
+            let layout = allocator.props.length > 0 ? ir_allocator_layout_name(site, i) : null
+            if isset(layout) : ir_write_layout_constant(out, layout, allocator_layout_words(allocator.props, 0, 0, 0))
+            if grove : ir_write_kind_constant(out, ir_allocator_kind_name(site, i), allocator, layout)
         }
 
         let ir = IRFunc {func: owner}
@@ -205,9 +223,22 @@ fn ir_write_allocator_helpers(out: ByteBuffer, build: Build, unit: Unit) !Error 
             if !global.is_used : continue
             let pool_class = (global.get_type() !>).get_class_or_null()
             if !isset(pool_class) : build.bug("Generated allocator global is not a Pool")
-            let init = pool_class.get_func("init")
-            if !isset(init) : build.bug("gc.Pool.init is missing")
+            let init = pool_class.get_func(allocator_setup_name(build))
+            if !isset(init) : build.bug("gc.Pool's setup function is missing")
 
+            if grove {
+                // The pool is the TLS symbol itself, set up in place
+                ir.line_start()
+                ir.write("call void ")
+                ir.write(ir_func_address(init))
+                ir.write("(ptr ")
+                ir.write(ir_global_address(global))
+                ir.write(", ptr ")
+                ir.write(ir_symbol_address(ir_allocator_kind_name(site, i)))
+                ir.write(")")
+                ir.line_end()
+                continue
+            }
             let pool = ir.var()
             ir_open_call(ir, pool, ir_type(init.get_rett()) !>)
             ir.write(" ")
@@ -3320,7 +3351,15 @@ fn ir_emit_slice_layout(parent: IRFunc, value: Value, class: Class) ?String !Err
     let ir = ir_adapter_ir(parent, name)
     let words = allocator_layout_words(props, 1, (class.slice_data_offset() !>).to(uint), (element.byte_size() !>).to(uint))
     ir_write_layout_constant(ir.code, name, words)
+    if parent.func.ns.build.grove_mode() {
+        // The TLS word where gc.alloc_seq caches the layout's pools
+        ir.code.append_text("@\"" + ir_slice_kinds_name(name) + "\" = internal thread_local(initialexec) global ptr null, align 8\n\n")
+    }
     return name
+}
+
+fn ir_slice_kinds_name(layout: String) String {
+    return layout + ".pools"
 }
 
 fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Value], field_mark: uint) String !Error {
@@ -3357,6 +3396,11 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     }
     let total = ir_emit_binary_index(ir, "add", "i64", bytes, header)
 
+    if ir.func.ns.build.grove_mode() {
+        let slot = ir_emit_grove_seq_alloc(ir, value, class, total, true) !>
+        ir_emit_store(ir, "i64", length, slot)
+        return slot
+    }
     let alloc_name = ir_alloc_polls(ir) ? "alloc_typed_zeroed_polling" : "alloc_typed_zeroed"
     let idf = valk_idf(ir.func.ns.build, "gc", alloc_name) !>
     let alloc = idf.func
@@ -3372,6 +3416,26 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let slot = ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
     ir_emit_store(ir, "i64", length, slot)
     return slot
+}
+
+// C-21: Grove's inlined sequence allocation of `total` bytes, zeroed after the length word
+// unless `zero` is false (C-18: the caller writes every element before the next safepoint)
+fn ir_emit_grove_seq_alloc(ir: IRFunc, value: Value, class: Class, total: String, zero: bool) String !Error {
+    let idf = valk_idf(ir.func.ns.build, "gc", "alloc_seq") !>
+    let alloc = idf.func
+    if !isset(alloc) : value.bug("gc.alloc_seq is not a function")
+    if !alloc.parsed_types : parse_func_types(alloc) !>
+    ir_use_func(ir, alloc)
+    ir_note_gc_allocates(ir)
+
+    let props = ir_emit_slice_layout(ir, value, class) !>
+    let mark = ir.arg_list.length
+    ir.write_arg(mark, "i64", total)
+    ir.write_arg(mark, "ptr", isset(props) ? ir_symbol_address(props) : "null")
+    ir.write_arg(mark, "ptr", isset(props) ? ir_symbol_address(ir_slice_kinds_name(props)) : "null")
+    ir.write_arg(mark, "i1", zero ? "true" : "false")
+    ir.write_arg(mark, "i1", ir_alloc_polls(ir) ? "true" : "false")
+    return ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
 }
 
 fn ir_emit_slice_init_into(
@@ -3857,12 +3921,22 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
         ir_use_global(ir, global)
         let pool_type = global.get_type() !>
         let pool_get = allocator.pool_get
-        if ir_alloc_polls(ir) {
+        let grove = ir.func.ns.build.grove_mode()
+        if !grove && ir_alloc_polls(ir) {
             pool_get = allocator.pool_get_polling ?? (allocator_pool_get(global, pool_get.name + "_polling", value.exp ?? ir.func.exp) !>)
             allocator.pool_get_polling = pool_get
         }
         ir_use_func(ir, pool_get)
 
+        if grove {
+            // C-21: the pool is the kind's TLS symbol; the fast path is inlined with the
+            // slot size as a constant
+            let mark = ir.arg_list.length
+            ir_write_receiver_arg(ir, mark, pool_get, ir_global_address(global))
+            ir.write_arg(mark, "i64", allocator.size.to_string())
+            ir.write_arg(mark, "i1", ir_alloc_polls(ir) ? "true" : "false")
+            return ir_emit_arg_call(ir, ir_type(pool_get.get_rett()) !>, ir_func_address(pool_get), mark)
+        }
         let pool = ir_emit_load(ir, ir_type(pool_type) !>, ir_global_address(global))
         let mark = ir.arg_list.length
         ir_write_receiver_arg(ir, mark, pool_get, pool)
