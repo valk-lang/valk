@@ -2738,8 +2738,6 @@ Marked `$default`: it also provides the type's default value.
 + class Mutex {
     // Waits until the mutex is unlocked, without keeping it locked.
     + fn await_unlock() void
-    // Returns this same mutex, so clones of an object that holds it share it.
-    + fn clone() Mutex
     // Takes the mutex, waiting while it is locked.
     + fn lock() void
     // Creates an unlocked mutex.
@@ -2761,10 +2759,6 @@ waiting waiter, which takes the mutex unless another locker was quicker.
 #### await_unlock
 
 Waits until the mutex is unlocked, without keeping it locked.
-
-#### clone
-
-Returns this same mutex, so clones of an object that holds it share it.
 
 #### lock
 
@@ -3713,8 +3707,6 @@ into the string, nothing is copied.
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
 + class SyncMutex {
-    // Returns this same mutex, so clones of an object that holds it share it.
-    + fn clone() SyncMutex
     // Takes the mutex, blocking the thread until it is free.
     + fn lock() void
     // Creates an unlocked mutex; panics when the OS cannot create one.
@@ -3731,10 +3723,6 @@ A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
 Waiting blocks the whole thread, including its other coroutines; coroutine code should
 use `Mutex` instead. On Windows the owning thread may lock it again (it is reentrant);
 elsewhere locking it twice from one thread deadlocks.
-
-#### clone
-
-Returns this same mutex, so clones of an object that holds it share it.
 
 #### lock
 
@@ -10000,6 +9988,8 @@ one waited for the shared lock.
 + fn lock() void
 // Returns the bytes held by the GC pool blocks of all threads, including free slots.
 + fn mem_usage() uint
+// In a `--def GC_ORACLE=1` build: collects, then writes the number of allocations so far and the allocation serial numbers of the objects that are still allocated to the file named by the environment variable `VALK_GC_ORACLE`. Does nothing in other builds.
++ fn oracle_checkpoint() void
 // Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
 + fn reset_pause_durations() void
 // Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
@@ -10078,6 +10068,12 @@ Takes the calling thread's GC lock again after `unlock`.
 ### mem_usage
 
 Returns the bytes held by the GC pool blocks of all threads, including free slots.
+
+### oracle_checkpoint
+
+In a `--def GC_ORACLE=1` build: collects, then writes the number of allocations so far and
+the allocation serial numbers of the objects that are still allocated to the file named by
+the environment variable `VALK_GC_ORACLE`. Does nothing in other builds.
 
 ### reset_pause_durations
 
@@ -16793,8 +16789,6 @@ Throws `init` when the thread cannot be started.
 ```js
 // A condition variable that blocks OS threads until another thread calls `signal`.
 + class ThreadSuspendGate {
-    // Returns this same gate, so clones of an object that holds it share it.
-    + fn clone() ThreadSuspendGate
     // Returns a new gate; panics when the OS mutex or condition cannot be created.
     + static fn new() ThreadSuspendGate
     // Wakes one thread blocked in `wait` so it re-checks its condition.
@@ -16809,10 +16803,6 @@ Throws `init` when the thread cannot be started.
 A condition variable that blocks OS threads until another thread calls `signal`.
 
 Waiting releases the thread's GC lock, so other threads can collect meanwhile.
-
-#### clone
-
-Returns this same gate, so clones of an object that holds it share it.
 
 #### new
 

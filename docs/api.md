@@ -819,8 +819,6 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + class Mutex {
     // Waits until the mutex is unlocked, without keeping it locked.
     + fn await_unlock() void
-    // Returns this same mutex, so clones of an object that holds it share it.
-    + fn clone() Mutex
     // Takes the mutex, waiting while it is locked.
     + fn lock() void
     // Creates an unlocked mutex.
@@ -1078,8 +1076,6 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```js
 // A mutex backed by an OS mutex (pthread, or a Win32 mutex object on Windows).
 + class SyncMutex {
-    // Returns this same mutex, so clones of an object that holds it share it.
-    + fn clone() SyncMutex
     // Takes the mutex, blocking the thread until it is free.
     + fn lock() void
     // Creates an unlocked mutex; panics when the OS cannot create one.
@@ -2965,6 +2961,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn lock() void
 // Returns the bytes held by the GC pool blocks of all threads, including free slots.
 + fn mem_usage() uint
+// In a `--def GC_ORACLE=1` build: collects, then writes the number of allocations so far and the allocation serial numbers of the objects that are still allocated to the file named by the environment variable `VALK_GC_ORACLE`. Does nothing in other builds.
++ fn oracle_checkpoint() void
 // Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
 + fn reset_pause_durations() void
 // Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
@@ -4965,8 +4963,6 @@ error ParseError (parse, missing, write) extends (Error) payload { index: uint (
 ```js
 // A condition variable that blocks OS threads until another thread calls `signal`.
 + class ThreadSuspendGate {
-    // Returns this same gate, so clones of an object that holds it share it.
-    + fn clone() ThreadSuspendGate
     // Returns a new gate; panics when the OS mutex or condition cannot be created.
     + static fn new() ThreadSuspendGate
     // Wakes one thread blocked in `wait` so it re-checks its condition.
