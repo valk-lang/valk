@@ -34,6 +34,12 @@ run_error_case() {
 
     if [[ "$file" == "@"* ]]; then
         inputs+=("./tests/compile-errors/${file#@}")
+        # A directory case with a `flags` file (which may be empty) is built through code
+        # generation, with its flags: errors found while lowering, or under a define
+        if [ -f "./tests/compile-errors/${file#@}/flags" ]; then
+            read -r -a flags < "./tests/compile-errors/${file#@}/flags"
+            inputs+=("${flags[@]}" -o "$workdir/$index.bin")
+        fi
     else
         IFS=',' read -r -a source_names <<< "$file"
         for source_name in "${source_names[@]}"; do
