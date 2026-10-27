@@ -3388,6 +3388,12 @@ fn first_byte(text: String) u8 @unsafe {
 
 Use `valk build --ignore-unsafe` to allow them for an entire build.
 
+Memory that holds GC references (an object with reference fields, `Array.items()` of
+objects, a borrow of such a value) is stricter: making a raw pointer or an integer of it
+needs `@unsafe`, and a load or store through such a pointer (`@ptrv`, `p[i]`,
+`mem.copy_bytes` and the other byte calls, a property store) is only allowed in a function
+marked `$gc_primitive`. Read a reference through a raw pointer with `@property_get(p[i])`.
+
 ## Structs
 
 A `struct` is an inline value type. Assignment, argument passing, and returning

@@ -1,0 +1,136 @@
+// The primitive-only rule (Grove C-31): raw reads and writes of memory that holds GC
+// references belong to functions marked `$gc_primitive` (and the collector itself).
+// (i) Deriving a raw view of such memory needs '@unsafe'; (ii) a byte call, a plain
+// '@ptrv' load or store, or a property store through a pointer derived that way (by
+// casts, offsets, pointer arithmetic and local copies) is rejected outside a primitive.
+
+// How a value derives from GC memory
+value RAW_GC_NONE (0)
+// From a GcPtr: the contents are unknown until it is cast to a typed pointer
+value RAW_GC_UNTYPED (1)
+// From memory with GC references
+value RAW_GC_TYPED (2)
+
+fn raw_access_exempt(scope: Scope) bool {
+    let func = scope.func ?! return false
+    if func.is_gc_primitive : return true
+    let ns = func.ns
+    return ns.name == "gc" && ns.pkg.name == "valk"
+}
+
+// Check (i): `what` derives a raw view of memory with GC references
+fn raw_access_require_unsafe(at: Exp, scope: Scope, what: String) !Error {
+    if raw_access_exempt(scope) : return
+    require_unsafe(at, scope, what + " (memory with GC references)") !>
+}
+
+// Check (ii): `pointer` is the address of a raw access
+fn raw_access_check(pointer: Value, scope: Scope, at: Exp, what: String) !Error {
+    if raw_gc_derivation(pointer) == RAW_GC_NONE || raw_access_exempt(scope) : return
+    at.error(what + " through a pointer derived from memory with GC references is only allowed in a $gc_primitive function")
+}
+
+fn type_is_gc_ptr(t: Type) bool {
+    let class = t.get_non_nullable().get_class_or_null() ?! return false
+    return class.name == "GcPtr" && class.ns.name == "gc" && class.ns.pkg.name == "valk"
+}
+
+// What a value of type `t` points at or holds has GC references
+fn type_content_has_refs(t: Type) bool {
+    let nn = t.get_non_nullable()
+    if nn.is_fat_borrow() || nn.kind == TYPE.adr_of || nn.kind == TYPE.ptr_of || nn.kind == TYPE.array {
+        let sub = type_native_sequence_element(nn) ?! return false
+        return sub.has_gc_refs()
+    }
+    if nn.is_gc_type() || nn.is_struct_object() {
+        let class = nn.get_class_or_null() ?! return true
+        each class.props as prop {
+            if prop.type.has_gc_refs() : return true
+        }
+        return false
+    }
+    return nn.has_gc_refs()
+}
+
+// A raw pointer (`*T`, `*[T]`, a struct pointer) to memory with GC references
+fn type_raw_gc_pointer(t: Type) bool {
+    let nn = t.get_non_nullable()
+    if nn.kind != TYPE.ptr_of && !nn.is_struct_object() : return false
+    return type_content_has_refs(nn)
+}
+
+// A borrow of storage with GC references
+fn type_raw_gc_borrow(t: Type) bool {
+    let nn = t.get_non_nullable()
+    if !nn.is_fat_borrow() && nn.kind != TYPE.adr_of : return false
+    return type_content_has_refs(nn)
+}
+
+// A raw pointer or an integer: what a cast of GC memory must not produce outside '@unsafe'
+fn type_is_raw_target(t: Type) bool {
+    let nn = t.get_non_nullable()
+    return nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.is_struct_object() || nn.is_integer_type()
+}
+
+fn raw_gc_cast_source(on: Type, target: Type) uint {
+    if !type_is_raw_target(target) : return RAW_GC_NONE
+    if type_is_gc_ptr(on) : return RAW_GC_UNTYPED
+    if type_content_has_refs(on) : return RAW_GC_TYPED
+    return RAW_GC_NONE
+}
+
+fn raw_gc_derivation(v: Value) uint {
+    let nn = v.rett.get_non_nullable()
+    if type_raw_gc_pointer(nn) || type_raw_gc_borrow(nn) : return RAW_GC_TYPED
+    let t = v.type
+    if t == VAL.decl {
+        let decl = v.decl ?! return RAW_GC_NONE
+        return decl.raw_gc
+    }
+    if t == VAL.cast || t == VAL.wrap {
+        let on = v.value1 ?! return RAW_GC_NONE
+        let base = t == VAL.cast ? raw_gc_cast_source(on.rett, nn) : RAW_GC_NONE
+        if base == RAW_GC_NONE : base = raw_gc_derivation(on)
+        // A GcPtr cast to a pointer at elements without references
+        if base == RAW_GC_UNTYPED && nn.kind == TYPE.ptr_of : return RAW_GC_NONE
+        return base
+    }
+    if t == VAL.ptr_offset {
+        let on = v.value1 ?! return RAW_GC_NONE
+        return raw_gc_derivation(on)
+    }
+    if t == VAL.op {
+        let a = v.value1
+        let b = v.value2
+        let da = isset(a) ? raw_gc_derivation(a) : RAW_GC_NONE
+        let db = isset(b) ? raw_gc_derivation(b) : RAW_GC_NONE
+        return da > db ? da : db
+    }
+    return RAW_GC_NONE
+}
+
+// Byte calls take an untyped pointer: each pointer argument is a raw access
+fn raw_access_check_byte_call(func: Func, args: Array[Value], scope: Scope, at: Exp) !Error {
+    let name = func.name
+    if name != "copy_bytes" && name != "move_bytes" && name != "clear_bytes" : return
+    if func.ns.name != "mem" || func.ns.pkg.name != "valk" : return
+    each args as arg {
+        if arg.rett.is_pointer() : raw_access_check(arg, scope, at, "'mem." + name + "'") !>
+    }
+}
+
+// Evaluates `exp` as the address operand of '@ref' or a '@property_*' intrinsic: not a raw access
+fn raw_access_address(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    while exp.type == EXP.value && exp.value_kind == VALUE_KIND.paren {
+        exp = exp.get(VALUE_EXP.left) ?! break
+    }
+    let b = ctx.build
+    let saved = b.raw_address
+    b.raw_address = exp
+    let v = value_from_exp(exp, scope, ctx) ! {
+        b.raw_address = saved
+        throw E
+    }
+    b.raw_address = saved
+    return v
+}
