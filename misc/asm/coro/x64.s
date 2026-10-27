@@ -89,7 +89,8 @@ jmp Lvalk_gc_collect
 
 # valk_gc_poll_most(): valk_gc_poll for a caller that keeps its values in every general
 # register but r11 across the call (LLVM's preserve_mostcc), so a loop keeps its registers.
-# They are saved where the stack scan sees them, then restored
+# They are saved where the stack scan sees them, then restored. Kind 3 passes the caller's
+# stack pointer as well, for the poll's own depth test
 .global _valk_gc_poll_most
 _valk_gc_poll_most:
 .global valk_gc_poll_most
@@ -102,8 +103,10 @@ pushq %rdi
 pushq %r8
 pushq %r9
 pushq %r10
+leaq 72(%rsp), %rdx
+movl $3, %esi
 subq $8, %rsp
-call Lvalk_gc_poll
+call Lvalk_gc_collect
 addq $8, %rsp
 popq %r10
 popq %r9
@@ -121,7 +124,6 @@ retq
 _valk_gc_poll:
 .global valk_gc_poll
 valk_gc_poll:
-Lvalk_gc_poll:
 movl $2, %esi
 
 Lvalk_gc_collect:
