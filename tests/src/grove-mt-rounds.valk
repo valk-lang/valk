@@ -1,0 +1,376 @@
+@unsafe
+
+#if GROVE_MT
+
+use valk.gc
+use valk.ext
+use valk.sync
+use valk.time
+use valk.thread
+
+// Grove-MT rounds: S is marked from every thread's roots (stacks, X_t, the join scan) and swept
+@ignore_access
+
+class MtList {
+    value: uint (0)
+    next: ?MtList (null)
+}
+
+class MtHolder {
+    list: ?atomic MtList (null)
+}
+
+fn mt_list(n: uint) MtList $noinline {
+    let head = MtList { value: 1 }
+    let i: uint = 2
+    while i <= n {
+        head = MtList { value: i, next: head }
+        i++
+    }
+    return head
+}
+
+fn mt_sum(list: ?atomic MtList) uint $noinline {
+    let sum: uint = 0
+    let n = list
+    while isset(n) {
+        sum += n.value
+        n = n.next
+    }
+    return sum
+}
+
+// Waits until the threads a test started have left the registry (they unregister after their
+// awaiters wake), so later tests count threads from a settled registry
+fn mt_settle(before: uint) {
+    let tries: uint = 0
+    while gc.registered_threads_for_test() > before && tries < 400 {
+        time.sleep_ms(5)
+        tries++
+    }
+}
+
+fn mt_expected(n: uint) uint {
+    return n * (n + 1) / 2
+}
+
+// Stores a published list into the holder; nothing of it stays in the caller's frame
+fn mt_fill(h: MtHolder, n: uint) $noinline {
+    h.list = mt_list(n)
+}
+
+fn mt_holder_sum(h: MtHolder) uint $noinline {
+    return mt_sum(h.list)
+}
+
+fn mt_holder_list(h: MtHolder) uint $noinline {
+    let at: uint = h.list.@cast(?ptr).@cast(uint)
+    return at
+}
+
+// Publishes a list, measures it live after a round and drops it. Returns S's live bytes with it
+fn mt_publish_and_drop(n: uint) uint $noinline {
+    let kept: ?atomic MtList = mt_list(n)
+    gc.collect_shared()
+    let with = gc.shared_live_for_test()
+    assert(mt_sum(kept) == mt_expected(n))
+    kept = null
+    return with
+}
+
+synctest "Grove-MT rounds: a dropped atomic graph is freed by the next round" {
+    gc.collect_shared()
+    let before = gc.shared_live_for_test()
+    let with = mt_publish_and_drop(20000)
+    // 20 000 objects of at least 16 bytes
+    assert(with >= before + 20000 * 16)
+    gc.collect_shared()
+    assert(gc.shared_live_for_test() + 20000 * 16 <= with)
+}
+
+synctest "Grove-MT rounds: a graph named only by an old object survives through X_t" {
+    let h = MtHolder {}
+    gc.collect()
+    mt_fill(h, 1000)
+    // The word is counted at the next local collection
+    gc.collect()
+    let at = mt_holder_list(h)
+    assert(gc.in_shared(at.@cast(ptr)))
+    assert(gc.shared_counted_for_test(at.@cast(ptr)) == 1)
+    gc.collect_shared()
+    gc.collect_shared()
+    assert(gc.shared_allocated_for_test(at.@cast(ptr)))
+    assert(mt_holder_sum(h) == mt_expected(1000))
+    // A store over the counted word is a removal record: the count goes at the next collection
+    h.list = null
+    gc.collect()
+    assert(gc.shared_counted_for_test(at.@cast(ptr)) == 0)
+}
+
+synctest "Grove-MT rounds: a graph named by a young object or a logged card survives through the join scan" {
+    // A young holder
+    let young = MtHolder {}
+    mt_fill(young, 500)
+    gc.collect_shared()
+    assert(mt_holder_sum(young) == mt_expected(500))
+    // An old holder whose card the store logged
+    let old = MtHolder {}
+    gc.collect()
+    mt_fill(old, 10)
+    gc.collect_shared()
+    gc.collect_shared()
+    assert(mt_holder_sum(old) == mt_expected(10))
+    gc.collect()
+    gc.collect_shared()
+    assert(mt_holder_sum(old) == mt_expected(10))
+    assert(mt_holder_sum(young) == mt_expected(500))
+}
+
+shared mt_rounds_stop: uint (0)
+
+synctest "Grove-MT rounds: rounds during a large publication keep the partial copy and its sources" {
+    let threads_before = gc.registered_threads_for_test()
+    atomic_store(mt_rounds_stop, 0)
+    let t = thread.Thread[uint].start(fn() uint {
+        let rounds: uint = 0
+        while atomic_load(mt_rounds_stop) == 0 && rounds < 300 {
+            gc.collect_shared()
+            rounds++
+        }
+        return rounds
+    }) !!
+    let plain = mt_list(100000)
+    let shared: atomic MtList = plain
+    atomic_store(mt_rounds_stop, 1)
+    assert(t.await() > 0)
+    assert(mt_sum(shared) == mt_expected(100000))
+    // The source is intact too
+    let n: ?MtList = plain
+    let sum: uint = 0
+    while isset(n) {
+        sum += n.value
+        n = n.next
+    }
+    assert(sum == mt_expected(100000))
+    mt_settle(threads_before)
+}
+
+fn mt_park_holder(ch: atomic sync.Channel[uint]) uint {
+    let list: atomic MtList = mt_list(2000)
+    let go = ch.recv() !? 0
+    return mt_sum(list) + go
+}
+
+synctest "Grove-MT rounds: a parked coroutine keeps what its stack names" {
+    let ch = sync.Channel[uint].new(1) !!
+    let task = co mt_park_holder(ch)
+    // The coroutine runs until it parks on the channel
+    time.sleep_ms(1)
+    gc.collect_shared()
+    gc.collect()
+    mt_list(5000)
+    gc.collect_shared()
+    ch.send(7) !!
+    assert(await task == mt_expected(2000) + 7)
+}
+
+synctest "Grove-MT rounds: a thread held in a native call keeps what it names" {
+    let threads_before = gc.registered_threads_for_test()
+    let t = thread.Thread[uint].start(fn() uint {
+        let list: atomic MtList = mt_list(3000)
+        let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: 100_000_000 }
+        let rem = ext.libc_timespec { tv_sec: 0, tv_nsec: 0 }
+        ext.nanosleep(@ref(ts), @ref(rem))
+        return mt_sum(list)
+    }) !!
+    time.sleep_ms(30)
+    gc.collect_shared()
+    mt_list(5000)
+    gc.collect_shared()
+    assert(t.await() == mt_expected(3000))
+    mt_settle(threads_before)
+}
+
+synctest "Grove-MT rounds: a thread that drops a shared graph collects before it blocks" {
+    let threads_before = gc.registered_threads_for_test()
+    let t = thread.Thread[uint].start(fn() uint {
+        let h = MtHolder {}
+        gc.collect()
+        mt_fill(h, 100)
+        gc.collect()
+        let at = mt_holder_list(h)
+        let counted = gc.shared_counted_for_test(at.@cast(ptr))
+        h.list = null
+        // The event wait of the sleep collects first (RT5)
+        time.sleep_ms(3)
+        time.sleep_ms(3)
+        return counted * 10 + gc.shared_counted_for_test(at.@cast(ptr))
+    }) !!
+    assert(t.await() == 10)
+    mt_settle(threads_before)
+}
+
+synctest "Grove-MT rounds: a thread that did not collect since the last round collects at its next poll" {
+    gc.collect_shared()
+    gc.collect_shared()
+    let before = gc.gc.collect_count
+    // A loop without calls polls at every 4096th iteration
+    mt_count(10000)
+    assert(gc.gc.collect_count > before)
+}
+
+global mt_counted: uint
+
+fn mt_count(n: uint) $noinline {
+    let i: uint = 0
+    while i < n {
+        mt_counted += i
+        i++
+    }
+}
+
+class MtFinal $atomic {
+    n: uint
+    fn gc_free() {
+    }
+}
+
+fn mt_finalizable(n: uint) $noinline {
+    let i: uint = 0
+    while i < n {
+        MtFinal { n: i }
+        i++
+    }
+}
+
+synctest "Grove-MT rounds: unreachable finalizable shared objects are queued for their finalizer" {
+    let before = gc.shared_finalize_pending_for_test()
+    mt_finalizable(20)
+    gc.collect_shared()
+    gc.collect_shared()
+    assert(gc.shared_finalize_pending_for_test() >= before + 20)
+}
+
+class MtTree {
+    value: uint (0)
+    left: ?MtTree (null)
+    right: ?MtTree (null)
+}
+
+fn mt_stree(depth: uint) MtTree {
+    if depth == 0 : return MtTree { value: 1 }
+    return MtTree { value: 1, left: mt_stree(depth - 1), right: mt_stree(depth - 1) }
+}
+
+fn mt_stree_sum(t: ?atomic MtTree) uint {
+    let n = t ?! return 0
+    return n.value + mt_stree_sum(n.left) + mt_stree_sum(n.right)
+}
+
+shared mt_markers_stop: uint (0)
+
+// A thread that keeps reaching polls: it joins rounds as SAFE and may mark
+fn mt_polling_worker() uint {
+    let loops: uint = 0
+    while atomic_load(mt_markers_stop) == 0 {
+        mt_count(10000)
+        loops++
+    }
+    return loops
+}
+
+synctest "Grove-MT rounds: SAFE threads mark a large shared graph with the initiator" {
+    let threads_before = gc.registered_threads_for_test()
+    atomic_store(mt_markers_stop, 0)
+    let workers = Array[thread.Thread[uint]]{}
+    let i: uint = 0
+    while i < 3 {
+        workers.append(thread.Thread[uint].start(fn() uint { return mt_polling_worker() }) !!)
+        i++
+    }
+    // 2^18 - 1 objects of 32 bytes: L_S above 4 MiB
+    let tree: atomic MtTree = mt_stree(17)
+    gc.collect_shared()
+    let one = gc.shared_live_for_test()
+    assert(one >= 4 * 1024 * 1024)
+    gc.collect_shared()
+    let several = gc.shared_live_for_test()
+    // The same marked set; D10 checked every marked object's targets
+    assert(several == one)
+    if ext.sysconf(84) > 1 : assert(gc.round_markers > 1)
+    atomic_store(mt_markers_stop, 1)
+    each workers as w : w.await()
+    assert(mt_stree_sum(tree) == (1 << 18) - 1)
+    mt_settle(threads_before)
+}
+
+synctest "Grove-MT rounds: a thread whose native call returns during a round waits for the release" {
+    let threads_before = gc.registered_threads_for_test()
+    let tree: atomic MtTree = mt_stree(16)
+    let t = thread.Thread[uint].start(fn() uint {
+        let list: atomic MtList = mt_list(2000)
+        let i: uint = 0
+        while i < 50 {
+            let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: 1_000_000 }
+            let rem = ext.libc_timespec { tv_sec: 0, tv_nsec: 0 }
+            ext.nanosleep(@ref(ts), @ref(rem))
+            i++
+        }
+        return mt_sum(list)
+    }) !!
+    let rounds: uint = 0
+    while rounds < 20 {
+        gc.collect_shared()
+        rounds++
+    }
+    assert(t.await() == mt_expected(2000))
+    assert(mt_stree_sum(tree) == (1 << 17) - 1)
+    mt_settle(threads_before)
+}
+
+class MtChain $atomic {
+    next: ?MtChain (null)
+    fn gc_free() {
+    }
+}
+
+fn mt_chain(n: uint) $noinline {
+    let head: ?MtChain = null
+    let i: uint = 0
+    while i < n {
+        head = MtChain { next: head }
+        i++
+    }
+}
+
+synctest "Grove-MT rounds: a chain of finalizable shared objects is queued in one round" {
+    gc.collect_shared()
+    let before = gc.shared_finalize_pending_for_test()
+    mt_chain(100)
+    gc.collect_shared()
+    assert(gc.shared_finalize_pending_for_test() >= before + 100)
+}
+
+synctest "Grove-MT rounds: a thread held in its event wait is rung to mark" {
+    let threads_before = gc.registered_threads_for_test()
+    gc.round_thresholds_for_test(0, 0)
+    let before = gc.rung_markers_for_test()
+    let t = thread.Thread[uint].start(fn() uint {
+        let list: atomic MtList = mt_list(1000)
+        // The event wait of the sleep: held by a round, then rung
+        time.sleep_ms(200)
+        return mt_sum(list)
+    }) !!
+    time.sleep_ms(50)
+    let rounds: uint = 0
+    while rounds < 5 && gc.rung_markers_for_test() == before {
+        gc.collect_shared()
+        rounds++
+    }
+    assert(gc.rung_markers_for_test() > before)
+    assert(t.await() == mt_expected(1000))
+    gc.round_thresholds_for_test(4 * 1024 * 1024, 64 * 1024 * 1024)
+    mt_settle(threads_before)
+}
+
+#end
