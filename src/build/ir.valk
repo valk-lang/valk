@@ -359,6 +359,12 @@ class IRFunc {
     loops: Array[IRLoop] (.{})
     // Calls emitted so far that count for a loop's poll (see ir_emit_while)
     calls: uint (0)
+    // Z3 (C-18): every call emitted so far; the count after the last `@uninit` allocation
+    // (`fresh`) and the `@init` stores emitted
+    safepoints: uint (0)
+    fresh: bool (false)
+    fresh_mark: uint (0)
+    init_stores: uint (0)
     cleanup_active: bool (false)
     // Release calls of the lock blocks the emitter is currently inside
     active_locks: Array[Value] (.{})
@@ -1536,6 +1542,8 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     let latch = polls && ir.func.ns.build.grove_mode()
     let latch_block = latch ? ir.block("while.latch") : cond_block
     let calls = ir.calls
+    let safepoints = ir.safepoints
+    let inits = ir.init_stores
     ir.jump(cond_block)
 
     ir.label(cond_block)
@@ -1556,6 +1564,10 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
             ir.label(latch_block)
             if ir.calls > calls : ir_emit_poll(ir) !>
             ir.jump(cond_block)
+        }
+        // Z3: the next iteration's `@init` would follow this iteration's call
+        if ir.init_stores > inits && ir.safepoints > safepoints {
+            value.error("A loop with an '@init' store cannot make a call, allocate or store through a barrier")
         }
     }
     ir.loops.pop_last() ! value.bug("IR loop stack is empty")
@@ -1626,6 +1638,21 @@ fn ir_emit_arith_update(ir: IRFunc, old: String, operand: String, op: VALUE_OP, 
 }
 
 fn ir_emit_assign(ir: IRFunc, value: Value) !Error {
+    ir_emit_assign_store(ir, value) !>
+    let meta = value.meta
+    if isset(meta) && meta.init_store : ir_check_init_store(ir, value) !>
+}
+
+// Z3 (C-18): an `@init` store follows its `@uninit` storage's allocation with no call (an
+// allocation, a barrier, a poll) in between; its loops are checked when they end
+fn ir_check_init_store(ir: IRFunc, value: Value) !Error {
+    if !ir.fresh || ir.safepoints != ir.fresh_mark {
+        value.error("'@init' must follow its '@uninit' storage with no call, allocation or barriered store in between")
+    }
+    ir.init_stores++
+}
+
+fn ir_emit_assign_store(ir: IRFunc, value: Value) !Error {
     let left = value.value1
     let right = value.value2
     if !isset(left) || !isset(right) : value.bug("IR assignment is missing an operand")
@@ -1894,6 +1921,7 @@ fn ir_open_call(ir: IRFunc, name: String, rett: String) {
     }
     ir.write("call ")
     ir.write(rett)
+    ir.safepoints++
 }
 
 fn ir_close_call(ir: IRFunc, target: String, mark: uint) {
@@ -3397,7 +3425,9 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let total = ir_emit_binary_index(ir, "add", "i64", bytes, header)
 
     if ir.func.ns.build.grove_mode() {
-        let slot = ir_emit_grove_seq_alloc(ir, value, class, total, true) !>
+        let meta = value.meta
+        let zero = !isset(meta) || !meta.uninit_storage
+        let slot = ir_emit_grove_seq_alloc(ir, value, class, total, zero) !>
         ir_emit_store(ir, "i64", length, slot)
         return slot
     }
@@ -3466,6 +3496,11 @@ fn ir_emit_slice_init_into(
         }
     }
     let allocated = ir_emit_slice_alloc(ir, value, class, fields, field_mark) !>
+    let meta = value.meta
+    if isset(meta) && meta.uninit_storage {
+        ir.fresh = true
+        ir.fresh_mark = ir.safepoints
+    }
     ir_emit_store(ir, "ptr", allocated, address)
     let data_prop = class.get_prop_by_name("data") ! value.bug("Slice descriptor has no data property")
     let data = ir_offset_address(ir, allocated, (class.slice_data_offset() !>).to(uint))
@@ -3536,8 +3571,15 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         slot = ir.var()
         ir_name_alloca(ir, slot, lowered)
     }
+    // C-17: a Grove object is not zeroed; its constructor writes every word but padding
+    let zeroed = size > 0
     if size > 0 && class.kind != CLASS_KIND.slice {
-        ir_emit_zero(ir, slot, size.to(uint))
+        if lowered == "ptr" && isset(value.get_allocator()) && ir.func.ns.build.grove_mode() {
+            ir_emit_zero_unwritten(ir, class, fields, slot) !>
+            zeroed = false
+        } else {
+            ir_emit_zero(ir, slot, size.to(uint))
+        }
     }
 
     if isset(fields) {
@@ -3547,7 +3589,7 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
             let start = starts.get(i) !? field_mark + i
             let address = ir_prop_address(ir, slot, prop)
             if field.type == VAL.array_init && ir_field_inits_in_place(field) {
-                ir_emit_array_store(ir, field, ir.field_values, start, address, size > 0) !>
+                ir_emit_array_store(ir, field, ir.field_values, start, address, zeroed) !>
                 continue
             }
             let field_value = ir.field_values.get(start) !? "undef"
@@ -3563,6 +3605,38 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         return ir_build_tagged_nullable(ir, value.rett, out) !>
     }
     return out
+}
+
+// Zeroes what a constructor's fields leave unwritten: every property without a field
+// (`zero_default` ones such as `Array.data`, `@undefined` ones) and the bytes before the first
+// property (a closure environment's header). Padding stays as the slot held it
+fn ir_emit_zero_unwritten(ir: IRFunc, class: Class, fields: ?Array[Value], slot: String) !Error {
+    let written = Array[Prop]{}
+    if isset(fields) {
+        each fields as field {
+            let prop = field.get_init_prop()
+            if isset(prop) : written.append(prop)
+        }
+    }
+    let total = class.compute_body_size() !>
+    let first: u32 = total
+    let start: u32 = 0
+    let end: u32 = 0
+    each class.props as prop {
+        if prop.offset < first : first = prop.offset
+        if written.contains(prop) : continue
+        let size = prop.type.byte_size() !>
+        if size == 0 : continue
+        if end > start && prop.offset == end {
+            end += size
+            continue
+        }
+        if end > start : ir_emit_zero(ir, ir_offset_address(ir, slot, start.to(uint)), (end - start).to(uint))
+        start = prop.offset
+        end = prop.offset + size
+    }
+    if end > start : ir_emit_zero(ir, ir_offset_address(ir, slot, start.to(uint)), (end - start).to(uint))
+    if first > 0 : ir_emit_zero(ir, slot, first.to(uint))
 }
 
 fn ir_collect_inline_init_fields(value: Value, offset: u32, fields: Array[Value], offsets: Array[u32]) !Error {
