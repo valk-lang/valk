@@ -97,15 +97,52 @@ struct FreeRun {
 // Set in heap_init only: the program assigns global initial values after the gc started
 @shared heap_size: uint         // R: bytes reserved
 @shared heap_top: uint          // bytes of the chunks taken
-@shared heap_used: uint         // bytes of the blocks and large objects
 @shared shadow_top: uint        // bytes of the shadow committed
 @shared page_table: ptr         // ?*Desc per page
 @shared chunk_states: ptr       // u8 per chunk
+@shared thp_madvise: u8         // 0 unknown, 1 madvise huge pages, 2 leave them to the kernel
+#if GROVE_MT
+// Each thread heap has its own free pages, descriptors and usage (RT1)
+global heap_used: uint
+global free_runs: *Bump (@undefined)
+global descs_free: ?*Desc
+global descs_slab: ptr
+global descs_slab_left: uint
+// The descriptor slabs, freed at the thread's end
+global descs_slabs: ?*Bump
+#else
+@shared heap_used: uint         // bytes of the blocks and large objects
 @shared free_runs: *Bump (@undefined) // FreeRun records, ordered by address
 @shared descs_free: ?*Desc
 @shared descs_slab: ptr
 @shared descs_slab_left: uint
-@shared thp_madvise: u8         // 0 unknown, 1 madvise huge pages, 2 leave them to the kernel
+#end
+
+#if GROVE_MT
+// Grove-MT (RT1): the reservation is owned in 64 KiB granules. The pool, under pool_lock, takes
+// chunks at the frontier and hands out runs of granules; OWNER names the thread of each granule,
+// and only the pool writes it. A thread heap's free page runs cover its own granules only
+value GRANULE_SHIFT (16)
+value GRANULE_SIZE (65536)
+value GRANULE_PAGES (16)
+value CHUNK_GRANULES (32)
+// RT10: free granules the pool keeps with their pages; the rest go back to the OS
+value POOL_RETAIN (64)
+
+@shared pool_lock: uint
+// FreeRun records in granules
+@shared pool_runs: *Bump (@undefined)
+// Granules in the pool whose pages were not given back to the OS
+@shared pool_kept: uint
+// u32 per granule: the number of the thread that owns it, 0 while the pool holds it
+@shared owner_table: ptr
+// u8 per granule: the owner's collections that found it wholly free, in a row
+@shared granule_idle: ptr
+// Bytes of the blocks and large objects of every thread heap
+@shared heap_used_all: uint
+// The running thread's number: what OWNER holds for its granules
+global heap_tid: uint
+#end
 
 fn heap_init() {
     let size: uint = HEAP_MAX
@@ -124,9 +161,15 @@ fn heap_init() {
     if address == (~0).to(uint) : heap_fail()
     page_table = table
     chunk_states = ext.calloc(size >> CHUNK_SHIFT, 1)
+    #if GROVE_MT
+    owner_table = ext.calloc(size >> GRANULE_SHIFT, 4)
+    granule_idle = ext.calloc(size >> GRANULE_SHIFT, 1)
+    pool_runs = Bump.new(64 * size_of(FreeRun))
+    #else
     free_runs = Bump.new(64 * size_of(FreeRun))
-    heap_size = size
     epoch = 1
+    #end
+    heap_size = size
     // The shadow of the first 16 MiB of heap keeps 4 KiB pages
     ext.madvise((HEAP_BASE >> 3).@cast(ptr), CHUNK_SIZE, MADV_NOHUGEPAGE)
 }
@@ -187,8 +230,170 @@ fn heap_take_chunks(count: uint) {
     }
     let first_page = heap_top >> PAGE_SHIFT
     heap_top += size
-    free_insert(first_page, count * CHUNK_PAGES, true)
+    #if GROVE_MT
+    free_insert(pool_runs, first_page / GRANULE_PAGES, count * CHUNK_GRANULES, true)
+    #else
+    free_insert(free_runs, first_page, count * CHUNK_PAGES, true)
+    #end
 }
+
+#if GROVE_MT
+// A thread heap: its own free pages and epochs; the main heap's are set up the same way
+fn heap_thread_init(tid: uint) {
+    heap_tid = tid
+    free_runs = Bump.new(64 * size_of(FreeRun))
+    descs_slabs = Bump.new(16 * size_of(ptr))
+    epoch = 1
+}
+
+fn pool_lock_take() $inline {
+    while atomic(pool_lock | 1) != 0 {
+        while atomic_load(pool_lock) != 0 : ext.sched_yield()
+    }
+}
+
+fn pool_lock_drop() $inline {
+    atomic(pool_lock & 0)
+}
+
+fn owner_of(granule: uint) uint $inline {
+    return @ptrv(owner_table, u32, granule).to(uint)
+}
+
+// RT1: `count` contiguous granules from the pool, owned by this thread from here on; their
+// pages join the thread's free runs, pre-zeroed only if the pool had them zeroed
+fn heap_take_granules(count: uint) {
+    pool_lock_take()
+    let g, zeroed = free_take(pool_runs, count)
+    if g == (~0).to(uint) {
+        heap_take_chunks((count + CHUNK_GRANULES - 1) / CHUNK_GRANULES)
+        let again, again_zeroed = free_take(pool_runs, count)
+        if again == (~0).to(uint) : panic("Grove: no free granules after taking chunks (bug)")
+        g = again
+        zeroed = again_zeroed
+    }
+    let i: uint = 0
+    while i < count {
+        #if GC_DEBUG
+        if owner_of(g + i) != 0 : panic("GC error: the pool handed out a granule that has an owner")
+        #end
+        @ptrv(owner_table, u32, g + i) = heap_tid.to(u32)
+        @ptrv(granule_idle, u8, g + i) = 0
+        i++
+    }
+    if !zeroed : pool_kept = pool_kept > count ? pool_kept - count : 0
+    pool_lock_drop()
+    free_insert(free_runs, g * GRANULE_PAGES, count * GRANULE_PAGES, zeroed)
+}
+
+// RT10: a granule the thread no longer uses goes back to the pool. Its pages are free: their
+// shadow is zero and their cards are clean. The pool keeps POOL_RETAIN granules with their
+// pages; the others go back to the OS and are zero when taken again
+fn heap_give_granule(g: uint, to_os: bool) {
+    let at = HEAP_BASE + g * GRANULE_SIZE
+    // Page-table entries of free pages are null already, but a thread's end leaves them set
+    mem.clear_bytes(page_table + g * GRANULE_PAGES * size_of(ptr), GRANULE_PAGES * size_of(ptr))
+    let zeroed = to_os || atomic_load(pool_kept) >= POOL_RETAIN
+    if zeroed {
+        ext.madvise(at.@cast(ptr), GRANULE_SIZE, MADV_DONTNEED)
+        ext.madvise((at >> 3).@cast(ptr), GRANULE_SIZE >> 3, MADV_DONTNEED)
+    }
+    pool_lock_take()
+    #if GC_DEBUG
+    if owner_of(g) != heap_tid : panic("GC error: a thread gave back a granule it does not own")
+    #end
+    @ptrv(owner_table, u32, g) = 0
+    if !zeroed : pool_kept++
+    free_insert(pool_runs, g, 1, zeroed)
+    pool_lock_drop()
+}
+
+// After a collection: each granule that lay wholly in free pages for 2 collections in a row
+// leaves the thread's free runs for the pool
+fn heap_return_granules() {
+    let count = free_count(free_runs)
+    let back = Bump.new(16 * size_of(uint))
+    let i: uint = 0
+    while i < count {
+        let run = free_run(free_runs, i)
+        i++
+        let g = (run.start + GRANULE_PAGES - 1) / GRANULE_PAGES
+        let last = (run.start + run.pages) / GRANULE_PAGES
+        while g < last {
+            let idle = @ptrv(granule_idle, u8, g).to(uint)
+            if idle < 3 : idle++
+            @ptrv(granule_idle, u8, g) = idle.to(u8)
+            if idle >= 2 : back.add_ptr(g.@cast(ptr))
+            g++
+        }
+    }
+    let adr = back.data
+    let end = adr + back.index
+    while adr < end {
+        let g = @ptrv(adr, uint)
+        adr += size_of(ptr)
+        free_cut(free_runs, g * GRANULE_PAGES, GRANULE_PAGES)
+        #if GC_DEBUG
+        // OWNER audit: a granule changes owner only while it holds no object
+        let page: uint = 0
+        while page < GRANULE_PAGES {
+            if isset(@ptrv(page_table, ?ptr, g * GRANULE_PAGES + page)) : panic("GC error: a granule that holds a block went back to the pool")
+            page++
+        }
+        #end
+        heap_give_granule(g, false)
+    }
+    back.free()
+}
+
+// Takes the pages [start, start + pages) out of the free run that holds them
+fn free_cut(runs: *Bump, start: uint, pages: uint) {
+    let count = free_count(runs)
+    let i: uint = 0
+    while i < count && free_run(runs, i).start + free_run(runs, i).pages <= start : i++
+    if i >= count || free_run(runs, i).start > start : panic("GC error: a returned granule is not in a free run")
+    let run = free_run(runs, i)
+    let run_start = run.start
+    let run_end = run.start + run.pages
+    let zeroed = run.zeroed
+    if start + pages > run_end : panic("GC error: a returned granule is not in one free run")
+    free_remove(runs, i, 1)
+    if run_start < start {
+        free_insert_at(runs, i, run_start, start - run_start, zeroed)
+        i++
+    }
+    if start + pages < run_end : free_insert_at(runs, i, start + pages, run_end - start - pages, zeroed)
+}
+
+// RT9 step 11: every granule of the ended thread's heap goes back to the pool, its pages, shadow
+// and cards cleared, so the next owner finds pre-zeroed memory and no stale entry
+fn heap_thread_end() {
+    let top = heap_top >> GRANULE_SHIFT
+    let g: uint = 0
+    while g < top {
+        if owner_of(g) == heap_tid {
+            let at = HEAP_BASE + g * GRANULE_SIZE
+            mem.clear_bytes(card_of(at), GRANULE_SIZE >> CARD_SHIFT)
+            heap_give_granule(g, true)
+        }
+        g++
+    }
+    free_runs.free()
+    let slabs = descs_slabs
+    if isset(slabs) {
+        let adr = slabs.data
+        let end = adr + slabs.index
+        while adr < end {
+            mem.free(@ptrv(adr, ptr))
+            adr += size_of(ptr)
+        }
+        slabs.free()
+        descs_slabs = null
+    }
+    atomic(heap_used_all - heap_used)
+    heap_used = 0
+}
+#end
 
 // The shadow is committed in 2 MiB steps (16 MiB of heap), so beyond the first step, whose
 // pages stay small, it can have huge pages
@@ -234,14 +439,28 @@ fn thp_setting_has(path: String, word: String) bool {
 
 // Takes `pages` free pages, the lowest that fit, and whether they are zero
 fn heap_carve(pages: uint) (ptr, bool) {
-    let start, zeroed = free_take(pages)
+    let start, zeroed = free_take(free_runs, pages)
     if start == (~0).to(uint) {
+        #if GROVE_MT
+        heap_take_granules((pages + GRANULE_PAGES - 1) / GRANULE_PAGES)
+        #else
         heap_take_chunks((pages + CHUNK_PAGES - 1) / CHUNK_PAGES)
-        let again, again_zeroed = free_take(pages)
+        #end
+        let again, again_zeroed = free_take(free_runs, pages)
         if again == (~0).to(uint) : panic("Grove: no free pages after taking chunks (bug)")
         start = again
         zeroed = again_zeroed
     }
+    #if GROVE_MT
+    // The granules are in use again
+    let g = start / GRANULE_PAGES
+    let g_last = (start + pages - 1) / GRANULE_PAGES
+    while g <= g_last {
+        @ptrv(granule_idle, u8, g) = 0
+        g++
+    }
+    atomic(heap_used_all + pages * PAGE_SIZE)
+    #else
     // The chunks are in use again
     let chunk = start >> (CHUNK_SHIFT - PAGE_SHIFT)
     let last = (start + pages - 1) >> (CHUNK_SHIFT - PAGE_SHIFT)
@@ -249,6 +468,7 @@ fn heap_carve(pages: uint) (ptr, bool) {
         @ptrv(chunk_states, u8, chunk) = 0
         chunk++
     }
+    #end
     heap_used += pages * PAGE_SIZE
     return ((HEAP_BASE + start * PAGE_SIZE).@cast(ptr), zeroed)
 }
@@ -275,6 +495,9 @@ fn heap_release(desc: *Desc) {
         page++
     }
     heap_used -= pages * PAGE_SIZE
+    #if GROVE_MT
+    atomic(heap_used_all - pages * PAGE_SIZE)
+    #end
     #if GC_DEBUG
     // Free pages have a zero shadow
     let sh: ptr = (a >> 3).@cast(ptr)
@@ -291,13 +514,17 @@ fn heap_release(desc: *Desc) {
         i += 8
     }
     #end
-    free_insert(start, pages, false)
+    free_insert(free_runs, start, pages, false)
     desc.next = descs_free
     descs_free = desc
 }
 
 fn heap_note_usage() {
+    #if GROVE_MT
+    let used = heap_used_all
+    #else
     let used = heap_used
+    #end
     mem_usage_shared = used
     if used > mem_usage_peak : mem_usage_peak = used
     gc.mem_usage_thread = used
@@ -313,6 +540,10 @@ fn desc_new() *Desc {
     if descs_slab_left == 0 {
         descs_slab = mem.calloc(64 * size_of(Desc))
         descs_slab_left = 64
+        #if GROVE_MT
+        let slabs = descs_slabs
+        if isset(slabs) : slabs.add_ptr(descs_slab)
+        #end
     }
     let slot: *Desc = descs_slab
     descs_slab += size_of(Desc)
@@ -324,87 +555,89 @@ fn desc_new() *Desc {
 // Free page runs
 //////////////////////////
 
-fn free_count() uint $inline {
-    return free_runs.index / size_of(FreeRun)
+// A list of free runs (FreeRun records, ordered by start): a heap's free pages, or Grove-MT's
+// pool of free granules, in units of granules
+fn free_count(runs: *Bump) uint $inline {
+    return runs.index / size_of(FreeRun)
 }
 
-fn free_run(i: uint) *FreeRun $inline {
-    return free_runs.data + i * size_of(FreeRun)
+fn free_run(runs: *Bump, i: uint) *FreeRun $inline {
+    return runs.data + i * size_of(FreeRun)
 }
 
-fn free_insert_at(i: uint, start: uint, pages: uint, zeroed: bool) {
-    let count = free_count()
-    free_runs.get(size_of(FreeRun))
-    if i < count : mem.move_bytes(free_run(i), free_run(i + 1), (count - i) * size_of(FreeRun))
-    @ptrv(free_run(i), FreeRun) = FreeRun { start: start, pages: pages, zeroed: zeroed }
+fn free_insert_at(runs: *Bump, i: uint, start: uint, pages: uint, zeroed: bool) {
+    let count = free_count(runs)
+    runs.get(size_of(FreeRun))
+    if i < count : mem.move_bytes(free_run(runs, i), free_run(runs, i + 1), (count - i) * size_of(FreeRun))
+    @ptrv(free_run(runs, i), FreeRun) = FreeRun { start: start, pages: pages, zeroed: zeroed }
 }
 
-fn free_remove(i: uint, n: uint) {
-    let count = free_count()
-    if i + n < count : mem.move_bytes(free_run(i + n), free_run(i), (count - i - n) * size_of(FreeRun))
-    free_runs.index -= n * size_of(FreeRun)
+fn free_remove(runs: *Bump, i: uint, n: uint) {
+    let count = free_count(runs)
+    if i + n < count : mem.move_bytes(free_run(runs, i + n), free_run(runs, i), (count - i - n) * size_of(FreeRun))
+    runs.index -= n * size_of(FreeRun)
 }
 
 // Adds a run, merged with touching free neighbours whose zero flag is the same
-fn free_insert(start: uint, pages: uint, zeroed: bool) {
-    let count = free_count()
+fn free_insert(runs: *Bump, start: uint, pages: uint, zeroed: bool) {
+    let count = free_count(runs)
     let lo: uint = 0
     let hi = count
     while lo < hi {
         let mid = (lo + hi) / 2
-        if free_run(mid).start < start : lo = mid + 1
+        if free_run(runs, mid).start < start : lo = mid + 1
         else : hi = mid
     }
     let i = lo
     #if GC_DEBUG
-    if i > 0 && free_run(i - 1).start + free_run(i - 1).pages > start : panic("GC error: freed pages overlap a free run")
-    if i < count && start + pages > free_run(i).start : panic("GC error: freed pages overlap a free run")
+    if i > 0 && free_run(runs, i - 1).start + free_run(runs, i - 1).pages > start : panic("GC error: freed pages overlap a free run")
+    if i < count && start + pages > free_run(runs, i).start : panic("GC error: freed pages overlap a free run")
     #end
-    free_insert_at(i, start, pages, zeroed)
-    free_coalesce(i)
+    free_insert_at(runs, i, start, pages, zeroed)
+    free_coalesce(runs, i)
 }
 
 // Merges run i with touching neighbours whose zero flag is the same
-fn free_coalesce(i: uint) {
-    let run = free_run(i)
-    if i + 1 < free_count() {
-        let next = free_run(i + 1)
+fn free_coalesce(runs: *Bump, i: uint) {
+    let run = free_run(runs, i)
+    if i + 1 < free_count(runs) {
+        let next = free_run(runs, i + 1)
         if run.start + run.pages == next.start && run.zeroed == next.zeroed {
             run.pages += next.pages
-            free_remove(i + 1, 1)
+            free_remove(runs, i + 1, 1)
         }
     }
     if i > 0 {
-        let prev = free_run(i - 1)
+        let prev = free_run(runs, i - 1)
         if prev.start + prev.pages == run.start && prev.zeroed == run.zeroed {
             prev.pages += run.pages
-            free_remove(i, 1)
+            free_remove(runs, i, 1)
         }
     }
 }
 
 // First fit by address. Runs that touch (split by a returned chunk) are taken together.
 // Returns the first page, or ~0 when nothing fits
-fn free_take(pages: uint) (uint, bool) {
-    let count = free_count()
+fn free_take(runs: *Bump, pages: uint) (uint, bool) {
+    let count = free_count(runs)
     let i: uint = 0
     while i < count {
-        let span = free_run(i).pages
+        let span = free_run(runs, i).pages
         let j = i
-        while span < pages && j + 1 < count && free_run(j).start + free_run(j).pages == free_run(j + 1).start {
+        while span < pages && j + 1 < count && free_run(runs, j).start + free_run(runs, j).pages == free_run(runs, j + 1).start {
             j++
-            span += free_run(j).pages
+            span += free_run(runs, j).pages
         }
         if span < pages {
             i = j + 1
             continue
         }
-        let start = free_run(i).start
+        let start = free_run(runs, i).start
         let zeroed = true
         let left = pages
         let k = i
         while left > 0 {
-            let run = free_run(k)
+            let run = free_run(runs, k)
             zeroed = zeroed && run.zeroed
             if run.pages <= left {
                 left -= run.pages
@@ -415,7 +648,7 @@ fn free_take(pages: uint) (uint, bool) {
                 left = 0
             }
         }
-        if k > i : free_remove(i, k - i)
+        if k > i : free_remove(runs, i, k - i)
         return (start, zeroed)
     }
     return ((~0).to(uint), false)
@@ -429,15 +662,15 @@ fn free_take(pages: uint) (uint, bool) {
 // the OS, with its shadow, once more than `retain` bytes of free chunks are kept
 fn heap_return_idle(retain: uint) {
     let chunks = heap_top >> CHUNK_SHIFT
-    let count = free_count()
+    let count = free_count(free_runs)
     let i: uint = 0
     while i < count {
         // Touching runs (their zero flags differ) are one span of free pages
-        let start = free_run(i).start
-        let end = start + free_run(i).pages
+        let start = free_run(free_runs, i).start
+        let end = start + free_run(free_runs, i).pages
         i++
-        while i < count && free_run(i).start == end {
-            end += free_run(i).pages
+        while i < count && free_run(free_runs, i).start == end {
+            end += free_run(free_runs, i).pages
             i++
         }
         let chunk = (start + CHUNK_PAGES - 1) / CHUNK_PAGES
@@ -481,24 +714,24 @@ fn heap_return_chunk(chunk: uint) {
     // The chunk becomes one pre-zeroed run; the runs it cuts keep their flags outside it
     let start = chunk * CHUNK_PAGES
     let end = start + CHUNK_PAGES
-    let count = free_count()
+    let count = free_count(free_runs)
     let i: uint = 0
-    while i < count && free_run(i).start + free_run(i).pages <= start : i++
+    while i < count && free_run(free_runs, i).start + free_run(free_runs, i).pages <= start : i++
     let k = i
-    while k < count && free_run(k).start + free_run(k).pages < end : k++
-    if k >= count || free_run(i).start > start : panic("GC error: a returned chunk is not in a free run")
-    let head_start = free_run(i).start
-    let head_zeroed = free_run(i).zeroed
-    let tail_end = free_run(k).start + free_run(k).pages
-    let tail_zeroed = free_run(k).zeroed
-    free_remove(i, k - i + 1)
+    while k < count && free_run(free_runs, k).start + free_run(free_runs, k).pages < end : k++
+    if k >= count || free_run(free_runs, i).start > start : panic("GC error: a returned chunk is not in a free run")
+    let head_start = free_run(free_runs, i).start
+    let head_zeroed = free_run(free_runs, i).zeroed
+    let tail_end = free_run(free_runs, k).start + free_run(free_runs, k).pages
+    let tail_zeroed = free_run(free_runs, k).zeroed
+    free_remove(free_runs, i, k - i + 1)
     if head_start < start {
-        free_insert_at(i, head_start, start - head_start, head_zeroed)
+        free_insert_at(free_runs, i, head_start, start - head_start, head_zeroed)
         i++
     }
-    free_insert_at(i, start, CHUNK_PAGES, true)
-    if end < tail_end : free_insert_at(i + 1, end, tail_end - end, tail_zeroed)
-    free_coalesce(i)
+    free_insert_at(free_runs, i, start, CHUNK_PAGES, true)
+    if end < tail_end : free_insert_at(free_runs, i + 1, end, tail_end - end, tail_zeroed)
+    free_coalesce(free_runs, i)
 }
 
 // The shadow of a free chunk is zero. The first shadow step has small pages and goes back
@@ -550,7 +783,11 @@ fn chunk_gone(chunk: uint) bool {
 }
 
 // The current epoch: one per collection, starting at 1 (a new descriptor has epoch 0)
+#if GROVE_MT
+global epoch: uint
+#else
 @shared epoch: uint
+#end
 
 // Whether a slot is young: allocated in this epoch, inside its block's window. `hi` is the
 // window's end (a current block's cursor)
@@ -578,16 +815,16 @@ fn heap_check(touched: *Bump) {
         adr += size_of(ptr)
         desc_check(desc)
     }
-    let count = free_count()
+    let count = free_count(free_runs)
     let i: uint = 0
     while i < count {
-        let run = free_run(i)
+        let run = free_run(free_runs, i)
         if run.pages == 0 : panic("GC error: an empty free page run")
         if @ptrv(page_table, ?ptr, run.start) != null || @ptrv(page_table, ?ptr, run.start + run.pages - 1) != null {
             panic("GC error: a free page run is named by the page table")
         }
         if i + 1 < count {
-            let next = free_run(i + 1)
+            let next = free_run(free_runs, i + 1)
             if run.start + run.pages > next.start : panic("GC error: free page runs overlap")
             if run.start + run.pages == next.start && run.zeroed == next.zeroed : panic("GC error: free page runs are not coalesced")
         }
@@ -610,6 +847,20 @@ fn desc_check(desc: *Desc) {
 #if TEST
 /// Test helper: bytes of the chunks whose pages are all free and that are not returned.
 + fn free_chunks_kept_for_test() uint {
+    #if GROVE_MT
+    // The thread's granules that lie wholly in its free pages
+    let bytes: uint = 0
+    let count = free_count(free_runs)
+    let i: uint = 0
+    while i < count {
+        let run = free_run(free_runs, i)
+        i++
+        let g = (run.start + GRANULE_PAGES - 1) / GRANULE_PAGES
+        let last = (run.start + run.pages) / GRANULE_PAGES
+        if last > g : bytes += (last - g) * GRANULE_SIZE
+    }
+    return bytes
+    #end
     let kept: uint = 0
     let chunks = heap_top >> CHUNK_SHIFT
     let chunk: uint = 0

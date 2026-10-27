@@ -6,17 +6,124 @@ use ext
 use mem
 use coro
 
+#if GROVE_MT
+// Grove-MT: every thread owns a Grove heap (RT1). The main thread also sets up the reservation,
+// the shared heap and the fork handler
+fn thread_init(is_main: bool (false), stack_top: ?ptr (null)) {
+    @unsafe
+    if is_main {
+        heap_init()
+        s_init()
+        ext.valk_gc_set_entry(Gc.collect_native.@cast(ptr))
+        ext.valk_gc_set_leave_slow(native_leave_slow.@cast(ptr))
+        ext.pthread_atfork(null, null, fork_child.@cast(ptr))
+        #if GC_DEBUG
+        verify = true
+        #else
+        verify = false
+        #end
+    }
+    spin_take(@ref(reg_lock))
+    let tid = tid_take()
+    spin_drop(@ref(reg_lock))
+    heap_thread_init(tid)
+    pools_init()
+    @INIT_ALLOCATORS
+    gc = Gc.init()
+    let stack_low, block_top = thread_stack_bounds()
+    // A new thread's stack block also holds its TLS, whose pools name heap slots: the scan
+    // stops at the frame of the thread's entry
+    gc.stack_top = stack_top ?? block_top
+    coro.stack_guard_init(is_main, stack_low)
+    let c = ctl_new(tid, is_main)
+    ctl = c
+    thread_register(c)
+}
+
+// RT9 steps 8-11, after the thread's last Valk code that uses its objects: the heap's
+// finalizers, the S buffers, unregistration in NAT, then the heap's memory and the number
+fn thread_stop() {
+    @unsafe
+    let c = ctl ?! panic("GC error: a thread ends without a control block")
+    finalize_heap()
+    s_retire_buffers()
+    thread_unregister(c)
+    heap_thread_end()
+    gc_free_state()
+    #if OS != "win"
+    coro.stack_cache_release()
+    #end
+    let tid = c.tid
+    ctl = null
+    mem.free(c)
+    // Last: OWNER never names a new thread for an old thread's granules
+    tid_give(tid)
+}
+
+// Nothing is left to free once thread_stop has run
+fn thread_free() {
+}
+
+// RT9 step 8: gc_free runs on every allocated object of every finalizable kind of the heap. The
+// heap ends with the thread, so none of them is reachable any more
+fn finalize_heap() {
+    @unsafe
+    close_runs(alc_list)
+    let adr = alc_list.data
+    let end = adr + alc_list.index
+    while adr < end {
+        let pool = @ptrv(adr, *Pool)
+        adr += size_of(ptr)
+        let onfree = pool.onfree ?! continue
+        let block = pool.first
+        while isset(block) {
+            let isize = block.isize
+            let slot = block.first
+            let last = slot + block.slots_total * isize
+            while slot < last {
+                if gcdata(slot).is_not_new() || in_window(block, slot, block.aw_hi) : onfree(slot)
+                slot += isize
+            }
+            block = block.next
+        }
+    }
+}
+
+// The collector's buffers and tables of the ended thread
+fn gc_free_state() {
+    @unsafe
+    let g = gc
+    g.globals.free()
+    g.conditional_globals.free()
+    g.stack_items.free()
+    g.roots_prev.free()
+    g.roots_now.free()
+    g.card_log.free()
+    g.blanks.free()
+    g.cut_list.free()
+    g.re_own_list.free()
+    g.growth_sources.free()
+    g.mark_list.free()
+    g.trace_list.free()
+    g.props_removed.free()
+    g.touched_blocks.free()
+    mem.free(g)
+    pools_free()
+    kinds_free()
+    if cnt_map_cap != 0 : mem.free(cnt_map)
+    cnt_map_cap = 0
+    if ranges_cap != 0 : mem.free(ranges)
+    ranges_cap = 0
+    pub_free()
+    s_kcache_free()
+}
+#else
 // Grove programs are single-threaded: only the main thread runs Valk code with a gc
 fn thread_init(is_main: bool (false)) {
     @unsafe
     if !is_main : panic("Grove supports single-threaded programs only")
     heap_init()
     ext.valk_gc_set_entry(Gc.collect_native.@cast(ptr))
-    #if GROVE_MT
-    s_init()
-    ext.valk_gc_set_leave_slow(native_leave_slow.@cast(ptr))
-    ctl = ctl_new()
-    #end
     pools_init()
     @INIT_ALLOCATORS
     gc = Gc.init()
@@ -48,6 +155,7 @@ fn thread_stop() {
 fn thread_free() {
     panic("Grove supports single-threaded programs only")
 }
+#end
 
 #if OS == "linux"
 fn thread_stack_bounds() (uint, ptr) {

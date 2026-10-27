@@ -85,6 +85,15 @@ _valk_gc_collect_shared:
 .global valk_gc_collect_shared
 valk_gc_collect_shared:
 movl $1, %esi
+jmp Lvalk_gc_collect
+
+# valk_gc_poll(): Grove-MT's loop poll, whose word fired: a round waits for the thread, or a
+# collection is pending
+.global _valk_gc_poll
+_valk_gc_poll:
+.global valk_gc_poll
+valk_gc_poll:
+movl $2, %esi
 
 Lvalk_gc_collect:
 pushq %rbp

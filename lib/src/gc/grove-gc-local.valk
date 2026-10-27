@@ -125,9 +125,17 @@ struct Gc {
         g.collect_run()
     }
 
-    // Both assembly entries pass the caller's saved registers and the kind: 0 local, 1 shared.
-    // There is no shared memory to collect
+    // Both assembly entries pass the caller's saved registers and the kind: 0 local, 1 shared,
+    // 2 a loop poll (Grove-MT's poll word fired: a round waits, or a collection is pending)
     static fn collect_native(sp: ptr, kind: uint) {
+        #if GROVE_MT
+        if atomic_load(round_req) != 0 : join(sp)
+        if kind == 2 {
+            // The poll's own test, against the local trigger
+            if poll_inv == 0 || sp < ~poll_inv : return
+            kind = 0
+        }
+        #end
         if kind != 0 : return
         let g = gc
         if !g.collect_allowed() : return
@@ -146,6 +154,7 @@ struct Gc {
         // are exact
         this.state = GcState.collecting
         #if GROVE_MT
+        if gc_dead != 0 : ext._exit(127)
         nj_set(true)
         #if GC_DEBUG
         s_check_ranges()
@@ -211,7 +220,11 @@ struct Gc {
         this.pace(allocated)
         // Free chunks beyond twice the young budget go back to the OS
         let retain = this.mem_trigger * 2
+        #if GROVE_MT
+        heap_return_granules()
+        #else
         heap_return_idle(retain > RETAIN_MIN ? retain : RETAIN_MIN)
+        #end
         this.shrink_buffers()
         this.collect_count++
 
@@ -221,6 +234,7 @@ struct Gc {
         // Nothing is pending
         poll_inv = 0
         #if GROVE_MT
+        poll_sync()
         nj_set(false)
         #end
         this.state = GcState.idle
@@ -245,7 +259,23 @@ struct Gc {
     // R-50: B, H and the log's caps of the next cycle; `allocated` bytes were allocated in
     // the one that ends
     fn pace(allocated: uint) {
+        #if GROVE_MT
+        // LC3: with n thread heaps B_floor = clamp(64 MiB / n, 64 KiB, 512 KiB), and every
+        // heap but main's may defer up to H_MT = min(16 MiB, 512 MiB / n)
+        let n = thread_heaps()
+        let floor = (64 * 1024 * 1024) / n
+        if floor < 64 * 1024 : floor = 64 * 1024
+        if floor > budget_min : floor = budget_min
+        let b, h = pacing(this.mem_marked, this.young_marked, allocated, floor)
+        let own = ctl ?! panic("GC error: a thread heap without a control block")
+        if !own.is_main {
+            let h_mt = (512 * 1024 * 1024) / n
+            if h_mt > 16 * 1024 * 1024 : h_mt = 16 * 1024 * 1024
+            if h < h_mt : h = h_mt
+        }
+        #else
         let b, h = pacing(this.mem_marked, this.young_marked, allocated)
+        #end
         this.mem_trigger = b
         this.mem_limit = h
         this.mem_new = 0
@@ -592,14 +622,14 @@ struct Gc {
         let at = word - HEAP_BASE
         // One past the end of a sequence whose block ends at this page boundary: the page
         // itself may hold another block, free pages or no chunk
-        if at & (PAGE_SIZE - 1) == 0 && at > 0 {
+        if at & (PAGE_SIZE - 1) == 0 && at > 0 && resolve_owned(at - 1) {
             let prev = @ptrv(page_table, ?*Desc, (at >> PAGE_SHIFT) - 1)
             if isset(prev) && (prev.kind & desc_seq) != 0 {
                 let end: uint = prev.first + prev.slots_total * prev.isize
                 if end == word : this.accept(prev, word - prev.isize)
             }
         }
-        if at >= heap_top : return
+        if at >= heap_top || !resolve_owned(at) : return
         let desc = @ptrv(page_table, ?*Desc, at >> PAGE_SHIFT) ?! return
         let first: uint = desc.first
         let off = word - first
@@ -643,6 +673,15 @@ struct Gc {
     }
 }
 
+// LC2: P1 takes a word only into the collecting thread's own granules
+fn resolve_owned(at: uint) bool $inline {
+    #if GROVE_MT
+    return owner_of(at >> GRANULE_SHIFT) == heap_tid
+    #else
+    return true
+    #end
+}
+
 // A coroutine whose stack holds roots: started, switched out and not finished
 fn is_parked(item: coro.Coro) bool $inline {
     return item.started && !item.active && !item.done
@@ -661,14 +700,14 @@ fn prefetch_stack(sp: ptr, top: ptr) $inline {
 
 // B and H of the cycle after one that ended with `live` bytes live and in which `young` of
 // the `allocated` bytes survived (THEORY 5.5.6)
-fn pacing(live: uint, young: uint, allocated: uint) (uint, uint) {
+fn pacing(live: uint, young: uint, allocated: uint, floor: uint (budget_min)) (uint, uint) {
     let b = live / 2
     if young > 0 {
         // 1 MiB / s
         let by_survival = allocated < (1.to(uint) << 43) ? (allocated << 20) / young : (allocated / young) << 20
         if by_survival < b : b = by_survival
     }
-    if b < budget_min : b = budget_min
+    if b < floor : b = floor
     if b > budget_max : b = budget_max
     // s >= 0.5: waiting cannot reduce the survivors
     if allocated > 0 && young * 2 >= allocated : return (b, b / 2 * 3)
