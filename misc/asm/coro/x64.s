@@ -87,37 +87,6 @@ valk_gc_collect_shared:
 movl $1, %esi
 jmp Lvalk_gc_collect
 
-# valk_gc_poll_most(): valk_gc_poll for a caller that keeps its values in every general
-# register but r11 across the call (LLVM's preserve_mostcc), so a loop keeps its registers.
-# They are saved where the stack scan sees them, then restored. Kind 3 passes the caller's
-# stack pointer as well, for the poll's own depth test
-.global _valk_gc_poll_most
-_valk_gc_poll_most:
-.global valk_gc_poll_most
-valk_gc_poll_most:
-pushq %rax
-pushq %rcx
-pushq %rdx
-pushq %rsi
-pushq %rdi
-pushq %r8
-pushq %r9
-pushq %r10
-leaq 72(%rsp), %rdx
-movl $3, %esi
-subq $8, %rsp
-call Lvalk_gc_collect
-addq $8, %rsp
-popq %r10
-popq %r9
-popq %r8
-popq %rdi
-popq %rsi
-popq %rdx
-popq %rcx
-popq %rax
-retq
-
 # valk_gc_poll(): Grove-MT's loop poll, whose word fired: a round waits for the thread, or a
 # collection is pending
 .global _valk_gc_poll
