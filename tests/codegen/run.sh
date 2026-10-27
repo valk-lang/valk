@@ -244,8 +244,9 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
+# Grove's barrier (B1): the store, then the card test, whose slow path logs the card
 property_fast_body=$(sed -n '/^define .*__property_update__/,/^}/p' "$fast_path_ir")
-if [[ "$property_fast_body" != *"property_update_slow"* ]] \
+if [[ "$property_fast_body" != *"card_slow"* ]] \
     || [[ "$property_fast_body" != *"store ptr"* ]]; then
     echo "# Managed property update did not contain its guarded fast path"
     echo "$property_fast_body"
@@ -459,9 +460,10 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
+# The pool is a TLS global that both allocations name directly; its setup names it once more
 pool_globals=$(grep -c '^@".*__ALC_.*__SharedPoolValue__' "$pool_ir")
-pool_loads=$(grep -c '= load ptr, ptr @".*__ALC_.*__SharedPoolValue__' "$pool_ir")
-if [ "$pool_globals" -ne 1 ] || [ "$pool_loads" -ne 2 ]; then
+pool_uses=$(grep -v 'Pool__setup' "$pool_ir" | grep -c '^  .*ptr @".*__ALC_.*__SharedPoolValue__')
+if [ "$pool_globals" -ne 1 ] || [ "$pool_uses" -ne 2 ]; then
     echo "# Expected local and shared SharedPoolValue allocations to use one pool"
     exit 1
 fi
