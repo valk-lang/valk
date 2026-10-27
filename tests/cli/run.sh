@@ -1417,8 +1417,8 @@ if [[ "$grove_out" != *"Grove supports only the linux-x64 target"* ]]; then
     exit 1
 fi
 
-# --gc auto (the default) builds a single-threaded linux-x64 program with Grove, and a program
-# that can start a thread with Valk's collector; --gc and --def GROVE choose one
+# --gc auto (the default) builds a linux-x64 program with Grove, in its multi-threaded mode when
+# the program can start a thread; --gc and --def GROVE choose one
 gc_mode_check() {
     local expected="$1" file="$2"
     shift 2
@@ -1439,7 +1439,8 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
     gc_mode_check valk gc-mode.valk --gc valk
     gc_mode_check grove gc-mode.valk --gc grove
     gc_mode_check valk gc-mode.valk --def GROVE=0
-    gc_mode_check valk gc-mode-thread.valk
+    gc_mode_check grove-mt gc-mode-thread.valk
+    gc_mode_check valk gc-mode-thread.valk --gc valk
     gc_mode_check grove-mt gc-mode-thread.valk --gc grove
     gc_mode_check grove-mt gc-mode.valk --def GROVE_MT=1
 else

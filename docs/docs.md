@@ -147,7 +147,7 @@ valk run ./src -- alice bob                 # Compile and run; program arguments
 valk build ./src -o ./app --run --watch     # Rebuild and restart when a file changes
 valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, linux-arm64, macos-x64, macos-arm64, win-x64
 valk build ./src -o ./app --release --cpu native  # Use this machine's CPU features (AVX2, ...); or a name like x86-64-v3
-valk build ./src -o ./app --gc valk         # Collector: auto (default: Grove for single-threaded linux-x64 programs), grove (also programs with threads) or valk
+valk build ./src -o ./app --gc valk         # Collector: auto (default: Grove on linux-x64), grove or valk
 valk build ./src --lint                     # Check without building
 valk fmt ./src                              # Format in place and list the changed files
 valk fmt ./src --check                      # For CI: list unformatted files, exit 1, write nothing

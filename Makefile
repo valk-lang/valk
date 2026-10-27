@@ -148,8 +148,8 @@ test-gc-stress: $(TEST_COMPILER)
 GROVE_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "TEST_ST_ONLY=1"
 GROVE_COMPILER_FLAGS := $(FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
 
-# Grove-MT: the suite in forced multi-threaded mode, without the thread tests it cannot run yet
-GROVE_MT_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "GROVE_MT=1" --def "TEST_MT_TODO=1"
+# Grove-MT: the suite in forced multi-threaded mode
+GROVE_MT_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "GROVE_MT=1"
 
 test-grove: test-grove-st test-grove-mt
 
