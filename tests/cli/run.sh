@@ -1415,6 +1415,42 @@ if [[ "$grove_out" != *"Grove supports only the linux-x64 target"* ]]; then
     exit 1
 fi
 
+# --gc auto (the default) builds a single-threaded linux-x64 program with Grove, and a program
+# that can start a thread with Valk's collector; --gc and --def GROVE choose one
+gc_mode_check() {
+    local expected="$1" file="$2"
+    shift 2
+    "$VALK" build "$DIR/$file" --no-warn -c -o "$output" "$@" > "$workdir/gc-mode.log" 2>&1 || {
+        echo "# Failed to build $file with: $*"
+        cat "$workdir/gc-mode.log"
+        exit 1
+    }
+    local got
+    got=$("$output") || { echo "# $file built with '$*' failed"; exit 1; }
+    if [[ "$got" != "$expected" ]]; then
+        echo "# Expected $file built with '$*' on $expected's collector, got: $got"
+        exit 1
+    fi
+}
+if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+    gc_mode_check grove gc-mode.valk
+    gc_mode_check valk gc-mode.valk --gc valk
+    gc_mode_check grove gc-mode.valk --gc grove
+    gc_mode_check valk gc-mode.valk --def GROVE=0
+    gc_mode_check valk gc-mode-thread.valk
+else
+    gc_mode_check valk gc-mode.valk
+fi
+gc_out=$("$VALK" build "$input" --gc other --no-warn -o "$output" 2>&1) && {
+    echo "# --gc accepted an unknown collector"
+    exit 1
+}
+if [[ "$gc_out" != *"'--gc' expects auto, grove or valk"* ]]; then
+    echo "# Unexpected --gc error"
+    echo "$gc_out"
+    exit 1
+fi
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     echo ""
     echo "# Test the HTTP server making room for new connections when out of file descriptors"
@@ -1433,4 +1469,4 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 87"
+echo "# Test count: 94"

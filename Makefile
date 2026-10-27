@@ -15,8 +15,8 @@ TEST_COMPILER ?= ./valk
 EXE_SUFFIX ?=
 
 FLAGS := --def "VERSION=$(VERSION)"
-# The compiler's own sources test GROVE, which older compilers do not define
-SELF_FLAGS := $(FLAGS) --def "GROVE=0"
+# The compiler's own sources test GROVE and GC_AUTO, which older compilers do not define
+SELF_FLAGS := $(FLAGS) --def "GROVE=0" --def "GC_AUTO=0"
 DIST_FLAGS := . --static --release -vv -c
 IR_TARGETS := linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64
 BUILD_TARGETS := $(IR_TARGETS)
