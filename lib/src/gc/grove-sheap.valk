@@ -67,12 +67,14 @@ value S_DEBUG_CAP (1024 * 1024 * 1024)
 // order: s_recycle_at), large objects and free page runs ((start, pages), by address)
 @shared s_used: *Bump (@undefined)
 @shared s_free_blocks: *Bump (@undefined)
+// RT10: per free block, when it became free (coarse us), or 0 once its pages went back to the OS
+@shared s_free_stamps: *Bump (@undefined)
 @shared s_recycle: *Bump (@undefined)
 @shared s_recycle_at: uint
 @shared s_large: *Bump (@undefined)
 @shared s_free_runs: *Bump (@undefined)
-// K6's finalize list: S objects whose finalizer waits, each a root of every round. No FIN duty
-// runs them yet (MT4): the list only grows
+// K6's finalize list: S objects whose finalizer waits, each a root of every round until the FIN
+// duty (grove-service.valk) ran it. Bit 0 of an entry: claimed by a FIN runner; 0: done
 @shared s_fin_list: *Bump (@undefined)
 // The block whose holes are handed out, and where the next search starts
 @shared s_hole_block: uint
@@ -85,6 +87,14 @@ value S_DEBUG_CAP (1024 * 1024 * 1024)
 @shared s_alloc_bytes: uint
 @shared s_budget: uint
 @shared s_live: uint
+// Bytes of S taken since the program started (RT10's "S allocated in the last second")
+@shared s_alloc_total: uint
+// When the last sweep ran (coarse us), and whether PAGES has returned the free pages of the
+// blocks it left with free lines (RT10)
+@shared s_sweep_us: uint
+@shared s_recycle_paged: bool
+// D3: flagged objects that a later round found marked again (resurrection)
+@shared s_resurrected: uint
 // Kind records (SKind), id - 1 is the index
 @shared s_kind_list: ptr
 @shared s_kind_count: uint
@@ -97,6 +107,9 @@ struct SKind {
     onfree: ?fnptr(ptr)()
     // Runtime-sized storage: a word one past its end also names it (R-46)
     seq: bool
+    // K6's needs-finalization test: 1 + the offset of a word whose 0 means that the finalizer
+    // would do nothing; 0 when the kind declares none
+    need: uint
 }
 
 // Per thread: the S buffer [s_cursor, s_limit), its next size, the overflow buffer and a cache
@@ -141,6 +154,7 @@ fn s_init() {
     s_kind_list = mem.calloc(s_kind_cap * size_of(SKind))
     s_used = Bump.new(256)
     s_free_blocks = Bump.new(64)
+    s_free_stamps = Bump.new(64)
     s_recycle = Bump.new(256)
     s_large = Bump.new(256)
     s_free_runs = Bump.new(64)
@@ -419,6 +433,7 @@ fn s_alloc_slow(size: uint, kind: uint) ptr $noinline {
 fn s_buffer_taken(lo: uint, hi: uint, dirty: bool) {
     if dirty : mem.clear_bytes(lo.@cast(ptr), hi - lo)
     atomic(s_alloc_bytes + (hi - lo))
+    atomic(s_alloc_total + (hi - lo))
     #if GC_DEBUG
     s_note_range(lo, hi)
     #end
@@ -431,6 +446,8 @@ fn s_pace() {
     if gc_dead != 0 : ext._exit(127)
     if !isset(ctl) || gc.state == GcState.disabled : return
     if atomic_load(round_req) != 0 : join_now()
+    // K1: a thread that allocates S runs mutator code
+    active_set()
     #if GC_STRESS
     // Stress: a round at every 64th refill
     s_stress_refills++
@@ -478,8 +495,10 @@ fn s_take_bump(bytes: uint) (uint, uint, bool) {
         let b: uint = 0
         if s_free_blocks.index > 0 {
             s_free_blocks.index -= size_of(ptr)
+            s_free_stamps.index -= size_of(ptr)
             b = @ptrv(s_free_blocks.data + s_free_blocks.index, uint)
-            dirty = true
+            // Pages given back to the OS come back zero
+            dirty = @ptrv(s_free_stamps.data + s_free_stamps.index, uint) != 0
         } else {
             b = s_take(S_BLOCK, S_BLOCK)
         }
@@ -536,6 +555,7 @@ fn s_take_large(bytes: uint) uint {
     s_large.add_ptr(at.@cast(ptr))
     s_lock_drop()
     atomic(s_alloc_bytes + bytes)
+    atomic(s_alloc_total + bytes)
     return at
 }
 
@@ -799,6 +819,8 @@ fn s_find_finalizable_large(queue: *Bump) {
 
 fn s_queue_finalizable(a: uint, e: uint, kind: *SKind, queue: *Bump) $inline {
     if !isset(kind.onfree) || (e & S_FINALIZED) != 0 || @ptrv(s_mark_byte(a), u8) != 0 : return
+    // A kind's word that says its finalizer would do nothing: freed in this round, unflagged
+    if kind.need != 0 && @ptrv((a + kind.need - 1).@cast(ptr), uint) == 0 : return
     @ptrv(s_kind_entry(a), u16) = (e | S_FINALIZED).to(u16)
     queue.add_ptr(a.@cast(ptr))
 }
@@ -835,6 +857,9 @@ fn s_sweep_range(from: uint, to: uint) {
 // K7's filing and K8's input: empty blocks become free, blocks with free lines are recycled in
 // address order, dead large objects give their pages back. Returns L_S, the marked bytes
 fn s_sweep_file(n: uint) uint {
+    let now = coarse_us()
+    s_sweep_us = now
+    s_recycle_paged = false
     let live: uint = 0
     let used = s_used
     s_recycle.reset()
@@ -853,6 +878,7 @@ fn s_sweep_file(n: uint) uint {
         if bytes == 0 {
             @ptrv(s_block_byte(b), u8) = 0
             s_free_blocks.add_ptr(b.@cast(ptr))
+            s_free_stamps.add_ptr(now.@cast(ptr))
             continue
         }
         @ptrv(used.data, uint, kept) = b
@@ -871,6 +897,7 @@ fn s_sweep_file(n: uint) uint {
         let pages = r & S_RUN_PAGES
         if @ptrv(m, u8) != 0 {
             @ptrv(m, u8) = 0
+            if (@ptrv(s_kind_entry(a), u16).to(uint) & S_FIN_DONE) != 0 : atomic(s_resurrected + 1)
             live += pages * S_PAGE
             @ptrv(large.data + kept, uint) = a
             kept += size_of(ptr)
@@ -912,6 +939,7 @@ fn s_sweep_block(b: uint) uint {
             @ptrv(m, u8) = 0
             live += size
             if isset(kind.onfree) : fin = true
+            if (e & S_FIN_DONE) != 0 : atomic(s_resurrected + 1)
         } else {
             if (e & S_FINALIZED) != 0 && (e & S_FIN_DONE) == 0 : panic("GC error: a shared object waiting for its finalizer was not marked (D3)")
             @ptrv(k, u16) = 0

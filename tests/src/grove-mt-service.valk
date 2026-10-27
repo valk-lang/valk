@@ -1,0 +1,312 @@
+@unsafe
+
+#if GROVE_MT
+
+use valk.gc
+use valk.core
+use valk.ext
+use valk.fs
+use valk.mem
+use valk.sync
+use valk.time
+use valk.thread
+
+@ignore_access
+
+// Grove-MT's service duties (v6 K12): finalizers of shared objects (FIN), time-triggered rounds
+// (K1) and the return of free shared memory (RT10); the GC service thread; foreign threads (C7)
+
+shared svc_fin_count: uint (0)
+
+class SvcFinObject $atomic {
+    n: uint (0)
+    fn gc_free() {
+        atomic(svc_fin_count + 1)
+    }
+}
+
+fn svc_make_finalizable(n: uint) $noinline {
+    let i: uint = 0
+    while i < n {
+        let item = SvcFinObject { n: i }
+        i++
+    }
+}
+
+// Rounds, with pauses for whoever runs the finalizers, until `done` returns true (5 s at most)
+fn svc_rounds_until(done: fn()(bool)) bool {
+    let tries: uint = 0
+    while tries < 500 {
+        if done() : return true
+        gc.collect()
+        gc.collect_shared()
+        time.sleep_ms(10)
+        tries++
+    }
+    return done()
+}
+
+test "Grove-MT service: dropped shared objects with a finalizer are finalized (probe nostart)" {
+    let before = atomic_load(svc_fin_count)
+    svc_make_finalizable(200000)
+    assert(svc_rounds_until(fn() bool { return atomic_load(svc_fin_count) >= before + 200000 }))
+}
+
+fn svc_make_mutexes(n: uint) $noinline {
+    let i: uint = 0
+    while i < n {
+        let mutex: atomic core.Mutex = core.Mutex.new() !!
+        mutex.lock()
+        mutex.unlock()
+        i++
+    }
+}
+
+synctest "Grove-MT service: a mutex without waiters is freed without its finalizer (K6)" {
+    svc_rounds_until(fn() bool { return gc.shared_finalize_pending_for_test() == 0 })
+    let done, _ = gc.shared_finalized_for_test()
+    svc_make_mutexes(10000)
+    gc.collect()
+    gc.collect_shared()
+    gc.collect_shared()
+    let after, _ = gc.shared_finalized_for_test()
+    assert(after - done < 1000)
+}
+
+shared svc_task_fin: uint (0)
+
+class SvcTaskCapture $atomic {
+    value: uint (5)
+    fn gc_free() {
+        atomic(svc_task_fin + 1)
+    }
+}
+
+shared svc_task_sum: uint (0)
+
+fn svc_task_with_capture() thread.Task $noinline {
+    let capture = SvcTaskCapture {}
+    let task = thread.task(fn() {
+        atomic(svc_task_sum + capture.value)
+    }) !!
+    task.await()
+    return task
+}
+
+test "Grove-MT service: a task that ran keeps nothing its handler captured (S7)" {
+    let before = atomic_load(svc_task_fin)
+    let task = svc_task_with_capture()
+    assert(svc_rounds_until(fn() bool { return atomic_load(svc_task_fin) > before }))
+    task.await()
+}
+
+shared svc_service_bad: uint (0)
+
+synctest "Grove-MT service: a second program thread starts the GC service thread; its end stops it" {
+    let starts, _ = gc.service_threads_for_test()
+    // Threads of earlier tests (idle task runners) may still run, and with them the service thread
+    let alone = gc.program_threads_for_test() == 1
+    let i: uint = 0
+    while i < 50 {
+        let t = thread.start(fn() {
+            // Two program threads run: the service thread runs too
+            let _, live = gc.service_threads_for_test()
+            if !live : atomic(svc_service_bad + 1)
+        }) !!
+        t.await()
+        i++
+    }
+    let later, _ = gc.service_threads_for_test()
+    assert(svc_service_bad == 0)
+    if alone : assert(later > starts)
+    // Once the main thread is the only program thread, the service thread ends
+    let tries: uint = 0
+    while tries < 200 && (gc.program_threads_for_test() > 1 || gc.registered_threads_for_test() > gc.program_threads_for_test()) {
+        time.sleep_ms(10)
+        tries++
+    }
+    if gc.program_threads_for_test() == 1 {
+        let _, live = gc.service_threads_for_test()
+        assert(!live)
+        assert(gc.registered_threads_for_test() == 1)
+    }
+}
+
+shared svc_slow_done: uint (0)
+shared svc_fast_done: uint (0)
+shared svc_slow_stop: uint (0)
+
+class SvcSlowFin $atomic {
+    n: uint (0)
+    fn gc_free() {
+        let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: 200_000_000 }
+        let rem = ext.libc_timespec { tv_sec: 0, tv_nsec: 0 }
+        ext.nanosleep(@ref(ts), @ref(rem))
+        atomic(svc_slow_done + 1)
+    }
+}
+
+class SvcFastFin $atomic {
+    n: uint (0)
+    fn gc_free() {
+        atomic(svc_fast_done + 1)
+    }
+}
+
+fn svc_make_slow_and_fast() $noinline {
+    let slow = SvcSlowFin {}
+    let i: uint = 0
+    while i < 100 {
+        let fast = SvcFastFin { n: i }
+        i++
+    }
+}
+
+synctest "Grove-MT service: a finalizer that sleeps 200 ms is reported and the others still run (D14)" {
+    let slow_reports = gc.slow_finalizers_for_test()
+    atomic_store(svc_slow_stop, 0)
+    // A second program thread: the service thread runs the finalizers, until it is stuck
+    let worker = thread.start(fn() {
+        while atomic_load(svc_slow_stop) == 0 : time.sleep_ms(5)
+    }) !!
+    let slow_before = atomic_load(svc_slow_done)
+    let fast_before = atomic_load(svc_fast_done)
+    svc_make_slow_and_fast()
+    assert(svc_rounds_until(fn() bool {
+        return atomic_load(svc_slow_done) > slow_before && atomic_load(svc_fast_done) >= fast_before + 100
+    }))
+    assert(gc.slow_finalizers_for_test() > slow_reports)
+    atomic_store(svc_slow_stop, 1)
+    worker.await()
+}
+
+class SvcBlob $atomic {
+    a: uint (0)
+    b: uint (0)
+    c: uint (0)
+    d: uint (0)
+    e: uint (0)
+    f: uint (0)
+    g: uint (0)
+    next: ?SvcBlob (null)
+}
+
+fn svc_rss() uint {
+    let text = fs.read("/proc/self/statm") ! return 0
+    let parts = text.split(" ")
+    let pages = (parts.get(1) !? "0").to_uint() !? 0
+    return pages * 4096
+}
+
+// Chains of S objects, 64 bytes each, held only by this frame; returns the RSS with them
+fn svc_blobs_hold(chains: uint, length: uint) uint $noinline {
+    let heads = Array[SvcBlob]{}
+    let c: uint = 0
+    while c < chains {
+        let head = SvcBlob {}
+        let i: uint = 1
+        while i < length {
+            head = SvcBlob { next: head }
+            i++
+        }
+        heads.append(head)
+        c++
+    }
+    gc.collect()
+    let rss = svc_rss()
+    assert(heads.length == chains)
+    return rss
+}
+
+// Stale copies of the dropped words in dead frames are overwritten
+fn svc_scrub_stack() $noinline {
+    let words: [uint x 1024] = @undefined
+    mem.clear_bytes(@ref(words).@cast(ptr), size_of(uint) * 1024)
+    assert(words[1023] == 0)
+}
+
+synctest "Grove-MT service: an idle program gives back a dropped 64 MiB of shared memory (TIME, PAGES)" {
+    let rss_with = svc_blobs_hold(1024, 1024)
+    svc_scrub_stack()
+    // The counted words go at the next local collection; a time round then frees the blobs
+    gc.collect()
+    let returned = gc.shared_pages_returned_for_test()
+    let rounds = gc.time_rounds_for_test(true)
+    let tries: uint = 0
+    while tries < 80 && gc.shared_pages_returned_for_test() < returned + 32 * 1024 * 1024 {
+        time.sleep_ms(100)
+        tries++
+    }
+    assert(gc.time_rounds_for_test(false) > rounds)
+    assert(gc.shared_pages_returned_for_test() >= returned + 32 * 1024 * 1024)
+    let rss_after = svc_rss()
+    assert(rss_after + 32 * 1024 * 1024 <= rss_with)
+}
+
+// C7: a thread that Valk did not start, running a Valk callback
+class SvcForeignNode {
+    left: ?SvcForeignNode (null)
+    right: ?SvcForeignNode (null)
+}
+
+fn svc_foreign_tree(depth: uint) SvcForeignNode {
+    if depth == 0 : return SvcForeignNode {}
+    return SvcForeignNode { left: svc_foreign_tree(depth - 1), right: svc_foreign_tree(depth - 1) }
+}
+
+fn svc_foreign_count(node: ?SvcForeignNode) uint {
+    let n = node ?! return 0
+    return 1 + svc_foreign_count(n.left) + svc_foreign_count(n.right)
+}
+
+shared svc_foreign_result: uint (0)
+shared svc_foreign_go: uint (0)
+
+fn svc_foreign_main(arg: ?ptr) ?ptr $entrance {
+    let total: uint = 0
+    let round: uint = 0
+    while round < 20 {
+        total += svc_foreign_count(svc_foreign_tree(8))
+        round++
+    }
+    gc.collect()
+    atomic_store(svc_foreign_result, total)
+    // Waits in native code, where a round holds it
+    while atomic_load(svc_foreign_go) == 0 {
+        let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: 1_000_000 }
+        let rem = ext.libc_timespec { tv_sec: 0, tv_nsec: 0 }
+        ext.nanosleep(@ref(ts), @ref(rem))
+    }
+    return null
+}
+
+synctest "Grove-MT: a thread that Valk did not start registers at its first callback (C7)" {
+    let foreign = gc.foreign_threads_for_test()
+    atomic_store(svc_foreign_result, 0)
+    atomic_store(svc_foreign_go, 0)
+    let thr: ext.pthread_t = .{}
+    assert(ext.pthread_create(@ref(thr), null, svc_foreign_main.@cast(ptr), null) == 0)
+    ext.pthread_detach(thr.data)
+    let tries: uint = 0
+    while tries < 500 && atomic_load(svc_foreign_result) == 0 {
+        time.sleep_ms(10)
+        tries++
+    }
+    assert(atomic_load(svc_foreign_result) == 20 * 511)
+    // It counts as a program thread, so the service thread runs; a round holds it in its sleep
+    assert(gc.foreign_threads_for_test() == foreign + 1)
+    assert(gc.program_threads_for_test() >= 2)
+    let _, live = gc.service_threads_for_test()
+    assert(live)
+    gc.collect_shared()
+    atomic_store(svc_foreign_go, 1)
+    // Its exit ends the registration (the key's destructor runs RT9's end)
+    tries = 0
+    while tries < 500 && gc.foreign_threads_for_test() > foreign {
+        time.sleep_ms(10)
+        tries++
+    }
+    assert(gc.foreign_threads_for_test() == foreign)
+}
+
+#end

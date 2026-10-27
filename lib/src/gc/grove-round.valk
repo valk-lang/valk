@@ -161,6 +161,11 @@ fn join(sp: ptr) {
     }
     while atomic_load(round_req) != 0 && atomic_load(round_epoch) == epoch : futex_wait(@ref(round_epoch), epoch)
     atomic(c.state & 0)
+    // K1: a thread that ran mutator code until the round is active; K12: FIN at its next poll
+    if !c.is_service {
+        active_set()
+        fin_note()
+    }
     poll_sync()
 }
 
@@ -191,18 +196,21 @@ fn gather_roots(u: *ThreadCtl) {
     exact.reset()
     cons.reset()
     let g = u.heap ?! return
-    if atomic_load(u.state) == TS_HELD {
-        // The callee-saved registers saved at the enter-native
-        gather_words(cons, @ref(u.rbx).@cast(ptr), @ref(u.nat_exits).@cast(ptr))
-    }
-    let sp: ptr = u.sp.@cast(ptr)
-    let current = @ptrv(g.current_coro, ?coro.Coro)
-    if isset(current) {
-        gather_words(cons, sp, current.stack_top)
-        let main_sp = @ptrv(g.main_sp, ?ptr)
-        if isset(main_sp) : gather_words(cons, main_sp, g.stack_top)
-    } else {
-        gather_words(cons, sp, g.stack_top)
+    // C7: a foreign thread between callbacks has no Valk frames; its stack is not read
+    if !u.foreign_idle {
+        if atomic_load(u.state) == TS_HELD {
+            // The callee-saved registers saved at the enter-native
+            gather_words(cons, @ref(u.rbx).@cast(ptr), @ref(u.nat_exits).@cast(ptr))
+        }
+        let sp: ptr = u.sp.@cast(ptr)
+        let current = @ptrv(g.current_coro, ?coro.Coro)
+        if isset(current) {
+            gather_words(cons, sp, current.stack_top)
+            let main_sp = @ptrv(g.main_sp, ?ptr)
+            if isset(main_sp) : gather_words(cons, main_sp, g.stack_top)
+        } else {
+            gather_words(cons, sp, g.stack_top)
+        }
     }
     // Parked coroutines and what they keep for the kernel. A thread that registered and has
     // not run INIT GLOBALS yet has no coroutine list
@@ -386,11 +394,13 @@ fn gather_heap(g: *Gc, cons: *Bump) {
 // the call; otherwise (K1) only while S_alloc is at B_S. A thread whose try-lock fails joins
 // the running round, or retries (RT7). `entry_sp`: where the caller's registers were pushed
 // by the runtime's assembly entry; else the initiator's stack is read from round's own frame
-fn round(forced: bool, entry_sp: ptr (null_ptr())) {
+fn round(forced: bool, entry_sp: ptr (null_ptr()), time: bool (false)) {
     let c = ctl ?! return
     if gc_dead != 0 : ext._exit(127)
     while true {
         if !forced && atomic_load(s_alloc_bytes) < atomic_load(s_budget) : return
+        // K1's time term: only while active and T_idle after the last round
+        if time && !time_due() : return
         if atomic(round_lock | 1) == 0 : break
         if atomic_load(round_req) != 0 {
             join_now()
@@ -398,6 +408,12 @@ fn round(forced: bool, entry_sp: ptr (null_ptr())) {
             ext.sched_yield()
         }
     }
+    if time && !time_due() {
+        atomic(round_lock & 0)
+        return
+    }
+    let start_us = coarse_us()
+    let before = s_live + atomic_load(s_alloc_bytes)
     spin_take(@ref(reg_lock))
     atomic(round_req | 1)
     let epoch = atomic_load(round_epoch)
@@ -444,6 +460,8 @@ fn round(forced: bool, entry_sp: ptr (null_ptr())) {
         }
         u.collects_seen = u.collects
     }
+    // K8: active cleared, the back-off exponent; K9: the finalize queue went to the list
+    round_settle(time, forced, before, start_us)
     // K9: release
     atomic_store(round_phase, 0)
     atomic(round_req & 0)
@@ -459,6 +477,9 @@ fn round(forced: bool, entry_sp: ptr (null_ptr())) {
     spin_drop(@ref(reg_lock))
     atomic(round_lock & 0)
     atomic(rounds_done + 1)
+    // K1: an initiator that resumes mutator code is active; a duty's time round is not
+    if !time && !c.is_service : active_set()
+    if !c.is_service : fin_note()
     poll_sync()
 }
 
@@ -808,7 +829,8 @@ fn round_collect(c: *ThreadCtl, epoch: uint) {
     let adr = fin.data
     let end = adr + fin.index
     while adr < end {
-        s_mark(@ptrv(adr, uint), list)
+        // Bit 0: claimed by a FIN runner, whose finalizer still runs
+        s_mark(@ptrv(adr, uint) & (~1).to(uint), list)
         adr += size_of(ptr)
     }
     mark_roots(c, list)
@@ -832,6 +854,8 @@ fn round_collect(c: *ThreadCtl, epoch: uint) {
     mark_queue(c)
     mark_loop(c, false)
     // The queues join the finalize list
+    spin_take(@ref(fin_lock))
+    fin = s_fin_list
     i = 0
     while i < count {
         let u = @ptrv(registry, *ThreadCtl, i)
@@ -846,6 +870,7 @@ fn round_collect(c: *ThreadCtl, epoch: uint) {
         }
         queue.reset()
     }
+    spin_drop(@ref(fin_lock))
     #if GC_DEBUG
     marked_check()
     cover_check(count)

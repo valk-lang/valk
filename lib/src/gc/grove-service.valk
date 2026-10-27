@@ -1,0 +1,483 @@
+@unsafe
+
+#if GROVE_MT
+
+use ext
+use mem
+
+// K12, the service duties (v6 2.12): FIN runs the finalizers of the finalize list, TIME starts a
+// round when the program was active and no round ran for T_idle (K1), PAGES gives free S memory
+// back to the OS (RT10). While two or more program threads are registered the GC service thread
+// does them; otherwise, and while the service thread is stuck in one finalizer for more than
+// 100 ms, the program threads do them at their pre-block points, their idle point, their next
+// poll after a round appended to the finalize list (FIN), and at P10 (TIME and PAGES)
+
+// FIN: entries before fin_claim_at are claimed (bit 0) or done (0); fin_running counts the
+// claims whose finalizer has not returned. Indexes stay valid while one runs: rounds append at
+// the end, and the done entries are dropped only when none runs
+@shared fin_lock: uint
+@shared fin_claim_at: uint
+@shared fin_running: uint
+// Statistics and D14, D15: finalizers run, by program threads, longer than 100 ms; the last
+// progress, and the rounds the waiting list grew in a row
+@shared fin_done_total: uint
+@shared fin_by_program: uint
+@shared fin_slow: uint
+@shared fin_progress_us: uint
+@shared fin_waiting_seen: uint
+@shared fin_grow_rounds: uint
+@shared fin_stale: uint
+// The thread's next poll runs FIN: a round it joined or initiated appended to the list
+global fin_due: bool
+
+// K1's time term: `active`, the end and pause of the last round, the back-off exponent; D9
+@shared s_active: uint
+@shared round_end_us: uint
+@shared round_pause_us: uint
+@shared backoff: uint
+@shared time_rounds: uint
+@shared time_round_prev_us: uint
+@shared d9_reports: uint
+
+// K12: program threads (under reg_lock); the generation of the service thread that should run
+// (0: none, or the last one exits); its futex word; when it entered its current finalizer
+@shared program_threads: uint
+@shared service_live: uint
+@shared service_next: uint
+@shared service_starts: uint
+@shared service_bell: uint
+@shared service_fin_us: uint
+// Set by the program's entry: the service thread's entry, and the routine that initializes a
+// thread's globals (thread.service_entry, thread.init_thread_globals)
+@shared service_entry_fn: uint
+@shared globals_init_fn: uint
+
+// RT10: PAGES runs at most once per second; when it is due next (0: nothing waits); the S
+// allocated until its last run; bytes it gave back
+@shared pages_us: uint
+@shared pages_next_us: uint
+@shared pages_alloc_seen: uint
+@shared s_pages_returned: uint
+
+value SECOND_US (1_000_000)
+value STUCK_US (100_000)
+value BACKOFF_MAX (6)
+
+// Set by the program's entry before a second thread can register
+fn service_setup(entry: ptr, globals_init: ptr) {
+    service_entry_fn = entry.@cast(uint)
+    globals_init_fn = globals_init.@cast(uint)
+}
+
+fn active_set() $inline {
+    if atomic_load(s_active) == 0 : atomic_store(s_active, 1)
+}
+
+//////////////////////////
+// FIN
+//////////////////////////
+
+// Whether the finalize list has an entry nobody claimed
+fn fin_pending() bool $inline {
+    return atomic_load(fin_claim_at) < s_fin_list.index / size_of(ptr)
+}
+
+// Runs the waiting finalizers, one claim at a time under fin_lock. The service thread of
+// generation `gen` stops taking new ones once it is told to exit; 0 for a program thread.
+// Returns how many ran
+fn fin_run(gen: uint) uint {
+    let ran: uint = 0
+    while true {
+        if gen != 0 && atomic_load(service_live) != gen : break
+        spin_take(@ref(fin_lock))
+        let list = s_fin_list
+        let count = list.index / size_of(ptr)
+        let at = fin_claim_at
+        if at >= count {
+            // No finalizer runs: the done entries before the cursor go
+            if fin_running == 0 && at > 0 {
+                mem.move_bytes(list.data + at * size_of(ptr), list.data, (count - at) * size_of(ptr))
+                list.index = (count - at) * size_of(ptr)
+                atomic_store(fin_claim_at, 0)
+            }
+            spin_drop(@ref(fin_lock))
+            break
+        }
+        let a = @ptrv(list.data, uint, at)
+        @ptrv(list.data, uint, at) = a | 1
+        atomic_store(fin_claim_at, at + 1)
+        fin_running++
+        spin_drop(@ref(fin_lock))
+        fin_one(a, gen != 0)
+        spin_take(@ref(fin_lock))
+        @ptrv(s_fin_list.data, uint, at) = 0
+        fin_running--
+        spin_drop(@ref(fin_lock))
+        ran++
+    }
+    if ran > 0 {
+        atomic_store(fin_progress_us, coarse_us())
+        // K1: a finished batch is activity, and resets the back-off
+        atomic_store(backoff, 0)
+        active_set()
+    }
+    return ran
+}
+
+// One finalizer, as ordinary code; the object stays a round root (claimed) until it returned
+// and its done bit is set (K7 frees it at a later round)
+fn fin_one(a: uint, service: bool) {
+    let kind = s_kind_of(a.@cast(ptr)) ?! panic("GC error: a finalize-list entry names no shared object")
+    let onfree = kind.onfree ?! panic("GC error: a finalize-list entry has no finalizer")
+    let start = coarse_us()
+    if service : atomic_store(service_fin_us, start | 1)
+    else : atomic(fin_by_program + 1)
+    onfree(a.@cast(ptr))
+    if service : atomic_store(service_fin_us, 0)
+    let entry = s_kind_entry(a)
+    atomic(entry[0] | S_FIN_DONE.to(u16))
+    atomic(fin_done_total + 1)
+    // D14: a finalizer that ran longer than 100 ms
+    if coarse_us() - start > STUCK_US {
+        atomic(fin_slow + 1)
+        #if GC_DEBUG
+        nj_off()
+        print("GC warning: a shared object's finalizer ran longer than 100 ms (D14), kind layout 0x")
+        let lay: uint = kind.layout.@cast(uint)
+        lay.print(16)
+        print("\n")
+        #end
+    }
+}
+
+// After a round this thread joined or initiated: its next poll runs FIN when the program
+// threads do the duties, else the service thread is woken
+fn fin_note() {
+    if !fin_pending() : return
+    if duties_by_program() : fin_due = true
+    else : service_wake()
+}
+
+// The poll that fin_due fired
+fn fin_poll() {
+    fin_due = false
+    poll_sync()
+    if duties_by_program() : fin_run(0)
+}
+
+//////////////////////////
+// TIME (K1)
+//////////////////////////
+
+// T_idle = max(1 s, 50 x the last pause) x 2^b
+fn t_idle_us() uint {
+    let base = atomic_load(round_pause_us) * 50
+    if base < SECOND_US : base = SECOND_US
+    return base << atomic_load(backoff)
+}
+
+fn time_due() bool {
+    if atomic_load(s_active) == 0 : return false
+    return coarse_us() - atomic_load(round_end_us) >= t_idle_us()
+}
+
+fn time_duty() {
+    if time_due() : round(true, null_ptr(), true)
+}
+
+// K8 and K9's accounting, by the initiator while every other thread is stopped: `active`
+// cleared, the back-off exponent, the round's end and pause; the finalize list handed to FIN
+fn round_settle(time: bool, forced: bool, before: uint, start_us: uint) {
+    let now = coarse_us()
+    if time {
+        // D9: time rounds closer than T_idle
+        if time_round_prev_us != 0 && now - time_round_prev_us < t_idle_us() : atomic(d9_reports + 1)
+        time_round_prev_us = now
+        atomic(time_rounds + 1)
+        let live = s_live
+        let freed = before > live ? before - live : 0
+        let enough = live / 32
+        if enough < 1024 * 1024 : enough = 1024 * 1024
+        if freed < enough {
+            if backoff < BACKOFF_MAX : atomic_store(backoff, backoff + 1)
+        } else {
+            atomic_store(backoff, 0)
+        }
+    } else {
+        atomic_store(backoff, 0)
+    }
+    atomic_store(s_active, 0)
+    atomic_store(round_pause_us, now - start_us)
+    atomic_store(round_end_us, now)
+    // RT10: the blocks this sweep freed are returned after a second
+    if s_free_blocks.index > 0 || s_recycle.index > 0 {
+        let due = now + SECOND_US
+        if pages_next_us == 0 || due < pages_next_us : atomic_store(pages_next_us, due)
+    }
+    // D15: an entry waiting for more than 10 s, or a waiting list that grew for 10 rounds
+    let waiting = s_fin_list.index / size_of(ptr) - fin_claim_at
+    if waiting > fin_waiting_seen && fin_waiting_seen > 0 {
+        fin_grow_rounds++
+    } else {
+        fin_grow_rounds = 0
+    }
+    fin_waiting_seen = waiting
+    if waiting > 0 && fin_progress_us != 0 && now - fin_progress_us > 10 * SECOND_US : fin_stale_report()
+    else if fin_grow_rounds >= 10 : fin_stale_report()
+    if waiting > 0 : service_wake()
+}
+
+fn fin_stale_report() {
+    atomic(fin_stale + 1)
+    fin_grow_rounds = 0
+    #if GC_DEBUG
+    nj_off()
+    print("GC warning: shared finalizers wait for more than 10 s, or their list grew for 10 rounds (D15)\n")
+    #end
+}
+
+//////////////////////////
+// PAGES (RT10)
+//////////////////////////
+
+// Gives back to the OS the free line blocks that have been free for a second, beyond the free S
+// it keeps: max(8 MiB, the S allocated during the last second), at most B_S; then the free pages
+// of the blocks the last sweep left with free lines and that no refill has reached
+fn pages_duty() {
+    let now = coarse_us()
+    let next = atomic_load(pages_next_us)
+    if next == 0 || now < next || now - atomic_load(pages_us) < SECOND_US : return
+    s_lock_take()
+    atomic_store(pages_us, now)
+    let total = atomic_load(s_alloc_total)
+    let keep = total - pages_alloc_seen
+    pages_alloc_seen = total
+    if keep < S_BUDGET_MIN : keep = S_BUDGET_MIN
+    let budget = atomic_load(s_budget)
+    if keep > budget : keep = budget
+    let blocks = s_free_blocks
+    let stamps = s_free_stamps
+    let n = blocks.index / size_of(ptr)
+    let held: uint = 0
+    let i: uint = 0
+    while i < n {
+        if @ptrv(stamps.data, uint, i) != 0 : held += S_BLOCK
+        i++
+    }
+    let waiting: uint = 0
+    // The oldest free blocks first: the list is a stack
+    i = 0
+    while i < n && held > keep {
+        let stamp = @ptrv(stamps.data, uint, i)
+        if stamp != 0 {
+            if now - stamp >= SECOND_US {
+                pages_return(@ptrv(blocks.data, uint, i), S_BLOCK)
+                @ptrv(stamps.data, uint, i) = 0
+                held -= S_BLOCK
+            } else if waiting == 0 || stamp + SECOND_US < waiting {
+                waiting = stamp + SECOND_US
+            }
+        }
+        i++
+    }
+    if !s_recycle_paged {
+        if now - s_sweep_us >= SECOND_US {
+            s_recycle_paged = true
+            pages_recycled()
+        } else if waiting == 0 || s_sweep_us + SECOND_US < waiting {
+            waiting = s_sweep_us + SECOND_US
+        }
+    }
+    if waiting != 0 && waiting < now + SECOND_US : waiting = now + SECOND_US
+    atomic_store(pages_next_us, waiting)
+    s_lock_drop()
+}
+
+// The 4 KiB pages of the recycled blocks that no refill reached since the sweep, whose lines
+// are all free. Under s_lock
+fn pages_recycled() {
+    let list = s_recycle
+    let i = s_recycle_at
+    while i < list.index {
+        let b = @ptrv(list.data + i, uint)
+        i += size_of(ptr)
+        if b == s_hole_block : continue
+        let page = b
+        while page < b + S_BLOCK {
+            if @ptrv(s_line_byte(page), u64) == 0 && @ptrv(s_line_byte(page) + 8, u64) == 0 && @ptrv(s_line_byte(page) + 16, u64) == 0 && @ptrv(s_line_byte(page) + 24, u64) == 0 {
+                pages_return(page, S_PAGE)
+            }
+            page += S_PAGE
+        }
+    }
+}
+
+// Memory goes back to the OS; its 2 MiB chunk takes no huge pages from then on
+fn pages_return(at: uint, bytes: uint) {
+    let chunk = at & (~(S_CHUNK - 1)).to(uint)
+    ext.madvise(chunk.@cast(ptr), S_CHUNK, MADV_NOHUGEPAGE)
+    ext.madvise(at.@cast(ptr), bytes, MADV_DONTNEED)
+    atomic(s_pages_returned + bytes)
+}
+
+//////////////////////////
+// Who does the duties
+//////////////////////////
+
+// The program threads do the duties when no service thread runs, or while it is stuck
+fn duties_by_program() bool {
+    if atomic_load(service_live) == 0 : return true
+    let since = atomic_load(service_fin_us)
+    return since != 0 && coarse_us() - since > STUCK_US
+}
+
+// A program thread's pre-block point or idle point
+fn duties() {
+    let c = ctl ?! return
+    if c.is_service || gc_dead != 0 : return
+    if !duties_by_program() {
+        if fin_pending() : service_wake()
+        return
+    }
+    if fin_pending() : fin_run(0)
+    time_duty()
+    pages_duty()
+}
+
+// TIME and PAGES at a program thread's P10
+fn duties_light() {
+    let c = ctl ?! return
+    if c.is_service || gc_dead != 0 || !duties_by_program() : return
+    time_duty()
+    pages_duty()
+}
+
+// Milliseconds until a duty is due that this thread would do; uint.$max when none is
+fn duty_wait_ms() uint {
+    let c = ctl ?! return uint.$max
+    if c.is_service || !duties_by_program() : return uint.$max
+    if fin_pending() : return 0
+    let now = coarse_us()
+    let due: uint = 0
+    if atomic_load(s_active) != 0 : due = atomic_load(round_end_us) + t_idle_us()
+    let pages = atomic_load(pages_next_us)
+    if pages != 0 {
+        let p = pages
+        let earliest = atomic_load(pages_us) + SECOND_US
+        if p < earliest : p = earliest
+        if due == 0 || p < due : due = p
+    }
+    if due == 0 : return uint.$max
+    if due <= now : return 0
+    return (due - now + 999) / 1000
+}
+
+//////////////////////////
+// The GC service thread
+//////////////////////////
+
+// Starts the service thread of generation `gen` (the registration under reg_lock decided it)
+fn service_start(gen: uint) {
+    let entry = service_entry_fn
+    if entry == 0 {
+        atomic_store(service_live, 0)
+        return
+    }
+    let thr: ext.pthread_t = .{}
+    if ext.pthread_create(@ref(thr), null, entry.@cast(ptr), gen.@cast(ptr)) != 0 {
+        atomic_store(service_live, 0)
+        return
+    }
+    ext.pthread_detach(thr.data)
+    atomic(service_starts + 1)
+}
+
+fn service_wake() {
+    atomic(service_bell + 1)
+    futex_wake_all(@ref(service_bell))
+}
+
+// The service thread's loop: FIN until the list is empty, TIME, PAGES, then a sleep in NAT until
+// the next deadline (at most a second) or a bell. It ends once its generation is no longer live
+fn service_loop(gen: uint) {
+    let c = ctl ?! return
+    while atomic_load(service_live) == gen {
+        let bell = atomic_load(service_bell)
+        fin_run(gen)
+        if atomic_load(service_live) != gen : break
+        time_duty()
+        pages_duty()
+        if fin_pending() : continue
+        let wait = service_wait_ms()
+        ext.valk_gc_native_enter(c.@cast(ptr))
+        futex_wait_ms(@ref(service_bell), bell, wait)
+        ext.valk_gc_native_leave(c.@cast(ptr))
+    }
+}
+
+// The earlier of the next time-round deadline and the next page return; a second at most, so
+// a program that becomes active is seen
+fn service_wait_ms() uint {
+    let now = coarse_us()
+    let due = now + SECOND_US
+    if atomic_load(s_active) != 0 {
+        let t = atomic_load(round_end_us) + t_idle_us()
+        if t < due : due = t
+    }
+    let pages = atomic_load(pages_next_us)
+    if pages != 0 && pages < due : due = pages
+    if due <= now : return 1
+    return (due - now + 999) / 1000
+}
+
+fn futex_wait_ms(address: *uint, expected: uint, ms: uint) {
+    let ts = ext.libc_timespec { tv_sec: (ms / 1000).to(int), tv_nsec: ((ms % 1000) * 1_000_000).to(int) }
+    ext.syscall(202, address.@cast(ptr), 128, (expected & 0xFFFFFFFF).to(i32), @ref(ts).@cast(ptr))
+}
+
+// K6's needs-finalization test, declared by the runtime package: an S object of `item`'s kind
+// needs no finalizer while the word at `word` is 0
+fn fin_needs_word(item: ptr, word: ptr) {
+    if !in_shared(item) : return
+    let kind = s_kind_of(item) ?! return
+    if kind.need != 0 : return
+    s_lock_take()
+    let again = s_kind_of(item)
+    if isset(again) && again.need == 0 : again.need = (word - item) + 1
+    s_lock_drop()
+}
+
+#if TEST
+/// Test helper: shared finalizers that ran, and those that program threads ran.
++ fn shared_finalized_for_test() (uint, uint) {
+    return (atomic_load(fin_done_total), atomic_load(fin_by_program))
+}
+
+/// Test helper: shared finalizers that ran longer than 100 ms (D14).
++ fn slow_finalizers_for_test() uint {
+    return atomic_load(fin_slow)
+}
+
+/// Test helper: GC service threads started so far, and whether one should run now.
++ fn service_threads_for_test() (uint, bool) {
+    return (atomic_load(service_starts), atomic_load(service_live) != 0)
+}
+
+/// Test helper: time-triggered rounds so far; `reset` sets `active` and makes T_idle 1 s (no
+/// back-off, no pause recorded).
++ fn time_rounds_for_test(reset: bool) uint {
+    if reset {
+        atomic_store(backoff, 0)
+        atomic_store(round_pause_us, 0)
+        active_set()
+    }
+    return atomic_load(time_rounds)
+}
+
+/// Test helper: bytes of free shared memory given back to the OS so far (RT10).
++ fn shared_pages_returned_for_test() uint {
+    return atomic_load(s_pages_returned)
+}
+#end
+
+#end

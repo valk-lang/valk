@@ -5,6 +5,7 @@
 use ext
 use mem
 use coro
+use io
 
 // Grove-MT's thread states (v6 RT6). A thread runs Valk code (RUN), runs native code (NAT),
 // is held in native code by a round (HELD), or is stopped at a safepoint (SAFE)
@@ -60,6 +61,12 @@ struct ThreadCtl {
     roots_done: uint
     nat_seen: uint
     idle_efd: i32
+    // K12: the GC service thread, which is no program thread
+    is_service: bool
+    // C7: a thread that Valk did not start, registered at its first callback; between
+    // callbacks (foreign_idle) it has no Valk frames, and rounds read no stack of it
+    foreign: bool
+    foreign_idle: bool
 }
 
 /// The control block of the running thread; null on a thread the GC does not know.
@@ -143,7 +150,7 @@ fn tid_give(tid: uint) {
     spin_drop(@ref(reg_lock))
 }
 
-fn ctl_new(tid: uint, is_main: bool) *ThreadCtl {
+fn ctl_new(tid: uint, is_main: bool, is_service: bool) *ThreadCtl {
     return mem.new[ThreadCtl](.{
         state: TS_RUN, sp: 0, rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0, nat_exits: 0, in_gc: 0
         tid: tid, poll_ref: @ref(poll_word), is_main: is_main
@@ -153,6 +160,7 @@ fn ctl_new(tid: uint, is_main: bool) *ThreadCtl {
         safe_epoch: 0, roots_exact: Bump.new(256), roots_cons: Bump.new(1024)
         collects: 0, collects_seen: 0, want_local: 0
         marker: 0, mark_list: null, fin_queue: Bump.new(64), roots_done: 0, nat_seen: (~0).to(uint), idle_efd: -1
+        is_service: is_service, foreign: false, foreign_idle: false
     })
 }
 
@@ -172,10 +180,20 @@ fn thread_heaps() uint $inline {
 }
 
 // RT9: a new thread registers its control block under reg_lock while it is in NAT, so a round
-// never sees it half registered, then leaves NAT (waiting while a round holds it)
+// never sees it half registered, then leaves NAT (waiting while a round holds it). K12: the
+// registration that makes two program threads starts the GC service thread
 fn thread_register(c: *ThreadCtl) {
     ext.valk_gc_native_enter(c.@cast(ptr))
     spin_take(@ref(reg_lock))
+    let start: uint = 0
+    if !c.is_service {
+        program_threads++
+        if program_threads == 2 && service_live == 0 {
+            service_next++
+            atomic_store(service_live, service_next)
+            start = service_next
+        }
+    }
     if registry_len == registry_cap {
         let cap = registry_cap == 0 ? 16 : registry_cap * 2
         let bigger = mem.alloc(cap * size_of(ptr))
@@ -189,6 +207,7 @@ fn thread_register(c: *ThreadCtl) {
     @ptrv(registry, *ThreadCtl, registry_len) = c
     atomic(registry_len + 1)
     spin_drop(@ref(reg_lock))
+    if start != 0 : service_start(start)
     ext.valk_gc_native_leave(c.@cast(ptr))
 }
 
@@ -206,7 +225,17 @@ fn thread_unregister(c: *ThreadCtl) {
         }
         i++
     }
+    // K12: the unregistration that leaves one program thread sets the service thread exiting
+    let stop = false
+    if !c.is_service {
+        program_threads--
+        if program_threads == 1 && service_live != 0 {
+            atomic_store(service_live, 0)
+            stop = true
+        }
+    }
     spin_drop(@ref(reg_lock))
+    if stop : service_wake()
 }
 
 // RT7: the thread's poll word follows its local trigger, or stops it while a round is requested.
@@ -215,7 +244,7 @@ fn thread_unregister(c: *ThreadCtl) {
 fn poll_sync() $inline {
     atomic(poll_word & 0)
     atomic(poll_word | poll_inv)
-    if atomic_load(round_req) != 0 || local_wanted() : atomic(poll_word | (~0).to(uint))
+    if atomic_load(round_req) != 0 || local_wanted() || fin_due : atomic(poll_word | (~0).to(uint))
 }
 
 // K10: a round asked this thread for a local collection
@@ -260,23 +289,115 @@ fn fork_child() $entrance {
     s_lock = 0
     pool_lock = 0
     mark_lock = 0
+    fin_lock = 0
+    service_live = 0
+    program_threads = 1
     gc_dead = 1
     poll_word = poll_inv
 }
 
 // C7: a Valk function that native code calls enters through a stop point: a thread inside a
-// native call leaves NAT, waiting while a round holds it. Returns whether it was in NAT
-fn callback_enter() bool {
-    let c = ctl ?! return false
-    if c.state == TS_RUN : return false
+// native call leaves NAT, waiting while a round holds it. A thread without a control block is
+// a foreign thread: it registers at its first callback. `top` is the callback's frame address,
+// above which a foreign thread has no Valk frames. A callback whose call tree the compiler found
+// GC-free (`gc_free`) runs unregistered. Returns whether the thread was in NAT
+fn callback_enter(top: ptr, gc_free: bool) bool {
+    if gc_free : return false
+    let c = ctl ?! return foreign_register(top + 16)
+    if c.state == TS_RUN {
+        if c.foreign : foreign_depth++
+        return false
+    }
     ext.valk_gc_native_leave(c.@cast(ptr))
+    if c.foreign {
+        if foreign_depth == 0 {
+            c.foreign_idle = false
+            let g = c.heap ?! return true
+            g.stack_top = top + 16
+            active_set()
+            // RT5: a collection skipped at the last callback's return runs first
+            if foreign_due {
+                foreign_due = false
+                collect_now()
+            }
+        }
+        foreign_depth++
+    }
     return true
 }
 
 // The callback returns to native code
 fn callback_leave(was_native: bool) {
+    let c = ctl
+    if isset(c) && c.foreign {
+        foreign_depth--
+        if foreign_depth == 0 : foreign_return(c)
+    }
     if !was_native : return
     ext.valk_gc_native_enter(ctl.@cast(?ptr))
+}
+
+// Nested callbacks of a foreign thread; a collection due at its next callback (RT5)
+global foreign_depth: uint
+global foreign_due: bool
+global foreign_collect_us: uint
+// The key whose destructor ends a foreign thread's registration when it exits (C7)
+@shared foreign_key: u32
+@shared foreign_key_made: uint
+// Registered foreign threads
+@shared foreign_live: uint
+
+// C7: the first callback on a thread Valk did not start registers it: a heap, a control block,
+// the program's globals and a key whose destructor runs RT9's end when the thread exits
+fn foreign_register(top: ptr) bool {
+    if gc_dead != 0 : ext._exit(127)
+    if globals_init_fn == 0 : panic("GC error: a callback from a foreign thread before the program started")
+    thread_init(false, top, false)
+    let c = ctl ?! return false
+    c.foreign = true
+    let init = globals_init_fn.@cast(fnptr(bool)())
+    init(false)
+    gc.state = GcState.idle
+    if atomic_load(foreign_key_made) != 2 {
+        if atomic(foreign_key_made | 1) == 0 {
+            ext.pthread_key_create(@ref(foreign_key), foreign_exit.@cast(ptr))
+            atomic_store(foreign_key_made, 2)
+        }
+        while atomic_load(foreign_key_made) != 2 : ext.sched_yield()
+    }
+    ext.pthread_setspecific(foreign_key, c.@cast(ptr))
+    atomic(foreign_live + 1)
+    foreign_depth = 1
+    active_set()
+    return true
+}
+
+// RT5: the outermost callback of a foreign thread returns to native code. It collects when it
+// allocated or logged since its last collection, which ran at least 1 ms ago; otherwise its
+// next callback collects first. Then it has no Valk frames until that callback
+fn foreign_return(c: *ThreadCtl) {
+    let g = c.heap ?! return
+    if g.state == GcState.idle && preblock_due(g) {
+        let now = coarse_us()
+        if now - foreign_collect_us >= 1000 {
+            foreign_collect_us = now
+            collect_now()
+        } else {
+            foreign_due = true
+        }
+    }
+    c.foreign_idle = true
+}
+
+// C7, RT9: a registered foreign thread exits; its key's destructor ends the registration
+fn foreign_exit(arg: ?ptr) $entrance {
+    let c = ctl ?! return
+    if !c.foreign : return
+    atomic(foreign_live - 1)
+    io.uring_drain()
+    coro.parks_leave()
+    coro.home_close()
+    thread_stop()
 }
 
 // K11: the thread waits in the runtime's event wait, whose doorbell is `efd` (-1: it left it)
@@ -320,6 +441,16 @@ fn nj_off() {
 /// Test helper: the number of registered threads.
 + fn registered_threads_for_test() uint {
     return atomic_load(registry_len)
+}
+
+/// Test helper: the number of registered foreign threads (C7).
++ fn foreign_threads_for_test() uint {
+    return atomic_load(foreign_live)
+}
+
+/// Test helper: the number of registered program threads (the GC service thread is none).
++ fn program_threads_for_test() uint {
+    return atomic_load(program_threads)
 }
 
 /// Test helper: the running thread's number.
