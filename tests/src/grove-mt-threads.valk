@@ -1,0 +1,203 @@
+@unsafe
+
+#if GROVE_MT
+
+use valk.gc
+use valk.ext
+use valk.io
+use valk.sync
+use valk.time
+use valk.thread
+
+// Grove-MT with threads: thread heaps owned in granules, thread start and end, results and the
+// round handshake that stops every thread
+@ignore_access
+
+class MtTreeNode {
+    left: ?MtTreeNode (null)
+    right: ?MtTreeNode (null)
+}
+
+fn mt_tree(depth: uint) MtTreeNode {
+    if depth == 0 : return MtTreeNode {}
+    return MtTreeNode { left: mt_tree(depth - 1), right: mt_tree(depth - 1) }
+}
+
+fn mt_tree_size(node: ?MtTreeNode) uint {
+    let n = node ?! return 0
+    return 1 + mt_tree_size(n.left) + mt_tree_size(n.right)
+}
+
+// Builds trees, collects, and checks that every object of the last tree lies in a granule
+// this thread owns. Returns the number of objects whose granule had another owner
+fn mt_owned_trees() uint {
+    let me = gc.thread_number_for_test()
+    let foreign: uint = 0
+    let round: uint = 0
+    while round < 20 {
+        let tree = mt_tree(9)
+        gc.collect()
+        let stack = Array[MtTreeNode]{ tree }
+        while stack.length > 0 {
+            let n = stack.pop_last() !!
+            if gc.owner_of_for_test(n.@cast(ptr)) != me : foreign++
+            let l = n.left
+            if isset(l) : stack.append(l)
+            let r = n.right
+            if isset(r) : stack.append(r)
+        }
+        round++
+    }
+    return foreign
+}
+
+test "Grove-MT: threads allocate and collect their own heaps at the same time" {
+    let workers = Array[thread.Thread[uint]]{}
+    let i: uint = 0
+    while i < 3 {
+        workers.append(thread.Thread[uint].start(fn() uint { return mt_owned_trees() }) !!)
+        i++
+    }
+    let main_foreign = mt_owned_trees()
+    assert(main_foreign == 0)
+    each workers as w : assert(w.await() == 0)
+}
+
+// Waits a bounded time for `check` to hold
+fn mt_eventually(check: fn()(bool)) bool {
+    let tries: uint = 0
+    while tries < 400 {
+        if check() : return true
+        time.sleep_ms(5)
+        tries++
+    }
+    return false
+}
+
+synctest "Grove-MT: a thread's end gives its granules back and its number to the next thread" {
+    let threads_before = gc.registered_threads_for_test()
+    let t = thread.Thread[uint].start(fn() uint {
+        let tree = mt_tree(8)
+        // The address and the owner, as words
+        let at: uint = tree.@cast(ptr)
+        return (at << 8) | gc.thread_number_for_test()
+    }) !!
+    let word = t.await()
+    let at = (word >> 8).@cast(ptr)
+    let tid = word & 255
+    assert(tid > 1)
+    // Unregistration and the return of the granules follow the wake of the awaiters
+    assert(mt_eventually(fn() bool { return gc.registered_threads_for_test() == threads_before }))
+    assert(gc.owner_of_for_test(at) != tid || mt_eventually(fn() bool { return gc.owner_of_for_test(at) != tid }))
+}
+
+shared mt_spin_started: uint (0)
+shared mt_spin_stop: uint (0)
+
+// A loop without calls: only its strip-mined poll stops it for a round
+fn mt_spin() uint $noinline {
+    let spins: uint = 0
+    atomic_store(mt_spin_started, 1)
+    while atomic_load(mt_spin_stop) == 0 && spins < 4_000_000_000 : spins++
+    return spins
+}
+
+synctest "Grove-MT: a round stops a thread in a loop without calls" {
+    atomic_store(mt_spin_started, 0)
+    atomic_store(mt_spin_stop, 0)
+    let t = thread.Thread[uint].start(fn() uint { return mt_spin() }) !!
+    assert(mt_eventually(fn() bool { return atomic_load(mt_spin_started) == 1 }))
+    let before = gc.rounds_done
+    gc.collect_shared()
+    assert(gc.rounds_done > before)
+    atomic_store(mt_spin_stop, 1)
+    assert(t.await() < 4_000_000_000)
+}
+
+synctest "Grove-MT: a round holds a thread in a native sleep without waiting for it" {
+    let t = thread.start(fn() {
+        let ts = ext.libc_timespec { tv_sec: 0, tv_nsec: 400_000_000 }
+        let rem = ext.libc_timespec { tv_sec: 0, tv_nsec: 0 }
+        ext.nanosleep(@ref(ts), @ref(rem))
+    }) !!
+    time.sleep_ms(50)
+    let start = time.mono_ms()
+    gc.collect_shared()
+    // Held in its native call: the round did not wait for the sleep to end
+    assert(time.mono_ms() - start < 300)
+    t.await()
+}
+
+synctest "Grove-MT: a round holds a thread parked on a channel" {
+    let ch = sync.Channel[uint].new(1) !!
+    let t = thread.Thread[uint].start(fn() uint { return ch.recv() !? 0 }) !!
+    time.sleep_ms(50)
+    gc.collect_shared()
+    gc.collect_shared()
+    ch.send(42) !!
+    assert(t.await() == 42)
+}
+
+shared mt_drain_fd: i32 (0)
+
+fn mt_read_forever() {
+    let buf: [u8 x 16] = @undefined
+    io.read_bytes(atomic_load(mt_drain_fd), @ref(buf), 16, uint.$max) ! return
+}
+
+synctest "Grove-MT: a thread that ends with a read in flight drains it first" {
+    let fds: [i32 x 2] = @undefined
+    if ext.pipe(@ref(fds)) != 0 : panic("pipe")
+    atomic_store(mt_drain_fd, fds[0])
+    let threads_before = gc.registered_threads_for_test()
+    let t = thread.Thread[uint].start(fn() uint {
+        // A coroutine parked on a read that never completes; the thread's handler returns
+        let reader = co mt_read_forever()
+        time.sleep_ms(10)
+        return io.uring_in_flight_for_test()
+    }) !!
+    assert(t.await() >= 1)
+    assert(mt_eventually(fn() bool { return gc.registered_threads_for_test() == threads_before }))
+    // The kernel no longer reads into the ended thread's buffer
+    let one: [u8 x 1] = { 7 }
+    ext.write(fds[1], @ref(one), 1)
+    ext.close(fds[0])
+    ext.close(fds[1])
+}
+
+test "Grove-MT: await of a plain result thaws a new copy at each call" {
+    let t = thread.Thread[Array[uint]].start(fn() Array[uint] { return Array[uint]{ 1, 2, 3 } }) !!
+    let a = t.await()
+    a.append(4)
+    let b = t.await()
+    assert(a.length == 4)
+    assert(b.length == 3)
+    assert(!gc.in_shared(a.@cast(ptr)))
+}
+
+test "Grove-MT: a thread heap other than main's may defer up to H_MT" {
+    let t = thread.Thread[uint].start(fn() uint {
+        gc.collect()
+        return gc.gc.mem_limit
+    }) !!
+    let limit = t.await()
+    let n = gc.registered_threads_for_test()
+    let h_mt: uint = (512 * 1024 * 1024) / (n > 0 ? n : 1)
+    if h_mt > 16 * 1024 * 1024 : h_mt = 16 * 1024 * 1024
+    // Counted when the thread collected, with at most the threads alive then
+    assert(limit >= h_mt / 2)
+}
+
+synctest "Grove-MT: a child forked from a multi-threaded program may not run the GC" {
+    let pid = ext.fork()
+    if pid == 0 {
+        gc.collect()
+        ext._exit(5)
+    }
+    let status: i32 = 0
+    ext.waitpid(pid, @ref(status), 0)
+    // Exit status 127 (D12)
+    assert((status >> 8) & 255 == 127)
+}
+
+#end

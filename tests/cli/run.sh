@@ -1390,20 +1390,22 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] && command -v obj
     fi
 fi
 
-# GROVE=1 builds single-threaded linux-x64 programs only; the error names the path to Thread.start
+# GROVE=1 builds a linux-x64 program without threads
 if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
     "$VALK" build "$input" --def GROVE=1 --no-warn -c -o "$output" > /dev/null 2>&1 || { echo "# GROVE=1 failed to build a program without threads"; exit 1; }
     "$output" || { echo "# A GROVE=1 program without threads failed"; exit 1; }
 fi
-# The error comes before linking, so this check works on every host
-grove_out=$("$VALK" build "$DIR/grove-thread.valk" --def GROVE=1 --target linux-x64 --no-warn -c -o "$output" 2>&1) && {
-    echo "# GROVE=1 accepted a program that starts a thread"
-    exit 1
-}
-if [[ "$grove_out" != *"Thread.start is reachable through 'main' -> 'work' -> 'start' -> 'Thread[void].start'"* ]]; then
-    echo "# Unexpected GROVE=1 thread error"
-    echo "$grove_out"
-    exit 1
+# GROVE=1 builds a program that can start a thread in Grove's multi-threaded mode (GROVE_MT)
+if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
+    grove_out=$("$VALK" build "$DIR/grove-thread.valk" --def GROVE=1 --no-warn -c -o "$output" 2>&1) || {
+        echo "# GROVE=1 failed to build a program that starts a thread"
+        echo "$grove_out"
+        exit 1
+    }
+    if [[ "$("$output")" != "worker" ]]; then
+        echo "# A GROVE=1 program with a thread failed"
+        exit 1
+    fi
 fi
 grove_out=$("$VALK" build "$input" --def GROVE=1 --target win-x64 --no-warn -c -o "$output" 2>&1) && {
     echo "# GROVE=1 accepted a target other than linux-x64"
@@ -1438,6 +1440,8 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]]; then
     gc_mode_check grove gc-mode.valk --gc grove
     gc_mode_check valk gc-mode.valk --def GROVE=0
     gc_mode_check valk gc-mode-thread.valk
+    gc_mode_check grove-mt gc-mode-thread.valk --gc grove
+    gc_mode_check grove-mt gc-mode.valk --def GROVE_MT=1
 else
     gc_mode_check valk gc-mode.valk
 fi
