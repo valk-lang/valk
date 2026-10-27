@@ -148,10 +148,20 @@ test-gc-stress: $(TEST_COMPILER)
 GROVE_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "TEST_ST_ONLY=1"
 GROVE_COMPILER_FLAGS := $(FLAGS) $(LLD_FLAGS) $(NATIVE_LINK_FLAGS)
 
-test-grove: $(TEST_COMPILER)
+# Grove-MT: the suite in forced multi-threaded mode, without the thread tests it cannot run yet
+GROVE_MT_TEST_FLAGS := $(TEST_FLAGS) --def "GROVE=1" --def "GROVE_MT=1" --def "TEST_MT_TODO=1"
+
+test-grove: test-grove-st test-grove-mt
+
+test-grove-st: $(TEST_COMPILER)
 	mkdir -p ./debug
 	$(TEST_COMPILER) build ./tests $(GROVE_TEST_FLAGS) $(FLAGS) -o ./debug/test-grove$(EXE_SUFFIX)
 	./debug/test-grove$(EXE_SUFFIX)
+
+test-grove-mt: $(TEST_COMPILER)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(GROVE_MT_TEST_FLAGS) $(FLAGS) -o ./debug/test-grove-mt$(EXE_SUFFIX)
+	./debug/test-grove-mt$(EXE_SUFFIX)
 
 test-grove-stress: $(TEST_COMPILER)
 	mkdir -p ./debug
@@ -437,4 +447,4 @@ clean:
 	test test-all test-examples test-http2 test-api-compat api-baseline test-compile-errors test-cross test-cross-ir test-diagnostics \
 	test-exit-code test-fmt test-fmt-corpus test-gc-shared-stress test-lsp \
 	test-macos-build test-release test-win test-win-build \
-	test-grove test-grove-stress test-grove-small-caps grove-compiler-check
+	test-grove test-grove-st test-grove-mt test-grove-stress test-grove-small-caps grove-compiler-check

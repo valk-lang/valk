@@ -107,3 +107,67 @@ popq %r12
 popq %rbx
 popq %rbp
 retq
+
+# Grove-MT native regions (v6 C7, RT6). The control block starts with the thread's state
+# (0 RUN, 1 NAT, 2 HELD, 3 SAFE), its NAT save area (the caller's stack pointer and its
+# callee-saved registers, at 8..56) and its count of NAT exits (64)
+
+# valk_gc_native_enter(ctl): RUN -> NAT before a call into native code. A null ctl is a thread
+# that is not registered
+.global _valk_gc_native_enter
+_valk_gc_native_enter:
+.global valk_gc_native_enter
+valk_gc_native_enter:
+testq %rdi, %rdi
+jz 1f
+leaq 8(%rsp), %rax
+movq %rax, 8(%rdi)
+movq %rbx, 16(%rdi)
+movq %rbp, 24(%rdi)
+movq %r12, 32(%rdi)
+movq %r13, 40(%rdi)
+movq %r14, 48(%rdi)
+movq %r15, 56(%rdi)
+movq $1, %rax
+xchgq %rax, (%rdi)
+1:
+retq
+
+# valk_gc_native_leave(ctl): NAT -> RUN by a compare-and-swap; while a round holds the thread
+# (HELD) the installed slow path waits for its release
+.global _valk_gc_native_leave
+_valk_gc_native_leave:
+.global valk_gc_native_leave
+valk_gc_native_leave:
+testq %rdi, %rdi
+jz 1f
+incq 64(%rdi)
+movq $1, %rax
+xorl %ecx, %ecx
+lock cmpxchgq %rcx, (%rdi)
+jne 2f
+1:
+retq
+2:
+jmp *valk_gc_leave_slow(%rip)
+
+.data
+valk_gc_leave_slow:
+.quad 0
+.text
+
+.global _valk_gc_set_leave_slow
+_valk_gc_set_leave_slow:
+.global valk_gc_set_leave_slow
+valk_gc_set_leave_slow:
+movq %rdi, valk_gc_leave_slow(%rip)
+retq
+
+# valk_gc_cas(address, expected, desired): returns the old value
+.global _valk_gc_cas
+_valk_gc_cas:
+.global valk_gc_cas
+valk_gc_cas:
+movq %rsi, %rax
+lock cmpxchgq %rdx, (%rdi)
+retq

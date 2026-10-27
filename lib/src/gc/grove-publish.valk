@@ -1,0 +1,268 @@
+@unsafe
+
+#if GROVE_MT
+
+use mem
+
+// C2's copy into S (publication). The compiler's copy points (Valk's clone of the value, as in
+// Valk) hand their result here, and so do the stores into S objects: every thread-heap object
+// the value reaches is copied into S, depth first, keeping shape through a visited table. Parts
+// already in S are kept by reference (Valk's identity rule), strings and other fat values have
+// their owner copied and their data word rebased. A copy is written whole before the next
+// allocation; a reference not copied yet is 0 until the drain fills it. No safepoint and no
+// user code runs inside: S allocations do not collect thread heaps
+
+// The visited table: (source, copy) pairs in malloc'd memory. The work stack: (slot | fat,
+// source) pairs, a slot of a copy waiting for the copy of its source
+global pub_map: ptr
+global pub_cap: uint
+global pub_len: uint
+global pub_work: ?*Lifo
+
+/// Copies the thread-heap object graph `item` reaches into the shared heap and returns the copy.
+///
+/// Null, objects outside the thread heap (static strings) and objects already shared are
+/// returned as they are.
++ fn publish(item: ?ptr) ?ptr {
+    if !in_heap(item.@cast(ptr)) : return item
+    pub_begin()
+    let copy = pub_object(item.@cast(ptr))
+    pub_drain()
+    pub_end()
+    return copy
+}
+
+// Publishes every reference word of the value at `addr`, laid out as `layout`, in place
+fn publish_value(addr: ptr, layout: ptr) {
+    pub_begin()
+    pub_slots(addr, layout)
+    pub_drain()
+    pub_end()
+}
+
+// The words of a fat value (a string, slice or borrow) are {owner, data, ...}: published, its
+// data word moves with the owner's copy
+fn publish_fat(slot: ptr) {
+    let w = @ptrv(slot, uint) & (~prop_mask).to(uint)
+    if !in_heap(w.@cast(ptr)) : return
+    pub_begin()
+    pub_work_list().add_unchecked(w.@cast(ptr))
+    pub_work_list().add_unchecked(slot + 1)
+    @ptrv(slot, uint) = 0
+    pub_drain()
+    pub_end()
+}
+
+fn pub_work_list() *Lifo $inline {
+    return pub_work ?? <{
+        let created = Lifo.new()
+        pub_work = created
+        return created
+    }
+}
+
+fn pub_begin() {
+    if pub_cap == 0 {
+        pub_cap = 64
+        pub_map = mem.calloc(pub_cap * 2 * size_of(uint))
+    }
+    pub_work_list().reserve(64)
+}
+
+fn pub_end() {
+    // A large table is not kept, so a small publication never clears it
+    if pub_cap > 1024 {
+        mem.free(pub_map)
+        pub_cap = 0
+    } else if pub_len > 0 {
+        mem.clear_bytes(pub_map, pub_cap * 2 * size_of(uint))
+    }
+    pub_len = 0
+}
+
+fn pub_find(source: uint) uint {
+    let mask = pub_cap - 1
+    let i = cnt_map_home(source) & mask
+    while true {
+        let k = @ptrv(pub_map, uint, i * 2)
+        if k == source : return @ptrv(pub_map, uint, i * 2 + 1)
+        if k == 0 : return 0
+        i = (i + 1) & mask
+    }
+    return 0
+}
+
+fn pub_note(source: uint, copy: uint) {
+    if (pub_len + 1) * 2 > pub_cap {
+        let old = pub_map
+        let old_cap = pub_cap
+        pub_cap = old_cap * 2
+        pub_map = mem.calloc(pub_cap * 2 * size_of(uint))
+        let i: uint = 0
+        while i < old_cap {
+            let k = @ptrv(old, uint, i * 2)
+            if k != 0 : pub_insert(k, @ptrv(old, uint, i * 2 + 1))
+            i++
+        }
+        mem.free(old)
+    }
+    pub_insert(source, copy)
+    pub_len++
+}
+
+fn pub_insert(source: uint, copy: uint) {
+    let mask = pub_cap - 1
+    let i = cnt_map_home(source) & mask
+    while @ptrv(pub_map, uint, i * 2) != 0 : i = (i + 1) & mask
+    @ptrv(pub_map, uint, i * 2) = source
+    @ptrv(pub_map, uint, i * 2 + 1) = copy
+}
+
+// The S copy of one thread-heap object: its bytes, with every reference word 0 until the drain
+// fills it
+fn pub_object(source: ptr) ptr {
+    let desc = desc_of(source)
+    // C2: two owners of one resource would release it twice
+    if isset(desc.onfree) : panic("Cannot publish an object whose class releases a resource in gc_free: give the class a 'clone' method or make it $atomic")
+    let size = desc.isize
+    let slot = s_slot_size(size)
+    let kind = s_kind_id(desc.layout, slot > S_LARGE ? 0 : slot, null)
+    let copy = s_alloc(slot, kind)
+    mem.copy_bytes(source, copy, size)
+    pub_note(source, copy)
+    let layout = desc.layout ?! return copy
+    pub_slots(copy, layout)
+    return copy
+}
+
+// Moves every non-null reference word of the object or value at `base` to the work stack
+fn pub_slots(base: ptr, layout: ptr) {
+    if @ptrv(layout, uint, layout_kind) == 0 {
+        pub_field_slots(base, layout)
+        return
+    }
+    let length = @ptrv(base, uint)
+    let stride = @ptrv(layout, uint, layout_stride)
+    let at: ptr = base + @ptrv(layout, uint, layout_data_offset)
+    let end: ptr = at + length * stride
+    while at < end {
+        pub_field_slots(at, layout)
+        at += stride
+    }
+}
+
+fn pub_field_slots(base: ptr, layout: ptr) {
+    let plain = @ptrv(layout, uint, layout_plain_count)
+    let groups = @ptrv(layout, uint, layout_group_count)
+    let word: ptr = layout + layout_header * size_of(ptr)
+    let end: ptr = word + plain * size_of(ptr)
+    while word < end {
+        pub_slot(base, @ptrv(word, uint))
+        word += size_of(ptr)
+    }
+    while groups > 0 {
+        groups--
+        let conditions = @ptrv(word, uint)
+        word += size_of(ptr)
+        let active = true
+        while conditions > 0 {
+            conditions--
+            if @ptrv(base + @ptrv(word, uint), u8).to(uint) != @ptrv(word, uint, 1) : active = false
+            word += size_of(ptr) * 2
+        }
+        let count = @ptrv(word, uint)
+        word += size_of(ptr)
+        let group_end: ptr = word + count * size_of(ptr)
+        if active {
+            while word < group_end {
+                pub_slot(base, @ptrv(word, uint))
+                word += size_of(ptr)
+            }
+        }
+        word = group_end
+    }
+}
+
+// One reference word at `base + offset`; the offset's bit 2 marks a fat value's owner word
+fn pub_slot(base: ptr, offset: uint) $inline {
+    let slot = base + (offset & (~7).to(uint))
+    let w = @ptrv(slot, uint) & (~prop_mask).to(uint)
+    if w == 0 : return
+    if !in_heap(w.@cast(ptr)) {
+        @ptrv(slot, uint) = w
+        return
+    }
+    let list = pub_work_list()
+    list.reserve(2)
+    list.add_unchecked(w.@cast(ptr))
+    list.add_unchecked(slot + ((offset & layout_fat) != 0 ? 1 : 0))
+    @ptrv(slot, uint) = 0
+}
+
+// Fills the waiting slots, copying what is not copied yet
+fn pub_drain() {
+    let list = pub_work_list()
+    while list.index > 0 {
+        let entry: uint = list.pop_unchecked()
+        let source: uint = list.pop_unchecked()
+        let slot: ptr = (entry & (~7).to(uint)).@cast(ptr)
+        let copy = pub_find(source)
+        if copy == 0 : copy = pub_object(source.@cast(ptr))
+        @ptrv(slot, uint) = copy
+        if (entry & 1) != 0 : pub_rebase(slot, source, copy)
+    }
+}
+
+// A fat value's data word that points into its old owner points into the copy
+fn pub_rebase(slot: ptr, source: uint, copy: uint) {
+    let data = @ptrv(slot + size_of(ptr), uint)
+    let size = desc_of(source.@cast(ptr)).isize
+    if data >= source && data <= source + size : @ptrv(slot + size_of(ptr), uint) = data - source + copy
+}
+
+/// Returns whether every reference word of the S object at `item` names S, a static object or nothing.
+fn s_words_ok(item: ptr) bool {
+    let kind = s_kind_of(item) ?! return true
+    let layout = kind.layout ?! return true
+    return s_value_ok(item, layout)
+}
+
+// Whether no reference word of the value at `base` names a thread heap
+fn s_value_ok(base: ptr, layout: ptr) bool {
+    let list = pub_work_list()
+    let mark = list.index
+    pub_check_slots(base, layout)
+    let ok = list.index == mark
+    list.index = mark
+    return ok
+}
+
+// pub_slots without writes: pushes nothing but a failure marker per thread-heap word
+fn pub_check_slots(base: ptr, layout: ptr) {
+    if @ptrv(layout, uint, layout_kind) == 0 {
+        pub_check_field_slots(base, layout)
+        return
+    }
+    let length = @ptrv(base, uint)
+    let stride = @ptrv(layout, uint, layout_stride)
+    let at: ptr = base + @ptrv(layout, uint, layout_data_offset)
+    let end: ptr = at + length * stride
+    while at < end {
+        pub_check_field_slots(at, layout)
+        at += stride
+    }
+}
+
+fn pub_check_field_slots(base: ptr, layout: ptr) {
+    let list = pub_work_list()
+    each_field_ref(base, layout, list, fn(ref: ptr, l: *Lifo) {
+        @unsafe
+        let w = @ptrv(ref, uint) & (~prop_mask).to(uint)
+        if in_heap(w.@cast(ptr)) {
+            l.reserve(1)
+            l.add_unchecked(ref)
+        }
+    })
+}
+
+#end

@@ -63,10 +63,67 @@ fn uring_submit(ring: *ext.io_uring) uint {
 }
 
 fn uring_record_submitted(submitc: i32) uint {
-    if submitc < 0 : panic("Failed to submit io_uring requests")
+    if submitc < 0 {
+        // Busy rings take the entries at the next submission
+        if submitc == 0 - ext.EBUSY || submitc == 0 - ext.EAGAIN || submitc == 0 - ext.EINTR : return 0
+        let ring = uring() ! panic("Failed to submit io_uring requests")
+        uring_fail_unsubmitted(ring, submitc)
+        return 0
+    }
     uring_unsubmitted = uring_remaining(uring_unsubmitted, submitc.to(uint))
     return submitc
 }
+
+// S6: operations the kernel refused at submission post no completion. Each fails at once: its
+// coroutine wakes with the error and releases what it kept for the kernel (`io_keep`)
+fn uring_fail_unsubmitted(ring: *ext.io_uring, err: i32) {
+    @unsafe
+    let mask = ring.sq.kring_mask[0]
+    let head = ring.sq.sqe_head
+    let tail = ring.sq.sqe_tail
+    let home = false
+    while head != tail {
+        let sqe = @ptrv(ring.sq.sqes, ext.io_uring_sqe, (head & mask).to(uint))
+        head++
+        uring_done(1)
+        let user_data = sqe.user_data
+        if user_data == coro.HOME_EVENT.to(u64) {
+            home = true
+            continue
+        }
+        let c = coro.take_kernel_event(user_data.to(uint)) ?! continue
+        c.disarm_kernel_event()
+        // A linked timeout's entry wakes nothing: its operation's entry does
+        if c.done || (user_data & 3) == 1 : continue
+        c.completion_res = err.to(i64)
+        c.poll_event = ext.POLLERR
+        c.release_io()
+        coro.run_coros.append(c)
+    }
+    ring.sq.sqe_tail = ring.sq.sqe_head
+    uring_unsubmitted = 0
+    if home : coro.home_event(err)
+}
+
+// S6: the operations of this thread whose last completion has not been reaped
+global uring_in_flight: uint
+
+fn uring_done(count: uint) $inline {
+    uring_in_flight = count > uring_in_flight ? 0 : uring_in_flight - count
+}
+
+#if TEST
+/// Test helper: fails the operations queued but not submitted yet, as a refused submission does.
++ fn uring_fail_unsubmitted_for_test(err: i32) {
+    let ring = uring() ! return
+    uring_fail_unsubmitted(ring, err)
+}
+
+/// Test helper: the operations of this thread that are in flight.
++ fn uring_in_flight_for_test() uint {
+    return uring_in_flight
+}
+#end
 
 fn uring_remaining(unsubmitted: uint, submitted: uint) uint {
     if submitted > unsubmitted : return 0
@@ -109,6 +166,7 @@ fn take_sqe(coro: ?coro.Coro, ring: *ext.io_uring) *ext.io_uring_sqe !IoError {
     target.arm_kernel_event()
     sqe.user_data = target.event_id().to(u64)
     uring_unsubmitted++
+    uring_in_flight++
     return sqe
 }
 
@@ -223,6 +281,7 @@ fn io_uring_wait_cqe(ring: *ext.io_uring, cqe_ptr: *?*ext.io_uring_cqe) i32 {
 }
 fn io_uring_cqe_seen(ring: *ext.io_uring, cqe: *ext.io_uring_cqe) {
     io_uring_cq_advance(ring, 1);
+    uring_done(1)
 }
 // check if an io_uring completion event is available
 fn io_uring_peek_cqe(ring: *ext.io_uring, cqe_ptr: *?*ext.io_uring_cqe) i32 {

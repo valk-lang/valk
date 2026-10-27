@@ -1,0 +1,455 @@
+@unsafe
+
+#if GROVE_MT
+
+use ext
+use mem
+
+// Grove-MT's shared heap S (v6 RT2). One reservation outside the thread heaps, made of 64 KiB
+// blocks of 128-byte lines and 16-byte granules. Objects are headerless and untagged, in the
+// layout of their kind. The kind map holds a 2-byte kind at each object's first granule and 0
+// elsewhere; a large object (above 8 KiB) takes a page run, recorded in the run table. Small
+// objects are bumped from the thread's S buffer. Until rounds collect S (MT2), S is an arena:
+// nothing in it is freed or reused, so its memory is fresh and zero
+value S_BASE (0x300000000000)
+value S_MAX (64 * 1024 * 1024 * 1024)
+value S_BLOCK (65536)
+value S_GRANULE (16)
+value S_LARGE (8192)
+value S_PAGE (4096)
+value S_CHUNK (2 * 1024 * 1024)
+// The S buffer: 1 KiB after a thread start, doubling at each refill up to 16 KiB; objects above
+// 128 bytes that do not fit its rest go to the overflow buffer
+value S_BUF_FIRST (1024)
+value S_BUF_MAX (16384)
+value S_SMALL (128)
+value S_OVERFLOW (16384)
+// A run-table entry of a large object's later page: the distance back to its first page
+value S_RUN_BACK (0x80000000)
+#if GC_DEBUG
+// A runaway test stops here instead of filling the machine
+value S_DEBUG_CAP (1024 * 1024 * 1024)
+#end
+
+// Process-wide, set by s_init on the main thread before any other thread exists
+@shared s_size: uint            // bytes reserved for objects
+@shared s_kinds: uint           // the kind map: u16 per granule, (a - S_BASE) >> 3 past it
+@shared s_runs: uint            // the run table: u32 per page
+// Under s_lock (v6's shared_heap_lock: a spin lock, no safepoint or bracket inside)
+@shared s_lock: uint
+@shared s_top: uint             // bytes handed out, in address order
+@shared s_committed: uint
+// S_alloc: bytes of the buffers and runs taken (K1's trigger, MT2)
+@shared s_alloc_bytes: uint
+// Kind records (SKind), id - 1 is the index
+@shared s_kind_list: ptr
+@shared s_kind_count: uint
+@shared s_kind_cap: uint
+
+struct SKind {
+    layout: ?ptr
+    // The slot size; 0 for large objects, which the run table sizes
+    size: uint
+    onfree: ?fnptr(ptr)()
+}
+
+// Per thread: the S buffer [s_cursor, s_limit), its next size, the overflow buffer and a cache
+// of kind ids. Globals without a default are zero on a new thread
+global s_cursor: uint
+global s_limit: uint
+global s_buf_lo: uint
+global s_buf_size: uint
+global s_ov_cursor: uint
+global s_ov_limit: uint
+global s_kcache: ptr
+global s_kcache_cap: uint
+global s_kcache_len: uint
+
+fn s_init() {
+    let size: uint = S_MAX
+    let limit: [uint x 2] = @undefined
+    if ext.getrlimit(RLIMIT_AS, @ref(limit)) == 0 && limit[0] != (~0).to(uint) {
+        // The heap takes half of the address space limit; S a quarter
+        let quarter = (limit[0] / 4) & (~(S_CHUNK - 1)).to(uint)
+        if quarter < size : size = quarter
+    }
+    if size < S_CHUNK * 4 : s_fail()
+    s_size = size
+    s_kinds = S_BASE + size
+    s_runs = s_kinds + size / 8
+    let total = size + size / 8 + size / 1024
+    let p = ext.mmap(S_BASE.@cast(ptr), total, 0, MAP_FLAGS | MAP_FIXED_NOREPLACE, -1, 0)
+    let got: uint = p
+    if got != S_BASE {
+        if got != (~0).to(uint) : ext.munmap(p, total)
+        s_fail()
+    }
+    s_kind_cap = 256
+    s_kind_list = mem.calloc(s_kind_cap * size_of(SKind))
+}
+
+fn s_fail() $exit {
+    panic("Grove cannot reserve its shared heap at 0x300000000000: the address space limit (RLIMIT_AS) is too small or the range is in use")
+}
+
+/// Whether `item` lies in the shared heap S.
++ fn in_shared(item: ?ptr) bool $inline {
+    let a: uint = item.@cast(uint)
+    return a - S_BASE < s_size
+}
+
+fn s_lock_take() $inline {
+    while atomic(s_lock | 1) != 0 {
+        // GC code: an unbracketed yield, the holder is RUN and leaves in finite time
+        while atomic_load(s_lock) != 0 : ext.sched_yield()
+    }
+}
+
+fn s_lock_drop() $inline {
+    atomic(s_lock & 0)
+}
+
+// Takes `bytes` of fresh S at the frontier, aligned to `align`; a small buffer (`whole_block`)
+// never crosses a block. Under s_lock
+fn s_take(bytes: uint, align: uint, whole_block: bool) uint {
+    let a = (s_top + align - 1) & (~(align - 1)).to(uint)
+    if whole_block {
+        let block_end = (a | (S_BLOCK - 1)) + 1
+        if a + bytes > block_end : a = block_end
+    }
+    let top = a + bytes
+    if top > s_size : panic("Grove's shared heap is full")
+    #if GC_DEBUG
+    if top > S_DEBUG_CAP : panic("Grove's shared heap grew past its debug cap of 1 GiB (GC_DEBUG)")
+    #end
+    if top > s_committed : s_commit(top)
+    s_top = top
+    s_alloc_bytes += bytes
+    return S_BASE + a
+}
+
+// Commits chunks of S and the kind map and run table pages that cover them
+fn s_commit(top: uint) {
+    let to = (top + S_CHUNK - 1) & (~(S_CHUNK - 1)).to(uint)
+    if to > s_size : to = s_size
+    let from = s_committed
+    if ext.mprotect((S_BASE + from).@cast(ptr), to - from, 0x1 | 0x2) != 0 : panic("Grove cannot commit shared heap memory")
+    s_commit_side(s_kinds, from / 8, to / 8)
+    s_commit_side(s_runs, from / 1024, to / 1024)
+    s_committed = to
+}
+
+fn s_commit_side(base: uint, from: uint, to: uint) {
+    let lo = (base + from) & (~(S_PAGE - 1)).to(uint)
+    let hi = (base + to + S_PAGE - 1) & (~(S_PAGE - 1)).to(uint)
+    if hi > lo && ext.mprotect(lo.@cast(ptr), hi - lo, 0x1 | 0x2) != 0 : panic("Grove cannot commit shared heap memory")
+}
+
+// The slot size of an S object of `size` bytes: Grove's size classes, in whole granules, or
+// whole pages above 8 KiB
+fn s_slot_size(size: uint) uint {
+    if size == 0 : size = 1
+    if size > S_LARGE : return (size + S_PAGE - 1) & (~(S_PAGE - 1)).to(uint)
+    let index, isize = get_pool_slot(size)
+    return (isize + S_GRANULE - 1) & (~(S_GRANULE - 1)).to(uint)
+}
+
+fn s_kind_entry(a: uint) *u16 $inline {
+    return (s_kinds + ((a - S_BASE) >> 3)).@cast(*u16)
+}
+
+fn s_run_entry(a: uint) *u32 $inline {
+    return (s_runs + ((a - S_BASE) >> 12) * 4).@cast(*u32)
+}
+
+// The kind record of an S object start, or null
+fn s_kind_of(item: ptr) ?*SKind {
+    let id = @ptrv(s_kind_entry(item), u16).to(uint)
+    if id == 0 : return null
+    return (s_kind_list + (id - 1) * size_of(SKind)).@cast(*SKind)
+}
+
+// The bytes of the S object that starts at `item`
+fn s_object_size(item: ptr, kind: *SKind) uint {
+    if kind.size != 0 : return kind.size
+    return @ptrv(s_run_entry(item), u32).to(uint) * S_PAGE
+}
+
+// The id of the kind (layout, slot size, finalizer): from the thread's cache, else from the
+// records under s_lock
+fn s_kind_id(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)()) uint {
+    let l: uint = layout.@cast(uint)
+    let f: uint = onfree.@cast(uint)
+    let cap = s_kcache_cap
+    if cap != 0 {
+        let mask = cap - 1
+        let i = s_kcache_home(l, size, f) & mask
+        while true {
+            let e = s_kcache + i * 32
+            let id = @ptrv(e, uint, 3)
+            if id == 0 : break
+            if @ptrv(e, uint) == l && @ptrv(e, uint, 1) == size && @ptrv(e, uint, 2) == f : return id
+            i = (i + 1) & mask
+        }
+    }
+    let id = s_kind_register(layout, size, onfree)
+    s_kcache_put(l, size, f, id)
+    return id
+}
+
+fn s_kcache_home(l: uint, size: uint, f: uint) uint $inline {
+    return ((l ^ (size * 0x9E3779B97F4A7C15) ^ (f >> 4)) * 0x9E3779B97F4A7C15) >> 32
+}
+
+fn s_kcache_put(l: uint, size: uint, f: uint, id: uint) {
+    if (s_kcache_len + 1) * 2 > s_kcache_cap {
+        let old = s_kcache
+        let old_cap = s_kcache_cap
+        s_kcache_cap = old_cap == 0 ? 64 : old_cap * 2
+        s_kcache = mem.calloc(s_kcache_cap * 32)
+        s_kcache_len = 0
+        let i: uint = 0
+        while i < old_cap {
+            let e = old + i * 32
+            if @ptrv(e, uint, 3) != 0 : s_kcache_put(@ptrv(e, uint), @ptrv(e, uint, 1), @ptrv(e, uint, 2), @ptrv(e, uint, 3))
+            i++
+        }
+        if old_cap != 0 : mem.free(old)
+    }
+    let mask = s_kcache_cap - 1
+    let i = s_kcache_home(l, size, f) & mask
+    while @ptrv(s_kcache + i * 32, uint, 3) != 0 : i = (i + 1) & mask
+    let e = s_kcache + i * 32
+    @ptrv(e, uint) = l
+    @ptrv(e, uint, 1) = size
+    @ptrv(e, uint, 2) = f
+    @ptrv(e, uint, 3) = id
+    s_kcache_len++
+}
+
+fn s_kind_register(layout: ?ptr, size: uint, onfree: ?fnptr(ptr)()) uint {
+    s_lock_take()
+    let i: uint = 0
+    while i < s_kind_count {
+        let k = (s_kind_list + i * size_of(SKind)).@cast(*SKind)
+        if k.layout == layout && k.size == size && k.onfree == onfree {
+            s_lock_drop()
+            return i + 1
+        }
+        i++
+    }
+    if s_kind_count == 65535 {
+        s_lock_drop()
+        panic("Grove's shared heap has more than 65535 kinds")
+    }
+    if s_kind_count == s_kind_cap {
+        // Kinds are read without the lock: the old list stays valid for readers
+        let bigger = mem.calloc(s_kind_cap * 2 * size_of(SKind))
+        mem.copy_bytes(s_kind_list, bigger, s_kind_cap * size_of(SKind))
+        s_kind_list = bigger
+        s_kind_cap = s_kind_cap * 2
+    }
+    let k = (s_kind_list + s_kind_count * size_of(SKind)).@cast(*SKind)
+    k.layout = layout
+    k.size = size
+    k.onfree = onfree
+    s_kind_count++
+    let id = s_kind_count
+    s_lock_drop()
+    return id
+}
+
+// RT2's fast path: a bump in the thread's S buffer and the kind store. `size` is a slot size
+fn s_alloc(size: uint, kind: uint) ptr $inline {
+    let item = s_cursor
+    let next = item + size
+    if next > s_limit || size > S_LARGE : return s_alloc_slow(size, kind)
+    s_cursor = next
+    @ptrv(s_kind_entry(item), u16) = kind.to(u16)
+    return item.@cast(ptr)
+}
+
+fn s_alloc_slow(size: uint, kind: uint) ptr $noinline {
+    let item: uint = 0
+    if size > S_LARGE {
+        item = s_take_buffer(size, false)
+        let pages = size / S_PAGE
+        @ptrv(s_run_entry(item), u32) = pages.to(u32)
+        let i: uint = 1
+        while i < pages {
+            @ptrv(s_run_entry(item + i * S_PAGE), u32) = (S_RUN_BACK | i).to(u32)
+            i++
+        }
+    } else if size > S_SMALL {
+        if s_ov_cursor + size > s_ov_limit {
+            s_ov_cursor = s_take_buffer(S_OVERFLOW, true)
+            s_ov_limit = s_ov_cursor + S_OVERFLOW
+        }
+        item = s_ov_cursor
+        s_ov_cursor += size
+    } else {
+        let want = s_buf_size
+        if want == 0 : want = S_BUF_FIRST
+        let buf = s_take_buffer(want, true)
+        if want < S_BUF_MAX : s_buf_size = want * 2
+        s_buf_lo = buf
+        s_cursor = buf + size
+        s_limit = buf + want
+        item = buf
+    }
+    @ptrv(s_kind_entry(item), u16) = kind.to(u16)
+    #if GC_DEBUG
+    s_zero_check(item.@cast(ptr), size)
+    #end
+    return item.@cast(ptr)
+}
+
+fn s_take_buffer(bytes: uint, whole_block: bool) uint {
+    s_lock_take()
+    let at = s_take(bytes, whole_block ? S_GRANULE : S_PAGE, whole_block)
+    s_lock_drop()
+    #if GC_DEBUG
+    s_note_range(at, at + bytes)
+    #end
+    return at
+}
+
+// C1: an object of a compiler class kind in S, from the class's pool (its kind descriptor)
+fn s_alloc_pool(pool: *Pool) ptr {
+    let kind = pool.s_kind
+    if kind == 0 {
+        kind = s_kind_id(pool.layout, s_slot_size(pool.isize), pool.onfree)
+        pool.s_kind = kind
+    }
+    let k = (s_kind_list + (kind - 1) * size_of(SKind)).@cast(*SKind)
+    return s_alloc(k.size, kind)
+}
+
+// C1: sequence storage of `size` bytes in S. Fresh S memory is zero
+fn s_alloc_seq(size: uint, layout: ?ptr) ptr {
+    let slot = s_slot_size(size)
+    let kind = s_kind_id(layout, slot > S_LARGE ? 0 : slot, null)
+    return s_alloc(slot, kind)
+}
+
+// C5: what a constructor stored into a new S object of the pool's class is in S
+fn s_publish_fields(item: ptr, pool: *Pool) {
+    let layout = pool.layout ?! return
+    publish_value(item, layout)
+}
+
+// C5 for a store the compiler did not publish (a `@threadsafe` body, a plain view of an
+// S-resident object): the value is published first, so S never names a thread heap
+fn s_store(property_ref: ptr, new_value: ?ptr) $noinline {
+    @ptrv(property_ref, ?ptr) = publish(new_value)
+}
+
+// S2: the growth of an S container's own storage: new storage in S with the elements copied
+// plainly (S words carry no tags) and the rest zero
+fn s_grow(data_ref: ptr, count: uint, size: uint) {
+    let from: ptr = @ptrv(data_ref, ptr)
+    let layout = s_kind_of(from) ?! panic("gc_grow: shared storage has no kind")
+    let lay = layout.layout ?! panic("gc_grow: the storage has no reference layout")
+    let stride = @ptrv(lay, uint, layout_stride)
+    let offset = @ptrv(lay, uint, layout_data_offset)
+    let to = s_alloc_seq(offset + size * stride, lay)
+    @ptrv(to, uint) = size
+    mem.copy_bytes(from + offset, to + offset, count * stride)
+    @ptrv(data_ref, ptr) = to
+}
+
+// S2: gc_move on S storage
+fn s_move(item: ptr, dst: uint, src: uint, count: uint) {
+    let kind = s_kind_of(item) ?! panic("gc_move: shared storage has no kind")
+    let layout = kind.layout ?! panic("gc_move: the storage has no reference layout")
+    let stride = @ptrv(layout, uint, layout_stride)
+    let base: ptr = item + @ptrv(layout, uint, layout_data_offset)
+    mem.move_bytes(base + src * stride, base + dst * stride, count * stride)
+    let v_lo = src
+    let v_hi = src + count
+    if dst > src && dst < v_hi : v_hi = dst
+    if dst < src && dst + count > src : v_lo = dst + count
+    mem.clear_bytes(base + v_lo * stride, (v_hi - v_lo) * stride)
+}
+
+// S2: elements copied into S storage; what they name in the thread heap is published
+fn s_copy_in(from: ptr, to: ptr, count: uint, storage: ptr) {
+    let kind = s_kind_of(storage) ?! panic("copy_strip: shared storage has no kind")
+    let layout = kind.layout ?! panic("copy_strip: the storage has no reference layout")
+    let stride = @ptrv(layout, uint, layout_stride)
+    mem.copy_bytes(from, to, count * stride)
+    pub_begin()
+    let at = to
+    let end = to + count * stride
+    while at < end {
+        pub_field_slots(at, layout)
+        at += stride
+    }
+    pub_drain()
+    pub_end()
+}
+
+#if GC_DEBUG
+// D1's single-thread clause: no reference word of an S object names a thread heap. Checked at
+// each local collection over the S memory the thread took since its previous one
+global s_ranges: ?*Bump
+
+fn s_note_range(lo: uint, hi: uint) {
+    let list = s_ranges ?? <{
+        let created = Bump.new(256)
+        s_ranges = created
+        return created
+    }
+    list.add_ptr(lo.@cast(ptr))
+    list.add_ptr(hi.@cast(ptr))
+}
+
+fn s_check_ranges() {
+    let list = s_ranges ?! return
+    let i: uint = 0
+    while i < list.index {
+        let lo = @ptrv(list.data + i, uint)
+        let hi = @ptrv(list.data + i + size_of(ptr), uint)
+        i += 2 * size_of(ptr)
+        let a = lo
+        while a < hi {
+            let kind = s_kind_of(a.@cast(ptr))
+            if !isset(kind) {
+                a += S_GRANULE
+                continue
+            }
+            if !s_words_ok(a.@cast(ptr)) {
+                nj_off()
+                print("\nGC error: the shared object at 0x")
+                a.print(16)
+                print(" names a thread heap\n")
+                panic("GC error: a shared object names a thread-heap object (D1)")
+            }
+            a += s_object_size(a.@cast(ptr), kind)
+        }
+    }
+    // The current buffers keep filling: checked again next time
+    list.reset()
+    if s_limit > 0 : s_note_range(s_buf_lo, s_limit)
+    if s_ov_limit > 0 : s_note_range(s_ov_limit - S_OVERFLOW, s_ov_limit)
+}
+
+// Until rounds reuse S memory, every S allocation is fresh and zero
+fn s_zero_check(item: ptr, size: uint) {
+    let len = size > 4096 ? 4096 : size
+    let i: uint = 0
+    while i < len {
+        if @ptrv(item + i, u64) != 0 : panic("GC error: a new shared object's memory is not zero")
+        i += 8
+    }
+}
+#end
+
+#if TEST
+/// Test helper: the bytes of the shared heap handed out so far.
++ fn shared_heap_top_for_test() uint {
+    return s_top
+}
+#end
+
+#end

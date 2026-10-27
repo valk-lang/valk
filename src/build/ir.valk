@@ -444,6 +444,8 @@ class IRFunc {
     fresh_mark: uint (0)
     init_stores: uint (0)
     cleanup_active: bool (false)
+    // Grove-MT: the slot of a callback's `callback_enter` result (C7)
+    callback_slot: String ("")
     // Release calls of the lock blocks the emitter is currently inside
     active_locks: Array[Value] (.{})
     vscope_lock_depth: uint (0)
@@ -742,6 +744,7 @@ fn generate_func_ir(func: Func) !Error {
     }
     ir_debug_variables(ir) !>
     ir_debug_frame_enter(ir) !>
+    ir_emit_callback_enter(ir) !>
 
     ir_emit_values(ir, scope.values) !>
 
@@ -949,7 +952,35 @@ fn ir_emit_func_cleanup(ir: IRFunc) !Error {
         each scope.values as value : ir_emit_stmt(ir, value) !>
     }
     ir_emit_keep_alive(ir) !>
+    ir_emit_callback_leave(ir) !>
     ir.cleanup_active = false
+}
+
+// Grove-MT (C7): a function that native code calls back enters through a stop point: the
+// thread leaves NAT (waiting while a round holds it) and enters it again when it returns
+fn ir_func_is_callback(func: Func) bool {
+    if !func.is_entrance || !func.ns.build.grove_mt_mode() || is_thread_entry(func) : return false
+    return !entrance_is_gc_free(func)
+}
+
+fn ir_emit_callback_enter(ir: IRFunc) !Error {
+    if !ir_func_is_callback(ir.func) : return
+    let enter = (valk_idf(ir.func.ns.build, "gc", "callback_enter") !>).func ?! ir.func.exp.bug("gc.callback_enter is not a function")
+    if !enter.parsed_types : parse_func_types(enter) !>
+    ir_use_func(ir, enter)
+    ir.callback_slot = ir_emit_alloca(ir, "i1")
+    let was = ir.var()
+    ir.line4(was, " = call i1 ", ir_func_address(enter), "()")
+    ir_emit_store(ir, "i1", was, ir.callback_slot)
+}
+
+fn ir_emit_callback_leave(ir: IRFunc) !Error {
+    if ir.callback_slot == "" : return
+    let leave = (valk_idf(ir.func.ns.build, "gc", "callback_leave") !>).func ?! ir.func.exp.bug("gc.callback_leave is not a function")
+    if !leave.parsed_types : parse_func_types(leave) !>
+    ir_use_func(ir, leave)
+    let was = ir_emit_load(ir, "i1", ir.callback_slot)
+    ir.line4("call void ", ir_func_address(leave), "(i1 ", was + ")")
 }
 
 // Roots are found on the native stack, so a value would only live until its
@@ -1624,6 +1655,11 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     let callees_at = ir.loop_callees.length
     let safepoints = ir.safepoints
     let inits = ir.init_stores
+    // Grove-MT (C6): every loop polls; a loop without calls counts its iterations and polls at
+    // every 4096th
+    let mt = latch && ir.func.ns.build.grove_mt_mode() && !ir_func_in_mem(ir.func)
+    let counter = mt ? ir_emit_alloca(ir, "i64") : ""
+    if mt : ir_emit_store(ir, "i64", "0", counter)
     ir.jump(cond_block)
 
     ir.label(cond_block)
@@ -1642,7 +1678,13 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
         }
         if latch {
             ir.label(latch_block)
-            if ir.calls > calls {
+            if mt && ir.calls == calls && ir.init_stores == inits {
+                ir.func.info_polls = true
+                ir.func.gc_poll_source = ir.func
+                ir_emit_strip_poll(ir, counter) !>
+            } else if mt && ir.calls > calls {
+                ir_emit_poll(ir, null) !>
+            } else if ir.calls > calls {
                 // Only direct calls: the poll is kept when one of the callees reaches GC work
                 let gate : ?String = null
                 if ir.unknown_calls == unknown_calls {
@@ -1666,6 +1708,43 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     ir.label(after_block)
 }
 
+// Grove-MT (C7): an extern call outside GC code runs in a native region, unless the extern is
+// `$nonblocking`. A raw thread entry runs unregistered (M1), and GC code never brackets
+fn ir_native_bracketed(ir: IRFunc, func: Func) bool {
+    if !func.is_extern || func.is_nonblocking : return false
+    let caller = ir.func
+    if !caller.ns.build.grove_mt_mode() : return false
+    if caller.is_gc_primitive || ir_func_in_gc(caller) : return false
+    return !caller.is_entrance || ir_func_is_callback(caller)
+}
+
+// RUN -> NAT; returns the control block, which the leave takes
+fn ir_emit_native_enter(ir: IRFunc) String !Error {
+    let b = ir.func.ns.build
+    // D4: a native call inside local GC code stops the program
+    if b.macro_bool("GC_DEBUG") {
+        let check = (valk_idf(b, "gc", "native_check") !>).func ?! ir.func.exp.bug("gc.native_check is not a function")
+        if !check.parsed_types : parse_func_types(check) !>
+        ir_use_func(ir, check)
+        ir.line3("call void ", ir_func_address(check), "()")
+    }
+    let global = (valk_idf(b, "gc", "ctl") !>).global ?! ir.func.exp.bug("gc.ctl is not a global")
+    ir_use_global(ir, global)
+    let ctl = ir_emit_load(ir, "ptr", ir_global_address(global))
+    let enter = (valk_idf(b, "ext", "valk_gc_native_enter") !>).func ?! ir.func.exp.bug("ext.valk_gc_native_enter is not a function")
+    ir_use_func(ir, enter)
+    ir.line4("call void ", ir_func_address(enter), "(ptr ", ctl + ")")
+    return ctl
+}
+
+// NAT -> RUN, waiting while a round holds the thread
+fn ir_emit_native_leave(ir: IRFunc, ctl: String) !Error {
+    let b = ir.func.ns.build
+    let leave = (valk_idf(b, "ext", "valk_gc_native_leave") !>).func ?! ir.func.exp.bug("ext.valk_gc_native_leave is not a function")
+    ir_use_func(ir, leave)
+    ir.line4("call void ", ir_func_address(leave), "(ptr ", ctl + ")")
+}
+
 // C-26: source loops poll, except in Grove's runtime, the GC primitives and raw thread entries
 fn ir_func_polls(func: Func) bool {
     if func.is_gc_primitive || func.is_entrance : return false
@@ -1674,6 +1753,27 @@ fn ir_func_polls(func: Func) bool {
 
 fn ir_func_in_gc(func: Func) bool {
     return func.ns.name == "gc" && func.ns.pkg.name == "valk"
+}
+
+// The memory primitives the collector and the GC primitives use: their loops never poll
+fn ir_func_in_mem(func: Func) bool {
+    return func.ns.name == "mem" && func.ns.pkg.name == "valk"
+}
+
+// Grove-MT (C6): a call-free loop polls once per 4096 iterations
+fn ir_emit_strip_poll(ir: IRFunc, counter: String) !Error {
+    let count = ir_emit_load(ir, "i64", counter)
+    let next = ir_emit_binary_instruction(ir, "add", "i64", count, "1")
+    ir_emit_store(ir, "i64", next, counter)
+    let low = ir_emit_binary_instruction(ir, "and", "i64", next, "4095")
+    let due = ir_emit_binary_instruction(ir, "icmp eq", "i64", low, "0")
+    let poll_block = ir.block("strip.poll")
+    let next_block = ir.block("strip.next")
+    ir.cond_jump(due, poll_block, next_block)
+    ir.label(poll_block)
+    ir_emit_poll(ir, null) !>
+    ir.jump(next_block)
+    ir.label(next_block)
 }
 
 // A call made inside a loop; calls into Grove's runtime (barriers, primitives) do not count.
@@ -2469,7 +2569,10 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
     if t == VAL.shared_view {
         let inner = value.value1
         if !isset(inner) : value.bug("Shared view is missing its value")
-        return ir_emit_value(ir, inner) !>
+        let rendered = ir_emit_value(ir, inner) !>
+        let meta = value.meta
+        if isset(meta) && meta.publish && !ir.terminated : return ir_emit_mt_publish(ir, inner, rendered) !>
+        return rendered
     }
     if t == VAL.interface_wrap {
         return ir_emit_interface_wrap(ir, value) !>
@@ -3546,6 +3649,17 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     }
     let total = ir_emit_binary_index(ir, "add", "i64", bytes, header)
 
+    if ir_storage_in_shared(ir, value) {
+        let alloc = ir_gc_func(ir, "s_alloc_seq", value) !>
+        ir_note_gc_allocates(ir)
+        let props = ir_emit_slice_layout(ir, value, class) !>
+        let mark = ir.arg_list.length
+        ir.write_arg(mark, "i64", total)
+        ir.write_arg(mark, "ptr", isset(props) ? ir_symbol_address(props) : "null")
+        let slot = ir_emit_arg_call(ir, "ptr", ir_func_address(alloc), mark)
+        ir_emit_store(ir, "i64", length, slot)
+        return slot
+    }
     if ir.func.ns.build.grove_mode() {
         let meta = value.meta
         let zero = !isset(meta) || !meta.uninit_storage
@@ -3568,6 +3682,75 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let slot = ir_emit_arg_call(ir, ir_type(alloc.get_rett()) !>, ir_func_address(alloc), mark)
     ir_emit_store(ir, "i64", length, slot)
     return slot
+}
+
+// A function of Grove's runtime (valk.gc), declared for this module
+fn ir_gc_func(ir: IRFunc, name: String, value: Value) Func !Error {
+    let func = (valk_idf(ir.func.ns.build, "gc", name) !>).func ?! value.bug("gc." + name + " is not a function")
+    if !func.parsed_types : parse_func_types(func) !>
+    ir_use_func(ir, func)
+    return func
+}
+
+// Grove-MT (C1, S1): an object goes to the shared heap when its class is S-resident or it is a
+// literal written in place as a view
+fn ir_class_init_in_shared(ir: IRFunc, value: Value, class: Class) bool {
+    if !ir.func.ns.build.grove_mt_mode() || !isset(value.get_allocator()) : return false
+    let meta = value.meta
+    if isset(meta) && meta.alloc_shared : return true
+    return class_is_shared_resident(class)
+}
+
+// S1: `$atomic` classes, an `atomic fn`'s environment and the runtime's thread classes
+fn class_is_shared_resident(class: Class) bool {
+    let base = class.generic_from ?? class
+    if base.atomic || base.shared_resident : return true
+    if base.ns.pkg.name != "valk" : return false
+    let ns = base.ns.name
+    let name = base.name
+    if ns == "core" : return name == "Mutex" || name == "SyncMutex"
+    if ns == "thread" {
+        return name == "Thread" || name == "Task" || name == "ThreadSuspendGate" || name == "ThreadCompletionQueue"
+    }
+    return false
+}
+
+// Grove-MT (S2, C1): storage made by a method on shared or locked data (a container's growth),
+// or for a literal in S, goes to the shared heap
+fn ir_storage_in_shared(ir: IRFunc, value: Value) bool {
+    if !ir.func.ns.build.grove_mt_mode() : return false
+    let meta = value.meta
+    if isset(meta) && meta.alloc_shared : return true
+    return ir.func.is_locked_receiver || ir.func.is_shared_receiver
+}
+
+// Grove-MT (C2): `rendered`, a value of `inner`'s type, with every thread-heap object it reaches
+// copied into the shared heap
+fn ir_emit_mt_publish(ir: IRFunc, inner: Value, rendered: String) String !Error {
+    let type = inner.rett
+    if type.is_gc_type() && !type.is_tagged_nullable() {
+        let publish = ir_gc_func(ir, "publish", inner) !>
+        let mark = ir.arg_list.length
+        ir.write_arg(mark, "ptr", rendered)
+        return ir_emit_arg_call(ir, "ptr", ir_func_address(publish), mark)
+    }
+    let props = Array[AllocatorProp]{}
+    allocator_collect_props(type, 0, props) !>
+    if props.length == 0 : return rendered
+    let name = "valk.publish.layout." + helper.ctxhash(type_identity_key(type))
+    if !ir_reuse_adapter(ir, name) {
+        let adapter = ir_adapter_ir(ir, name)
+        ir_write_layout_constant(adapter.code, name, allocator_layout_words(props, 0, 0, 0))
+    }
+    let lowered = ir_type(type) !>
+    let slot = ir_emit_alloca(ir, lowered)
+    ir_emit_store(ir, lowered, rendered, slot)
+    let publish = ir_gc_func(ir, "publish_value", inner) !>
+    let mark = ir.arg_list.length
+    ir.write_arg(mark, "ptr", slot)
+    ir.write_arg(mark, "ptr", ir_symbol_address(name))
+    ir_emit_arg_call(ir, "void", ir_func_address(publish), mark)
+    return ir_emit_load(ir, lowered, slot)
 }
 
 // C-21: Grove's inlined sequence allocation of `total` bytes, zeroed after the length word
@@ -3720,6 +3903,18 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         }
     }
     ir.release_field_values(field_mark)
+    // Grove-MT (C5): what the constructor stored into an S object is in S
+    if lowered == "ptr" && ir_class_init_in_shared(ir, value, class) {
+        let allocator = value.get_allocator()
+        if isset(allocator) && allocator.props.length > 0 {
+            let fix = ir_gc_func(ir, "s_publish_fields", value) !>
+            ir_use_global(ir, allocator.global)
+            let mark = ir.arg_list.length
+            ir.write_arg(mark, "ptr", slot)
+            ir.write_arg(mark, "ptr", ir_global_address(allocator.global))
+            ir_emit_arg_call(ir, "void", ir_func_address(fix), mark)
+        }
+    }
     if lowered == "ptr" : return slot
 
     let out = ir_emit_load(ir, lowered, slot)
@@ -4118,6 +4313,13 @@ fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String
         let pool_type = global.get_type() !>
         let pool_get = allocator.pool_get
         let grove = ir.func.ns.build.grove_mode()
+        // Grove-MT (C1): from the class's pool, which describes the kind, into S
+        if ir_class_init_in_shared(ir, value, class) {
+            let alloc = ir_gc_func(ir, "s_alloc_pool", value) !>
+            let mark = ir.arg_list.length
+            ir.write_arg(mark, "ptr", ir_global_address(global))
+            return ir_emit_arg_call(ir, "ptr", ir_func_address(alloc), mark)
+        }
         if !grove && ir_alloc_polls(ir) {
             pool_get = allocator.pool_get_polling ?? (allocator_pool_get(global, pool_get.name + "_polling", value.exp ?? ir.func.exp) !>)
             allocator.pool_get_polling = pool_get
@@ -4486,6 +4688,8 @@ fn ir_emit_call(ir: IRFunc, value: Value, into: String ("")) String !Error {
     if exits : ir_emit_func_cleanup(ir) !>
     let has_result = call_type != "void"
     let out = has_result ? ir.var() : ""
+    let bracket = !exits && isset(direct_func) && ir_native_bracketed(ir, direct_func)
+    let ctl = bracket ? (ir_emit_native_enter(ir) !>) : ""
     ir_open_call(ir, out, call_type)
     if isset(direct_func) && direct_func.infinite_args {
         ir.write(" (")
@@ -4501,6 +4705,8 @@ fn ir_emit_call(ir: IRFunc, value: Value, into: String ("")) String !Error {
     if exits {
         ir.line("unreachable")
         ir.terminated = true
+    } else if bracket {
+        ir_emit_native_leave(ir, ctl) !>
     }
     if by_pointer : return into.length > 0 ? "" : ir_emit_load(ir, ir_type(value.rett) !>, result_slot)
     if !has_result : return ""
