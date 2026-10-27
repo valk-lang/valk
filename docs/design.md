@@ -790,9 +790,10 @@ reassigned, since a reader could see half of the old value and half of the new
 one. Their slice and borrow elements can be assigned under the same one-word
 rule, because the view never changes their length. Fields marked `-` or `~` are
 read-only through the view, since they can be part of an invariant of their
-class, like an array's length and storage. A `@threadsafe` method synchronizes
-on its own and is not checked; other explicitly synchronized low-level code uses
-the shared-unsafe mechanisms.
+class, like an array's length and storage. A `@threadsafe` method of Valk's
+runtime (`core`, `coro`, `thread`, `sync`, `gc`) synchronizes on its own and is not
+checked; outside the runtime the flag changes nothing, and mutable shared state
+lives in a `Lock` field or a `$atomic` object.
 
 Language-level atomic reads use acquire ordering, atomic writes use release
 ordering, and atomic read-modify-write operations are sequentially consistent.
@@ -824,7 +825,7 @@ An ordinary value becomes `atomic T` as a copy, so no alias of the shared graph
 can remain. The copy is the one `clone` makes, with two differences: `clone`
 methods run through their atomic-receiver variant, so a method's body is checked
 against a read-only `this` and cannot hand back the original's parts (a
-`@threadsafe` one, like `Mutex.clone` returning itself, is trusted); and every
+runtime's `@threadsafe` one is trusted); and every
 generated object copy notes what it copied in a per-thread table, so cycles and
 objects reached twice keep their shape. Parts already `atomic` are kept by
 reference. A literal written in place is not copied, only the values it was
@@ -857,14 +858,18 @@ are atomic and the method gets the atomic or locked receiver variant, with its
 `this` typed as a borrow of the viewed struct.
 A class declared `$atomic` is only ever reached through its view: naming
 `X` means `atomic X`, and its methods see `this` as atomic data, except
-`@threadsafe` ones, which synchronize on their own and see it plainly. Such an
+the runtime's `@threadsafe` ones, which synchronize on their own and see it plainly. Such an
 object is never copied on publication, since no plain alias of it can exist.
-`Lock`, `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore` and
-`ConcurrentMap` are declared this way.
-A `shared` global reads as `atomic T`, so it is governed by the same rules.
+`Lock`, `Channel`, `CancelToken`, `Waker`, `WaitGroup`, `Semaphore`,
+`ConcurrentMap`, `Mutex`, `SyncMutex`, `Thread`, `Task`, `ThreadSuspendGate` and
+`ThreadCompletionQueue` are declared this way. The `gc_free` of such a class may
+run on another thread, so it cannot read a thread-local global of the program.
+A `shared` global reads as `atomic T`, so it is governed by the same rules; a
+reference stored into it, into an object of a `$atomic` class or through an
+atomic view is a release store, and loading it back is an acquire load.
 `@shared` globals are the explicit unsafe override when an external protocol
-guarantees synchronization and lifetime safety. Within an expression,
-`value.@cast(atomic T)` is the corresponding explicit unsafe conversion.
+guarantees synchronization, for types without references only. A
+`.@cast` into or out of an atomic or locked view is allowed only in the runtime.
 
 ### `locked T`
 
