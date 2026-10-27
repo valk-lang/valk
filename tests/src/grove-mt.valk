@@ -1,0 +1,271 @@
+@unsafe
+
+#if GROVE_MT
+
+use valk.gc
+use valk.ext
+use valk.io
+use valk.coro
+use valk.sync
+
+// Grove-MT with one thread: placement in the shared heap S, publication, the view variants,
+// polls and native brackets
+@ignore_access
+
+class MtUser {
+    name: String ("")
+    tags: Array[String] (.{})
+    friend: ?atomic MtUser (null)
+}
+
+// A string whose bytes lie in the thread heap
+fn mt_text(prefix: String, i: uint) String $noinline {
+    return prefix + i
+}
+
+fn mt_in_s(item: ?ptr) bool {
+    return gc.in_shared(item)
+}
+
+fn mt_string_in_s(text: String) bool {
+    return gc.in_shared(text.owner.@cast(?ptr)) && gc.in_shared(text.data.@cast(?ptr))
+}
+
+test "Grove-MT: an atomic conversion copies the graph into the shared heap" {
+    let plain = MtUser { name: mt_text("user-", 1), tags: Array[String]{ mt_text("tag-", 2) } }
+    assert(!mt_in_s(plain.@cast(ptr)))
+    assert(!mt_in_s(plain.name.owner.@cast(?ptr)))
+    let shared: atomic MtUser = plain
+    assert(mt_in_s(shared.@cast(ptr)))
+    assert(mt_in_s(shared.tags.@cast(ptr)))
+    assert(mt_in_s(shared.tags.data.@cast(?ptr)))
+    // String bytes are copied and the data word follows them
+    assert(mt_string_in_s(shared.name))
+    assert(shared.name == "user-1")
+    let tag = shared.tags.get(0) !!
+    assert(mt_string_in_s(tag))
+    assert(tag == "tag-2")
+    // The original stays usable, and its later changes are not seen through the copy
+    plain.tags.append("more")
+    assert(plain.tags.length == 2)
+    assert(shared.tags.length == 1)
+    gc.collect()
+    assert(shared.name == "user-1")
+}
+
+test "Grove-MT: parts already in S are kept by reference" {
+    let friend: atomic MtUser = MtUser { name: mt_text("friend-", 3) }
+    assert(mt_in_s(friend.@cast(ptr)))
+    let plain = MtUser { name: "u", friend: friend }
+    let shared: atomic MtUser = plain
+    let kept = shared.friend ?! panic("no friend")
+    assert(kept.@cast(ptr) == friend.@cast(ptr))
+    // Converting it again copies nothing
+    let again: atomic MtUser = friend
+    assert(again.@cast(ptr) == friend.@cast(ptr))
+}
+
+class MtCounted {
+    n: uint
+    fn clone() SELF {
+        return SELF { n: this.n + 100 }
+    }
+}
+
+class MtBox {
+    counted: MtCounted
+}
+
+test "Grove-MT: a clone method makes the published copy" {
+    let box = MtBox { counted: MtCounted { n: 1 } }
+    let shared: atomic MtBox = box
+    assert(shared.counted.n == 101)
+    assert(mt_in_s(shared.counted.@cast(ptr)))
+    assert(box.counted.n == 1)
+}
+
+test "Grove-MT: a Lock and its data live in S, and so does the growth of its array" {
+    let l = Lock[Array[uint]].new(.{}) !!
+    assert(mt_in_s(l.@cast(ptr)))
+    lock l as a {
+        let i: uint = 0
+        while i < 1000 {
+            a.append(i)
+            i++
+        }
+    }
+    gc.collect()
+    lock l as a {
+        assert(mt_in_s(a.@cast(ptr)))
+        assert(mt_in_s(a.data.@cast(?ptr)))
+        assert(a.length == 1000)
+        assert((a.get(999) !? 0) == 999)
+    }
+}
+
+class MtNamed {
+    name: String ("")
+    items: Array[MtUser] (.{})
+}
+
+test "Grove-MT: values stored into locked data are published" {
+    let l = Lock[MtNamed].new(.{}) !!
+    let name = mt_text("named-", 4)
+    let user = MtUser { name: mt_text("item-", 5) }
+    lock l as v {
+        v.name = name
+        v.items.append(user)
+    }
+    gc.collect()
+    lock l as v {
+        assert(mt_string_in_s(v.name))
+        assert(v.name == "named-4")
+        let first = v.items.get(0) !!
+        assert(mt_in_s(first.@cast(ptr)))
+        assert(first.name == "item-5")
+    }
+}
+
+class MtMsg {
+    id: uint
+    text: String
+}
+
+fn mt_consume(ch: atomic sync.Channel[atomic MtMsg], total: atomic Lock[Array[uint]]) {
+    while true {
+        let msg = ch.recv() ! return
+        assert(mt_in_s(msg.@cast(ptr)))
+        assert(msg.text == "msg-" + msg.id)
+        lock total as t : t.append(msg.id)
+    }
+}
+
+test "Grove-MT: a channel and a lock used by the coroutines of one thread" {
+    let ch = sync.Channel[atomic MtMsg].new(2) !!
+    let total = Lock[Array[uint]].new(.{}) !!
+    let task = co mt_consume(ch, total)
+    let i: uint = 0
+    while i < 20 {
+        ch.send(MtMsg { id: i, text: mt_text("msg-", i) }) !!
+        i++
+    }
+    ch.close()
+    await task
+    lock total as t {
+        assert(t.length == 20)
+        assert((t.get(19) !? 0) == 19)
+    }
+}
+
+global mt_loop_sum: uint
+
+fn mt_count_loop(n: uint) $noinline {
+    let i: uint = 0
+    while i < n {
+        mt_loop_sum += i
+        i++
+    }
+}
+
+synctest "Grove-MT: a loop without calls still reaches a poll" {
+    gc.collect()
+    let before = gc.gc.collect_count
+    // A collection pending at any depth
+    gc.poll_inv = (~0).to(uint)
+    mt_count_loop(10000)
+    assert(gc.gc.collect_count > before)
+    assert(!gc.pending)
+}
+
+test "Grove-MT: an extern call runs in a native region, a non-blocking one does not" {
+    assert(gc.thread_state_for_test() == 0)
+    let before = gc.native_exits_for_test()
+    ext.getpid()
+    assert(gc.native_exits_for_test() == before)
+    ext.sched_yield()
+    assert(gc.native_exits_for_test() == before + 1)
+    assert(gc.thread_state_for_test() == 0)
+}
+
+extern fn qsort(base: ptr, count: uint, size: uint, compare: ptr) void;
+
+global mt_callback_states: uint
+global mt_callback_boxes: ?Array[MtCounted] (null)
+
+// Called back from native code: it allocates, so it is no GC-free entry and runs as Valk code
+fn mt_compare(a: ptr, b: ptr) i32 $entrance {
+    if gc.thread_state_for_test() != 0 : mt_callback_states++
+    let boxes = mt_callback_boxes ?? Array[MtCounted]{}
+    boxes.append(MtCounted { n: 1 })
+    mt_callback_boxes = boxes
+    let x = @ptrv(a, uint)
+    let y = @ptrv(b, uint)
+    if x < y : return -1
+    if x > y : return 1
+    return 0
+}
+
+synctest "Grove-MT: a callback from native code runs in RUN and returns to the native region" {
+    let values: [uint x 8] = {5, 3, 8, 1, 9, 2, 7, 4}
+    mt_callback_states = 0
+    let before = gc.native_exits_for_test()
+    qsort(@ref(values), 8, size_of(uint), mt_compare.@cast(ptr))
+    assert(mt_callback_states == 0)
+    assert(values[0] == 1 && values[7] == 9)
+    let boxes = mt_callback_boxes ?! panic("no callback ran")
+    // The qsort call and every callback entry left a native region
+    assert(gc.native_exits_for_test() == before + 1 + boxes.length)
+    assert(gc.thread_state_for_test() == 0)
+    mt_callback_boxes = null
+}
+
+global mt_read_failed: bool
+global mt_reader: ?coro.Coro (null)
+
+fn mt_read_pipe(fd: i32) {
+    mt_reader = coro.current_coro
+    let buf: [u8 x 16] = @undefined
+    io.read_bytes(fd, @ref(buf), 16, uint.$max) ! {
+        mt_read_failed = true
+        return
+    }
+}
+
+synctest "Grove-MT: a refused io_uring submission fails its operation and clears io_keep" {
+    let fds: [i32 x 2] = @undefined
+    if ext.pipe(@ref(fds)) != 0 : panic("pipe")
+    mt_read_failed = false
+    let before = io.uring_in_flight_for_test()
+    let task = co mt_read_pipe(fds[0])
+    // The read is queued, not submitted yet, and keeps its buffer
+    let reader = mt_reader
+    if isset(reader) : assert(reader.io_keep[0] != 0)
+    let queued = io.uring_in_flight_for_test()
+    assert(queued > before)
+    io.uring_fail_unsubmitted_for_test(0 - ext.EINVAL)
+    if isset(reader) : assert(reader.io_keep[0] == 0)
+    assert(io.uring_in_flight_for_test() < queued)
+    await task
+    assert(mt_read_failed)
+    mt_reader = null
+    ext.close(fds[0])
+    ext.close(fds[1])
+}
+
+@shared mt_global: ?MtUser (null)
+
+fn mt_set_global() $noinline {
+    mt_global = MtUser { name: mt_text("global-", 6) }
+}
+
+synctest "Grove-MT: an @shared global holds a published copy" {
+    mt_set_global()
+    gc.collect()
+    let user = mt_global ?! panic("no global")
+    assert(mt_in_s(user.@cast(ptr)))
+    assert(mt_string_in_s(user.name))
+    assert(user.name == "global-6")
+    mt_global = null
+}
+
+#end
