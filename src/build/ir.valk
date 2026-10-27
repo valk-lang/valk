@@ -124,6 +124,7 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
     out.append_text("\n")
 
     ir_write_allocator_helpers(out, build, unit) !>
+    ir_write_poll_gates(out, unit)
 
     each unit.functions as func {
         if func.is_extern || func.is_generic_base || !func.info_used : continue
@@ -431,8 +432,11 @@ class IRFunc {
     terminated: bool (false)
     // The loops the emitter is inside, innermost last
     loops: Array[IRLoop] (.{})
-    // Calls emitted so far that count for a loop's poll (see ir_emit_while)
+    // Calls emitted so far that count for a loop's poll (see ir_emit_while): the direct
+    // callees made inside loops, and the count of other calls
     calls: uint (0)
+    loop_callees: Array[Func] (.{})
+    unknown_calls: uint (0)
     // Z3 (C-18): every call emitted so far; the count after the last `@uninit` allocation
     // (`fresh`) and the `@init` stores emitted
     safepoints: uint (0)
@@ -1616,6 +1620,8 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     let latch = polls && ir.func.ns.build.grove_mode()
     let latch_block = latch ? ir.block("while.latch") : cond_block
     let calls = ir.calls
+    let unknown_calls = ir.unknown_calls
+    let callees_at = ir.loop_callees.length
     let safepoints = ir.safepoints
     let inits = ir.init_stores
     ir.jump(cond_block)
@@ -1636,7 +1642,17 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
         }
         if latch {
             ir.label(latch_block)
-            if ir.calls > calls : ir_emit_poll(ir) !>
+            if ir.calls > calls {
+                // Only direct calls: the poll is kept when one of the callees reaches GC work
+                let gate : ?String = null
+                if ir.unknown_calls == unknown_calls {
+                    let unit = ir.func.unit
+                    let name = "valk.pollgate." + unit.poll_gates.length
+                    unit.poll_gates.append(PollGate { name: name, callees: ir.loop_callees.range(callees_at, ir.loop_callees.length - callees_at) })
+                    gate = name
+                }
+                ir_emit_poll(ir, gate) !>
+            }
             ir.jump(cond_block)
         }
         // Z3: the next iteration's `@init` would follow this iteration's call
@@ -1645,6 +1661,7 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
         }
     }
     ir.loops.pop_last() ! value.bug("IR loop stack is empty")
+    if ir.loops.length == 0 : ir.loop_callees.clear()
 
     ir.label(after_block)
 }
@@ -1659,16 +1676,43 @@ fn ir_func_in_gc(func: Func) bool {
     return func.ns.name == "gc" && func.ns.pkg.name == "valk"
 }
 
-// A call made inside a loop; calls into Grove's runtime (barriers, primitives) do not count
+// A call made inside a loop; calls into Grove's runtime (barriers, primitives) do not count.
+// `callee` is null for an indirect call
 fn ir_note_call(ir: IRFunc, callee: ?Func) {
     if isset(callee) && ir_func_in_gc(callee) : return
     ir.calls++
+    if ir.loops.length == 0 : return
+    if isset(callee) : ir.loop_callees.append(callee)
+    else : ir.unknown_calls++
+}
+
+// A loop poll whose callees are known when the module is written: the poll is kept if one of
+// them reaches GC work (Func.info_reaches_gc), otherwise its gate constant is false and LLVM
+// removes it
+class PollGate {
+    name: String
+    callees: Array[Func]
+}
+
+fn ir_write_poll_gates(out: ByteBuffer, unit: Unit) {
+    each unit.poll_gates as gate {
+        let on = false
+        each gate.callees as callee {
+            if callee.info_reaches_gc {
+                on = true
+                break
+            }
+        }
+        out.append_text("@\"")
+        out.append_text(gate.name)
+        out.append_text(on ? "\" = internal constant i1 true\n" : "\" = internal constant i1 false\n")
+    }
 }
 
 // `if sp >= POLL_SP : collect`. The runtime keeps POLL_SP complemented in `gc.poll_inv`, so the
 // zero every thread starts with means nothing is pending. The stub is a raw call, not an effect
 // edge, so a finalizer's loop still passes the gc_free check
-fn ir_emit_poll(ir: IRFunc) !Error {
+fn ir_emit_poll(ir: IRFunc, gate: ?String) !Error {
     let b = ir.func.ns.build
     let global = (valk_idf(b, "gc", "poll_inv") !>).global
     if !isset(global) : ir.func.exp.bug("gc.poll_inv is not a global")
@@ -1682,6 +1726,10 @@ fn ir_emit_poll(ir: IRFunc) !Error {
     ir.line4(sp, " = call i64 @llvm.read_register.i64(metadata !{!\"", reg, "\"})")
     let threshold = ir_emit_binary_instruction(ir, "xor", "i64", inv, "-1")
     let due = ir_emit_binary_instruction(ir, "icmp uge", "i64", sp, threshold)
+    if isset(gate) {
+        let on = ir_emit_load(ir, "i1", "@\"" + gate + "\"")
+        due = ir_emit_binary_instruction(ir, "and", "i1", on, due)
+    }
     let collect_block = ir.block("poll.collect")
     let next_block = ir.block("poll.next")
     ir.cond_jump(due, collect_block, next_block)
@@ -4352,8 +4400,8 @@ fn ir_emit_call(ir: IRFunc, value: Value, into: String ("")) String !Error {
     let args = value.values
     let arg_mark = ir.arg_list.length
     let direct_func : ?Func = callee.type == VAL.func ? callee.func : null
-    ir_note_call(ir, direct_func)
     let call_kind = value.op.@cast(CALL_KIND)
+    ir_note_call(ir, call_kind == CALL_KIND.direct ? direct_func : null)
     let interface_call = call_kind == CALL_KIND.interface_dispatch
     let closure_call = call_kind == CALL_KIND.closure
     let fallible = value.can_error || isset(value.get_error_type())

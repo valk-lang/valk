@@ -58,6 +58,7 @@ queue_ir "$workdir/export.ll" "$DIR/export.valk" --ir --no-warn
 queue_ir "$workdir/shared-pool.ll" "$DIR/shared-pool.valk" --ir --no-warn
 for grove in 0 1; do queue_ir "$workdir/grove-is-shared-$grove.ll" "$DIR/grove-is-shared.valk" --target linux-x64 --ir --no-warn --def "GROVE=$grove"; done
 for gc in auto valk; do queue_ir "$workdir/gc-auto-$gc.ll" "$DIR/gc-auto.valk" --target linux-x64 --ir --no-warn --gc "$gc"; done
+queue_ir "$workdir/grove-poll-gates.ll" "$DIR/grove-poll-gates.valk" --target linux-x64 --ir --no-warn --gc grove
 queue_ir "$workdir/fixed-array-bounds.ll" "$DIR/fixed-array-bounds.valk" --ir --no-warn
 queue_ir "$workdir/fixed-array-fills.ll" "$DIR/fixed-array-fills.valk" --ir --no-warn
 queue_ir "$workdir/direct-initializer.ll" "$DIR/direct-initializer.valk" --ir --no-warn
@@ -1310,6 +1311,27 @@ for gc in auto valk; do
     if [[ -z "$loop_body" || ( "$gc" == auto && "$polls" -eq 0 ) || ( "$gc" == valk && "$polls" -ne 0 ) ]]; then
         echo "# Wrong loop polls for --gc $gc"
         echo "$loop_body"
+        exit 1
+    fi
+done
+
+echo "> Grove: loops whose calls reach no GC work have a false poll gate"
+
+ir="$workdir/grove-poll-gates.ll"
+if ! out=$(ir_result "$ir"); then
+    echo "# Failed to build grove-poll-gates IR fixture"
+    echo "$out"
+    exit 1
+fi
+for case in leaf:false alloc:true; do
+    name=${case%%:*}
+    want=${case##*:}
+    body=$(sed -n "/^define .*__poll_gate_${name}_loop__/,/^}/p" "$ir")
+    gate=$(grep -o 'valk\.pollgate\.[0-9]*' <<< "$body" | head -1)
+    if [[ -z "$gate" ]] || ! grep -q "^@\"$gate\" = internal constant i1 $want\$" "$ir"; then
+        echo "# Wrong poll gate for poll_gate_${name}_loop (expected $want)"
+        echo "$body"
+        grep "pollgate" "$ir"
         exit 1
     fi
 done
