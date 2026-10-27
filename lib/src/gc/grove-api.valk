@@ -4,15 +4,21 @@ use mem
 use core
 use ext
 
-// At the young budget B (until polls exist, at once), or when the log reaches its soft cap (see
-// Gc.set_log_caps): a collection works through the log in one stop, so the cap bounds the
-// pause and the log's memory
+// At the young budget B or the log's soft cap (see Gc.set_log_caps): a collection works
+// through the log in one stop, so the cap bounds the pause and the log's memory
 value trigger_reached (gc.mem_new >= gc.mem_trigger || log_full)
 value log_full (log_entries >= gc.e_soft)
 // Removal records, card entries and range entries
 value log_entries (gc.props_removed.index + gc.card_log.index / size_of(ptr))
 // The scheduler's idle point: three quarters of the young budget
 value trigger_almost_reached (gc.mem_new >= gc.mem_trigger / 4 * 3)
+
+// R-13: a collection is pending while `poll_inv` is not 0. It holds POLL_SP complemented: the
+// stack pointer where the budget or the soft cap ran out (the trigger_sp). The zero every
+// thread starts with means nothing is pending. The compiler's loop polls collect at a stack
+// pointer at or above it (a shallow point); P10 clears it
+global poll_inv: uint (0)
+value pending (poll_inv != 0)
 
 /// Bytes of the GC blocks and large objects in use, including free slots.
 ~+ shared mem_usage_shared: uint
@@ -83,20 +89,24 @@ value trigger_almost_reached (gc.mem_new >= gc.mem_trigger / 4 * 3)
 ///
 /// Does nothing while a collection is running or the GC is not idle.
 + fn collect_if_threshold_reached() {
-    if trigger_reached {
-        if gc.state != GcState.idle : return
-        gc.collect()
-    }
+    if trigger_reached : collect_now()
 }
 /// Collects like `collect_if_threshold_reached`, but at three quarters of the trigger.
 ///
 /// Useful at idle points such as an event loop iteration, so the collection happens before
 /// an allocation forces it.
 + fn collect_if_threshold_almost_reached() {
-    if trigger_almost_reached {
-        if gc.state != GcState.idle : return
-        gc.collect()
-    }
+    if trigger_almost_reached : collect_now()
+}
+
+// R-49: a coroutine switch collects while a collection is pending
+fn collect_if_pending() {
+    if pending : collect_now()
+}
+
+fn collect_now() {
+    if gc.state != GcState.idle : return
+    gc.collect()
 }
 
 // No other thread scans this stack while it blocks
@@ -107,12 +117,36 @@ fn clear_stack() $inline {
 + fn collect_shared_if_threshold_reached() {
 }
 
-// Before an allocation of `bytes` that has not been counted yet
-fn collect_for(bytes: uint) {
-    if gc.mem_new + bytes >= gc.mem_trigger || log_full {
-        if gc.state != GcState.idle : return
-        gc.collect()
+// The stack pointer, near enough: the address of a local of the calling frame
+fn stack_pointer() uint $inline {
+    let probe: uint = 0
+    return @ref(probe).@cast(ptr)
+}
+
+// R-13, at a refill or a large allocation that brings `allocated` to `bytes` more: pending at
+// B, at once at H or the log's hard cap. A polling refill (an allocation site inside a loop)
+// also collects when pending at a stack pointer at or above the trigger_sp
+fn alloc_trigger(bytes: uint, polling: bool) {
+    let allocated = gc.mem_new + bytes
+    if allocated >= gc.mem_limit || log_entries >= gc.e_hard {
+        collect_now()
+        return
     }
+    if !pending && (allocated < gc.mem_trigger || gc.state != GcState.idle) : return
+    // One probe: two would be two slots of this frame
+    let sp = stack_pointer()
+    if !pending : poll_inv = ~sp
+    if polling && sp >= ~poll_inv : collect_now()
+}
+
+// B6 at the soft cap: pending; at the hard cap: at once
+fn log_trigger() {
+    if log_entries >= gc.e_hard {
+        collect_now()
+        return
+    }
+    if pending || gc.state != GcState.idle : return
+    poll_inv = ~stack_pointer()
 }
 
 /// Allocates `size` bytes of GC memory whose contents are not scanned for references.
@@ -143,9 +177,20 @@ fn collect_for(bytes: uint) {
 /// allocated from since, is not cleared again.
 + fn alloc_typed_zeroed(size: uint, layout: ?ptr) GcPtr {
     @unsafe
+    return alloc_zeroed(size, layout, false)
+}
+
+// The compiler's slice allocation inside a loop
+fn alloc_typed_zeroed_polling(size: uint, layout: ?ptr) GcPtr {
+    @unsafe
+    return alloc_zeroed(size, layout, true)
+}
+
+fn alloc_zeroed(size: uint, layout: ?ptr, polling: bool) GcPtr {
+    @unsafe
     if size == 0 : size = 1
     let pool = get_typed_pool(size, layout)
-    let item = pool.large ? pool.get_large(size) : pool.get()
+    let item = pool.large ? pool.get_large(size, polling) : (polling ? pool.get_polling() : pool.get())
     if pool.zeroed {
         #if GC_DEBUG
         zero_check(item, size)
