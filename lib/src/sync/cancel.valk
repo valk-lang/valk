@@ -1,14 +1,30 @@
+@unsafe
+
 use core
 use coro
 use time
 use io
+use mem
 
 class CancelState {
     cancelled: bool (false)
     waiters: Array[Waker] (.{})
     children: Array[CancelToken] (.{})
     callbacks: Array[atomic fn()()] (.{})
-    fds: Array[Fd] (.{})
+    // S8: watch records (*FdWatch) of descriptors that a cancel interrupts
+    watches: Array[uint] (.{})
+    // The length the last clean-up of `watches` left
+    watches_kept: uint (0)
+}
+
+// S8: a descriptor that a token interrupts when cancelled, in malloc'd memory. One reference for
+// the token's list and one for the object that watches it. `alive` is cleared under the guard
+// before the descriptor is closed, so a cancel never touches a descriptor number reused since
+struct FdWatch {
+    fd: Fd
+    alive: uint
+    refs: uint
+    guard: uint
 }
 
 /// A cancellation signal shared between coroutines and threads.
@@ -41,10 +57,10 @@ class CancelState {
         lock this.state as s {
             if s.cancelled : return
             s.cancelled = true
-            // Under the lock, so a descriptor that `unwatch_fd` has released
-            // (and that may since have been reused) is never touched
-            each s.fds as fd : io.interrupt_fd(fd)
-            s.fds.clear()
+            // Under each record's guard, so a descriptor that its owner has closed (and whose
+            // number may have been reused since) is never touched
+            each s.watches as record : watch_cancel(record)
+            s.watches.clear()
             waiters = s.waiters.clone()
             children = s.children.clone()
             callbacks = s.callbacks.clone()
@@ -134,19 +150,39 @@ class CancelState {
         co cancel_later(token, ms)
     }
 
-    // Interrupts socket I/O on `fd` when cancelled (see
-    // `net.TcpConnection.set_cancel`); true when already cancelled, in which
-    // case the caller interrupts it itself
-    fn watch_fd(fd: Fd) bool @threadsafe {
+    // Interrupts socket I/O on `fd` once cancelled (see `net.TcpConnection.set_cancel`). Returns
+    // the watch record for `unwatch_fd`, or null when the token is already cancelled; the caller
+    // then interrupts the descriptor itself
+    fn watch_fd(fd: Fd) ?ptr @threadsafe {
+        let record = mem.new[FdWatch](.{ fd: fd, alive: 1, refs: 2, guard: 0 })
+        let cancelled = false
         lock this.state as s {
-            if s.cancelled : return true
-            s.fds.append(fd)
+            if s.cancelled {
+                cancelled = true
+            } else {
+                s.watches.append(record.@cast(uint))
+                s.watches_kept = drop_dead_watches(s.watches, s.watches_kept, false)
+            }
         }
-        return false
+        if cancelled {
+            mem.free(record)
+            return null
+        }
+        return record.@cast(ptr)
     }
 
-    fn unwatch_fd(fd: Fd) @threadsafe {
-        lock this.state as s : s.fds.remove_value(fd)
+    // The watcher stops watching, before it closes its descriptor
+    fn unwatch_fd(record: ?ptr) @threadsafe {
+        let r = record ?! return
+        watch_kill(r)
+        let found = false
+        lock this.state as s {
+            let before = s.watches.length
+            s.watches.remove_value(r.@cast(uint))
+            found = s.watches.length != before
+        }
+        if found : watch_release(r)
+        watch_release(r)
     }
 
     fn register(waker: Waker) bool @threadsafe {
@@ -160,9 +196,69 @@ class CancelState {
     fn forget(waker: Waker) @threadsafe {
         lock this.state as s : s.waiters.remove_value(waker)
     }
+
+    #if TEST
+    /// Test hook: the watch records the token holds.
+    + fn watches_for_test() uint @threadsafe {
+        lock this.state as s : return s.watches.length
+    }
+    #end
 }
 
 fn cancel_later(token: CancelToken, ms: uint) {
     time.sleep_ms(ms)
     token.cancel()
+}
+
+// A cancel interrupts the descriptor while its watcher still holds it open, then drops the
+// list's reference
+fn watch_cancel(record: uint) {
+    @unsafe
+    let r = record.@cast(*FdWatch)
+    coro.spin_acquire(@ref(r.guard))
+    if r.alive != 0 : io.interrupt_fd(r.fd)
+    coro.spin_release(@ref(r.guard))
+    watch_release(record.@cast(ptr))
+}
+
+// The watcher is done with its descriptor: no cancel touches it from here on
+fn watch_kill(record: ptr) {
+    @unsafe
+    let r = record.@cast(*FdWatch)
+    coro.spin_acquire(@ref(r.guard))
+    r.alive = 0
+    coro.spin_release(@ref(r.guard))
+}
+
+fn watch_release(record: ptr) {
+    @unsafe
+    let r = record.@cast(*FdWatch)
+    if atomic(r.refs - 1) == 1 : mem.free(r)
+}
+
+// S8: a watcher's finalizer, which may touch no other GC object, ends its watch; the token's
+// list lets go of the record at its next clean-up or cancel
+fn watch_drop(record: ?ptr) {
+    let r = record ?! return
+    watch_kill(r)
+    watch_release(r)
+}
+
+// Drops the records whose watcher ended, at twice the length the last clean-up left (and at
+// least 16), or always with `now`. Returns the length to compare with next time
+fn drop_dead_watches(list: locked Array[uint], kept: uint, now: bool) uint {
+    @unsafe
+    let length = list.length
+    if !now && (length < 16 || length < kept * 2) : return kept
+    let i: uint = 0
+    while i < list.length {
+        let record = list.get(i) ! break
+        if atomic_load(record.@cast(*FdWatch).alive) == 0 {
+            list.remove(i)
+            watch_release(record.@cast(ptr))
+            continue
+        }
+        i++
+    }
+    return list.length
 }
