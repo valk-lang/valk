@@ -5,6 +5,8 @@
 
 ```
 - Release 0.8.3
++ HTTP server: a connection waiting for its next request keeps no buffers: its output buffer goes to the worker for the connections that wake, and its next request gets new input storage, so views a handler kept never show another connection's request (about 5.9 KB -> 2.7 KB per idle connection, measured with 200,000)
++ `ByteBuffer.swap(other)` exchanges contents and storage without copying
 
 + Release 0.8.2
 + HTTP server: `compress_level` sets the gzip level of `compress`, and defaults to 1 (was 6): on JSON it is about 40% faster and the output a few percent larger, as nginx does by default

@@ -1330,6 +1330,8 @@ Available on arrays of non-nullable integers and floats.
     + fn starts_with(str: String, offset: uint (0)) bool
     // A copy of the bytes the buffer can hold, written or not.
     + get storage: String $deprecated
+    // Exchanges the contents and storage with `other`, without copying.
+    + fn swap(other: ByteBuffer) void
     // Returns a copy of the contents as a new `String`.
     + fn to_string() String
     // Removes the bytes for which `filter` returns true from both ends.
@@ -1543,6 +1545,12 @@ Returns false when `offset` is past the length.
 A copy of the bytes the buffer can hold, written or not.
 
 Deprecated: use `to_string()` for the written bytes.
+
+#### swap
+
+Exchanges the contents and storage with `other`, without copying.
+
+Views taken from either buffer keep the bytes they were taken from.
 
 #### to_string
 

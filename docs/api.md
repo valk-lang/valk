@@ -443,6 +443,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn starts_with(str: String, offset: uint (0)) bool
     // A copy of the bytes the buffer can hold, written or not.
     + get storage: String $deprecated
+    // Exchanges the contents and storage with `other`, without copying.
+    + fn swap(other: ByteBuffer) void
     // Returns a copy of the contents as a new `String`.
     + fn to_string() String
     // Removes the bytes for which `filter` returns true from both ends.
