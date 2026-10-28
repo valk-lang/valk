@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.2
+
 + Release 0.8.1
 + Breaking: a `String` has no zero byte after its text, so `range`, `split`, `lines`, `trim` and the like return views of the same bytes instead of copies. `*[u8]` and `ptr` no longer convert to `cstring` by themselves: `data_cstring` copies the text into one of 8 buffers per thread (valid until that thread converts 8 more strings), and `.@cast(cstring)` is the explicit way for bytes known to end in a zero
 + Breaking: `json.Value` holds `Array[Value]` and `Map[Value]` directly; `json.ArrayValue` and `json.ObjectValue` are removed. `json.decode` takes a `String`, strings without escapes are views of the input and repeated member names are shared; `json.encode` writes `HashMap`, `FlatMap`, `HashSet` and `Deque` directly instead of through a `Value` copy
