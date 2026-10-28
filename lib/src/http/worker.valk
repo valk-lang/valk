@@ -111,10 +111,11 @@ class Worker {
     now: uint
     last_sweep: uint (0)
     last_parked_sweep: uint (0)
-    // Connections with a coroutine, and parked ones; doubly linked so that moving and
-    // `remove_client` are O(1). The frequent sweep walks only the first list
-    clients: ?Connection
-    parked_clients: ?Connection
+    // Connections with a coroutine, and parked ones; each knows its index, so moving and
+    // `remove_client` are O(1). The frequent sweep walks only the first list. Arrays, not
+    // linked lists: a moved list node would hand the GC the whole chain behind it
+    clients: Array[Connection] (.{})
+    parked_clients: Array[Connection] (.{})
     // The epoll set parked connections wait in, -1 without one; parked connections by descriptor
     // (descriptors are small dense numbers, and one array slot per connection logs little for the GC)
     epoll_fd: i32 (-1)
@@ -175,20 +176,18 @@ class Worker {
         this.now = now
         if now - this.last_sweep < SWEEP_MS : return
         this.last_sweep = now
-        let connection = this.clients
-        while isset(connection) {
+        each this.clients as connection {
             let deadline = connection.deadline_ms
             if deadline > 0 && now >= deadline : connection.netcon.interrupt()
-            connection = connection.next
         }
         if now - this.last_parked_sweep < PARKED_SWEEP_MS : return
         this.last_parked_sweep = now
-        connection = this.parked_clients
-        while isset(connection) {
-            let next = connection.next
+        // Backwards: closing moves the last connection into the closed one's slot
+        let i = this.parked_clients.length
+        while i-- > 0 {
+            let connection = this.parked_clients.get(i) ! continue
             let deadline = connection.deadline_ms
             if deadline > 0 && now >= deadline : this.close_parked(connection)
-            connection = next
         }
     }
 
@@ -204,13 +203,11 @@ class Worker {
         return true
     }
 
-    fn longest_idle(list: ?Connection) ?Connection {
+    fn longest_idle(list: Array[Connection]) ?Connection {
         let victim: ?Connection = null
-        let connection = list
-        while isset(connection) {
+        each list as connection {
             let since = connection.idle_since
             if since > 0 && (!isset(victim) || since < victim.idle_since) : victim = connection
-            connection = connection.next
         }
         return victim
     }
@@ -354,24 +351,20 @@ class Worker {
     }
 
     fn link(client: Connection, parked: bool) {
-        let head = parked ? this.parked_clients : this.clients
-        client.next = head
-        if isset(head) : head.prev = client
-        if parked : this.parked_clients = client
-        else : this.clients = client
+        let list = parked ? this.parked_clients : this.clients
+        client.list_index = list.length
+        list.append(client)
         client.in_parked_list = parked
     }
 
     fn unlink(client: Connection) {
-        let prev = client.prev
-        let next = client.next
-        if isset(prev) : prev.next = next
-        else if client.in_parked_list {
-            if this.parked_clients == client : this.parked_clients = next
-        } else if this.clients == client : this.clients = next
-        if isset(next) : next.prev = prev
-        client.prev = null
-        client.next = null
+        let list = client.in_parked_list ? this.parked_clients : this.clients
+        let index = client.list_index
+        let found = list.get(index) ! return
+        if found != client : return
+        let last = list.last() ! return
+        last.list_index = index
+        list.swap_remove(index)
     }
 
     // Runs once the server is stopping: idle connections are closed or interrupted right
@@ -383,18 +376,15 @@ class Worker {
             let now = this.now
             let deadline = this.server.deadline_ms
             let expired = now >= deadline
-            let connection = this.parked_clients
-            while isset(connection) {
-                let next = connection.next
+            let i = this.parked_clients.length
+            while i-- > 0 {
+                let connection = this.parked_clients.get(i) ! continue
                 this.close_parked(connection)
-                connection = next
             }
-            connection = this.clients
-            while isset(connection) {
+            each this.clients as connection {
                 let h2 = connection.h2
                 if isset(h2) : h2.request_shutdown()
                 if expired || (!isset(h2) && !connection.active) : connection.netcon.interrupt()
-                connection = connection.next
             }
             let wait_ms: uint = DRAIN_POLL_MS
             if !expired && deadline - now < wait_ms : wait_ms = deadline - now
