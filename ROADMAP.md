@@ -7,6 +7,7 @@
 - Release 0.8.4
 + HTTP server: the worker keeps its connections in arrays instead of linked lists; a connection moving between the active and parked list made the GC walk the whole chain behind it, which with many busy connections cost more than the requests (300k users: 61 -> 51 µs of CPU per request)
 + HTTP server: a connection woken by its next request reads it with one direct receive instead of a round through io_uring, since the data is known to be there
++ HTTP server: the once-a-second sweep of parked connections reads their idle deadlines from one array instead of from every connection object
 
 + Release 0.8.3
 + HTTP server: a connection waiting for its next request keeps no buffers: its output buffer goes to the worker for the connections that wake, and its next request gets new input storage, so views a handler kept never show another connection's request (about 5.9 KB -> 2.7 KB per idle connection, measured with 200,000)
