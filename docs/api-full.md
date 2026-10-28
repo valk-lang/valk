@@ -7243,6 +7243,8 @@ verifies any salt length, so signatures made with the largest salt (Python's
 + fn base64_encoded_size(length: uint) uint
 // Decodes URL-safe base64 (`-` and `_`), with or without `=` padding.
 + fn base64url_decode(text: local &[u8]) String !CryptoError
+// Decodes URL-safe base64 into `out` and returns the bytes written, like `base64url_decode` without allocating.
++ fn base64url_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
 // Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
 + fn base64url_encode(data: local &[u8]) String
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
@@ -7395,6 +7397,13 @@ Decodes URL-safe base64 (`-` and `_`), with or without `=` padding.
 
 Throws `invalid_input` on the standard alphabet's `+` and `/`, and on anything
 `base64_decode` rejects.
+
+### base64url_decode_in
+
+Decodes URL-safe base64 into `out` and returns the bytes written, like `base64url_decode`
+without allocating.
+
+`out` must hold at least `base64_decoded_size(text.length)` bytes; a shorter buffer panics.
 
 ### base64url_encode
 
@@ -10755,6 +10764,8 @@ stored between requests: a client that wants to send these back adds them to the
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
     + fn form() Map[String]
+    // Returns the value of the first header called `name`, compared without case, like `headers().get(name)` but without parsing the other headers.
+    + fn header(name: String) String !LookupError
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
     // Returns the request body as JSON.
@@ -10835,6 +10846,13 @@ value is re-encoded as JSON text. The media type is compared case-insensitively
 and without its parameters, so `application/json; charset=utf-8` is read as JSON;
 the multipart `boundary` parameter may be quoted. Any other body gives an empty
 map.
+
+#### header
+
+Returns the value of the first header called `name`, compared without case, like
+`headers().get(name)` but without parsing the other headers.
+
+Throws `LookupError` when the request has no such header.
 
 #### headers
 
@@ -11515,6 +11533,8 @@ in `headers` are all kept. Names not in `headers` stay untouched.
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
     + fn form() Map[String]
+    // Returns the value of the first header called `name`, compared without case, like `headers().get(name)` but without parsing the other headers.
+    + fn header(name: String) String !LookupError
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
     // Returns the request body as JSON.
@@ -11597,6 +11617,13 @@ value is re-encoded as JSON text. The media type is compared case-insensitively
 and without its parameters, so `application/json; charset=utf-8` is read as JSON;
 the multipart `boundary` parameter may be quoted. Any other body gives an empty
 map.
+
+#### header
+
+Returns the value of the first header called `name`, compared without case, like
+`headers().get(name)` but without parsing the other headers.
+
+Throws `LookupError` when the request has no such header.
 
 #### headers
 
@@ -11994,6 +12021,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + body_timeout_ms: uint
     // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
+    // The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
+    + compress_level: uint
     // How long a request head may take to arrive once it started, and how long the TLS handshake may take, in milliseconds.
     + header_timeout_ms: uint
     // The address the server listens on.
@@ -12075,6 +12104,12 @@ JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
 
 Adds `Vary: Accept-Encoding`. A response with its own `Content-Encoding` and a
 streamed response are sent as they are.
+
+#### compress_level
+
+The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1:
+on JSON and HTML it is about 40% faster than level 6 and the output only a few percent
+larger, the trade nginx makes by default.
 
 #### header_timeout_ms
 

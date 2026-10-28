@@ -2032,6 +2032,8 @@ error KeyError (invalid_input, key, failed)
 + fn base64_encoded_size(length: uint) uint
 // Decodes URL-safe base64 (`-` and `_`), with or without `=` padding.
 + fn base64url_decode(text: local &[u8]) String !CryptoError
+// Decodes URL-safe base64 into `out` and returns the bytes written, like `base64url_decode` without allocating.
++ fn base64url_decode_in(text: local &[u8], out: local mut &[u8]) uint !CryptoError
 // Returns `data` encoded as URL-safe base64 (`-` and `_`) without `=` padding, the form JWT, JWK and WebAuthn use.
 + fn base64url_encode(data: local &[u8]) String
 // Computes the bcrypt hash of `password` with the given `cost` and `salt` into `output`.
@@ -3189,6 +3191,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
     + fn form() Map[String]
+    // Returns the value of the first header called `name`, compared without case, like `headers().get(name)` but without parsing the other headers.
+    + fn header(name: String) String !LookupError
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
     // Returns the request body as JSON.
@@ -3411,6 +3415,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn files() Map[InMemoryFile]
     // Returns the form fields of the request body.
     + fn form() Map[String]
+    // Returns the value of the first header called `name`, compared without case, like `headers().get(name)` but without parsing the other headers.
+    + fn header(name: String) String !LookupError
     // Returns the request headers, with names lowercased.
     + fn headers() Headers
     // Returns the request body as JSON.
@@ -3524,6 +3530,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + body_timeout_ms: uint
     // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
     + compress: bool
+    // The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
+    + compress_level: uint
     // How long a request head may take to arrive once it started, and how long the TLS handshake may take, in milliseconds.
     + header_timeout_ms: uint
     // The address the server listens on.
