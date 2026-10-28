@@ -5,6 +5,9 @@
 
 ```
 - Release 0.8.2
++ HTTP server: `compress_level` sets the gzip level of `compress`, and defaults to 1 (was 6): on JSON it is about 40% faster and the output a few percent larger, as nginx does by default
++ Faster stdlib: compressing reserves only the bytes a block takes, so gzip of a 5 KB response allocates 4.7 KB instead of 16 KB
++ `gc.gc.collect_count` can be read, to count a thread's collections
 
 + Release 0.8.1
 + Breaking: a `String` has no zero byte after its text, so `range`, `split`, `lines`, `trim` and the like return views of the same bytes instead of copies. `*[u8]` and `ptr` no longer convert to `cstring` by themselves: `data_cstring` copies the text into one of 8 buffers per thread (valid until that thread converts 8 more strings), and `.@cast(cstring)` is the explicit way for bytes known to end in a zero
