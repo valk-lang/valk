@@ -9,7 +9,7 @@
 + Faster stdlib: compressing reserves only the bytes a block takes, so gzip of a 5 KB response allocates 4.7 KB instead of 16 KB; `compress_into` and the `*_into` variants write into a `ByteBuffer` in one go, and the HTTP server compresses responses into a buffer of the thread instead of a new string each
 + `gc.gc.collect_count` can be read, to count a thread's collections
 + JSON: member names without escapes are views of the input like string values, and the string buffer is made only for escapes: decoding a small object allocates about 370 bytes instead of 2.4 KB
-+ HTTP: `header(name)` on a request or fast-handler context returns one header without parsing the others; the server reads `Accept-Encoding` that way for every compressible response
++ HTTP: `header(name)` on a request or fast-handler context returns one header without parsing the others; the server reads `Accept-Encoding` that way for every compressible response, and checks it without splitting or copying
 
 + Release 0.8.1
 + Breaking: a `String` has no zero byte after its text, so `range`, `split`, `lines`, `trim` and the like return views of the same bytes instead of copies. `*[u8]` and `ptr` no longer convert to `cstring` by themselves: `data_cstring` copies the text into one of 8 buffers per thread (valid until that thread converts 8 more strings), and `.@cast(cstring)` is the explicit way for bytes known to end in a zero
