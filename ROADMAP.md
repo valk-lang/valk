@@ -6,7 +6,7 @@
 ```
 - Release 0.8.2
 + HTTP server: `compress_level` sets the gzip level of `compress`, and defaults to 1 (was 6): on JSON it is about 40% faster and the output a few percent larger, as nginx does by default
-+ Faster stdlib: compressing reserves only the bytes a block takes, so gzip of a 5 KB response allocates 4.7 KB instead of 16 KB
++ Faster stdlib: compressing reserves only the bytes a block takes, so gzip of a 5 KB response allocates 4.7 KB instead of 16 KB; `compress_into` and the `*_into` variants write into a `ByteBuffer` in one go, and the HTTP server compresses responses into a buffer of the thread instead of a new string each
 + `gc.gc.collect_count` can be read, to count a thread's collections
 
 + Release 0.8.1
