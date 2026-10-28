@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.8.3
++ Release 0.8.3
 + HTTP server: a connection waiting for its next request keeps no buffers: its output buffer goes to the worker for the connections that wake, and its next request gets new input storage, so views a handler kept never show another connection's request (about 5.9 KB -> 2.7 KB per idle connection, measured with 200,000)
 + `ByteBuffer.swap(other)` exchanges contents and storage without copying
 + `core.cpu_thread_count` counts the CPUs the process may run on (its affinity on Linux), so the HTTP server and `thread.parallel_for` start one thread per CPU they were given
