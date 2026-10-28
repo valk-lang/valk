@@ -4,7 +4,7 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.8.1
++ Release 0.8.1
 + Breaking: a `String` has no zero byte after its text, so `range`, `split`, `lines`, `trim` and the like return views of the same bytes instead of copies. `*[u8]` and `ptr` no longer convert to `cstring` by themselves: `data_cstring` copies the text into one of 8 buffers per thread (valid until that thread converts 8 more strings), and `.@cast(cstring)` is the explicit way for bytes known to end in a zero
 + Breaking: `json.Value` holds `Array[Value]` and `Map[Value]` directly; `json.ArrayValue` and `json.ObjectValue` are removed. `json.decode` takes a `String`, strings without escapes are views of the input and repeated member names are shared; `json.encode` writes `HashMap`, `FlatMap`, `HashSet` and `Deque` directly instead of through a `Value` copy
 + Vector types: `u8x16`, `f32x8` and other `[uif]<bits>x<lanes>` types with lane-wise operators, lane compares that give masks (`$eq`, `$lt`, ...) and `$splat`, `$load`, `$store`, `$extract`, `$insert`, `$shuffle`, `$select`, `$mask_bits`, `$bitcast`, `$reduce_*`. `--cpu <name>` picks the CPU to optimize for (`native` for this machine); `$target_*` CPU feature flags, `$cpuid`, `$xgetbv`, `$lookup` tables and `core.cpu_has` choose code paths, and `$prefetch(address)` hints a load
