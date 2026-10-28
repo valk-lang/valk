@@ -1390,6 +1390,23 @@ if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "x86_64" ]] && command -v obj
     fi
 fi
 
+# The CPU count follows the affinity a process was started with
+if [[ "$(uname -s)" == "Linux" ]] && command -v taskset > /dev/null; then
+    "$VALK" build "$DIR/cpu-affinity.valk" --no-warn -o "$workdir/cpu-affinity" > /dev/null || exit 1
+    one=$(taskset -c 0 "$workdir/cpu-affinity")
+    if [[ "$one" != "1" ]]; then
+        echo "# Expected 1 CPU under taskset -c 0, got: '$one'"
+        exit 1
+    fi
+    if (( $(nproc --all) > 1 )); then
+        two=$(taskset -c 0,1 "$workdir/cpu-affinity")
+        if [[ "$two" != "2" ]]; then
+            echo "# Expected 2 CPUs under taskset -c 0,1, got: '$two'"
+            exit 1
+        fi
+    fi
+fi
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     echo ""
     echo "# Test the HTTP server making room for new connections when out of file descriptors"

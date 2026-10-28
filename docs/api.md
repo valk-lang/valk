@@ -156,7 +156,7 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn cpu_core_count() uint
 // Returns whether the CPU this program runs on has `feature`.
 + fn cpu_has(feature: CpuFeature) bool
-// Returns the number of logical CPUs (hardware threads) that are online; at least 1.
+// Returns the number of logical CPUs (hardware threads) this process may run on; at least 1.
 + fn cpu_thread_count() uint
 // Returns every environment variable of this process as a new map from name to value.
 + fn env_vars() Map[String]

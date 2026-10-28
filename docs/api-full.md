@@ -398,7 +398,7 @@ How `Process.start` connects one standard stream of a child.
 + fn cpu_core_count() uint
 // Returns whether the CPU this program runs on has `feature`.
 + fn cpu_has(feature: CpuFeature) bool
-// Returns the number of logical CPUs (hardware threads) that are online; at least 1.
+// Returns the number of logical CPUs (hardware threads) this process may run on; at least 1.
 + fn cpu_thread_count() uint
 // Returns every environment variable of this process as a new map from name to value.
 + fn env_vars() Map[String]
@@ -465,7 +465,10 @@ if core.cpu_has(.avx2) : sum_avx2(data) else : sum(data)
 
 ### cpu_thread_count
 
-Returns the number of logical CPUs (hardware threads) that are online; at least 1.
+Returns the number of logical CPUs (hardware threads) this process may run on; at least 1.
+
+On Linux it follows the CPU affinity, so a process limited with `taskset` or a systemd
+`CPUAffinity`/`AllowedCPUs` gets the CPUs it was given rather than every CPU of the machine.
 
 ### env_vars
 
