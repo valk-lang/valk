@@ -820,6 +820,8 @@ the sign, or a value that does not fit.
     + fn insert(index: uint, value: T) void !LookupError
     // Returns a new array of the elements that also occur in `with`, in this array's order and without duplicates.
     + fn intersect(with: Array[T]) Array[T]
+    // Returns true when the array holds no elements.
+    + fn is_empty() bool
     // Returns a raw pointer to the first element.
     + fn items() *[T]
     // Converts each element to a `String` and joins them with `divider` between each pair.
@@ -1045,6 +1047,10 @@ An `index` equal to `length` appends. Throws `range` when `index` is greater tha
 
 Returns a new array of the elements that also occur in `with`, in this array's order
 and without duplicates.
+
+#### is_empty
+
+Returns true when the array holds no elements.
 
 #### items
 
@@ -2115,6 +2121,8 @@ Returns a new array with the items from front to back.
     + fn has(key: K) bool
     // Returns whether any entry holds a value equal to `value`.
     + fn has_value(value: T) bool
+    // Returns true when the map holds no entries.
+    + fn is_empty() bool
     // Returns a new array of the keys, in entry order.
     + fn keys() Array[K]
     // The number of entries.
@@ -2176,6 +2184,10 @@ Returns whether an entry for `key` exists.
 #### has_value
 
 Returns whether any entry holds a value equal to `value`.
+
+#### is_empty
+
+Returns true when the map holds no entries.
 
 #### keys
 
@@ -2254,6 +2266,8 @@ Returns a new array of the values, in entry order.
     + fn has(key: K) bool
     // Returns whether any entry holds a value equal to `value` (a linear scan using `==`).
     + fn has_value(value: T) bool
+    // Returns true when the map holds no entries.
+    + fn is_empty() bool
     // Returns a new array of the keys, in entry order.
     + fn keys() Array[K]
     // The number of entries.
@@ -2329,6 +2343,10 @@ Returns whether an entry for `key` exists.
 #### has_value
 
 Returns whether any entry holds a value equal to `value` (a linear scan using `==`).
+
+#### is_empty
+
+Returns true when the map holds no entries.
 
 #### keys
 
@@ -2477,6 +2495,8 @@ Reorders the entries so iteration, `keys` and `values` follow ascending key orde
     + fn intersection(other: HashSet[T]) HashSet[T]
     // Returns true when the two sets share no value.
     + fn is_disjoint(other: HashSet[T]) bool
+    // Returns true when the set holds no values.
+    + fn is_empty() bool
     // Returns true when every value of this set is also in `other`.
     + fn is_subset_of(other: HashSet[T]) bool
     // Returns the values as a new array, in iteration order.
@@ -2556,6 +2576,10 @@ Returns a new set with the values that are in both sets.
 #### is_disjoint
 
 Returns true when the two sets share no value.
+
+#### is_empty
+
+Returns true when the set holds no values.
 
 #### is_subset_of
 
