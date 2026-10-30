@@ -1,6 +1,7 @@
 use valk.http
 use valk.net
 use valk.time
+use valk.sync
 
 fn http_limit_handler(req: http.Request) http.Response {
     return http.Response.text("ok")
@@ -311,4 +312,113 @@ synctest "HTTP server serves a request that arrived while the connection was bus
     assert(seen.contains("ok /slow"))
     assert(seen.contains("ok /after"))
     connection.close() _
+}
+
+fn http_limit_slot_handler(req: http.Request) http.Response {
+    return http.Response.text(req.path + "|" + (req.header("Authorization") !? "") + "|" + (req.cookie("session") !? "") + "|" + req.body)
+}
+
+fn http_limit_slot_fast_handler(ctx: http.Context, res: http.ResponseWriter) {
+    res.send(ctx.path.to_string() + "|" + (ctx.header("Authorization") !? "") + "|" + (ctx.cookie("session") !? "") + "|" + ctx.body, 200, "text/plain")
+}
+
+fn http_limit_slot_body(round: uint, i: uint) String {
+    let sizes = Array[uint]{ 0, 64, 4096, 20000 }
+    let size = sizes.get((round + i) % sizes.length) !!
+    if size == 0 : return ""
+    return ("private-body-" + round + "-" + i + ":").pad_right('x', size)
+}
+
+fn http_limit_slot_churn(port: u16, workers: uint, delay_ms: uint) {
+    let server = http.Server.new("127.0.0.1", port, http_limit_slot_handler)
+    if workers > 1 : server.fast(http_limit_slot_fast_handler)
+    server.batch_delay_ms = delay_ms
+    let running = co server.start(workers)
+    let connections = Array[net.TcpConnection]{}
+    let inputs = Array[ByteBuffer]{}
+    // More than one epoll batch on a single worker
+    each 0 .. 280 {
+        let connection = net.tcp_client("127.0.0.1", port) !!
+        connection.read_timeout_ms = 2000 * TIME_SCALE
+        connections.append(connection)
+        inputs.append(ByteBuffer.new(256))
+    }
+
+    each 0 .. 5 as round {
+        each connections as connection, i {
+            let path = "/slot-" + round + "-" + i
+            let body = http_limit_slot_body(round, i)
+            connection.write("POST " + path + " HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer " + path + "\r\nCookie: session=" + path + "\r\nContent-Length: " + body.bytes + "\r\n\r\n" + body) !!
+        }
+        each connections as connection, i {
+            let path = "/slot-" + round + "-" + i
+            let expected = path + "|Bearer " + path + "|" + path + "|" + http_limit_slot_body(round, i)
+            assert(keep_alive_read_response(connection, inputs.get(i)!!) == expected)
+        }
+        time.sleep_ms(30)
+        if round == 4 : break
+        each connections as connection, i {
+            if i % 3 != round % 3 : continue
+            if i % 2 == 0 {
+                connection.write("GET /close HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") !!
+                assert(keep_alive_read_response(connection, inputs.get(i)!!) == "/close|||")
+            }
+            connection.close() _
+            // Reconnect while other closes and wakes are still pending
+            let replacement = net.tcp_client("127.0.0.1", port) !!
+            replacement.read_timeout_ms = 2000 * TIME_SCALE
+            connections.set(i, replacement) !!
+        }
+    }
+
+    stop_http_test_server(server, running)
+    each connections as connection {
+        connection.read_timeout_ms = 2000 * TIME_SCALE
+        let buffer = [u8]{ 0 x 1 }
+        let closed = false
+        connection.read(buffer) ! { closed = error_is(E.code, closed) }
+        assert(closed)
+        connection.close() _
+    }
+}
+
+synctest "HTTP server isolates responses and drains reused slots under connection churn" {
+    http_limit_slot_churn(19643, 1, 0)
+    http_limit_slot_churn(19644, 4, 2)
+}
+
+synctest "HTTP server rejects excess busy connections and recovers after they close" {
+    let entered = sync.Waker.new() !!
+    let release = sync.Waker.new() !!
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        if req.path == "/hold" {
+            entered.wake()
+            release.wait(5000 * TIME_SCALE)
+        }
+        return http.Response.text("ok")
+    }
+    let server = http.Server.new("127.0.0.1", 19646, handler)
+    server.max_connections = 1
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    defer release.wake()
+    let busy = net.tcp_client("127.0.0.1", 19646) !!
+    busy.read_timeout_ms = 2000 * TIME_SCALE
+    busy.write("GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    assert(entered.wait(2000 * TIME_SCALE))
+    each 0 .. 4 {
+        let excess = net.tcp_client("127.0.0.1", 19646) !!
+        excess.read_timeout_ms = 2000 * TIME_SCALE
+        assert(http_limit_response(excess).contains(" 503 "))
+        excess.close() _
+    }
+    release.wake()
+    assert(keep_alive_read_response(busy, ByteBuffer.new(256)) == "ok")
+    busy.close() _
+    time.sleep_ms(30)
+    let recovered = net.tcp_client("127.0.0.1", 19646) !!
+    recovered.read_timeout_ms = 2000 * TIME_SCALE
+    recovered.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") !!
+    assert(keep_alive_read_response(recovered, ByteBuffer.new(256)) == "ok")
+    recovered.close() _
 }

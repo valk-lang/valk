@@ -45,6 +45,7 @@ queue_ir "$workdir/windows-coro-stack.ll" "$DIR/native-address.valk" --target wi
 queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --no-warn
 queue_ir "$workdir/alias-tags.ll" "$DIR/alias-tags.valk" --ir --no-warn
 queue_ir "$workdir/atomic-alignment.ll" "$DIR/atomic-alignment.valk" --ir --no-warn
+for target in linux-x64 linux-arm64; do queue_ir "$workdir/http-epoll-$target.ll" "$DIR/http-epoll.valk" --target "$target" --ir --no-warn; done
 queue_ir "$workdir/vectors.ll" "$DIR/vectors.valk" --ir --no-warn
 queue_ir "$workdir/pointer-integer-compare.ll" "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/windows-bool.ll" "$DIR/windows-bool.valk" --target win-x64 --ir --no-warn
@@ -90,6 +91,25 @@ ls "$workdir"/job-*.sh | xargs -n 1 -P "$jobs" bash
 
 echo ""
 echo "# Test generated-code optimizations"
+echo "> Read packed epoll data without assuming integer alignment"
+
+for target in linux-x64 linux-arm64; do
+    http_ir="$workdir/http-epoll-$target.ll"
+    out=$(ir_result "$http_ir")
+    if [ "$?" -ne 0 ]; then
+        echo "# Failed to build HTTP epoll fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    watch_body=$(sed -n '/^define .*__Worker__watch_parked__/,/^}/p' "$http_ir")
+    if ! grep -Eq 'call i64 @".*__read_uint_le__.*\(ptr ' <<< "$watch_body" \
+        || grep -q 'getelementptr i64,' <<< "$watch_body"; then
+        echo "# Epoll slot decoding assumes integer alignment on $target"
+        echo "$watch_body"
+        exit 1
+    fi
+done
+
 echo "> Call the native GC entry directly on every target"
 
 for target in linux-x64 macos-x64 macos-arm64 win-x64; do
@@ -1270,5 +1290,5 @@ if ! grep -q 'store double .*, !tbaa !7$' <<< "$set_body" \
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 49"
+echo "# Test count: 50"
 echo ""
