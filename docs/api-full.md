@@ -374,7 +374,7 @@ An operating-system call failed (`failed`) or is not available on this platform
 
 ```js
 // A CPU feature that `cpu_has` checks at run time, for code with a `$target_` variant.
-+ enum CpuFeature { ssse3, sse41, avx2 }
++ enum CpuFeature { ssse3, sse41, avx2, pclmul }
 // How `Process.start` connects one standard stream of a child.
 + enum Stdio { inherit, pipe, discard }
 ```
@@ -410,6 +410,8 @@ How `Process.start` connects one standard stream of a child.
 + fn getenv(var: String) String !LookupError
 // Returns the host name of this machine.
 + fn hostname() String !SystemError
+// Returns the memory this process may use in bytes; 0 when it cannot be determined.
++ fn memory_limit() uint
 // Prints `msg` to stderr and ends the process with exit code 1.
 + fn panic(msg: String, location: String ("")) void
 // Returns the id of this process.
@@ -510,6 +512,13 @@ Throws `missing` when it is not set.
 Returns the host name of this machine.
 
 On Windows it is the DNS host name. Throws `failed` when the system does not report one.
+
+### memory_limit
+
+Returns the memory this process may use in bytes; 0 when it cannot be determined.
+
+That is the machine's RAM or, on Linux, the cgroup limit of the process (a container's or a
+systemd unit's) when that is lower.
 
 ### panic
 
@@ -1317,12 +1326,14 @@ Available on arrays of non-nullable integers and floats.
     + fn into_string() String
     // Removes leading bytes for which `filter` returns true and moves the rest to the front.
     + fn ltrim(filter: fnptr(u8)(bool)) void
-    // Creates an empty buffer with room for `start_size` bytes (at least 32).
+    // Creates an empty buffer with room for `start_size` bytes (at least 32). A `start_size` of 0 allocates nothing until the first write.
     + static fn new(start_size: uint (128)) ByteBuffer
     // Returns a copy of `length` bytes starting at `start_index`, clamped to the contents.
     + fn range(start_index: uint, length: uint) String
     // Returns a `ByteReader` over the current contents.
     + fn reader() ByteReader
+    // Empties the buffer and lets go of its storage without allocating; the next write allocates new storage. Views taken before keep the old bytes.
+    + fn release_storage() void
     // Ensures room for `length` more bytes after the contents, growing the capacity if needed.
     + fn reserve(length: uint) void
     // Sets the length to `length`, growing the capacity when needed.
@@ -1491,7 +1502,8 @@ Removes leading bytes for which `filter` returns true and moves the rest to the 
 
 #### new
 
-Creates an empty buffer with room for `start_size` bytes (at least 32).
+Creates an empty buffer with room for `start_size` bytes (at least 32). A `start_size`
+of 0 allocates nothing until the first write.
 
 Marked `$default`, so it also provides `ByteBuffer.$default_value`.
 
@@ -1506,6 +1518,11 @@ Returns "" when `start_index` is at or past the length.
 Returns a `ByteReader` over the current contents.
 
 The reader keeps a view of the bytes as they are now: bytes appended later are not seen.
+
+#### release_storage
+
+Empties the buffer and lets go of its storage without allocating; the next write
+allocates new storage. Views taken before keep the old bytes.
 
 #### reserve
 
@@ -10042,6 +10059,8 @@ one waited for the shared lock.
 + fn lock() void
 // Returns the bytes held by the GC pool blocks of all threads, including free slots.
 + fn mem_usage() uint
+// Collects the calling thread's garbage and returns the memory it frees to the system.
++ fn release_memory() void
 // Resets `pause_last_us` and `pause_max_us` of the calling thread to zero.
 + fn reset_pause_durations() void
 // Resets `shared_pause_last_us` and `shared_pause_max_us` to zero under the shared lock.
@@ -10112,6 +10131,13 @@ Takes the calling thread's GC lock again after `unlock`.
 ### mem_usage
 
 Returns the bytes held by the GC pool blocks of all threads, including free slots.
+
+### release_memory
+
+Collects the calling thread's garbage and returns the memory it frees to the system.
+
+Costs a few full collections, so it is meant for a thread that went idle after a burst of
+work. Collections only reuse freed memory on their own, they keep it for the next allocation.
 
 ### reset_pause_durations
 
@@ -12052,6 +12078,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
 ```js
 // A multi-threaded HTTP/1.1 server, with optional TLS and experimental HTTP/2.
 + class Server {
+    // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
+    + batch_delay_ms: uint
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
     // Compresses responses with gzip for clients that accept it: text, HTML, CSS, JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
@@ -12072,7 +12100,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + max_request_body_size: uint
     // The largest accepted request head (request line and headers) in bytes; 0 means no limit. Defaults to 8 KiB.
     + max_request_header_size: uint
-    // The combined size of the request bodies being received at once, over all connections, in bytes; 0 means no limit.
+    // The combined size of the request bodies being received at once, over all connections, in bytes; 0 means no limit. Defaults to a quarter of `core.memory_limit`, so uploads alone cannot run the process out of memory.
     + max_server_wide_body_size: uint
     // The port the server listens on.
     ~ port: u16
@@ -12127,6 +12155,14 @@ let s = http.Server.new("127.0.0.1", 9000, handler)
 s.max_request_body_size = 1024 * 1024
 s.start() ! { println("Failed to start http server"); return }
 ```
+
+#### batch_delay_ms
+
+A worker that wakes for only a few idle keep-alive connections waits this many
+milliseconds before it looks for more, so one wake-up serves the requests that arrived
+meanwhile together: fewer system calls, and handlers on a pipelined database connection
+share round trips (about 25% less CPU per request under moderate load). A request on an
+idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
 
 #### body_timeout_ms
 
@@ -12191,7 +12227,8 @@ Larger requests are answered with 431 and the connection is closed.
 #### max_server_wide_body_size
 
 The combined size of the request bodies being received at once, over all
-connections, in bytes; 0 means no limit.
+connections, in bytes; 0 means no limit. Defaults to a quarter of `core.memory_limit`,
+so uploads alone cannot run the process out of memory.
 
 A request that would exceed it is answered with 503, and while the limit is
 reached new connections are answered with 503 as well.
