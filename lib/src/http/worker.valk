@@ -28,12 +28,12 @@ value SERVE_EXTRA (8)
 
 #if OS == "linux"
 value EPOLL_CTL_ADD (1)
-value EPOLL_CTL_MOD (3)
+value EPOLL_CTL_DEL (2)
 value EPOLLIN (1)
 value EPOLLERR (8)
 value EPOLLHUP (16)
 value EPOLLRDHUP (8192)
-value EPOLLONESHOT (1 << 30)
+value EPOLLET (1 << 31)
 value EPOLL_CLOEXEC (0x80000)
 // A C `struct epoll_event`: u32 events, then 8 bytes of user data. Packed on x86-64 only;
 // elsewhere the data is aligned to 8 bytes
@@ -250,17 +250,25 @@ class Worker {
     }
 
     #if OS == "linux"
-    // Registers a parked connection for one readiness event; false when epoll refuses it
+    // Parks a connection in the epoll set; false when it has input already or epoll refuses it.
+    // A connection is registered once, edge-triggered, so parking again needs no system call:
+    // input that arrives while it is busy shows up as `input_signaled` instead
     fn park(connection: Connection) bool {
         @unsafe
-        let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
-        let events: u32 = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP | EPOLLONESHOT
         let fd = connection.fd
-        mem.copy_bytes(@ref(events), @ref(event[0]), 4)
-        mem.copy_bytes(@ref(fd), @ref(event[EPOLL_DATA_OFFSET]), 4)
-        let op: i32 = connection.polled ? EPOLL_CTL_MOD : EPOLL_CTL_ADD
-        if ext.epoll_ctl(this.epoll_fd, op, fd, @ref(event[0])) != 0 : return false
-        connection.polled = true
+        if connection.input_signaled {
+            connection.input_signaled = false
+            let entry = ext.libc_pollfd { fd: fd, events: ext.POLLIN.to(i16), revents: 0 }
+            if ext.poll(@ref(entry), 1, 0) != 0 : return false
+        }
+        if !connection.polled {
+            let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
+            let events: u32 = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP | EPOLLET
+            mem.copy_bytes(@ref(events), @ref(event[0]), 4)
+            mem.copy_bytes(@ref(fd), @ref(event[EPOLL_DATA_OFFSET]), 4)
+            if ext.epoll_ctl(this.epoll_fd, EPOLL_CTL_ADD, fd, @ref(event[0])) != 0 : return false
+            connection.polled = true
+        }
         let index = fd.to(uint)
         while this.parked.length <= index : this.parked.append(null)
         // The slot keeps the connection until it closes: a removed reference costs the
@@ -288,7 +296,11 @@ class Worker {
                 let fd: Fd = @ptrv(base + i * EPOLL_EVENT_SIZE + EPOLL_DATA_OFFSET, i32)
                 i++
                 let connection = (this.parked.get(fd.to(uint)) !? null) ?! continue
-                if !connection.parked : continue
+                if !connection.parked {
+                    // Input for a busy connection: its next park checks for it
+                    connection.input_signaled = true
+                    continue
+                }
                 // Busy again from here, so the sweep leaves it to its coroutine
                 connection.parked = false
                 this.unlink(connection)
@@ -367,12 +379,21 @@ class Worker {
         this.connections++
     }
 
-    fn remove_client(client: Connection) {
+    // Takes a registered connection out of the epoll set before its descriptor closes, so no
+    // event of it can reach a later connection that gets the same number
+    fn unregister(client: Connection) {
         #if OS == "linux"
-        // The descriptor may be reused already: only this connection's own slot is cleared
+        if !client.polled : return
+        client.polled = false
+        @unsafe
+        let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
+        ext.epoll_ctl(this.epoll_fd, EPOLL_CTL_DEL, client.fd, @ref(event[0]))
         let index = client.fd.to(uint)
-        if client.polled && index < this.parked.length && (this.parked.get(index) !? null) == client : this.parked.set(index, null) _
+        if index < this.parked.length && (this.parked.get(index) !? null) == client : this.parked.set(index, null) _
         #end
+    }
+
+    fn remove_client(client: Connection) {
         this.unlink(client)
         this.connections--
     }
