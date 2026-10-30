@@ -5,6 +5,7 @@
 
 ```
 - Release 0.8.4
++ HTTP server: a worker looks up a polled connection by a compact slot instead of by its descriptor, so its table is as large as the worker's connections and not as the process's highest descriptor, and a wake reads a small hot array (16 workers, 50,000 idle connections: 2.56 -> 2.19 KB per connection; 32 workers, 100,000: 2.65 -> 1.86 KB)
 + HTTP server: the worker keeps its connections in arrays instead of linked lists; a connection moving between the active and parked list made the GC walk the whole chain behind it, which with many busy connections cost more than the requests (300k users: 61 -> 51 µs of CPU per request)
 + HTTP server: a connection woken by its next request reads it with one direct receive instead of a round through io_uring, since the data is known to be there
 + HTTP server: the once-a-second sweep of parked connections reads their idle deadlines from one array instead of from every connection object
