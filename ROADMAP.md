@@ -5,6 +5,15 @@
 
 ```
 - Release 0.8.4
++ HTTP server: `max_server_wide_body_size` defaults to a quarter of `core.memory_limit()` instead of no limit: many large uploads at once are answered with 503 instead of the process being killed (128 x 31 MB in a 3 GB container: killed -> 1.5 GB peak)
++ HTTP server: a worker that goes idle after holding a lot of memory gives it back to the system (after a burst of large uploads: 3.5 GB -> 83 MB)
++ `gc.release_memory()` collects the thread's garbage and returns the freed memory to the system
++ `core.memory_limit()`: the machine's RAM or, on Linux, the cgroup limit when lower
++ HTTP server: `batch_delay_ms` (default 2): a worker woken for few parked connections waits before the next wake-up, so one wake-up serves many requests
++ HTTP server: an idle connection keeps no request storage, and connections register in epoll once instead of on every park
++ `$clmul` and `$target_pclmul` (x64); CRC-32 folds with PCLMULQDQ when the CPU has it (5.6x)
++ `ByteBuffer.release_storage()`; `ByteBuffer.new(0)` allocates nothing until the first write
++ `is_empty()` on Array, HashMap, HashSet and FlatMap
 + HTTP server: a worker looks up a polled connection by a compact slot instead of by its descriptor, so its table is as large as the worker's connections and not as the process's highest descriptor, and a wake reads a small hot array (16 workers, 50,000 idle connections: 2.56 -> 2.19 KB per connection; 32 workers, 100,000: 2.65 -> 1.86 KB)
 + HTTP server: the worker keeps its connections in arrays instead of linked lists; a connection moving between the active and parked list made the GC walk the whole chain behind it, which with many busy connections cost more than the requests (300k users: 61 -> 51 µs of CPU per request)
 + HTTP server: a connection woken by its next request reads it with one direct receive instead of a round through io_uring, since the data is known to be there

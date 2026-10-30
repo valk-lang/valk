@@ -6,6 +6,7 @@ use io
 use mem
 use ext
 use sync
+use gc
 
 // How often an idle acceptor checks whether the server is stopping
 value ACCEPT_POLL_MS (20)
@@ -25,6 +26,12 @@ value BATCH_MIN (32)
 // the next batch. When all are busy, up to SERVE_EXTRA temporary ones per batch help out
 value SERVE_POOL_MAX (256)
 value SERVE_EXTRA (8)
+// How often a worker checks whether it went idle. It is idle when it allocated less than
+// IDLE_ALLOCATED since the last check; it then gives back memory when it held IDLE_RELEASE more
+// than after the last time
+value IDLE_CHECK_MS (1000)
+value IDLE_ALLOCATED (256 * 1024)
+value IDLE_RELEASE (16 * 1024 * 1024)
 
 #if OS == "linux"
 value EPOLL_CTL_ADD (1)
@@ -119,6 +126,13 @@ class Worker {
     now: uint
     last_sweep: uint (0)
     last_parked_sweep: uint (0)
+    last_idle_check: uint (0)
+    // At the last idle check: the bytes allocated and the collections
+    idle_allocated: uint (0)
+    idle_collections: uint (0)
+    // The most pool memory held since the last release, and what was left after that release
+    mem_held: uint (0)
+    mem_released: uint (0)
     // Connections with a coroutine, and the slots of parked ones; each knows its index, so
     // moving and `remove_client` are O(1). The frequent sweep walks only the first list.
     // Moving a reference costs the GC a walk of the connection, so the parked list holds
@@ -204,6 +218,7 @@ class Worker {
             let deadline = connection.deadline_ms
             if deadline > 0 && now >= deadline : connection.netcon.interrupt()
         }
+        this.release_idle_memory(now)
         if now - this.last_parked_sweep < PARKED_SWEEP_MS : return
         this.last_parked_sweep = now
         // Backwards: closing moves the last connection into the closed one's slot
@@ -214,6 +229,27 @@ class Worker {
             let connection = this.parked_at(i) ?! continue
             this.close_parked(connection)
         }
+    }
+
+    // Nothing collects on a thread that does not allocate, so the memory of a burst of large
+    // requests would stay with an idle worker
+    fn release_idle_memory(now: uint) {
+        let usage = gc.gc.mem_usage_thread
+        if usage > this.mem_held : this.mem_held = usage
+        if now - this.last_idle_check < IDLE_CHECK_MS : return
+        this.last_idle_check = now
+        let allocated = gc.gc.mem_new
+        let collections = gc.gc.collect_count
+        let idle = collections == this.idle_collections && allocated - this.idle_allocated < IDLE_ALLOCATED
+        this.idle_allocated = allocated
+        this.idle_collections = collections
+        if !idle || this.mem_held < this.mem_released + IDLE_RELEASE : return
+        output_pool.clear()
+        gc.release_memory()
+        this.mem_held = gc.gc.mem_usage_thread
+        this.mem_released = this.mem_held
+        this.idle_allocated = gc.gc.mem_new
+        this.idle_collections = gc.gc.collect_count
     }
 
     // The parked connection at index `i` of `parked_list`
