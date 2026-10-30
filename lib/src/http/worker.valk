@@ -113,15 +113,16 @@ class Worker {
     now: uint
     last_sweep: uint (0)
     last_parked_sweep: uint (0)
-    // Connections with a coroutine, and parked ones; each knows its index, so moving and
-    // `remove_client` are O(1). The frequent sweep walks only the first list. Arrays, not
-    // linked lists: a moved list node would hand the GC the whole chain behind it
+    // Connections with a coroutine, and the descriptors of parked ones (`parked` holds those);
+    // each knows its index, so moving and `remove_client` are O(1). The frequent sweep walks
+    // only the first list. Moving a reference costs the GC a walk of the connection, so the
+    // parked list holds numbers
     clients: Array[Connection] (.{})
-    parked_clients: Array[Connection] (.{})
-    // The idle deadlines of `parked_clients`, at the same indexes: the sweep reads these in a row
+    parked_fds: Array[Fd] (.{})
+    // The idle deadlines of `parked_fds`, at the same indexes: the sweep reads these in a row
     parked_deadlines: Array[uint] (.{})
-    // The epoll set parked connections wait in, -1 without one; parked connections by descriptor
-    // (descriptors are small dense numbers, and one array slot per connection logs little for the GC)
+    // The epoll set parked connections wait in, -1 without one. Connections that parked, by
+    // descriptor (small dense numbers), kept until they close
     epoll_fd: i32 (-1)
     parked: Array[?Connection] (.{})
     // Woken connections waiting for a serving coroutine
@@ -191,15 +192,26 @@ class Worker {
         while i-- > 0 {
             let deadline = this.parked_deadlines.get(i) ! continue
             if deadline == 0 || now < deadline : continue
-            let connection = this.parked_clients.get(i) ! continue
+            let connection = this.parked_at(i) ?! continue
             this.close_parked(connection)
         }
+    }
+
+    // The parked connection at index `i` of `parked_fds`
+    fn parked_at(i: uint) ?Connection {
+        let fd = this.parked_fds.get(i) ! return null
+        return this.parked.get(fd.to(uint)) !? null
     }
 
     // Closes the connection that has waited longest for its next request; false when every
     // connection is busy. Parked connections first: those on a coroutine are busier
     fn evict_idle() bool {
-        let victim = this.longest_idle(this.parked_clients)
+        let victim: ?Connection = null
+        each this.parked_fds as fd, i {
+            let connection = this.parked_at(i) ?! continue
+            let since = connection.idle_since
+            if since > 0 && (!isset(victim) || since < victim.idle_since) : victim = connection
+        }
         if !isset(victim) : victim = this.longest_idle(this.clients)
         let found = victim ?! return false
         found.idle_since = 0
@@ -251,7 +263,9 @@ class Worker {
         connection.polled = true
         let index = fd.to(uint)
         while this.parked.length <= index : this.parked.append(null)
-        this.parked.set(index, connection) _
+        // The slot keeps the connection until it closes: a removed reference costs the
+        // collector a walk of the connection
+        if (this.parked.get(index) !? null) != connection : this.parked.set(index, connection) _
         this.unlink(connection)
         this.link(connection, true)
         return true
@@ -274,7 +288,7 @@ class Worker {
                 let fd: Fd = @ptrv(base + i * EPOLL_EVENT_SIZE + EPOLL_DATA_OFFSET, i32)
                 i++
                 let connection = (this.parked.get(fd.to(uint)) !? null) ?! continue
-                this.parked.set(fd.to(uint), null) _
+                if !connection.parked : continue
                 // Busy again from here, so the sweep leaves it to its coroutine
                 connection.parked = false
                 this.unlink(connection)
@@ -354,27 +368,46 @@ class Worker {
     }
 
     fn remove_client(client: Connection) {
+        #if OS == "linux"
+        // The descriptor may be reused already: only this connection's own slot is cleared
+        let index = client.fd.to(uint)
+        if client.polled && index < this.parked.length && (this.parked.get(index) !? null) == client : this.parked.set(index, null) _
+        #end
         this.unlink(client)
         this.connections--
     }
 
     fn link(client: Connection, parked: bool) {
-        let list = parked ? this.parked_clients : this.clients
-        client.list_index = list.length
-        list.append(client)
-        if parked : this.parked_deadlines.append(client.deadline_ms)
         client.in_parked_list = parked
+        if parked {
+            client.list_index = this.parked_fds.length
+            this.parked_fds.append(client.fd)
+            this.parked_deadlines.append(client.deadline_ms)
+            return
+        }
+        client.list_index = this.clients.length
+        this.clients.append(client)
     }
 
     fn unlink(client: Connection) {
-        let list = client.in_parked_list ? this.parked_clients : this.clients
         let index = client.list_index
-        let found = list.get(index) ! return
+        if client.in_parked_list {
+            let fd = this.parked_fds.get(index) ! return
+            if fd != client.fd : return
+            let last = this.parked_fds.length - 1
+            if index != last {
+                let moved = this.parked_at(last)
+                if isset(moved) : moved.list_index = index
+            }
+            this.parked_fds.swap_remove(index)
+            this.parked_deadlines.swap_remove(index)
+            return
+        }
+        let found = this.clients.get(index) ! return
         if found != client : return
-        let last = list.last() ! return
+        let last = this.clients.last() ! return
         last.list_index = index
-        list.swap_remove(index)
-        if client.in_parked_list : this.parked_deadlines.swap_remove(index)
+        this.clients.swap_remove(index)
     }
 
     // Runs once the server is stopping: idle connections are closed or interrupted right
@@ -386,9 +419,9 @@ class Worker {
             let now = this.now
             let deadline = this.server.deadline_ms
             let expired = now >= deadline
-            let i = this.parked_clients.length
+            let i = this.parked_fds.length
             while i-- > 0 {
-                let connection = this.parked_clients.get(i) ! continue
+                let connection = this.parked_at(i) ?! continue
                 this.close_parked(connection)
             }
             each this.clients as connection {
