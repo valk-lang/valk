@@ -500,10 +500,12 @@ Builtins (the type goes in `[...]` where it cannot be inferred):
   index (16 or 32 lanes; an index with bit 7 set gives 0). It needs a byte shuffle
   instruction, so on x86-64 the function must be marked `$target_ssse3` (16 lanes) or
   `$target_avx2` (32 lanes).
+- `$clmul(a, b)`: the carry-less product of two `u64` values as a `u64x2` (low half in lane 0),
+  as CRC and GCM computations use. x86-64 only, in a function marked `$target_pclmul`.
 
-A function flag `$target_ssse3`, `$target_sse41`, `$target_avx` or `$target_avx2` compiles one
-function for that CPU feature regardless of `--cpu`; call it only after `core.cpu_has(.avx2)`
-(or `.ssse3`, `.sse41`) said the machine has it, with a plain version for the others. Such a
+A function flag `$target_ssse3`, `$target_sse41`, `$target_avx`, `$target_avx2` or `$target_pclmul`
+compiles one function for that CPU feature regardless of `--cpu`; call it only after
+`core.cpu_has(.avx2)` (or `.ssse3`, `.sse41`, `.pclmul`) said the machine has it, with a plain version for the others. Such a
 function cannot be `$inline` and cannot take or return a vector wider than 128 bits.
 
 Every range in Valk is a start offset and a length, never a start and an end,
