@@ -32,6 +32,14 @@ value SERVE_EXTRA (8)
 value IDLE_CHECK_MS (1000)
 value IDLE_ALLOCATED (256 * 1024)
 value IDLE_RELEASE (16 * 1024 * 1024)
+// While a release left memory behind, the most time between tries (it may be live data)
+value IDLE_RETRY_MAX_MS (60_000)
+// A worker collects once dropped request bodies add up to this: they are garbage from then on,
+// and a burst of them would otherwise wait for the next collection on top of the new ones
+value BODY_GARBAGE_MAX (64 * 1024 * 1024)
+value LARGE_BODY_SIZE (1024 * 1024)
+// Above `max_memory`, how often a worker tries to free memory before it refuses requests
+value MEMORY_RELEASE_MS (250)
 
 #if OS == "linux"
 value EPOLL_CTL_ADD (1)
@@ -133,6 +141,14 @@ class Worker {
     // The most pool memory held since the last release, and what was left after that release
     mem_held: uint (0)
     mem_released: uint (0)
+    // When a release may try again for what the last one left, and how long it waited
+    idle_retry_at: uint (0)
+    idle_retry_ms: uint (IDLE_CHECK_MS)
+    // Connections removed since the last release: they may have held what is left
+    removed: uint (0)
+    // Bytes of dropped request bodies since the last collection for them
+    body_garbage: uint (0)
+    last_memory_release: uint (0)
     // Connections with a coroutine, and the slots of parked ones; each knows its index, so
     // moving and `remove_client` are O(1). The frequent sweep walks only the first list.
     // Moving a reference costs the GC a walk of the connection, so the parked list holds
@@ -161,6 +177,7 @@ class Worker {
         let server = this.server
         // Reads wait without a timer of their own: `tick` interrupts them at their deadline
         netcon.set_timeouts(0, server.write_timeout_ms)
+        netcon.min_write_rate = server.min_transfer_rate
         if server.stopping != 0 {
             netcon.interrupt()
             netcon.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
@@ -171,8 +188,7 @@ class Worker {
         let too_many_connections = server.max_connections > 0 && connections > server.max_connections
         // At the limit, an idle connection makes room for the new one
         if too_many_connections && this.evict_idle() : too_many_connections = false
-        let body_capacity_full = server.max_server_wide_body_size > 0 && server.active_body_size >= server.max_server_wide_body_size
-        let rejected = too_many_connections || body_capacity_full
+        let rejected = too_many_connections
         // A rejected connection gives its slot back right away, so the next
         // accept is judged without it. `finish()` skips the decrement for it.
         if rejected : server.connections--
@@ -240,16 +256,50 @@ class Worker {
         this.last_idle_check = now
         let allocated = gc.gc.mem_new
         let collections = gc.gc.collect_count
+        let changed = allocated != this.idle_allocated || collections != this.idle_collections
         let idle = collections == this.idle_collections && allocated - this.idle_allocated < IDLE_ALLOCATED
         this.idle_allocated = allocated
         this.idle_collections = collections
-        if !idle || this.mem_held < this.mem_released + IDLE_RELEASE : return
+        if !idle : return
+        // A burst since the last release, or what that one left when it may be free by now
+        let burst = this.mem_held >= this.mem_released + IDLE_RELEASE
+        let retry = usage >= IDLE_RELEASE && now >= this.idle_retry_at && (changed || this.removed > 0)
+        if !burst && !retry : return
         output_pool.clear()
         gc.release_memory()
-        this.mem_held = gc.gc.mem_usage_thread
-        this.mem_released = this.mem_held
+        let left = gc.gc.mem_usage_thread
+        if usage >= left + IDLE_RELEASE {
+            this.idle_retry_ms = IDLE_CHECK_MS
+        } else if this.idle_retry_ms < IDLE_RETRY_MAX_MS {
+            this.idle_retry_ms *= 2
+        }
+        this.idle_retry_at = now + this.idle_retry_ms
+        this.removed = 0
+        this.mem_held = left
+        this.mem_released = left
         this.idle_allocated = gc.gc.mem_new
         this.idle_collections = gc.gc.collect_count
+    }
+
+    // See `Server.max_memory`
+    fn over_memory() bool {
+        let limit = this.server.max_memory
+        if limit == 0 || gc.mem_usage_shared < limit : return false
+        let now = time.mono_ms()
+        if now - this.last_memory_release >= MEMORY_RELEASE_MS {
+            this.last_memory_release = now
+            gc.release_memory()
+        }
+        return gc.mem_usage_shared >= limit
+    }
+
+    // A request's input storage of `size` bytes was dropped
+    fn body_dropped(size: uint) {
+        if size < LARGE_BODY_SIZE : return
+        this.body_garbage += size
+        if this.body_garbage < BODY_GARBAGE_MAX : return
+        this.body_garbage = 0
+        gc.collect()
     }
 
     // The parked connection at index `i` of `parked_list`
@@ -444,6 +494,7 @@ class Worker {
     }
 
     fn remove_client(client: Connection) {
+        this.removed++
         this.unlink(client)
         // After the lists, so a slot is never reused while a stale list entry names it
         #if OS == "linux"

@@ -41,6 +41,12 @@ cmp "$workdir/large" "$workdir/echo"
 version=$(curl -ksS --http1.1 --max-time 10 -o "$workdir/fallback" -w '%{http_version}' https://127.0.0.1:9095/fallback)
 [[ "$version" == 1.1 ]]
 [[ $(cat "$workdir/fallback") == 'h2:/fallback' ]]
+# A body far below the minimum rate is reset instead of holding its buffer
+head -c 1000000 /dev/zero > "$workdir/slow"
+if curl -ksS --http2 --max-time 10 --limit-rate 1k --data-binary "@$workdir/slow" -o /dev/null https://127.0.0.1:9095/echo 2>/dev/null; then
+    echo 'A slow HTTP/2 body was not reset'
+    exit 1
+fi
 curl -ksS --http2 --max-time 10 https://127.0.0.1:9095/stop > /dev/null
 wait "$server_pid"
 server_pid=

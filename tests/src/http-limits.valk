@@ -27,11 +27,12 @@ fn http_limit_response(connection: net.TcpConnection) String {
     return response.view(0, received).to_string()
 }
 
-fn http_limit_wait_for_rejection() bool {
+fn http_limit_wait_for_body_rejection() bool {
     let deadline = time.mono_ms() + 2000
     while time.mono_ms() < deadline {
         let connection = http_limit_connection() ! return false
-        connection.read_timeout_ms = 10
+        connection.read_timeout_ms = 20
+        connection.write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\n\r\n") ! return false
         let rejected = http_limit_response(connection).contains(" 503 ")
         connection.close() ! {}
         if rejected : return true
@@ -94,7 +95,12 @@ test "HTTP server enforces request and server-wide size limits" {
     let reserved_body = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 12\r\n\r\n"
     reserved_connection.write(reserved_body) ! assert(false)
 
-    assert(http_limit_wait_for_rejection())
+    // The bodies in flight are at the limit: no more bodies, but other requests are served
+    assert(http_limit_wait_for_body_rejection())
+    let plain = http_limit_connection() !!
+    plain.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") !!
+    assert(http_limit_response(plain).contains(" 200 "))
+    plain.close() _
     reserved_connection.close() ! assert(false)
 
     assert(http_limit_wait_for_recovery())
@@ -458,4 +464,96 @@ synctest "HTTP server gives back the memory of large requests once idle" {
         time.sleep_ms(50)
     }
     assert(released)
+}
+
+synctest "HTTP server closes a request body that arrives too slowly" {
+    let server = http.Server.new("127.0.0.1", 19649, http_limit_handler)
+    server.body_timeout_ms = 200
+    server.min_transfer_rate = 100_000
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    let connection = net.tcp_client("127.0.0.1", 19649) !!
+    connection.read_timeout_ms = 20
+    connection.write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\nx") !!
+    // Each byte keeps the read short, but not the body
+    let closed = false
+    let deadline = time.mono_ms() + 3000 * TIME_SCALE
+    while time.mono_ms() < deadline {
+        let buffer = [u8]{ 0 x 16 }
+        connection.read(buffer) ! {
+            if !error_is(E.code, timeout) {
+                closed = true
+                break
+            }
+        }
+        connection.write("x") ! {
+            closed = true
+            break
+        }
+    }
+    assert(closed)
+    connection.close() _
+}
+
+synctest "HTTP server measures the body rate per body, not from an earlier request" {
+    let server = http.Server.new("127.0.0.1", 19650, http_limit_handler)
+    server.body_timeout_ms = 100 * TIME_SCALE
+    server.min_transfer_rate = 1000
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    let connection = net.tcp_client("127.0.0.1", 19650) !!
+    connection.read_timeout_ms = 2000 * TIME_SCALE
+    let input = ByteBuffer.new(256)
+    let body = "".pad_right('x', 1000)
+    // The first body and the head of the next arrive together, the pause comes before the next body
+    connection.write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\n" + body + "POST / HTTP/1.1\r\nHost: localhost\r\nContent-") !!
+    assert(keep_alive_read_response(connection, input) == "ok")
+    time.sleep_ms(50 * TIME_SCALE)
+    connection.write("Length: 1000\r\n\r\n" + body) !!
+    assert(keep_alive_read_response(connection, input) == "ok")
+    connection.close() _
+}
+
+fn http_limit_slow_write(server: atomic net.TcpServer, done: sync.Waker, result: Array[bool]) {
+    let connection = server.accept(5000 * TIME_SCALE) ! return
+    connection.write_timeout_ms = 200
+    connection.min_write_rate = 10 * 1024 * 1024
+    let data = "".pad_right('x', 64 * 1024 * 1024)
+    connection.write(data) ! {
+        result.append(error_is(E.code, timeout))
+    }
+    connection.close() _
+    done.wake()
+}
+
+synctest "A socket write below its minimum rate throws timeout" {
+    let listener = net.tcp_server("127.0.0.1", 19651) !!
+    let done = sync.Waker.new() !!
+    let result = Array[bool]{}
+    co http_limit_slow_write(listener, done, result)
+    let client = net.tcp_client("127.0.0.1", 19651) !!
+    client.read_timeout_ms = 20
+    let buffer = [u8]{ 0 x 4096 }
+    let deadline = time.mono_ms() + 10_000 * TIME_SCALE
+    // Reads keep every send short, but the whole write far below the rate
+    while result.length == 0 && time.mono_ms() < deadline {
+        client.read(buffer) ! {}
+        time.sleep_ms(5)
+    }
+    assert(result.length == 1 && (result.get(0) !? false))
+    client.close() _
+    listener.close() _
+}
+
+test "HTTP server refuses requests above max_memory and serves them again below it" {
+    assert(http.Server.new("127.0.0.1", 19652, http_limit_handler).max_memory == core.memory_limit() / 4 * 3)
+    let server = http.Server.new("127.0.0.1", 19652, http_limit_handler)
+    server.max_memory = 1
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    let connection = net.tcp_client("127.0.0.1", 19652) !!
+    connection.read_timeout_ms = 2000 * TIME_SCALE
+    connection.write("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    assert(http_limit_response(connection).contains(" 503 "))
+    connection.close() _
 }

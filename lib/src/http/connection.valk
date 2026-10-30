@@ -17,6 +17,9 @@ value SPARE_BUFFERS (4096)
 // A connection parks between requests once the client paused at least this long before
 // its last request; clients that keep requests coming stay on their coroutine
 value PARK_GAP_MS (5)
+// A body up to this size gets its room at once when its length is known; a larger one, possible
+// with the limits turned off, grows as it arrives
+value BODY_RESERVE_MAX (64 * 1024 * 1024)
 
 /// One accepted client connection of a `Server`, served on a coroutine while a request is
 /// in flight. On Linux a plain connection waiting for its next request holds no coroutine:
@@ -71,6 +74,10 @@ class Connection {
     rejected: bool (false)
     // Its index in that list
     list_index: uint (0)
+    // The current window of `min_transfer_rate` over a request body: its start, 0 between
+    // bodies, and the bytes received in it
+    body_window_start: uint (0)
+    body_window_bytes: uint (0)
     h2: ?H2Connection
 
     fn handle() {
@@ -175,6 +182,11 @@ class Connection {
                         }
                         if this.park() : return
                     }
+                    // Finished responses do not wait for the rest of the next request
+                    if !this.answer_pending && res.count_bytes_to_send() > 0 {
+                        res.send_bytes(this.netcon) ! break
+                        res.reset()
+                    }
                     let bytes = this.read_more(input, context, res) ! break
                     if bytes == 0 : break
                     continue
@@ -192,6 +204,11 @@ class Connection {
             }
 
             if !this.reserve_body(context) {
+                this.send_error(503, res)
+                break
+            }
+
+            if worker.over_memory() {
                 this.send_error(503, res)
                 break
             }
@@ -270,6 +287,7 @@ class Connection {
 
             // Clear input
             let reached_end = context.parsed_index >= input.length
+            let input_size = input.size
             if reached_end {
                 input.clear()
                 input.shrink_capacity(this.read_size)
@@ -279,6 +297,8 @@ class Connection {
                 context.parsed_index = 0
                 input.shrink_capacity(this.read_size)
             }
+            worker.body_dropped(input_size - input.size)
+            this.body_window_start = 0
 
             // Flush output. A small answer to everything the client sent goes out with the
             // read of its next request (`read_more`)
@@ -366,10 +386,13 @@ class Connection {
         if request.stage >= 2 {
             this.head_started = 0
             timeout = settings.body_timeout_ms
+            this.check_body_rate(now) !>
             size = READ_SIZE
             if request.has_content_length && !request.chunked && request.content_length > request.body_received {
                 let left = request.content_length - request.body_received
                 if left < size : size = left > HEAD_READ_SIZE ? left : HEAD_READ_SIZE
+                // Room for the whole body: growing in steps leaves garbage as large as the body
+                else if left <= BODY_RESERVE_MAX : buffer.reserve(left)
             }
         } else if buffer.length == 0 {
             this.head_started = 0
@@ -440,8 +463,23 @@ class Connection {
         }
         if settings.stopping != 0 && !this.active : throw .closed
         if bytes > 0 : this.active = true
+        this.body_window_bytes += bytes
         buffer.skip(bytes)
         return bytes
+    }
+
+    // Ends a request body that arrives slower than `min_transfer_rate`
+    fn check_body_rate(now: uint) !net.NetError {
+        let settings = this.worker.server
+        let window = settings.body_timeout_ms
+        if settings.min_transfer_rate == 0 || window == 0 : return
+        let elapsed = now - this.body_window_start
+        if this.body_window_start != 0 {
+            if elapsed < window : return
+            if this.body_window_bytes < settings.min_transfer_rate * elapsed / 1000 : throw .timeout
+        }
+        this.body_window_start = now
+        this.body_window_bytes = 0
     }
 
     fn send_error(code: u16, res: ResponseWriter) {

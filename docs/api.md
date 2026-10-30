@@ -3560,12 +3560,16 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + idle_timeout_ms: uint
     // The number of open connections allowed; 0 means no limit, which is the default.
     + max_connections: uint
+    // New requests are answered with 503 while the memory of the process, after a collection, is above this many bytes; 0 means no limit. Defaults to three quarters of `core.memory_limit`, so handlers that allocate a lot slow down the service instead of getting the process killed.
+    + max_memory: uint
     // The largest accepted request body in bytes; 0 means no limit. Defaults to 32 MiB.
     + max_request_body_size: uint
     // The largest accepted request head (request line and headers) in bytes; 0 means no limit. Defaults to 8 KiB.
     + max_request_header_size: uint
     // The combined size of the request bodies being received at once, over all connections, in bytes; 0 means no limit. Defaults to a quarter of `core.memory_limit`, so uploads alone cannot run the process out of memory.
     + max_server_wide_body_size: uint
+    // The lowest speed of a request body or a response in bytes per second, measured over `body_timeout_ms` and `write_timeout_ms`; 0 means no minimum. A connection below it is closed, so a client cannot hold a large buffer by sending or reading a little at a time.
+    + min_transfer_rate: uint
     // The port the server listens on.
     ~ port: u16
     // Lets several processes listen on the same port at once (`SO_REUSEPORT`; not on Windows). Start the new process, then stop the old one, for a restart without refused connections.
@@ -4391,6 +4395,8 @@ error NetError (init, connect, disconnected, invalid_host, ssl, port_in_use, max
     ~ fd: i32
     // The host the connection was made to; empty for accepted connections and `new`.
     ~+ host: String
+    // The lowest speed of one `write` in bytes per second, measured over `write_timeout_ms`; 0 means no minimum. A slower write throws `timeout`.
+    + min_write_rate: uint
     // Milliseconds a single `read` may wait for data; 0 waits forever.
     + read_timeout_ms: uint
     // The TLS session, once `ssl_connect` or `ssl_accept` succeeded.

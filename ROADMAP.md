@@ -5,8 +5,13 @@
 
 ```
 - Release 0.8.4
-+ HTTP server: `max_server_wide_body_size` defaults to a quarter of `core.memory_limit()` instead of no limit: many large uploads at once are answered with 503 instead of the process being killed (128 x 31 MB in a 3 GB container: killed -> 1.5 GB peak)
-+ HTTP server: a worker that goes idle after holding a lot of memory gives it back to the system (after a burst of large uploads: 3.5 GB -> 83 MB)
++ HTTP server: `max_server_wide_body_size` defaults to a quarter of `core.memory_limit()` instead of no limit: many large uploads at once are answered with 503 instead of the process being killed (128 x 31 MB in a 3 GB container: killed -> survives)
++ HTTP server: a worker that goes idle after holding a lot of memory gives it back to the system (after a burst of large uploads: 3.5 GB -> under 100 MB)
++ HTTP server: `min_transfer_rate` (default 4 KB/s): a client that sends a body or reads a response slower than that is cut off, also over TLS and HTTP/2, so it cannot hold a large buffer by moving a little at a time. `TcpConnection.min_write_rate` is the same for one write
++ HTTP server: `max_memory` (default three quarters of `core.memory_limit()`): above it new requests get 503, so handlers that allocate a lot slow the service down instead of getting the process killed (256 x 16 MB responses in a 3 GB container: killed -> 1.1 GB peak)
++ HTTP server: at `max_server_wide_body_size`, only requests with a body are refused; other requests and new connections are still served
++ HTTP server: a body of known length gets its room at once and dropped bodies are collected soon: 128 x 31 MB uploads peak at 4.1 GB instead of 6.1 GB and leave 0.7 GB instead of 3.4 GB until the next ones
++ HTTP server: a finished response no longer waits for the rest of a next pipelined request
 + `gc.release_memory()` collects the thread's garbage and returns the freed memory to the system
 + `core.memory_limit()`: the machine's RAM or, on Linux, the cgroup limit when lower
 + HTTP server: `batch_delay_ms` (default 2): a worker woken for few parked connections waits before the next wake-up, so one wake-up serves many requests
