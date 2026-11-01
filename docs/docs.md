@@ -1909,6 +1909,25 @@ let name = list.get_required(0) ! panic("Missing item")
 let name_str = name.string_value() ! panic("Json value must be a string")
 ```
 
+`json.read` parses into a read-only `json.View`. It takes the same limits and throws the same
+errors as `json.decode`, and reads the same way:
+
+```rust
+let data = json.read(text) ! panic("Invalid JSON")
+let first_name = data["names"][0].string
+each data["names"] as name { println(name.string) }
+each data["settings"] as setting, key { println(key.string + ": " + setting.string) }
+let editable = data["settings"].to_value() // A json.Value copy that can be changed
+```
+
+Which one to use:
+
+* `json.decode_to[T]` when you know the shape of the data.
+* `json.read` when you only read it, and the shape varies or the document is large.
+* `json.decode` when you need to change it, or the document is tiny.
+
+All duplicate member names appear in `each` over a view, while lookups see the last one.
+
 `json.from(value)` converts any value to a json.Value.
 `value.to_type[T]()` converts json.Value back to a Valk type and returns an
 error when the document does not match that type. Every field of `T` must be

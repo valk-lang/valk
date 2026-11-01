@@ -13123,6 +13123,8 @@ The type of a JSON value, as reported by `Value.kind`.
 + fn new_object(values: ?Map[Value] (null)) Map[Value]
 // Returns `value` as a JSON string.
 + fn new_string(value: String) Value
+// Parses JSON text into a read-only `View` of its top-level value.
++ fn read(json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) View !ParseError
 ```
 
 ### decode
@@ -13222,6 +13224,19 @@ The object keeps a reference to `values`; it is not copied.
 ### new_string
 
 Returns `value` as a JSON string.
+
+### read
+
+Parses JSON text into a read-only `View` of its top-level value.
+
+Takes the same limits and throws the same errors as `decode`. Cheaper than `decode` for all
+but tiny documents when the data does not have to change. The view keeps `json` alive and
+its strings are views of it.
+
+```valk
+let data = json.read("{\"names\":[\"a\",\"b\"]}") ! panic("invalid JSON")
+let first = data["names"][0].string
+```
 
 ## Classes for 'json'
 
@@ -13669,6 +13684,317 @@ string-keyed maps convert item by item. For a class or struct the value must be 
 object: fields that are nullable or declare an explicit default may be absent or
 `null` and then get their default, every other field is required, and unknown
 members are ignored.
+
+```js
+// A read-only value of a JSON document, made by `json.read`. Small and free to copy; it keeps the document and its input alive.
++ struct View {
+    // Returns this view when it holds an array, or a `null` view, which reads as empty.
+    + get array: View
+    // Returns this view.
+    + fn array_value() View !LookupError
+    // Returns the bool held, or `false` when the value is not a bool.
+    + get bool: bool
+    // Returns the bool held.
+    + fn bool_value() bool !LookupError
+    // Returns the value encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String
+    // Returns the number held as a float, or `0.0` when the value is not a number.
+    + get float: float
+    // Returns the number held as a float; an integer is converted.
+    + fn float_value() float !LookupError
+    // Returns the object member named `key` or the array item at index `key`.
+    + fn get(key: String | uint) View
+    // Returns the array at `key` as a view.
+    + fn get_array(key: String | uint) View !LookupError
+    // Returns the bool at `key`.
+    + fn get_bool(key: String | uint) bool !LookupError
+    // Returns the number at `key` as a float; an integer is converted.
+    + fn get_float(key: String | uint) float !LookupError
+    // Returns the integer at `key`; a whole float counts as its integer.
+    + fn get_int(key: String | uint) int !LookupError
+    // Returns the object at `key` as a view.
+    + fn get_object(key: String | uint) View !LookupError
+    // Returns the object member named `key` or the array item at index `key`.
+    + fn get_required(key: String | uint) View !LookupError
+    // Returns the string at `key`.
+    + fn get_string(key: String | uint) String !LookupError
+    // Returns whether an object member named `key` or an array item at index `key` exists.
+    + fn has(key: String | uint) bool
+    // Returns whether the value at `key` exists and is an array.
+    + fn has_array(key: String | uint) bool
+    // Returns whether the value at `key` exists and is a bool.
+    + fn has_bool(key: String | uint) bool
+    // Returns whether the value at `key` exists and is a number, i.e. whether `get_float` succeeds; an integer counts.
+    + fn has_float(key: String | uint) bool
+    // Returns whether the value at `key` exists and is an integer.
+    + fn has_int(key: String | uint) bool
+    // Returns whether the value at `key` exists and is an object.
+    + fn has_object(key: String | uint) bool
+    // Returns whether the value at `key` exists and is a string.
+    + fn has_string(key: String | uint) bool
+    // Returns the integer held, or `0` when the value is not an integer.
+    + get int: int
+    // Returns the integer held; a whole float counts as its integer.
+    + fn int_value() int !LookupError
+    // Returns whether the value is an array.
+    + get is_array: bool
+    // Returns whether the value is a bool.
+    + get is_bool: bool
+    // Returns whether the value is a float.
+    + get is_float: bool
+    // Returns whether the value is an integer.
+    + get is_int: bool
+    // Returns whether the value is `null`, which a missing member or item also reads as.
+    + get is_null: bool
+    // Returns whether the value is an integer or a float.
+    + get is_number: bool
+    // Returns whether the value is an object.
+    + get is_object: bool
+    // Returns whether the value is a string.
+    + get is_string: bool
+    // Returns the kind of value held.
+    + get kind: Kind
+    // Returns the number of items or members, the byte length of a string, or `0` otherwise.
+    + get length: uint
+    // Returns this view when it holds an object, or a `null` view, which reads as empty.
+    + get object: View
+    // Returns this view.
+    + fn object_value() View !LookupError
+    // Returns the value as text; any kind converts, as `Value.string` does.
+    + get string: String
+    // Returns the string held.
+    + fn string_value() String !LookupError
+    // Converts to a `Value`, so `json.from` and `json.encode` take a view.
+    + fn to_json_value() Value
+    // Returns a `Value` holding a copy of this part of the document, which can be changed.
+    + fn to_value() Value
+}
+```
+
+### View
+
+A read-only value of a JSON document, made by `json.read`. Small and free to copy; it keeps
+the document and its input alive.
+
+Reads like `Value`: a missing member or item reads as `null`, and `each` walks array items
+or object members. All duplicate member names appear in `each`, while lookups see the last.
+
+#### array
+
+Returns this view when it holds an array, or a `null` view, which reads as empty.
+
+#### array_value
+
+Returns this view.
+
+Throws `.missing` when the value is not an array.
+
+#### bool
+
+Returns the bool held, or `false` when the value is not a bool.
+
+#### bool_value
+
+Returns the bool held.
+
+Throws `.missing` when the value is not a bool.
+
+#### encode
+
+Returns the value encoded as JSON text; see `json.encode`.
+
+#### float
+
+Returns the number held as a float, or `0.0` when the value is not a number.
+
+#### float_value
+
+Returns the number held as a float; an integer is converted.
+
+Throws `.missing` when the value is not a number.
+
+#### get
+
+Returns the object member named `key` or the array item at index `key`.
+
+Returns a `null` node when it is absent or the key form does not match the kind.
+
+#### get_array
+
+Returns the array at `key` as a view.
+
+Throws `.missing` when it is absent or not an array.
+
+#### get_bool
+
+Returns the bool at `key`.
+
+Throws `.missing` when it is absent or not a bool.
+
+#### get_float
+
+Returns the number at `key` as a float; an integer is converted.
+
+Throws `.missing` when it is absent or not a number.
+
+#### get_int
+
+Returns the integer at `key`; a whole float counts as its integer.
+
+Throws `.missing` when it is absent or not an integer, including a float that is not
+whole.
+
+#### get_object
+
+Returns the object at `key` as a view.
+
+Throws `.missing` when it is absent or not an object.
+
+#### get_required
+
+Returns the object member named `key` or the array item at index `key`.
+
+Throws `.missing` when it is absent or the key form does not match the kind.
+
+#### get_string
+
+Returns the string at `key`.
+
+Throws `.missing` when it is absent or not a string.
+
+#### has
+
+Returns whether an object member named `key` or an array item at index `key` exists.
+
+#### has_array
+
+Returns whether the value at `key` exists and is an array.
+
+#### has_bool
+
+Returns whether the value at `key` exists and is a bool.
+
+#### has_float
+
+Returns whether the value at `key` exists and is a number, i.e. whether `get_float`
+succeeds; an integer counts.
+
+#### has_int
+
+Returns whether the value at `key` exists and is an integer.
+
+#### has_object
+
+Returns whether the value at `key` exists and is an object.
+
+#### has_string
+
+Returns whether the value at `key` exists and is a string.
+
+#### int
+
+Returns the integer held, or `0` when the value is not an integer.
+
+A whole float counts as its integer (`3.0` gives `3`); `1.5` gives `0`.
+
+#### int_value
+
+Returns the integer held; a whole float counts as its integer.
+
+Throws `.missing` when the value is not an integer, including a float that is not whole
+or does not fit in `int`.
+
+#### is_array
+
+Returns whether the value is an array.
+
+#### is_bool
+
+Returns whether the value is a bool.
+
+#### is_float
+
+Returns whether the value is a float.
+
+#### is_int
+
+Returns whether the value is an integer.
+
+#### is_null
+
+Returns whether the value is `null`, which a missing member or item also reads as.
+
+#### is_number
+
+Returns whether the value is an integer or a float.
+
+#### is_object
+
+Returns whether the value is an object.
+
+#### is_string
+
+Returns whether the value is a string.
+
+#### kind
+
+Returns the kind of value held.
+
+#### length
+
+Returns the number of items or members, the byte length of a string, or `0` otherwise.
+
+#### object
+
+Returns this view when it holds an object, or a `null` view, which reads as empty.
+
+#### object_value
+
+Returns this view.
+
+Throws `.missing` when the value is not an object.
+
+#### string
+
+Returns the value as text; any kind converts, as `Value.string` does.
+
+#### string_value
+
+Returns the string held.
+
+Throws `.missing` when the value is not a string.
+
+#### to_json_value
+
+Converts to a `Value`, so `json.from` and `json.encode` take a view.
+
+#### to_value
+
+Returns a `Value` holding a copy of this part of the document, which can be changed.
+
+```js
+// The key `each` gives for a `View`: a member's name, or an item's index.
++ struct ViewKey {
+    // Returns the item's index, or `0` for a member's name.
+    + get int: int
+    // Returns the member's name, or the item's index as text.
+    + get string: String
+}
+```
+
+### ViewKey
+
+The key `each` gives for a `View`: a member's name, or an item's index.
+
+Reads like the key of a `Value`. Nothing is formatted unless `string` is called on an index.
+
+#### int
+
+Returns the item's index, or `0` for a member's name.
+
+#### string
+
+Returns the member's name, or the item's index as text.
 
 # log
 
