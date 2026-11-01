@@ -1,0 +1,646 @@
+@ignore_access
+
+use core
+
+value DOC_NULL (0)
+value DOC_TRUE (1)
+value DOC_FALSE (2)
+value DOC_INT (3)            // a, b: low and high bits
+value DOC_FLOAT (4)          // a, b: low and high bits
+value DOC_STRING (5)         // a, b: start and length in the source
+value DOC_DECODED_STRING (6) // a: index in decoded, b: length
+value DOC_ARRAY (7)          // a: first link, b: count; a link is an item
+value DOC_OBJECT (8)         // a: first link, b: count; a link is a key, its value the next node
+
+// An object above this many members also gets a map, which the link before its first holds
+value DOC_MAP_MEMBERS (16)
+
+struct DocNode {
+    tag: u8
+    a: u32 (0)
+    b: u32 (0)
+
+    fn bits() u64 {
+        return this.a.to(u64) | (this.b.to(u64) << 32)
+    }
+    fn int_number() int {
+        return this.bits().to(int)
+    }
+    fn float_number() float {
+        return core.f64_from_bits(this.bits()).to(float)
+    }
+}
+
+// The members of the containers being parsed; parsing never suspends, so a thread needs one
+global doc_stack: Array[u32] (Array[u32]{})
+value DOC_STACK_KEEP (65536)
+
+// The storage of a parsed document: its nodes live in one block the collector does not walk
+class Doc {
+    - source: String
+    - nodes: Array[DocNode] (Array[DocNode]{})
+    - links: Array[u32] (Array[u32]{})
+    - decoded: ?Array[String] (null)
+    - maps: ?Array[Map[uint]] (null)
+
+    - get root: View {
+        return View { doc: this, index: 1 }
+    }
+
+    - fn add(tag: u8, a: u32, b: u32) u32 {
+        let index = this.nodes.length.to(u32)
+        this.nodes.append(DocNode { tag: tag, a: a, b: b })
+        return index
+    }
+
+    - fn add_number(tag: u8, bits: u64) u32 {
+        return this.add(tag, bits.to(u32), (bits >> 32).to(u32))
+    }
+
+    - fn add_decoded(text: String) u32 {
+        let decoded = this.decoded ?? Array[String]{}
+        this.decoded = decoded
+        let index = decoded.length.to(u32)
+        decoded.append(text)
+        return this.add(DOC_DECODED_STRING, index, text.bytes.to(u32))
+    }
+
+    // Moves the links a container collected from the stack to their final place
+    - fn close_container(node: u32, mark: uint) {
+        let stack = doc_stack
+        let links = this.links
+        let count = stack.length - mark
+        let map_index: u32 = 0
+        if count > DOC_MAP_MEMBERS && this.nodes[node.to(uint)].tag == DOC_OBJECT {
+            let maps = this.maps ?? Array[Map[uint]]{}
+            this.maps = maps
+            map_index = maps.length.to(u32)
+            let map = Map[uint]{}
+            each mark .. count as i {
+                let key = stack[i]
+                map.set(this.text(key), key.to(uint) + 1)
+            }
+            maps.append(map)
+            links.append(map_index)
+        }
+        let first = links.length.to(u32)
+        each mark .. count as i : links.append(stack[i])
+        while stack.length > mark : stack.pop_last() ! break
+        let item = &this.nodes[node.to(uint)]
+        item.a = first
+        item.b = count.to(u32)
+    }
+
+    - fn decoded_text(index: u32) String {
+        let decoded = this.decoded ?! panic("JSON document has no decoded strings")
+        return decoded[index.to(uint)]
+    }
+
+    - fn text(index: u32) String {
+        let node = this.nodes[index.to(uint)]
+        if node.tag == DOC_DECODED_STRING : return this.decoded_text(node.a)
+        return this.source.range(node.a.to(uint), node.b.to(uint))
+    }
+
+    // The node of a member's value, 0 when absent; the last of duplicate names wins
+    - fn find(object: DocNode, name: String) u32 {
+        if object.b.to(uint) > DOC_MAP_MEMBERS {
+            let maps = this.maps ?! panic("JSON document has no maps")
+            let map = maps[this.links[object.a.to(uint) - 1].to(uint)]
+            return (map.get(name) !? 0).to(u32)
+        }
+        let first = object.a.to(uint)
+        let i = first + object.b.to(uint)
+        while i > first {
+            i--
+            let key = this.links[i]
+            let node = this.nodes[key.to(uint)]
+            if node.b.to(uint) != name.bytes : continue
+            let same = node.tag == DOC_STRING
+                ? this.source.view(node.a.to(uint), node.b.to(uint)).equals(name)
+                : this.decoded_text(node.a) == name
+            if same : return key + 1
+        }
+        return 0
+    }
+}
+
+/// A read-only value of a JSON document, made by `json.read`. Small and free to copy; it keeps
+/// the document and its input alive.
+///
+/// Reads like `Value`: a missing member or item reads as `null`, and `each` walks array items
+/// or object members. All duplicate member names appear in `each`, while lookups see the last.
++ struct View {
+    - doc: Doc
+    - index: u32
+
+    - get data: DocNode {
+        return this.doc.nodes[this.index.to(uint)]
+    }
+
+    /// Returns the kind of value held.
+    + get kind: Kind {
+        let tag = this.data.tag
+        if tag == DOC_NULL : return Kind.null
+        if tag == DOC_TRUE || tag == DOC_FALSE : return Kind.bool
+        if tag == DOC_INT : return Kind.int
+        if tag == DOC_FLOAT : return Kind.float
+        if tag == DOC_ARRAY : return Kind.array
+        if tag == DOC_OBJECT : return Kind.object
+        return Kind.string
+    }
+
+    /// Returns whether the value is `null`, which a missing member or item also reads as.
+    + get is_null: bool {
+        return this.data.tag == DOC_NULL
+    }
+
+    /// Returns whether the value is a string.
+    + get is_string: bool {
+        let tag = this.data.tag
+        return tag == DOC_STRING || tag == DOC_DECODED_STRING
+    }
+
+    /// Returns whether the value is a bool.
+    + get is_bool: bool {
+        let tag = this.data.tag
+        return tag == DOC_TRUE || tag == DOC_FALSE
+    }
+
+    /// Returns whether the value is an integer.
+    + get is_int: bool {
+        return this.data.tag == DOC_INT
+    }
+
+    /// Returns whether the value is a float.
+    + get is_float: bool {
+        return this.data.tag == DOC_FLOAT
+    }
+
+    /// Returns whether the value is an integer or a float.
+    + get is_number: bool {
+        let tag = this.data.tag
+        return tag == DOC_INT || tag == DOC_FLOAT
+    }
+
+    /// Returns whether the value is an array.
+    + get is_array: bool {
+        return this.data.tag == DOC_ARRAY
+    }
+
+    /// Returns whether the value is an object.
+    + get is_object: bool {
+        return this.data.tag == DOC_OBJECT
+    }
+
+    /// Returns the value as text; any kind converts, as `Value.string` does.
+    + get string: String {
+        let tag = this.data.tag
+        if tag == DOC_STRING || tag == DOC_DECODED_STRING : return this.doc.text(this.index)
+        return this.to_value().string
+    }
+
+    /// Returns the string held.
+    ///
+    /// Throws `.missing` when the value is not a string.
+    + fn string_value() String !LookupError {
+        let tag = this.data.tag
+        if tag != DOC_STRING && tag != DOC_DECODED_STRING : throw .missing
+        return this.doc.text(this.index)
+    }
+
+    /// Returns the integer held, or `0` when the value is not an integer.
+    ///
+    /// A whole float counts as its integer (`3.0` gives `3`); `1.5` gives `0`.
+    + get int: int {
+        let node = this.data
+        if node.tag == DOC_INT : return node.int_number()
+        if node.tag == DOC_FLOAT : return whole_float(node.float_number()) ?? 0
+        return 0
+    }
+
+    /// Returns the integer held; a whole float counts as its integer.
+    ///
+    /// Throws `.missing` when the value is not an integer, including a float that is not whole
+    /// or does not fit in `int`.
+    + fn int_value() int !LookupError {
+        let node = this.data
+        if node.tag == DOC_INT : return node.int_number()
+        if node.tag == DOC_FLOAT : return whole_float(node.float_number()) ?! throw .missing
+        throw .missing
+    }
+
+    /// Returns the number held as a float, or `0.0` when the value is not a number.
+    + get float: float {
+        let node = this.data
+        if node.tag == DOC_FLOAT : return node.float_number()
+        if node.tag == DOC_INT : return node.int_number().to(float)
+        return 0.0
+    }
+
+    /// Returns the number held as a float; an integer is converted.
+    ///
+    /// Throws `.missing` when the value is not a number.
+    + fn float_value() float !LookupError {
+        let node = this.data
+        if node.tag == DOC_FLOAT : return node.float_number()
+        if node.tag == DOC_INT : return node.int_number().to(float)
+        throw .missing
+    }
+
+    /// Returns the bool held, or `false` when the value is not a bool.
+    + get bool: bool {
+        return this.data.tag == DOC_TRUE
+    }
+
+    /// Returns the bool held.
+    ///
+    /// Throws `.missing` when the value is not a bool.
+    + fn bool_value() bool !LookupError {
+        let tag = this.data.tag
+        if tag != DOC_TRUE && tag != DOC_FALSE : throw .missing
+        return tag == DOC_TRUE
+    }
+
+    /// Returns this view when it holds an array, or a `null` view, which reads as empty.
+    + get array: View {
+        return this.is_array ? this : View { doc: this.doc, index: 0 }
+    }
+
+    /// Returns this view.
+    ///
+    /// Throws `.missing` when the value is not an array.
+    + fn array_value() View !LookupError {
+        if !this.is_array : throw .missing
+        return this
+    }
+
+    /// Returns this view when it holds an object, or a `null` view, which reads as empty.
+    + get object: View {
+        return this.is_object ? this : View { doc: this.doc, index: 0 }
+    }
+
+    /// Returns this view.
+    ///
+    /// Throws `.missing` when the value is not an object.
+    + fn object_value() View !LookupError {
+        if !this.is_object : throw .missing
+        return this
+    }
+
+    /// Returns the number of items or members, the byte length of a string, or `0` otherwise.
+    + get length: uint {
+        let node = this.data
+        if node.tag >= DOC_STRING : return node.b.to(uint)
+        return 0
+    }
+
+    /// Returns the object member named `key` or the array item at index `key`.
+    ///
+    /// Returns a `null` node when it is absent or the key form does not match the kind.
+    + fn get(key: uint | String) View $offset {
+        return View { doc: this.doc, index: this.lookup(key) }
+    }
+
+    /// Returns the object member named `key` or the array item at index `key`.
+    ///
+    /// Throws `.missing` when it is absent or the key form does not match the kind.
+    + fn get_required(key: uint | String) View !LookupError {
+        let index = this.lookup(key)
+        if index == 0 : throw .missing
+        return View { doc: this.doc, index: index }
+    }
+
+    /// Returns whether an object member named `key` or an array item at index `key` exists.
+    + fn has(key: uint | String) bool {
+        return this.lookup(key) != 0
+    }
+
+    /// Returns the string at `key`.
+    ///
+    /// Throws `.missing` when it is absent or not a string.
+    + fn get_string(key: uint | String) String !LookupError {
+        return this.get(key).string_value() !>
+    }
+
+    /// Returns the integer at `key`; a whole float counts as its integer.
+    ///
+    /// Throws `.missing` when it is absent or not an integer, including a float that is not
+    /// whole.
+    + fn get_int(key: uint | String) int !LookupError {
+        return this.get(key).int_value() !>
+    }
+
+    /// Returns the number at `key` as a float; an integer is converted.
+    ///
+    /// Throws `.missing` when it is absent or not a number.
+    + fn get_float(key: uint | String) float !LookupError {
+        return this.get(key).float_value() !>
+    }
+
+    /// Returns the bool at `key`.
+    ///
+    /// Throws `.missing` when it is absent or not a bool.
+    + fn get_bool(key: uint | String) bool !LookupError {
+        return this.get(key).bool_value() !>
+    }
+
+    /// Returns the array at `key` as a view.
+    ///
+    /// Throws `.missing` when it is absent or not an array.
+    + fn get_array(key: uint | String) View !LookupError {
+        return this.get(key).array_value() !>
+    }
+
+    /// Returns the object at `key` as a view.
+    ///
+    /// Throws `.missing` when it is absent or not an object.
+    + fn get_object(key: uint | String) View !LookupError {
+        return this.get(key).object_value() !>
+    }
+
+    /// Returns whether the value at `key` exists and is a string.
+    + fn has_string(key: uint | String) bool {
+        return this.get(key).is_string
+    }
+
+    /// Returns whether the value at `key` exists and is an integer.
+    + fn has_int(key: uint | String) bool {
+        return this.get(key).is_int
+    }
+
+    /// Returns whether the value at `key` exists and is a number, i.e. whether `get_float`
+    /// succeeds; an integer counts.
+    + fn has_float(key: uint | String) bool {
+        return this.get(key).is_number
+    }
+
+    /// Returns whether the value at `key` exists and is a bool.
+    + fn has_bool(key: uint | String) bool {
+        return this.get(key).is_bool
+    }
+
+    /// Returns whether the value at `key` exists and is an array.
+    + fn has_array(key: uint | String) bool {
+        return this.get(key).is_array
+    }
+
+    /// Returns whether the value at `key` exists and is an object.
+    + fn has_object(key: uint | String) bool {
+        return this.get(key).is_object
+    }
+
+    // The node at `key`, 0 when absent. View 0 is the null node every missing value reads
+    - fn lookup(key: uint | String) u32 {
+        let node = this.data
+        match key {
+            String as name => {
+                if node.tag != DOC_OBJECT : return 0
+                return this.doc.find(node, name)
+            }
+            uint as index => {
+                if node.tag != DOC_ARRAY || index >= node.b.to(uint) : return 0
+                return this.doc.links[node.a.to(uint) + index]
+            }
+        }
+    }
+
+    /// Returns a `Value` holding a copy of this part of the document, which can be changed.
+    + fn to_value() Value {
+        let doc = this.doc
+        let node = this.data
+        let tag = node.tag
+        if tag == DOC_NULL : return null
+        if tag == DOC_TRUE : return true
+        if tag == DOC_FALSE : return false
+        if tag == DOC_INT : return node.int_number()
+        if tag == DOC_FLOAT : return node.float_number()
+        if tag == DOC_ARRAY {
+            let array = Array[Value]{}
+            each 0 .. node.b.to(uint) as i {
+                let item = View { doc: doc, index: doc.links[node.a.to(uint) + i] }
+                array.append(item.to_value())
+            }
+            return array
+        }
+        if tag == DOC_OBJECT {
+            let object = Map[Value]{}
+            each 0 .. node.b.to(uint) as i {
+                let key = doc.links[node.a.to(uint) + i]
+                let member = View { doc: doc, index: key + 1 }
+                object.set(doc.text(key), member.to_value())
+            }
+            return object
+        }
+        return doc.text(this.index)
+    }
+
+    /// Converts to a `Value`, so `json.from` and `json.encode` take a view.
+    + fn to_json_value() Value {
+        return this.to_value()
+    }
+
+    /// Returns the value encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String {
+        return encode(this.to_value(), pretty)
+    }
+
+    fn _next(index: uint) (View, ViewKey) !IterError {
+        let doc = this.doc
+        let node = this.data
+        if index >= node.b.to(uint) : throw .end
+        let link = doc.links[node.a.to(uint) + index]
+        if node.tag == DOC_ARRAY : return (View { doc: doc, index: link }, ViewKey { doc: doc, node: 0, index: index })
+        if node.tag == DOC_OBJECT : return (View { doc: doc, index: link + 1 }, ViewKey { doc: doc, node: link, index: index })
+        throw .end
+    }
+}
+
+/// The key `each` gives for a `View`: a member's name, or an item's index.
+///
+/// Reads like the key of a `Value`. Nothing is formatted unless `string` is called on an index.
++ struct ViewKey {
+    - doc: Doc
+    - node: u32
+    - index: uint
+
+    /// Returns the member's name, or the item's index as text.
+    + get string: String {
+        if this.node == 0 : return this.index.to_string()
+        return this.doc.text(this.node)
+    }
+
+    /// Returns the item's index, or `0` for a member's name.
+    + get int: int {
+        return this.node == 0 ? this.index.to(int) : 0
+    }
+}
+
+/// Parses JSON text into a read-only `View` of its top-level value.
+///
+/// Takes the same limits and throws the same errors as `decode`. Cheaper than `decode` for all
+/// but tiny documents when the data does not have to change. The view keeps `json` alive and
+/// its strings are views of it.
+///
+/// ```valk
+/// let data = json.read("{\"names\":[\"a\",\"b\"]}") ! panic("invalid JSON")
+/// let first = data["names"][0].string
+/// ```
++ fn read(json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) View !ParseError {
+    let length = json.bytes
+    if max_bytes > 0 && length > max_bytes : throw .too_large {
+        message: "JSON input exceeds the maximum byte length"
+        at_index: max_bytes
+    }
+    // Nodes address the input with 32 bits
+    if length > u32.$max.to(uint) : throw .too_large {
+        message: "JSON input exceeds the maximum byte length"
+        at_index: u32.$max.to(uint)
+    }
+    let parser = Parser[String] {
+        source: json
+        data_length: length
+        max_depth: clamp_depth(max_depth)
+        max_entries: max_entries
+    }
+    let doc = Doc { source: json }
+    doc.add(DOC_NULL, 0, 0)
+    // An error leaves members behind
+    doc_stack.clear()
+    parser.doc_value(doc) !>
+    if doc_stack.size > DOC_STACK_KEEP : doc_stack = Array[u32]{}
+    parser.skip_whitespace()
+    if parser.index != length : throw .invalid {
+        message: "Trailing character at index"
+        at_index: parser.index
+        character: parser.get(parser.index)
+    }
+    return doc.root
+}
+
+extend Parser[S] {
+    fn doc_value(doc: Doc) u32 !ParseError {
+        this.skip_whitespace()
+        let ch = this.get(this.index++)
+        if ch == '{' : return this.doc_object(doc) !>
+        if ch == '[' : return this.doc_array(doc) !>
+        if ch == '"' : return this.doc_string(doc) !>
+        if (ch >= '0' && ch <= '9') || ch == '-' {
+            this.index--
+            return this.doc_number(doc) !>
+        }
+        if ch >= 'a' && ch <= 'z' {
+            this.index--
+            let start = this.index
+            while true {
+                let letter = this.get(this.index)
+                if letter < 'a' || letter > 'z' : break
+                this.index++
+            }
+            let word = this.view(start, this.index - start)
+            if word.equals("null") : return doc.add(DOC_NULL, 0, 0)
+            if word.equals("true") : return doc.add(DOC_TRUE, 0, 0)
+            if word.equals("false") : return doc.add(DOC_FALSE, 0, 0)
+        }
+        throw .invalid {
+            message: "Unknown value character"
+            at_index: this.index
+            character: ch
+        }
+    }
+
+    fn doc_object(doc: Doc) u32 !ParseError {
+        this.enter_container() !>
+        let node = doc.add(DOC_OBJECT, 0, 0)
+        let mark = doc_stack.length
+        let count = 0
+        while true {
+            this.skip_whitespace()
+            let ch = this.get(this.index++)
+            if ch == '}' : break
+            if count > 0 {
+                if ch != ',' : throw .invalid {
+                    message: "Missing object comma"
+                    at_index: this.index
+                    character: ch
+                }
+                this.skip_whitespace()
+                ch = this.get(this.index++)
+            }
+            this.add_entry() !>
+            count++
+            if ch != '"' : throw .invalid {
+                message: "Invalid json object syntax"
+                at_index: this.index
+                character: ch
+            }
+            doc_stack.append(this.doc_string(doc) !>)
+            this.expect(':') !>
+            this.doc_value(doc) !>
+        }
+        this.leave_container()
+        doc.close_container(node, mark)
+        return node
+    }
+
+    fn doc_array(doc: Doc) u32 !ParseError {
+        this.enter_container() !>
+        let node = doc.add(DOC_ARRAY, 0, 0)
+        let mark = doc_stack.length
+        let count = 0
+        while true {
+            this.skip_whitespace()
+            let ch = this.get(this.index++)
+            if ch == ']' : break
+            if count > 0 {
+                if ch != ',' : throw .invalid {
+                    message: "Missing array comma"
+                    at_index: this.index
+                    character: ch
+                }
+                this.skip_whitespace()
+                ch = this.get(this.index++)
+            }
+            this.add_entry() !>
+            count++
+            this.index--
+            doc_stack.append(this.doc_value(doc) !>)
+        }
+        this.leave_container()
+        doc.close_container(node, mark)
+        return node
+    }
+
+    // After the opening quote. A plain string stays a range of the source; read_string
+    // decodes the others, with its checks of escapes and UTF-8
+    fn doc_string(doc: Doc) u32 !ParseError {
+        let start = this.index
+        this.skip_plain_bytes()
+        // The fast scan stops within 16 bytes of the end, so the rest goes byte by byte
+        while true {
+            let ch = this.get(this.index)
+            if ch == '"' {
+                let length = this.index - start
+                this.index++
+                return doc.add(DOC_STRING, start.to(u32), length.to(u32))
+            }
+            if ch < 32 || ch >= 0x80 || ch == '\\' : break
+            this.index++
+        }
+        this.index = start
+        return doc.add_decoded(this.read_string() !>)
+    }
+
+    fn doc_number(doc: Doc) u32 !ParseError {
+        let value = this.parse_number() !>
+        match value {
+            int as number => {
+                return doc.add_number(DOC_INT, number.to(u64))
+            }
+            float as number => {
+                return doc.add_number(DOC_FLOAT, core.f64_to_bits(number.to(f64)))
+            }
+            default => panic("A JSON number is an int or a float")
+        }
+    }
+}

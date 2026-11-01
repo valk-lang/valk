@@ -3863,6 +3863,8 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
 + fn new_object(values: ?Map[Value] (null)) Map[Value]
 // Returns `value` as a JSON string.
 + fn new_string(value: String) Value
+// Parses JSON text into a read-only `View` of its top-level value.
++ fn read(json: String, max_depth: uint (JSON_MAX_DEPTH), max_bytes: uint (JSON_MAX_BYTES), max_entries: uint (JSON_MAX_ENTRIES)) View !ParseError
 ```
 
 ## Classes for 'json'
@@ -3982,6 +3984,102 @@ error IoError (open, access, read, write, exists, os, closed, timeout, range, ca
     + fn string_value() String !LookupError
     // Converts the value to `T`.
     + fn to_type[T]() T !LookupError
+}
+```
+
+```js
+// A read-only value of a JSON document, made by `json.read`. Small and free to copy; it keeps the document and its input alive.
++ struct View {
+    // Returns this view when it holds an array, or a `null` view, which reads as empty.
+    + get array: View
+    // Returns this view.
+    + fn array_value() View !LookupError
+    // Returns the bool held, or `false` when the value is not a bool.
+    + get bool: bool
+    // Returns the bool held.
+    + fn bool_value() bool !LookupError
+    // Returns the value encoded as JSON text; see `json.encode`.
+    + fn encode(pretty: bool (false)) String
+    // Returns the number held as a float, or `0.0` when the value is not a number.
+    + get float: float
+    // Returns the number held as a float; an integer is converted.
+    + fn float_value() float !LookupError
+    // Returns the object member named `key` or the array item at index `key`.
+    + fn get(key: String | uint) View
+    // Returns the array at `key` as a view.
+    + fn get_array(key: String | uint) View !LookupError
+    // Returns the bool at `key`.
+    + fn get_bool(key: String | uint) bool !LookupError
+    // Returns the number at `key` as a float; an integer is converted.
+    + fn get_float(key: String | uint) float !LookupError
+    // Returns the integer at `key`; a whole float counts as its integer.
+    + fn get_int(key: String | uint) int !LookupError
+    // Returns the object at `key` as a view.
+    + fn get_object(key: String | uint) View !LookupError
+    // Returns the object member named `key` or the array item at index `key`.
+    + fn get_required(key: String | uint) View !LookupError
+    // Returns the string at `key`.
+    + fn get_string(key: String | uint) String !LookupError
+    // Returns whether an object member named `key` or an array item at index `key` exists.
+    + fn has(key: String | uint) bool
+    // Returns whether the value at `key` exists and is an array.
+    + fn has_array(key: String | uint) bool
+    // Returns whether the value at `key` exists and is a bool.
+    + fn has_bool(key: String | uint) bool
+    // Returns whether the value at `key` exists and is a number, i.e. whether `get_float` succeeds; an integer counts.
+    + fn has_float(key: String | uint) bool
+    // Returns whether the value at `key` exists and is an integer.
+    + fn has_int(key: String | uint) bool
+    // Returns whether the value at `key` exists and is an object.
+    + fn has_object(key: String | uint) bool
+    // Returns whether the value at `key` exists and is a string.
+    + fn has_string(key: String | uint) bool
+    // Returns the integer held, or `0` when the value is not an integer.
+    + get int: int
+    // Returns the integer held; a whole float counts as its integer.
+    + fn int_value() int !LookupError
+    // Returns whether the value is an array.
+    + get is_array: bool
+    // Returns whether the value is a bool.
+    + get is_bool: bool
+    // Returns whether the value is a float.
+    + get is_float: bool
+    // Returns whether the value is an integer.
+    + get is_int: bool
+    // Returns whether the value is `null`, which a missing member or item also reads as.
+    + get is_null: bool
+    // Returns whether the value is an integer or a float.
+    + get is_number: bool
+    // Returns whether the value is an object.
+    + get is_object: bool
+    // Returns whether the value is a string.
+    + get is_string: bool
+    // Returns the kind of value held.
+    + get kind: Kind
+    // Returns the number of items or members, the byte length of a string, or `0` otherwise.
+    + get length: uint
+    // Returns this view when it holds an object, or a `null` view, which reads as empty.
+    + get object: View
+    // Returns this view.
+    + fn object_value() View !LookupError
+    // Returns the value as text; any kind converts, as `Value.string` does.
+    + get string: String
+    // Returns the string held.
+    + fn string_value() String !LookupError
+    // Converts to a `Value`, so `json.from` and `json.encode` take a view.
+    + fn to_json_value() Value
+    // Returns a `Value` holding a copy of this part of the document, which can be changed.
+    + fn to_value() Value
+}
+```
+
+```js
+// The key `each` gives for a `View`: a member's name, or an item's index.
++ struct ViewKey {
+    // Returns the item's index, or `0` for a member's name.
+    + get int: int
+    // Returns the member's name, or the item's index as text.
+    + get string: String
 }
 ```
 
