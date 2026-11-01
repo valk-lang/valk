@@ -774,6 +774,145 @@ Throws `SyntaxError` for an empty slice, any byte other than the digits `0`-`9` 
 the sign, or a value that does not fit.
 
 ```js
+// Items of one type in a single block that grows as needed, addressed with `Link[T]`.
++ class Arena[T] {
+    // Adds `item` and returns a link to it.
+    + fn add(item: T) Link[T]
+    // Drops every item and keeps the block for reuse.
+    + fn clear() void
+    // Returns an independent copy; links to this arena reach the same items in the copy.
+    + fn clone() Arena[T]
+    // Returns a copy of the item behind `link`.
+    + fn get(link: Link[T]) T
+    // The number of items.
+    + get length: uint
+    // Returns the link to the item at `index`.
+    + fn link(index: uint) Link[T]
+    // Creates an empty arena with room for `start_size` items before it has to grow.
+    + static fn new(start_size: uint (0)) Arena[T]
+    // Returns the link the next `add` will return, for an item that refers to itself.
+    + fn next_link() Link[T]
+    // Returns a borrow of the item behind `link`, to change its fields in place.
+    + fn ref(link: Link[T]) mut &T
+    // Replaces the item behind `link`. Backs `arena[link] = item`.
+    + fn set(link: Link[T], item: T) void
+    // Returns a view of the items as they are now, for reading and writing through links in a loop that adds nothing: the view holds what an access through the arena has to load each time.
+    + fn view() ArenaView[T]
+}
+```
+
+### Arena
+
+Items of one type in a single block that grows as needed, addressed with `Link[T]`.
+
+An arena costs the collector one object however many items it holds, and items without GC
+references are never walked. Items cannot be removed one by one: `clear` drops them all and
+keeps the block for reuse, and dropping the arena frees everything at once.
+
+#### add
+
+Adds `item` and returns a link to it.
+
+Panics when the arena would hold more items than a link can address.
+
+#### clear
+
+Drops every item and keeps the block for reuse.
+
+Links to the old items now reach new items or panic, so do not keep them.
+
+#### clone
+
+Returns an independent copy; links to this arena reach the same items in the copy.
+
+#### get
+
+Returns a copy of the item behind `link`.
+
+Panics when `link` is beyond the arena, which takes a link from elsewhere. Backs `arena[link]`.
+
+#### length
+
+The number of items.
+
+#### link
+
+Returns the link to the item at `index`.
+
+Panics when there is no such item. Lets items be placed by position, as in a grid.
+
+#### new
+
+Creates an empty arena with room for `start_size` items before it has to grow.
+
+Marked `$default`: it also provides the type's default value.
+
+#### next_link
+
+Returns the link the next `add` will return, for an item that refers to itself.
+
+Reading through it before that `add` panics.
+
+#### ref
+
+Returns a borrow of the item behind `link`, to change its fields in place.
+
+It keeps its storage alive and stays valid when the arena grows, but then points at the
+old block, so finish with it before adding more items.
+
+#### set
+
+Replaces the item behind `link`. Backs `arena[link] = item`.
+
+#### view
+
+Returns a view of the items as they are now, for reading and writing through links in a
+loop that adds nothing: the view holds what an access through the arena has to load each time.
+
+It keeps its storage alive, but items added afterwards are not in it, and after the arena
+grows it writes to the old block.
+
+```js
+// The items of an `Arena[T]` at one moment, addressed with links; see `Arena.view`.
++ struct ArenaView[T] {
+    // Returns a copy of the item behind `link`. Backs `view[link]`.
+    + fn get(link: Link[T]) T
+    // The number of items.
+    + get length: uint
+    // Returns a borrow of the item behind `link`, to change its fields in place.
+    + fn ref(link: Link[T]) mut &T
+    // Replaces the item behind `link`. Backs `view[link] = item`.
+    + fn set(link: Link[T], item: T) void
+    // Returns the items as a slice, in the order they were added.
+    + fn slice() mut &[T]
+}
+```
+
+### ArenaView
+
+The items of an `Arena[T]` at one moment, addressed with links; see `Arena.view`.
+
+#### get
+
+Returns a copy of the item behind `link`. Backs `view[link]`.
+
+#### length
+
+The number of items.
+
+#### ref
+
+Returns a borrow of the item behind `link`, to change its fields in place.
+
+#### set
+
+Replaces the item behind `link`. Backs `view[link] = item`.
+
+#### slice
+
+Returns the items as a slice, in the order they were added.
+
+```js
 // A growable array of `T` stored in one contiguous block.
 + array Array[T] {
     // The storage block holding the elements; null until the first element is stored.
@@ -2729,6 +2868,51 @@ heap unchanged. Throws `empty` when the heap is empty, without pushing `item`.
 #### to_array
 
 Returns the items as a new array in heap order, which is not sorted.
+
+```js
+// A typed reference to an item of an `Arena[T]`: one 32-bit number, and `?Link[T]` takes no more room, so items can refer to each other at a fraction of the cost of objects.
++ struct Link[T] {
+    // Returns the same link: it holds nothing that can be shared.
+    + fn clone() Link[T]
+    // Returns whether both links reach the same item. Backs `==`.
+    + fn equals(other: Link[T]) bool
+    // Returns the index of the item in its arena.
+    + get index: uint
+}
+```
+
+### Link
+
+A typed reference to an item of an `Arena[T]`: one 32-bit number, and `?Link[T]` takes no
+more room, so items can refer to each other at a fraction of the cost of objects.
+
+A link holds no reference, so it does not keep its arena alive and the collector never looks
+at it. Reading through a link is checked against the arena's length: a link from another
+arena, or one kept past `clear`, can reach the wrong item but never invalid memory.
+
+```valk
+struct Node {
+    value: int
+    next: ?Link[Node] (null)
+}
+
+let nodes = Arena[Node]{}
+let last = nodes.add(Node { value: 2 })
+let first = nodes.add(Node { value: 1, next: last })
+println(nodes[first].value)
+```
+
+#### clone
+
+Returns the same link: it holds nothing that can be shared.
+
+#### equals
+
+Returns whether both links reach the same item. Backs `==`.
+
+#### index
+
+Returns the index of the item in its arena.
 
 ```js
 // Mutable data shared between threads. The value can only be reached inside a `lock` block, which holds the mutex for the length of the block:

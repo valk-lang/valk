@@ -17,6 +17,7 @@
 * [Arrays](#arrays)
 * [Maps](#maps)
     * [Sets, deques and heaps](#sets-deques-and-heaps)
+* [Arenas and links](#arenas-and-links)
 * [Typehints](#typehints)
 * [Tagged unions](#tagged-unions)
 
@@ -649,6 +650,39 @@ A compound assignment such as `values[i] += 1` reads the element through
 `$offset` and stores it back through `$offset_assign`, evaluating `values` and
 `i` once. A handler after the value covers both: `counts[word] += 1 !? 0`
 starts a missing key at 0.
+
+## Arenas and links
+
+An `Arena[T]` keeps many items in one block, and a `Link[T]` refers to one of them. It suits trees,
+graphs and grids: a million items cost the garbage collector a single object, and a link takes 4
+bytes, also when it is nullable. Items cannot be removed one by one; `clear` drops them all and
+dropping the arena frees everything at once.
+
+```rust
+struct Node {
+    value: int
+    left: ?Link[Node] (null)
+    right: ?Link[Node] (null)
+}
+
+let nodes = Arena[Node]{}
+let leaf = nodes.add(Node { value: 2 })
+let root = nodes.add(Node { value: 1, left: leaf })
+
+println(nodes[root].value)          // A copy of the item
+nodes.ref(leaf).value = 3           // Changes the item in place
+let left = nodes[root].left
+if isset(left) : println(nodes[left].value)
+```
+
+A link is its own type: `nodes[0]`, a link to another type of item and an unchecked `?Link` are
+compile errors. Reading through a link is always checked, so a link from another arena or one kept
+past `clear` can reach the wrong item or panic, but never invalid memory. `nodes.link(index)` turns
+a position into a link, as in a grid, and `link.index` gives the position back.
+
+In a loop that adds nothing, read through `let view = nodes.view()`, which works the same way but
+is faster. Items added after that are not in the view. A nullable link costs a check on each read,
+so a loop that reads many links is faster when they are not nullable.
 
 ## Typehints
 

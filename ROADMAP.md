@@ -5,6 +5,7 @@
 
 ```
 - Release 0.8.4
++ `Arena[T]` and `Link[T]`: items in one block that refer to each other with 32-bit typed links; `?Link[T]` is as small as `Link[T]`, and a mix-up with an index or a link of another type is a compile error
 + `json.read`: a read-only `json.View` that reads like a `Value`, with the limits and errors of `json.decode`; its nodes live in one block the collector does not walk, which makes a large document about 5x cheaper to parse and read
 + Regex: a group whose place follows from the match, as in `\{\{(.*?)\}\}` or `key=(\w+)`, needs no pass of its own, a pattern with a literal prefix finds the match start without reading backwards, and a match costs one allocation less (LangArena Template::Regex 2.41 -> 0.83 s)
 + Fixed a use-after-free: `view[i].field = value` through a slice of structs stored without telling the collector, so the value could be freed while still in use, and the old value leaked
