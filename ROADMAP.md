@@ -5,6 +5,7 @@
 
 ```
 - Release 0.8.4
++ Fix: an out-of-bounds index on an `Array` reported the line of the first index compiled for that array type; each one now reports its own line
 + `Arena[T]` and `Link[T]`: items in one block that refer to each other with 32-bit typed links; `?Link[T]` is as small as `Link[T]`, and a mix-up with an index or a link of another type is a compile error
 + `json.read`: a read-only `json.View` that reads like a `Value`, with the limits and errors of `json.decode`; its nodes live in one block the collector does not walk, which makes a large document about 5x cheaper to parse and read
 + Regex: a group whose place follows from the match, as in `\{\{(.*?)\}\}` or `key=(\w+)`, needs no pass of its own, a pattern with a literal prefix finds the match start without reading backwards, and a match costs one allocation less (LangArena Template::Regex 2.41 -> 0.83 s)
