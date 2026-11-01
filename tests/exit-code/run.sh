@@ -49,7 +49,7 @@ cases="$cases global-init-print:0 global-init-abort:1 global-init-error:1"
 cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-line:1:shift-count-line.valk:3"
 # Panic locations are relative to the package root, or the working directory
 # for loose files; a dependency names its package
-cases="$cases panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:1:tests/exit-code/fixed-array-bounds.valk:4"
+cases="$cases array-line-read:1:tests/exit-code/array-line-read.valk:2 array-line-write:1:tests/exit-code/array-line-write.valk:2 array-line-compound:1:tests/exit-code/array-line-compound.valk:6 panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:1:tests/exit-code/fixed-array-bounds.valk:4"
 cases="$cases panic-in-library:1:ByteBuffer.valk:"
 # A `test-` fixture is built with --test: a panic names its test and prints the summary
 cases="$cases test-crash-named:1:panicked"
