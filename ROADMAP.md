@@ -6,6 +6,7 @@
 ```
 - Release 0.8.4
 + `json.read`: a read-only `json.View` that reads like a `Value`, with the limits and errors of `json.decode`; its nodes live in one block the collector does not walk, which makes a large document about 5x cheaper to parse and read
++ Regex: a group whose place follows from the match, as in `\{\{(.*?)\}\}` or `key=(\w+)`, needs no pass of its own, a pattern with a literal prefix finds the match start without reading backwards, and a match costs one allocation less (LangArena Template::Regex 2.41 -> 0.83 s)
 + Fixed a use-after-free: `view[i].field = value` through a slice of structs stored without telling the collector, so the value could be freed while still in use, and the old value leaked
 + HTTP server: `max_server_wide_body_size` defaults to a quarter of `core.memory_limit()` instead of no limit: many large uploads at once are answered with 503 instead of the process being killed (128 x 31 MB in a 3 GB container: killed -> survives)
 + HTTP server: a worker that goes idle after holding a lot of memory gives it back to the system (after a burst of large uploads: 3.5 GB -> under 100 MB)
