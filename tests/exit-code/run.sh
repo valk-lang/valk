@@ -44,6 +44,7 @@ cases="$cases matrix-borrow-row-bounds:1 matrix-borrow-column-bounds:1"
 cases="$cases division-by-zero:1 division-overflow:1 remainder-by-zero:1 shift-count-overflow:1 shift-count-negative:1 division-literal-minus-one:1"
 cases="$cases round-up-overflow:1:outside round-down-overflow:1:outside"
 cases="$cases panic-in-thread:1"
+cases="$cases large-slice-zeroed:0"
 cases="$cases global-init-print:0 global-init-abort:1 global-init-error:1"
 cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-line:1:shift-count-line.valk:3"
 # Panic locations are relative to the package root, or the working directory
