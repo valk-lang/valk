@@ -203,6 +203,36 @@ else
     fi
 fi
 
+# Windows has no descriptor limit to run into
+if [ -z "$EXE_SUFFIX" ]; then
+    count=$((count + 1))
+    input="$DIR/descriptors-collected.valk"
+    exe="$workdir/descriptors-collected"
+    echo "> Run: dropped descriptors are collected when they run out"
+    set +e
+    out=$("$VALK" build "$input" --no-warn -o "$exe" 2>&1)
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ]; then
+        echo "# Build failed"
+        echo "- File: $input"
+        echo "- Output:"
+        echo "$out"
+        failed=1
+    else
+        set +e
+        out=$(ulimit -n 256; "$exe" 2>&1)
+        got=$?
+        set -e
+        if [ "$got" -ne 0 ]; then
+            echo "# Ran out of descriptors"
+            echo "- Exit code: $got"
+            echo "- Output: $out"
+            failed=1
+        fi
+    fi
+fi
+
 if [ "$count" -eq 0 ]; then
     echo "# No exit-code fixtures found in $DIR"
     exit 1
