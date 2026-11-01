@@ -252,6 +252,50 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 ```
 
 ```js
+// Items of one type in a single block that grows as needed, addressed with `Link[T]`.
++ class Arena[T] {
+    // Adds `item` and returns a link to it.
+    + fn add(item: T) Link[T]
+    // Drops every item and keeps the block for reuse.
+    + fn clear() void
+    // Returns an independent copy; links to this arena reach the same items in the copy.
+    + fn clone() Arena[T]
+    // Returns a copy of the item behind `link`.
+    + fn get(link: Link[T]) T
+    // The number of items.
+    + get length: uint
+    // Returns the link to the item at `index`.
+    + fn link(index: uint) Link[T]
+    // Creates an empty arena with room for `start_size` items before it has to grow.
+    + static fn new(start_size: uint (0)) Arena[T]
+    // Returns the link the next `add` will return, for an item that refers to itself.
+    + fn next_link() Link[T]
+    // Returns a borrow of the item behind `link`, to change its fields in place.
+    + fn ref(link: Link[T]) mut &T
+    // Replaces the item behind `link`. Backs `arena[link] = item`.
+    + fn set(link: Link[T], item: T) void
+    // Returns a view of the items as they are now, for reading and writing through links in a loop that adds nothing: the view holds what an access through the arena has to load each time.
+    + fn view() ArenaView[T]
+}
+```
+
+```js
+// The items of an `Arena[T]` at one moment, addressed with links; see `Arena.view`.
++ struct ArenaView[T] {
+    // Returns a copy of the item behind `link`. Backs `view[link]`.
+    + fn get(link: Link[T]) T
+    // The number of items.
+    + get length: uint
+    // Returns a borrow of the item behind `link`, to change its fields in place.
+    + fn ref(link: Link[T]) mut &T
+    // Replaces the item behind `link`. Backs `view[link] = item`.
+    + fn set(link: Link[T], item: T) void
+    // Returns the items as a slice, in the order they were added.
+    + fn slice() mut &[T]
+}
+```
+
+```js
 // A growable array of `T` stored in one contiguous block.
 + array Array[T] {
     // The storage block holding the elements; null until the first element is stored.
@@ -807,6 +851,18 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
     + fn replace(item: T) T !LookupError
     // Returns the items as a new array in heap order, which is not sorted.
     + fn to_array() Array[T]
+}
+```
+
+```js
+// A typed reference to an item of an `Arena[T]`: one 32-bit number, and `?Link[T]` takes no more room, so items can refer to each other at a fraction of the cost of objects.
++ struct Link[T] {
+    // Returns the same link: it holds nothing that can be shared.
+    + fn clone() Link[T]
+    // Returns whether both links reach the same item. Backs `==`.
+    + fn equals(other: Link[T]) bool
+    // Returns the index of the item in its arena.
+    + get index: uint
 }
 ```
 

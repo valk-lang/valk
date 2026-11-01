@@ -28,7 +28,7 @@ trap 'rm -rf "$workdir"' EXIT
 # fixture:expected exit status[:expected output substring]
 cases="return-3:3 return-0:0 void-main:0 return-int:7 unbound-bounds:1 named-unbound-bounds:1 fixed-array-write-bounds:1 fixed-array-range-bounds:1 unbound-range-bounds:1 named-unbound-range-bounds:1 named-unbound-write-bounds:1 array-set-expand-overflow:1 gc-alloc-overflow:1"
 
-cases="$cases unhandled-error:1 array-bounds:1 array-write-bounds:1 slice-bounds:1 slice-write-bounds:1 ref-slice-bounds:1 ref-slice-range-bounds:1 slice-empty-element:1 each-empty-element:1 view-cleared-element:1"
+cases="$cases arena-stale-link:1 arena-bad-index:1 unhandled-error:1 array-bounds:1 array-write-bounds:1 slice-bounds:1 slice-write-bounds:1 ref-slice-bounds:1 ref-slice-range-bounds:1 slice-empty-element:1 each-empty-element:1 view-cleared-element:1"
 cases="$cases coalesce-panic:1 ternary-panic-first:1 ternary-panic-second:1 ternary-panic-both:1"
 cases="$cases logical-panic-left:1 logical-panic-right:1 ternary-panic-condition:1"
 cases="$cases ternary-panic-return:1 ternary-panic-vscope:1"

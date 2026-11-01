@@ -558,6 +558,10 @@ make entries unreachable when the mode supplies different equality or hashing.
 - `value ?? fallback` evaluates and returns `fallback` only when `value` is
   null.
 
+- A `struct` declared `$null_zero` holds exactly one integer property, and `?T`
+  is the same integer with all-zero bytes as the empty state, so it takes no
+  extra room and zero-filled storage reads as `null`. `Link[T]` is one.
+
 The compiler must not erase nullable state until control-flow analysis proves
 the value non-null.
 
