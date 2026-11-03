@@ -78,8 +78,10 @@ fn uring_files() uint {
 }
 
 // Completions that belong to no coroutine carry this index where a coroutine's would be, and
-// a payload of 30 bits above it (see `coro.side_events`). Payload 0 is dropped
+// a payload of 30 bits above it (see `coro.side_event`). Payload 0 is dropped
 value SIDE_INDEX (0xFFFF_FFFF)
+// The payload of the main ring's read of the extra rings' eventfd (channel 0, data 1)
+value EXTRA_DOORBELL (1 << 6)
 
 fn side_user_data(payload: uint) u64 {
     return ((payload << 34) | (SIDE_INDEX << 2)).to(u64)
@@ -89,50 +91,151 @@ fn is_side_event(user_data: u64) bool {
     return (user_data >> 2) & 0xFFFF_FFFF == SIDE_INDEX.to(u64)
 }
 
-// A submission that no coroutine waits for; its completion is a side event with `payload`
-fn detached_sqe(payload: uint) *ext.io_uring_sqe !IoError {
-    let ring = uring() !>
-    return detached_sqe_on(ring, payload) !>
+// More rings of this thread for direct descriptors, each with a table of its own: one table
+// holds at most RLIMIT_NOFILE. Ring 0 is the main ring (`uring`), ring i the extra ring i - 1.
+// They signal one eventfd, which the main ring reads, and the scheduler reaps them with it
+value DIRECT_RINGS_MAX (16)
+value EFD_CLOEXEC (0x80000)
+
+class ExtraRing {
+    inst: *ext.io_uring
+    unsubmitted: uint (0)
+    fn gc_free() {
+        @unsafe
+        ext.io_uring_queue_exit(this.inst)
+        mem.free(this.inst)
+    }
 }
 
-fn detached_sqe_on(ring: *ext.io_uring, payload: uint) *ext.io_uring_sqe !IoError {
-    @unsafe
-    if uring_unsubmitted + 2 > 128 || sq_space_left(ring) < 2 : uring_submit(ring)
-    let sqe = ext.io_uring_get_sqe(ring) ?! throw .os
-    uring_unsubmitted++
-    io_uring_prep_rw(ext.IORING_OP.NOP, sqe, -1, null, 0, 0)
-    sqe.user_data = side_user_data(payload)
-    return sqe
+global extra_rings: Array[ExtraRing] (.{})
+global extra_efd: i32 (-1)
+global extra_efd_count: ?ptr (null)
+
+// The number of rings with a table of direct descriptors, the main ring included; 0 without
+fn direct_ring_count() uint {
+    if uring_files() == 0 : return 0
+    return extra_rings.length + 1
 }
 
-// Closes the direct descriptor `slot`, without waiting; the socket ends once no operation
-// holds it. Uses the ring the descriptor lives in, so it allocates nothing (collectors call it).
-// No shutdown: io_uring runs that on a worker thread, where it would find the slot by number
-// after a new connection took it
-fn close_direct(slot: i32) {
+// Adds a ring with a table of direct descriptors and returns its index; 0 when none can be made
+fn add_direct_ring() uint {
     @unsafe
-    let existing = uring_instance ?! return
-    let ring = existing.inst
-    let close = detached_sqe_on(ring, 0) ! return
+    let size = uring_files()
+    if size == 0 || extra_rings.length + 1 >= DIRECT_RINGS_MAX : return 0
+    let main = uring() ! return 0
+    if extra_efd < 0 {
+        let efd = ext.eventfd(0, EFD_CLOEXEC)
+        if efd < 0 : return 0
+        extra_efd = efd
+        extra_efd_count = mem.alloc(8)
+        arm_extra_doorbell()
+    }
+    let inst = mem.new[ext.io_uring]()
+    let params: [u32 x 30] = @undefined
+    mem.clear_bytes(@ref(params).@cast(ptr), 120)
+    params[1] = 4096
+    params[2] = IORING_SETUP_CQSIZE
+    if ext.io_uring_queue_init_params(256, inst, @ref(params).@cast(ptr)) < 0 {
+        mem.free(inst)
+        return 0
+    }
+    let ring = ExtraRing { inst: inst }
+    if ext.io_uring_register_files_sparse(inst, size.to(u32)) < 0 : return 0
+    if ext.io_uring_register_eventfd(inst, extra_efd) < 0 : return 0
+    extra_rings.append(ring)
+    return extra_rings.length
+}
+
+// Queues the main ring's read of the extra rings' eventfd
+fn arm_extra_doorbell() {
+    @unsafe
+    let count = extra_efd_count ?! return
+    let sqe = detached_sqe(0, EXTRA_DOORBELL) ! return
+    io_uring_prep_read(sqe, extra_efd, count, 8, 0)
+}
+
+// Submits what was queued on the extra rings
+fn submit_extra_rings() {
+    each extra_rings as extra {
+        if extra.unsubmitted == 0 : continue
+        let submitted = ext.io_uring_submit(extra.inst)
+        if submitted < 0 : continue
+        extra.unsubmitted = uring_remaining(extra.unsubmitted, submitted.to(uint))
+    }
+}
+
+// A submission entry on ring `index` for `coro`, like `sqe`
+fn sqe_on(coro: ?coro.Coro, index: uint) *ext.io_uring_sqe !IoError {
+    if index == 0 : return sqe(coro) !>
+    let extra = extra_rings.get(index - 1) ! throw .os
+    if extra.unsubmitted + 2 > 128 || sq_space_left(extra.inst) < 2 : submit_extra(extra)
+    let entry = take_sqe_raw(coro, extra.inst) !>
+    extra.unsubmitted++
+    return entry
+}
+
+fn linked_sqe_on(coro: ?coro.Coro, index: uint) *ext.io_uring_sqe !IoError {
+    if index == 0 : return linked_sqe(coro) !>
+    let extra = extra_rings.get(index - 1) ! throw .os
+    let entry = take_sqe_raw(coro, extra.inst) !>
+    extra.unsubmitted++
+    return entry
+}
+
+fn submit_extra(extra: ExtraRing) {
+    let submitted = ext.io_uring_submit(extra.inst)
+    if submitted < 0 : panic("Failed to submit io_uring requests")
+    extra.unsubmitted = uring_remaining(extra.unsubmitted, submitted.to(uint))
+}
+
+// A submission on ring `index` that no coroutine waits for; its completion is a side event
+// with `payload`. Allocates nothing: collectors use it
+fn detached_sqe(index: uint, payload: uint) *ext.io_uring_sqe !IoError {
+    @unsafe
+    let sqe: ?*ext.io_uring_sqe = null
+    if index == 0 {
+        let main = uring_instance ?! throw .os
+        let ring = main.inst
+        if uring_unsubmitted + 2 > 128 || sq_space_left(ring) < 2 : uring_submit(ring)
+        sqe = ext.io_uring_get_sqe(ring)
+        if isset(sqe) : uring_unsubmitted++
+    } else {
+        let extra = extra_rings.get(index - 1) ! throw .os
+        if extra.unsubmitted + 2 > 128 || sq_space_left(extra.inst) < 2 : submit_extra(extra)
+        sqe = ext.io_uring_get_sqe(extra.inst)
+        if isset(sqe) : extra.unsubmitted++
+    }
+    let entry = sqe ?! throw .os
+    io_uring_prep_rw(ext.IORING_OP.NOP, entry, -1, null, 0, 0)
+    entry.user_data = side_user_data(payload)
+    return entry
+}
+
+// Closes the direct descriptor `slot` of ring `index`, without waiting; the socket ends once no
+// operation holds it. No shutdown: io_uring runs that on a worker thread, where it would find
+// the slot by number after a new connection took it
+fn close_direct(index: uint, slot: i32) {
+    @unsafe
+    let close = detached_sqe(index, 0) ! return
     io_uring_prep_rw(ext.IORING_OP.CLOSE, close, 0, null, 0, 0)
     close.file_index = (slot + 1).to(u32)
 }
 
-// Arms a multishot poll on the direct descriptor `slot`; each time it becomes readable (or
-// ends) a side event with `payload` arrives
-fn poll_direct(slot: i32, mask: u32, payload: uint) bool {
+// Arms a multishot poll on the direct descriptor `slot` of ring `index`; each time it becomes
+// readable (or ends) a side event with `payload` arrives
+fn poll_direct(index: uint, slot: i32, mask: u32, payload: uint) bool {
     @unsafe
-    let sqe = detached_sqe(payload) ! return false
+    let sqe = detached_sqe(index, payload) ! return false
     io_uring_prep_poll_add(sqe, slot, mask)
     sqe.len = IORING_POLL_ADD_MULTI
     sqe.flags = IOSQE_FIXED_FILE.to(u8)
     return true
 }
 
-// Removes the poll armed with `payload`, without waiting
-fn poll_remove_side(payload: uint) {
+// Removes the poll armed on ring `index` with `payload`, without waiting
+fn poll_remove_side(index: uint, payload: uint) {
     @unsafe
-    let sqe = detached_sqe(0) ! return
+    let sqe = detached_sqe(index, 0) ! return
     io_uring_prep_rw(ext.IORING_OP.POLL_REMOVE, sqe, -1, null, 0, 0)
     sqe.addr = side_user_data(payload)
 }
@@ -189,13 +292,19 @@ fn linked_sqe(coro: ?coro.Coro, ring: ?*ext.io_uring (null)) *ext.io_uring_sqe !
 }
 
 fn take_sqe(coro: ?coro.Coro, ring: *ext.io_uring) *ext.io_uring_sqe !IoError {
+    let sqe = take_sqe_raw(coro, ring) !>
+    uring_unsubmitted++
+    return sqe
+}
+
+// Like `take_sqe`, without counting it for the main ring
+fn take_sqe_raw(coro: ?coro.Coro, ring: *ext.io_uring) *ext.io_uring_sqe !IoError {
     if !isset(coro) : coro = coro.current_coro
     let sqe = ext.io_uring_get_sqe(ring)
     if !isset(sqe) : throw .os
     let target = coro ?! panic("Cannot schedule an io_uring operation without a coroutine")
     target.arm_kernel_event()
     sqe.user_data = target.event_id().to(u64)
-    uring_unsubmitted++
     return sqe
 }
 
@@ -273,12 +382,12 @@ fn io_uring_prep_link_timeout(sqe: *ext.io_uring_sqe, ts: &kernel_timespec, flag
     sqe.rw_flags = flags
 }
 
-fn link_timeout(coro: coro.Coro, operation: *ext.io_uring_sqe, timeout_ms: uint) !IoError {
+fn link_timeout(coro: coro.Coro, operation: *ext.io_uring_sqe, timeout_ms: uint, ring: uint (0)) !IoError {
     if timeout_ms == 0 : return
 
     operation.flags = operation.flags | (1 << ext.IORING_SQE_FLAGS.IO_LINK_BIT)
     operation.user_data = operation.user_data | 2
-    let timeout = linked_sqe(coro) !>
+    let timeout = linked_sqe_on(coro, ring) !>
     // Split into whole seconds and a nanosecond remainder: one nanosecond count
     // wraps the signed field once the timeout passes about 292 years, and a
     // negative timespec fires at once
