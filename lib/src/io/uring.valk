@@ -26,6 +26,11 @@ value IORING_FEAT_REG_REG_RING (8192)
 // ring, or for none at all.
 // struct io_uring_params: u32 sq_entries, cq_entries, flags, ...
 value IORING_SETUP_CQSIZE (8)
+// Only this thread submits, and the kernel completes its work when the thread waits instead of
+// interrupting it (Linux 6.1+). The flag tells a peek that deferred completions are pending
+value IORING_SETUP_TASKRUN_FLAG (512)
+value IORING_SETUP_SINGLE_ISSUER (4096)
+value IORING_SETUP_DEFER_TASKRUN (8192)
 
 fn uring() *ext.io_uring !IoError {
     @unsafe
@@ -38,8 +43,14 @@ fn uring() *ext.io_uring !IoError {
     let params: [u32 x 30] = @undefined
     mem.clear_bytes(@ref(params).@cast(ptr), 120)
     params[1] = 2048
-    params[2] = IORING_SETUP_CQSIZE
+    params[2] = IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG
     let err = ext.io_uring_queue_init_params(256, inst, @ref(params).@cast(ptr))
+    if err < 0 {
+        mem.clear_bytes(@ref(params).@cast(ptr), 120)
+        params[1] = 2048
+        params[2] = IORING_SETUP_CQSIZE
+        err = ext.io_uring_queue_init_params(256, inst, @ref(params).@cast(ptr))
+    }
     if err >= 0 : uring_features = params[5]
     if err < 0 : err = ext.io_uring_queue_init(64, inst, 0)
     if err < 0 {
@@ -72,9 +83,31 @@ fn uring_files() uint {
     let size = limits[0].to(uint)
     if size > DIRECT_TABLE_MAX : size = DIRECT_TABLE_MAX
     if size < 64 : return 0
-    if ext.io_uring_register_files_sparse(ring, size.to(u32)) < 0 : return 0
+    if !register_files_sparse(ring, size) : return 0
     uring_files_size = size
     return size
+}
+
+// System calls of their own: the liburing that static builds link predates these
+value SYS_IO_URING_ENTER (426)
+value SYS_IO_URING_REGISTER (427)
+value IORING_ENTER_GETEVENTS (1)
+value IORING_REGISTER_FILES2 (13)
+value IORING_RSRC_REGISTER_SPARSE (1)
+value IORING_SQ_TASKRUN (4)
+
+fn uring_register(ring: *ext.io_uring, opcode: uint, arg: ptr, nr: uint) bool {
+    @unsafe
+    return ext.syscall(SYS_IO_URING_REGISTER, ring.ring_fd.to(int), opcode.to(int), arg, nr.to(int)) >= 0
+}
+
+// An empty table of `size` direct descriptors (Linux 5.19+)
+fn register_files_sparse(ring: *ext.io_uring, size: uint) bool {
+    @unsafe
+    // struct io_uring_rsrc_register { u32 nr, flags; u64 resv2, data, tags }
+    let reg: [u64 x 4] = { 0 ... }
+    reg[0] = size.to(u64) | (IORING_RSRC_REGISTER_SPARSE.to(u64) << 32)
+    return uring_register(ring, IORING_REGISTER_FILES2, @ref(reg).@cast(ptr), 32)
 }
 
 // Completions that belong to no coroutine carry this index where a coroutine's would be, and
@@ -140,7 +173,7 @@ fn add_direct_ring() uint {
         return 0
     }
     let ring = ExtraRing { inst: inst }
-    if ext.io_uring_register_files_sparse(inst, size.to(u32)) < 0 : return 0
+    if !register_files_sparse(inst, size) : return 0
     if ext.io_uring_register_eventfd(inst, extra_efd) < 0 : return 0
     extra_rings.append(ring)
     return extra_rings.length
@@ -422,6 +455,11 @@ fn io_uring_cqe_seen(ring: *ext.io_uring, cqe: *ext.io_uring_cqe) {
 }
 // check if an io_uring completion event is available
 fn io_uring_peek_cqe(ring: *ext.io_uring, cqe_ptr: *?*ext.io_uring_cqe) i32 {
+    @unsafe
+    // A deferred completion is only posted once this thread enters the kernel
+    if io_uring_cq_ready(ring) == 0 && (atomic_load(ring.sq.kflags[0]) & IORING_SQ_TASKRUN.to(u32)) != 0 {
+        ext.syscall(SYS_IO_URING_ENTER, ring.ring_fd.to(int), 0, 0, IORING_ENTER_GETEVENTS, 0, 0)
+    }
     while true {
         let err = io_uring_wait_cqe_nr(ring, cqe_ptr, 0)
         if err == 0 - ext.EINTR : continue
