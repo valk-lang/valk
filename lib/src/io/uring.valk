@@ -50,6 +50,93 @@ fn uring() *ext.io_uring !IoError {
     return inst
 }
 
+// Direct descriptors: sockets that live in the ring's own file table instead of the process's,
+// so they do not count against RLIMIT_NOFILE. The kernel caps one table at that limit
+value IOSQE_FIXED_FILE (1)
+value IORING_FILE_INDEX_ALLOC (0xFFFF_FFFF)
+value IORING_POLL_ADD_MULTI (1)
+value DIRECT_TABLE_MAX ((1 << 18) - 64)
+
+global uring_files_size: uint
+global uring_files_tried: bool
+
+// The size of this thread's table of direct descriptors, registered on first use; 0 when the
+// kernel has none (before 5.19)
+fn uring_files() uint {
+    @unsafe
+    if uring_files_tried : return uring_files_size
+    uring_files_tried = true
+    let ring = uring() ! return 0
+    let limits: [u64 x 2] = { 0 ... }
+    if ext.getrlimit(ext.RLIMIT_NOFILE, @ref(limits).@cast(ptr)) != 0 : return 0
+    let size = limits[0].to(uint)
+    if size > DIRECT_TABLE_MAX : size = DIRECT_TABLE_MAX
+    if size < 64 : return 0
+    if ext.io_uring_register_files_sparse(ring, size.to(u32)) < 0 : return 0
+    uring_files_size = size
+    return size
+}
+
+// Completions that belong to no coroutine carry this index where a coroutine's would be, and
+// a payload of 30 bits above it (see `coro.side_events`). Payload 0 is dropped
+value SIDE_INDEX (0xFFFF_FFFF)
+
+fn side_user_data(payload: uint) u64 {
+    return ((payload << 34) | (SIDE_INDEX << 2)).to(u64)
+}
+
+fn is_side_event(user_data: u64) bool {
+    return (user_data >> 2) & 0xFFFF_FFFF == SIDE_INDEX.to(u64)
+}
+
+// A submission that no coroutine waits for; its completion is a side event with `payload`
+fn detached_sqe(payload: uint) *ext.io_uring_sqe !IoError {
+    let ring = uring() !>
+    return detached_sqe_on(ring, payload) !>
+}
+
+fn detached_sqe_on(ring: *ext.io_uring, payload: uint) *ext.io_uring_sqe !IoError {
+    @unsafe
+    if uring_unsubmitted + 2 > 128 || sq_space_left(ring) < 2 : uring_submit(ring)
+    let sqe = ext.io_uring_get_sqe(ring) ?! throw .os
+    uring_unsubmitted++
+    io_uring_prep_rw(ext.IORING_OP.NOP, sqe, -1, null, 0, 0)
+    sqe.user_data = side_user_data(payload)
+    return sqe
+}
+
+// Closes the direct descriptor `slot`, without waiting; the socket ends once no operation
+// holds it. Uses the ring the descriptor lives in, so it allocates nothing (collectors call it).
+// No shutdown: io_uring runs that on a worker thread, where it would find the slot by number
+// after a new connection took it
+fn close_direct(slot: i32) {
+    @unsafe
+    let existing = uring_instance ?! return
+    let ring = existing.inst
+    let close = detached_sqe_on(ring, 0) ! return
+    io_uring_prep_rw(ext.IORING_OP.CLOSE, close, 0, null, 0, 0)
+    close.file_index = (slot + 1).to(u32)
+}
+
+// Arms a multishot poll on the direct descriptor `slot`; each time it becomes readable (or
+// ends) a side event with `payload` arrives
+fn poll_direct(slot: i32, mask: u32, payload: uint) bool {
+    @unsafe
+    let sqe = detached_sqe(payload) ! return false
+    io_uring_prep_poll_add(sqe, slot, mask)
+    sqe.len = IORING_POLL_ADD_MULTI
+    sqe.flags = IOSQE_FIXED_FILE.to(u8)
+    return true
+}
+
+// Removes the poll armed with `payload`, without waiting
+fn poll_remove_side(payload: uint) {
+    @unsafe
+    let sqe = detached_sqe(0) ! return
+    io_uring_prep_rw(ext.IORING_OP.POLL_REMOVE, sqe, -1, null, 0, 0)
+    sqe.addr = side_user_data(payload)
+}
+
 // Whether a send can be linked to a read: the send must go out whole, or the read
 // would start after a part of it and the peer would wait for the rest
 fn uring_links_full_sends() bool {

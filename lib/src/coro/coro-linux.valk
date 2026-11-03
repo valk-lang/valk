@@ -6,6 +6,76 @@ use ext
 use io
 use gc
 
+// Completions of operations no coroutine waits for (see `io.side_user_data`). The low bits of
+// their payload name a channel of this thread, the rest is the channel owner's
+value SIDE_CHANNEL_BITS (6)
+value SIDE_CHANNELS (64)
+
+struct SideEvent {
+    data: uint
+    res: i32
+    flags: u32
+}
+
+// One owner's queue of side events, and the coroutine that waits for them
+class SideChannel {
+    id: uint
+    events: Array[SideEvent] (.new(64))
+    waiter: ?Coro (null)
+
+    // The payload of a side event for this channel, carrying `data` (24 bits)
+    fn payload(data: uint) uint {
+        return this.id | (data << SIDE_CHANNEL_BITS)
+    }
+
+    // Waits until events are queued, or until `wake`
+    fn wait() {
+        if this.events.length > 0 : return
+        let current = current_coro ?! return
+        this.waiter = current
+        current.yield()
+    }
+
+    fn wake() {
+        let waiter = this.waiter ?! return
+        this.waiter = null
+        run_coros.append(waiter)
+    }
+
+    // Events for the channel are dropped from now on; its waiter wakes
+    fn close() {
+        if (side_channels.get(this.id) !? null) == this : side_channels.set(this.id, null) _
+        this.wake()
+    }
+}
+
+global side_channels: Array[?SideChannel] (.{})
+// Ids are handed out in turn, so a late event of a closed channel does not reach a new one
+global side_next: uint (1)
+
+// A new channel of this thread; null when all are taken
+fn side_channel() ?SideChannel {
+    while side_channels.length < SIDE_CHANNELS : side_channels.append(null)
+    let tries: uint = 0
+    while tries++ < SIDE_CHANNELS {
+        let id = side_next
+        side_next = side_next % (SIDE_CHANNELS - 1) + 1
+        if isset(side_channels.get(id) !? null) : continue
+        let channel = SideChannel { id: id }
+        side_channels.set(id, channel) _
+        return channel
+    }
+    return null
+}
+
+fn side_event(payload: uint, res: i32, flags: u32) {
+    let id = payload & (SIDE_CHANNELS - 1)
+    if id == 0 : return
+    let channel = (side_channels.get(id) !? null) ?! return
+    channel.events.append(SideEvent { data: payload >> SIDE_CHANNEL_BITS, res: res, flags: flags })
+    channel.wake()
+}
+
 extend Coro {
     timeout_ts: io.kernel_timespec (@undefined)
 
@@ -64,6 +134,13 @@ extend Coro {
             }
             //
             let user_data = cqe.user_data
+            if io.is_side_event(user_data) {
+                let res = cqe.res
+                let flags = cqe.flags
+                io.io_uring_cqe_seen(ring, cqe)
+                side_event((user_data >> 34).to(uint), res, flags)
+                continue
+            }
             if user_data == HOME_EVENT.to(u64) {
                 // Another thread woke coroutines of this one
                 let res = cqe.res
