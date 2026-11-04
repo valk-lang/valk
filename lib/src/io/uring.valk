@@ -102,23 +102,28 @@ value IORING_REGISTER_PBUF_RING (22)
 value IOSQE_BUFFER_SELECT (32)
 value IORING_CQE_F_BUFFER (1)
 value RECV_BUFFERS (4096)
+// The pool starts with this many and grows when receives find none free
+value RECV_BUFFERS_START (64)
 value RECV_BUFFER_SIZE (1024)
-// struct io_uring_buf { u64 addr; u32 len; u16 bid, resv } per buffer, then the buffers
+// struct io_uring_buf { u64 addr; u32 len; u16 bid, resv } per buffer, then the buffers. Only
+// the buffers handed out are ever touched, so the rest of the mapping stays unused
 value RECV_RING_BYTES (RECV_BUFFERS * 16)
 value RECV_MEMORY_SIZE (RECV_RING_BYTES + RECV_BUFFERS * RECV_BUFFER_SIZE)
+value MAP_NORESERVE (0x4000)
 
 class RecvBuffers {
     memory: ptr
     tail: uint (0)
+    // Buffers handed to the kernel so far, and receives that found none free since the last grow
+    count: uint (0)
+    missed: uint (0)
 
     fn data(bid: uint) ptr {
-        @unsafe
         return this.memory + RECV_RING_BYTES + bid * RECV_BUFFER_SIZE
     }
 
     // Hands buffer `bid` (back) to the kernel
     fn give(bid: uint) {
-        @unsafe
         let entry = this.memory + (this.tail & (RECV_BUFFERS - 1)) * 16
         entry.write_u64_le(this.data(bid).@cast(u64))
         (entry + 8).write_u32_le(RECV_BUFFER_SIZE.to(u32))
@@ -128,19 +133,30 @@ class RecvBuffers {
         let tail = (this.memory + 14).@cast(*u16)
         atomic_store(tail[0], (this.tail & 0xFFFF).to(u16))
     }
+
+    // Adds buffers after misses: twice as many, or as many more as were missed
+    fn grow() {
+        if this.missed == 0 : return
+        let target = this.count * 2
+        if this.count + this.missed > target : target = this.count + this.missed
+        if target > RECV_BUFFERS : target = RECV_BUFFERS
+        this.missed = 0
+        while this.count < target : this.give(this.count++)
+    }
 }
 
-// Maps and registers the buffers of `ring`, all handed to the kernel; null without support
+// Maps and registers the buffers of `ring`, the first ones handed to the kernel; null without
+// support
 fn recv_buffers(ring: *ext.io_uring) ?RecvBuffers {
     @unsafe
-    let memory = ext.mmap(null, RECV_MEMORY_SIZE, 0x1 | 0x2, 0x2 | 0x20, -1, 0)
+    let memory = ext.mmap(null, RECV_MEMORY_SIZE, 0x1 | 0x2, 0x2 | 0x20 | MAP_NORESERVE, -1, 0)
     if memory.@cast(int) == -1 : return null
     // struct io_uring_buf_reg { u64 ring_addr; u32 ring_entries; u16 bgid, flags; u64 resv[3] }
     let reg: [u64 x 5] = { 0 ... }
     reg[0] = memory.@cast(u64)
     reg[1] = RECV_BUFFERS.to(u64)
     let buffers = RecvBuffers { memory: memory }
-    each 0 .. RECV_BUFFERS as bid : buffers.give(bid)
+    while buffers.count < RECV_BUFFERS_START : buffers.give(buffers.count++)
     if !uring_register(ring, IORING_REGISTER_PBUF_RING, @ref(reg).@cast(ptr), 1) {
         ext.munmap(memory, RECV_MEMORY_SIZE)
         return null
@@ -169,6 +185,38 @@ fn give_recv_buffer(index: uint, bid: uint) {
     buffers.give(bid)
 }
 
+// A receive on ring `index` found no free buffer
+fn recv_buffer_missed(index: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    buffers.missed++
+}
+
+// Grows the pools of the rings whose receives found no free buffer
+fn grow_recv_buffers() {
+    let main = uring_instance ?! return
+    let buffers = main.recv ?! return
+    buffers.grow()
+    each extra_rings as extra {
+        let pool = extra.recv ?! continue
+        pool.grow()
+    }
+}
+
+#if TEST
+/// Test hook: the buffers ring `index` has handed to the kernel.
++ fn recv_buffer_count_for_test(index: uint) uint {
+    let buffers = recv_buffers_of(index) ?! return 0
+    return buffers.count
+}
+
+/// Test hook: counts `misses` receives without a free buffer on ring `index`, then grows.
++ fn recv_buffer_grow_for_test(index: uint, misses: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    buffers.missed += misses
+    grow_recv_buffers()
+}
+#end
+
 // System calls of their own: the liburing that static builds link predates these
 value SYS_IO_URING_ENTER (426)
 value SYS_IO_URING_REGISTER (427)
@@ -178,7 +226,6 @@ value IORING_RSRC_REGISTER_SPARSE (1)
 value IORING_SQ_TASKRUN (4)
 
 fn uring_register(ring: *ext.io_uring, opcode: uint, arg: ptr, nr: uint) bool {
-    @unsafe
     return ext.syscall(SYS_IO_URING_REGISTER, ring.ring_fd.to(int), opcode.to(int), arg, nr.to(int)) >= 0
 }
 
@@ -543,7 +590,6 @@ fn io_uring_cqe_seen(ring: *ext.io_uring, cqe: *ext.io_uring_cqe) {
 }
 // check if an io_uring completion event is available
 fn io_uring_peek_cqe(ring: *ext.io_uring, cqe_ptr: *?*ext.io_uring_cqe) i32 {
-    @unsafe
     // A deferred completion is only posted once this thread enters the kernel
     if io_uring_cq_ready(ring) == 0 && (atomic_load(ring.sq.kflags[0]) & IORING_SQ_TASKRUN.to(u32)) != 0 {
         ext.syscall(SYS_IO_URING_ENTER, ring.ring_fd.to(int), 0, 0, IORING_ENTER_GETEVENTS, 0, 0)

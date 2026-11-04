@@ -1,6 +1,7 @@
 use valk.net
 use valk.time
 use valk.http
+use valk.io
 
 #if OS == "linux"
 fn direct_accept(server: atomic net.TcpServer, ring: uint (0)) ?net.TcpConnection {
@@ -169,6 +170,64 @@ test "HTTP: a parked direct connection gets its next requests from the receive i
     }
 }
 
+test "IO: the receive buffer pool of a ring grows after misses, up to its limit" {
+    let server = net.tcp_server("127.0.0.1", 9348) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let client = net.tcp_client("127.0.0.1", 9348) ! {
+        assert(false)
+        return
+    }
+    defer client.close() ! {}
+    // The first direct accept sets up the pool
+    let accepted = direct_accept(server) ?! return
+    defer accepted.close() ! {}
+    let start = io.recv_buffer_count_for_test(0)
+    assert(start >= 64)
+    io.recv_buffer_grow_for_test(0, 0)
+    assert(io.recv_buffer_count_for_test(0) == start)
+    // One miss doubles it, many add as many
+    io.recv_buffer_grow_for_test(0, 1)
+    let doubled = io.recv_buffer_count_for_test(0)
+    assert(doubled == (start * 2 < 4096 ? start * 2 : 4096))
+    io.recv_buffer_grow_for_test(0, doubled * 3)
+    let more = io.recv_buffer_count_for_test(0)
+    assert(more == (doubled * 4 < 4096 ? doubled * 4 : 4096))
+    io.recv_buffer_grow_for_test(0, 100000)
+    assert(io.recv_buffer_count_for_test(0) == 4096)
+}
+
+test "HTTP: many parked direct connections woken at once are all answered" {
+    let server = http.Server.new("127.0.0.1", 9349, direct_http_handler)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(20)
+    let clients = Array[net.TcpConnection].new()
+    defer {
+        each clients as client : client.close() ! {}
+    }
+    each 0 .. 300 as i {
+        let client = net.tcp_client("127.0.0.1", 9349) ! {
+            assert(false)
+            return
+        }
+        clients.append(client)
+    }
+    // Two answered requests with a pause park each connection; then all get a request at once,
+    // more than the pool starts with
+    each 0 .. 3 as round {
+        each clients as client, i {
+            client.write("GET /m" + i + "r" + round + " HTTP/1.1\r\nHost: a\r\n\r\n") ! assert(false)
+        }
+        each clients as client, i {
+            assert(direct_http_answer(client, "ok:/m" + i + "r" + round))
+        }
+        time.sleep_ms(20)
+    }
+}
+
 fn direct_drain(client: net.TcpConnection, total: uint) uint {
     client.read_timeout_ms = 5000 * TIME_SCALE
     let buffer = [u8]{ 0 x 65536 }
@@ -192,15 +251,17 @@ test "TCP: a direct write that fills the socket buffer waits for the peer, or ti
             return
         }
         let accepted = direct_accept(server) ?! return
-        accepted.write_timeout_ms = 300 * TIME_SCALE
         if i == 0 {
-            // More than the socket buffers hold: the first try finds them full and waits
+            // More than the socket buffers hold: the first try finds them full and waits, as
+            // long as the reader takes
+            accepted.write_timeout_ms = 10000 * TIME_SCALE
             let reader = co direct_drain(client, data.length)
             let sent = accepted.write(data) !? 0
             assert(sent == data.length)
             assert(await reader == data.length)
         } else {
             // A peer that never reads: the wait for room times out
+            accepted.write_timeout_ms = 300 * TIME_SCALE
             let timed_out = false
             accepted.write(data) ! {
                 timed_out = error_is(E.code, timeout)
