@@ -10,10 +10,15 @@ global uring_features: u32
 
 class URing {
     inst: *ext.io_uring
+    recv: ?RecvBuffers (null)
+    // Unmapped only after the ring is gone, the kernel may still fill a buffer until then
+    recv_memory: ?ptr (null)
     fn gc_free() {
         @unsafe
         ext.io_uring_queue_exit(this.inst)
         mem.free(this.inst)
+        let memory = this.recv_memory ?! return
+        ext.munmap(memory, RECV_MEMORY_SIZE)
     }
 }
 
@@ -65,7 +70,6 @@ fn uring() *ext.io_uring !IoError {
 // so they do not count against RLIMIT_NOFILE. The kernel caps one table at that limit
 value IOSQE_FIXED_FILE (1)
 value IORING_FILE_INDEX_ALLOC (0xFFFF_FFFF)
-value IORING_POLL_ADD_MULTI (1)
 value DIRECT_TABLE_MAX ((1 << 18) - 64)
 
 global uring_files_size: uint
@@ -84,8 +88,85 @@ fn uring_files() uint {
     if size > DIRECT_TABLE_MAX : size = DIRECT_TABLE_MAX
     if size < 64 : return 0
     if !register_files_sparse(ring, size) : return 0
+    let main = uring_instance ?! return 0
+    let buffers = recv_buffers(ring) ?! return 0
+    main.recv_memory = buffers.memory
+    main.recv = buffers
     uring_files_size = size
     return size
+}
+
+// Buffers the kernel picks for the receives of parked direct descriptors (`recv_direct_select`),
+// one group per ring, so a parked connection holds no read buffer of its own (Linux 5.19+)
+value IORING_REGISTER_PBUF_RING (22)
+value IOSQE_BUFFER_SELECT (32)
+value IORING_CQE_F_BUFFER (1)
+value RECV_BUFFERS (4096)
+value RECV_BUFFER_SIZE (1024)
+// struct io_uring_buf { u64 addr; u32 len; u16 bid, resv } per buffer, then the buffers
+value RECV_RING_BYTES (RECV_BUFFERS * 16)
+value RECV_MEMORY_SIZE (RECV_RING_BYTES + RECV_BUFFERS * RECV_BUFFER_SIZE)
+
+class RecvBuffers {
+    memory: ptr
+    tail: uint (0)
+
+    fn data(bid: uint) ptr {
+        @unsafe
+        return this.memory + RECV_RING_BYTES + bid * RECV_BUFFER_SIZE
+    }
+
+    // Hands buffer `bid` (back) to the kernel
+    fn give(bid: uint) {
+        @unsafe
+        let entry = this.memory + (this.tail & (RECV_BUFFERS - 1)) * 16
+        entry.write_u64_le(this.data(bid).@cast(u64))
+        (entry + 8).write_u32_le(RECV_BUFFER_SIZE.to(u32))
+        (entry + 12).write_u16_le(bid.to(u16))
+        this.tail++
+        // The ring's tail shares the first entry's last two bytes
+        let tail = (this.memory + 14).@cast(*u16)
+        atomic_store(tail[0], (this.tail & 0xFFFF).to(u16))
+    }
+}
+
+// Maps and registers the buffers of `ring`, all handed to the kernel; null without support
+fn recv_buffers(ring: *ext.io_uring) ?RecvBuffers {
+    @unsafe
+    let memory = ext.mmap(null, RECV_MEMORY_SIZE, 0x1 | 0x2, 0x2 | 0x20, -1, 0)
+    if memory.@cast(int) == -1 : return null
+    // struct io_uring_buf_reg { u64 ring_addr; u32 ring_entries; u16 bgid, flags; u64 resv[3] }
+    let reg: [u64 x 5] = { 0 ... }
+    reg[0] = memory.@cast(u64)
+    reg[1] = RECV_BUFFERS.to(u64)
+    let buffers = RecvBuffers { memory: memory }
+    each 0 .. RECV_BUFFERS as bid : buffers.give(bid)
+    if !uring_register(ring, IORING_REGISTER_PBUF_RING, @ref(reg).@cast(ptr), 1) {
+        ext.munmap(memory, RECV_MEMORY_SIZE)
+        return null
+    }
+    return buffers
+}
+
+fn recv_buffers_of(index: uint) ?RecvBuffers {
+    if index == 0 {
+        let main = uring_instance ?! return null
+        return main.recv
+    }
+    let extra = extra_rings.get(index - 1) ! return null
+    return extra.recv
+}
+
+// The data of buffer `bid` of ring `index`
+fn recv_buffer_data(index: uint, bid: uint) ?ptr {
+    let buffers = recv_buffers_of(index) ?! return null
+    return buffers.data(bid)
+}
+
+// Hands buffer `bid` of ring `index` back to the kernel
+fn give_recv_buffer(index: uint, bid: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    buffers.give(bid)
 }
 
 // System calls of their own: the liburing that static builds link predates these
@@ -133,10 +214,14 @@ value EFD_CLOEXEC (0x80000)
 class ExtraRing {
     inst: *ext.io_uring
     unsubmitted: uint (0)
+    recv: ?RecvBuffers (null)
+    recv_memory: ?ptr (null)
     fn gc_free() {
         @unsafe
         ext.io_uring_queue_exit(this.inst)
         mem.free(this.inst)
+        let memory = this.recv_memory ?! return
+        ext.munmap(memory, RECV_MEMORY_SIZE)
     }
 }
 
@@ -174,6 +259,9 @@ fn add_direct_ring() uint {
     }
     let ring = ExtraRing { inst: inst }
     if !register_files_sparse(inst, size) : return 0
+    let buffers = recv_buffers(inst) ?! return 0
+    ring.recv_memory = buffers.memory
+    ring.recv = buffers
     if ext.io_uring_register_eventfd(inst, extra_efd) < 0 : return 0
     extra_rings.append(ring)
     return extra_rings.length
@@ -254,22 +342,22 @@ fn close_direct(index: uint, slot: i32) {
     close.file_index = (slot + 1).to(u32)
 }
 
-// Arms a multishot poll on the direct descriptor `slot` of ring `index`; each time it becomes
-// readable (or ends) a side event with `payload` arrives
-fn poll_direct(index: uint, slot: i32, mask: u32, payload: uint) bool {
+// Arms one receive on the direct descriptor `slot` of ring `index`, into a buffer the kernel
+// picks from the ring's group (`RecvBuffers`). It completes as a side event with `payload`;
+// with data, its flags carry `IORING_CQE_F_BUFFER` and the buffer id above bit 16
+fn recv_direct_select(index: uint, slot: i32, payload: uint) bool {
     @unsafe
     let sqe = detached_sqe(index, payload) ! return false
-    io_uring_prep_poll_add(sqe, slot, mask)
-    sqe.len = IORING_POLL_ADD_MULTI
-    sqe.flags = IOSQE_FIXED_FILE.to(u8)
+    io_uring_prep_rw(ext.IORING_OP.RECV, sqe, slot, null, RECV_BUFFER_SIZE.to(u32), 0)
+    sqe.flags = (IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT).to(u8)
     return true
 }
 
-// Removes the poll armed on ring `index` with `payload`, without waiting
-fn poll_remove_side(index: uint, payload: uint) {
+// Cancels the operation armed on ring `index` with `payload`, without waiting
+fn cancel_side(index: uint, payload: uint) {
     @unsafe
     let sqe = detached_sqe(index, 0) ! return
-    io_uring_prep_rw(ext.IORING_OP.POLL_REMOVE, sqe, -1, null, 0, 0)
+    io_uring_prep_rw(ext.IORING_OP.ASYNC_CANCEL, sqe, -1, null, 0, 0)
     sqe.addr = side_user_data(payload)
 }
 

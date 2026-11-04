@@ -453,8 +453,7 @@ class Worker {
                 return false
             }
             if !connection.polled {
-                let mask: u32 = (ext.POLLIN | ext.POLLRDHUP | ext.POLLERR | ext.POLLHUP).to(u32)
-                if !io.poll_direct(connection.netcon.direct_ring, fd, mask, this.poll_payload(connection.slot)) : return false
+                if !io.recv_direct_select(connection.netcon.direct_ring, fd, this.poll_payload(connection.slot)) : return false
                 connection.polled = true
             }
             this.unlink(connection)
@@ -530,8 +529,8 @@ class Worker {
         return side.payload((slot + 1) | ((gen & SLOT_GEN_MASK) << SLOT_BITS))
     }
 
-    // Like `watch_parked`, for direct descriptors: their polls complete as side events of the
-    // thread's ring
+    // Like `watch_parked`, for direct descriptors: the receives armed for them complete as side
+    // events of the thread's rings, with the data
     fn watch_direct() {
         let side = this.side ?! return
         while !this.ended {
@@ -541,21 +540,30 @@ class Worker {
             let count = events.length
             let now = time.mono_ms()
             each events as event {
+                let buffered = event.flags & io.IORING_CQE_F_BUFFER.to(u32) != 0
+                let bid = (event.flags >> 16).to(uint)
                 let index = event.data & ((1 << SLOT_BITS) - 1)
-                if index == 0 : continue
+                if index == 0 {
+                    if buffered : io.give_recv_buffer(event.ring, bid)
+                    continue
+                }
                 let slot = index - 1
                 let gen = event.data >> SLOT_BITS
-                let connection = (this.parked.get(slot) !? null) ?! continue
-                if (this.slot_gens.get(slot) !? 0) & SLOT_GEN_MASK != gen : continue
-                // Without "more" the poll ended; the next park arms a new one
-                if event.flags & io.IORING_CQE_F_MORE == 0 : connection.polled = false
-                // A removed or cancelled poll says nothing about input
-                if event.res == 0 - ext.ECANCELED : continue
-                let mask = event.res < 0 ? ext.POLLERR : event.res
-                if mask & (ext.POLLRDHUP | ext.POLLERR | ext.POLLHUP) != 0 : connection.input_signaled = true
-                if !connection.parked {
-                    connection.input_signaled = true
+                let connection = (this.parked.get(slot) !? null) ?! {
+                    if buffered : io.give_recv_buffer(event.ring, bid)
                     continue
+                }
+                if (this.slot_gens.get(slot) !? 0) & SLOT_GEN_MASK != gen || !connection.polled {
+                    if buffered : io.give_recv_buffer(event.ring, bid)
+                    continue
+                }
+                connection.polled = false
+                // A cancelled receive got nothing
+                if event.res == 0 - ext.ECANCELED : continue
+                // Without a buffer (the end, no free buffer, an error) its coroutine reads
+                if buffered {
+                    if event.res > 0 : this.take_received(connection, event.ring, bid, event.res.to(uint))
+                    io.give_recv_buffer(event.ring, bid)
                 }
                 this.wake(connection, now)
             }
@@ -568,6 +576,20 @@ class Worker {
             let waker = this.idle_servers.pop_last() ! break
             waker.wake()
         }
+    }
+
+    // Copies what the armed receive of a parked connection got into its input, so the buffer
+    // goes back to the ring at once
+    fn take_received(connection: Connection, ring: uint, bid: uint, bytes: uint) {
+        @unsafe
+        let data = io.recv_buffer_data(ring, bid) ?! return
+        let input = connection.input
+        input.reserve(bytes)
+        mem.copy_bytes(data, input.view_spare(bytes).data, bytes)
+        input.skip(bytes)
+        connection.recv_bytes = bytes
+        // A full buffer can leave more input behind
+        if bytes == io.RECV_BUFFER_SIZE : connection.input_signaled = true
     }
 
     // A parked connection has input: a serving coroutine reads it
@@ -647,8 +669,8 @@ class Worker {
         if !client.polled : return
         client.polled = false
         if this.direct {
-            // Before the close: a poll keeps the socket of a closed slot alive
-            io.poll_remove_side(client.netcon.direct_ring, this.poll_payload(client.slot))
+            // Before the close: an armed receive keeps the socket of a closed slot alive
+            io.cancel_side(client.netcon.direct_ring, this.poll_payload(client.slot))
             return
         }
         @unsafe
