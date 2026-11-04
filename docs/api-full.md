@@ -3587,9 +3587,8 @@ Returns whether the string equals `cmp` or sorts after it in byte order; backs `
 
 Returns a hash of the bytes; what `HashMap` and `HashSet` keys use.
 
-Strings shorter than 8 bytes hash every byte. Longer strings hash their length and the
-first and last 8 bytes, plus 8 bytes from the middle past 16 bytes, so long keys that
-differ only elsewhere share a hash.
+Every byte counts, and the hash is seeded randomly per process: the same string hashes
+differently in another run.
 
 #### hex_to_int
 
