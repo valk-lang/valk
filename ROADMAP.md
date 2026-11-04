@@ -4,7 +4,12 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.8.4
++ Release 0.8.4
++ `String.hash` reads every byte and is seeded per process: crafted JSON or form keys can no longer make map inserts quadratic
++ HTTP fixes: control bytes in chunk lines and trailers are rejected, many small chunks no longer cost quadratic time, a SETTINGS frame walks the streams once, `//docs` no longer redirects to another host, and `http.download` no longer writes redirect bodies into the file
++ CookieJar: plain HTTP cannot set or replace Secure cookies, `__Secure-`/`__Host-` prefixes are enforced, at most 3000 cookies
++ WebSocket client: a refused handshake fails at the head instead of buffering its body
++ HTTP server: `http.Server.direct` (opt-in, Linux): connections as io_uring direct descriptors, parked connections receive into a kernel buffer ring
 + Fix: an out-of-bounds index on an `Array` reported the line of the first index compiled for that array type; each one now reports its own line
 + `Arena[T]` and `Link[T]`: items in one block that refer to each other with 32-bit typed links; `?Link[T]` is as small as `Link[T]`, and a mix-up with an index or a link of another type is a compile error
 + `json.read`: a read-only `json.View` that reads like a `Value`, with the limits and errors of `json.decode`; its nodes live in one block the collector does not walk, which makes a large document about 5x cheaper to parse and read
