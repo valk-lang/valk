@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.5
+
 + Release 0.8.4
 + `String.hash` reads every byte and is seeded per process: crafted JSON or form keys can no longer make map inserts quadratic
 + HTTP fixes: control bytes in chunk lines and trailers are rejected, many small chunks no longer cost quadratic time, a SETTINGS frame walks the streams once, `//docs` no longer redirects to another host, and `http.download` no longer writes redirect bodies into the file
