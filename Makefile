@@ -104,9 +104,12 @@ test: $(TEST_COMPILER)
 	./debug/test-core$(EXE_SUFFIX)
 
 # The HTTP and TCP tests again with direct descriptors (`http.Server.direct`, Linux only)
+# Direct descriptors exist on Linux only; elsewhere this would rerun the same tests
 test-http-direct: test
+ifeq ($(HOST_SYSTEM),Linux)
 	VALK_TEST_HTTP_DIRECT=1 ./debug/test-core$(EXE_SUFFIX) --filter Http
 	VALK_TEST_HTTP_DIRECT=1 ./debug/test-core$(EXE_SUFFIX) --filter TCP
+endif
 
 test-compile-errors: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/compile-errors/run.sh
