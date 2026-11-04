@@ -468,3 +468,76 @@ synctest "HTTP2: a frame trickled in pieces has the header timeout over all of t
     assert(!alive)
     socket.close() _
 }
+
+fn h2_settings_payload(values: Array[uint]) String {
+    let out = ByteBuffer.new()
+    each values as value {
+        out.write_big_endian(4, 2)
+        out.write_big_endian(value, 4)
+    }
+    return out.to_string()
+}
+
+// Reads frames until a GOAWAY and returns its error code, or until a SETTINGS ack (-1)
+fn h2_settings_answer(socket: net.TcpConnection, input: ByteBuffer) int {
+    while true {
+        let frame = h2_tls_frame(socket, input, "the SETTINGS answer")
+        if frame.kind == 7 {
+            let reader = ByteReader.new(frame.payload)
+            reader.read_u32_be()
+            return reader.read_u32_be().to(int)
+        }
+        if frame.kind == 4 && (frame.flags & 1) != 0 : return -1
+    }
+    return -2
+}
+
+test "HTTP2: SETTINGS change open streams' windows once, and an intermediate overflow is an error" {
+    let handler: atomic fn(http.Request)(http.Response) = fn(request: http.Request) http.Response {
+        return http.Response.text(request.body)
+    }
+    let server = http.Server.new("127.0.0.1", 19188, handler)
+    server.http2 = true
+    server.tls(__DIR__ + "/../assets/tls-cert.pem", __DIR__ + "/../assets/tls-key.pem") !!
+    let running = co server.start(1)
+    time.sleep_ms(20)
+    let fields = Array[http.HpackField] {
+        .{ name: ":method", value: "POST" },
+        .{ name: ":scheme", value: "https" },
+        .{ name: ":path", value: "/" },
+        .{ name: ":authority", value: "localhost" }
+    }
+
+    // The window of open stream 1 grows by 1000, so 2^31 - 1 on the way overflows it
+    let socket = h2_open(19188)
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input, "the server SETTINGS")
+    // The ack of the client's first SETTINGS
+    assert(h2_settings_answer(socket, input) == -1)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    socket.write(http.H2Frame { kind: 1, flags: 4, stream: 1, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+    let grow = ByteBuffer.new()
+    grow.write_big_endian(1000, 4)
+    socket.write(http.H2Frame { kind: 8, stream: 1, payload: grow.to_string() }.encode() !!) !!
+    socket.write(http.H2Frame { kind: 4, payload: h2_settings_payload(.{ 0x7fffffff, 65535 }) }.encode() !!) !!
+    assert(h2_settings_answer(socket, input) == 3)
+    socket.close() _
+
+    // Many entries in one frame are acknowledged, and the stream still answers
+    let again = h2_open(19188)
+    let input2 = ByteBuffer.new()
+    h2_tls_frame(again, input2, "the server SETTINGS")
+    assert(h2_settings_answer(again, input2) == -1)
+    again.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+    again.write(http.H2Frame { kind: 1, flags: 4, stream: 1, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+    let values = Array[uint].new()
+    each 0 .. 2000 as i : values.append(i % 2 == 0 ? 0 : 65535)
+    again.write(http.H2Frame { kind: 4, payload: h2_settings_payload(values) }.encode() !!) !!
+    assert(h2_settings_answer(again, input2) == -1)
+    again.write(http.H2Frame { kind: 0, flags: 1, stream: 1, payload: "abc" }.encode() !!) !!
+    let status, body = h2_response(again, input2, 1)
+    assert(status == "200" && body == "abc")
+    again.close() _
+    server.request_shutdown(1000)
+    await running !!
+}
