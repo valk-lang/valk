@@ -3587,9 +3587,8 @@ Returns whether the string equals `cmp` or sorts after it in byte order; backs `
 
 Returns a hash of the bytes; what `HashMap` and `HashSet` keys use.
 
-Strings shorter than 8 bytes hash every byte. Longer strings hash their length and the
-first and last 8 bytes, plus 8 bytes from the middle past 16 bytes, so long keys that
-differ only elsewhere share a hash.
+Every byte counts, and the hash is seeded randomly per process: the same string hashes
+differently in another run.
 
 #### hex_to_int
 
@@ -11286,6 +11285,8 @@ The cookies a `Client` received, sent back on later requests as a browser does
 A cookie with a `Domain` goes to that domain and its subdomains, one without it only to
 the host that set it. `Path` limits it to the paths below it, `Secure` to HTTPS, and
 `Max-Age` or `Expires` to a lifetime; a cookie that is set again replaces the earlier one.
+A plain HTTP response cannot set or replace a `Secure` cookie, `__Secure-` and `__Host-`
+names need their attributes, and the jar keeps at most 3000 cookies, dropping the oldest.
 
 #### clear
 
