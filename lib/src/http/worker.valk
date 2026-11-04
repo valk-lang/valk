@@ -7,6 +7,7 @@ use mem
 use ext
 use sync
 use gc
+use coro
 
 // How often an idle acceptor checks whether the server is stopping
 value ACCEPT_POLL_MS (20)
@@ -61,6 +62,14 @@ value EPOLL_DATA_OFFSET (8)
 #end
 #end
 
+#if OS == "linux"
+// Slots a ring keeps free for the accepts that are on their way when it counts as full
+value RING_ROOM (64)
+// Side-event payloads of parked polls: the slot plus one, then its generation
+value SLOT_BITS (18)
+value SLOT_GEN_MASK (0x3F)
+#end
+
 // A parked connection: its slot in the worker's table and its idle deadline
 struct Parked {
     slot: uint
@@ -73,10 +82,20 @@ fn worker(server: atomic ServerWorkerData) {
         now: time.mono_ms()
     }
     #if OS == "linux"
-    // Connections waiting for their next request park here, without a coroutine
-    // Not inherited by child processes
-    worker.epoll_fd = ext.epoll_create1(EPOLL_CLOEXEC)
-    if worker.epoll_fd >= 0 : co worker.watch_parked()
+    // Plain connections live in this thread's io_uring table when it has one: they do not count
+    // against the process's descriptor limit, and wait for their next request on a poll there
+    if server.direct && !isset(server.tls_context) && io.uring_files() > 0 : worker.side = coro.side_channel()
+    worker.direct = isset(worker.side)
+    if worker.direct {
+        worker.parking = true
+        co worker.watch_direct()
+    } else {
+        // Connections waiting for their next request park here, without a coroutine
+        // Not inherited by child processes
+        worker.epoll_fd = ext.epoll_create1(EPOLL_CLOEXEC)
+        worker.parking = worker.epoll_fd >= 0
+        if worker.parking : co worker.watch_parked()
+    }
     #end
 
     let sock = server.socket
@@ -86,7 +105,7 @@ fn worker(server: atomic ServerWorkerData) {
             time.sleep_ms(1)
             continue
         }
-        let netcon = sock.accept(ACCEPT_POLL_MS) ! {
+        let netcon = worker.accept(sock) ! {
             if server.stopping != 0 : break
             if error_is(E.code, timeout) : continue
             if error_is(E.code, max_connections) {
@@ -114,6 +133,10 @@ fn worker(server: atomic ServerWorkerData) {
     }
     worker.drain()
     worker.ended = true
+    #if OS == "linux"
+    let side = worker.side
+    if isset(side) : side.close()
+    #end
     if --server.workers == 0 : server.done.unlock()
 }
 
@@ -162,7 +185,19 @@ class Worker {
     // a compact per-worker index: an array as large as the process's highest descriptor is
     // mostly empty and a cache miss on every wake
     epoll_fd: i32 (-1)
+    // Connections are direct descriptors of this thread's io_uring, parked on polls there whose
+    // completions come through `side`
+    direct: bool (false)
+    #if OS == "linux"
+    side: ?coro.SideChannel (null)
+    #end
+    // Connections can wait for their next request without a coroutine
+    parking: bool (false)
     parked: Array[?Connection] (.{})
+    // Per slot, a count of the connections that held it: a poll event of an earlier one is stale
+    slot_gens: Array[uint] (.{})
+    // Connections per ring of direct descriptors
+    ring_connections: Array[uint] (.{})
     // Slots freed when their connection closed, for the next accept
     free_slots: Array[uint] (.{})
     // Woken connections waiting for a serving coroutine
@@ -173,6 +208,49 @@ class Worker {
     // Set once the worker drained: the watcher of parked connections ends
     ended: bool (false)
 
+    fn accept(sock: atomic net.TcpServer) net.TcpConnection !net.NetError {
+        #if OS == "linux"
+        if this.direct {
+            let ring = this.accept_ring()
+            let accepted = sock.accept_direct(ACCEPT_POLL_MS, ring) ! {
+                // A full table: the next ring, made when there is none
+                if !error_is(E.code, max_connections) : throw E
+                while this.ring_connections.length <= ring : this.ring_connections.append(0)
+                this.ring_connections.set(ring, uint.$max / 2) _
+                throw E
+            }
+            if isset(accepted) {
+                while this.ring_connections.length <= ring : this.ring_connections.append(0)
+                this.ring_connections.set(ring, (this.ring_connections.get(ring) !? 0) + 1) _
+                return accepted
+            }
+        }
+        #end
+        return sock.accept(ACCEPT_POLL_MS) !>
+    }
+
+    #if OS == "linux"
+    // The ring the next connection goes to: the first with room in its table, or a new one.
+    // A worker past one table's worth of connections spreads them over several rings instead
+    // of needing more threads
+    fn accept_ring() uint {
+        let size = io.uring_files()
+        let count = io.direct_ring_count()
+        each 0 .. count as i {
+            if (this.ring_connections.get(i) !? 0) + RING_ROOM < size : return i
+        }
+        let added = io.add_direct_ring()
+        if added > 0 : return added
+        // No more rings: the fullest gets its descriptors back as connections close
+        let best: uint = 0
+        each 0 .. count as i {
+            if (this.ring_connections.get(i) !? 0) < (this.ring_connections.get(best) !? 0) : best = i
+        }
+        if (this.ring_connections.get(best) !? 0) >= uint.$max / 2 : this.ring_connections.set(best, size) _
+        return best
+    }
+    #end
+
     fn handle(netcon: net.TcpConnection) {
         let server = this.server
         // Reads wait without a timer of their own: `tick` interrupts them at their deadline
@@ -181,6 +259,7 @@ class Worker {
         if server.stopping != 0 {
             netcon.interrupt()
             netcon.close() ! core.cleanup_warning("Failed to close HTTP connection", __FILE__, __LINE__)
+            this.release_ring(netcon)
             return
         }
 
@@ -213,8 +292,12 @@ class Worker {
             context: Context.new(input),
         }
         #if OS == "linux"
-        if slot == this.parked.length : this.parked.append(http_con)
-        else : this.parked.set(slot, http_con) _
+        if slot == this.parked.length {
+            this.parked.append(http_con)
+            this.slot_gens.append(0)
+        } else {
+            this.parked.set(slot, http_con) _
+        }
         #end
         this.add_client(http_con)
 
@@ -362,6 +445,21 @@ class Worker {
     fn park(connection: Connection) bool {
         @unsafe
         let fd = connection.fd
+        if this.direct {
+            // Checking through the ring would yield while the connection counts as parked, and
+            // a wake meanwhile would serve it twice: it reads on its coroutine instead
+            if connection.input_signaled {
+                connection.input_signaled = false
+                return false
+            }
+            if !connection.polled {
+                if !io.recv_direct_select(connection.netcon.direct_ring, fd, this.poll_payload(connection.slot)) : return false
+                connection.polled = true
+            }
+            this.unlink(connection)
+            this.link(connection, true)
+            return true
+        }
         if connection.input_signaled {
             connection.input_signaled = false
             let entry = ext.libc_pollfd { fd: fd, events: ext.POLLIN.to(i16), revents: 0 }
@@ -408,32 +506,9 @@ class Worker {
                     connection.input_signaled = true
                     continue
                 }
-                // Busy again from here, so the sweep leaves it to its coroutine
-                connection.parked = false
-                this.unlink(connection)
-                this.link(connection, false)
-                connection.woken = true
-                connection.deadline_ms = 0
-                if connection.served : connection.last_gap_ms = now - connection.idle_since
-                connection.idle_since = 0
-                this.ready.push_back(connection)
+                this.wake(connection, now)
             }
-            // Serving coroutines that wait get the work; without enough of them more are started,
-            // so no coroutine is created per request
-            let pending = this.ready.length
-            while pending > 0 {
-                let waker = this.idle_servers.pop_last() ! break
-                waker.wake()
-                pending--
-            }
-            while pending > 0 && this.servers < SERVE_POOL_MAX {
-                pending--
-                let waker = sync.Waker.new() ! break
-                this.servers++
-                co this.serve_loop(waker)
-            }
-            if pending > SERVE_EXTRA : pending = SERVE_EXTRA
-            while pending-- > 0 : co this.serve_ready()
+            this.dispatch_ready()
             // Only this watcher waits: the woken connections are served meanwhile
             let delay = this.server.batch_delay_ms
             if delay > 0 && count < BATCH_MIN : time.sleep_ms(delay)
@@ -445,6 +520,111 @@ class Worker {
             let waker = this.idle_servers.pop_last() ! break
             waker.wake()
         }
+    }
+
+    // The side-event payload of the poll of `slot`: the slot and its generation
+    fn poll_payload(slot: uint) uint {
+        let side = this.side ?! return 0
+        let gen = this.slot_gens.get(slot) !? 0
+        return side.payload((slot + 1) | ((gen & SLOT_GEN_MASK) << SLOT_BITS))
+    }
+
+    // Like `watch_parked`, for direct descriptors: the receives armed for them complete as side
+    // events of the thread's rings, with the data
+    fn watch_direct() {
+        let side = this.side ?! return
+        while !this.ended {
+            side.wait()
+            let events = side.events
+            if events.length == 0 : continue
+            let count = events.length
+            let now = time.mono_ms()
+            each events as event {
+                let buffered = event.flags & io.IORING_CQE_F_BUFFER.to(u32) != 0
+                let bid = (event.flags >> 16).to(uint)
+                if buffered : io.took_recv_buffer(event.ring, bid)
+                let index = event.data & ((1 << SLOT_BITS) - 1)
+                if index == 0 {
+                    if buffered : io.give_recv_buffer(event.ring, bid)
+                    continue
+                }
+                let slot = index - 1
+                let gen = event.data >> SLOT_BITS
+                let connection = (this.parked.get(slot) !? null) ?! {
+                    if buffered : io.give_recv_buffer(event.ring, bid)
+                    continue
+                }
+                if (this.slot_gens.get(slot) !? 0) & SLOT_GEN_MASK != gen || !connection.polled {
+                    if buffered : io.give_recv_buffer(event.ring, bid)
+                    continue
+                }
+                connection.polled = false
+                if buffered {
+                    if event.res > 0 : this.take_received(connection, event.ring, bid, event.res.to(uint))
+                    io.give_recv_buffer(event.ring, bid)
+                }
+                // A cancelled receive got nothing
+                if event.res == 0 - ext.ECANCELED : continue
+                if event.res == 0 - ext.ENOBUFS : io.recv_buffer_missed(event.ring)
+                // Without data (the end, no free buffer, an error) its coroutine reads
+                this.wake(connection, now)
+            }
+            events.clear()
+            io.grow_recv_buffers()
+            this.dispatch_ready()
+            let delay = this.server.batch_delay_ms
+            if delay > 0 && count < BATCH_MIN : time.sleep_ms(delay)
+        }
+        while true {
+            let waker = this.idle_servers.pop_last() ! break
+            waker.wake()
+        }
+    }
+
+    // Copies what the armed receive of a parked connection got into its input, so the buffer
+    // goes back to the ring at once
+    fn take_received(connection: Connection, ring: uint, bid: uint, bytes: uint) {
+        @unsafe
+        let data = io.recv_buffer_data(ring, bid) ?! return
+        let input = connection.input
+        input.reserve(bytes)
+        mem.copy_bytes(data, input.view_spare(bytes).data, bytes)
+        input.skip(bytes)
+        connection.recv_bytes = bytes
+        // A full buffer can leave more input behind
+        if bytes == io.RECV_BUFFER_SIZE : connection.input_signaled = true
+    }
+
+    // A parked connection has input: a serving coroutine reads it
+    fn wake(connection: Connection, now: uint) {
+        // Busy again from here, so the sweep leaves it to its coroutine
+        connection.parked = false
+        this.unlink(connection)
+        this.link(connection, false)
+        connection.woken = true
+        connection.deadline_ms = 0
+        if connection.served : connection.last_gap_ms = now - connection.idle_since
+        connection.idle_since = 0
+        this.ready.push_back(connection)
+    }
+
+    // Serving coroutines that wait get the woken connections; without enough of them more are
+    // started, so no coroutine is created per request
+    fn dispatch_ready() {
+        let pending = this.ready.length
+        while pending > 0 {
+            let waker = this.idle_servers.pop_last() ! break
+            waker.wake()
+            pending--
+        }
+        while pending > 0 && this.servers < SERVE_POOL_MAX {
+            pending--
+            let waker = sync.Waker.new() ! break
+            this.servers++
+            co this.serve_loop(waker)
+        }
+        if pending > SERVE_EXTRA : pending = SERVE_EXTRA
+        while pending-- > 0 : co this.serve_ready()
     }
 
     // A serving coroutine: drains the ready queue, then waits for the watcher's wake
@@ -491,20 +671,39 @@ class Worker {
         #if OS == "linux"
         if !client.polled : return
         client.polled = false
+        if this.direct {
+            // Before the close: an armed receive keeps the socket of a closed slot alive
+            io.cancel_side(client.netcon.direct_ring, this.poll_payload(client.slot))
+            return
+        }
         @unsafe
         let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
         ext.epoll_ctl(this.epoll_fd, EPOLL_CTL_DEL, client.fd, @ref(event[0]))
         #end
     }
 
+    // A connection of ring `ring` closed
+    fn release_ring(netcon: net.TcpConnection) {
+        #if OS == "linux"
+        if !this.direct : return
+        let ring = netcon.direct_ring
+        let held = this.ring_connections.get(ring) !? 0
+        // A ring marked full counts again from its table size
+        if held >= uint.$max / 2 : held = io.uring_files()
+        if held > 0 : this.ring_connections.set(ring, held - 1) _
+        #end
+    }
+
     fn remove_client(client: Connection) {
         this.removed++
+        this.release_ring(client.netcon)
         this.unlink(client)
         // After the lists, so a slot is never reused while a stale list entry names it
         #if OS == "linux"
         let slot = client.slot
         if slot < this.parked.length && (this.parked.get(slot) !? null) == client {
             this.parked.set(slot, null) _
+            this.slot_gens.set(slot, (this.slot_gens.get(slot) !? 0) + 1) _
             this.free_slots.append(slot)
         }
         #end

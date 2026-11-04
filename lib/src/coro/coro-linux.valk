@@ -6,6 +6,83 @@ use ext
 use io
 use gc
 
+// Completions of operations no coroutine waits for (see `io.side_user_data`). The low bits of
+// their payload name a channel of this thread, the rest is the channel owner's
+value SIDE_CHANNEL_BITS (6)
+value SIDE_CHANNELS (64)
+
+struct SideEvent {
+    data: uint
+    res: i32
+    flags: u32
+    // The ring it completed on (see `io.add_direct_ring`)
+    ring: uint
+}
+
+// One owner's queue of side events, and the coroutine that waits for them
+class SideChannel {
+    id: uint
+    events: Array[SideEvent] (.new(64))
+    waiter: ?Coro (null)
+
+    // The payload of a side event for this channel, carrying `data` (24 bits)
+    fn payload(data: uint) uint {
+        return this.id | (data << SIDE_CHANNEL_BITS)
+    }
+
+    // Waits until events are queued, or until `wake`
+    fn wait() {
+        if this.events.length > 0 : return
+        let current = current_coro ?! return
+        this.waiter = current
+        current.yield()
+    }
+
+    fn wake() {
+        let waiter = this.waiter ?! return
+        this.waiter = null
+        run_coros.append(waiter)
+    }
+
+    // Events for the channel are dropped from now on; its waiter wakes
+    fn close() {
+        if (side_channels.get(this.id) !? null) == this : side_channels.set(this.id, null) _
+        this.wake()
+    }
+}
+
+global side_channels: Array[?SideChannel] (.{})
+// Ids are handed out in turn, so a late event of a closed channel does not reach a new one
+global side_next: uint (1)
+
+// A new channel of this thread; null when all are taken
+fn side_channel() ?SideChannel {
+    while side_channels.length < SIDE_CHANNELS : side_channels.append(null)
+    let tries: uint = 0
+    while tries++ < SIDE_CHANNELS {
+        let id = side_next
+        side_next = side_next % (SIDE_CHANNELS - 1) + 1
+        if isset(side_channels.get(id) !? null) : continue
+        let channel = SideChannel { id: id }
+        side_channels.set(id, channel) _
+        return channel
+    }
+    return null
+}
+
+fn side_event(payload: uint, res: i32, flags: u32, ring: uint) {
+    // The extra rings have completions: read again, the scheduler reaps them
+    if payload == io.EXTRA_DOORBELL {
+        if res >= 0 || res == 0 - ext.EINTR || res == 0 - ext.EAGAIN : io.arm_extra_doorbell()
+        return
+    }
+    let id = payload & (SIDE_CHANNELS - 1)
+    if id == 0 : return
+    let channel = (side_channels.get(id) !? null) ?! return
+    channel.events.append(SideEvent { data: payload >> SIDE_CHANNEL_BITS, res: res, flags: flags, ring: ring })
+    channel.wake()
+}
+
 extend Coro {
     timeout_ts: io.kernel_timespec (@undefined)
 
@@ -34,10 +111,13 @@ extend Coro {
         let ring = io.uring() ! panic("Failed to initialize io_uring: the locked-memory limit leaves no room for a ring")
         // With nothing to run, the entries go out with the wait below, in one system call
         if io.uring_unsubmitted > 0 && run_coros.length > 0 : io.uring_submit(ring)
+        if io.extra_rings.length > 0 : io.submit_extra_rings()
         expire_parks()
         while true {
             let cqe: ?*ext.io_uring_cqe = null
             if run_coros.length == 0 {
+                // Completions of the extra rings first: they only ring the doorbell once per read
+                if io.extra_rings.length > 0 && reap_extra_rings() > 0 : continue
                 // A park deadline bounds the wait
                 let wait_ms = park_wait_ms()
                 gc.unlock()
@@ -59,70 +139,90 @@ extend Coro {
             } else {
                 io.io_uring_peek_cqe(ring, @ref(cqe))
             }
-            if !isset(cqe) {
-                break
-            }
-            //
-            let user_data = cqe.user_data
-            if user_data == HOME_EVENT.to(u64) {
-                // Another thread woke coroutines of this one
-                let res = cqe.res
-                io.io_uring_cqe_seen(ring, cqe)
-                home_event(res)
-                continue
-            }
-            let timeout_tag = user_data & 3
-            let coro = take_kernel_event(user_data.to(uint))
-            if !isset(coro) {
-                io.io_uring_cqe_seen(ring, cqe)
-                continue
-            }
-            // Read `done` before disarming: the last event may release the
-            // global root, and no field is touched after that.
-            let done = coro.done
-            coro.disarm_kernel_event()
-            if done {
-                io.io_uring_cqe_seen(ring, cqe)
-                continue
-            }
-            if timeout_tag == 1 {
-                // Linked timeout completion. ETIME: the timeout fired and
-                // the linked operation was cancelled by the kernel, so its
-                // completion is stale now — resolve both arms (this bumps
-                // the generation and invalidates the counterpart) and wake
-                // with a timeout. ECANCELED: the operation completed first
-                // and cancelled this timeout; the operation's completion
-                // wakes the coroutine, nothing to do here.
-                if cqe.res == 0 - ext.ETIME {
-                    coro.disarm_kernel_event()
-                    coro.poll_event = io.POLL_TIMEOUT
-                    coro.completion_res = 0 - ext.ETIMEDOUT
-                    run_coros.append(coro)
-                }
-            } else if timeout_tag == 3 {
-                // A send linked to a read (net.send_then_recv): the read's completion
-                // wakes the coroutine, and a failed send cancels that read
-            } else if timeout_tag == 2 && cqe.res == 0 - ext.ECANCELED {
-                // The operation was cancelled because the linked timeout
-                // fired — the timeout completion is stale now. Resolve both
-                // arms and wake with a timeout.
-                coro.disarm_kernel_event()
-                coro.poll_event = io.POLL_TIMEOUT
-                coro.completion_res = 0 - ext.ETIMEDOUT
-                run_coros.append(coro)
-            } else {
-                // The operation completed; the linked timeout (if any) was
-                // cancelled by the kernel and its completion is stale after
-                // the disarm below.
-                if timeout_tag == 2 : coro.disarm_kernel_event()
-                // A negative result is an error like EBADF, not an event mask:
-                // as a mask it would satisfy every predicate at once
-                coro.poll_event = cqe.res < 0 ? ext.POLLERR : cqe.res.@cast(io.PollEvent)
-                coro.completion_res = cqe.res
-                run_coros.append(coro)
-            }
-            io.io_uring_cqe_seen(ring, cqe)
+            let entry = cqe ?! break
+            let user_data = entry.user_data
+            let res = entry.res
+            let flags = entry.flags
+            io.io_uring_cqe_seen(ring, entry)
+            dispatch_completion(user_data, res, flags, 0)
         }
+        if io.extra_rings.length > 0 : reap_extra_rings()
+    }
+}
+
+// Dispatches the completions waiting on the extra rings (see `io.add_direct_ring`) and returns
+// how many there were. Reading them needs no system call
+fn reap_extra_rings() uint {
+    let count: uint = 0
+    each io.extra_rings as extra, i {
+        while true {
+            let cqe: ?*ext.io_uring_cqe = null
+            io.io_uring_peek_cqe(extra.inst, @ref(cqe))
+            let entry = cqe ?! break
+            let user_data = entry.user_data
+            let res = entry.res
+            let flags = entry.flags
+            io.io_uring_cqe_seen(extra.inst, entry)
+            dispatch_completion(user_data, res, flags, i + 1)
+            count++
+        }
+    }
+    return count
+}
+
+// Hands one completion to the coroutine or side channel it belongs to
+fn dispatch_completion(user_data: u64, res: i32, flags: u32, ring: uint) {
+    if io.is_side_event(user_data) {
+        side_event((user_data >> 34).to(uint), res, flags, ring)
+        return
+    }
+    if user_data == HOME_EVENT.to(u64) {
+        // Another thread woke coroutines of this one
+        home_event(res)
+        return
+    }
+    let timeout_tag = user_data & 3
+    let coro = take_kernel_event(user_data.to(uint)) ?! return
+    // Read `done` before disarming: the last event may release the
+    // global root, and no field is touched after that.
+    let done = coro.done
+    coro.disarm_kernel_event()
+    if done : return
+    if timeout_tag == 1 {
+        // Linked timeout completion. ETIME: the timeout fired and
+        // the linked operation was cancelled by the kernel, so its
+        // completion is stale now — resolve both arms (this bumps
+        // the generation and invalidates the counterpart) and wake
+        // with a timeout. ECANCELED: the operation completed first
+        // and cancelled this timeout; the operation's completion
+        // wakes the coroutine, nothing to do here.
+        if res == 0 - ext.ETIME {
+            coro.disarm_kernel_event()
+            coro.poll_event = io.POLL_TIMEOUT
+            coro.completion_res = 0 - ext.ETIMEDOUT
+            run_coros.append(coro)
+        }
+    } else if timeout_tag == 3 {
+        // A send linked to a read (net.send_then_recv): the read's completion
+        // wakes the coroutine, and a failed send cancels that read
+    } else if timeout_tag == 2 && res == 0 - ext.ECANCELED {
+        // The operation was cancelled because the linked timeout
+        // fired — the timeout completion is stale now. Resolve both
+        // arms and wake with a timeout.
+        coro.disarm_kernel_event()
+        coro.poll_event = io.POLL_TIMEOUT
+        coro.completion_res = 0 - ext.ETIMEDOUT
+        run_coros.append(coro)
+    } else {
+        // The operation completed; the linked timeout (if any) was
+        // cancelled by the kernel and its completion is stale after
+        // the disarm below.
+        if timeout_tag == 2 : coro.disarm_kernel_event()
+        // A negative result is an error like EBADF, not an event mask:
+        // as a mask it would satisfy every predicate at once
+        coro.poll_event = res < 0 ? ext.POLLERR : res.@cast(io.PollEvent)
+        coro.completion_res = res
+        run_coros.append(coro)
     }
 }
 

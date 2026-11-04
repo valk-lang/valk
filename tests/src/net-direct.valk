@@ -1,0 +1,301 @@
+use valk.net
+use valk.time
+use valk.http
+use valk.io
+
+#if OS == "linux"
+fn direct_accept(server: atomic net.TcpServer, ring: uint (0)) ?net.TcpConnection {
+    let accepted = server.accept_direct_for_test(2000 * TIME_SCALE, ring) ! return null
+    return accepted
+}
+
+fn direct_read(connection: net.TcpConnection) String {
+    connection.read_timeout_ms = 2000 * TIME_SCALE
+    let buffer = [u8]{ 0 x 64 }
+    let got = connection.read(buffer) ! return "<error>"
+    return buffer.view(0, got).to_string()
+}
+
+test "TCP: a direct descriptor reads, writes, knows its peer and closes" {
+    let server = net.tcp_server("127.0.0.1", 9341) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let client = net.tcp_client("127.0.0.1", 9341) ! {
+        assert(false)
+        return
+    }
+    defer client.close() ! {}
+    // A kernel without direct descriptors (before 5.19) has nothing to test here
+    let accepted = direct_accept(server) ?! return
+    assert(accepted.is_direct_for_test())
+
+    let peer = accepted.peer_address() ! {
+        assert(false)
+        return
+    }
+    let local = client.local_address() ! {
+        assert(false)
+        return
+    }
+    assert(peer.port == local.port)
+
+    client.write("ping") ! assert(false)
+    assert(direct_read(accepted) == "ping")
+    accepted.write("pong") ! assert(false)
+    assert(direct_read(client) == "pong")
+
+    accepted.close() ! assert(false)
+    let ended = false
+    let buffer = [u8]{ 0 x 8 }
+    client.read(buffer) ! {
+        ended = error_is(E.code, closed)
+    }
+    assert(ended)
+}
+
+test "TCP: closing a direct descriptor leaves the connection that takes its slot alone" {
+    let server = net.tcp_server("127.0.0.1", 9342) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let previous: ?net.TcpConnection = null
+    each 0 .. 10 as i {
+        // The next accept takes the slot this close frees: nothing of the close may reach it
+        let last = previous
+        if isset(last) : last.close() ! assert(false)
+        let client = net.tcp_client("127.0.0.1", 9342) ! {
+            assert(false)
+            return
+        }
+        let accepted = direct_accept(server) ?! return
+        time.sleep_ms(5)
+        client.write("n" + i) ! assert(false)
+        assert(direct_read(accepted) == "n" + i)
+        accepted.write("r" + i) ! assert(false)
+        assert(direct_read(client) == "r" + i)
+        client.close() ! {}
+        previous = accepted
+    }
+}
+
+test "TCP: a direct descriptor on an extra ring of the thread reads, writes and closes" {
+    let server = net.tcp_server("127.0.0.1", 9345) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let ring = server.add_direct_ring_for_test()
+    if ring == 0 : return
+    each 0 .. 3 as i {
+        let client = net.tcp_client("127.0.0.1", 9345) ! {
+            assert(false)
+            return
+        }
+        let accepted = direct_accept(server, ring) ?! {
+            assert(false)
+            return
+        }
+        client.write("q" + i) ! assert(false)
+        assert(direct_read(accepted) == "q" + i)
+        accepted.write("a" + i) ! assert(false)
+        assert(direct_read(client) == "a" + i)
+        // A read that waits on the extra ring wakes when it is interrupted
+        let reader = co direct_read(accepted)
+        time.sleep_ms(5)
+        accepted.interrupt_for_test()
+        assert(await reader == "<error>")
+        accepted.close() ! assert(false)
+        let ended = false
+        let buffer = [u8]{ 0 x 8 }
+        client.read_timeout_ms = 2000 * TIME_SCALE
+        client.read(buffer) ! {
+            ended = error_is(E.code, closed)
+        }
+        assert(ended)
+        client.close() ! {}
+    }
+}
+
+fn direct_http_handler(req: http.Request) http.Response {
+    return http.Response.text("ok:" + req.path)
+}
+
+test "HTTP: connections on fresh direct descriptors one after the other are all served" {
+    let server = http.Server.new("127.0.0.1", 9344, direct_http_handler)
+    server.direct = true
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(20)
+    // Each closed connection frees the slot the next one gets: a late shutdown of the old one
+    // used to hang up the new one
+    each 0 .. 20 as i {
+        let res = http.get("http://127.0.0.1:9344/n" + i) ! {
+            assert(false)
+            continue
+        }
+        assert(res.body == "ok:/n" + i)
+    }
+}
+
+fn direct_http_answer(client: net.TcpConnection, expect: String) bool {
+    client.read_timeout_ms = 2000 * TIME_SCALE
+    let got = ""
+    let buffer = [u8]{ 0 x 4096 }
+    each 0 .. 50 as _ {
+        let n = client.read(buffer) ! return false
+        got = got + buffer.view(0, n).to_string()
+        if got.contains(expect) : return true
+    }
+    return false
+}
+
+test "HTTP: a parked direct connection gets its next requests from the receive it armed" {
+    let server = http.Server.new("127.0.0.1", 9347, direct_http_handler)
+    server.direct = true
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(20)
+    let client = net.tcp_client("127.0.0.1", 9347) ! {
+        assert(false)
+        return
+    }
+    defer client.close() ! {}
+    // Pauses park the connection; the larger heads do not fit in one receive buffer
+    each 0 .. 8 as i {
+        let pad = i % 2 == 1 ? "x".repeat(3000) : "y"
+        client.write("GET /p" + i + " HTTP/1.1\r\nHost: a\r\nX-Pad: " + pad + "\r\n\r\n") ! assert(false)
+        assert(direct_http_answer(client, "ok:/p" + i))
+        time.sleep_ms(10)
+    }
+}
+
+test "IO: the receive buffer pool of a ring grows after misses, up to its limit" {
+    let server = net.tcp_server("127.0.0.1", 9348) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let client = net.tcp_client("127.0.0.1", 9348) ! {
+        assert(false)
+        return
+    }
+    defer client.close() ! {}
+    // The first direct accept sets up the pool
+    let accepted = direct_accept(server) ?! return
+    defer accepted.close() ! {}
+    let start = io.recv_buffer_count_for_test(0)
+    assert(start >= 64)
+    io.recv_buffer_grow_for_test(0, 0)
+    assert(io.recv_buffer_count_for_test(0) == start)
+    // One miss doubles it, many add as many
+    io.recv_buffer_grow_for_test(0, 1)
+    let doubled = io.recv_buffer_count_for_test(0)
+    assert(doubled == (start * 2 < 4096 ? start * 2 : 4096))
+    io.recv_buffer_grow_for_test(0, doubled * 3)
+    let more = io.recv_buffer_count_for_test(0)
+    assert(more == (doubled * 4 < 4096 ? doubled * 4 : 4096))
+    io.recv_buffer_grow_for_test(0, 100000)
+    assert(io.recv_buffer_count_for_test(0) == 4096)
+    // Test builds track which buffers the kernel holds
+    assert(io.recv_buffer_checks_for_test(0))
+}
+
+test "HTTP: many parked direct connections woken at once are all answered" {
+    let server = http.Server.new("127.0.0.1", 9349, direct_http_handler)
+    server.direct = true
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(20)
+    let clients = Array[net.TcpConnection].new()
+    defer {
+        each clients as client : client.close() ! {}
+    }
+    each 0 .. 300 as i {
+        let client = net.tcp_client("127.0.0.1", 9349) ! {
+            assert(false)
+            return
+        }
+        clients.append(client)
+    }
+    // Two answered requests with a pause park each connection; then all get a request at once,
+    // more than the pool starts with
+    each 0 .. 3 as round {
+        each clients as client, i {
+            client.write("GET /m" + i + "r" + round + " HTTP/1.1\r\nHost: a\r\n\r\n") ! assert(false)
+        }
+        each clients as client, i {
+            assert(direct_http_answer(client, "ok:/m" + i + "r" + round))
+        }
+        time.sleep_ms(20)
+    }
+}
+
+fn direct_drain(client: net.TcpConnection, total: uint) uint {
+    client.read_timeout_ms = 5000 * TIME_SCALE
+    let buffer = [u8]{ 0 x 65536 }
+    let got: uint = 0
+    while got < total {
+        got += client.read(buffer) ! break
+    }
+    return got
+}
+
+test "TCP: a direct write that fills the socket buffer waits for the peer, or times out" {
+    let server = net.tcp_server("127.0.0.1", 9346) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let data = [u8]{ 7 x 16 * 1024 * 1024 }
+    each 0 .. 2 as i {
+        let client = net.tcp_client("127.0.0.1", 9346) ! {
+            assert(false)
+            return
+        }
+        let accepted = direct_accept(server) ?! return
+        if i == 0 {
+            // More than the socket buffers hold: the first try finds them full and waits, as
+            // long as the reader takes
+            accepted.write_timeout_ms = 10000 * TIME_SCALE
+            let reader = co direct_drain(client, data.length)
+            let sent = accepted.write(data) !? 0
+            assert(sent == data.length)
+            assert(await reader == data.length)
+        } else {
+            // A peer that never reads: the wait for room times out
+            accepted.write_timeout_ms = 300 * TIME_SCALE
+            let timed_out = false
+            accepted.write(data) ! {
+                timed_out = error_is(E.code, timeout)
+            }
+            assert(timed_out)
+        }
+        accepted.close() ! {}
+        client.close() ! {}
+    }
+}
+
+test "TCP: an interrupted direct descriptor ends its pending read" {
+    let server = net.tcp_server("127.0.0.1", 9343) ! {
+        assert(false)
+        return
+    }
+    defer server.close() ! {}
+    let client = net.tcp_client("127.0.0.1", 9343) ! {
+        assert(false)
+        return
+    }
+    defer client.close() ! {}
+    let accepted = direct_accept(server) ?! return
+    let reader = co direct_read(accepted)
+    time.sleep_ms(10)
+    accepted.interrupt_for_test()
+    assert(await reader == "<error>")
+    // Later reads fail at once
+    assert(direct_read(accepted) == "<error>")
+    accepted.close() ! {}
+}
+#end

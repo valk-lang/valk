@@ -10,10 +10,15 @@ global uring_features: u32
 
 class URing {
     inst: *ext.io_uring
+    recv: ?RecvBuffers (null)
+    // Unmapped only after the ring is gone, the kernel may still fill a buffer until then
+    recv_memory: ?ptr (null)
     fn gc_free() {
         @unsafe
         ext.io_uring_queue_exit(this.inst)
         mem.free(this.inst)
+        let memory = this.recv_memory ?! return
+        ext.munmap(memory, RECV_MEMORY_SIZE)
     }
 }
 
@@ -26,6 +31,11 @@ value IORING_FEAT_REG_REG_RING (8192)
 // ring, or for none at all.
 // struct io_uring_params: u32 sq_entries, cq_entries, flags, ...
 value IORING_SETUP_CQSIZE (8)
+// Only this thread submits, and the kernel completes its work when the thread waits instead of
+// interrupting it (Linux 6.1+). The flag tells a peek that deferred completions are pending
+value IORING_SETUP_TASKRUN_FLAG (512)
+value IORING_SETUP_SINGLE_ISSUER (4096)
+value IORING_SETUP_DEFER_TASKRUN (8192)
 
 fn uring() *ext.io_uring !IoError {
     @unsafe
@@ -38,8 +48,14 @@ fn uring() *ext.io_uring !IoError {
     let params: [u32 x 30] = @undefined
     mem.clear_bytes(@ref(params).@cast(ptr), 120)
     params[1] = 2048
-    params[2] = IORING_SETUP_CQSIZE
+    params[2] = IORING_SETUP_CQSIZE | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_TASKRUN_FLAG
     let err = ext.io_uring_queue_init_params(256, inst, @ref(params).@cast(ptr))
+    if err < 0 {
+        mem.clear_bytes(@ref(params).@cast(ptr), 120)
+        params[1] = 2048
+        params[2] = IORING_SETUP_CQSIZE
+        err = ext.io_uring_queue_init_params(256, inst, @ref(params).@cast(ptr))
+    }
     if err >= 0 : uring_features = params[5]
     if err < 0 : err = ext.io_uring_queue_init(64, inst, 0)
     if err < 0 {
@@ -48,6 +64,396 @@ fn uring() *ext.io_uring !IoError {
     }
     uring_instance = URing { inst: inst }
     return inst
+}
+
+// Direct descriptors: sockets that live in the ring's own file table instead of the process's,
+// so they do not count against RLIMIT_NOFILE. The kernel caps one table at that limit
+value IOSQE_FIXED_FILE (1)
+value IORING_FILE_INDEX_ALLOC (0xFFFF_FFFF)
+value DIRECT_TABLE_MAX ((1 << 18) - 64)
+
+global uring_files_size: uint
+global uring_files_tried: bool
+
+// The size of this thread's table of direct descriptors, registered on first use; 0 when the
+// kernel has none (before 5.19)
+fn uring_files() uint {
+    @unsafe
+    if uring_files_tried : return uring_files_size
+    uring_files_tried = true
+    let ring = uring() ! return 0
+    let limits: [u64 x 2] = { 0 ... }
+    if ext.getrlimit(ext.RLIMIT_NOFILE, @ref(limits).@cast(ptr)) != 0 : return 0
+    let size = limits[0].to(uint)
+    if size > DIRECT_TABLE_MAX : size = DIRECT_TABLE_MAX
+    if size < 64 : return 0
+    if !register_files_sparse(ring, size) : return 0
+    let main = uring_instance ?! return 0
+    let buffers = recv_buffers(ring) ?! return 0
+    main.recv_memory = buffers.memory
+    main.recv = buffers
+    uring_files_size = size
+    return size
+}
+
+// Buffers the kernel picks for the receives of parked direct descriptors (`recv_direct_select`),
+// one group per ring, so a parked connection holds no read buffer of its own (Linux 5.19+)
+value IORING_REGISTER_PBUF_RING (22)
+value IOSQE_BUFFER_SELECT (32)
+value IORING_CQE_F_BUFFER (1)
+value RECV_BUFFERS (4096)
+// The pool starts with this many and grows when receives find none free
+value RECV_BUFFERS_START (64)
+value RECV_BUFFER_SIZE (1024)
+// struct io_uring_buf { u64 addr; u32 len; u16 bid, resv } per buffer, then the buffers. Only
+// the buffers handed out are ever touched, so the rest of the mapping stays unused
+value RECV_RING_BYTES (RECV_BUFFERS * 16)
+value RECV_MEMORY_SIZE (RECV_RING_BYTES + RECV_BUFFERS * RECV_BUFFER_SIZE)
+value MAP_NORESERVE (0x4000)
+
+class RecvBuffers {
+    memory: ptr
+    tail: uint (0)
+    // Buffers handed to the kernel so far, and receives that found none free since the last grow
+    count: uint (0)
+    missed: uint (0)
+    #if DEBUG || TEST
+    // Which buffers the kernel holds: one handed out twice would let two receives share it
+    held: Array[bool] (Array[bool].new())
+    #end
+
+    fn data(bid: uint) ptr {
+        return this.memory + RECV_RING_BYTES + bid * RECV_BUFFER_SIZE
+    }
+
+    // Records that the kernel holds `bid` again; false when it held it already
+    fn track_give(bid: uint) bool {
+        #if DEBUG || TEST
+        while this.held.length <= bid : this.held.append(false)
+        if this.held.get(bid) !? false : return false
+        this.held.set(bid, true) _
+        #end
+        return true
+    }
+
+    // Records that a receive took `bid` from the kernel; false when the kernel did not hold it
+    fn track_take(bid: uint) bool {
+        #if DEBUG || TEST
+        if !(this.held.get(bid) !? false) : return false
+        this.held.set(bid, false) _
+        #end
+        return true
+    }
+
+    // Hands buffer `bid` (back) to the kernel
+    fn give(bid: uint) {
+        if !this.track_give(bid) : panic("Receive buffer %{bid} handed to the kernel twice")
+        let entry = this.memory + (this.tail & (RECV_BUFFERS - 1)) * 16
+        entry.write_u64_le(this.data(bid).@cast(u64))
+        (entry + 8).write_u32_le(RECV_BUFFER_SIZE.to(u32))
+        (entry + 12).write_u16_le(bid.to(u16))
+        this.tail++
+        // The ring's tail shares the first entry's last two bytes
+        let tail = (this.memory + 14).@cast(*u16)
+        atomic_store(tail[0], (this.tail & 0xFFFF).to(u16))
+    }
+
+    // Adds buffers after misses: twice as many, or as many more as were missed
+    fn grow() {
+        if this.missed == 0 : return
+        let target = this.count * 2
+        if this.count + this.missed > target : target = this.count + this.missed
+        if target > RECV_BUFFERS : target = RECV_BUFFERS
+        this.missed = 0
+        while this.count < target : this.give(this.count++)
+    }
+}
+
+// Maps and registers the buffers of `ring`, the first ones handed to the kernel; null without
+// support
+fn recv_buffers(ring: *ext.io_uring) ?RecvBuffers {
+    @unsafe
+    let memory = ext.mmap(null, RECV_MEMORY_SIZE, 0x1 | 0x2, 0x2 | 0x20 | MAP_NORESERVE, -1, 0)
+    if memory.@cast(int) == -1 : return null
+    // struct io_uring_buf_reg { u64 ring_addr; u32 ring_entries; u16 bgid, flags; u64 resv[3] }
+    let reg: [u64 x 5] = { 0 ... }
+    reg[0] = memory.@cast(u64)
+    reg[1] = RECV_BUFFERS.to(u64)
+    let buffers = RecvBuffers { memory: memory }
+    while buffers.count < RECV_BUFFERS_START : buffers.give(buffers.count++)
+    if !uring_register(ring, IORING_REGISTER_PBUF_RING, @ref(reg).@cast(ptr), 1) {
+        // Ubuntu 6.8.0-136 and later invert the check of the reserved field (Launchpad
+        // #2162843) and only take a nonzero one; a correct kernel rejects that again
+        reg[2] = 1
+        if !uring_register(ring, IORING_REGISTER_PBUF_RING, @ref(reg).@cast(ptr), 1) {
+            ext.munmap(memory, RECV_MEMORY_SIZE)
+            return null
+        }
+    }
+    return buffers
+}
+
+fn recv_buffers_of(index: uint) ?RecvBuffers {
+    if index == 0 {
+        let main = uring_instance ?! return null
+        return main.recv
+    }
+    let extra = extra_rings.get(index - 1) ! return null
+    return extra.recv
+}
+
+// The data of buffer `bid` of ring `index`
+fn recv_buffer_data(index: uint, bid: uint) ?ptr {
+    let buffers = recv_buffers_of(index) ?! return null
+    return buffers.data(bid)
+}
+
+// A receive on ring `index` completed into buffer `bid`
+fn took_recv_buffer(index: uint, bid: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    if !buffers.track_take(bid) : panic("Receive buffer %{bid} came back without being handed out")
+}
+
+// Hands buffer `bid` of ring `index` back to the kernel
+fn give_recv_buffer(index: uint, bid: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    buffers.give(bid)
+}
+
+// A receive on ring `index` found no free buffer
+fn recv_buffer_missed(index: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    buffers.missed++
+}
+
+// Grows the pools of the rings whose receives found no free buffer
+fn grow_recv_buffers() {
+    let main = uring_instance ?! return
+    let buffers = main.recv ?! return
+    buffers.grow()
+    each extra_rings as extra {
+        let pool = extra.recv ?! continue
+        pool.grow()
+    }
+}
+
+#if TEST
+/// Test hook: the buffers ring `index` has handed to the kernel.
++ fn recv_buffer_count_for_test(index: uint) uint {
+    let buffers = recv_buffers_of(index) ?! return 0
+    return buffers.count
+}
+
+/// Test hook: whether the pool's check catches a buffer given twice and one taken that was
+/// never given; `index` names a ring with a pool.
++ fn recv_buffer_checks_for_test(index: uint) bool {
+    let pool = recv_buffers_of(index) ?! return false
+    // A tracker of its own: nothing handed out yet
+    let buffers = RecvBuffers { memory: pool.memory }
+    let bid: uint = 7
+    if buffers.track_take(bid) : return false
+    if !buffers.track_give(bid) || buffers.track_give(bid) : return false
+    if !buffers.track_take(bid) || buffers.track_take(bid) : return false
+    return true
+}
+
+/// Test hook: counts `misses` receives without a free buffer on ring `index`, then grows.
++ fn recv_buffer_grow_for_test(index: uint, misses: uint) {
+    let buffers = recv_buffers_of(index) ?! return
+    buffers.missed += misses
+    grow_recv_buffers()
+}
+#end
+
+// System calls of their own: the liburing that static builds link predates these
+value SYS_IO_URING_ENTER (426)
+value SYS_IO_URING_REGISTER (427)
+value IORING_ENTER_GETEVENTS (1)
+value IORING_REGISTER_FILES2 (13)
+value IORING_RSRC_REGISTER_SPARSE (1)
+value IORING_SQ_TASKRUN (4)
+
+fn uring_register(ring: *ext.io_uring, opcode: uint, arg: ptr, nr: uint) bool {
+    return ext.syscall(SYS_IO_URING_REGISTER, ring.ring_fd.to(int), opcode.to(int), arg, nr.to(int)) >= 0
+}
+
+// An empty table of `size` direct descriptors (Linux 5.19+)
+fn register_files_sparse(ring: *ext.io_uring, size: uint) bool {
+    @unsafe
+    // struct io_uring_rsrc_register { u32 nr, flags; u64 resv2, data, tags }
+    let reg: [u64 x 4] = { 0 ... }
+    reg[0] = size.to(u64) | (IORING_RSRC_REGISTER_SPARSE.to(u64) << 32)
+    return uring_register(ring, IORING_REGISTER_FILES2, @ref(reg).@cast(ptr), 32)
+}
+
+// Completions that belong to no coroutine carry this index where a coroutine's would be, and
+// a payload of 30 bits above it (see `coro.side_event`). Payload 0 is dropped
+value SIDE_INDEX (0xFFFF_FFFF)
+// The payload of the main ring's read of the extra rings' eventfd (channel 0, data 1)
+value EXTRA_DOORBELL (1 << 6)
+
+fn side_user_data(payload: uint) u64 {
+    return ((payload << 34) | (SIDE_INDEX << 2)).to(u64)
+}
+
+fn is_side_event(user_data: u64) bool {
+    return (user_data >> 2) & 0xFFFF_FFFF == SIDE_INDEX.to(u64)
+}
+
+// More rings of this thread for direct descriptors, each with a table of its own: one table
+// holds at most RLIMIT_NOFILE. Ring 0 is the main ring (`uring`), ring i the extra ring i - 1.
+// They signal one eventfd, which the main ring reads, and the scheduler reaps them with it
+value DIRECT_RINGS_MAX (16)
+value EFD_CLOEXEC (0x80000)
+
+class ExtraRing {
+    inst: *ext.io_uring
+    unsubmitted: uint (0)
+    recv: ?RecvBuffers (null)
+    recv_memory: ?ptr (null)
+    fn gc_free() {
+        @unsafe
+        ext.io_uring_queue_exit(this.inst)
+        mem.free(this.inst)
+        let memory = this.recv_memory ?! return
+        ext.munmap(memory, RECV_MEMORY_SIZE)
+    }
+}
+
+global extra_rings: Array[ExtraRing] (.{})
+global extra_efd: i32 (-1)
+global extra_efd_count: ?ptr (null)
+
+// The number of rings with a table of direct descriptors, the main ring included; 0 without
+fn direct_ring_count() uint {
+    if uring_files() == 0 : return 0
+    return extra_rings.length + 1
+}
+
+// Adds a ring with a table of direct descriptors and returns its index; 0 when none can be made
+fn add_direct_ring() uint {
+    @unsafe
+    let size = uring_files()
+    if size == 0 || extra_rings.length + 1 >= DIRECT_RINGS_MAX : return 0
+    let main = uring() ! return 0
+    if extra_efd < 0 {
+        let efd = ext.eventfd(0, EFD_CLOEXEC)
+        if efd < 0 : return 0
+        extra_efd = efd
+        extra_efd_count = mem.alloc(8)
+        arm_extra_doorbell()
+    }
+    let inst = mem.new[ext.io_uring]()
+    let params: [u32 x 30] = @undefined
+    mem.clear_bytes(@ref(params).@cast(ptr), 120)
+    params[1] = 4096
+    params[2] = IORING_SETUP_CQSIZE
+    if ext.io_uring_queue_init_params(256, inst, @ref(params).@cast(ptr)) < 0 {
+        mem.free(inst)
+        return 0
+    }
+    let ring = ExtraRing { inst: inst }
+    if !register_files_sparse(inst, size) : return 0
+    let buffers = recv_buffers(inst) ?! return 0
+    ring.recv_memory = buffers.memory
+    ring.recv = buffers
+    if ext.io_uring_register_eventfd(inst, extra_efd) < 0 : return 0
+    extra_rings.append(ring)
+    return extra_rings.length
+}
+
+// Queues the main ring's read of the extra rings' eventfd
+fn arm_extra_doorbell() {
+    @unsafe
+    let count = extra_efd_count ?! return
+    let sqe = detached_sqe(0, EXTRA_DOORBELL) ! return
+    io_uring_prep_read(sqe, extra_efd, count, 8, 0)
+}
+
+// Submits what was queued on the extra rings
+fn submit_extra_rings() {
+    each extra_rings as extra {
+        if extra.unsubmitted == 0 : continue
+        let submitted = ext.io_uring_submit(extra.inst)
+        if submitted < 0 : continue
+        extra.unsubmitted = uring_remaining(extra.unsubmitted, submitted.to(uint))
+    }
+}
+
+// A submission entry on ring `index` for `coro`, like `sqe`
+fn sqe_on(coro: ?coro.Coro, index: uint) *ext.io_uring_sqe !IoError {
+    if index == 0 : return sqe(coro) !>
+    let extra = extra_rings.get(index - 1) ! throw .os
+    if extra.unsubmitted + 2 > 128 || sq_space_left(extra.inst) < 2 : submit_extra(extra)
+    let entry = take_sqe_raw(coro, extra.inst) !>
+    extra.unsubmitted++
+    return entry
+}
+
+fn linked_sqe_on(coro: ?coro.Coro, index: uint) *ext.io_uring_sqe !IoError {
+    if index == 0 : return linked_sqe(coro) !>
+    let extra = extra_rings.get(index - 1) ! throw .os
+    let entry = take_sqe_raw(coro, extra.inst) !>
+    extra.unsubmitted++
+    return entry
+}
+
+fn submit_extra(extra: ExtraRing) {
+    let submitted = ext.io_uring_submit(extra.inst)
+    if submitted < 0 : panic("Failed to submit io_uring requests")
+    extra.unsubmitted = uring_remaining(extra.unsubmitted, submitted.to(uint))
+}
+
+// A submission on ring `index` that no coroutine waits for; its completion is a side event
+// with `payload`. Allocates nothing: collectors use it
+fn detached_sqe(index: uint, payload: uint) *ext.io_uring_sqe !IoError {
+    @unsafe
+    let sqe: ?*ext.io_uring_sqe = null
+    if index == 0 {
+        let main = uring_instance ?! throw .os
+        let ring = main.inst
+        if uring_unsubmitted + 2 > 128 || sq_space_left(ring) < 2 : uring_submit(ring)
+        sqe = ext.io_uring_get_sqe(ring)
+        if isset(sqe) : uring_unsubmitted++
+    } else {
+        let extra = extra_rings.get(index - 1) ! throw .os
+        if extra.unsubmitted + 2 > 128 || sq_space_left(extra.inst) < 2 : submit_extra(extra)
+        sqe = ext.io_uring_get_sqe(extra.inst)
+        if isset(sqe) : extra.unsubmitted++
+    }
+    let entry = sqe ?! throw .os
+    io_uring_prep_rw(ext.IORING_OP.NOP, entry, -1, null, 0, 0)
+    entry.user_data = side_user_data(payload)
+    return entry
+}
+
+// Closes the direct descriptor `slot` of ring `index`, without waiting; the socket ends once no
+// operation holds it. No shutdown: io_uring runs that on a worker thread, where it would find
+// the slot by number after a new connection took it
+fn close_direct(index: uint, slot: i32) {
+    @unsafe
+    let close = detached_sqe(index, 0) ! return
+    io_uring_prep_rw(ext.IORING_OP.CLOSE, close, 0, null, 0, 0)
+    close.file_index = (slot + 1).to(u32)
+}
+
+// Arms one receive on the direct descriptor `slot` of ring `index`, into a buffer the kernel
+// picks from the ring's group (`RecvBuffers`). It completes as a side event with `payload`;
+// with data, its flags carry `IORING_CQE_F_BUFFER` and the buffer id above bit 16
+fn recv_direct_select(index: uint, slot: i32, payload: uint) bool {
+    @unsafe
+    let sqe = detached_sqe(index, payload) ! return false
+    io_uring_prep_rw(ext.IORING_OP.RECV, sqe, slot, null, RECV_BUFFER_SIZE.to(u32), 0)
+    sqe.flags = (IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT).to(u8)
+    return true
+}
+
+// Cancels the operation armed on ring `index` with `payload`, without waiting
+fn cancel_side(index: uint, payload: uint) {
+    @unsafe
+    let sqe = detached_sqe(index, 0) ! return
+    io_uring_prep_rw(ext.IORING_OP.ASYNC_CANCEL, sqe, -1, null, 0, 0)
+    sqe.addr = side_user_data(payload)
 }
 
 // Whether a send can be linked to a read: the send must go out whole, or the read
@@ -102,13 +508,19 @@ fn linked_sqe(coro: ?coro.Coro, ring: ?*ext.io_uring (null)) *ext.io_uring_sqe !
 }
 
 fn take_sqe(coro: ?coro.Coro, ring: *ext.io_uring) *ext.io_uring_sqe !IoError {
+    let sqe = take_sqe_raw(coro, ring) !>
+    uring_unsubmitted++
+    return sqe
+}
+
+// Like `take_sqe`, without counting it for the main ring
+fn take_sqe_raw(coro: ?coro.Coro, ring: *ext.io_uring) *ext.io_uring_sqe !IoError {
     if !isset(coro) : coro = coro.current_coro
     let sqe = ext.io_uring_get_sqe(ring)
     if !isset(sqe) : throw .os
     let target = coro ?! panic("Cannot schedule an io_uring operation without a coroutine")
     target.arm_kernel_event()
     sqe.user_data = target.event_id().to(u64)
-    uring_unsubmitted++
     return sqe
 }
 
@@ -186,12 +598,12 @@ fn io_uring_prep_link_timeout(sqe: *ext.io_uring_sqe, ts: &kernel_timespec, flag
     sqe.rw_flags = flags
 }
 
-fn link_timeout(coro: coro.Coro, operation: *ext.io_uring_sqe, timeout_ms: uint) !IoError {
+fn link_timeout(coro: coro.Coro, operation: *ext.io_uring_sqe, timeout_ms: uint, ring: uint (0)) !IoError {
     if timeout_ms == 0 : return
 
     operation.flags = operation.flags | (1 << ext.IORING_SQE_FLAGS.IO_LINK_BIT)
     operation.user_data = operation.user_data | 2
-    let timeout = linked_sqe(coro) !>
+    let timeout = linked_sqe_on(coro, ring) !>
     // Split into whole seconds and a nanosecond remainder: one nanosecond count
     // wraps the signed field once the timeout passes about 292 years, and a
     // negative timespec fires at once
@@ -226,6 +638,10 @@ fn io_uring_cqe_seen(ring: *ext.io_uring, cqe: *ext.io_uring_cqe) {
 }
 // check if an io_uring completion event is available
 fn io_uring_peek_cqe(ring: *ext.io_uring, cqe_ptr: *?*ext.io_uring_cqe) i32 {
+    // A deferred completion is only posted once this thread enters the kernel
+    if io_uring_cq_ready(ring) == 0 && (atomic_load(ring.sq.kflags[0]) & IORING_SQ_TASKRUN.to(u32)) != 0 {
+        ext.syscall(SYS_IO_URING_ENTER, ring.ring_fd.to(int), 0, 0, IORING_ENTER_GETEVENTS, 0, 0)
+    }
     while true {
         let err = io_uring_wait_cqe_nr(ring, cqe_ptr, 0)
         if err == 0 - ext.EINTR : continue

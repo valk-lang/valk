@@ -12270,6 +12270,8 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + compress: bool
     // The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1: on JSON and HTML it is about 40% faster than level 6 and the output only a few percent larger, the trade nginx makes by default.
     + compress_level: uint
+    // On Linux, plain connections live in io_uring's own table of sockets instead of the process's, so the open-file limit (`RLIMIT_NOFILE`) does not cap how many a server holds, and waiting connections receive into a buffer pool the kernel fills. Such a socket has no descriptor number: its local address and socket options are not available. Ignored with TLS, on other systems and on kernels before 5.19.
+    + direct: bool
     // How long a request head may take to arrive once it started, and how long the TLS handshake may take, in milliseconds.
     + header_timeout_ms: uint
     // The address the server listens on.
@@ -12369,6 +12371,14 @@ streamed response are sent as they are.
 The DEFLATE level `compress` uses, from 1 (fastest) to 9 (smallest). Defaults to 1:
 on JSON and HTML it is about 40% faster than level 6 and the output only a few percent
 larger, the trade nginx makes by default.
+
+#### direct
+
+On Linux, plain connections live in io_uring's own table of sockets instead of the
+process's, so the open-file limit (`RLIMIT_NOFILE`) does not cap how many a server
+holds, and waiting connections receive into a buffer pool the kernel fills. Such a
+socket has no descriptor number: its local address and socket options are not
+available. Ignored with TLS, on other systems and on kernels before 5.19.
 
 #### header_timeout_ms
 
@@ -15419,7 +15429,7 @@ the file.
 ```js
 // A connected TCP stream, optionally with TLS, read and written from a coroutine.
 + class TcpConnection is Reader, Writer, Closer {
-    // The OS socket descriptor.
+    // The OS socket descriptor; for a connection accepted with `TcpServer.accept_direct`, its slot in the accepting thread's io_uring table instead.
     ~ fd: i32
     // The host the connection was made to; empty for accepted connections and `new`.
     ~+ host: String
@@ -15476,7 +15486,8 @@ collected.
 
 #### fd
 
-The OS socket descriptor.
+The OS socket descriptor; for a connection accepted with `TcpServer.accept_direct`, its
+slot in the accepting thread's io_uring table instead.
 
 #### host
 
