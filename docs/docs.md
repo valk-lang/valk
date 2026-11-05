@@ -2177,8 +2177,7 @@ let response_2 = await request_2 !? http.Response.empty(400)
 ```
 
 Use `co` to start a coroutine and `await` to wait for its result.
-Coroutine error types cannot contain payload fields, including inherited fields.
-Handle payload errors inside the coroutine or encode them in its return type.
+An error's payload fields reach the `await` with its code.
 An error thrown by a coroutine reaches the `await`; a coroutine that is never
 awaited drops its error silently. A handler written after `await task` handles
 the await, including when the task is a direct call: write

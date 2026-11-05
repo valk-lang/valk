@@ -2594,11 +2594,21 @@ fn ir_emit_atomic_store(ir: IRFunc, value: Value) String !Error {
     if ir.terminated : return "undef"
     let rendered = ir_emit_value(ir, right) !>
     if ir.terminated : return "undef"
+    // Atomic accesses need whole bytes: a bool is stored as its byte
+    let irt = ir_type(left.rett) !>
+    let stored = rendered
+    if irt == "i1" {
+        irt = "i8"
+        stored = ir.var()
+        ir.line_start()
+        ir.write(stored + " = zext i1 " + rendered + " to i8")
+        ir.line_end()
+    }
     ir.line_start()
     ir.write("store atomic ")
-    ir.write(ir_type(left.rett) !>)
+    ir.write(irt)
     ir.write(" ")
-    ir.write(rendered)
+    ir.write(stored)
     ir.write(", ptr ")
     ir.write(address)
     ir.write(" release, align ")
@@ -2613,17 +2623,24 @@ fn ir_emit_atomic_load(ir: IRFunc, value: Value) String !Error {
 
     let address = ir_emit_address(ir, left) !>
     if ir.terminated : return "undef"
+    let irt = ir_type(left.rett) !>
+    let is_bool = irt == "i1"
     let out = ir.var()
     ir.line_start()
     ir.write(out)
     ir.write(" = load atomic ")
-    ir.write(ir_type(left.rett) !>)
+    ir.write(is_bool ? "i8" : irt)
     ir.write(", ptr ")
     ir.write(address)
     ir.write(" acquire, align ")
     ir.write_uint(ir_atomic_align(left.rett) !>)
     ir.line_end()
-    return out
+    if !is_bool : return out
+    let bit = ir.var()
+    ir.line_start()
+    ir.write(bit + " = trunc i8 " + out + " to i1")
+    ir.line_end()
+    return bit
 }
 
 fn ir_atomic_align(type: Type) u32 !Error {
@@ -4452,6 +4469,67 @@ fn ir_coro_result_types(type: Type) Array[Type] {
     return result
 }
 
+// The payload fields of a coroutine's error type, in the order they are saved
+fn ir_coro_payload_types(error_type: ?ErrorType) Array[Type] {
+    let types = Array[Type]{}
+    if !isset(error_type) : return types
+    each error_type.payload_globals as _, name {
+        let ptype = error_type.payload.get(name) ! continue
+        types.append(ptype)
+    }
+    return types
+}
+
+// A failed coroutine keeps its error's payload with its results: other coroutines on the
+// thread may throw and overwrite the payload globals before it is awaited
+fn ir_coro_save_payloads(ir: IRFunc, value: Value, error_type: ?ErrorType, raw_args: String, gc_args: String) !Error {
+    if !isset(error_type) : return
+    let offset : uint = 0
+    each error_type.payload_globals as global, name {
+        let type = error_type.payload.get(name) ! continue
+        ir_use_global(ir, global)
+        let loaded = ir_emit_load(ir, ir_type(type) !>, ir_global_address(global))
+        if type.is_gc_type() {
+            ir_coro_append_gc(ir, value, gc_args, loaded) !>
+            continue
+        }
+        let alignment = type.storage_alignment() !>.to(uint)
+        if alignment > 1 : offset = offset.round_up(alignment)
+        let address = ir_offset_address(ir, raw_args, offset)
+        ir_emit_aligned_store(ir, ir_type(type) !>, loaded, address, alignment.to(u32))
+        if type.gc_root_count() !> > 0 {
+            ir_coro_append_type_roots(ir, value, type, address, gc_args, type.storage_alignment() !>) !>
+        }
+        offset += type.byte_size() !>
+    }
+}
+
+// `await` on a failed coroutine puts its payload back for the error handler
+fn ir_coro_restore_payloads(ir: IRFunc, value: Value, error_type: ?ErrorType, task: String, args_prop: Prop, gc_args_prop: Prop) !Error {
+    if !isset(error_type) || error_type.payload_globals.length == 0 : return
+    let raw_args = ir_coro_load_prop(ir, task, args_prop) !>
+    let gc_args = ir_coro_load_prop(ir, task, gc_args_prop) !>
+    let offset : uint = 0
+    let gc_index : uint = 0
+    each error_type.payload_globals as global, name {
+        let type = error_type.payload.get(name) ! continue
+        let rendered = ""
+        if type.is_gc_type() {
+            rendered = ir_coro_get_gc(ir, value, gc_args, gc_index) !>
+            gc_index++
+        } else {
+            let alignment = type.storage_alignment() !>.to(uint)
+            if alignment > 1 : offset = offset.round_up(alignment)
+            let address = ir_offset_address(ir, raw_args, offset)
+            rendered = ir_emit_aligned_load(ir, ir_type(type) !>, address, alignment.to(u32))
+            offset += type.byte_size() !>
+            gc_index += type.gc_root_count() !>
+        }
+        ir_use_global(ir, global)
+        ir_emit_store(ir, ir_type(type) !>, rendered, ir_global_address(global))
+    }
+}
+
 fn ir_coro_raw_size(types: Array[Type]) uint !Error {
     let size : uint = 0
     each types as type {
@@ -4506,6 +4584,8 @@ fn ir_emit_co(ir: IRFunc, value: Value) String !Error {
     let arg_size = ir_coro_raw_size(arg_types) !>
     let result_size = ir_coro_raw_size(ir_coro_result_types(call.rett)) !>
     let raw_size = arg_size > result_size ? arg_size : result_size
+    let payload_size = ir_coro_raw_size(ir_coro_payload_types(call.get_error_type())) !>
+    if payload_size > raw_size : raw_size = payload_size
 
     ir_emit_coro_helper(ir, value, call, arg_types) !>
 
@@ -4634,6 +4714,7 @@ fn ir_emit_coro_helper(parent: IRFunc, value: Value, call: Value, arg_types: Arr
         let success_block = ir.block("coro.success")
         ir.cond_jump(failed, error_block, success_block)
         ir.label(error_block)
+        ir_coro_save_payloads(ir, value, call.get_error_type(), raw_args, gc_args) !>
         ir_emit_coro_complete(ir, value, class, coro) !>
         ir.line("ret void")
         ir.terminated = true
@@ -4699,6 +4780,7 @@ fn ir_emit_await(ir: IRFunc, value: Value) String !Error {
         let has_error = ir_emit_binary_instruction(ir, "icmp ne", "i32", code, "0")
         ir.cond_jump(has_error, error_block, success_block)
         ir.label(error_block)
+        ir_coro_restore_payloads(ir, value, task_value.rett.get_error_type(), task, args_prop, gc_args_prop) !>
         failed = ir_build_error_result(ir, "zeroinitializer", value.rett, code) !>
         ir.jump(after_block)
         ir.label(success_block)
