@@ -5,6 +5,14 @@
 
 ```
 - Release 0.8.5
++ Coroutine errors can have payload fields: each task keeps its payload until it is awaited
++ `http.HttpError.status` carries the answered status in `http_status`
++ JSON: enum properties decode from their number
++ Fix: `each` over a mode of `Array` read the storage header instead of the elements
++ Fix: atomic `Array[bool]` failed to build; atomic bools are stored as a byte
++ Fix: a local struct can pass to a `String` parameter through its `$auto` hook
++ Fix: a missing static function is named in the error instead of 'Value is not callable: void'
++ Docs show the default-order `sort`, `sorted`, `binary_search` and `Heap.new`
 
 + Release 0.8.4
 + `String.hash` reads every byte and is seeded per process: crafted JSON or form keys can no longer make map inserts quadratic
