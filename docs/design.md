@@ -395,9 +395,8 @@ or handed to a coroutine. `co` on such a callable is rejected directly, through
 a local, and through a parameter: `co f(...)` inside a function makes `f`
 escape, so passing a frame-bound method for `f` is an error at the call site.
 
-Coroutines may return payload-free errors. Error types with payload fields,
-including inherited fields, must be handled inside the coroutine or encoded in
-its ordinary return type.
+A failed coroutine keeps its error's payload with its results, and `await`
+restores it, so other coroutines throwing on the same thread cannot overwrite it.
 
 ### Interfaces
 
