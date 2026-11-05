@@ -930,8 +930,8 @@ Returns the items as a slice, in the order they were added.
     + fn append(item: T, unique: bool (false)) void
     // Appends every element of `items` in order; with `unique`, each one is skipped when an equal item is already present (tracked in a set for integers and types with `hash`).
     + fn append_many(items: Array[T], unique: bool (false)) void
-    // Searches this array, sorted with `func`, for `value` in O(log n).
-    + fn binary_search(value: T, func: fn(T, T)(bool)) (bool, uint)
+    // Searches this sorted array for `value` in O(log n).
+    + fn binary_search(value: T, func: ?fn(T, T)(bool) (null)) (bool, uint)
     // Removes every element.
     + fn clear(reduce_size: bool (false)) void
     // Returns a deep copy: a new array holding a clone of every element.
@@ -1020,12 +1020,12 @@ Returns the items as a slice, in the order they were added.
     + fn shuffle(rng: ?Rng (null)) void
     // Returns a copy with the elements in random order; see `shuffle`.
     + fn shuffled(rng: ?Rng (null)) Array[T]
-    // Sorts the elements in place with `func`, which returns true when `a` belongs after `b`.
-    + fn sort(func: fn(T, T)(bool)) void
+    // Sorts the elements in place, ascending by default.
+    + fn sort(func: ?fn(T, T)(bool) (null)) void
     // Sorts the elements in place by the value `key` gives for each, ascending.
     + fn sort_by[K](key: fn(T)(K)) void
-    // Returns a copy sorted with `func`; see `sort`.
-    + fn sorted(func: fn(T, T)(bool)) Array[T]
+    // Returns a sorted copy, ascending by default; `func` works as in `sort`.
+    + fn sorted(func: ?fn(T, T)(bool) (null)) Array[T]
     // Returns a copy sorted by `key`; see `sort_by`.
     + fn sorted_by[K](key: fn(T)(K)) Array[T]
     // Exchanges the elements at `index_a` and `index_b`; does nothing when either is out of range.
@@ -1080,11 +1080,11 @@ equal item is already present (tracked in a set for integers and types with `has
 
 #### binary_search
 
-Searches this array, sorted with `func`, for `value` in O(log n).
+Searches this sorted array for `value` in O(log n).
 
 Returns whether it was found, and its position: the first of several equal elements,
 or where `value` would go to keep the order, so `insert(position, value)` keeps the
-array sorted.
+array sorted. `func` works as in `sort`, for an array sorted another way.
 
 #### clear
 
@@ -1352,10 +1352,11 @@ Returns a copy with the elements in random order; see `shuffle`.
 
 #### sort
 
-Sorts the elements in place with `func`, which returns true when `a` belongs after `b`.
+Sorts the elements in place, ascending by default.
 
-The element type has no natural order, so `func` is required. The sort is stable:
-elements that compare equal keep their order.
+`func(a, b)` returns true when `a` belongs after `b`. The sort is stable: elements that
+compare equal keep their order. With the default order, null elements come first and
+NaN last.
 
 #### sort_by
 
@@ -1366,7 +1367,7 @@ with a function for another order.
 
 #### sorted
 
-Returns a copy sorted with `func`; see `sort`.
+Returns a sorted copy, ascending by default; `func` works as in `sort`.
 
 #### sorted_by
 
@@ -2301,6 +2302,8 @@ Returns a new array with the items from front to back.
     + fn set_many(map: FlatMap[K, T]) void
     // Adds a new entry for `key` at the end.
     + fn set_unique(key: K, value: T) void !LookupError
+    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+    + fn sort_keys() void
     // Returns a new array of the values, in entry order.
     + fn values() Array[T]
 }
@@ -2401,6 +2404,10 @@ Adds a new entry for `key` at the end.
 
 Throws `exists`, leaving the map unchanged, when `key` is already present.
 
+#### sort_keys
+
+Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+
 #### values
 
 Returns a new array of the values, in entry order.
@@ -2444,6 +2451,8 @@ Returns a new array of the values, in entry order.
     + fn set(key: K, value: T) void
     // Adds a new entry for `key`.
     + fn set_unique(key: K, value: T) void !LookupError
+    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+    + fn sort_keys() void
     // Stores what `change` makes of the current value (`null` when there is none), and returns it.
     + fn update(key: K, change: fn(?T)(T)) T
     // Returns a new array of the values, in entry order.
@@ -2561,6 +2570,10 @@ Adds a new entry for `key`.
 
 Throws `exists`, leaving the map unchanged, when `key` is already present.
 
+#### sort_keys
+
+Reorders the entries so iteration, `keys` and `values` follow ascending key order.
+
 #### update
 
 Stores what `change` makes of the current value (`null` when there is none), and returns
@@ -2587,8 +2600,6 @@ Probes for `key` once: `counts.add(word, 1)` counts occurrences.
 + extend HashMap[String, T] {
     // Builds a map from a JSON object, converting each member with `to_type`.
     + static fn from_json_value_auto[X](value: X) HashMap[String, T] !LookupError
-    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-    + fn sort_keys() void
 }
 ```
 
@@ -2599,16 +2610,10 @@ Builds a map from a JSON object, converting each member with `to_type`.
 Only available when the key type is `String`. Throws `.missing` when `value` is
 not an object or a member cannot be converted to the value type.
 
-#### HashMap[String, T].sort_keys
-
-Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-
 ```js
 + extend HashMap[u32, T] {
     // Builds a map from a JSON object whose member names are integers, converting each member with `to_type`.
     + static fn from_json_value_auto[X](value: X) HashMap[u32, T] !LookupError
-    // Reorders the entries so iteration, `keys` and `values` follow ascending key order.
-    + fn sort_keys() void
 }
 ```
 
@@ -2619,10 +2624,6 @@ member with `to_type`.
 
 Throws `.missing` when `value` is not an object, a name is not an integer of the key
 type, or a member cannot be converted to the value type.
-
-#### HashMap[u32, T].sort_keys
-
-Reorders the entries so iteration, `keys` and `values` follow ascending key order.
 
 ```js
 // A set of unique values, hashed and compared like `HashMap` keys.
@@ -2788,8 +2789,8 @@ Returns a new set with the values in this set or in `other`; backs `a + b` (`$ad
     + fn is_empty() bool
     // The number of items.
     + get length: uint
-    // Creates an empty heap ordered by `before`.
-    + static fn new(before: atomic fn(T, T)(bool)) Heap[T]
+    // Creates an empty heap ordered by `before`, or smallest first when `before` is `null`.
+    + static fn new(before: ?atomic fn(T, T)(bool) (null)) Heap[T]
     // Returns the first item without removing it.
     + fn peek() T !LookupError
     // Removes and returns the first item, in O(log n).
@@ -2838,9 +2839,9 @@ The number of items.
 
 #### new
 
-Creates an empty heap ordered by `before`.
+Creates an empty heap ordered by `before`, or smallest first when `before` is `null`.
 
-This form is used when `T` has no `<`; the `before` function is then required.
+Marked `$default`: it also provides `Heap[T].$default_value`.
 
 #### peek
 
