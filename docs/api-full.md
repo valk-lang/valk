@@ -10505,7 +10505,7 @@ Replaces `'` with `&#39;`.
 // An HTTP/2 framing, HPACK or flow-control violation, found by the HTTP/2 server.
 error H2Error (incomplete, protocol, frame_size, flow_control, compression, limit)
 // Thrown by the HTTP client and by starting an HTTP server.
-error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, status) extends (net:NetError, HttpParseError)
+error HttpError (invalid_url, invalid_response, in_progress, too_many_redirects, invalid_request, response_too_large, status) extends (net:NetError, HttpParseError) payload { http_status: uint (0) }
 // Thrown by `parse_http` when HTTP/1.x bytes are not a valid request or response.
 error HttpParseError (invalid, http413, http431, incomplete, missing_host_header, not_implemented) extends (io:IoError)
 // A router error.
@@ -10548,6 +10548,8 @@ Thrown by the HTTP client and by starting an HTTP server.
 Also carries every `net.NetError` and `HttpParseError` code; the client uses `timeout`,
 `read`, `write` and `ssl`; `Server.start` throws `init` when it was started before, when
 `http2` is set without TLS or with a fast handler, or when a worker cannot start.
+
+The payload's `http_status` is the status the server or proxy answered with, for `status`.
 
 ### HttpParseError
 
@@ -10653,7 +10655,7 @@ Sends a DELETE request; see `request`.
 Sends a request and writes the response body to the file at `to_path`.
 
 Redirects are followed as `request` does. The final response must have a 2xx status:
-any other status throws `status` (`request` with `Options.output` set to a file gives
+any other status throws `status` with the code in `E.http_status` (`request` with `Options.output` set to a file gives
 the code itself). The file is created or truncated first and removed again when the
 download fails, so it only exists after a successful one. The request uses a copy of `options` whose `output` is the file; the
 caller's object is not changed. Without `options` the timeout is 30 seconds instead of
