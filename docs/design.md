@@ -998,6 +998,14 @@ inside the scope it belongs to, and in a function that can suspend. `$region`
 on a function allows its own loops: what they make and no longer use then
 stays until the region ends, which the author of the loop accepts.
 
+A region object may refer to data of the collector that holds no references
+itself: text, a slice of numbers. Such data is not in the group of the object,
+so text read from a file can be referred to by a region that ends long before
+the text does. The collector does not look inside a region, so the region pins
+the owner of every such reference until it ends or starts its next round. Data
+of that kind that could itself be in a region joins the group that refers to
+it, and data stored in an object the collector owns is the collector's.
+
 An array is an object like any other: its storage is in the group of the
 array, and so is every element stored in it. The compiler follows the array's
 own code for that. It only has to be told what a few runtime functions do

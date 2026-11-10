@@ -27,6 +27,10 @@ value REGION_MAX_OWN (8)
 // What a call hands a copy for one of its regions is a region of the caller, or from this
 // number on one the caller got itself
 value REGION_PASSED (1048576)
+// What the group of a slot refers to as plain data, in a summary: the group of another slot,
+// its own group, or data the collector owns
+value REGION_LEAF_SELF (uint.$max - 1)
+value REGION_LEAF_HEAP (uint.$max - 2)
 
 class RegionSite {
     name: String
@@ -42,6 +46,17 @@ class RegionSite {
     // its caller
     region: uint (REGION_NONE)
     param: uint (REGION_NONE)
+}
+
+// A store of plain data, such as text, into an object: when the object is in a region and the
+// data is the collector's, the region pins it
+class RegionPin {
+    node: uint
+    loop: uint
+    dual: bool (false)
+    emitted: bool (false)
+    // The region that pins: as for a call
+    pass: uint (REGION_NONE)
 }
 
 class RegionCall {
@@ -71,6 +86,7 @@ class RegionRuntime {
     transfer_refs: Func
     moved_elements: Func
     move_bytes: Func
+    pin: Func
     init: Func
     alloc: Func
     alloc_zeroed: Func
@@ -82,6 +98,7 @@ class RegionRuntime {
     reason: Array[uint] (.{})
     source: Array[bool] (.{})
     deep: Array[bool] (.{})
+    leaf: Array[uint] (.{})
     vscopes: Array[uint] (.{})
     arg_stack: Array[uint] (.{})
     // Why a group is not a region, as a number: a function reads and writes these often,
@@ -121,6 +138,12 @@ class RegionFacts {
     sites: Array[RegionSite] (.{})
     calls: Array[RegionCall] (.{})
     call_args: Array[uint] (.{})
+    // An object and plain data it refers to, in pairs: the data is not in the group of the
+    // object, so a region object can refer to text that lives longer than the region
+    holds: Array[uint] (.{})
+    pins: Array[RegionPin] (.{})
+    // Stands for plain data of the collector that a callee stored
+    heap_leaf: uint (REGION_NONE)
     args: Array[uint] (.{})
     ret: uint (0)
     // The results of the value scopes being walked
@@ -141,6 +164,8 @@ class RegionFacts {
     source: Array[bool]
     // A source inside a loop of this function
     deep: Array[bool]
+    // The plain data a group refers to: a node of its group
+    leaf: Array[uint]
 
     // The summary, per parameter and then the result: its group, why a region cannot hold it,
     // and the one parameter or result whose group this function makes objects in
@@ -149,6 +174,8 @@ class RegionFacts {
     runtime: RegionRuntime
     // Whether the function makes objects in the group of a slot: its copy takes a region for it
     slot_grows: Array[bool] (.{})
+    // What the group of a slot refers to as plain data (see REGION_LEAF_SELF)
+    slot_leaf: Array[uint] (.{})
     // The groups the copy takes a region for, each named by its first slot, in the order of
     // the copy's parameters; and whether a caller may pass none for one
     params: Array[uint] (.{})
@@ -181,6 +208,21 @@ class RegionFacts {
         if a == REGION_NONE || b == REGION_NONE || a == b : return
         this.joins.append(a)
         this.joins.append(b)
+    }
+
+    // `holder` refers to `data`, which holds no references itself
+    fn hold(holder: uint, data: uint) {
+        if holder == REGION_NONE || data == REGION_NONE : return
+        this.holds.append(holder)
+        this.holds.append(data)
+    }
+
+    // Plain data read out of an object: one of the things the object refers to
+    fn read_leaf(holder: uint) uint {
+        if holder == REGION_NONE : return REGION_NONE
+        let node = this.add_node()
+        this.hold(holder, node)
+        return node
     }
 
     fn mark(node: uint, reason: String) {
@@ -244,6 +286,12 @@ class RegionFacts {
         return this.sites.get(id - 1) !? null
     }
 
+    fn known_pin(value: Value) ?RegionPin {
+        let id = this.number_of(value)
+        if id == 0 || value.type != VAL.assign : return null
+        return this.pins.get(id - 1) !? null
+    }
+
     fn known_call(value: Value) ?RegionCall {
         let id = this.number_of(value)
         if id == 0 || value.type != VAL.call : return null
@@ -259,11 +307,58 @@ class RegionFacts {
         return at
     }
 
+    // Merges two groups, and with them the plain data they refer to
     fn unify(a: uint, b: uint) {
-        if a == REGION_NONE || b == REGION_NONE : return
-        let x = this.find(a)
-        let y = this.find(b)
-        if x != y : this.parent[x] = y
+        while a != REGION_NONE && b != REGION_NONE {
+            let x = this.find(a)
+            let y = this.find(b)
+            if x == y : return
+            this.parent[x] = y
+            a = this.leaf[x]
+            b = this.leaf[y]
+            if b == REGION_NONE : this.leaf[y] = a
+        }
+    }
+
+    fn settle_hold(holder: uint, data: uint) {
+        if holder == REGION_NONE || data == REGION_NONE : return
+        let root = this.find(holder)
+        let known = this.leaf[root]
+        if known == REGION_NONE : this.leaf[root] = data
+        else : this.unify(known, data)
+    }
+
+    fn slot_of_root(root: uint) uint {
+        each 0 .. this.slot_count() as slot {
+            let node = this.slot_node(slot)
+            if node != REGION_NONE && this.find(node) == root : return slot
+        }
+        return REGION_NONE
+    }
+
+    // What holds plain data passes its reason on to it: text stored in an object the
+    // collector owns is the collector's. Data that could be in a region joins the group that
+    // refers to it, so that the two end together; data that is a parameter's stays apart,
+    // and so does data the collector owns
+    fn settle_leafs() {
+        let changed = true
+        while changed {
+            changed = false
+            each 0 .. this.count as i {
+                let data = this.leaf[i]
+                if data == REGION_NONE || this.find(i) != i : continue
+                let x = this.find(data)
+                if x == i : continue
+                if this.reason[i] > 0 && this.reason[x] == 0 {
+                    this.reason[x] = this.reason[i]
+                    changed = true
+                }
+                if this.reason[x] == 0 && this.slot_of_root(x) == REGION_NONE {
+                    this.unify(i, x)
+                    changed = true
+                }
+            }
+        }
     }
 
     fn slot_count() uint {
@@ -355,9 +450,16 @@ class RegionFacts {
             this.source.append(false)
             this.deep.append(false)
         }
+        this.leaf.clear()
+        each 0 .. this.count : this.leaf.append(REGION_NONE)
         let i: uint = 0
         while i + 1 < this.joins.length {
             this.unify(this.joins[i], this.joins[i + 1])
+            i += 2
+        }
+        i = 0
+        while i + 1 < this.holds.length {
+            this.settle_hold(this.holds[i], this.holds[i + 1])
             i += 2
         }
 
@@ -372,11 +474,19 @@ class RegionFacts {
                     each 0 .. slot as other {
                         if callee.slot_class[other] == callee.slot_class[slot] : this.unify(this.call_actual(call, callee, other), actual)
                     }
+                    // Plain data the callee makes the argument refer to
+                    let data = callee.slot_leaf[slot]
+                    if data == REGION_LEAF_SELF : this.settle_hold(actual, actual)
+                    else if data == REGION_LEAF_HEAP : this.settle_hold(actual, this.heap_leaf)
+                    else if data != REGION_NONE : this.settle_hold(actual, this.call_actual(call, callee, data))
                 }
             }
         }
         each this.mark_nodes as node, m : this.give_reason(node, this.mark_reasons[m])
-        if own : return false
+        if own {
+            this.settle_leafs()
+            return false
+        }
         let beyond = this.runtime.reason_id(REGION_WHY_BEYOND)
         each this.calls as call {
             let callee = call.callee.region_facts
@@ -393,7 +503,17 @@ class RegionFacts {
                 if callee.slot_reason[slot] > 0 : this.give_reason(this.call_actual(call, callee, slot), callee.slot_reason[slot])
             }
         }
+        this.settle_leafs()
 
+        each this.pins as pin {
+            let root = this.find(pin.node)
+            if !pin.dual || !pin.emitted {
+                if this.reason[root] == 0 : this.reason[root] = this.runtime.reason_id(REGION_WHY_NO_FORM)
+                continue
+            }
+            this.source[root] = true
+            if pin.loop != 0 && !this.func.region_loops : this.deep[root] = true
+        }
         each this.sites as site {
             let root = this.find(site.node)
             if !site.dual || !site.emitted {
@@ -456,6 +576,24 @@ class RegionFacts {
                 }
                 changed = true
             }
+        }
+        // The plain data the group of a slot refers to
+        each 0 .. slots as slot {
+            let node = this.slot_node(slot)
+            if node == REGION_NONE : continue
+            let root = this.find(node)
+            let data = this.leaf[root]
+            let found = REGION_NONE
+            if data != REGION_NONE {
+                let x = this.find(data)
+                let other = this.slot_of_root(x)
+                if x == root : found = REGION_LEAF_SELF
+                else if other != REGION_NONE : found = other
+                else : found = REGION_LEAF_HEAP
+            }
+            if found == this.slot_leaf[slot] : continue
+            this.slot_leaf[slot] = found
+            changed = true
         }
         // The groups this function makes objects in: its copy takes a region for each
         each 0 .. slots as slot {
@@ -525,6 +663,11 @@ class RegionFacts {
                 let root = this.find(site.node)
                 if site.loop != scope[root] && fits[root] : this.refused[root] = "made in a loop inside the scope it lives in ($region on the function allows it)"
             }
+            // Data pinned in a loop stays pinned until the region ends, like what a loop makes
+            each this.pins as pin {
+                let root = this.find(pin.node)
+                if pin.loop != scope[root] && fits[root] : this.refused[root] = "made in a loop inside the scope it lives in ($region on the function allows it)"
+            }
             each this.calls as call {
                 let callee = call.callee.region_facts ?! continue
                 if !call.dual || !call.emitted : continue
@@ -547,6 +690,11 @@ class RegionFacts {
             let root = this.find(site.node)
             if passed[root] != REGION_NONE : site.param = passed[root]
             else : site.region = chosen[root]
+        }
+        each this.pins as pin {
+            let root = this.find(pin.node)
+            if !pin.dual || !pin.emitted : continue
+            pin.pass = passed[root] != REGION_NONE ? REGION_PASSED + passed[root] : chosen[root]
         }
         each this.calls as call {
             let callee = call.callee.region_facts ?! continue
@@ -629,7 +777,7 @@ fn region_token(kind: u8, id: uint) String {
 fn region_runtime(build: Build) ?RegionRuntime {
     let known = build.region_runtime
     if isset(known) || build.region_off : return known
-    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "transfer_refs", "moved_elements", "region_init", "region_alloc", "region_alloc_zeroed", "region_reset", "region_exit", "move_bytes" }
+    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "transfer_refs", "moved_elements", "region_init", "region_alloc", "region_alloc_zeroed", "region_reset", "region_exit", "move_bytes", "region_pin" }
     let funcs = Array[Func]{}
     // Looked up quietly: a standard library without regions builds as before
     let main = build.main_pkg
@@ -665,6 +813,7 @@ fn region_runtime(build: Build) ?RegionRuntime {
         reset: funcs[9]
         exit: funcs[10]
         move_bytes: funcs[11]
+        pin: funcs[12]
     }
     build.region_runtime = made
     return made
@@ -678,6 +827,22 @@ fn region_slice_is_view(value: Value) bool {
         if isset(prop) && prop.name == "data" : return true
     }
     return false
+}
+
+// Data that holds no references and is referred to through an owner: text, a slice of numbers.
+// An object can refer to such data without being in its group
+fn region_is_leaf(type: Type) bool {
+    if type.is_nullable_type() : return false
+    if type.kind != TYPE.ref_slice || type.is_local : return false
+    let sub = type.get_sub_type() ?! return false
+    return !sub.has_gc_refs()
+}
+
+// Whether `place` is a field or element of an object, not of a value in the frame
+fn region_in_object(place: Value) bool {
+    if place.type != VAL.prop : return true
+    let base = place.value1 ?! return false
+    return !base.rett.get_non_nullable().is_inline
 }
 
 fn region_at(value: Value) String {
@@ -771,7 +936,7 @@ fn region_walk_call(f: RegionFacts, value: Value) uint {
         if target == runtime.property_get {
             let from = count > 0 ? args[first] : REGION_NONE
             region_cut(args, first)
-            if from != REGION_NONE : return from
+            if from != REGION_NONE : return region_is_leaf(value.rett) ? f.read_leaf(from) : from
             return region_unknown(f, value, from, f.here("read out of raw memory"))
         }
         if target == runtime.property_set || target == runtime.property_update {
@@ -842,8 +1007,16 @@ fn region_walk_assign(f: RegionFacts, value: Value) uint {
         if isset(other) : region_walk(f, other)
         let holder = isset(base) ? region_walk_place(f, base) : REGION_NONE
         let stored = isset(right) ? region_walk(f, right) : REGION_NONE
-        if holder == REGION_NONE : f.mark(stored, f.here("written through raw memory"))
-        else : f.join(holder, stored)
+        if holder == REGION_NONE {
+            f.mark(stored, f.here("written through raw memory"))
+        } else if region_is_leaf(left.rett) && region_in_object(left) && value.assign_op == ASSIGN_OP.set {
+            // The object refers to the data and pins it when it has to
+            f.hold(holder, stored)
+            f.pins.append(RegionPin { node: holder, loop: f.loop })
+            value.region_id = f.number(f.pins.length)
+        } else {
+            f.join(holder, stored)
+        }
         return REGION_NONE
     }
     let from = isset(right) ? region_walk(f, right) : REGION_NONE
@@ -1005,7 +1178,9 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         if isset(fields) {
             each fields as field {
                 let inner = region_walk(f, field)
+                let prop = field.get_init_prop()
                 if node == REGION_NONE : f.mark(inner, "written through raw memory")
+                else if gc_object && isset(prop) && region_is_leaf(prop.type) : f.hold(node, inner)
                 else : f.join(node, inner)
             }
         }
@@ -1044,6 +1219,7 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         if isset(other) : region_walk(f, other)
         let holder = isset(base) ? region_walk(f, base) : REGION_NONE
         if !region_holds_refs(value.rett) : return REGION_NONE
+        if region_is_leaf(value.rett) && region_in_object(value) : return f.read_leaf(holder)
         return holder
     }
     if t == VAL.vscope {
@@ -1220,7 +1396,10 @@ fn region_collect_facts(func: Func) {
         reason: runtime.reason
         source: runtime.source
         deep: runtime.deep
+        leaf: runtime.leaf
     }
+    f.heap_leaf = f.add_node()
+    f.mark(f.heap_leaf, "data the collector owns")
     f.vscopes.clear()
     f.arg_stack.clear()
     f.ret = region_holds_refs(func.get_rett()) ? f.add_node() : REGION_NONE
@@ -1233,6 +1412,7 @@ fn region_collect_facts(func: Func) {
         f.slot_class.append(slot)
         f.slot_reason.append(0)
         f.slot_grows.append(false)
+        f.slot_leaf.append(REGION_NONE)
     }
     // What a closure reads of the function around it is not followed
     if func.is_literal {
@@ -1257,6 +1437,10 @@ fn region_collect_facts(func: Func) {
     each f.sites as site {
         site.dual = f.reason[f.find(site.node)] == 0
         if site.dual : f.has_tokens = true
+    }
+    each f.pins as pin {
+        pin.dual = f.reason[f.find(pin.node)] == 0
+        if pin.dual : f.has_tokens = true
     }
     each f.calls as call {
         if call.callee.infinite_args : continue
@@ -1452,6 +1636,12 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
             }
             if kind == 'U' : out.append_text(name.length > 0 ? used : "false")
             else : out.append_text(name.length > 0 ? name : "null")
+        } else if kind == 'Q' {
+            let pin = f.pins.get(id - 1) ! f.func.exp.bug("Region token of an unknown store")
+            let pass = pin.pass
+            if !decided || pass == REGION_NONE || (pass >= REGION_PASSED && !copy) : out.append_text("null")
+            else if pass >= REGION_PASSED : out.append_text(region_passed_name(pass - REGION_PASSED))
+            else : out.append_text(region_local_name(pass))
         } else if kind == 'C' {
             let call = f.calls.get(id - 1) ! f.func.exp.bug("Region token of an unknown call")
             if !decided || !f.call_uses_copy(call, copy) {
