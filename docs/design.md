@@ -992,9 +992,13 @@ whole tree in the region of the function that uses it.
 What the compiler cannot follow stays with the collector, so regions change
 where an object lives and never what a program may do. A region is also
 refused where it could hold on to garbage: when its objects are made in a loop
-inside the scope it belongs to, and in a function that can suspend. Slices,
-arrays, maps and text made at run time are collected objects, and so is
-everything that refers to them.
+inside the scope it belongs to, and in a function that can suspend.
+
+An array is an object like any other: its storage is in the group of the
+array, and so is every element stored in it. The compiler follows the array's
+own code for that. It only has to be told what a few runtime functions do
+that work on raw memory: the write barrier, `gc.transfer_refs`,
+`gc.moved_elements` and `mem.move_bytes`.
 
 `valk build --region-report` lists where every object of a program lives and
 why; `--no-regions` turns regions off.

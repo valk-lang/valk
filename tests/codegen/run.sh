@@ -21,7 +21,9 @@ export VALK DIR workdir
 ir_build() {
     local path="$1"
     shift
-    "$VALK" build "$@" -o "$path" > "$path.log" 2>&1
+    # One form per function: these fixtures are about how a function is lowered, and a region
+    # gives some a second form. The last test builds with regions
+    "$VALK" build "$@" --no-regions -o "$path" > "$path.log" 2>&1
     echo "$?" > "$path.status"
 }
 export -f ir_build
@@ -1289,6 +1291,28 @@ if ! grep -q 'store double .*, !tbaa !7$' <<< "$set_body" \
     exit 1
 fi
 
+echo "> Build a returned structure in the region of the caller that keeps it to itself"
+region_ir="$workdir/regions.ll"
+if ! out=$("$VALK" build "$DIR/regions.valk" --release --ir --no-warn -o "$region_ir" 2>&1); then
+    echo "# Failed to build the regions fixture"
+    echo "$out"
+    exit 1
+fi
+copy_body=$(sed -n '/^define .*__Node__tree__[0-9]*\.rg"(ptr %rg\.in, /,/^}/p' "$region_ir")
+host_body=$(sed -n '/^define .*__in_region__[0-9]*"(/,/^}/p' "$region_ir")
+# Both forms of an allocation are written, behind a constant that picks one
+if [[ -z "$copy_body" || "$copy_body" == *'br i1 false, label %rg.object'* ]] \
+    || [ "$(grep -c 'br i1 true, label %rg.object' <<< "$copy_body")" -ne 2 ] \
+    || [ "$(grep -c 'call .*__Node__tree__[0-9]*\.rg"(ptr %rg\.in, ' <<< "$copy_body")" -ne 2 ] \
+    || [[ "$host_body" != *' = alloca [32 x i64]'* || "$host_body" != *'__region_init__'* || "$host_body" != *'__region_exit__'* ]] \
+    || [ "$(grep -c 'call .*__Node__tree__[0-9]*\.rg"(ptr %"rg\.0", ' <<< "$host_body")" -ne 1 ] \
+    || grep -q 'call .*__Node__tree__[0-9]*"(' <<< "$host_body"; then
+    echo "# The tree is not built in a region of in_region, or its copy still asks the collector"
+    echo "$host_body"
+    echo "$copy_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 50"
+echo "# Test count: 51"
 echo ""

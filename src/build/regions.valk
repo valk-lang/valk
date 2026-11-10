@@ -27,7 +27,9 @@ value REGION_MAX_OWN (8)
 
 class RegionSite {
     name: String
-    exp: Exp
+    // Where it is in the source, for the report
+    src: Source
+    at: u32
     node: uint
     loop: uint
     // The IR has both forms
@@ -40,7 +42,8 @@ class RegionSite {
 
 class RegionCall {
     callee: Func
-    exp: ?Exp
+    src: ?Source
+    at: u32
     // Its arguments in `RegionFacts.call_args`
     first: uint
     count: uint
@@ -59,11 +62,40 @@ class RegionRuntime {
     property_set: Func
     property_update: Func
     property_remove: Func
+    transfer_refs: Func
+    moved_elements: Func
+    move_bytes: Func
     init: Func
     alloc: Func
+    alloc_zeroed: Func
     reset: Func
     exit: Func
+    // Lists every function works in while its body is walked or its groups are solved, so
+    // that a function does not keep its own
+    parent: Array[uint] (.{})
+    reason: Array[uint] (.{})
+    source: Array[bool] (.{})
+    deep: Array[bool] (.{})
+    vscopes: Array[uint] (.{})
+    arg_stack: Array[uint] (.{})
+    // Why a group is not a region, as a number: a function reads and writes these often,
+    // and a number in a list costs the collector nothing. 0 is no reason
+    reasons: Array[String] (.{ "" })
+    reason_ids: Map[uint] (.{})
+
+    fn reason_id(text: String) uint {
+        let known = this.reason_ids.get(text) !? 0
+        if known > 0 : return known
+        this.reasons.append(text)
+        this.reason_ids.set(text, this.reasons.length - 1)
+        return this.reasons.length - 1
+    }
 }
+
+value REGION_WHY_NO_FORM ("made where no region can be given")
+value REGION_WHY_CALL_NO_FORM ("grown by a call that cannot be given a region")
+value REGION_WHY_BEYOND ("passed beyond the parameters of a function")
+value REGION_WHY_BLIND ("passed to a function the compiler cannot follow")
 
 class RegionFacts {
     func: Func
@@ -79,32 +111,36 @@ class RegionFacts {
     joins: Array[uint] (.{})
     // Why a node cannot be in a region: the two lists go together
     mark_nodes: Array[uint] (.{})
-    mark_reasons: Array[String] (.{})
+    mark_reasons: Array[uint] (.{})
     sites: Array[RegionSite] (.{})
     calls: Array[RegionCall] (.{})
     call_args: Array[uint] (.{})
     args: Array[uint] (.{})
     ret: uint (0)
     // The results of the value scopes being walked
-    vscopes: Array[uint] (.{})
-    // The value of every object and call, until the IR of the function is written
-    site_values: Array[Value] (.{})
-    call_values: Array[Value] (.{})
+    vscopes: Array[uint]
+    // Which walk of the function this is: a value carries it next to its number, so that a
+    // number left by an earlier walk is not taken for one of this walk
+    round: uint (1)
     // The arguments of the calls being walked
-    arg_stack: Array[uint] (.{})
+    arg_stack: Array[uint]
     has_tokens: bool (false)
+    // Where the function ends in its IR; helpers such as layouts follow
+    body_bytes: uint (0)
 
-    // The groups of the last solve, kept at their root node
-    parent: Array[uint] (.{})
-    reason: Array[String] (.{})
-    source: Array[bool] (.{})
+    // The groups of the last function that was solved, kept at their root node: `solve`
+    // comes before every use of them
+    parent: Array[uint]
+    reason: Array[uint]
+    source: Array[bool]
     // A source inside a loop of this function
-    deep: Array[bool] (.{})
+    deep: Array[bool]
 
     // The summary, per parameter and then the result: its group, why a region cannot hold it,
     // and the one parameter or result whose group this function makes objects in
     slot_class: Array[uint] (.{})
-    slot_reason: Array[String] (.{})
+    slot_reason: Array[uint] (.{})
+    runtime: RegionRuntime
     target: uint (REGION_NONE)
 
     // The loop of every region of this function, why a group that could be one is not, and
@@ -112,6 +148,8 @@ class RegionFacts {
     regions: Array[uint] (.{})
     refused: Array[String] (.{})
     needs_copy: bool (false)
+    // Whether the last solve found a group that something makes objects in
+    has_source: bool (false)
     callers: Array[RegionFacts] (.{})
     queued: bool (false)
 
@@ -136,7 +174,7 @@ class RegionFacts {
     fn mark(node: uint, reason: String) {
         if node == REGION_NONE : return
         this.mark_nodes.append(node)
-        this.mark_reasons.append(reason)
+        this.mark_reasons.append(this.runtime.reason_id(reason))
     }
 
     // A reason with the function it was found in, which only the report shows
@@ -176,19 +214,27 @@ class RegionFacts {
         return node
     }
 
-    fn known_site(value: Value) ?RegionSite {
+    // The number of an object, call or loop with the walk it is from
+    fn number(id: uint) u32 {
+        return (id | (this.round << 24)).to(u32)
+    }
+
+    // The number this walk gave a value, 0 when it gave none
+    fn number_of(value: Value) uint {
         let id = value.region_id.to(uint)
-        if id == 0 : return null
-        let known = this.site_values.get(id - 1) !? null
-        if !isset(known) || known != value : return null
+        if id >> 24 != this.round : return 0
+        return id & 0xFFFFFF
+    }
+
+    fn known_site(value: Value) ?RegionSite {
+        let id = this.number_of(value)
+        if id == 0 || value.type != VAL.class_init : return null
         return this.sites.get(id - 1) !? null
     }
 
     fn known_call(value: Value) ?RegionCall {
-        let id = value.region_id.to(uint)
-        if id == 0 : return null
-        let known = this.call_values.get(id - 1) !? null
-        if !isset(known) || known != value : return null
+        let id = this.number_of(value)
+        if id == 0 || value.type != VAL.call : return null
         return this.calls.get(id - 1) !? null
     }
 
@@ -224,27 +270,27 @@ class RegionFacts {
         return REGION_NONE
     }
 
-    fn give_reason(node: uint, reason: String) {
+    fn give_reason(node: uint, reason: uint) {
         if node == REGION_NONE : return
         let root = this.find(node)
-        if this.reason[root].length == 0 : this.reason[root] = reason
+        if this.reason[root] == 0 : this.reason[root] = reason
     }
 
     // Why a group that reaches a function the compiler cannot follow stays on the heap
-    fn blind_reason(callee: Func) String {
-        if !this.func.ns.build.options.region_report : return "passed to a function the compiler cannot follow"
-        return "passed to " + callee.ns.name + "." + callee.name + ", which the compiler cannot follow"
+    fn blind_reason(callee: Func) uint {
+        if !this.func.ns.build.options.region_report : return this.runtime.reason_id(REGION_WHY_BLIND)
+        return this.runtime.reason_id("passed to " + callee.ns.name + "." + callee.name + ", which the compiler cannot follow")
     }
 
     fn has_target() bool {
-        return this.target != REGION_NONE && this.slot_reason[this.target].length == 0
+        return this.target != REGION_NONE && this.slot_reason[this.target] == 0
     }
 
     // Whether a caller can hand this function a region to make objects in
     fn copy_allowed() bool {
         let func = this.func
         if func.is_literal || func.is_export || func.is_extern || func.is_entrance || func.infinite_args : return false
-        return !func.region_no_copy && !this.lost
+        return !this.lost
     }
 
     // The groups with the summaries of the callees applied. `own` leaves the calls out: what
@@ -256,7 +302,7 @@ class RegionFacts {
         this.deep.clear()
         each 0 .. this.count as i {
             this.parent.append(i)
-            this.reason.append("")
+            this.reason.append(0)
             this.source.append(false)
             this.deep.append(false)
         }
@@ -282,6 +328,7 @@ class RegionFacts {
         }
         each this.mark_nodes as node, m : this.give_reason(node, this.mark_reasons[m])
         if own : return false
+        let beyond = this.runtime.reason_id(REGION_WHY_BEYOND)
         each this.calls as call {
             let callee = call.callee.region_facts
             if !isset(callee) || callee.lost {
@@ -291,17 +338,17 @@ class RegionFacts {
                 continue
             }
             each 0 .. call.count as a {
-                if a >= callee.args.length : this.give_reason(this.call_args[call.first + a], "passed beyond the parameters of a function")
+                if a >= callee.args.length : this.give_reason(this.call_args[call.first + a], beyond)
             }
             each 0 .. callee.slot_count() as slot {
-                if callee.slot_reason[slot].length > 0 : this.give_reason(this.call_actual(call, callee, slot), callee.slot_reason[slot])
+                if callee.slot_reason[slot] > 0 : this.give_reason(this.call_actual(call, callee, slot), callee.slot_reason[slot])
             }
         }
 
         each this.sites as site {
             let root = this.find(site.node)
             if !site.dual || !site.emitted {
-                if this.reason[root].length == 0 : this.reason[root] = "made where no region can be given"
+                if this.reason[root] == 0 : this.reason[root] = this.runtime.reason_id(REGION_WHY_NO_FORM)
                 continue
             }
             this.source[root] = true
@@ -320,11 +367,16 @@ class RegionFacts {
             if actual == REGION_NONE : continue
             let root = this.find(actual)
             if !call.dual || !call.emitted {
-                if this.reason[root].length == 0 : this.reason[root] = "grown by a call that cannot be given a region"
+                if this.reason[root] == 0 : this.reason[root] = this.runtime.reason_id(REGION_WHY_CALL_NO_FORM)
                 continue
             }
             this.source[root] = true
             if call.loop != 0 : this.deep[root] = true
+        }
+
+        this.has_source = false
+        each this.source as has {
+            if has : this.has_source = true
         }
 
         // A fact in a summary is never taken back, so that the rounds of recursive functions
@@ -333,7 +385,7 @@ class RegionFacts {
         let slots = this.slot_count()
         if this.lost {
             each 0 .. slots as slot {
-                if this.slot_reason[slot].length == 0 {
+                if this.slot_reason[slot] == 0 {
                     this.slot_reason[slot] = this.blind_reason(this.func)
                     changed = true
                 }
@@ -344,7 +396,7 @@ class RegionFacts {
             let node = this.slot_node(slot)
             if node == REGION_NONE : continue
             let root = this.find(node)
-            if this.reason[root].length > 0 && this.slot_reason[slot].length == 0 {
+            if this.reason[root] > 0 && this.slot_reason[slot] == 0 {
                 this.slot_reason[slot] = this.reason[root]
                 changed = true
             }
@@ -365,7 +417,7 @@ class RegionFacts {
         while slot > 0 {
             slot--
             let node = this.slot_node(slot)
-            if node == REGION_NONE || this.slot_reason[slot].length > 0 : continue
+            if node == REGION_NONE || this.slot_reason[slot] > 0 : continue
             let root = this.find(node)
             if !this.source[root] : continue
             let target = this.target
@@ -378,10 +430,10 @@ class RegionFacts {
             let why = "grown by a function that already grows another group"
             if this.deep[root] : why = "grown in a loop by a function"
             else if !this.copy_allowed() : why = "grown by a function that cannot be given a region"
-            why = this.here(why)
+            let why_id = this.runtime.reason_id(this.here(why))
             // All of the group, so that its members stay alike
             each 0 .. slots as k {
-                if this.slot_class[k] == this.slot_class[slot] && this.slot_reason[k].length == 0 : this.slot_reason[k] = why
+                if this.slot_class[k] == this.slot_class[slot] && this.slot_reason[k] == 0 : this.slot_reason[k] = why_id
             }
             changed = true
         }
@@ -390,12 +442,8 @@ class RegionFacts {
 
     // Which groups of the last solve become regions
     fn decide(build: Build) {
-        if this.lost : return
-        let any = false
-        each this.source as has {
-            if has : any = true
-        }
-        if !any : return
+        if this.lost || !this.has_source : return
+        this.solve()
         let is_slot = Array[bool]{}
         let scope = Array[uint]{}
         let chosen = Array[uint]{}
@@ -417,7 +465,7 @@ class RegionFacts {
         let hosts = !this.func.region_suspends && !this.func.is_literal
         let fits = Array[bool]{}
         each 0 .. this.count as i {
-            fits.append(this.source[i] && this.reason[i].length == 0 && !is_slot[i])
+            fits.append(this.source[i] && this.reason[i] == 0 && !is_slot[i])
             this.refused.append("")
             if !fits[i] || hosts : continue
             this.refused[i] = this.func.is_literal ? "inside a closure" : "the function may suspend"
@@ -478,11 +526,11 @@ class RegionFacts {
     fn heap_reason(of: uint) String {
         if this.lost : return "the compiler cannot follow " + this.func.ns.name + "." + this.func.name + " (" + this.lost_why + ")"
         let root = this.find(of)
-        if this.reason[root].length > 0 : return this.reason[root]
+        if this.reason[root] > 0 : return this.runtime.reasons[this.reason[root]]
         each 0 .. this.slot_count() as slot {
             let node = this.slot_node(slot)
             if node == REGION_NONE || this.find(node) != root : continue
-            if this.slot_reason[slot].length > 0 : return this.slot_reason[slot]
+            if this.slot_reason[slot] > 0 : return this.runtime.reasons[this.slot_reason[slot]]
             if slot == this.args.length : return "returned to a caller that keeps it on the heap"
             return "linked to a parameter"
         }
@@ -490,6 +538,14 @@ class RegionFacts {
         if refused.length > 0 : return refused
         return "nothing makes an object in it"
     }
+}
+
+// Writes a token into IR that is being written
+fn region_put(out: ByteBuffer, kind: u8, id: uint) {
+    out.write_byte(1)
+    out.write_byte(kind)
+    out.write_uint_ascii(id)
+    out.write_byte(1)
 }
 
 fn region_token(kind: u8, id: uint) String {
@@ -504,13 +560,15 @@ fn region_token(kind: u8, id: uint) String {
 fn region_runtime(build: Build) ?RegionRuntime {
     let known = build.region_runtime
     if isset(known) || build.region_off : return known
-    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "region_init", "region_alloc", "region_reset", "region_exit" }
+    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "transfer_refs", "moved_elements", "region_init", "region_alloc", "region_alloc_zeroed", "region_reset", "region_exit", "move_bytes" }
     let funcs = Array[Func]{}
     // Looked up quietly: a standard library without regions builds as before
     let main = build.main_pkg
     let valk = isset(main) ? (main.sub_pkgs.get("valk") !? null) : null
-    let ns = isset(valk) ? (valk.namespaces.get("gc") !? null) : null
+    let gc_ns = isset(valk) ? (valk.namespaces.get("gc") !? null) : null
+    let mem_ns = isset(valk) ? (valk.namespaces.get("mem") !? null) : null
     each names as name {
+        let ns = name == "move_bytes" ? mem_ns : gc_ns
         let idf = isset(ns) ? ns.scope.get_idf(name) : null
         let func = isset(idf) ? idf.func : null
         if !isset(func) {
@@ -530,13 +588,27 @@ fn region_runtime(build: Build) ?RegionRuntime {
         property_set: funcs[1]
         property_update: funcs[2]
         property_remove: funcs[3]
-        init: funcs[4]
-        alloc: funcs[5]
-        reset: funcs[6]
-        exit: funcs[7]
+        transfer_refs: funcs[4]
+        moved_elements: funcs[5]
+        init: funcs[6]
+        alloc: funcs[7]
+        alloc_zeroed: funcs[8]
+        reset: funcs[9]
+        exit: funcs[10]
+        move_bytes: funcs[11]
     }
     build.region_runtime = made
     return made
+}
+
+// A slice literal with `data` is a view of storage that exists
+fn region_slice_is_view(value: Value) bool {
+    let fields = value.values ?! return false
+    each fields as field {
+        let prop = field.get_init_prop()
+        if isset(prop) && prop.name == "data" : return true
+    }
+    return false
 }
 
 fn region_at(value: Value) String {
@@ -641,7 +713,19 @@ fn region_walk_call(f: RegionFacts, value: Value) uint {
             region_cut(args, first)
             return REGION_NONE
         }
-        if target == runtime.property_remove {
+        // Bytes move from one place to another, and old storage hands its elements to the
+        // new: the two hold the same
+        if target == runtime.transfer_refs || target == runtime.move_bytes {
+            if count >= 2 {
+                let from = args[first]
+                let to = args[first + 1]
+                if from != REGION_NONE && to != REGION_NONE : f.join(from, to)
+                else : f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+            }
+            region_cut(args, first)
+            return REGION_NONE
+        }
+        if target == runtime.property_remove || target == runtime.moved_elements {
             region_cut(args, first)
             return REGION_NONE
         }
@@ -668,9 +752,9 @@ fn region_walk_call(f: RegionFacts, value: Value) uint {
     let call_first = f.call_args.length
     each first .. count as a : f.call_args.append(args[a])
     region_cut(args, first)
-    f.calls.append(RegionCall { callee: target, exp: value.exp, first: call_first, count: count, result: result, loop: f.loop })
-    f.call_values.append(value)
-    value.region_id = f.calls.length.to(u32)
+    let at = value.exp
+    f.calls.append(RegionCall { callee: target, src: isset(at) ? at.src : null, at: isset(at) ? at.i : 0, first: call_first, count: count, result: result, loop: f.loop })
+    value.region_id = f.number(f.calls.length)
     return result
 }
 
@@ -859,21 +943,26 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         if isset(class) && gc_object {
             let exp = value.exp
             let allocator = value.get_allocator()
-            if class.kind != CLASS_KIND.class : f.mark(node, "not a plain object")
+            if class.kind != CLASS_KIND.class && class.kind != CLASS_KIND.array : f.mark(node, "not a plain object")
             // The runtime finds the helpers of such an object through its block
             else if class.closure_env || (isset(allocator) && (isset(allocator.onfree) || isset(allocator.env_clone))) : f.mark(node, "the runtime keeps helpers for it")
             else if isset(class.get_func("gc_free")) : f.mark(node, "the class has a finalizer")
             else if class.atomic : f.mark(node, "the class is shared between threads")
             else if !isset(exp) : f.mark(node, "made by the compiler")
             if isset(exp) {
-                f.sites.append(RegionSite { name: class.pretty_name(), exp: exp, node: node, loop: f.loop })
-                f.site_values.append(value)
-                value.region_id = f.sites.length.to(u32)
+                f.sites.append(RegionSite { name: class.pretty_name(), src: exp.src, at: exp.i, node: node, loop: f.loop })
+                value.region_id = f.number(f.sites.length)
             }
-        } else if isset(class) && class.kind == CLASS_KIND.slice {
-            // A slice literal makes its storage on the heap
+        } else if isset(class) && class.kind == CLASS_KIND.slice && !region_slice_is_view(value) {
+            // A slice literal that names no data makes its storage
             if node == REGION_NONE : node = f.add_node()
-            f.mark(node, "storage of a slice")
+            let exp = value.exp
+            if isset(exp) {
+                f.sites.append(RegionSite { name: value.rett.get_non_nullable().compat_display_name(), src: exp.src, at: exp.i, node: node, loop: f.loop })
+                value.region_id = f.number(f.sites.length)
+            } else {
+                f.mark(node, "made by the compiler")
+            }
         } else if node != REGION_NONE && !value.rett.is_inline {
             f.mark(node, "storage that is not an object")
         }
@@ -1013,7 +1102,7 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         let outer = f.loop
         f.loops.append(outer)
         f.loop = f.loops.length - 1
-        value.region_id = f.loop.to(u32)
+        value.region_id = f.number(f.loop)
         let cond = value.value1
         if isset(cond) : region_walk(f, cond)
         region_walk_statements(f, value.values)
@@ -1046,12 +1135,25 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
 // Called for a function whose IR is about to be written, while its body still exists
 fn region_collect_facts(func: Func) {
     let build = func.ns.build
-    let again = isset(func.region_facts)
+    let before = func.region_facts
+    let again = isset(before)
     func.region_facts = null
     if !build.options.regions || build.options.debug || func.is_local_check || func.is_generic_base : return
     let scope = func.body_scope ?! return
-    if !isset(region_runtime(build)) : return
-    let f = RegionFacts { func: func }
+    let runtime = region_runtime(build) ?! return
+    let f = RegionFacts {
+        func: func
+        round: isset(before) ? before.round % 200 + 1 : 1
+        runtime: runtime
+        vscopes: runtime.vscopes
+        arg_stack: runtime.arg_stack
+        parent: runtime.parent
+        reason: runtime.reason
+        source: runtime.source
+        deep: runtime.deep
+    }
+    f.vscopes.clear()
+    f.arg_stack.clear()
     f.ret = region_holds_refs(func.get_rett()) ? f.add_node() : REGION_NONE
     each func.all_decls as decl : decl.region_node = REGION_NONE
     each func.args as arg {
@@ -1060,7 +1162,7 @@ fn region_collect_facts(func: Func) {
     }
     each 0 .. f.slot_count() as slot {
         f.slot_class.append(slot)
-        f.slot_reason.append("")
+        f.slot_reason.append(0)
     }
     // What a closure reads of the function around it is not followed
     if func.is_literal {
@@ -1070,6 +1172,12 @@ fn region_collect_facts(func: Func) {
         let defers = func.defer_scope
         if isset(defers) : region_walk_statements(f, defers.values)
     }
+    // A function that takes, gives and makes no references says nothing to its callers
+    let empty = !f.lost && f.sites.length == 0 && f.calls.length == 0 && f.ret == REGION_NONE
+    each f.args as arg {
+        if arg != REGION_NONE : empty = false
+    }
+    if empty : return
     func.region_facts = f
     if !again : build.region_funcs.append(func)
     if f.lost : return
@@ -1077,15 +1185,15 @@ fn region_collect_facts(func: Func) {
     // What this body alone rules out never comes back, so those places get no second form
     f.solve(true)
     each f.sites as site {
-        site.dual = f.reason[f.find(site.node)].length == 0
+        site.dual = f.reason[f.find(site.node)] == 0
         if site.dual : f.has_tokens = true
     }
     each f.calls as call {
         if call.callee.infinite_args : continue
-        let open = call.result != REGION_NONE && f.reason[f.find(call.result)].length == 0
+        let open = call.result != REGION_NONE && f.reason[f.find(call.result)] == 0
         each call.first .. call.count as a {
             let arg = f.call_args[a]
-            if arg != REGION_NONE && f.reason[f.find(arg)].length == 0 : open = true
+            if arg != REGION_NONE && f.reason[f.find(arg)] == 0 : open = true
         }
         call.dual = open
         if open : f.has_tokens = true
@@ -1223,9 +1331,12 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
     let runtime = build.region_runtime ?! f.func.exp.bug("Region runtime is missing")
     let decided = build.region_decided
     let at: uint = 0
+    // The copy is the function alone
+    let bytes = copy ? f.body_bytes : code.bytes
     while true {
-        let start = code.index_of_byte(1, at) ! {
-            out.append_text(code.range(at, code.bytes - at))
+        let start = code.index_of_byte(1, at) !? bytes
+        if start >= bytes {
+            out.append_text(code.range(at, bytes - at))
             break
         }
         out.append_text(code.range(at, start - at))
@@ -1311,8 +1422,9 @@ fn region_print_report(build: Build) {
     let main_pkg = build.main_pkg
     each build.region_funcs as func {
         let f = func.region_facts ?! continue
+        f.solve()
         each f.sites as site {
-            let src = site.exp.src
+            let src = site.src
             let ns = src.ns
             if !isset(ns) || ns.pkg != main_pkg : continue
             let verdict = ""
@@ -1327,7 +1439,7 @@ fn region_print_report(build: Build) {
                 verdict = "heap: " + f.heap_reason(site.node)
             }
             let display = source_display(src)
-            let place = display.path + ":" + src.line_of(site.exp.i) + "  " + site.name
+            let place = display.path + ":" + src.line_of(site.at) + "  " + site.name
             let known = verdicts.get(place) !? ""
             if known.length == 0 {
                 places.append(place)
@@ -1338,8 +1450,7 @@ fn region_print_report(build: Build) {
         }
         // A call of a function that makes its objects where the caller says
         each f.calls as call {
-            let exp = call.exp ?! continue
-            let src = exp.src
+            let src = call.src ?! continue
             let ns = src.ns
             if !isset(ns) || ns.pkg != main_pkg : continue
             let callee = call.callee.region_facts ?! continue
@@ -1361,7 +1472,7 @@ fn region_print_report(build: Build) {
                 verdict = "heap: " + f.heap_reason(actual)
             }
             let display = source_display(src)
-            let place = display.path + ":" + src.line_of(exp.i) + "  call of " + call.callee.name
+            let place = display.path + ":" + src.line_of(call.at) + "  call of " + call.callee.name
             let known = verdicts.get(place) !? ""
             if known.length == 0 {
                 places.append(place)
