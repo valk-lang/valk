@@ -9,16 +9,18 @@
 // round of a loop, and so can an object of the function around that loop.
 //
 // What a group refers to has to live at least as long as the group. The collector's objects
-// live longest: a group that something of the collector refers to is the collector's too, and
-// a region that refers to something of the collector pins it, because the collector does not
-// look inside a region. A group that only objects of this function refer to lives in a region
-// of the innermost loop all of it is in, or of a wider one when something wider refers to it.
+// live longest: a group that something of the collector refers to is the collector's too. So
+// is a group that refers to an object of the collector, except to plain data or to an
+// argument: those a region pins, because the collector does not look inside a region. A group
+// that only objects of this function refer to lives in a region of the innermost loop all of
+// it is in, or of a wider one when something wider refers to it.
 //
-// A function's summary says which of its parameters and result share a group, what each of
-// those groups refers to, which of them touch something that rules a region out, and in which
-// of them the function makes objects. For those it has a copy that takes a region for each from
-// its caller. Whatever the analysis does not understand rules a region out, so it only changes
-// where an object lives.
+// A function's summary is the graph of the groups its callers can see: those of its
+// parameters and result and what they refer to, a few references deep. It says what refers to
+// what, which groups touch something that rules a region out, and in which the function makes
+// objects. For those it has a copy that takes a region for each from its caller. A group the
+// function only reads is not in the summary. Whatever the analysis does not understand rules
+// a region out, so it only changes where an object lives.
 //
 // The decisions need every function, and a function's IR is written before that: the places
 // that depend on them are written as tokens, replaced when the module is put together.
@@ -33,10 +35,11 @@ value REGION_MAX_OWN (8)
 // What a call hands a copy for one of its regions is a region of the caller, or from this
 // number on one the caller got itself
 value REGION_PASSED (1048576)
-// What the group of a slot refers to, in a summary: the group of another slot, its own group,
-// or something the collector owns
-value REGION_LINK_SELF (uint.$max - 1)
-value REGION_LINK_HEAP (uint.$max - 2)
+// A summary names the groups up to this many references away from a parameter or the result;
+// what is further away is one group with what refers to it
+value REGION_SUMMARY_DEPTH (4)
+// The groups a caller can see are looked at up to this many
+value REGION_REACH_MAX (64)
 
 // What a value is to the analysis: plain data that is referred to through an owner, one
 // reference to an object, or several things in one value (a struct, a union, a tuple)
@@ -128,8 +131,23 @@ class RegionRuntime {
     deep: Array[bool] (.{})
     scope: Array[uint] (.{})
     made: Array[bool] (.{})
+    map: Array[uint] (.{})
+    // The groups of the function being solved that a caller can see: the number of each, and
+    // per number its root, the one it was reached from, how far it is from a parameter,
+    // whether the summary names it and under which number
+    reach: Array[uint] (.{})
+    reach_root: Array[uint] (.{})
+    reach_from: Array[uint] (.{})
+    reach_slots: uint (0)
     degree: Array[uint] (.{})
-    plain: Array[bool] (.{})
+    depth: Array[uint] (.{})
+    keep: Array[bool] (.{})
+    sum_index: Array[uint] (.{})
+    new_content: Array[uint] (.{})
+    new_leaf: Array[uint] (.{})
+    new_reason: Array[uint] (.{})
+    new_grows: Array[bool] (.{})
+    new_made: Array[bool] (.{})
     todo: Array[uint] (.{})
     vscopes: Array[uint] (.{})
     vscope_types: Array[Type] (.{})
@@ -189,8 +207,6 @@ class RegionFacts {
     pins: Array[RegionPin] (.{})
     args: Array[uint] (.{})
     ret: uint (0)
-    // Stands for something of the collector that a callee stored
-    heap_node: uint (REGION_NONE)
     // The results of the value scopes being walked, and their types
     vscopes: Array[uint]
     vscope_types: Array[Type]
@@ -220,16 +236,19 @@ class RegionFacts {
     deep: Array[bool]
     scope: Array[uint]
 
-    // The summary, per parameter and then the result: its group, why a region cannot hold it,
-    // what it refers to, and whether the function makes objects in it: its copy then takes
-    // a region for it
-    slot_class: Array[uint] (.{})
-    slot_reason: Array[uint] (.{})
-    slot_grows: Array[bool] (.{})
-    slot_content: Array[uint] (.{})
-    slot_leaf: Array[uint] (.{})
-    // The groups the copy takes a region for, each named by its first slot, in the order of
-    // the copy's parameters; and whether a caller may pass none for one
+    // The summary: the groups a caller has to know, by number. Per parameter and then the
+    // result which group it is in; per group what it refers to, why a region cannot hold it,
+    // and whether the function makes objects in it: its copy then takes a region for it
+    slot_group: Array[uint] (.{})
+    sum_content: Array[uint] (.{})
+    sum_leaf: Array[uint] (.{})
+    sum_reason: Array[uint] (.{})
+    sum_grows: Array[bool] (.{})
+    // It makes objects in the group, and does not only pin for it
+    sum_made: Array[bool] (.{})
+    any_grows: bool (false)
+    // The groups the copy takes a region for, in the order of the copy's parameters; and
+    // whether a caller may pass none for one
     params: Array[uint] (.{})
     may_null: Array[bool] (.{})
     call_pass: Array[uint] (.{})
@@ -453,14 +472,6 @@ class RegionFacts {
         return this.ret
     }
 
-    fn slot_of_root(root: uint) uint {
-        each 0 .. this.slot_count() as slot {
-            let node = this.slot_node(slot)
-            if node != REGION_NONE && this.find(node) == root : return slot
-        }
-        return REGION_NONE
-    }
-
     // What a call passes for a slot of its callee
     fn call_actual(call: RegionCall, callee: RegionFacts, slot: uint) uint {
         if slot == callee.args.length : return call.result
@@ -482,44 +493,62 @@ class RegionFacts {
         return this.runtime.reason_id("passed to " + callee.ns.name + "." + callee.name + ", which the compiler cannot follow")
     }
 
-    // Whether `slot` names a group the copy takes a region for
-    fn grows(slot: uint) bool {
-        return this.slot_grows[slot] && this.slot_reason[slot] == 0 && this.slot_class[slot] == slot
+    // Whether the copy takes a region for group `g` of the summary
+    fn grows(g: uint) bool {
+        return this.sum_grows[g] && this.sum_reason[g] == 0
     }
 
-    fn grows_any() bool {
-        each 0 .. this.slot_count() as slot {
-            if this.grows(slot) : return true
-        }
-        return false
-    }
-
-    // The group here that stands for the group `slot` names in a callee: every member of the
-    // callee's group is in one group here, so any of them names it. When the call passes none
-    // of them, it is what another argument refers to
-    fn call_group(call: RegionCall, callee: RegionFacts, slot: uint) uint {
-        each slot .. callee.slot_count() - slot as member {
-            if callee.slot_class[member] != slot : continue
-            let actual = this.call_actual(call, callee, member)
-            if actual != REGION_NONE : return this.find(actual)
-        }
-        each 0 .. callee.slot_count() as holder {
-            let actual = this.call_actual(call, callee, holder)
+    // Finds, for every group of a callee's summary, the group here that stands for it, in
+    // `runtime.map`: what the call passes for a parameter or takes as the result, and from
+    // there what those refer to. `apply` makes the groups here refer to each other the way
+    // the summary says; without it, a group the call has nothing for stays REGION_NONE
+    fn map_call(call: RegionCall, callee: RegionFacts, apply: bool) {
+        let map = this.runtime.map
+        map.clear()
+        let count = callee.sum_reason.length
+        each 0 .. count : map.append(REGION_NONE)
+        each 0 .. callee.slot_count() as slot {
+            let g = callee.slot_group[slot]
+            if g == REGION_NONE : continue
+            let actual = this.call_actual(call, callee, slot)
             if actual == REGION_NONE : continue
-            let root = this.find(actual)
-            let content = callee.slot_content[holder]
-            if content < REGION_LINK_HEAP && callee.slot_class[content] == slot && this.content[root] != REGION_NONE : return this.find(this.content[root])
-            let leaf = callee.slot_leaf[holder]
-            if leaf < REGION_LINK_HEAP && callee.slot_class[leaf] == slot && this.leaf[root] != REGION_NONE : return this.find(this.leaf[root])
+            if map[g] == REGION_NONE : map[g] = actual
+            else if apply : this.unify(map[g], actual)
         }
-        return REGION_NONE
+        let changed = true
+        while changed {
+            changed = false
+            each 0 .. count as g {
+                let from = map[g]
+                if from == REGION_NONE : continue
+                each 0 .. 2 as side {
+                    let to = side == 0 ? callee.sum_content[g] : callee.sum_leaf[g]
+                    if to == REGION_NONE : continue
+                    if apply {
+                        let link = this.link_of(from, side == 1)
+                        if map[to] == REGION_NONE {
+                            map[to] = link
+                            changed = true
+                        } else {
+                            this.unify(link, map[to])
+                        }
+                    } else if map[to] == REGION_NONE {
+                        let root = this.find(from)
+                        let link = side == 0 ? this.content[root] : this.leaf[root]
+                        if link == REGION_NONE : continue
+                        map[to] = link
+                        changed = true
+                    }
+                }
+            }
+        }
     }
 
     fn set_params() {
         if this.lost : return
-        each 0 .. this.slot_count() as slot {
-            if !this.grows(slot) : continue
-            this.params.append(slot)
+        each 0 .. this.sum_reason.length as g {
+            if !this.grows(g) : continue
+            this.params.append(g)
             this.may_null.append(false)
         }
     }
@@ -538,22 +567,6 @@ class RegionFacts {
         let func = this.func
         if func.is_literal || func.is_export || func.is_extern || func.is_entrance || func.infinite_args : return false
         return !this.lost
-    }
-
-    // What a callee says the group of an argument refers to
-    fn apply_link(call: RegionCall, callee: RegionFacts, actual: uint, to: uint, leaf: bool) {
-        if to == REGION_NONE : return
-        let link = this.link_of(actual, leaf)
-        if to == REGION_LINK_SELF {
-            this.unify(link, actual)
-        } else if to == REGION_LINK_HEAP {
-            this.unify(link, this.heap_node)
-        } else {
-            // With no argument for that group, the link itself stands for it
-            each to .. callee.slot_count() - to as member {
-                if callee.slot_class[member] == callee.slot_class[to] : this.unify(link, this.call_actual(call, callee, member))
-            }
-        }
     }
 
     // What holds something passes its reason on to it: what an object of the collector refers
@@ -583,60 +596,113 @@ class RegionFacts {
         }
     }
 
-    // What a parameter or the result refers to joins their group when a caller has to know
-    // more about it than a summary says: something is made in it, or it is reached in more
-    // than one way. A group that is only read stays apart, and so the caller's stay apart.
-    // Returns whether a group joined
-    fn ride() bool {
-        let count = this.parent.length
-        let degree = this.runtime.degree
-        let plain = this.runtime.plain
-        degree.clear()
-        plain.clear()
-        each 0 .. count {
-            degree.append(0)
-            plain.append(false)
+    // Numbers the groups a caller can see: those of the parameters and the result first, then
+    // whatever they refer to. Returns whether two were merged because there are too many
+    fn find_reach() bool {
+        let rt = this.runtime
+        let reach = rt.reach
+        let roots = rt.reach_root
+        let from = rt.reach_from
+        reach.clear()
+        roots.clear()
+        from.clear()
+        each 0 .. this.parent.length : reach.append(REGION_NONE)
+        each 0 .. this.slot_count() as slot {
+            let node = this.slot_node(slot)
+            if node == REGION_NONE : continue
+            let root = this.find(node)
+            if reach[root] != REGION_NONE : continue
+            reach[root] = roots.length
+            roots.append(root)
+            from.append(REGION_NONE)
         }
-        each 0 .. count as i {
-            if this.parent[i] != i : continue
+        rt.reach_slots = roots.length
+        let g: uint = 0
+        while g < roots.length {
+            let root = roots[g]
             each 0 .. 2 as side {
-                let link = side == 0 ? this.content[i] : this.leaf[i]
+                let link = side == 0 ? this.content[root] : this.leaf[root]
                 if link == REGION_NONE : continue
                 let x = this.find(link)
+                if reach[x] != REGION_NONE : continue
+                if roots.length >= REGION_REACH_MAX {
+                    this.unify(root, x)
+                    return true
+                }
+                reach[x] = roots.length
+                roots.append(x)
+                from.append(g)
+            }
+            g++
+        }
+        return false
+    }
+
+    // Which of the groups a caller can see the summary has to name. A group this function
+    // only reads says nothing: it makes no object in it, nothing rules a region out for it
+    // and it is reached in one way, so the groups of a caller already look like it. Neither
+    // does a group of the collector that a group of the collector refers to. Returns whether
+    // two groups were merged
+    fn trim_reach() bool {
+        let rt = this.runtime
+        let reach = rt.reach
+        let roots = rt.reach_root
+        let from = rt.reach_from
+        let degree = rt.degree
+        let keep = rt.keep
+        let depth = rt.depth
+        let made = rt.made
+        // What this function makes and what it makes for that to refer to live equally
+        // long: one group, one region. A function that builds by calling itself would
+        // otherwise see its result one reference further away each time
+        each rt.reach_slots .. roots.length - rt.reach_slots as g {
+            let root = roots[g]
+            let holder = roots[from[g]]
+            if !made[root] || !made[holder] || this.reason[root] > 0 || this.reason[holder] > 0 : continue
+            this.unify(holder, root)
+            return true
+        }
+        degree.clear()
+        keep.clear()
+        depth.clear()
+        each 0 .. roots.length {
+            degree.append(0)
+            keep.append(true)
+        }
+        each roots as root {
+            each 0 .. 2 as side {
+                let link = side == 0 ? this.content[root] : this.leaf[root]
+                if link == REGION_NONE : continue
+                let x = reach[this.find(link)]
                 degree[x] = degree[x] + 1
             }
         }
-        // Plain: nothing is made in it, one group refers to it, and it refers to plain groups
         let changed = true
         while changed {
             changed = false
-            each 0 .. count as i {
-                if this.parent[i] != i || plain[i] || this.source[i] || this.reason[i] > 0 || degree[i] != 1 : continue
-                let content = this.content[i]
-                let leaf = this.leaf[i]
-                if content != REGION_NONE && !plain[this.find(content)] : continue
-                if leaf != REGION_NONE && !plain[this.find(leaf)] : continue
-                if this.slot_of_root(i) != REGION_NONE : continue
-                plain[i] = true
+            each rt.reach_slots .. roots.length - rt.reach_slots as g {
+                if !keep[g] || degree[g] != 1 : continue
+                let root = roots[g]
+                if this.reason[root] == 0 && this.source[root] : continue
+                if this.reason[root] > 0 && this.reason[roots[from[g]]] == 0 : continue
+                let content = this.content[root]
+                let leaf = this.leaf[root]
+                if content != REGION_NONE && keep[reach[this.find(content)]] : continue
+                if leaf != REGION_NONE && keep[reach[this.find(leaf)]] : continue
+                keep[g] = false
                 changed = true
             }
         }
-        let rode = false
-        each 0 .. count as i {
-            each 0 .. 2 as side {
-                if this.parent[i] != i || this.reason[i] > 0 : break
-                let link = side == 0 ? this.content[i] : this.leaf[i]
-                if link == REGION_NONE : continue
-                let x = this.find(link)
-                if x == i || plain[x] || this.reason[x] > 0 : continue
-                if this.slot_of_root(i) == REGION_NONE || this.slot_of_root(x) != REGION_NONE : continue
-                // A group that joined changes which others are plain: those wait for the next time
-                if rode && !this.source[x] : continue
-                this.unify(i, x)
-                rode = true
-            }
+        each 0 .. roots.length as g {
+            let before = from[g]
+            let deep = before == REGION_NONE ? 0 : depth[before] + 1
+            depth.append(deep)
+            if !keep[g] || deep <= REGION_SUMMARY_DEPTH || before == REGION_NONE : continue
+            // Too far from a parameter to tell apart from what refers to it
+            this.unify(roots[before], roots[g])
+            return true
         }
-        return rode
+        return false
     }
 
     // Whether a group refers to something that can be the collector's: a store into it pins.
@@ -644,19 +710,20 @@ class RegionFacts {
     // and what is read out of one
     fn refers_out(root: uint) bool {
         let made = this.runtime.made
+        let reach = this.runtime.reach
         each 0 .. 2 as side {
             let link = side == 0 ? this.content[root] : this.leaf[root]
             if link == REGION_NONE : continue
             let x = this.find(link)
             if x == root : continue
-            if !made[x] || this.reason[x] > 0 || this.slot_of_root(x) != REGION_NONE : return true
+            if !made[x] || this.reason[x] > 0 || reach[x] != REGION_NONE : return true
         }
         return false
     }
 
     // Whether a group is one this function can keep in a region of its own
     fn is_local(root: uint) bool {
-        return this.source[root] && this.reason[root] == 0 && this.slot_of_root(root) == REGION_NONE
+        return this.source[root] && this.reason[root] == 0 && this.runtime.reach[root] == REGION_NONE
     }
 
     // Marks the groups something makes objects in. Returns whether a group got a reason
@@ -680,19 +747,20 @@ class RegionFacts {
             made[root] = true
             if site.loop != 0 && !loops : this.deep[root] = true
         }
+        let map = this.runtime.map
         each this.calls as call {
             let callee = call.callee.region_facts ?! continue
-            if callee.lost : continue
-            each 0 .. callee.slot_count() as slot {
-                if !callee.grows(slot) : continue
-                let root = this.call_group(call, callee, slot)
-                if root == REGION_NONE : continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if !callee.grows(g) || map[g] == REGION_NONE : continue
+                let root = this.find(map[g])
                 if !call.dual || !call.emitted {
                     if this.give_reason(root, this.runtime.reason_id(REGION_WHY_CALL_NO_FORM)) : changed = true
                     continue
                 }
                 this.source[root] = true
-                made[root] = true
+                if callee.sum_made[g] : made[root] = true
                 if call.loop != 0 && !loops : this.deep[root] = true
             }
         }
@@ -756,13 +824,15 @@ class RegionFacts {
                 let root = this.find(site.node)
                 if this.is_local(root) && site.loop != this.scope[root] && this.give_reason(root, why) : changed = true
             }
+            let map = this.runtime.map
             each this.calls as call {
                 let callee = call.callee.region_facts ?! continue
-                if callee.lost : continue
-                each 0 .. callee.slot_count() as slot {
-                    if !callee.grows(slot) : continue
-                    let root = this.call_group(call, callee, slot)
-                    if root != REGION_NONE && this.is_local(root) && call.loop != this.scope[root] && this.give_reason(root, why) : changed = true
+                if callee.lost || !callee.any_grows : continue
+                this.map_call(call, callee, false)
+                each 0 .. callee.sum_reason.length as g {
+                    if !callee.grows(g) || map[g] == REGION_NONE : continue
+                    let root = this.find(map[g])
+                    if this.is_local(root) && call.loop != this.scope[root] && this.give_reason(root, why) : changed = true
                 }
             }
             each this.pins as pin {
@@ -788,6 +858,7 @@ class RegionFacts {
     // The groups with the summaries of the callees applied. `own` leaves the calls out: what
     // the body alone rules out. Returns whether the summary of this function changed
     fn solve(own: bool (false)) bool {
+        if this.lost : return false
         this.parent.clear()
         this.content.clear()
         this.leaf.clear()
@@ -807,15 +878,7 @@ class RegionFacts {
             each this.calls as call {
                 let callee = call.callee.region_facts
                 if !isset(callee) || callee.lost : continue
-                each 0 .. callee.slot_count() as slot {
-                    let actual = this.call_actual(call, callee, slot)
-                    if actual == REGION_NONE : continue
-                    each 0 .. slot as other {
-                        if callee.slot_class[other] == callee.slot_class[slot] : this.unify(this.call_actual(call, callee, other), actual)
-                    }
-                    this.apply_link(call, callee, actual, callee.slot_content[slot], false)
-                    this.apply_link(call, callee, actual, callee.slot_leaf[slot], true)
-                }
+                this.map_call(call, callee, true)
             }
         }
 
@@ -833,6 +896,7 @@ class RegionFacts {
             return false
         }
         let beyond = this.runtime.reason_id(REGION_WHY_BEYOND)
+        let map = this.runtime.map
         each this.calls as call {
             let callee = call.callee.region_facts
             if !isset(callee) || callee.lost {
@@ -844,16 +908,18 @@ class RegionFacts {
             each 0 .. call.count as a {
                 if a >= callee.args.length : this.give_reason(this.call_args[call.first + a], beyond)
             }
-            each 0 .. callee.slot_count() as slot {
-                if callee.slot_reason[slot] > 0 : this.give_reason(this.call_actual(call, callee, slot), callee.slot_reason[slot])
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.sum_reason[g] > 0 : this.give_reason(map[g], callee.sum_reason[g])
             }
         }
         // A group that turns out to be the collector's makes what it refers to the
         // collector's, which can rule out more
         while true {
             this.settle()
+            if this.find_reach() : continue
             if this.find_sources() : continue
-            if this.ride() : continue
+            if this.trim_reach() : continue
             this.find_scopes()
             if !this.refuse_locals() : break
         }
@@ -862,96 +928,96 @@ class RegionFacts {
         each this.source as has {
             if has : this.has_source = true
         }
+        return this.summarize()
+    }
 
-        // A fact in a summary is never taken back, so that the rounds of recursive functions
-        // end: what is known grows, and there is only so much to know
-        let changed = false
-        let slots = this.slot_count()
-        if this.lost {
-            each 0 .. slots as slot {
-                if this.slot_reason[slot] == 0 {
-                    this.slot_reason[slot] = this.blind_reason(this.func)
-                    changed = true
-                }
-            }
-            return changed
+    // Writes the summary: the groups a caller has to know, what they refer to, why a region
+    // cannot hold one, and in which of them this function makes objects, for which its copy
+    // takes a region. Returns whether it changed
+    fn summarize() bool {
+        let rt = this.runtime
+        let reach = rt.reach
+        let roots = rt.reach_root
+        let keep = rt.keep
+        let index = rt.sum_index
+        let new_content = rt.new_content
+        let new_leaf = rt.new_leaf
+        let new_reason = rt.new_reason
+        let new_grows = rt.new_grows
+        let new_made = rt.new_made
+        new_made.clear()
+        index.clear()
+        new_content.clear()
+        new_leaf.clear()
+        new_reason.clear()
+        new_grows.clear()
+        let count: uint = 0
+        each 0 .. roots.length as g {
+            index.append(keep[g] ? count : REGION_NONE)
+            if keep[g] : count++
         }
-        each 0 .. slots as slot {
-            let node = this.slot_node(slot)
-            if node == REGION_NONE : continue
-            let root = this.find(node)
-            if this.reason[root] > 0 && this.slot_reason[slot] == 0 {
-                this.slot_reason[slot] = this.reason[root]
-                changed = true
+        each roots as root, g {
+            if !keep[g] : continue
+            let content = this.content[root]
+            let leaf = this.leaf[root]
+            new_content.append(content == REGION_NONE ? REGION_NONE : index[reach[this.find(content)]])
+            new_leaf.append(leaf == REGION_NONE ? REGION_NONE : index[reach[this.find(leaf)]])
+            let why = this.reason[root]
+            let grows = false
+            if why == 0 && this.source[root] {
+                // The objects it makes there come from the collector when it cannot take a region
+                if !this.deep[root] && this.copy_allowed() : grows = true
+                else : why = this.runtime.reason_id(this.here(this.deep[root] ? "grown in a loop by a function without $region" : "grown by a function that cannot be given a region"))
             }
-            each 0 .. slot as other {
-                let other_node = this.slot_node(other)
-                if other_node == REGION_NONE || this.find(other_node) != root : continue
-                let from = this.slot_class[slot]
-                let to = this.slot_class[other]
-                if from == to : continue
-                each 0 .. slots as k {
-                    if this.slot_class[k] == from : this.slot_class[k] = to
-                }
-                changed = true
-            }
+            new_reason.append(why)
+            new_grows.append(grows)
+            new_made.append(grows && rt.made[root])
         }
-        // What the group of a slot refers to
-        each 0 .. slots as slot {
+        let changed = this.sum_reason.length != count
+        each 0 .. this.slot_count() as slot {
             let node = this.slot_node(slot)
-            if node == REGION_NONE : continue
-            let root = this.find(node)
-            each 0 .. 2 as side {
-                let link = side == 0 ? this.content[root] : this.leaf[root]
-                let found = REGION_NONE
-                if link != REGION_NONE {
-                    let x = this.find(link)
-                    let other = this.slot_of_root(x)
-                    if x == root : found = REGION_LINK_SELF
-                    else if other != REGION_NONE : found = other
-                    else if this.reason[x] > 0 : found = REGION_LINK_HEAP
-                }
-                let known = side == 0 ? this.slot_content[slot] : this.slot_leaf[slot]
-                if found == known : continue
-                if side == 0 : this.slot_content[slot] = found
-                else : this.slot_leaf[slot] = found
-                changed = true
-            }
-        }
-        // The groups this function makes objects in: its copy takes a region for each
-        each 0 .. slots as slot {
-            let node = this.slot_node(slot)
-            if node == REGION_NONE || this.slot_reason[slot] > 0 : continue
-            let root = this.find(node)
-            if !this.source[root] : continue
-            if !this.deep[root] && this.copy_allowed() {
-                if this.slot_grows[slot] : continue
-                this.slot_grows[slot] = true
-                changed = true
-                continue
-            }
-            let why = this.deep[root] ? "grown in a loop by a function without $region" : "grown by a function that cannot be given a region"
-            let why_id = this.runtime.reason_id(this.here(why))
-            // All of the group, so that its members stay alike
-            each 0 .. slots as k {
-                if this.slot_class[k] == this.slot_class[slot] && this.slot_reason[k] == 0 : this.slot_reason[k] = why_id
-            }
+            let g = node == REGION_NONE ? REGION_NONE : index[reach[this.find(node)]]
+            if this.slot_group[slot] == g : continue
+            this.slot_group[slot] = g
             changed = true
         }
-        return changed
+        if !changed {
+            each 0 .. count as g {
+                if this.sum_content[g] != new_content[g] || this.sum_leaf[g] != new_leaf[g] || this.sum_reason[g] != new_reason[g] || this.sum_grows[g] != new_grows[g] || this.sum_made[g] != new_made[g] {
+                    changed = true
+                    break
+                }
+            }
+        }
+        if !changed : return false
+        this.sum_content.clear()
+        this.sum_leaf.clear()
+        this.sum_reason.clear()
+        this.sum_grows.clear()
+        this.sum_made.clear()
+        this.any_grows = false
+        each 0 .. count as g {
+            this.sum_content.append(new_content[g])
+            this.sum_leaf.append(new_leaf[g])
+            this.sum_reason.append(new_reason[g])
+            this.sum_grows.append(new_grows[g])
+            this.sum_made.append(new_made[g])
+            if new_grows[g] && new_reason[g] == 0 : this.any_grows = true
+        }
+        return true
     }
 
     // Which groups of the last solve become regions
     fn decide(build: Build) {
         if this.lost || !this.has_source : return
         this.solve()
+        let rt = this.runtime
         // The groups a copy gets a region for
         let passed = Array[uint]{}
         each 0 .. this.parent.length : passed.append(REGION_NONE)
-        each this.params as slot, n {
-            each slot .. this.slot_count() - slot as member {
-                let node = this.slot_node(member)
-                if this.slot_class[member] == slot && node != REGION_NONE : passed[this.find(node)] = n
+        each this.params as g, n {
+            each rt.reach_root as root, r {
+                if rt.sum_index[r] == g : passed[root] = n
             }
         }
         each this.sites as site {
@@ -970,9 +1036,10 @@ class RegionFacts {
             if !call.dual || !call.emitted || callee.params.length == 0 : continue
             call.pass_first = this.call_pass.length
             call.pass_count = callee.params.length
-            each callee.params as slot {
-                let root = this.call_group(call, callee, slot)
-                this.call_pass.append(root == REGION_NONE ? REGION_NONE : this.region_of(root, passed))
+            this.map_call(call, callee, false)
+            each callee.params as g {
+                let node = rt.map[g]
+                this.call_pass.append(node == REGION_NONE ? REGION_NONE : this.region_of(this.find(node), passed))
             }
         }
     }
@@ -1023,14 +1090,12 @@ class RegionFacts {
         if this.lost : return "the compiler cannot follow " + this.func.ns.name + "." + this.func.name + " (" + this.lost_why + ")"
         let root = this.find(of)
         if this.reason[root] > 0 : return this.runtime.reasons[this.reason[root]]
-        each 0 .. this.slot_count() as slot {
-            let node = this.slot_node(slot)
-            if node == REGION_NONE || this.find(node) != root : continue
-            if this.slot_reason[slot] > 0 : return this.runtime.reasons[this.slot_reason[slot]]
-            if slot == this.args.length : return "returned to a caller that keeps it on the heap"
-            return "linked to a parameter"
-        }
-        return "nothing makes an object in it"
+        let seen = this.runtime.reach[root]
+        if seen == REGION_NONE : return "nothing makes an object in it"
+        let g = this.runtime.sum_index[seen]
+        if g != REGION_NONE && this.sum_reason[g] > 0 : return this.runtime.reasons[this.sum_reason[g]]
+        if this.ret != REGION_NONE && this.find(this.ret) == root : return "returned to a caller that keeps it on the heap"
+        return "linked to a parameter"
     }
 }
 
@@ -1813,8 +1878,6 @@ fn region_collect_facts(func: Func) {
         deep: runtime.deep
         scope: runtime.scope
     }
-    f.heap_node = f.add_node()
-    f.mark(f.heap_node, "something the collector owns")
     f.vscopes.clear()
     f.vscope_types.clear()
     f.arg_stack.clear()
@@ -1824,13 +1887,7 @@ fn region_collect_facts(func: Func) {
         arg.decl.region_node = REGION_NONE
         f.args.append(region_holds_refs(arg.type) ? f.decl_node(arg.decl, true, true) : REGION_NONE)
     }
-    each 0 .. f.slot_count() as slot {
-        f.slot_class.append(slot)
-        f.slot_reason.append(0)
-        f.slot_grows.append(false)
-        f.slot_content.append(REGION_NONE)
-        f.slot_leaf.append(REGION_NONE)
-    }
+    each 0 .. f.slot_count() : f.slot_group.append(REGION_NONE)
     // What a closure reads of the function around it is not followed
     if func.is_literal {
         f.lose("a closure")
@@ -2177,14 +2234,13 @@ fn region_print_report(build: Build) {
             let ns = src.ns
             if !isset(ns) || ns.pkg != main_pkg : continue
             let callee = call.callee.region_facts ?! continue
-            if callee.lost || !callee.grows_any() : continue
+            if f.lost || callee.lost || !callee.any_grows : continue
             // The first group of the callee that this function has a region for decides
             let actual = REGION_NONE
             let pass = REGION_NONE
-            each 0 .. callee.slot_count() as slot {
-                if !callee.grows(slot) : continue
-                let root = f.call_group(call, callee, slot)
-                if actual == REGION_NONE : actual = root
+            f.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && actual == REGION_NONE : actual = f.runtime.map[g]
             }
             each 0 .. call.pass_count as n {
                 if pass == REGION_NONE : pass = f.call_pass[call.pass_first + n]

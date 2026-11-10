@@ -976,20 +976,34 @@ operation such as `close`.
 An object that provably stays in one scope is not given to the collector. It
 is made in a region: memory of that scope, freed as a whole when the function
 returns, or reused when the loop the scope is one round of starts its next
-round. The first 224 bytes of a region are in the frame; a region that grows
+round. The first 184 bytes of a region are in the frame; a region that grows
 past them takes chunks from the allocator.
 
-The proof groups every value that holds references: two values share a group
-when one can be the other, refer to it or be referred to by it. A group is a
-region when all its objects are made by the function or by functions it calls
-for that, and nothing else is in it: no parameter, global, result of unknown
-code, closure, coroutine, shared value or number. Nothing collected can then
-point into a region, and a region points at nothing collected. A function that
-makes objects in the group of its result or of a parameter has a second form
-that takes a region for each such group from its caller, so `Node.tree(depth)`
-builds a whole tree in the region of the function that uses it. Every call
-decides for itself: a caller that keeps one of the groups on the heap passes
-no region for it, and one that keeps them all calls the first form.
+The proof groups every value that holds references. Two values share a group
+when one can be the other. What an object refers to is not in its group: a
+group refers to the group of the objects its objects refer to, and to the
+group of the plain data (text, a slice of numbers) they refer to. What a group
+refers to has to live at least as long as the group, never the other way
+around. So the objects of one round of a loop may refer to an object of the
+function around the loop, or to an argument, and still be freed every round.
+
+A group is a region when all its objects are made by the function or by
+functions it calls for that, and nothing rules it out: a global, the result of
+unknown code, a closure, a coroutine, a shared value, a number. What an object
+of the collector refers to is the collector's, so nothing collected points
+into a region. A function that makes objects in a group its caller can see has
+a second form that takes a region for each such group from its caller, so
+`Node.tree(depth)` builds a whole tree in the region of the function that uses
+it. Every call decides for itself: a caller that keeps one of the groups on
+the heap passes no region for it, and one that keeps them all calls the first
+form.
+
+The summary of a function is the small graph of the groups its callers can
+see: those of its parameters and its result, and what they refer to, up to
+four references away. A group the function only reads is left out, so reading
+through a structure tells a caller nothing, and `Array.append` tells it that
+the array refers to storage that refers to the element, three groups. What a
+function makes together and links together is one group.
 
 What the compiler cannot follow stays with the collector, so regions change
 where an object lives and never what a program may do. A region is also
@@ -998,19 +1012,18 @@ inside the scope it belongs to, and in a function that can suspend. `$region`
 on a function allows its own loops: what they make and no longer use then
 stays until the region ends, which the author of the loop accepts.
 
-A region object may refer to data of the collector that holds no references
-itself: text, a slice of numbers. Such data is not in the group of the object,
-so text read from a file can be referred to by a region that ends long before
-the text does. The collector does not look inside a region, so the region pins
-the owner of every such reference until it ends or starts its next round. Data
-of that kind that could itself be in a region joins the group that refers to
-it, and data stored in an object the collector owns is the collector's.
+A region object may refer to something the collector owns in two cases: plain
+data, which has no references and no finalizer, and an argument or what is
+read out of one, which the caller holds. The collector does not look inside a
+region, so the region pins the owner of every such reference until it ends or
+starts its next round: an argument may live until the function returns. An
+object that refers to any other object of the collector stays with the
+collector, or a region would delay that object's finalizer.
 
-An array is an object like any other: its storage is in the group of the
-array, and so is every element stored in it. The compiler follows the array's
-own code for that. It only has to be told what a few runtime functions do
-that work on raw memory: the write barrier, `gc.transfer_refs`,
-`gc.moved_elements` and `mem.move_bytes`.
+An array is an object like any other, and the compiler follows the array's own
+code. It only has to be told what a few runtime functions do that work on raw
+memory: the write barrier, `gc.transfer_refs`, `gc.moved_elements` and
+`mem.move_bytes`.
 
 `valk build --region-report` lists where every object of a program lives and
 why; `--no-regions` turns regions off.
