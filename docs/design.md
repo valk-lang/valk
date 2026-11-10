@@ -1017,8 +1017,13 @@ go inside a loop: a store that replaces or removes a reference is a drop, and
 a drop on the way from the keeping variable to the object refuses the region.
 Summaries carry both facts, so a builder may be a callee: where each parameter
 and each object it makes ends up, also when it fails, and which groups it
-drops from. `list.append(x)` in a loop passes, a conditional append, `map.set`
-and `slot.x = y` do not. `$region` on a function vouches for its own loops and
+drops from. An object counts as kept when both arms of a branch keep it in the
+same place, and a struct value keeps what its fields were given when the
+struct is kept. `list.append(x)` in a loop passes, a conditional append,
+`map.set` and `slot.x = y` do not. `json.decode` passes: the parser adds
+members with a setter that keeps both the name and the value, and vouches for
+what a repeated name replaces, so a document that is read and dropped lives in
+a region. `$region` on a function vouches for its own loops and
 drops: what they leave behind stays until the region ends. `Array` and
 `ByteBuffer` use it where they replace their storage, which leaves at most as
 much again as they end up with.
@@ -1033,8 +1038,11 @@ collector, or a region would delay that object's finalizer.
 
 An array is an object like any other, and the compiler follows the array's own
 code. It only has to be told what a few runtime functions do that work on raw
-memory: the write barrier, `gc.transfer_refs`, `gc.moved_elements` and
-`mem.move_bytes`.
+memory: the write barrier, `gc.transfer_refs`, `gc.moved_elements`,
+`mem.move_bytes` and `mem.identity`. Bytes copied from one place to another
+make the two refer to the same things without making them one group, and
+`mem.identity` gives a number for an object that is not a reference to it; any
+other pointer that becomes a number keeps its object with the collector.
 
 `valk build --region-report` lists where every object of a program lives and
 why; `--no-regions` turns regions off.

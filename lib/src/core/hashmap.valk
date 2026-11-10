@@ -1,3 +1,5 @@
+use mem
+
 // Up to this many entries a map finds keys by a linear scan and keeps no bucket table
 value HASHMAP_SMALL_LIMIT (8)
 
@@ -146,6 +148,12 @@ struct HashMapEntry[K, T] {
         @property_update(this.entries.data, @ptrv(slot, T), value)
     }
 
+    fn update_key(index: uint, key: K) $inline {
+        @unsafe
+        let slot = this.entries.items().@offset(index * size_of(HashMapEntry[K, T]))
+        @property_update(this.entries.data, @ptrv(slot, K), key)
+    }
+
     fn key_hash(key: K) uint {
         #if K.$is_raw_pointer
         @unsafe
@@ -189,7 +197,7 @@ struct HashMapEntry[K, T] {
         let base = this.entries.data.@cast(ptr)
         let i: uint = 0
         while i < length {
-            if SELF.key_at(items, i) == key && !this.is_hole(i) : return i
+            if !this.is_hole(i) && SELF.key_at(items, i) == key : return i
             // A `$eq` that changed the map ends the search
             if this.entries.changed(length, base) : return HASHMAP_NONE
             i++
@@ -245,28 +253,59 @@ struct HashMapEntry[K, T] {
     fn rebuild_buckets(new_bucket_count: uint) {
         @unsafe
         if this.entries.length > u32.$max.to(uint) : panic("HashMap capacity is too large")
-        let group_count = new_bucket_count / 8
+        let words = new_bucket_count / 8 + new_bucket_count / 2
+        let known = this.table
+        if isset(known) && known.length == words {
+            this.refill_buckets()
+            return
+        }
+        this.grow_buckets(new_bucket_count, words)
+    }
+
+    // Gives every entry its bucket again in the table the map has: it makes nothing
+    fn refill_buckets() {
+        @unsafe
+        let table = this.table ?! return
+        let at = table.items()
+        let words = table.length
+        let i: uint = 0
+        while i < words {
+            @ptrv(at, u64, i) = 0xFFFFFFFFFFFFFFFF
+            i++
+        }
+        this.fill_buckets(at, this.bucket_count)
+    }
+
+    // `$region`: the table it replaces stays behind in a region. A table is only replaced by
+    // one of another size, which is a bigger one unless the map was emptied in between
+    fn grow_buckets(new_bucket_count: uint, words: uint) $region {
+        @unsafe
         // Control groups all EMPTY; the entry indexes are written as buckets fill
-        let table = Array[u64].fill(group_count + new_bucket_count / 2, 0xFFFFFFFFFFFFFFFF)
-        let groups = table.items()
+        let table = Array[u64].fill(words, 0xFFFFFFFFFFFFFFFF)
+        this.fill_buckets(table.items(), new_bucket_count)
+        this.table = table
+    }
+
+    // Gives every entry its bucket in a table of all EMPTY groups, by its address: a table
+    // of locked data is filled where it is
+    fn fill_buckets(groups: ptr, new_bucket_count: uint) {
+        @unsafe
+        let group_count = new_bucket_count / 8
         let entries_at = new_bucket_count / 4
         let count = this.entries.length
         let index: uint = 0
         while index < count {
-            if this.is_hole(index) {
-                index++
-                continue
+            if !this.is_hole(index) {
+                let hash = this.key_hash(SELF.key_at(this.entries.items(), index))
+                let slot = SELF.find_free_slot(groups, group_count - 1, hash)
+                @ptrv(groups, u8, slot) = hashmap_h2(hash)
+                @ptrv(groups, u32, entries_at + slot) = index.to(u32)
             }
-            let hash = this.key_hash(SELF.key_at(this.entries.items(), index))
-            let slot = SELF.find_free_slot(groups, group_count - 1, hash)
-            @ptrv(groups, u8, slot) = hashmap_h2(hash)
-            @ptrv(groups, u32, entries_at + slot) = index.to(u32)
             index++
         }
         this.bucket_count = new_bucket_count
         this.growth_left = hashmap_capacity(new_bucket_count) - this.length
         this.deleted = 0
-        this.table = table
     }
 
     // Adds an entry for a key the map does not hold yet
@@ -401,6 +440,34 @@ struct HashMapEntry[K, T] {
         this.insert_new(key, value)
     }
 
+    // Like `set`, but an existing entry takes the given key object too: the map then holds
+    // everything it was handed. The JSON parser fills its objects with it
+    fn set_entry(key: K, value: T) {
+        #if K.$is_raw_pointer || T.$is_raw_pointer
+        @unsafe
+        #end
+        if isset(this.table) {
+            let hash = this.key_hash(key)
+            let slot = this.find_slot(key, hash)
+            let table = this.table
+            if slot != HASHMAP_NONE && isset(table) {
+                let index = @ptrv(table.items(), u32, this.bucket_count / 4 + slot).to(uint)
+                this.update_key(index, key)
+                this.update_value(index, value)
+                return
+            }
+            this.append_entry(key, value, hash)
+            return
+        }
+        let index = this.find_entry(key)
+        if index != HASHMAP_NONE {
+            this.update_key(index, key)
+            this.update_value(index, value)
+            return
+        }
+        this.insert_new(key, value)
+    }
+
     /// Adds a new entry for `key`.
     ///
     /// Throws `exists`, leaving the map unchanged, when `key` is already present.
@@ -512,7 +579,7 @@ struct HashMapEntry[K, T] {
     /// Returns whether any entry holds a value equal to `value` (a linear scan using `==`).
     + fn has_value(value: T) bool {
         each this.entries into entry, index {
-            if entry.value == value && !this.is_hole(index) : return true
+            if !this.is_hole(index) && entry.value == value : return true
         }
         return false
     }
@@ -718,6 +785,9 @@ struct HashMapEntry[K, T] {
     }
 
     fn mark_hole(index: uint) {
+        // The entry lets go of its key and value here, not when the loop ends: a hole is
+        // empty from then on
+        this.empty_entry(index)
         // Read back from the map, a kept local would alias the stored array
         if !isset(this.hole_marks) : this.hole_marks = Array[bool].new(this.entries.length)
         let marks = this.hole_marks ?! return
@@ -726,9 +796,17 @@ struct HashMapEntry[K, T] {
         this.holes++
     }
 
+    fn empty_entry(index: uint) {
+        @unsafe
+        let slot = this.entries.items().@offset(index * size_of(HashMapEntry[K, T]))
+        @property_clear(this.entries.data, @ptrv(slot, HashMapEntry[K, T]))
+        mem.clear_bytes(slot, size_of(HashMapEntry[K, T]))
+    }
+
     // Moves the entries left of the holes together, keeping their order. In place: the
-    // entries never leave the map, so this also works on locked data
-    fn close_holes() $noinline {
+    // entries never leave the map, so this also works on locked data.
+    // `$region`: a hole is empty already, so what this moves and cuts off leaves nothing behind
+    fn close_holes() $noinline $region {
         let count = this.entries.length
         let kept: uint = 0
         let i: uint = 0
@@ -742,6 +820,6 @@ struct HashMapEntry[K, T] {
         this.entries.truncate(kept)
         this.holes = 0
         this.hole_marks = null
-        if isset(this.table) : this.rebuild_buckets(this.bucket_count)
+        this.refill_buckets()
     }
 }
