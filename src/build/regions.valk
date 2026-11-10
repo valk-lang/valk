@@ -24,6 +24,9 @@ value REGION_SOLVE_ROUNDS (64)
 value REGION_FRAME_WORDS (32)
 // A function has at most this many regions of its own, so that they do not fill its frame
 value REGION_MAX_OWN (8)
+// What a call hands a copy for one of its regions is a region of the caller, or from this
+// number on one the caller got itself
+value REGION_PASSED (1048576)
 
 class RegionSite {
     name: String
@@ -35,9 +38,10 @@ class RegionSite {
     // The IR has both forms
     dual: bool (false)
     emitted: bool (false)
-    // The region of this function it is made in, or the one a copy got from its caller
+    // The region of this function it is made in, or which of the regions a copy gets from
+    // its caller
     region: uint (REGION_NONE)
-    target: bool (false)
+    param: uint (REGION_NONE)
 }
 
 class RegionCall {
@@ -52,8 +56,10 @@ class RegionCall {
     dual: bool (false)
     emitted: bool (false)
     has_args: bool (false)
-    region: uint (REGION_NONE)
-    target: bool (false)
+    // What it hands the copy of its callee, one for every region that takes, in
+    // `RegionFacts.call_pass`: REGION_NONE, a region of this function, or REGION_PASSED + n
+    pass_first: uint (0)
+    pass_count: uint (0)
 }
 
 // The runtime functions the analysis knows by what they do, and the ones the IR calls
@@ -141,7 +147,13 @@ class RegionFacts {
     slot_class: Array[uint] (.{})
     slot_reason: Array[uint] (.{})
     runtime: RegionRuntime
-    target: uint (REGION_NONE)
+    // Whether the function makes objects in the group of a slot: its copy takes a region for it
+    slot_grows: Array[bool] (.{})
+    // The groups the copy takes a region for, each named by its first slot, in the order of
+    // the copy's parameters; and whether a caller may pass none for one
+    params: Array[uint] (.{})
+    may_null: Array[bool] (.{})
+    call_pass: Array[uint] (.{})
 
     // The loop of every region of this function, why a group that could be one is not, and
     // whether a caller uses the copy
@@ -282,8 +294,45 @@ class RegionFacts {
         return this.runtime.reason_id("passed to " + callee.ns.name + "." + callee.name + ", which the compiler cannot follow")
     }
 
-    fn has_target() bool {
-        return this.target != REGION_NONE && this.slot_reason[this.target] == 0
+    // Whether `slot` names a group the copy takes a region for
+    fn grows(slot: uint) bool {
+        return this.slot_grows[slot] && this.slot_reason[slot] == 0 && this.slot_class[slot] == slot
+    }
+
+    fn grows_any() bool {
+        each 0 .. this.slot_count() as slot {
+            if this.grows(slot) : return true
+        }
+        return false
+    }
+
+    // What a call passes for the group that `slot` names: every member of the callee's group
+    // is in one group here, so any of them names it
+    fn call_group(call: RegionCall, callee: RegionFacts, slot: uint) uint {
+        each slot .. callee.slot_count() - slot as member {
+            if callee.slot_class[member] != slot : continue
+            let actual = this.call_actual(call, callee, member)
+            if actual != REGION_NONE : return this.find(actual)
+        }
+        return REGION_NONE
+    }
+
+    fn set_params() {
+        if this.lost : return
+        each 0 .. this.slot_count() as slot {
+            if !this.grows(slot) : continue
+            this.params.append(slot)
+            this.may_null.append(false)
+        }
+    }
+
+    // Whether a call reaches the copy of its callee, in this function's own form or its copy
+    fn call_uses_copy(call: RegionCall, copy: bool) bool {
+        each call.pass_first .. call.pass_count as i {
+            let pass = this.call_pass[i]
+            if pass != REGION_NONE && (copy || pass < REGION_PASSED) : return true
+        }
+        return false
     }
 
     // Whether a caller can hand this function a region to make objects in
@@ -356,22 +405,18 @@ class RegionFacts {
         }
         each this.calls as call {
             let callee = call.callee.region_facts ?! continue
-            if callee.lost || !callee.has_target() : continue
-            let actual = this.call_actual(call, callee, callee.target)
-            // Every member of the callee's group is in one group here, so any of them names it
-            if actual == REGION_NONE {
-                each 0 .. callee.slot_count() as slot {
-                    if callee.slot_class[slot] == callee.slot_class[callee.target] && actual == REGION_NONE : actual = this.call_actual(call, callee, slot)
+            if callee.lost : continue
+            each 0 .. callee.slot_count() as slot {
+                if !callee.grows(slot) : continue
+                let root = this.call_group(call, callee, slot)
+                if root == REGION_NONE : continue
+                if !call.dual || !call.emitted {
+                    if this.reason[root] == 0 : this.reason[root] = this.runtime.reason_id(REGION_WHY_CALL_NO_FORM)
+                    continue
                 }
+                this.source[root] = true
+                if call.loop != 0 && !this.func.region_loops : this.deep[root] = true
             }
-            if actual == REGION_NONE : continue
-            let root = this.find(actual)
-            if !call.dual || !call.emitted {
-                if this.reason[root] == 0 : this.reason[root] = this.runtime.reason_id(REGION_WHY_CALL_NO_FORM)
-                continue
-            }
-            this.source[root] = true
-            if call.loop != 0 && !this.func.region_loops : this.deep[root] = true
         }
 
         this.has_source = false
@@ -412,24 +457,19 @@ class RegionFacts {
                 changed = true
             }
         }
-        // The group this function makes objects in: the result's first, as it is listed last
-        let slot = slots
-        while slot > 0 {
-            slot--
+        // The groups this function makes objects in: its copy takes a region for each
+        each 0 .. slots as slot {
             let node = this.slot_node(slot)
             if node == REGION_NONE || this.slot_reason[slot] > 0 : continue
             let root = this.find(node)
             if !this.source[root] : continue
-            let target = this.target
-            if target != REGION_NONE && this.slot_class[target] == this.slot_class[slot] && !this.deep[root] && this.copy_allowed() : continue
-            if target == REGION_NONE && !this.deep[root] && this.copy_allowed() {
-                this.target = slot
+            if !this.deep[root] && this.copy_allowed() {
+                if this.slot_grows[slot] : continue
+                this.slot_grows[slot] = true
                 changed = true
                 continue
             }
-            let why = "grown by a function that already grows another group"
-            if this.deep[root] : why = "grown in a loop by a function without $region"
-            else if !this.copy_allowed() : why = "grown by a function that cannot be given a region"
+            let why = this.deep[root] ? "grown in a loop by a function without $region" : "grown by a function that cannot be given a region"
             let why_id = this.runtime.reason_id(this.here(why))
             // All of the group, so that its members stay alike
             each 0 .. slots as k {
@@ -460,7 +500,15 @@ class RegionFacts {
             let root = this.find(i)
             scope[root] = scope[root] == REGION_NONE ? this.node_loop[i] : this.common_loop(scope[root], this.node_loop[i])
         }
-        let target_root = this.has_target() ? this.find(this.slot_node(this.target)) : REGION_NONE
+        // The groups a copy gets a region for
+        let passed = Array[uint]{}
+        each 0 .. this.count : passed.append(REGION_NONE)
+        each this.params as slot, n {
+            each slot .. this.slot_count() - slot as member {
+                let node = this.slot_node(member)
+                if this.slot_class[member] == slot && node != REGION_NONE : passed[this.find(node)] = n
+            }
+        }
         // A region of this function: every source runs once per round of the loop it belongs to
         let hosts = !this.func.region_suspends && !this.func.is_literal
         let fits = Array[bool]{}
@@ -478,8 +526,12 @@ class RegionFacts {
                 if site.loop != scope[root] && fits[root] : this.refused[root] = "made in a loop inside the scope it lives in ($region on the function allows it)"
             }
             each this.calls as call {
-                let root = this.call_root(call)
-                if root != REGION_NONE && call.loop != scope[root] && fits[root] : this.refused[root] = "made in a loop inside the scope it lives in ($region on the function allows it)"
+                let callee = call.callee.region_facts ?! continue
+                if !call.dual || !call.emitted : continue
+                each callee.params as slot {
+                    let root = this.call_group(call, callee, slot)
+                    if root != REGION_NONE && call.loop != scope[root] && fits[root] : this.refused[root] = "made in a loop inside the scope it lives in ($region on the function allows it)"
+                }
             }
         }
         each 0 .. this.count as i {
@@ -493,37 +545,50 @@ class RegionFacts {
         }
         each this.sites as site {
             let root = this.find(site.node)
-            if root == target_root : site.target = true
+            if passed[root] != REGION_NONE : site.param = passed[root]
             else : site.region = chosen[root]
         }
         each this.calls as call {
-            let root = this.call_root(call)
-            if root == REGION_NONE : continue
-            if root == target_root : call.target = true
-            else : call.region = chosen[root]
+            let callee = call.callee.region_facts ?! continue
+            if !call.dual || !call.emitted || callee.params.length == 0 : continue
+            call.pass_first = this.call_pass.length
+            call.pass_count = callee.params.length
+            each callee.params as slot {
+                let root = this.call_group(call, callee, slot)
+                let pass = REGION_NONE
+                if root != REGION_NONE && passed[root] != REGION_NONE : pass = REGION_PASSED + passed[root]
+                else if root != REGION_NONE : pass = chosen[root]
+                this.call_pass.append(pass)
+            }
         }
-    }
-
-    // The group a call makes objects in, when it is a source of the last solve
-    fn call_root(call: RegionCall) uint {
-        let callee = call.callee.region_facts ?! return REGION_NONE
-        if callee.lost || !callee.has_target() || !call.dual || !call.emitted : return REGION_NONE
-        each 0 .. callee.slot_count() as slot {
-            if callee.slot_class[slot] != callee.slot_class[callee.target] : continue
-            let actual = this.call_actual(call, callee, slot)
-            if actual != REGION_NONE : return this.find(actual)
-        }
-        return REGION_NONE
     }
 
     fn mark_copy() {
         if this.needs_copy : return
         this.needs_copy = true
         each this.calls as call {
-            if !call.target : continue
+            if !this.call_uses_copy(call, true) : continue
             let callee = call.callee.region_facts ?! continue
             callee.mark_copy()
         }
+    }
+
+    // A region a copy may get none for: one of its callers has that group on the heap.
+    // Returns whether a callee learned that
+    fn spread_null(copy: bool) bool {
+        let changed = false
+        each this.calls as call {
+            if !this.call_uses_copy(call, copy) : continue
+            let callee = call.callee.region_facts ?! continue
+            each 0 .. call.pass_count as n {
+                let pass = this.call_pass[call.pass_first + n]
+                let none = pass == REGION_NONE || (pass >= REGION_PASSED && (!copy || this.may_null[pass - REGION_PASSED]))
+                if !none || callee.may_null[n] : continue
+                callee.may_null[n] = true
+                changed = true
+            }
+        }
+        return changed
     }
 
     // Why the group of a node is not a region, for the report
@@ -1167,6 +1232,7 @@ fn region_collect_facts(func: Func) {
     each 0 .. f.slot_count() as slot {
         f.slot_class.append(slot)
         f.slot_reason.append(0)
+        f.slot_grows.append(false)
     }
     // What a closure reads of the function around it is not followed
     if func.is_literal {
@@ -1289,12 +1355,21 @@ fn region_solve(build: Build) {
             todo.append(caller)
         }
     }
+    each all as f : f.set_params()
     each all as f : f.decide(build)
     each all as f {
         each f.calls as call {
-            if call.region == REGION_NONE : continue
+            if !f.call_uses_copy(call, false) : continue
             let callee = call.callee.region_facts ?! continue
             callee.mark_copy()
+        }
+    }
+    let spreading = true
+    while spreading {
+        spreading = false
+        each all as f {
+            if f.spread_null(false) : spreading = true
+            if f.needs_copy && f.spread_null(true) : spreading = true
         }
     }
     build.region_decided = true
@@ -1312,13 +1387,18 @@ fn region_local_name(index: uint) String {
     return "\%\"rg." + index + "\""
 }
 
-fn region_copy_declare(func: Func) String !Error {
+fn region_passed_name(index: uint) String {
+    return "\%rg.in." + index
+}
+
+fn region_copy_declare(func: Func, regions: uint) String !Error {
     let out = ByteBuffer.new(128)
     out.append_text("declare ")
     out.append_text(ir_func_rett_type(func) !>)
     out.append_text(" ")
     out.append_text(region_copy_address(func))
     out.append_text("(ptr")
+    each 1 .. regions - 1 : out.append_text(", ptr")
     if ir_func_rett_by_pointer(func) : out.append_text(", ptr")
     each func.args as arg {
         out.append_text(", ")
@@ -1329,7 +1409,8 @@ fn region_copy_declare(func: Func) String !Error {
 }
 
 // Writes one form of a function's IR with its tokens replaced. `copy`: the form that makes
-// the objects of its target group in the region its first parameter names
+// the objects of the groups it grows in the regions its first parameters name. A caller that
+// has one of those groups on the heap passes null for it, and the copy then asks the collector
 fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteBuffer) !Error {
     let build = f.func.ns.build
     let runtime = build.region_runtime ?! f.func.exp.bug("Region runtime is missing")
@@ -1352,33 +1433,52 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
         if kind == 'N' {
             if copy : out.append_text(".rg")
         } else if kind == 'H' || kind == 'h' {
-            if copy : out.append_text(kind == 'H' ? "ptr \%rg.in, " : "ptr \%rg.in")
+            if copy {
+                each f.params as slot, n {
+                    if n > 0 : out.append_text(", ")
+                    out.append_text("ptr " + region_passed_name(n))
+                }
+                if kind == 'H' : out.append_text(", ")
+            }
         } else if kind == 'U' || kind == 'P' {
             let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
             let name = ""
-            if decided && copy && site.target : name = "\%rg.in"
-            else if decided && site.region != REGION_NONE : name = region_local_name(site.region)
-            if kind == 'U' : out.append_text(name.length > 0 ? "true" : "false")
+            let used = "true"
+            if decided && copy && site.param != REGION_NONE {
+                name = region_passed_name(site.param)
+                if f.may_null[site.param] : used = "\%rg.on." + site.param
+            } else if decided && site.region != REGION_NONE {
+                name = region_local_name(site.region)
+            }
+            if kind == 'U' : out.append_text(name.length > 0 ? used : "false")
             else : out.append_text(name.length > 0 ? name : "null")
         } else if kind == 'C' {
             let call = f.calls.get(id - 1) ! f.func.exp.bug("Region token of an unknown call")
-            let name = ""
-            if decided && copy && call.target : name = "\%rg.in"
-            else if decided && call.region != REGION_NONE : name = region_local_name(call.region)
-            if name.length == 0 {
+            if !decided || !f.call_uses_copy(call, copy) {
                 out.append_text(ir_func_address(call.callee))
                 out.append_text("(")
             } else {
                 out.append_text(region_copy_address(call.callee))
-                out.append_text("(ptr ")
-                out.append_text(name)
+                out.append_text("(")
+                each 0 .. call.pass_count as n {
+                    let pass = f.call_pass[call.pass_first + n]
+                    if n > 0 : out.append_text(", ")
+                    if pass == REGION_NONE || (pass >= REGION_PASSED && !copy) : out.append_text("ptr null")
+                    else if pass >= REGION_PASSED : out.append_text("ptr " + region_passed_name(pass - REGION_PASSED))
+                    else : out.append_text("ptr " + region_local_name(pass))
+                }
                 if call.has_args : out.append_text(", ")
                 if call.callee.unit != unit {
                     let symbol = region_copy_address(call.callee)
-                    if !unit.region_declares.has(symbol) : unit.region_declares.set(symbol, region_copy_declare(call.callee) !>)
+                    if !unit.region_declares.has(symbol) : unit.region_declares.set(symbol, region_copy_declare(call.callee, call.pass_count) !>)
                 }
             }
         } else if kind == 'E' {
+            if decided && copy {
+                each f.may_null as may, n {
+                    if may : out.append_text("  \%rg.on." + n + " = icmp ne ptr " + region_passed_name(n) + ", null\n")
+                }
+            }
             if decided {
                 each f.regions as loop, i {
                     out.append_text("  " + region_local_name(i) + " = alloca [" + REGION_FRAME_WORDS + " x i64]\n")
@@ -1435,9 +1535,9 @@ fn region_print_report(build: Build) {
             if build.region_decided && site.region != REGION_NONE {
                 verdict = "region of " + func.name
                 if f.regions[site.region] != 0 : verdict += ", per round of a loop"
-            } else if build.region_decided && site.target && f.needs_copy {
+            } else if build.region_decided && site.param != REGION_NONE && f.needs_copy {
                 verdict = "region of a caller"
-            } else if build.region_decided && site.target {
+            } else if build.region_decided && site.param != REGION_NONE {
                 verdict = "heap: no caller keeps it in a region"
             } else {
                 verdict = "heap: " + f.heap_reason(site.node)
@@ -1458,19 +1558,26 @@ fn region_print_report(build: Build) {
             let ns = src.ns
             if !isset(ns) || ns.pkg != main_pkg : continue
             let callee = call.callee.region_facts ?! continue
-            if callee.lost || !callee.has_target() : continue
+            if callee.lost || !callee.grows_any() : continue
+            // The first group of the callee that this function has a region for decides
             let actual = REGION_NONE
+            let pass = REGION_NONE
             each 0 .. callee.slot_count() as slot {
-                if callee.slot_class[slot] == callee.slot_class[callee.target] && actual == REGION_NONE : actual = f.call_actual(call, callee, slot)
+                if !callee.grows(slot) : continue
+                let root = f.call_group(call, callee, slot)
+                if actual == REGION_NONE : actual = root
+            }
+            each 0 .. call.pass_count as n {
+                if pass == REGION_NONE : pass = f.call_pass[call.pass_first + n]
             }
             if actual == REGION_NONE : continue
             let verdict = ""
-            if build.region_decided && call.region != REGION_NONE {
+            if build.region_decided && pass != REGION_NONE && pass < REGION_PASSED {
                 verdict = "region of " + func.name
-                if f.regions[call.region] != 0 : verdict += ", per round of a loop"
-            } else if build.region_decided && call.target && f.needs_copy {
+                if f.regions[pass] != 0 : verdict += ", per round of a loop"
+            } else if build.region_decided && pass != REGION_NONE && f.needs_copy {
                 verdict = "region of a caller"
-            } else if build.region_decided && call.target {
+            } else if build.region_decided && pass != REGION_NONE {
                 verdict = "heap: no caller keeps it in a region"
             } else {
                 verdict = "heap: " + f.heap_reason(actual)

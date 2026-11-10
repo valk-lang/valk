@@ -985,9 +985,11 @@ region when all its objects are made by the function or by functions it calls
 for that, and nothing else is in it: no parameter, global, result of unknown
 code, closure, coroutine, shared value or number. Nothing collected can then
 point into a region, and a region points at nothing collected. A function that
-makes objects in the group of its result or of one parameter has a second
-form that takes the region from its caller, so `Node.tree(depth)` builds a
-whole tree in the region of the function that uses it.
+makes objects in the group of its result or of a parameter has a second form
+that takes a region for each such group from its caller, so `Node.tree(depth)`
+builds a whole tree in the region of the function that uses it. Every call
+decides for itself: a caller that keeps one of the groups on the heap passes
+no region for it, and one that keeps them all calls the first form.
 
 What the compiler cannot follow stays with the collector, so regions change
 where an object lives and never what a program may do. A region is also
