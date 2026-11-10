@@ -158,6 +158,7 @@ class RegionRuntime {
     transfer_refs: Func
     moved_elements: Func
     move_bytes: Func
+    copy_bytes: Func
     // Names an object by a number, which is not a reference to it
     identity: ?Func (null)
     pin: Func
@@ -695,11 +696,11 @@ class RegionFacts {
     // `runtime.map`: what the call passes for a parameter or takes as the result, and from
     // there what those refer to. `apply` makes the groups here refer to each other the way
     // the summary says; without it, a group the call has nothing for stays REGION_NONE
-    fn map_call(call: RegionCall, callee: RegionFacts, apply: bool) {
+    fn map_call(call: ?RegionCall, callee: RegionFacts, apply: bool) {
         let map = this.runtime.map
         map.clear()
         let count = callee.sum_reason.length
-        let known = call.map_at
+        let known = isset(call) ? call.map_at : REGION_NONE
         if !apply && known != REGION_NONE {
             // Worked out when the summary was applied: the groups only merged since
             let kept = this.runtime.call_map
@@ -710,7 +711,8 @@ class RegionFacts {
         each 0 .. callee.slot_count() as slot {
             let g = callee.slot_group[slot]
             if g == REGION_NONE : continue
-            let actual = this.call_actual(call, callee, slot)
+            // Without a call: this function's own slots
+            let actual = isset(call) ? this.call_actual(call, callee, slot) : this.slot_node(slot)
             if actual == REGION_NONE : continue
             if map[g] == REGION_NONE : map[g] = actual
             else if apply : this.unify(map[g], actual)
@@ -1399,6 +1401,10 @@ class RegionFacts {
                 call.map_at = kept.length
                 each map as node : kept.append(node)
             }
+            // What the last summary merged stays merged, so that summaries only grow: a
+            // function that calls itself would otherwise fold a chain of references and
+            // unfold it again, for ever
+            this.map_call(null, this, true)
         }
 
         this.source.clear()
@@ -1619,6 +1625,10 @@ class RegionFacts {
             }
         }
         if !changed : return false
+        // What a call of itself was mapped to names the groups of the old summary
+        each this.calls as call {
+            if call.callee == this.func : call.map_at = REGION_NONE
+        }
         this.sum_content.clear()
         this.sum_leaf.clear()
         this.sum_reason.clear()
@@ -1762,7 +1772,7 @@ fn region_token(kind: u8, id: uint) String {
 fn region_runtime(build: Build) ?RegionRuntime {
     let known = build.region_runtime
     if isset(known) || build.region_off : return known
-    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "transfer_refs", "moved_elements", "region_init", "region_alloc", "region_alloc_zeroed", "region_reset", "region_exit", "move_bytes", "region_pin", "region_property_set", "region_property_update" }
+    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "transfer_refs", "moved_elements", "region_init", "region_alloc", "region_alloc_zeroed", "region_reset", "region_exit", "move_bytes", "region_pin", "region_property_set", "region_property_update", "copy_bytes" }
     let funcs = Array[Func]{}
     // Looked up quietly: a standard library without regions builds as before
     let main = build.main_pkg
@@ -1770,7 +1780,7 @@ fn region_runtime(build: Build) ?RegionRuntime {
     let gc_ns = isset(valk) ? (valk.namespaces.get("gc") !? null) : null
     let mem_ns = isset(valk) ? (valk.namespaces.get("mem") !? null) : null
     each names as name {
-        let ns = name == "move_bytes" ? mem_ns : gc_ns
+        let ns = name == "move_bytes" || name == "copy_bytes" ? mem_ns : gc_ns
         let idf = isset(ns) ? ns.scope.get_idf(name) : null
         let func = isset(idf) ? idf.func : null
         if !isset(func) {
@@ -1801,6 +1811,7 @@ fn region_runtime(build: Build) ?RegionRuntime {
         pin: funcs[12]
         pinned_set: funcs[13]
         pinned_update: funcs[14]
+        copy_bytes: funcs[15]
     }
     // Newer than the rest: a standard library without it has no such calls
     let named = isset(mem_ns) ? mem_ns.scope.get_idf("identity") : null
@@ -2001,6 +2012,27 @@ fn region_root_of(f: RegionFacts, value: Value) uint {
     return 0
 }
 
+// Whether an address is known to point at bytes without references: the data of text or of
+// a slice of numbers, or a pointer whose type says so
+fn region_plain_bytes(value: Value) bool {
+    let at = value
+    while true {
+        let t = at.type
+        let type = at.rett.get_non_nullable()
+        if type.kind == TYPE.ref_slice || type.kind == TYPE.ptr_of || type.kind == TYPE.ref_of || type.kind == TYPE.adr_of {
+            let sub = type.get_sub_type()
+            if isset(sub) : return !sub.has_gc_refs()
+        }
+        let inner = at.value1 ?! return false
+        if t == VAL.cast || t == VAL.ptr_offset || t == VAL.wrap || t == VAL.prop || (t == VAL.op && region_holds_refs(at.rett)) {
+            at = inner
+        } else {
+            return false
+        }
+    }
+    return false
+}
+
 // The parameter an `if` tests, when all it does is leave: with `false` passed, it is not there
 fn region_guard_slot(f: RegionFacts, value: Value) uint {
     let test = value.value1 ?! return REGION_NONE
@@ -2116,13 +2148,20 @@ fn region_walk_call(f: RegionFacts, value: Value) uint {
             return REGION_NONE
         }
         // Bytes move from one place to another, and old storage hands its elements to the
-        // new: the two refer to the same things, without being one
-        if target == runtime.transfer_refs || target == runtime.move_bytes {
+        // new. References that are copied as bytes keep the marks the collector gave them,
+        // so the two places are the collector's together or a region's together: one group.
+        // Bytes without references only make the two refer to the same things
+        if target == runtime.transfer_refs || target == runtime.move_bytes || target == runtime.copy_bytes {
             if count >= 2 {
                 let from = args[first]
                 let to = args[first + 1]
-                if from != REGION_NONE && to != REGION_NONE : f.step(REGION_STEP_ABSORB, to, from)
-                else : f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+                let plain = target != runtime.transfer_refs && isset(values) && values.length >= 2 && (region_plain_bytes(values[0]) || region_plain_bytes(values[1]))
+                if from != REGION_NONE && to != REGION_NONE {
+                    if plain : f.step(REGION_STEP_ABSORB, to, from)
+                    else : f.join(from, to)
+                } else if !plain {
+                    f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+                }
             }
             region_cut_args(f, first)
             return REGION_NONE
@@ -2345,7 +2384,18 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
     if isset(checked) : region_walk(f, checked)
     let t = value.type
 
-    if t == VAL.int || t == VAL.float || t == VAL.bool || t == VAL.null || t == VAL.string || t == VAL.undefined || t == VAL.type || t == VAL.property_meta || t == VAL.ir_comment || t == VAL.init_allocators || t == VAL.error_value {
+    if t == VAL.int || t == VAL.float || t == VAL.bool || t == VAL.null || t == VAL.string || t == VAL.undefined || t == VAL.type || t == VAL.property_meta || t == VAL.ir_comment || t == VAL.init_allocators {
+        return REGION_NONE
+    }
+    if t == VAL.error_value {
+        // The fields of an error are kept where its handler reads them, long after this
+        // function is gone
+        let code = value.value1
+        if isset(code) : region_walk(f, code)
+        let fields = value.values
+        if isset(fields) {
+            each fields as field : f.mark(region_walk(f, field), "kept in the fields of an error")
+        }
         return REGION_NONE
     }
     // Comparing and testing values links nothing
@@ -2587,7 +2637,14 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         let apart = t == VAL.phi || t == VAL.error_handler
         let leaves = t == VAL.error_handler && (value.op == ERRH_KIND.pass.to(u8) || value.op == ERRH_KIND.panic.to(u8))
         if apart : f.branch()
-        if t == VAL.error_handler && value.op == ERRH_KIND.pass.to(u8) : f.exits_error++
+        if t == VAL.error_handler && value.op == ERRH_KIND.pass.to(u8) {
+            f.exits_error++
+            // What an error is passed on with goes into its fields
+            let fields = value.values
+            if isset(fields) {
+                each fields as field : f.mark(region_walk(f, field), "kept in the fields of an error")
+            }
+        }
         merged = region_into(f, merged, value.value1, value.rett)
         merged = region_into(f, merged, value.value2, value.rett)
         merged = region_into_list(f, merged, value.values, value.rett)
@@ -2659,7 +2716,8 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         return region_unknown(f, value, region_walk_children(f, value), "shared between threads")
     }
     if t == VAL.memcpy {
-        // The bytes of one place become those of another: the two refer to the same things
+        // The bytes of one place become those of another: one group, unless the bytes are
+        // known to hold no references
         let parts = value.values
         let from = REGION_NONE
         let to = REGION_NONE
@@ -2670,8 +2728,13 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
                 if i == 1 : to = node
             }
         }
-        if from != REGION_NONE && to != REGION_NONE : f.step(REGION_STEP_ABSORB, to, from)
-        else : f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+        let plain = isset(parts) && parts.length >= 2 && (region_plain_bytes(parts[0]) || region_plain_bytes(parts[1]))
+        if from != REGION_NONE && to != REGION_NONE {
+            if plain : f.step(REGION_STEP_ABSORB, to, from)
+            else : f.join(from, to)
+        } else if !plain {
+            f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+        }
         return REGION_NONE
     }
     if t == VAL.co {
@@ -3135,6 +3198,7 @@ fn region_write_ir(func: Func, code: String, unit: Unit, out: ByteBuffer) !Error
 
 fn region_print_report(build: Build) {
     region_solve(build)
+    if !build.region_decided && build.region_funcs.length > 0 : println("The analysis did not settle (a compiler bug): nothing is in a region")
     // One verdict per place in the source; a generic instance that is refused decides it
     let verdicts = Map[String]{}
     let places = Array[String]{}
