@@ -992,7 +992,9 @@ whole tree in the region of the function that uses it.
 What the compiler cannot follow stays with the collector, so regions change
 where an object lives and never what a program may do. A region is also
 refused where it could hold on to garbage: when its objects are made in a loop
-inside the scope it belongs to, and in a function that can suspend.
+inside the scope it belongs to, and in a function that can suspend. `$region`
+on a function allows its own loops: what they make and no longer use then
+stays until the region ends, which the author of the loop accepts.
 
 An array is an object like any other: its storage is in the group of the
 array, and so is every element stored in it. The compiler follows the array's

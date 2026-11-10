@@ -859,6 +859,21 @@ fn add_two(value: int) int $noinline { return value + 2 }
 
 These flags cannot be combined on the same function.
 
+Objects that provably stay in one scope are not given to the garbage collector: they are freed
+together when the scope ends. The compiler does not do this for objects made in a loop, because
+what the loop no longer uses would stay until the end too. `$region` on a function says its loops
+may do that. Use it where a function builds something in a loop and keeps all of it:
+
+```rust
+fn numbers(count: int) Array[Item] $region {
+    let list = Array[Item]{}
+    each 0 .. count as i : list.append(Item { n: i })
+    return list
+}
+```
+
+`valk build --region-report` shows where each object lives and why.
+
 `$deprecated` keeps a function callable but warns at every call from another
 package. The warning quotes the sentence of the `///` block that starts with
 "Deprecated", so say what to use instead; `valk doc` shows the flag and editors
