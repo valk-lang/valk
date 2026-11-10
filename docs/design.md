@@ -976,8 +976,10 @@ operation such as `close`.
 An object that provably stays in one scope is not given to the collector. It
 is made in a region: memory of that scope, freed as a whole when the function
 returns, or reused when the loop the scope is one round of starts its next
-round. The first 184 bytes of a region are in the frame; a region that grows
-past them takes chunks from the allocator.
+round. The first 176 bytes of a region are in the frame; a region that grows
+past them takes chunks from the allocator, and a thread keeps a few small
+chunks for the next region. A region is set up when its first object is made,
+so a call that makes none pays two stores for it.
 
 The proof groups every value that holds references. Two values share a group
 when one can be the other. What an object refers to is not in its group: a
@@ -1032,7 +1034,10 @@ A region object may refer to something the collector owns in two cases: plain
 data, which has no references and no finalizer, and an argument or what is
 read out of one, which the caller holds. The collector does not look inside a
 region, so the region pins the owner of every such reference until it ends or
-starts its next round: an argument may live until the function returns. An
+starts its next round: an argument may live until the function returns. The
+header of a region object says where its region is, so a store that pins finds
+the region from the object it stores into, and a function that only stores
+takes no region from its caller. An
 object that refers to any other object of the collector stays with the
 collector, or a region would delay that object's finalizer.
 
