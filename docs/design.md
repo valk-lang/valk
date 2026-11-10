@@ -1007,10 +1007,21 @@ function makes together and links together is one group.
 
 What the compiler cannot follow stays with the collector, so regions change
 where an object lives and never what a program may do. A region is also
-refused where it could hold on to garbage: when its objects are made in a loop
-inside the scope it belongs to, and in a function that can suspend. `$region`
-on a function allows its own loops: what they make and no longer use then
-stays until the region ends, which the author of the loop accepts.
+refused where it could hold on to garbage: in a function that can suspend, and
+when its objects are made in a loop inside the scope it belongs to, unless the
+loop provably leaves nothing behind. That takes two things. Every object a
+round makes is kept on every way through the round: stored in an object,
+passed to a parameter the callee keeps, or returned, without a branch or a way
+out in between. And what keeps it lives as long as the region and never lets
+go inside a loop: a store that replaces or removes a reference is a drop, and
+a drop on the way from the keeping variable to the object refuses the region.
+Summaries carry both facts, so a builder may be a callee: where each parameter
+and each object it makes ends up, also when it fails, and which groups it
+drops from. `list.append(x)` in a loop passes, a conditional append, `map.set`
+and `slot.x = y` do not. `$region` on a function vouches for its own loops and
+drops: what they leave behind stays until the region ends. `Array` and
+`ByteBuffer` use it where they replace their storage, which leaves at most as
+much again as they end up with.
 
 A region object may refer to something the collector owns in two cases: plain
 data, which has no references and no finalizer, and an argument or what is

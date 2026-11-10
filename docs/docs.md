@@ -860,15 +860,26 @@ fn add_two(value: int) int $noinline { return value + 2 }
 These flags cannot be combined on the same function.
 
 Objects that provably stay in one scope are not given to the garbage collector: they are freed
-together when the scope ends. The compiler does not do this for objects made in a loop, because
-what the loop no longer uses would stay until the end too. `$region` on a function says its loops
-may do that. Use it where a function builds something in a loop and keeps all of it:
+together when the scope ends. That includes what a loop adds to a list, when every object a round
+makes is added on every path and nothing is taken out or replaced in a loop:
 
 ```rust
-fn numbers(count: int) Array[Item] $region {
+fn numbers(count: int) Array[Item] {
     let list = Array[Item]{}
     each 0 .. count as i : list.append(Item { n: i })
     return list
+}
+```
+
+Where the compiler cannot see that, such as a loop that fills a `Map` with `set`, the objects stay
+with the garbage collector, because whatever the loop no longer uses would stay until the scope
+ends. `$region` on a function says its loops may do that:
+
+```rust
+fn index(words: Array[String]) Map[Item] $region {
+    let found = Map[Item]{}
+    each words as word, i : found.set(word, Item { n: i.to(int) })
+    return found
 }
 ```
 
