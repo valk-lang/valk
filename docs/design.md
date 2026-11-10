@@ -971,6 +971,34 @@ operation such as `close`.
   deadlock collection. Releasing or destroying an unheld native lock is
   permitted.
 
+### Regions
+
+An object that provably stays in one scope is not given to the collector. It
+is made in a region: memory of that scope, freed as a whole when the function
+returns, or reused when the loop the scope is one round of starts its next
+round. The first 224 bytes of a region are in the frame; a region that grows
+past them takes chunks from the allocator.
+
+The proof groups every value that holds references: two values share a group
+when one can be the other, refer to it or be referred to by it. A group is a
+region when all its objects are made by the function or by functions it calls
+for that, and nothing else is in it: no parameter, global, result of unknown
+code, closure, coroutine, shared value or number. Nothing collected can then
+point into a region, and a region points at nothing collected. A function that
+makes objects in the group of its result or of one parameter has a second
+form that takes the region from its caller, so `Node.tree(depth)` builds a
+whole tree in the region of the function that uses it.
+
+What the compiler cannot follow stays with the collector, so regions change
+where an object lives and never what a program may do. A region is also
+refused where it could hold on to garbage: when its objects are made in a loop
+inside the scope it belongs to, and in a function that can suspend. Slices,
+arrays, maps and text made at run time are collected objects, and so is
+everything that refers to them.
+
+`valk build --region-report` lists where every object of a program lives and
+why; `--no-regions` turns regions off.
+
 ## Layout and ABI
 
 - Layout is target-specific and computed from the target pointer size and

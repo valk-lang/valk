@@ -5,6 +5,7 @@
 
 ```
 - Release 0.8.5
++ Regions: objects that provably stay in one scope are made in memory that is freed with the scope instead of on the GC heap, also when another function builds them (`Node.tree(depth)` for a caller that only reads the tree); `--region-report` shows where every object lives and why, `--no-regions` turns it off (binary-tree 20: 1.56 -> 0.72 s, merkletrees 18: 0.53 -> 0.42 s)
 + Coroutine errors can have payload fields: each task keeps its payload until it is awaited
 + `http.HttpError.status` carries the answered status in `http_status`
 + JSON: enum properties decode from their number

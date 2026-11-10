@@ -122,12 +122,16 @@ fn generate_unit_module(build: Build, unit: Unit) String !Error {
 
     ir_write_allocator_helpers(out, build, unit) !>
 
+    // Which form of a function's code is used was decided after it was written. A copy that
+    // takes a region may live in another unit: its declaration follows the functions
+    unit.region_declares = Map[String]{}
     each unit.functions as func {
         if func.is_extern || func.is_generic_base || !func.info_used : continue
         let code = func.get_ir_code()
         if code.length == 0 : continue
-        out.append_text(code)
+        region_write_ir(func, code, unit, out) !>
     }
+    each unit.region_declares as declare, symbol : out.append_text(declare)
     out.append_text("\n")
     out.append_text(IR_TBAA_NODES)
     if build.options.debug : ir_debug_module_nodes(out, build, unit)
@@ -359,6 +363,8 @@ class IRFunc {
     debug_chain: String ("")
     // Addresses whose loads and stores carry an alias tag (see IR_TBAA_HEADER)
     tbaa: HashMap[String, String] (.{})
+    // Set when the function has places that a region may take over (regions.valk)
+    regions: ?RegionFacts (null)
 
     fn line(text: String) {
         this.code.append_text("  ")
@@ -550,6 +556,9 @@ fn generate_func_ir(func: Func) !Error {
     let ir_name = func_ir_name(func)
     let c_abi = func.is_export ? (ir_c_abi_of(func) !>) : null
     ir.c_abi = c_abi
+    region_collect_facts(func)
+    let facts = func.region_facts
+    if isset(facts) && facts.has_tokens && !isset(c_abi) : ir.regions = facts
 
     if func.ns.build.options.single_unit
         && func.ns.build.options.mode == BUILDTYPE.exe
@@ -562,11 +571,16 @@ fn generate_func_ir(func: Func) !Error {
     ir.code.append_text(isset(c_abi) ? (ir_c_result_type(func, c_abi) !>) : (ir_func_rett_type(func) !>))
     ir.code.append_text(" @\"")
     ir.code.append_text(ir_name)
+    if isset(ir.regions) : ir.code.append_text(region_token('N', 0))
     ir.code.append_text("\"(")
     if isset(c_abi) {
         ir.code.append_text(ir_c_params(func, c_abi, true) !>)
     } else {
         let by_pointer = ir_func_rett_by_pointer(func)
+        if isset(ir.regions) {
+            let more = by_pointer || func.is_literal || func.args.length > 0 || func.infinite_args
+            ir.code.append_text(region_token(more ? 'H' : 'h', 0))
+        }
         if by_pointer : ir.code.append_text("ptr \%sret.out")
         if func.is_literal {
             if by_pointer : ir.code.append_text(", ")
@@ -622,6 +636,14 @@ fn generate_func_ir(func: Func) !Error {
     }
     ir_debug_variables(ir) !>
     ir_debug_frame_enter(ir) !>
+    if isset(ir.regions) {
+        let runtime = func.ns.build.region_runtime ?! func.exp.bug("Region runtime is missing")
+        ir_use_func(ir, runtime.init)
+        ir_use_func(ir, runtime.alloc)
+        ir_use_func(ir, runtime.reset)
+        ir_use_func(ir, runtime.exit)
+        ir.code.append_text(region_token('E', 0))
+    }
 
     ir_emit_values(ir, scope.values) !>
 
@@ -641,6 +663,12 @@ fn generate_func_ir(func: Func) !Error {
     ir_splice_entry_allocas(ir)
     ir.code.append_text("}\n\n")
     ir_debug_finish(ir, ir.code)
+    // A copy of the code would define the helpers twice
+    if ir.coro_helpers.length > 0 : func.region_no_copy = true
+    if isset(facts) {
+        facts.site_values.clear()
+        facts.call_values.clear()
+    }
     ir.code.append_buffer(ir.coro_helpers)
     func.set_ir_code(ir.code.to_string())
 }
@@ -820,7 +848,8 @@ fn ir_emit_lock_cleanup(ir: IRFunc, depth: uint) !Error {
     }
 }
 
-fn ir_emit_func_cleanup(ir: IRFunc) !Error {
+// `exiting`: the program ends here, and what it prints on the way may read a region
+fn ir_emit_func_cleanup(ir: IRFunc, exiting: bool (false)) !Error {
     if ir.cleanup_active : return
     ir.cleanup_active = true
     ir_emit_lock_cleanup(ir, 0) !>
@@ -829,6 +858,7 @@ fn ir_emit_func_cleanup(ir: IRFunc) !Error {
         each scope.values as value : ir_emit_stmt(ir, value) !>
     }
     ir_emit_keep_alive(ir) !>
+    if isset(ir.regions) && !exiting && !ir.terminated : ir.code.append_text(region_token('X', 0))
     ir.cleanup_active = false
 }
 
@@ -1500,6 +1530,8 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     ir.jump(cond_block)
 
     ir.label(cond_block)
+    // A round starts: the regions of this loop hold nothing that is still used
+    if isset(ir.regions) && value.region_id > 0 : ir.code.append_text(region_token('L', value.region_id.to(uint)))
     let condv = value.value1
     if !isset(condv) : value.bug("IR while is missing its condition")
     ir.loops.append(IRLoop { cond: cond_block, after: after_block, locks: ir.active_locks.length })
@@ -3036,7 +3068,7 @@ fn ir_emit_error_panic(ir: IRFunc, value: Value, code: String) !Error {
 fn ir_emit_panic_call(ir: IRFunc, panic_func: Func, message: String, location: String) !Error {
     let msg = ir_emit_string_data(ir, message)
     let loc = ir_emit_string_data(ir, location)
-    ir_emit_func_cleanup(ir) !>
+    ir_emit_func_cleanup(ir, true) !>
     let arg = panic_func.args.get(0) ! panic_func.exp.bug("core.panic has no message argument")
     let location_arg = panic_func.args.get(1) ! panic_func.exp.bug("core.panic has no location argument")
     let mark = ir.arg_list.length
@@ -3425,9 +3457,15 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
 
     let slot = ""
     if lowered == "ptr" {
-        slot = class.kind == CLASS_KIND.slice
-        ? (ir_emit_slice_alloc(ir, value, class, fields, field_mark) !>)
-        : (ir_emit_class_alloc(ir, value, class, size) !>)
+        let regions = ir.regions
+        let site = isset(regions) ? regions.known_site(value) : null
+        if class.kind == CLASS_KIND.slice {
+            slot = ir_emit_slice_alloc(ir, value, class, fields, field_mark) !>
+        } else if isset(site) && site.dual {
+            slot = ir_emit_region_or_heap_alloc(ir, value, class, size, site) !>
+        } else {
+            slot = ir_emit_class_alloc(ir, value, class, size) !>
+        }
     } else {
         slot = ir.var()
         ir_name_alloca(ir, slot, lowered)
@@ -3803,6 +3841,30 @@ fn ir_write_receiver_arg(ir: IRFunc, mark: uint, method: Func, address: String) 
     ir.write_arg(mark, "ptr", address)
 }
 
+// Whether the object lives in a region is only known once every function has been read, so
+// its code has both forms behind a token that becomes `true` or `false`. A region object has
+// the header of an object without a block, all zero: the collector leaves it alone and
+// stores into it are plain
+fn ir_emit_region_or_heap_alloc(ir: IRFunc, value: Value, class: Class, size: u32, site: RegionSite) String !Error {
+    let id = value.region_id.to(uint)
+    let runtime = ir.func.ns.build.region_runtime ?! value.bug("Region runtime is missing")
+    site.emitted = true
+    let in_region = ir.block("rg.object")
+    let on_heap = ir.block("rg.heap")
+    let after = ir.block("rg.after")
+    ir.cond_jump(region_token('U', id), in_region, on_heap)
+    ir.label(in_region)
+    let item = ir.var()
+    ir.line(item + " = call ptr " + ir_func_address(runtime.alloc) + "(ptr " + region_token('P', id) + ", i64 " + size + ")")
+    ir.jump(after)
+    ir.label(on_heap)
+    let heap = ir_emit_class_alloc(ir, value, class, size) !>
+    let heap_end = ir.current_block
+    ir.jump(after)
+    ir.label(after)
+    return ir_emit_phi2(ir, "ptr", item, in_region, heap, heap_end)
+}
+
 fn ir_emit_class_alloc(ir: IRFunc, value: Value, class: Class, size: u32) String !Error {
     let allocator = value.get_allocator()
     if isset(allocator) {
@@ -4162,7 +4224,7 @@ fn ir_emit_call(ir: IRFunc, value: Value, into: String ("")) String !Error {
         call_type = ir_error_abi_type(value.rett) !>
     }
     if by_pointer : call_type = "void"
-    if exits : ir_emit_func_cleanup(ir) !>
+    if exits : ir_emit_func_cleanup(ir, true) !>
     let has_result = call_type != "void"
     let out = has_result ? ir.var() : ""
     ir_open_call(ir, out, call_type)
@@ -4176,7 +4238,20 @@ fn ir_emit_call(ir: IRFunc, value: Value, into: String ("")) String !Error {
         if direct_func.args.length > 0 || direct_func.is_literal : ir.write(", ")
         ir.write("...)")
     }
-    ir_close_call(ir, isset(target_symbol) ? ir_func_address(target_symbol) : target, arg_mark)
+    // Which form of the function a call reaches is decided when the module is written
+    let regions = ir.regions
+    let region_call = isset(regions) && isset(target_symbol) ? regions.known_call(value) : null
+    if isset(region_call) && region_call.dual && region_call.callee == target_symbol {
+        region_call.emitted = true
+        region_call.has_args = ir.arg_list.length > arg_mark
+        ir.write(" ")
+        ir.write(region_token('C', value.region_id.to(uint)))
+        ir.flush_args(arg_mark)
+        ir.write(")")
+        ir.line_end()
+    } else {
+        ir_close_call(ir, isset(target_symbol) ? ir_func_address(target_symbol) : target, arg_mark)
+    }
     if exits {
         ir.line("unreachable")
         ir.terminated = true
