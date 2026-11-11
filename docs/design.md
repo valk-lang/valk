@@ -1044,10 +1044,17 @@ collector, or a region would delay that object's finalizer.
 An array is an object like any other, and the compiler follows the array's own
 code. It only has to be told what a few runtime functions do that work on raw
 memory: the write barrier, `gc.transfer_refs`, `gc.moved_elements`,
-`mem.move_bytes` and `mem.identity`. Bytes copied from one place to another
-make the two refer to the same things without making them one group, and
-`mem.identity` gives a number for an object that is not a reference to it; any
-other pointer that becomes a number keeps its object with the collector.
+`mem.move_bytes`, `mem.copy_bytes` and `mem.identity`. Memory copied from one
+place to another makes the two one group, unless the bytes are known to hold no
+references: then the two only refer to the same things. `mem.identity` gives a
+number for an object that is not a reference to it; any other pointer that
+becomes a number keeps its object with the collector. What an error is thrown
+with stays with the collector: its handler reads it after the function is gone.
+
+A `GC_DEBUG` build checks the analysis while the program runs. A region
+overwrites its memory when it ends or starts a new round, so an object that was
+wrongly kept reads as an address that crashes at once, and the collector stops
+when an object of its own refers to an object in a region.
 
 `valk build --region-report` lists where every object of a program lives and
 why; `--no-regions` turns regions off.
