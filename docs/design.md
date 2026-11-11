@@ -979,7 +979,8 @@ returns, or reused when the loop the scope is one round of starts its next
 round. A thread keeps the state of its regions in a stack of records apart
 from the native stack, innermost last. The first 176 bytes of a region are in
 its record; a region that grows past them takes chunks from the allocator,
-and a thread keeps a few small chunks for the next region. A region is set
+and a thread keeps a few small chunks for the next region, and chunks of
+the largest size until a collection finds that no region took one. A region is set
 up when its first object is made, so a call that makes none only takes a
 record and gives it back.
 
