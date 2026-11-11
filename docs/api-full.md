@@ -14705,6 +14705,8 @@ Returns `value` with its fractional part removed, rounding toward zero.
 + fn find_char_bytes(adr: ptr, ch: u8, length: uint) uint !LookupError
 // Releases memory obtained from `alloc`, `calloc`, `new` or `resize`.
 + fn free(value: ptr) void
+// Returns a number that names the object `object` points at: the same for one object, different for two that exist together. The number is not a reference: it keeps nothing alive, and it is only good for telling objects apart.
++ fn identity(object: ptr) uint
 // Copies the bytes of `from` to the start of `to` and returns the number copied.
 + fn move(from: local &[u8], to: local mut &[u8]) uint
 // Copies `length` bytes from `from` to `to`; the two ranges may overlap.
@@ -14818,6 +14820,12 @@ Releases memory obtained from `alloc`, `calloc`, `new` or `resize`.
 
 Takes a raw pointer, so a call needs `@unsafe`: nothing checks that the memory came from
 these functions or is still in use.
+
+### identity
+
+Returns a number that names the object `object` points at: the same for one object,
+different for two that exist together. The number is not a reference: it keeps nothing
+alive, and it is only good for telling objects apart.
 
 ### move
 
