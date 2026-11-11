@@ -54,8 +54,9 @@ cases="$cases panic-in-library:1:ByteBuffer.valk:"
 # A `test-` fixture is built with --test: a panic names its test and prints the summary
 cases="$cases test-crash-named:1:panicked"
 cases="$cases await-cycle:1"
-# The collector of a debug build refuses an object of its own that refers into a region
+# The collector of a debug build refuses an object of its own that refers into a region or a frame
 cases="$cases gc-debug-region-escape:1:region"
+cases="$cases gc-debug-frame-escape:1:frame"
 # Windows delivers the overflow exception only when it can still push a frame
 if [ -z "$EXE_SUFFIX" ]; then
     cases="$cases stack-overflow:1 stack-overflow-coroutine:1 stack-overflow-thread:1"

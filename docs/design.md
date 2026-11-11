@@ -983,6 +983,14 @@ and a thread keeps a few small chunks for the next region. A region is set
 up when its first object is made, so a call that makes none only takes a
 record and gives it back.
 
+An object is made in the frame, with no region at all, when its size is known
+and small and it lives exactly as long as the scope it is made in: the function,
+or one round of the loop it is made in, so one place in the frame is enough for
+it. Its header says it is neither the collector's nor a region's. What it
+refers to is found by the scan of the stack, so nothing is pinned for it, and
+that also makes it fine in a function that waits, where a region is not.
+`GC_DEBUG` builds stop when an object of the collector refers to one.
+
 A function gets no region for a number of objects that does not depend on its
 data: none made in a loop, and none by a callee of which that cannot be said.
 Taking a record and giving it back costs every call the same, an object costs

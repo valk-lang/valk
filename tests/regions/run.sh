@@ -23,7 +23,7 @@ line_nr=0
 while IFS= read -r line; do
     line_nr=$((line_nr + 1))
     case "$line" in
-        *" // region of "* | *" // heap: "*) ;;
+        *" // region of "* | *" // frame of "* | *" // heap: "*) ;;
         *) continue ;;
     esac
     expected="${line##* // }"

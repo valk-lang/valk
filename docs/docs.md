@@ -883,8 +883,9 @@ fn index(words: Array[String]) Map[Item] $region {
 }
 ```
 
-A function that only makes a few objects per call leaves them to the garbage collector, which
-frees such objects at no cost; `$region` asks for the region there too.
+A small object that lives exactly as long as its scope is made in the frame of its function. A
+function that only makes a few other objects per call leaves them to the garbage collector, which
+frees such objects at no cost; `$region` asks for a region there too.
 
 `valk build --region-report` shows where each object lives and why.
 

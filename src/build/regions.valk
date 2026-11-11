@@ -100,6 +100,10 @@ class RegionSite {
     param: uint (REGION_NONE)
     // Its fields can refer to something the collector owns: the region pins what they get
     pins: bool (false)
+    // Bytes of the object when that is known where it is made, and whether it is made in
+    // the frame: it lives exactly as long as its scope and is small
+    bytes: uint (0)
+    stack: bool (false)
     // The stretch of code it runs with, and how it is kept: the first of its `keeps`
     ctx: uint (0)
     errors: uint (0)
@@ -149,6 +153,7 @@ class RegionCall {
 
 // The runtime functions the analysis knows by what they do, and the ones the IR calls
 class RegionRuntime {
+    stack_object: ?Func (null)
     // Every summary is final: the regions are being chosen
     settled: bool (false)
     property_get: Func
@@ -206,6 +211,8 @@ class RegionRuntime {
     arg_stack: Array[uint] (.{})
     source_stack: Array[uint] (.{})
     held_stack: Array[uint] (.{})
+    // Per group: only objects in the frame
+    framed: Array[bool] (.{})
     root_stack: Array[uint] (.{})
     ctx_stack: Array[uint] (.{})
     drops_any: Array[uint] (.{})
@@ -245,6 +252,9 @@ value REGION_WHY_SUSPENDS ("the function may suspend")
 value REGION_WHY_CLOSURE ("inside a closure")
 value REGION_WHY_REFERS ("refers to an object on the heap: ")
 value REGION_WHY_FULL ("the function has its regions already")
+// An object in a frame is at most this big, and a function has at most this much of them
+value REGION_STACK_OBJECT (128)
+value REGION_STACK_TOTAL (256)
 value REGION_WHY_FEW ("a few objects per call: the collector frees those at no cost")
 
 class RegionFacts {
@@ -1363,17 +1373,65 @@ class RegionFacts {
                 any = true
             }
         }
-        if !any : return false
+        return any && this.keeps_to_itself()
+    }
+
+    // Whether nothing this function keeps to itself refers to something a caller can see and
+    // that may be in a region: where its own objects are made then changes nothing for others
+    fn keeps_to_itself() bool {
         each 0 .. this.parent.length as i {
-            if this.parent[i] != i || !this.is_local(i) : continue
-            each 0 .. 2 as side {
-                let link = side == 0 ? this.content[i] : this.leaf[i]
-                if link == REGION_NONE : continue
-                let x = this.find(link)
-                if this.reason[x] == 0 && this.runtime.reach[x] != REGION_NONE : return false
-            }
+            if this.parent[i] == i && this.is_local(i) && this.links_out(i) : return false
         }
         return true
+    }
+
+    // Whether an object can be made in the frame: its size is known and small, and it is gone
+    // when the scope it is made in ends or starts its next round, so one place in the frame
+    // is enough for it. `$region` asks for a region
+    fn in_frame(site: RegionSite, root: uint) bool {
+        if !isset(this.runtime.stack_object) || this.func.region_loops : return false
+        return site.emitted && site.bytes > 0 && site.bytes <= REGION_STACK_OBJECT && site.loop == this.scope[root]
+    }
+
+    // Which of the groups this function keeps to itself hold nothing but objects that are
+    // made in its frame, in `runtime.framed`: no callee makes anything for such a group, and
+    // it needs no region, also not to pin
+    fn find_framed() {
+        let rt = this.runtime
+        let framed = rt.framed
+        framed.clear()
+        each 0 .. this.parent.length : framed.append(false)
+        each this.sites as site {
+            let root = this.find(site.node)
+            if this.is_local(root) : framed[root] = true
+        }
+        let total: uint = 0
+        each this.sites as site {
+            let root = this.find(site.node)
+            if !this.is_local(root) : continue
+            if this.in_frame(site, root) && total + site.bytes + 16 <= REGION_STACK_TOTAL : total += site.bytes + 16
+            else : framed[root] = false
+        }
+        let map = rt.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && map[g] != REGION_NONE : framed[this.find(map[g])] = false
+            }
+        }
+    }
+
+    // Whether a group refers to something a caller can see and that may be in a region
+    fn links_out(root: uint) bool {
+        each 0 .. 2 as side {
+            let link = side == 0 ? this.content[root] : this.leaf[root]
+            if link == REGION_NONE : continue
+            let x = this.find(link)
+            if this.reason[x] == 0 && this.runtime.reach[x] != REGION_NONE : return true
+        }
+        return false
     }
 
     // Gives a reason to the groups this function cannot keep in a region of its own. Returns
@@ -1381,10 +1439,19 @@ class RegionFacts {
     fn refuse_locals() bool {
         let changed = false
         let func = this.func
+        // A frame is there while its function waits, and the collector reads it: objects in
+        // it are fine where a region is not
         if func.region_suspends || func.is_literal {
             let why = this.runtime.reason_id(func.is_literal ? REGION_WHY_CLOSURE : REGION_WHY_SUSPENDS)
+            // Only once the summaries are final: what a group refers to must not come to
+            // depend on it
+            let frames = this.runtime.settled && !func.is_literal
+            if frames : this.find_framed()
+            let framed = this.runtime.framed
             each 0 .. this.parent.length as i {
-                if this.parent[i] == i && this.is_local(i) && this.give_reason(i, why) : changed = true
+                if this.parent[i] != i || !this.is_local(i) : continue
+                if frames && framed[i] && !this.links_out(i) : continue
+                if this.give_reason(i, why) : changed = true
             }
             return changed
         }
@@ -1422,9 +1489,13 @@ class RegionFacts {
         }
         if changed : return true
         if this.runtime.settled && this.few_objects() {
+            // What can be made in the frame is: better than the collector, nothing is asked
+            // for at all
             let why = this.runtime.reason_id(this.here(REGION_WHY_FEW))
+            this.find_framed()
+            let framed = this.runtime.framed
             each 0 .. this.parent.length as i {
-                if this.parent[i] == i && this.is_local(i) && this.give_reason(i, why) : changed = true
+                if this.parent[i] == i && this.is_local(i) && !framed[i] && this.give_reason(i, why) : changed = true
             }
             if changed : return true
         }
@@ -1745,7 +1816,19 @@ class RegionFacts {
                 if rt.sum_index[r] == g : passed[root] = n
             }
         }
+        // Objects in the frame first: a group of nothing else needs no region, also not to pin
+        this.find_framed()
+        let framed = rt.framed
+        let in_frames: uint = 0
         each this.sites as site {
+            let root = this.find(site.node)
+            if passed[root] != REGION_NONE || !this.is_local(root) || !this.in_frame(site, root) : continue
+            if in_frames + site.bytes + 16 > REGION_STACK_TOTAL : continue
+            in_frames += site.bytes + 16
+            site.stack = true
+        }
+        each this.sites as site {
+            if site.stack : continue
             let root = this.find(site.node)
             let region = this.region_of(root, passed)
             if region >= REGION_PASSED && region != REGION_NONE : site.param = region - REGION_PASSED
@@ -1754,6 +1837,7 @@ class RegionFacts {
         }
         each this.pins as pin {
             let root = this.find(pin.node)
+            if framed[root] : continue
             if pin.dual && pin.emitted && this.refers_out(root) : pin.pass = this.region_or_callers(root, passed)
         }
         each this.calls as call {
@@ -1769,7 +1853,9 @@ class RegionFacts {
             // The copy is also the form that pins: called when a group it pins for is in a region
             each 0 .. callee.sum_reason.length as g {
                 if !callee.grows(g) || callee.sum_made[g] || rt.map[g] == REGION_NONE : continue
-                let at = this.region_or_callers(this.find(rt.map[g]), passed)
+                let pinned = this.find(rt.map[g])
+                if framed[pinned] : continue
+                let at = this.region_or_callers(pinned, passed)
                 if at != REGION_NONE && (call.pinned == REGION_NONE || at < REGION_PASSED) : call.pinned = at
             }
         }
@@ -1780,6 +1866,8 @@ class RegionFacts {
     fn region_of(root: uint, passed: Array[uint]) uint {
         if passed[root] != REGION_NONE : return REGION_PASSED + passed[root]
         if !this.is_local(root) : return REGION_NONE
+        // Never a region where the function may give up its thread
+        if this.func.region_suspends : return REGION_NONE
         let loop = this.scope[root]
         each this.regions as known, n {
             if known == loop : return n
@@ -1890,6 +1978,13 @@ fn region_runtime(build: Build) ?RegionRuntime {
         pinned_set: funcs[13]
         pinned_update: funcs[14]
         copy_bytes: funcs[15]
+    }
+    // Newer than the rest: without it no object is made in a frame
+    let in_frame = isset(gc_ns) ? gc_ns.scope.get_idf("region_stack_object") : null
+    let stack_object = isset(in_frame) ? in_frame.func : null
+    if isset(stack_object) {
+        if !stack_object.parsed_types : parse_func_types(stack_object) ! { stack_object = null }
+        made.stack_object = stack_object
     }
     // Newer than the rest: a standard library without it has no such calls
     let named = isset(mem_ns) ? mem_ns.scope.get_idf("identity") : null
@@ -3186,6 +3281,10 @@ fn region_local_name(index: uint) String {
     return "\%\"rg." + index + "\""
 }
 
+fn region_frame_name(site: uint) String {
+    return "\%\"rg.f" + site + "\""
+}
+
 fn region_passed_name(index: uint) String {
     return "\%rg.in." + index
 }
@@ -3239,11 +3338,18 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
                 }
                 if kind == 'H' : out.append_text(", ")
             }
+        } else if kind == 'A' {
+            // What makes the object: a region, or the place the frame has for it
+            let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
+            let in_frame = runtime.stack_object
+            out.append_text(ir_func_address(decided && site.stack && isset(in_frame) ? in_frame : runtime.alloc))
         } else if kind == 'U' || kind == 'P' {
             let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
             let name = ""
             let used = "true"
-            if decided && copy && site.param != REGION_NONE {
+            if decided && site.stack {
+                name = region_frame_name(id)
+            } else if decided && copy && site.param != REGION_NONE {
                 name = region_passed_name(site.param)
                 if f.may_null[site.param] : used = "\%rg.on." + site.param
             } else if decided && site.region != REGION_NONE {
@@ -3297,6 +3403,10 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
                 each f.regions as loop, i {
                     out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
                 }
+                // The objects of the frame, each with its header
+                each f.sites as site, i {
+                    if site.stack : out.append_text("  " + region_frame_name(i + 1) + " = alloca [" + ((site.bytes + 15) / 8) + " x i64]\n")
+                }
             }
         } else if kind == 'X' {
             if decided {
@@ -3347,7 +3457,9 @@ fn region_print_report(build: Build) {
             let ns = src.ns
             if !isset(ns) || ns.pkg != main_pkg : continue
             let verdict = ""
-            if build.region_decided && site.region != REGION_NONE {
+            if build.region_decided && site.stack {
+                verdict = "frame of " + func.name
+            } else if build.region_decided && site.region != REGION_NONE {
                 verdict = "region of " + func.name
                 if f.regions[site.region] != 0 : verdict += ", per round of a loop"
             } else if build.region_decided && site.param != REGION_NONE && f.needs_copy {
@@ -3410,11 +3522,13 @@ fn region_print_report(build: Build) {
     }
     places.sort(fn(a: String, b: String) bool { return a < b })
     let in_region: uint = 0
+    let in_frame: uint = 0
     each places as place {
         let verdict = verdicts.get(place) !? ""
         println(place + "  " + verdict)
-        if !verdict.starts_with("heap") : in_region++
+        if verdict.starts_with("frame") : in_frame++
+        else if !verdict.starts_with("heap") : in_region++
     }
     println("")
-    println("%{places.length} places make objects, %in_region of them in a region (places in the source, not how often they run)")
+    println("%{places.length} places make objects, %in_region of them in a region, %in_frame in a frame (places in the source, not how often they run)")
 }
