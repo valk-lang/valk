@@ -65,7 +65,13 @@ struct Gc {
     updated_slots: *Bump (Bump.new())
     blanks: *Bump (Bump.new())
     dis_owned_list: *Bump (Bump.new())
+    // Lost their owner while others still refer to them: checked after the written slots (loop_trials)
+    trial_list: *Bump (Bump.new())
     re_own_list: *Bump (Bump.new())
+    // Marking from a root that is owned again: see adopt_root
+    re_owning: bool (false)
+    // Marking from the slots written since the last collection: see leave_to_re_own
+    updating: bool (false)
     adopted: *Bump (Bump.new()) // New storage that received ownership through transfer_refs()
     transfer_from: uint (0)     // Blocks of the running transfer_refs()
     transfer_to: uint (0)
@@ -245,6 +251,7 @@ struct Gc {
         if !this.did_shutdown : this.loop_updates()
         else : this.clean_updates()
         this.loop_adopted()
+        this.loop_trials()
         if !this.did_shutdown : this.loop_re_own()
 
         this.check_blanks()
@@ -353,9 +360,6 @@ struct Gc {
         if data.is_not_owned() {
             mark_used(item)
             gc.prev_stack_items.add_ptr(item)
-        } else if data.is_still_co_owned() {
-            data.remove_still_co_owned()
-            gc.prev_stack_items.add_ptr(item)
         }
     }
 
@@ -438,6 +442,11 @@ struct Gc {
 
             // A dis-owned item can become shared, so we need to make sure it's ignored
             if data.is_no_owner_not_shared() {
+                // Something still refers to it: it may live on, see loop_trials
+                if data.co_count > 0 {
+                    this.trial_list.add_ptr(item)
+                    continue
+                }
                 let count, bytes = dis_own_rec(item)
                 disowned += count
                 unmarked_bytes += bytes
@@ -446,6 +455,36 @@ struct Gc {
 
         list.reset()
         this.dis_own_count = disowned
+        if unmarked_bytes > this.mem_marked : panic("GC marked-memory accounting underflow")
+        this.mem_marked -= unmarked_bytes
+        this.unmarked_run += unmarked_bytes
+    }
+
+    // An item that lost its owner while others refer to it is dis-owned with all it owns, and
+    // owned again when a reference from outside is left (loop_re_own): the references from
+    // what it owns are gone then. This runs after the written slots are read. Until then the
+    // item keeps what it owns, so those slots count as references to its objects instead of
+    // becoming their owners, and every reference from inside is one the walk finds
+    fn loop_trials() {
+        let list = this.trial_list
+        let i: uint = 0
+        let disowned: uint = 0
+        let unmarked_bytes: uint = 0
+
+        // The list can grow while running this code
+        while i < list.index {
+            let item = @ptrv(list.data, ptr, i / size_of(ptr))
+            i += size_of(ptr)
+            let data: *GcData = item.$offset(-8)
+            if data.is_no_owner_not_shared() {
+                let count, bytes = dis_own_rec(item)
+                disowned += count
+                unmarked_bytes += bytes
+            }
+        }
+
+        list.reset()
+        this.dis_own_count += disowned
         if unmarked_bytes > this.mem_marked : panic("GC marked-memory accounting underflow")
         this.mem_marked -= unmarked_bytes
         this.unmarked_run += unmarked_bytes
@@ -466,7 +505,9 @@ struct Gc {
             // if data.is_shared() : panic("Shared re-own item")
 
             if data.is_new() && data.co_count > 0 {
+                this.re_owning = true
                 mark_used(item)
+                this.re_owning = false
                 // Co ownership can be from stack or an object
                 if data.is_on_stack() : this.prev_stack_items.add_ptr(item)
                 else : data.set_still_co_owned()
@@ -502,6 +543,7 @@ struct Gc {
     }
 
     fn loop_updates() {
+        this.updating = true
         let list = this.updated_list
         let data = list.data
         let adr = data
@@ -542,6 +584,7 @@ struct Gc {
         }
 
         mark_used(null)
+        this.updating = false
     }
 
     fn clean_updates() {
@@ -574,14 +617,28 @@ struct Gc {
         let end = adr + list.index
         list.reset()
 
+        // An item that was dis-owned, owned again and dis-owned again is in the list twice:
+        // the dead ones are marked and moved to the front, each once
+        let unique = data
         while adr < end {
             let item = @ptrv(adr, GcItem)
             adr = adr.$offset(size_of(ptr))
 
             let data = gcdata(item)
-            if data.is_not_new() : continue
-
-            free_blank(item)
+            if data.is_not_new() || data.is_in_updates() : continue
+            data.set_in_updates()
+            @ptrv(unique, GcItem) = item
+            unique = unique.$offset(size_of(ptr))
+        }
+        adr = data
+        while adr < unique {
+            gcdata(@ptrv(adr, GcItem)).remove_in_updates()
+            adr = adr.$offset(size_of(ptr))
+        }
+        adr = data
+        while adr < unique {
+            free_blank(@ptrv(adr, GcItem))
+            adr = adr.$offset(size_of(ptr))
         }
     }
 
@@ -892,6 +949,7 @@ struct Gc {
         this.window_freed.free()
         this.dis_owned_list.free()
         this.re_own_list.free()
+        this.trial_list.free()
         this.adopted.free()
         this.shared_items.free()
         this.mark_list.free()

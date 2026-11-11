@@ -927,6 +927,25 @@ hold a reference may keep its object alive until the slot is overwritten or
 the frame returns; code that needs a collection to reclaim an object should
 let the frame that referenced it return first.
 
+The local collector works by ownership instead of tracing the heap. A live
+object is owned by one slot that refers to it, and the other slots that refer
+to it count as co-owners. A collection looks at what changed: slots that were
+written, references that were removed, and objects the stack no longer refers
+to. When an owner goes, what it owned is walked: objects that still have
+co-owners are owned again, the rest is freed. An object without an owning slot
+is a root, kept by the stack or by its co-owners; when one of those co-owners
+goes, the root is walked the same way, which is how unreachable cycles are
+found.
+
+Three rules keep a large structure from being walked again and again. A root
+that co-owners keep stays as it is while a local refers to it. A root that
+loses its owner or a co-owner while others still refer to it is walked after
+the slots written since the last collection are read: it keeps what it owns
+until then, so a written slot counts as a reference to those objects and a
+temporary result does not become their owner. And a slot that is reached while
+a root is marked again takes over a root that only co-owners kept, which puts
+a structure back under the object that holds it.
+
 Shared memory is collected in rounds that stop every thread. A round runs each
 thread's local collection and then marks the shared objects that thread-local
 data, stacks and globals still reach. The threads that wait at their
