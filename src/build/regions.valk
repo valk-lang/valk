@@ -180,6 +180,8 @@ class RegionRuntime {
     content: Array[uint] (.{})
     leaf: Array[uint] (.{})
     reason: Array[uint] (.{})
+    soft: Array[bool] (.{})
+    new_soft: Array[bool] (.{})
     source: Array[bool] (.{})
     scope: Array[uint] (.{})
     made: Array[bool] (.{})
@@ -213,6 +215,13 @@ class RegionRuntime {
     held_stack: Array[uint] (.{})
     // Per group: only objects in the frame
     framed: Array[bool] (.{})
+    // Per node, and per group: an object of the frame that may refer to an object of the
+    // collector (see `find_exempt`), and whether any is
+    exempt: Array[bool] (.{})
+    exempt_root: Array[bool] (.{})
+    exempt_any: bool (false)
+    // `summarize` only says whether the summary would change
+    dry: bool (false)
     root_stack: Array[uint] (.{})
     ctx_stack: Array[uint] (.{})
     drops_any: Array[uint] (.{})
@@ -339,6 +348,9 @@ class RegionFacts {
     content: Array[uint]
     leaf: Array[uint]
     reason: Array[uint]
+    // The reason of a group is only what it refers to: an object in a frame may refer to
+    // that, where one in a region may not
+    soft: Array[bool]
     source: Array[bool]
     scope: Array[uint]
 
@@ -349,6 +361,7 @@ class RegionFacts {
     sum_content: Array[uint] (.{})
     sum_leaf: Array[uint] (.{})
     sum_reason: Array[uint] (.{})
+    sum_soft: Array[bool] (.{})
     sum_grows: Array[bool] (.{})
     // It makes objects in the group, and does not only pin for it
     sum_made: Array[bool] (.{})
@@ -620,7 +633,12 @@ class RegionFacts {
             let x = this.find(todo.pop_last() ! break)
             if x == y : continue
             this.parent[x] = y
-            if this.reason[y] == 0 : this.reason[y] = this.reason[x]
+            if this.reason[y] == 0 {
+                this.reason[y] = this.reason[x]
+                this.soft[y] = this.soft[x]
+            } else if this.reason[x] > 0 && !this.soft[x] {
+                this.soft[y] = false
+            }
             let cx = this.content[x]
             let cy = this.content[y]
             if cy == REGION_NONE {
@@ -650,6 +668,7 @@ class RegionFacts {
         this.content.append(REGION_NONE)
         this.leaf.append(REGION_NONE)
         this.reason.append(0)
+        this.soft.append(false)
         if leaf : this.leaf[root] = made
         else : this.content[root] = made
         return made
@@ -690,9 +709,25 @@ class RegionFacts {
     fn give_reason(node: uint, reason: uint) bool {
         if node == REGION_NONE : return false
         let root = this.find(node)
+        this.soft[root] = false
         if this.reason[root] > 0 : return false
         this.reason[root] = reason
         return true
+    }
+
+    // A reason that is only what the group refers to: none for a group that is let off
+    fn give_soft(node: uint, reason: uint) {
+        if node == REGION_NONE : return
+        let root = this.find(node)
+        if this.reason[root] > 0 : return
+        let rt = this.runtime
+        if rt.exempt_any {
+            each this.sites as site {
+                if rt.exempt[site.node] && this.find(site.node) == root : return
+            }
+        }
+        this.reason[root] = reason
+        this.soft[root] = true
     }
 
     // Why a group that reaches a function the compiler cannot follow stays on the heap
@@ -810,6 +845,16 @@ class RegionFacts {
     // the region ends. Plain data has nothing to free, so a region object may refer to it
     fn settle() {
         let report = this.func.ns.build.options.region_report
+        let rt = this.runtime
+        let frames = rt.exempt_any
+        let exempt = rt.exempt_root
+        if frames {
+            exempt.clear()
+            each 0 .. this.parent.length : exempt.append(false)
+            each this.sites as site {
+                if rt.exempt[site.node] : exempt[this.find(site.node)] = true
+            }
+        }
         let changed = true
         while changed {
             changed = false
@@ -819,11 +864,19 @@ class RegionFacts {
                     let link = side == 0 ? this.content[i] : this.leaf[i]
                     if link == REGION_NONE : continue
                     let x = this.find(link)
-                    if this.reason[i] > 0 && this.reason[x] == 0 {
-                        this.reason[x] = this.reason[i]
-                        changed = true
-                    } else if side == 0 && this.reason[x] > 0 && this.reason[i] == 0 {
+                    if this.reason[i] > 0 {
+                        // What an object of the collector refers to is the collector's
+                        if this.reason[x] == 0 {
+                            this.reason[x] = this.reason[i]
+                            this.soft[x] = false
+                            changed = true
+                        } else if this.soft[x] {
+                            this.soft[x] = false
+                            changed = true
+                        }
+                    } else if side == 0 && this.reason[x] > 0 && !(frames && exempt[i]) {
                         this.reason[i] = this.runtime.held_reason(this.reason[x], report)
+                        this.soft[i] = true
                         changed = true
                     }
                 }
@@ -1439,6 +1492,22 @@ class RegionFacts {
     fn refuse_locals() bool {
         let changed = false
         let func = this.func
+        if this.runtime.exempt_any {
+            // Let off for being in the frame: in a region it could not refer to what it does
+            this.find_framed()
+            let framed = this.runtime.framed
+            let report = func.ns.build.options.region_report
+            each this.sites as site {
+                if !this.runtime.exempt[site.node] : continue
+                let root = this.find(site.node)
+                if !this.is_local(root) || (framed[root] && !this.links_out(root)) : continue
+                let to = this.content[root]
+                let held = to == REGION_NONE ? 0 : this.reason[this.find(to)]
+                let why = held > 0 ? this.runtime.held_reason(held, report) : this.runtime.reason_id(REGION_WHY_REFERS + "an object of the collector")
+                if this.give_reason(root, why) : changed = true
+            }
+            if changed : return true
+        }
         // A frame is there while its function waits, and the collector reads it: objects in
         // it are fine where a region is not
         if func.region_suspends || func.is_literal {
@@ -1517,15 +1586,44 @@ class RegionFacts {
     // the body alone rules out. Returns whether the summary of this function changed
     fn solve(own: bool (false)) bool {
         if this.lost : return false
+        let rt = this.runtime
+        rt.exempt_any = false
+        this.solve_groups(own)
+        if own : return false
+        // An object in the frame may refer to an object of the collector, which a region
+        // object may not: the groups that were ruled out for that and can be made in the
+        // frame are let off, as long as nothing a caller sees comes to depend on it
+        if rt.settled && this.find_exempt() {
+            this.solve_groups(false)
+            rt.dry = true
+            let differs = this.summarize()
+            rt.dry = false
+            if differs {
+                rt.exempt_any = false
+                this.solve_groups(false)
+            }
+        }
+
+        this.has_source = false
+        each this.source as has {
+            if has : this.has_source = true
+        }
+        return this.summarize()
+    }
+
+    // The groups, with the summaries of the callees applied unless `own`
+    fn solve_groups(own: bool) {
         this.parent.clear()
         this.content.clear()
         this.leaf.clear()
         this.reason.clear()
+        this.soft.clear()
         each 0 .. this.count as i {
             this.parent.append(i)
             this.content.append(REGION_NONE)
             this.leaf.append(REGION_NONE)
             this.reason.append(0)
+            this.soft.append(false)
         }
         let i: uint = 0
         while i + 2 < this.steps.length {
@@ -1559,7 +1657,7 @@ class RegionFacts {
         each this.mark_nodes as node, m : this.give_reason(node, this.mark_reasons[m])
         if own {
             this.settle()
-            return false
+            return
         }
         let beyond = this.runtime.reason_id(REGION_WHY_BEYOND)
         let map = this.runtime.map
@@ -1576,7 +1674,9 @@ class RegionFacts {
             }
             this.map_call(call, callee, false)
             each 0 .. callee.sum_reason.length as g {
-                if callee.sum_reason[g] > 0 : this.give_reason(map[g], callee.sum_reason[g])
+                if callee.sum_reason[g] == 0 : continue
+                if callee.sum_soft[g] : this.give_soft(map[g], callee.sum_reason[g])
+                else : this.give_reason(map[g], callee.sum_reason[g])
             }
         }
         // A group that turns out to be the collector's makes what it refers to the
@@ -1590,12 +1690,45 @@ class RegionFacts {
             this.find_drops()
             if !this.refuse_locals() : break
         }
+    }
 
-        this.has_source = false
-        each this.source as has {
-            if has : this.has_source = true
+    // Marks the objects that were ruled out and could be made in the frame: nothing a caller
+    // sees, every object of the group of a known small size and gone with its scope, none
+    // made by a callee. Returns whether there are any
+    fn find_exempt() bool {
+        let rt = this.runtime
+        if !isset(rt.stack_object) || this.func.region_loops || this.func.is_literal : return false
+        let could = rt.framed
+        could.clear()
+        each 0 .. this.parent.length : could.append(false)
+        each this.sites as site {
+            let root = this.find(site.node)
+            if rt.reach[root] == REGION_NONE && this.reason[root] > 0 && this.soft[root] : could[root] = true
         }
-        return this.summarize()
+        each this.sites as site {
+            let root = this.find(site.node)
+            if could[root] && !(site.emitted && site.bytes > 0 && site.bytes <= REGION_STACK_OBJECT && site.loop == this.scope[root]) : could[root] = false
+        }
+        let map = rt.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && map[g] != REGION_NONE : could[this.find(map[g])] = false
+            }
+        }
+        let exempt = rt.exempt
+        exempt.clear()
+        each 0 .. this.count : exempt.append(false)
+        let any = false
+        each this.sites as site {
+            if !could[this.find(site.node)] : continue
+            exempt[site.node] = true
+            any = true
+        }
+        rt.exempt_any = any
+        return any
     }
 
     // Per group a caller can see: where the objects this function makes in it end up
@@ -1719,6 +1852,8 @@ class RegionFacts {
         new_content.clear()
         new_leaf.clear()
         new_reason.clear()
+        let new_soft = rt.new_soft
+        new_soft.clear()
         new_grows.clear()
         let count: uint = 0
         each 0 .. roots.length as g {
@@ -1739,6 +1874,7 @@ class RegionFacts {
                 else : why = this.runtime.reason_id(this.here(loose[g] ? "grown in a loop by a function without $region" : "grown by a function that cannot be given a region"))
             }
             new_reason.append(why)
+            new_soft.append(why > 0 && why == this.reason[root] && this.soft[root])
             new_grows.append(grows)
             new_made.append(grows && rt.made[root])
             new_keeper.append(grows && rt.made[root] && !rt.acc_open[g] ? keeper[g] : 0)
@@ -1757,6 +1893,7 @@ class RegionFacts {
             let to = kind == REGION_REF_PARAM ? end & REGION_REF_MASK : (kind == REGION_REF_RET ? this.args.length : REGION_NONE)
             let firm = to != REGION_NONE && (end & REGION_STRICT) != 0
             if this.slot_group[slot] == g && this.slot_keeper[slot] == to && this.slot_strict[slot] == firm : continue
+            if rt.dry : return true
             this.slot_group[slot] = g
             this.slot_keeper[slot] = to
             this.slot_strict[slot] = firm
@@ -1767,13 +1904,14 @@ class RegionFacts {
         }
         if !changed {
             each 0 .. count as g {
-                if this.sum_content[g] != new_content[g] || this.sum_leaf[g] != new_leaf[g] || this.sum_reason[g] != new_reason[g] || this.sum_grows[g] != new_grows[g] || this.sum_made[g] != new_made[g] || this.sum_keeper[g] != new_keeper[g] || this.sum_strict[g] != new_strict[g] || this.sum_drops[g] != new_drops[g] {
+                if this.sum_content[g] != new_content[g] || this.sum_leaf[g] != new_leaf[g] || this.sum_reason[g] != new_reason[g] || this.sum_soft[g] != new_soft[g] || this.sum_grows[g] != new_grows[g] || this.sum_made[g] != new_made[g] || this.sum_keeper[g] != new_keeper[g] || this.sum_strict[g] != new_strict[g] || this.sum_drops[g] != new_drops[g] {
                     changed = true
                     break
                 }
             }
         }
         if !changed : return false
+        if rt.dry : return true
         // What a call of itself was mapped to names the groups of the old summary
         each this.calls as call {
             if call.callee == this.func : call.map_at = REGION_NONE
@@ -1781,6 +1919,7 @@ class RegionFacts {
         this.sum_content.clear()
         this.sum_leaf.clear()
         this.sum_reason.clear()
+        this.sum_soft.clear()
         this.sum_grows.clear()
         this.sum_made.clear()
         this.sum_keeper.clear()
@@ -1792,6 +1931,7 @@ class RegionFacts {
             this.sum_content.append(new_content[g])
             this.sum_leaf.append(new_leaf[g])
             this.sum_reason.append(new_reason[g])
+            this.sum_soft.append(new_soft[g])
             this.sum_grows.append(new_grows[g])
             this.sum_made.append(new_made[g])
             this.sum_keeper.append(new_keeper[g])
@@ -3083,6 +3223,7 @@ fn region_collect_facts(func: Func) {
         content: runtime.content
         leaf: runtime.leaf
         reason: runtime.reason
+        soft: runtime.soft
         source: runtime.source
         scope: runtime.scope
     }
@@ -3490,6 +3631,10 @@ fn region_print_report(build: Build) {
             let actual = REGION_NONE
             let pass = REGION_NONE
             f.map_call(call, callee, false)
+            // What the callee makes says more than what it only pins for
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && actual == REGION_NONE : actual = f.runtime.map[g]
+            }
             each 0 .. callee.sum_reason.length as g {
                 if callee.grows(g) && actual == REGION_NONE : actual = f.runtime.map[g]
             }
@@ -3498,6 +3643,8 @@ fn region_print_report(build: Build) {
             }
             if pass == REGION_NONE : pass = call.pinned
             if actual == REGION_NONE : continue
+            // Nothing to say about a call that only writes into objects of the frame
+            if pass == REGION_NONE && f.reason[f.find(actual)] == 0 && f.runtime.reach[f.find(actual)] == REGION_NONE : continue
             let verdict = ""
             if build.region_decided && pass != REGION_NONE && pass < REGION_PASSED {
                 verdict = "region of " + func.name

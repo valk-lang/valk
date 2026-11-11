@@ -991,6 +991,15 @@ refers to is found by the scan of the stack, so nothing is pinned for it, and
 that also makes it fine in a function that waits, where a region is not.
 `GC_DEBUG` builds stop when an object of the collector refers to one.
 
+An object in a frame may refer to any object of the collector, like a local
+variable does, where a region object may only refer to plain data of the
+collector. So a group that is ruled out for a region only because of what it
+refers to is let off when all of it can be made in the frame. A summary says
+for each group whether its reason is of that kind, so this also goes for an
+object that a callee fills. It is decided once every summary is final, and
+dropped for a function when anything its callers see would come to depend on
+it.
+
 A function gets no region for a number of objects that does not depend on its
 data: none made in a loop, and none by a callee of which that cannot be said.
 Taking a record and giving it back costs every call the same, an object costs
