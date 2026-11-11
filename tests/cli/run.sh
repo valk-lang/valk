@@ -127,6 +127,28 @@ if [ "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)" -gt 1 ] && ! printf '%
     exit 1
 fi
 
+echo "> An optimized build of several units emitted in parts links"
+units="$workdir/units"
+mkdir -p "$units"
+for unit in one two; do
+    for i in $(seq 1 80); do
+        echo "fn ${unit}_$i(n: int) String { if n > $i : return \"$unit $i\" return \"$unit\" }"
+    done > "$units/$unit.valk"
+done
+{
+    echo "fn main() {"
+    echo "    let total : uint = 0"
+    for i in $(seq 1 80); do echo "    total += one_$i($i).bytes + two_$i(100).bytes"; done
+    echo "    println(total)"
+    echo "}"
+} > "$units/main.valk"
+units_out=$("$VALK" build "$units" --no-warn -c --opt -o "$output" 2>&1) || { echo "$units_out"; exit 1; }
+units_says=$($TIMEOUT "$output")
+if [ "$units_says" != "711" ]; then
+    echo "# Optimized build of several units printed '$units_says'"
+    exit 1
+fi
+
 if [ "$(uname -s)" = Linux ] && command -v readelf >/dev/null 2>&1; then
     echo "> Release builds leave out the symbol table and unused libraries"
     build --release >/dev/null || exit 1
