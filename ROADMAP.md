@@ -10,7 +10,8 @@
 + GC: a structure that a field holds is not walked again when a local stops referring to it, and a temporary object that refers to its parts no longer becomes their owner (a maze of 5.9M objects searched 84 times: 13.5 -> 1.8 s)
 + Regions: a thread keeps the large chunks of a region for the next one, until a collection finds them unused (LangArena Binarytrees::Obj 0.65 -> 0.40 s)
 + `crypto.base64_decode` looks for line breaks only when the input does not decode as it is (LangArena Base64::Decode 0.19 -> 0.13 s)
-+ Fix: `TcpServer.close` released the descriptor while other threads were still in `accept`; its number could go to a new socket and an old accept then took that socket's connections. A close now shuts the socket down and the last accept out releases it
++ Fix: `TcpServer.close` released the descriptor while other threads were still in `accept`; its number could go to a new socket and an old accept then took that socket's connections. A close now ends the listener and keeps the number taken until the last accept is out
++ Fix: on macOS a connect that was refused could be reported as a connection, so `TcpConnection.new` did not try a name's other addresses; the outcome of the attempt is now asked of the socket
 + Fix: an HTTP connection that ended kept the input storage of its last request for as long as anything still referred to it, and a word left on the stack of an idle serving coroutine did: uploads could stay in memory until that coroutine served again
 + Fix: an `--opt` build without `--release` failed to link (`duplicate symbol: valk.str.3`) when two units were each emitted in parts
 + Release builds use about a quarter of the memory: each part reads only its own function bodies (test suite peak 9.0 -> 2.4 GB)
