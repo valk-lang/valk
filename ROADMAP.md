@@ -7,6 +7,11 @@
 - Release 0.8.5
 + Regions: objects that provably stay in one scope are made in memory that is freed with the scope instead of on the GC heap, also when another function builds them (`Node.tree(depth)` for a caller that only reads the tree), and arrays with their storage and elements; `$region` on a function lets its loops add to a region; `--region-report` shows where every object lives and why, `--no-regions` turns it off (binary-tree 20: 1.56 -> 0.72 s, merkletrees 18: 0.53 -> 0.42 s)
 + Regions: a small object that lives as long as its scope is made in the function's frame, a function that makes only a few objects per call leaves them to the GC, a loop that provably leaves nothing behind fills a region, and a decoded JSON document that is only read lives in one; debug builds (`GC_DEBUG`) panic when a GC object refers to an object in a region or a frame
++ GC: a structure that a field holds is not walked again when a local stops referring to it, and a temporary object that refers to its parts no longer becomes their owner (a maze of 5.9M objects searched 84 times: 13.5 -> 1.8 s)
++ Regions: a thread keeps the large chunks of a region for the next one, until a collection finds them unused (LangArena Binarytrees::Obj 0.65 -> 0.40 s)
++ `crypto.base64_decode` looks for line breaks only when the input does not decode as it is (LangArena Base64::Decode 0.19 -> 0.13 s)
++ Fix: an HTTP connection that ended kept the input storage of its last request for as long as anything still referred to it, and a word left on the stack of an idle serving coroutine did: uploads could stay in memory until that coroutine served again
++ Fix: an `--opt` build without `--release` failed to link (`duplicate symbol: valk.str.3`) when two units were each emitted in parts
 + Release builds use about a quarter of the memory: each part reads only its own function bodies (test suite peak 9.0 -> 2.4 GB)
 + Coroutine errors can have payload fields: each task keeps its payload until it is awaited
 + `http.HttpError.status` carries the answered status in `http_status`

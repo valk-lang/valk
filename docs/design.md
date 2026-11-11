@@ -927,6 +927,25 @@ hold a reference may keep its object alive until the slot is overwritten or
 the frame returns; code that needs a collection to reclaim an object should
 let the frame that referenced it return first.
 
+The local collector works by ownership instead of tracing the heap. A live
+object is owned by one slot that refers to it, and the other slots that refer
+to it count as co-owners. A collection looks at what changed: slots that were
+written, references that were removed, and objects the stack no longer refers
+to. When an owner goes, what it owned is walked: objects that still have
+co-owners are owned again, the rest is freed. An object without an owning slot
+is a root, kept by the stack or by its co-owners; when one of those co-owners
+goes, the root is walked the same way, which is how unreachable cycles are
+found.
+
+Three rules keep a large structure from being walked again and again. A root
+that co-owners keep stays as it is while a local refers to it. A root that
+loses its owner or a co-owner while others still refer to it is walked after
+the slots written since the last collection are read: it keeps what it owns
+until then, so a written slot counts as a reference to those objects and a
+temporary result does not become their owner. And a slot that is reached while
+a root is marked again takes over a root that only co-owners kept, which puts
+a structure back under the object that holds it.
+
 Shared memory is collected in rounds that stop every thread. A round runs each
 thread's local collection and then marks the shared objects that thread-local
 data, stacks and globals still reach. The threads that wait at their
@@ -979,7 +998,8 @@ returns, or reused when the loop the scope is one round of starts its next
 round. A thread keeps the state of its regions in a stack of records apart
 from the native stack, innermost last. The first 176 bytes of a region are in
 its record; a region that grows past them takes chunks from the allocator,
-and a thread keeps a few small chunks for the next region. A region is set
+and a thread keeps a few small chunks for the next region, and chunks of
+the largest size until a collection finds that no region took one. A region is set
 up when its first object is made, so a call that makes none only takes a
 record and gives it back.
 
