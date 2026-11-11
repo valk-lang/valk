@@ -1,5 +1,6 @@
 use io
 use core
+use ext
 
 /// A listening TCP socket, made by `new` or `net.tcp_server`; `accept` hands out connections.
 ///
@@ -14,6 +15,13 @@ use core
     // The family AcceptEx needs to open the accepted socket with on Windows
     - ipv6: bool (false)
     - closed: u8 (0)
+    // Accepts in flight, and whether the descriptor went back to the system. A close while a
+    // thread is in `accept` only shuts the socket down, which wakes that thread: the descriptor
+    // is released when the last accept is out. Released at once, its number can name another
+    // socket by the time that thread calls the system again, and it would take connections
+    // of that one
+    - accepting: uint (0)
+    - released: u8 (0)
 
     /// Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
     ///
@@ -47,8 +55,18 @@ use core
     /// `closed` after `close`, and `max_connections` when the process is out of file
     /// descriptors (Linux and macOS).
     + fn accept(timeout_ms: uint (0)) TcpConnection !NetError @threadsafe {
-        if this.closed != 0 : throw .closed
-        let fd = accept(this.fd, this.ipv6, timeout_ms) !>
+        atomic(this.accepting + 1)
+        if this.closed != 0 {
+            this.accept_done()
+            throw .closed
+        }
+        let fd = accept(this.fd, this.ipv6, timeout_ms) ! {
+            let closed = this.closed != 0
+            this.accept_done()
+            if closed : throw .closed
+            throw E
+        }
+        this.accept_done()
         #if OS == "win"
         if !io.associate(fd) {
             close_fd_cleanup(fd, __FILE__, __LINE__)
@@ -63,12 +81,22 @@ use core
     // the thread has no such table
     fn accept_direct(timeout_ms: uint (0), ring: uint (0)) ?TcpConnection !NetError {
         #if OS == "linux"
-        if this.closed != 0 : throw .closed
         if io.uring_files() == 0 : return null
+        atomic(this.accepting + 1)
+        if this.closed != 0 {
+            this.accept_done()
+            throw .closed
+        }
         @unsafe
         let buffer = [u8 x 128]{ 0... }
         let length: u32 = 128
-        let slot = accept_direct(this.fd, timeout_ms, @ref(buffer).@cast(ptr), @ref(length), ring) !>
+        let slot = accept_direct(this.fd, timeout_ms, @ref(buffer).@cast(ptr), @ref(length), ring) ! {
+            let closed = this.closed != 0
+            this.accept_done()
+            if closed : throw .closed
+            throw E
+        }
+        this.accept_done()
         let peer = SocketAddress.from_sockaddr(@ref(buffer).@cast(ptr), length.to(uint)) !? SocketAddress {}
         return TcpConnection.wrap_direct(slot, ring, peer)
         #else
@@ -104,12 +132,36 @@ use core
     + fn close() !io.IoError @threadsafe {
         // Only the first close releases the socket, also when threads race to close it
         if atomic(this.closed + 1) != 0 : return
-        close_fd(this.fd) ! throw .os
+        #if OS == "win"
+        // Closing the socket is what ends a pending AcceptEx
+        if !this.release() : throw .os
+        #else
+        ext.shutdown(this.fd, ext.O_RDWR)
+        if this.accepting == 0 && !this.release() : throw .os
+        #end
+    }
+
+    // An accept is out: the last one after a close releases the descriptor
+    fn accept_done() @threadsafe {
+        if atomic(this.accepting - 1) == 1 && this.closed != 0 && !this.release() {
+            core.cleanup_warning("Failed to close socket", __FILE__, __LINE__)
+        }
+    }
+
+    // Gives the descriptor back once; false when the system refused
+    fn release() bool @threadsafe {
+        if atomic(this.released + 1) != 0 : return true
+        #if OS == "win"
+        return ext.closesocket(this.fd) == 0
+        #else
+        return ext.close(this.fd) == 0
+        #end
     }
 
     fn gc_free() {
-        if this.closed != 0 : return
+        if this.released != 0 : return
         this.closed = 1
+        this.released = 1
         close_fd_cleanup(this.fd, __FILE__, __LINE__)
     }
 }
