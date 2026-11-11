@@ -971,6 +971,129 @@ operation such as `close`.
   deadlock collection. Releasing or destroying an unheld native lock is
   permitted.
 
+### Regions
+
+An object that provably stays in one scope is not given to the collector. It
+is made in a region: memory of that scope, freed as a whole when the function
+returns, or reused when the loop the scope is one round of starts its next
+round. A thread keeps the state of its regions in a stack of records apart
+from the native stack, innermost last. The first 176 bytes of a region are in
+its record; a region that grows past them takes chunks from the allocator,
+and a thread keeps a few small chunks for the next region. A region is set
+up when its first object is made, so a call that makes none only takes a
+record and gives it back.
+
+An object is made in the frame, with no region at all, when its size is known
+and small and it lives exactly as long as the scope it is made in: the function,
+or one round of the loop it is made in, so one place in the frame is enough for
+it. Its header says it is neither the collector's nor a region's. What it
+refers to is found by the scan of the stack, so nothing is pinned for it, and
+that also makes it fine in a function that waits, where a region is not.
+`GC_DEBUG` builds stop when an object of the collector refers to one.
+
+An object in a frame may refer to any object of the collector, like a local
+variable does, where a region object may only refer to plain data of the
+collector. So a group that is ruled out for a region only because of what it
+refers to is let off when all of it can be made in the frame. A summary says
+for each group whether its reason is of that kind, so this also goes for an
+object that a callee fills. It is decided once every summary is final, and
+dropped for a function when anything its callers see would come to depend on
+it.
+
+A function gets no region for a number of objects that does not depend on its
+data: none made in a loop, and none by a callee of which that cannot be said.
+Taking a record and giving it back costs every call the same, an object costs
+about as much in a region as with the collector, and objects that are gone
+before the next collection cost the collector nothing. `$region` on the
+function asks for the region all the same.
+
+The records are not in the frame because the collector scans frames word by
+word. A region in a frame becomes part of the frame of whatever its function
+is inlined into, long before the region is set up, and a function that waits
+there (a parked coroutine, a thread on a lock) would show the collector the
+stale words of memory the region never used. A record that is not in use is
+all zero, and the collector scans only the records that are in use.
+
+The proof groups every value that holds references. Two values share a group
+when one can be the other. What an object refers to is not in its group: a
+group refers to the group of the objects its objects refer to, and to the
+group of the plain data (text, a slice of numbers) they refer to. What a group
+refers to has to live at least as long as the group, never the other way
+around. So the objects of one round of a loop may refer to an object of the
+function around the loop, or to an argument, and still be freed every round.
+
+A group is a region when all its objects are made by the function or by
+functions it calls for that, and nothing rules it out: a global, the result of
+unknown code, a closure, a coroutine, a shared value, a number. What an object
+of the collector refers to is the collector's, so nothing collected points
+into a region. A function that makes objects in a group its caller can see has
+a second form that takes a region for each such group from its caller, so
+`Node.tree(depth)` builds a whole tree in the region of the function that uses
+it. Every call decides for itself: a caller that keeps one of the groups on
+the heap passes no region for it, and one that keeps them all calls the first
+form.
+
+The summary of a function is the small graph of the groups its callers can
+see: those of its parameters and its result, and what they refer to, up to
+four references away. A group the function only reads is left out, so reading
+through a structure tells a caller nothing, and `Array.append` tells it that
+the array refers to storage that refers to the element, three groups. What a
+function makes together and links together is one group.
+
+What the compiler cannot follow stays with the collector, so regions change
+where an object lives and never what a program may do. A region is also
+refused where it could hold on to garbage: in a function that can suspend, and
+when its objects are made in a loop inside the scope it belongs to, unless the
+loop provably leaves nothing behind. That takes two things. Every object a
+round makes is kept on every way through the round: stored in an object,
+passed to a parameter the callee keeps, or returned, without a branch or a way
+out in between. And what keeps it lives as long as the region and never lets
+go inside a loop: a store that replaces or removes a reference is a drop, and
+a drop on the way from the keeping variable to the object refuses the region.
+Summaries carry both facts, so a builder may be a callee: where each parameter
+and each object it makes ends up, also when it fails, and which groups it
+drops from. An object counts as kept when both arms of a branch keep it in the
+same place, and a struct value keeps what its fields were given when the
+struct is kept. `list.append(x)` in a loop passes, a conditional append,
+`map.set` and `slot.x = y` do not. `json.decode` passes: the parser adds
+members with a setter that keeps both the name and the value, and vouches for
+what a repeated name replaces, so a document that is read and dropped lives in
+a region. `$region` on a function vouches for its own loops and
+drops: what they leave behind stays until the region ends. `Array` and
+`ByteBuffer` use it where they replace their storage, which leaves at most as
+much again as they end up with.
+
+A region object may refer to something the collector owns in two cases: plain
+data, which has no references and no finalizer, and an argument or what is
+read out of one, which the caller holds. The collector does not look inside a
+region, so the region pins the owner of every such reference until it ends or
+starts its next round: an argument may live until the function returns. The
+header of a region object says where its region is, so a store that pins finds
+the region from the object it stores into, and a function that only stores
+takes no region from its caller. An
+object that refers to any other object of the collector stays with the
+collector, or a region would delay that object's finalizer.
+
+An array is an object like any other, and the compiler follows the array's own
+code. It only has to be told what a few runtime functions do that work on raw
+memory: the write barrier, `gc.transfer_refs`, `gc.moved_elements`,
+`mem.move_bytes`, `mem.copy_bytes` and `mem.identity`. Memory copied from one
+place to another makes the two one group. Bytes copied out of memory that holds
+no references (the data of a `[u8]` slice, by the type of the pointer and not
+behind a cast) link nothing, and a copy into such memory only makes the two
+refer to the same things. `mem.identity` gives a
+number for an object that is not a reference to it; any other pointer that
+becomes a number keeps its object with the collector. What an error is thrown
+with stays with the collector: its handler reads it after the function is gone.
+
+A `GC_DEBUG` build checks the analysis while the program runs. A region
+overwrites its memory when it ends or starts a new round, so an object that was
+wrongly kept reads as an address that crashes at once, and the collector stops
+when an object of its own refers to an object in a region.
+
+`valk build --region-report` lists where every object of a program lives and
+why; `--no-regions` turns regions off.
+
 ## Layout and ABI
 
 - Layout is target-specific and computed from the target pointer size and

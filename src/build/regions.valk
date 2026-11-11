@@ -1,0 +1,3681 @@
+
+// Regions: objects that provably stay in one scope are made in memory that is freed as a whole
+// when the scope ends, and the collector never sees them (lib/src/gc/region.valk).
+//
+// The analysis puts every value that holds references in a group. Values that can be the same
+// object share a group, and a group refers to two others: the objects its objects refer to,
+// and the plain data (text, numbers in a slice) they refer to. So what an object refers to is
+// not in its group: text read from a file can be referred to by an object that lives for one
+// round of a loop, and so can an object of the function around that loop.
+//
+// What a group refers to has to live at least as long as the group. The collector's objects
+// live longest: a group that something of the collector refers to is the collector's too. So
+// is a group that refers to an object of the collector, except to plain data or to an
+// argument: those a region pins, because the collector does not look inside a region. A group
+// that only objects of this function refer to lives in a region of the innermost loop all of
+// it is in, or of a wider one when something wider refers to it.
+//
+// A function's summary is the graph of the groups its callers can see: those of its
+// parameters and result and what they refer to, a few references deep. It says what refers to
+// what, which groups touch something that rules a region out, and in which the function makes
+// objects. For those it has a copy that takes a region for each from its caller. A group the
+// function only reads is not in the summary. Whatever the analysis does not understand rules
+// a region out, so it only changes where an object lives.
+//
+// A loop that adds to a region of a wider scope has to leave nothing behind. The walk notes
+// how every object is kept (stored, passed on, returned) and whether that runs whenever the
+// object is made, and where a reference may be dropped. A loop is accepted when what keeps
+// its objects lives as long as the region and never lets go in a loop.
+//
+// The decisions need every function, and a function's IR is written before that: the places
+// that depend on them are written as tokens, replaced when the module is put together.
+
+value REGION_NONE (uint.$max)
+// How many times the average function may be read before the analysis gives up
+value REGION_SOLVE_ROUNDS (64)
+// A function has at most this many regions of its own, so that they do not fill its frame
+value REGION_MAX_OWN (8)
+// What a call hands a copy for one of its regions is a region of the caller, or from this
+// number on one the caller got itself
+value REGION_PASSED (1048576)
+// A summary names the groups up to this many references away from a parameter or the result;
+// what is further away is one group with what refers to it
+value REGION_SUMMARY_DEPTH (4)
+// The groups a caller can see are looked at up to this many
+value REGION_REACH_MAX (64)
+
+// What a value is to the analysis: plain data that is referred to through an owner, one
+// reference to an object, or several things in one value (a struct, a union, a tuple)
+value REGION_KIND_NONE (0)
+value REGION_KIND_LEAF (1)
+value REGION_KIND_REF (2)
+value REGION_KIND_AGG (3)
+
+// A source (an object the function makes, the result of a call, a parameter) or what holds
+// one, as a kind and a number: kind << 28 | number
+value REGION_REF_PARAM (1)
+value REGION_REF_SITE (2)
+value REGION_REF_CALL (3)
+// A variable, by its node
+value REGION_REF_DECL (4)
+// Where a source ends up: returned, or in a function whose author vouches for its loops
+value REGION_REF_RET (5)
+value REGION_REF_TRUSTED (6)
+// A struct value that carries sources in its fields
+value REGION_REF_PACK (7)
+value REGION_REF_MASK (268435455)
+// With an end: also when the function leaves with an error
+value REGION_STRICT (1099511627776)
+
+// How a source is kept: stored into what a root holds, passed to a call, or returned
+value REGION_KEEP_ROOT (1)
+value REGION_KEEP_ARG (2)
+value REGION_KEEP_RET (3)
+// The keepers of a group in a summary are a bit per slot; this one says the function vouches
+// for the group. A slot from this number on has no bit
+value REGION_KEEPER_TRUSTED (62)
+
+// One step of what a body does: two values are the same group (`join`), a group refers to an
+// object (`ref`) or to plain data (`leaf`), two groups refer to the same things (`absorb`),
+// or a group refers to itself (`own`)
+value REGION_STEP_JOIN (0)
+value REGION_STEP_REF (1)
+value REGION_STEP_LEAF (2)
+value REGION_STEP_ABSORB (3)
+value REGION_STEP_OWN (4)
+
+class RegionSite {
+    name: String
+    // Where it is in the source, for the report
+    src: Source
+    at: u32
+    node: uint
+    loop: uint
+    // The IR has both forms
+    dual: bool (false)
+    emitted: bool (false)
+    // The region of this function it is made in, or which of the regions a copy gets from
+    // its caller
+    region: uint (REGION_NONE)
+    param: uint (REGION_NONE)
+    // Its fields can refer to something the collector owns: the region pins what they get
+    pins: bool (false)
+    // Bytes of the object when that is known where it is made, and whether it is made in
+    // the frame: it lives exactly as long as its scope and is small
+    bytes: uint (0)
+    stack: bool (false)
+    // The stretch of code it runs with, and how it is kept: the first of its `keeps`
+    ctx: uint (0)
+    errors: uint (0)
+    keep: uint (REGION_NONE)
+}
+
+// A store of a reference into an object, through the write barrier: when the object is in a
+// region and what it now refers to can be the collector's, the region pins it
+class RegionPin {
+    node: uint
+    loop: uint
+    dual: bool (false)
+    emitted: bool (false)
+    // The region that pins: as for a call
+    pass: uint (REGION_NONE)
+}
+
+class RegionCall {
+    callee: Func
+    src: ?Source
+    at: u32
+    // Its arguments in `RegionFacts.call_args`
+    first: uint
+    count: uint
+    result: uint
+    loop: uint
+    dual: bool (false)
+    emitted: bool (false)
+    has_args: bool (false)
+    // What it hands the copy of its callee, one for every region that takes, in
+    // `RegionFacts.call_pass`: REGION_NONE, a region of this function, or REGION_PASSED + n
+    pass_first: uint (0)
+    pass_count: uint (0)
+    // As for an object: the stretch of code its result is there with, and how that is kept
+    ctx: uint (0)
+    errors: uint (0)
+    keep: uint (REGION_NONE)
+    // The arguments that are the constant `false`, one bit each
+    false_args: uint (0)
+    // When it fails, this function leaves with the error
+    passes: bool (false)
+    // Where a group lives that the callee only pins for: as `RegionPin.pass`
+    pinned: uint (REGION_NONE)
+    // Where the last solve of the caller left what stands for the callee's groups
+    map_at: uint (REGION_NONE)
+}
+
+// The runtime functions the analysis knows by what they do, and the ones the IR calls
+class RegionRuntime {
+    stack_object: ?Func (null)
+    // Every summary is final: the regions are being chosen
+    settled: bool (false)
+    property_get: Func
+    property_set: Func
+    property_update: Func
+    property_remove: Func
+    transfer_refs: Func
+    moved_elements: Func
+    move_bytes: Func
+    copy_bytes: Func
+    // Names an object by a number, which is not a reference to it
+    identity: ?Func (null)
+    pin: Func
+    pinned_set: Func
+    pinned_update: Func
+    init: Func
+    alloc: Func
+    alloc_zeroed: Func
+    reset: Func
+    exit: Func
+    // Lists every function works in while its body is walked or its groups are solved, so
+    // that a function does not keep its own
+    parent: Array[uint] (.{})
+    content: Array[uint] (.{})
+    leaf: Array[uint] (.{})
+    reason: Array[uint] (.{})
+    soft: Array[bool] (.{})
+    new_soft: Array[bool] (.{})
+    source: Array[bool] (.{})
+    scope: Array[uint] (.{})
+    made: Array[bool] (.{})
+    map: Array[uint] (.{})
+    // The maps of every call of the function being solved, one after the other
+    call_map: Array[uint] (.{})
+    // The groups of the function being solved that a caller can see: the number of each, and
+    // per number its root, the one it was reached from, how far it is from a parameter,
+    // whether the summary names it and under which number
+    reach: Array[uint] (.{})
+    reach_root: Array[uint] (.{})
+    reach_from: Array[uint] (.{})
+    reach_slots: uint (0)
+    degree: Array[uint] (.{})
+    depth: Array[uint] (.{})
+    keep: Array[bool] (.{})
+    sum_index: Array[uint] (.{})
+    new_content: Array[uint] (.{})
+    new_leaf: Array[uint] (.{})
+    new_reason: Array[uint] (.{})
+    new_grows: Array[bool] (.{})
+    new_made: Array[bool] (.{})
+    new_keeper: Array[uint] (.{})
+    new_strict: Array[bool] (.{})
+    new_drops: Array[uint] (.{})
+    todo: Array[uint] (.{})
+    vscopes: Array[uint] (.{})
+    vscope_types: Array[Type] (.{})
+    arg_stack: Array[uint] (.{})
+    source_stack: Array[uint] (.{})
+    held_stack: Array[uint] (.{})
+    // Per group: only objects in the frame
+    framed: Array[bool] (.{})
+    // Per node, and per group: an object of the frame that may refer to an object of the
+    // collector (see `find_exempt`), and whether any is
+    exempt: Array[bool] (.{})
+    exempt_root: Array[bool] (.{})
+    exempt_any: bool (false)
+    // `summarize` only says whether the summary would change
+    dry: bool (false)
+    root_stack: Array[uint] (.{})
+    ctx_stack: Array[uint] (.{})
+    drops_any: Array[uint] (.{})
+    drops_bad: Array[uint] (.{})
+    acc_keeper: Array[uint] (.{})
+    acc_open: Array[bool] (.{})
+    acc_strict: Array[bool] (.{})
+    acc_loose: Array[bool] (.{})
+    // Why a group is not a region, as a number: a function reads and writes these often,
+    // and a number in a list costs the collector nothing. 0 is no reason
+    reasons: Array[String] (.{ "" })
+    reason_ids: Map[uint] (.{})
+
+    // The reason of an object for what refers to it
+    fn held_reason(id: uint, report: bool) uint {
+        if !report : return id
+        let text = this.reasons[id]
+        if text.starts_with(REGION_WHY_REFERS) : return id
+        return this.reason_id(REGION_WHY_REFERS + text)
+    }
+
+    fn reason_id(text: String) uint {
+        let known = this.reason_ids.get(text) !? 0
+        if known > 0 : return known
+        this.reasons.append(text)
+        this.reason_ids.set(text, this.reasons.length - 1)
+        return this.reasons.length - 1
+    }
+}
+
+value REGION_WHY_NO_FORM ("made where no region can be given")
+value REGION_WHY_CALL_NO_FORM ("grown by a call that cannot be given a region")
+value REGION_WHY_BEYOND ("passed beyond the parameters of a function")
+value REGION_WHY_BLIND ("passed to a function the compiler cannot follow")
+value REGION_WHY_LOOP ("made in a loop inside the scope it lives in ($region on the function allows it)")
+value REGION_WHY_SUSPENDS ("the function may suspend")
+value REGION_WHY_CLOSURE ("inside a closure")
+value REGION_WHY_REFERS ("refers to an object on the heap: ")
+value REGION_WHY_FULL ("the function has its regions already")
+// An object in a frame is at most this big, and a function has at most this much of them
+value REGION_STACK_OBJECT (128)
+value REGION_STACK_TOTAL (256)
+value REGION_WHY_FEW ("a few objects per call: the collector frees those at no cost")
+
+class RegionFacts {
+    func: Func
+    runtime: RegionRuntime
+    // Nothing in this function may rely on the walk, and what it did not understand
+    lost: bool (false)
+    lost_why: String ("")
+    count: uint (0)
+    // The loop every loop of the body is in; loop 0 is the body itself. A loop has a higher
+    // number than the one it is in
+    loops: Array[uint] (.{ 0 })
+    loop: uint (0)
+    node_loop: Array[uint] (.{})
+    // What the body does: a step and its two nodes, three numbers each
+    steps: Array[uint] (.{})
+    // Why a node cannot be in a region: the two lists go together
+    mark_nodes: Array[uint] (.{})
+    mark_reasons: Array[uint] (.{})
+    sites: Array[RegionSite] (.{})
+    calls: Array[RegionCall] (.{})
+    call_args: Array[uint] (.{})
+    pins: Array[RegionPin] (.{})
+    args: Array[uint] (.{})
+    ret: uint (0)
+    // The results of the value scopes being walked, and their types
+    vscopes: Array[uint]
+    vscope_types: Array[Type]
+    // The arguments of the calls being walked
+    arg_stack: Array[uint]
+    // A store through a pointer that the write barrier may follow: its step, and the address
+    // it went to. With the barrier it is a reference of the object the barrier names
+    pending_step: uint (REGION_NONE)
+    pending_base: ?Value (null)
+    pending_kind: uint (0)
+    // The stretch of code being walked: statements with the same number run together or
+    // not at all, unless an error ends the function in between
+    ctx: uint (1)
+    ctx_next: uint (2)
+    // Stretches that between them see every way on from another: that one, and the two
+    splits: Array[uint] (.{})
+    // Struct values that carry sources: the stretch each is made in, the errors seen by
+    // then, how it is kept and the loop
+    pack_ctx: Array[uint] (.{})
+    pack_errors: Array[uint] (.{})
+    pack_keep: Array[uint] (.{})
+    pack_loop: Array[uint] (.{})
+    // The ways out seen so far: of the function or a loop, with an error, of a value scope
+    exits: uint (0)
+    exits_error: uint (0)
+    exits_scope: uint (0)
+    // `break` and `continue`: ways out of a round, not of what follows the loop
+    exits_loop: uint (0)
+    // Per node, for a variable: what it was last given (a source or a root), how often it
+    // was assigned and in which loop the first time: alias | assigns << 32 | loop << 40
+    node_info: Array[uint] (.{})
+    // What holds every argument of every call, next to `call_args`
+    call_root: Array[uint] (.{})
+    // How sources are kept: kind | strict << 8, what by, the next one of the same source,
+    // and the stretch of code it is kept in
+    keeps: Array[uint] (.{})
+    arg_keep: Array[uint] (.{})
+    // Where a reference may be dropped: the node of the object and loop << 2 | sides
+    // (1 what it refers to as objects, 2 as plain data)
+    drop_nodes: Array[uint] (.{})
+    drop_info: Array[uint] (.{})
+    // The bool parameters this function's keeps hold for when they are false, one bit each,
+    // and the bool parameters it assigns
+    keep_guard: uint (0)
+    args_written: uint (0)
+    // Which walk of the function this is: a value carries it next to its number, so that a
+    // number left by an earlier walk is not taken for one of this walk
+    round: uint (1)
+    has_tokens: bool (false)
+    // Where the function ends in its IR; helpers such as layouts follow
+    body_bytes: uint (0)
+
+    // The groups of the last function that was solved, kept at their root node: `solve`
+    // comes before every use of them. A group refers to the group of `content` (objects) and
+    // of `leaf` (plain data); `scope` is the loop it lives in
+    parent: Array[uint]
+    content: Array[uint]
+    leaf: Array[uint]
+    reason: Array[uint]
+    // The reason of a group is only what it refers to: an object in a frame may refer to
+    // that, where one in a region may not
+    soft: Array[bool]
+    source: Array[bool]
+    scope: Array[uint]
+
+    // The summary: the groups a caller has to know, by number. Per parameter and then the
+    // result which group it is in; per group what it refers to, why a region cannot hold it,
+    // and whether the function makes objects in it: its copy then takes a region for it
+    slot_group: Array[uint] (.{})
+    sum_content: Array[uint] (.{})
+    sum_leaf: Array[uint] (.{})
+    sum_reason: Array[uint] (.{})
+    sum_soft: Array[bool] (.{})
+    sum_grows: Array[bool] (.{})
+    // It makes objects in the group, and does not only pin for it
+    sum_made: Array[bool] (.{})
+    any_grows: bool (false)
+    // A call makes a number of objects that does not depend on its data: none in a loop,
+    // and none by a callee of which that cannot be said (one that calls itself, to begin with)
+    bounded: bool (false)
+    // Per group: where the objects it makes there end up, on every way out: a bit for the
+    // slot of every parameter that holds some of them and for the result, 0 when one of them
+    // is not kept. And whether that also goes for the ways out that are errors. And the sides on which the function may let go of a reference
+    sum_keeper: Array[uint] (.{})
+    sum_strict: Array[bool] (.{})
+    sum_drops: Array[uint] (.{})
+    any_drops: bool (false)
+    // The same for what a caller passes: where every parameter ends up
+    slot_keeper: Array[uint] (.{})
+    slot_strict: Array[bool] (.{})
+    // How often it was solved: one that keeps changing stops vouching for anything
+    rounds: uint (0)
+    // The groups the copy takes a region for, in the order of the copy's parameters; and
+    // whether a caller may pass none for one
+    params: Array[uint] (.{})
+    may_null: Array[bool] (.{})
+    call_pass: Array[uint] (.{})
+
+    // The loop of every region of this function, and whether a caller uses the copy
+    regions: Array[uint] (.{})
+    needs_copy: bool (false)
+    // Whether the last solve found a group that something makes objects in
+    has_source: bool (false)
+    callers: Array[RegionFacts] (.{})
+    queued: bool (false)
+
+    fn add_node() uint {
+        let node = this.count
+        this.count++
+        this.node_loop.append(this.loop)
+        this.node_info.append(0)
+        return node
+    }
+
+    fn arg_slot(node: uint) uint {
+        each this.args as arg, i {
+            if arg == node : return i
+        }
+        return REGION_NONE
+    }
+
+    fn fresh() uint {
+        this.ctx_next++
+        return this.ctx_next
+    }
+
+    // Code that may not run starts here
+    fn branch() {
+        let stack = this.runtime.ctx_stack
+        stack.append(this.ctx)
+        stack.append(this.exits + this.exits_scope)
+        stack.append(this.exits_loop)
+        this.ctx = this.fresh()
+    }
+
+    // And ends here. What follows runs with what came before it, unless there was a way
+    // out: returns whether there was. `loop`: what ends is a loop, which a `break` or
+    // `continue` inside it does not skip the end of
+    fn merge(loop: bool (false)) bool {
+        let stack = this.runtime.ctx_stack
+        let rounds = stack.pop_last() !? 0
+        let exits = stack.pop_last() !? 0
+        let ctx = stack.pop_last() !? 0
+        let left = this.exits + this.exits_scope != exits || (!loop && this.exits_loop != rounds)
+        this.ctx = left ? this.fresh() : ctx
+        return left
+    }
+
+    // Every way on from `from` goes through `a` or through `b`
+    fn split(from: uint, a: uint, b: uint) {
+        this.splits.append(from)
+        this.splits.append(a)
+        this.splits.append(b)
+    }
+
+    // `source` is kept here, in this stretch of code
+    fn keep(source: uint, kind: uint, by: uint) {
+        if source == 0 || (kind == REGION_KEEP_ROOT && by == 0) : return
+        let which = source >> 28
+        let i = source & REGION_REF_MASK
+        let entry = this.keeps.length
+        let next = REGION_NONE
+        let errors: uint = 0
+        if which == REGION_REF_SITE {
+            let site = this.sites.get(i) ! return
+            next = site.keep
+            errors = site.errors
+            site.keep = entry
+        } else if which == REGION_REF_CALL {
+            let call = this.calls.get(i) ! return
+            next = call.keep
+            errors = call.errors
+            call.keep = entry
+        } else if which == REGION_REF_PARAM {
+            if i >= this.arg_keep.length : return
+            next = this.arg_keep[i]
+            this.arg_keep[i] = entry
+        } else if which == REGION_REF_PACK {
+            if i >= this.pack_keep.length : return
+            next = this.pack_keep[i]
+            errors = this.pack_errors[i]
+            this.pack_keep[i] = entry
+        } else {
+            return
+        }
+        // Strict: no error could have ended the function since the source was made
+        this.keeps.append(kind | (errors == this.exits_error ? 256 : 0))
+        this.keeps.append(by)
+        this.keeps.append(next)
+        this.keeps.append(this.ctx)
+    }
+
+    // An object of the group of `node` may let go of something here
+    fn drop(node: uint, sides: uint) {
+        // `$region`: the author vouches for what the function leaves behind
+        if node == REGION_NONE || this.func.region_loops : return
+        this.drop_nodes.append(node)
+        this.drop_info.append((this.loop << 2) | sides)
+    }
+
+    fn lose(why: String) {
+        if !this.lost : this.lost_why = why
+        this.lost = true
+    }
+
+    fn step(op: uint, a: uint, b: uint) {
+        if a == REGION_NONE || b == REGION_NONE : return
+        this.steps.append(op)
+        this.steps.append(a)
+        this.steps.append(b)
+    }
+
+    fn join(a: uint, b: uint) {
+        if a != b : this.step(REGION_STEP_JOIN, a, b)
+    }
+
+    // `holder` refers to `value`, which is of `kind`
+    fn store(holder: uint, value: uint, kind: uint) {
+        if kind == REGION_KIND_LEAF : this.step(REGION_STEP_LEAF, holder, value)
+        else if kind == REGION_KIND_REF : this.step(REGION_STEP_REF, holder, value)
+        else if kind == REGION_KIND_AGG : this.step(REGION_STEP_ABSORB, holder, value)
+    }
+
+    // What is read out of `holder` as a value of `kind`: one of the things it refers to
+    fn load(holder: uint, kind: uint) uint {
+        if holder == REGION_NONE || kind == REGION_KIND_NONE : return REGION_NONE
+        let node = this.add_node()
+        this.store(holder, node, kind)
+        return node
+    }
+
+    // A value of one kind as a value of another: several things in one value refer to what
+    // they are made of
+    fn convert(node: uint, from: Type, to: Type) uint {
+        if node == REGION_NONE : return REGION_NONE
+        let have = region_kind(from)
+        let want = region_kind(to)
+        if want == REGION_KIND_NONE : return REGION_NONE
+        if have == want || have == REGION_KIND_NONE : return node
+        if want == REGION_KIND_AGG {
+            let made = this.add_node()
+            this.store(made, node, have)
+            return made
+        }
+        if have == REGION_KIND_AGG : return this.load(node, want)
+        // Plain data and a pointer to it are the same storage
+        return node
+    }
+
+    fn mark(node: uint, reason: String) {
+        if node == REGION_NONE : return
+        this.mark_nodes.append(node)
+        this.mark_reasons.append(this.runtime.reason_id(reason))
+    }
+
+    // A reason with the function it was found in, which only the report shows
+    fn here(reason: String) String {
+        if !this.func.ns.build.options.region_report : return reason
+        return reason + " in " + this.func.ns.name + "." + this.func.name
+    }
+
+    // The innermost loop both are in
+    fn common_loop(a: uint, b: uint) uint {
+        while a != b {
+            if a > b : a = this.loops[a]
+            else : b = this.loops[b]
+        }
+        return a
+    }
+
+    // `written`: this use gives the variable a value. `declares`: where the variable starts to exist
+    fn decl_node(decl: Decl, written: bool, declares: bool) uint {
+        let node = decl.region_node
+        if node != REGION_NONE {
+            this.node_loop[node] = this.common_loop(this.node_loop[node], this.loop)
+            return node
+        }
+        node = this.add_node()
+        decl.region_node = node
+        if decl.owner != this.func : this.mark(node, "belongs to another function")
+        if decl.is_buffer {
+            if !written : this.lose("a temporary read before it is written")
+            return node
+        }
+        // Read before the walk saw it written: its value came some other way, such as the
+        // payload of a caught error
+        if !written : this.mark(node, this.here("holds a value the compiler did not see stored"))
+        // Declared somewhere else: it may carry its value into a later round of a loop
+        if !declares : this.node_loop[node] = 0
+        return node
+    }
+
+    // The number of an object, call or loop with the walk it is from
+    fn number(id: uint) u32 {
+        return (id | (this.round << 24)).to(u32)
+    }
+
+    // The number this walk gave a value, 0 when it gave none
+    fn number_of(value: Value) uint {
+        let id = value.region_id.to(uint)
+        if id >> 24 != this.round : return 0
+        return id & 0xFFFFFF
+    }
+
+    fn known_site(value: Value) ?RegionSite {
+        let id = this.number_of(value)
+        if id == 0 || value.type != VAL.class_init : return null
+        return this.sites.get(id - 1) !? null
+    }
+
+    // A call of the write barrier that pins: numbered from 0x800000
+    fn known_pin(value: Value) ?RegionPin {
+        let id = this.number_of(value)
+        if id <= 0x800000 || value.type != VAL.call : return null
+        return this.pins.get(id - 0x800001) !? null
+    }
+
+    fn known_call(value: Value) ?RegionCall {
+        let id = this.number_of(value)
+        if id == 0 || id >= 0x800000 || value.type != VAL.call : return null
+        return this.calls.get(id - 1) !? null
+    }
+
+    fn find(node: uint) uint {
+        let at = node
+        while this.parent[at] != at {
+            this.parent[at] = this.parent[this.parent[at]]
+            at = this.parent[at]
+        }
+        return at
+    }
+
+    // Merges two groups, and with them what they refer to
+    fn unify(a: uint, b: uint) {
+        if a == REGION_NONE || b == REGION_NONE : return
+        let todo = this.runtime.todo
+        let base = todo.length
+        todo.append(a)
+        todo.append(b)
+        while todo.length > base {
+            let y = this.find(todo.pop_last() ! break)
+            let x = this.find(todo.pop_last() ! break)
+            if x == y : continue
+            this.parent[x] = y
+            if this.reason[y] == 0 {
+                this.reason[y] = this.reason[x]
+                this.soft[y] = this.soft[x]
+            } else if this.reason[x] > 0 && !this.soft[x] {
+                this.soft[y] = false
+            }
+            let cx = this.content[x]
+            let cy = this.content[y]
+            if cy == REGION_NONE {
+                this.content[y] = cx
+            } else if cx != REGION_NONE {
+                todo.append(cx)
+                todo.append(cy)
+            }
+            let lx = this.leaf[x]
+            let ly = this.leaf[y]
+            if ly == REGION_NONE {
+                this.leaf[y] = lx
+            } else if lx != REGION_NONE {
+                todo.append(lx)
+                todo.append(ly)
+            }
+        }
+    }
+
+    // A node of the group that `node` refers to, made when it refers to nothing yet
+    fn link_of(node: uint, leaf: bool) uint {
+        let root = this.find(node)
+        let known = leaf ? this.leaf[root] : this.content[root]
+        if known != REGION_NONE : return known
+        let made = this.parent.length
+        this.parent.append(made)
+        this.content.append(REGION_NONE)
+        this.leaf.append(REGION_NONE)
+        this.reason.append(0)
+        this.soft.append(false)
+        if leaf : this.leaf[root] = made
+        else : this.content[root] = made
+        return made
+    }
+
+    fn apply(op: uint, a: uint, b: uint) {
+        if op == REGION_STEP_JOIN {
+            this.unify(a, b)
+        } else if op == REGION_STEP_REF {
+            this.unify(this.link_of(a, false), b)
+        } else if op == REGION_STEP_LEAF {
+            this.unify(this.link_of(a, true), b)
+        } else if op == REGION_STEP_ABSORB {
+            this.unify(this.link_of(a, false), this.link_of(b, false))
+            this.unify(this.link_of(a, true), this.link_of(b, true))
+        } else {
+            this.unify(this.link_of(a, false), a)
+            this.unify(this.link_of(a, true), a)
+        }
+    }
+
+    fn slot_count() uint {
+        return this.args.length + 1
+    }
+
+    fn slot_node(slot: uint) uint {
+        if slot < this.args.length : return this.args[slot]
+        return this.ret
+    }
+
+    // What a call passes for a slot of its callee
+    fn call_actual(call: RegionCall, callee: RegionFacts, slot: uint) uint {
+        if slot == callee.args.length : return call.result
+        if slot < call.count : return this.call_args[call.first + slot]
+        return REGION_NONE
+    }
+
+    fn give_reason(node: uint, reason: uint) bool {
+        if node == REGION_NONE : return false
+        let root = this.find(node)
+        this.soft[root] = false
+        if this.reason[root] > 0 : return false
+        this.reason[root] = reason
+        return true
+    }
+
+    // A reason that is only what the group refers to: none for a group that is let off
+    fn give_soft(node: uint, reason: uint) {
+        if node == REGION_NONE : return
+        let root = this.find(node)
+        if this.reason[root] > 0 : return
+        let rt = this.runtime
+        if rt.exempt_any {
+            each this.sites as site {
+                if rt.exempt[site.node] && this.find(site.node) == root : return
+            }
+        }
+        this.reason[root] = reason
+        this.soft[root] = true
+    }
+
+    // Why a group that reaches a function the compiler cannot follow stays on the heap
+    fn blind_reason(callee: Func) uint {
+        if !this.func.ns.build.options.region_report : return this.runtime.reason_id(REGION_WHY_BLIND)
+        return this.runtime.reason_id("passed to " + callee.ns.name + "." + callee.name + ", which the compiler cannot follow")
+    }
+
+    // Whether the copy takes a region for group `g` of the summary
+    fn grows(g: uint) bool {
+        return this.sum_grows[g] && this.sum_reason[g] == 0
+    }
+
+    // Finds, for every group of a callee's summary, the group here that stands for it, in
+    // `runtime.map`: what the call passes for a parameter or takes as the result, and from
+    // there what those refer to. `apply` makes the groups here refer to each other the way
+    // the summary says; without it, a group the call has nothing for stays REGION_NONE
+    fn map_call(call: ?RegionCall, callee: RegionFacts, apply: bool) {
+        let map = this.runtime.map
+        map.clear()
+        let count = callee.sum_reason.length
+        let known = isset(call) ? call.map_at : REGION_NONE
+        if !apply && known != REGION_NONE {
+            // Worked out when the summary was applied: the groups only merged since
+            let kept = this.runtime.call_map
+            each known .. count as at : map.append(kept[at])
+            return
+        }
+        each 0 .. count : map.append(REGION_NONE)
+        each 0 .. callee.slot_count() as slot {
+            let g = callee.slot_group[slot]
+            if g == REGION_NONE : continue
+            // Without a call: this function's own slots
+            let actual = isset(call) ? this.call_actual(call, callee, slot) : this.slot_node(slot)
+            if actual == REGION_NONE : continue
+            if map[g] == REGION_NONE : map[g] = actual
+            else if apply : this.unify(map[g], actual)
+        }
+        let changed = true
+        while changed {
+            changed = false
+            each 0 .. count as g {
+                let from = map[g]
+                if from == REGION_NONE : continue
+                each 0 .. 2 as side {
+                    let to = side == 0 ? callee.sum_content[g] : callee.sum_leaf[g]
+                    if to == REGION_NONE : continue
+                    if apply {
+                        let link = this.link_of(from, side == 1)
+                        if map[to] == REGION_NONE {
+                            map[to] = link
+                            changed = true
+                        } else {
+                            this.unify(link, map[to])
+                        }
+                    } else if map[to] == REGION_NONE {
+                        let root = this.find(from)
+                        let link = side == 0 ? this.content[root] : this.leaf[root]
+                        if link == REGION_NONE : continue
+                        map[to] = link
+                        changed = true
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_params() {
+        if this.lost : return
+        each 0 .. this.sum_reason.length as g {
+            if !this.grows(g) || !this.sum_made[g] : continue
+            this.params.append(g)
+            this.may_null.append(false)
+        }
+        // A copy that only pins takes one region that nothing uses, so that every copy is
+        // called alike
+        if this.params.length == 0 && this.any_grows {
+            this.params.append(REGION_NONE)
+            this.may_null.append(true)
+        }
+    }
+
+    // Where a group lives, for what only has to know whether it is in a region: one of this
+    // function's (below REGION_PASSED), one a caller of the copy chose, or none
+    fn region_or_callers(root: uint, passed: Array[uint]) uint {
+        let region = this.region_of(root, passed)
+        if region != REGION_NONE : return region
+        let seen = this.runtime.reach[root]
+        if seen == REGION_NONE : return REGION_NONE
+        let g = this.runtime.sum_index[seen]
+        if g == REGION_NONE || g >= this.sum_reason.length || !this.grows(g) : return REGION_NONE
+        return REGION_PASSED
+    }
+
+    // Whether a call reaches the copy of its callee, in this function's own form or its copy
+    fn call_uses_copy(call: RegionCall, copy: bool) bool {
+        if call.pinned != REGION_NONE && (copy || call.pinned < REGION_PASSED) : return true
+        each call.pass_first .. call.pass_count as i {
+            let pass = this.call_pass[i]
+            if pass != REGION_NONE && (copy || pass < REGION_PASSED) : return true
+        }
+        return false
+    }
+
+    // Whether a caller can hand this function a region to make objects in
+    fn copy_allowed() bool {
+        let func = this.func
+        if func.is_literal || func.is_export || func.is_extern || func.is_entrance || func.infinite_args : return false
+        return !this.lost
+    }
+
+    // What holds something passes its reason on to it: what an object of the collector refers
+    // to is the collector's. And an object that refers to one of the collector's is the
+    // collector's too: a region would keep that object, and what its finalizer frees, until
+    // the region ends. Plain data has nothing to free, so a region object may refer to it
+    fn settle() {
+        let report = this.func.ns.build.options.region_report
+        let rt = this.runtime
+        let frames = rt.exempt_any
+        let exempt = rt.exempt_root
+        if frames {
+            exempt.clear()
+            each 0 .. this.parent.length : exempt.append(false)
+            each this.sites as site {
+                if rt.exempt[site.node] : exempt[this.find(site.node)] = true
+            }
+        }
+        let changed = true
+        while changed {
+            changed = false
+            each 0 .. this.parent.length as i {
+                if this.parent[i] != i : continue
+                each 0 .. 2 as side {
+                    let link = side == 0 ? this.content[i] : this.leaf[i]
+                    if link == REGION_NONE : continue
+                    let x = this.find(link)
+                    if this.reason[i] > 0 {
+                        // What an object of the collector refers to is the collector's
+                        if this.reason[x] == 0 {
+                            this.reason[x] = this.reason[i]
+                            this.soft[x] = false
+                            changed = true
+                        } else if this.soft[x] {
+                            this.soft[x] = false
+                            changed = true
+                        }
+                    } else if side == 0 && this.reason[x] > 0 && !(frames && exempt[i]) {
+                        this.reason[i] = this.runtime.held_reason(this.reason[x], report)
+                        this.soft[i] = true
+                        changed = true
+                    }
+                }
+            }
+        }
+    }
+
+    // Numbers the groups a caller can see: those of the parameters and the result first, then
+    // whatever they refer to. Returns whether two were merged because there are too many
+    fn find_reach() bool {
+        let rt = this.runtime
+        let reach = rt.reach
+        let roots = rt.reach_root
+        let from = rt.reach_from
+        reach.clear()
+        roots.clear()
+        from.clear()
+        each 0 .. this.parent.length : reach.append(REGION_NONE)
+        each 0 .. this.slot_count() as slot {
+            let node = this.slot_node(slot)
+            if node == REGION_NONE : continue
+            let root = this.find(node)
+            if reach[root] != REGION_NONE : continue
+            reach[root] = roots.length
+            roots.append(root)
+            from.append(REGION_NONE)
+        }
+        rt.reach_slots = roots.length
+        let g: uint = 0
+        while g < roots.length {
+            let root = roots[g]
+            each 0 .. 2 as side {
+                let link = side == 0 ? this.content[root] : this.leaf[root]
+                if link == REGION_NONE : continue
+                let x = this.find(link)
+                if reach[x] != REGION_NONE : continue
+                if roots.length >= REGION_REACH_MAX {
+                    this.unify(root, x)
+                    return true
+                }
+                reach[x] = roots.length
+                roots.append(x)
+                from.append(g)
+            }
+            g++
+        }
+        return false
+    }
+
+    // Which of the groups a caller can see the summary has to name. A group this function
+    // only reads says nothing: it makes no object in it, nothing rules a region out for it
+    // and it is reached in one way, so the groups of a caller already look like it. Neither
+    // does a group of the collector that a group of the collector refers to. Returns whether
+    // two groups were merged
+    fn trim_reach() bool {
+        let rt = this.runtime
+        let reach = rt.reach
+        let roots = rt.reach_root
+        let from = rt.reach_from
+        let degree = rt.degree
+        let keep = rt.keep
+        let depth = rt.depth
+        let made = rt.made
+        // What this function makes and what it makes for that to refer to live equally
+        // long: one group, one region. A function that builds by calling itself would
+        // otherwise see its result one reference further away each time
+        each rt.reach_slots .. roots.length - rt.reach_slots as g {
+            let root = roots[g]
+            let holder = roots[from[g]]
+            if !made[root] || !made[holder] || this.reason[root] > 0 || this.reason[holder] > 0 : continue
+            // Plain data stays apart: text is often the collector's when its objects are not
+            let content = this.content[holder]
+            if content == REGION_NONE || this.find(content) != root : continue
+            this.unify(holder, root)
+            return true
+        }
+        degree.clear()
+        keep.clear()
+        depth.clear()
+        each 0 .. roots.length {
+            degree.append(0)
+            keep.append(true)
+        }
+        each roots as root {
+            each 0 .. 2 as side {
+                let link = side == 0 ? this.content[root] : this.leaf[root]
+                if link == REGION_NONE : continue
+                let x = reach[this.find(link)]
+                degree[x] = degree[x] + 1
+            }
+        }
+        let changed = true
+        while changed {
+            changed = false
+            each rt.reach_slots .. roots.length - rt.reach_slots as g {
+                if !keep[g] || degree[g] != 1 : continue
+                let root = roots[g]
+                if this.reason[root] == 0 && this.source[root] : continue
+                if this.reason[root] > 0 && this.reason[roots[from[g]]] == 0 : continue
+                let content = this.content[root]
+                let leaf = this.leaf[root]
+                if content != REGION_NONE && keep[reach[this.find(content)]] : continue
+                if leaf != REGION_NONE && keep[reach[this.find(leaf)]] : continue
+                keep[g] = false
+                changed = true
+            }
+        }
+        each 0 .. roots.length as g {
+            let before = from[g]
+            let deep = before == REGION_NONE ? 0 : depth[before] + 1
+            depth.append(deep)
+            if !keep[g] || deep <= REGION_SUMMARY_DEPTH || before == REGION_NONE : continue
+            // Too far from a parameter to tell apart from what refers to it
+            this.unify(roots[before], roots[g])
+            return true
+        }
+        return false
+    }
+
+    // Whether a group refers to something that can be the collector's: a store into it pins.
+    // That is anything this function does not make in a region itself, such as an argument
+    // and what is read out of one
+    fn refers_out(root: uint) bool {
+        let made = this.runtime.made
+        let reach = this.runtime.reach
+        each 0 .. 2 as side {
+            let link = side == 0 ? this.content[root] : this.leaf[root]
+            if link == REGION_NONE : continue
+            let x = this.find(link)
+            if x == root : continue
+            if !made[x] || this.reason[x] > 0 || reach[x] != REGION_NONE : return true
+        }
+        return false
+    }
+
+    // Whether a group is one this function can keep in a region of its own
+    fn is_local(root: uint) bool {
+        return this.source[root] && this.reason[root] == 0 && this.runtime.reach[root] == REGION_NONE
+    }
+
+    // Marks the groups something makes objects in. Returns whether a group got a reason
+    fn find_sources() bool {
+        let changed = false
+        let made = this.runtime.made
+        made.clear()
+        each 0 .. this.parent.length as i {
+            this.source[i] = false
+            made.append(false)
+        }
+        each this.sites as site {
+            let root = this.find(site.node)
+            if !site.dual || !site.emitted {
+                if this.give_reason(root, this.runtime.reason_id(REGION_WHY_NO_FORM)) : changed = true
+                continue
+            }
+            this.source[root] = true
+            made[root] = true
+        }
+        let map = this.runtime.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if !callee.grows(g) || map[g] == REGION_NONE : continue
+                let root = this.find(map[g])
+                if !call.dual || !call.emitted {
+                    if this.give_reason(root, this.runtime.reason_id(REGION_WHY_CALL_NO_FORM)) : changed = true
+                    continue
+                }
+                this.source[root] = true
+                if callee.sum_made[g] : made[root] = true
+            }
+        }
+        // A store that pins needs the region of the object, like a place that makes one
+        each this.pins as pin {
+            let root = this.find(pin.node)
+            if this.reason[root] > 0 || !this.refers_out(root) : continue
+            if !pin.dual || !pin.emitted {
+                if this.give_reason(root, this.runtime.reason_id(REGION_WHY_NO_FORM)) : changed = true
+                continue
+            }
+            this.source[root] = true
+        }
+        return changed
+    }
+
+    // The loop every group lives in: the innermost one all of it is in, widened to that of
+    // whatever refers to it
+    fn find_scopes() {
+        each 0 .. this.parent.length as i : this.scope[i] = REGION_NONE
+        each 0 .. this.count as i {
+            let root = this.find(i)
+            this.scope[root] = this.scope[root] == REGION_NONE ? this.node_loop[i] : this.common_loop(this.scope[root], this.node_loop[i])
+        }
+        let changed = true
+        while changed {
+            changed = false
+            each 0 .. this.parent.length as i {
+                if this.parent[i] != i || this.scope[i] == REGION_NONE : continue
+                each 0 .. 2 as side {
+                    let link = side == 0 ? this.content[i] : this.leaf[i]
+                    if link == REGION_NONE : continue
+                    let x = this.find(link)
+                    let wide = this.scope[x] == REGION_NONE ? this.scope[i] : this.common_loop(this.scope[x], this.scope[i])
+                    if wide == this.scope[x] : continue
+                    this.scope[x] = wide
+                    changed = true
+                }
+            }
+        }
+    }
+
+    // Where every group may let go of a reference: anywhere (`drops_any`), and in a loop
+    // inside the scope the group lives in (`drops_bad`), which is what leaves garbage behind
+    // round after round
+    fn find_drops() {
+        let any = this.runtime.drops_any
+        let bad = this.runtime.drops_bad
+        any.clear()
+        bad.clear()
+        each 0 .. this.parent.length {
+            any.append(0)
+            bad.append(0)
+        }
+        each this.drop_nodes as node, i {
+            let root = this.find(node)
+            let info = this.drop_info[i]
+            any[root] = any[root] | (info & 3)
+            if (info >> 2) != this.scope[root] : bad[root] = bad[root] | (info & 3)
+        }
+        if this.func.region_loops : return
+        let map = this.runtime.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_drops : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_drops.length as g {
+                let sides = callee.sum_drops[g]
+                if sides == 0 || map[g] == REGION_NONE : continue
+                let root = this.find(map[g])
+                any[root] = any[root] | sides
+                if call.loop != this.scope[root] : bad[root] = bad[root] | sides
+            }
+        }
+    }
+
+    // Whether the objects of `target` stay referred to from the group `from`, for as long
+    // as `target` lives: the groups on the way live as long and never let go
+    fn path_ok(from: uint, target: uint) bool {
+        let bad = this.runtime.drops_bad
+        let at = from
+        each 0 .. 16 {
+            if at == target {
+                // Objects of the group that hold each other
+                let own = this.content[at]
+                return own == REGION_NONE || this.find(own) != at || (bad[at] & 1) == 0
+            }
+            if this.scope[at] != this.scope[target] : return false
+            let leaf = this.leaf[at]
+            if leaf != REGION_NONE && this.find(leaf) == target : return (bad[at] & 2) == 0
+            let content = this.content[at]
+            if content == REGION_NONE || (bad[at] & 1) != 0 : return false
+            let next = this.find(content)
+            if next == at : return false
+            at = next
+        }
+        return false
+    }
+
+    // Whether the end of a source keeps it in the region of group `root` of this function
+    fn holds(end: uint, root: uint) bool {
+        let kind = (end >> 28) & 15
+        let i = end & REGION_REF_MASK
+        if kind == REGION_REF_TRUSTED : return true
+        let node = REGION_NONE
+        if kind == REGION_REF_DECL {
+            node = i
+        } else if kind == REGION_REF_SITE {
+            let site = this.sites.get(i) ! return false
+            node = site.node
+        } else if kind == REGION_REF_CALL {
+            let call = this.calls.get(i) ! return false
+            node = call.result
+        }
+        if node == REGION_NONE : return false
+        return this.path_ok(this.find(node), root)
+    }
+
+    // Where what holds something ends: a parameter, a variable that names one object for
+    // the whole loop, an object that is there for as long as its region, or wherever the
+    // object ends up that holds it. 0 when nothing says it stays
+    fn kept_root(root: uint, loop: uint, depth: uint) uint {
+        if depth > 12 : return 0
+        let which = (root >> 28) & 15
+        let i = root & REGION_REF_MASK
+        if which == REGION_REF_PARAM : return root | REGION_STRICT
+        if which == REGION_REF_DECL {
+            let info = this.node_info[i]
+            let assigns = (info >> 32) & 255
+            let slot = this.arg_slot(i)
+            if slot != REGION_NONE : return assigns == 0 ? ((REGION_REF_PARAM << 28) | slot | REGION_STRICT) : 0
+            if assigns != 1 : return 0
+            let alias = info & 4294967295
+            if alias != 0 : return this.kept_root(alias, loop, depth + 1)
+            // Something the function got: one object while the loop runs when the variable
+            // was given it outside the loop
+            let assigned = info >> 40
+            if assigned == loop || this.common_loop(assigned, loop) != assigned : return 0
+            return root | REGION_STRICT
+        }
+        if which == REGION_REF_PACK : return this.kept_source(root, depth + 1)
+        if which != REGION_REF_SITE && which != REGION_REF_CALL : return 0
+        let node = REGION_NONE
+        let made_in: uint = 0
+        if which == REGION_REF_SITE {
+            let site = this.sites.get(i) ! return 0
+            node = site.node
+            made_in = site.loop
+        } else {
+            let call = this.calls.get(i) ! return 0
+            node = call.result
+            made_in = call.loop
+        }
+        if node != REGION_NONE {
+            let group = this.find(node)
+            if this.runtime.reach[group] == REGION_NONE && made_in == this.scope[group] : return root | REGION_STRICT
+        }
+        let end = this.kept_made_root(root, depth)
+        // Kept nowhere, but there before the loop began: one object for all its rounds, like
+        // a variable that was given its value outside the loop
+        if end == 0 && node != REGION_NONE && made_in != loop && this.common_loop(made_in, loop) == made_in : return root | REGION_STRICT
+        return end
+    }
+
+    // Where the object of a place or call ends up that is not there for as long as its region
+    fn kept_made_root(root: uint, depth: uint) uint {
+        let i = root & REGION_REF_MASK
+        if ((root >> 28) & 15) == REGION_REF_CALL {
+            // A call that hands out a part of an argument: held by what holds the argument
+            let call = this.calls.get(i) ! return 0
+            let origin = this.call_origin(call)
+            if origin != REGION_NONE : return this.kept_root(this.call_root[call.first + origin], call.loop, depth + 1)
+            // One that hands out an object it made: where the callee put it, when it kept it
+            let callee = call.callee.region_facts
+            if isset(callee) && !callee.lost {
+                let made = callee.slot_group[callee.args.length]
+                if made != REGION_NONE && made < callee.sum_made.length && callee.sum_made[made] {
+                    let keepers = this.made_keepers(i, made)
+                    each 0 .. REGION_KEEPER_TRUSTED + 1 as slot {
+                        if keepers != (1.to(uint) << slot) : continue
+                        let end = this.kept_made(i, made, slot, depth + 1)
+                        if end != 0 : return end
+                    }
+                }
+            }
+        }
+        return this.kept_source(root, depth + 1)
+    }
+
+    // The one argument the result of a call comes out of: the callee makes nothing in the
+    // group of its result, and that group is what one parameter refers to, or the parameter
+    // itself. REGION_NONE when it can be more than one
+    fn call_origin(call: RegionCall) uint {
+        let callee = call.callee.region_facts ?! return REGION_NONE
+        if callee.lost : return REGION_NONE
+        let target = callee.slot_group[callee.args.length]
+        if target == REGION_NONE || target >= callee.sum_made.length || callee.sum_made[target] : return REGION_NONE
+        let found = REGION_NONE
+        each 0 .. callee.args.length as slot {
+            let at = callee.slot_group[slot]
+            if at == REGION_NONE : continue
+            let steps = 0
+            while at != target && steps++ < 8 {
+                let next = callee.sum_content[at]
+                if next == REGION_NONE || next == at : break
+                at = next
+            }
+            if at != target : continue
+            if found != REGION_NONE : return REGION_NONE
+            found = slot
+        }
+        if found != REGION_NONE && found >= call.count : return REGION_NONE
+        return found
+    }
+
+    // Where a source ends up on every way through the code after it
+    fn kept_source(source: uint, depth: uint) uint {
+        if depth > 12 : return 0
+        let which = (source >> 28) & 15
+        let i = source & REGION_REF_MASK
+        let head = REGION_NONE
+        let loop: uint = 0
+        let ctx: uint = 1
+        if which == REGION_REF_SITE {
+            let site = this.sites.get(i) ! return 0
+            head = site.keep
+            loop = site.loop
+            ctx = site.ctx
+        } else if which == REGION_REF_CALL {
+            let call = this.calls.get(i) ! return 0
+            head = call.keep
+            loop = call.loop
+            ctx = call.ctx
+        } else if which == REGION_REF_PARAM {
+            head = this.arg_keep.get(i) !? REGION_NONE
+        } else if which == REGION_REF_PACK {
+            head = this.pack_keep.get(i) !? REGION_NONE
+            loop = this.pack_loop.get(i) !? 0
+            ctx = this.pack_ctx.get(i) !? 0
+        } else {
+            return 0
+        }
+        if loop != 0 && this.func.region_loops : return (REGION_REF_TRUSTED << 28) | REGION_STRICT
+        return this.kept_in(head, ctx, loop, depth)
+    }
+
+    // Where a source ends up once the stretch of code `ctx` runs: it is kept in that stretch,
+    // or in both of two that every way on goes through, in the same place
+    fn kept_in(head: uint, ctx: uint, loop: uint, depth: uint) uint {
+        if depth > 12 : return 0
+        let at = head
+        let returned: uint = 0
+        while at != REGION_NONE {
+            let kind = this.keeps[at] & 255
+            let strict = (this.keeps[at] & 256) != 0
+            let by = this.keeps[at + 1]
+            let where = this.keeps[at + 3]
+            at = this.keeps[at + 2]
+            if where != ctx : continue
+            let end: uint = 0
+            if kind == REGION_KEEP_RET : end = (REGION_REF_RET << 28) | REGION_STRICT
+            else if kind == REGION_KEEP_ROOT : end = this.kept_root(by, loop, depth + 1)
+            else if kind == REGION_KEEP_ARG : end = this.kept_arg(by >> 8, by & 255, depth + 1)
+            if end == 0 : continue
+            if !strict : end = end & 4294967295
+            // Stored somewhere says more than returned: the caller need not keep it then
+            if ((end >> 28) & 15) != REGION_REF_RET : return end
+            returned = end
+        }
+        if returned != 0 : return returned
+        if head == REGION_NONE : return 0
+        let i: uint = 0
+        while i + 2 < this.splits.length {
+            if this.splits[i] == ctx {
+                let a = this.kept_in(head, this.splits[i + 1], loop, depth + 1)
+                if a != 0 {
+                    let b = this.kept_in(head, this.splits[i + 2], loop, depth + 1)
+                    if b != 0 && (a & 4294967295) == (b & 4294967295) : return a & b
+                }
+            }
+            i += 3
+        }
+        return 0
+    }
+
+    // Whether what the callee says it keeps goes for this call
+    fn vouches(call: RegionCall, callee: RegionFacts) bool {
+        if callee.lost : return false
+        return (callee.keep_guard & (call.false_args ^ uint.$max)) == 0
+    }
+
+    // Where an argument ends up: where the callee puts that parameter
+    fn kept_arg(index: uint, slot: uint, depth: uint) uint {
+        let call = this.calls.get(index) ! return 0
+        let callee = call.callee.region_facts ?! return 0
+        if !this.vouches(call, callee) || slot >= callee.slot_keeper.length : return 0
+        if callee.slot_keeper[slot] == REGION_NONE : return 0
+        return this.kept_by(index, call, callee.slot_keeper[slot], callee.slot_strict[slot], callee.args.length, depth)
+    }
+
+    // The keepers of what a call makes in group `g` of its callee: a bit per slot, 0 when
+    // nothing says they stay or it does not go for this call
+    fn made_keepers(index: uint, g: uint) uint {
+        let call = this.calls.get(index) ! return 0
+        let callee = call.callee.region_facts ?! return 0
+        if !this.vouches(call, callee) || g >= callee.sum_keeper.length : return 0
+        return callee.sum_keeper[g]
+    }
+
+    // Where the objects end up that a call makes in group `g` of its callee and that its
+    // slot `keeper` keeps
+    fn kept_made(index: uint, g: uint, keeper: uint, depth: uint (0)) uint {
+        let call = this.calls.get(index) ! return 0
+        let callee = call.callee.region_facts ?! return 0
+        if g >= callee.sum_strict.length : return 0
+        return this.kept_by(index, call, keeper, callee.sum_strict[g], callee.args.length, depth)
+    }
+
+    // Whether everything a call makes in group `g` of its callee stays in the region of
+    // group `root` here
+    fn made_holds(index: uint, g: uint, root: uint) bool {
+        let keepers = this.made_keepers(index, g)
+        if keepers == 0 : return false
+        each 0 .. REGION_KEEPER_TRUSTED + 1 as slot {
+            if (keepers & (1.to(uint) << slot)) == 0 : continue
+            if !this.holds(this.kept_made(index, g, slot), root) : return false
+        }
+        return true
+    }
+
+    fn kept_by(index: uint, call: RegionCall, keeper: uint, strict: bool, result: uint, depth: uint) uint {
+        // A callee that fails leaves them behind: fine when this function then leaves too
+        if !strict && !call.passes : return 0
+        let end: uint = 0
+        if keeper == REGION_KEEPER_TRUSTED : end = (REGION_REF_TRUSTED << 28) | REGION_STRICT
+        else if keeper == result : end = this.kept_source((REGION_REF_CALL << 28) | index, depth + 1)
+        else if keeper < call.count : end = this.kept_root(this.call_root[call.first + keeper], call.loop, depth + 1)
+        return strict ? end : end & 4294967295
+    }
+
+    // Whether a call of this function makes objects without a loop: in its own code and in
+    // what it calls
+    fn is_bounded() bool {
+        each this.sites as site {
+            if site.loop != 0 : return false
+        }
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            if call.loop != 0 || !callee.bounded : return false
+        }
+        return true
+    }
+
+    // Whether the regions of this function would hold a few objects per call and no more.
+    // Objects that are gone before the next collection cost the collector nothing, and a
+    // region has to be taken and given back on every call. Not when one of them refers to
+    // something that is not the function's own: on the heap it would keep that there too
+    fn few_objects() bool {
+        // `$region` asks for the region
+        if this.func.region_loops : return false
+        let any = false
+        each this.sites as site {
+            if !this.is_local(this.find(site.node)) : continue
+            if site.loop != 0 : return false
+            any = true
+        }
+        let map = this.runtime.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if !callee.grows(g) || map[g] == REGION_NONE || !this.is_local(this.find(map[g])) : continue
+                if call.loop != 0 || !callee.bounded : return false
+                any = true
+            }
+        }
+        return any && this.keeps_to_itself()
+    }
+
+    // Whether nothing this function keeps to itself refers to something a caller can see and
+    // that may be in a region: where its own objects are made then changes nothing for others
+    fn keeps_to_itself() bool {
+        each 0 .. this.parent.length as i {
+            if this.parent[i] == i && this.is_local(i) && this.links_out(i) : return false
+        }
+        return true
+    }
+
+    // Whether an object can be made in the frame: its size is known and small, and it is gone
+    // when the scope it is made in ends or starts its next round, so one place in the frame
+    // is enough for it. `$region` asks for a region
+    fn in_frame(site: RegionSite, root: uint) bool {
+        if !isset(this.runtime.stack_object) || this.func.region_loops : return false
+        return site.emitted && site.bytes > 0 && site.bytes <= REGION_STACK_OBJECT && site.loop == this.scope[root]
+    }
+
+    // Which of the groups this function keeps to itself hold nothing but objects that are
+    // made in its frame, in `runtime.framed`: no callee makes anything for such a group, and
+    // it needs no region, also not to pin
+    fn find_framed() {
+        let rt = this.runtime
+        let framed = rt.framed
+        framed.clear()
+        each 0 .. this.parent.length : framed.append(false)
+        each this.sites as site {
+            let root = this.find(site.node)
+            if this.is_local(root) : framed[root] = true
+        }
+        let total: uint = 0
+        each this.sites as site {
+            let root = this.find(site.node)
+            if !this.is_local(root) : continue
+            if this.in_frame(site, root) && total + site.bytes + 16 <= REGION_STACK_TOTAL : total += site.bytes + 16
+            else : framed[root] = false
+        }
+        let map = rt.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && map[g] != REGION_NONE : framed[this.find(map[g])] = false
+            }
+        }
+    }
+
+    // Whether a group refers to something a caller can see and that may be in a region
+    fn links_out(root: uint) bool {
+        each 0 .. 2 as side {
+            let link = side == 0 ? this.content[root] : this.leaf[root]
+            if link == REGION_NONE : continue
+            let x = this.find(link)
+            if this.reason[x] == 0 && this.runtime.reach[x] != REGION_NONE : return true
+        }
+        return false
+    }
+
+    // Gives a reason to the groups this function cannot keep in a region of its own. Returns
+    // whether one got a reason: what it refers to is then the collector's too
+    fn refuse_locals() bool {
+        let changed = false
+        let func = this.func
+        if this.runtime.exempt_any {
+            // Let off for being in the frame: in a region it could not refer to what it does
+            this.find_framed()
+            let framed = this.runtime.framed
+            let report = func.ns.build.options.region_report
+            each this.sites as site {
+                if !this.runtime.exempt[site.node] : continue
+                let root = this.find(site.node)
+                if !this.is_local(root) || (framed[root] && !this.links_out(root)) : continue
+                let to = this.content[root]
+                let held = to == REGION_NONE ? 0 : this.reason[this.find(to)]
+                let why = held > 0 ? this.runtime.held_reason(held, report) : this.runtime.reason_id(REGION_WHY_REFERS + "an object of the collector")
+                if this.give_reason(root, why) : changed = true
+            }
+            if changed : return true
+        }
+        // A frame is there while its function waits, and the collector reads it: objects in
+        // it are fine where a region is not
+        if func.region_suspends || func.is_literal {
+            let why = this.runtime.reason_id(func.is_literal ? REGION_WHY_CLOSURE : REGION_WHY_SUSPENDS)
+            // Only once the summaries are final: what a group refers to must not come to
+            // depend on it
+            let frames = this.runtime.settled && !func.is_literal
+            if frames : this.find_framed()
+            let framed = this.runtime.framed
+            each 0 .. this.parent.length as i {
+                if this.parent[i] != i || !this.is_local(i) : continue
+                if frames && framed[i] && !this.links_out(i) : continue
+                if this.give_reason(i, why) : changed = true
+            }
+            return changed
+        }
+        // A loop inside the scope would fill the region with whatever its rounds leave
+        // behind, unless every object a round makes is kept by something that lives as long
+        // as the region and never lets go. `$region` on the function vouches for its loops
+        if !func.region_loops {
+            let why = this.runtime.reason_id(REGION_WHY_LOOP)
+            let bad = this.runtime.drops_bad
+            each this.sites as site, i {
+                let root = this.find(site.node)
+                if !this.is_local(root) || site.loop == this.scope[root] : continue
+                if this.holds(this.kept_source((REGION_REF_SITE << 28) | i, 0), root) : continue
+                if this.give_reason(root, why) : changed = true
+            }
+            let map = this.runtime.map
+            each this.calls as call, c {
+                let callee = call.callee.region_facts ?! continue
+                if callee.lost || !callee.any_grows : continue
+                this.map_call(call, callee, false)
+                each 0 .. callee.sum_reason.length as g {
+                    if !callee.grows(g) || map[g] == REGION_NONE : continue
+                    let root = this.find(map[g])
+                    if !this.is_local(root) || call.loop == this.scope[root] : continue
+                    // A callee that only pins there: every pin goes with a reference that stays
+                    if callee.sum_made[g] ? this.made_holds(c, g, root) : bad[root] == 0 : continue
+                    if this.give_reason(root, why) : changed = true
+                }
+            }
+            each this.pins as pin {
+                let root = this.find(pin.node)
+                if !this.is_local(root) || !this.refers_out(root) || pin.loop == this.scope[root] || bad[root] == 0 : continue
+                if this.give_reason(root, why) : changed = true
+            }
+        }
+        if changed : return true
+        if this.runtime.settled && this.few_objects() {
+            // What can be made in the frame is: better than the collector, nothing is asked
+            // for at all
+            let why = this.runtime.reason_id(this.here(REGION_WHY_FEW))
+            this.find_framed()
+            let framed = this.runtime.framed
+            each 0 .. this.parent.length as i {
+                if this.parent[i] == i && this.is_local(i) && !framed[i] && this.give_reason(i, why) : changed = true
+            }
+            if changed : return true
+        }
+        // One region for every loop that has groups: a frame takes only so many
+        let loops = Array[uint]{}
+        each 0 .. this.parent.length as i {
+            if this.parent[i] != i || !this.is_local(i) : continue
+            if loops.contains(this.scope[i]) : continue
+            if loops.length < REGION_MAX_OWN {
+                loops.append(this.scope[i])
+            } else if this.give_reason(i, this.runtime.reason_id(REGION_WHY_FULL)) {
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    // The groups with the summaries of the callees applied. `own` leaves the calls out: what
+    // the body alone rules out. Returns whether the summary of this function changed
+    fn solve(own: bool (false)) bool {
+        if this.lost : return false
+        let rt = this.runtime
+        rt.exempt_any = false
+        this.solve_groups(own)
+        if own : return false
+        // An object in the frame may refer to an object of the collector, which a region
+        // object may not: the groups that were ruled out for that and can be made in the
+        // frame are let off, as long as nothing a caller sees comes to depend on it
+        if rt.settled && this.find_exempt() {
+            this.solve_groups(false)
+            rt.dry = true
+            let differs = this.summarize()
+            rt.dry = false
+            if differs {
+                rt.exempt_any = false
+                this.solve_groups(false)
+            }
+        }
+
+        this.has_source = false
+        each this.source as has {
+            if has : this.has_source = true
+        }
+        return this.summarize()
+    }
+
+    // The groups, with the summaries of the callees applied unless `own`
+    fn solve_groups(own: bool) {
+        this.parent.clear()
+        this.content.clear()
+        this.leaf.clear()
+        this.reason.clear()
+        this.soft.clear()
+        each 0 .. this.count as i {
+            this.parent.append(i)
+            this.content.append(REGION_NONE)
+            this.leaf.append(REGION_NONE)
+            this.reason.append(0)
+            this.soft.append(false)
+        }
+        let i: uint = 0
+        while i + 2 < this.steps.length {
+            this.apply(this.steps[i], this.steps[i + 1], this.steps[i + 2])
+            i += 3
+        }
+        if !own {
+            let kept = this.runtime.call_map
+            let map = this.runtime.map
+            kept.clear()
+            each this.calls as call {
+                call.map_at = REGION_NONE
+                let callee = call.callee.region_facts
+                if !isset(callee) || callee.lost : continue
+                this.map_call(call, callee, true)
+                call.map_at = kept.length
+                each map as node : kept.append(node)
+            }
+            // What the last summary merged stays merged, so that summaries only grow: a
+            // function that calls itself would otherwise fold a chain of references and
+            // unfold it again, for ever
+            this.map_call(null, this, true)
+        }
+
+        this.source.clear()
+        this.scope.clear()
+        each 0 .. this.parent.length {
+            this.source.append(false)
+            this.scope.append(REGION_NONE)
+        }
+        each this.mark_nodes as node, m : this.give_reason(node, this.mark_reasons[m])
+        if own {
+            this.settle()
+            return
+        }
+        let beyond = this.runtime.reason_id(REGION_WHY_BEYOND)
+        let map = this.runtime.map
+        each this.calls as call {
+            let callee = call.callee.region_facts
+            if !isset(callee) || callee.lost {
+                let why = this.blind_reason(call.callee)
+                each 0 .. call.count as a : this.give_reason(this.call_args[call.first + a], why)
+                this.give_reason(call.result, why)
+                continue
+            }
+            each 0 .. call.count as a {
+                if a >= callee.args.length : this.give_reason(this.call_args[call.first + a], beyond)
+            }
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.sum_reason[g] == 0 : continue
+                if callee.sum_soft[g] : this.give_soft(map[g], callee.sum_reason[g])
+                else : this.give_reason(map[g], callee.sum_reason[g])
+            }
+        }
+        // A group that turns out to be the collector's makes what it refers to the
+        // collector's, which can rule out more
+        while true {
+            this.settle()
+            if this.find_reach() : continue
+            if this.find_sources() : continue
+            if this.trim_reach() : continue
+            this.find_scopes()
+            this.find_drops()
+            if !this.refuse_locals() : break
+        }
+    }
+
+    // Marks the objects that were ruled out and could be made in the frame: nothing a caller
+    // sees, every object of the group of a known small size and gone with its scope, none
+    // made by a callee. Returns whether there are any
+    fn find_exempt() bool {
+        let rt = this.runtime
+        if !isset(rt.stack_object) || this.func.region_loops || this.func.is_literal : return false
+        let could = rt.framed
+        could.clear()
+        each 0 .. this.parent.length : could.append(false)
+        each this.sites as site {
+            let root = this.find(site.node)
+            if rt.reach[root] == REGION_NONE && this.reason[root] > 0 && this.soft[root] : could[root] = true
+        }
+        each this.sites as site {
+            let root = this.find(site.node)
+            if could[root] && !(site.emitted && site.bytes > 0 && site.bytes <= REGION_STACK_OBJECT && site.loop == this.scope[root]) : could[root] = false
+        }
+        let map = rt.map
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && map[g] != REGION_NONE : could[this.find(map[g])] = false
+            }
+        }
+        let exempt = rt.exempt
+        exempt.clear()
+        each 0 .. this.count : exempt.append(false)
+        let any = false
+        each this.sites as site {
+            if !could[this.find(site.node)] : continue
+            exempt[site.node] = true
+            any = true
+        }
+        rt.exempt_any = any
+        return any
+    }
+
+    // Per group a caller can see: where the objects this function makes in it end up
+    // (`acc_keeper`: a bit per slot; `acc_open`: one of them is not kept), whether that also
+    // goes for errors, and whether a loop leaves something behind in it
+    fn account_sources() {
+        let rt = this.runtime
+        let reach = rt.reach
+        let keeper = rt.acc_keeper
+        let strict = rt.acc_strict
+        let loose = rt.acc_loose
+        keeper.clear()
+        strict.clear()
+        loose.clear()
+        rt.acc_open.clear()
+        each 0 .. rt.reach_root.length {
+            keeper.append(0)
+            strict.append(true)
+            loose.append(false)
+            rt.acc_open.append(false)
+        }
+        each this.sites as site, i {
+            if !site.dual || !site.emitted : continue
+            let root = this.find(site.node)
+            let r = reach[root]
+            if r != REGION_NONE : this.account(r, root, this.kept_source((REGION_REF_SITE << 28) | i, 0), site.loop)
+        }
+        let map = rt.map
+        let vouched = this.func.region_loops
+        each this.calls as call, c {
+            let callee = call.callee.region_facts ?! continue
+            if callee.lost || !callee.any_grows : continue
+            this.map_call(call, callee, false)
+            each 0 .. callee.sum_reason.length as g {
+                if !callee.grows(g) || map[g] == REGION_NONE : continue
+                let root = this.find(map[g])
+                let r = reach[root]
+                if r == REGION_NONE : continue
+                if callee.sum_made[g] {
+                    let keepers = this.made_keepers(c, g)
+                    if keepers == 0 : this.account(r, root, 0, call.loop)
+                    each 0 .. REGION_KEEPER_TRUSTED + 1 as slot {
+                        if (keepers & (1.to(uint) << slot)) != 0 : this.account(r, root, this.kept_made(c, g, slot), call.loop)
+                    }
+                } else if call.loop != 0 && !vouched && rt.drops_any[root] != 0 : loose[r] = true
+            }
+        }
+        // A pin in a loop goes with a reference that stays, unless the group lets go of some
+        each this.pins as pin {
+            let root = this.find(pin.node)
+            let r = reach[root]
+            if r == REGION_NONE || pin.loop == 0 || vouched : continue
+            if this.reason[root] == 0 && this.refers_out(root) && rt.drops_any[root] != 0 : loose[r] = true
+        }
+    }
+
+    fn account(r: uint, root: uint, end: uint, loop: uint) {
+        let rt = this.runtime
+        let kind = (end >> 28) & 15
+        let i = end & REGION_REF_MASK
+        // The slot a caller can be told, and the node of what holds the object
+        let to = REGION_NONE
+        let holder = REGION_NONE
+        if kind == REGION_REF_PARAM {
+            to = i
+            holder = this.args.get(i) !? REGION_NONE
+        } else if kind == REGION_REF_RET {
+            to = this.args.length
+            holder = this.ret
+        } else if kind == REGION_REF_TRUSTED {
+            to = REGION_KEEPER_TRUSTED
+        } else if kind == REGION_REF_DECL {
+            holder = i
+        } else if kind == REGION_REF_SITE {
+            let site = this.sites.get(i) !? null
+            if isset(site) : holder = site.node
+        } else if kind == REGION_REF_CALL {
+            let call = this.calls.get(i) !? null
+            if isset(call) : holder = call.result
+        }
+        // A loop leaves something behind when a round's object is not kept, or kept by
+        // something that goes with this call or that lets go inside a loop
+        if loop != 0 && !this.func.region_loops && kind != REGION_REF_TRUSTED {
+            let from = holder == REGION_NONE ? REGION_NONE : this.find(holder)
+            if from == REGION_NONE || rt.reach[from] == REGION_NONE || !this.path_ok(from, root) : rt.acc_loose[r] = true
+        }
+        if to >= REGION_KEEPER_TRUSTED + 1 {
+            rt.acc_open[r] = true
+            return
+        }
+        rt.acc_keeper[r] = rt.acc_keeper[r] | (1.to(uint) << to)
+        if (end & REGION_STRICT) == 0 : rt.acc_strict[r] = false
+    }
+
+    // Writes the summary: the groups a caller has to know, what they refer to, why a region
+    // cannot hold one, and in which of them this function makes objects, for which its copy
+    // takes a region. Returns whether it changed
+    fn summarize() bool {
+        let rt = this.runtime
+        let reach = rt.reach
+        let roots = rt.reach_root
+        let keep = rt.keep
+        let index = rt.sum_index
+        let new_content = rt.new_content
+        let new_leaf = rt.new_leaf
+        let new_reason = rt.new_reason
+        let new_grows = rt.new_grows
+        let new_made = rt.new_made
+        let new_keeper = rt.new_keeper
+        let new_strict = rt.new_strict
+        let new_drops = rt.new_drops
+        new_made.clear()
+        new_keeper.clear()
+        new_strict.clear()
+        new_drops.clear()
+        this.account_sources()
+        let keeper = rt.acc_keeper
+        let strict = rt.acc_strict
+        let loose = rt.acc_loose
+        index.clear()
+        new_content.clear()
+        new_leaf.clear()
+        new_reason.clear()
+        let new_soft = rt.new_soft
+        new_soft.clear()
+        new_grows.clear()
+        let count: uint = 0
+        each 0 .. roots.length as g {
+            index.append(keep[g] ? count : REGION_NONE)
+            if keep[g] : count++
+        }
+        each roots as root, g {
+            if !keep[g] : continue
+            let content = this.content[root]
+            let leaf = this.leaf[root]
+            new_content.append(content == REGION_NONE ? REGION_NONE : index[reach[this.find(content)]])
+            new_leaf.append(leaf == REGION_NONE ? REGION_NONE : index[reach[this.find(leaf)]])
+            let why = this.reason[root]
+            let grows = false
+            if why == 0 && this.source[root] {
+                // The objects it makes there come from the collector when it cannot take a region
+                if !loose[g] && this.copy_allowed() : grows = true
+                else : why = this.runtime.reason_id(this.here(loose[g] ? "grown in a loop by a function without $region" : "grown by a function that cannot be given a region"))
+            }
+            new_reason.append(why)
+            new_soft.append(why > 0 && why == this.reason[root] && this.soft[root])
+            new_grows.append(grows)
+            new_made.append(grows && rt.made[root])
+            new_keeper.append(grows && rt.made[root] && !rt.acc_open[g] ? keeper[g] : 0)
+            new_strict.append(strict[g])
+            new_drops.append(rt.drops_any[root])
+        }
+        let changed = this.sum_reason.length != count
+        // A keep that needs a parameter to be `false` is none when the function assigns it
+        let vouch = (this.keep_guard & this.args_written) == 0 && this.rounds < REGION_SOLVE_ROUNDS / 2
+        each 0 .. this.slot_count() as slot {
+            let node = this.slot_node(slot)
+            let g = node == REGION_NONE ? REGION_NONE : index[reach[this.find(node)]]
+            // Where the caller's object ends up, for a parameter
+            let end: uint = slot < this.args.length && node != REGION_NONE && vouch ? this.kept_source((REGION_REF_PARAM << 28) | slot, 0) : 0
+            let kind = (end >> 28) & 15
+            let to = kind == REGION_REF_PARAM ? end & REGION_REF_MASK : (kind == REGION_REF_RET ? this.args.length : REGION_NONE)
+            let firm = to != REGION_NONE && (end & REGION_STRICT) != 0
+            if this.slot_group[slot] == g && this.slot_keeper[slot] == to && this.slot_strict[slot] == firm : continue
+            if rt.dry : return true
+            this.slot_group[slot] = g
+            this.slot_keeper[slot] = to
+            this.slot_strict[slot] = firm
+            changed = true
+        }
+        if !vouch {
+            each 0 .. count as g : new_keeper[g] = 0
+        }
+        if !changed {
+            each 0 .. count as g {
+                if this.sum_content[g] != new_content[g] || this.sum_leaf[g] != new_leaf[g] || this.sum_reason[g] != new_reason[g] || this.sum_soft[g] != new_soft[g] || this.sum_grows[g] != new_grows[g] || this.sum_made[g] != new_made[g] || this.sum_keeper[g] != new_keeper[g] || this.sum_strict[g] != new_strict[g] || this.sum_drops[g] != new_drops[g] {
+                    changed = true
+                    break
+                }
+            }
+        }
+        if !changed : return false
+        if rt.dry : return true
+        // What a call of itself was mapped to names the groups of the old summary
+        each this.calls as call {
+            if call.callee == this.func : call.map_at = REGION_NONE
+        }
+        this.sum_content.clear()
+        this.sum_leaf.clear()
+        this.sum_reason.clear()
+        this.sum_soft.clear()
+        this.sum_grows.clear()
+        this.sum_made.clear()
+        this.sum_keeper.clear()
+        this.sum_strict.clear()
+        this.sum_drops.clear()
+        this.any_grows = false
+        this.any_drops = false
+        each 0 .. count as g {
+            this.sum_content.append(new_content[g])
+            this.sum_leaf.append(new_leaf[g])
+            this.sum_reason.append(new_reason[g])
+            this.sum_soft.append(new_soft[g])
+            this.sum_grows.append(new_grows[g])
+            this.sum_made.append(new_made[g])
+            this.sum_keeper.append(new_keeper[g])
+            this.sum_strict.append(new_strict[g])
+            this.sum_drops.append(new_drops[g])
+            if new_drops[g] != 0 : this.any_drops = true
+            if new_grows[g] && new_reason[g] == 0 : this.any_grows = true
+        }
+        return true
+    }
+
+    // Which groups of the last solve become regions
+    fn decide(build: Build) {
+        if this.lost || !this.has_source : return
+        this.solve()
+        let rt = this.runtime
+        // The groups a copy gets a region for
+        let passed = Array[uint]{}
+        each 0 .. this.parent.length : passed.append(REGION_NONE)
+        each this.params as g, n {
+            each rt.reach_root as root, r {
+                if rt.sum_index[r] == g : passed[root] = n
+            }
+        }
+        // Objects in the frame first: a group of nothing else needs no region, also not to pin
+        this.find_framed()
+        let framed = rt.framed
+        let in_frames: uint = 0
+        each this.sites as site {
+            let root = this.find(site.node)
+            if passed[root] != REGION_NONE || !this.is_local(root) || !this.in_frame(site, root) : continue
+            if in_frames + site.bytes + 16 > REGION_STACK_TOTAL : continue
+            in_frames += site.bytes + 16
+            site.stack = true
+        }
+        each this.sites as site {
+            if site.stack : continue
+            let root = this.find(site.node)
+            let region = this.region_of(root, passed)
+            if region >= REGION_PASSED && region != REGION_NONE : site.param = region - REGION_PASSED
+            else : site.region = region
+            site.pins = region != REGION_NONE && this.refers_out(root)
+        }
+        each this.pins as pin {
+            let root = this.find(pin.node)
+            if framed[root] : continue
+            if pin.dual && pin.emitted && this.refers_out(root) : pin.pass = this.region_or_callers(root, passed)
+        }
+        each this.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            if !call.dual || !call.emitted || callee.params.length == 0 : continue
+            call.pass_first = this.call_pass.length
+            call.pass_count = callee.params.length
+            this.map_call(call, callee, false)
+            each callee.params as g {
+                let node = g == REGION_NONE ? REGION_NONE : rt.map[g]
+                this.call_pass.append(node == REGION_NONE ? REGION_NONE : this.region_of(this.find(node), passed))
+            }
+            // The copy is also the form that pins: called when a group it pins for is in a region
+            each 0 .. callee.sum_reason.length as g {
+                if !callee.grows(g) || callee.sum_made[g] || rt.map[g] == REGION_NONE : continue
+                let pinned = this.find(rt.map[g])
+                if framed[pinned] : continue
+                let at = this.region_or_callers(pinned, passed)
+                if at != REGION_NONE && (call.pinned == REGION_NONE || at < REGION_PASSED) : call.pinned = at
+            }
+        }
+    }
+
+    // The region a group is in: one of this function by its number, REGION_PASSED + n for
+    // one a copy got, or none
+    fn region_of(root: uint, passed: Array[uint]) uint {
+        if passed[root] != REGION_NONE : return REGION_PASSED + passed[root]
+        if !this.is_local(root) : return REGION_NONE
+        // Never a region where the function may give up its thread
+        if this.func.region_suspends : return REGION_NONE
+        let loop = this.scope[root]
+        each this.regions as known, n {
+            if known == loop : return n
+        }
+        this.regions.append(loop)
+        return this.regions.length - 1
+    }
+
+    fn mark_copy() {
+        if this.needs_copy : return
+        this.needs_copy = true
+        each this.calls as call {
+            if !this.call_uses_copy(call, true) : continue
+            let callee = call.callee.region_facts ?! continue
+            callee.mark_copy()
+        }
+    }
+
+    // A region a copy may get none for: one of its callers has that group on the heap.
+    // Returns whether a callee learned that
+    fn spread_null(copy: bool) bool {
+        let changed = false
+        each this.calls as call {
+            if !this.call_uses_copy(call, copy) : continue
+            let callee = call.callee.region_facts ?! continue
+            each 0 .. call.pass_count as n {
+                let pass = this.call_pass[call.pass_first + n]
+                let none = pass == REGION_NONE || (pass >= REGION_PASSED && (!copy || this.may_null[pass - REGION_PASSED]))
+                if !none || callee.may_null[n] : continue
+                callee.may_null[n] = true
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    // Why the group of a node is not a region, for the report
+    fn heap_reason(of: uint) String {
+        if this.lost : return "the compiler cannot follow " + this.func.ns.name + "." + this.func.name + " (" + this.lost_why + ")"
+        let root = this.find(of)
+        if this.reason[root] > 0 : return this.runtime.reasons[this.reason[root]]
+        let seen = this.runtime.reach[root]
+        if seen == REGION_NONE : return "nothing makes an object in it"
+        let g = this.runtime.sum_index[seen]
+        if g != REGION_NONE && this.sum_reason[g] > 0 : return this.runtime.reasons[this.sum_reason[g]]
+        if this.ret != REGION_NONE && this.find(this.ret) == root : return "returned to a caller that keeps it on the heap"
+        return "linked to a parameter"
+    }
+}
+
+// Writes a token into IR that is being written
+fn region_put(out: ByteBuffer, kind: u8, id: uint) {
+    out.write_byte(1)
+    out.write_byte(kind)
+    out.write_uint_ascii(id)
+    out.write_byte(1)
+}
+
+fn region_token(kind: u8, id: uint) String {
+    let out = ByteBuffer.new(16)
+    out.write_byte(1)
+    out.write_byte(kind)
+    out.write_uint_ascii(id)
+    out.write_byte(1)
+    return out.to_string()
+}
+
+fn region_runtime(build: Build) ?RegionRuntime {
+    let known = build.region_runtime
+    if isset(known) || build.region_off : return known
+    let names = Array[String]{ "property_get", "property_set", "property_update", "property_remove", "transfer_refs", "moved_elements", "region_init", "region_alloc", "region_alloc_zeroed", "region_reset", "region_exit", "move_bytes", "region_pin", "region_property_set", "region_property_update", "copy_bytes" }
+    let funcs = Array[Func]{}
+    // Looked up quietly: a standard library without regions builds as before
+    let main = build.main_pkg
+    let valk = isset(main) ? (main.sub_pkgs.get("valk") !? null) : null
+    let gc_ns = isset(valk) ? (valk.namespaces.get("gc") !? null) : null
+    let mem_ns = isset(valk) ? (valk.namespaces.get("mem") !? null) : null
+    each names as name {
+        let ns = name == "move_bytes" || name == "copy_bytes" ? mem_ns : gc_ns
+        let idf = isset(ns) ? ns.scope.get_idf(name) : null
+        let func = isset(idf) ? idf.func : null
+        if !isset(func) {
+            build.region_off = true
+            return null
+        }
+        if !func.parsed_types {
+            parse_func_types(func) ! {
+                build.region_off = true
+                return null
+            }
+        }
+        funcs.append(func)
+    }
+    let made = RegionRuntime {
+        property_get: funcs[0]
+        property_set: funcs[1]
+        property_update: funcs[2]
+        property_remove: funcs[3]
+        transfer_refs: funcs[4]
+        moved_elements: funcs[5]
+        init: funcs[6]
+        alloc: funcs[7]
+        alloc_zeroed: funcs[8]
+        reset: funcs[9]
+        exit: funcs[10]
+        move_bytes: funcs[11]
+        pin: funcs[12]
+        pinned_set: funcs[13]
+        pinned_update: funcs[14]
+        copy_bytes: funcs[15]
+    }
+    // Newer than the rest: without it no object is made in a frame
+    let in_frame = isset(gc_ns) ? gc_ns.scope.get_idf("region_stack_object") : null
+    let stack_object = isset(in_frame) ? in_frame.func : null
+    if isset(stack_object) {
+        if !stack_object.parsed_types : parse_func_types(stack_object) ! { stack_object = null }
+        made.stack_object = stack_object
+    }
+    // Newer than the rest: a standard library without it has no such calls
+    let named = isset(mem_ns) ? mem_ns.scope.get_idf("identity") : null
+    if isset(named) : made.identity = named.func
+    build.region_runtime = made
+    return made
+}
+
+// A slice literal with `data` is a view of storage that exists
+fn region_slice_is_view(value: Value) bool {
+    let fields = value.values ?! return false
+    each fields as field {
+        let prop = field.get_init_prop()
+        if isset(prop) && prop.name == "data" : return true
+    }
+    return false
+}
+
+fn region_at(value: Value) String {
+    let exp = value.exp ?! return ""
+    return " at line " + exp.src.line_of(exp.i)
+}
+
+fn region_holds_refs(type: Type) bool {
+    let t = type.get_non_nullable()
+    // A raw pointer is followed like what it was taken from, until it becomes a number
+    return type.has_gc_refs() || t.kind == TYPE.closure || t.kind == TYPE.interface || t.is_raw_pointer() || t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.is_fat_borrow()
+}
+
+// What a value of this type is to the analysis (see REGION_KIND_LEAF)
+fn region_kind(type: Type) uint {
+    if !region_holds_refs(type) : return REGION_KIND_NONE
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.ref_slice {
+        let sub = t.get_sub_type()
+        if isset(sub) && !sub.has_gc_refs() : return REGION_KIND_LEAF
+        return REGION_KIND_REF
+    }
+    if t.is_gc_type() || t.is_raw_pointer() || t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.kind == TYPE.ref_of || t.kind == TYPE.closure || t.kind == TYPE.interface : return REGION_KIND_REF
+    return REGION_KIND_AGG
+}
+
+fn region_walk_statements(f: RegionFacts, values: ?Array[Value]) {
+    if !isset(values) : return
+    each values as item {
+        // Nothing of a function that is not understood is used
+        if f.lost : return
+        region_walk(f, item)
+    }
+}
+
+// One node for what two values hold together
+fn region_both(f: RegionFacts, a: uint, b: uint) uint {
+    if a == REGION_NONE : return b
+    f.join(a, b)
+    return a
+}
+
+// Walks a value that may be missing and adds what it holds, as a value of type `to`, to `merged`
+fn region_into(f: RegionFacts, merged: uint, value: ?Value, to: Type) uint {
+    if !isset(value) : return merged
+    return region_both(f, merged, f.convert(region_walk(f, value), value.rett, to))
+}
+
+fn region_into_list(f: RegionFacts, merged: uint, values: ?Array[Value], to: Type) uint {
+    if !isset(values) : return merged
+    each values as item : merged = region_into(f, merged, item, to)
+    return merged
+}
+
+// Walks every child, in the order they run, and returns one node for all that they hold
+fn region_walk_children(f: RegionFacts, value: Value) uint {
+    let merged = REGION_NONE
+    let first = value.value1
+    let second = value.value2
+    if isset(first) : merged = region_both(f, merged, region_walk(f, first))
+    if isset(second) : merged = region_both(f, merged, region_walk(f, second))
+    let values = value.values
+    if isset(values) {
+        each values as item : merged = region_both(f, merged, region_walk(f, item))
+    }
+    return merged
+}
+
+fn region_cut(list: Array[uint], length: uint) {
+    while list.length > length {
+        list.pop_last() _
+    }
+}
+
+// An address without what was added to it
+fn region_peel_address(value: Value) Value {
+    let at = value
+    while at.type == VAL.ptr_offset || at.type == VAL.cast || at.type == VAL.wrap {
+        at = at.value1 ?! break
+    }
+    return at
+}
+
+// The source a value is: an object this function makes, the result of a call or a parameter,
+// also by way of the variable that holds it. 0 when it is none of them
+fn region_source_of(f: RegionFacts, value: Value) uint {
+    let at = value
+    while true {
+        let t = at.type
+        let inner = at.value1
+        // A value in another form, such as one packed into a union, is the value it was made of
+        let origin = at.get_graph_source()
+        if isset(origin) {
+            at = origin
+        } else if t == VAL.error_handler {
+            at = at.get_pre_value() ?! return 0
+        } else if !isset(inner) {
+            break
+        } else if t == VAL.cast || t == VAL.wrap || t == VAL.error_success {
+            at = inner
+        } else if (t == VAL.prop || t == VAL.multi) && inner.rett.is_fat_borrow() {
+            // A part of a pointer is what the pointer points at
+            at = inner
+        } else if t == VAL.prop && region_only_reference(inner.rett, at.rett) {
+            // The one field of a struct that holds references is all the struct holds
+            at = inner
+        } else if t == VAL.class_init && f.number_of(at) == 0 {
+            // A literal with hooks is the object they fill
+            at = inner
+        } else {
+            break
+        }
+    }
+    let t = at.type
+    if t == VAL.class_init {
+        let id = f.number_of(at)
+        if id > 8388608 && id - 8388609 < f.pack_keep.length : return (REGION_REF_PACK << 28) | (id - 8388609)
+        if id == 0 || id > f.sites.length : return 0
+        return (REGION_REF_SITE << 28) | (id - 1)
+    }
+    if t == VAL.call {
+        let id = f.number_of(at)
+        if id == 0 || id > f.calls.length : return 0
+        return (REGION_REF_CALL << 28) | (id - 1)
+    }
+    if t == VAL.decl {
+        let decl = at.decl ?! return 0
+        let node = decl.region_node
+        if node == REGION_NONE : return 0
+        let info = f.node_info[node]
+        if ((info >> 32) & 255) == 0 {
+            let slot = f.arg_slot(node)
+            if slot != REGION_NONE : return (REGION_REF_PARAM << 28) | slot
+        }
+        let alias = info & 4294967295
+        let kind = alias >> 28
+        if kind == REGION_REF_SITE || kind == REGION_REF_CALL || kind == REGION_REF_PARAM || kind == REGION_REF_PACK : return alias
+    }
+    return 0
+}
+
+// Whether a struct value holds its references in one field, of type `field`
+fn region_only_reference(type: Type, field: Type) bool {
+    if type.is_nullable_type() || !type.is_inline || region_kind(type) != REGION_KIND_AGG || !region_holds_refs(field) : return false
+    let class = type.get_class_or_null() ?! return false
+    if class.kind != CLASS_KIND.struct : return false
+    let count = 0
+    each class.props as prop {
+        if region_holds_refs(prop.type) : count++
+    }
+    return count == 1
+}
+
+// What a place is reached from: the variable, object or call result an address was worked out
+// from. 0 when the walk cannot tell
+fn region_root_of(f: RegionFacts, value: Value) uint {
+    let at = value
+    while true {
+        let t = at.type
+        let inner = at.value1
+        if t == VAL.error_handler {
+            at = at.get_pre_value() ?! return 0
+        } else if !isset(inner) {
+            break
+        } else if t == VAL.prop || t == VAL.ptrv || t == VAL.load || t == VAL.cast || t == VAL.wrap || t == VAL.ptr_offset || t == VAL.ptr_of || t == VAL.error_success {
+            at = inner
+        } else if t == VAL.multi && at.get_name() == "part" {
+            at = inner
+        } else if t == VAL.op && region_holds_refs(at.rett) {
+            at = inner
+        } else {
+            break
+        }
+    }
+    if at.type == VAL.decl {
+        let decl = at.decl ?! return 0
+        let node = decl.region_node
+        if node == REGION_NONE : return 0
+        return (REGION_REF_DECL << 28) | node
+    }
+    if at.type == VAL.class_init || at.type == VAL.call : return region_source_of(f, at)
+    return 0
+}
+
+// Whether an address is known to point at bytes without references: the data of text or of
+// a slice of numbers, or a pointer whose type says so
+fn region_plain_bytes(value: Value) bool {
+    let at = value
+    while true {
+        let t = at.type
+        let type = at.rett.get_non_nullable()
+        if type.kind == TYPE.ref_slice || type.kind == TYPE.ptr_of || type.kind == TYPE.ref_of || type.kind == TYPE.adr_of {
+            let sub = type.get_sub_type()
+            if isset(sub) : return !sub.has_gc_refs()
+        }
+        let inner = at.value1 ?! return false
+        if t == VAL.cast || t == VAL.ptr_offset || t == VAL.wrap || t == VAL.prop || (t == VAL.op && region_holds_refs(at.rett)) {
+            at = inner
+        } else {
+            return false
+        }
+    }
+    return false
+}
+
+// Whether the memory a pointer names holds nothing the analysis follows, and was not memory
+// with references before a cast: bytes copied out of it refer to nothing. A pointer in a
+// field says so by its own type, or it is the data of a slice of such elements
+fn region_no_refs_source(value: Value) bool {
+    let at = value
+    let plain = false
+    while true {
+        let t = at.type
+        let type = at.rett.get_non_nullable()
+        if type.kind == TYPE.ref_slice || type.kind == TYPE.ptr_of || type.kind == TYPE.ref_of || type.kind == TYPE.adr_of {
+            let sub = type.get_sub_type()
+            if isset(sub) {
+                if region_holds_refs(sub) : return false
+                plain = true
+            }
+        }
+        let inner = at.value1 ?! break
+        if t == VAL.cast || t == VAL.ptr_offset || t == VAL.wrap {
+            at = inner
+        } else if t == VAL.prop && !plain {
+            let base = inner.rett.get_non_nullable()
+            let sub = base.kind == TYPE.ref_slice ? base.get_sub_type() : null
+            return isset(sub) && !region_holds_refs(sub)
+        } else {
+            break
+        }
+    }
+    return plain
+}
+
+// The parameter an `if` tests, when all it does is leave: with `false` passed, it is not there
+fn region_guard_slot(f: RegionFacts, value: Value) uint {
+    let test = value.value1 ?! return REGION_NONE
+    if isset(value.value2) : return REGION_NONE
+    let at = test
+    if at.type == VAL.op && at.op == VALUE_OP.and.to(u8) : at = at.value1 ?! return REGION_NONE
+    if at.type != VAL.decl : return REGION_NONE
+    let decl = at.decl ?! return REGION_NONE
+    if !decl.is_arg || !decl.type.is_bool_type() : return REGION_NONE
+    each f.func.args as arg, i {
+        if arg.decl == decl && i < 64 : return i
+    }
+    return REGION_NONE
+}
+
+fn region_cut_args(f: RegionFacts, first: uint) {
+    region_cut(f.arg_stack, first)
+    region_cut(f.runtime.source_stack, first)
+    region_cut(f.runtime.root_stack, first)
+}
+
+// The write barrier: `owner` now refers to `pointer`, stored at `address`. A store through a
+// pointer just before it, to that address, was that reference
+fn region_walk_barrier(f: RegionFacts, value: Value, owner: uint, address: uint, pointer: uint) {
+    let values = value.values
+    let base = f.pending_base
+    if isset(values) && isset(base) && f.pending_step != REGION_NONE && values.length >= 2 {
+        if region_peel_address(values[1]) == base {
+            let kind = f.pending_kind
+            f.steps[f.pending_step] = kind == REGION_KIND_LEAF ? REGION_STEP_LEAF : (kind == REGION_KIND_REF ? REGION_STEP_REF : REGION_STEP_ABSORB)
+            if owner != REGION_NONE : f.steps[f.pending_step + 1] = owner
+            f.pending_step = REGION_NONE
+        }
+    }
+    f.join(owner, address)
+    f.store(owner, pointer, REGION_KIND_REF)
+    if owner == REGION_NONE : return
+    f.pins.append(RegionPin { node: owner, loop: f.loop })
+    value.region_id = f.number(0x800000 + f.pins.length)
+}
+
+fn region_walk_call(f: RegionFacts, value: Value) uint {
+    // A value that is used in two places is worked out once: it lives where both are
+    let known = f.known_call(value)
+    if isset(known) {
+        let result = known.result
+        if result != REGION_NONE : f.node_loop[result] = f.common_loop(f.node_loop[result], f.loop)
+        return result
+    }
+    if isset(f.known_pin(value)) : return REGION_NONE
+    let callee = value.value1
+    let args = f.arg_stack
+    let sources = f.runtime.source_stack
+    let roots = f.runtime.root_stack
+    let first = args.length
+    let false_args: uint = 0
+    let direct = value.call_kind == CALL_KIND.direct && isset(callee) && callee.type == VAL.func
+    let target = direct && isset(callee) ? callee.func : null
+    // An argument is what its parameter takes: a text passed as a union is in a union
+    let at: uint = 0
+    if isset(callee) {
+        let receiver = callee.value1
+        if callee.type == VAL.func {
+            if isset(receiver) {
+                let node = region_walk(f, receiver)
+                let param = isset(target) ? (target.args.get(at) !? null) : null
+                args.append(isset(param) ? f.convert(node, receiver.rett, param.type) : node)
+                sources.append(region_source_of(f, receiver))
+                roots.append(region_root_of(f, receiver))
+                at++
+            }
+        } else {
+            args.append(region_walk(f, callee))
+            sources.append(0)
+            roots.append(0)
+        }
+    }
+    let values = value.values
+    if isset(values) {
+        each values as item {
+            let node = region_walk(f, item)
+            let param = isset(target) ? (target.args.get(at) !? null) : null
+            args.append(isset(param) ? f.convert(node, item.rett, param.type) : node)
+            sources.append(region_source_of(f, item))
+            roots.append(region_root_of(f, item))
+            if item.type == VAL.bool && !item.bool_val && at < 64 : false_args = false_args | (1.to(uint) << at)
+            at++
+        }
+    }
+    let holds = region_holds_refs(value.rett)
+
+    let count = args.length - first
+    let runtime = region_runtime(f.func.ns.build)
+    if isset(target) && isset(runtime) {
+        // The write barrier and its read tell where a reference goes
+        if target == runtime.property_get {
+            let from = count > 0 ? args[first] : REGION_NONE
+            region_cut_args(f, first)
+            if from != REGION_NONE : return f.load(from, region_kind(value.rett))
+            return region_unknown(f, value, from, f.here("read out of raw memory"))
+        }
+        if target == runtime.property_set || target == runtime.property_update {
+            if count >= 3 {
+                region_walk_barrier(f, value, args[first], args[first + 1], args[first + 2])
+                // The store itself: the owner keeps the value, and lets go of what it held
+                f.keep(sources[first + 2], REGION_KEEP_ROOT, roots[first])
+                if target == runtime.property_update && isset(values) {
+                    let kind = region_kind(values[2].rett)
+                    f.drop(args[first], kind == REGION_KIND_LEAF ? 2 : (kind == REGION_KIND_REF ? 1 : 3))
+                }
+            }
+            region_cut_args(f, first)
+            return REGION_NONE
+        }
+        // Bytes move from one place to another, and old storage hands its elements to the
+        // new. References that are copied as bytes keep the marks the collector gave them,
+        // so the two places are the collector's together or a region's together: one group.
+        // Bytes without references only make the two refer to the same things
+        if target == runtime.transfer_refs || target == runtime.move_bytes || target == runtime.copy_bytes {
+            if count >= 2 {
+                let from = args[first]
+                let to = args[first + 1]
+                let plain = target != runtime.transfer_refs && isset(values) && values.length >= 2 && (region_plain_bytes(values[0]) || region_plain_bytes(values[1]))
+                // Out of memory that holds no references: the copy refers to nothing
+                if target != runtime.transfer_refs && isset(values) && values.length >= 2 && region_no_refs_source(values[0]) {
+                    region_cut_args(f, first)
+                    return REGION_NONE
+                }
+                if from != REGION_NONE && to != REGION_NONE {
+                    if plain : f.step(REGION_STEP_ABSORB, to, from)
+                    else : f.join(from, to)
+                } else if !plain {
+                    f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+                }
+            }
+            region_cut_args(f, first)
+            return REGION_NONE
+        }
+        if target == runtime.identity {
+            region_cut_args(f, first)
+            return REGION_NONE
+        }
+        if target == runtime.property_remove && count >= 1 : f.drop(args[first], 3)
+        if target == runtime.property_remove || target == runtime.moved_elements {
+            region_cut_args(f, first)
+            return REGION_NONE
+        }
+    }
+
+    let result = holds ? f.add_node() : REGION_NONE
+    if !isset(target) || target.is_extern {
+        let kind = !isset(target) ? (value.call_kind == CALL_KIND.interface_dispatch ? "passed to an interface call" : "passed to a call through a function value") : "passed to a C function"
+        let why = f.here(kind)
+        each first .. count as a : f.mark(args[a], why)
+        f.mark(result, why)
+        region_cut_args(f, first)
+        return result
+    }
+    // A call that passes and gives no references links nothing
+    let any = result != REGION_NONE
+    each first .. count as a {
+        if args[a] != REGION_NONE : any = true
+    }
+    if !any {
+        region_cut_args(f, first)
+        return result
+    }
+    let call_first = f.call_args.length
+    let index = f.calls.length
+    let exp = value.exp
+    f.calls.append(RegionCall { callee: target, src: isset(exp) ? exp.src : null, at: isset(exp) ? exp.i : 0, first: call_first, count: count, result: result, loop: f.loop, ctx: f.ctx, errors: f.exits_error, false_args: false_args })
+    value.region_id = f.number(f.calls.length)
+    each first .. count as a {
+        f.call_args.append(args[a])
+        f.call_root.append(roots[a])
+        // What is passed is kept when the callee keeps that parameter
+        if a - first < 256 : f.keep(sources[a], REGION_KEEP_ARG, (index << 8) | (a - first))
+    }
+    region_cut_args(f, first)
+    return result
+}
+
+// The variable an address points into, when it is the address of a struct or union value in
+// the frame: what is read or written there is a part of that value. REGION_NONE otherwise
+fn region_frame_value(f: RegionFacts, base: Value) uint {
+    let at = base
+    while at.type == VAL.ptr_offset {
+        at = at.value1 ?! return REGION_NONE
+    }
+    if at.type != VAL.cast || !at.rett.is_raw_pointer() : return REGION_NONE
+    let inner = at.value1 ?! return REGION_NONE
+    if inner.type != VAL.decl || region_kind(inner.rett) != REGION_KIND_AGG : return REGION_NONE
+    return region_walk(f, inner)
+}
+
+fn region_walk_assign(f: RegionFacts, value: Value) uint {
+    let left = value.value1
+    let right = value.value2
+    if !isset(left) {
+        if isset(right) : region_walk(f, right)
+        return REGION_NONE
+    }
+    let t = left.type
+    // The address of a place is worked out before the value that goes in it
+    if t == VAL.prop || t == VAL.ptrv || t == VAL.load {
+        let base = left.value1
+        let other = left.value2
+        if isset(other) : region_walk(f, other)
+        let frame = isset(base) && t != VAL.prop ? region_frame_value(f, base) : REGION_NONE
+        let holder = frame != REGION_NONE ? frame : (isset(base) ? region_base(f, base) : REGION_NONE)
+        let stored = isset(right) ? f.convert(region_walk(f, right), right.rett, left.rett) : REGION_NONE
+        let kind = region_kind(left.rett)
+        if holder == REGION_NONE {
+            f.mark(stored, f.here("written through raw memory"))
+            return REGION_NONE
+        }
+        if !isset(base) || stored == REGION_NONE : return REGION_NONE
+        if isset(right) : f.keep(region_source_of(f, right), REGION_KEEP_ROOT, region_root_of(f, base))
+        if frame != REGION_NONE {
+            f.store(holder, stored, kind)
+        } else if base.rett.is_fat_borrow() && t == VAL.prop {
+            // A part of a pointer: the pointer points at what the part did
+            f.join(holder, stored)
+        } else if region_kind(base.rett) == REGION_KIND_REF {
+            // Through a pointer: the same group, unless the write barrier follows and says
+            // which object now refers to the value
+            f.pending_step = f.steps.length
+            f.pending_base = region_peel_address(base)
+            f.pending_kind = kind
+            f.join(holder, stored)
+            if f.steps.length == f.pending_step : f.pending_step = REGION_NONE
+        } else {
+            // A value in the frame refers to what is put in it
+            f.store(holder, stored, kind)
+        }
+        return REGION_NONE
+    }
+    let from = isset(right) ? region_walk(f, right) : REGION_NONE
+    if t == VAL.global {
+        f.mark(from, "stored in a global")
+        return REGION_NONE
+    }
+    if t == VAL.decl {
+        let decl = left.decl
+        if !isset(decl) || !region_holds_refs(decl.type) {
+            f.mark(from, f.here("turned into a number"))
+            if isset(decl) && decl.is_arg {
+                each f.func.args as arg, i {
+                    if arg.decl == decl && i < 64 : f.args_written = f.args_written | (1.to(uint) << i)
+                }
+            }
+            return REGION_NONE
+        }
+        // A temporary is written once, where it is taken: the same one stands for an
+        // unrelated value the next time, and every read comes with that write before it
+        if decl.is_buffer : decl.region_node = REGION_NONE
+        // A `let` gives its variable a value where the variable starts to exist, and so does
+        // the compiler for a variable of its own
+        let at = decl.exp
+        let to = f.decl_node(decl, true, !isset(at) || at == value.exp)
+        if isset(right) : f.join(to, f.convert(from, right.rett, decl.type))
+        // What the variable is from here on
+        let info = f.node_info[to]
+        let assigns = (info >> 32) & 255
+        let alias = isset(right) ? region_source_of(f, right) : 0
+        if alias == 0 && isset(right) : alias = region_root_of(f, right)
+        if alias == ((REGION_REF_DECL << 28) | to) : alias = 0
+        let loop = assigns == 0 ? f.loop : (info >> 40)
+        if assigns < 200 : assigns++
+        f.node_info[to] = alias | (assigns << 32) | (loop << 40)
+        return REGION_NONE
+    }
+    // A place the analysis does not know
+    if from != REGION_NONE : f.lose("a store into a place of kind " + t.to(uint) + region_at(value))
+    region_walk(f, left)
+    return REGION_NONE
+}
+
+// Reading a reference strips the collector's tag bits: `(load as int & mask) as T`. It stays
+// the same reference, though it passes through a number
+fn region_tag_strip_source(value: Value) ?Value {
+    if value.type != VAL.op : return null
+    let left = value.value1 ?! return null
+    if left.type != VAL.cast : return null
+    let source = left.value1 ?! return null
+    let from = source.rett.get_non_nullable()
+    if from.is_raw_pointer() || from.is_gc_type() : return source
+    return null
+}
+
+// What a field or element of `base` is in: the object a pointer points at, or the value in the
+// frame that `base` is a part of
+fn region_base(f: RegionFacts, base: Value) uint {
+    if region_kind(base.rett) == REGION_KIND_REF || base.rett.is_fat_borrow() : return region_walk(f, base)
+    return region_place(f, base)
+}
+
+// The group a place is in: a variable, or what a field or element of it is in
+fn region_place(f: RegionFacts, value: Value) uint {
+    let t = value.type
+    let base = value.value1
+    if isset(base) && (t == VAL.prop || t == VAL.ptrv || t == VAL.load || t == VAL.wrap || t == VAL.cast) {
+        let pre = value.get_pre_value()
+        if isset(pre) : region_walk(f, pre)
+        let checked = value.get_checked_read()
+        if isset(checked) : region_walk(f, checked)
+        let other = value.value2
+        if isset(other) : region_walk(f, other)
+        if t == VAL.wrap || t == VAL.cast : return region_place(f, base)
+        return region_base(f, base)
+    }
+    return region_walk(f, value)
+}
+
+// The node of what `value` holds, REGION_NONE when that is plain data. A value that holds
+// references and has no node was lost track of: nothing in this function may then rely on the walk
+fn region_walk(f: RegionFacts, value: Value) uint {
+    let node = region_walk_value(f, value)
+    if node != REGION_NONE || !region_holds_refs(value.rett) : return node
+    // Reading a reference out of memory nothing is known about. Any other value without a
+    // node only passes on what its parts hold, and they hold none: `null`, text of the program
+    let t = value.type
+    if t == VAL.prop || t == VAL.load || t == VAL.ptrv || t == VAL.member || t == VAL.intrinsic {
+        let at = value
+        while at.type == VAL.prop || at.type == VAL.load || at.type == VAL.ptrv || at.type == VAL.cast || at.type == VAL.wrap || at.type == VAL.ptr_offset {
+            at = at.value1 ?! break
+        }
+        // Text of the program is there for ever; what a global holds is the collector's
+        if at.type == VAL.string : return node
+        if at.type == VAL.global : return region_unknown(f, value, node, f.here("linked with a global"))
+        f.lose("a reference out of a value of kind " + t.to(uint) + region_at(value))
+    }
+    return node
+}
+
+// A reference that comes from somewhere the walk does not see
+fn region_unknown(f: RegionFacts, value: Value, known: uint, reason: String) uint {
+    let node = known
+    if node == REGION_NONE && region_holds_refs(value.rett) : node = f.add_node()
+    f.mark(node, reason)
+    return node
+}
+
+// A value made of parts: it refers to what they are
+fn region_walk_parts(f: RegionFacts, value: Value, parts: ?Array[Value]) uint {
+    let node = region_holds_refs(value.rett) ? f.add_node() : REGION_NONE
+    if isset(parts) {
+        each parts as part {
+            let inner = region_walk(f, part)
+            if node == REGION_NONE : f.mark(inner, "written through raw memory")
+            else : f.store(node, inner, region_kind(part.rett))
+        }
+    }
+    return node
+}
+
+fn region_walk_value(f: RegionFacts, value: Value) uint {
+    let pre = value.get_pre_value()
+    if isset(pre) && value.type != VAL.error_handler : region_walk(f, pre)
+    let checked = value.get_checked_read()
+    if isset(checked) : region_walk(f, checked)
+    let t = value.type
+
+    if t == VAL.int || t == VAL.float || t == VAL.bool || t == VAL.null || t == VAL.string || t == VAL.undefined || t == VAL.type || t == VAL.property_meta || t == VAL.ir_comment || t == VAL.init_allocators {
+        return REGION_NONE
+    }
+    if t == VAL.error_value {
+        // The fields of an error are kept where its handler reads them, long after this
+        // function is gone
+        let code = value.value1
+        if isset(code) : region_walk(f, code)
+        let fields = value.values
+        if isset(fields) {
+            each fields as field : f.mark(region_walk(f, field), "kept in the fields of an error")
+        }
+        return REGION_NONE
+    }
+    // Comparing and testing values links nothing
+    if t == VAL.op && (value.op == VALUE_OP.and.to(u8) || value.op == VALUE_OP.or.to(u8)) {
+        // The right side runs when the left one does not decide
+        let left = value.value1
+        let right = value.value2
+        if isset(left) : region_walk(f, left)
+        f.branch()
+        if isset(right) : region_walk(f, right)
+        f.merge()
+        return REGION_NONE
+    }
+    if t == VAL.op || t == VAL.unary || t == VAL.isset || t == VAL.is_a || t == VAL.break || t == VAL.continue || t == VAL.run_defers {
+        if t == VAL.break || t == VAL.continue : f.exits_loop++
+        // Arithmetic on an address stays in the object, or makes an address out of numbers
+        if region_holds_refs(value.rett) {
+            let known = region_walk_children(f, value)
+            if known != REGION_NONE : return known
+            return region_unknown(f, value, known, f.here("an address made out of numbers"))
+        }
+        let left = value.value1
+        let right = value.value2
+        if isset(left) : region_walk(f, left)
+        if isset(right) : region_walk(f, right)
+        let rest = value.values
+        if isset(rest) {
+            each rest as item : region_walk(f, item)
+        }
+        return REGION_NONE
+    }
+    if t == VAL.decl {
+        let decl = value.decl
+        if !isset(decl) || !region_holds_refs(decl.type) : return REGION_NONE
+        return f.decl_node(decl, false, false)
+    }
+    if t == VAL.global {
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        let node = f.add_node()
+        f.mark(node, f.here("linked with a global"))
+        return node
+    }
+    if t == VAL.func {
+        let func = value.func
+        if isset(func) {
+            each func.capture_decls as decl {
+                if region_holds_refs(decl.type) : f.mark(f.decl_node(decl, true, false), f.here("captured by a closure"))
+            }
+        }
+        let receiver = value.value1
+        if isset(receiver) {
+            let node = region_walk(f, receiver)
+            f.mark(node, "bound to a function value")
+            return node
+        }
+        // A closure keeps what it captured in an object the collector owns
+        if isset(func) && (func.is_literal || func.capture_decls.length > 0) : return region_unknown(f, value, REGION_NONE, "a closure")
+        return REGION_NONE
+    }
+    if t == VAL.call : return region_walk_call(f, value)
+    if t == VAL.assign : return region_walk_assign(f, value)
+    if t == VAL.class_init {
+        let known = f.known_site(value)
+        if isset(known) {
+            f.node_loop[known.node] = f.common_loop(f.node_loop[known.node], f.loop)
+            return known.node
+        }
+        // A literal with hooks: the object, then the calls that fill it
+        let base = value.value1
+        if isset(base) {
+            let node = f.convert(region_walk(f, base), base.rett, value.rett)
+            let hooks = value.values
+            if isset(hooks) {
+                each hooks as hook {
+                    if hook != base : f.join(node, f.convert(region_walk(f, hook), hook.rett, value.rett))
+                }
+            }
+            return node
+        }
+        let class = value.get_class_ref() ?? value.rett.get_non_nullable().get_class_or_null()
+        let fields = value.values
+        let gc_object = isset(class) && isset(value.get_allocator())
+        // A slice literal with `data` is a view: a pointer to what its parts point at
+        if isset(class) && !gc_object && class.kind == CLASS_KIND.slice && region_slice_is_view(value) {
+            let merged = REGION_NONE
+            if isset(fields) {
+                each fields as field : merged = region_both(f, merged, region_walk(f, field))
+            }
+            return region_holds_refs(value.rett) ? merged : REGION_NONE
+        }
+        let node = region_holds_refs(value.rett) || gc_object ? f.add_node() : REGION_NONE
+        let held = f.runtime.held_stack
+        let held_first = held.length
+        if isset(fields) {
+            each fields as field {
+                let inner = region_walk(f, field)
+                held.append(region_source_of(f, field))
+                let prop = field.get_init_prop()
+                if node == REGION_NONE {
+                    f.mark(inner, "written through raw memory")
+                } else if isset(prop) {
+                    f.store(node, f.convert(inner, field.rett, prop.type), region_kind(prop.type))
+                } else {
+                    f.join(node, inner)
+                }
+            }
+        }
+        if isset(class) && gc_object {
+            let exp = value.exp
+            let allocator = value.get_allocator()
+            if class.kind != CLASS_KIND.class && class.kind != CLASS_KIND.array : f.mark(node, "not a plain object")
+            // The runtime finds the helpers of such an object through its block
+            else if class.closure_env || (isset(allocator) && (isset(allocator.onfree) || isset(allocator.env_clone))) : f.mark(node, "the runtime keeps helpers for it")
+            else if isset(class.get_func("gc_free")) : f.mark(node, "the class has a finalizer")
+            else if class.atomic : f.mark(node, "the class is shared between threads")
+            else if !isset(exp) : f.mark(node, "made by the compiler")
+            if isset(exp) {
+                f.sites.append(RegionSite { name: class.pretty_name(), src: exp.src, at: exp.i, node: node, loop: f.loop, ctx: f.ctx, errors: f.exits_error })
+                value.region_id = f.number(f.sites.length)
+                // The object keeps what its fields are given
+                each held_first .. held.length - held_first as h : f.keep(held[h], REGION_KEEP_ROOT, (REGION_REF_SITE << 28) | (f.sites.length - 1))
+            }
+        } else if isset(class) && class.kind == CLASS_KIND.slice {
+            // A slice literal that names no data makes its storage
+            if node == REGION_NONE : node = f.add_node()
+            let exp = value.exp
+            if isset(exp) {
+                f.sites.append(RegionSite { name: value.rett.get_non_nullable().compat_display_name(), src: exp.src, at: exp.i, node: node, loop: f.loop, ctx: f.ctx, errors: f.exits_error })
+                value.region_id = f.number(f.sites.length)
+            } else {
+                f.mark(node, "made by the compiler")
+            }
+        } else if node != REGION_NONE && !value.rett.is_inline {
+            f.mark(node, "storage that is not an object")
+        } else if node != REGION_NONE {
+            // A struct value: kept where it is kept, with what its fields were given
+            let carries = false
+            each held_first .. held.length - held_first as h {
+                if held[h] != 0 : carries = true
+            }
+            if carries && f.pack_keep.length < 8000000 {
+                let pack = (REGION_REF_PACK << 28) | f.pack_keep.length
+                f.pack_ctx.append(f.ctx)
+                f.pack_errors.append(f.exits_error)
+                f.pack_keep.append(REGION_NONE)
+                f.pack_loop.append(f.loop)
+                value.region_id = f.number(8388608 + f.pack_keep.length)
+                each held_first .. held.length - held_first as h : f.keep(held[h], REGION_KEEP_ROOT, pack)
+            }
+        }
+        region_cut(held, held_first)
+        return node
+    }
+    // What is read out of an object is one of the things the object refers to
+    if t == VAL.prop || t == VAL.load || t == VAL.ptrv {
+        let base = value.value1
+        let other = value.value2
+        if isset(other) : region_walk(f, other)
+        let frame = isset(base) && t != VAL.prop ? region_frame_value(f, base) : REGION_NONE
+        if frame != REGION_NONE : return f.load(frame, region_kind(value.rett))
+        let holder = isset(base) ? region_base(f, base) : REGION_NONE
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        // A part of a pointer points at what the pointer does
+        if isset(base) && t == VAL.prop && base.rett.is_fat_borrow() : return holder
+        return f.load(holder, region_kind(value.rett))
+    }
+    if t == VAL.vscope {
+        // A `return` inside gives the scope its value
+        let result = region_holds_refs(value.rett) ? f.add_node() : REGION_NONE
+        f.vscopes.append(result)
+        f.vscope_types.append(value.rett)
+        let ctx = f.ctx
+        let exits = f.exits
+        let body = value.values
+        if isset(body) {
+            each body as item : region_walk(f, item)
+        }
+        f.vscopes.pop_last() _
+        f.vscope_types.pop_last() _
+        // Its own `return`s end here
+        f.ctx = f.exits != exits ? f.fresh() : ctx
+        let phi = value.value1
+        if isset(phi) : f.join(result, f.convert(region_walk(f, phi), phi.rett, value.rett))
+        return result
+    }
+    if t == VAL.match {
+        // The subject, then every case: its test, its statements and what it gives
+        let subject = value.value1
+        if isset(subject) : region_walk(f, subject)
+        let merged = REGION_NONE
+        let cases = value.values
+        if isset(cases) {
+            each cases as case {
+                f.branch()
+                let test = case.value1
+                if isset(test) : region_walk(f, test)
+                let body = case.values
+                if isset(body) {
+                    each body as item : region_walk(f, item)
+                }
+                merged = region_into(f, merged, case.value2, value.rett)
+                f.merge()
+            }
+        }
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        return merged
+    }
+    if t == VAL.block {
+        // Its statements, then what it gives
+        let body = value.values
+        if isset(body) {
+            each body as item : region_walk(f, item)
+        }
+        let merged = region_into(f, REGION_NONE, value.value1, value.rett)
+        merged = region_into(f, merged, value.value2, value.rett)
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        return merged
+    }
+    if t == VAL.this_or_that {
+        let test = value.value1
+        if isset(test) : region_walk(f, test)
+        let before = f.ctx
+        f.branch()
+        let first = f.ctx
+        let merged = region_into(f, REGION_NONE, value.value2, value.rett)
+        f.merge()
+        f.branch()
+        let second = f.ctx
+        merged = region_into_list(f, merged, value.values, value.rett)
+        f.merge()
+        f.split(before, first, second)
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        return merged
+    }
+    if t == VAL.phi || t == VAL.wrap || t == VAL.interface_wrap || t == VAL.interface_object || t == VAL.error_handler || t == VAL.error_success {
+        let merged = REGION_NONE
+        if isset(pre) && t == VAL.error_handler : merged = region_into(f, merged, pre, value.rett)
+        // What a handler does, and the arms of a phi, may not run
+        let apart = t == VAL.phi || t == VAL.error_handler
+        let leaves = t == VAL.error_handler && (value.op == ERRH_KIND.pass.to(u8) || value.op == ERRH_KIND.panic.to(u8))
+        if apart : f.branch()
+        if t == VAL.error_handler && value.op == ERRH_KIND.pass.to(u8) {
+            f.exits_error++
+            // What an error is passed on with goes into its fields
+            let fields = value.values
+            if isset(fields) {
+                each fields as field : f.mark(region_walk(f, field), "kept in the fields of an error")
+            }
+        }
+        merged = region_into(f, merged, value.value1, value.rett)
+        merged = region_into(f, merged, value.value2, value.rett)
+        merged = region_into_list(f, merged, value.values, value.rett)
+        if apart : f.merge()
+        if isset(pre) && t == VAL.error_handler {
+            // The result is there when the call did not fail: it runs with what follows
+            let source = region_source_of(f, pre)
+            if (source >> 28) == REGION_REF_CALL {
+                let call = f.calls.get(source & REGION_REF_MASK) !? null
+                if isset(call) && call.keep == REGION_NONE {
+                    call.ctx = f.ctx
+                    call.errors = f.exits_error
+                    call.passes = leaves
+                }
+            }
+        }
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        return merged
+    }
+    if t == VAL.multi && value.get_name() == "part" {
+        let source = value.value1 ?! return REGION_NONE
+        let node = region_walk(f, source)
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        // A part of a pointer points at what the pointer does
+        if region_kind(source.rett) != REGION_KIND_AGG : return node
+        return f.load(node, region_kind(value.rett))
+    }
+    if t == VAL.array_init || t == VAL.multi {
+        let first = value.value1
+        let second = value.value2
+        if isset(first) : region_walk(f, first)
+        if isset(second) : region_walk(f, second)
+        return region_walk_parts(f, value, value.values)
+    }
+    if t == VAL.ptr_offset || t == VAL.member || t == VAL.intrinsic {
+        let merged = region_walk_children(f, value)
+        // A field or element without references takes nothing along from the object
+        if !region_holds_refs(value.rett) : return REGION_NONE
+        return merged
+    }
+    if t == VAL.cast {
+        let inner = value.value1
+        let tagged = isset(inner) && region_holds_refs(value.rett) ? region_tag_strip_source(inner) : null
+        if isset(tagged) : return f.convert(region_walk(f, tagged), tagged.rett, value.rett)
+        let node = isset(inner) ? region_walk(f, inner) : REGION_NONE
+        if !region_holds_refs(value.rett) {
+            // A union's tag is a number too, without saying where anything lives
+            let from = isset(inner) ? inner.rett.get_non_nullable() : null
+            if isset(from) && (from.is_raw_pointer() || from.is_gc_type() || from.kind == TYPE.ptr_of || from.kind == TYPE.adr_of) {
+                f.mark(node, f.here("turned into a number"))
+            }
+            return REGION_NONE
+        }
+        // A number that becomes a reference names something the walk never saw
+        if isset(inner) && !region_holds_refs(inner.rett) && inner.type != VAL.null && inner.type != VAL.int {
+            return region_unknown(f, value, node, f.here("made out of a number"))
+        }
+        return isset(inner) ? f.convert(node, inner.rett, value.rett) : node
+    }
+    if t == VAL.ptr_of {
+        let inner = value.value1 ?! return REGION_NONE
+        let node = region_place(f, inner)
+        // A pointer to a variable: what is written through it is what the variable holds
+        let decl = inner.decl
+        if inner.type == VAL.decl && isset(decl) && region_kind(decl.type) != REGION_KIND_AGG : f.step(REGION_STEP_OWN, node, node)
+        return node
+    }
+    if t == VAL.shared_view || t == VAL.atomic_store || t == VAL.atomic_op || t == VAL.atomic_load {
+        return region_unknown(f, value, region_walk_children(f, value), "shared between threads")
+    }
+    if t == VAL.memcpy {
+        // The bytes of one place become those of another: one group, unless the bytes are
+        // known to hold no references
+        let parts = value.values
+        let from = REGION_NONE
+        let to = REGION_NONE
+        if isset(parts) {
+            each parts as part, i {
+                let node = region_walk(f, part)
+                if i == 0 : from = node
+                if i == 1 : to = node
+            }
+        }
+        let plain = isset(parts) && parts.length >= 2 && (region_plain_bytes(parts[0]) || region_plain_bytes(parts[1]))
+        if isset(parts) && parts.length >= 2 && region_no_refs_source(parts[0]) : return REGION_NONE
+        if from != REGION_NONE && to != REGION_NONE {
+            if plain : f.step(REGION_STEP_ABSORB, to, from)
+            else : f.join(from, to)
+        } else if !plain {
+            f.mark(from != REGION_NONE ? from : to, "copied through raw memory")
+        }
+        return REGION_NONE
+    }
+    if t == VAL.co {
+        let first = f.calls.length
+        let inner = value.value1
+        let node = isset(inner) ? region_walk(f, inner) : REGION_NONE
+        each f.calls as call, i {
+            if i < first : continue
+            each call.first .. call.count as a : f.mark(f.call_args[a], "handed to a coroutine")
+            f.mark(call.result, "handed to a coroutine")
+        }
+        return region_unknown(f, value, node, "handed to a coroutine")
+    }
+    if t == VAL.await {
+        let inner = value.value1
+        let node = isset(inner) ? region_walk(f, inner) : REGION_NONE
+        f.mark(node, "comes from a coroutine")
+        let result = region_holds_refs(value.rett) ? f.add_node() : REGION_NONE
+        f.mark(result, "comes from a coroutine")
+        return result
+    }
+    if t == VAL.return {
+        let inner = value.value1
+        if isset(inner) {
+            let node = region_walk(f, inner)
+            let depth = f.vscopes.length
+            let scope = depth > 0 ? f.vscopes[depth - 1] : f.ret
+            let type = depth > 0 ? f.vscope_types[depth - 1] : f.func.get_rett()
+            if scope == REGION_NONE : f.mark(node, "leaves a scope as plain data")
+            else : f.join(scope, f.convert(node, inner.rett, type))
+            if depth == 0 : f.keep(region_source_of(f, inner), REGION_KEEP_RET, 0)
+        }
+        if f.vscopes.length > 0 : f.exits_scope++
+        else : f.exits++
+        // What a `return` runs on its way out
+        let after = value.values
+        if isset(after) {
+            each after as item : region_walk(f, item)
+        }
+        return REGION_NONE
+    }
+    if t == VAL.throw {
+        f.exits_error++
+        f.mark(region_walk_children(f, value), "thrown as an error")
+        return REGION_NONE
+    }
+    if t == VAL.while {
+        let outer = f.loop
+        f.loops.append(outer)
+        f.loop = f.loops.length - 1
+        value.region_id = f.number(f.loop)
+        // The test runs once more than the rounds do
+        f.branch()
+        let cond = value.value1
+        if isset(cond) : region_walk(f, cond)
+        f.merge()
+        f.branch()
+        region_walk_statements(f, value.values)
+        f.merge(true)
+        f.loop = outer
+        return REGION_NONE
+    }
+    if t == VAL.if {
+        let cond = value.value1
+        let guard = region_guard_slot(f, value)
+        let before = f.ctx
+        let exits = f.exits
+        let errors = f.exits_error
+        let scoped = f.exits_scope
+        let rounds = f.exits_loop
+        if isset(cond) : region_walk(f, cond)
+        f.branch()
+        let then_ctx = f.ctx
+        region_walk_statements(f, value.values)
+        let left = f.merge()
+        let other = value.value2
+        if guard != REGION_NONE && left {
+            // With `false` for that parameter none of this runs: what the function keeps,
+            // it keeps for those calls
+            f.keep_guard = f.keep_guard | (1.to(uint) << guard)
+            f.ctx = before
+            f.exits = exits
+            f.exits_error = errors
+            f.exits_scope = scoped
+            f.exits_loop = rounds
+        } else if isset(other) {
+            f.branch()
+            let else_ctx = f.ctx
+            region_walk(f, other)
+            f.merge()
+            f.split(before, then_ctx, else_ctx)
+        } else if left {
+            // What follows is what runs when the branch was not taken, or did not leave
+            f.split(before, then_ctx, f.ctx)
+        }
+        return REGION_NONE
+    }
+    if t == VAL.allocas || t == VAL.lock_block {
+        let first = value.value1
+        if isset(first) : region_walk(f, first)
+        let body = value.values
+        if isset(body) {
+            each body as item : region_walk(f, item)
+        }
+        let other = value.value2
+        if isset(other) : region_walk(f, other)
+        return REGION_NONE
+    }
+    // Not understood: everything in it counts as reaching something
+    return region_unknown(f, value, region_walk_children(f, value), "used in a way the compiler does not follow")
+}
+
+// Called for a function whose IR is about to be written, while its body still exists
+fn region_collect_facts(func: Func) {
+    let build = func.ns.build
+    let before = func.region_facts
+    let again = isset(before)
+    func.region_facts = null
+    if !build.options.regions || build.options.debug || func.is_local_check || func.is_generic_base : return
+    let scope = func.body_scope ?! return
+    let runtime = region_runtime(build) ?! return
+    let f = RegionFacts {
+        func: func
+        round: isset(before) ? before.round % 200 + 1 : 1
+        runtime: runtime
+        vscopes: runtime.vscopes
+        vscope_types: runtime.vscope_types
+        arg_stack: runtime.arg_stack
+        parent: runtime.parent
+        content: runtime.content
+        leaf: runtime.leaf
+        reason: runtime.reason
+        soft: runtime.soft
+        source: runtime.source
+        scope: runtime.scope
+    }
+    f.vscopes.clear()
+    f.vscope_types.clear()
+    f.arg_stack.clear()
+    f.ret = region_holds_refs(func.get_rett()) ? f.add_node() : REGION_NONE
+    each func.all_decls as decl : decl.region_node = REGION_NONE
+    each func.args as arg {
+        arg.decl.region_node = REGION_NONE
+        f.args.append(region_holds_refs(arg.type) ? f.decl_node(arg.decl, true, true) : REGION_NONE)
+        f.arg_keep.append(REGION_NONE)
+    }
+    runtime.source_stack.clear()
+    runtime.held_stack.clear()
+    runtime.root_stack.clear()
+    runtime.ctx_stack.clear()
+    each 0 .. f.slot_count() {
+        f.slot_group.append(REGION_NONE)
+        f.slot_keeper.append(REGION_NONE)
+        f.slot_strict.append(false)
+    }
+    // What a closure reads of the function around it is not followed
+    if func.is_literal {
+        f.lose("a closure")
+    } else if func.ns == runtime.pin.ns {
+        // The collector's own code is not rewritten: the write barrier that pins calls the
+        // write barrier
+        f.lose("code of the collector")
+    } else {
+        region_walk_statements(f, scope.values)
+        let defers = func.defer_scope
+        if isset(defers) : region_walk_statements(f, defers.values)
+    }
+    // A function that takes, gives and makes no references says nothing to its callers
+    let empty = !f.lost && f.sites.length == 0 && f.calls.length == 0 && f.ret == REGION_NONE
+    each f.args as arg {
+        if arg != REGION_NONE : empty = false
+    }
+    if empty : return
+    func.region_facts = f
+    if !again : build.region_funcs.append(func)
+    if f.lost : return
+
+    // What this body alone rules out never comes back, so those places get no second form
+    f.solve(true)
+    each f.sites as site {
+        site.dual = f.reason[f.find(site.node)] == 0
+        if site.dual : f.has_tokens = true
+    }
+    each f.pins as pin {
+        pin.dual = f.reason[f.find(pin.node)] == 0
+        if pin.dual : f.has_tokens = true
+    }
+    each f.calls as call {
+        if call.callee.infinite_args : continue
+        let open = call.result != REGION_NONE && f.reason[f.find(call.result)] == 0
+        each call.first .. call.count as a {
+            let arg = f.call_args[a]
+            if arg != REGION_NONE && f.reason[f.find(arg)] == 0 : open = true
+        }
+        call.dual = open
+        if open : f.has_tokens = true
+    }
+}
+
+// Which functions can give up the thread while a region of theirs is alive. `may_suspend` also
+// counts what a collection may run, which reaches nearly everything through the write barrier.
+// A collection does not switch coroutines and a finalizer may not block, so the collector
+// does not count
+fn region_find_suspending(build: Build) {
+    let changed = true
+    each build.lists.units as unit {
+        each unit.functions as func : func.region_suspends = func.suspends_directly
+    }
+    while changed {
+        changed = false
+        each build.lists.units as unit {
+            each unit.functions as func {
+                if func.region_suspends : continue
+                each func.effect_callees as callee {
+                    if !callee.region_suspends || callee.ns.name == "gc" : continue
+                    func.region_suspends = true
+                    changed = true
+                    break
+                }
+            }
+        }
+    }
+}
+
+fn region_solve(build: Build) {
+    if build.region_solved : return
+    build.region_solved = true
+    region_find_suspending(build)
+    let all = Array[RegionFacts]{}
+    each build.region_funcs as func {
+        let f = func.region_facts
+        if isset(f) : all.append(f)
+    }
+    each all as f {
+        // A caller is listed once: its calls are read together
+        each f.calls as call {
+            let callee = call.callee.region_facts ?! continue
+            let last = callee.callers.get(callee.callers.length - 1) !? null
+            if callee.callers.length == 0 || last != f : callee.callers.append(f)
+        }
+    }
+    // Callees first, so that most functions are read once: `todo` is taken from its end
+    let todo = Array[RegionFacts]{}
+    let path = Array[RegionFacts]{}
+    let at = Array[uint]{}
+    each all as start {
+        if start.queued : continue
+        start.queued = true
+        path.append(start)
+        at.append(0)
+        while path.length > 0 {
+            let f = path[path.length - 1]
+            let next = at[at.length - 1]
+            if next == f.calls.length {
+                todo.append(f)
+                path.pop_last() _
+                at.pop_last() _
+                continue
+            }
+            at[at.length - 1] = next + 1
+            let callee = f.calls[next].callee.region_facts
+            if !isset(callee) || callee.queued : continue
+            callee.queued = true
+            path.append(callee)
+            at.append(0)
+        }
+    }
+    todo.reverse()
+    // A function is read again when a callee learned something. The summaries only grow, so
+    // this ends; the limit is there so that a mistake in that costs speed and not a hanging
+    // compiler. Every function is read at least once, and after the last change of a callee
+    let budget = all.length * REGION_SOLVE_ROUNDS + 1000
+    while true {
+        let f = todo.pop_last() ! break
+        f.queued = false
+        if budget == 0 : return
+        budget--
+        f.rounds++
+        if !f.solve() : continue
+        each f.callers as caller {
+            if caller.queued : continue
+            caller.queued = true
+            todo.append(caller)
+        }
+    }
+    // From none upward: a function that calls itself, or one that does, never gets there
+    let more = true
+    while more {
+        more = false
+        each all as f {
+            if f.bounded || f.lost || !f.is_bounded() : continue
+            f.bounded = true
+            more = true
+        }
+    }
+    each all as f {
+        f.runtime.settled = true
+        break
+    }
+    each all as f : f.set_params()
+    each all as f : f.decide(build)
+    each all as f {
+        each f.calls as call {
+            if !f.call_uses_copy(call, false) : continue
+            let callee = call.callee.region_facts ?! continue
+            callee.mark_copy()
+        }
+    }
+    let spreading = true
+    while spreading {
+        spreading = false
+        each all as f {
+            if f.spread_null(false) : spreading = true
+            if f.needs_copy && f.spread_null(true) : spreading = true
+        }
+    }
+    build.region_decided = true
+}
+
+////////////////////////////
+// IR
+////////////////////////////
+
+fn region_copy_address(func: Func) String {
+    return ir_symbol_address(func_ir_name(func) + ".rg")
+}
+
+fn region_local_name(index: uint) String {
+    return "\%\"rg." + index + "\""
+}
+
+fn region_frame_name(site: uint) String {
+    return "\%\"rg.f" + site + "\""
+}
+
+fn region_passed_name(index: uint) String {
+    return "\%rg.in." + index
+}
+
+fn region_copy_declare(func: Func, regions: uint) String !Error {
+    let out = ByteBuffer.new(128)
+    out.append_text("declare ")
+    out.append_text(ir_func_rett_type(func) !>)
+    out.append_text(" ")
+    out.append_text(region_copy_address(func))
+    out.append_text("(ptr")
+    each 1 .. regions - 1 : out.append_text(", ptr")
+    if ir_func_rett_by_pointer(func) : out.append_text(", ptr")
+    each func.args as arg {
+        out.append_text(", ")
+        out.append_text(ir_param_type(arg.type) !>)
+    }
+    out.append_text(")\n")
+    return out.to_string()
+}
+
+// Writes one form of a function's IR with its tokens replaced. `copy`: the form that makes
+// the objects of the groups it grows in the regions its first parameters name. A caller that
+// has one of those groups on the heap passes null for it, and the copy then asks the collector
+fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteBuffer) !Error {
+    let build = f.func.ns.build
+    let runtime = build.region_runtime ?! f.func.exp.bug("Region runtime is missing")
+    let decided = build.region_decided
+    let at: uint = 0
+    // The copy is the function alone
+    let bytes = copy ? f.body_bytes : code.bytes
+    while true {
+        let start = code.index_of_byte(1, at) !? bytes
+        if start >= bytes {
+            out.append_text(code.range(at, bytes - at))
+            break
+        }
+        out.append_text(code.range(at, start - at))
+        let end = code.index_of_byte(1, start + 2) ! f.func.exp.bug("Region token without an end")
+        let kind = code.get(start + 1)
+        let id = code.range(start + 2, end - start - 2).to_uint() !? 0
+        at = end + 1
+
+        if kind == 'N' {
+            if copy : out.append_text(".rg")
+        } else if kind == 'H' || kind == 'h' {
+            if copy {
+                each f.params as slot, n {
+                    if n > 0 : out.append_text(", ")
+                    out.append_text("ptr " + region_passed_name(n))
+                }
+                if kind == 'H' : out.append_text(", ")
+            }
+        } else if kind == 'A' {
+            // What makes the object: a region, or the place the frame has for it
+            let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
+            let in_frame = runtime.stack_object
+            out.append_text(ir_func_address(decided && site.stack && isset(in_frame) ? in_frame : runtime.alloc))
+        } else if kind == 'U' || kind == 'P' {
+            let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
+            let name = ""
+            let used = "true"
+            if decided && site.stack {
+                name = region_frame_name(id)
+            } else if decided && copy && site.param != REGION_NONE {
+                name = region_passed_name(site.param)
+                if f.may_null[site.param] : used = "\%rg.on." + site.param
+            } else if decided && site.region != REGION_NONE {
+                name = region_local_name(site.region)
+            }
+            if kind == 'U' : out.append_text(name.length > 0 ? used : "false")
+            else : out.append_text(name.length > 0 ? name : "null")
+        } else if kind == 'F' {
+            // What pins for the fields of an object: its region, when a field can refer to
+            // something of the collector
+            let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
+            if !decided || !site.pins : out.append_text("null")
+            else if copy && site.param != REGION_NONE : out.append_text(region_passed_name(site.param))
+            else if site.region != REGION_NONE : out.append_text(region_local_name(site.region))
+            else : out.append_text("null")
+        } else if kind == 'Q' {
+            // Whether the store pins: the region comes from the object that is stored into
+            let pin = f.pins.get(id - 1) ! f.func.exp.bug("Region token of an unknown store")
+            let pass = pin.pass
+            if !decided || pass == REGION_NONE || (pass >= REGION_PASSED && !copy) : out.append_text("null")
+            else : out.append_text("inttoptr (i64 1 to ptr)")
+        } else if kind == 'C' {
+            let call = f.calls.get(id - 1) ! f.func.exp.bug("Region token of an unknown call")
+            if !decided || !f.call_uses_copy(call, copy) {
+                out.append_text(ir_func_address(call.callee))
+                out.append_text("(")
+            } else {
+                out.append_text(region_copy_address(call.callee))
+                out.append_text("(")
+                each 0 .. call.pass_count as n {
+                    let pass = f.call_pass[call.pass_first + n]
+                    if n > 0 : out.append_text(", ")
+                    if pass == REGION_NONE || (pass >= REGION_PASSED && !copy) : out.append_text("ptr null")
+                    else if pass >= REGION_PASSED : out.append_text("ptr " + region_passed_name(pass - REGION_PASSED))
+                    else : out.append_text("ptr " + region_local_name(pass))
+                }
+                if call.has_args : out.append_text(", ")
+                if call.callee.unit != unit {
+                    let symbol = region_copy_address(call.callee)
+                    if !unit.region_declares.has(symbol) : unit.region_declares.set(symbol, region_copy_declare(call.callee, call.pass_count) !>)
+                }
+            }
+        } else if kind == 'E' {
+            if decided && copy {
+                each f.may_null as may, n {
+                    if may : out.append_text("  \%rg.on." + n + " = icmp ne ptr " + region_passed_name(n) + ", null\n")
+                }
+            }
+            if decided {
+                // A record of the thread's region stack each, given back in reverse
+                each f.regions as loop, i {
+                    out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
+                }
+                // The objects of the frame, each with its header
+                each f.sites as site, i {
+                    if site.stack : out.append_text("  " + region_frame_name(i + 1) + " = alloca [" + ((site.bytes + 15) / 8) + " x i64]\n")
+                }
+            }
+        } else if kind == 'X' {
+            if decided {
+                let i = f.regions.length
+                while i-- > 0 {
+                    out.append_text("  call void " + ir_func_address(runtime.exit) + "(ptr " + region_local_name(i) + ")\n")
+                }
+            }
+        } else if kind == 'L' {
+            if decided {
+                each f.regions as loop, i {
+                    if loop == id : out.append_text("  call void " + ir_func_address(runtime.reset) + "(ptr " + region_local_name(i) + ")\n")
+                }
+            }
+        } else {
+            f.func.exp.bug("Unknown region token")
+        }
+    }
+}
+
+// Writes the IR of a function once all is decided: its own form, and the copy when a caller uses it
+fn region_write_ir(func: Func, code: String, unit: Unit, out: ByteBuffer) !Error {
+    let f = func.region_facts
+    if !isset(f) || !f.has_tokens {
+        out.append_text(code)
+        return
+    }
+    region_patch(f, code, false, unit, out) !>
+    if f.needs_copy && func.ns.build.region_decided : region_patch(f, code, true, unit, out) !>
+}
+
+////////////////////////////
+// Report
+////////////////////////////
+
+fn region_print_report(build: Build) {
+    region_solve(build)
+    if !build.region_decided && build.region_funcs.length > 0 : println("The analysis did not settle (a compiler bug): nothing is in a region")
+    // One verdict per place in the source; a generic instance that is refused decides it
+    let verdicts = Map[String]{}
+    let places = Array[String]{}
+    let main_pkg = build.main_pkg
+    each build.region_funcs as func {
+        let f = func.region_facts ?! continue
+        f.solve()
+        each f.sites as site {
+            let src = site.src
+            let ns = src.ns
+            if !isset(ns) || ns.pkg != main_pkg : continue
+            let verdict = ""
+            if build.region_decided && site.stack {
+                verdict = "frame of " + func.name
+            } else if build.region_decided && site.region != REGION_NONE {
+                verdict = "region of " + func.name
+                if f.regions[site.region] != 0 : verdict += ", per round of a loop"
+            } else if build.region_decided && site.param != REGION_NONE && f.needs_copy {
+                verdict = "region of a caller"
+            } else if build.region_decided && site.param != REGION_NONE {
+                verdict = "heap: no caller keeps it in a region"
+            } else {
+                verdict = "heap: " + f.heap_reason(site.node)
+            }
+            let display = source_display(src)
+            let place = display.path + ":" + src.line_of(site.at) + "  " + site.name
+            let known = verdicts.get(place) !? ""
+            if known.length == 0 {
+                places.append(place)
+                verdicts.set(place, verdict)
+            } else if verdict.starts_with("heap") && !known.starts_with("heap") {
+                verdicts.set(place, verdict)
+            }
+        }
+        // A call of a function that makes its objects where the caller says
+        each f.calls as call {
+            let src = call.src ?! continue
+            let ns = src.ns
+            if !isset(ns) || ns.pkg != main_pkg : continue
+            let callee = call.callee.region_facts ?! continue
+            if f.lost || callee.lost || !callee.any_grows : continue
+            // The first group of the callee that this function has a region for decides
+            let actual = REGION_NONE
+            let pass = REGION_NONE
+            f.map_call(call, callee, false)
+            // What the callee makes says more than what it only pins for
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && callee.sum_made[g] && actual == REGION_NONE : actual = f.runtime.map[g]
+            }
+            each 0 .. callee.sum_reason.length as g {
+                if callee.grows(g) && actual == REGION_NONE : actual = f.runtime.map[g]
+            }
+            each 0 .. call.pass_count as n {
+                if pass == REGION_NONE : pass = f.call_pass[call.pass_first + n]
+            }
+            if pass == REGION_NONE : pass = call.pinned
+            if actual == REGION_NONE : continue
+            // Nothing to say about a call that only writes into objects of the frame
+            if pass == REGION_NONE && f.reason[f.find(actual)] == 0 && f.runtime.reach[f.find(actual)] == REGION_NONE : continue
+            let verdict = ""
+            if build.region_decided && pass != REGION_NONE && pass < REGION_PASSED {
+                verdict = "region of " + func.name
+                if f.regions[pass] != 0 : verdict += ", per round of a loop"
+            } else if build.region_decided && pass != REGION_NONE && f.needs_copy {
+                verdict = "region of a caller"
+            } else if build.region_decided && pass != REGION_NONE {
+                verdict = "heap: no caller keeps it in a region"
+            } else {
+                verdict = "heap: " + f.heap_reason(actual)
+            }
+            let display = source_display(src)
+            let place = display.path + ":" + src.line_of(call.at) + "  call of " + call.callee.name
+            let known = verdicts.get(place) !? ""
+            if known.length == 0 {
+                places.append(place)
+                verdicts.set(place, verdict)
+            } else if verdict.starts_with("heap") && !known.starts_with("heap") {
+                verdicts.set(place, verdict)
+            }
+        }
+    }
+    places.sort(fn(a: String, b: String) bool { return a < b })
+    let in_region: uint = 0
+    let in_frame: uint = 0
+    each places as place {
+        let verdict = verdicts.get(place) !? ""
+        println(place + "  " + verdict)
+        if verdict.starts_with("frame") : in_frame++
+        else if !verdict.starts_with("heap") : in_region++
+    }
+    println("")
+    println("%{places.length} places make objects, %in_region of them in a region, %in_frame in a frame (places in the source, not how often they run)")
+}

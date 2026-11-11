@@ -859,6 +859,36 @@ fn add_two(value: int) int $noinline { return value + 2 }
 
 These flags cannot be combined on the same function.
 
+Objects that provably stay in one scope are not given to the garbage collector: they are freed
+together when the scope ends. That includes what a loop adds to a list, when every object a round
+makes is added on every path and nothing is taken out or replaced in a loop:
+
+```rust
+fn numbers(count: int) Array[Item] {
+    let list = Array[Item]{}
+    each 0 .. count as i : list.append(Item { n: i })
+    return list
+}
+```
+
+Where the compiler cannot see that, such as a loop that fills a `Map` with `set`, the objects stay
+with the garbage collector, because whatever the loop no longer uses would stay until the scope
+ends. `$region` on a function says its loops may do that:
+
+```rust
+fn index(words: Array[String]) Map[Item] $region {
+    let found = Map[Item]{}
+    each words as word, i : found.set(word, Item { n: i.to(int) })
+    return found
+}
+```
+
+A small object that lives exactly as long as its scope is made in the frame of its function. A
+function that only makes a few other objects per call leaves them to the garbage collector, which
+frees such objects at no cost; `$region` asks for a region there too.
+
+`valk build --region-report` shows where each object lives and why.
+
 `$deprecated` keeps a function callable but warns at every call from another
 package. The warning quotes the sentence of the `///` block that starts with
 "Deprecated", so say what to use instead; `valk doc` shows the flag and editors

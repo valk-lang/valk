@@ -144,6 +144,10 @@ test-library: $(TEST_COMPILER)
 test-extend-access: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/extend-access/run.sh
 
+# Where `--region-report` says every object of a fixture lives
+test-regions: $(TEST_COMPILER)
+	@VALK=$(TEST_COMPILER) ./tests/regions/run.sh
+
 # The suite with a collection every 512 allocations: exposes values no root names
 test-gc-stress: $(TEST_COMPILER)
 	mkdir -p ./debug
@@ -181,7 +185,7 @@ api-baseline: valk
 test-http2: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./tests/http2/run.sh
 
-test-all: test test-http-direct test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2 test-api-compat test-probe
+test-all: test test-regions test-http-direct test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2 test-api-compat test-probe
 
 # The suites whose outcome depends on the host: the runtime, the linker and
 # the CLI's path handling. The front-end suites (compile errors, formatting,

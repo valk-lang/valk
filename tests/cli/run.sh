@@ -111,6 +111,22 @@ if [ "$opt_cache" != "$release_cache" ]; then
     exit 1
 fi
 
+echo "> A release build emitted in parts runs like a default build"
+parts_input="$DIR/../regions/fixture.valk"
+parts_out=$("$VALK" build "$parts_input" --no-warn -vvv -c --release -o "$output" 2>&1) || { echo "$parts_out"; exit 1; }
+release_says=$($TIMEOUT "$output")
+"$VALK" build "$parts_input" --no-warn -c -o "$output" >/dev/null 2>&1 || exit 1
+default_says=$($TIMEOUT "$output")
+if [ -z "$release_says" ] || [ "$release_says" != "$default_says" ]; then
+    echo "# Release output '$release_says', default output '$default_says'"
+    exit 1
+fi
+# One core emits the unit whole
+if [ "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)" -gt 1 ] && ! printf '%s\n' "$parts_out" | grep -Eq "emitted as [0-9]+ objects"; then
+    echo "# The release build was not emitted in parts"
+    exit 1
+fi
+
 if [ "$(uname -s)" = Linux ] && command -v readelf >/dev/null 2>&1; then
     echo "> Release builds leave out the symbol table and unused libraries"
     build --release >/dev/null || exit 1

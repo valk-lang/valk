@@ -1,0 +1,380 @@
+use mem
+use core
+
+// A region holds the objects of one scope that the compiler proved never leave it: they are
+// handed out by moving a cursor and all freed at once when the scope ends or starts a new
+// round. The collector never sees them: an object has the header of an object without a
+// block, and the proof includes that no collected object refers to one. The first objects
+// live next to the state, in a record of the thread's region stack.
+//
+// The header of a region object says where its region is, in the bits the collector uses as
+// a count for objects of its own: how far on the memory it was cut from ends. The word there
+// names the region, after the objects in the record and at the end of every chunk. Flags and
+// offset stay zero, as for anything the collector does not own.
+//
+// A region object may refer to data of the collector that holds no references itself, such as
+// the text a string is a part of. The collector does not look inside a region, so the region
+// pins that data: the owner of every such reference is kept where the collector does look,
+// in the record and in a list it names
+
+value REGION_HEAD (72)
+// Bytes of objects in the record, before the word that names the region
+value REGION_INLINE (176)
+// A record: the state, the first objects and that word
+value REGION_RECORD (256)
+// Records come in segments at addresses that are a multiple of their size; the first record
+// of a segment holds the next segment and the address the allocator gave
+value REGION_SEGMENT (65536)
+
+// The regions of a thread are a stack of records apart from the native stack: innermost
+// last, `region_top` is the next free one. In a frame, a region would be part of the frame
+// of whatever its function is inlined into, and a function that waits there for long would
+// show the collector the stale words of memory the region never used. Of the records below
+// `region_top`, the collector reads what they have pinned, and nothing else.
+//
+// The two are not given a value when a thread starts: they are zero as the thread's memory
+// comes, and the thread's own start-up takes records before it gets to its globals
+global region_top: uint (@undefined)
+global region_first: ?ptr (@undefined)
+value REGION_PINS (4)
+value REGION_CHUNK_HEAD (24)
+value REGION_CHUNK_MIN (4096)
+// Chunks double up to this size; a round that needed several asks for their sum the next time
+value REGION_CHUNK_MAX (4 * 1024 * 1024)
+// A header holds a distance of 32 bits. A chunk that several objects share stays below this
+// size, and the one object of a bigger chunk points back at the head of its chunk instead
+value REGION_CHUNK_FAR (2 * 1024 * 1024 * 1024)
+value REGION_HEADER_BACK (1 << 40)
+// The header of an object in a frame: not the collector's and in no region
+value REGION_HEADER_STACK (1 << 41)
+
+// Chunks of the smallest size that a region of this thread let go of, linked by their first
+// word: a function with a region that is called often would ask the allocator for one, and
+// give it back, on every call
+global region_spare: ?ptr (null)
+global region_spares: uint (0)
+value REGION_SPARE_MAX (8)
+
+struct Region {
+    cursor: ptr
+    // Where the memory ends that objects are cut from now: the word there is the region
+    limit: ptr
+    // Newest chunk from the allocator: [older chunk, bytes, the region] ... [the region]
+    chunk: ?ptr
+    // Bytes the chunks of the last round had together
+    hint: uint
+    // The owners pinned last, by their address, and the ones they pushed out
+    pin: [?ptr x 4]
+    // An Array[GcPtr], as an address: the stack scan finds it here
+    pins: ?ptr
+}
+
+// A record is ready for its first object from the day its segment is made, and a region
+// leaves it that way: taking one is a matter of moving `region_top`
+fn region_init() ptr $inline {
+    @unsafe
+    let r = region_top
+    if (r & (REGION_SEGMENT - 1)) == 0 : return region_next_segment(r)
+    region_top = r + REGION_RECORD
+    return r.@cast(ptr)
+}
+
+// The first record of the segment after the one that is full; `top` is 0 before the first
+fn region_next_segment(top: uint) ptr $noinline {
+    @unsafe
+    let full: ?ptr = top == 0 ? null : (top - REGION_SEGMENT).@cast(ptr)
+    let next: ?ptr = isset(full) ? @ptrv(full, ?ptr, 0) : region_first
+    if !isset(next) {
+        // Twice the size: a whole segment at a multiple of it fits in there
+        let raw = mem.calloc(REGION_SEGMENT * 2)
+        let base: ptr = ((raw.@cast(uint) + REGION_SEGMENT - 1) & (~(REGION_SEGMENT - 1)).to(uint)).@cast(ptr)
+        @ptrv(base, ptr, 1) = raw
+        let record: ptr = base + REGION_RECORD
+        while record < base + REGION_SEGMENT {
+            region_setup(record.@cast(*Region))
+            record += REGION_RECORD
+        }
+        if isset(full) : @ptrv(full, ?ptr, 0) = base
+        else : region_first = base
+        next = base
+    }
+    let r: ptr = next + REGION_RECORD
+    region_top = r.@cast(uint) + REGION_RECORD
+    return r
+}
+
+// The thread ends: its spare chunks go back, and its segments unless a region is still in use
+fn region_segments_free() {
+    @unsafe
+    let spare = region_spare
+    region_spare = null
+    region_spares = 0
+    while isset(spare) {
+        let older = @ptrv(spare, ?ptr, 0)
+        mem.free(spare)
+        spare = older
+    }
+    let first = region_first ?! return
+    if region_top != first.@cast(uint) + REGION_RECORD : return
+    region_first = null
+    region_top = 0
+    let at: ?ptr = first
+    while isset(at) {
+        let next = @ptrv(at, ?ptr, 0)
+        mem.free(@ptrv(at, ptr, 1))
+        at = next
+    }
+}
+
+fn region_setup(r: *Region) {
+    @unsafe
+    let base: ptr = r.@cast(ptr) + REGION_HEAD
+    r.cursor = base
+    r.limit = base + REGION_INLINE
+    @ptrv(base + REGION_INLINE, ptr) = r.@cast(ptr)
+    r.chunk = null
+    r.hint = 0
+    region_unpin(r)
+}
+
+// The region an object is in, null for one of the collector and for static data
+fn region_of(object: ptr) ?ptr $inline {
+    @unsafe
+    let item = object - 8
+    let header = @ptrv(item, uint)
+    if header == 0 || (header & 0xFFFF00FF00000000) != 0 : return null
+    if header >= REGION_HEADER_BACK {
+        if header >= REGION_HEADER_STACK : return null
+        return @ptrv(item - (header & 0xFFFFFFFF), ?ptr, 2)
+    }
+    return @ptrv(item + header, ?ptr)
+}
+
+// An object that lives exactly as long as the scope it is made in, small and of a known size:
+// the compiler reserved its memory in the frame. What it refers to is found by the scan of
+// the stack, so nothing is pinned for it. The second argument is the size `region_alloc` takes
+fn region_stack_object(slot: ptr, size: uint) ptr $inline {
+    @unsafe
+    @ptrv(slot, uint) = REGION_HEADER_STACK
+    return slot + 8
+}
+
+fn region_unpin(r: *Region) $inline {
+    @unsafe
+    r.pin[0] = null
+    r.pin[1] = null
+    r.pin[2] = null
+    r.pin[3] = null
+    r.pins = null
+}
+
+// `owner` is referred to by an object of the region from now on: it is kept until the region
+// ends or starts a new round. No region, no owner: the object is the collector's, or the
+// data is text of the program
+fn region_pin(region: ?ptr, owner: ?ptr) $inline {
+    @unsafe
+    if !isset(region) || !isset(owner) : return
+    let r = region.@cast(*Region)
+    let slot = (owner.@cast(uint) >> 4) & (REGION_PINS - 1)
+    if r.pin[slot] == owner : return
+    // Storage in a region lives as long as the region does, and static data for ever
+    if gcdata(owner).offset == 0 : return
+    region_pin_new(r, owner, slot)
+}
+
+// The write barrier for an object that may be in a region, when `pins` is set: what it now
+// refers to is pinned by the region the object is in
+fn region_property_set(pins: ?ptr, on_object: ptr, property_ref: ptr, value: ?ptr) $inline {
+    @unsafe
+    property_set(on_object, property_ref, value)
+    if isset(pins) && isset(value) : region_pin(region_of(on_object), value)
+}
+
+fn region_property_update(pins: ?ptr, on_object: ptr, property_ref: ptr, new_value: ?ptr) $inline {
+    @unsafe
+    property_update(on_object, property_ref, new_value)
+    if isset(pins) && isset(new_value) : region_pin(region_of(on_object), new_value)
+}
+
+fn region_pin_new(r: *Region, owner: ptr, slot: uint) $noinline {
+    @unsafe
+    let last = r.pin[slot]
+    r.pin[slot] = owner
+    if !isset(last) : return
+    let known = r.pins
+    let pins = isset(known) ? known.@cast(Array[GcPtr]) : Array[GcPtr].new(8)
+    r.pins = pins.@cast(ptr)
+    pins.append(last.@cast(GcPtr))
+}
+
+fn region_alloc(r: *Region, size: uint) ptr $inline {
+    @unsafe
+    // The object after its header, in whole words
+    let isize = (size + 15) & (~7).to(uint)
+    let item = r.cursor
+    let next = item + isize
+    let limit = r.limit
+    if next > limit : return region_grow(r, isize)
+    r.cursor = next
+    @ptrv(item, uint) = limit.@cast(uint) - item.@cast(uint)
+    return item + 8
+}
+
+// Storage of a slice: all zero, as the collector hands it out
+fn region_alloc_zeroed(r: *Region, size: uint) ptr {
+    @unsafe
+    let item = region_alloc(r, size)
+    mem.clear_bytes(item, size)
+    return item
+}
+
+fn region_grow(r: *Region, isize: uint) ptr $noinline {
+    @unsafe
+    let size = r.hint
+    r.hint = 0
+    let chunk = r.chunk
+    if isset(chunk) {
+        let twice = @ptrv(chunk, uint, 1) * 2
+        if twice > REGION_CHUNK_MAX : twice = REGION_CHUNK_MAX
+        if twice > size : size = twice
+    }
+    if size < REGION_CHUNK_MIN : size = REGION_CHUNK_MIN
+    if size > REGION_CHUNK_FAR : size = REGION_CHUNK_FAR
+    // Head, the object and the word after it
+    if size < isize + REGION_CHUNK_HEAD + 8 : size = isize + REGION_CHUNK_HEAD + 8
+    let spare = region_spare
+    let new: ptr = isset(spare) && size == REGION_CHUNK_MIN ? spare : mem.alloc(size)
+    if new == spare {
+        region_spare = @ptrv(new, ?ptr, 0)
+        region_spares--
+    }
+    let limit = new + size - 8
+    @ptrv(new, ?ptr, 0) = chunk
+    @ptrv(new, uint, 1) = size
+    @ptrv(new, ptr, 2) = r.@cast(ptr)
+    @ptrv(limit, ptr) = r.@cast(ptr)
+    r.chunk = new
+    let item = new + REGION_CHUNK_HEAD
+    r.cursor = item + isize
+    r.limit = limit
+    @ptrv(item, uint) = size > REGION_CHUNK_FAR ? REGION_HEADER_BACK | REGION_CHUNK_HEAD : limit.@cast(uint) - item.@cast(uint)
+    return item + 8
+}
+
+// A new round of the loop the region belongs to: nothing of the last round is in use
+fn region_reset(r: *Region) $inline {
+    @unsafe
+    // A round that made nothing leaves nothing to do
+    let cursor = r.cursor
+    let start: ptr = r.@cast(ptr) + REGION_HEAD
+    if cursor == start : return
+    #if GC_DEBUG
+    region_poison(r)
+    #end
+    region_unpin(r)
+    if isset(r.chunk) {
+        region_reset_chunks(r)
+        return
+    }
+    r.cursor = start
+}
+
+fn region_reset_chunks(r: *Region) $noinline {
+    @unsafe
+    let chunk = r.chunk ?! return
+    let older = @ptrv(chunk, ?ptr, 0)
+    if !isset(older) && @ptrv(chunk, uint, 1) <= REGION_CHUNK_FAR {
+        // One chunk held the round: the next one starts in it
+        r.cursor = chunk + REGION_CHUNK_HEAD
+        return
+    }
+    r.hint = region_free_chunks(r)
+}
+
+fn region_exit(r: *Region) $inline {
+    @unsafe
+    let start: ptr = r.@cast(ptr) + REGION_HEAD
+    if r.cursor != start {
+        // Debug builds always go there, to overwrite what the region gives up
+        #if GC_DEBUG
+        region_leave(r)
+        #else
+        if isset(r.chunk) || isset(r.pins) : region_leave(r)
+        #end
+        r.cursor = start
+        r.pin[0] = null
+        r.pin[1] = null
+        r.pin[2] = null
+        r.pin[3] = null
+    }
+    region_top = r.@cast(uint)
+}
+
+// The chunks go back, and a pin list keeps nothing when a stale word still names it
+fn region_leave(r: *Region) $noinline {
+    @unsafe
+    #if GC_DEBUG
+    region_poison(r)
+    #end
+    if isset(r.chunk) : region_free_chunks(r)
+    r.hint = 0
+    let pins = r.pins
+    if isset(pins) {
+        pins.@cast(Array[GcPtr]).clear()
+        r.pins = null
+    }
+}
+
+#if GC_DEBUG
+// Debug builds overwrite what a region gives up: an object that was wrongly kept reads as
+// an address that crashes at once, instead of as whatever is made there next
+value REGION_POISON (0xDDDDDDDDDDDDDDDD)
+
+fn region_poison(r: *Region) $noinline {
+    @unsafe
+    let base: ptr = r.@cast(ptr) + REGION_HEAD
+    region_poison_range(base, base + REGION_INLINE)
+    let chunk = r.chunk
+    // The newest chunk is used up to the cursor, the older ones are full
+    let end = r.cursor
+    while isset(chunk) {
+        region_poison_range(chunk + REGION_CHUNK_HEAD, end)
+        chunk = @ptrv(chunk, ?ptr, 0)
+        if isset(chunk) : end = chunk + @ptrv(chunk, uint, 1) - 8
+    }
+}
+
+fn region_poison_range(from: ptr, to: ptr) {
+    @unsafe
+    let at = from
+    while at < to {
+        @ptrv(at, uint) = REGION_POISON
+        at += 8
+    }
+}
+#end
+
+// Frees every chunk and returns their bytes; the region is as after region_init
+fn region_free_chunks(r: *Region) uint $noinline {
+    @unsafe
+    let total: uint = 0
+    let chunk = r.chunk
+    while isset(chunk) {
+        let older = @ptrv(chunk, ?ptr, 0)
+        let size = @ptrv(chunk, uint, 1)
+        total += size
+        if size == REGION_CHUNK_MIN && region_spares < REGION_SPARE_MAX {
+            @ptrv(chunk, ?ptr, 0) = region_spare
+            region_spare = chunk
+            region_spares++
+        } else {
+            mem.free(chunk)
+        }
+        chunk = older
+    }
+    let base: ptr = r.@cast(ptr) + REGION_HEAD
+    r.cursor = base
+    r.limit = base + REGION_INLINE
+    r.chunk = null
+    return total
+}
