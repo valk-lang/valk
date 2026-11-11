@@ -883,6 +883,9 @@ fn index(words: Array[String]) Map[Item] $region {
 }
 ```
 
+A function that only makes a few objects per call leaves them to the garbage collector, which
+frees such objects at no cost; `$region` asks for the region there too.
+
 `valk build --region-report` shows where each object lives and why.
 
 `$deprecated` keeps a function callable but warns at every call from another

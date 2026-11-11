@@ -983,6 +983,13 @@ and a thread keeps a few small chunks for the next region. A region is set
 up when its first object is made, so a call that makes none only takes a
 record and gives it back.
 
+A function gets no region for a number of objects that does not depend on its
+data: none made in a loop, and none by a callee of which that cannot be said.
+Taking a record and giving it back costs every call the same, an object costs
+about as much in a region as with the collector, and objects that are gone
+before the next collection cost the collector nothing. `$region` on the
+function asks for the region all the same.
+
 The records are not in the frame because the collector scans frames word by
 word. A region in a frame becomes part of the frame of whatever its function
 is inlined into, long before the region is set up, and a function that waits
