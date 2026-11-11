@@ -976,10 +976,19 @@ operation such as `close`.
 An object that provably stays in one scope is not given to the collector. It
 is made in a region: memory of that scope, freed as a whole when the function
 returns, or reused when the loop the scope is one round of starts its next
-round. The first 176 bytes of a region are in the frame; a region that grows
-past them takes chunks from the allocator, and a thread keeps a few small
-chunks for the next region. A region is set up when its first object is made,
-so a call that makes none pays two stores for it.
+round. A thread keeps the state of its regions in a stack of records apart
+from the native stack, innermost last. The first 176 bytes of a region are in
+its record; a region that grows past them takes chunks from the allocator,
+and a thread keeps a few small chunks for the next region. A region is set
+up when its first object is made, so a call that makes none only takes a
+record and gives it back.
+
+The records are not in the frame because the collector scans frames word by
+word. A region in a frame becomes part of the frame of whatever its function
+is inlined into, long before the region is set up, and a function that waits
+there (a parked coroutine, a thread on a lock) would show the collector the
+stale words of memory the region never used. A record that is not in use is
+all zero, and the collector scans only the records that are in use.
 
 The proof groups every value that holds references. Two values share a group
 when one can be the other. What an object refers to is not in its group: a

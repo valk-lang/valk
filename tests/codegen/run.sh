@@ -1301,10 +1301,11 @@ fi
 copy_body=$(sed -n '/^define .*__Node__tree__[0-9]*\.rg"(ptr %rg\.in\.0, /,/^}/p' "$region_ir")
 host_body=$(sed -n '/^define .*__in_region__[0-9]*"(/,/^}/p' "$region_ir")
 # Both forms of an allocation are written, behind a constant that picks one
+# The region is a record of the thread's region stack, not memory of the frame
 if [[ -z "$copy_body" || "$copy_body" == *'br i1 false, label %rg.object'* ]] \
     || [ "$(grep -c 'br i1 true, label %rg.object' <<< "$copy_body")" -ne 2 ] \
     || [ "$(grep -c 'call .*__Node__tree__[0-9]*\.rg"(ptr %rg\.in\.0, ' <<< "$copy_body")" -ne 2 ] \
-    || [[ "$host_body" != *' = alloca [32 x i64]'* || "$host_body" != *'__region_init__'* || "$host_body" != *'__region_exit__'* ]] \
+    || [[ "$host_body" == *' = alloca [32 x i64]'* || "$host_body" != *'%"rg.0" = call ptr @'*'__region_init__'* || "$host_body" != *'__region_exit__'* ]] \
     || [ "$(grep -c 'call .*__Node__tree__[0-9]*\.rg"(ptr %"rg\.0", ' <<< "$host_body")" -ne 1 ] \
     || grep -q 'call .*__Node__tree__[0-9]*"(' <<< "$host_body"; then
     echo "# The tree is not built in a region of in_region, or its copy still asks the collector"
