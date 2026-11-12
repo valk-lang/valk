@@ -95,6 +95,8 @@ struct Gc {
     props_removed: *Lifo (Lifo.new())
     // Blocks allocated into or freed from since the last collection
     touched_blocks: *Bump (Bump.new())
+    local_ranges: *BlockRegistry (BlockRegistry.new())
+    scan_ranges: *BlockRegistry (@undefined)
 
     // Native stacks
     stack_top: ptr (null_ptr())              // Highest address of the thread stack
@@ -224,6 +226,7 @@ struct Gc {
         if this.sweep_pending : this.sweep_shared()
 
         let pause_start = time.mono_us()
+        this.mem_new += flush_pool_accounting(this.alc_list_ptr[0])
         let marked_before = this.mem_marked
         let allocated = this.mem_new > marked_before ? this.mem_new - marked_before : 0
         this.unmarked_run = 0
@@ -530,6 +533,7 @@ struct Gc {
             let item = @ptrv(adr, GcItem)
             adr = adr.$offset(size_of(ptr))
             let data = gcdata(item)
+            data.slot_logs = 0
             if data.is_new() && !data.is_shared() {
                 let count, bytes = dis_own_children(item)
                 disowned += count
@@ -733,11 +737,14 @@ struct Gc {
     // stack while a coroutine runs, and each suspended coroutine
     fn scan_stacks(sp: ptr) {
         mark_alloc_limits(this.alc_list_ptr[0])
-        block_lock.lock()
-        sort_block_ranges()
-        let count = block_range_count()
+        let shared = this.scanning_shared
+        if shared : block_lock.lock()
+        let reg = shared ? shared_block_ranges : this.local_ranges
+        this.scan_ranges = reg
+        reg.sort()
+        let count = reg.count()
         if count > 0 {
-            let base = block_ranges.data
+            let base = reg.ranges.data
             this.scan_min = @ptrv(base, BlockRange, 0).start
             this.scan_max = @ptrv(base, BlockRange, count - 1).end
             let current = @ptrv(this.current_coro, ?coro.Coro)
@@ -757,7 +764,7 @@ struct Gc {
             }
             this.scan_regions()
         }
-        block_lock.unlock()
+        if shared : block_lock.unlock()
     }
 
     // What the regions of the thread have pinned (region.valk): the records below the top.
@@ -799,14 +806,15 @@ struct Gc {
     // MRU cache over the block registry: consecutive stack words usually land
     // in the same block, so recheck the last hit before binary searching
     fn find_root_range(word: ptr) ?*BlockRange {
-        let base = block_ranges.data
-        let count = block_range_count()
+        let reg = this.scan_ranges
+        let base = reg.ranges.data
+        let count = reg.count()
         let hint = this.scan_hint
         if hint < count {
             let cached: *BlockRange = base + hint * size_of(BlockRange)
             if word >= cached.start && word < cached.end : return cached
         }
-        let range = find_block_range(word) ?! return null
+        let range = reg.find(word) ?! return null
         this.scan_hint = (range.@cast(ptr) - base) / size_of(BlockRange)
         return range
     }
@@ -818,7 +826,7 @@ struct Gc {
         if word < data : return null
         let isize = @ptrv(block, uint, b_isize)
         let rel: uint = word - data
-        let slot: ptr = data + (rel - rel % isize)
+        let slot: ptr = data + ((rel * range.inv_isize) >> 48) * isize
         let gcd: *GcData = slot
         let item: ptr = slot + 8
         // A sequence's first word is its length, so no reference points into it: a word
@@ -830,7 +838,7 @@ struct Gc {
             let layout = @ptrv(block, ?ptr, b_layout)
             if isset(layout) && @ptrv(layout, uint, layout_kind) == 1 : return null
         }
-        if gcd.is_shared() : return item
+        if gcd.is_shared() : return this.scanning_shared ? item : null
         if range.gc != this.@cast(?*Gc) : return null
         if gcd.is_not_new() : return item
         if slot >= @ptrv(block, ptr, b_alloc_start) && slot < @ptrv(block, ptr, b_alloc_limit) && gcd.co_count != WINDOW_FREED : return item
@@ -945,6 +953,7 @@ struct Gc {
         this.updated_slots.free()
         this.blanks.free()
         this.touched_blocks.free()
+        this.local_ranges.free()
         this.foreign_dead.free()
         this.window_freed.free()
         this.dis_owned_list.free()

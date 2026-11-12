@@ -3,7 +3,7 @@
 use mem
 use core
 
-@shared unused_blocks: [ptr x 128]
+@shared unused_blocks: ?*Bump (null)
 shared pool_lock: core.SyncMutex (core.SyncMutex.new())
 
 value b_next (0)
@@ -89,21 +89,18 @@ fn loop_all_blocks(func: fnptr(*Block)()) {
 
 fn add_unused_block(block: *Block) {
     block.next = null
-    let index = get_pool_index_for_size(block.isize)
-    let list = @ptrv(unused_blocks, ?*Bump, index)
+    let list = unused_blocks
     if !isset(list) {
         list = Bump.new(32)
-        @ptrv(unused_blocks, ?*Bump, index) = list
+        unused_blocks = list
     }
     list.add_ptr(block)
 }
 
 fn free_empty_unused_blocks() {
     pool_lock.lock()
-    let i: uint = 0
-    while i < 128 {
-        let list = @ptrv(unused_blocks, ?*Bump, i++)
-        if !isset(list) : continue
+    let list = unused_blocks
+    if isset(list) && list.index > 0 {
         let start = list.data
         let end = list.data.$offset(list.index)
         list.reset()
@@ -127,123 +124,177 @@ fn free_empty_unused_blocks() {
 // Block registry
 //////////////////////////
 
-// Every pool block of every thread, so a word found on a native stack can be
-// resolved to the slot it points into. Guarded by block_lock, which is never
-// held while waiting on anything else. Registering appends and unregistering
-// leaves a hole (start == end); the array is sorted and compacted before a
-// lookup, so block churn costs little per block
+// Pool block address ranges, so a word found on a native stack can be resolved to
+// the slot it points into. Each thread keeps its own `local_ranges` for lock-free
+// local stack scans; `shared_block_ranges` holds every block of every thread under
+// `block_lock` for shared collections. Registering appends and unregistering leaves
+// a hole (start == end); the array is sorted and compacted before a lookup
 struct BlockRange {
     start: ptr
     end: ptr
     // Owning thread's gc; null once the thread is gone
     gc: ?*Gc
+    inv_isize: uint
+}
+
+struct BlockRegistry {
+    ranges: *Bump
+    // Appended since the last sort; a hole keeps the order, so lookups stay binary
+    unsorted: bool (false)
+    holes: bool (false)
+    // The ranges before this index are in order; the appended ones follow
+    sorted: uint (0)
+
+    static fn new(initial_cap: uint (64)) *BlockRegistry {
+        return mem.new[BlockRegistry](.{
+            ranges: Bump.new(initial_cap * size_of(BlockRange))
+        })
+    }
+
+    fn free() {
+        this.ranges.free()
+        mem.free(this)
+    }
+
+    fn count() uint $inline {
+        return this.ranges.index / size_of(BlockRange)
+    }
+
+    fn add(block: ptr, alloc_size: uint, owner: ?*Gc, inv_isize: uint) {
+        if !this.unsorted {
+            this.sorted = this.count()
+            this.unsorted = true
+        }
+        let adr = this.ranges.get(size_of(BlockRange))
+        @ptrv(adr, BlockRange) = BlockRange {
+            start: block
+            end: block + alloc_size
+            gc: owner
+            inv_isize: inv_isize
+        }
+    }
+
+    fn remove(block: ptr) {
+        // Holes keep the lookup binary; appended blocks need a sort
+        if this.unsorted : this.sort()
+        let range = this.find(block)
+        if isset(range) {
+            range.end = range.start
+            this.holes = true
+        }
+    }
+
+    fn release_owner(block: ptr) {
+        if this.unsorted : this.sort()
+        let range = this.find(block)
+        if isset(range) : range.gc = null
+    }
+
+    // Drops the holes, sorts the appended ranges on their own and merges them
+    // into the sorted ones from the back
+    fn sort() {
+        @unsafe
+        if !this.unsorted && !this.holes : return
+        let size = size_of(BlockRange)
+        let base = this.ranges.data
+        let count = this.count()
+        let sorted = this.unsorted ? this.sorted : count
+        let kept: uint = 0
+        let kept_sorted: uint = 0
+        let i: uint = 0
+        while i < count {
+            let range: *BlockRange = base + i * size
+            if range.start != range.end {
+                if kept != i : @ptrv(base, BlockRange, kept) = @ptrv(range, BlockRange)
+                kept++
+                if i < sorted : kept_sorted = kept
+            }
+            i++
+        }
+        this.ranges.index = kept * size
+        this.holes = false
+        if this.unsorted {
+            this.unsorted = false
+            let tail = kept - kept_sorted
+            sort_block_ranges_rec(base + kept_sorted * size, 0, tail)
+            if kept_sorted > 0 && tail > 0 {
+                let temp = mem.alloc(tail * size)
+                mem.copy_bytes(base + kept_sorted * size, temp, tail * size)
+                let a = kept_sorted
+                let b = tail
+                let w = kept
+                while b > 0 {
+                    w--
+                    if a > 0 && @ptrv(base, BlockRange, a - 1).start > @ptrv(temp, BlockRange, b - 1).start {
+                        a--
+                        @ptrv(base, BlockRange, w) = @ptrv(base, BlockRange, a)
+                    } else {
+                        b--
+                        @ptrv(base, BlockRange, w) = @ptrv(temp, BlockRange, b)
+                    }
+                }
+                mem.free(temp)
+            }
+        }
+        this.sorted = kept
+    }
+
+    // A binary search over the sorted ranges, and a linear one over the ones appended since
+    fn find(adr: ptr) ?*BlockRange {
+        let base = this.ranges.data
+        let count = this.count()
+        let sorted = this.unsorted ? this.sorted : count
+        let lo: uint = 0
+        let hi = sorted
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            let range: *BlockRange = base + mid * size_of(BlockRange)
+            if adr < range.start : hi = mid
+            else if adr >= range.end : lo = mid + 1
+            else : return range
+        }
+        let i = sorted
+        while i < count {
+            let range: *BlockRange = base + i * size_of(BlockRange)
+            if adr >= range.start && adr < range.end : return range
+            i++
+        }
+        return null
+    }
 }
 
 // Set in blocks_init only: the program assigns global initial values after the main thread's
 // gc started, and blocks are registered by then
-@shared block_ranges: *Bump (@undefined)
+@shared shared_block_ranges: *BlockRegistry (@undefined)
 @shared block_lock: *core.MutexStruct[void] (@undefined)
-// Appended since the last sort; a hole keeps the order, so lookups stay binary
-@shared block_ranges_unsorted: bool (@undefined)
-@shared block_ranges_holes: bool (@undefined)
-// The ranges before this index are in order; the appended ones follow
-@shared block_ranges_sorted: uint (@undefined)
 
 fn blocks_init() {
-    block_ranges = Bump.new(256 * size_of(BlockRange))
+    shared_block_ranges = BlockRegistry.new(256)
     block_lock = core.MutexStruct[void].new()
-    block_ranges_unsorted = false
-    block_ranges_holes = false
-    block_ranges_sorted = 0
 }
 
-fn block_range_count() uint $inline {
-    return block_ranges.index / size_of(BlockRange)
-}
-
-fn register_block(block: ptr, alloc_size: uint) {
+fn register_block(block: ptr, alloc_size: uint, slots_total: uint, isize: uint) {
+    let inv_isize: uint = slots_total <= 1 ? 0 : ((1.to(uint) << 48) + isize - 1) / isize
+    gc.local_ranges.add(block, alloc_size, gc, inv_isize)
     block_lock.lock()
-    if !block_ranges_unsorted {
-        block_ranges_sorted = block_range_count()
-        block_ranges_unsorted = true
-    }
-    let adr = block_ranges.get(size_of(BlockRange))
-    @ptrv(adr, BlockRange) = BlockRange {
-        start: block
-        end: block + alloc_size
-        gc: gc
-    }
+    shared_block_ranges.add(block, alloc_size, gc, inv_isize)
     block_lock.unlock()
 }
 
 fn unregister_block(block: ptr) {
-    block_lock.lock()
-    // Holes keep the lookup binary; appended blocks need a sort
-    if block_ranges_unsorted : sort_block_ranges()
-    let range = find_block_range(block)
-    if isset(range) {
-        range.end = range.start
-        block_ranges_holes = true
+    let owner = @ptrv(block, ?*Gc, b_owner)
+    if isset(owner) && !owner.did_shutdown {
+        owner.local_ranges.remove(block)
     }
+    block_lock.lock()
+    shared_block_ranges.remove(block)
     block_lock.unlock()
 }
 
 fn release_block_owner(block: ptr) {
     block_lock.lock()
-    // Holes keep the lookup binary; appended blocks need a sort
-    if block_ranges_unsorted : sort_block_ranges()
-    let range = find_block_range(block)
-    if isset(range) : range.gc = null
+    shared_block_ranges.release_owner(block)
     block_lock.unlock()
-}
-
-// Callers hold block_lock. Drops the holes, sorts the appended ranges on
-// their own and merges them into the sorted ones from the back
-fn sort_block_ranges() {
-    @unsafe
-    if !block_ranges_unsorted && !block_ranges_holes : return
-    let size = size_of(BlockRange)
-    let base = block_ranges.data
-    let count = block_range_count()
-    let sorted = block_ranges_unsorted ? block_ranges_sorted : count
-    let kept: uint = 0
-    let kept_sorted: uint = 0
-    let i: uint = 0
-    while i < count {
-        let range: *BlockRange = base + i * size
-        if range.start != range.end {
-            if kept != i : @ptrv(base, BlockRange, kept) = @ptrv(range, BlockRange)
-            kept++
-            if i < sorted : kept_sorted = kept
-        }
-        i++
-    }
-    block_ranges.index = kept * size
-    block_ranges_holes = false
-    if block_ranges_unsorted {
-        block_ranges_unsorted = false
-        let tail = kept - kept_sorted
-        sort_block_ranges_rec(base + kept_sorted * size, 0, tail)
-        if kept_sorted > 0 && tail > 0 {
-            let temp = mem.alloc(tail * size)
-            mem.copy_bytes(base + kept_sorted * size, temp, tail * size)
-            let a = kept_sorted
-            let b = tail
-            let w = kept
-            while b > 0 {
-                w--
-                if a > 0 && @ptrv(base, BlockRange, a - 1).start > @ptrv(temp, BlockRange, b - 1).start {
-                    a--
-                    @ptrv(base, BlockRange, w) = @ptrv(base, BlockRange, a)
-                } else {
-                    b--
-                    @ptrv(base, BlockRange, w) = @ptrv(temp, BlockRange, b)
-                }
-            }
-            mem.free(temp)
-        }
-    }
-    block_ranges_sorted = kept
 }
 
 fn sort_block_ranges_rec(base: ptr, lo: uint, hi: uint) {
@@ -285,42 +336,27 @@ fn sort_block_ranges_rec(base: ptr, lo: uint, hi: uint) {
     }
 }
 
-// Callers hold block_lock. A binary search over the sorted ranges, and a
-// linear one over the ones appended since
-fn find_block_range(adr: ptr) ?*BlockRange {
-    let base = block_ranges.data
-    let count = block_range_count()
-    let sorted = block_ranges_unsorted ? block_ranges_sorted : count
-    let lo: uint = 0
-    let hi = sorted
-    while lo < hi {
-        let mid = (lo + hi) / 2
-        let range: *BlockRange = base + mid * size_of(BlockRange)
-        if adr < range.start : hi = mid
-        else if adr >= range.end : lo = mid + 1
-        else : return range
-    }
-    let i = sorted
-    while i < count {
-        let range: *BlockRange = base + i * size_of(BlockRange)
-        if adr >= range.start && adr < range.end : return range
-        i++
-    }
-    return null
-}
-
 #if TEST
 /// Test helper: whether the block registry is in order after a sort and finds every block of
 /// the calling thread's pools.
 + fn block_registry_ok_for_test() bool {
+    let local_reg = gc.local_ranges
+    local_reg.sort()
     block_lock.lock()
-    sort_block_ranges()
+    shared_block_ranges.sort()
     let ok = true
-    let base = block_ranges.data
-    let count = block_range_count()
+    let base = shared_block_ranges.ranges.data
+    let count = shared_block_ranges.count()
     let i: uint = 1
     while i < count {
         if @ptrv(base, BlockRange, i - 1).start >= @ptrv(base, BlockRange, i).start : ok = false
+        i++
+    }
+    let lbase = local_reg.ranges.data
+    let lcount = local_reg.count()
+    i = 1
+    while i < lcount {
+        if @ptrv(lbase, BlockRange, i - 1).start >= @ptrv(lbase, BlockRange, i).start : ok = false
         i++
     }
     let adr = alc_list.data
@@ -330,7 +366,8 @@ fn find_block_range(adr: ptr) ?*BlockRange {
         adr += size_of(ptr)
         let block = alc.first
         while isset(block) {
-            if !isset(find_block_range(block)) : ok = false
+            if !isset(shared_block_ranges.find(block)) : ok = false
+            if !isset(local_reg.find(block)) : ok = false
             block = @ptrv(block, ?ptr, b_next)
         }
     }

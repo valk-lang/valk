@@ -3031,6 +3031,8 @@ type EnvCloneFn (fnptr(ptr)(ptr))
 + fn collect_shared_if_threshold_reached() void
 // Returns the largest count of `item`-byte elements, at least `count`, whose storage of `prefix` bytes plus the elements still fits the GC size class that `count` of them need.
 + fn fit_count(prefix: uint, item: uint, count: uint) uint
+// Flushes buffered allocation counts on the calling thread.
++ fn flush_allocations() void
 // Takes the calling thread's GC lock again after `unlock`.
 + fn lock() void
 // Returns the bytes held by the GC pool blocks of all threads, including free slots.

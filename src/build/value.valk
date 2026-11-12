@@ -1929,7 +1929,11 @@ fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_acces
     if plain.is_gc_type() {
         let make = value_clone_make_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
         if defers : return make
-        return value_clone_top_func(key, type, make, owner, at) !>
+        let direct: ?Func = null
+        if type_clone_is_unique_tree(type, copy_shared, Array[Class]{}) && isset(valk_idf(ctx.build, "core", "clone_is_outer") !? null) {
+            direct = value_clone_direct_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+        }
+        return value_clone_top_func(key, type, make, direct, owner, at) !>
     }
 
     // A struct is copied by value: it has no identity to keep
@@ -2070,8 +2074,87 @@ fn value_clone_fill_func(key: String, type: Type, class: Class, owner: Func, at:
     return fill
 }
 
+// Whether an outer clone of `type` can never visit any structural GC object twice:
+// no structural GC class appears more than once or inside a multi-element container
+fn type_clone_is_unique_tree(type: Type, copy_shared: bool, seen: Array[Class], allow_structural: bool (true)) bool {
+    let t = type.get_non_nullable()
+    if t.is_shared && !copy_shared : return true
+    if !t.has_gc_refs() && t.kind != TYPE.closure : return true
+    if t.kind == TYPE.closure || t.kind == TYPE.interface : return false
+    let string_class = type_string(t.build).get_class_or_null()
+    let class = value_member_class(t)
+    if isset(string_class) && class == string_class : return true
+    if isset(class) && class.atomic && !copy_shared : return true
+    if isset(class) && isset(class.get_clone_hook()) {
+        let base_name = (class.generic_from ?? class).name
+        if class.ns.pkg.name == "valk" && class.ns.name == "core" && (base_name == "Array" || base_name == "HashMap" || base_name == "ByteBuffer") {
+            let args = class.generic_types ?! return true
+            each args as arg {
+                if !type_clone_is_unique_tree(arg, copy_shared, seen, false) : return false
+            }
+            return true
+        }
+        return false
+    }
+    if t.kind == TYPE.ref_slice && !isset(t.class) {
+        let sub = t.get_sub_type() ?! return true
+        return type_clone_is_unique_tree(sub, copy_shared, seen, false)
+    }
+    if t.is_fixed_array_type() {
+        if t.length == 0 : return true
+        let sub = t.get_sub_type() ?! return true
+        return type_clone_is_unique_tree(sub, copy_shared, seen, t.length == 1 && allow_structural)
+    }
+    if t.kind == TYPE.union || (t.kind == TYPE.struct && t.is_inline && !isset(t.class)) {
+        let members = t.get_members() ?! return true
+        each members as member {
+            if member.is_null_alt() : continue
+            if !type_clone_is_unique_tree(member, copy_shared, seen, allow_structural) : return false
+        }
+        return true
+    }
+    if isset(class) && t.is_structural_type() {
+        if t.is_gc_type() {
+            if !allow_structural || seen.contains(class) : return false
+            seen.append(class)
+        }
+        each class.props as prop {
+            if !type_clone_is_unique_tree(prop.type, clone_copies_shared(copy_shared, prop.type), seen, allow_structural) : return false
+        }
+        return true
+    }
+    return false
+}
+
+// Single-pass clone for an acyclic unique-class tree when no outer clone is active
+fn value_clone_direct_func(key: String, type: Type, class: Class, owner: Func, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool, view_hooks: bool) Func !Error {
+    let b = owner.ns.build
+    let direct_key = key + ":direct"
+    b.cache.clone_funcs.get(direct_key) -> cached : return cached
+    let plain = type.plain_type()
+    let direct = value_clone_helper(owner, "<clone_direct." + class.name + "." + helper.ctxhash(direct_key) + ">", plain, at)
+    b.cache.clone_funcs.set(direct_key, direct)
+    append_func_arg(direct, "value", type)
+    bind_func_arg_decls(direct) !>
+    let body_scope = direct.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(direct)
+    let value_arg = direct.args.get(0) ! at.bug("Clone helper is missing its value")
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        field.rett = type.storage_view_of(prop.type)
+        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+        prop.type.compat_check(cloned.rett, at) !>
+        fields.set(prop, cloned)
+    }
+    let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
+    body_scope.append_value(vgen_return(result, b, at))
+    value_clone_helper_finish(owner, direct) !>
+    return direct
+}
+
 // A clone outside a fill: makes the copy, then fills everything it queued
-fn value_clone_top_func(key: String, type: Type, make: Func, owner: Func, at: Exp) Func !Error {
+fn value_clone_top_func(key: String, type: Type, make: Func, direct: ?Func, owner: Func, at: Exp) Func !Error {
     let b = owner.ns.build
     let top_key = key + ":top"
     b.cache.clone_funcs.get(top_key) -> cached : return cached
@@ -2083,6 +2166,13 @@ fn value_clone_top_func(key: String, type: Type, make: Func, owner: Func, at: Ex
     let body_scope = top.body_scope ?! at.bug("Clone helper has no body")
     let inner_ctx = Context.for_func(top)
     let value_arg = top.args.get(0) ! at.bug("Clone helper is missing its value")
+    if isset(direct) {
+        let is_outer_f = value_clone_core_func(b, "clone_is_outer", at) !>
+        let cond = vgen_call(inner_ctx, vgen_func(is_outer_f), Array[Value]{}, is_outer_f.get_rett(), body_scope)
+        let fast_call = vgen_call(inner_ctx, vgen_func(direct), Array[Value]{ vgen_decl(value_arg.decl) }, plain, body_scope)
+        let fast_body = Array[Value]{ vgen_return(fast_call, b, at) }
+        body_scope.append_value(vgen_if(cond, fast_body, null, b, at))
+    }
     let begin_f = value_clone_core_func(b, "clone_begin", at) !>
     let end_f = value_clone_core_func(b, "clone_end", at) !>
 

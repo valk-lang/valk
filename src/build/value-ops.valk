@@ -471,6 +471,7 @@ fn value_publish_copy(value: Value, ctx: Context, scope: Scope, target: Type) Va
         at.error("Cannot copy '" + value.rett.compat_display_name() + "' into '" + target.compat_display_name()
             + "': it has properties marked '-' or '~', interface values, raw memory or a resource released by 'gc_free', and no 'clone' method to copy it")
     }
+    if value_is_fresh_unaliased_call(value, ctx) : return value
     // `$clone` hooks run as on shared data, so they cannot hand back the original's parts
     return value_clone(value, ctx, scope, at, false, false, true, true) !>
 }
@@ -499,7 +500,7 @@ fn value_publish_needs_no_copy(value: Value) bool {
     if t == VAL.call {
         let callee = value.value1 ?! return false
         let func = callee.resolve_call_func() ?! return false
-        return func.is_clone_hook || func.name.starts_with("<clone.")
+        return func.is_clone_hook || func.name.starts_with("<clone.") || func.name.starts_with("<clone_top.") || func.name.starts_with("<clone_direct.")
     }
     // An object made from a raw pointer is unsafe code's own claim
     if t == VAL.cast {
@@ -508,6 +509,197 @@ fn value_publish_needs_no_copy(value: Value) bool {
         return inner_nn.is_raw_pointer() || inner_nn.kind == TYPE.ptr_of
     }
     return false
+}
+
+fn type_is_publish_isolated(type: Type) bool {
+    if !type_refs_all_shared(type) : return false
+    return !type_has_raw_or_borrow_pointer(type)
+}
+
+fn type_has_raw_or_borrow_pointer(type: Type) bool {
+    let t = type.get_non_nullable()
+    if t.is_raw_pointer() || t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of || t.is_bare_borrow() || t.is_fat_borrow() : return true
+    if !t.is_inline : return false
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type() ?! return false
+        return type_has_raw_or_borrow_pointer(sub)
+    }
+    let class = t.get_class_or_null()
+    let members = t.get_members()
+    if isset(members) && !isset(class) {
+        each members as member {
+            if type_has_raw_or_borrow_pointer(member) : return true
+        }
+        return false
+    }
+    if isset(class) && class.kind == CLASS_KIND.struct {
+        each class.props as prop {
+            if type_has_raw_or_borrow_pointer(prop.type) : return true
+        }
+    }
+    return false
+}
+
+fn type_has_user_clone_hook(type: Type, seen: Array[Class]) bool {
+    let nn = type.get_non_nullable()
+    if nn.kind == TYPE.closure || nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow() || nn.is_fat_borrow() : return true
+    let class = value_member_class(nn)
+    if isset(class) {
+        if seen.contains(class) : return false
+        seen.append(class)
+        if isset(class.get_clone_hook()) {
+            let base_name = (class.generic_from ?? class).name
+            if class.ns.pkg.name == "valk" && class.ns.name == "core" && (base_name == "Array" || base_name == "HashMap" || base_name == "ByteBuffer" || base_name == "String") {
+                let args = class.generic_types ?! return false
+                each args as arg {
+                    if type_has_user_clone_hook(arg, seen) : return true
+                }
+                return false
+            }
+            return true
+        }
+        if nn.is_structural_type() {
+            each class.props as prop {
+                if type_has_user_clone_hook(prop.type, seen) : return true
+            }
+        }
+        return false
+    }
+    if nn.kind == TYPE.ref_slice || nn.is_fixed_array_type() {
+        let sub = nn.get_sub_type() ?! return false
+        return type_has_user_clone_hook(sub, seen)
+    }
+    if nn.kind == TYPE.union || (nn.kind == TYPE.struct && nn.is_inline) {
+        let members = nn.get_members() ?! return false
+        each members as member {
+            if member.is_null_alt() : continue
+            if type_has_user_clone_hook(member, seen) : return true
+        }
+    }
+    return false
+}
+
+fn func_is_known_isolated_stdlib(func: Func) bool {
+    if func.ns.pkg.name != "valk" : return false
+    let ns = func.ns.name
+    if ns == "gc" {
+        let n = func.name
+        return n == "property_get" || n == "property_set" || n == "property_update" || n == "property_remove" || n == "fit_count" || n == "moved_elements" || n == "transfer_refs"
+    }
+    if ns == "mem" {
+        let n = func.name
+        return n == "copy_bytes" || n == "move_bytes" || n == "clear_bytes" || n == "equals_bytes" || n == "identity"
+    }
+    if ns == "core" {
+        let class = func.class ?! return false
+        let base_name = (class.generic_from ?? class).name
+        return base_name == "Array" || base_name == "HashMap" || base_name == "ByteBuffer" || base_name == "String" || class.kind == CLASS_KIND.slice || class.kind == CLASS_KIND.integer || class.kind == CLASS_KIND.float || class.kind == CLASS_KIND.boolean
+    }
+    return false
+}
+
+fn func_record_isolation(func: Func) {
+    if func.is_extern || func.capture_decls.length > 0 || func.info_calls_unknown_code || func.has_globals_loop {
+        func.isolated_state = 2
+        return
+    }
+    let body_scope = func.body_scope ?! {
+        func.isolated_state = 2
+        return
+    }
+    if !body_scope.did_return {
+        func.isolated_state = 2
+        return
+    }
+    each body_scope.values as item {
+        if !value_tree_locally_isolated(item) {
+            func.isolated_state = 2
+            return
+        }
+    }
+    let defer_scope = func.defer_scope
+    if isset(defer_scope) {
+        each defer_scope.values as item {
+            if !value_tree_locally_isolated(item) {
+                func.isolated_state = 2
+                return
+            }
+        }
+    }
+    func.isolated_state = 1
+}
+
+fn value_tree_locally_isolated(value: Value) bool {
+    let t = value.type
+    if t == VAL.global || t == VAL.co || t == VAL.await || t == VAL.lock_block || t == VAL.atomic_store || t == VAL.atomic_op || t == VAL.atomic_load : return false
+    if t == VAL.cast {
+        let inner = value.value1
+        if value.rett.has_gc_refs() && isset(inner) {
+            if !inner.rett.has_gc_refs() : return false
+            if inner.rett.get_non_nullable().is_shared && !value.rett.get_non_nullable().is_shared : return false
+        }
+    }
+    if t == VAL.call {
+        if value.call_kind != CALL_KIND.direct : return false
+        let callee = value.value1 ?! return false
+        if callee.type != VAL.func || !isset(callee.func) : return false
+    }
+    let pre = value.get_pre_value()
+    if isset(pre) && !value_tree_locally_isolated(pre) : return false
+    let v1 = value.value1
+    if isset(v1) && !value_tree_locally_isolated(v1) : return false
+    let v2 = value.value2
+    if isset(v2) && !value_tree_locally_isolated(v2) : return false
+    let list = value.values
+    if isset(list) {
+        each list as item {
+            if !value_tree_locally_isolated(item) : return false
+        }
+    }
+    return true
+}
+
+// Direct call whose inputs carry no mutable local references and whose body touches
+// no globals, coroutines or unknown targets: every mutable object it returns is fresh
+fn value_is_fresh_unaliased_call(value: Value, ctx: Context) bool {
+    let caller = ctx.func ?! return false
+    if !caller.info_used || caller.is_local_check || ctx.build.silent > 0 || !ctx.build.options.needs_ir() : return false
+    if value.type != VAL.call || value.call_kind != CALL_KIND.direct : return false
+    let callee = value.value1 ?! return false
+    if callee.type != VAL.func : return false
+    let func = callee.func ?! return false
+    let receiver = callee.value1
+    if isset(receiver) && !type_is_publish_isolated(receiver.rett) : return false
+    each func.args as arg {
+        if !type_is_publish_isolated(arg.type) : return false
+    }
+    if type_has_user_clone_hook(value.rett, Array[Class]{}) : return false
+    return func_body_is_isolated(func, Array[Func]{})
+}
+
+fn func_body_is_isolated(func: Func, seen: Array[Func]) bool {
+    if func_is_known_isolated_stdlib(func) : return true
+    if func.isolated_state == 3 : return true
+    if func.isolated_state == 2 : return false
+    if func.is_extern || func.capture_decls.length > 0 : return false
+    if !func.parsed_ast {
+        mark_func_used(func)
+        parse_func_ast(func) ! return false
+    }
+    if func.isolated_state == 3 : return true
+    if func.isolated_state != 1 : return false
+    if seen.contains(func) : return true
+    if seen.length >= 16 : return false
+    seen.append(func)
+    each func.effect_callees as sub {
+        if !func_body_is_isolated(sub, seen) {
+            seen.pop_last() _
+            return false
+        }
+    }
+    seen.pop_last() _
+    if seen.length == 0 : func.isolated_state = 3
+    return true
 }
 
 fn value_is_capture_free_func(value: Value) bool {
