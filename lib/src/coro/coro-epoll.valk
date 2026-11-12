@@ -1,6 +1,7 @@
 // Linux coroutine backend: epoll. A waited descriptor is armed for one event at a time; the
-// socket of a connection stays armed, edge-triggered, so its waits cost no system call. Sleeps
-// and I/O timeouts are a heap of deadlines that bounds the event wait.
+// socket of a connection stays armed, edge-triggered, so its waits cost no system call, and a
+// read that emptied it lets the next one wait without asking the socket first. Sleeps and I/O
+// timeouts are a heap of deadlines that bounds the event wait.
 
 #if EPOLL
 
@@ -20,10 +21,19 @@ value POLL_GAP_NS (20_000)
 global fd_waiters: Array[uint] (.new(64))
 // Per descriptor number: the owner (see `next_owner`) whose socket is in the epoll set for good,
 // edge-triggered, 0 for none. An owner is the one object that holds the socket, so a number
-// that comes back for another socket never matches
+// that comes back for another socket never matches. Two flags sit above the owner
 global fd_owners: Array[uint] (.new(64))
 shared owner_count: uint (0)
 value OWNED_EVENTS (io.EPOLLIN | io.EPOLLOUT | io.EPOLLRDHUP | io.EPOLLET)
+// The owner's last read emptied the socket and no event reported input since: a read finds
+// nothing until one does
+value OWNER_EMPTY (1 << 62)
+// The socket reported an error or its peer's end of input. No later event has to follow, so
+// it never counts as empty again
+value OWNER_CLOSED (1 << 61)
+value OWNER_FLAGS (OWNER_EMPTY | OWNER_CLOSED)
+value INPUT_EVENTS (io.EPOLLIN | io.EPOLLRDHUP | io.EPOLLHUP | io.EPOLLERR)
+value CLOSED_EVENTS (io.EPOLLRDHUP | io.EPOLLHUP | io.EPOLLERR)
 // Coroutines with a deadline, the nearest first: a binary heap
 global timers: Array[Coro] (.new(16))
 global last_poll: uint (0)
@@ -56,7 +66,7 @@ extend Coro {
         }
         let slot = fd.to(uint)
         // An owner's socket is in the set for good: its next event comes without a system call
-        if owner == 0 || (fd_owners.get(slot) !? 0) != owner {
+        if owner == 0 || ((fd_owners.get(slot) !? 0) & ~OWNER_FLAGS) != owner {
             let error = fd_arm(fd, events, owner)
             if error != 0 {
                 // A regular file cannot be polled: it is always ready
@@ -83,20 +93,22 @@ extend Coro {
         let events: [u8 x (io.EPOLL_EVENT_SIZE * EVENT_BATCH)] = @undefined
         let base = @ref(events[0]).@cast(ptr)
         expire_parks()
-        run_timers()
+        let now = time.mono_ns()
+        run_timers(now)
         let count: i32 = 0
         let failed = false
+        let waited = false
         if run_coros.length > 0 {
             // Coroutines that only hand the thread to each other would pay a system call per
             // round: events wait at most POLL_GAP_NS for them
-            let now = time.mono_ns()
             if now - last_poll < POLL_GAP_NS : return
             last_poll = now
             count = io.epoll_wait_ns(base, EVENT_BATCH, 0)
             failed = count < 0 && ext.get_errno() != ext.EINTR
         } else {
+            waited = true
             // The nearest deadline, of a timer or a park, bounds the wait
-            let wait_ns = timer_wait_ns()
+            let wait_ns = timer_wait_ns(now)
             let park_ms = park_wait_ms()
             if park_ms != uint.$max && park_ms < wait_ns / 1_000_000 : wait_ns = park_ms * 1_000_000
             gc.unlock()
@@ -117,7 +129,7 @@ extend Coro {
             }
             fd_event(data.to(Fd), event.read_u32_le())
         }
-        run_timers()
+        if waited && timers.length > 0 : run_timers(time.mono_ns())
     }
 }
 
@@ -181,6 +193,12 @@ fn fd_arm(fd: Fd, events: u32, owner: uint) i32 {
 // for them the descriptor is armed again, unless it is an owner's and stays armed
 fn fd_event(fd: Fd, events: u32) {
     let slot = fd.to(uint)
+    let owned = fd_owners.get(slot) !? 0
+    if owned != 0 && (events & INPUT_EVENTS) != 0 {
+        let now = owned & ~OWNER_EMPTY
+        if (events & CLOSED_EVENTS) != 0 : now = now | OWNER_CLOSED
+        if now != owned : fd_owners.set(slot, now) _
+    }
     let waiter = first_waiter(fd_waiters.get(slot) !? 0)
     if !isset(waiter) : return
     // An error or a hang-up ends every wait
@@ -202,8 +220,21 @@ fn fd_event(fd: Fd, events: u32) {
     fd_waiters.set(slot, 1) _
     if !isset(stay) : return
     fd_waiters.set(slot, stay.event_id() | 3) _
-    if (fd_owners.get(slot) !? 0) != 0 : return
+    if owned != 0 : return
     if io.epoll_arm(fd, left, false) != 0 : fd_closing(fd)
+}
+
+// Whether a read of the socket of `owner` finds nothing: its last read emptied it and no
+// input was reported since. The read then waits for the next event without asking the socket
+fn fd_input_empty(fd: Fd, owner: uint) bool {
+    return (fd_owners.get(fd.to(uint)) !? 0) == owner | OWNER_EMPTY
+}
+
+// A read just emptied the socket of `owner`: a stream socket, where a read that got less
+// than it asked for took all there was
+fn fd_input_drained(fd: Fd, owner: uint) {
+    let slot = fd.to(uint)
+    if (fd_owners.get(slot) !? 0) == owner : fd_owners.set(slot, owner | OWNER_EMPTY) _
 }
 
 // `fd` closes, or closed: the coroutines of this thread that wait for it wake with an error
@@ -308,9 +339,7 @@ fn timer_down(index: uint, coro: Coro) {
 }
 
 // Runs the coroutines whose deadline passed; a descriptor wait ends as timed out
-fn run_timers() {
-    if timers.length == 0 : return
-    let now = time.mono_ns()
+fn run_timers(now: uint) {
     while true {
         let coro = timers.get(0) ! break
         if coro.timer_at > now : break
@@ -325,9 +354,8 @@ fn run_timers() {
 }
 
 // Nanoseconds until the nearest deadline, uint.$max when there is none
-fn timer_wait_ns() uint {
+fn timer_wait_ns(now: uint) uint {
     let coro = timers.get(0) ! return uint.$max
-    let now = time.mono_ns()
     return coro.timer_at > now ? coro.timer_at - now : 0
 }
 
