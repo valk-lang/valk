@@ -1,7 +1,8 @@
-// Linux coroutine backend: epoll. A waited descriptor is armed for one event at a time; the
-// socket of a connection stays armed, edge-triggered, so its waits cost no system call, and a
-// read that emptied it lets the next one wait without asking the socket first. Sleeps and I/O
-// timeouts are a heap of deadlines that bounds the event wait.
+// Linux coroutine backend: epoll. A waited descriptor is armed for one event at a time. The
+// socket of a connection stays armed, edge-triggered, so its waits cost no system call, and
+// once a read emptied it the event loop does its receives and sends: those of one round in a
+// row, not each between the work of two coroutines. Sleeps and I/O timeouts are a heap of
+// deadlines that bounds the event wait.
 
 #if EPOLL
 
@@ -37,6 +38,8 @@ value CLOSED_EVENTS (io.EPOLLRDHUP | io.EPOLLHUP | io.EPOLLERR)
 // Coroutines with a deadline, the nearest first: a binary heap
 global timers: Array[Coro] (.new(16))
 global last_poll: uint (0)
+// Coroutines whose send waits for the end of the round
+global pending_sends: Array[Coro] (.new(16))
 
 extend Coro {
     // The descriptor wait this coroutine is in: what it waits for (0: none), and the next
@@ -44,6 +47,15 @@ extend Coro {
     fd_wait_fd: Fd (-1)
     fd_wait_events: u32 (0)
     fd_wait_next: ?Coro (null)
+    // A receive the event loop does for this coroutine once its socket reports input: the
+    // result goes to `completion_res`, a byte count or a negative error number
+    fd_recv_buf: ?ptr (null)
+    fd_recv_size: uint (0)
+    // A send the event loop does for this coroutine at the end of the round, before the wait
+    // above goes on (see `flush_sends`): the bytes sent, or a negative error number
+    fd_send_buf: ?ptr (null)
+    fd_send_size: uint (0)
+    fd_send_done: int (0)
     // Monotonic ns at which its sleep ends or its wait times out, and its place in `timers`
     // plus one (0: no deadline)
     timer_at: uint (0)
@@ -92,6 +104,7 @@ extend Coro {
         @unsafe
         let events: [u8 x (io.EPOLL_EVENT_SIZE * EVENT_BATCH)] = @undefined
         let base = @ref(events[0]).@cast(ptr)
+        if pending_sends.length > 0 : flush_sends()
         expire_parks()
         let now = time.mono_ns()
         run_timers(now)
@@ -208,7 +221,7 @@ fn fd_event(fd: Fd, events: u32) {
     while isset(waiter) {
         let next = waiter.fd_wait_next
         let wanted = waiter.fd_wait_events | closed
-        if (events & wanted) != 0 {
+        if (events & wanted) != 0 && fd_receive(waiter, fd, slot) {
             fd_wait_end(waiter, (events & wanted).@cast(io.PollEvent))
         } else {
             waiter.fd_wait_next = stay
@@ -237,6 +250,64 @@ fn fd_input_drained(fd: Fd, owner: uint) {
     if (fd_owners.get(slot) !? 0) == owner : fd_owners.set(slot, owner | OWNER_EMPTY) _
 }
 
+// Does the receive `waiter` asked for, if any, so the receives of a round follow each other
+// without the coroutines' own work in between. False when nothing was there: it waits on
+fn fd_receive(waiter: Coro, fd: Fd, slot: uint) bool {
+    @unsafe
+    let buf = waiter.fd_recv_buf ?! return true
+    let size = waiter.fd_recv_size
+    while true {
+        let got = ext.recv(fd, buf, size, ext.MSG_DONTWAIT)
+        if got >= 0 {
+            waiter.completion_res = got
+            // Less than asked for: that emptied the socket
+            let owned = fd_owners.get(slot) !? 0
+            if got > 0 && got.to(uint) < size && (owned & OWNER_CLOSED) == 0 : fd_owners.set(slot, owned | OWNER_EMPTY) _
+            break
+        }
+        let error = ext.get_errno()
+        if error == ext.EINTR : continue
+        if error == ext.EAGAIN {
+            let owned = fd_owners.get(slot) !? 0
+            if (owned & OWNER_CLOSED) == 0 : fd_owners.set(slot, owned | OWNER_EMPTY) _
+            return false
+        }
+        waiter.completion_res = 0 - error
+        break
+    }
+    waiter.fd_recv_buf = null
+    return true
+}
+
+// Sends what coroutines left for the end of the round, one send after the other: system calls
+// in a row cost less than each between the work of two coroutines. A coroutine whose data
+// went out whole waits on for its input; another one runs, and deals with the rest
+fn flush_sends() {
+    @unsafe
+    each pending_sends as coro {
+        // Null: its wait ended in the meantime
+        let buf = coro.fd_send_buf ?! continue
+        coro.fd_send_buf = null
+        let size = coro.fd_send_size
+        let sent: int = 0
+        while true {
+            sent = ext.send(coro.fd_wait_fd, buf, size, ext.MSG_DONTWAIT | ext.MSG_NOSIGNAL)
+            if sent >= 0 || ext.get_errno() != ext.EINTR : break
+        }
+        if sent < 0 {
+            let error = ext.get_errno()
+            sent = error == ext.EAGAIN ? 0 : 0 - error
+        }
+        coro.fd_send_done = sent
+        if sent >= 0 && sent.to(uint) == size : continue
+        fd_wait_leave(coro)
+        timer_remove(coro)
+        coro.poll_event = 0
+        run_coros.append(coro)
+    }
+    pending_sends.clear()
+}
+
 // `fd` closes, or closed: the coroutines of this thread that wait for it wake with an error
 // and POLLNVAL. The number may name another descriptor by the time they run, so they must
 // not use it again
@@ -258,6 +329,8 @@ fn fd_closing(fd: Fd) {
 fn fd_wait_end(coro: Coro, result: io.PollEvent) {
     coro.fd_wait_events = 0
     coro.fd_wait_next = null
+    coro.fd_recv_buf = null
+    coro.fd_send_buf = null
     timer_remove(coro)
     coro.poll_event = result
     run_coros.append(coro)
@@ -282,6 +355,7 @@ fn fd_wait_leave(coro: Coro) {
     }
     coro.fd_wait_events = 0
     coro.fd_wait_next = null
+    coro.fd_recv_buf = null
 }
 
 //////////////////////
