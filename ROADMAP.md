@@ -5,9 +5,9 @@
 
 ```
 - Release 0.8.6
-+ HTTP server: `Server.http2 = true` without `tls` serves cleartext HTTP/2 (`h2c` prior knowledge); `Server.reuse_port` opens one `SO_REUSEPORT` listener per worker on Linux and macOS; `add_static_dir` takes `prefix:` (such as `"/static"`), and `compress = true` serves up-to-date `.br` and `.gz` sidecar files next to static files on HTTP/1.1 and HTTP/2
-+ HTTP: `query_param(name)` on `Request` and `Context` reads one query parameter without parsing the rest into a map, `Route.param(path, name)` reads one route parameter the same way, and `Router` looks up static paths in a map before walking parameterized routes
-+ Faster HTTP/2, WebSocket, JSON and TLS: HTTP/2 frames are read in place and written straight into the output buffer, HPACK decodes Huffman codes through a 4-bit table, streams are reused, idle HTTP/2 reads wait without a 20 ms poll, and one coroutine drains a connection's ready streams and flushes once unless a handler suspends; WebSocket echoes batch every frame already in the read buffer into one send and mask and check UTF-8 8 bytes at a time; `json.encode` reuses a buffer of the thread and checks 8 bytes at a time for escapes, and TLS connections read 16 KB records into kept 16 KB response buffers (HttpArena, 6 cores: `echo-ws-pipeline` 1.16M -> 15.46M req/s, `baseline-h2c` 1.67M -> 4.99M, `baseline-h2` 1.52M -> 4.43M, `json-h2c` 429k -> 954k, `json-tls` 241k -> 343k)
++ HTTP server: cleartext HTTP/2 (`Server.http2 = true` without `tls`), per-worker `SO_REUSEPORT` listeners, `prefix:` on `add_static_dir`, and precompressed `.br` / `.gz` static files
++ HTTP: `query_param(name)` on `Request` and `Context`, `Route.param(path, name)`, and faster static route lookups in `Router`
++ Faster HTTP/2, WebSocket, JSON encoding and TLS
 + Linux: when io_uring is not permitted or unavailable at runtime, `--io uring` (the default) falls back to epoll automatically; `--io epoll` builds with epoll alone without liburing, and `make test-epoll` runs the suite on it
 + Linux: a program that gets no io_uring reports the kernel's error (not permitted, not supported, no memory) instead of always blaming the locked-memory limit
 
