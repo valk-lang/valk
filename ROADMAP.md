@@ -5,7 +5,7 @@
 
 ```
 - Release 0.8.6
-+ Linux: `--io epoll` builds a program that waits for files, sockets and timers with epoll instead of io_uring, for containers and sandboxes that do not permit io_uring; `--io uring` stays the default. `make test-epoll` runs the suite on it
++ Linux: when io_uring is not permitted or unavailable at runtime, `--io uring` (the default) falls back to epoll automatically; `--io epoll` builds with epoll alone without liburing, and `make test-epoll` runs the suite on it
 + Linux: a program that gets no io_uring reports the kernel's error (not permitted, not supported, no memory) instead of always blaming the locked-memory limit
 
 + Release 0.8.5

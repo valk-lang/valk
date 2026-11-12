@@ -53,7 +53,7 @@ fn LoadAcceptEx(s: ext.SOCKET) AcceptExFn !NetError {
 #end
 
 // `ipv6` is the listener's family; the accepted socket must match it on Windows
-fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0)) Fd !NetError {
+fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0), owner: uint (0)) Fd !NetError {
     #if OS == "win"
     @unsafe
     let family: i32 = ipv6 ? ext.AF_INET6 : ext.AF_INET
@@ -98,30 +98,33 @@ fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0)) Fd !NetError {
 
     return fd
 
-    #elif URING
+    #elif OS == "linux"
     @unsafe
-
+    if io.use_epoll_backend() {
+        while true {
+            let fd = ext.accept4(sock_fd, null, null, ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK)
+            if fd >= 0 : return fd
+            let err = ext.get_errno()
+            // A connection that ended while it waited in the queue: on to the next
+            if err == ext.EINTR || err == ext.ECONNABORTED : continue
+            if err == ext.EMFILE || err == ext.ENFILE : throw .max_connections
+            if err != ext.EAGAIN : throw .init
+            let ev = io.await_owned_fd(sock_fd, true, false, timeout_ms, owner)
+            if ev.is_timeout() : throw .timeout
+            if io.is_gone(ev) : throw .closed
+        }
+        throw .init
+    }
+    #if URING
     let coro = coro.current_coro.@cast(coro.Coro)
     let sqe = io.sqe(coro) ! throw .os
-    io.io_uring_prep_accept(sqe, sock_fd, null, 0, ext.SOCK_CLOEXEC)
+    io.io_uring_prep_accept(sqe, sock_fd, null, 0, ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK)
     io.link_timeout(coro, sqe, timeout_ms) ! throw .os
     coro.yield()
     return accept_completion_result(coro.completion_res) !>
-    #elif EPOLL
-    @unsafe
-    while true {
-        let fd = ext.accept4(sock_fd, null, null, ext.SOCK_CLOEXEC)
-        if fd >= 0 : return fd
-        let err = ext.get_errno()
-        // A connection that ended while it waited in the queue: on to the next
-        if err == ext.EINTR || err == ext.ECONNABORTED : continue
-        if err == ext.EMFILE || err == ext.ENFILE : throw .max_connections
-        if err != ext.EAGAIN : throw .init
-        let ev = io.await_fd(sock_fd, true, false, timeout_ms)
-        if ev.is_timeout() : throw .timeout
-        if io.is_gone(ev) : throw .closed
-    }
+    #else
     throw .init
+    #end
     #elif OS == "macos"
     while true {
         let fd = ext.accept(sock_fd, null, null)
@@ -239,7 +242,23 @@ fn connect(fd: Fd, addr: AddrInfo, timeout_ms: uint (5000)) !NetError {
         throw .connect
     }
 
-    #elif URING
+    #elif OS == "linux"
+    @unsafe
+    if io.use_epoll_backend() {
+        if ext.connect(fd, addr.sock_addr(), addr.addr_len()) != 0 {
+            let error = ext.get_errno()
+            if error != ext.EINPROGRESS && error != ext.EINTR : throw .connect
+            // The attempt goes on without us: the socket is writable once it ended, either way
+            let ev = io.await_fd(fd, false, true, timeout_ms)
+            if ev.is_timeout() : throw .timeout
+            if io.is_gone(ev) : throw .connect
+            let failed: i32 = 0
+            let size: u32 = size_of(i32)
+            if ext.getsockopt(fd, ext.SOL_SOCKET, ext.SO_ERROR, @ref(failed).@cast(ptr), @ref(size)) != 0 || failed != 0 : throw .connect
+        }
+        return
+    }
+    #if URING
     let coro = coro.current_coro.@cast(coro.Coro)
     let sqe = io.sqe(coro) !>
     io.io_uring_prep_connect(sqe, fd, addr.sock_addr(), addr.addr_len())
@@ -248,20 +267,7 @@ fn connect(fd: Fd, addr: AddrInfo, timeout_ms: uint (5000)) !NetError {
     let res = coro.completion_res
     if res == 0 - ext.ETIMEDOUT : throw .timeout
     if res < 0 : throw .connect
-
-    #elif EPOLL
-    @unsafe
-    if ext.connect(fd, addr.sock_addr(), addr.addr_len()) != 0 {
-        let error = ext.get_errno()
-        if error != ext.EINPROGRESS && error != ext.EINTR : throw .connect
-        // The attempt goes on without us: the socket is writable once it ended, either way
-        let ev = io.await_fd(fd, false, true, timeout_ms)
-        if ev.is_timeout() : throw .timeout
-        if io.is_gone(ev) : throw .connect
-        let failed: i32 = 0
-        let size: u32 = size_of(i32)
-        if ext.getsockopt(fd, ext.SOL_SOCKET, ext.SO_ERROR, @ref(failed).@cast(ptr), @ref(size)) != 0 || failed != 0 : throw .connect
-    }
+    #end
 
     #elif OS == "macos"
     @unsafe
@@ -339,8 +345,39 @@ fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000), owner: ui
     }
     throw .read
 
-    #elif URING
+    #elif OS == "linux"
     @unsafe
+    if io.use_epoll_backend() {
+        while true {
+            // A socket known to be empty is not asked: the wait comes first
+            if !stream || !io.owned_input_empty(fd, owner) {
+                let rcvd = ext.recv(fd, buf, amount, ext.MSG_DONTWAIT)
+                if rcvd >= 0 {
+                    if stream && rcvd > 0 && rcvd.to(uint) < amount : io.owned_input_drained(fd, owner)
+                    return rcvd.to(uint)
+                }
+                let error = ext.get_errno()
+                if error == ext.EINTR : continue
+                if error != ext.EAGAIN : throw .read
+                if stream : io.owned_input_drained(fd, owner)
+            }
+            if stream && io.owned_input_empty(fd, owner) {
+                // The event loop receives when input comes, together with the round's other receives
+                let ev, got = io.await_owned_recv(fd, buf, amount, timeout_ms, owner)
+                if ev.is_timeout() : throw .timeout
+                if io.is_gone(ev) : throw .closed
+                if got >= 0 : return got.to(uint)
+                if got != io.NOT_RECEIVED : throw .read
+                continue
+            }
+            // Woken for an error or a hang-up too: the next receive reports it
+            let ev = io.await_owned_fd(fd, true, false, timeout_ms, owner)
+            if ev.is_timeout() : throw .timeout
+            if io.is_gone(ev) : throw .closed
+        }
+        throw .read
+    }
+    #if URING
     let sqe = io.sqe(coro) ! throw .os
     io.io_uring_prep_recv(sqe, fd, buf, amount.to(u32), 0)
     io.link_timeout(coro, sqe, timeout_ms) ! throw .os
@@ -350,37 +387,9 @@ fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000), owner: ui
     if rcvd == 0 - ext.ETIMEDOUT : throw .timeout
     if rcvd < 0 : throw .read
     return rcvd.to(uint)
-
-    #elif EPOLL
-    @unsafe
-    while true {
-        // A socket known to be empty is not asked: the wait comes first
-        if !stream || !io.owned_input_empty(fd, owner) {
-            let rcvd = ext.recv(fd, buf, amount, ext.MSG_DONTWAIT)
-            if rcvd >= 0 {
-                if stream && rcvd > 0 && rcvd.to(uint) < amount : io.owned_input_drained(fd, owner)
-                return rcvd.to(uint)
-            }
-            let error = ext.get_errno()
-            if error == ext.EINTR : continue
-            if error != ext.EAGAIN : throw .read
-            if stream : io.owned_input_drained(fd, owner)
-        }
-        if stream && io.owned_input_empty(fd, owner) {
-            // The event loop receives when input comes, together with the round's other receives
-            let ev, got = io.await_owned_recv(fd, buf, amount, timeout_ms, owner)
-            if ev.is_timeout() : throw .timeout
-            if io.is_gone(ev) : throw .closed
-            if got >= 0 : return got.to(uint)
-            if got != io.NOT_RECEIVED : throw .read
-            continue
-        }
-        // Woken for an error or a hang-up too: the next receive reports it
-        let ev = io.await_owned_fd(fd, true, false, timeout_ms, owner)
-        if ev.is_timeout() : throw .timeout
-        if io.is_gone(ev) : throw .closed
-    }
+    #else
     throw .read
+    #end
 
     #elif OS == "win"
     @unsafe
@@ -474,14 +483,14 @@ fn send_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000), owner: ui
         let error = ext.get_errno()
         if error == ext.EINTR : continue
         if error != ext.EAGAIN : throw .write
-        #if EPOLL
-        // Woken for an error or a hang-up too: the next send reports it
-        let ev = io.await_owned_fd(fd, false, true, timeout_ms, owner)
-        if ev.is_timeout() : throw .timeout
-        if io.is_gone(ev) : throw .closed
-        #else
+        if io.use_epoll_backend() {
+            // Woken for an error or a hang-up too: the next send reports it
+            let ev = io.await_owned_fd(fd, false, true, timeout_ms, owner)
+            if ev.is_timeout() : throw .timeout
+            if io.is_gone(ev) : throw .closed
+            continue
+        }
         break
-        #end
     }
     #if URING
     let sqe = io.sqe(coro) ! throw .os

@@ -4,12 +4,86 @@
 // row, not each between the work of two coroutines. Sleeps and I/O timeouts are a heap of
 // deadlines that bounds the event wait.
 
-#if EPOLL
+#if OS == "linux"
 
 use ext
 use io
 use gc
 use time
+
+#if URING
+// Events that belong to no coroutine (see `io.side_user_data`). The low bits of their payload
+// name a channel of this thread, the rest is the channel owner's
+value SIDE_CHANNEL_BITS (6)
+value SIDE_CHANNELS (64)
+
+struct SideEvent {
+    data: uint
+    res: i32
+    flags: u32
+    // The ring it completed on (see `io.add_direct_ring`)
+    ring: uint
+}
+
+// One owner's queue of side events, and the coroutine that waits for them
+class SideChannel {
+    id: uint
+    events: Array[SideEvent] (.new(64))
+    waiter: ?Coro (null)
+
+    // The payload of a side event for this channel, carrying `data` (24 bits)
+    fn payload(data: uint) uint {
+        return this.id | (data << SIDE_CHANNEL_BITS)
+    }
+
+    // Waits until events are queued, or until `wake`
+    fn wait() {
+        if this.events.length > 0 : return
+        let current = current_coro ?! return
+        this.waiter = current
+        current.yield()
+    }
+
+    fn wake() {
+        let waiter = this.waiter ?! return
+        this.waiter = null
+        run_coros.append(waiter)
+    }
+
+    // Events for the channel are dropped from now on; its waiter wakes
+    fn close() {
+        if (side_channels.get(this.id) !? null) == this : side_channels.set(this.id, null) _
+        this.wake()
+    }
+}
+
+global side_channels: Array[?SideChannel] (.{})
+// Ids are handed out in turn, so a late event of a closed channel does not reach a new one
+global side_next: uint (1)
+
+// A new channel of this thread; null when all are taken
+fn side_channel() ?SideChannel {
+    while side_channels.length < SIDE_CHANNELS : side_channels.append(null)
+    let tries: uint = 0
+    while tries++ < SIDE_CHANNELS {
+        let id = side_next
+        side_next = side_next % (SIDE_CHANNELS - 1) + 1
+        if isset(side_channels.get(id) !? null) : continue
+        let channel = SideChannel { id: id }
+        side_channels.set(id, channel) _
+        return channel
+    }
+    return null
+}
+
+fn side_deliver(payload: uint, res: i32, flags: u32, ring: uint) {
+    let id = payload & (SIDE_CHANNELS - 1)
+    if id == 0 : return
+    let channel = (side_channels.get(id) !? null) ?! return
+    channel.events.append(SideEvent { data: payload >> SIDE_CHANNEL_BITS, res: res, flags: flags, ring: ring })
+    channel.wake()
+}
+#end
 
 // Events taken per wait
 value EVENT_BATCH (128)
@@ -61,7 +135,17 @@ extend Coro {
     timer_at: uint (0)
     timer_slot: uint (0)
 
+    #if !URING
     fn sleep(ns: uint) {
+        this.sleep_epoll(ns)
+    }
+
+    static fn wait_for_events() {
+        SELF.wait_for_events_epoll()
+    }
+    #end
+
+    fn sleep_epoll(ns: uint) {
         let now = time.mono_ns()
         timer_add(this, ns > uint.$max - now ? uint.$max : now + ns)
         this.yield()
@@ -100,7 +184,7 @@ extend Coro {
     }
 
     // Takes events from the thread's epoll set, blocking when no coroutine is runnable
-    static fn wait_for_events() {
+    static fn wait_for_events_epoll() {
         @unsafe
         let events: [u8 x (io.EPOLL_EVENT_SIZE * EVENT_BATCH)] = @undefined
         let base = @ref(events[0]).@cast(ptr)
@@ -118,6 +202,7 @@ extend Coro {
             last_poll = now
             count = io.epoll_wait_ns(base, EVENT_BATCH, 0)
             failed = count < 0 && ext.get_errno() != ext.EINTR
+            if count == EVENT_BATCH : last_poll = 0
         } else {
             waited = true
             // The nearest deadline, of a timer or a park, bounds the wait
@@ -142,7 +227,11 @@ extend Coro {
             }
             fd_event(data.to(Fd), event.read_u32_le())
         }
-        if waited && timers.length > 0 : run_timers(time.mono_ns())
+        if waited {
+            let after = time.mono_ns()
+            last_poll = count == EVENT_BATCH ? 0 : after
+            if timers.length > 0 : run_timers(after)
+        }
     }
 }
 

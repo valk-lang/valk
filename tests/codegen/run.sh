@@ -48,6 +48,7 @@ queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --
 queue_ir "$workdir/alias-tags.ll" "$DIR/alias-tags.valk" --ir --no-warn
 queue_ir "$workdir/atomic-alignment.ll" "$DIR/atomic-alignment.valk" --ir --no-warn
 for target in linux-x64 linux-arm64; do queue_ir "$workdir/http-epoll-$target.ll" "$DIR/http-epoll.valk" --target "$target" --ir --no-warn; done
+for target in linux-x64 linux-arm64; do queue_ir "$workdir/io-epoll-$target.ll" "$DIR/http-epoll.valk" --target "$target" --io epoll --ir --no-warn; done
 queue_ir "$workdir/vectors.ll" "$DIR/vectors.valk" --ir --no-warn
 queue_ir "$workdir/pointer-integer-compare.ll" "$DIR/pointer-integer-compare.valk" --target win-x64 --ir --no-warn
 queue_ir "$workdir/windows-bool.ll" "$DIR/windows-bool.valk" --target win-x64 --ir --no-warn
@@ -108,6 +109,23 @@ for target in linux-x64 linux-arm64; do
         || grep -q 'getelementptr i64,' <<< "$watch_body"; then
         echo "# Epoll slot decoding assumes integer alignment on $target"
         echo "$watch_body"
+        exit 1
+    fi
+done
+
+echo "> Build the epoll backend on Linux x64 and arm64 without liburing"
+
+for target in linux-x64 linux-arm64; do
+    epoll_ir="$workdir/io-epoll-$target.ll"
+    out=$(ir_result "$epoll_ir")
+    if [ "$?" -ne 0 ]; then
+        echo "# Failed to build --io epoll fixture for $target"
+        echo "$out"
+        exit 1
+    fi
+    if grep -q 'io_uring_' "$epoll_ir"; then
+        echo "# --io epoll emitted io_uring declarations on $target"
+        grep 'io_uring_' "$epoll_ir"
         exit 1
     fi
 done
@@ -1315,5 +1333,5 @@ if [[ -z "$copy_body" || "$copy_body" == *'br i1 false, label %rg.object'* ]] \
 fi
 
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 51"
+echo "# Test count: 52"
 echo ""

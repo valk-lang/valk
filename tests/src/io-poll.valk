@@ -5,6 +5,7 @@ use valk.io
 use valk.ext
 use valk.time
 use valk.net
+use valk.http
 
 test "IO: descriptor polling honours its timeout" {
     assert(io.await_fd_timeout_for_test(20))
@@ -144,6 +145,24 @@ test "IO: a read from an empty pipe in blocking mode lets other coroutines run" 
     assert(ext.close(pipe[1]) == 0)
 }
 
+synctest "IO: two coroutines reading a blocking pipe do not stall when one takes the only byte" {
+    @unsafe
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    let first = co poll_read_byte(pipe[0])
+    let second = co poll_read_byte(pipe[0])
+    time.sleep_ms(5)
+    let byte: u8 = 1
+    assert(ext.write(pipe[1], @ref(byte), 1) == 1)
+    // Only one reader took the byte; the second must wait again without blocking the thread
+    time.sleep_ms(10)
+    assert(ext.write(pipe[1], @ref(byte), 1) == 1)
+    assert(await first == 1)
+    assert(await second == 1)
+    assert(ext.close(pipe[0]) == 0)
+    assert(ext.close(pipe[1]) == 0)
+}
+
 global sleep_order: Array[uint] (.{})
 global sleep_waits_ready: uint (0)
 
@@ -185,7 +204,6 @@ synctest "Time: sleeps end in the order of their length, also when timed waits e
 
 #if EPOLL
 test "IO: closing a descriptor ends the waits for it" {
-    @unsafe
     let pipe: [i32 x 2] = { -1... }
     assert(ext.pipe(@ref(pipe)) == 0)
     let waiting = co io.await_fd(pipe[0], true, false, 2000 * TIME_SCALE)
@@ -285,7 +303,6 @@ synctest "TCP: a connection on the number of one that waited before gets its own
 }
 
 synctest "IO: a descriptor on the number of a connection that waited before is polled as itself" {
-    @unsafe
     let server = net.tcp_server("127.0.0.1", 9350) !!
     let old, old_peer = poll_waited_connection(server, 9350)
     let number = old.fd
@@ -450,4 +467,121 @@ synctest "TCP: connections that wait for every answer keep getting them" {
     assert(poll_echo_done == 8)
     server.close() !!
 }
+
+fn poll_http_handler(req: http.Request) http.Response {
+    return http.Response.text("ep:" + req.path)
+}
+
+test "HTTP: parked keep-alive connections serve paused, pipelined and closing clients" {
+    let server = http.Server.new("127.0.0.1", 9357, poll_http_handler)
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(10)
+
+    let first = net.tcp_client("127.0.0.1", 9357) !!
+    let second = net.tcp_client("127.0.0.1", 9357) !!
+    let first_in = ByteBuffer.new(256)
+    let second_in = ByteBuffer.new(256)
+
+    first.write("GET /a0 HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    second.write("GET /b0 HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    assert(keep_alive_read_response(first, first_in) == "ep:/a0")
+    assert(keep_alive_read_response(second, second_in) == "ep:/b0")
+    time.sleep_ms(20)
+
+    first.write("GET /a1 HTTP/1.1\r\nHost: localhost\r\n\r\nGET /a2 HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+    second.close() !!
+    assert(keep_alive_read_response(first, first_in) == "ep:/a1")
+    assert(keep_alive_read_response(first, first_in) == "ep:/a2")
+    time.sleep_ms(20)
+
+    first.write("GET /a3 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") !!
+    assert(keep_alive_read_response(first, first_in) == "ep:/a3")
+    first.close() ! {}
+}
+
+#if URING
+use valk.core
+use valk.sync
+use valk.thread
+
+fn poll_fallback_http_handler(req: http.Request) http.Response {
+    return http.Response.text("fb:" + req.path)
+}
+
+fn poll_fallback_accept_once(server: atomic net.TcpServer) bool {
+    let local = server.accept(5000 * TIME_SCALE) ! return false
+    let buf = [u8]{ 0 x 16 }
+    let got = local.read(buf) ! return false
+    if buf.view(0, got).to_string() != "epoll-ok" : return false
+    let sent = local.write_many(.{ "re", "ply" }) ! return false
+    local.close() ! return false
+    return sent == 5
+}
+
+fn poll_fallback_worker(to_worker: atomic sync.Channel[String], from_worker: atomic sync.Channel[String]) bool {
+    if !io.is_epoll_backend_for_test() : return false
+    time.sleep_ms(5)
+
+    let pipe: [i32 x 2] = { -1... }
+    if ext.pipe(@ref(pipe)) != 0 : return false
+    co feed_pipe_later(pipe[1])
+    let read_ok = poll_read_byte(pipe[0]) == 1
+    ext.close(pipe[0])
+    ext.close(pipe[1])
+    if !read_ok : return false
+
+    let tcp = net.tcp_server("127.0.0.1", 9355) ! return false
+    let accepted = co poll_fallback_accept_once(tcp)
+    let client = net.tcp_client("127.0.0.1", 9355) ! return false
+    if (client.write_many(.{ "ep", "oll", "-ok" }) !? 0) != 8 : return false
+    let reply = [u8]{ 0 x 16 }
+    let reply_len = client.read(reply) !? 0
+    client.close() ! {}
+    if !(await accepted) || reply.view(0, reply_len).to_string() != "reply" {
+        tcp.close() ! {}
+        return false
+    }
+    tcp.close() ! return false
+
+    let proc = core.Process.output("echo", .{ "fallback-ok" }) ! return false
+    if proc.code != 0 || proc.stdout.trim("\n") != "fallback-ok" : return false
+
+    let http_server = http.Server.new("127.0.0.1", 9356, poll_fallback_http_handler)
+    let serving = co http_server.start(1)
+    time.sleep_ms(10)
+    from_worker.send("ready") ! {
+        stop_http_test_server(http_server, serving)
+        return false
+    }
+    let msg = to_worker.recv(5000 * TIME_SCALE) !? ""
+    stop_http_test_server(http_server, serving)
+    return msg == "done"
+}
+
+synctest "IO: a thread falls back to epoll at runtime when io_uring is blocked" {
+    let to_worker: atomic sync.Channel[String] = sync.Channel[String].new(2) !!
+    let from_worker: atomic sync.Channel[String] = sync.Channel[String].new(2) !!
+    io.set_force_epoll_for_test(true)
+    defer io.set_force_epoll_for_test(false)
+
+    let worker = thread.Thread[bool].start(fn() bool {
+        return poll_fallback_worker(to_worker, from_worker)
+    }) !!
+
+    assert((from_worker.recv(5000 * TIME_SCALE) !? "") == "ready")
+
+    let client = net.tcp_client("127.0.0.1", 9356) !!
+    let input = ByteBuffer.new(256)
+    each 0 .. 3 as i {
+        client.write("GET /r" + i + " HTTP/1.1\r\nHost: localhost\r\n\r\n") !!
+        assert(keep_alive_read_response(client, input) == "fb:/r" + i)
+        time.sleep_ms(15)
+    }
+    client.close() ! {}
+
+    to_worker.send("done") !!
+    assert(worker.await())
+}
+#end
 #end
