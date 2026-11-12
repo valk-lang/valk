@@ -541,3 +541,185 @@ test "HTTP2: SETTINGS change open streams' windows once, and an intermediate ove
     server.request_shutdown(1000)
     await running !!
 }
+
+test "HTTP2: cleartext h2c prior-knowledge, lazy headers, query_param and peer_address" {
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        let host = req.header("Host") !? ""
+        let custom = req.header("X-Custom") !? ""
+        let q = req.query_param("m") !? ""
+        let c1 = req.cookie("a") !? ""
+        let c2 = req.cookie("b") !? ""
+        let has_peer = req.peer_address.port > 0 ? "1" : "0"
+        return http.Response.text(host + "|" + custom + "|" + q + "|" + c1 + "," + c2 + "|" + has_peer)
+    }
+    let server = http.Server.new("127.0.0.1", 19189, handler)
+    server.http2 = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let socket = net.tcp_client("127.0.0.1", 19189) !!
+    socket.read_timeout_ms = 5000
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input, "h2c server SETTINGS")
+    assert(h2_settings_answer(socket, input) == -1)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+
+    let fields = Array[http.HpackField] {
+        .{ name: ":method", value: "GET" },
+        .{ name: ":scheme", value: "http" },
+        .{ name: ":path", value: "/test?m=1&m=42" },
+        .{ name: ":authority", value: "localhost:19189" },
+        .{ name: "x-custom", value: "val" },
+        .{ name: "cookie", value: "a=one" },
+        .{ name: "cookie", value: "b=two" }
+    }
+    socket.write(http.H2Frame { kind: 1, flags: 5, stream: 1, payload: http.hpack_encode(fields) !! }.encode() !!) !!
+    let status, body = h2_response(socket, input, 1)
+    assert(status == "200")
+    assert(body == "localhost:19189|val|42|one,two|1")
+
+    socket.close() _
+    server.request_shutdown(1000)
+    await running !!
+}
+
+test "HTTP2: 16-stream multiplexed h2c batch answers fast streams ahead of slow stream" {
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        if req.path == "/slow" : time.sleep_ms(60)
+        return http.Response.text("ok:" + req.path)
+    }
+    let server = http.Server.new("127.0.0.1", 19190, handler)
+    server.http2 = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let socket = net.tcp_client("127.0.0.1", 19190) !!
+    socket.read_timeout_ms = 5000
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input, "h2c batch SETTINGS")
+    assert(h2_settings_answer(socket, input) == -1)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+
+    let batch = ByteBuffer.new(2048)
+    each 0 .. 16 as idx {
+        let sid: u32 = (idx * 2 + 1).to(u32)
+        let path = idx == 0 ? "/slow" : ("/fast-" + idx)
+        let fields = Array[http.HpackField] {
+            .{ name: ":method", value: "GET" },
+            .{ name: ":scheme", value: "http" },
+            .{ name: ":path", value: path },
+            .{ name: ":authority", value: "localhost:19190" }
+        }
+        batch.write(http.H2Frame { kind: 1, flags: 5, stream: sid, payload: http.hpack_encode(fields) !! }.encode() !!)
+    }
+    socket.write(batch) !!
+
+    let done = HashMap[u32, String].new()
+    let first_done_stream: u32 = 0
+    while done.length < 16 {
+        let frame = h2_tls_frame(socket, input, "batch response frame")
+        if frame.kind == http.H2_DATA && (frame.flags & 1) != 0 {
+            done.set(frame.stream, frame.payload)
+            if first_done_stream == 0 : first_done_stream = frame.stream
+        }
+    }
+    // Fast streams (3..31) finish before stream 1 (/slow)
+    assert(first_done_stream != 1)
+    assert((done.get(1) !? "") == "ok:/slow")
+    assert((done.get(31) !? "") == "ok:/fast-15")
+
+    socket.close() _
+    server.request_shutdown(1000)
+    await running !!
+}
+
+test "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        if req.path == "/slow" : time.sleep_ms(120)
+        return http.Response.text("ok:" + req.path)
+    }
+    let server = http.Server.new("127.0.0.1", 19191, handler)
+    server.http2 = true
+    let running = co server.start(1)
+    time.sleep_ms(20)
+
+    let socket = net.tcp_client("127.0.0.1", 19191) !!
+    socket.read_timeout_ms = 5000
+    socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
+    socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
+    let input = ByteBuffer.new()
+    h2_tls_frame(socket, input, "h2c 100 SETTINGS")
+    assert(h2_settings_answer(socket, input) == -1)
+    socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
+
+    // Case 1: fast stream 1 followed by last-in-batch slow stream 3; stream 1's buffered
+    // response must flush immediately when stream 3 yields instead of waiting 120ms.
+    let pair = ByteBuffer.new(512)
+    let enc = http.HpackEncoder {}
+    let f1 = Array[http.HpackField] {
+        .{ name: ":method", value: "GET" },
+        .{ name: ":scheme", value: "http" },
+        .{ name: ":path", value: "/fast-first" },
+        .{ name: ":authority", value: "localhost:19191" },
+        .{ name: "user-agent", value: "valk-test/1.0" }
+    }
+    let f3 = Array[http.HpackField] {
+        .{ name: ":method", value: "GET" },
+        .{ name: ":scheme", value: "http" },
+        .{ name: ":path", value: "/slow" },
+        .{ name: ":authority", value: "localhost:19191" },
+        .{ name: "user-agent", value: "valk-test/1.0" }
+    }
+    pair.write(http.H2Frame { kind: 1, flags: 5, stream: 1, payload: enc.encode(f1, 4096) !! }.encode() !!)
+    pair.write(http.H2Frame { kind: 1, flags: 5, stream: 3, payload: enc.encode(f3, 4096) !! }.encode() !!)
+    let started = time.mono_ms()
+    socket.write(pair) !!
+    let got1 = false
+    while !got1 {
+        let frame = h2_tls_frame(socket, input, "stream 1 early flush")
+        if frame.kind == http.H2_DATA && frame.stream == 1 && (frame.flags & 1) != 0 {
+            assert(frame.payload == "ok:/fast-first")
+            got1 = true
+        }
+    }
+    assert(time.mono_ms() - started < 90)
+    let got3 = false
+    while !got3 {
+        let frame = h2_tls_frame(socket, input, "stream 3 slow finish")
+        if frame.kind == http.H2_DATA && frame.stream == 3 && (frame.flags & 1) != 0 {
+            assert(frame.payload == "ok:/slow")
+            got3 = true
+        }
+    }
+
+    // Case 2: 100 concurrent fast streams in one batch (-m 100)
+    let batch = ByteBuffer.new(4096)
+    each 0 .. 100 as idx {
+        let sid: u32 = (idx * 2 + 5).to(u32)
+        let fields = Array[http.HpackField] {
+            .{ name: ":method", value: "GET" },
+            .{ name: ":scheme", value: "http" },
+            .{ name: ":path", value: "/b" },
+            .{ name: ":authority", value: "localhost:19191" },
+            .{ name: "user-agent", value: "valk-test/1.0" }
+        }
+        batch.write(http.H2Frame { kind: 1, flags: 5, stream: sid, payload: enc.encode(fields, 4096) !! }.encode() !!)
+    }
+    socket.write(batch) !!
+    let count: uint = 0
+    while count < 100 {
+        let frame = h2_tls_frame(socket, input, "100-stream batch frame")
+        if frame.kind == http.H2_DATA && (frame.flags & 1) != 0 {
+            assert(frame.payload == "ok:/b")
+            count++
+        }
+    }
+
+    socket.close() _
+    server.request_shutdown(1000)
+    await running !!
+}

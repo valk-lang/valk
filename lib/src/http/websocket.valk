@@ -7,6 +7,7 @@ use time
 use core
 use sync
 use compress
+use mem
 
 /// Thrown by `WebSocket` methods.
 ///
@@ -88,6 +89,7 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
 + class WebSocket {
     - con: net.TcpConnection
     - input: ByteBuffer
+    - input_pos: uint (0)
     - fragments: ByteBuffer (ByteBuffer.new(0))
     - output: ByteBuffer (ByteBuffer.new(0))
     // Decompressed messages; with `inflate_takeover` it keeps the last 32 KiB as history
@@ -446,6 +448,17 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             each parts as part : this.queue.write(part)
             return
         }
+        let batch_limit = this.max_queue < 65536 ? this.max_queue : 65536
+        if !this.is_client && !isset(this.con.ssl) && !this.close_sent && this.input_pos < this.input.length && this.queue.length < batch_limit {
+            each parts as part : this.queue.write(part)
+            if this.queue.length >= batch_limit : this.flush_deferred() !>
+            return
+        }
+        if this.queue.length > 0 {
+            each parts as part : this.queue.write(part)
+            this.flush_deferred() !>
+            return
+        }
         this.writing = true
         let sent = this.con.write_now(parts) ! {
             this.writing = false
@@ -470,6 +483,41 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         this.flush() !>
     }
 
+    - fn flush_deferred() !WebSocketError {
+        if this.closed : throw .closed
+        if this.writing || this.queue.length == 0 : return
+        this.writing = true
+        let out = this.queue
+        this.queue = this.sending
+        this.sending = out
+        let sent = this.con.write_now(.{ out.view() }) ! {
+            out.clear()
+            this.writing = false
+            this.finish()
+            throw E
+        }
+        if sent < out.length {
+            let tail = out.length - sent
+            if this.queue.length == 0 {
+                out.clear_until(sent)
+                this.sending = this.queue
+                this.queue = out
+            } else {
+                let combined = ByteBuffer.new(tail + this.queue.length)
+                combined.write(out.view(sent, tail))
+                combined.write(this.queue)
+                out.clear()
+                this.queue.clear()
+                this.queue = combined
+            }
+            co this.flush()
+            return
+        }
+        out.clear()
+        if out.size > 65536 : out.shrink_capacity(4096)
+        this.flush() !>
+    }
+
     // Sends the queue; the caller holds `writing`, which this releases
     - fn flush() !WebSocketError {
         while this.queue.length > 0 {
@@ -490,27 +538,45 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
     - fn send_frame(opcode: uint, data: local &[u8]) !WebSocketError {
         this.wait_for_room() !>
 
-        // The payload goes after room for the header, which is put in front of it
-        let frame = this.output
-        frame.clear()
-        frame.skip(WS_HEADER_ROOM)
         let first = 0x80 | opcode
         if this.deflate_bits > 0 && this.deflate_level > 0 && opcode < 8 && data.length >= this.deflate_min_size {
+            let frame = this.output
+            frame.clear()
+            frame.skip(WS_HEADER_ROOM)
             compress.deflate_message(data, frame, this.deflate_level, this.deflate_bits)
             let compressed = frame.length - WS_HEADER_ROOM
             if compressed < data.length {
                 this.finish_frame(first | 0x40, compressed, "") !>
                 return
             }
-            frame.truncate(WS_HEADER_ROOM)
         }
-        if this.is_client {
-            // Masked in place
-            frame.write(data)
-            this.finish_frame(first, data.length, "") !>
+        if !this.is_client {
+            let batch_limit = this.max_queue < 65536 ? this.max_queue : 65536
+            let batching = !isset(this.con.ssl) && !this.close_sent && this.input_pos < this.input.length && this.queue.length < batch_limit
+            if this.writing || batching || this.queue.length > 0 {
+                websocket_append_unmasked(this.queue, first.to(u8), data)
+                if !this.writing && (!batching || this.queue.length >= batch_limit) : this.flush_deferred() !>
+                return
+            }
+            if data.length <= 4096 {
+                let frame = this.output
+                frame.clear()
+                websocket_append_unmasked(frame, first.to(u8), data)
+                this.write_out(.{ frame.view() }) !>
+                return
+            }
+            let frame = this.output
+            frame.clear()
+            frame.skip(WS_HEADER_ROOM)
+            this.finish_frame(first, data.length, data) !>
             return
         }
-        this.finish_frame(first, data.length, data) !>
+        // Masked in place
+        let frame = this.output
+        frame.clear()
+        frame.skip(WS_HEADER_ROOM)
+        frame.write(data)
+        this.finish_frame(first, data.length, "") !>
     }
 
     // Puts the header for `length` bytes of payload in front of `output` and sends it. A
@@ -564,6 +630,56 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
     /// closing handshake (see `close_code`) or when the connection dropped, `timeout`
     /// after the read timeout, `cancelled`, `protocol` and `too_large`.
     + fn read() WebSocketMessage !WebSocketError {
+        if this.closed : throw .closed
+        if !this.in_fragment {
+            let input = this.input
+            this.fill(2) !>
+            @unsafe
+            let pos = this.input_pos
+            let p = input.data
+            let b0 = @ptrv(p, u8, pos)
+            let opcode = (b0 & 0x0f).to(uint)
+            let b1 = @ptrv(p, u8, pos + 1)
+            let masked = (b1 & 0x80) != 0
+            if (b0 & 0xf0) == 0x80 && (opcode == WS_OP_TEXT || opcode == WS_OP_BINARY) && masked != this.is_client {
+                let length = (b1 & 0x7f).to(uint)
+                let header: uint = 2
+                let ok = true
+                if length == 126 {
+                    this.fill(4) !>
+                    pos = this.input_pos
+                    p = input.data
+                    length = (@ptrv(p, u8, pos + 2).to(uint) << 8) | @ptrv(p, u8, pos + 3).to(uint)
+                    header = 4
+                } else if length == 127 {
+                    this.fill(10) !>
+                    pos = this.input_pos
+                    p = input.data
+                    length = p.@offset(pos + 2).read_u64_be()
+                    if (length >> 63) != 0 : ok = false
+                    header = 10
+                }
+                let max = this.max_message_size
+                if ok && (max == 0 || length <= max) {
+                    if masked : header += 4
+                    this.fill(header + length) !>
+                    pos = this.input_pos
+                    p = input.data
+                    let payload = input.view(pos + header, length)
+                    if masked {
+                        let k = pos + header - 4
+                        websocket_mask(payload, @ptrv(p, u8, k), @ptrv(p, u8, k + 1), @ptrv(p, u8, k + 2), @ptrv(p, u8, k + 3))
+                    }
+                    if opcode == WS_OP_TEXT && !websocket_utf8_is_valid(payload) {
+                        this.fail(1007, "Invalid UTF-8") !>
+                    }
+                    let data = String.copy_from_ptr(p.@offset(pos + header), length)
+                    this.consume_input(header + length)
+                    let kind = opcode == WS_OP_TEXT ? WebSocketMessageType.text : WebSocketMessageType.binary
+                    return WebSocketMessage { type: kind, data: data }
+                }
+            }
+        }
         let out = ByteBuffer.new(256)
         let type = this.read_into(out) !>
         return WebSocketMessage { type: type, data: out.to_string() }
@@ -586,8 +702,9 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         if this.closed : throw .closed
         let input = this.input
         this.fill(2) !>
-        let b0 = input.get(0)
-        let b1 = input.get(1)
+        let pos = this.input_pos
+        let b0 = input.get(pos)
+        let b1 = input.get(pos + 1)
         let fin = (b0 & 0x80) != 0
         let opcode = (b0 & 0x0f).to(uint)
         // RSV1 marks a compressed message, on its first frame only (RFC 7692 §6)
@@ -602,14 +719,16 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         let header: uint = 2
         if length == 126 {
             this.fill(4) !>
-            length = (input.get(2).to(uint) << 8) | input.get(3).to(uint)
+            pos = this.input_pos
+            length = (input.get(pos + 2).to(uint) << 8) | input.get(pos + 3).to(uint)
             header = 4
         } else if length == 127 {
             this.fill(10) !>
+            pos = this.input_pos
             length = 0
             let i: uint = 2
             while i < 10 {
-                length = (length << 8) | input.get(i).to(uint)
+                length = (length << 8) | input.get(pos + i).to(uint)
                 i++
             }
             if (length >> 63) != 0 : this.fail(1002, "Invalid length") !>
@@ -633,13 +752,11 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             if max > 0 && (length > max || this.fragments.length + length > max) : this.fail(1009, "Message too large") !>
         }
         this.fill(header + length) !>
-        let payload = input.view(header, length)
+        pos = this.input_pos
+        let payload = input.view(pos + header, length)
         if masked {
-            let k0 = input.get(header - 4)
-            let k1 = input.get(header - 3)
-            let k2 = input.get(header - 2)
-            let k3 = input.get(header - 1)
-            websocket_mask(payload, k0, k1, k2, k3)
+            let k = pos + header - 4
+            websocket_mask(payload, input.get(k), input.get(k + 1), input.get(k + 2), input.get(k + 3))
         }
 
         let complete = false
@@ -665,7 +782,7 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
                 this.close_code = code
                 this.close_reason = reason
             }
-            input.clear_until(header + length)
+            this.consume_input(header + length)
             this.send_close(code == 1005 ? 1000 : code, "") ! {}
             this.finish()
             throw .closed
@@ -705,8 +822,20 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
             }
         }
 
-        input.clear_until(header + length)
+        this.consume_input(header + length)
         return complete
+    }
+
+    - fn consume_input(amount: uint) $inline {
+        let next = this.input_pos + amount
+        let input = this.input
+        if next >= input.length {
+            input.clear()
+            if input.size > 65536 : input.shrink_capacity(WS_READ_SIZE)
+            this.input_pos = 0
+        } else {
+            this.input_pos = next
+        }
     }
 
     // Decompresses the message in `fragments` onto `inflated` and returns where it starts
@@ -728,9 +857,16 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
         if isset(out) : out.write(data) ! throw .write
     }
 
-    // Makes sure `input` holds at least `needed` bytes
+    // Makes sure `input` holds at least `needed` unread bytes from `input_pos`
     - fn fill(needed: uint) !WebSocketError {
         let input = this.input
+        if input.length - this.input_pos >= needed : return
+        if !this.writing && this.queue.length > 0 : this.flush_deferred() !>
+        if this.input_pos > 0 {
+            if this.input_pos >= input.length : input.clear()
+            else : input.clear_until(this.input_pos)
+            this.input_pos = 0
+        }
         while input.length < needed {
             input.reserve(WS_READ_SIZE)
             let bytes = this.con.read(input.view_spare(WS_READ_SIZE)) ! {
@@ -754,11 +890,13 @@ value WS_DEFLATE_TAIL ("\x00\x00\xff\xff")
 
     - fn finish() {
         if this.closed : return
+        if !this.writing && this.queue.length > 0 : this.flush_deferred() ! {}
         this.closed = true
         // A pending write sends what was queued (such as a close frame) first
         while this.writing : time.sleep_ms(1)
         this.queue.clear()
         this.input.clear()
+        this.input_pos = 0
         this.fragments.clear()
         this.inflated.clear()
         this.con.close() ! core.cleanup_warning("Failed to close WebSocket connection", __FILE__, __LINE__)
@@ -862,20 +1000,52 @@ fn websocket_frame_head_size(frame: String) uint {
     return 2
 }
 
+fn websocket_append_unmasked(out: ByteBuffer, first: u8, payload: local &[u8]) $inline {
+    @unsafe
+    let length = payload.length
+    let header: uint = length < 126 ? 2 : (length < 65536 ? 4 : 10)
+    out.reserve(header + length)
+    let p = out.data.@offset(out.length)
+    @ptrv(p, u8, 0) = first
+    if length < 126 {
+        @ptrv(p, u8, 1) = length.to(u8)
+    } else if length < 65536 {
+        @ptrv(p, u8, 1) = 126
+        @ptrv(p, u8, 2) = (length >> 8).to(u8)
+        @ptrv(p, u8, 3) = length.to(u8)
+    } else {
+        @ptrv(p, u8, 1) = 127
+        p.@offset(2).write_u64_be(length.to(u64))
+    }
+    if length > 0 : mem.copy_bytes(payload.data, p.@offset(header), length)
+    out.skip(header + length)
+}
+
 // XORs `data` with the 4-byte masking key (RFC 6455 §5.3)
 fn websocket_mask(data: local mut &[u8], k0: u8, k1: u8, k2: u8, k3: u8) {
+    @unsafe
     let length = data.length
+    let p = data.data
     let i: uint = 0
-    while i + 4 <= length {
-        data[i] = data[i] ^ k0
-        data[i + 1] = data[i + 1] ^ k1
-        data[i + 2] = data[i + 2] ^ k2
-        data[i + 3] = data[i + 3] ^ k3
+    if length >= 8 {
+        let mask_bytes: [u8 x 8] = { k0, k1, k2, k3, k0, k1, k2, k3 }
+        let mask64 = @ptrv(@ref(mask_bytes[0]).@cast(ptr), u64)
+        while length - i >= 8 {
+            let at = p.@offset(i)
+            @ptrv(at, u64) = @ptrv(at, u64) ^ mask64
+            i += 8
+        }
+    }
+    if i + 4 <= length {
+        @ptrv(p, u8, i) = @ptrv(p, u8, i) ^ k0
+        @ptrv(p, u8, i + 1) = @ptrv(p, u8, i + 1) ^ k1
+        @ptrv(p, u8, i + 2) = @ptrv(p, u8, i + 2) ^ k2
+        @ptrv(p, u8, i + 3) = @ptrv(p, u8, i + 3) ^ k3
         i += 4
     }
-    if i < length : data[i] = data[i] ^ k0
-    if i + 1 < length : data[i + 1] = data[i + 1] ^ k1
-    if i + 2 < length : data[i + 2] = data[i + 2] ^ k2
+    if i < length : @ptrv(p, u8, i) = @ptrv(p, u8, i) ^ k0
+    if i + 1 < length : @ptrv(p, u8, i + 1) = @ptrv(p, u8, i + 1) ^ k1
+    if i + 2 < length : @ptrv(p, u8, i + 2) = @ptrv(p, u8, i + 2) ^ k2
 }
 
 fn websocket_close_socket(con: net.TcpConnection) {
@@ -1019,12 +1189,19 @@ fn websocket_header_is_reserved(name: String) bool {
 
 // Strict UTF-8 (RFC 3629): no overlong forms, surrogates or code points above U+10FFFF
 fn websocket_utf8_is_valid(data: local &[u8]) bool {
+    @unsafe
     let i: uint = 0
     let length = data.length
+    let p = data.data
+    while length - i >= 8 {
+        if (@ptrv(p.@offset(i), u64) & 0x8080808080808080) != 0 : break
+        i += 8
+    }
     while i < length {
-        let b = data[i]
+        let b = @ptrv(p, u8, i)
         if b < 0x80 {
             i++
+            while length - i >= 8 && (@ptrv(p.@offset(i), u64) & 0x8080808080808080) == 0 : i += 8
             continue
         }
         let need: uint = 0

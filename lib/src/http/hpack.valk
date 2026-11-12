@@ -1,9 +1,32 @@
-class HpackField {
+struct HpackField {
     name: String
     value: String
     never_index: bool (false)
+    valid: bool (false)
 
     fn size() uint { return this.name.bytes + this.value.bytes + 32 }
+}
+
+fn hpack_slice_int(bytes: local &[u8], pos: uint, prefix: uint) (uint, uint) !H2Error {
+    @unsafe
+    let len = bytes.length
+    if prefix == 0 || prefix > 8 || pos >= len : throw .compression
+    let src = bytes.data
+    let mask: uint = (1 << prefix) - 1
+    let result = @ptrv(src, u8, pos).to(uint) & mask
+    pos++
+    if result < mask : return (result, pos)
+    let shift: uint = 0
+    while pos < len {
+        let byte = @ptrv(src, u8, pos).to(uint)
+        pos++
+        let part = byte & 127
+        if shift > 56 : throw .compression
+        result = result.checked_add(part << shift) ! throw .compression
+        if byte < 128 : return (result, pos)
+        shift += 7
+    }
+    throw .compression
 }
 
 fn hpack_integer(reader: ByteReader, prefix: uint) uint !H2Error {
@@ -38,32 +61,99 @@ fn hpack_write_integer(out: ByteBuffer, number: uint, prefix: uint, flags: u8) {
     out.write_byte(number.to(u8))
 }
 
-fn hpack_huffman(bytes: String, limit: uint) String !H2Error {
-    let out = ByteBuffer.new()
+global hpack_nibble_table: [u32 x 8208] ({ 0... })
+global hpack_nibble_ready: bool (false)
+global hpack_huff_buf: ByteBuffer (.new(256))
+
+fn hpack_init_nibble_table() {
     let node: uint = 0
-    let tail: uint = 0
-    let ones = true
-    each bytes as byte {
-        let bit: uint = 8
-        while bit-- > 0 {
-            let one = (byte.to(uint) & (1 << bit)) != 0
-            let next = one ? hpack_huffman_right[node] : hpack_huffman_left[node]
-            if next < 0 : throw .compression
-            node = next.to(uint)
-            tail++
-            ones = ones && one
-            let symbol = hpack_huffman_symbol[node]
-            if symbol < 0 : continue
-            if symbol == 256 : throw .compression
-            if out.length >= limit : throw .limit
-            out.write_byte(symbol.to(u8))
-            node = 0
-            tail = 0
-            ones = true
+    while node < 513 {
+        let nib: uint = 0
+        while nib < 16 {
+            let cur = node
+            let sym: u32 = 0
+            let flags: u32 = 0
+            let shift: uint = 4
+            while shift-- > 0 {
+                let one = ((nib >> shift) & 1) != 0
+                let next = one ? hpack_huffman_right[cur] : hpack_huffman_left[cur]
+                if next < 0 {
+                    flags = 0x80000000
+                    break
+                }
+                cur = next.to(uint)
+                let s = hpack_huffman_symbol[cur]
+                if s < 0 : continue
+                if s == 256 {
+                    flags = 0x80000000
+                    break
+                }
+                sym = s.to(u32)
+                flags = 0x40000000
+                cur = 0
+            }
+            hpack_nibble_table[(node << 4) | nib] = flags | (sym << 16) | cur.to(u32)
+            nib++
         }
+        node++
     }
-    if node != 0 && (tail > 7 || !ones) : throw .compression
-    return out.into_string()
+    hpack_nibble_ready = true
+}
+
+fn hpack_huffman_slice(bytes: local &[u8], limit: uint) String !H2Error {
+    @unsafe
+    if bytes.length == 0 : return ""
+    if !hpack_nibble_ready : hpack_init_nibble_table()
+    let out = hpack_huff_buf
+    out.clear()
+    out.reserve(bytes.length * 2)
+    let dst = out.data
+    let src = bytes.data
+    let len = bytes.length
+    let out_len: uint = 0
+    let node: uint = 0
+    let i: uint = 0
+    while i < len {
+        let b = @ptrv(src, u8, i).to(uint)
+        let e1 = hpack_nibble_table[(node << 4) | (b >> 4)]
+        if (e1 & 0x80000000) != 0 : throw .compression
+        if (e1 & 0x40000000) != 0 {
+            if out_len >= limit : throw .limit
+            @ptrv(dst, u8, out_len) = ((e1 >> 16) & 0xff).to(u8)
+            out_len++
+        }
+        node = (e1 & 0xffff).to(uint)
+        let e2 = hpack_nibble_table[(node << 4) | (b & 15)]
+        if (e2 & 0x80000000) != 0 : throw .compression
+        if (e2 & 0x40000000) != 0 {
+            if out_len >= limit : throw .limit
+            @ptrv(dst, u8, out_len) = ((e2 >> 16) & 0xff).to(u8)
+            out_len++
+        }
+        node = (e2 & 0xffff).to(uint)
+        i++
+    }
+    if node > 7 : throw .compression
+    out.skip(out_len)
+    let res = out.to_string()
+    if out.size > 65_536 : out.shrink_capacity(256)
+    return res
+}
+
+fn hpack_huffman(bytes: String, limit: uint) String !H2Error {
+    return hpack_huffman_slice(bytes, limit) !>
+}
+
+fn hpack_slice_str(bytes: local &[u8], pos: uint, limit: uint) (String, uint) !H2Error {
+    if pos >= bytes.length : throw .compression
+    let huffman = (bytes.byte(pos) & 128) != 0
+    let length, next_pos = hpack_slice_int(bytes, pos, 7) !>
+    if length > bytes.length - next_pos : throw .compression
+    if !huffman && length > limit : throw .limit
+    let slice = bytes.view(next_pos, length)
+    let end_pos = next_pos + length
+    if huffman : return (hpack_huffman_slice(slice, limit) !>, end_pos)
+    return (slice.to_string(), end_pos)
 }
 
 fn hpack_string(reader: ByteReader, limit: uint) String !H2Error {
@@ -99,8 +189,7 @@ class HpackDecoder {
         if index <= 61 {
             return HpackField { name: hpack_names[index - 1], value: hpack_values[index - 1] }
         }
-        let entry = this.entries.get(index - 62) ! throw .compression
-        return HpackField { name: entry.name, value: entry.value }
+        return this.entries.get(index - 62) ! throw .compression
     }
 
     fn evict(limit: uint) {
@@ -118,23 +207,31 @@ class HpackDecoder {
             return
         }
         this.evict(this.capacity - size)
-        this.entries.prepend(HpackField { name: field.name, value: field.value })
+        let valid = !field.name.starts_with(":") && h2_regular_field(field) && field.name != "host" && field.name != "content-length"
+        this.entries.prepend(HpackField { name: field.name, value: field.value, valid: valid })
         this.size += size
     }
 
     fn decode(block: String) Array[HpackField] !H2Error {
+        let result = Array[HpackField].new(8)
+        this.decode_into(block, result) !>
+        return result
+    }
+
+    fn decode_into(block: local &[u8], result: Array[HpackField]) !H2Error {
         if this.failed : throw .compression
         this.failed = true
-        if block.bytes > this.max_block_size : throw .limit
-        let reader = ByteReader.new(block)
-        let result = Array[HpackField].new()
+        if block.length > this.max_block_size : throw .limit
+        let pos: uint = 0
+        let len = block.length
         let size: uint = 0
         let fields_started = false
-        while reader.remaining().length > 0 {
-            let first = reader.remaining().byte(0)
+        while pos < len {
+            let first = block.byte(pos)
             if (first & 224) == 32 {
                 if fields_started : throw .compression
-                let capacity = hpack_integer(reader, 5) !>
+                let capacity, next_pos = hpack_slice_int(block, pos, 5) !>
+                pos = next_pos
                 if capacity > this.allowed_capacity || capacity > this.required_capacity : throw .compression
                 this.capacity = capacity
                 this.required_capacity = 0xffffffff
@@ -145,12 +242,23 @@ class HpackDecoder {
             fields_started = true
             let field: HpackField = @undefined
             if (first & 128) != 0 {
-                field = this.lookup(hpack_integer(reader, 7) !>) !>
+                let index, next_pos = hpack_slice_int(block, pos, 7) !>
+                pos = next_pos
+                field = this.lookup(index) !>
             } else {
                 let indexed = (first & 64) != 0
-                let index = hpack_integer(reader, indexed ? 6 : 4) !>
-                let name = index == 0 ? (hpack_string(reader, this.max_header_size) !>) : (this.lookup(index) !>).name
-                let value = hpack_string(reader, this.max_header_size) !>
+                let index, next_pos = hpack_slice_int(block, pos, indexed ? 6 : 4) !>
+                pos = next_pos
+                let name = ""
+                if index == 0 {
+                    let parsed_name, after_name = hpack_slice_str(block, pos, this.max_header_size) !>
+                    name = parsed_name
+                    pos = after_name
+                } else {
+                    name = (this.lookup(index) !>).name
+                }
+                let value, after_val = hpack_slice_str(block, pos, this.max_header_size) !>
+                pos = after_val
                 field = HpackField { name: name, value: value, never_index: !indexed && (first & 16) != 0 }
                 if indexed : this.insert(field)
             }
@@ -161,7 +269,6 @@ class HpackDecoder {
         if this.capacity > this.required_capacity : throw .compression
         this.required_capacity = 0xffffffff
         this.failed = false
-        return result
     }
 }
 
@@ -176,9 +283,25 @@ fn hpack_build_name_indexes() HashMap[String, uint] {
 }
 
 fn hpack_static_indexes(field: HpackField) (uint, uint) {
-    let name_index = hpack_name_indexes.get(field.name) ! return (0, 0)
+    let name = field.name
+    if name == ":status" {
+        let val = field.value
+        if val == "200" : return (8, 8)
+        if val == "204" : return (8, 9)
+        if val == "206" : return (8, 10)
+        if val == "304" : return (8, 11)
+        if val == "400" : return (8, 12)
+        if val == "404" : return (8, 13)
+        if val == "500" : return (8, 14)
+        return (8, 0)
+    }
+    if name == "content-type" : return (31, field.value == "" ? 31 : 0)
+    if name == "content-length" : return (28, field.value == "" ? 28 : 0)
+    if name == "vary" : return (59, field.value == "" ? 59 : 0)
+    if name == "content-encoding" : return (26, field.value == "" ? 26 : 0)
+    let name_index = hpack_name_indexes.get(name) ! return (0, 0)
     let index = name_index - 1
-    while index < 61 && hpack_names[index] == field.name {
+    while index < 61 && hpack_names[index] == name {
         if hpack_values[index] == field.value : return (name_index, index + 1)
         index++
     }

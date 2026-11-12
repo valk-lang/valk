@@ -27,6 +27,7 @@ value BATCH_MIN (32)
 // the next batch. When all are busy, up to SERVE_EXTRA temporary ones per batch help out
 value SERVE_POOL_MAX (256)
 value SERVE_EXTRA (8)
+value H2_SERVE_POOL_MAX (64)
 // How often a worker checks whether it went idle. It is idle when it allocated less than
 // IDLE_ALLOCATED since the last check; it then gives back memory when it held IDLE_RELEASE more
 // than after the last time
@@ -65,7 +66,7 @@ struct Parked {
     deadline_ms: uint
 }
 
-fn worker(server: atomic ServerWorkerData) {
+fn worker(server: atomic ServerWorkerData, worker_id: uint (0)) {
     let worker = Worker {
         server: server
         now: time.mono_ms()
@@ -73,7 +74,7 @@ fn worker(server: atomic ServerWorkerData) {
     #if URING
     // Plain connections live in this thread's io_uring table when it has one: they do not count
     // against the process's descriptor limit, and wait for their next request on a poll there
-    if !io.use_epoll_backend() && server.direct && !isset(server.tls_context) && io.uring_files() > 0 : worker.side = coro.side_channel()
+    if !io.use_epoll_backend() && server.direct && !isset(server.tls_context) && !server.http2 && io.uring_files() > 0 : worker.side = coro.side_channel()
     worker.direct = isset(worker.side)
     if worker.direct {
         #if TEST
@@ -87,24 +88,19 @@ fn worker(server: atomic ServerWorkerData) {
     }
     #end
     #if OS == "linux"
-    if !worker.direct {
-        // Connections waiting for their next request park here, without a coroutine
-        // Not inherited by child processes
-        worker.epoll_fd = ext.epoll_create1(io.EPOLL_CLOEXEC)
-        worker.parking = worker.epoll_fd >= 0
-        if worker.parking : co worker.watch_parked()
-    }
+    if !worker.direct : worker.parking = true
     #end
 
-    let sock = server.socket
+    let sock = worker_socket(server, worker_id)
+    let shared_listener = !isset(server.extra_sockets)
     while server.stopping == 0 {
         worker.tick()
-        if !worker_may_accept(worker.connections, server.connections, server.worker_count) {
+        if shared_listener && !worker_may_accept(worker.connections, server.connections, server.worker_count) {
             time.sleep_ms(1)
             continue
         }
         let netcon = worker.accept(sock) ! {
-            if server.stopping != 0 : break
+            if server.stopping != 0 || error_is(E.code, closed) : break
             if error_is(E.code, timeout) : continue
             if error_is(E.code, max_connections) {
                 // Out of file descriptors: close the connection idle the longest, give its
@@ -127,10 +123,22 @@ fn worker(server: atomic ServerWorkerData) {
     }
 
     if --server.acceptors == 0 {
-        sock.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+        server.socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+        close_extra_sockets(server.extra_sockets)
     }
     worker.drain()
     worker.ended = true
+    while true {
+        let waker = worker.h2_idle_servers.pop_last() ! break
+        waker.wake()
+    }
+    #if OS == "linux"
+    if worker.watch_efd >= 0 {
+        @unsafe
+        let one: u64 = 1
+        ext.write(worker.watch_efd, @ref(one).@cast(ptr), 8)
+    }
+    #end
     #if URING
     let side = worker.side
     if isset(side) : side.close()
@@ -183,6 +191,8 @@ class Worker {
     // a compact per-worker index: an array as large as the process's highest descriptor is
     // mostly empty and a cache miss on every wake
     epoll_fd: i32 (-1)
+    watch_efd: i32 (-1)
+    sweeping_clients: bool (false)
     // Connections are direct descriptors of this thread's io_uring, parked on polls there whose
     // completions come through `side`
     direct: bool (false)
@@ -203,14 +213,34 @@ class Worker {
     // Wakers of the serving coroutines that wait for work, and how many serving coroutines exist
     idle_servers: Array[sync.Waker] (.{})
     servers: uint (0)
+    // HTTP/2 connections with ready streams and the pool of coroutines serving them
+    h2_ready: Deque[H2Connection] (.new())
+    h2_idle_servers: Array[sync.Waker] (.{})
+    h2_active_conn: ?H2Connection (null)
+    h2_servers: uint (0)
+    h2_runners: uint (0)
+    h2_waking: uint (0)
     // Set once the worker drained: the watcher of parked connections ends
     ended: bool (false)
 
+    fn accept_timeout_ms() uint {
+        if this.clients.length > 0 : return SWEEP_MS
+        if this.parked_list.length == 0 && !this.has_idle_memory() : return 0
+        let idle = this.server.idle_timeout_ms
+        if idle > 0 && idle < PARKED_SWEEP_MS : return SWEEP_MS
+        return PARKED_SWEEP_MS
+    }
+
+    fn has_idle_memory() bool {
+        return gc.gc.mem_usage_thread >= IDLE_RELEASE || this.mem_held >= this.mem_released + IDLE_RELEASE
+    }
+
     fn accept(sock: atomic net.TcpServer) net.TcpConnection !net.NetError {
+        let timeout_ms = this.accept_timeout_ms()
         #if URING
         if this.direct {
             let ring = this.accept_ring()
-            let accepted = sock.accept_direct(ACCEPT_POLL_MS, ring) ! {
+            let accepted = sock.accept_direct(timeout_ms, ring) ! {
                 // A full table: the next ring, made when there is none
                 if !error_is(E.code, max_connections) : throw E
                 while this.ring_connections.length <= ring : this.ring_connections.append(0)
@@ -224,7 +254,7 @@ class Worker {
             }
         }
         #end
-        return sock.accept(ACCEPT_POLL_MS) !>
+        return sock.accept(timeout_ms) !>
     }
 
     #if URING
@@ -316,7 +346,9 @@ class Worker {
             if deadline > 0 && now >= deadline : connection.netcon.interrupt()
         }
         this.release_idle_memory(now)
-        if now - this.last_parked_sweep < PARKED_SWEEP_MS : return
+        let idle = this.server.idle_timeout_ms
+        let parked_sweep = idle > 0 && idle < PARKED_SWEEP_MS ? SWEEP_MS : PARKED_SWEEP_MS
+        if now - this.last_parked_sweep < parked_sweep : return
         this.last_parked_sweep = now
         // Backwards: closing moves the last connection into the closed one's slot
         let i = this.parked_list.length
@@ -463,6 +495,21 @@ class Worker {
             return true
         }
         #end
+        if this.epoll_fd < 0 {
+            this.epoll_fd = ext.epoll_create1(io.EPOLL_CLOEXEC)
+            if this.epoll_fd < 0 {
+                this.parking = false
+                return false
+            }
+            this.watch_efd = ext.eventfd(0, io.EPOLL_CLOEXEC | 0x800)
+            if this.watch_efd >= 0 {
+                if io.epoll_change(this.epoll_fd, io.EPOLL_CTL_ADD, this.watch_efd, io.EPOLLIN, uint.$max) != 0 {
+                    ext.close(this.watch_efd)
+                    this.watch_efd = -1
+                }
+            }
+            co this.watch_parked()
+        }
         if connection.input_signaled {
             connection.input_signaled = false
             let entry = ext.libc_pollfd { fd: fd, events: ext.POLLIN.to(i16), revents: 0 }
@@ -484,8 +531,10 @@ class Worker {
         @unsafe
         let buffer: [u8 x (io.EPOLL_EVENT_SIZE * WATCH_BATCH)] = @undefined
         let base = @ref(buffer[0]).@cast(ptr)
+        let wait_ms: uint = this.watch_efd >= 0 ? 0 : WATCH_POLL_MS
         while !this.ended {
-            let ready = io.await_fd(this.epoll_fd, true, false, WATCH_POLL_MS)
+            let ready = io.await_fd(this.epoll_fd, true, false, wait_ms)
+            if this.ended : break
             if ready.is_timeout() : continue
             if !ready.is_readable() : continue
             let count = ext.epoll_wait(this.epoll_fd, base, WATCH_BATCH, 0)
@@ -497,6 +546,7 @@ class Worker {
                 let events = event.read_u32_le()
                 let slot = (event + io.EPOLL_DATA_OFFSET).read_uint_le()
                 i++
+                if slot == uint.$max : continue
                 let connection = (this.parked.get(slot) !? null) ?! continue
                 // The client's end gets no later edge, and a read of its last request stops before it
                 if events & (io.EPOLLRDHUP | io.EPOLLERR | io.EPOLLHUP) != 0 : connection.input_signaled = true
@@ -511,6 +561,10 @@ class Worker {
             // Only this watcher waits: the woken connections are served meanwhile
             let delay = this.server.batch_delay_ms
             if delay > 0 && count < BATCH_MIN : time.sleep_ms(delay)
+        }
+        if this.watch_efd >= 0 {
+            io.close(this.watch_efd) ! {}
+            this.watch_efd = -1
         }
         io.close(this.epoll_fd) ! {}
         this.epoll_fd = -1
@@ -607,6 +661,19 @@ class Worker {
         if connection.served : connection.last_gap_ms = now - connection.idle_since
         connection.idle_since = 0
         this.ready.push_back(connection)
+        if !this.sweeping_clients {
+            this.sweeping_clients = true
+            co this.sweep_active()
+        }
+    }
+
+    fn sweep_active() {
+        while !this.ended && this.clients.length > 0 {
+            time.sleep_ms(SWEEP_MS)
+            if this.ended : break
+            this.tick()
+        }
+        this.sweeping_clients = false
     }
 
     // Serving coroutines that wait get the woken connections; without enough of them more are
@@ -661,6 +728,125 @@ class Worker {
         connection.finish()
     }
 
+    fn enqueue_h2(conn: H2Connection) {
+        if conn.in_h2_queue || conn.ready_streams.length == 0 : return
+        conn.in_h2_queue = true
+        this.h2_ready.push_back(conn)
+    }
+
+    fn enqueue_h2_any(conn: H2Connection) {
+        if conn.in_h2_queue : return
+        if conn.ready_streams.length == 0 && !conn.session.has_output() : return
+        conn.in_h2_queue = true
+        this.h2_ready.push_back(conn)
+    }
+
+    fn dispatch_h2(conn: H2Connection) {
+        if conn.ready_streams.length == 0 : return
+        this.enqueue_h2(conn)
+        if this.h2_runners == 0 && this.h2_waking == 0 {
+            this.wake_one_h2()
+        }
+    }
+
+    fn wake_one_h2() {
+        if this.ended : return
+        let idle = this.h2_idle_servers.pop_last() !? null
+        if isset(idle) {
+            this.h2_waking++
+            idle.wake()
+            return
+        }
+        if this.h2_servers < H2_SERVE_POOL_MAX {
+            let waker = sync.Waker.new() !? null
+            if isset(waker) {
+                this.h2_servers++
+                this.h2_waking++
+                co this.h2_serve_loop(waker)
+                return
+            }
+        }
+        this.h2_waking++
+        co this.h2_serve_overflow()
+    }
+
+    fn h2_serve_loop(waker: sync.Waker) {
+        while true {
+            this.h2_waking--
+            this.h2_serve_ready()
+            if this.ended : break
+            this.h2_idle_servers.append(waker)
+            waker.wait()
+            if this.ended : break
+        }
+        this.h2_servers--
+    }
+
+    fn h2_serve_overflow() {
+        this.h2_waking--
+        this.h2_serve_ready()
+    }
+
+    fn h2_runner_yielded() {
+        this.h2_runners--
+        let conn = this.h2_active_conn
+        this.h2_active_conn = null
+        if isset(conn) : this.enqueue_h2_any(conn)
+        if this.h2_ready.length > 0 && this.h2_runners == 0 && this.h2_waking == 0 {
+            this.wake_one_h2()
+        }
+    }
+
+    fn h2_serve_ready() {
+        @unsafe
+        let self_coro = coro.current_coro.@cast(coro.Coro)
+        this.h2_runners++
+        while true {
+            let conn = this.h2_ready.pop_front() ! break
+            conn.in_h2_queue = false
+            while true {
+                let stream = conn.ready_streams.pop_front() ! break
+                this.h2_active_conn = conn
+                self_coro.on_yield_fn = worker_h2_on_yield
+                self_coro.on_yield_arg = this.@cast(ptr)
+                conn.handle(stream)
+                this.h2_active_conn = null
+                if !isset(self_coro.on_yield_fn) {
+                    this.h2_runners++
+                    break
+                }
+                self_coro.on_yield_fn = null
+                self_coro.on_yield_arg = null
+                if conn.session.out_len() >= 16_384 {
+                    if conn.ready_streams.length > 0 : this.h2_active_conn = conn
+                    self_coro.on_yield_fn = worker_h2_on_yield
+                    self_coro.on_yield_arg = this.@cast(ptr)
+                    conn.flush()
+                    this.h2_active_conn = null
+                    if !isset(self_coro.on_yield_fn) {
+                        this.h2_runners++
+                        break
+                    }
+                    self_coro.on_yield_fn = null
+                    self_coro.on_yield_arg = null
+                }
+            }
+            if conn.ready_streams.length > 0 : this.enqueue_h2(conn)
+            if conn.session.has_output() {
+                self_coro.on_yield_fn = worker_h2_on_yield
+                self_coro.on_yield_arg = this.@cast(ptr)
+                conn.flush()
+                if !isset(self_coro.on_yield_fn) {
+                    this.h2_runners++
+                } else {
+                    self_coro.on_yield_fn = null
+                    self_coro.on_yield_arg = null
+                }
+            }
+        }
+        this.h2_runners--
+    }
+
     fn add_client(client: Connection) {
         this.link(client, false)
         this.connections++
@@ -679,7 +865,7 @@ class Worker {
             return
         }
         #end
-        io.epoll_change(this.epoll_fd, io.EPOLL_CTL_DEL, client.fd, 0, 0)
+        if this.epoll_fd >= 0 : io.epoll_change(this.epoll_fd, io.EPOLL_CTL_DEL, client.fd, 0, 0)
         #end
     }
 
@@ -766,4 +952,10 @@ class Worker {
             time.sleep_ms(wait_ms)
         }
     }
+}
+
+fn worker_h2_on_yield(arg: ptr) {
+    @unsafe
+    let worker = arg.@cast(Worker)
+    worker.h2_runner_yielded()
 }

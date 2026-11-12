@@ -53,7 +53,7 @@ fn LoadAcceptEx(s: ext.SOCKET) AcceptExFn !NetError {
 #end
 
 // `ipv6` is the listener's family; the accepted socket must match it on Windows
-fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0), owner: uint (0)) Fd !NetError {
+fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0), owner: uint (0), addr: ?ptr (null), addr_length: ?*u32 (null)) Fd !NetError {
     #if OS == "win"
     @unsafe
     let family: i32 = ipv6 ? ext.AF_INET6 : ext.AF_INET
@@ -100,25 +100,28 @@ fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0), owner: uint (0)) Fd !Ne
 
     #elif OS == "linux"
     @unsafe
-    if io.use_epoll_backend() {
-        while true {
-            let fd = ext.accept4(sock_fd, null, null, ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK)
-            if fd >= 0 : return fd
-            let err = ext.get_errno()
-            // A connection that ended while it waited in the queue: on to the next
-            if err == ext.EINTR || err == ext.ECONNABORTED : continue
-            if err == ext.EMFILE || err == ext.ENFILE : throw .max_connections
-            if err != ext.EAGAIN : throw .init
+    while true {
+        if isset(addr_length) : addr_length[0] = 128
+        let fd = ext.accept4(sock_fd, addr.@cast(?*ext.libc_sockaddr), addr_length, ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK)
+        if fd >= 0 : return fd
+        let err = ext.get_errno()
+        // A connection that ended while it waited in the queue: on to the next
+        if err == ext.EINTR || err == ext.ECONNABORTED : continue
+        if err == ext.EMFILE || err == ext.ENFILE : throw .max_connections
+        if err != ext.EAGAIN : throw .init
+        if io.use_epoll_backend() {
             let ev = io.await_owned_fd(sock_fd, true, false, timeout_ms, owner)
             if ev.is_timeout() : throw .timeout
             if io.is_gone(ev) : throw .closed
+            continue
         }
-        throw .init
+        break
     }
     #if URING
+    if isset(addr_length) : addr_length[0] = 128
     let coro = coro.current_coro.@cast(coro.Coro)
     let sqe = io.sqe(coro) ! throw .os
-    io.io_uring_prep_accept(sqe, sock_fd, null, 0, ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK)
+    io.io_uring_prep_accept(sqe, sock_fd, addr, addr_length.@cast(uint), ext.SOCK_CLOEXEC | ext.SOCK_NONBLOCK)
     io.link_timeout(coro, sqe, timeout_ms) ! throw .os
     coro.yield()
     return accept_completion_result(coro.completion_res) !>
@@ -207,7 +210,8 @@ fn direct_op(op: i32, ring: uint, fd: Fd, buf: ?ptr, amount: uint, flags: i32, t
 // timeout is only armed when the socket buffer is full
 fn direct_send(op: i32, ring: uint, fd: Fd, buf: ptr, amount: uint, flags: i32, timeout_ms: uint) i32 {
     @unsafe
-    if timeout_ms > 0 && (flags & ext.MSG_DONTWAIT) == 0 {
+    if (flags & ext.MSG_DONTWAIT) != 0 : return direct_op(op, ring, fd, buf, amount, flags, 0)
+    if timeout_ms > 0 {
         let res = direct_op(op, ring, fd, buf, amount, flags | ext.MSG_DONTWAIT, 0)
         if res != 0 - ext.EAGAIN : return res
     }
@@ -555,21 +559,38 @@ fn send_parts_now(fd: Fd, parts: local &[local &[u8]], skip: uint, direct: bool 
         count++
     }
     if count == 0 : return 0
-    #if OS == "linux"
-    let msg = MsgHdr { iov: @ref(iov), iov_count: count }
-    #end
     #if URING
     if direct {
         // Through the ring: a direct descriptor has no number for a system call. Without
         // `wait` only what fits in the socket buffer goes out
         let flags: i32 = ext.MSG_NOSIGNAL
         if !wait : flags |= ext.MSG_DONTWAIT
-        let res = direct_send(ext.IORING_OP.SENDMSG, ring, fd, @ref(msg).@cast(ptr), 1, flags, timeout_ms)
+        let res: i32 = 0
+        if count == 1 {
+            res = direct_send(ext.IORING_OP.SEND, ring, fd, iov[0].base, iov[0].length, flags, timeout_ms)
+        } else {
+            let msg = MsgHdr { iov: @ref(iov), iov_count: count }
+            res = direct_send(ext.IORING_OP.SENDMSG, ring, fd, @ref(msg).@cast(ptr), 1, flags, timeout_ms)
+        }
         if res >= 0 : return res.to(uint)
         if res == 0 - ext.EAGAIN : return 0
         if res == 0 - ext.ETIMEDOUT : throw .timeout
         throw .write
     }
+    #end
+    #if OS == "linux"
+    if count == 1 {
+        while true {
+            let res = ext.send(fd, iov[0].base, iov[0].length, ext.MSG_DONTWAIT | ext.MSG_NOSIGNAL)
+            if res >= 0 : return res.to(uint)
+            let error = ext.get_errno()
+            if error == ext.EINTR : continue
+            if error == ext.EAGAIN : return 0
+            throw .write
+        }
+        return 0
+    }
+    let msg = MsgHdr { iov: @ref(iov), iov_count: count }
     #end
     while true {
         #if OS == "linux"

@@ -1,5 +1,9 @@
+global h2_stream_pool: Array[H2Stream] (.new(64))
+
 class H2Stream {
     id: u32
+    method: String ("")
+    target: String ("")
     fields: Array[HpackField] (.new())
     trailers: ?Array[HpackField]
     body: ?ByteBuffer
@@ -22,7 +26,7 @@ class H2Stream {
 }
 
 fn h2_number(value: u32) String {
-    let bytes = ByteBuffer.new()
+    let bytes = ByteBuffer.new(4)
     bytes.write_u32_be(value)
     return bytes.into_string()
 }
@@ -35,6 +39,7 @@ class H2Session {
     header_block: H2HeaderBlock (.{})
     streams: HashMap[u32, H2Stream] (.new())
     output: Array[H2Frame] (.new())
+    out_buf: ?ByteBuffer (null)
     last_stream: u32 (0)
     header_stream: u32 (0)
     header_end_stream: bool (false)
@@ -48,9 +53,98 @@ class H2Session {
     max_body_size: uint (32 * 1024 * 1024)
     max_buffered_body: uint (32 * 1024 * 1024)
     buffered_body: uint (0)
+    receiving_streams: uint (0)
+
+    fn has_output() bool $inline {
+        let buf = this.out_buf
+        if isset(buf) : return buf.length > 0 || this.output.length > 0
+        return this.output.length > 0
+    }
+
+    fn out_len() uint $inline {
+        let buf = this.out_buf
+        return isset(buf) ? buf.length : this.output.length * 16
+    }
+
+    fn write_raw_header(buf: ByteBuffer, kind: u8, flags: u8, stream: u32, len: uint) $inline {
+        @unsafe
+        buf.reserve(9)
+        let dst = buf.data
+        let p = buf.length
+        @ptrv(dst, u8, p) = (len >> 16).to(u8)
+        @ptrv(dst, u8, p + 1) = (len >> 8).to(u8)
+        @ptrv(dst, u8, p + 2) = len.to(u8)
+        @ptrv(dst, u8, p + 3) = kind
+        @ptrv(dst, u8, p + 4) = flags
+        @ptrv(dst, u8, p + 5) = (stream >> 24).to(u8)
+        @ptrv(dst, u8, p + 6) = (stream >> 16).to(u8)
+        @ptrv(dst, u8, p + 7) = (stream >> 8).to(u8)
+        @ptrv(dst, u8, p + 8) = stream.to(u8)
+        buf.skip(9)
+    }
+
+    fn emit_frame(kind: u8, flags: u8, stream: u32, payload: local &[u8]) {
+        let buf = this.out_buf
+        if isset(buf) {
+            this.write_raw_header(buf, kind, flags, stream, payload.length)
+            if payload.length > 0 : buf.write(payload)
+            return
+        }
+        this.output.append(H2Frame { kind: kind, flags: flags, stream: stream, payload: payload.to_string() })
+    }
+
+    fn emit_u32_frame(kind: u8, flags: u8, stream: u32, value: u32) {
+        let buf = this.out_buf
+        if isset(buf) {
+            @unsafe
+            buf.reserve(13)
+            let dst = buf.data
+            let p = buf.length
+            @ptrv(dst, u8, p) = 0
+            @ptrv(dst, u8, p + 1) = 0
+            @ptrv(dst, u8, p + 2) = 4
+            @ptrv(dst, u8, p + 3) = kind
+            @ptrv(dst, u8, p + 4) = flags
+            @ptrv(dst, u8, p + 5) = (stream >> 24).to(u8)
+            @ptrv(dst, u8, p + 6) = (stream >> 16).to(u8)
+            @ptrv(dst, u8, p + 7) = (stream >> 8).to(u8)
+            @ptrv(dst, u8, p + 8) = stream.to(u8)
+            @ptrv(dst, u8, p + 9) = (value >> 24).to(u8)
+            @ptrv(dst, u8, p + 10) = (value >> 16).to(u8)
+            @ptrv(dst, u8, p + 11) = (value >> 8).to(u8)
+            @ptrv(dst, u8, p + 12) = value.to(u8)
+            buf.skip(13)
+            return
+        }
+        this.output.append(H2Frame { kind: kind, flags: flags, stream: stream, payload: h2_number(value) })
+    }
+
+    fn emit_goaway(last_stream: u32, code: u32) {
+        let buf = this.out_buf
+        if isset(buf) {
+            this.write_raw_header(buf, H2_GOAWAY, 0, 0, 8)
+            buf.write_u32_be(last_stream)
+            buf.write_u32_be(code)
+            return
+        }
+        let payload = ByteBuffer.new(8)
+        payload.write_u32_be(last_stream)
+        payload.write_u32_be(code)
+        this.output.append(H2Frame { kind: H2_GOAWAY, payload: payload.into_string() })
+    }
 
     fn start() {
-        let settings = ByteBuffer.new()
+        let buf = this.out_buf
+        if isset(buf) {
+            this.write_raw_header(buf, H2_SETTINGS, 0, 0, 12)
+            buf.write_u16_be(3)
+            buf.write_u32_be(this.max_streams.to(u32))
+            buf.write_u16_be(6)
+            buf.write_u32_be(this.decoder.max_header_size.to(u32))
+            this.settings_pending = true
+            return
+        }
+        let settings = ByteBuffer.new(12)
         settings.write_u16_be(3)
         settings.write_u32_be(this.max_streams.to(u32))
         settings.write_u16_be(6)
@@ -62,11 +156,12 @@ class H2Session {
     fn reset_stream(id: u32, code: u32) {
         let stream = this.streams.get(id) !? null
         if isset(stream) {
+            if !stream.remote_closed : this.receiving_streams--
             stream.cancelled = true
             this.release_body(stream)
             this.streams.remove(id)
         }
-        this.output.append(H2Frame { kind: H2_RST_STREAM, stream: id, payload: h2_number(code) })
+        this.emit_u32_frame(H2_RST_STREAM, 0, id, code)
     }
 
     fn release_body(stream: H2Stream) {
@@ -78,49 +173,51 @@ class H2Session {
         if this.draining : return
         this.draining = true
         this.goaway_last_stream = this.last_stream
-        let payload = ByteBuffer.new()
-        payload.write_u32_be(this.goaway_last_stream)
-        payload.write_u32_be(0)
-        this.output.append(H2Frame { kind: H2_GOAWAY, payload: payload.into_string() })
+        this.emit_goaway(this.goaway_last_stream, 0)
     }
 
     fn receive(frame: H2Frame) ?H2Stream !H2Error {
         h2_frame_header(frame.kind, frame.flags, frame.stream, frame.payload.bytes, 16_384) !>
-        frame.validate_payload() !>
-        if frame.stream != 0 && frame.stream % 2 == 0 && (frame.kind == H2_DATA || frame.kind == H2_RST_STREAM || frame.kind == H2_WINDOW_UPDATE) : throw .protocol
+        let fragment = h2_fragment_slice(frame.kind, frame.flags, frame.payload) !>
+        return this.receive_raw(frame.kind, frame.flags, frame.stream, frame.payload, fragment) !>
+    }
+
+    fn receive_raw(kind: u8, flags: u8, stream: u32, payload: local &[u8], fragment: local &[u8]) ?H2Stream !H2Error {
+        if stream != 0 && stream % 2 == 0 && (kind == H2_DATA || kind == H2_RST_STREAM || kind == H2_WINDOW_UPDATE) : throw .protocol
         if !this.received_settings {
-            if frame.kind != H2_SETTINGS || (frame.flags & 1) != 0 : throw .protocol
+            if kind != H2_SETTINGS || (flags & 1) != 0 : throw .protocol
             this.received_settings = true
         }
-        if this.header_block.stream != 0 || frame.kind == H2_HEADERS || frame.kind == H2_CONTINUATION {
-            return this.receive_headers(frame) !>
+        if this.header_block.stream != 0 || kind == H2_HEADERS || kind == H2_CONTINUATION {
+            return this.receive_headers_raw(kind, flags, stream, fragment) !>
         }
-        if frame.kind == H2_PUSH_PROMISE : throw .protocol
-        if frame.kind == H2_SETTINGS {
-            this.receive_settings(frame) !>
-        } else if frame.kind == H2_PING {
-            if (frame.flags & 1) == 0 : this.output.append(H2Frame { kind: H2_PING, flags: 1, payload: frame.payload })
-        } else if frame.kind == H2_GOAWAY {
+        if kind == H2_PUSH_PROMISE : throw .protocol
+        if kind == H2_SETTINGS {
+            this.receive_settings_raw(flags, payload) !>
+        } else if kind == H2_PING {
+            if (flags & 1) == 0 : this.emit_frame(H2_PING, 1, 0, payload)
+        } else if kind == H2_GOAWAY {
             this.shutdown()
-        } else if frame.kind == H2_WINDOW_UPDATE {
-            this.receive_window_update(frame) !>
-        } else if frame.kind == H2_PRIORITY {
+        } else if kind == H2_WINDOW_UPDATE {
+            this.receive_window_update_raw(stream, payload) !>
+        } else if kind == H2_PRIORITY {
             // PRIORITY carries no stream state and RFC 9113 dropped the
             // self-dependency rule, so the frame has no effect
-        } else if frame.kind == H2_RST_STREAM {
-            if frame.stream > this.last_stream : throw .protocol
-            let stream = this.streams.get(frame.stream) ! return null
-            stream.cancelled = true
-            this.release_body(stream)
-            this.streams.remove(frame.stream)
-        } else if frame.kind == H2_DATA {
-            return this.receive_data(frame) !>
+        } else if kind == H2_RST_STREAM {
+            if stream > this.last_stream : throw .protocol
+            let found = this.streams.get(stream) ! return null
+            if !found.remote_closed : this.receiving_streams--
+            found.cancelled = true
+            this.release_body(found)
+            this.streams.remove(stream)
+        } else if kind == H2_DATA {
+            return this.receive_data_raw(flags, stream, payload, fragment) !>
         }
         return null
     }
 
-    fn receive_settings(frame: H2Frame) !H2Error {
-        if (frame.flags & 1) != 0 {
+    fn receive_settings_raw(flags: u8, payload: local &[u8]) !H2Error {
+        if (flags & 1) != 0 {
             if !this.settings_pending : throw .protocol
             this.settings_pending = false
             return
@@ -128,15 +225,15 @@ class H2Session {
         // Apply duplicates in wire order: an intermediate window can overflow. The streams are
         // walked once, with the highest intermediate change, so a frame of many entries costs
         // no more than one
-        let reader = ByteReader.new(frame.payload)
         let start_window = this.peer.initial_window_size.to(int)
         let highest: int = 0
-        while reader.remaining().length > 0 {
-            let entry = reader.read_string(6)
-            this.peer.apply(H2Frame { kind: H2_SETTINGS, payload: entry }) !>
+        let pos: uint = 0
+        while pos < payload.length {
+            this.peer.apply_raw(0, 0, payload.view(pos, 6)) !>
             this.encoder.set_limit(this.peer.header_table_size)
             let delta = this.peer.initial_window_size.to(int) - start_window
             if delta > highest : highest = delta
+            pos += 6
         }
         let delta = this.peer.initial_window_size.to(int) - start_window
         if delta != 0 || highest > 0 {
@@ -145,36 +242,49 @@ class H2Session {
                 stream.send_window += delta
             }
         }
-        this.output.append(H2Frame { kind: H2_SETTINGS, flags: 1 })
+        this.emit_frame(H2_SETTINGS, 1, 0, "")
     }
 
-    fn receive_window_update(frame: H2Frame) !H2Error {
-        let increment = (ByteReader.new(frame.payload).read_u32_be() & 0x7fffffff).to(int)
-        if frame.stream == 0 {
+    fn receive_window_update_raw(stream_id: u32, payload: local &[u8]) !H2Error {
+        let raw: u32 = (payload.byte(0).to(u32) << 24) | (payload.byte(1).to(u32) << 16)
+            | (payload.byte(2).to(u32) << 8) | payload.byte(3).to(u32)
+        let increment = (raw & 0x7fffffff).to(int)
+        if stream_id == 0 {
             if increment == 0 : throw .protocol
             if this.send_window + increment > 0x7fffffff : throw .flow_control
             this.send_window += increment
             return
         }
-        if frame.stream > this.last_stream : throw .protocol
-        let stream = this.streams.get(frame.stream) ! return
+        if stream_id > this.last_stream : throw .protocol
+        let stream = this.streams.get(stream_id) ! return
         if increment == 0 {
-            this.reset_stream(frame.stream, 1)
+            this.reset_stream(stream_id, 1)
         } else if stream.send_window + increment > 0x7fffffff {
-            this.reset_stream(frame.stream, 3)
+            this.reset_stream(stream_id, 3)
         } else {
             stream.send_window += increment
         }
     }
 
-    fn receive_headers(frame: H2Frame) ?H2Stream !H2Error {
-        if frame.kind == H2_HEADERS && this.header_block.stream == 0 {
-            this.header_stream = frame.stream
-            this.header_end_stream = (frame.flags & 1) != 0
+    fn receive_headers_raw(kind: u8, flags: u8, stream_id: u32, fragment: local &[u8]) ?H2Stream !H2Error {
+        let single = this.header_block.stream == 0 && (flags & 4) != 0
+        if kind == H2_HEADERS && this.header_block.stream == 0 {
+            this.header_stream = stream_id
+            this.header_end_stream = (flags & 1) != 0
         }
-        let block = this.header_block.accept(frame) !>
-        if !isset(block) : return null
-        let fields = this.decoder.decode(block) !>
+        if !this.header_block.accept_raw(kind, flags, stream_id, fragment) !> : return null
+        let fields = Array[HpackField].new(8)
+        if single {
+            this.decoder.decode_into(fragment, fields) !>
+        } else {
+            let buf = this.header_block.fragments
+            this.decoder.decode_into(buf.view(0, buf.length), fields) ! {
+                buf.clear()
+                throw E
+            }
+            buf.clear()
+            if buf.size > 65_536 : buf.shrink_capacity(1024)
+        }
         let id = this.header_stream
         if id % 2 == 0 : throw .protocol
         let stream = this.streams.get(id) !? null
@@ -188,8 +298,35 @@ class H2Session {
                 this.reset_stream(id, 7)
                 return null
             }
-            stream = H2Stream { id: id, fields: fields, send_window: this.peer.initial_window_size.to(int) }
+            let init_win = this.peer.initial_window_size.to(int)
+            if isset(this.out_buf) {
+                let pooled = h2_stream_pool.pop_last() !? null
+                if isset(pooled) {
+                    pooled.id = id
+                    pooled.method = ""
+                    pooled.target = ""
+                    pooled.fields = fields
+                    pooled.trailers = null
+                    pooled.body = null
+                    pooled.send_window = init_win
+                    pooled.receive_window = 65_535
+                    pooled.remote_closed = false
+                    pooled.local_closed = false
+                    pooled.cancelled = false
+                    pooled.headers_sent = false
+                    pooled.expected_length = null
+                    pooled.last_read_ms = 0
+                    pooled.window_start = 0
+                    pooled.window_size = 0
+                    stream = pooled
+                } else {
+                    stream = H2Stream { id: id, fields: fields, send_window: init_win }
+                }
+            } else {
+                stream = H2Stream { id: id, fields: fields, send_window: init_win }
+            }
             this.streams.set(id, stream)
+            this.receiving_streams++
             h2_validate_request(stream) ! {
                 this.reset_stream(id, 1)
                 return null
@@ -204,7 +341,7 @@ class H2Session {
                 return null
             }
             each fields as field {
-                if !h2_regular_field(field) || field.name == "content-length" || field.name == "host" {
+                if !field.valid && (!h2_regular_field(field) || field.name == "content-length" || field.name == "host") {
                     this.reset_stream(id, 1)
                     return null
                 }
@@ -221,90 +358,131 @@ class H2Session {
             this.reset_stream(stream.id, 1)
             return null
         }
-        stream.remote_closed = true
+        if !stream.remote_closed {
+            stream.remote_closed = true
+            this.receiving_streams--
+        }
         return stream
     }
 
-    fn receive_data(frame: H2Frame) ?H2Stream !H2Error {
-        let bytes = frame.payload.bytes
+    fn receive_data_raw(flags: u8, stream_id: u32, payload: local &[u8], data: local &[u8]) ?H2Stream !H2Error {
+        let bytes = payload.length
         if bytes.to(int) > this.receive_window : throw .flow_control
-        if frame.stream > this.last_stream : throw .protocol
+        if stream_id > this.last_stream : throw .protocol
         this.receive_window -= bytes.to(int)
         // Bodies are buffered under explicit limits, so accepted bytes can be credited immediately.
         if bytes > 0 {
             this.receive_window += bytes.to(int)
-            this.output.append(H2Frame { kind: H2_WINDOW_UPDATE, payload: h2_number(bytes.to(u32)) })
+            this.emit_u32_frame(H2_WINDOW_UPDATE, 0, 0, bytes.to(u32))
         }
-        let stream = this.streams.get(frame.stream) ! {
-            this.reset_stream(frame.stream, 5)
+        let stream = this.streams.get(stream_id) ! {
+            this.reset_stream(stream_id, 5)
             return null
         }
         if stream.remote_closed {
-            this.reset_stream(frame.stream, 5)
+            this.reset_stream(stream_id, 5)
             return null
         }
         if bytes.to(int) > stream.receive_window {
-            this.reset_stream(frame.stream, 3)
+            this.reset_stream(stream_id, 3)
             return null
         }
-        let data = frame.fragment() !>
         let body_size = stream.body_size()
         if body_size > this.max_body_size || this.buffered_body > this.max_buffered_body
-            || data.bytes > this.max_body_size - body_size
-            || data.bytes > this.max_buffered_body - this.buffered_body {
-            this.reset_stream(frame.stream, 11)
+            || data.length > this.max_body_size - body_size
+            || data.length > this.max_buffered_body - this.buffered_body {
+            this.reset_stream(stream_id, 11)
             return null
         }
-        if data.bytes > 0 {
+        if data.length > 0 {
             let body = stream.body
             if !isset(body) {
-                body = ByteBuffer.new(data.bytes)
+                body = ByteBuffer.new(data.length)
                 stream.body = body
             }
             body.write(data)
         }
-        this.buffered_body += data.bytes
-        if bytes > 0 : this.output.append(H2Frame { kind: H2_WINDOW_UPDATE, stream: frame.stream, payload: h2_number(bytes.to(u32)) })
-        if (frame.flags & 1) != 0 : return this.end_request(stream)
+        this.buffered_body += data.length
+        if bytes > 0 : this.emit_u32_frame(H2_WINDOW_UPDATE, 0, stream_id, bytes.to(u32))
+        if (flags & 1) != 0 : return this.end_request(stream)
         return null
     }
 
     // Returns the bytes consumed; zero means the caller must wait for window credit.
     fn send_data(stream: H2Stream, data: String, end_stream: bool) uint !H2Error {
-        if stream.cancelled || stream.local_closed || !stream.headers_sent : throw .protocol
-        let count = data.bytes
+        return this.send_data_view(stream, data, end_stream) !>
+    }
+
+    fn send_data_view(stream: H2Stream, data: local &[u8], end_stream: bool) uint !H2Error {
+        if stream.cancelled || stream.local_closed || !stream.headers_sent || stream.id > 0x7fffffff : throw .protocol
+        let count = data.length
         if count > this.peer.max_frame_size : count = this.peer.max_frame_size
         let credit = this.send_window < stream.send_window ? this.send_window : stream.send_window
         if count > 0 {
             if credit <= 0 : return 0
             if count > credit.to(uint) : count = credit.to(uint)
         }
-        let ended = end_stream && count == data.bytes
-        this.output.append(H2Frame { kind: H2_DATA, stream: stream.id, flags: ended ? 1 : 0, payload: data.range(0, count) })
+        let ended = end_stream && count == data.length
+        this.emit_frame(H2_DATA, ended ? 1 : 0, stream.id, data.view(0, count))
         this.send_window -= count.to(int)
         stream.send_window -= count.to(int)
         if ended : this.close_local(stream)
         return count
     }
 
-    fn send_headers(stream: H2Stream, fields: Array[HpackField], end_stream: bool) !H2Error {
-        if stream.cancelled || stream.local_closed || stream.headers_sent : throw .protocol
-        let limit = this.peer.max_header_list_size.to(uint)
-        if limit > 65_536 : limit = 65_536
-        let block = this.encoder.encode(fields, limit) !>
+    fn emit_header_frames(stream_id: u32, block: local &[u8], end_stream: bool) {
         let offset: uint = 0
         let kind: u8 = H2_HEADERS
         while true {
-            let size = block.bytes - offset
+            let size = block.length - offset
             if size > this.peer.max_frame_size : size = this.peer.max_frame_size
             let flags: u8 = 0
             if end_stream && kind == H2_HEADERS : flags = 1
-            if offset + size == block.bytes : flags = flags | 4
-            this.output.append(H2Frame { kind: kind, stream: stream.id, flags: flags, payload: block.range(offset, size) })
+            if offset + size == block.length : flags = flags | 4
+            this.emit_frame(kind, flags, stream_id, block.view(offset, size))
             offset += size
-            if offset == block.bytes : break
+            if offset == block.length : break
             kind = H2_CONTINUATION
         }
+    }
+
+    fn send_headers(stream: H2Stream, fields: Array[HpackField], end_stream: bool) !H2Error {
+        if stream.cancelled || stream.local_closed || stream.headers_sent || stream.id > 0x7fffffff : throw .protocol
+        let limit = this.peer.max_header_list_size.to(uint)
+        if limit > 65_536 : limit = 65_536
+        let buf = this.out_buf
+        if isset(buf) {
+            let start_pos = buf.length
+            buf.skip(9)
+            this.encoder.encode_into(fields, limit, buf) ! {
+                buf.truncate(start_pos)
+                throw E
+            }
+            let block_len = buf.length - start_pos - 9
+            if block_len <= this.peer.max_frame_size.to(uint) {
+                @unsafe
+                let flags: u8 = (end_stream ? 1 : 0) | 4
+                let dst = buf.data
+                @ptrv(dst, u8, start_pos) = (block_len >> 16).to(u8)
+                @ptrv(dst, u8, start_pos + 1) = (block_len >> 8).to(u8)
+                @ptrv(dst, u8, start_pos + 2) = block_len.to(u8)
+                @ptrv(dst, u8, start_pos + 3) = H2_HEADERS
+                @ptrv(dst, u8, start_pos + 4) = flags
+                @ptrv(dst, u8, start_pos + 5) = (stream.id >> 24).to(u8)
+                @ptrv(dst, u8, start_pos + 6) = (stream.id >> 16).to(u8)
+                @ptrv(dst, u8, start_pos + 7) = (stream.id >> 8).to(u8)
+                @ptrv(dst, u8, start_pos + 8) = stream.id.to(u8)
+            } else {
+                let block = buf.range(start_pos + 9, block_len)
+                buf.truncate(start_pos)
+                this.emit_header_frames(stream.id, block, end_stream)
+            }
+            stream.headers_sent = true
+            if end_stream : this.close_local(stream)
+            return
+        }
+        let block = this.encoder.encode(fields, limit) !>
+        this.emit_header_frames(stream.id, block, end_stream)
         stream.headers_sent = true
         if end_stream : this.close_local(stream)
     }
@@ -318,8 +496,20 @@ class H2Session {
     }
 }
 
+fn h2_header_name_is_valid(name: String) bool {
+    if name.bytes == 0 : return false
+    each name as ch {
+        if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') : continue
+        if ch == '-' || ch == '_' || ch == '.' || ch == '!' || ch == '#' || ch == '$'
+            || ch == '%' || ch == '&' || ch == '\'' || ch == '*' || ch == '+'
+            || ch == '^' || ch == '`' || ch == '|' || ch == '~' : continue
+        return false
+    }
+    return true
+}
+
 fn h2_regular_field(field: HpackField) bool {
-    if !response_header_name_is_safe(field.name) || field.name != field.name.lower() : return false
+    if !h2_header_name_is_valid(field.name) : return false
     if !response_header_value_is_safe(field.value) : return false
     if field.value.bytes > 0 {
         let first = field.value[0]
@@ -340,6 +530,10 @@ fn h2_validate_request(stream: H2Stream) !H2Error {
     let regular = false
     let host: ?String = null
     each stream.fields as field {
+        if field.valid {
+            regular = true
+            continue
+        }
         if field.name.starts_with(":") {
             if regular : throw .protocol
             let bit: u8 = 0
@@ -390,4 +584,6 @@ fn h2_validate_request(stream: H2Stream) !H2Error {
         if (!path.starts_with("/") && !(method == "OPTIONS" && path == "*")) || path.contains("#") : throw .protocol
         if authority == "" && (!isset(host) || host == "") : throw .protocol
     }
+    stream.method = method
+    stream.target = path
 }

@@ -3279,6 +3279,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
     + fn query_grouped() Map[Array[String]]
+    // Returns the value of the query parameter `name`, like `query().get(name)` without parsing the other parameters.
+    + fn query_param(name: String) String !LookupError
 }
 ```
 
@@ -3501,6 +3503,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
     + fn query_grouped() Map[Array[String]]
+    // Returns the value of the query parameter `name`, like `query().get(name)` without parsing the other parameters.
+    + fn query_param(name: String) String !LookupError
 }
 ```
 
@@ -3576,6 +3580,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 
     // Returns an independent copy of the route.
     + fn clone() Route[T]
+    // Returns the value of one `@name` part (or `*` for a wildcard part) from `path`, like `params(path, decode).get(name)` without extracting the other parts.
+    + fn param(path: String, name: String, decode: bool (true)) String !LookupError
     // Returns the values of the route's `@name` parts, taken from `path`, and the rest of the path matched by a `*` part under the name `*`.
     + fn params(path: String, decode: bool (true)) Map[String]
 }
@@ -3614,7 +3620,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + header_timeout_ms: uint
     // The address the server listens on.
     ~ host: String
-    // Enables experimental HTTP/2, negotiated through ALPN with HTTP/1.1 as fallback.
+    // Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is configured, or cleartext HTTP/2 (`h2c` prior knowledge) without `tls`.
     + http2: bool
     // How long a connection may wait for the next request, in milliseconds. Defaults to 75 seconds: an idle connection costs little, and a client that comes back within a minute keeps its connection.
     + idle_timeout_ms: uint
@@ -3652,7 +3658,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     // Wraps the handler in `middleware`, which runs for every request that reaches the handler.
     + fn add_middleware(middleware: atomic fn(Request, atomic fn(Request)(Response))(Response)) void
     // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
+    + fn add_static_dir(path: String, index: String ("index.html"), prefix: String ("")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: atomic fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.

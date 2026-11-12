@@ -393,3 +393,83 @@ test "HTTP server: a worker accepts while it holds no more than its share" {
     assert(http.worker_may_accept(56, 200, 4))
     assert(!http.worker_may_accept(57, 200, 4))
 }
+
+test "HTTP server: query_param, Route.param, prefixed static dir and precompressed sidecars" {
+    let router = http.Router[uint].new()
+    router.add("GET", "/", 1)
+    router.add("GET", "/users/@id/posts/@slug", 2)
+    router.add("GET", "/users/me", 3)
+    router.add("GET", "/files/*", 4)
+    assert((router.find("GET", "/") !!).handler == 1)
+    assert((router.find("GET", "/users/me") !!).handler == 3)
+    let matched = router.find("GET", "/users/a%20b/posts/hello+world") !!
+    assert(matched.handler == 2)
+    assert((matched.param("/users/a%20b/posts/hello+world", "id") !!) == "a b")
+    assert((matched.param("/users/a%20b/posts/hello+world", "slug") !!) == "hello+world")
+    assert((matched.param("/users/a%20b/posts/hello+world", "id", false) !!) == "a%20b")
+    let missing_param = false
+    matched.param("/users/a%20b/posts/hello+world", "none") ! { missing_param = true }
+    assert(missing_param)
+    let wild = router.find("GET", "/files/sub/a%2fb.txt") !!
+    assert(wild.handler == 4 && (wild.param("/files/sub/a%2fb.txt", "*") !!) == "sub/a/b.txt")
+
+    let dir = fs.create_temp_dir("valk-static-prefix-") !!
+    defer fs.delete_all(dir) _
+    let raw_js = "console.log('x');\n".repeat(100)
+    let fake_br = "BROTLI-PRECOMPRESSED-PAYLOAD"
+    let gz_js = compress.gzip(raw_js)
+    fs.write(fs.add(dir, "app.js"), raw_js) !!
+    fs.write(fs.add(dir, "app.js.br"), fake_br) !!
+    fs.write(fs.add(dir, "app.js.gz"), gz_js) !!
+
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        let a = req.query_param("a") !? "-"
+        let b = req.query_param("k space") !? "-"
+        let flag = req.query_param("flag") !? "missing"
+        let none = req.query_param("none") !? "absent"
+        return http.Response.text(req.path + "|" + a + "|" + b + "|" + flag + "|" + none)
+    }
+    let server = http.Server.new("127.0.0.1", 19624, handler)
+    server.compress = true
+    server.reuse_port = true
+    server.add_static_dir(dir, "", "/static/") !!
+    let running = co server.start(4)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(20)
+
+    // Non-prefixed `/app.js` reaches `handler` instead of hitting the static dir
+    let api = http.get("http://127.0.0.1:19624/app.js?a=1&k+space=two+words&flag&a=9") !!
+    assert(api.body == "/app.js|9|two words||absent")
+
+    // Prefixed `/static/app.js` serves `.br` when client accepts `br`, `.gz` when `gzip`
+    let br_res = http.get("http://127.0.0.1:19624/static/app.js", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "br, gzip" }
+    }) !!
+    assert(br_res.status == 200)
+    assert((br_res.headers.get("content-encoding") !? "") == "br")
+    assert((br_res.headers.get("vary") !? "") == "Accept-Encoding")
+    assert(br_res.body == fake_br)
+    let br_etag = br_res.headers.get("etag") !? ""
+    assert(br_etag.ends_with("-br\""))
+
+    let not_mod = http.get("http://127.0.0.1:19624/static/app.js", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "br, gzip", "If-None-Match" => br_etag }
+    }) !!
+    assert(not_mod.status == 304)
+
+    let gz_res = http.get("http://127.0.0.1:19624/static/app.js", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "gzip" }
+    }) !!
+    assert(gz_res.status == 200 && (gz_res.headers.get("content-encoding") !? "") == "gzip")
+    assert(gz_res.body == gz_js)
+
+    // Byte range serves the uncompressed slice even when sidecars exist
+    let part = http.get("http://127.0.0.1:19624/static/app.js", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "br, gzip", "Range" => "bytes=0-10" }
+    }) !!
+    assert(part.status == 206 && part.body == "console.log")
+}

@@ -11031,6 +11031,8 @@ stored between requests: a client that wants to send these back adds them to the
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
     + fn query_grouped() Map[Array[String]]
+    // Returns the value of the query parameter `name`, like `query().get(name)` without parsing the other parameters.
+    + fn query_param(name: String) String !LookupError
 }
 ```
 
@@ -11152,6 +11154,14 @@ the value `""`, and for a repeated key the last value wins; see `query_grouped`.
 Returns every value of each query string parameter, in order.
 
 Decoded like `query`.
+
+#### query_param
+
+Returns the value of the query parameter `name`, like `query().get(name)` without
+parsing the other parameters.
+
+Keys and values are decoded with `url.decode`, and for a repeated key the last value
+wins. Throws `LookupError` when the query string has no such parameter.
 
 ```js
 // A cookie to send with a response.
@@ -11800,6 +11810,8 @@ in `headers` are all kept. Names not in `headers` stay untouched.
     + fn query() Map[String]
     // Returns every value of each query string parameter, in order.
     + fn query_grouped() Map[Array[String]]
+    // Returns the value of the query parameter `name`, like `query().get(name)` without parsing the other parameters.
+    + fn query_param(name: String) String !LookupError
 }
 ```
 
@@ -11918,6 +11930,14 @@ the value `""`, and for a repeated key the last value wins; see `query_grouped`.
 Returns every value of each query string parameter, in order.
 
 Decoded like `query`.
+
+#### query_param
+
+Returns the value of the query parameter `name`, like `query().get(name)` without
+parsing the other parameters.
+
+Keys and values are decoded with `url.decode`, and for a repeated key the last value
+wins. Throws `LookupError` when the query string has no such parameter.
 
 ```js
 // A response returned by a server handler.
@@ -12174,6 +12194,8 @@ work as in `WebSocket.upgrade`.
 
     // Returns an independent copy of the route.
     + fn clone() Route[T]
+    // Returns the value of one `@name` part (or `*` for a wildcard part) from `path`, like `params(path, decode).get(name)` without extracting the other parts.
+    + fn param(path: String, name: String, decode: bool (true)) String !LookupError
     // Returns the values of the route's `@name` parts, taken from `path`, and the rest of the path matched by a `*` part under the name `*`.
     + fn params(path: String, decode: bool (true)) Map[String]
 }
@@ -12190,6 +12212,13 @@ The value registered with `Router.add`.
 #### clone
 
 Returns an independent copy of the route.
+
+#### param
+
+Returns the value of one `@name` part (or `*` for a wildcard part) from `path`, like
+`params(path, decode).get(name)` without extracting the other parts.
+
+Throws `LookupError` when the route has no such part or `path` is shorter than it.
 
 #### params
 
@@ -12231,7 +12260,7 @@ the path exists for others, for a 405 answer.
 let router = http.Router[fn(http.Request)(http.Response)].new()
 router.add("GET", "/users/@id", show_user)
 let route = router.find(req.method, req.path) ! return http.Response.empty(404)
-let id = route.params(req.path).get("id") !? ""
+let id = route.param(req.path, "id") !? ""
 ```
 
 #### add
@@ -12286,7 +12315,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     + header_timeout_ms: uint
     // The address the server listens on.
     ~ host: String
-    // Enables experimental HTTP/2, negotiated through ALPN with HTTP/1.1 as fallback.
+    // Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is configured, or cleartext HTTP/2 (`h2c` prior knowledge) without `tls`.
     + http2: bool
     // How long a connection may wait for the next request, in milliseconds. Defaults to 75 seconds: an idle connection costs little, and a client that comes back within a minute keeps its connection.
     + idle_timeout_ms: uint
@@ -12324,7 +12353,7 @@ Creates an empty router; also backs `Router[T]{}` and default construction.
     // Wraps the handler in `middleware`, which runs for every request that reaches the handler.
     + fn add_middleware(middleware: atomic fn(Request, atomic fn(Request)(Response))(Response)) void
     // Serves files from the directory `path` before a request reaches the handler.
-    + fn add_static_dir(path: String, index: String ("index.html")) void !io:IoError
+    + fn add_static_dir(path: String, index: String ("index.html"), prefix: String ("")) void !io:IoError
     // Sets a fast handler, which is used instead of the regular one.
     + fn fast(handler: atomic fn(Context, ResponseWriter)()) void
     // Sets the handler that answers each request.
@@ -12401,9 +12430,10 @@ The address the server listens on.
 
 #### http2
 
-Enables experimental HTTP/2, negotiated through ALPN with HTTP/1.1 as fallback.
+Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is
+configured, or cleartext HTTP/2 (`h2c` prior knowledge) without `tls`.
 
-Requires `tls` and the regular handler; `start` fails with `init` otherwise.
+Requires the regular handler; `start` fails with `init` when a `fast` handler is set.
 
 #### idle_timeout_ms
 
@@ -12522,8 +12552,10 @@ Serves files from the directory `path` before a request reaches the handler.
 
 Throws `open` when `path` is not a directory. A request whose path names a file
 inside the directory gets that file whatever the method (over HTTP/2: except
-`CONNECT`). The path is percent-decoded first (`+` stays `+`); paths containing
-`..` are never served. The directory added last is searched first.
+`CONNECT`). With `prefix` (such as `"/static"`), only paths under that URL prefix
+are matched and the prefix is stripped before resolving inside `path`. The path is
+percent-decoded first (`+` stays `+`); paths containing `..` are never served. The
+directory added last is searched first.
 
 A path naming a directory that holds an `index` file gets that file, so `/` serves
 `index.html`. Without the trailing slash (`/docs`) the answer is a 301 redirect to
@@ -13008,8 +13040,9 @@ Reads up to `buf.length` bytes from `fd` into `buf` and returns the number read.
 Returns 0 at the end of the input. An explicit `offset` reads at that file position without
 moving the current position; the default (`uint.$max`) reads at the current position and
 advances it, so repeated calls read a file sequentially. Pipes and sockets ignore it. Inside
-a coroutine the call lets other coroutines run while it waits (io_uring on Linux, IOCP on
-Windows, kqueue for non-blocking descriptors on macOS); outside one it blocks. Throws
+a coroutine the call lets other coroutines run while it waits (io_uring or epoll on Linux,
+IOCP on Windows, kqueue for non-blocking descriptors on macOS); outside one it blocks. With
+epoll a read at a file position blocks, as files are always ready. Throws
 `.read`, or `.os` when the request cannot be queued.
 
 ### read_all
@@ -13078,8 +13111,8 @@ The count may be less than `data.length`; call again for the rest. An explicit `
 writes at that file position without moving the current position; the default
 (`uint.$max`) writes at the current position and advances it, or at the end of a file
 opened in `fs.WriteMode.append`. Inside a coroutine the call lets other coroutines run
-while it waits on Linux and Windows. Throws `.write`, or `.os` when the request cannot be
-queued.
+while it waits on Linux and Windows; with epoll only for a non-blocking descriptor. Throws
+`.write`, or `.os` when the request cannot be queued.
 
 ## Classes for 'io'
 

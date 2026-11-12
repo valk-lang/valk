@@ -10,6 +10,32 @@ use compress
 global h2_test_end_reasons: Array[String] (.{})
 #end
 
+global h2_resp_headers: Array[HpackField] (.new(8))
+global h2_chunk_pool: Array[ByteBuffer] (.{})
+global h2_small_ints: [String x 64] ({
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15",
+    "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+    "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47",
+    "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63"
+})
+
+fn h2_uint_str(n: uint) String $inline {
+    if n < 64 : return h2_small_ints[n]
+    return n.to_string()
+}
+
+fn h2_take_chunk_buf() ByteBuffer {
+    let buf = h2_chunk_pool.pop_last() !? ByteBuffer.new(16_384)
+    buf.clear()
+    buf.reserve(16_384)
+    return buf
+}
+
+fn h2_give_chunk_buf(buf: ByteBuffer) {
+    buf.clear()
+    if h2_chunk_pool.length < 16 : h2_chunk_pool.append(buf)
+}
+
 fn h2_close_file(file: ?fs.FileStream) {
     if isset(file) : file.close() ! {}
 }
@@ -53,9 +79,10 @@ class H2Connection {
     session: H2Session
     writer: core.Mutex
     output_buffer: ByteBuffer (.new(16_384))
+    ready_streams: Deque[H2Stream] (.new())
+    in_h2_queue: bool (false)
+    waiting_idle_read: bool (false)
     reading_batch: bool (false)
-    // A flush coroutine is scheduled behind the handlers that are runnable now
-    flush_pending: bool (false)
     closed: bool (false)
     handlers: uint (0)
     processing_body: uint (0)
@@ -73,6 +100,8 @@ class H2Connection {
             owner: owner,
             writer: core.Mutex.new() !>,
             session: H2Session {
+                out_buf: ByteBuffer.new(16_384),
+                max_streams: 256,
                 max_body_size: body_limit,
                 max_buffered_body: body_limit,
                 // The compressed block is capped by the same configured limit as the
@@ -84,13 +113,17 @@ class H2Connection {
     }
 
     fn flush() bool {
-        if this.session.output.length == 0 || this.closed : return !this.closed
-        if this.reading_batch && this.session.output.length < 64 : return true
+        if !this.session.has_output() || this.closed : return !this.closed
+        if this.reading_batch && this.session.out_len() < 16_384 : return true
         this.writer.lock()
         defer this.writer.unlock()
-        while this.session.output.length > 0 && !this.closed {
+        while this.session.has_output() && !this.closed {
             let out = this.output_buffer
             out.clear()
+            let sbuf = this.session.out_buf
+            if isset(sbuf) && sbuf.length > 0 {
+                out.swap(sbuf)
+            }
             while this.session.output.length > 0 && out.length < 16_384 {
                 let frame = this.session.output.pop_first() !!
                 frame.encode_into(out, this.session.peer.max_frame_size) ! {
@@ -98,33 +131,37 @@ class H2Connection {
                     break
                 }
             }
-            if this.closed : break
+            if this.closed || out.length == 0 : break
             this.owner.netcon.write(out) ! {
                 this.closed = true
                 break
             }
+            if out.size > 65_536 : out.shrink_capacity(16_384)
         }
         return !this.closed
     }
 
-    // Used by handlers: the responses of every handler that runs before the
-    // scheduler gets back around go out in one write, instead of one TLS
-    // record and one write per response
-    fn flush_soon() bool {
-        if this.closed : return false
-        if this.session.output.length == 0 || this.flush_pending : return true
-        this.flush_pending = true
-        co this.flush_batch()
-        return true
-    }
-
-    fn flush_batch() {
-        this.flush_pending = false
-        this.flush()
-    }
-
     fn request_shutdown() {
-        this.session.shutdown()
+        if !this.session.draining {
+            this.session.shutdown()
+            this.flush()
+        }
+        if this.session.streams.length == 0 && this.handlers == 0 {
+            this.finish_drain()
+        }
+    }
+
+    fn finish_drain() {
+        if this.closed : return
+        this.flush()
+        this.end_reason = "drained"
+        this.closed = true
+        let socket = this.owner.netcon
+        this.writer.lock()
+        let ssl = socket.ssl
+        if isset(ssl) : ssl.close(socket.write_timeout_ms) ! {}
+        this.writer.unlock()
+        socket.interrupt()
     }
 
     // See `Server.min_transfer_rate`
@@ -164,9 +201,7 @@ class H2Connection {
     fn run() {
         let socket = this.owner.netcon
         let settings = this.owner.worker.server
-        socket.read_timeout_ms = 20
-        let input = ByteBuffer.new()
-        let chunk = [u8]{ 0 x 16_393 }
+        let input = ByteBuffer.new(16_393)
         let preface = false
         let last_read = time.mono_ms()
         let header_started: uint = 0
@@ -183,7 +218,8 @@ class H2Connection {
         }
         if this.owner.rejected : this.session.shutdown()
         while !this.closed {
-            let now = time.mono_ms()
+            let need_time = header_started != 0 || partial_since != 0 || this.session.receiving_streams > 0
+            let now: uint = need_time ? time.mono_ms() : last_read
             if header_started != 0 && settings.header_timeout_ms > 0 && now - header_started >= settings.header_timeout_ms {
                 this.end_reason = "header timeout"
                 this.fail(1)
@@ -194,25 +230,52 @@ class H2Connection {
                 this.end_reason = "partial frame timeout"
                 break
             }
-            let expired = Array[u32].new()
-            each this.session.streams as stream {
-                if !stream.remote_closed && settings.body_timeout_ms > 0 && (now - stream.last_read_ms >= settings.body_timeout_ms || this.body_too_slow(stream, now)) : expired.append(stream.id)
+            if this.session.receiving_streams > 0 && settings.body_timeout_ms > 0 {
+                let expired: ?Array[u32] = null
+                each this.session.streams as stream {
+                    if !stream.remote_closed && (now - stream.last_read_ms >= settings.body_timeout_ms || this.body_too_slow(stream, now)) {
+                        let list = expired ?? <{
+                            let a = Array[u32].new()
+                            expired = a
+                            return a
+                        }
+                        list.append(stream.id)
+                    }
+                }
+                if isset(expired) {
+                    each expired as id : this.session.reset_stream(id, 8)
+                }
             }
-            each expired as id : this.session.reset_stream(id, 8)
             this.sync_body()
             if settings.stopping != 0 : this.request_shutdown()
+            if this.closed : break
             if !this.flush() {
                 this.end_reason = "flush failed"
                 break
             }
             if this.session.draining && this.session.streams.length == 0 && this.handlers == 0 {
-                // flush() can yield on the writer lock after its last check; a GOAWAY the
-                // worker's drain queued meanwhile goes out before the close
-                if this.session.output.length > 0 : continue
+                if this.session.has_output() : continue
                 this.end_reason = "drained"
                 break
             }
-            let received = socket.read(chunk) ! {
+            input.reserve(16_393)
+            let fast_wait = preface && partial_since == 0 && header_started == 0 && this.session.receiving_streams == 0 && !this.session.draining
+            socket.read_timeout_ms = fast_wait ? 0 : 20
+            if fast_wait && this.handlers == 0 && settings.idle_timeout_ms > 0 {
+                this.owner.deadline_ms = last_read.checked_add(settings.idle_timeout_ms) !? uint.$max
+            } else {
+                this.owner.deadline_ms = 0
+            }
+            this.waiting_idle_read = fast_wait
+            let received = socket.read(input.view_spare(16_393)) ! {
+                this.waiting_idle_read = false
+                let idle_expired = this.owner.deadline_ms > 0 && time.mono_ms() >= this.owner.deadline_ms
+                this.owner.deadline_ms = 0
+                if this.closed : break
+                if idle_expired {
+                    this.end_reason = "idle for " + (time.mono_ms() - last_read) + " ms"
+                    break
+                }
                 if !error_is(E.code, timeout) {
                     let ssl_detail = socket.ssl
                     let kind = error_is(E.code, closed) ? "closed" : (error_is(E.code, cancelled) ? "cancelled" : "error")
@@ -226,16 +289,20 @@ class H2Connection {
                 }
                 continue
             }
+            this.waiting_idle_read = false
+            this.owner.deadline_ms = 0
             if received == 0 {
                 this.end_reason = "peer closed"
                 break
             }
             last_read = time.mono_ms()
-            input.write(chunk.view(0, received))
+            this.owner.worker.now = last_read
+            input.skip(received)
             if !preface {
                 let expected = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
                 let count = input.length < expected.bytes ? input.length : expected.bytes
-                if input.to_string().range(0, count) != expected.range(0, count) {
+                let prefix = count == expected.bytes ? expected : expected.range(0, count)
+                if !input.view(0, count).equals(prefix) {
                     this.end_reason = "bad preface"
                     break
                 }
@@ -244,25 +311,46 @@ class H2Connection {
                 preface = true
                 partial_since = 0
             }
-            let reader = input.reader()
+            let pos: uint = 0
+            let total = input.length
             this.reading_batch = true
-            while reader.remaining().length > 0 && !this.closed {
-                let frame = h2_read_frame(reader) ! {
-                    if error_is(E.code, incomplete) : break
+            while total - pos >= 9 && !this.closed {
+                @unsafe
+                let base = input.data
+                let length: uint = (@ptrv(base, u8, pos).to(uint) << 16)
+                    | (@ptrv(base, u8, pos + 1).to(uint) << 8)
+                    | @ptrv(base, u8, pos + 2).to(uint)
+                let kind = @ptrv(base, u8, pos + 3)
+                let flags = @ptrv(base, u8, pos + 4)
+                let stream: u32 = ((@ptrv(base, u8, pos + 5).to(u32) << 24)
+                    | (@ptrv(base, u8, pos + 6).to(u32) << 16)
+                    | (@ptrv(base, u8, pos + 7).to(u32) << 8)
+                    | @ptrv(base, u8, pos + 8).to(u32)) & 0x7fffffff
+                h2_frame_header(kind, flags, stream, length, 16_384) ! {
                     this.end_reason = "bad frame"
                     this.fail(error_is(E.code, frame_size) ? 6 : 1)
                     break
                 }
-                if time.mono_ms() - frame_epoch >= 1000 {
-                    frame_epoch = time.mono_ms()
-                    frame_count = 0
-                }
-                if ++frame_count > 10_000 {
-                    this.fail(11)
+                if length > total - pos - 9 : break
+                let payload = input.view(pos + 9, length)
+                let fragment = h2_fragment_slice(kind, flags, payload) ! {
+                    this.end_reason = "bad frame"
+                    this.fail(error_is(E.code, frame_size) ? 6 : 1)
                     break
                 }
+                pos += 9 + length
+                if h2_raw_counts_toward_flood(kind, flags, length) {
+                    if last_read - frame_epoch >= 1000 {
+                        frame_epoch = last_read
+                        frame_count = 0
+                    }
+                    if ++frame_count > 10_000 {
+                        this.fail(11)
+                        break
+                    }
+                }
                 this.session.max_buffered_body = this.processing_body >= this.session.max_body_size ? 0 : this.session.max_body_size - this.processing_body
-                let ready = this.session.receive(frame) ! {
+                let ready = this.session.receive_raw(kind, flags, stream, payload, fragment) ! {
                     let code: u32 = 1
                     if error_is(E.code, compression) : code = 9
                     if error_is(E.code, flow_control) : code = 3
@@ -271,28 +359,28 @@ class H2Connection {
                     break
                 }
                 if this.session.header_block.stream != 0 {
-                    if header_started == 0 : header_started = time.mono_ms()
+                    if header_started == 0 : header_started = last_read
                 } else {
                     header_started = 0
                 }
-                if frame.kind == H2_DATA || frame.kind == H2_HEADERS || frame.kind == H2_CONTINUATION {
-                    this.session.streams.get(frame.stream) -> stream: stream.last_read_ms = time.mono_ms()
+                if this.session.receiving_streams > 0 && (kind == H2_DATA || kind == H2_HEADERS || kind == H2_CONTINUATION) {
+                    this.session.streams.get(stream) -> s: s.last_read_ms = last_read
                 }
                 if !this.sync_body() {
-                    if frame.stream == 0 {
+                    if stream == 0 {
                         this.fail(11)
                         break
                     }
-                    this.session.reset_stream(frame.stream, 11)
+                    this.session.reset_stream(stream, 11)
                     ready = null
                     this.sync_body()
                 }
                 if isset(ready) {
-                    if this.handlers >= this.session.max_streams {
+                    if this.handlers >= this.session.max_streams * 2 {
                         this.session.reset_stream(ready.id, 7)
                     } else {
                         this.handlers++
-                        co this.handle(ready)
+                        this.ready_streams.push_back(ready)
                     }
                 }
             }
@@ -301,15 +389,29 @@ class H2Connection {
                 this.end_reason = "flush failed"
                 break
             }
-            if input.length == reader.pos : partial_since = 0
-            else if partial_since == 0 || reader.pos > 0 : partial_since = time.mono_ms()
-            input.clear_until(reader.pos)
+            if pos >= total {
+                partial_since = 0
+                input.clear()
+                if input.size > 65_536 : input.shrink_capacity(16_393)
+            } else {
+                if partial_since == 0 || pos > 0 : partial_since = last_read
+                if pos > 0 : input.clear_until(pos)
+            }
+            if this.ready_streams.length > 0 && !this.closed {
+                this.owner.worker.dispatch_h2(this)
+            }
         }
+        this.waiting_idle_read = false
+        this.owner.deadline_ms = 0
         #if TEST
         let port = (socket.local_address() !? net.SocketAddress {}).port
         h2_test_end_reasons.append("port " + port + ": " + this.end_reason + ", draining " + this.session.draining + ", streams " + this.session.streams.length + ", handlers " + this.handlers)
         #end
         this.closed = true
+        while true {
+            let _ = this.ready_streams.pop_front() ! break
+            this.handlers--
+        }
         if this.handlers > 0 {
             // Handlers still use the socket: waking them costs the TLS close notify
             socket.interrupt()
@@ -330,10 +432,7 @@ class H2Connection {
     fn fail(code: u32) {
         if this.end_reason == "closed" : this.end_reason = "failed with code " + code
         this.reading_batch = false
-        let payload = ByteBuffer.new()
-        payload.write_u32_be(this.session.draining ? this.session.goaway_last_stream : this.session.last_stream)
-        payload.write_u32_be(code)
-        this.session.output.append(H2Frame { kind: H2_GOAWAY, payload: payload.into_string() })
+        this.session.emit_goaway(this.session.draining ? this.session.goaway_last_stream : this.session.last_stream, code)
         this.flush()
         this.closed = true
     }
@@ -344,19 +443,12 @@ class H2Connection {
         let body = isset(buffer) ? buffer.into_string() : ""
         this.processing_body += body.bytes
         defer this.handler_finished(body.bytes)
-        let headers = Headers.new()
-        let method = ""
-        let target = ""
-        each stream.fields as field {
-            if field.name == ":method" : method = field.value
-            else if field.name == ":path" : target = field.value
-            else if field.name == ":authority" : headers.set("host", field.value)
-            else if field.name == "cookie" && headers.has("cookie") : headers.set("cookie", (headers.get("cookie") !!) + "; " + field.value)
-            else if !field.name.starts_with(":") : headers.append(field.name, field.value)
-        }
+        if stream.cancelled || this.closed : return
+        let method = stream.method
+        let target = stream.target
         let path = target
         let query = ""
-        target.index_of("?") -> index: {
+        target.index_of_byte('?') -> index: {
             path = target.range(0, index)
             query = target.range(index + 1, target.bytes - index - 1)
         }
@@ -367,28 +459,34 @@ class H2Connection {
             query_string: query
             body_data: body
             header_data: ""
-            header_map: headers
+            h2_fields: stream.fields
             peer_address: owner.peer_address
             client_subject: owner.client_subject
             client_certificate_sha256: owner.client_certificate_sha256
         }
         let response: ?Response = null
-        if method != "CONNECT" {
-            let found = static_file(this.owner.worker.server.static_dirs, path)
+        let server = owner.worker.server
+        if method != "CONNECT" && isset(server.static_dirs) {
+            let found = static_file(server.static_dirs, path)
             if isset(found) {
                 if found.redirect : response = Response.redirect(static_redirect_location(path, query), 301)
                 else : response = Response.file(found.path)
             }
         }
-        if !isset(response) && this.owner.worker.over_memory() : response = Response.empty(503)
-        if !isset(response) : response = method == "CONNECT" ? Response.empty(501) : this.owner.worker.server.handler(request)
+        if !isset(response) && owner.worker.over_memory() : response = Response.empty(503)
+        if !isset(response) : response = method == "CONNECT" ? Response.empty(501) : server.handler(request)
         if !isset(response) : return
         if stream.cancelled || this.closed : return
         this.respond(stream, request, response) ! {
             if !this.closed {
                 this.session.reset_stream(stream.id, 2)
-                this.flush_soon()
             }
+        }
+        if stream.local_closed && stream.remote_closed && !stream.cancelled && h2_stream_pool.length < 256 {
+            stream.trailers = null
+            stream.body = null
+            stream.expected_length = null
+            h2_stream_pool.append(stream)
         }
     }
 
@@ -396,18 +494,25 @@ class H2Connection {
         this.processing_body -= bytes
         this.handlers--
         this.sync_body()
+        if this.handlers == 0 {
+            if this.session.draining && this.session.streams.length == 0 {
+                this.finish_drain()
+            } else if this.waiting_idle_read {
+                let idle = this.owner.worker.server.idle_timeout_ms
+                if idle > 0 : this.owner.deadline_ms = time.mono_ms().checked_add(idle) !? uint.$max
+            }
+        }
     }
 
     // See `ResponseWriter.file_plan_for`
-    fn file_plan_for(request: Request, status: u16, info: fs.FileInfo, content_type: String, extra: ?Headers) ?FilePlan {
+    fn file_plan_for(request: Request, status: u16, info: fs.FileInfo, content_type: String, extra: ?Headers, accept_encoding: String) ?FilePlan {
         if status != 200 : return null
         let get = request.method == "GET"
         if !get && request.method != "HEAD" : return null
         if isset(extra) && (extra.has("etag") || extra.has("last-modified") || extra.has("content-encoding")) : return null
-        let h = request.headers()
-        let range = get ? h.get("range") !? "" : ""
-        return file_plan(info.size, info.modified_time, content_type, this.owner.worker.server.compress, h.get("if-none-match") !? "",
-            h.get("if-modified-since") !? "", range, h.get("if-range") !? "", h.get("accept-encoding") !? "")
+        let range = get ? request.header("range") !? "" : ""
+        return file_plan(info.size, info.modified_time, content_type, this.owner.worker.server.compress, request.header("if-none-match") !? "",
+            request.header("if-modified-since") !? "", range, request.header("if-range") !? "", accept_encoding)
     }
 
     fn respond(stream: H2Stream, request: Request, response: Response) !H2Error {
@@ -425,14 +530,34 @@ class H2Connection {
         let plan: ?FilePlan = null
         let path = response.filepath
         if isset(path) {
-            file = fs.stream(path) !? null
             let info = fs.stat(path) !? null
-            if isset(file) && isset(info) {
-                source = file.to(io.Reader)
-                size = info.size
+            if isset(info) && info.kind != fs.FileKind.directory {
                 content_type = fs.mime_type(fs.extension(path))
                 if isset(extra) : content_type = extra.get("content-type") !? content_type
-                plan = this.file_plan_for(request, status, info, content_type, extra)
+                let accept_encoding = request.header("accept-encoding") !? ""
+                plan = this.file_plan_for(request, status, info, content_type, extra, accept_encoding)
+                if isset(plan) {
+                    if plan.status == 304 || plan.status == 416 {
+                        size = 0
+                    } else {
+                        file = open_precompressed_sidecar(path, info, content_type, this.owner.worker.server.compress, accept_encoding, plan)
+                        if isset(file) {
+                            source = file.to(io.Reader)
+                            size = plan.length
+                        }
+                    }
+                }
+                if !isset(file) && !(isset(plan) && (plan.status == 304 || plan.status == 416)) {
+                    file = fs.stream(path) !? null
+                    if isset(file) {
+                        source = file.to(io.Reader)
+                        size = info.size
+                    } else {
+                        plan = null
+                        status = 404
+                        size = 0
+                    }
+                }
             } else {
                 status = 404
                 size = 0
@@ -454,13 +579,15 @@ class H2Connection {
             if status == 304 || status == 416 : source = null
         }
         if status < 200 || status > 599 : status = 500
-        let headers = Array[HpackField] { .{ name: ":status", value: status.to_string() } }
+        let headers = h2_resp_headers
+        headers.clear()
+        headers.append(.{ name: ":status", value: status == 200 ? "200" : status.to_string() })
         if isset(extra) : content_type = extra.get("content-type") !? content_type
         // `Server.compress`: a body in memory is sent gzip-compressed to a client that takes it
         if !isset(source) && !isset(plan) && this.owner.worker.server.compress && status != 204 && status != 304 && body.bytes >= GZIP_MIN_SIZE
             && response_gzip_type(content_type) && !(isset(extra) && extra.has("content-encoding")) {
             headers.append(.{ name: "vary", value: "Accept-Encoding" })
-            if request_accepts_gzip(request.headers().get("accept-encoding") !? "") {
+            if request_accepts_gzip(request.header("accept-encoding") !? "") {
                 body = compress.gzip(body, this.owner.worker.server.compress_level)
                 size = body.bytes
                 headers.append(.{ name: "content-encoding", value: "gzip" })
@@ -476,7 +603,7 @@ class H2Connection {
         }
         if status != 304 || !isset(plan) {
             if response_header_value_is_safe(content_type) : headers.append(.{ name: "content-type", value: content_type })
-            if status != 204 && !open_body : headers.append(.{ name: "content-length", value: size.to_string() })
+            if status != 204 && !open_body : headers.append(.{ name: "content-length", value: h2_uint_str(size) })
         }
         if isset(extra) {
             each extra as value, name {
@@ -495,72 +622,85 @@ class H2Connection {
         }
         let no_body = request.method == "HEAD" || status == 204 || status == 304 || (size == 0 && !open_body)
         this.session.send_headers(stream, headers, no_body) !>
-        if no_body {
-            this.flush_soon()
-            return
-        }
-        if isset(source) && !this.flush_soon() : return
+        if no_body : return
         if open_body && isset(source) {
-            let buffer = [u8]{ 0 x 16_384 }
+            if !this.flush() : return
+            let chunk_buf = h2_take_chunk_buf()
+            defer h2_give_chunk_buf(chunk_buf)
             while !stream.cancelled && !this.closed {
-                let read = read_body_piece(source, buffer) ! throw .protocol
-                if !this.send_all_data(stream, buffer.view(0, read).to_string(), read == 0) !> : return
+                let read = read_body_piece(source, chunk_buf.view_spare(16_384)) ! throw .protocol
+                if !this.send_all_data_slice(stream, chunk_buf.view_spare(16_384).view(0, read), read == 0) !> : return
+                if !this.flush() : return
                 if read == 0 : return
             }
             return
         }
-        let offset: uint = 0
-        while offset < size && !stream.cancelled && !this.closed {
-            let amount = size - offset
-            if amount > 16_384 : amount = 16_384
-            let data = ""
-            if isset(source) {
-                let buffer = [u8]{ 0 x amount }
-                let read = source.read(buffer) ! throw .protocol
+        if isset(source) {
+            if this.session.out_len() >= 16_384 && !this.flush() : return
+            let offset: uint = 0
+            let chunk_buf = h2_take_chunk_buf()
+            defer h2_give_chunk_buf(chunk_buf)
+            while offset < size && !stream.cancelled && !this.closed {
+                let amount = size - offset
+                if amount > 16_384 : amount = 16_384
+                let read = source.read(chunk_buf.view_spare(amount)) ! throw .protocol
                 if read == 0 || read > amount : throw .protocol
-                data = buffer.view(0, read).to_string()
-            } else {
-                data = body.range(offset, amount)
+                if !this.send_all_data_slice(stream, chunk_buf.view_spare(amount).view(0, read), offset + read == size) !> : return
+                offset += read
             }
-            if !this.send_all_data(stream, data, offset + data.bytes == size) !> : return
-            offset += data.bytes
+            return
         }
+        this.send_all_data_slice(stream, body.view(0, size), true) !>
     }
 
     // Sends `data` as DATA frames, waiting for flow-control credit; false when the stream
     // or the connection is gone
-    fn send_all_data(stream: H2Stream, data: String, end_stream: bool) bool !H2Error {
-        if data.bytes == 0 {
-            this.session.send_data(stream, data, end_stream) !>
-            return this.flush_soon()
+    fn send_all_data_slice(stream: H2Stream, data: local &[u8], end_stream: bool) bool !H2Error {
+        if data.length == 0 {
+            this.session.send_data_view(stream, data, end_stream) !>
+            return !this.closed
         }
         let offset: uint = 0
-        let last_write = time.mono_ms()
         let settings = this.owner.worker.server
+        let check_rate = settings.min_transfer_rate > 0 && settings.write_timeout_ms > 0
+        let last_write: uint = check_rate ? time.mono_ms() : 0
         let window_start = last_write
         let window_offset: uint = 0
-        while offset < data.bytes {
+        while offset < data.length {
             if stream.cancelled || this.closed : return false
-            let count = this.session.send_data(stream, data.range(offset, data.bytes - offset), end_stream) !>
+            let count = this.session.send_data_view(stream, data.view(offset, data.length - offset), end_stream) !>
             if count == 0 {
                 if !this.flush() : return false
-                let timeout = this.owner.worker.server.write_timeout_ms
-                if timeout > 0 && time.mono_ms() - last_write >= timeout : throw .limit
+                let now = time.mono_ms()
+                if last_write == 0 : last_write = now
+                let timeout = settings.write_timeout_ms
+                if timeout > 0 && now - last_write >= timeout : throw .limit
                 time.sleep_ms(1)
                 continue
             }
-            last_write = time.mono_ms()
             offset += count
-            let elapsed = last_write - window_start
-            if settings.min_transfer_rate > 0 && settings.write_timeout_ms > 0 && elapsed >= settings.write_timeout_ms {
-                if offset - window_offset < settings.min_transfer_rate * elapsed / 1000 : throw .limit
-                window_start = last_write
-                window_offset = offset
+            if check_rate {
+                last_write = time.mono_ms()
+                let elapsed = last_write - window_start
+                if elapsed >= settings.write_timeout_ms {
+                    if offset - window_offset < settings.min_transfer_rate * elapsed / 1000 : throw .limit
+                    window_start = last_write
+                    window_offset = offset
+                }
+            } else if last_write != 0 {
+                last_write = time.mono_ms()
             }
-            if !this.flush_soon() : return false
+            if this.session.out_len() >= 16_384 && !this.flush() : return false
         }
-        return true
+        return !this.closed
     }
+}
+
+fn h2_raw_counts_toward_flood(kind: u8, flags: u8, length: uint) bool $inline {
+    if kind == H2_DATA : return length == 0 && (flags & 0x01) == 0
+    if kind == H2_HEADERS || kind == H2_CONTINUATION : return length == 0 && (flags & 0x04) == 0
+    if kind == H2_WINDOW_UPDATE : return false
+    return true
 }
 
 fn h2_file_plan_fields(headers: Array[HpackField], plan: FilePlan) {
@@ -569,6 +709,7 @@ fn h2_file_plan_fields(headers: Array[HpackField], plan: FilePlan) {
     if plan.status != 304 : headers.append(.{ name: "accept-ranges", value: "bytes" })
     if plan.vary : headers.append(.{ name: "vary", value: "Accept-Encoding" })
     if plan.gzip : headers.append(.{ name: "content-encoding", value: "gzip" })
+    else if plan.encoding.bytes > 0 : headers.append(.{ name: "content-encoding", value: plan.encoding })
     if plan.status == 206 {
         headers.append(.{ name: "content-range", value: "bytes " + plan.start + "-" + (plan.start + plan.length - 1) + "/" + plan.size })
     }

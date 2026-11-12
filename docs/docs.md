@@ -2704,18 +2704,19 @@ fn main() {
 ```
 
 A handler gets the parsed request: `method`, `path`, `query_string` and
-`peer_address` as fields, and `headers()`, `query()`, `form()`, `json()` and
-`files()` which parse on first use. `json()` gives an empty object for a body that
-is not JSON; `parse_json()` throws for it instead. Responses come from `Response.text`,
+`peer_address` as fields, `header(name)` and `query_param(name)` for individual
+fields, and `headers()`, `query()`, `form()`, `json()` and `files()` which parse
+on first use. `json()` gives an empty object for a body that is not JSON;
+`parse_json()` throws for it instead. Responses come from `Response.text`,
 `html`, `json`, `json_of` (encodes any value), `redirect`, `file`, `stream`,
 `empty` and the general `Response.new(body, code, content_type)`.
 
 `s.add_static_dir("public")` serves the files in `public` before a request
-reaches the handler. A directory path serves its `index.html`, so `/` shows
-`public/index.html`; pass `index: ""` to leave directory paths to the handler.
-Files (also `Response.file`) carry an `ETag` and `Last-Modified`, answer 304
-when the browser's copy is current, and serve a `Range` of bytes for resumed
-downloads and video.
+reaches the handler (`prefix: "/static"` mounts them under a URL prefix). A
+directory path serves its `index.html`, so `/` shows `public/index.html`; pass
+`index: ""` to leave directory paths to the handler. Files (also `Response.file`)
+carry an `ETag` and `Last-Modified`, answer 304 when the browser's copy is
+current, and serve a `Range` of bytes for resumed downloads and video.
 
 Cookies are read from the request by name and set on the response:
 
@@ -2751,9 +2752,9 @@ s.add_middleware(fn(req: http.Request, next: atomic fn(http.Request)(http.Respon
 ```
 
 `http.Router[T]` maps a method and path pattern to a value such as a handler.
-`@name` matches one part and `*` the rest; `route.params(path)` returns them
-decoded. When a path has routes for other methods only, `allowed_methods` gives
-them for a 405 answer:
+`@name` matches one part and `*` the rest; `route.param(path, name)` and
+`route.params(path)` return them decoded. When a path has routes for other
+methods only, `allowed_methods` gives them for a 405 answer:
 
 ```rust
 let router = http.Router[fn(http.Request)(http.Response)].new()
@@ -2764,7 +2765,7 @@ let route = router.find(req.method, req.path) ! {
     if allowed.length == 0 : return http.Response.empty(404)
     return http.Response.empty(405, http.Headers { "Allow" => allowed.join(", ") })
 }
-let id = route.params(req.path).get("id") !? ""
+let id = route.param(req.path, "id") !? ""
 ```
 
 `Response.stream(reader)` without a size sends the body as it is read, for
@@ -2804,8 +2805,9 @@ s.http2 = true
 s.start() !!
 ```
 
-HTTP/2 uses the same request handlers and responses, with HTTP/1.1 fallback.
-It currently requires TLS and the regular handler API, not `fast` handlers.
+HTTP/2 uses the same request handlers and responses, with HTTP/1.1 fallback over
+TLS (or cleartext `h2c` prior knowledge when `tls` is not set). It requires the
+regular handler API, not `fast` handlers.
 
 A server can also ask its clients for a certificate (mutual TLS). A client without a valid
 one then cannot connect, and a handler reads who the client is from the request:

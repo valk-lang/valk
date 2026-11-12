@@ -19,6 +19,8 @@ class ServerStaticDir {
     path: String
     // Served for a directory; "" for none
     index: String
+    // Normalized URL mount prefix without trailing slash (e.g. "/static"); "" for root
+    prefix: String
     next: ?atomic ServerStaticDir
 }
 
@@ -28,10 +30,35 @@ class StaticMatch {
     redirect: bool
 }
 
+fn normalize_static_prefix(prefix: String) String {
+    let trimmed = prefix.trim("/")
+    if trimmed.bytes == 0 : return ""
+    return "/" + trimmed
+}
+
+fn static_dirs_may_match(dirs: ?atomic ServerStaticDir, raw_path: local &[u8]) bool {
+    let dir = dirs
+    while isset(dir) {
+        let pfx = dir.prefix
+        if pfx.bytes == 0 : return true
+        if raw_path.starts_with(pfx) {
+            if raw_path.length == pfx.bytes : return true
+            let next = raw_path[pfx.bytes]
+            if next == '/' || next == '%' : return true
+        } else {
+            let pct = raw_path.index_of_byte('%') !? raw_path.length
+            if pct < pfx.bytes : return true
+        }
+        dir = dir.next
+    }
+    return false
+}
+
 // The file a request path names in one of the static dirs. `%XX` escapes are decoded
 // (a `+` stays a `+`) before the `..` check, so `%2e%2e` cannot leave the directory.
 fn static_file(dirs: ?atomic ServerStaticDir, request_path: String) ?StaticMatch {
     if !isset(dirs) || request_path.bytes == 0 : return null
+    if !static_dirs_may_match(dirs, request_path.view()) : return null
     let path = request_path
     if path.contains("%") {
         let buf = ByteBuffer.new(path.bytes)
@@ -57,6 +84,11 @@ fn static_file(dirs: ?atomic ServerStaticDir, request_path: String) ?StaticMatch
 }
 
 fn static_file_in(dir: atomic ServerStaticDir, path: String, request_path: String) ?StaticMatch {
+    if dir.prefix.bytes > 0 {
+        if !path.starts_with(dir.prefix) : return null
+        if path.bytes > dir.prefix.bytes && path[dir.prefix.bytes] != '/' : return null
+        path = path.bytes == dir.prefix.bytes ? "/" : path.range(dir.prefix.bytes, path.bytes - dir.prefix.bytes)
+    }
     let full = fs.resolve(fs.add(dir.path, path))
     if !full.starts_with(dir.path) : return null
     let info = fs.stat(full) ! return null
@@ -75,9 +107,41 @@ fn static_redirect_location(request_path: String, query_string: String) String {
     return path + "/?" + query_string
 }
 
+class ServerSocketLink {
+    socket: atomic net.TcpServer
+    next: ?atomic ServerSocketLink
+}
+
+fn start_extra_worker(server: atomic ServerWorkerData, wid: uint) bool {
+    let run: atomic fn()() = fn() { worker(server, wid) }
+    thread.Thread[void].start(run) ! return false
+    return true
+}
+
+fn close_extra_sockets(list: ?atomic ServerSocketLink) {
+    let link = list
+    while isset(link) {
+        link.socket.close() ! {}
+        link = link.next
+    }
+}
+
+fn worker_socket(server: atomic ServerWorkerData, worker_id: uint) atomic net.TcpServer {
+    if worker_id == 0 : return server.socket
+    let link = server.extra_sockets
+    let left = worker_id - 1
+    while isset(link) {
+        if left == 0 : return link.socket
+        left--
+        link = link.next
+    }
+    return server.socket
+}
+
 // State shared by the worker threads of one `start()` call
 class ServerWorkerData {
     socket: atomic net.TcpServer
+    extra_sockets: ?atomic ServerSocketLink (null)
     tls_context: ?atomic net.SslServerContext
     handler: atomic fn(Request)(Response)
     fast_handler: ?atomic fn(Context, ResponseWriter)()
@@ -121,12 +185,22 @@ class ServerWorkerData {
     fn request_shutdown(timeout_ms: uint) @threadsafe {
         // An overflowing timeout saturates: "wait as long as it takes"
         let deadline = time.mono_ms().checked_add(timeout_ms) !? (~0).to(uint)
+        let first = false
         this.mutex.lock()
-        if this.stopping == 0 || deadline < this.deadline_ms : this.deadline_ms = deadline
+        if this.stopping == 0 {
+            first = true
+            this.deadline_ms = deadline
+        } else if deadline < this.deadline_ms {
+            this.deadline_ms = deadline
+        }
         this.stopping = 1
         this.mutex.unlock()
         let stop = this.stop
         if isset(stop) : stop.cancel()
+        if first {
+            this.socket.close() ! {}
+            close_extra_sockets(this.extra_sockets)
+        }
     }
 }
 
@@ -194,6 +268,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     fast_handler: ?atomic fn(Context, ResponseWriter)()
     -+ static_dirs: Array[String] (.{})
     -+ static_indexes: Array[String] (.{})
+    -+ static_prefixes: Array[String] (.{})
     /// The largest accepted request head (request line and headers) in bytes; 0 means
     /// no limit. Defaults to 8 KiB.
     ///
@@ -228,9 +303,10 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     + stop_on_signal: bool (false)
     /// How long in-flight requests may take after a stop signal, in milliseconds.
     + stop_on_signal_timeout_ms: uint (5000)
-    /// Enables experimental HTTP/2, negotiated through ALPN with HTTP/1.1 as fallback.
+    /// Enables HTTP/2: negotiated through ALPN with HTTP/1.1 as fallback when `tls` is
+    /// configured, or cleartext HTTP/2 (`h2c` prior knowledge) without `tls`.
     ///
-    /// Requires `tls` and the regular handler; `start` fails with `init` otherwise.
+    /// Requires the regular handler; `start` fails with `init` when a `fast` handler is set.
     + http2: bool (false)
     /// Compresses responses with gzip for clients that accept it: text, HTML, CSS,
     /// JavaScript, JSON, XML and SVG of at least 1 KiB, and such files up to 1 MiB.
@@ -406,7 +482,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     + fn start(worker_count: uint (0)) void !HttpError {
         if isset(this.run) : throw .init
         if this.http2 {
-            if !isset(this.tls_context) || isset(this.fast_handler) : throw .init
+            if isset(this.fast_handler) : throw .init
             let context = this.tls_context
             if isset(context) {
                 @unsafe
@@ -440,17 +516,29 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             println("[+] Worker count: " + count)
         }
 
+        let extra_sockets: ?atomic ServerSocketLink = null
+        #if OS == "linux" || OS == "macos"
+        if this.reuse_port && this.port > 0 && count > 1 {
+            each 0 .. (count - 1) as _ {
+                let extra = net.tcp_server(this.host, this.port, 5000, true) ! break
+                extra_sockets = .{ socket: extra, next: extra_sockets }
+            }
+        }
+        #end
+
         let static_dirs: ?atomic ServerStaticDir = null
         each this.static_dirs as path, i {
             static_dirs = .{
                 path: path
                 index: this.static_indexes.get(i) !? ""
+                prefix: this.static_prefixes.get(i) !? ""
                 next: static_dirs
             }
         }
 
         let server: atomic ServerWorkerData = .{
             socket: socket
+            extra_sockets: extra_sockets
             tls_context: this.tls_context
             handler: server_handler_chain(this.handler, this.middlewares)
             fast_handler: this.fast_handler
@@ -485,15 +573,18 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             let stop: atomic fn()() = fn() { server.request_shutdown(timeout) }
             signal.on(signal.Signal.interrupt, stop) ! {
                 socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                close_extra_sockets(extra_sockets)
                 throw .init
             }
             signal.on(signal.Signal.terminate, stop) ! {
                 socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                close_extra_sockets(extra_sockets)
                 throw .init
             }
             #if OS != "win"
             signal.on(signal.Signal.hangup, stop) ! {
                 socket.close() ! core.cleanup_warning("Failed to close HTTP listener", __FILE__, __LINE__)
+                close_extra_sockets(extra_sockets)
                 throw .init
             }
             #end
@@ -504,10 +595,14 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
         // Worker 0 is this thread; the others get a thread each
         let failed = false
         let remaining = server.workers - 1
+        let next_worker_id: uint = 1
         while remaining > 0 && !failed {
-            let run: atomic fn()() = fn() { worker(server) }
-            thread.Thread[void].start(run) ! { failed = true }
-            if !failed : remaining--
+            if !start_extra_worker(server, next_worker_id) {
+                failed = true
+            } else {
+                remaining--
+                next_worker_id++
+            }
         }
         if failed {
             // Workers that never started are not waited for; the rest drain
@@ -516,7 +611,7 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
             server.request_shutdown(0)
         }
 
-        worker(server)
+        worker(server, 0)
         server.done.await_unlock()
         if failed : throw .init
     }
@@ -525,8 +620,10 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     ///
     /// Throws `open` when `path` is not a directory. A request whose path names a file
     /// inside the directory gets that file whatever the method (over HTTP/2: except
-    /// `CONNECT`). The path is percent-decoded first (`+` stays `+`); paths containing
-    /// `..` are never served. The directory added last is searched first.
+    /// `CONNECT`). With `prefix` (such as `"/static"`), only paths under that URL prefix
+    /// are matched and the prefix is stripped before resolving inside `path`. The path is
+    /// percent-decoded first (`+` stays `+`); paths containing `..` are never served. The
+    /// directory added last is searched first.
     ///
     /// A path naming a directory that holds an `index` file gets that file, so `/` serves
     /// `index.html`. Without the trailing slash (`/docs`) the answer is a 301 redirect to
@@ -535,12 +632,13 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     ///
     /// Files are sent like `Response.file`: with `ETag` and `Last-Modified`, 304 for a
     /// current copy and 206 for a `Range`.
-    + fn add_static_dir(path: String, index: String ("index.html")) !io.IoError {
+    + fn add_static_dir(path: String, index: String ("index.html"), prefix: String ("")) !io.IoError {
         let full = fs.resolve(path)
         if !fs.is_dir(full) : throw .open
         if this.show_info : println("[+] Add static dir: " + full)
         this.static_dirs.append(full)
         this.static_indexes.append(index)
+        this.static_prefixes.append(normalize_static_prefix(prefix))
     }
 }
 

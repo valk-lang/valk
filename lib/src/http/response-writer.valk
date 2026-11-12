@@ -25,9 +25,35 @@ global output_pool: Array[ByteBuffer] (.{})
 
 // Content types worth compressing
 fn response_gzip_type(content_type: String) bool {
-    let t = content_type.lower()
+    let t = content_type
+    let i: uint = 0
+    while i < t.bytes {
+        let ch = t[i]
+        if ch >= 'A' && ch <= 'Z' {
+            t = content_type.lower()
+            break
+        }
+        i++
+    }
     return t.starts_with("text/") || t.starts_with("application/json") || t.starts_with("application/javascript")
         || t.starts_with("application/xml") || t.starts_with("image/svg+xml") || t.contains("+json") || t.contains("+xml")
+}
+
+// Whether an `Accept-Encoding` value explicitly takes brotli (`br`) without `q=0`
+fn request_accepts_br(value: String) bool {
+    let length = value.bytes
+    let pos: uint = 0
+    while pos < length {
+        let end = value.index_of_byte(',', pos) !? length
+        let semi = value.index_of_byte(';', pos) !? length
+        let name_end = semi < end ? semi : end
+        let name = trim_blanks(value.view(pos, name_end - pos))
+        if name.equals_ignore_ascii_case("br") {
+            if !coding_refused(value.view(name_end, end - name_end)) : return true
+        }
+        pos = end + 1
+    }
+    return false
 }
 
 // Whether an `Accept-Encoding` value takes gzip (and does not rule it out with q=0)
@@ -182,7 +208,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         out.clear()
         // A buffer that grew for a large response goes back to the pool, so an idle
         // connection keeps a small one
-        if out.size > OUTPUT_SMALL_SIZE * 2 {
+        if out.size > SEND_WITH_READ_MAX {
             if out.size <= OUTPUT_POOL_MAX && output_pool.length < OUTPUT_POOL_COUNT : output_pool.append(out)
             this.output = ByteBuffer.new(OUTPUT_SMALL_SIZE)
         }
@@ -304,25 +330,39 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) {
         if this.responded : return
 
-        let stream = fs.stream(path) ! {
+        let info = fs.stat(path) ! {
             this.send("", 404, "text/plain", headers)
             return
         }
-        let info = fs.stat(path) ! {
-            stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
+        if info.kind == fs.FileKind.directory {
             this.send("", 404, "text/plain", headers)
             return
         }
 
         let content_type = fs.mime_type(fs.extension(path))
         if isset(headers) : content_type = headers.get("content-type") !? content_type
-        let plan = this.file_plan_for(code, info, content_type, headers)
+        let accept_encoding = ""
+        let req_ctx = this.request_context
+        if isset(req_ctx) : accept_encoding = req_ctx.header("accept-encoding") !? ""
+        let plan = this.file_plan_for(code, info, content_type, headers, accept_encoding)
         if isset(plan) {
             if plan.status == 304 || plan.status == 416 {
-                stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
                 this.send_file_status(plan, headers)
                 return
             }
+            let sidecar = open_precompressed_sidecar(path, info, content_type, this.compress, accept_encoding, plan)
+            if isset(sidecar) {
+                this.file_response = sidecar
+                this.stream_response(sidecar.to(io.Reader), plan.length, content_type, filename, headers, 200, plan)
+                return
+            }
+        }
+
+        let stream = fs.stream(path) ! {
+            this.send("", 404, "text/plain", headers)
+            return
+        }
+        if isset(plan) {
             if plan.gzip {
                 let data = io.read_all(stream) !? null
                 stream.close() ! core.cleanup_warning("Failed to close HTTP response file", __FILE__, __LINE__)
@@ -348,17 +388,16 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
 
     // The caching and range answer for a file, or null when the response is not a
     // plain 200 to a GET or HEAD request
-    - fn file_plan_for(code: u16, info: fs.FileInfo, content_type: String, headers: ?Headers) ?FilePlan {
+    - fn file_plan_for(code: u16, info: fs.FileInfo, content_type: String, headers: ?Headers, accept_encoding: String) ?FilePlan {
         if code != 200 : return null
         let context = this.request_context ?! return null
         let get = context.method.equals("GET")
         if !get && !context.method.equals("HEAD") : return null
         if isset(headers) && (headers.has("etag") || headers.has("last-modified") || headers.has("content-encoding")) : return null
-        let h = context.headers()
         // Ranges are only defined for GET (RFC 9110 14.2)
-        let range = get ? h.get("range") !? "" : ""
-        return file_plan(info.size, info.modified_time, content_type, this.compress, h.get("if-none-match") !? "",
-            h.get("if-modified-since") !? "", range, h.get("if-range") !? "", h.get("accept-encoding") !? "")
+        let range = get ? context.header("range") !? "" : ""
+        return file_plan(info.size, info.modified_time, content_type, this.compress, context.header("if-none-match") !? "",
+            context.header("if-modified-since") !? "", range, context.header("if-range") !? "", accept_encoding)
     }
 
     // Answers 304 or 416 for a file
@@ -386,6 +425,11 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         out.write(plan.last_modified)
         out.write("\r\n")
         if plan.status != 304 : out.write("Accept-Ranges: bytes\r\n")
+        if plan.encoding.bytes > 0 {
+            out.write("Content-Encoding: ")
+            out.write(plan.encoding)
+            out.write("\r\n")
+        }
         if plan.vary && !plan.gzip : out.write("Vary: Accept-Encoding\r\n")
         if plan.status == 206 {
             out.write("Content-Range: bytes ")
