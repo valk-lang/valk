@@ -5,6 +5,7 @@
 
 ```
 - Release 0.8.6
++ Linux: a program that gets no io_uring reports the kernel's error (not permitted, not supported, no memory) instead of always blaming the locked-memory limit
 
 + Release 0.8.5
 + Regions: objects that provably stay in one scope are made in memory that is freed with the scope instead of on the GC heap, also when another function builds them (`Node.tree(depth)` for a caller that only reads the tree), and arrays with their storage and elements; `$region` on a function lets its loops add to a region; `--region-report` shows where every object lives and why, `--no-regions` turns it off (binary-tree 20: 1.56 -> 0.72 s, merkletrees 18: 0.53 -> 0.42 s)
