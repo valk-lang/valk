@@ -42,27 +42,7 @@ value LARGE_BODY_SIZE (1024 * 1024)
 // Above `max_memory`, how often a worker tries to free memory before it refuses requests
 value MEMORY_RELEASE_MS (250)
 
-#if OS == "linux"
-value EPOLL_CTL_ADD (1)
-value EPOLL_CTL_DEL (2)
-value EPOLLIN (1)
-value EPOLLERR (8)
-value EPOLLHUP (16)
-value EPOLLRDHUP (8192)
-value EPOLLET (1 << 31)
-value EPOLL_CLOEXEC (0x80000)
-// A C `struct epoll_event`: u32 events, then 8 bytes of user data. Packed on x86-64 only;
-// elsewhere the data is aligned to 8 bytes
-#if ARCH == "x64"
-value EPOLL_EVENT_SIZE (12)
-value EPOLL_DATA_OFFSET (4)
-#else
-value EPOLL_EVENT_SIZE (16)
-value EPOLL_DATA_OFFSET (8)
-#end
-#end
-
-#if OS == "linux"
+#if URING
 // Slots a ring keeps free for the accepts that are on their way when it counts as full
 value RING_ROOM (64)
 // Side-event payloads of parked polls: the slot plus one, then its generation
@@ -90,7 +70,7 @@ fn worker(server: atomic ServerWorkerData) {
         server: server
         now: time.mono_ms()
     }
-    #if OS == "linux"
+    #if URING
     // Plain connections live in this thread's io_uring table when it has one: they do not count
     // against the process's descriptor limit, and wait for their next request on a poll there
     if server.direct && !isset(server.tls_context) && io.uring_files() > 0 : worker.side = coro.side_channel()
@@ -104,10 +84,13 @@ fn worker(server: atomic ServerWorkerData) {
         #end
         worker.parking = true
         co worker.watch_direct()
-    } else {
+    }
+    #end
+    #if OS == "linux"
+    if !worker.direct {
         // Connections waiting for their next request park here, without a coroutine
         // Not inherited by child processes
-        worker.epoll_fd = ext.epoll_create1(EPOLL_CLOEXEC)
+        worker.epoll_fd = ext.epoll_create1(io.EPOLL_CLOEXEC)
         worker.parking = worker.epoll_fd >= 0
         if worker.parking : co worker.watch_parked()
     }
@@ -148,7 +131,7 @@ fn worker(server: atomic ServerWorkerData) {
     }
     worker.drain()
     worker.ended = true
-    #if OS == "linux"
+    #if URING
     let side = worker.side
     if isset(side) : side.close()
     #end
@@ -203,7 +186,7 @@ class Worker {
     // Connections are direct descriptors of this thread's io_uring, parked on polls there whose
     // completions come through `side`
     direct: bool (false)
-    #if OS == "linux"
+    #if URING
     side: ?coro.SideChannel (null)
     #end
     // Connections can wait for their next request without a coroutine
@@ -224,7 +207,7 @@ class Worker {
     ended: bool (false)
 
     fn accept(sock: atomic net.TcpServer) net.TcpConnection !net.NetError {
-        #if OS == "linux"
+        #if URING
         if this.direct {
             let ring = this.accept_ring()
             let accepted = sock.accept_direct(ACCEPT_POLL_MS, ring) ! {
@@ -244,7 +227,7 @@ class Worker {
         return sock.accept(ACCEPT_POLL_MS) !>
     }
 
-    #if OS == "linux"
+    #if URING
     // The ring the next connection goes to: the first with room in its table, or a new one.
     // A worker past one table's worth of connections spreads them over several rings instead
     // of needing more threads
@@ -461,6 +444,7 @@ class Worker {
     fn park(connection: Connection) bool {
         @unsafe
         let fd = connection.fd
+        #if URING
         if this.direct {
             // Checking through the ring would yield while the connection counts as parked, and
             // a wake meanwhile would serve it twice: it reads on its coroutine instead
@@ -478,18 +462,15 @@ class Worker {
             this.link(connection, true)
             return true
         }
+        #end
         if connection.input_signaled {
             connection.input_signaled = false
             let entry = ext.libc_pollfd { fd: fd, events: ext.POLLIN.to(i16), revents: 0 }
             if ext.poll(@ref(entry), 1, 0) != 0 : return false
         }
         if !connection.polled {
-            let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
-            let events: u32 = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP | EPOLLET
-            let slot = connection.slot
-            mem.copy_bytes(@ref(events), @ref(event[0]), 4)
-            mem.copy_bytes(@ref(slot), @ref(event[EPOLL_DATA_OFFSET]), size_of(uint))
-            if ext.epoll_ctl(this.epoll_fd, EPOLL_CTL_ADD, fd, @ref(event[0])) != 0 : return false
+            let events: u32 = io.EPOLLIN | io.EPOLLRDHUP | io.EPOLLERR | io.EPOLLHUP | io.EPOLLET
+            if io.epoll_change(this.epoll_fd, io.EPOLL_CTL_ADD, fd, events, connection.slot) != 0 : return false
             connection.polled = true
         }
         this.unlink(connection)
@@ -501,7 +482,7 @@ class Worker {
     // the parked connections hold none
     fn watch_parked() {
         @unsafe
-        let buffer: [u8 x (EPOLL_EVENT_SIZE * WATCH_BATCH)] = @undefined
+        let buffer: [u8 x (io.EPOLL_EVENT_SIZE * WATCH_BATCH)] = @undefined
         let base = @ref(buffer[0]).@cast(ptr)
         while !this.ended {
             let ready = io.await_fd(this.epoll_fd, true, false, WATCH_POLL_MS)
@@ -512,13 +493,13 @@ class Worker {
             let i = 0
             while i < count {
                 // Both Linux targets are little-endian; packed event data may be unaligned
-                let event = base + i * EPOLL_EVENT_SIZE
+                let event = base + i * io.EPOLL_EVENT_SIZE
                 let events = event.read_u32_le()
-                let slot = (event + EPOLL_DATA_OFFSET).read_uint_le()
+                let slot = (event + io.EPOLL_DATA_OFFSET).read_uint_le()
                 i++
                 let connection = (this.parked.get(slot) !? null) ?! continue
                 // The client's end gets no later edge, and a read of its last request stops before it
-                if events & (EPOLLRDHUP | EPOLLERR | EPOLLHUP) != 0 : connection.input_signaled = true
+                if events & (io.EPOLLRDHUP | io.EPOLLERR | io.EPOLLHUP) != 0 : connection.input_signaled = true
                 if !connection.parked {
                     // Input for a busy connection: its next park checks for it
                     connection.input_signaled = true
@@ -540,6 +521,7 @@ class Worker {
         }
     }
 
+    #if URING
     // The side-event payload of the poll of `slot`: the slot and its generation
     fn poll_payload(slot: uint) uint {
         let side = this.side ?! return 0
@@ -612,6 +594,7 @@ class Worker {
         // A full buffer can leave more input behind
         if bytes == io.RECV_BUFFER_SIZE : connection.input_signaled = true
     }
+    #end
 
     // A parked connection has input: a serving coroutine reads it
     fn wake(connection: Connection, now: uint) {
@@ -689,20 +672,20 @@ class Worker {
         #if OS == "linux"
         if !client.polled : return
         client.polled = false
+        #if URING
         if this.direct {
             // Before the close: an armed receive keeps the socket of a closed slot alive
             io.cancel_side(client.netcon.direct_ring, this.poll_payload(client.slot))
             return
         }
-        @unsafe
-        let event: [u8 x EPOLL_EVENT_SIZE] = { 0 ... }
-        ext.epoll_ctl(this.epoll_fd, EPOLL_CTL_DEL, client.fd, @ref(event[0]))
+        #end
+        io.epoll_change(this.epoll_fd, io.EPOLL_CTL_DEL, client.fd, 0, 0)
         #end
     }
 
     // A connection of ring `ring` closed
     fn release_ring(netcon: net.TcpConnection) {
-        #if OS == "linux"
+        #if URING
         if !this.direct : return
         let ring = netcon.direct_ring
         let held = this.ring_connections.get(ring) !? 0

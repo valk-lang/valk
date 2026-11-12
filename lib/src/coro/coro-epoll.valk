@@ -1,0 +1,334 @@
+// Linux coroutine backend: epoll. A waited descriptor is armed for one event at a time; the
+// socket of a connection stays armed, edge-triggered, so its waits cost no system call. Sleeps
+// and I/O timeouts are a heap of deadlines that bounds the event wait.
+
+#if EPOLL
+
+use ext
+use io
+use gc
+use time
+
+// Events taken per wait
+value EVENT_BATCH (128)
+// While coroutines are runnable, the least time between two looks at the epoll set
+value POLL_GAP_NS (20_000)
+
+// Per descriptor number: bit 0 says this thread armed the number before, so it is in the epoll
+// set unless the descriptor closed since; bit 1 that coroutines wait for it, the rest is then
+// the event id of the first one
+global fd_waiters: Array[uint] (.new(64))
+// Per descriptor number: the owner (see `next_owner`) whose socket is in the epoll set for good,
+// edge-triggered, 0 for none. An owner is the one object that holds the socket, so a number
+// that comes back for another socket never matches
+global fd_owners: Array[uint] (.new(64))
+shared owner_count: uint (0)
+value OWNED_EVENTS (io.EPOLLIN | io.EPOLLOUT | io.EPOLLRDHUP | io.EPOLLET)
+// Coroutines with a deadline, the nearest first: a binary heap
+global timers: Array[Coro] (.new(16))
+global last_poll: uint (0)
+
+extend Coro {
+    // The descriptor wait this coroutine is in: what it waits for (0: none), and the next
+    // coroutine that waits for the same descriptor
+    fd_wait_fd: Fd (-1)
+    fd_wait_events: u32 (0)
+    fd_wait_next: ?Coro (null)
+    // Monotonic ns at which its sleep ends or its wait times out, and its place in `timers`
+    // plus one (0: no deadline)
+    timer_at: uint (0)
+    timer_slot: uint (0)
+
+    fn sleep(ns: uint) {
+        let now = time.mono_ns()
+        timer_add(this, ns > uint.$max - now ? uint.$max : now + ns)
+        this.yield()
+    }
+
+    // Starts a wait for `events` on `fd`; the coroutine yields next. False when there is
+    // nothing to wait for: `poll_event` then holds the outcome. With an `owner` (see
+    // `fd_owners`) the caller found the socket not ready just before and tries again after
+    fn fd_wait(fd: Fd, events: u32, timeout_ms: uint, owner: uint (0)) bool {
+        this.poll_event = 0
+        if fd < 0 {
+            this.poll_event = ext.POLLERR
+            return false
+        }
+        let slot = fd.to(uint)
+        // An owner's socket is in the set for good: its next event comes without a system call
+        if owner == 0 || (fd_owners.get(slot) !? 0) != owner {
+            let error = fd_arm(fd, events, owner)
+            if error != 0 {
+                // A regular file cannot be polled: it is always ready
+                if error == ext.EPERM : this.poll_event = (events & (io.EPOLLIN | io.EPOLLOUT)).@cast(io.PollEvent)
+                else : this.poll_event = ext.POLLERR
+                return false
+            }
+        }
+        this.fd_wait_fd = fd
+        this.fd_wait_events = events
+        this.fd_wait_next = first_waiter(fd_waiters.get(slot) !? 0)
+        fd_waiters.set(slot, this.event_id() | 3) _
+        if timeout_ms > 0 {
+            let now = time.mono_ns()
+            let span = timeout_ms > (uint.$max - now) / 1_000_000 ? uint.$max - now : timeout_ms * 1_000_000
+            timer_add(this, now + span)
+        }
+        return true
+    }
+
+    // Takes events from the thread's epoll set, blocking when no coroutine is runnable
+    static fn wait_for_events() {
+        @unsafe
+        let events: [u8 x (io.EPOLL_EVENT_SIZE * EVENT_BATCH)] = @undefined
+        let base = @ref(events[0]).@cast(ptr)
+        expire_parks()
+        run_timers()
+        let count: i32 = 0
+        let failed = false
+        if run_coros.length > 0 {
+            // Coroutines that only hand the thread to each other would pay a system call per
+            // round: events wait at most POLL_GAP_NS for them
+            let now = time.mono_ns()
+            if now - last_poll < POLL_GAP_NS : return
+            last_poll = now
+            count = io.epoll_wait_ns(base, EVENT_BATCH, 0)
+            failed = count < 0 && ext.get_errno() != ext.EINTR
+        } else {
+            // The nearest deadline, of a timer or a park, bounds the wait
+            let wait_ns = timer_wait_ns()
+            let park_ms = park_wait_ms()
+            if park_ms != uint.$max && park_ms < wait_ns / 1_000_000 : wait_ns = park_ms * 1_000_000
+            gc.unlock()
+            count = io.epoll_wait_ns(base, EVENT_BATCH, wait_ns)
+            failed = count < 0 && ext.get_errno() != ext.EINTR
+            gc.lock()
+        }
+        if failed : panic("Coroutine event wait failed")
+        let i = 0
+        while i < count {
+            let event = base + i * io.EPOLL_EVENT_SIZE
+            i++
+            let data = (event + io.EPOLL_DATA_OFFSET).read_uint_le()
+            if data == io.EPOLL_HOME {
+                // Another thread woke coroutines of this one
+                drain_home()
+                continue
+            }
+            fd_event(data.to(Fd), event.read_u32_le())
+        }
+        run_timers()
+    }
+}
+
+// A number no other owner has, in any thread
+fn next_owner() uint {
+    return atomic(owner_count + 1) + 1
+}
+
+fn first_waiter(entry: uint) ?Coro {
+    if (entry & 2) == 0 : return null
+    return take_kernel_event(entry)
+}
+
+// Puts `fd` in the epoll set for a wait for `events` that is about to start. Returns 0, or the
+// error number
+fn fd_arm(fd: Fd, events: u32, owner: uint) i32 {
+    let slot = fd.to(uint)
+    while fd_waiters.length <= slot {
+        fd_waiters.append(0)
+        fd_owners.append(0)
+    }
+    let ep = io.epoll()
+    let data = fd.to(uint)
+    if owner != 0 {
+        let error = io.epoll_change(ep, io.EPOLL_CTL_ADD, fd, OWNED_EVENTS, data)
+        // New in the set: whoever still waits for this number waits for a descriptor that closed
+        if error == 0 : fd_closing(fd)
+        // In the set from a wait without an owner, such as the one for its connect
+        else if error == ext.EEXIST : error = io.epoll_change(ep, io.EPOLL_CTL_MOD, fd, OWNED_EVENTS, data)
+        if error == 0 : fd_owners.set(slot, owner) _
+        return error
+    }
+    if (fd_owners.get(slot) !? 0) != 0 {
+        // An owner's socket: setting it again makes the kernel report what is ready now
+        let error = io.epoll_change(ep, io.EPOLL_CTL_MOD, fd, OWNED_EVENTS, data)
+        if error != ext.ENOENT : return error
+        // That socket closed, the number names another descriptor
+        fd_closing(fd)
+    }
+    // One registration per descriptor: it covers every coroutine that waits for it
+    let entry = fd_waiters.get(slot) !? 0
+    let all = events
+    let other = first_waiter(entry)
+    while isset(other) {
+        all = all | other.fd_wait_events
+        other = other.fd_wait_next
+    }
+    let error: i32 = ext.ENOENT
+    if (entry & 1) != 0 : error = io.epoll_arm(fd, all, false)
+    if error == ext.ENOENT {
+        // Not in the set, or no longer: the kernel drops a descriptor that closes. Whoever
+        // still waits for this number waits for one that is gone
+        fd_closing(fd)
+        error = io.epoll_arm(fd, events, true)
+        if error == ext.EEXIST : error = io.epoll_arm(fd, events, false)
+    }
+    return error
+}
+
+// `fd` reported `events`: runs the coroutines that wait for one of them. The others wait on:
+// for them the descriptor is armed again, unless it is an owner's and stays armed
+fn fd_event(fd: Fd, events: u32) {
+    let slot = fd.to(uint)
+    let waiter = first_waiter(fd_waiters.get(slot) !? 0)
+    if !isset(waiter) : return
+    // An error or a hang-up ends every wait
+    let closed: u32 = io.EPOLLERR | io.EPOLLHUP
+    let stay: ?Coro = null
+    let left: u32 = 0
+    while isset(waiter) {
+        let next = waiter.fd_wait_next
+        let wanted = waiter.fd_wait_events | closed
+        if (events & wanted) != 0 {
+            fd_wait_end(waiter, (events & wanted).@cast(io.PollEvent))
+        } else {
+            waiter.fd_wait_next = stay
+            stay = waiter
+            left = left | waiter.fd_wait_events
+        }
+        waiter = next
+    }
+    fd_waiters.set(slot, 1) _
+    if !isset(stay) : return
+    fd_waiters.set(slot, stay.event_id() | 3) _
+    if (fd_owners.get(slot) !? 0) != 0 : return
+    if io.epoll_arm(fd, left, false) != 0 : fd_closing(fd)
+}
+
+// `fd` closes, or closed: the coroutines of this thread that wait for it wake with an error
+// and POLLNVAL. The number may name another descriptor by the time they run, so they must
+// not use it again
+fn fd_closing(fd: Fd) {
+    if fd < 0 : return
+    let slot = fd.to(uint)
+    if slot >= fd_waiters.length : return
+    let waiter = first_waiter(fd_waiters.get(slot) !? 0)
+    fd_waiters.set(slot, 0) _
+    fd_owners.set(slot, 0) _
+    while isset(waiter) {
+        let next = waiter.fd_wait_next
+        fd_wait_end(waiter, ext.POLLERR | ext.POLLNVAL)
+        waiter = next
+    }
+}
+
+// Ends the descriptor wait of `coro` with `result` and runs it
+fn fd_wait_end(coro: Coro, result: io.PollEvent) {
+    coro.fd_wait_events = 0
+    coro.fd_wait_next = null
+    timer_remove(coro)
+    coro.poll_event = result
+    run_coros.append(coro)
+}
+
+// Takes `coro` out of the waiters of its descriptor. The registration stays armed: an event
+// nobody waits for is dropped
+fn fd_wait_leave(coro: Coro) {
+    let slot = coro.fd_wait_fd.to(uint)
+    let first = first_waiter(fd_waiters.get(slot) !? 0)
+    let next = coro.fd_wait_next
+    if first == coro {
+        if isset(next) : fd_waiters.set(slot, next.event_id() | 3) _
+        else : fd_waiters.set(slot, 1) _
+    }
+    while isset(first) {
+        if first.fd_wait_next == coro {
+            first.fd_wait_next = next
+            break
+        }
+        first = first.fd_wait_next
+    }
+    coro.fd_wait_events = 0
+    coro.fd_wait_next = null
+}
+
+//////////////////////
+// Timers
+//////////////////////
+
+fn timer_add(coro: Coro, at: uint) {
+    coro.timer_at = at
+    timers.append(coro)
+    timer_up(timers.length - 1, coro)
+}
+
+fn timer_remove(coro: Coro) {
+    let slot = coro.timer_slot
+    if slot == 0 : return
+    coro.timer_slot = 0
+    let last = timers.pop_last() ! return
+    if last == coro : return
+    // The last one takes the free place and moves to where it belongs
+    timer_down(timer_up(slot - 1, last), last)
+}
+
+// Puts `coro` at `index` or, while it is due before the one above, further up; returns its place
+fn timer_up(index: uint, coro: Coro) uint {
+    while index > 0 {
+        let above = (index - 1) / 2
+        let parent = timers.get(above) ! break
+        if parent.timer_at <= coro.timer_at : break
+        timers.set(index, parent) _
+        parent.timer_slot = index + 1
+        index = above
+    }
+    timers.set(index, coro) _
+    coro.timer_slot = index + 1
+    return index
+}
+
+// Puts `coro` at `index` or, while one below is due before it, further down
+fn timer_down(index: uint, coro: Coro) {
+    while true {
+        let below = index * 2 + 1
+        let child = timers.get(below) ! break
+        let other = timers.get(below + 1) !? child
+        if other.timer_at < child.timer_at {
+            child = other
+            below++
+        }
+        if coro.timer_at <= child.timer_at : break
+        timers.set(index, child) _
+        child.timer_slot = index + 1
+        index = below
+    }
+    timers.set(index, coro) _
+    coro.timer_slot = index + 1
+}
+
+// Runs the coroutines whose deadline passed; a descriptor wait ends as timed out
+fn run_timers() {
+    if timers.length == 0 : return
+    let now = time.mono_ns()
+    while true {
+        let coro = timers.get(0) ! break
+        if coro.timer_at > now : break
+        timer_remove(coro)
+        if coro.fd_wait_events != 0 {
+            fd_wait_leave(coro)
+            coro.poll_event = io.POLL_TIMEOUT
+            coro.completion_res = 0 - ext.ETIMEDOUT
+        }
+        run_coros.append(coro)
+    }
+}
+
+// Nanoseconds until the nearest deadline, uint.$max when there is none
+fn timer_wait_ns() uint {
+    let coro = timers.get(0) ! return uint.$max
+    let now = time.mono_ns()
+    return coro.timer_at > now ? coro.timer_at - now : 0
+}
+
+#end

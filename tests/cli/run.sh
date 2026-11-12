@@ -416,6 +416,27 @@ def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o
     exit 1
 }
 
+# --io: both Linux backends build and run; another name is refused
+if [[ "$(uname -s)" == "Linux" ]]; then
+    for backend in uring epoll; do
+        io_out=$("$VALK" build "$input" --no-warn -c --io "$backend" -o "$output" 2>&1) || {
+            echo "# --io $backend failed to build"
+            echo "$io_out"
+            exit 1
+        }
+        "$output" || exit 1
+    done
+fi
+io_out=$("$VALK" build "$input" --no-warn -c --io select -o "$output" 2>&1) && {
+    echo "# --io accepted an unknown name"
+    exit 1
+}
+if [[ "$io_out" != *"'--io' expects uring or epoll"* ]]; then
+    echo "# Unexpected --io error"
+    echo "$io_out"
+    exit 1
+fi
+
 # --cpu: this machine's CPU builds and runs; native refuses a cross target; an unknown
 # name is reported once, before any unit is compiled
 cpu_out=$("$VALK" build "$input" --no-warn -c --release --cpu native -o "$output" 2>&1) || {

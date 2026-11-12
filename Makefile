@@ -111,6 +111,14 @@ ifeq ($(HOST_SYSTEM),Linux)
 	VALK_TEST_HTTP_DIRECT=1 ./debug/test-core$(EXE_SUFFIX) --filter TCP
 endif
 
+# The suite again on the epoll backend (`--io epoll`, Linux only)
+test-epoll: $(TEST_COMPILER)
+ifeq ($(HOST_SYSTEM),Linux)
+	mkdir -p ./debug
+	$(TEST_COMPILER) build ./tests $(TEST_FLAGS) $(FLAGS) --io epoll -o ./debug/test-epoll$(EXE_SUFFIX)
+	./debug/test-epoll$(EXE_SUFFIX)
+endif
+
 test-compile-errors: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) ./tests/compile-errors/run.sh
 
@@ -185,13 +193,13 @@ api-baseline: valk
 test-http2: $(TEST_COMPILER)
 	@VALK=$(TEST_COMPILER) bash ./tests/http2/run.sh
 
-test-all: test test-regions test-http-direct test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2 test-api-compat test-probe
+test-all: test test-regions test-http-direct test-epoll test-compile-errors test-diagnostics test-exit-code test-cli test-lsp test-fmt test-fmt-corpus test-codegen test-deps test-library test-extend-access test-doc test-examples test-http2 test-api-compat test-probe
 
 # The suites whose outcome depends on the host: the runtime, the linker and
 # the CLI's path handling. The front-end suites (compile errors, formatting,
 # codegen, docs, examples) behave the same on every host, so only one CI job
 # runs 'test-all'.
-test-native: test test-http-direct test-library test-exit-code test-cli test-lsp test-diagnostics test-deps
+test-native: test test-http-direct test-epoll test-library test-exit-code test-cli test-lsp test-diagnostics test-deps
 
 bench-json: valk
 	mkdir -p ./debug

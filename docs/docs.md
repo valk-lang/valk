@@ -148,6 +148,7 @@ valk run ./src -- alice bob                 # Compile and run; program arguments
 valk build ./src -o ./app --run --watch     # Rebuild and restart when a file changes
 valk build ./src -o ./app --target win-x64  # Cross compile: linux-x64, linux-arm64, macos-x64, macos-arm64, win-x64
 valk build ./src -o ./app --release --cpu native  # Use this machine's CPU features (AVX2, ...); or a name like x86-64-v3
+valk build ./src -o ./app --io epoll        # Linux: use epoll instead of io_uring, for systems that block io_uring
 valk build ./src --lint                     # Check without building
 valk fmt ./src                              # Format in place and list the changed files
 valk fmt ./src --check                      # For CI: list unformatted files, exit 1, write nothing

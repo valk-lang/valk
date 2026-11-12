@@ -83,8 +83,9 @@ use time
 /// Returns 0 at the end of the input. An explicit `offset` reads at that file position without
 /// moving the current position; the default (`uint.$max`) reads at the current position and
 /// advances it, so repeated calls read a file sequentially. Pipes and sockets ignore it. Inside
-/// a coroutine the call lets other coroutines run while it waits (io_uring on Linux, IOCP on
-/// Windows, kqueue for non-blocking descriptors on macOS); outside one it blocks. Throws
+/// a coroutine the call lets other coroutines run while it waits (io_uring or epoll on Linux,
+/// IOCP on Windows, kqueue for non-blocking descriptors on macOS); outside one it blocks. With
+/// epoll a read at a file position blocks, as files are always ready. Throws
 /// `.read`, or `.os` when the request cannot be queued.
 + fn read(fd: Fd, buf: local mut &[u8], offset: uint (uint.$max)) uint !IoError {
     @unsafe
@@ -181,11 +182,31 @@ fn read_bytes(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
     let coro = coro.current_coro
     if !isset(coro) : return read_bytes_sync(fd, buf, amount, offset) !>
 
-    #if OS == "linux"
+    #if URING
     // Without a ring (the locked-memory limit is shared by every program of the user) the
     // read blocks the thread instead of failing
     let sqe = sqe(coro) ! return read_bytes_sync(fd, buf, amount, offset) !>
     io_uring_prep_read(sqe, fd, buf, amount.to(u32), offset)
+
+    #elif EPOLL
+    let position = offset.to(i64)
+    while true {
+        let rcvd: int = -1
+        if position >= 0 {
+            // A regular file is always ready
+            rcvd = ext.pread(fd, buf, amount, position)
+            if rcvd < 0 && ext.get_errno() == ext.ESPIPE : position = -1
+        }
+        if position < 0 {
+            // A descriptor in blocking mode would stall every coroutine of the thread
+            if !ready_now(fd, true) && is_gone(await_fd(fd, true, false)) : throw .closed
+            rcvd = ext.read(fd, buf, amount)
+        }
+        if rcvd >= 0 : return rcvd.to(uint)
+        let error = ext.get_errno()
+        if error != ext.EINTR && error != ext.EAGAIN : throw .read
+    }
+    return 0
 
     #elif OS == "win"
     let ov = overlap()
@@ -254,7 +275,7 @@ fn read_bytes(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
     #error "IO read: Unsupported OS"
     #end
 
-    #if OS == "linux" || OS == "bsd"
+    #if URING || OS == "bsd"
     coro.yield()
     #if OS == "bsd"
     let rcvd = ext.aio_return(cb)
@@ -274,8 +295,8 @@ fn read_bytes(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
 /// writes at that file position without moving the current position; the default
 /// (`uint.$max`) writes at the current position and advances it, or at the end of a file
 /// opened in `fs.WriteMode.append`. Inside a coroutine the call lets other coroutines run
-/// while it waits on Linux and Windows. Throws `.write`, or `.os` when the request cannot be
-/// queued.
+/// while it waits on Linux and Windows; with epoll only for a non-blocking descriptor. Throws
+/// `.write`, or `.os` when the request cannot be queued.
 + fn write(fd: Fd, data: local &[u8], offset: uint (uint.$max)) uint !IoError $inline {
     @unsafe
     return write_bytes(fd, data.data, data.length, offset) !>
@@ -294,7 +315,34 @@ fn write_bytes_sync(fd: Fd, buf: ptr, amount: uint) uint !IoError {
         throw .write
     }
 }
-#if OS == "linux"
+#if EPOLL
+// Like `await_fd`, for the socket of the object `owner` stands for (see `coro.fd_owners`),
+// right after a system call found the socket not ready. The caller tries that call again
+// afterwards: the wait may end without the socket being ready
+fn await_owned_fd(fd: Fd, read: bool, write: bool, timeout_ms: uint, owner: uint) PollEvent {
+    let current = coro.current_coro
+    if !isset(current) || owner == 0 : return await_fd(fd, read, write, timeout_ms)
+    let events: u32 = 0
+    if read : events = events | EPOLLIN | EPOLLRDHUP
+    if write : events = events | EPOLLOUT
+    if current.fd_wait(fd, events, timeout_ms, owner) : current.yield()
+    return current.poll_event
+}
+
+// Whether a wait ended because its descriptor closed: the number must not be used again, it
+// may name another descriptor by now
+fn is_gone(event: PollEvent) bool {
+    return (event & ext.POLLNVAL) != 0
+}
+
+// Whether `fd` can be read (or written) without waiting; an error or a hang-up counts
+fn ready_now(fd: Fd, read: bool) bool {
+    @unsafe
+    let entry = ext.libc_pollfd { fd: fd, events: (read ? ext.POLLIN : ext.POLLOUT).to(i16), revents: 0 }
+    return ext.poll(@ref(entry), 1, 0) != 0
+}
+#end
+#if URING
 fn write_bytes_blocking(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoError {
     @unsafe
     while true {
@@ -310,7 +358,7 @@ fn write_bytes_blocking(fd: Fd, buf: ptr, amount: uint, offset: uint) uint !IoEr
 fn write_bytes(fd: Fd, buf: ptr, amount: uint, offset: uint (uint.$max)) uint !IoError {
     let coro = coro.current_coro
 
-    #if OS == "linux"
+    #if URING
     @unsafe
     if !isset(coro) : return write_bytes_blocking(fd, buf, amount, offset) !>
     // Without a ring the write blocks the thread instead of failing, like a read
@@ -320,6 +368,20 @@ fn write_bytes(fd: Fd, buf: ptr, amount: uint, offset: uint (uint.$max)) uint !I
     let sent = coro.completion_res
     if sent < 0 : throw .write
     return sent.to(uint)
+
+    #elif EPOLL
+    @unsafe
+    while true {
+        let sent = offset == uint.$max ? ext.write(fd, buf, amount.to(u32)).to(int)
+            : ext.pwrite(fd, buf, amount.to(u32), offset.to(i64))
+        if sent >= 0 : return sent.to(uint)
+        let error = ext.get_errno()
+        if error == ext.EINTR : continue
+        // A full pipe or socket in non-blocking mode
+        if error != ext.EAGAIN || !isset(coro) : throw .write
+        if is_gone(await_fd(fd, false, true)) : throw .closed
+    }
+    return 0
 
     #elif OS == "win"
     @unsafe
@@ -401,13 +463,20 @@ fn cancel_kqueue_wait_events(kq: i32, current: coro.Coro) {
         panic("Polling outside coroutine")
     }
 
-    #if OS == "linux"
+    #if URING
     let sqe = sqe(coro) ! return ext.POLLERR
     let events: u32 = ext.POLLERR | ext.POLLHUP | ext.POLLRDHUP
     if read : events = events | ext.POLLIN
     if write : events = events | ext.POLLOUT
     io_uring_prep_poll_add(sqe, fd, events)
     link_timeout(coro, sqe, timeout_ms) ! return ext.POLLERR
+
+    #elif EPOLL
+    // The peer's end of input only matters to a reader: a writer would wake on it for nothing
+    let events: u32 = 0
+    if read : events = events | EPOLLIN | EPOLLRDHUP
+    if write : events = events | EPOLLOUT
+    if !coro.fd_wait(fd, events, timeout_ms) : return coro.poll_event
 
     #elif OS == "macos"
     @unsafe

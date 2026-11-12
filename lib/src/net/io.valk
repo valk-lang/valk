@@ -98,7 +98,7 @@ fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0)) Fd !NetError {
 
     return fd
 
-    #elif OS == "linux"
+    #elif URING
     @unsafe
 
     let coro = coro.current_coro.@cast(coro.Coro)
@@ -107,6 +107,21 @@ fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0)) Fd !NetError {
     io.link_timeout(coro, sqe, timeout_ms) ! throw .os
     coro.yield()
     return accept_completion_result(coro.completion_res) !>
+    #elif EPOLL
+    @unsafe
+    while true {
+        let fd = ext.accept4(sock_fd, null, null, ext.SOCK_CLOEXEC)
+        if fd >= 0 : return fd
+        let err = ext.get_errno()
+        // A connection that ended while it waited in the queue: on to the next
+        if err == ext.EINTR || err == ext.ECONNABORTED : continue
+        if err == ext.EMFILE || err == ext.ENFILE : throw .max_connections
+        if err != ext.EAGAIN : throw .init
+        let ev = io.await_fd(sock_fd, true, false, timeout_ms)
+        if ev.is_timeout() : throw .timeout
+        if io.is_gone(ev) : throw .closed
+    }
+    throw .init
     #elif OS == "macos"
     while true {
         let fd = ext.accept(sock_fd, null, null)
@@ -136,7 +151,7 @@ fn accept(sock_fd: Fd, ipv6: bool, timeout_ms: uint (0)) Fd !NetError {
     #end
 }
 
-#if OS == "linux"
+#if URING
 fn accept_completion_result(result: int) Fd !NetError {
     if result == 0 - ext.ETIMEDOUT : throw .timeout
     if result == 0 - ext.EMFILE || result == 0 - ext.ENFILE : throw .max_connections
@@ -224,7 +239,7 @@ fn connect(fd: Fd, addr: AddrInfo, timeout_ms: uint (5000)) !NetError {
         throw .connect
     }
 
-    #elif OS == "linux"
+    #elif URING
     let coro = coro.current_coro.@cast(coro.Coro)
     let sqe = io.sqe(coro) !>
     io.io_uring_prep_connect(sqe, fd, addr.sock_addr(), addr.addr_len())
@@ -233,6 +248,20 @@ fn connect(fd: Fd, addr: AddrInfo, timeout_ms: uint (5000)) !NetError {
     let res = coro.completion_res
     if res == 0 - ext.ETIMEDOUT : throw .timeout
     if res < 0 : throw .connect
+
+    #elif EPOLL
+    @unsafe
+    if ext.connect(fd, addr.sock_addr(), addr.addr_len()) != 0 {
+        let error = ext.get_errno()
+        if error != ext.EINPROGRESS && error != ext.EINTR : throw .connect
+        // The attempt goes on without us: the socket is writable once it ended, either way
+        let ev = io.await_fd(fd, false, true, timeout_ms)
+        if ev.is_timeout() : throw .timeout
+        if io.is_gone(ev) : throw .connect
+        let failed: i32 = 0
+        let size: u32 = size_of(i32)
+        if ext.getsockopt(fd, ext.SOL_SOCKET, ext.SO_ERROR, @ref(failed).@cast(ptr), @ref(size)) != 0 || failed != 0 : throw .connect
+    }
 
     #elif OS == "macos"
     @unsafe
@@ -276,7 +305,17 @@ fn connect(fd: Fd, addr: AddrInfo, timeout_ms: uint (5000)) !NetError {
     @unsafe
     return recv_bytes(fd, buf.data, buf.length, timeout_ms) !>
 }
-fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.IoError {
+// `recv` and `write` for the object that holds the socket, which `owner` stands for; only the
+// epoll backend uses it
+fn recv_owned(fd: Fd, buf: local mut &[u8], timeout_ms: uint, owner: uint) uint !io.IoError {
+    @unsafe
+    return recv_bytes(fd, buf.data, buf.length, timeout_ms, owner) !>
+}
+fn write_owned(fd: Fd, data: local &[u8], timeout_ms: uint, owner: uint) uint !io.IoError {
+    @unsafe
+    return send_bytes(fd, data.data, data.length, timeout_ms, owner) !>
+}
+fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000), owner: uint (0)) uint !io.IoError {
     let coro = coro.current_coro.@cast(coro.Coro)
 
     #if OS == "macos"
@@ -299,7 +338,7 @@ fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.
     }
     throw .read
 
-    #elif OS == "linux"
+    #elif URING
     @unsafe
     let sqe = io.sqe(coro) ! throw .os
     io.io_uring_prep_recv(sqe, fd, buf, amount.to(u32), 0)
@@ -310,6 +349,21 @@ fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.
     if rcvd == 0 - ext.ETIMEDOUT : throw .timeout
     if rcvd < 0 : throw .read
     return rcvd.to(uint)
+
+    #elif EPOLL
+    @unsafe
+    while true {
+        let rcvd = ext.recv(fd, buf, amount, ext.MSG_DONTWAIT)
+        if rcvd >= 0 : return rcvd.to(uint)
+        let error = ext.get_errno()
+        if error == ext.EINTR : continue
+        if error != ext.EAGAIN : throw .read
+        // Woken for an error or a hang-up too: the next receive reports it
+        let ev = io.await_owned_fd(fd, true, false, timeout_ms, owner)
+        if ev.is_timeout() : throw .timeout
+        if io.is_gone(ev) : throw .closed
+    }
+    throw .read
 
     #elif OS == "win"
     @unsafe
@@ -333,7 +387,7 @@ fn recv_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.
     #end
 }
 
-#if OS == "linux"
+#if URING
 // Sends all of `data` and then receives into `buf`, as two linked io_uring operations
 // that reach the kernel with other coroutines' at the scheduler's next wait. Returns the
 // bytes received. Needs `io.uring_links_full_sends()`; no timeout.
@@ -369,7 +423,7 @@ fn send_then_recv(fd: Fd, data: local &[u8], buf: local mut &[u8], direct: bool 
     @unsafe
     return send_bytes(fd, data.data, data.length, timeout_ms) !>
 }
-fn send_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.IoError {
+fn send_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000), owner: uint (0)) uint !io.IoError {
     let coro = coro.current_coro.@cast(coro.Coro)
 
     #if OS == "macos"
@@ -394,7 +448,8 @@ fn send_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.
 
     #elif OS == "linux"
     @unsafe
-    // Send right away while the socket buffer has room; io_uring only for a send that has to wait
+    // Send right away while the socket buffer has room; the event loop only for a send that
+    // has to wait
     while true {
         let res = ext.send(fd, buf, amount, ext.MSG_DONTWAIT | ext.MSG_NOSIGNAL)
         if res > 0 : return res.to(uint)
@@ -402,8 +457,16 @@ fn send_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.
         let error = ext.get_errno()
         if error == ext.EINTR : continue
         if error != ext.EAGAIN : throw .write
+        #if EPOLL
+        // Woken for an error or a hang-up too: the next send reports it
+        let ev = io.await_owned_fd(fd, false, true, timeout_ms, owner)
+        if ev.is_timeout() : throw .timeout
+        if io.is_gone(ev) : throw .closed
+        #else
         break
+        #end
     }
+    #if URING
     let sqe = io.sqe(coro) ! throw .os
     io.io_uring_prep_send(sqe, fd, buf, amount.to(u32), ext.MSG_NOSIGNAL)
     io.link_timeout(coro, sqe, timeout_ms) ! throw .os
@@ -413,6 +476,9 @@ fn send_bytes(fd: Fd, buf: ptr, amount: uint, timeout_ms: uint (5000)) uint !io.
     if sent == 0 - ext.ETIMEDOUT : throw .timeout
     if sent <= 0 : throw .write
     return sent.to(uint)
+    #else
+    throw .write
+    #end
 
     #elif OS == "win"
     @unsafe
@@ -465,6 +531,8 @@ fn send_parts_now(fd: Fd, parts: local &[local &[u8]], skip: uint, direct: bool 
     if count == 0 : return 0
     #if OS == "linux"
     let msg = MsgHdr { iov: @ref(iov), iov_count: count }
+    #end
+    #if URING
     if direct {
         // Through the ring: a direct descriptor has no number for a system call. Without
         // `wait` only what fits in the socket buffer goes out

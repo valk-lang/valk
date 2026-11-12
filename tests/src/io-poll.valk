@@ -1,0 +1,355 @@
+@ignore_access
+
+#if OS == "linux"
+use valk.io
+use valk.ext
+use valk.time
+use valk.net
+
+test "IO: descriptor polling honours its timeout" {
+    assert(io.await_fd_timeout_for_test(20))
+}
+
+test "IO: a failed poll reports an error event and nothing else" {
+    // The completion carries -EBADF. Read as a bit mask it used to set every flag at once
+    let invalid: io.Fd = 4242
+    let waiting = co io.await_fd(invalid, true, false, 0)
+    let ev = await waiting
+    assert(ev.is_closed())
+    assert(!ev.is_timeout())
+    assert(!ev.is_readable())
+    assert(!ev.is_writable())
+}
+
+fn feed_pipe_later(fd: i32) {
+    time.sleep_ms(30)
+    @unsafe
+    let byte: u8 = 1
+    ext.write(fd, @ref(byte), 1)
+}
+
+synctest "IO: descriptor polling rearms after a drained wake and a timeout" {
+    @unsafe
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    defer ext.close(pipe[0])
+    defer ext.close(pipe[1])
+    each 0 .. 8 {
+        co feed_pipe_later(pipe[1])
+        let ready = io.await_fd(pipe[0], true, false, 500 * TIME_SCALE)
+        assert(ready.is_readable())
+        assert(!ready.is_timeout())
+        let byte: u8 = 0
+        assert(ext.read(pipe[0], @ref(byte), 1) == 1)
+        assert(byte == 1)
+        let idle = io.await_fd(pipe[0], true, false, 5)
+        assert(idle.is_timeout())
+        assert(!idle.is_readable())
+    }
+}
+
+test "IO: a timeout past the nanosecond count does not fire at once" {
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    co feed_pipe_later(pipe[1])
+    let waiting = co io.await_fd(pipe[0], true, false, uint.$max)
+    let ev = await waiting
+    assert(ev.is_readable())
+    assert(!ev.is_timeout())
+    assert(ext.close(pipe[0]) == 0)
+    assert(ext.close(pipe[1]) == 0)
+}
+
+test "IO: two coroutines wait to read the same descriptor" {
+    @unsafe
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    let first = co io.await_fd(pipe[0], true, false, 2000 * TIME_SCALE)
+    let second = co io.await_fd(pipe[0], true, false, 2000 * TIME_SCALE)
+    let byte: u8 = 1
+    assert(ext.write(pipe[1], @ref(byte), 1) == 1)
+    assert((await first).is_readable())
+    assert((await second).is_readable())
+    assert(ext.close(pipe[0]) == 0)
+    assert(ext.close(pipe[1]) == 0)
+}
+
+global poll_writer_done: bool (false)
+
+fn poll_await_writable(fd: i32) io.PollEvent {
+    let ev = io.await_fd(fd, false, true, 5000 * TIME_SCALE)
+    poll_writer_done = true
+    return ev
+}
+
+synctest "IO: a reader and a writer wait for the same descriptor" {
+    @unsafe
+    let server = net.tcp_server("127.0.0.1", 9347) !!
+    let accepting = co server.accept(2000 * TIME_SCALE)
+    let peer = net.tcp_client("127.0.0.1", 9347) !!
+    let local = await accepting !!
+    // A full send buffer, so the writer has to wait
+    let chunk = [u8]{ 0 x 65536 }
+    let filled: uint = 0
+    while true {
+        let sent = ext.send(local.fd, chunk.data, chunk.length, ext.MSG_DONTWAIT | ext.MSG_NOSIGNAL)
+        if sent <= 0 : break
+        filled += sent.to(uint)
+    }
+    poll_writer_done = false
+    let writer = co poll_await_writable(local.fd)
+    let reader = co io.await_fd(local.fd, true, false, 5000 * TIME_SCALE)
+    peer.write("x") !!
+    let readable = await reader
+    assert(readable.is_readable())
+    assert(!readable.is_timeout())
+    // The event for the reader left the writer waiting
+    assert(!poll_writer_done)
+    let got: uint = 0
+    while got < filled : got += peer.read(chunk) !!
+    let writable = await writer
+    assert(writable.is_writable())
+    assert(!writable.is_timeout())
+    local.close() !!
+    peer.close() !!
+    server.close() !!
+}
+
+test "IO: a regular file is ready at once" {
+    @unsafe
+    let fd = ext.open("/proc/self/exe".data_cstring, 0)
+    assert(fd >= 0)
+    let ev = io.await_fd(fd, true, false, 2000 * TIME_SCALE)
+    assert(ev.is_readable())
+    assert(!ev.is_timeout())
+    assert(ext.close(fd) == 0)
+}
+
+fn poll_read_byte(fd: i32) uint {
+    let buffer = [u8]{ 0 x 4 }
+    return io.read(fd, buffer) !? 99
+}
+
+test "IO: a read from an empty pipe in blocking mode lets other coroutines run" {
+    @unsafe
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    let reading = co poll_read_byte(pipe[0])
+    // Reached only when the read did not stall the thread
+    time.sleep_ms(5)
+    let byte: u8 = 1
+    assert(ext.write(pipe[1], @ref(byte), 1) == 1)
+    assert(await reading == 1)
+    assert(ext.close(pipe[0]) == 0)
+    assert(ext.close(pipe[1]) == 0)
+}
+
+global sleep_order: Array[uint] (.{})
+global sleep_waits_ready: uint (0)
+
+fn sleep_and_record(ms: uint, id: uint) {
+    time.sleep_ms(ms)
+    sleep_order.append(id)
+}
+
+fn sleep_wait_readable(fd: i32, timeout_ms: uint) {
+    let ev = io.await_fd(fd, true, false, timeout_ms)
+    if ev.is_readable() && !ev.is_timeout() : sleep_waits_ready++
+}
+
+synctest "Time: sleeps end in the order of their length, also when timed waits end in between" {
+    @unsafe
+    sleep_order.clear()
+    sleep_waits_ready = 0
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    let step = 10 * TIME_SCALE
+    each 0 .. 12 as i {
+        // Started in a mixed order, with a wait between every two sleeps whose timeout would
+        // end between theirs
+        let id = (i * 5) % 12
+        co sleep_and_record((id + 1) * step, id)
+        co sleep_wait_readable(pipe[0], (id + 1) * step + step / 2)
+    }
+    // The waits end now, long before their timeouts
+    let byte: u8 = 1
+    assert(ext.write(pipe[1], @ref(byte), 1) == 1)
+    let deadline = time.mono_ms() + 14 * step + 2000
+    while sleep_order.length < 12 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(sleep_waits_ready == 12)
+    assert(sleep_order.length == 12)
+    each sleep_order as id, i : assert(id == i)
+    assert(ext.close(pipe[0]) == 0)
+    assert(ext.close(pipe[1]) == 0)
+}
+
+#if EPOLL
+test "IO: closing a descriptor ends the waits for it" {
+    @unsafe
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    let waiting = co io.await_fd(pipe[0], true, false, 2000 * TIME_SCALE)
+    io.close(pipe[0]) !!
+    let ev = await waiting
+    assert(ev.is_closed())
+    assert(!ev.is_readable())
+    assert(!ev.is_timeout())
+    assert(ext.close(pipe[1]) == 0)
+}
+
+test "IO: a wait for a descriptor that closed ends once its number is waited for again" {
+    @unsafe
+    let old: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(old)) == 0)
+    let number = old[0]
+    let stale = co io.await_fd(number, true, false, 2000 * TIME_SCALE)
+    // Closed behind the event loop's back, its number given to another pipe in the same step
+    let next: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(next)) == 0)
+    assert(ext.dup2(next[0], number) == number)
+    assert(ext.close(next[0]) == 0)
+    let fresh = co io.await_fd(number, true, false, 2000 * TIME_SCALE)
+    // The old wait must not see the new pipe's input
+    let gone = await stale
+    assert(gone.is_closed())
+    assert(!gone.is_readable())
+    let byte: u8 = 1
+    assert(ext.write(next[1], @ref(byte), 1) == 1)
+    let ready = await fresh
+    assert(ready.is_readable())
+    assert(!ready.is_closed())
+    assert(ext.close(number) == 0)
+    assert(ext.close(next[1]) == 0)
+    assert(ext.close(old[1]) == 0)
+}
+
+fn poll_read_fails(connection: net.TcpConnection) bool {
+    let buffer = [u8]{ 0 x 8 }
+    connection.read(buffer) ! return error_is(E.code, closed)
+    return false
+}
+
+test "TCP: closing a connection ends the read another coroutine waits in" {
+    let server = net.tcp_server("127.0.0.1", 9348) !!
+    let accepting = co server.accept(2000 * TIME_SCALE)
+    let peer = net.tcp_client("127.0.0.1", 9348) !!
+    let local = await accepting !!
+    local.set_timeouts(2000 * TIME_SCALE, 0)
+    let reading = co poll_read_fails(local)
+    local.close() !!
+    assert(await reading)
+    peer.close() !!
+    server.close() !!
+}
+
+// A connection that waited for input once, so its socket stays in the epoll set
+fn poll_waited_connection(server: atomic net.TcpServer, port: u16) (net.TcpConnection, net.TcpConnection) {
+    let accepting = co server.accept(2000 * TIME_SCALE)
+    let peer = net.tcp_client("127.0.0.1", port) !!
+    let local = await accepting !!
+    local.set_timeouts(10 * TIME_SCALE, 0)
+    let buffer = [u8]{ 0 x 8 }
+    let timed_out = false
+    local.read(buffer) ! { timed_out = error_is(E.code, timeout) }
+    assert(timed_out)
+    return (local, peer)
+}
+
+synctest "TCP: a connection on the number of one that waited before gets its own input" {
+    @unsafe
+    let server = net.tcp_server("127.0.0.1", 9349) !!
+    let old, old_peer = poll_waited_connection(server, 9349)
+    let number = old.fd
+    // The old socket goes without a close through the connection, as when it is collected,
+    // and its number names the next connection's socket
+    let accepting = co server.accept(2000 * TIME_SCALE)
+    let peer = net.tcp_client("127.0.0.1", 9349) !!
+    let accepted = await accepting !!
+    assert(ext.dup2(accepted.fd, number) == number)
+    old.closed = true
+    // Not through the connection: its close shuts the socket down, under both numbers
+    assert(ext.close(accepted.fd) == 0)
+    accepted.closed = true
+    let next = net.TcpConnection.wrap(number) !!
+    next.set_timeouts(2000 * TIME_SCALE, 0)
+    peer.write("x") !!
+    let buffer = [u8]{ 0 x 8 }
+    assert((next.read(buffer) !? 0) == 1)
+    // And again, now that its socket is in the set
+    peer.write("yz") !!
+    assert((next.read(buffer) !? 0) == 2)
+    next.close() !!
+    peer.close() !!
+    old_peer.close() !!
+    server.close() !!
+}
+
+synctest "IO: a descriptor on the number of a connection that waited before is polled as itself" {
+    @unsafe
+    let server = net.tcp_server("127.0.0.1", 9350) !!
+    let old, old_peer = poll_waited_connection(server, 9350)
+    let number = old.fd
+    let pipe: [i32 x 2] = { -1... }
+    assert(ext.pipe(@ref(pipe)) == 0)
+    assert(ext.dup2(pipe[0], number) == number)
+    old.closed = true
+    assert(ext.close(pipe[0]) == 0)
+    let idle = io.await_fd(number, true, false, 10 * TIME_SCALE)
+    assert(idle.is_timeout())
+    co feed_pipe_later(pipe[1])
+    let ready = io.await_fd(number, true, false, 2000 * TIME_SCALE)
+    assert(ready.is_readable())
+    assert(!ready.is_timeout())
+    assert(ext.close(number) == 0)
+    assert(ext.close(pipe[1]) == 0)
+    old_peer.close() !!
+    server.close() !!
+}
+#end
+
+global poll_echo_done: uint (0)
+
+fn poll_echo_serve(connection: net.TcpConnection) {
+    let buffer = [u8]{ 0 x 16 }
+    while true {
+        let got = connection.read(buffer) ! break
+        connection.write(buffer.view(0, got)) ! break
+    }
+    connection.close() ! {}
+}
+
+fn poll_echo_client(port: u16, rounds: uint) {
+    let connection = net.tcp_client("127.0.0.1", port) !!
+    connection.set_timeouts(5000 * TIME_SCALE, 5000 * TIME_SCALE)
+    let buffer = [u8]{ 0 x 16 }
+    each 0 .. rounds as round {
+        connection.write("ping") !!
+        // The answer is not there yet: every round waits for the socket
+        assert((connection.read(buffer) !? 0) == 4)
+        assert(buffer.view(0, 4).to_string() == "ping")
+        // Now and then other coroutines run between two waits
+        if round % 7 == 0 : time.sleep_ms(1)
+    }
+    connection.close() !!
+    poll_echo_done++
+}
+
+fn poll_echo_accept(server: atomic net.TcpServer, count: uint) {
+    each 0 .. count {
+        let connection = server.accept(5000 * TIME_SCALE) ! return
+        connection.set_timeouts(5000 * TIME_SCALE, 5000 * TIME_SCALE)
+        co poll_echo_serve(connection)
+    }
+}
+
+synctest "TCP: connections that wait for every answer keep getting them" {
+    let server = net.tcp_server("127.0.0.1", 9351) !!
+    poll_echo_done = 0
+    co poll_echo_accept(server, 8)
+    each 0 .. 8 : co poll_echo_client(9351, 200)
+    let deadline = time.mono_ms() + 10000 * TIME_SCALE
+    while poll_echo_done < 8 && time.mono_ms() < deadline : time.sleep_ms(1)
+    assert(poll_echo_done == 8)
+    server.close() !!
+}
+#end

@@ -42,6 +42,8 @@ value WRITE_PART_SIZE (64 * 1024)
     // A shutdown of the direct descriptor is in flight; a close waits for it (see `interrupt`)
     - direct_shutting: bool (false)
     - direct_close_deferred: bool (false)
+    // What stands for this connection in the event loop (see `owner`), 0 until it waits
+    - poll_owner: uint (0)
 
     /// Resolves `host` and connects to it and `port` over TCP; also `net.tcp_client`.
     ///
@@ -164,7 +166,7 @@ value WRITE_PART_SIZE (64 * 1024)
     + fn close() !io.IoError {
         if this.closed : return
         this.closed = true
-        #if OS == "linux"
+        #if URING
         if this.direct {
             this.socket_closed = true
             // Unread input would make the close a reset, which can discard the last response
@@ -257,6 +259,15 @@ value WRITE_PART_SIZE (64 * 1024)
         }
     }
 
+    // The connection as the one holder of its socket: with epoll the socket then stays in the
+    // event loop's set, and a wait for it costs no system call
+    fn owner() uint {
+        #if EPOLL
+        if this.poll_owner == 0 : this.poll_owner = coro.next_owner()
+        #end
+        return this.poll_owner
+    }
+
     fn is_cancelled() bool {
         let cancel = this.cancel
         return isset(cancel) && cancel.is_cancelled()
@@ -267,7 +278,7 @@ value WRITE_PART_SIZE (64 * 1024)
     fn interrupt() {
         if this.socket_closed || this.interrupted : return
         this.interrupted = true
-        #if OS == "linux"
+        #if URING
         if this.direct {
             // Later operations fail before they start; the shutdown ends pending ones and tells
             // the peer. io_uring runs it on a worker thread that finds the slot by number, so the
@@ -283,7 +294,7 @@ value WRITE_PART_SIZE (64 * 1024)
     fn gc_free() {
         if !this.closed {
             this.closed = true
-            #if OS == "linux"
+            #if URING
             if this.direct {
                 io.close_direct(this.direct_ring, this.fd)
                 return
@@ -365,7 +376,7 @@ value WRITE_PART_SIZE (64 * 1024)
                     throw E
                 }
             } else {
-                sent = write(this.fd, part, this.write_timeout_ms) ! {
+                sent = write_owned(this.fd, part, this.write_timeout_ms, this.owner()) ! {
                     if this.is_cancelled() : throw .cancelled
                     throw E
                 }
@@ -475,7 +486,7 @@ value WRITE_PART_SIZE (64 * 1024)
             }
             bytes = res.to(uint)
         } else {
-            bytes = recv(this.fd, buf, this.read_timeout_ms) ! {
+            bytes = recv_owned(this.fd, buf, this.read_timeout_ms, this.owner()) ! {
                 if this.is_cancelled() : throw .cancelled
                 throw E
             }
@@ -490,7 +501,7 @@ value WRITE_PART_SIZE (64 * 1024)
     // One receive without waiting: null when nothing is there yet. Without a direct receive
     // (TLS, other systems) it reads like `read`
     fn read_now(buf: local mut &[u8]) ?uint !io.IoError {
-        #if OS == "linux"
+        #if URING
         if this.direct && !this.closed && buf.length > 0 && !this.is_cancelled() {
             let res = this.recv_direct(buf, ext.MSG_DONTWAIT)
             if res > 0 : return res.to(uint)
@@ -499,6 +510,8 @@ value WRITE_PART_SIZE (64 * 1024)
             if this.is_cancelled() : throw .cancelled
             throw .read
         }
+        #end
+        #if OS == "linux"
         if !isset(this.ssl) && !this.closed && buf.length > 0 && !this.is_cancelled() {
             @unsafe
             let res = ext.recv(this.fd, buf.data, buf.length, ext.MSG_DONTWAIT)
@@ -529,7 +542,7 @@ value WRITE_PART_SIZE (64 * 1024)
     // Sends all of `data`, then reads like `read`. On Linux, without TLS or a read timeout,
     // both go to the kernel together
     fn write_then_read(data: local &[u8], buf: local mut &[u8]) uint !io.IoError {
-        #if OS == "linux"
+        #if URING
         if !isset(this.ssl) && this.read_timeout_ms == 0 && data.length > 0 && buf.length > 0 && io.uring_links_full_sends() {
             if this.closed : throw .closed
             if this.is_cancelled() : throw .cancelled
@@ -550,7 +563,7 @@ value WRITE_PART_SIZE (64 * 1024)
     }
 
     fn shutdown_direct() {
-        #if OS == "linux"
+        #if URING
         @unsafe
         direct_op(ext.IORING_OP.SHUTDOWN, this.direct_ring, this.fd, null, 2, 0, 0)
         this.direct_shutting = false
@@ -560,7 +573,7 @@ value WRITE_PART_SIZE (64 * 1024)
 
     // One receive on a direct descriptor: the byte count, or a negative errno
     fn recv_direct(buf: local mut &[u8], flags: i32) i32 {
-        #if OS == "linux"
+        #if URING
         @unsafe
         if this.interrupted : return 0 - ext.ECANCELED
         return direct_op(ext.IORING_OP.RECV, this.direct_ring, this.fd, buf.data, buf.length, flags, this.read_timeout_ms)
@@ -571,7 +584,7 @@ value WRITE_PART_SIZE (64 * 1024)
 
     // One send on a direct descriptor
     fn send_direct(data: local &[u8]) uint !io.IoError {
-        #if OS == "linux"
+        #if URING
         @unsafe
         if this.interrupted : throw .write
         let res = direct_send(ext.IORING_OP.SEND, this.direct_ring, this.fd, data.data, data.length, ext.MSG_NOSIGNAL, this.write_timeout_ms)
