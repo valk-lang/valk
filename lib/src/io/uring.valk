@@ -290,6 +290,26 @@ fn grow_recv_buffers() {
     buffers.missed += misses
     grow_recv_buffers()
 }
+
+/// Test hook: whether `sq_space_left` measures against the kernel head when `sqe_head` has
+/// already advanced to `sqe_tail` (as happens on an interrupted `io_uring_submit_and_wait`).
++ fn sq_space_tracks_khead_for_test() bool {
+    @unsafe
+    let ring = uring() ! return true
+    if sq_unsubmitted(ring) > 0 : uring_submit(ring)
+    let baseline = sq_space_left(ring)
+    if baseline < 4 : return false
+    let sqe = ext.io_uring_get_sqe(ring) ?! return false
+    io_uring_prep_rw(ext.IORING_OP.NOP, sqe, -1, null, 0, 0)
+    sqe.user_data = side_user_data(0)
+    uring_unsubmitted++
+    let saved_head = ring.sq.sqe_head
+    ring.sq.sqe_head = ring.sq.sqe_tail
+    let space = sq_space_left(ring)
+    ring.sq.sqe_head = saved_head
+    uring_submit(ring)
+    return space == baseline - 1
+}
 #end
 
 // System calls of their own: the liburing that static builds link predates these
@@ -298,6 +318,7 @@ value SYS_IO_URING_REGISTER (427)
 value IORING_ENTER_GETEVENTS (1)
 value IORING_REGISTER_FILES2 (13)
 value IORING_RSRC_REGISTER_SPARSE (1)
+value IORING_SQ_CQ_OVERFLOW (2)
 value IORING_SQ_TASKRUN (4)
 
 fn uring_register(ring: *ext.io_uring, opcode: uint, arg: ptr, nr: uint) bool {
@@ -401,9 +422,7 @@ fn arm_extra_doorbell() {
 fn submit_extra_rings() {
     each extra_rings as extra {
         if extra.unsubmitted == 0 : continue
-        let submitted = ext.io_uring_submit(extra.inst)
-        if submitted < 0 : continue
-        extra.unsubmitted = uring_remaining(extra.unsubmitted, submitted.to(uint))
+        submit_extra(extra)
     }
 }
 
@@ -411,7 +430,7 @@ fn submit_extra_rings() {
 fn sqe_on(coro: ?coro.Coro, index: uint) *ext.io_uring_sqe !IoError {
     if index == 0 : return sqe(coro) !>
     let extra = extra_rings.get(index - 1) ! throw .os
-    if extra.unsubmitted + 2 > 128 || sq_space_left(extra.inst) < 2 : submit_extra(extra)
+    extra_flush_space(extra, 2)
     let entry = take_sqe_raw(coro, extra.inst) !>
     extra.unsubmitted++
     return entry
@@ -425,10 +444,10 @@ fn linked_sqe_on(coro: ?coro.Coro, index: uint) *ext.io_uring_sqe !IoError {
     return entry
 }
 
-fn submit_extra(extra: ExtraRing) {
-    let submitted = ext.io_uring_submit(extra.inst)
-    if submitted < 0 : panic("Failed to submit io_uring requests")
-    extra.unsubmitted = uring_remaining(extra.unsubmitted, submitted.to(uint))
+fn submit_extra(extra: ExtraRing) uint {
+    let submitted = submit_ring(extra.inst)
+    extra.unsubmitted = sq_unsubmitted(extra.inst)
+    return submitted
 }
 
 // A submission on ring `index` that no coroutine waits for; its completion is a side event
@@ -439,12 +458,12 @@ fn detached_sqe(index: uint, payload: uint) *ext.io_uring_sqe !IoError {
     if index == 0 {
         let main = uring_instance ?! throw .os
         let ring = main.inst
-        if uring_unsubmitted + 2 > 128 || sq_space_left(ring) < 2 : uring_submit(ring)
+        uring_flush_space(ring, 2)
         sqe = ext.io_uring_get_sqe(ring)
         if isset(sqe) : uring_unsubmitted++
     } else {
         let extra = extra_rings.get(index - 1) ! throw .os
-        if extra.unsubmitted + 2 > 128 || sq_space_left(extra.inst) < 2 : submit_extra(extra)
+        extra_flush_space(extra, 2)
         sqe = ext.io_uring_get_sqe(extra.inst)
         if isset(sqe) : extra.unsubmitted++
     }
@@ -490,28 +509,67 @@ fn uring_links_full_sends() bool {
     return (uring_features & IORING_FEAT_REG_REG_RING) != 0
 }
 
-fn uring_submit(ring: *ext.io_uring) uint {
-    let submitc = ext.io_uring_submit(ring)
-    return uring_record_submitted(submitc)
+fn submit_ring(ring: *ext.io_uring) uint {
+    let flushed_cq = false
+    while true {
+        let submitc = ext.io_uring_submit(ring)
+        if submitc == 0 - ext.EINTR : continue
+        if submitc == 0 - ext.EBUSY && !flushed_cq {
+            flushed_cq = true
+            ext.syscall(SYS_IO_URING_ENTER, ring.ring_fd.to(int), 0, 0, IORING_ENTER_GETEVENTS, 0, 0)
+            continue
+        }
+        if submitc == 0 - ext.EBUSY : return 0
+        if submitc < 0 : panic("Failed to submit io_uring requests")
+        return submitc.to(uint)
+    }
 }
 
-fn uring_record_submitted(submitc: i32) uint {
-    if submitc < 0 : panic("Failed to submit io_uring requests")
-    uring_unsubmitted = uring_remaining(uring_unsubmitted, submitc.to(uint))
+fn uring_submit(ring: *ext.io_uring) uint {
+    let submitc = submit_ring(ring)
+    uring_unsubmitted = sq_unsubmitted(ring)
     return submitc
 }
 
+fn uring_record_submitted(ring: *ext.io_uring, submitc: i32) uint {
+    if submitc < 0 : panic("Failed to submit io_uring requests")
+    uring_unsubmitted = sq_unsubmitted(ring)
+    return submitc.to(uint)
+}
+
+#if TEST
 fn uring_remaining(unsubmitted: uint, submitted: uint) uint {
     if submitted > unsubmitted : return 0
     return unsubmitted - submitted
+}
+#end
+
+fn sq_unsubmitted(ring: *ext.io_uring) uint {
+    return (ring.sq.sqe_tail - atomic_load(ring.sq.khead[0])).to(uint)
 }
 
 // Free submission slots that have not been handed out yet
 fn sq_space_left(ring: *ext.io_uring) uint {
     let entries = ring.sq.kring_entries[0].to(uint)
-    let used = (ring.sq.sqe_tail - ring.sq.sqe_head).to(uint)
+    let used = sq_unsubmitted(ring)
     if used >= entries : return 0
     return entries - used
+}
+
+fn uring_flush_space(ring: *ext.io_uring, needed: uint) {
+    if uring_unsubmitted + needed <= 128 && sq_space_left(ring) >= needed : return
+    uring_submit(ring)
+    while sq_space_left(ring) < needed {
+        if uring_submit(ring) == 0 : break
+    }
+}
+
+fn extra_flush_space(extra: ExtraRing, needed: uint) {
+    if extra.unsubmitted + needed <= 128 && sq_space_left(extra.inst) >= needed : return
+    submit_extra(extra)
+    while sq_space_left(extra.inst) < needed {
+        if submit_extra(extra) == 0 : break
+    }
 }
 
 // Hands out one submission entry and, if the batch is large or the queue is
@@ -523,7 +581,7 @@ fn sq_space_left(ring: *ext.io_uring) uint {
 // from its operation by a flush in between.
 fn sqe(coro: ?coro.Coro, ring: ?*ext.io_uring (null)) *ext.io_uring_sqe !IoError {
     if !isset(ring) : ring = uring() !>
-    if uring_unsubmitted + 2 > 128 || sq_space_left(ring) < 2 : uring_submit(ring)
+    uring_flush_space(ring, 2)
     return take_sqe(coro, ring) !>
 }
 
@@ -666,7 +724,7 @@ fn io_uring_cqe_seen(ring: *ext.io_uring, cqe: *ext.io_uring_cqe) {
 // check if an io_uring completion event is available
 fn io_uring_peek_cqe(ring: *ext.io_uring, cqe_ptr: *?*ext.io_uring_cqe) i32 {
     // A deferred completion is only posted once this thread enters the kernel
-    if io_uring_cq_ready(ring) == 0 && (atomic_load(ring.sq.kflags[0]) & IORING_SQ_TASKRUN.to(u32)) != 0 {
+    if io_uring_cq_ready(ring) == 0 && (atomic_load(ring.sq.kflags[0]) & (IORING_SQ_CQ_OVERFLOW | IORING_SQ_TASKRUN).to(u32)) != 0 {
         ext.syscall(SYS_IO_URING_ENTER, ring.ring_fd.to(int), 0, 0, IORING_ENTER_GETEVENTS, 0, 0)
     }
     while true {
