@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.8
+
 + Release 0.8.7
 + Regions: chunks up to 256 KiB are pooled per size class out of 2 MiB slabs instead of one 2 MiB chunk per region (binary-tree 17 peak RSS 22 -> 14 MB)
 + GC: a full pool block goes back to the reuse list on the first collection that empties it instead of waiting for another block to fill, and an unused large block is returned on the next collection
