@@ -1,9 +1,9 @@
 
 <div align="center"><p>
-    <img height="150" src="misc/valk-logo.png" alt="Valk programming language">
+    <img height="200" src="misc/valk.png" alt="Valk programming language">
 </p></div>
 
-# Valk
+# The Valk Programming Language
 
 [Website](https://valk-lang.dev) | [Documentation](https://valk-lang.dev/docs) | [Discord](https://discord.gg/RwEGqdSERA) | [Packages](https://vpkg.dev) | [vman](https://github.com/valk-lang/vman)
 
@@ -83,19 +83,19 @@ make
 
 ## Benchmarks
 
-Valk 0.7.11, Go 1.27.1, Rust 1.97.1 on an AMD Ryzen 5 7600X (6 cores, 12 threads). Median of 3 runs after one warm-up, memory is peak RSS.
+Valk 0.8.7, Go 1.27.1, Rust 1.97.1 on an AMD Ryzen 5 7600X (6 cores, 12 threads). Median of 3 runs after one warm-up, memory is peak RSS.
 
 | Benchmark | Input | Valk time / memory | Go time / memory | Rust time / memory |
 |---|---:|---:|---:|---:|
-| binary-tree | 19 | 0.500s (57.6 MB) | 1.340s (58.1 MB) | 2.500s (66.3 MB) |
-| binary-tree-multi | 19 | 0.310s (76.7 MB) | 0.510s (86.3 MB) | 0.680s (66.4 MB) |
-| json | 2000000 | 0.430s (4.9 MB) | 2.100s (11.5 MB) | 0.420s (2.5 MB) |
-| json-serde | sample, 50000 | 0.200s (155.7 MB) | 0.310s (215.1 MB) | 0.230s (119.2 MB) |
-| lru | 1000, 11000000 | 0.360s (4.6 MB) | 0.770s (5.5 MB) | 0.440s (2.6 MB) |
-| merkletrees | 18 | 0.490s (68.4 MB) | 1.210s (70.8 MB) | 1.620s (66.3 MB) |
-| nsieve | 13 | 0.730s (82.1 MB) | 0.830s (141.9 MB) | 0.850s (80.5 MB) |
-| spectral-norm | 5500 | 1.100s (2.4 MB) | 1.120s (5.6 MB) | 1.080s (2.6 MB) |
-| spectral-norm-multi | 8000, 4 workers | 0.630s (7.0 MB) | 0.640s (11.7 MB) | 0.640s (2.8 MB) |
+| binary-tree | 19 | 0.300s (52.4 MB) | 1.280s (56.5 MB) | 2.440s (66.3 MB) |
+| binary-tree-multi | 19 | 0.110s (77.0 MB) | 0.470s (87.5 MB) | 0.640s (66.4 MB) |
+| json | 2000000 | 0.280s (7.9 MB) | 2.110s (11.5 MB) | 0.430s (2.5 MB) |
+| json-serde | sample, 50000 | 0.210s (167.7 MB) | 0.380s (218.2 MB) | 0.220s (119.4 MB) |
+| lru | 1000, 11000000 | 0.310s (4.2 MB) | 0.750s (5.5 MB) | 0.450s (2.6 MB) |
+| merkletrees | 18 | 0.280s (60.5 MB) | 1.120s (72.5 MB) | 1.560s (66.3 MB) |
+| nsieve | 13 | 0.690s (82.3 MB) | 0.820s (142.3 MB) | 0.740s (80.5 MB) |
+| spectral-norm | 5500 | 1.090s (2.5 MB) | 1.100s (5.6 MB) | 1.070s (2.6 MB) |
+| spectral-norm-multi | 8000, 4 workers | 0.620s (9.2 MB) | 0.620s (9.7 MB) | 0.630s (2.8 MB) |
 
 Code: [Link](examples/bench)
 
@@ -103,17 +103,17 @@ Code: [Link](examples/bench)
 
 ### GC benchmarks
 
-Valk 0.7.11, Go 1.27.1, LDC 1.43.0, .NET 10.0.112. Median of 3 runs.
+Valk 0.8.7, Go 1.27.1, LDC 1.43.0, .NET 10.0.112. Median of 3 runs.
 
 | Scenario | Valk | Go | D | C# |
 |---|---:|---:|---:|---:|
-| short-lived alloc | 8 ms | 74 ms | 130 ms | 77 ms |
-| stable-heap forced collects | 0 ms | 4187 ms | 2535 ms | 2909 ms |
-| build long-lived chain | 50 ms | 58 ms | 132 ms | 209 ms |
-| free long-lived chain | 25 ms | 67 ms | 2 ms | 13 ms |
-| mutate live links | 9 ms | 7 ms | 10 ms | 12 ms |
-| short-lived churn with large live set | 4 ms | 77 ms | 87 ms | 48 ms |
-| tree churn | 39 ms | 123 ms | 249 ms | 121 ms |
+| short-lived alloc | 8 ms | 74 ms | 131 ms | 72 ms |
+| stable-heap forced collects | 0 ms | 4144 ms | 1546 ms | 2843 ms |
+| build long-lived chain | 46 ms | 72 ms | 129 ms | 205 ms |
+| free long-lived chain | 25 ms | 52 ms | 6 ms | 13 ms |
+| mutate live links | 9 ms | 7 ms | 12 ms | 13 ms |
+| short-lived churn with large live set | 3 ms | 73 ms | 88 ms | 46 ms |
+| tree churn | 29 ms | 123 ms | 249 ms | 119 ms |
 
 Code: [Link](examples/bench/gc)
 
@@ -179,6 +179,5 @@ Either way, you should join our [discord](https://discord.gg/RwEGqdSERA) 😊 Ev
 ---
 
 <div align="center"><p>
-    <img height="234" src="misc/valk.png" alt="Valk logo">
-</p>
-</div>
+    <img height="200" src="misc/valk-logo.png" alt="Valk logo">
+</p></div>
