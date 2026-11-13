@@ -39,8 +39,10 @@ global region_first: ?ptr (@undefined)
 value REGION_PINS (4)
 value REGION_CHUNK_HEAD (24)
 value REGION_CHUNK_MIN (4096)
-// Chunks double up to this size; a round that needed several asks for their sum the next time
-value REGION_CHUNK_MAX (4 * 1024 * 1024)
+// Chunks double up to this size; a round that needed several starts at a larger class next time
+value REGION_CHUNK_MAX (256 * 1024)
+value REGION_CHUNK_SHIFT (12)
+value REGION_CLASSES (7)
 // A header holds a distance of 32 bits. A chunk that several objects share stays below this
 // size, and the one object of a bigger chunk points back at the head of its chunk instead
 value REGION_CHUNK_FAR (2 * 1024 * 1024 * 1024)
@@ -48,19 +50,22 @@ value REGION_HEADER_BACK (1 << 40)
 // The header of an object in a frame: not the collector's and in no region
 value REGION_HEADER_STACK (1 << 41)
 
-// Chunks of the smallest size that a region of this thread let go of, linked by their first
-// word: a function with a region that is called often would ask the allocator for one, and
-// give it back, on every call
-global region_spare: ?ptr (null)
-global region_spares: uint (0)
 value REGION_SPARE_MAX (8)
-// The same for chunks of the largest size: a region that grew big is likely to grow big again,
-// and memory fresh from the system costs a page fault per page. `gc.release_memory` frees them
-global region_big: ?ptr (null)
-global region_bigs: uint (0)
-// Whether one was taken since the last collection: a collection frees them when none was
-global region_big_used: bool (false)
-value REGION_BIG_MAX (16)
+value REGION_MID_MAX (4)
+// 256 KiB chunks are cut from 2 MiB slabs so the system can back them with huge pages
+value REGION_SLAB_CHUNKS (8)
+value REGION_SLAB_SIZE (REGION_CHUNK_MAX * REGION_SLAB_CHUNKS)
+value REGION_SLABS_MAX (64)
+value REGION_BIG_IDX (REGION_CLASSES - 1)
+
+// Spare chunks of each power-of-two size from 4 KiB to 256 KiB, linked by their first word.
+// The smallest stay for the next region; larger ones stay until a collection finds none were
+// taken, or `gc.release_memory` frees them
+global region_pool: [?ptr x 7]
+global region_pool_count: [uint x 7]
+global region_slabs: [ptr x 64]
+global region_slab_count: uint (@undefined)
+global region_pool_used: bool (@undefined)
 
 struct Region {
     cursor: ptr
@@ -68,7 +73,7 @@ struct Region {
     limit: ptr
     // Newest chunk from the allocator: [older chunk, bytes, the region] ... [the region]
     chunk: ?ptr
-    // Bytes the chunks of the last round had together
+    // Starting chunk size for the next round
     hint: uint
     // The owners pinned last, by their address, and the ones they pushed out
     pin: [?ptr x 4]
@@ -109,35 +114,41 @@ fn region_next_segment(top: uint) ptr $noinline {
 }
 
 // The chunks kept for the next region go back to the allocator
+fn region_pool_free_from(start: uint) {
+    @unsafe
+    let idx = start
+    while idx < REGION_BIG_IDX {
+        let spare = @ptrv(region_pool, ?ptr, idx)
+        @ptrv(region_pool, ?ptr, idx) = null
+        @ptrv(region_pool_count, uint, idx) = 0
+        while isset(spare) {
+            let older = @ptrv(spare, ?ptr, 0)
+            mem.free(spare)
+            spare = older
+        }
+        idx++
+    }
+    let slabs = region_slab_count
+    if slabs > 0 && @ptrv(region_pool_count, uint, REGION_BIG_IDX) == slabs * REGION_SLAB_CHUNKS {
+        @ptrv(region_pool, ?ptr, REGION_BIG_IDX) = null
+        @ptrv(region_pool_count, uint, REGION_BIG_IDX) = 0
+        region_slab_count = 0
+        let i: uint = 0
+        while i < slabs {
+            mem.free(@ptrv(region_slabs, ptr, i))
+            i++
+        }
+    }
+}
+
 fn region_spares_free() {
-    @unsafe
-    let spare = region_spare
-    region_spare = null
-    region_spares = 0
-    while isset(spare) {
-        let older = @ptrv(spare, ?ptr, 0)
-        mem.free(spare)
-        spare = older
-    }
-    region_bigs_free()
+    region_pool_free_from(0)
 }
 
-fn region_bigs_free() {
-    @unsafe
-    let big = region_big
-    region_big = null
-    region_bigs = 0
-    while isset(big) {
-        let older = @ptrv(big, ?ptr, 0)
-        mem.free(big)
-        big = older
-    }
-}
-
-// A collection of the thread: large chunks that no region took since the last one go back
+// A collection of the thread: larger chunks that no region took since the last one go back
 fn region_spares_age() {
-    if !region_big_used && isset(region_big) : region_bigs_free()
-    region_big_used = false
+    if !region_pool_used : region_pool_free_from(1)
+    region_pool_used = false
 }
 
 // The thread ends: its spare chunks go back, and its segments unless a region is still in use
@@ -252,25 +263,39 @@ fn region_alloc_zeroed(r: *Region, size: uint) ptr {
     return item
 }
 
-// A chunk of `size` bytes: a spare one of that size, or one from the allocator
-fn region_chunk(size: uint) ptr {
-    if size == REGION_CHUNK_MIN {
-        let spare = region_spare
+// A chunk of `size` bytes: a spare one, a slice of a 2 MiB slab, or one from the allocator
+fn region_chunk(size: uint) (ptr, uint) {
+    if size <= REGION_CHUNK_MAX {
+        let idx = size.trailing_zeros() - REGION_CHUNK_SHIFT
+        if idx > 0 : region_pool_used = true
+        let spare = @ptrv(region_pool, ?ptr, idx)
         if isset(spare) {
-            region_spare = @ptrv(spare, ?ptr, 0)
-            region_spares--
-            return spare
+            @ptrv(region_pool, ?ptr, idx) = @ptrv(spare, ?ptr, 0)
+            @ptrv(region_pool_count, uint, idx) -= 1
+            return (spare, size)
         }
-    } else if size == REGION_CHUNK_MAX {
-        let big = region_big
-        if isset(big) {
-            region_big = @ptrv(big, ?ptr, 0)
-            region_bigs--
-            region_big_used = true
-            return big
+        if idx == REGION_BIG_IDX {
+            let slabs = region_slab_count
+            if slabs < REGION_SLABS_MAX {
+                let slab = mem.alloc(REGION_SLAB_SIZE)
+                @ptrv(region_slabs, ptr, slabs) = slab
+                region_slab_count = slabs + 1
+                let head: ?ptr = null
+                let i: uint = REGION_SLAB_CHUNKS - 1
+                while i > 0 {
+                    let part: ptr = slab + i * REGION_CHUNK_MAX
+                    @ptrv(part, ?ptr, 0) = head
+                    head = part
+                    i--
+                }
+                @ptrv(region_pool, ?ptr, REGION_BIG_IDX) = head
+                @ptrv(region_pool_count, uint, REGION_BIG_IDX) = REGION_SLAB_CHUNKS - 1
+                return (slab, REGION_CHUNK_MAX)
+            }
+            return (mem.alloc(REGION_SLAB_SIZE), REGION_SLAB_SIZE)
         }
     }
-    return mem.alloc(size)
+    return (mem.alloc(size), size)
 }
 
 fn region_grow(r: *Region, isize: uint) ptr $noinline {
@@ -278,25 +303,27 @@ fn region_grow(r: *Region, isize: uint) ptr $noinline {
     r.hint = 0
     let chunk = r.chunk
     if isset(chunk) {
-        let twice = @ptrv(chunk, uint, 1) * 2
-        if twice > REGION_CHUNK_MAX : twice = REGION_CHUNK_MAX
+        let prev = @ptrv(chunk, uint, 1)
+        let twice = prev >= REGION_CHUNK_MAX ? REGION_CHUNK_MAX : prev * 2
         if twice > size : size = twice
     }
     if size < REGION_CHUNK_MIN : size = REGION_CHUNK_MIN
-    if size > REGION_CHUNK_FAR : size = REGION_CHUNK_FAR
     // Head, the object and the word after it
-    if size < isize + REGION_CHUNK_HEAD + 8 : size = isize + REGION_CHUNK_HEAD + 8
-    let new = region_chunk(size)
-    let limit = new + size - 8
+    let need = isize + REGION_CHUNK_HEAD + 8
+    if size < need {
+        size = need <= REGION_CHUNK_MAX ? (1.to(uint) << (64 - (need - 1).leading_zeros())) : need
+    }
+    let new, actual = region_chunk(size)
+    let limit = new + actual - 8
     @ptrv(new, ?ptr, 0) = chunk
-    @ptrv(new, uint, 1) = size
+    @ptrv(new, uint, 1) = actual
     @ptrv(new, ptr, 2) = r.@cast(ptr)
     @ptrv(limit, ptr) = r.@cast(ptr)
     r.chunk = new
     let item = new + REGION_CHUNK_HEAD
     r.cursor = item + isize
     r.limit = limit
-    @ptrv(item, uint) = size > REGION_CHUNK_FAR ? REGION_HEADER_BACK | REGION_CHUNK_HEAD : limit.@cast(uint) - item.@cast(uint)
+    @ptrv(item, uint) = actual > REGION_CHUNK_FAR ? REGION_HEADER_BACK | REGION_CHUNK_HEAD : limit.@cast(uint) - item.@cast(uint)
     return item + 8
 }
 
@@ -317,6 +344,12 @@ fn region_reset(r: *Region) $inline {
     r.cursor = start
 }
 
+fn region_round_hint(total: uint) uint {
+    if total >= REGION_CHUNK_MAX : return REGION_CHUNK_MAX
+    if total <= REGION_CHUNK_MIN : return REGION_CHUNK_MIN
+    return 1.to(uint) << (64 - (total - 1).leading_zeros())
+}
+
 fn region_reset_chunks(r: *Region) $noinline {
     let chunk = r.chunk ?! return
     let older = @ptrv(chunk, ?ptr, 0)
@@ -325,7 +358,7 @@ fn region_reset_chunks(r: *Region) $noinline {
         r.cursor = chunk + REGION_CHUNK_HEAD
         return
     }
-    r.hint = region_free_chunks(r)
+    r.hint = region_round_hint(region_free_chunks(r))
 }
 
 fn region_exit(r: *Region) $inline {
@@ -398,17 +431,26 @@ fn region_free_chunks(r: *Region) uint $noinline {
         let older = @ptrv(chunk, ?ptr, 0)
         let size = @ptrv(chunk, uint, 1)
         total += size
-        if size == REGION_CHUNK_MIN && region_spares < REGION_SPARE_MAX {
-            @ptrv(chunk, ?ptr, 0) = region_spare
-            region_spare = chunk
-            region_spares++
-        } else if size == REGION_CHUNK_MAX && region_bigs < REGION_BIG_MAX {
-            @ptrv(chunk, ?ptr, 0) = region_big
-            region_big = chunk
-            region_bigs++
-        } else {
-            mem.free(chunk)
+        if size <= REGION_CHUNK_MAX {
+            let idx = size.trailing_zeros() - REGION_CHUNK_SHIFT
+            if idx == REGION_BIG_IDX {
+                @ptrv(chunk, ?ptr, 0) = @ptrv(region_pool, ?ptr, REGION_BIG_IDX)
+                @ptrv(region_pool, ?ptr, REGION_BIG_IDX) = chunk
+                @ptrv(region_pool_count, uint, REGION_BIG_IDX) += 1
+                chunk = older
+                continue
+            }
+            let max: uint = idx == 0 ? REGION_SPARE_MAX : REGION_MID_MAX
+            let count = @ptrv(region_pool_count, uint, idx)
+            if count < max {
+                @ptrv(chunk, ?ptr, 0) = @ptrv(region_pool, ?ptr, idx)
+                @ptrv(region_pool, ?ptr, idx) = chunk
+                @ptrv(region_pool_count, uint, idx) = count + 1
+                chunk = older
+                continue
+            }
         }
+        mem.free(chunk)
         chunk = older
     }
     let base: ptr = r.@cast(ptr) + REGION_HEAD
