@@ -4,7 +4,10 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.8.7
++ Release 0.8.7
++ Regions: chunks up to 256 KiB are pooled per size class out of 2 MiB slabs instead of one 2 MiB chunk per region (binary-tree 17 peak RSS 22 -> 14 MB)
++ GC: a full pool block goes back to the reuse list on the first collection that empties it instead of waiting for another block to fill, and an unused large block is returned on the next collection
++ Compiler: resolved all build warnings across all 5 targets, enforced in CI
 
 + Release 0.8.6
 + HTTP server: cleartext HTTP/2 (`Server.http2 = true` without `tls`), per-worker `SO_REUSEPORT` listeners, `prefix:` on `add_static_dir`, and precompressed `.br` / `.gz` static files
