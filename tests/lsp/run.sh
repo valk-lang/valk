@@ -778,8 +778,13 @@ check "definition on error return type resolves to error declaration" '"line":7,
     "$(request textDocument/definition trait-nav.valk 15 18)"
 
 ROOT="$(cd "$DIR/../.." && pwd)"
+case "$(uname -s)" in
+    MINGW*|MSYS*) ROOT="$(cd "$DIR/../.." && pwd -W)" ;;
+esac
 check "definition on use Number in stdlib resolves to number.valk" 'lib/src/core/number.valk' \
     "$(printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://%s/lib/src/core/uint.valk"},"position":{"line":3,"character":9}}}' "$ROOT")"
+check "definition accepts percent-encoded file URI" '"line":1,"character":' \
+    "$(printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file://%s/trait%%2dnav.valk"},"position":{"line":11,"character":10}}}' "$DIR")"
 
 echo "> \$/cancelRequest is ignored silently"
 stream="$(frame "$init")$(frame '{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}')"
