@@ -1,0 +1,190 @@
+use core
+use coro
+
+value RW_MAX_READERS (1 << 29)
+
+/// A reader-writer mutual exclusion lock whose waiters yield to other coroutines instead of
+/// blocking the thread.
+///
+/// Multiple readers may hold the lock at the same time; writers are exclusive and waiting
+/// writers block new readers from starving them. Works across threads.
++ class RwMutex $atomic {
+    - w_mutex: atomic core.Mutex
+    - readers: int (0)
+    - reader_wait: int (0)
+    - guard: uint (0)
+    - writer_park: ?ptr (null)
+    - r_first: ?ptr (null)
+    - r_last: ?ptr (null)
+    - r_tickets: uint (0)
+
+    /// Returns an unlocked reader-writer mutex.
+    + static fn new() SELF !SyncError {
+        return SELF { w_mutex: core.Mutex.new() ! throw .init }
+    }
+
+    /// Locks the mutex for shared reading, waiting while a writer holds or waits for it.
+    + fn read_lock() @threadsafe {
+        if atomic(this.readers + 1) >= 0 : return
+        this.read_lock_slow()
+    }
+
+    fn read_lock_slow() @threadsafe {
+        let p = coro.park_new()
+        coro.spin_acquire(@ref(this.guard))
+        if this.r_tickets > 0 {
+            this.r_tickets--
+            coro.spin_release(@ref(this.guard))
+            coro.park_discard(p)
+            return
+        }
+        p.next = null
+        let last = this.r_last
+        if isset(last) {
+            last.@cast(*coro.Park).next = p.@cast(ptr)
+        } else {
+            this.r_first = p.@cast(ptr)
+        }
+        this.r_last = p.@cast(ptr)
+        coro.spin_release(@ref(this.guard))
+        coro.park_wait(p, 0)
+        coro.park_release(p)
+    }
+
+    /// Releases a shared read lock.
+    + fn read_unlock() @threadsafe {
+        if atomic(this.readers - 1) - 1 >= 0 : return
+        this.read_unlock_slow()
+    }
+
+    fn read_unlock_slow() @threadsafe {
+        if atomic(this.reader_wait - 1) != 1 : return
+        coro.spin_acquire(@ref(this.guard))
+        let wp = this.writer_park
+        this.writer_park = null
+        coro.spin_release(@ref(this.guard))
+        if isset(wp) : coro.wake_park(wp.@cast(*coro.Park))
+    }
+
+    /// Locks the mutex for exclusive writing.
+    + fn write_lock() @threadsafe {
+        this.w_mutex.lock()
+        let active = atomic(this.readers - RW_MAX_READERS)
+        if active == 0 : return
+        let p = coro.park_new()
+        coro.spin_acquire(@ref(this.guard))
+        let rem = atomic(this.reader_wait + active) + active
+        if rem != 0 {
+            this.writer_park = p.@cast(ptr)
+            coro.spin_release(@ref(this.guard))
+            coro.park_wait(p, 0)
+            coro.park_release(p)
+            return
+        }
+        coro.spin_release(@ref(this.guard))
+        coro.park_discard(p)
+    }
+
+    /// Releases the exclusive write lock, waking readers queued while it was held.
+    + fn write_unlock() @threadsafe {
+        coro.spin_acquire(@ref(this.guard))
+        let waiting_i = atomic(this.readers + RW_MAX_READERS) + RW_MAX_READERS
+        let waiting: uint = waiting_i > 0 ? waiting_i.to(uint) : 0
+        let to_wake: ?ptr = null
+        let to_wake_last: ?ptr = null
+        let taken: uint = 0
+        while taken < waiting && isset(this.r_first) {
+            let p = this.r_first.@cast(*coro.Park)
+            this.r_first = p.next
+            if !isset(this.r_first) : this.r_last = null
+            p.next = null
+            if isset(to_wake_last) {
+                to_wake_last.@cast(*coro.Park).next = p.@cast(ptr)
+            } else {
+                to_wake = p.@cast(ptr)
+            }
+            to_wake_last = p.@cast(ptr)
+            taken++
+        }
+        this.r_tickets += waiting - taken
+        coro.spin_release(@ref(this.guard))
+        while isset(to_wake) {
+            let p = to_wake.@cast(*coro.Park)
+            to_wake = p.next
+            if !coro.wake_park(p) : atomic(this.readers - 1)
+        }
+        this.w_mutex.unlock()
+    }
+
+    fn gc_free() {
+        let wp = this.writer_park
+        if isset(wp) : coro.park_release(wp.@cast(*coro.Park))
+        let p = this.r_first
+        while isset(p) {
+            let park = p.@cast(*coro.Park)
+            p = park.next
+            coro.park_release(park)
+        }
+    }
+}
+
+/// A value shared across threads and coroutines with concurrent readers and exclusive writers.
+///
+/// Values cross threads, so `T` is a number, bool, string or `atomic` object.
+///
+/// ```valk
+/// let count: atomic sync.RwLock[uint] = sync.RwLock[uint].new(0) !!
+/// count.write(fn(v: uint) uint { return v + 1 })
+/// ```
++ class RwLock[T] $atomic {
+    #if T.$has_gc_refs && !T.$nonnull.$is_shared && !T.$nonnull.$is_type_of(String)
+    #error "An RwLock is used by several threads, so its value is a number, bool, string or 'atomic' object, like 'RwLock[atomic User]'"
+    #end
+    - mutex: RwMutex
+    - value: T
+
+    /// Creates a read-write lock holding `value`.
+    + static fn new(value: T) SELF !SyncError {
+        return SELF { mutex: RwMutex.new() !>, value: value }
+    }
+
+    /// Reads the stored value under a shared read lock.
+    + fn get() T @threadsafe {
+        this.mutex.read_lock()
+        let v = this.value
+        this.mutex.read_unlock()
+        return v
+    }
+
+    /// Replaces the stored value under an exclusive write lock.
+    + fn set(value: T) @threadsafe {
+        this.mutex.write_lock()
+        this.value = value
+        this.mutex.write_unlock()
+    }
+
+    /// Calls `reader` with the stored value under a shared read lock and returns its result.
+    + fn read[R](reader: fn(T)(R)) R @threadsafe {
+        this.mutex.read_lock()
+        let res = reader(this.value)
+        this.mutex.read_unlock()
+        return res
+    }
+
+    /// Calls `writer` with the stored value under an exclusive write lock and returns its result.
+    + fn write[R](writer: fn(T)(R)) R @threadsafe {
+        this.mutex.write_lock()
+        let res = writer(this.value)
+        this.mutex.write_unlock()
+        return res
+    }
+
+    /// Replaces the stored value with what `change` returns under an exclusive write lock.
+    + fn update(change: fn(T)(T)) T @threadsafe {
+        this.mutex.write_lock()
+        let v = change(this.value)
+        this.value = v
+        this.mutex.write_unlock()
+        return v
+    }
+}

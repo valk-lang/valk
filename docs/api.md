@@ -170,6 +170,10 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn hostname() String !SystemError
 // Returns the memory this process may use in bytes; 0 when it cannot be determined.
 + fn memory_limit() uint
+// Registers a callback to run in reverse registration order when the process exits normally or via `exit`.
++ fn on_exit(hook: atomic fn()()) void
+// Registers a callback to run in reverse registration order when the current OS thread finishes.
++ fn on_thread_exit(hook: fn()()) void
 // Prints `msg` to stderr and ends the process with exit code 1.
 + fn panic(msg: String, location: String ("")) void
 // Returns the id of this process.
@@ -3167,6 +3171,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 + class Client {
     // The cookies servers set, sent back on later requests.
     ~ cookies: CookieJar
+    // Whether requests sent through this client prefer HTTP/2 (`h2` ALPN on HTTPS with HTTP/1.1 fallback, or cleartext prior-knowledge `h2c` on plain HTTP). Defaults to `false`.
+    + http2: bool
     // How long an idle connection is kept, in milliseconds.
     + idle_timeout_ms: uint
     // How many idle connections are kept per host.
@@ -3415,6 +3421,8 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
     + headers: ?Headers
     // The `Host` header to send instead of the URL's host and port.
     + host: ?String
+    // Whether the HTTP client uses HTTP/2: ALPN `h2` with HTTP/1.1 fallback on `https://`, or prior-knowledge cleartext HTTP/2 (`h2c`) on `http://`. Defaults to `false`.
+    + http2: bool
     // The number of redirects to follow before failing with `too_many_redirects`.
     + max_redirects: uint
     // The largest accepted response body in bytes, also when it goes to `output`; zero disables the limit.
@@ -4967,6 +4975,40 @@ error SignalError (unsupported, init)
     + fn snapshot() HashMap[K, V]
     // Stores what `change` makes of the current value (`null` when there is none), and returns it. `change` runs while the key's shard is locked: it must not use this map.
     + fn update(key: K, change: fn(?V)(V)) V
+}
+```
+
+```js
+// A value shared across threads and coroutines with concurrent readers and exclusive writers.
++ class RwLock[T] {
+    // Reads the stored value under a shared read lock.
+    + fn get() T
+    // Creates a read-write lock holding `value`.
+    + static fn new(value: T) RwLock[T] !SyncError
+    // Calls `reader` with the stored value under a shared read lock and returns its result.
+    + fn read[R](reader: fn(T)(R)) R
+    // Replaces the stored value under an exclusive write lock.
+    + fn set(value: T) void
+    // Replaces the stored value with what `change` returns under an exclusive write lock.
+    + fn update(change: fn(T)(T)) T
+    // Calls `writer` with the stored value under an exclusive write lock and returns its result.
+    + fn write[R](writer: fn(T)(R)) R
+}
+```
+
+```js
+// A reader-writer mutual exclusion lock whose waiters yield to other coroutines instead of blocking the thread.
++ class RwMutex {
+    // Returns an unlocked reader-writer mutex.
+    + static fn new() RwMutex !SyncError
+    // Locks the mutex for shared reading, waiting while a writer holds or waits for it.
+    + fn read_lock() void
+    // Releases a shared read lock.
+    + fn read_unlock() void
+    // Locks the mutex for exclusive writing.
+    + fn write_lock() void
+    // Releases the exclusive write lock, waking readers queued while it was held.
+    + fn write_unlock() void
 }
 ```
 

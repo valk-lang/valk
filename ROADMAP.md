@@ -6,8 +6,11 @@
 ```
 - Release 0.8.6
 + HTTP server: cleartext HTTP/2 (`Server.http2 = true` without `tls`), per-worker `SO_REUSEPORT` listeners, `prefix:` on `add_static_dir`, and precompressed `.br` / `.gz` static files
++ HTTP client: HTTP/2 support (`Options.http2`, `Client.http2`, TLS ALPN negotiation with HTTP/1.1 fallback, cleartext h2c, and connection multiplexing)
 + HTTP: `query_param(name)` on `Request` and `Context`, `Route.param(path, name)`, and faster static route lookups in `Router`
-+ Faster HTTP/2, WebSocket, JSON encoding and TLS
++ Standard library: `sync.RwMutex` and `sync.RwLock[T]` reader-writer locks, `core.on_exit` / `core.on_thread_exit` LIFO lifecycle hooks, and `$pause()` spin-wait intrinsic
++ Faster HTTP, WebSocket, DNS, JSON encoding/decoding, locking, and TLS
++ LSP: `textDocument/inlayHint`, `textDocument/semanticTokens/full`, and faster single-file requests with multiple open tabs
 + Linux: when io_uring is not permitted or unavailable at runtime, `--io uring` (the default) falls back to epoll automatically; `--io epoll` builds with epoll alone without liburing, and `make test-epoll` runs the suite on it
 + Linux: a program that gets no io_uring reports the kernel's error (not permitted, not supported, no memory) instead of always blaming the locked-memory limit
 
@@ -405,7 +408,6 @@
 
 ```
 - Complete libc integration
-- on exit thread/process { ... }
 - WASM support
 - Allow @undefined for entire struct. E.g. let user = User { @undefined }
 - @stack(StructName) -> stackalloc StructName { ... }

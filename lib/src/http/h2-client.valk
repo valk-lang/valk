@@ -1,0 +1,906 @@
+
+use net
+use url
+use compress
+use time
+use core
+use io
+use sync
+
+value H2_CLIENT_PREFACE ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+value H2_CLIENT_WINDOW (262_144)
+value H2_CLIENT_DEFAULT_WINDOW (65_535)
+value H2_CLIENT_READ_SLICE_MS (1_000)
+
+value H2_FAIL_NONE (0)
+value H2_FAIL_CLOSED (1)
+value H2_FAIL_READ (2)
+value H2_FAIL_WRITE (3)
+value H2_FAIL_TIMEOUT (4)
+value H2_FAIL_INVALID_RESPONSE (5)
+value H2_FAIL_TOO_LARGE (6)
+
+fn h2_throw_fail(kind: u8) !HttpError {
+    if kind == H2_FAIL_CLOSED : throw .closed
+    if kind == H2_FAIL_READ : throw .read
+    if kind == H2_FAIL_WRITE : throw .write
+    if kind == H2_FAIL_TIMEOUT : throw .timeout
+    if kind == H2_FAIL_TOO_LARGE : throw .response_too_large
+    throw .invalid_response
+}
+
+class H2ClientStream {
+    id: u32
+    waker: sync.Waker
+    send_window: int
+    receive_window: int (H2_CLIENT_WINDOW)
+    unacked_recv: uint (0)
+    status: u16 (0)
+    headers: Headers (.{})
+    headers_done: bool (false)
+    body: ByteBuffer (.new(0))
+    body_bytes: uint (0)
+    output: ?io.Writer (null)
+    is_head: bool (false)
+    accepts_gzip: bool (false)
+    max_header_size: uint (DEFAULT_MAX_RESPONSE_HEADER_SIZE)
+    max_body_size: uint (DEFAULT_MAX_RESPONSE_BODY_SIZE)
+    bytes_sent: uint (0)
+    done: bool (false)
+    fail_kind: u8 (H2_FAIL_NONE)
+    retryable: bool (false)
+    send_window_waiters: Array[sync.Waker] (.new())
+
+    fn wake_window_waiters() {
+        while this.send_window_waiters.length > 0 {
+            let w = this.send_window_waiters.pop_first() ! break
+            w.wake()
+        }
+    }
+
+    fn fail(kind: u8, retryable: bool (false)) {
+        if this.done : return
+        this.fail_kind = kind
+        this.retryable = this.retryable || retryable
+        this.done = true
+        this.wake_window_waiters()
+        this.waker.wake()
+    }
+}
+
+class H2ClientConnection {
+    con: net.TcpConnection
+    key: String
+    idle_timeout_ms: uint (60_000)
+    write_timeout_ms: uint (5_000)
+    closed: bool (false)
+    reader_started: bool (false)
+    reader_done: bool (false)
+    goaway: bool (false)
+    goaway_last_stream: u32 (0)
+    next_stream_id: u32 (1)
+    peer_settings: H2Settings (.{})
+    decoder: HpackDecoder (.{})
+    header_block: H2HeaderBlock (.{})
+    streams: HashMap[u32, H2ClientStream] (.new())
+    recv_buf: ByteBuffer (.new(16_384))
+    send_window: int (H2_CLIENT_DEFAULT_WINDOW)
+    conn_receive_window: int (H2_CLIENT_WINDOW)
+    conn_unacked_recv: uint (0)
+    last_activity_ms: uint (0)
+    write_busy: bool (false)
+    write_waiters: Array[sync.Waker] (.new())
+    window_waiters: Array[sync.Waker] (.new())
+
+    static fn open(con: net.TcpConnection, key: String, idle_timeout_ms: uint, write_timeout_ms: uint) SELF !HttpError {
+        let conn = SELF {
+            con: con,
+            key: key,
+            idle_timeout_ms: idle_timeout_ms,
+            write_timeout_ms: write_timeout_ms,
+            last_activity_ms: time.mono_ms(),
+        }
+        conn.send_preface() ! {
+            conn.close()
+            throw E
+        }
+        conn.start_reader()
+        return conn
+    }
+
+    fn can_take_stream() bool {
+        if this.closed || this.reader_done || this.goaway : return false
+        return this.streams.length < this.peer_settings.max_concurrent_streams
+    }
+
+    fn lock_write() {
+        while this.write_busy {
+            let w = sync.Waker.new() ! {
+                time.sleep_ms(1)
+                continue
+            }
+            this.write_waiters.append(w)
+            w.wait()
+        }
+        this.write_busy = true
+    }
+
+    fn unlock_write() {
+        this.write_busy = false
+        if this.write_waiters.length > 0 {
+            let w = this.write_waiters.pop_first() ! return
+            w.wake()
+        }
+    }
+
+    fn write_bytes(data: local &[u8], timeout_ms: uint) !HttpError {
+        this.lock_write()
+        defer this.unlock_write()
+        if this.closed : throw .closed
+        this.con.set_timeouts(H2_CLIENT_READ_SLICE_MS, timeout_ms)
+        let view = data
+        while view.length > 0 {
+            let n = this.con.write(view) ! {
+                if error_is(E.code, timeout) : throw .timeout
+                if error_is(E.code, closed) || error_is(E.code, cancelled) : throw .closed
+                throw .write
+            }
+            if n == 0 || n > view.length : throw .write
+            view = view.view(n, view.length - n)
+        }
+        this.last_activity_ms = time.mono_ms()
+    }
+
+    fn send_preface() !HttpError {
+        let out = ByteBuffer.new(64)
+        out.write(H2_CLIENT_PREFACE)
+
+        // SETTINGS: disable server push, set larger stream window
+        let settings = ByteBuffer.new(18)
+        // ENABLE_PUSH = 0
+        settings.write_u16_be(2)
+        settings.write_u32_be(0)
+        // INITIAL_WINDOW_SIZE = H2_CLIENT_WINDOW
+        settings.write_u16_be(4)
+        settings.write_u32_be(H2_CLIENT_WINDOW)
+        // MAX_FRAME_SIZE = 16384
+        settings.write_u16_be(5)
+        settings.write_u32_be(16_384)
+        H2Frame { kind: H2_SETTINGS, flags: 0, stream: 0, payload: settings.into_string() }.encode_into(out, 16_384) ! throw .invalid_request
+
+        // Increase connection-level receive window to match H2_CLIENT_WINDOW
+        let delta = H2_CLIENT_WINDOW - H2_CLIENT_DEFAULT_WINDOW
+        if delta > 0 {
+            let wu = ByteBuffer.new(4)
+            wu.write_u32_be(delta.to(u32))
+            H2Frame { kind: H2_WINDOW_UPDATE, flags: 0, stream: 0, payload: wu.into_string() }.encode_into(out, 16_384) ! throw .invalid_request
+        }
+
+        this.write_bytes(out.view(), this.write_timeout_ms) !>
+    }
+
+    fn wake_window_waiters() {
+        while this.window_waiters.length > 0 {
+            let w = this.window_waiters.pop_first() ! break
+            w.wake()
+        }
+    }
+
+    fn start_reader() {
+        if this.reader_started : return
+        this.reader_started = true
+        co this.read_loop()
+    }
+
+    fn read_loop() {
+        while !this.closed {
+            this.process_buffered_frames() ! {
+                this.fail_all(H2_FAIL_INVALID_RESPONSE, false)
+                break
+            }
+            if this.closed : break
+
+            this.con.set_timeouts(H2_CLIENT_READ_SLICE_MS, this.write_timeout_ms)
+            this.recv_buf.reserve(16_393)
+            let buf = this.recv_buf.view_spare(16_393)
+            let n = this.con.read(buf) ! {
+                if this.closed : break
+                if error_is(E.code, timeout) {
+                    if this.streams.length == 0 && this.idle_timeout_ms > 0 {
+                        if time.mono_ms() - this.last_activity_ms >= this.idle_timeout_ms {
+                            this.close()
+                            break
+                        }
+                    }
+                    continue
+                }
+                if error_is(E.code, closed) || error_is(E.code, cancelled) {
+                    this.fail_all(H2_FAIL_CLOSED, true)
+                    break
+                }
+                this.fail_all(H2_FAIL_READ, true)
+                break
+            }
+            if n == 0 {
+                this.fail_all(H2_FAIL_CLOSED, true)
+                break
+            }
+            this.last_activity_ms = time.mono_ms()
+            this.recv_buf.skip(n)
+        }
+        this.reader_done = true
+        this.close_internal(false)
+    }
+
+    fn process_buffered_frames() !HttpError {
+        if this.recv_buf.length < 9 : return
+        let reader = ByteReader.new(this.recv_buf)
+        while !this.closed {
+            let frame = h2_read_frame(reader, 16_384) ! {
+                if error_is(E.code, incomplete) : break
+                if reader.pos > 0 : this.recv_buf.clear_until(reader.pos)
+                throw .invalid_response
+            }
+            this.handle_frame(frame) ! {
+                if reader.pos > 0 : this.recv_buf.clear_until(reader.pos)
+                throw E
+            }
+        }
+        if reader.pos > 0 : this.recv_buf.clear_until(reader.pos)
+        if this.recv_buf.length == 0 && this.recv_buf.size > 65_536 {
+            this.recv_buf.shrink_capacity(16_384)
+        }
+    }
+
+    fn handle_frame(frame: H2Frame) !HttpError {
+        // Continuation block enforcement
+        if this.header_block.stream != 0 {
+            if frame.kind != H2_CONTINUATION || frame.stream != this.header_block.stream {
+                throw .invalid_response
+            }
+        } else if frame.kind == H2_CONTINUATION {
+            throw .invalid_response
+        }
+
+        if frame.kind == H2_SETTINGS {
+            if (frame.flags & 1) != 0 : return
+            let old_init = this.peer_settings.initial_window_size.to(int)
+            this.peer_settings.apply(frame, true) ! throw .invalid_response
+            let new_init = this.peer_settings.initial_window_size.to(int)
+            let delta = new_init - old_init
+            if delta != 0 {
+                each this.streams as st {
+                    st.send_window += delta
+                    if delta > 0 : st.wake_window_waiters()
+                }
+            }
+            let ack = ByteBuffer.new(9)
+            H2Frame { kind: H2_SETTINGS, flags: 1, stream: 0 }.encode_into(ack, 16_384) ! throw .invalid_response
+            this.write_bytes(ack.view(), this.write_timeout_ms) ! {}
+            return
+        }
+
+        if frame.kind == H2_PING {
+            if (frame.flags & 1) != 0 : return
+            let pong = ByteBuffer.new(17)
+            H2Frame { kind: H2_PING, flags: 1, stream: 0, payload: frame.payload }.encode_into(pong, 16_384) ! throw .invalid_response
+            this.write_bytes(pong.view(), this.write_timeout_ms) ! {}
+            return
+        }
+
+        if frame.kind == H2_WINDOW_UPDATE {
+            let r = ByteReader.new(frame.payload)
+            let inc = (r.read_u32_be() & 0x7fffffff).to(int)
+            if inc <= 0 : throw .invalid_response
+            if frame.stream == 0 {
+                this.send_window += inc
+                this.wake_window_waiters()
+            } else {
+                let st = this.streams.get(frame.stream) !? null
+                if isset(st) {
+                    st.send_window += inc
+                    st.wake_window_waiters()
+                }
+            }
+            return
+        }
+
+        if frame.kind == H2_GOAWAY {
+            let r = ByteReader.new(frame.payload)
+            let last_stream = r.read_u32_be() & 0x7fffffff
+            let err_code = r.read_u32_be()
+            this.goaway = true
+            this.goaway_last_stream = last_stream
+            let keys = Array[u32].new()
+            each this.streams as st, sid : keys.append(sid)
+            each keys as sid {
+                if sid > last_stream {
+                    let st = this.streams.get(sid) !? null
+                    if isset(st) {
+                        this.streams.remove(sid)
+                        st.fail(err_code == 0 ? H2_FAIL_CLOSED : H2_FAIL_INVALID_RESPONSE, true)
+                    }
+                }
+            }
+            return
+        }
+
+        if frame.kind == H2_RST_STREAM {
+            let r = ByteReader.new(frame.payload)
+            let err_code = r.read_u32_be()
+            let st = this.streams.get(frame.stream) !? null
+            if isset(st) {
+                this.streams.remove(frame.stream)
+                // REFUSED_STREAM (7) is always safe to retry
+                st.fail(H2_FAIL_INVALID_RESPONSE, err_code == 7)
+            }
+            return
+        }
+
+        if frame.kind == H2_HEADERS || frame.kind == H2_CONTINUATION {
+            let block = this.header_block.accept(frame) ! throw .invalid_response
+            let stream_id = frame.stream
+            let st = this.streams.get(stream_id) !? null
+            if !isset(block) : return
+            let fields = this.decoder.decode(block) ! throw .invalid_response
+            if !isset(st) : return
+
+            if !st.headers_done {
+                let status_str = ""
+                let size: uint = 0
+                let limit = st.max_header_size == 0 ? uint.$max : st.max_header_size
+                let hdrs = Headers.new()
+                each fields as field {
+                    if field.name == ":status" {
+                        if status_str.bytes > 0 : { st.fail(H2_FAIL_INVALID_RESPONSE); return }
+                        status_str = field.value
+                        continue
+                    }
+                    if field.name.starts_with(":") : { st.fail(H2_FAIL_INVALID_RESPONSE); return }
+                    let add = field.name.bytes + field.value.bytes + 32
+                    if add > limit || size > limit - add {
+                        this.streams.remove(stream_id)
+                        st.fail(H2_FAIL_TOO_LARGE)
+                        return
+                    }
+                    size += add
+                    hdrs.append(field.name, field.value)
+                }
+                if status_str.bytes != 3 {
+                    this.streams.remove(stream_id)
+                    st.fail(H2_FAIL_INVALID_RESPONSE)
+                    return
+                }
+                let code = status_str.to_uint() ! {
+                    this.streams.remove(stream_id)
+                    st.fail(H2_FAIL_INVALID_RESPONSE)
+                    return
+                }
+                if code < 100 || code > 599 {
+                    this.streams.remove(stream_id)
+                    st.fail(H2_FAIL_INVALID_RESPONSE)
+                    return
+                }
+                // Skip intermediate 1xx response headers (RFC 9110)
+                if code >= 100 && code < 200 && (frame.flags & 1) == 0 : return
+                st.status = code.to(u16)
+                st.headers = hdrs
+                st.headers_done = true
+            }
+            if (frame.flags & 1) != 0 {
+                this.streams.remove(stream_id)
+                this.finish_stream(st)
+            }
+            return
+        }
+
+        if frame.kind == H2_DATA {
+            let flow_len = frame.payload.bytes
+            if flow_len > this.conn_receive_window.to(uint) : throw .invalid_response
+            this.conn_receive_window -= flow_len.to(int)
+            this.conn_unacked_recv += flow_len
+
+            let st = this.streams.get(frame.stream) !? null
+            if !isset(st) {
+                this.maybe_send_conn_window_update()
+                return
+            }
+            if !st.headers_done {
+                this.streams.remove(frame.stream)
+                st.fail(H2_FAIL_INVALID_RESPONSE)
+                this.maybe_send_conn_window_update()
+                return
+            }
+            if flow_len > st.receive_window.to(uint) {
+                this.streams.remove(frame.stream)
+                st.fail(H2_FAIL_INVALID_RESPONSE)
+                this.maybe_send_conn_window_update()
+                return
+            }
+            st.receive_window -= flow_len.to(int)
+            st.unacked_recv += flow_len
+
+            let data = frame.fragment() ! {
+                this.streams.remove(frame.stream)
+                st.fail(H2_FAIL_INVALID_RESPONSE)
+                this.maybe_send_conn_window_update()
+                return
+            }
+            if data.bytes > 0 && !st.is_head {
+                let limit = st.max_body_size == 0 ? uint.$max : st.max_body_size
+                if data.bytes > limit || st.body_bytes > limit - data.bytes {
+                    this.streams.remove(frame.stream)
+                    this.send_rst_stream(frame.stream, 11)
+                    st.fail(H2_FAIL_TOO_LARGE)
+                    this.maybe_send_conn_window_update()
+                    return
+                }
+                st.body_bytes += data.bytes
+                let out = st.output
+                if isset(out) {
+                    let ok = true
+                    let view = data.view()
+                    while view.length > 0 {
+                        let written = out.write(view) ! {
+                            ok = false
+                            break
+                        }
+                        if written == 0 || written > view.length {
+                            ok = false
+                            break
+                        }
+                        view = view.view(written, view.length - written)
+                    }
+                    if !ok {
+                        this.streams.remove(frame.stream)
+                        this.send_rst_stream(frame.stream, 8)
+                        st.fail(H2_FAIL_WRITE)
+                        this.maybe_send_conn_window_update()
+                        return
+                    }
+                } else {
+                    st.body.write(data)
+                }
+            }
+
+            if (frame.flags & 1) != 0 {
+                this.streams.remove(frame.stream)
+                this.finish_stream(st)
+            } else {
+                this.maybe_send_stream_window_update(st)
+            }
+            this.maybe_send_conn_window_update()
+            return
+        }
+    }
+
+    fn finish_stream(st: H2ClientStream) {
+        st.done = true
+        st.waker.wake()
+    }
+
+    fn maybe_send_conn_window_update() {
+        let inc = this.conn_unacked_recv
+        if inc < H2_CLIENT_WINDOW / 2 : return
+        this.conn_unacked_recv = 0
+        this.conn_receive_window += inc.to(int)
+        let buf = ByteBuffer.new(13)
+        let wu = ByteBuffer.new(4)
+        wu.write_u32_be(inc.to(u32))
+        H2Frame { kind: H2_WINDOW_UPDATE, flags: 0, stream: 0, payload: wu.into_string() }.encode_into(buf, 16_384) ! return
+        this.write_bytes(buf.view(), this.write_timeout_ms) ! {}
+    }
+
+    fn maybe_send_stream_window_update(st: H2ClientStream) {
+        let inc = st.unacked_recv
+        if inc < H2_CLIENT_WINDOW / 2 : return
+        st.unacked_recv = 0
+        st.receive_window += inc.to(int)
+        let buf = ByteBuffer.new(13)
+        let wu = ByteBuffer.new(4)
+        wu.write_u32_be(inc.to(u32))
+        H2Frame { kind: H2_WINDOW_UPDATE, flags: 0, stream: st.id, payload: wu.into_string() }.encode_into(buf, 16_384) ! return
+        this.write_bytes(buf.view(), this.write_timeout_ms) ! {}
+    }
+
+    fn send_rst_stream(stream_id: u32, code: u32) {
+        let buf = ByteBuffer.new(13)
+        let payload = ByteBuffer.new(4)
+        payload.write_u32_be(code)
+        H2Frame { kind: H2_RST_STREAM, flags: 0, stream: stream_id, payload: payload.into_string() }.encode_into(buf, 16_384) ! return
+        this.write_bytes(buf.view(), this.write_timeout_ms) ! {}
+    }
+
+    fn fail_all(kind: u8, retryable: bool) {
+        let list = Array[H2ClientStream].new()
+        each this.streams as st : list.append(st)
+        this.streams.clear()
+        each list as st : st.fail(kind, retryable && !st.headers_done)
+        this.wake_window_waiters()
+    }
+
+    fn close() {
+        this.close_internal(true)
+    }
+
+    fn close_internal(send_goaway: bool) {
+        if this.closed : return
+        this.closed = true
+        if send_goaway {
+            // Best-effort close on socket interrupt/close will wake reader
+        }
+        this.fail_all(H2_FAIL_CLOSED, false)
+        this.con.close() ! core.cleanup_warning("Failed to close HTTP/2 connection", __FILE__, __LINE__)
+    }
+
+    fn execute(method: String, target: url.Url, options: ?Options, deadline_ms: uint) ClientResponse !HttpError {
+        if this.closed || this.reader_done || this.goaway || this.next_stream_id > 0x7ffffffd : throw .closed
+
+        let read_timeout_ms: uint = 5000
+        let write_timeout_ms: uint = 5000
+        let max_header = DEFAULT_MAX_RESPONSE_HEADER_SIZE
+        let max_body = DEFAULT_MAX_RESPONSE_BODY_SIZE
+        let output: ?io.Writer = null
+        let body = ""
+        if isset(options) {
+            read_timeout_ms = options.read_timeout_ms
+            write_timeout_ms = options.write_timeout_ms
+            max_header = options.max_response_header_size
+            max_body = options.max_response_body_size
+            output = options.output
+            body = options.body
+        }
+
+        let fields = h2_build_request_fields(method, target, options) !>
+        let block = hpack_encode(fields, this.peer_settings.max_header_list_size) ! throw .invalid_request
+
+        let stream_id = this.next_stream_id
+        this.next_stream_id += 2
+        let waker = sync.Waker.new() ! throw .write
+        let st = H2ClientStream {
+            id: stream_id,
+            waker: waker,
+            send_window: this.peer_settings.initial_window_size.to(int),
+            output: output,
+            is_head: method.equals_ignore_ascii_case("HEAD"),
+            accepts_gzip: ClientRequest.asks_for_gzip(options),
+            max_header_size: max_header,
+            max_body_size: max_body,
+        }
+        this.streams.set(stream_id, st)
+
+        // Encode & write HEADERS (+ CONTINUATION if needed)
+        let has_body = body.bytes > 0
+        let max_frame = this.peer_settings.max_frame_size
+        if max_frame < 16_384 : max_frame = 16_384
+        let head_out = ByteBuffer.new(block.bytes + 32)
+        h2_encode_header_frames(head_out, stream_id, block, !has_body, max_frame) ! {
+            this.streams.remove(stream_id)
+            throw .invalid_request
+        }
+        let write_timeout = ClientRequest.remaining_timeout(deadline_ms, write_timeout_ms) ! {
+            this.streams.remove(stream_id)
+            throw E
+        }
+        this.write_bytes(head_out.view(), write_timeout) ! {
+            this.streams.remove(stream_id)
+            throw E
+        }
+
+        // Write DATA frames if body is present, respecting stream & connection send windows
+        if has_body {
+            this.send_request_body(st, body, deadline_ms, write_timeout_ms) ! {
+                this.streams.remove(stream_id)
+                this.send_rst_stream(stream_id, 8)
+                throw E
+            }
+        }
+
+        // Wait for stream completion (or timeout / failure)
+        while !st.done {
+            if this.closed : throw .closed
+            let wait_ms = ClientRequest.remaining_timeout(deadline_ms, read_timeout_ms) ! {
+                this.streams.remove(stream_id)
+                this.send_rst_stream(stream_id, 8)
+                throw E
+            }
+            if !st.waker.wait(wait_ms) && !st.done {
+                this.streams.remove(stream_id)
+                this.send_rst_stream(stream_id, 8)
+                throw .timeout
+            }
+        }
+
+        if st.fail_kind != H2_FAIL_NONE : h2_throw_fail(st.fail_kind) !>
+
+        let resp = ClientResponse {
+            status: st.status,
+            headers: st.headers,
+            body: isset(st.output) ? "" : st.body.into_string(),
+        }
+        if st.accepts_gzip {
+            h2_decompress_response(resp, st.max_body_size) !>
+        }
+        return resp
+    }
+
+    fn send_request_body(st: H2ClientStream, body: String, deadline_ms: uint, write_timeout_ms: uint) !HttpError {
+        let pos: uint = 0
+        let total = body.bytes
+        while pos < total {
+            while !this.closed && !st.done && (this.send_window <= 0 || st.send_window <= 0) {
+                let wait_ms = ClientRequest.remaining_timeout(deadline_ms, write_timeout_ms) !>
+                let waiter = sync.Waker.new() ! throw .write
+                if this.send_window <= 0 {
+                    this.window_waiters.append(waiter)
+                } else {
+                    st.send_window_waiters.append(waiter)
+                }
+                if !waiter.wait(wait_ms) {
+                    if this.send_window <= 0 || st.send_window <= 0 : throw .timeout
+                }
+            }
+            if this.closed : throw .closed
+            if st.done : h2_throw_fail(st.fail_kind != H2_FAIL_NONE ? st.fail_kind : H2_FAIL_CLOSED) !>
+
+            let avail_conn = this.send_window.to(uint)
+            let avail_stream = st.send_window.to(uint)
+            let chunk = total - pos
+            let max_frame = this.peer_settings.max_frame_size
+            if max_frame < 16_384 : max_frame = 16_384
+            if chunk > max_frame : chunk = max_frame
+            if chunk > avail_conn : chunk = avail_conn
+            if chunk > avail_stream : chunk = avail_stream
+
+            let end_stream = pos + chunk == total
+            let frame_buf = ByteBuffer.new(chunk + 9)
+            H2Frame {
+                kind: H2_DATA,
+                flags: end_stream ? 1 : 0,
+                stream: st.id,
+                payload: body.range(pos, chunk),
+            }.encode_into(frame_buf, max_frame) ! throw .write
+
+            this.send_window -= chunk.to(int)
+            st.send_window -= chunk.to(int)
+            let wt = ClientRequest.remaining_timeout(deadline_ms, write_timeout_ms) !>
+            this.write_bytes(frame_buf.view(), wt) !>
+            st.bytes_sent += chunk
+            pos += chunk
+        }
+    }
+}
+
+fn h2_encode_header_frames(out: ByteBuffer, stream_id: u32, block: String, end_stream: bool, max_frame: uint) !H2Error {
+    let total = block.bytes
+    let first_end = total < max_frame ? total : max_frame
+    let first_flags: u8 = end_stream ? 1 : 0
+    if first_end == total : first_flags |= 4
+    H2Frame {
+        kind: H2_HEADERS,
+        flags: first_flags,
+        stream: stream_id,
+        payload: block.range(0, first_end),
+    }.encode_into(out, max_frame) !>
+    let pos = first_end
+    while pos < total {
+        let next = pos + max_frame
+        if next > total : next = total
+        let flags: u8 = next == total ? 4 : 0
+        H2Frame {
+            kind: H2_CONTINUATION,
+            flags: flags,
+            stream: stream_id,
+            payload: block.range(pos, next - pos),
+        }.encode_into(out, max_frame) !>
+        pos = next
+    }
+}
+
+fn h2_header_is_connection_specific(name: String) bool {
+    return name.equals_ignore_ascii_case("connection")
+        || name.equals_ignore_ascii_case("keep-alive")
+        || name.equals_ignore_ascii_case("proxy-connection")
+        || name.equals_ignore_ascii_case("transfer-encoding")
+        || name.equals_ignore_ascii_case("upgrade")
+}
+
+fn h2_build_request_fields(method: String, target: url.Url, options: ?Options) Array[HpackField] !HttpError {
+    if !request_method_is_safe(method) : throw .invalid_request
+    if target.path.bytes > 0 && !target.path.starts_with("/") : throw .invalid_request
+    if !request_target_part_is_safe(target.path) || !request_target_part_is_safe(target.query) : throw .invalid_request
+
+    let headers: ?Headers = null
+    let has_custom_agent = false
+    let has_authorization = false
+    let authority = target.host_with_port()
+
+    if isset(options) {
+        let custom_host = options.host
+        if isset(custom_host) {
+            if custom_host.bytes == 0 || !response_header_value_is_safe(custom_host) : throw .invalid_request
+            authority = custom_host
+        }
+        headers = options.headers
+        if isset(headers) {
+            each headers as value, name {
+                if name.starts_with(":") || !response_header_name_is_safe(name)
+                    || !response_header_value_is_safe(value) || request_header_is_reserved(name) : throw .invalid_request
+                if name.equals_ignore_ascii_case("user-agent") : has_custom_agent = true
+                if name.equals_ignore_ascii_case("authorization") : has_authorization = true
+            }
+        }
+        let qdata = options.query_data
+        if isset(qdata) {
+            let qstr = url.build_query(qdata)
+            if qstr.bytes > 0 : target.query += target.query.bytes > 0 ? "&" + qstr : qstr
+        }
+    }
+
+    let path = target.path.bytes > 0 ? target.path : "/"
+    if !target.query.is_empty() : path = path + "?" + target.query
+
+    let fields = Array[HpackField] {
+        .{ name: ":method", value: method },
+        .{ name: ":scheme", value: target.scheme },
+        .{ name: ":authority", value: authority },
+        .{ name: ":path", value: path },
+    }
+    if !has_custom_agent {
+        fields.append(HpackField { name: "user-agent", value: "Valk http client" })
+    }
+    if ClientRequest.asks_for_gzip(options) {
+        fields.append(HpackField { name: "accept-encoding", value: "gzip" })
+    }
+    if !has_authorization && (target.user.bytes > 0 || target.password.bytes > 0) {
+        let auth = basic_auth_header(url.decode(target.user), url.decode(target.password))
+        fields.append(HpackField { name: "authorization", value: auth })
+    }
+    if isset(headers) {
+        each headers as value, name {
+            if h2_header_is_connection_specific(name) : continue
+            fields.append(HpackField { name: name.lower(), value: value })
+        }
+    }
+    return fields
+}
+
+fn h2_decompress_response(resp: ClientResponse, max_body_size: uint) !HttpError {
+    let encoding = resp.headers.get("content-encoding") !? ""
+    if !encoding.trim().equals_ignore_ascii_case("gzip") : return
+    if resp.body.bytes > 0 {
+        resp.body = compress.gunzip(resp.body, max_body_size) ! {
+            if error_is(E.code, too_large) : throw .response_too_large
+            throw .invalid_response
+        }
+    }
+    resp.headers.remove("content-encoding")
+    resp.headers.remove("content-length")
+}
+
+fn h2_take_pooled(client: Client, key: String) ?H2ClientConnection {
+    let list = client.h2_conns.get(key) !? null
+    if !isset(list) : return null
+    let i = list.length
+    while i > 0 {
+        i--
+        let c = list.get(i) ! continue
+        if c.closed || c.reader_done || c.goaway {
+            list.remove(i)
+            continue
+        }
+        if c.can_take_stream() : return c
+    }
+    return null
+}
+
+fn h2_remove_pooled(client: Client, key: String, target: H2ClientConnection) {
+    let list = client.h2_conns.get(key) !? null
+    if !isset(list) : return
+    let i = list.length
+    while i > 0 {
+        i--
+        let c = list.get(i) ! continue
+        if c == target {
+            list.remove(i)
+            return
+        }
+    }
+}
+
+fn h2_store_pooled(client: Client, key: String, conn: H2ClientConnection) {
+    let list = client.h2_conns.get(key) !? <{
+        let created = Array[H2ClientConnection]{}
+        client.h2_conns.set(key, created)
+        return created
+    }
+    list.append(conn)
+}
+
+fn send_h2_once(method: String, raw_url: String, options: ?Options, deadline_ms: uint, client: ?Client) ClientResponse !HttpError {
+    let connect_timeout_ms: uint = 5000
+    let read_timeout_ms: uint = 5000
+    let write_timeout_ms: uint = 5000
+    if isset(options) {
+        connect_timeout_ms = options.connect_timeout_ms
+        read_timeout_ms = options.read_timeout_ms
+        write_timeout_ms = options.write_timeout_ms
+        if deadline_ms == 0 && options.timeout_ms > 0 {
+            deadline_ms = time.deadline_ms(options.timeout_ms)
+        }
+    }
+
+    let u = url.parse(raw_url)
+    if u.scheme != "http" && u.scheme != "https" : throw .invalid_url
+    if !request_host_is_safe(u.host) || u.host.bytes == 0 : throw .invalid_url
+    let is_https = u.scheme == "https"
+    let port: u16 = is_https ? 443 : 80
+    let parsed_port = u.port
+    if isset(parsed_port) {
+        if parsed_port == 0 || parsed_port > 65535 : throw .invalid_url
+        port = parsed_port.to(u16)
+    }
+
+    let proxy = request_proxy(u, options) !>
+    // Plain HTTP proxies speak HTTP/1.x absolute-URI syntax
+    if isset(proxy) && !is_https {
+        return send_http1_once(method, raw_url, options, deadline_ms, client, null) !>
+    }
+
+    let pool: ?ConnectionPool = isset(client) ? client.connections() : null
+    let key = ""
+    if isset(client) {
+        key = connection_key(u.scheme, u.host, port, options)
+        if isset(proxy) : key = key + "|proxy=" + proxy.host + ":" + proxy.port + "|" + proxy.auth
+    }
+
+    if isset(client) {
+        let pooled = h2_take_pooled(client, key)
+        if isset(pooled) {
+            let res = pooled.execute(method, u, options, deadline_ms) ! {
+                h2_remove_pooled(client, key, pooled)
+                if !pooled.closed && !pooled.goaway && !method_is_idempotent(method) : throw E
+                if !method_is_idempotent(method) && !error_is(E.code, closed) : throw E
+                return send_h2_fresh(method, raw_url, u, port, is_https, proxy, options, deadline_ms,
+                    connect_timeout_ms, read_timeout_ms, write_timeout_ms, key, client, pool) !>
+            }
+            return res
+        }
+    }
+
+    return send_h2_fresh(method, raw_url, u, port, is_https, proxy, options, deadline_ms,
+        connect_timeout_ms, read_timeout_ms, write_timeout_ms, key, client, pool) !>
+}
+
+fn send_h2_fresh(method: String, raw_url: String, u: url.Url, port: u16, is_https: bool, proxy: ?ProxyTarget,
+    options: ?Options, deadline_ms: uint, connect_timeout_ms: uint, read_timeout_ms: uint, write_timeout_ms: uint,
+    key: String, client: ?Client, pool: ?ConnectionPool) ClientResponse !HttpError {
+    let alpn = Array[String]{ "h2", "http/1.1" }
+    let con = ClientRequest.connect_socket(is_https, u.host, port, proxy, options, deadline_ms,
+        connect_timeout_ms, read_timeout_ms, write_timeout_ms, alpn) !>
+
+    if is_https {
+        let ssl = con.ssl
+        if !isset(ssl) || ssl.selected_alpn() != "h2" {
+            return send_http1_once(method, raw_url, options, deadline_ms, client, con) !>
+        }
+    }
+
+    let idle_ms: uint = isset(client) ? client.idle_timeout_ms : 60_000
+    let h2c = H2ClientConnection.open(con, key, idle_ms, write_timeout_ms) !>
+    if isset(client) {
+        h2_store_pooled(client, key, h2c)
+        return h2c.execute(method, u, options, deadline_ms) ! {
+            h2_remove_pooled(client, key, h2c)
+            h2c.close()
+            throw E
+        }
+    }
+    let res = h2c.execute(method, u, options, deadline_ms) ! {
+        h2c.close()
+        throw E
+    }
+    h2c.close()
+    return res
+}
+

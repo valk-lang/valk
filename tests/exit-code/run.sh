@@ -46,6 +46,7 @@ cases="$cases round-up-overflow:1:outside round-down-overflow:1:outside"
 cases="$cases panic-in-thread:1"
 cases="$cases large-slice-zeroed:0"
 cases="$cases global-init-print:0 global-init-abort:1 global-init-error:1"
+cases="$cases on-exit-return:0:T2-T1-E2-E1 on-exit-explicit:0:T2-T1-E2-E1"
 cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-line:1:shift-count-line.valk:3"
 # Panic locations are relative to the package root, or the working directory
 # for loose files; a dependency names its package

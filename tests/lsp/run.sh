@@ -739,6 +739,33 @@ check "workspace symbols match a query in open files" '"name":"Counter","kind":5
 check "workspace symbols name the container of a member" '"containerName":"Counter"' \
     "$(notify_open nav.valk)" '{"jsonrpc":"2.0","id":2,"method":"workspace/symbol","params":{"query":"bump"}}'
 
+check "initialize advertises inlayHint and semanticTokens" '"inlayHintProvider":true,"semanticTokensProvider"'
+
+inlay_request() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/inlayHint","params":{"textDocument":{"uri":"file://%s"},"range":{"start":{"line":%s,"character":0},"end":{"line":%s,"character":0}}}}' \
+        "$DIR/$1" "$2" "$3"
+}
+sem_request() {
+    printf '{"jsonrpc":"2.0","id":2,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":"file://%s"}}}' \
+        "$DIR/$1"
+}
+
+check "inlayHint shows inferred let type and multi-arg parameter names" '"label":": String","kind":1' \
+    "$(notify_open nav.valk)" "$(inlay_request nav.valk 0 55)"
+check "inlayHint includes parameter label hints" '"label":"count:","kind":2,"paddingRight":true' \
+    "$(notify_open nav.valk)" "$(inlay_request nav.valk 0 55)"
+check_absent "inlayHint respects the requested line range" '"label":"label:","kind":2' \
+    "$(notify_open nav.valk)" "$(inlay_request nav.valk 10 30)"
+check_absent "inlayHint skips obvious constructor and literal types" '"position":{"line":38,"character":15}' \
+    "$(notify_open nav.valk)" "$(inlay_request nav.valk 35 45)"
+
+check "semanticTokens/full emits encoded token data" '"data":[0,3,6,10,1,' \
+    "$(notify_open nav.valk)" "$(sem_request nav.valk)"
+
+# Single-file requests skip body parsing of unrelated open tabs
+check "hover succeeds cleanly even when another open tab has a body error" '"contents":{"kind":"markdown","value":' \
+    "$(notify_open nav.valk)" "$(notify_open diag.valk 's/println(nope_xyz)/unknown_sym_xyz/')" "$(request textDocument/hover nav.valk 7 15)"
+
 echo "> \$/cancelRequest is ignored silently"
 stream="$(frame "$init")$(frame '{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}')"
 out=$(printf '%s' "$stream" | "$VALK" lsp run 2>&1)

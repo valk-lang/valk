@@ -1,0 +1,187 @@
+
+use build
+use valk.json
+use valk.fs
+
+extend Lsp {
+    fn semantic_tokens() {
+        let uri = this.request_file() ?! {
+            let empty = json.new_object()
+            empty.set("data", json.new_array())
+            this.success(empty)
+            return
+        }
+        this.file = uri
+        this.line = 0
+        this.col = 0
+        this.build()
+    }
+
+    fn send_semantic_tokens(b: build.Build) {
+        let content = this.file_content.get(this.file) !? (fs.read(this.file) !? "")
+        let main_pkg = b.main_pkg
+        let collected = Array[build.LspSemToken]{}
+        each b.lsp_sem_tokens as tok : collected.append(tok)
+
+        let decl_seen = Map[bool]{}
+        each b.lists.namespaces as ns {
+            if isset(main_pkg) && ns.pkg != main_pkg : continue
+            each ns.scope.idfs() as idf, name {
+                this.collect_sem_decl(collected, decl_seen, idf, name)
+            }
+        }
+        each b.scope.idfs() as idf, name {
+            this.collect_sem_decl(collected, decl_seen, idf, name)
+        }
+
+        collected.sort(fn(a: build.LspSemToken, b: build.LspSemToken) bool {
+            if a.offset != b.offset : return a.offset > b.offset
+            if (a.modifiers & sem_mod_declaration) != (b.modifiers & sem_mod_declaration) {
+                return (a.modifiers & sem_mod_declaration) < (b.modifiers & sem_mod_declaration)
+            }
+            return a.len < b.len
+        })
+
+        let data = json.new_array()
+        let bytes = content.bytes
+        let ptr_data = content.data
+        let cur_p: uint = 0
+        let cur_line: uint = 0
+        let cur_col: uint = 0
+        let prev_tok_line: uint = 0
+        let prev_tok_col: uint = 0
+        let prev_end: uint = 0
+
+        each collected as tok {
+            let start = tok.offset.to(uint)
+            let len = tok.len.to(uint)
+            if len == 0 || start + len > bytes : continue
+            if start < prev_end : continue
+
+            // Advance UTF-8 -> UTF-16 line/column cursor forward in O(n) total
+            while cur_p < start {
+                let ch = @ptrv(ptr_data, u8, cur_p)
+                if ch == '\n' {
+                    cur_line++
+                    cur_col = 0
+                    cur_p++
+                    continue
+                }
+                let w = lsp_utf8_width(ch)
+                if cur_p + w > start : break
+                cur_p += w
+                cur_col += lsp_utf16_width(ch).to(uint)
+            }
+
+            let tok_line = cur_line
+            let tok_col = cur_col
+            let utf16_len: uint = 0
+            let tp = cur_p
+            let end = start + len
+            while tp < end {
+                let ch = @ptrv(ptr_data, u8, tp)
+                if ch == '\n' : break
+                let w = lsp_utf8_width(ch)
+                if tp + w > end : break
+                tp += w
+                utf16_len += lsp_utf16_width(ch).to(uint)
+            }
+            if utf16_len == 0 : continue
+
+            let d_line = tok_line - prev_tok_line
+            let d_col = d_line == 0 ? tok_col - prev_tok_col : tok_col
+            data.append(json.from(d_line))
+            data.append(json.from(d_col))
+            data.append(json.from(utf16_len))
+            data.append(json.from(tok.token_type.to(uint)))
+            data.append(json.from(tok.modifiers.to(uint)))
+
+            prev_tok_line = tok_line
+            prev_tok_col = tok_col
+            prev_end = start + len
+        }
+
+        let resp = json.new_object()
+        resp.set("data", data)
+        this.success(resp)
+    }
+
+    fn collect_sem_decl(out: Array[build.LspSemToken], seen: Map[bool], idf: build.Idf, name: String) {
+        if idf.type == build.IDF.func {
+            let f = idf.func ?! return
+            if f.name != name : return
+            this.add_sem_exp(out, seen, f.exp, name, sem_function, sem_mod_declaration)
+            this.add_sem_func_args(out, seen, f)
+            return
+        }
+        if idf.type == build.IDF.class {
+            let c = idf.class ?! return
+            if c.name != name : return
+            let kind = c.kind == build.CLASS_KIND.struct ? sem_struct
+                : (c.kind == build.CLASS_KIND.interface || c.kind == build.CLASS_KIND.union || c.kind == build.CLASS_KIND.mode ? sem_type : sem_class)
+            this.add_sem_exp(out, seen, c.exp, name, kind, sem_mod_declaration)
+            each c.props as prop, pname {
+                this.add_sem_exp(out, seen, prop.exp, pname, sem_property, sem_mod_declaration)
+            }
+            each c.funcs as f, fname {
+                if f.is_setter || f.is_getter : continue
+                let mods = sem_mod_declaration | (f.is_static ? sem_mod_static : 0)
+                this.add_sem_exp(out, seen, f.exp, fname, sem_method, mods)
+                this.add_sem_func_args(out, seen, f)
+            }
+            return
+        }
+        if idf.type == build.IDF.enum {
+            let e = idf.enum ?! return
+            if e.name != name : return
+            this.add_sem_exp(out, seen, e.exp, name, sem_enum, sem_mod_declaration)
+            each e.items as item {
+                this.add_sem_exp(out, seen, e.exp, item.name, sem_enum_member, sem_mod_declaration | sem_mod_readonly)
+            }
+            return
+        }
+        if idf.type == build.IDF.error_type {
+            let et = idf.error_type ?! return
+            if et.name != name : return
+            this.add_sem_exp(out, seen, et.exp, name, sem_enum, sem_mod_declaration)
+            return
+        }
+        if idf.type == build.IDF.trait {
+            let t = idf.trait ?! return
+            if t.name != name : return
+            this.add_sem_exp(out, seen, t.exp, name, sem_type, sem_mod_declaration)
+            return
+        }
+        if idf.type == build.IDF.global {
+            let g = idf.global ?! return
+            if g.name != name : return
+            this.add_sem_exp(out, seen, g.exp, name, sem_variable, sem_mod_declaration)
+            return
+        }
+    }
+
+    fn add_sem_func_args(out: Array[build.LspSemToken], seen: Map[bool], f: build.Func) {
+        let args_exp = f.args_exp ?! return
+        each f.args as arg {
+            if arg.implicit || arg.name.bytes == 0 : continue
+            this.add_sem_exp(out, seen, args_exp, arg.name, sem_parameter, sem_mod_declaration)
+        }
+    }
+
+    fn add_sem_exp(out: Array[build.LspSemToken], seen: Map[bool], exp: build.Exp, name: String, token_type: int, modifiers: int) {
+        let at = build.message_resolve(exp.src, exp.i)
+        let path = at.src.path ?! return
+        if path != this.file : return
+        let found = build.lsp_find_word_range(at.src.content, name, at.i, at.i + exp.len, false)
+        if found == u32.$max : return
+        let key = "" + found
+        if seen.has(key) : return
+        seen.set(key, true)
+        out.append(build.LspSemToken {
+            offset: found
+            len: name.bytes.to(u32)
+            token_type: token_type.to(u32)
+            modifiers: modifiers.to(u32)
+        })
+    }
+}

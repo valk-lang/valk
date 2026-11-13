@@ -2264,6 +2264,8 @@ and `atomic` values, so an object or string it needs is published first, as in
 `let name: atomic String = "Ada" + "!"`. See [Data races](#data-races) for the
 rules and `Lock[T]` for mutable state.
 
+Use `on_thread_exit(fn() { ... })` to register cleanup callbacks that run in LIFO order when the current thread exits, and `on_exit(fn() { ... })` for process-wide cleanup hooks that run in LIFO order when `main` returns or `exit(code)` is called.
+
 ## Channels and cancellation
 
 API for [valk.sync](api.md#sync)
@@ -2358,7 +2360,9 @@ tick.stop()
 A `WaitGroup` waits until a number of tasks are done: `add(1)` before starting
 one, `done()` when it finishes and `wait()` for all of them. A `Semaphore` limits
 how many tasks run at once: `acquire()` takes one of its permits, waiting while
-none is free, and `release()` gives it back.
+none is free, and `release()` gives it back. `sync.RwLock[T]` (`read`, `write`, `get`, `set`)
+and `sync.RwMutex` provide reader-writer synchronization where multiple readers can
+proceed concurrently while writers take exclusive access.
 
 ### Shared maps
 
@@ -2669,6 +2673,8 @@ client.post("https://example.com/login", body) ! panic("Login failed")
 let page = client.get("https://example.com/account") ! panic("Request failed") // with the session cookie
 client.close()
 ```
+
+Set `client.http2 = true` on a client or `http.Options { http2: true }` on a request to use HTTP/2. Over HTTPS this negotiates HTTP/2 via ALPN with automatic fallback to HTTP/1.1, and over plain `http://` it uses cleartext HTTP/2 (`h2c`), multiplexing concurrent requests over a shared connection.
 
 The client asks for gzip and decompresses the body unless
 `Options.decompress` is off. Credentials in the URL (`https://user:pass@host/`)
