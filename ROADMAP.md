@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.7
+
 + Release 0.8.6
 + HTTP server: cleartext HTTP/2 (`Server.http2 = true` without `tls`), per-worker `SO_REUSEPORT` listeners, `prefix:` on `add_static_dir`, and precompressed `.br` / `.gz` static files
 + HTTP client: HTTP/2 support (`Options.http2`, `Client.http2`, TLS ALPN negotiation with HTTP/1.1 fallback, cleartext h2c, and connection multiplexing)
