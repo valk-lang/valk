@@ -411,6 +411,25 @@ for target in linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64; do
     fi
 done
 
+echo "> The compiler and standard library lint without warnings"
+repo_root="$(cd "$DIR/../.." && pwd)"
+for target in linux-x64 linux-arm64 macos-x64 macos-arm64 win-x64; do
+    for mode in default lld stdlib; do
+        case "$mode" in
+            default) clean_lint=$("$VALK" build "$repo_root" --lint --target "$target" 2>&1) ;;
+            lld) clean_lint=$("$VALK" build "$repo_root" --lint --def "LLD=1" --target "$target" 2>&1) ;;
+            stdlib) clean_lint=$("$VALK" build "$repo_root/lib" --lint --target "$target" 2>&1) ;;
+        esac
+        status=$?
+        clean_lint=$(printf '%s' "$clean_lint" | tr -d '\r')
+        if [ "$status" -ne 0 ] || [ "$clean_lint" != "> Lint passed" ]; then
+            echo "# Unexpected lint output ($mode, $target):"
+            echo "$clean_lint"
+            exit 1
+        fi
+    done
+done
+
 def_out=$("$VALK" build "$DIR/def-override" --def "OVERRIDE=cli" --no-warn -c -o "$output" 2>&1) || {
     echo "$def_out"
     exit 1
@@ -1484,4 +1503,4 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 84"
+echo "# Test count: 85"
