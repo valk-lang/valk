@@ -1,0 +1,192 @@
+use fs
+use compress
+
+// Files up to this size are kept in memory by the worker that served them
+value FILE_CACHE_MAX_FILE (1024 * 1024)
+// Bytes of file content one worker keeps; the cache starts over when more would not fit
+value FILE_CACHE_BUDGET (8 * 1024 * 1024)
+
+// One version of a file, known by its size, times and inode. Each request still stats the
+// file, so a change on disk is seen at once.
+class CachedFile {
+    meta: FileMeta
+    changed: uint
+    inode: uint
+    path: String
+    data: ?String (null)
+    gzipped: ?String (null)
+    gzipped_level: uint (0)
+    br: CachedSidecar
+    gz: CachedSidecar
+}
+
+// A pre-compressed copy next to a cached file, checked against its own size and time when used
+class CachedSidecar {
+    path: String
+    size: uint (0)
+    modified: uint (0)
+    changed: uint (0)
+    inode: uint (0)
+    data: ?String (null)
+}
+
+global file_cache: ?HashMap[String, CachedFile] (null)
+global file_cache_bytes: uint (0)
+
+// The cache entry for the file at `path` as `info` describes it; null for a file too big to keep
+fn cached_file(path: String, info: fs.FileInfo) ?CachedFile {
+    if info.size > FILE_CACHE_MAX_FILE : return null
+    let cache = file_cache ?? <{
+        let made = HashMap[String, CachedFile].new()
+        file_cache = made
+        return made
+    }
+    let entry = cache.get(path) !? null
+    if isset(entry) {
+        if file_cache_same(entry.meta.size, entry.meta.modified, entry.changed, entry.inode, info) : return entry
+        file_cache_forget(entry)
+    }
+    let made = CachedFile {
+        meta: file_meta(info.size, info.modified_time)
+        changed: info.changed_time
+        inode: info.inode
+        path: path
+        br: CachedSidecar { path: path + ".br" }
+        gz: CachedSidecar { path: path + ".gz" }
+    }
+    cache.set(path, made)
+    return made
+}
+
+// A file replaced or rewritten changes its inode or status change time, even when its size
+// and modification time are kept
+fn file_cache_same(size: uint, modified: uint, changed: uint, inode: uint, info: fs.FileInfo) bool {
+    return size == info.size && modified == info.modified_time && changed == info.changed_time && inode == info.inode
+}
+
+fn file_cache_forget(entry: CachedFile) {
+    let cache = file_cache ?! return
+    file_cache_bytes -= file_cache_entry_bytes(entry)
+    cache.remove(entry.path)
+}
+
+fn file_cache_entry_bytes(entry: CachedFile) uint {
+    let total: uint = 0
+    let data = entry.data
+    if isset(data) : total += data.bytes
+    let gzipped = entry.gzipped
+    if isset(gzipped) : total += gzipped.bytes
+    let br = entry.br.data
+    if isset(br) : total += br.bytes
+    let gz = entry.gz.data
+    if isset(gz) : total += gz.bytes
+    return total
+}
+
+// Makes room for `bytes` more; false when they do not fit even in an empty cache
+fn file_cache_reserve(entry: CachedFile, bytes: uint) bool {
+    if bytes > FILE_CACHE_BUDGET : return false
+    if file_cache_bytes + bytes > FILE_CACHE_BUDGET {
+        let cache = file_cache ?! return false
+        // Start over, keeping only the entry in use
+        cache.clear()
+        let kept = file_cache_entry_bytes(entry)
+        if kept + bytes > FILE_CACHE_BUDGET {
+            entry.data = null
+            entry.gzipped = null
+            entry.br.data = null
+            entry.gz.data = null
+            kept = 0
+        }
+        cache.set(entry.path, entry)
+        file_cache_bytes = kept
+    }
+    file_cache_bytes += bytes
+    return true
+}
+
+// The whole file; null when it no longer has the size the entry was made for
+fn cached_file_data(entry: CachedFile) ?String {
+    let data = entry.data
+    if isset(data) : return data
+    let read = fs.read(entry.path) ! return null
+    if read.bytes != entry.meta.size : return null
+    if file_cache_reserve(entry, read.bytes) : entry.data = read
+    return read
+}
+
+// The file gzip-compressed at `level`
+fn cached_file_gzip(entry: CachedFile, data: String, level: uint) String {
+    let gzipped = entry.gzipped
+    if isset(gzipped) && entry.gzipped_level == level : return gzipped
+    if isset(gzipped) {
+        file_cache_bytes -= gzipped.bytes
+        entry.gzipped = null
+    }
+    let made = compress.gzip(data, level)
+    if file_cache_reserve(entry, made.bytes) {
+        entry.gzipped = made
+        entry.gzipped_level = level
+    }
+    return made
+}
+
+// The sidecar's bytes, or null when there is no such regular file or it is too big to keep
+fn cached_sidecar_data(entry: CachedFile, sidecar: CachedSidecar) ?String {
+    let data = sidecar.data
+    let info = fs.stat(sidecar.path) !? null
+    if !isset(info) || info.kind != fs.FileKind.file || info.size > FILE_CACHE_MAX_FILE {
+        if isset(data) {
+            file_cache_bytes -= data.bytes
+            sidecar.data = null
+        }
+        return null
+    }
+    if isset(data) && file_cache_same(sidecar.size, sidecar.modified, sidecar.changed, sidecar.inode, info) : return data
+    if isset(data) {
+        file_cache_bytes -= data.bytes
+        sidecar.data = null
+    }
+    let read = fs.read(sidecar.path) ! return null
+    if read.bytes != info.size : return null
+    sidecar.size = info.size
+    sidecar.modified = info.modified_time
+    sidecar.changed = info.changed_time
+    sidecar.inode = info.inode
+    if file_cache_reserve(entry, read.bytes) : sidecar.data = read
+    return read
+}
+
+// Picks a `.br` or `.gz` sidecar the client accepts, as `open_precompressed_sidecar` does,
+// and returns its bytes
+fn cached_precompressed(entry: CachedFile, content_type: String, compress: bool, accept_encoding: String, plan: FilePlan) ?String {
+    if !compress || plan.status != 200 || !response_gzip_type(content_type) : return null
+    if request_accepts_br(accept_encoding) {
+        let data = cached_sidecar_data(entry, entry.br)
+        if isset(data) {
+            plan.gzip = false
+            plan.encoding = "br"
+            plan.vary = true
+            plan.length = data.bytes
+            plan.etag = entry.meta.br_etag
+            return data
+        }
+    }
+    if request_accepts_gzip(accept_encoding) {
+        let data = cached_sidecar_data(entry, entry.gz)
+        if isset(data) {
+            plan.gzip = false
+            plan.encoding = "gzip"
+            plan.vary = true
+            plan.length = data.bytes
+            plan.etag = entry.meta.gzip_etag
+            return data
+        }
+    }
+    if cached_sidecar_exists(entry.br) || cached_sidecar_exists(entry.gz) : plan.vary = true
+    return null
+}
+
+fn cached_sidecar_exists(sidecar: CachedSidecar) bool {
+    return fs.is_file(sidecar.path)
+}
