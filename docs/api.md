@@ -2890,6 +2890,10 @@ alias pid_t for i32
 ```js
 // Metadata of a file system entry, as returned by `stat`.
 + struct FileInfo {
+    // Last status change (contents, metadata or a rename onto the path) in nanoseconds since the Unix epoch. It cannot be set back, unlike `modified_time`. On Windows it is the modification time.
+    + changed_time: uint
+    // The file's number on its volume: the inode, or the file index on Windows.
+    + inode: uint
     // Whether the entry is a file, a directory or something else.
     + kind: FileKind
     // Last modification time in nanoseconds since the Unix epoch.
@@ -3614,7 +3618,7 @@ error WebSocketError (protocol, too_large, handshake, invalid_url, invalid_reque
 ```js
 // A multi-threaded HTTP/1.1 server, with optional TLS and experimental HTTP/2.
 + class Server {
-    // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
+    // A worker that wakes for only a few idle keep-alive connections waits this many milliseconds before it looks for more, so one wake-up serves the requests that arrived meanwhile together: fewer system calls, and handlers on a pipelined database connection share round trips (about 25% less CPU per request under moderate load). It waits only while idle connections wake often enough that more are expected in that time, so a trickle of requests is not delayed. A request on an idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
     + batch_delay_ms: uint
     // How long each read of a request body may take, in milliseconds.
     + body_timeout_ms: uint
