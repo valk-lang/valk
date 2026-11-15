@@ -23,6 +23,8 @@ value WATCH_POLL_MS (100)
 value WATCH_BATCH (256)
 // With `batch_delay_ms` set, a wake-up with fewer ready connections than this waits before the next
 value BATCH_MIN (32)
+// Request body room a worker takes from the server-wide count at a time
+value BODY_CREDIT_CHUNK (1024 * 1024)
 // Parked connections are counted over windows this long to tell how often they wake
 value BATCH_RATE_WINDOW_MS (100)
 // Serving coroutines kept per worker: each drains the ready queue, then waits on its waker for
@@ -132,6 +134,7 @@ fn worker(server: atomic ServerWorkerData, worker_id: uint (0)) {
         close_extra_sockets(server.extra_sockets)
     }
     worker.drain()
+    worker.return_body_room()
     worker.ended = true
     while true {
         let waker = worker.h2_idle_servers.pop_last() ! break
@@ -159,6 +162,8 @@ fn worker_may_accept(own: uint, total: uint, workers: uint) bool {
 
 class Worker {
     server: atomic ServerWorkerData
+    // Body room this worker took from `ServerCounters.active_body_size` and has not handed out
+    body_credit: uint (0)
     // Wakes of parked connections in the current rate window, when it started, and wakes per
     // second over the last one
     wake_window_count: uint (0)
@@ -302,14 +307,14 @@ class Worker {
             return
         }
 
-        let connections = ++server.connections
+        let connections = ++server.counters.connections
         let too_many_connections = server.max_connections > 0 && connections > server.max_connections
         // At the limit, an idle connection makes room for the new one
         if too_many_connections && this.evict_idle() : too_many_connections = false
         let rejected = too_many_connections
         // A rejected connection gives its slot back right away, so the next
         // accept is judged without it. `finish()` skips the decrement for it.
-        if rejected : server.connections--
+        if rejected : server.counters.connections--
         let fd = netcon.fd
         if server.show_info {
             println("[+] New connection: " + fd)
@@ -716,6 +721,60 @@ class Worker {
         batch_waits++
         #end
         time.sleep_ms(delay)
+    }
+
+    // Reserves `bytes` of request body against `Server.max_server_wide_body_size`. The room
+    // comes from this worker's credit; the shared count is updated a chunk at a time, so most
+    // requests do not write to memory every worker shares
+    fn take_body_room(bytes: uint) bool {
+        let limit = this.server.max_server_wide_body_size
+        if limit == 0 : return true
+        if bytes <= this.body_credit {
+            this.body_credit -= bytes
+            return true
+        }
+        let counters = this.server.counters
+        let need = bytes - this.body_credit
+        let chunk = this.body_chunk(limit)
+        let take = need > chunk ? need : chunk
+        let active = atomic(counters.active_body_size + take) + take
+        if active < take || active > limit {
+            atomic(counters.active_body_size - take)
+            if take == need : return false
+            // Only what is missing, without room ahead
+            active = atomic(counters.active_body_size + need) + need
+            if active < need || active > limit {
+                atomic(counters.active_body_size - need)
+                return false
+            }
+            take = need
+        }
+        this.body_credit = this.body_credit + take - bytes
+        return true
+    }
+
+    fn give_body_room(bytes: uint) {
+        let limit = this.server.max_server_wide_body_size
+        if limit == 0 : return
+        this.body_credit += bytes
+        let chunk = this.body_chunk(limit)
+        if this.body_credit > chunk * 2 {
+            let back = this.body_credit - chunk
+            atomic(this.server.counters.active_body_size - back)
+            this.body_credit -= back
+        }
+    }
+
+    // At most an eighth of the limit is held ahead by all workers together
+    fn body_chunk(limit: uint) uint {
+        let share = limit / 16 / (this.server.worker_count > 0 ? this.server.worker_count : 1)
+        return share < BODY_CREDIT_CHUNK ? share : BODY_CREDIT_CHUNK
+    }
+
+    fn return_body_room() {
+        if this.body_credit == 0 : return
+        atomic(this.server.counters.active_body_size - this.body_credit)
+        this.body_credit = 0
     }
 
     // A parked connection has input: a serving coroutine reads it
