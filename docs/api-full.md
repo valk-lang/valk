@@ -7323,6 +7323,8 @@ The stack size in bytes of the program's main coroutine: 8 MiB, like a native ma
 + fn await_last() void
 // Unmaps the coroutine stacks this thread keeps for reuse; called when the thread stops.
 + fn stack_cache_release() void
+// Takes the calling thread's alternate signal stack down; the runtime calls it at thread end.
++ fn stack_guard_free() void
 // Sets up stack-overflow reporting for the calling thread; the runtime calls it at thread start.
 + fn stack_guard_init(is_main: bool, stack_low: uint) void
 ```
@@ -7343,6 +7345,10 @@ Every coroutine scheduled before it runs first. Does nothing outside a coroutine
 ### stack_cache_release
 
 Unmaps the coroutine stacks this thread keeps for reuse; called when the thread stops.
+
+### stack_guard_free
+
+Takes the calling thread's alternate signal stack down; the runtime calls it at thread end.
 
 ### stack_guard_init
 
@@ -10474,9 +10480,11 @@ URL attributes are `href`, `src`, `action`, `formaction`, `poster`, `cite`,
 `manifest`; each value is checked with `url_is_allowed`. The attribute itself and its
 quotes stay, and a rejected value is emptied: a quoted one keeps its empty quotes, and an
 unquoted one gets `""` so the text that followed it cannot become the value.
-Nothing else is changed: event handler attributes such as `onclick`,
-`<script>` elements, comments and the content of raw text elements pass through as they
-are, so this is not a full HTML sanitizer.
+Every `<` followed by a letter is read as a start tag, also inside comments, attribute
+values and raw text elements such as `<script>`, so tag-like text there can change too.
+Nothing else is changed: event handler attributes such as `onclick` and `<script>`
+elements pass through, so this is not a full HTML sanitizer. Input built to make this
+check very slow gets every `<` escaped instead.
 
 ### url_is_allowed
 

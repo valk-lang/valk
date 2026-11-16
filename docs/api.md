@@ -2036,6 +2036,8 @@ error CompressError (invalid_input, checksum, truncated, too_large) extends (io:
 + fn await_last() void
 // Unmaps the coroutine stacks this thread keeps for reuse; called when the thread stops.
 + fn stack_cache_release() void
+// Takes the calling thread's alternate signal stack down; the runtime calls it at thread end.
++ fn stack_guard_free() void
 // Sets up stack-overflow reporting for the calling thread; the runtime calls it at thread start.
 + fn stack_guard_init(is_main: bool, stack_low: uint) void
 ```

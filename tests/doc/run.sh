@@ -212,7 +212,10 @@ fi
 public_markdown=$(<"$workdir/public-api.md")
 if [[ "$public_markdown" != *'+ value public_callable (hidden_target)'* ]] \
     || [[ "$public_markdown" == *'value private_callable'* ]] \
-    || [[ "$public_markdown" == *'fn hidden_target'* ]]; then
+    || [[ "$public_markdown" == *'fn hidden_target'* ]] \
+    || [[ "$public_markdown" == *'HiddenAhead'* ]] \
+    || [[ "$public_markdown" != *'alias PlainAhead for Ahead'* ]] \
+    || [[ "$public_markdown" != *'+ value nested_parens ((1 << 4) - 2)'* ]]; then
     echo "# Value alias visibility is incorrect"
     echo "$public_markdown"
     exit 1
@@ -361,6 +364,13 @@ lookup=$("$VALK" doc http.Stdio 2>&1)
 status=$?
 if [ "$status" -eq 0 ] || [[ "$lookup" != *"No documentation found for 'http.Stdio'"* ]] || [[ "$lookup" != *'core.Stdio'* ]]; then
     echo "# An unknown name must fail with suggestions"
+    echo "$lookup"
+    exit 1
+fi
+
+lookup=$("$VALK" doc String.utf8.length 2>&1)
+if [ "$?" -ne 0 ] || [[ "$lookup" != *'utf8.length'* ]]; then
+    echo "# A method of a group must be found"
     echo "$lookup"
     exit 1
 fi
