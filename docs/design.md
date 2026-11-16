@@ -785,7 +785,7 @@ reference for as long as the raw pointer is used.
 conversion turns it back into ordinary mutable `T`; `value.@cast(T)` is the
 explicit unsafe way back. Through an atomic view, a property not marked `-` or
 `~` can be assigned when it is one word: a number, bool, enum or object
-reference. Numbers use atomic access. A reference store is a release store of a
+reference. Integers use atomic access; floats and bools are plain stores. A reference store is a release store of a
 value that is copied first unless it is already shared, and reference loads
 through the view are acquire loads. Properties of more than one word (strings,
 slices, borrows, interfaces, closures, structs, tuples, unions) cannot be
