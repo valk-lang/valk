@@ -47,6 +47,7 @@ queue_ir "$workdir/windows-coro-stack.ll" "$DIR/native-address.valk" --target wi
 queue_ir "$workdir/gc-fast-paths.ll" "$DIR/gc-fast-paths.valk" --release --ir --no-warn
 queue_ir "$workdir/alias-tags.ll" "$DIR/alias-tags.valk" --ir --no-warn
 queue_ir "$workdir/atomic-alignment.ll" "$DIR/atomic-alignment.valk" --ir --no-warn
+queue_ir "$workdir/shared-refs.ll" "$DIR/shared-refs.valk" --ir --no-warn
 for target in linux-x64 linux-arm64; do queue_ir "$workdir/http-epoll-$target.ll" "$DIR/http-epoll.valk" --target "$target" --ir --no-warn; done
 for target in linux-x64 linux-arm64; do queue_ir "$workdir/io-epoll-$target.ll" "$DIR/http-epoll.valk" --target "$target" --io epoll --ir --no-warn; done
 queue_ir "$workdir/vectors.ll" "$DIR/vectors.valk" --ir --no-warn
@@ -295,6 +296,27 @@ if grep -q 'valk\.gc\.stack' "$fast_path_ir"; then
 fi
 
 echo "> Use natural alignment for atomic property accesses"
+
+shared_refs_ir="$workdir/shared-refs.ll"
+out=$(ir_result "$shared_refs_ir")
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "# Failed to build shared-refs IR fixture"
+    echo "$out"
+    exit 1
+fi
+# References other threads may read are stored with release and loaded with acquire
+for check in "shared_ref_global_store:store atomic ptr" "shared_ref_global_load:load atomic ptr" \
+    "shared_ref_element_store:property_update" "shared_ref_element_load:property_get_acquire"; do
+    name="${check%%:*}"
+    want="${check#*:}"
+    body=$(sed -n "/^define .*__${name}__/,/^}/p" "$shared_refs_ir")
+    if [[ "$body" != *"$want"* ]]; then
+        echo "# $name lacks '$want'"
+        echo "$body"
+        exit 1
+    fi
+done
 
 atomic_ir="$workdir/atomic-alignment.ll"
 out=$(ir_result "$atomic_ir")
