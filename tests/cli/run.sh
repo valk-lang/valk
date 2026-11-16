@@ -767,6 +767,15 @@ if [[ "$run_out" != *"Arguments for the program go after '--'"* ]]; then
     exit 1
 fi
 
+echo "> valk run passes compiler flags after -- to the program"
+printf 'fn main(args: Array[String]) {\n    args.remove(0)\n    println("args:" + args.join(","))\n}\n' > "$workdir/pass-args.valk"
+pass_out=$("$VALK" run "$workdir/pass-args.valk" -- -r --ir --docs --fmt --leak-check 2>&1)
+if [[ "$pass_out" != *"args:-r,--ir,--docs,--fmt,--leak-check"* ]]; then
+    echo "# Flags after '--' belong to the program"
+    echo "$pass_out"
+    exit 1
+fi
+
 echo "> valk fmt --check lists unformatted files and writes nothing"
 printf 'fn main() {\n  let  y = 2\n}\n' > "$workdir/check.valk"
 cp "$workdir/check.valk" "$workdir/check.orig"
