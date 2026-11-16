@@ -798,11 +798,12 @@ case "$out" in
 esac
 
 # A message with broken headers is skipped; the messages after it are still answered
-for broken in 'X-Junk-Without-Colon\r\n\r\n' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
+for broken in 'X-Junk-Without-Colon\r\n\r\n' 'X-No-Length: 1\r\n\r\n{"x":1}' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
     count=$((count + 1))
     echo "> broken input is skipped: $broken"
-    stream="$(frame "$init")$(printf "$broken")$(frame "$(notify_save diag.valk)")"
-    out=$(printf '%s' "$stream" | $TIMEOUT "$VALK" lsp run 2>&1)
+    # Piped straight in: a command substitution would drop the trailing line breaks
+    save="$(notify_save diag.valk)"
+    out=$({ frame "$init"; printf "$broken"; frame "$save"; } | $TIMEOUT "$VALK" lsp run 2>&1)
     case "$out" in
         *'"message":"Unknown identifier: nope_xyz"'*) ;;
         *)
