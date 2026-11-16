@@ -13,6 +13,14 @@
 + GC: local collections keep up to 48 stack roots per suspended coroutine until it runs again, stack scans use a 64-entry block-registry address cache, and event loops check for early collections every 16 turns
 + Fix (GC): dis-owning a container whose storage adopted elements (`transfer_refs`) now dis-owns what that storage owns as well, preventing an ownership cycle
 + Standard library: `fs.FileInfo` gains `changed_time` and `inode`, and `String.copy_from_ptr` skips zero-clearing storage it immediately overwrites
++ Fix (security): `html.sanitize_url_attributes` reads every `<` followed by a letter as a tag, whatever the context; raw-text tracking let tags through inside `<svg>`, comments, end tags, after `\v` and after `</scriptx`
++ Fix (GC): `?T` values whose type is aligned past a word (tuples with SIMD vectors) were scanned at the wrong offset; shared references in globals and slice slots are shared before a release store and read with acquire; a size past the largest pool class panics instead of getting a tiny slot; the trigger floor keeps the last window's live size
++ Fix (coroutines): every coroutine awaiting another one runs again when it finishes, not only the first; the main coroutine's linked send/receive could be taken for the doorbell; channel and semaphore waiters that time out pass a wake on; threads unmap their alternate signal stack when they end
++ Fix (HTTP): a connection could be finished twice and serve two clients; `TcpServer.close` could replace a descriptor another socket had reused; `100 Continue` is sent after answers to earlier pipelined requests; HEAD file responses neither keep the file open nor compress it; bodies reach output writers that take part of a write; template syntax errors are reported as parse errors
++ Fix (HTTP/2 client): END_STREAM on HEADERS followed by CONTINUATION no longer hangs; only requests the server cannot have processed are retried (no repeated POST), and a broken write closes the connection
++ Fix (time): time zone offsets of 26 hours or more are rejected instead of overflowing ISO 8601 output
++ Fix (compiler): calls through a function value copy locked data from a second lock like direct calls; `atomic_load`/`atomic_store` on wider types give a compile error; flags after `--` go to the program; `valk doc` honors alias markers, keeps parenthesized values whole and finds group methods (`String.utf8.length`); the LSP skips messages with broken headers
++ Performance: HTTP/2 streams waiting for flow-control credit are woken instead of polling every 1 ms; `gunzip`/`unzlib`, `fs.read` and `url.encode` adopt their result instead of copying it; the compiler frees function IR once its module is written
 
 + Release 0.8.7
 + Regions: chunks up to 256 KiB are pooled per size class out of 2 MiB slabs instead of one 2 MiB chunk per region (binary-tree 17 peak RSS 22 -> 14 MB)
