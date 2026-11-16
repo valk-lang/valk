@@ -4,7 +4,10 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
-- Release 0.8.8
++ Release 0.8.8
++ Fix (TLS): a wait that outlives its connection's close never touches the descriptor again; it could read the first bytes of a new connection that reused it (the occasional empty HTTP 400)
++ Fix (compiler): cloning a struct that holds itself through an `Array`, like valk-sql's `Value`, overflowed the compiler's stack
++ Test runner: a test that panics or calls `exit` is reported as failed, with the asserts that failed before it
 + HTTP server: static files up to 1 MiB (along with `.br`/`.gz` sidecars and gzipped responses) are served from a per-worker memory cache (up to 8 MiB and 4096 files per worker), still statting each request and validating size, timestamps, and inode; cached bodies over 64 KiB are sent without copying into the response buffer
 + HTTP server: smaller `Request` and `Response` objects (parsed-on-demand request caches and file, stream, and WebSocket response fields are allocated on first use)
 + HTTP server: shared counters (`connections`, `active_body_size`) are cache-line padded away from read-only server settings; workers reserve `max_server_wide_body_size` room in local chunks, check `max_memory` once per worker clock tick, park idle Linux connections only once a worker holds more than 256 connections, and wait `batch_delay_ms` only when recent wake rates predict at least 4 more wakes within the delay
