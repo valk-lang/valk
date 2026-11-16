@@ -52,8 +52,10 @@ cases="$cases division-by-zero-line:1:division-by-zero-line.valk:4 shift-count-l
 # for loose files; a dependency names its package
 cases="$cases array-line-read:1:tests/exit-code/array-line-read.valk:2 array-line-write:1:tests/exit-code/array-line-write.valk:2 array-line-compound:1:tests/exit-code/array-line-compound.valk:6 panic-line:1:tests/exit-code/panic-line.valk:2 fixed-array-bounds:1:tests/exit-code/fixed-array-bounds.valk:4"
 cases="$cases panic-in-library:1:ByteBuffer.valk:"
-# A `test-` fixture is built with --test: a panic names its test and prints the summary
-cases="$cases test-crash-named:1:panicked"
+# A `test-` fixture is built with --test: a panic or exit names its test, with the failures
+# it recorded, and prints the summary (also after `!!`, a panic or exit call, whose defers
+# run first); exit(0) from a test still fails the run
+cases="$cases test-crash-named:1:panicked test-unhandled-named:1:test-unhandled-named.valk:11 test-stop-named:1:test-stop-named.valk:5 test-exit-named:3:test-exit-named.valk:5 test-exit-zero-named:1:test-exit-zero-named.valk:5"
 cases="$cases await-cycle:1"
 # The collector of a debug build refuses an object of its own that refers into a region or a frame
 cases="$cases gc-debug-region-escape:1:region"
@@ -115,6 +117,16 @@ run_case() {
 
     if [ "$name" = "panic-line" ] && [[ "$output" != *"Explicit panic at tests/exit-code/panic-line.valk:2"* ]]; then
         echo "# Missing panic message or source location: $output" >> "$log"
+        : > "$fail"
+    fi
+
+    if { [ "$name" = "test-unhandled-named" ] || [ "$name" = "test-exit-named" ] || [ "$name" = "test-exit-zero-named" ]; } && { [[ "$output" != *"assert(a == 1)"* ]] || [[ "$output" != *"1 failed"* ]]; }; then
+        echo "# Missing the stopped test's assert failure or its count in the summary: $output" >> "$log"
+        : > "$fail"
+    fi
+
+    if [ "$name" = "test-unhandled-named" ] && [[ "$output" != *"The test panicked @"* ]]; then
+        echo "# The test was submitted before the panic instead of being named by it: $output" >> "$log"
         : > "$fail"
     fi
 
