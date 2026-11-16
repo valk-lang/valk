@@ -647,9 +647,27 @@ test "HTTP2: 16-stream multiplexed h2c batch answers fast streams ahead of slow 
     await running !!
 }
 
-test "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
+class H2SlowGate {
+    released: uint (0)
+    timed_out: uint (0)
+}
+
+// Alone: the handlers are coroutines on this thread, and a sibling test holding it past the
+// gate's deadline would end the slow handler early
+synctest "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
+    // The slow handler finishes only once the test has stream 1's response
+    let gate: atomic H2SlowGate = .{}
     let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
-        if req.path == "/slow" : time.sleep_ms(120)
+        if req.path == "/slow" {
+            let deadline = time.mono_ms() + 2000 * TIME_SCALE
+            while gate.released == 0 {
+                if time.mono_ms() > deadline {
+                    gate.timed_out = 1
+                    break
+                }
+                time.sleep_ms(5)
+            }
+        }
         return http.Response.text("ok:" + req.path)
     }
     let server = http.Server.new("127.0.0.1", 19191, handler)
@@ -658,7 +676,7 @@ test "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
     time.sleep_ms(20)
 
     let socket = net.tcp_client("127.0.0.1", 19191) !!
-    socket.read_timeout_ms = 5000
+    socket.read_timeout_ms = 5000 * TIME_SCALE
     socket.write("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") !!
     socket.write(http.H2Frame { kind: 4 }.encode() !!) !!
     let input = ByteBuffer.new()
@@ -667,7 +685,7 @@ test "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
     socket.write(http.H2Frame { kind: 4, flags: 1 }.encode() !!) !!
 
     // Case 1: fast stream 1 followed by last-in-batch slow stream 3; stream 1's buffered
-    // response must flush immediately when stream 3 yields instead of waiting 120ms.
+    // response must flush while stream 3's handler still runs
     let pair = ByteBuffer.new(512)
     let enc = http.HpackEncoder {}
     let f1 = Array[http.HpackField] {
@@ -686,17 +704,17 @@ test "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
     }
     pair.write(http.H2Frame { kind: 1, flags: 5, stream: 1, payload: enc.encode(f1, 4096) !! }.encode() !!)
     pair.write(http.H2Frame { kind: 1, flags: 5, stream: 3, payload: enc.encode(f3, 4096) !! }.encode() !!)
-    let started = time.mono_ms()
     socket.write(pair) !!
     let got1 = false
     while !got1 {
         let frame = h2_tls_frame(socket, input, "stream 1 early flush")
+        assert(frame.stream != 3)
         if frame.kind == http.H2_DATA && frame.stream == 1 && (frame.flags & 1) != 0 {
             assert(frame.payload == "ok:/fast-first")
             got1 = true
         }
     }
-    assert(time.mono_ms() - started < 90)
+    gate.released = 1
     let got3 = false
     while !got3 {
         let frame = h2_tls_frame(socket, input, "stream 3 slow finish")
@@ -705,6 +723,8 @@ test "HTTP2: 100-stream concurrent batch and buffered fast-before-slow flush" {
             got3 = true
         }
     }
+    // Released by the test, not by its deadline: stream 1 did not wait for stream 3
+    assert(gate.timed_out == 0)
 
     // Case 2: 100 concurrent fast streams in one batch (-m 100)
     let batch = ByteBuffer.new(4096)
