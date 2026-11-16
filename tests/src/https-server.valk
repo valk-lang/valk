@@ -1,3 +1,5 @@
+use valk.fs
+use valk.io
 use valk.http
 use valk.net
 use valk.time
@@ -532,3 +534,150 @@ test "HTTPS: HTTP/2 client ALPN negotiation and HTTP/1.1 fallback" {
     h1_server.request_shutdown(1000)
     await h1_run !!
 }
+
+// Accepts a TLS connection and stays silent; with `handshake` false it never answers the hello
+fn tls_stale_peer(server: atomic net.TcpServer, context: atomic net.SslServerContext, handshake: bool) {
+    let con = server.accept(3000 * TIME_SCALE) ! return
+    if handshake : con.ssl_accept(context, 3000 * TIME_SCALE) ! return
+    time.sleep_ms(400 * TIME_SCALE)
+    con.close() _
+}
+
+fn tls_stale_plain_peer(server: atomic net.TcpServer) {
+    let con = server.accept(3000 * TIME_SCALE) ! return
+    // After the stale waiter took up the new socket
+    time.sleep_ms(30)
+    con.write("POST /echo HTTP/1.1\r\n\r\n") ! return
+    time.sleep_ms(400 * TIME_SCALE)
+    con.close() _
+}
+
+fn tls_stale_read(con: net.TcpConnection) {
+    let buf = [u8]{ 0 x 64 }
+    con.read(buf) _
+}
+
+fn tls_stale_handshake(con: net.TcpConnection) {
+    let ssl = net.Ssl.new()
+    ssl.set_ca_cert(tls_cert_path()) ! return
+    con.ssl_connect(ssl, 3000 * TIME_SCALE) _
+}
+
+// Closes a TLS connection while another coroutine waits in a read or a handshake on it, then
+// opens a socket that gets the same descriptor number: the waiter must not read from it
+fn tls_stale_reader_case(handshake: bool) {
+    let context: atomic net.SslServerContext = net.SslServerContext.new(tls_cert_path(), tls_key_path()) !!
+    let tls_server = net.tcp_server("127.0.0.1", 0) !!
+    let plain_server = net.tcp_server("127.0.0.1", 0) !!
+    let tls_port = (tls_server.local_address() !!).port
+    let plain_port = (plain_server.local_address() !!).port
+    let tls_side = co tls_stale_peer(tls_server, context, handshake)
+    let plain_side = co tls_stale_plain_peer(plain_server)
+
+    let tls = net.tcp_client("127.0.0.1", tls_port) !!
+    tls.read_timeout_ms = 1000 * TIME_SCALE
+    if handshake {
+        let ssl = net.Ssl.new()
+        ssl.set_ca_cert(tls_cert_path()) !!
+        tls.ssl_connect(ssl, 3000 * TIME_SCALE) !!
+        co tls_stale_read(tls)
+    } else {
+        co tls_stale_handshake(tls)
+    }
+    // The waiter now sits in its wait for the socket
+    time.sleep_ms(20)
+    let old_fd = tls.fd
+    tls.close() !!
+    // Take the free numbers below it, so the next socket gets this one
+    let fillers = Array[io.Fd]{}
+    while true {
+        let fd = fs.open("/dev/null") !!
+        if fd >= old_fd {
+            io.close(fd) _
+            break
+        }
+        fillers.append(fd)
+    }
+
+    let victim = net.tcp_client("127.0.0.1", plain_port) !!
+    each fillers as fd : io.close(fd) _
+    victim.read_timeout_ms = 2000 * TIME_SCALE
+    let received = ByteBuffer.new()
+    // The request is there before this side reads: a stale waiter would get it first
+    time.sleep_ms(200)
+    assert(victim.fd == old_fd)
+    if victim.fd == old_fd {
+        let buf = [u8]{ 0 x 64 }
+        while !received.to_string().ends_with("\r\n\r\n") {
+            let bytes = victim.read(buf) ! break
+            if bytes == 0 : break
+            received.write(buf.view(0, bytes))
+        }
+        assert(received.to_string() == "POST /echo HTTP/1.1\r\n\r\n")
+    }
+    victim.close() _
+    await tls_side
+    await plain_side
+    tls_server.close() _
+    plain_server.close() _
+}
+
+fn plain_silent_peer(server: atomic net.TcpServer) {
+    let con = server.accept(3000 * TIME_SCALE) ! return
+    time.sleep_ms(400 * TIME_SCALE)
+    con.close() _
+}
+
+// A plain read waiting while another coroutine closes its connection
+fn plain_stale_reader_case() {
+    let server = net.tcp_server("127.0.0.1", 0) !!
+    let plain_server = net.tcp_server("127.0.0.1", 0) !!
+    let port = (server.local_address() !!).port
+    let plain_port = (plain_server.local_address() !!).port
+    let silent = co plain_silent_peer(server)
+    let plain_side = co tls_stale_plain_peer(plain_server)
+    let con = net.tcp_client("127.0.0.1", port) !!
+    con.read_timeout_ms = 1000 * TIME_SCALE
+    co tls_stale_read(con)
+    time.sleep_ms(20)
+    let old_fd = con.fd
+    con.close() !!
+    let fillers = Array[io.Fd]{}
+    while true {
+        let fd = fs.open("/dev/null") !!
+        if fd >= old_fd {
+            io.close(fd) _
+            break
+        }
+        fillers.append(fd)
+    }
+    let victim = net.tcp_client("127.0.0.1", plain_port) !!
+    each fillers as fd : io.close(fd) _
+    victim.read_timeout_ms = 2000 * TIME_SCALE
+    time.sleep_ms(200)
+    assert(victim.fd == old_fd)
+    let received = ByteBuffer.new()
+    let buf = [u8]{ 0 x 64 }
+    while !received.to_string().ends_with("\r\n\r\n") {
+        let bytes = victim.read(buf) ! break
+        if bytes == 0 : break
+        received.write(buf.view(0, bytes))
+    }
+    assert(received.to_string() == "POST /echo HTTP/1.1\r\n\r\n")
+    victim.close() _
+    await silent
+    await plain_side
+    server.close() _
+    plain_server.close() _
+}
+
+#if OS != "win"
+synctest "TCP: a plain read waiting while its connection closes never touches the reused descriptor" {
+    plain_stale_reader_case()
+}
+
+synctest "TLS: a read or handshake waiting while its connection closes never touches the reused descriptor" {
+    tls_stale_reader_case(true)
+    tls_stale_reader_case(false)
+}
+#end
