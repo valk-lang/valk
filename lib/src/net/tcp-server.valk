@@ -24,6 +24,10 @@ use coro
     - accepting: uint (0)
     - released: u8 (0)
     - poll_owner: uint (0)
+    #if TEST
+    - accept_ends_in_close: bool (false)
+    - other_fd: i32 (-1)
+    #end
 
     /// Resolves `host`, binds to it and `port`, and starts listening; also `net.tcp_server`.
     ///
@@ -131,6 +135,15 @@ use coro
     }
 
     #if TEST
+    /// Test hook: counts an accept in flight and, while `close` shuts the socket down, ends it.
+    + fn accept_ending_in_close_for_test() @threadsafe {
+        atomic(this.accepting + 1)
+        atomic_store(this.accept_ends_in_close, true)
+    }
+    /// Test hook: the descriptor opened during that close, a copy of stdout.
+    + fn other_fd_for_test() i32 @threadsafe {
+        return this.other_fd
+    }
     /// Test hook: accepts into this thread's io_uring table of direct descriptors; null when it has none.
     + fn accept_direct_for_test(timeout_ms: uint, ring: uint (0)) ?TcpConnection !NetError {
         return this.accept_direct(timeout_ms, ring) !>
@@ -163,45 +176,52 @@ use coro
         // Closing the socket is what ends a pending AcceptEx
         if !this.release() : throw .os
         #else
-        if this.accepting == 0 {
-            if !this.release() : throw .os
-            return
+        // Counts as an accept in flight, so an accept that ends meanwhile cannot release the
+        // descriptor while it is shut down or replaced here
+        if atomic(this.accepting + 1) != 0 {
+            // Accepts are in flight. A shutdown ends them on Linux. On macOS they wait for the
+            // descriptor to go, so the listener is closed by putting a socket that does nothing
+            // in its place: the number stays taken until the last accept is out
+            ext.shutdown(this.fd, ext.O_RDWR)
+            #if TEST
+            if this.accept_ends_in_close {
+                // Another thread opens a descriptor right after
+                this.accept_done()
+                this.other_fd = ext.dup(1)
+            }
+            #end
+            #if OS == "linux"
+            // With epoll the accepts wake on the shutdown, which also ends the listening.
+            // Another socket in its place would take the event out of their epoll sets
+            if !io.use_epoll_backend() && !this.hold_number() : this.release()
+            #else
+            if !this.hold_number() : this.release()
+            #end
         }
-        // Accepts are in flight. A shutdown ends them on Linux. On macOS they wait for the
-        // descriptor to go, so the listener is closed by putting a socket that does nothing
-        // in its place: the number stays taken until the last accept is out
-        ext.shutdown(this.fd, ext.O_RDWR)
+        if atomic(this.accepting - 1) == 1 && !this.release() : throw .os
+        #end
+    }
+
+    #if OS != "win"
+    // Puts a socket that does nothing in place of the listening one; false when out of
+    // descriptors, as nothing can hold the number then
+    fn hold_number() bool {
         #if OS == "linux"
-        if io.use_epoll_backend() {
-            // The accepts wake on the shutdown, which also ends the listening. Another socket in
-            // its place would take the event out of their epoll sets before they saw it
-            if this.accepting == 0 : this.release()
-            return
-        }
         let idle = ext.socket(ext.AF_INET, ext.SOCK_STREAM | ext.SOCK_CLOEXEC, 0)
-        if idle == io.INVALID_FD {
-            // Out of descriptors: nothing can hold the number
-            if !this.release() : throw .os
-            return
-        }
+        if idle == io.INVALID_FD : return false
         if idle != this.fd : ext.dup3(idle, this.fd, ext.O_CLOEXEC)
         ext.close(idle)
         #else
         let idle = ext.socket(ext.AF_INET, ext.SOCK_STREAM, 0)
-        if idle == io.INVALID_FD {
-            // Out of descriptors: nothing can hold the number
-            if !this.release() : throw .os
-            return
-        }
+        if idle == io.INVALID_FD : return false
         io.set_close_on_exec(idle) ! {}
         ext.dup2(idle, this.fd)
         io.set_close_on_exec(this.fd) ! {}
         ext.close(idle)
         #end
-        // The accepts may all have left in the meantime
-        if this.accepting == 0 : this.release()
-        #end
+        return true
     }
+    #end
 
     // An accept is out: the last one after a close releases the descriptor
     fn accept_done() @threadsafe {
