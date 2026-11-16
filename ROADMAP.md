@@ -5,6 +5,14 @@
 
 ```
 - Release 0.8.8
++ HTTP server: static files up to 1 MiB (along with `.br`/`.gz` sidecars and gzipped responses) are served from a per-worker memory cache (up to 8 MiB and 4096 files per worker), still statting each request and validating size, timestamps, and inode; cached bodies over 64 KiB are sent without copying into the response buffer
++ HTTP server: smaller `Request` and `Response` objects (parsed-on-demand request caches and file, stream, and WebSocket response fields are allocated on first use)
++ HTTP server: shared counters (`connections`, `active_body_size`) are cache-line padded away from read-only server settings; workers reserve `max_server_wide_body_size` room in local chunks, check `max_memory` once per worker clock tick, park idle Linux connections only once a worker holds more than 256 connections, and wait `batch_delay_ms` only when recent wake rates predict at least 4 more wakes within the delay
++ TLS & HTTP/2: on Linux with `io_uring`, TLS reads wait for socket readability before `SSL_read` when OpenSSL has no buffered input; Linux TLS writes over 16 KiB cork packets with `TCP_CORK`, and HTTP/2 batches writes up to 64 KiB
++ GC: making or freeing pool blocks no longer takes a process-wide lock; each thread keeps its own block registry, and shared collections merge them while threads are stopped
++ GC: local collections keep up to 48 stack roots per suspended coroutine until it runs again, stack scans use a 64-entry block-registry address cache, and event loops check for early collections every 16 turns
++ Fix (GC): dis-owning a container whose storage adopted elements (`transfer_refs`) now dis-owns what that storage owns as well, preventing an ownership cycle
++ Standard library: `fs.FileInfo` gains `changed_time` and `inode`, and `String.copy_from_ptr` skips zero-clearing storage it immediately overwrites
 
 + Release 0.8.7
 + Regions: chunks up to 256 KiB are pooled per size class out of 2 MiB slabs instead of one 2 MiB chunk per region (binary-tree 17 peak RSS 22 -> 14 MB)
