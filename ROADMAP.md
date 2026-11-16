@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.9
+
 + Release 0.8.8
 + Fix (TLS): a wait that outlives its connection's close never touches the descriptor again; it could read the first bytes of a new connection that reused it (the occasional empty HTTP 400)
 + Fix (compiler): cloning a struct that holds itself through an `Array`, like valk-sql's `Value`, overflowed the compiler's stack
