@@ -797,6 +797,22 @@ case "$out" in
         ;;
 esac
 
+# A message with broken headers is skipped; the messages after it are still answered
+for broken in 'X-Junk-Without-Colon\r\n\r\n' 'Content-Length: abc\r\n\r\n{"x":1}' '{ "body without headers": 1 }\r\n\r\n'; do
+    count=$((count + 1))
+    echo "> broken input is skipped: $broken"
+    stream="$(frame "$init")$(printf "$broken")$(frame "$(notify_save diag.valk)")"
+    out=$(printf '%s' "$stream" | $TIMEOUT "$VALK" lsp run 2>&1)
+    case "$out" in
+        *'"message":"Unknown identifier: nope_xyz"'*) ;;
+        *)
+            echo "# The message after broken input got no reply"
+            echo "$out"
+            failed=1
+            ;;
+    esac
+done
+
 echo ""
 if [ "$failed" -ne 0 ]; then
     echo "# LSP tests failed"
