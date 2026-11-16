@@ -21,6 +21,8 @@ value OUTPUT_POOL_COUNT (16)
 value OUTPUT_POOL_MAX (1024 * 1024)
 // The largest response sent together with the next read (`can_send_with_read`)
 value SEND_WITH_READ_MAX (16 * 1024)
+// A body in memory up to this size is copied into the output buffer, a larger one is sent from where it is
+value MEMORY_BODY_COPY_MAX (64 * 1024)
 
 // Large output buffers waiting for the next large response on this thread
 global output_pool: Array[ByteBuffer] (.{})
@@ -166,6 +168,8 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     - output: ByteBuffer (ByteBuffer.new(0))
     - file_response: ?fs.FileStream
     - body_reader: ?io.Reader
+    // A body in memory, sent after the head without copying it into `output`
+    - body_data: ?String (null)
     /// Whether a response has been written for the current request.
     ~ responded: bool (false)
     // Emits `Connection: close`; set by the server when it closes the
@@ -216,6 +220,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         }
         this.output_pos = 0
         this.body_reader = null
+        this.body_data = null
         this.body_left = 0
         this.body_open = false
         this.body_chunked = false
@@ -330,9 +335,16 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     /// answers 304 when the client's copy is current and 206 for a `Range` of bytes,
     /// unless `headers` sets its own `ETag`, `Last-Modified` or `Content-Encoding`.
     + fn send_file(path: String, filename: ?String (null), headers: ?Headers (null), code: u16 (200)) {
+        this.send_file_as(path, null, filename, headers, code)
+    }
+
+    // `send_file` with the file's metadata when the caller already has it
+    -+ fn send_file_as(path: String, known: ?fs.FileInfo, filename: ?String, headers: ?Headers, code: u16) {
         if this.responded : return
 
-        let info = fs.stat(path) ! {
+        let found = known
+        if !isset(found) : found = fs.stat(path) !? null
+        let info = found ?! {
             this.send("", 404, "text/plain", headers)
             return
         }
@@ -346,12 +358,39 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         let accept_encoding = ""
         let req_ctx = this.request_context
         if isset(req_ctx) : accept_encoding = req_ctx.header("accept-encoding") !? ""
-        let plan = this.file_plan_for(code, info, content_type, headers, accept_encoding)
-        if isset(plan) {
-            if plan.status == 304 || plan.status == 416 {
-                this.send_file_status(plan, headers)
+        let cached = cached_file(path, info)
+        let plan = this.file_plan_for(code, isset(cached) ? cached.meta : file_meta(info.size, info.modified_time), content_type, headers, accept_encoding)
+        if isset(plan) && (plan.status == 304 || plan.status == 416) {
+            this.send_file_status(plan, headers)
+            return
+        }
+        if isset(cached) {
+            if isset(plan) {
+                let sidecar = cached_precompressed(cached, content_type, this.compress, accept_encoding, plan)
+                if isset(sidecar) {
+                    this.send_memory_file(sidecar, content_type, filename, headers, 200, plan)
+                    return
+                }
+            }
+            let data = cached_file_data(cached) ?! {
+                this.send("", 500, "text/plain", headers)
                 return
             }
+            if isset(plan) && plan.gzip {
+                plan.gzip = false
+                plan.encoding = "gzip"
+                plan.vary = true
+                this.send_memory_file(cached_file_gzip(cached, data, this.compress_level), content_type, filename, headers, 200, plan)
+                return
+            }
+            if isset(plan) {
+                this.send_memory_file(data.range(plan.start, plan.length), content_type, filename, headers, plan.status, plan)
+                return
+            }
+            this.send_memory_file(data, content_type, filename, headers, code, null)
+            return
+        }
+        if isset(plan) {
             let sidecar = open_precompressed_sidecar(path, info, content_type, this.compress, accept_encoding, plan)
             if isset(sidecar) {
                 this.file_response = sidecar
@@ -390,7 +429,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
 
     // The caching and range answer for a file, or null when the response is not a
     // plain 200 to a GET or HEAD request
-    - fn file_plan_for(code: u16, info: fs.FileInfo, content_type: String, headers: ?Headers, accept_encoding: String) ?FilePlan {
+    - fn file_plan_for(code: u16, meta: FileMeta, content_type: String, headers: ?Headers, accept_encoding: String) ?FilePlan {
         if code != 200 : return null
         let context = this.request_context ?! return null
         let get = context.method.equals("GET")
@@ -398,7 +437,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
         if isset(headers) && (headers.has("etag") || headers.has("last-modified") || headers.has("content-encoding")) : return null
         // Ranges are only defined for GET (RFC 9110 14.2)
         let range = get ? context.header("range") !? "" : ""
-        return file_plan(info.size, info.modified_time, content_type, this.compress, context.header("if-none-match") !? "",
+        return file_plan(meta, content_type, this.compress, context.header("if-none-match") !? "",
             context.header("if-modified-since") !? "", range, context.header("if-range") !? "", accept_encoding)
     }
 
@@ -462,7 +501,6 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     - fn stream_response(reader: io.Reader, size: ?uint, content_type: String, filename: ?String, headers: ?Headers, code: u16, plan: ?FilePlan) {
         this.responded = true
 
-        let out = this.output
         let with_body = ResponseWriter.status_has_body(code) && !this.head
         if isset(size) {
             if with_body && size > 0 {
@@ -482,6 +520,24 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
             }
         }
 
+        this.write_file_head(size, content_type, filename, headers, code, plan)
+    }
+
+    // Sends a file's bytes from memory; a large body goes out after the head without a copy
+    - fn send_memory_file(data: String, content_type: String, filename: ?String, headers: ?Headers, code: u16, plan: ?FilePlan) {
+        this.responded = true
+        this.write_file_head(data.bytes, content_type, filename, headers, code, plan)
+        if !ResponseWriter.status_has_body(code) || this.head : return
+        if data.bytes > MEMORY_BODY_COPY_MAX {
+            this.body_data = data
+            return
+        }
+        this.reserve_output(data.bytes)
+        this.output.write(data)
+    }
+
+    - fn write_file_head(size: ?uint, content_type: String, filename: ?String, headers: ?Headers, code: u16, plan: ?FilePlan) {
+        let out = this.output
         this.write_status_line(code)
         out.write("Content-Type: ")
         out.write(response_header_value_is_safe(content_type) ? content_type : "application/octet-stream")
@@ -688,7 +744,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     // A small, fully written response, which may wait to go out with the connection's next read
     -+ fn can_send_with_read() bool {
         let count = this.count_bytes_to_send()
-        return count > 0 && count <= SEND_WITH_READ_MAX && !isset(this.body_reader) && !isset(this.file_response)
+        return count > 0 && count <= SEND_WITH_READ_MAX && !isset(this.body_reader) && !isset(this.body_data) && !isset(this.file_response)
     }
 
     -+ fn unsent_output() &[u8] {
@@ -697,7 +753,7 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
     }
 
     -+ fn should_send() bool {
-        return this.count_bytes_to_send() > (128 * 1024) || this.body_reader != null
+        return this.count_bytes_to_send() > (128 * 1024) || this.body_reader != null || this.body_data != null
     }
 
     // Copies exactly `body_left` bytes: the Content-Length promised that many, so a
@@ -774,6 +830,12 @@ fn write_response_quoted_header_value(out: ByteBuffer, value: String) {
                     this.body_reader = null
                     reader = null
                 }
+            }
+
+            let data = this.body_data
+            if isset(data) && this.count_bytes_to_send() == 0 {
+                this.body_data = null
+                write_all_to(writer, data) !>
             }
 
             let pos = this.output_pos

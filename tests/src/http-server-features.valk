@@ -474,6 +474,59 @@ test "HTTP server: query_param, Route.param, prefixed static dir and precompress
     assert(part.status == 206 && part.body == "console.log")
 }
 
+test "HTTP server: static files kept in memory follow the files on disk" {
+    let dir = fs.create_temp_dir("valk-static-cache-") !!
+    defer fs.delete_all(dir) _
+    let page = fs.add(dir, "page.html")
+    let sidecar = fs.add(dir, "page.html.br")
+    fs.write(page, "<p>first</p>".repeat(20)) !!
+    fs.write(sidecar, "BR-ONE") !!
+
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        return http.Response.text("fallback")
+    }
+    let server = http.Server.new("127.0.0.1", 19698, handler)
+    server.compress = true
+    server.add_static_dir(dir) !!
+    let running = co server.start(1)
+    defer stop_http_test_server(server, running)
+    time.sleep_ms(20)
+
+    let client = http.Client.new()
+    defer client.close()
+    let get = fn(accept: String) http.ClientResponse {
+        return client.get("http://127.0.0.1:19698/page.html", http.Options {
+            decompress: false,
+            headers: http.Headers { "Accept-Encoding" => accept }
+        }) !!
+    }
+
+    assert(get("br").body == "BR-ONE")
+    assert(get("identity").body == "<p>first</p>".repeat(20))
+    let first_etag = get("identity").headers.get("etag") !? ""
+
+    // A new version of the file, its sidecar replaced, then removed
+    fs.write(page, "<p>second version</p>".repeat(20)) !!
+    let second = get("identity")
+    assert(second.body == "<p>second version</p>".repeat(20))
+    assert((second.headers.get("etag") !? "") != first_etag)
+    fs.write(sidecar, "BR-TWO, LONGER") !!
+    assert(get("br").body == "BR-TWO, LONGER")
+    fs.delete_file(sidecar) !!
+    let plain = get("br")
+    assert(!plain.headers.has("content-encoding"))
+    assert(plain.body == "<p>second version</p>".repeat(20))
+
+    // Replaced by a file of the same size that keeps the modification time
+    let replacement = fs.add(dir, "replacement.tmp")
+    fs.write(replacement, "<p>SECOND VERSION</p>".repeat(20)) !!
+    fs.set_modified_time(replacement, fs.modified_time(page) !!) !!
+    // Windows does not move onto an existing file
+    fs.delete_file(page) !!
+    fs.move(replacement, page) !!
+    assert(get("identity").body == "<p>SECOND VERSION</p>".repeat(20))
+}
+
 test "HTTP server: static files sendfile large payloads, range, HEAD and empty files" {
     let dir = fs.create_temp_dir("valk-sendfile-") !!
     defer fs.delete_all(dir) _
@@ -511,4 +564,169 @@ test "HTTP server: static files sendfile large payloads, range, HEAD and empty f
     let empty = client.get("http://127.0.0.1:19695/files/empty.bin") !!
     assert(empty.status == 200)
     assert(empty.body == "")
+}
+
+fn static_cache_fetch_expect(url: String, accept: String, expected: String, results: Array[bool], idx: uint) {
+    let res = http.get(url, http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => accept }
+    }) ! {
+        results.set(idx, false) _
+        return
+    }
+    results.set(idx, res.status == 200 && res.body == expected) _
+}
+
+synctest "HTTP server: concurrent cold file cache reads and budget eviction keep byte count exact" {
+    http.file_cache_clear_for_test()
+    defer http.file_cache_clear_for_test()
+
+    let dir = fs.create_temp_dir("valk-static-race-") !!
+    defer fs.delete_all(dir) _
+
+    let hot = "hot-body-".repeat(25_000) // ~225 KB
+    let hot_br = "br-sidecar-".repeat(9_000) // ~99 KB
+    fs.write(fs.add(dir, "hot.txt"), hot) !!
+    fs.write(fs.add(dir, "hot.txt.br"), hot_br) !!
+
+    let base_chunk = "B".repeat(900 * 1024 - 4) // 900 KB per file across 10 files (> 8 MB budget)
+    let blobs = Array[String]{}
+    each 0 .. 10 as i {
+        let content = "F0" + ("" + i) + ":" + base_chunk
+        blobs.append(content)
+        fs.write(fs.add(dir, "f" + i + ".bin"), content) !!
+    }
+
+    let server = http.Server.new("127.0.0.1", 19705, server_features_handler)
+    server.compress = true
+    server.add_static_dir(dir) !!
+    let running = co server.start(1)
+    defer server.request_shutdown(0)
+    time.sleep_ms(20)
+
+    let base = "http://127.0.0.1:19705"
+
+    // Concurrent cold reads on the same file and sidecar
+    let phase1_results = Array[bool]{}
+    let phase1_tasks = Array[co()]{}
+    each 0 .. 16 as i {
+        phase1_results.append(false)
+        if i % 2 == 0 {
+            phase1_tasks.append(co static_cache_fetch_expect(base + "/hot.txt", "identity", hot, phase1_results, i))
+        } else {
+            phase1_tasks.append(co static_cache_fetch_expect(base + "/hot.txt", "br", hot_br, phase1_results, i))
+        }
+    }
+    each phase1_tasks as task : await task
+    each phase1_results as ok : assert(ok)
+
+    // Concurrent cold reads mixed with >8 MB budget clears
+    http.file_cache_clear_for_test()
+    let phase2_results = Array[bool]{}
+    let phase2_tasks = Array[co()]{}
+    each 0 .. 4 as i {
+        phase2_results.append(false)
+        phase2_tasks.append(co static_cache_fetch_expect(base + "/hot.txt", "identity", hot, phase2_results, phase2_results.length - 1))
+        phase2_results.append(false)
+        phase2_tasks.append(co static_cache_fetch_expect(base + "/hot.txt", "br", hot_br, phase2_results, phase2_results.length - 1))
+    }
+    each 0 .. 10 as i {
+        phase2_results.append(false)
+        phase2_tasks.append(co static_cache_fetch_expect(base + "/f" + i + ".bin", "identity", blobs[i], phase2_results, phase2_results.length - 1))
+    }
+    each phase2_tasks as task : await task
+    each phase2_results as ok : assert(ok)
+
+    stop_http_test_server(server, running)
+    assert(http.file_cache_bytes_ok_for_test())
+}
+
+synctest "HTTP server: static directory index, compressed filename downloads, and sidecar Vary" {
+    http.file_cache_clear_for_test()
+    defer http.file_cache_clear_for_test()
+
+    let dir = fs.create_temp_dir("valk-static-index-") !!
+    defer fs.delete_all(dir) _
+
+    fs.write(fs.add(dir, "index.html"), "<h1>root index</h1>") !!
+    let sub = fs.add(dir, "sub")
+    fs.create_dir(sub) !!
+    fs.write(fs.add(sub, "index.html"), "<h1>sub index</h1>") !!
+    fs.write(fs.add(dir, "small.txt"), "small") !!
+    let small_br = fs.add(dir, "small.txt.br")
+    fs.write(small_br, "BR-SMALL") !!
+
+    // High-entropy text whose gzipped output exceeds MEMORY_BODY_COPY_MAX (64 KB)
+    let download_buf = ByteBuffer.new(180 * 1024)
+    let state: uint = 0x12345678
+    each 0 .. 180 * 1024 {
+        state = (state * 1664525 + 1013904223) & 0xffffffff
+        download_buf.write_byte((32 + (state % 95)).to(u8))
+    }
+    let large_text = download_buf.into_string()
+    let download_path = fs.add(dir, "download.txt")
+    fs.write(download_path, large_text) !!
+
+    let handler: atomic fn(http.Request)(http.Response) = fn(req: http.Request) http.Response {
+        if req.path == "/download" {
+            return http.Response.file(download_path, filename: "report.txt")
+        }
+        return http.Response.text("fallback")
+    }
+    let server = http.Server.new("127.0.0.1", 19706, handler)
+    server.compress = true
+    server.add_static_dir(dir) !!
+    let running = co server.start(1)
+    defer server.request_shutdown(0)
+    time.sleep_ms(20)
+
+    let client = http.Client.new()
+    defer client.close()
+    let base = "http://127.0.0.1:19706"
+
+    let root_res = client.get(base + "/") !!
+    assert(root_res.status == 200 && root_res.body == "<h1>root index</h1>")
+    fs.write(fs.add(dir, "index.html"), "<h1>updated index</h1>") !!
+    let root_updated = client.get(base + "/") !!
+    assert(root_updated.status == 200 && root_updated.body == "<h1>updated index</h1>")
+
+    let redir = client.get(base + "/sub", http.Options { follow_redirects: false }) !!
+    assert(redir.status == 301 && (redir.headers.get("location") !? "") == "/sub/")
+    let sub_res = client.get(base + "/sub/") !!
+    assert(sub_res.status == 200 && sub_res.body == "<h1>sub index</h1>")
+
+    // Files below GZIP_MIN_SIZE still emit Vary: Accept-Encoding when a sidecar exists
+    let small_id = client.get(base + "/small.txt", http.Options { decompress: false }) !!
+    assert(small_id.status == 200 && small_id.body == "small")
+    assert((small_id.headers.get("vary") !? "") == "Accept-Encoding")
+    fs.delete_file(small_br) !!
+    let small_br_gone = client.get(base + "/small.txt", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "br, gzip" }
+    }) !!
+    assert(small_br_gone.status == 200 && small_br_gone.body == "small")
+    assert(!small_br_gone.headers.has("content-encoding") && !small_br_gone.headers.has("vary"))
+
+    // Cached dynamically gzipped response preserves filename and >64 KB body_data path
+    let dl = client.get(base + "/download", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "gzip" }
+    }) !!
+    assert(dl.status == 200)
+    assert(dl.body.bytes > 65_536)
+    assert((dl.headers.get("content-encoding") !? "") == "gzip")
+    assert((dl.headers.get("vary") !? "") == "Accept-Encoding")
+    assert((dl.headers.get("content-disposition") !? "") == "attachment; filename=\"report.txt\"")
+    assert(compress.gunzip(dl.body) !! == large_text)
+
+    let dl_head = client.head(base + "/download", http.Options {
+        decompress: false,
+        headers: http.Headers { "Accept-Encoding" => "gzip" }
+    }) !!
+    assert(dl_head.status == 200 && dl_head.body == "")
+    assert((dl_head.headers.get("content-length") !? "") == ("" + dl.body.bytes))
+    assert((dl_head.headers.get("content-disposition") !? "") == "attachment; filename=\"report.txt\"")
+
+    stop_http_test_server(server, running)
+    assert(http.file_cache_bytes_ok_for_test())
 }

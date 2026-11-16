@@ -3,8 +3,8 @@
 use mem
 use core
 
+// Blocks of ended threads that still hold items. Used only under `shared_lock`
 @shared unused_blocks: ?*Bump (null)
-shared pool_lock: core.SyncMutex (core.SyncMutex.new())
 
 value b_next (0)
 value b_slots_total (1)
@@ -98,7 +98,6 @@ fn add_unused_block(block: *Block) {
 }
 
 fn free_empty_unused_blocks() {
-    pool_lock.lock()
     let list = unused_blocks
     if isset(list) && list.index > 0 {
         let start = list.data
@@ -117,7 +116,6 @@ fn free_empty_unused_blocks() {
             start = start.$offset(size_of(ptr))
         }
     }
-    pool_lock.unlock()
 }
 
 //////////////////////////
@@ -125,10 +123,11 @@ fn free_empty_unused_blocks() {
 //////////////////////////
 
 // Pool block address ranges, so a word found on a native stack can be resolved to
-// the slot it points into. Each thread keeps its own `local_ranges` for lock-free
-// local stack scans; `shared_block_ranges` holds every block of every thread under
-// `block_lock` for shared collections. Registering appends and unregistering leaves
-// a hole (start == end); the array is sorted and compacted before a lookup
+// the slot it points into. Each thread keeps its own `local_ranges`, changed only while
+// it holds its gc. A shared collection, which holds every gc, merges them into
+// `shared_block_ranges` (see `build_shared_ranges`), so making and freeing blocks takes
+// no process-wide lock. Registering appends and unregistering leaves a hole
+// (start == end); the array is sorted and compacted before a scan
 struct BlockRange {
     start: ptr
     end: ptr
@@ -136,6 +135,9 @@ struct BlockRange {
     gc: ?*Gc
     inv_isize: uint
 }
+
+// Ranges appended since the last sort that a removal searches linearly before it sorts
+value UNSORTED_MAX (32)
 
 struct BlockRegistry {
     ranges: *Bump
@@ -175,8 +177,9 @@ struct BlockRegistry {
     }
 
     fn remove(block: ptr) {
-        // Holes keep the lookup binary; appended blocks need a sort
-        if this.unsorted : this.sort()
+        // Holes keep the lookup binary; a short appended tail is searched linearly, so a
+        // thread that frees and makes blocks in turn does not sort every time
+        if this.unsorted && this.count() - this.sorted > UNSORTED_MAX : this.sort()
         let range = this.find(block)
         if isset(range) {
             range.end = range.start
@@ -184,10 +187,24 @@ struct BlockRegistry {
         }
     }
 
-    fn release_owner(block: ptr) {
-        if this.unsorted : this.sort()
-        let range = this.find(block)
-        if isset(range) : range.gc = null
+    fn reset() {
+        this.ranges.reset()
+        this.unsorted = false
+        this.holes = false
+        this.sorted = 0
+    }
+
+    // Appends the ranges of `other`, holes included (a sort drops them)
+    fn append(other: *BlockRegistry) {
+        let bytes = other.ranges.index
+        if bytes == 0 : return
+        if !this.unsorted {
+            this.sorted = this.count()
+            this.unsorted = true
+        }
+        let adr = this.ranges.get(bytes)
+        mem.copy_bytes(other.ranges.data, adr, bytes)
+        this.holes = true
     }
 
     // Drops the holes, sorts the appended ranges on their own and merges them
@@ -266,19 +283,22 @@ struct BlockRegistry {
 // Set in blocks_init only: the program assigns global initial values after the main thread's
 // gc started, and blocks are registered by then
 @shared shared_block_ranges: *BlockRegistry (@undefined)
-@shared block_lock: *core.MutexStruct[void] (@undefined)
+// Set while a shared collection uses `shared_block_ranges`: blocks made or freed meanwhile
+// (by the collecting thread, which holds every gc) are added or removed there too
+@shared shared_ranges_live: bool (false)
 
 fn blocks_init() {
     shared_block_ranges = BlockRegistry.new(256)
-    block_lock = core.MutexStruct[void].new()
+}
+
+fn block_inv_isize(slots_total: uint, isize: uint) uint {
+    return slots_total <= 1 ? 0 : ((1.to(uint) << 48) + isize - 1) / isize
 }
 
 fn register_block(block: ptr, alloc_size: uint, slots_total: uint, isize: uint) {
-    let inv_isize: uint = slots_total <= 1 ? 0 : ((1.to(uint) << 48) + isize - 1) / isize
+    let inv_isize = block_inv_isize(slots_total, isize)
     gc.local_ranges.add(block, alloc_size, gc, inv_isize)
-    block_lock.lock()
-    shared_block_ranges.add(block, alloc_size, gc, inv_isize)
-    block_lock.unlock()
+    if shared_ranges_live : shared_block_ranges.add(block, alloc_size, gc, inv_isize)
 }
 
 fn unregister_block(block: ptr) {
@@ -286,15 +306,36 @@ fn unregister_block(block: ptr) {
     if isset(owner) && !owner.did_shutdown {
         owner.local_ranges.remove(block)
     }
-    block_lock.lock()
-    shared_block_ranges.remove(block)
-    block_lock.unlock()
+    if shared_ranges_live : shared_block_ranges.remove(block)
 }
 
-fn release_block_owner(block: ptr) {
-    block_lock.lock()
-    shared_block_ranges.release_owner(block)
-    block_lock.unlock()
+// Every block of every thread in `shared_block_ranges`, for the stack scans of a shared
+// collection. The caller holds every gc and the shared lock, so no thread changes its own
+// ranges and no thread exits meanwhile. Blocks of exited threads have no owner
+fn build_shared_ranges(gcs: Array[*Gc]) {
+    let reg = shared_block_ranges
+    reg.reset()
+    each gcs as gcx : reg.append(gcx.local_ranges)
+    let list = unused_blocks
+    if isset(list) {
+        let adr = list.data
+        let end = list.data.$offset(list.index)
+        while adr < end {
+            let block = @ptrv(adr, *Block)
+            adr = adr.$offset(size_of(ptr))
+            reg.add(block, block.slots_total * block.isize + POOL_DATA_OFFSET, null, block_inv_isize(block.slots_total, block.isize))
+        }
+    }
+    reg.sort()
+    shared_ranges_live = true
+    #if TEST
+    check_shared_ranges(gcs)
+    #end
+}
+
+fn end_shared_ranges() {
+    shared_ranges_live = false
+    shared_block_ranges.reset()
 }
 
 fn sort_block_ranges_rec(base: ptr, lo: uint, hi: uint) {
@@ -337,41 +378,49 @@ fn sort_block_ranges_rec(base: ptr, lo: uint, hi: uint) {
 }
 
 #if TEST
-/// Test helper: whether the block registry is in order after a sort and finds every block of
-/// the calling thread's pools.
+// Blocks of a thread's pools that a shared collection's ranges missed, over all shared collections
+shared shared_ranges_missing: uint (0)
+
+/// Test helper: whether the calling thread's block registry is in order after a sort and finds
+/// every block of its pools, and whether every shared collection so far found every block of
+/// every thread.
 + fn block_registry_ok_for_test() bool {
     let local_reg = gc.local_ranges
     local_reg.sort()
-    block_lock.lock()
-    shared_block_ranges.sort()
-    let ok = true
-    let base = shared_block_ranges.ranges.data
-    let count = shared_block_ranges.count()
+    return registry_in_order(local_reg) && registry_misses(local_reg, alc_list) == 0 && shared_ranges_missing == 0
+}
+
+fn registry_in_order(reg: *BlockRegistry) bool {
+    let base = reg.ranges.data
+    let count = reg.count()
     let i: uint = 1
     while i < count {
-        if @ptrv(base, BlockRange, i - 1).start >= @ptrv(base, BlockRange, i).start : ok = false
+        if @ptrv(base, BlockRange, i - 1).start >= @ptrv(base, BlockRange, i).start : return false
         i++
     }
-    let lbase = local_reg.ranges.data
-    let lcount = local_reg.count()
-    i = 1
-    while i < lcount {
-        if @ptrv(lbase, BlockRange, i - 1).start >= @ptrv(lbase, BlockRange, i).start : ok = false
-        i++
-    }
-    let adr = alc_list.data
-    let end = adr + alc_list.index
+    return true
+}
+
+// The blocks in the pools of `pools` that `reg` does not find
+fn registry_misses(reg: *BlockRegistry, pools: *Bump) uint {
+    let missing: uint = 0
+    let adr = pools.data
+    let end = adr + pools.index
     while adr < end {
         let alc = @ptrv(adr, *Pool)
         adr += size_of(ptr)
         let block = alc.first
         while isset(block) {
-            if !isset(shared_block_ranges.find(block)) : ok = false
-            if !isset(local_reg.find(block)) : ok = false
+            if !isset(reg.find(block)) : missing++
             block = @ptrv(block, ?ptr, b_next)
         }
     }
-    block_lock.unlock()
-    return ok
+    return missing
+}
+
+fn check_shared_ranges(gcs: Array[*Gc]) {
+    let reg = shared_block_ranges
+    if !registry_in_order(reg) : shared_ranges_missing++
+    each gcs as gcx : shared_ranges_missing += registry_misses(reg, gcx.alc_list_ptr[0])
 }
 #end

@@ -10,6 +10,8 @@ use ext
 // allocations: a collection costs far more than the bytes it accounts for (a stack
 // scan, the settle pass, and one walk per updated object), and a heap this small is
 // resident in any case
+// Entries of the cache of registry hits used while scanning stacks; a power of two
+value SCAN_CACHE_SIZE (64)
 value mem_minimum_trigger (2 * 1024 * 1024)
 // A collection marks what survived of the allocations since the last one.
 // The step between collections is sized so that is about this much: 8 MiB
@@ -107,6 +109,8 @@ struct Gc {
     scan_min: ptr (null_ptr())
     scan_max: ptr (null_ptr())
     scan_hint: uint (0) // Last block-registry hit while scanning stacks
+    // Recent registry hits by address bits, as index + 1; cleared for each scan
+    scan_cache: [uint x SCAN_CACHE_SIZE] ({ 0... })
 
     // Refs
     #if OS == "win"
@@ -763,10 +767,9 @@ struct Gc {
     // stack while a coroutine runs, and each suspended coroutine
     fn scan_stacks(sp: ptr) {
         mark_alloc_limits(this.alc_list_ptr[0])
-        let shared = this.scanning_shared
-        if shared : block_lock.lock()
-        let reg = shared ? shared_block_ranges : this.local_ranges
+        let reg = this.scanning_shared ? shared_block_ranges : this.local_ranges
         this.scan_ranges = reg
+        mem.clear_bytes(@ref(this.scan_cache[0]).@cast(ptr), size_of(uint) * SCAN_CACHE_SIZE)
         reg.sort()
         let count = reg.count()
         if count > 0 {
@@ -785,12 +788,55 @@ struct Gc {
             each coros as coro_item {
                 if !isset(coro_item) : continue
                 if coro_item.started && !coro_item.active && !coro_item.done {
-                    this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
+                    if this.scanning_shared : this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
+                    else if coro_item.gc_roots_kept : this.add_kept_roots(coro_item)
+                    else : this.scan_coro_words(coro_item)
                 }
             }
             this.scan_regions()
         }
-        if shared : block_lock.unlock()
+    }
+
+    // A suspended stack's words, keeping the roots found for the next local collection: until
+    // the coroutine runs, nothing writes to its stack
+    fn scan_coro_words(c: coro.Coro) {
+        let min = this.scan_min
+        let max = this.scan_max
+        let roots = @ref(c.gc_roots[0]).@cast(ptr)
+        let count: uint = 0
+        let kept = true
+        let adr: ptr = c.saved_sp() & (~7).to(uint)
+        let high = c.stack_top
+        while adr < high {
+            let word = @ptrv(adr, ptr)
+            adr += size_of(ptr)
+            if word < min || word >= max : continue
+            let item = this.find_root(word) ?! continue
+            this.collect_stack_item(item)
+            // Neighbouring copies of one pointer are kept once
+            if count > 0 && @ptrv(roots, ptr, count - 1) == item : continue
+            if count == coro.COROUTINE_GC_ROOTS {
+                kept = false
+                continue
+            }
+            @ptrv(roots, ptr, count) = item
+            count++
+        }
+        c.gc_root_count = count
+        c.gc_roots_kept = kept
+    }
+
+    fn add_kept_roots(c: coro.Coro) {
+        #if TEST
+        kept_root_stacks++
+        #end
+        let roots = @ref(c.gc_roots[0]).@cast(ptr)
+        let count = c.gc_root_count
+        let i: uint = 0
+        while i < count {
+            this.collect_stack_item(@ptrv(roots, ptr, i))
+            i++
+        }
     }
 
     // What the regions of the thread have pinned (region.valk): the records below the top.
@@ -840,8 +886,19 @@ struct Gc {
             let cached: *BlockRange = base + hint * size_of(BlockRange)
             if word >= cached.start && word < cached.end : return cached
         }
+        let slot = (word.@cast(uint) >> 16) & (SCAN_CACHE_SIZE - 1)
+        let known = this.scan_cache[slot]
+        if known > 0 && known <= count {
+            let cached: *BlockRange = base + (known - 1) * size_of(BlockRange)
+            if word >= cached.start && word < cached.end {
+                this.scan_hint = known - 1
+                return cached
+            }
+        }
         let range = reg.find(word) ?! return null
-        this.scan_hint = (range.@cast(ptr) - base) / size_of(BlockRange)
+        let index = (range.@cast(ptr) - base) / size_of(BlockRange)
+        this.scan_hint = index
+        this.scan_cache[slot] = index + 1
         return range
     }
 
@@ -944,7 +1001,6 @@ struct Gc {
         this.flush_shared_pending()
 
         // Free blocks or store them in unused-block-list if they still contain items
-        pool_lock.lock()
         loop_all_blocks(fn(block: *Block) {
             let alloc_size = block.slots_total * block.isize + POOL_DATA_OFFSET
             if alloc_size > gc.mem_usage_thread : panic("GC pool accounting underflow during thread shutdown")
@@ -954,12 +1010,10 @@ struct Gc {
                 unregister_block(block)
                 mem.free(block)
             } else {
-                release_block_owner(block)
                 block.owner = null
                 add_unused_block(block)
             }
         })
-        pool_lock.unlock()
     }
 
     fn flush_shared_pending() {
@@ -994,3 +1048,11 @@ struct Gc {
         mem.free(this)
     }
 }
+
+#if TEST
+global kept_root_stacks: uint (0)
+/// Test hook, only in `TEST` builds: how many suspended stacks collections took from kept roots.
++ fn kept_root_stacks_for_test() uint {
+    return kept_root_stacks
+}
+#end

@@ -23,6 +23,13 @@ value WATCH_POLL_MS (100)
 value WATCH_BATCH (256)
 // With `batch_delay_ms` set, a wake-up with fewer ready connections than this waits before the next
 value BATCH_MIN (32)
+// Request body room a worker takes from the server-wide count at a time
+value BODY_CREDIT_CHUNK (1024 * 1024)
+// Parked connections are counted over windows this long to tell how often they wake
+value BATCH_RATE_WINDOW_MS (100)
+// The watcher waits for a batch only when this many more wakes are expected meanwhile: fewer
+// save little and hold every request they gather
+value BATCH_EXPECTED (4)
 // Serving coroutines kept per worker: each drains the ready queue, then waits on its waker for
 // the next batch. When all are busy, up to SERVE_EXTRA temporary ones per batch help out
 value SERVE_POOL_MAX (256)
@@ -130,6 +137,7 @@ fn worker(server: atomic ServerWorkerData, worker_id: uint (0)) {
         close_extra_sockets(server.extra_sockets)
     }
     worker.drain()
+    worker.return_body_room()
     worker.ended = true
     while true {
         let waker = worker.h2_idle_servers.pop_last() ! break
@@ -157,6 +165,16 @@ fn worker_may_accept(own: uint, total: uint, workers: uint) bool {
 
 class Worker {
     server: atomic ServerWorkerData
+    // Body room this worker took from `ServerCounters.active_body_size` and has not handed out
+    body_credit: uint (0)
+    // The clock reading of the last `over_memory` check and its answer
+    memory_checked_at: uint (uint.$max)
+    memory_over: bool (false)
+    // Wakes of parked connections in the current rate window, when it started, and wakes per
+    // second over the last one
+    wake_window_count: uint (0)
+    wake_window_start: uint (0)
+    wake_rate: uint (0)
     // Output buffer storage of parked connections, for the connections that wake; a
     // connection waiting for its next request holds none. The holders are emptied buffers
     spare_outputs: Array[ByteBuffer] (.{})
@@ -295,14 +313,14 @@ class Worker {
             return
         }
 
-        let connections = ++server.connections
+        let connections = ++server.counters.connections
         let too_many_connections = server.max_connections > 0 && connections > server.max_connections
         // At the limit, an idle connection makes room for the new one
         if too_many_connections && this.evict_idle() : too_many_connections = false
         let rejected = too_many_connections
         // A rejected connection gives its slot back right away, so the next
         // accept is judged without it. `finish()` skips the decrement for it.
-        if rejected : server.connections--
+        if rejected : server.counters.connections--
         let fd = netcon.fd
         if server.show_info {
             println("[+] New connection: " + fd)
@@ -440,16 +458,22 @@ class Worker {
         this.idle_collections = gc.gc.collect_count
     }
 
-    // See `Server.max_memory`
+    // See `Server.max_memory`. The process-wide count every thread updates is read once per
+    // tick of the worker's clock
     fn over_memory() bool {
         let limit = this.server.max_memory
-        if limit == 0 || gc.mem_usage_shared < limit : return false
+        if limit == 0 : return false
+        if this.now == this.memory_checked_at : return this.memory_over
+        this.memory_checked_at = this.now
+        this.memory_over = false
+        if gc.mem_usage_shared < limit : return false
         let now = time.mono_ms()
         if now - this.last_memory_release >= MEMORY_RELEASE_MS {
             this.last_memory_release = now
             gc.release_memory()
         }
-        return gc.mem_usage_shared >= limit
+        this.memory_over = gc.mem_usage_shared >= limit
+        return this.memory_over
     }
 
     // A request's input storage of `size` bytes was dropped
@@ -602,9 +626,7 @@ class Worker {
                 this.wake(connection, now)
             }
             this.dispatch_ready()
-            // Only this watcher waits: the woken connections are served meanwhile
-            let delay = this.server.batch_delay_ms
-            if delay > 0 && count < BATCH_MIN : time.sleep_ms(delay)
+            this.batch_wait(count > 0 ? count.to(uint) : 0, now)
         }
         if this.watch_efd >= 0 {
             io.close(this.watch_efd) ! {}
@@ -670,8 +692,7 @@ class Worker {
             events.clear()
             io.grow_recv_buffers()
             this.dispatch_ready()
-            let delay = this.server.batch_delay_ms
-            if delay > 0 && count < BATCH_MIN : time.sleep_ms(delay)
+            this.batch_wait(count, now)
         }
         while true {
             let waker = this.idle_servers.pop_last() ! break
@@ -693,6 +714,26 @@ class Worker {
         if bytes == io.RECV_BUFFER_SIZE : connection.input_signaled = true
     }
     #end
+
+    // After a wake-up of `count` parked connections, the watcher waits `batch_delay_ms` when
+    // few woke but several more are expected meanwhile. Only this watcher waits: the woken
+    // connections are served in the meantime. A trickle of requests is not held up for nothing
+    fn batch_wait(count: uint, now: uint) {
+        let delay = this.server.batch_delay_ms
+        if delay == 0 : return
+        this.wake_window_count += count
+        let elapsed = now - this.wake_window_start
+        if elapsed >= BATCH_RATE_WINDOW_MS {
+            this.wake_rate = this.wake_window_count * 1000 / elapsed
+            this.wake_window_count = 0
+            this.wake_window_start = now
+        }
+        if count >= BATCH_MIN || this.wake_rate * delay < BATCH_EXPECTED * 1000 : return
+        #if TEST
+        batch_waits++
+        #end
+        time.sleep_ms(delay)
+    }
 
     // A parked connection has input: a serving coroutine reads it
     fn wake(connection: Connection, now: uint) {
@@ -763,6 +804,60 @@ class Worker {
         return false
     }
     #end
+
+    // Reserves `bytes` of request body against `Server.max_server_wide_body_size`. The room
+    // comes from this worker's credit; the shared count is updated a chunk at a time, so most
+    // requests do not write to memory every worker shares
+    fn take_body_room(bytes: uint) bool {
+        let limit = this.server.max_server_wide_body_size
+        if limit == 0 : return true
+        if bytes <= this.body_credit {
+            this.body_credit -= bytes
+            return true
+        }
+        let counters = this.server.counters
+        let need = bytes - this.body_credit
+        let chunk = this.body_chunk(limit)
+        let take = need > chunk ? need : chunk
+        let active = atomic(counters.active_body_size + take) + take
+        if active < take || active > limit {
+            atomic(counters.active_body_size - take)
+            if take == need : return false
+            // Only what is missing, without room ahead
+            active = atomic(counters.active_body_size + need) + need
+            if active < need || active > limit {
+                atomic(counters.active_body_size - need)
+                return false
+            }
+            take = need
+        }
+        this.body_credit = this.body_credit + take - bytes
+        return true
+    }
+
+    fn give_body_room(bytes: uint) {
+        let limit = this.server.max_server_wide_body_size
+        if limit == 0 : return
+        this.body_credit += bytes
+        let chunk = this.body_chunk(limit)
+        if this.body_credit > chunk * 2 {
+            let back = this.body_credit - chunk
+            atomic(this.server.counters.active_body_size - back)
+            this.body_credit -= back
+        }
+    }
+
+    // At most an eighth of the limit is held ahead by all workers together
+    fn body_chunk(limit: uint) uint {
+        let share = limit / 16 / (this.server.worker_count > 0 ? this.server.worker_count : 1)
+        return share < BODY_CREDIT_CHUNK ? share : BODY_CREDIT_CHUNK
+    }
+
+    fn return_body_room() {
+        if this.body_credit == 0 : return
+        atomic(this.server.counters.active_body_size - this.body_credit)
+        this.body_credit = 0
+    }
 
     // Ends a parked connection from the worker: nothing else holds its descriptor
     fn close_parked(connection: Connection) {
@@ -1001,3 +1096,11 @@ fn worker_h2_on_yield(arg: ptr) {
     let worker = arg.@cast(Worker)
     worker.h2_runner_yielded()
 }
+
+#if TEST
+global batch_waits: uint (0)
+/// Test hook, only in `TEST` builds: how often this thread's watchers waited for a batch.
++ fn batch_waits_for_test() uint {
+    return batch_waits
+}
+#end

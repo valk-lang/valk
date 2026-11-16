@@ -36,6 +36,9 @@ fn h2_give_chunk_buf(buf: ByteBuffer) {
     if h2_chunk_pool.length < 16 : h2_chunk_pool.append(buf)
 }
 
+// Output gathered before a write to the socket: one write carries several full TLS records
+value H2_WRITE_BATCH (65_536)
+
 fn h2_close_file(file: ?fs.FileStream) {
     if isset(file) : file.close() ! {}
 }
@@ -114,7 +117,7 @@ class H2Connection {
 
     fn flush() bool {
         if !this.session.has_output() || this.closed : return !this.closed
-        if this.reading_batch && this.session.out_len() < 16_384 : return true
+        if this.reading_batch && this.session.out_len() < H2_WRITE_BATCH : return true
         this.writer.lock()
         defer this.writer.unlock()
         while this.session.has_output() && !this.closed {
@@ -124,7 +127,7 @@ class H2Connection {
             if isset(sbuf) && sbuf.length > 0 {
                 out.swap(sbuf)
             }
-            while this.session.output.length > 0 && out.length < 16_384 {
+            while this.session.output.length > 0 && out.length < H2_WRITE_BATCH {
                 let frame = this.session.output.pop_first() !!
                 frame.encode_into(out, this.session.peer.max_frame_size) ! {
                     this.closed = true
@@ -136,7 +139,7 @@ class H2Connection {
                 this.closed = true
                 break
             }
-            if out.size > 65_536 : out.shrink_capacity(16_384)
+            if out.size > H2_WRITE_BATCH * 2 : out.shrink_capacity(16_384)
         }
         return !this.closed
     }
@@ -182,17 +185,11 @@ class H2Connection {
     fn sync_body() bool {
         let amount = this.session.buffered_body + this.processing_body
         if amount == this.reserved_body : return true
-        let server = this.owner.worker.server
+        let worker = this.owner.worker
         if amount > this.reserved_body {
-            let added = amount - this.reserved_body
-            server.active_body_size += added
-            let active = server.active_body_size
-            if server.max_server_wide_body_size > 0 && active > server.max_server_wide_body_size {
-                server.active_body_size -= added
-                return false
-            }
+            if !worker.take_body_room(amount - this.reserved_body) : return false
         } else {
-            server.active_body_size -= this.reserved_body - amount
+            worker.give_body_room(this.reserved_body - amount)
         }
         this.reserved_body = amount
         return true
@@ -424,7 +421,7 @@ class H2Connection {
         }
         each this.session.streams as stream : stream.cancelled = true
         while this.handlers > 0 : time.sleep_ms(1)
-        settings.active_body_size -= this.reserved_body
+        this.owner.worker.give_body_room(this.reserved_body)
         this.reserved_body = 0
     }
 
@@ -464,19 +461,25 @@ class H2Connection {
             client_certificate_sha256: owner.client_certificate_sha256
         }
         let response: ?Response = null
+        // The static file's metadata, read by the lookup
+        let static_info: ?fs.FileInfo = null
         let server = owner.worker.server
         if method != "CONNECT" && isset(server.static_dirs) {
             let found = static_file(server.static_dirs, path)
             if isset(found) {
-                if found.redirect : response = Response.redirect(static_redirect_location(path, query), 301)
-                else : response = Response.file(found.path)
+                if found.redirect {
+                    response = Response.redirect(static_redirect_location(path, query), 301)
+                } else {
+                    response = Response.file(found.path)
+                    static_info = found.info
+                }
             }
         }
         if !isset(response) && owner.worker.over_memory() : response = Response.empty(503)
         if !isset(response) : response = method == "CONNECT" ? Response.empty(501) : server.handler(request)
         if !isset(response) : return
         if stream.cancelled || this.closed : return
-        this.respond(stream, request, response) ! {
+        this.respond(stream, request, response, static_info) ! {
             if !this.closed {
                 this.session.reset_stream(stream.id, 2)
             }
@@ -504,17 +507,17 @@ class H2Connection {
     }
 
     // See `ResponseWriter.file_plan_for`
-    fn file_plan_for(request: Request, status: u16, info: fs.FileInfo, content_type: String, extra: ?Headers, accept_encoding: String) ?FilePlan {
+    fn file_plan_for(request: Request, status: u16, meta: FileMeta, content_type: String, extra: ?Headers, accept_encoding: String) ?FilePlan {
         if status != 200 : return null
         let get = request.method == "GET"
         if !get && request.method != "HEAD" : return null
         if isset(extra) && (extra.has("etag") || extra.has("last-modified") || extra.has("content-encoding")) : return null
         let range = get ? request.header("range") !? "" : ""
-        return file_plan(info.size, info.modified_time, content_type, this.owner.worker.server.compress, request.header("if-none-match") !? "",
+        return file_plan(meta, content_type, this.owner.worker.server.compress, request.header("if-none-match") !? "",
             request.header("if-modified-since") !? "", range, request.header("if-range") !? "", accept_encoding)
     }
 
-    fn respond(stream: H2Stream, request: Request, response: Response) !H2Error {
+    fn respond(stream: H2Stream, request: Request, response: Response, known_info: ?fs.FileInfo (null)) !H2Error {
         let source = response.stream_reader
         let file: ?fs.FileStream = null
         let body = response.body
@@ -528,14 +531,42 @@ class H2Connection {
         let extra = response.header_list
         let plan: ?FilePlan = null
         let path = response.filepath
+        let cached: ?CachedFile = null
+        let cached_body = false
         if isset(path) {
-            let info = fs.stat(path) !? null
+            let info = known_info
+            if !isset(info) : info = fs.stat(path) !? null
             if isset(info) && info.kind != fs.FileKind.directory {
                 content_type = fs.mime_type(fs.extension(path))
                 if isset(extra) : content_type = extra.get("content-type") !? content_type
                 let accept_encoding = request.header("accept-encoding") !? ""
-                plan = this.file_plan_for(request, status, info, content_type, extra, accept_encoding)
-                if isset(plan) {
+                cached = cached_file(path, info)
+                plan = this.file_plan_for(request, status, isset(cached) ? cached.meta : file_meta(info.size, info.modified_time), content_type, extra, accept_encoding)
+                let in_memory = cached
+                if isset(in_memory) && !(isset(plan) && (plan.status == 304 || plan.status == 416)) {
+                    // Sent from memory: a sidecar, the gzipped file or (part of) the file itself
+                    let sidecar: ?String = null
+                    if isset(plan) : sidecar = cached_precompressed(in_memory, content_type, this.owner.worker.server.compress, accept_encoding, plan)
+                    if isset(sidecar) {
+                        body = sidecar
+                    } else {
+                        let data = cached_file_data(in_memory)
+                        if !isset(data) {
+                            plan = null
+                            status = 500
+                            body = ""
+                        } else if isset(plan) && plan.gzip {
+                            body = cached_file_gzip(in_memory, data, this.owner.worker.server.compress_level)
+                        } else if isset(plan) {
+                            body = data.range(plan.start, plan.length)
+                        } else {
+                            body = data
+                        }
+                    }
+                    source = null
+                    size = body.bytes
+                    cached_body = true
+                } else if isset(plan) {
                     if plan.status == 304 || plan.status == 416 {
                         size = 0
                     } else {
@@ -546,7 +577,7 @@ class H2Connection {
                         }
                     }
                 }
-                if !isset(file) && !(isset(plan) && (plan.status == 304 || plan.status == 416)) {
+                if !cached_body && !isset(file) && !(isset(plan) && (plan.status == 304 || plan.status == 416)) {
                     file = fs.stream(path) !? null
                     if isset(file) {
                         source = file.to(io.Reader)
@@ -565,7 +596,7 @@ class H2Connection {
         defer h2_close_file(file)
         if isset(plan) {
             status = plan.status
-            size = plan.length
+            if !cached_body || plan.status == 304 || plan.status == 416 : size = plan.length
             open_body = false
             if isset(file) && plan.start > 0 : file.seek(plan.start.to(int)) ! throw .protocol
             if plan.gzip && isset(file) {
@@ -583,7 +614,7 @@ class H2Connection {
         headers.append(.{ name: ":status", value: status == 200 ? "200" : status.to_string() })
         if isset(extra) : content_type = extra.get("content-type") !? content_type
         // `Server.compress`: a body in memory is sent gzip-compressed to a client that takes it
-        if !isset(source) && !isset(plan) && this.owner.worker.server.compress && status != 204 && status != 304 && body.bytes >= GZIP_MIN_SIZE
+        if !isset(source) && !isset(plan) && !cached_body && this.owner.worker.server.compress && status != 204 && status != 304 && body.bytes >= GZIP_MIN_SIZE
             && response_gzip_type(content_type) && !(isset(extra) && extra.has("content-encoding")) {
             headers.append(.{ name: "vary", value: "Accept-Encoding" })
             if request_accepts_gzip(request.header("accept-encoding") !? "") {
@@ -635,7 +666,7 @@ class H2Connection {
             return
         }
         if isset(source) {
-            if this.session.out_len() >= 16_384 && !this.flush() : return
+            if this.session.out_len() >= H2_WRITE_BATCH && !this.flush() : return
             let offset: uint = 0
             let chunk_buf = h2_take_chunk_buf()
             defer h2_give_chunk_buf(chunk_buf)
@@ -689,7 +720,7 @@ class H2Connection {
             } else if last_write != 0 {
                 last_write = time.mono_ms()
             }
-            if this.session.out_len() >= 16_384 && !this.flush() : return false
+            if this.session.out_len() >= H2_WRITE_BATCH && !this.flush() : return false
         }
         return !this.closed
     }

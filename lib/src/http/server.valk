@@ -26,6 +26,8 @@ class ServerStaticDir {
 
 class StaticMatch {
     path: String
+    // The file's metadata, when it was read for the match
+    info: ?fs.FileInfo (null)
     // A directory's index asked for without the trailing slash: redirect first
     redirect: bool
 }
@@ -92,11 +94,12 @@ fn static_file_in(dir: atomic ServerStaticDir, path: String, request_path: Strin
     let full = fs.resolve(fs.add(dir.path, path))
     if !full.starts_with(dir.path) : return null
     let info = fs.stat(full) ! return null
-    if info.kind == fs.FileKind.file : return StaticMatch { path: full, redirect: false }
+    if info.kind == fs.FileKind.file : return StaticMatch { path: full, info: info, redirect: false }
     if info.kind != fs.FileKind.directory || dir.index.bytes == 0 : return null
     let index = fs.add(full, dir.index)
-    if !fs.is_file(index) : return null
-    return StaticMatch { path: index, redirect: !request_path.ends_with("/") }
+    let index_info = fs.stat(index) ! return null
+    if index_info.kind != fs.FileKind.file : return null
+    return StaticMatch { path: index, info: index_info, redirect: !request_path.ends_with("/") }
 }
 
 // Where a directory asked for without its trailing slash moves to
@@ -138,6 +141,17 @@ fn worker_socket(server: atomic ServerWorkerData, worker_id: uint) atomic net.Tc
     return server.socket
 }
 
+// Counts the workers update while serving. Padded, so these writes do not share a cache line
+// with what the workers only read
+class ServerCounters {
+    pad_before: [uint x 8] ({ 0... })
+    connections: uint (0)
+    // Request body bytes reserved against `Server.max_server_wide_body_size`, counting the room
+    // each worker took ahead (see `Worker.take_body_room`)
+    active_body_size: uint (0)
+    pad_after: [uint x 8] ({ 0... })
+}
+
 // State shared by the worker threads of one `start()` call
 class ServerWorkerData {
     socket: atomic net.TcpServer
@@ -165,8 +179,8 @@ class ServerWorkerData {
     websocket_compression: bool (false)
     websocket_compression_level: uint (WS_COMPRESS_LEVEL)
     websocket_compression_min_size: uint (WS_COMPRESS_MIN_SIZE)
-    connections: uint (0)
-    active_body_size: uint (0)
+    // Written by the workers while they serve: kept apart from the settings they read
+    counters: atomic ServerCounters (.{})
     // Shutdown: `stopping` is polled by the workers, `deadline_ms` says how
     // long in-flight requests may take. Both are written under `mutex`.
     mutex: atomic core.SyncMutex (.new())
@@ -201,6 +215,13 @@ class ServerWorkerData {
             this.socket.close() ! {}
             close_extra_sockets(this.extra_sockets)
         }
+    }
+
+    get connections: uint {
+        return this.counters.connections
+    }
+    get active_body_size: uint {
+        return this.counters.active_body_size
     }
 }
 
@@ -345,8 +366,10 @@ fn server_wrap(middleware: atomic fn(Request, atomic fn(Request)(Response))(Resp
     /// A worker that wakes for only a few idle keep-alive connections waits this many
     /// milliseconds before it looks for more, so one wake-up serves the requests that arrived
     /// meanwhile together: fewer system calls, and handlers on a pipelined database connection
-    /// share round trips (about 25% less CPU per request under moderate load). A request on an
-    /// idle connection may wait up to this long; a busy worker never waits. 0 turns it off.
+    /// share round trips (about 25% less CPU per request under moderate load). It waits only
+    /// while idle connections wake often enough that more are expected in that time, so a
+    /// trickle of requests is not delayed. A request on an idle connection may wait up to this
+    /// long; a busy worker never waits. 0 turns it off.
     + batch_delay_ms: uint (2)
     /// On Linux, plain connections live in io_uring's own table of sockets instead of the
     /// process's, so the open-file limit (`RLIMIT_NOFILE`) does not cap how many a server
