@@ -1,4 +1,5 @@
 use fs
+use io
 use compress
 
 // Files up to this size are kept in memory by the worker that served them
@@ -70,6 +71,11 @@ fn file_cache_same(size: uint, modified: uint, changed: uint, inode: uint, info:
     return size == info.size && modified == info.modified_time && changed == info.changed_time && inode == info.inode
 }
 
+fn file_cache_has(entry: CachedFile) bool {
+    let cache = file_cache ?! return false
+    return (cache.get(entry.path) !? null) == entry
+}
+
 fn file_cache_forget(entry: CachedFile) {
     let cache = file_cache ?! return
     file_cache_bytes -= file_cache_entry_bytes(entry)
@@ -89,9 +95,9 @@ fn file_cache_entry_bytes(entry: CachedFile) uint {
     return total
 }
 
-// Makes room for `bytes` more; false when they do not fit even in an empty cache
+// Makes room for `bytes` more; false when the entry was evicted or they do not fit
 fn file_cache_reserve(entry: CachedFile, bytes: uint) bool {
-    if bytes > FILE_CACHE_BUDGET : return false
+    if !file_cache_has(entry) || bytes > FILE_CACHE_BUDGET : return false
     if file_cache_bytes + bytes > FILE_CACHE_BUDGET {
         let cache = file_cache ?! return false
         // Start over, keeping only the entry in use
@@ -111,12 +117,32 @@ fn file_cache_reserve(entry: CachedFile, bytes: uint) bool {
     return true
 }
 
+// Reads `path` using a known size hint so cold fills avoid an extra stat syscall
+fn file_cache_read(path: String, size_hint: uint) String !io.IoError {
+    let fd = fs.open(path) ! throw .open
+    let buffer = ByteBuffer.new(size_hint + 1)
+    while true {
+        buffer.reserve(1)
+        let readcount = io.read(fd, buffer.view_spare(1024 * 1024 * 1024), buffer.length) ! {
+            io.close(fd) ! {}
+            throw .read
+        }
+        if readcount == 0 : break
+        buffer.skip(readcount)
+    }
+    io.close(fd) !>
+    return buffer.into_string()
+}
+
 // The whole file; null when it no longer has the size the entry was made for
 fn cached_file_data(entry: CachedFile) ?String {
     let data = entry.data
     if isset(data) : return data
-    let read = fs.read(entry.path) ! return null
+    let read = file_cache_read(entry.path, entry.meta.size) ! return null
     if read.bytes != entry.meta.size : return null
+    // Another coroutine on this worker may have filled or evicted the entry while io.read yielded
+    let existing = entry.data
+    if isset(existing) : return existing
     if file_cache_reserve(entry, read.bytes) : entry.data = read
     return read
 }
@@ -125,6 +151,7 @@ fn cached_file_data(entry: CachedFile) ?String {
 fn cached_file_gzip(entry: CachedFile, data: String, level: uint) String {
     let gzipped = entry.gzipped
     if isset(gzipped) && entry.gzipped_level == level : return gzipped
+    if !file_cache_has(entry) : return compress.gzip(data, level)
     if isset(gzipped) {
         file_cache_bytes -= gzipped.bytes
         entry.gzipped = null
@@ -137,29 +164,32 @@ fn cached_file_gzip(entry: CachedFile, data: String, level: uint) String {
     return made
 }
 
+fn file_cache_clear_sidecar(entry: CachedFile, sidecar: CachedSidecar, data: ?String) {
+    if !isset(data) : return
+    if file_cache_has(entry) : file_cache_bytes -= data.bytes
+    sidecar.data = null
+}
+
 // The sidecar's bytes, or null when there is no such regular file or it is too big to keep
 fn cached_sidecar_data(entry: CachedFile, sidecar: CachedSidecar) ?String {
     let data = sidecar.data
     let info = fs.stat(sidecar.path) !? null
     if !isset(info) || info.kind != fs.FileKind.file || info.size > FILE_CACHE_MAX_FILE {
-        if isset(data) {
-            file_cache_bytes -= data.bytes
-            sidecar.data = null
-        }
+        file_cache_clear_sidecar(entry, sidecar, data)
         return null
     }
     if isset(data) && file_cache_same(sidecar.size, sidecar.modified, sidecar.changed, sidecar.inode, info) : return data
-    if isset(data) {
-        file_cache_bytes -= data.bytes
-        sidecar.data = null
-    }
-    let read = fs.read(sidecar.path) ! return null
+    file_cache_clear_sidecar(entry, sidecar, data)
+    let read = file_cache_read(sidecar.path, info.size) ! return null
     if read.bytes != info.size : return null
-    sidecar.size = info.size
-    sidecar.modified = info.modified_time
-    sidecar.changed = info.changed_time
-    sidecar.inode = info.inode
-    if file_cache_reserve(entry, read.bytes) : sidecar.data = read
+    if isset(sidecar.data) : return read
+    if file_cache_reserve(entry, read.bytes) {
+        sidecar.size = info.size
+        sidecar.modified = info.modified_time
+        sidecar.changed = info.changed_time
+        sidecar.inode = info.inode
+        sidecar.data = read
+    }
     return read
 }
 
@@ -167,7 +197,10 @@ fn cached_sidecar_data(entry: CachedFile, sidecar: CachedSidecar) ?String {
 // and returns its bytes
 fn cached_precompressed(entry: CachedFile, content_type: String, compress: bool, accept_encoding: String, plan: FilePlan) ?String {
     if !compress || plan.status != 200 || !response_gzip_type(content_type) : return null
+    let checked_br = false
+    let checked_gz = false
     if request_accepts_br(accept_encoding) {
+        checked_br = true
         let data = cached_sidecar_data(entry, entry.br)
         if isset(data) {
             plan.gzip = false
@@ -179,6 +212,7 @@ fn cached_precompressed(entry: CachedFile, content_type: String, compress: bool,
         }
     }
     if request_accepts_gzip(accept_encoding) {
+        checked_gz = true
         let data = cached_sidecar_data(entry, entry.gz)
         if isset(data) {
             plan.gzip = false
@@ -189,10 +223,29 @@ fn cached_precompressed(entry: CachedFile, content_type: String, compress: bool,
             return data
         }
     }
-    if cached_sidecar_exists(entry.br) || cached_sidecar_exists(entry.gz) : plan.vary = true
+    if !plan.vary && ((!checked_br && cached_sidecar_exists(entry.br)) || (!checked_gz && cached_sidecar_exists(entry.gz))) {
+        plan.vary = true
+    }
     return null
 }
 
 fn cached_sidecar_exists(sidecar: CachedSidecar) bool {
     return fs.is_file(sidecar.path)
 }
+
+#if TEST
+/// Test hook: clears the current thread's static file cache.
++ fn file_cache_clear_for_test() {
+    let cache = file_cache
+    if isset(cache) : cache.clear()
+    file_cache_bytes = 0
+}
+
+/// Test hook: returns whether the current thread's tracked cache bytes match its entries.
++ fn file_cache_bytes_ok_for_test() bool {
+    let cache = file_cache ?! return file_cache_bytes == 0
+    let total: uint = 0
+    each cache as entry, _ : total += file_cache_entry_bytes(entry)
+    return total == file_cache_bytes
+}
+#end
