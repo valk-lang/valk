@@ -15,26 +15,27 @@ fn h2_raw_frame(out: ByteBuffer, kind: u8, flags: u8, stream: u32, payload: loca
     out.write(payload)
 }
 
-// Answers the first request once its HEADERS frame arrived, then waits for the client to close
-fn h2_raw_server(server: atomic net.TcpServer, frames: String) {
-    let connection = server.accept(2000 * TIME_SCALE) ! return
-    connection.read_timeout_ms = 5000 * TIME_SCALE
-    let input = ByteBuffer.new()
+// Reads until `count` HEADERS frames arrived after the connection preface
+fn h2_raw_wait_headers(connection: net.TcpConnection, input: ByteBuffer, count: uint) bool {
     let buf = [u8]{ 0 x 4096 }
-    let seen = false
-    while !seen {
-        let count = connection.read(buf) ! return
-        if count == 0 : return
-        input.write(buf.view(0, count))
-        // Frames follow the 24-byte connection preface
+    while true {
+        let seen: uint = 0
         let pos: uint = 24
         while pos + 9 <= input.length {
             let length = (input.get(pos).to(uint) << 16) | (input.get(pos + 1).to(uint) << 8) | input.get(pos + 2).to(uint)
-            if input.get(pos + 3) == 1 : seen = true
+            if input.get(pos + 3) == 1 : seen++
             pos += 9 + length
         }
+        if seen >= count : return true
+        let bytes = connection.read(buf) ! return false
+        if bytes == 0 : return false
+        input.write(buf.view(0, bytes))
     }
-    connection.write(frames) ! return
+    return false
+}
+
+fn h2_raw_drain(connection: net.TcpConnection) {
+    let buf = [u8]{ 0 x 4096 }
     while true {
         let count = connection.read(buf) ! break
         if count == 0 : break
@@ -42,10 +43,43 @@ fn h2_raw_server(server: atomic net.TcpServer, frames: String) {
     connection.close() _
 }
 
+fn h2_raw_settings(out: ByteBuffer) {
+    h2_raw_frame(out, 4, 0, 0, "")
+    h2_raw_frame(out, 4, 1, 0, "")
+}
+
+// Answers the first request once its HEADERS frame arrived, then waits for the client to close
+fn h2_raw_server(server: atomic net.TcpServer, frames: String) {
+    let connection = server.accept(2000 * TIME_SCALE) ! return
+    connection.read_timeout_ms = 5000 * TIME_SCALE
+    if !h2_raw_wait_headers(connection, ByteBuffer.new(), 1) : return
+    connection.write(frames) ! return
+    h2_raw_drain(connection)
+}
+
+// Answers the first request with 200 and drops the connection once the second one arrived.
+// Returns the connections it saw: a retried request opens another one
+fn h2_raw_drop_second(server: atomic net.TcpServer) uint {
+    let connection = server.accept(2000 * TIME_SCALE) ! return 0
+    connection.read_timeout_ms = 5000 * TIME_SCALE
+    let input = ByteBuffer.new()
+    if !h2_raw_wait_headers(connection, input, 1) : return 0
+    let frames = ByteBuffer.new()
+    h2_raw_settings(frames)
+    let block = ByteBuffer.new()
+    block.write_byte(0x88)
+    h2_raw_frame(frames, 1, 5, 1, block)
+    connection.write(frames) ! return 0
+    if !h2_raw_wait_headers(connection, input, 2) : return 0
+    connection.close() _
+    let again = server.accept(300 * TIME_SCALE) ! return 1
+    h2_raw_drain(again)
+    return 2
+}
+
 test "HTTP2 client: END_STREAM on HEADERS still ends the stream after CONTINUATION" {
     let frames = ByteBuffer.new()
-    h2_raw_frame(frames, 4, 0, 0, "")
-    h2_raw_frame(frames, 4, 1, 0, "")
+    h2_raw_settings(frames)
     // HEADERS with END_STREAM but without END_HEADERS, then the block in a CONTINUATION
     h2_raw_frame(frames, 1, 1, 1, "")
     let block = ByteBuffer.new()
@@ -62,4 +96,20 @@ test "HTTP2 client: END_STREAM on HEADERS still ends the stream after CONTINUATI
     assert(isset(response))
     if !isset(response) : return
     assert(response.status == 200 && response.body == "")
+}
+
+test "HTTP2 client: a POST the server may have processed is not sent again" {
+    let server = net.tcp_server("127.0.0.1", 0) !!
+    let address = server.local_address() !!
+    let url = "http://127.0.0.1:" + address.port + "/"
+    let running = co h2_raw_drop_second(server)
+    let client = http.Client.new()
+    client.http2 = true
+    let first = client.get(url, http.Options { timeout_ms: 2000 * TIME_SCALE }) !!
+    assert(first.status == 200)
+    let failed = false
+    client.post(url, "body", http.Options { timeout_ms: 2000 * TIME_SCALE }) ! { failed = true }
+    assert(failed)
+    assert(await running == 1)
+    server.close() _
 }

@@ -48,7 +48,10 @@ class H2ClientStream {
     bytes_sent: uint (0)
     done: bool (false)
     fail_kind: u8 (H2_FAIL_NONE)
+    // Failed before response headers because the connection went away
     retryable: bool (false)
+    // The peer did not process the request (REFUSED_STREAM, or past a GOAWAY's last stream)
+    unprocessed: bool (false)
     send_window_waiters: Array[sync.Waker] (.new())
 
     fn wake_window_waiters() {
@@ -58,10 +61,11 @@ class H2ClientStream {
         }
     }
 
-    fn fail(kind: u8, retryable: bool (false)) {
+    fn fail(kind: u8, retryable: bool (false), unprocessed: bool (false)) {
         if this.done : return
         this.fail_kind = kind
         this.retryable = this.retryable || retryable
+        this.unprocessed = unprocessed
         this.done = true
         this.wake_window_waiters()
         this.waker.wake()
@@ -142,12 +146,17 @@ class H2ClientConnection {
         this.con.set_timeouts(H2_CLIENT_READ_SLICE_MS, timeout_ms)
         let view = data
         while view.length > 0 {
+            // Frames cut off halfway leave nothing else to say on this connection
             let n = this.con.write(view) ! {
+                this.close_internal(false)
                 if error_is(E.code, timeout) : throw .timeout
                 if error_is(E.code, closed) || error_is(E.code, cancelled) : throw .closed
                 throw .write
             }
-            if n == 0 || n > view.length : throw .write
+            if n == 0 || n > view.length {
+                this.close_internal(false)
+                throw .write
+            }
             view = view.view(n, view.length - n)
         }
         this.last_activity_ms = time.mono_ms()
@@ -320,7 +329,7 @@ class H2ClientConnection {
                     let st = this.streams.get(sid) !? null
                     if isset(st) {
                         this.streams.remove(sid)
-                        st.fail(err_code == 0 ? H2_FAIL_CLOSED : H2_FAIL_INVALID_RESPONSE, true)
+                        st.fail(err_code == 0 ? H2_FAIL_CLOSED : H2_FAIL_INVALID_RESPONSE, true, true)
                     }
                 }
             }
@@ -334,7 +343,7 @@ class H2ClientConnection {
             if isset(st) {
                 this.streams.remove(frame.stream)
                 // REFUSED_STREAM (7) is always safe to retry
-                st.fail(H2_FAIL_INVALID_RESPONSE, err_code == 7)
+                st.fail(H2_FAIL_INVALID_RESPONSE, err_code == 7, err_code == 7)
             }
             return
         }
@@ -536,8 +545,12 @@ class H2ClientConnection {
         this.con.close() ! core.cleanup_warning("Failed to close HTTP/2 connection", __FILE__, __LINE__)
     }
 
-    fn execute(method: String, target: url.Url, options: ?Options, deadline_ms: uint) ClientResponse !HttpError {
-        if this.closed || this.reader_done || this.goaway || this.next_stream_id > 0x7ffffffd : throw .closed
+    // Sends one request; null when it failed in a way that another connection may retry: the
+    // peer never got or never processed it, or the connection went away and `method` is
+    // idempotent
+    fn execute(method: String, target: url.Url, options: ?Options, deadline_ms: uint) ?ClientResponse !HttpError {
+        if this.closed || this.reader_done || this.goaway || this.next_stream_id > 0x7ffffffd : return null
+        let idempotent = method_is_idempotent(method)
 
         let read_timeout_ms: uint = 5000
         let write_timeout_ms: uint = 5000
@@ -587,6 +600,7 @@ class H2ClientConnection {
         }
         this.write_bytes(head_out.view(), write_timeout) ! {
             this.streams.remove(stream_id)
+            if idempotent && (error_is(E.code, closed) || error_is(E.code, write)) : return null
             throw E
         }
 
@@ -595,6 +609,8 @@ class H2ClientConnection {
             this.send_request_body(st, body, deadline_ms, write_timeout_ms) ! {
                 this.streams.remove(stream_id)
                 this.send_rst_stream(stream_id, 8)
+                if st.unprocessed : return null
+                if idempotent && (error_is(E.code, closed) || error_is(E.code, write)) : return null
                 throw E
             }
         }
@@ -614,7 +630,10 @@ class H2ClientConnection {
             }
         }
 
-        if st.fail_kind != H2_FAIL_NONE : h2_throw_fail(st.fail_kind) !>
+        if st.fail_kind != H2_FAIL_NONE {
+            if st.unprocessed || (st.retryable && idempotent) : return null
+            h2_throw_fail(st.fail_kind) !>
+        }
 
         let resp = ClientResponse {
             status: st.status,
@@ -860,14 +879,10 @@ fn send_h2_once(method: String, raw_url: String, options: ?Options, deadline_ms:
     if isset(client) {
         let pooled = h2_take_pooled(client, key)
         if isset(pooled) {
-            let res = pooled.execute(method, u, options, deadline_ms) ! {
-                h2_remove_pooled(client, key, pooled)
-                if !pooled.closed && !pooled.goaway && !method_is_idempotent(method) : throw E
-                if !method_is_idempotent(method) && !error_is(E.code, closed) : throw E
-                return send_h2_fresh(method, raw_url, u, port, is_https, proxy, options, deadline_ms,
-                    connect_timeout_ms, read_timeout_ms, write_timeout_ms, key, client, pool) !>
-            }
-            return res
+            // A failure that leaves the connection open keeps it in the pool
+            let res = pooled.execute(method, u, options, deadline_ms) !>
+            if isset(res) : return res
+            h2_remove_pooled(client, key, pooled)
         }
     }
 
@@ -893,17 +908,17 @@ fn send_h2_fresh(method: String, raw_url: String, u: url.Url, port: u16, is_http
     let h2c = H2ClientConnection.open(con, key, idle_ms, write_timeout_ms) !>
     if isset(client) {
         h2_store_pooled(client, key, h2c)
-        return h2c.execute(method, u, options, deadline_ms) ! {
-            h2_remove_pooled(client, key, h2c)
-            h2c.close()
-            throw E
-        }
+        let res = h2c.execute(method, u, options, deadline_ms) !>
+        if isset(res) : return res
+        h2_remove_pooled(client, key, h2c)
+        h2c.close()
+        throw .closed
     }
     let res = h2c.execute(method, u, options, deadline_ms) ! {
         h2c.close()
         throw E
     }
     h2c.close()
-    return res
+    return res ?! throw .closed
 }
 
