@@ -1586,6 +1586,54 @@ if ! grep -Eq 'alloca \[8 x i64\], align 64' "$align_ir"; then
     exit 1
 fi
 
+echo "> Eliminate compile-time false branches in const generic specializations"
+cg_src="$workdir/const-generic-branch.valk"
+cg_ir="$workdir/const-generic-branch.ll"
+cat > "$cg_src" << 'EOF'
+fn pretty_helper(x: int) int $noinline {
+    return x * 100
+}
+fn compact_helper(x: int) int $noinline {
+    return x + 1
+}
+fn emit_mode[const PRETTY: bool](x: int) int $noinline {
+    #if PRETTY
+    return pretty_helper(x)
+    #else
+    return compact_helper(x)
+    #end
+}
+fn main() {
+    let a = emit_mode[false](5)
+    let b = emit_mode[true](5)
+    let _ = a + b
+}
+EOF
+if ! out=$("$VALK" build "$cg_src" --release --ir --no-warn -o "$cg_ir" 2>&1); then
+    echo "# Failed to emit IR for const generic fixture"
+    echo "$out"
+    exit 1
+fi
+compact_fn=$(grep -E '^define .*emit_mode__' "$cg_ir" | while read -r line; do
+    sym=$(echo "$line" | sed -E 's/.*@"([^"]+)".*/\1/')
+    body=$(sed -n "/^define .*@\"$sym\"/,/^}/p" "$cg_ir")
+    if echo "$body" | grep -q 'compact_helper' && ! echo "$body" | grep -q 'pretty_helper'; then
+        echo "$sym"
+    fi
+done)
+pretty_fn=$(grep -E '^define .*emit_mode__' "$cg_ir" | while read -r line; do
+    sym=$(echo "$line" | sed -E 's/.*@"([^"]+)".*/\1/')
+    body=$(sed -n "/^define .*@\"$sym\"/,/^}/p" "$cg_ir")
+    if echo "$body" | grep -q 'pretty_helper' && ! echo "$body" | grep -q 'compact_helper'; then
+        echo "$sym"
+    fi
+done)
+if [ -z "$compact_fn" ] || [ -z "$pretty_fn" ]; then
+    echo "# Expected distinct const-generic specializations with dead branches eliminated"
+    grep -n 'emit_mode__\|pretty_helper\|compact_helper' "$cg_ir" || true
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 56"
+echo "# Test count: 57"
 echo ""
