@@ -57,7 +57,9 @@ value REGION_SLAB_CHUNKS (8)
 value REGION_SLAB_SIZE (REGION_CHUNK_MAX * REGION_SLAB_CHUNKS)
 value REGION_SLABS_MAX (64)
 value REGION_BIG_IDX (REGION_CLASSES - 1)
-value REGION_LARGE_SLOTS (4)
+// Low bit of a chunk's stored size marks an over-cap 256 KiB allocation outside the slab pool
+value REGION_CHUNK_DIRECT_BIT (1)
+value REGION_LARGE_SLOTS (2)
 value REGION_LARGE_MAX (8 * 1024 * 1024)
 
 // Spare chunks of each power-of-two size from 4 KiB to 256 KiB, linked by their first word.
@@ -65,8 +67,8 @@ value REGION_LARGE_MAX (8 * 1024 * 1024)
 // taken, or `gc.release_memory` frees them
 global region_pool: [?ptr x 7]
 global region_pool_count: [uint x 7]
-global region_large_ptrs: [?ptr x 4]
-global region_large_sizes: [uint x 4]
+global region_large_ptrs: [?ptr x 2]
+global region_large_sizes: [uint x 2]
 global region_slabs: [ptr x 64]
 global region_slab_count: uint (@undefined)
 global region_pool_used: bool (@undefined)
@@ -339,7 +341,7 @@ fn region_alloc_zeroed(r: *Region, size: uint) ptr {
 }
 
 // A chunk of `size` bytes: a spare one, a slice of a 2 MiB slab, or one from the allocator
-fn region_chunk(size: uint) (ptr, uint) {
+fn region_chunk(size: uint) (ptr, uint, bool) {
     if size <= REGION_CHUNK_MAX {
         let idx = size.trailing_zeros() - REGION_CHUNK_SHIFT
         if idx > 0 : region_pool_used = true
@@ -347,7 +349,7 @@ fn region_chunk(size: uint) (ptr, uint) {
         if isset(spare) {
             @ptrv(region_pool, ?ptr, idx) = @ptrv(spare, ?ptr, 0)
             @ptrv(region_pool_count, uint, idx) -= 1
-            return (spare, size)
+            return (spare, size, false)
         }
         if idx == REGION_BIG_IDX {
             let slabs = region_slab_count
@@ -365,9 +367,9 @@ fn region_chunk(size: uint) (ptr, uint) {
                 }
                 @ptrv(region_pool, ?ptr, REGION_BIG_IDX) = head
                 @ptrv(region_pool_count, uint, REGION_BIG_IDX) = REGION_SLAB_CHUNKS - 1
-                return (slab, REGION_CHUNK_MAX)
+                return (slab, REGION_CHUNK_MAX, false)
             }
-            return (mem.alloc(size), size)
+            return (mem.alloc(size), size, true)
         }
     } else if size <= REGION_LARGE_MAX {
         region_pool_used = true
@@ -379,13 +381,13 @@ fn region_chunk(size: uint) (ptr, uint) {
                 if lsz >= size && lsz <= size * 2 {
                     @ptrv(region_large_ptrs, ?ptr, li) = null
                     @ptrv(region_large_sizes, uint, li) = 0
-                    return (lp, lsz)
+                    return (lp, lsz, false)
                 }
             }
             li++
         }
     }
-    return (mem.alloc(size), size)
+    return (mem.alloc(size), size, false)
 }
 
 fn region_grow(r: *Region, isize: uint) ptr $noinline {
@@ -394,7 +396,7 @@ fn region_grow(r: *Region, isize: uint) ptr $noinline {
     r.hint = 0
     let chunk = r.chunk
     if isset(chunk) {
-        let prev = @ptrv(chunk, uint, 1)
+        let prev = @ptrv(chunk, uint, 1) & (~REGION_CHUNK_DIRECT_BIT).to(uint)
         let twice = prev >= REGION_CHUNK_MAX ? REGION_CHUNK_MAX : prev * 2
         if twice > size : size = twice
     }
@@ -404,10 +406,10 @@ fn region_grow(r: *Region, isize: uint) ptr $noinline {
     if size < need {
         size = need <= REGION_CHUNK_MAX ? (1.to(uint) << (64 - (need - 1).leading_zeros())) : need
     }
-    let new, actual = region_chunk(size)
+    let new, actual, direct = region_chunk(size)
     let limit = new + actual - 8
     @ptrv(new, ?ptr, 0) = chunk
-    @ptrv(new, uint, 1) = actual
+    @ptrv(new, uint, 1) = direct ? (actual | REGION_CHUNK_DIRECT_BIT) : actual
     @ptrv(new, ptr, 2) = r.@cast(ptr)
     @ptrv(limit, ptr) = r.@cast(ptr)
     r.chunk = new
@@ -526,8 +528,15 @@ fn region_free_chunks(r: *Region) uint $noinline {
     let chunk = r.chunk
     while isset(chunk) {
         let older = @ptrv(chunk, ?ptr, 0)
-        let size = @ptrv(chunk, uint, 1)
+        let raw_size = @ptrv(chunk, uint, 1)
+        let direct = (raw_size & REGION_CHUNK_DIRECT_BIT) != 0
+        let size = raw_size & (~REGION_CHUNK_DIRECT_BIT).to(uint)
         total += size
+        if direct {
+            mem.free(chunk)
+            chunk = older
+            continue
+        }
         if size <= REGION_CHUNK_MAX {
             let idx = size.trailing_zeros() - REGION_CHUNK_SHIFT
             if idx == REGION_BIG_IDX {
