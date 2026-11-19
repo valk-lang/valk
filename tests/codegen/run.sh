@@ -1634,6 +1634,51 @@ if [ -z "$compact_fn" ] || [ -z "$pretty_fn" ]; then
     exit 1
 fi
 
+echo "> Borrow elements in each loops without copying large structs"
+eb_src="$workdir/each-borrow.valk"
+eb_ir="$workdir/each-borrow.ll"
+cat > "$eb_src" << 'EOF'
+struct BigItem {
+    a: int (0)
+    pad: [u64 x 16]
+}
+fn sum_array_borrow(arr: Array[BigItem]) int $noinline {
+    let total = 0
+    each arr as &item {
+        total += item.a
+    }
+    return total
+}
+fn sum_slice_borrow(items: local &[BigItem]) int $noinline {
+    let total = 0
+    each items as &item {
+        total += item.a
+    }
+    return total
+}
+fn main() {
+    let arr = Array[BigItem]{ BigItem { a: 1 }, BigItem { a: 2 } }
+    let _ = sum_array_borrow(arr) + sum_slice_borrow(arr)
+}
+EOF
+if ! out=$("$VALK" build "$eb_src" --release --ir --no-warn -o "$eb_ir" 2>&1); then
+    echo "# Failed to emit IR for each-borrow fixture"
+    echo "$out"
+    exit 1
+fi
+for fn_name in sum_array_borrow sum_slice_borrow; do
+    body=$(sed -n "/^define .*__${fn_name}__/,/^}/p" "$eb_ir")
+    if [ -z "$body" ]; then
+        echo "# Missing $fn_name in IR"
+        exit 1
+    fi
+    if echo "$body" | grep -Eq 'alloca \[17 x i64\]|llvm\.memcpy'; then
+        echo "# Expected zero-copy element borrow in $fn_name, found struct copy"
+        echo "$body"
+        exit 1
+    fi
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 57"
+echo "# Test count: 58"
 echo ""
