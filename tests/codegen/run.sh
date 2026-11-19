@@ -777,7 +777,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     if [[ "$direct" != *'__CloneCell__clone__'* ]] || [[ "$present" != *'__CloneCell__clone__'* ]] \
         || [[ "$before_guard$absent" == *'__CloneCell__clone__'* ]] \
         || [[ "$before_guard" != *'icmp ne ptr'* ]] \
-        || [[ "$payload" != *'getelementptr { i1, [7 x i8], [1 x i64] }'* ]] \
+        || [[ "$payload" != *'getelementptr inbounds { i1, [7 x i8], [1 x i64] }'* ]] \
         || [[ "$direct$nullable$payload$hooks" == *'__Pool__get__'* ]]; then
         echo "# Borrowed clone hooks must run only for present values without heap allocation on $target"
         echo "$direct$nullable$payload$hooks"
@@ -1210,7 +1210,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
             echo "$body"
             exit 1
         fi
-        if [ "$name" = read_row ] && [[ "$body" != *'getelementptr [2 x i64]'* ]]; then
+        if [ "$name" = read_row ] && [[ "$body" != *'getelementptr inbounds [2 x i64]'* ]]; then
             echo "# Matrix access lost its row stride on $target"
             echo "$body"
             exit 1
@@ -1378,6 +1378,15 @@ if [[ -z "$copy_body" || "$copy_body" == *'br i1 false, label %rg.object'* ]] \
     exit 1
 fi
 
+echo "> Emit nounwind on Valk functions, cold noreturn on panic, and inbounds on bounds-checked GEPs"
+if ! grep -q '^define .*__panic__.* nounwind cold noreturn' "$region_ir" \
+    || ! grep -q '^define .*__in_region__.* nounwind ' "$region_ir" \
+    || ! grep -q 'getelementptr inbounds ' "$alias_ir"; then
+    echo "# Missing nounwind, cold noreturn on panic, or inbounds GEP"
+    grep '^define .*__panic__' "$region_ir"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 52"
+echo "# Test count: 53"
 echo ""
