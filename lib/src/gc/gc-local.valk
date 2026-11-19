@@ -79,6 +79,8 @@ struct Gc {
     transfer_from: uint (0)     // Blocks of the running transfer_refs()
     transfer_to: uint (0)
     shared_items: *Bump (Bump.new())
+    shared_roots: *Bump (Bump.new())
+    shared_roots_limit: uint (65536)
     shared_pending: uint (0)    // Bytes published but not added to mem_shared yet
     // Items of `shared_items` before this byte offset wait for the sweep of the last shared
     // collection, which this thread runs itself (see sweep_shared)
@@ -86,6 +88,12 @@ struct Gc {
     sweep_pending: bool (false)
     // Waiting in shared_safepoint: it sweeps for itself once it runs again
     at_safepoint: bool (false)
+    // Shared collection generation this thread entered shared_safepoint for
+    safepoint_gen: uint (0)
+    // 1 while assigned to run its own STW pre-mark local collection
+    pcollect_ready: u8 (0)
+    // Deferred gc_free + block settling when CollectKind.shared had dead objects with onfree
+    blanks_pending: bool (false)
     // Unmarked items in other threads' blocks: freed by the next shared collection, while
     // those threads are stopped
     foreign_dead: *Bump (Bump.new())
@@ -96,6 +104,8 @@ struct Gc {
     stress_count: uint (0)      // Allocations since the last forced collection (GC_STRESS)
     mark_list: *Lifo (Lifo.new())
     props_removed: *Lifo (Lifo.new())
+    log_entries: uint (0)
+    log_limit: uint (131072)
     // Blocks allocated into or freed from since the last collection
     touched_blocks: *Bump (Bump.new())
     local_ranges: *BlockRegistry (BlockRegistry.new())
@@ -109,8 +119,10 @@ struct Gc {
     scan_min: ptr (null_ptr())
     scan_max: ptr (null_ptr())
     scan_hint: uint (0) // Last block-registry hit while scanning stacks
-    // Recent registry hits by address bits, as index + 1; cleared for each scan
+    // Recent registry hits by address bits, as index + 1; invalidated when registry version changes
     scan_cache: [uint x SCAN_CACHE_SIZE] ({ 0... })
+    scan_cache_reg: ?*BlockRegistry (null)
+    scan_cache_ver: uint (0)
 
     // Refs
     #if OS == "win"
@@ -123,6 +135,7 @@ struct Gc {
     region_first: ptr (@ref(region_first))
 
     coros_ptr: *Array[?coro.Coro] (@ref(coro.g_coros))
+    coro_count_ptr: ptr (@ref(coro.g_coro_count))
     alc_list_ptr: **Bump (@ref(alc_list))
     //
     mark_shared: bool (false)
@@ -132,6 +145,9 @@ struct Gc {
     free_epoch: uint (0) // The shared_free_epoch this thread's blocks were settled for
     // Counts
     dis_own_count: uint (0)
+    leaf_dis_owned: uint (0)
+    leaf_unmarked: uint (0)
+    share_leaf_added: uint (0)
     // Marking and dis-owning use the prefetch window when the last dis-own ran at
     // cache-miss speed; a heap that fits the cache is faster without it (see mark_used)
     mark_window_on: bool (false)
@@ -158,6 +174,8 @@ struct Gc {
     ~+ mem_new: uint (0)
     /// Bytes of pool blocks this thread's allocators hold, including free slots.
     ~+ mem_usage_thread: uint (0)
+    // Batched delta not yet flushed to `mem_usage_shared`
+    mem_usage_pending: int (0)
     /// Allocates a new collector with empty lists; it stays disabled until the thread enables it.
     + static fn init() *Gc {
         let value = mem.new[Gc]()
@@ -231,7 +249,7 @@ struct Gc {
         if this.sweep_pending : this.sweep_shared()
 
         let pause_start = time.mono_us()
-        this.mem_new += flush_pool_accounting(this.alc_list_ptr[0])
+        this.mem_new += prepare_pools_for_collect(this.alc_list_ptr[0])
         let marked_before = this.mem_marked
         let allocated = this.mem_new > marked_before ? this.mem_new - marked_before : 0
         this.unmarked_run = 0
@@ -243,8 +261,22 @@ struct Gc {
         this.loop_previous_stack_items()
         this.loop_props_removed()
 
-        // Mark stack items
-        if !this.did_shutdown : this.loop_stack_items(Gc.mark_stack_item)
+        // Mark stack items directly (avoid indirect fnptr per root)
+        if !this.did_shutdown {
+            let slist = this.stack_items
+            let sadr = slist.data
+            let send = sadr + slist.index
+            while sadr < send {
+                let sitem = @ptrv(sadr, GcItem)
+                sadr = sadr.$offset(size_of(ptr))
+                let sdata: *GcData = sitem.$offset(-8)
+                if sdata.is_shared() : continue
+                if sdata.is_not_owned() {
+                    mark_used(sitem)
+                    this.prev_stack_items.add_ptr(sitem)
+                }
+            }
+        }
 
         //
         let dis_own_start = time.mono_us()
@@ -264,26 +296,33 @@ struct Gc {
         this.loop_orphans()
         if !this.did_shutdown : this.loop_re_own()
 
-        this.check_blanks()
+        let defer_blanks = kind == CollectKind.shared && this.blanks.index > 0
+        if !defer_blanks {
+            this.check_blanks()
 
-        // A shared collection freed items of ours: every block gets settled
-        if this.free_epoch != shared_free_epoch {
-            this.free_epoch = shared_free_epoch
-            touch_all_blocks(this.alc_list_ptr[0])
+            // A shared collection freed items of ours: every block gets settled
+            if this.free_epoch != shared_free_epoch {
+                this.free_epoch = shared_free_epoch
+                touch_all_blocks(this.alc_list_ptr[0])
+            }
+            // The scan is done and settle_blocks closes every touched block's window (including current blocks)
+            this.clear_window_freed()
+            settle_blocks(this.touched_blocks, this.alc_list_ptr[0])
+            this.flush_mem_usage()
+
+            // Leak check
+            if verify && !this.did_shutdown : this.leak_check()
+        } else {
+            this.blanks_pending = true
         }
-        // The scan is done and the settle closes the windows
-        this.clear_window_freed()
-        close_current_alloc_windows(this.alc_list_ptr[0])
-        settle_blocks(this.touched_blocks, this.alc_list_ptr[0])
-
-        // Leak check
-        if verify && !this.did_shutdown : this.leak_check()
 
         // Clear stack items list
         if kind != CollectKind.shared : this.clear_stack_items()
 
         // Reset mem_new
         this.mem_new = this.mem_marked
+        this.log_entries = 0
+        this.log_limit = this.mem_marked / 128 > 131072 ? this.mem_marked / 128 : 131072
         if this.mem_marked > this.marked_max_next : this.marked_max_next = this.mem_marked
         if this.mem_marked > this.marked_max : this.marked_max = this.mem_marked
         let time = time.mono_us()
@@ -338,6 +377,13 @@ struct Gc {
 
         // Stay closed until the last allocating call is done
         if kind == CollectKind.local {
+            if this.shared_roots.index >= this.shared_roots_limit {
+                compact_shared_roots_local(this.shared_roots)
+                let next = this.shared_roots.index * 2
+                this.shared_roots_limit = next > 65536 ? next : 65536
+                this.shared_roots.shrink(1024 * 1024)
+            }
+            this.shrink_scratch_lists(1024 * 1024)
             region_spares_age()
             pause_last_us = time.mono_us() - pause_start
             if pause_last_us > pause_max_us : pause_max_us = pause_last_us
@@ -345,6 +391,25 @@ struct Gc {
 
         this.scanning_shared = false
         this.state = kind == CollectKind.shutdown ? GcState.stopping : GcState.idle
+    }
+
+    // Runs deferred onfree callbacks + block settling single-threaded after end_shared_ranges()
+    // so allocating gc_free hooks cannot mutate shared_block_ranges during parallel scans
+    fn finish_deferred_blanks() {
+        if !this.blanks_pending : return
+        this.blanks_pending = false
+        let prev_state = this.state
+        this.state = GcState.collecting
+        this.check_blanks()
+        if this.free_epoch != shared_free_epoch {
+            this.free_epoch = shared_free_epoch
+            touch_all_blocks(this.alc_list_ptr[0])
+        }
+        this.clear_window_freed()
+        settle_blocks(this.touched_blocks, this.alc_list_ptr[0])
+        this.flush_mem_usage()
+        if verify && !this.did_shutdown : this.leak_check()
+        this.state = prev_state
     }
 
     fn clear_window_freed() {
@@ -384,7 +449,12 @@ struct Gc {
                 if item == null : panic("GC error: removed 'owned' property is not a tagged pointer; its memory was reused")
                 #end
                 let data = gcdata(item)
-                data.set_no_owner()
+                if data.is_shared() {
+                    atomic(data.flags | flag_no_owner)
+                    atomic(data.flags & (255 - flag_owned))
+                } else {
+                    data.set_no_owner()
+                }
                 gc.dis_owned_list.add_ptr(item)
             } else {
                 #if GC_DEBUG
@@ -419,7 +489,8 @@ struct Gc {
 
             // A stack item can become shared
             if data.is_shared() {
-                data.set_no_owner()
+                atomic(data.flags | flag_no_owner)
+                atomic(data.flags & (255 - flag_owned))
                 continue
             }
 
@@ -667,12 +738,9 @@ struct Gc {
         }
         adr = data
         while adr < unique {
-            gcdata(@ptrv(adr, GcItem)).remove_in_updates()
-            adr = adr.$offset(size_of(ptr))
-        }
-        adr = data
-        while adr < unique {
-            free_blank(@ptrv(adr, GcItem))
+            let item = @ptrv(adr, GcItem)
+            gcdata(item).remove_in_updates()
+            free_blank(item)
             adr = adr.$offset(size_of(ptr))
         }
     }
@@ -719,15 +787,18 @@ struct Gc {
         }
         #end
         let data = gcdata(item)
-        // Another thread may be sweeping it
-        if data.is_shared() && !this.scanning_shared : return
+        if data.is_shared() {
+            // Another thread may be sweeping it during a local collection
+            if !this.scanning_shared : return
+            let old = atomic(data.flags | flag_on_stack)
+            if (old & flag_on_stack) != 0 : return
+            atomic(data.co_count + 1)
+            this.stack_items.add_ptr(item)
+            return
+        }
         if data.is_on_stack() : return
         data.set_on_stack()
-        if data.is_shared() {
-            atomic(data.co_count + 1)
-        } else {
-            data.co_count = data.co_count + 1
-        }
+        data.co_count = data.co_count + 1
         this.stack_items.add_ptr(item)
     }
     fn collect_stack_items() {
@@ -767,11 +838,14 @@ struct Gc {
     // Every native stack of the thread: the running one from sp, the main
     // stack while a coroutine runs, and each suspended coroutine
     fn scan_stacks(sp: ptr) {
-        mark_alloc_limits(this.alc_list_ptr[0])
         let reg = this.scanning_shared ? shared_block_ranges : this.local_ranges
         this.scan_ranges = reg
-        mem.clear_bytes(@ref(this.scan_cache[0]).@cast(ptr), size_of(uint) * SCAN_CACHE_SIZE)
         reg.sort()
+        if this.scan_cache_reg != reg || this.scan_cache_ver != reg.version {
+            mem.clear_bytes(@ref(this.scan_cache[0]).@cast(ptr), size_of(uint) * SCAN_CACHE_SIZE)
+            this.scan_cache_reg = reg
+            this.scan_cache_ver = reg.version
+        }
         let count = reg.count()
         if count > 0 {
             let base = reg.ranges.data
@@ -785,20 +859,22 @@ struct Gc {
             } else {
                 this.scan_words(sp, this.stack_top)
             }
-            let coros = this.coros_ptr[0]
-            each coros as coro_item {
-                if !isset(coro_item) : continue
-                if coro_item.started && !coro_item.active && !coro_item.done {
-                    if this.scanning_shared : this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
-                    else if coro_item.gc_roots_kept : this.add_kept_roots(coro_item)
-                    else : this.scan_coro_words(coro_item)
+            if @ptrv(this.coro_count_ptr, uint) > 0 {
+                let coros = this.coros_ptr[0]
+                let need_kept: u8 = this.scanning_shared ? 2 : 1
+                each coros as coro_item {
+                    if !isset(coro_item) : continue
+                    if coro_item.started && !coro_item.active && !coro_item.done {
+                        if coro_item.gc_roots_kept >= need_kept : this.add_kept_roots(coro_item)
+                        else : this.scan_coro_words(coro_item)
+                    }
                 }
             }
             this.scan_regions()
         }
     }
 
-    // A suspended stack's words, keeping the roots found for the next local collection: until
+    // A suspended stack's words, keeping the roots found for subsequent collections: until
     // the coroutine runs, nothing writes to its stack
     fn scan_coro_words(c: coro.Coro) {
         let min = this.scan_min
@@ -824,7 +900,7 @@ struct Gc {
             count++
         }
         c.gc_root_count = count
-        c.gc_roots_kept = kept
+        c.gc_roots_kept = kept ? (this.scanning_shared ? 2 : 1) : 0
     }
 
     fn add_kept_roots(c: coro.Coro) {
@@ -852,7 +928,13 @@ struct Gc {
             if last : end = top
             while record < end {
                 let r = record.@cast(*Region)
-                this.scan_words(@ref(r.pin[0]).@cast(ptr), record + REGION_HEAD)
+                let pin_start = @ref(r.pin[0]).@cast(ptr)
+                this.scan_words(pin_start, pin_start + REGION_PINS * size_of(ptr))
+                let pins = r.pins
+                if isset(pins) {
+                    let b = pins.@cast(*Bump)
+                    if b.index > 0 : this.scan_words(b.data, b.data + b.index)
+                }
                 record += REGION_RECORD
             }
             if last : break
@@ -887,7 +969,7 @@ struct Gc {
             let cached: *BlockRange = base + hint * size_of(BlockRange)
             if word >= cached.start && word < cached.end : return cached
         }
-        let slot = (word.@cast(uint) >> 16) & (SCAN_CACHE_SIZE - 1)
+        let slot = ((word.@cast(uint) >> 12) ^ (word.@cast(uint) >> 18)) & (SCAN_CACHE_SIZE - 1)
         let known = this.scan_cache[slot]
         if known > 0 && known <= count {
             let cached: *BlockRange = base + (known - 1) * size_of(BlockRange)
@@ -910,7 +992,8 @@ struct Gc {
         if word < data : return null
         let isize = @ptrv(block, uint, b_isize)
         let rel: uint = word - data
-        let slot: ptr = data + ((rel * range.inv_isize) >> 48) * isize
+        let inv = range.inv_isize
+        let slot: ptr = data + ((rel * (inv & BLOCK_RANGE_INV_MASK)) >> 48) * isize
         let gcd: *GcData = slot
         let item: ptr = slot + 8
         // A sequence's first word is its length, so no reference points into it: a word
@@ -919,8 +1002,7 @@ struct Gc {
         // element it ever held
         let tag = word - item
         if tag > 0 && tag < 8 && tag & prop_mask == tag {
-            let layout = @ptrv(block, ?ptr, b_layout)
-            if isset(layout) && @ptrv(layout, uint, layout_kind) == 1 : return null
+            if (inv & BLOCK_RANGE_SEQ_BIT) != 0 : return null
         }
         if gcd.is_shared() : return this.scanning_shared ? item : null
         if range.gc != this.@cast(?*Gc) : return null
@@ -952,6 +1034,8 @@ struct Gc {
         let read = data
         let end = data + this.sweep_end
         let write = data
+        let dead_block: ?*BlockMini = null
+        let dead_count: uint = 0
 
         while read < end {
             let item = @ptrv(read, GcItem)
@@ -963,15 +1047,26 @@ struct Gc {
                 continue
             }
             // A thread may share an item another thread allocated, such as a thread's result
-            let block = shared_item_block(item_data)
+            let block_mini = item_data.block()
+            let block = block_mini.@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET)
             if @ptrv(block, ?ptr, b_owner) != this.@cast(ptr) {
                 this.foreign_dead.add_ptr(item)
                 continue
             }
-            touch_block(block)
-            free_shared_item(item)
+            if block_mini != dead_block {
+                flush_dead_block(dead_block, dead_count)
+                dead_block = block_mini
+                dead_count = 0
+            }
+            dead_count++
+            item_data.set_new()
+            item_data.co_count = 0
+            item_data.flags = 0
+            let onfree = block_mini.onfree
+            if isset(onfree) : onfree(item)
             note_window_free(item_data, block)
         }
+        flush_dead_block(dead_block, dead_count)
 
         let tail = list.index - this.sweep_end
         mem.move_bytes(end, write, tail)
@@ -999,7 +1094,9 @@ struct Gc {
         // belong to no one.
         dump_shared(this.shared_items)
         dump_shared(this.foreign_dead)
+        dump_shared_roots(this.shared_roots)
         this.flush_shared_pending()
+        this.flush_mem_usage()
 
         // Free blocks or store them in unused-block-list if they still contain items
         loop_all_blocks(fn(block: *Block) {
@@ -1015,6 +1112,38 @@ struct Gc {
                 add_unused_block(block)
             }
         })
+    }
+
+    fn flush_mem_usage() {
+        let delta = this.mem_usage_pending
+        if delta == 0 : return
+        this.mem_usage_pending = 0
+        if delta > 0 {
+            let add = delta.to(uint)
+            let before = atomic(mem_usage_shared + add)
+            let usage = before + add
+            if usage > mem_usage_peak {
+                while atomic(mem_usage_peak_lock | 1) != 0 {}
+                if usage > mem_usage_peak : mem_usage_peak = usage
+                atomic_store(mem_usage_peak_lock, 0)
+            }
+        } else {
+            atomic(mem_usage_shared - (-delta).to(uint))
+        }
+    }
+
+    fn shrink_scratch_lists(max_bytes: uint) {
+        let max_items = max_bytes / size_of(ptr)
+        this.mark_list.shrink(max_items)
+        this.props_removed.shrink(max_items)
+        this.dis_owned_list.shrink(max_bytes)
+        this.updated_list.shrink(max_bytes)
+        this.updated_slots.shrink(max_bytes)
+        this.blanks.shrink(max_bytes)
+        this.trial_list.shrink(max_bytes)
+        this.re_own_list.shrink(max_bytes)
+        this.touched_blocks.shrink(max_bytes)
+        this.stack_items.shrink(max_bytes)
     }
 
     fn flush_shared_pending() {
@@ -1043,6 +1172,7 @@ struct Gc {
         this.trial_list.free()
         this.adopted.free()
         this.shared_items.free()
+        this.shared_roots.free()
         this.mark_list.free()
         this.props_removed.free()
         mem.free(this.blocked_regs)
@@ -1055,5 +1185,17 @@ global kept_root_stacks: uint (0)
 /// Test hook, only in `TEST` builds: how many suspended stacks collections took from kept roots.
 + fn kept_root_stacks_for_test() uint {
     return kept_root_stacks
+}
+/// Test hook, only in `TEST` builds: current top pointer of the calling thread's region stack.
++ fn region_top_for_test() uint {
+    return region_top
+}
+/// Test hook, only in `TEST` builds: bytes currently stored in the calling thread's `shared_roots`.
++ fn shared_roots_bytes_for_test() uint {
+    return gc.shared_roots.index
+}
+/// Test hook, only in `TEST` builds: unflushed pool byte delta on the calling thread.
++ fn mem_usage_pending_for_test() int {
+    return gc.mem_usage_pending
 }
 #end

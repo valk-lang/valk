@@ -19,6 +19,7 @@ shared pmark_idle: uint (0)
 shared pmark_live: uint (0)
 // This thread's stack while it marks
 global pmark_local_list: ?*Lifo (null)
+global pmark_local_live: uint (0)
 
 // Root lists cut into units the marking threads claim: (first entry, entry count, kind)
 @shared pmark_units: *Bump (@undefined)
@@ -41,7 +42,10 @@ fn pmark_yield() {
 }
 
 fn pmark_lock() {
-    while (atomic(pmark_spin | 1) & 1) != 0 {}
+    while true {
+        if atomic_load(pmark_spin) == 0 && (atomic(pmark_spin | 1) & 1) == 0 : return
+        $pause()
+    }
 }
 
 fn pmark_unlock() {
@@ -69,18 +73,44 @@ fn pmark_claim(item: ptr) bool $inline {
     return true
 }
 
+fn pmark_claim_single(item: ptr) bool $inline {
+    let data = gcdata(item)
+    let now = shmark_now
+    let flags = data.flags
+    if (flags & now) != 0 : return false
+    let last = flag_shmark + flag_leak - now
+    data.flags = (flags & (255 - last)) | now
+    return true
+}
+
 // Run by the collecting thread with every gc locked: marks from the roots of `gcs`
-fn pmark_run(gcs: Array[*Gc]) uint {
+fn pmark_run(gcs: Array[*Gc], stop_gen: uint) uint {
     // Helpers of the last round may still be leaving
-    while pmark_workers > 0 : pmark_yield()
+    let wait_spins: uint = 0
+    while pmark_workers > 0 {
+        if wait_spins < 64 {
+            $pause()
+            wait_spins++
+        } else {
+            pmark_yield()
+        }
+    }
+    let has_helpers = false
+    each gcs as gcx {
+        if gcx.safepoint_gen == stop_gen {
+            has_helpers = true
+            break
+        }
+    }
+    if !has_helpers : return pmark_run_single(gcs)
+
     let units = pmark_units
     units.reset()
     each gcs as gcx {
         pmark_add_units(gcx.stack_items, pmark_unit_stack)
-        pmark_add_units(gcx.shared_items, pmark_unit_list)
+        pmark_add_units(gcx.shared_roots, pmark_unit_list)
     }
-    // Items of threads that ended: those a live thread owns or co-owns are roots too
-    pmark_add_units(shared_dump, pmark_unit_list)
+    pmark_add_units(shared_dump_roots, pmark_unit_list)
     pmark_unit_count = units.index / (size_of(ptr) * 3)
     atomic_store(pmark_unit_next, 0)
     atomic_store(pmark_live, 0)
@@ -92,6 +122,200 @@ fn pmark_run(gcs: Array[*Gc]) uint {
     let live = pmark_live
     return live
 }
+
+fn pmark_drain_ref_single(ref: ptr, list: *Lifo) $hot $inline {
+    @unsafe
+    let sub = @ptrv(ref, ?ptr)
+    if !isset(sub) : return
+    let sub_item: ptr = sub & (~prop_mask).to(uint)
+    #if GC_DEBUG
+    if !gcdata(sub_item).is_shared() : panic("GC error: shared data refers to an object that is not shared")
+    #end
+    if pmark_claim_single(sub_item) {
+        let sub_data = gcdata(sub_item)
+        if sub_data.offset == 0 : return
+        let sub_block = sub_data.block()
+        if !isset(sub_block.layout) {
+            pmark_local_live += sub_block.isize
+            return
+        }
+        list.add_unchecked(sub_item)
+    }
+}
+
+fn pmark_push_roots_single(list: *Bump, from_stack: bool, local: *Lifo) {
+    let adr = list.data
+    let end = adr + list.index
+    while adr < end {
+        let item = @ptrv(adr, ptr)
+        adr = adr + size_of(ptr)
+        let data = gcdata(item)
+        if from_stack {
+            if !data.is_shared() : continue
+        } else if !data.is_shared() || data.is_marked() || (!data.is_owned() && data.co_count == 0) {
+            continue
+        }
+        if pmark_claim_single(item) {
+            if data.offset == 0 : continue
+            let block = data.block()
+            if !isset(block.layout) {
+                pmark_local_live += block.isize
+                continue
+            }
+            local.add(item)
+        }
+    }
+}
+
+// Single-threaded shared mark when no helper thread is waiting at a safepoint: zero atomics
+fn pmark_run_single(gcs: Array[*Gc]) uint $hot {
+    let local = pmark_local()
+    pmark_local_live = 0
+    each gcs as gcx {
+        pmark_push_roots_single(gcx.stack_items, true, local)
+        pmark_push_roots_single(gcx.shared_roots, false, local)
+    }
+    pmark_push_roots_single(shared_dump_roots, false, local)
+
+    let live: uint = 0
+    let prefetch_on = mem_shared >= 16 * 1024 * 1024
+    while local.index > 0 {
+        if prefetch_on && local.index >= 4 {
+            $prefetch((@ptrv(local.data, ptr, local.index - 4) - 8).@cast(ptr))
+        }
+        let item: GcItem = local.pop_unchecked()
+        let data = gcdata(item)
+        let block = data.block()
+        live += block.isize
+        let layout = block.layout
+        if isset(layout) {
+            local.reserve(block.isize / size_of(ptr))
+            each_ref(item, layout, local, pmark_drain_ref_single)
+        }
+    }
+    let total = live + pmark_local_live
+    pmark_local_live = 0
+    return total
+}
+
+// Drops entries no longer held by local objects and deduplicates; runs under STW after stack clear
+fn compact_shared_roots(list: *Bump) {
+    let base = list.data
+    let end = base + list.index
+    let write = base
+    let adr = base
+    while adr < end {
+        let item = @ptrv(adr, ptr)
+        adr = adr + size_of(ptr)
+        let data = gcdata(item)
+        if !data.is_shared() || (!data.is_owned() && data.co_count == 0) : continue
+        if data.is_in_updates() : continue
+        data.set_in_updates()
+        @ptrv(write, ptr) = item
+        write = write + size_of(ptr)
+    }
+    adr = base
+    while adr < write {
+        gcdata(@ptrv(adr, ptr)).remove_in_updates()
+        adr = adr + size_of(ptr)
+    }
+    list.index = write - base
+}
+
+fn sort_ptrs_rec(base: ptr, lo: uint, hi: uint) {
+    while hi - lo > 16 {
+        let pivot = @ptrv(base, ptr, (lo + hi) / 2)
+        let i = lo
+        let j = hi - 1
+        while true {
+            while @ptrv(base, ptr, i) < pivot : i++
+            while @ptrv(base, ptr, j) > pivot : j--
+            if i >= j : break
+            let tmp = @ptrv(base, ptr, i)
+            @ptrv(base, ptr, i) = @ptrv(base, ptr, j)
+            @ptrv(base, ptr, j) = tmp
+            i++
+            j--
+        }
+        let split = j + 1
+        if split - lo < hi - split {
+            sort_ptrs_rec(base, lo, split)
+            lo = split
+        } else {
+            sort_ptrs_rec(base, split, hi)
+            hi = split
+        }
+    }
+    let i = lo + 1
+    while i < hi {
+        let cur = @ptrv(base, ptr, i)
+        let j = i
+        while j > lo && @ptrv(base, ptr, j - 1) > cur {
+            @ptrv(base, ptr, j) = @ptrv(base, ptr, j - 1)
+            j--
+        }
+        @ptrv(base, ptr, j) = cur
+        i++
+    }
+}
+
+// Thread-local compaction of `shared_roots` outside STW: drops released entries using
+// atomic reads and deduplicates by sorting without writing any shared header flags
+fn compact_shared_roots_local(list: *Bump) {
+    let base = list.data
+    let end = base + list.index
+    let write = base
+    let adr = base
+    while adr < end {
+        let item = @ptrv(adr, ptr)
+        adr = adr + size_of(ptr)
+        let data = gcdata(item)
+        let flags = atomic_load(data.flags)
+        if (flags & flag_shared) == 0 : continue
+        if (flags & flag_owned) == 0 && atomic_load(data.co_count) == 0 : continue
+        @ptrv(write, ptr) = item
+        write = write + size_of(ptr)
+    }
+    let count = (write - base) / size_of(ptr)
+    if count <= 1 {
+        list.index = count * size_of(ptr)
+        return
+    }
+    sort_ptrs_rec(base, 0, count)
+    let kept: uint = 1
+    let prev = @ptrv(base, ptr, 0)
+    let i: uint = 1
+    while i < count {
+        let cur = @ptrv(base, ptr, i)
+        if cur != prev {
+            @ptrv(base, ptr, kept) = cur
+            prev = cur
+            kept++
+        }
+        i++
+    }
+    list.index = kept * size_of(ptr)
+}
+
+#if GC_DEBUG
+fn verify_shared_roots(gcs: Array[*Gc]) {
+    each gcs as gcx : verify_shared_list(gcx.shared_items)
+    verify_shared_list(shared_dump)
+}
+
+fn verify_shared_list(list: *Bump) {
+    let adr = list.data
+    let end = adr + list.index
+    while adr < end {
+        let item = @ptrv(adr, ptr)
+        adr = adr + size_of(ptr)
+        let data = gcdata(item)
+        if !data.is_marked() && (data.is_owned() || data.co_count > 0) {
+            panic("GC error: shared item held by local object was missed by shared_roots")
+        }
+    }
+}
+#end
 
 fn pmark_add_units(list: *Bump, kind: uint) {
     let count = list.index / size_of(ptr)
@@ -123,10 +347,18 @@ fn pmark_scan_unit(local: *Lifo) bool {
         let data = gcdata(item)
         if from_stack {
             if !data.is_shared() : continue
-        } else if data.is_marked() || (!data.is_owned() && data.co_count == 0) {
+        } else if !data.is_shared() || data.is_marked() || (!data.is_owned() && data.co_count == 0) {
             continue
         }
-        if pmark_claim(item) : local.add(item)
+        if pmark_claim(item) {
+            if data.offset == 0 : continue
+            let block = data.block()
+            if !isset(block.layout) {
+                pmark_local_live += block.isize
+                continue
+            }
+            local.add(item)
+        }
     }
     return true
 }
@@ -152,11 +384,21 @@ fn pmark_drain_ref(ref: ptr, list: *Lifo) $hot $inline {
     // What the compiler proved about publication: shared data reaches only shared data
     if !gcdata(sub_item).is_shared() : panic("GC error: shared data refers to an object that is not shared")
     #end
-    if pmark_claim(sub_item) : list.add(sub_item)
+        if pmark_claim(sub_item) {
+            let sub_data = gcdata(sub_item)
+            if sub_data.offset == 0 : return
+            let sub_block = sub_data.block()
+            if !isset(sub_block.layout) {
+                pmark_local_live += sub_block.isize
+                return
+            }
+            list.add_unchecked(sub_item)
+        }
 }
 
 fn pmark_drain(local: *Lifo) $hot {
     let live: uint = 0
+    pmark_local_live = 0
     let prefetch_on = mem_shared >= 16 * 1024 * 1024
     while true {
         while local.index > 0 {
@@ -170,6 +412,7 @@ fn pmark_drain(local: *Lifo) $hot {
             live += block.isize
             let layout = block.layout
             if isset(layout) {
+                local.reserve(block.isize / size_of(ptr))
                 each_ref(item, layout, local, pmark_drain_ref)
             }
             // Threads wait for work: hand over half
@@ -186,9 +429,14 @@ fn pmark_drain(local: *Lifo) $hot {
         if pmark_take(local) : continue
 
         // Nothing here and nothing queued: done once every thread waits
-        atomic(pmark_live + live)
-        live = 0
+        let total = live + pmark_local_live
+        if total > 0 {
+            atomic(pmark_live + total)
+            live = 0
+            pmark_local_live = 0
+        }
         atomic(pmark_idle + 1)
+        let spins: uint = 0
         while true {
             if pmark_active == 0 {
                 atomic(pmark_workers - 1)
@@ -205,7 +453,12 @@ fn pmark_drain(local: *Lifo) $hot {
                 }
                 pmark_unlock()
             }
-            pmark_yield()
+            if spins < 64 {
+                $pause()
+                spins++
+            } else {
+                pmark_yield()
+            }
         }
     }
 }

@@ -335,6 +335,30 @@ if [[ "$atomic_body" != *"load atomic i8"*"align 1"* ]] \
     echo "$atomic_body"
     exit 1
 fi
+readonly_body=$(sed -n '/^define .*__atomic_readonly_load__/,/^}/p' "$atomic_ir")
+if [[ -z "$readonly_body" || "$readonly_body" == *"load atomic"* ]]; then
+    echo "# Read-only field on non-threadsafe atomic view should use plain load"
+    echo "$readonly_body"
+    exit 1
+fi
+locked_body=$(sed -n '/^define .*__locked_plain_store__/,/^}/p' "$atomic_ir")
+if [[ -z "$locked_body" || "$locked_body" == *"atomicrmw"* || "$locked_body" == *"store atomic"* ]]; then
+    echo "# Locked view integer stores should not emit atomic operations"
+    echo "$locked_body"
+    exit 1
+fi
+elide_body=$(sed -n '/^define .*__publish_elide_dead__/,/^}/p' "$atomic_ir")
+if [[ -z "$elide_body" || "$elide_body" == *"__clone__"* ]]; then
+    echo "# Publishing a dead fresh local should elide the clone call"
+    echo "$elide_body"
+    exit 1
+fi
+keep_body=$(sed -n '/^define .*__publish_keep_live__/,/^}/p' "$atomic_ir")
+if [[ -z "$keep_body" || "$keep_body" != *"__clone__"* ]]; then
+    echo "# Publishing a local used afterwards must still clone it"
+    echo "$keep_body"
+    exit 1
+fi
 
 echo "> Vector types lower to LLVM vectors with element alignment"
 
@@ -753,7 +777,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
     if [[ "$direct" != *'__CloneCell__clone__'* ]] || [[ "$present" != *'__CloneCell__clone__'* ]] \
         || [[ "$before_guard$absent" == *'__CloneCell__clone__'* ]] \
         || [[ "$before_guard" != *'icmp ne ptr'* ]] \
-        || [[ "$payload" != *'getelementptr { i1, [7 x i8], [1 x i64] }'* ]] \
+        || [[ "$payload" != *'getelementptr inbounds { i1, [7 x i8], [1 x i64] }'* ]] \
         || [[ "$direct$nullable$payload$hooks" == *'__Pool__get__'* ]]; then
         echo "# Borrowed clone hooks must run only for present values without heap allocation on $target"
         echo "$direct$nullable$payload$hooks"
@@ -1186,7 +1210,7 @@ for target in linux-x64 macos-x64 macos-arm64 win-x64; do
             echo "$body"
             exit 1
         fi
-        if [ "$name" = read_row ] && [[ "$body" != *'getelementptr [2 x i64]'* ]]; then
+        if [ "$name" = read_row ] && [[ "$body" != *'getelementptr inbounds [2 x i64]'* ]]; then
             echo "# Matrix access lost its row stride on $target"
             echo "$body"
             exit 1
@@ -1354,6 +1378,182 @@ if [[ -z "$copy_body" || "$copy_body" == *'br i1 false, label %rg.object'* ]] \
     exit 1
 fi
 
+echo "> Emit nounwind on Valk functions, cold noreturn on panic, and inbounds on bounds-checked GEPs"
+if ! grep -q '^define .*__panic__.* nounwind cold noreturn' "$region_ir" \
+    || ! grep -q '^define .*__in_region__.* nounwind ' "$region_ir" \
+    || ! grep -q 'getelementptr inbounds ' "$alias_ir"; then
+    echo "# Missing nounwind, cold noreturn on panic, or inbounds GEP"
+    grep '^define .*__panic__' "$region_ir"
+    exit 1
+fi
+
+echo "> Version counted slice loops with pre-loop bounds guards while preserving out-of-bounds panics"
+loop_src="$workdir/loop-bounds.valk"
+loop_ir="$workdir/loop-bounds.ll"
+loop_bin="$workdir/loop-bounds"
+cat > "$loop_src" << 'EOF'
+fn merge_step(dst: local mut &[i32], src: local &[i32], left: uint, mid: uint, right: uint) {
+    let i = left
+    let j = mid + 1
+    let k = left
+    while i <= mid && j <= right {
+        if src[i] <= src[j] {
+            dst[k] = src[i]
+            i++
+        } else {
+            dst[k] = src[j]
+            j++
+        }
+        k++
+    }
+    while i <= mid {
+        dst[k] = src[i]
+        i++
+        k++
+    }
+}
+
+fn fill_stride(buf: local mut &[u8], limit: uint, step: uint) {
+    let m: uint = 0
+    while m <= limit {
+        buf[m] = 7
+        m += step
+    }
+}
+
+fn pre_inc_read(buf: local &[u8], limit: uint) uint {
+    let i: uint = 0
+    let sum: uint = 0
+    while i <= limit {
+        i++
+        sum += buf[i].to(uint)
+    }
+    return sum
+}
+
+fn main(args: Array[String]) i32 {
+    let mode = args.length > 1 ? args[1] : "ok"
+    if mode == "ok" {
+        let src = [i32]{ 1, 5, 2, 4 }
+        let dst = [i32]{ 0 x 4 }
+        merge_step(dst, src, 0, 1, 3)
+        let buf = [u8]{ 0 x 6 }
+        fill_stride(buf, 5, 2)
+        if dst[0] != 1 || dst[1] != 2 || dst[2] != 4 || dst[3] != 5 : return 1
+        if buf[0] != 7 || buf[2] != 7 || buf[4] != 7 : return 2
+        if pre_inc_read(buf, 3) != 14 : return 3
+        return 0
+    }
+    if mode == "oob-direct" {
+        let buf = [u8]{ 0 x 4 }
+        fill_stride(buf, 4, 2)
+        return 0
+    }
+    if mode == "oob-counter" {
+        let src = [i32]{ 1, 5, 2, 4 }
+        let dst = [i32]{ 0 x 2 }
+        merge_step(dst, src, 0, 1, 3)
+        return 0
+    }
+    if mode == "oob-preinc" {
+        let buf = [u8]{ 1 x 4 }
+        let _ = pre_inc_read(buf, 3)
+        return 0
+    }
+    if mode == "oob-max" {
+        let buf = [u8]{ 0 x 4 }
+        fill_stride(buf, uint.$max, 1)
+        return 0
+    }
+    return 9
+}
+EOF
+if ! out=$("$VALK" build "$loop_src" --opt --ir --no-warn -o "$loop_ir" 2>&1); then
+    echo "# Failed to emit IR for loop bounds fixture"
+    echo "$out"
+    exit 1
+fi
+merge_body=$(sed -n '/^define .*__merge_step__/,/^}/p' "$loop_ir")
+stride_body=$(sed -n '/^define .*__fill_stride__/,/^}/p' "$loop_ir")
+if [[ "$merge_body" != *'while.fast'* || "$merge_body" != *'while.slow'* || "$merge_body" != *'getelementptr inbounds'* ]] \
+    || [[ "$stride_body" != *'while.fast'* || "$stride_body" != *'while.slow'* ]]; then
+    echo "# Counted slice loops did not emit versioned fast/slow loops with inbounds GEP"
+    echo "$merge_body"
+    exit 1
+fi
+if ! out=$("$VALK" build "$loop_src" --opt --no-warn -o "$loop_bin" 2>&1); then
+    echo "# Failed to compile loop bounds fixture"
+    echo "$out"
+    exit 1
+fi
+if ! "$loop_bin" ok; then
+    echo "# Loop bounds fixture failed valid case"
+    exit 1
+fi
+for mode in oob-direct oob-counter oob-preinc oob-max; do
+    if out=$("$loop_bin" "$mode" 2>&1); then
+        echo "# Loop bounds fixture did NOT panic on $mode"
+        exit 1
+    fi
+    if [[ "$out" != *'Index out of bounds'* ]]; then
+        echo "# Unexpected failure output on $mode: $out"
+        exit 1
+    fi
+done
+
+echo "> Exit loop regions on early return from a value scope in a suspending function"
+vscope_src="$workdir/vscope-region-exit.valk"
+vscope_ir="$workdir/vscope-region-exit.ll"
+cat > "$vscope_src" << 'EOF'
+class VsNode {
+    v: int (1)
+    l: ?VsNode (null)
+    r: ?VsNode (null)
+    static fn tree(d: int) VsNode {
+        if d == 0 : return VsNode {}
+        return VsNode { l: VsNode.tree(d - 1), r: VsNode.tree(d - 1) }
+    }
+    fn sum() int {
+        let s = this.v
+        let l = this.l
+        if isset(l) : s += l.sum()
+        let r = this.r
+        if isset(r) : s += r.sum()
+        return s
+    }
+}
+fn susp_noop() $suspend {}
+fn find_in_vscope(limit: uint) uint {
+    let res = <{
+        let i: uint = 0
+        while i < limit {
+            let t = VsNode.tree(3)
+            if t.sum() > 2 && i > 2 : return i
+            i++
+        }
+        return 0
+    }
+    susp_noop()
+    return res
+}
+fn main() {
+    let _ = find_in_vscope(10)
+}
+EOF
+if ! out=$("$VALK" build "$vscope_src" --release --ir --no-warn -o "$vscope_ir" 2>&1); then
+    echo "# Failed to emit IR for vscope region exit fixture"
+    echo "$out"
+    exit 1
+fi
+vscope_body=$(sed -n '/^define .*__find_in_vscope__/,/^}/p' "$vscope_ir")
+init_count=$(grep -c '__region_init__' <<< "$vscope_body" || true)
+exit_count=$(grep -c '__region_exit__' <<< "$vscope_body" || true)
+if [ "$init_count" -lt 1 ] || [ "$exit_count" -lt 2 ]; then
+    echo "# Expected region_exit on both normal loop exit and value-scope early return (inits=$init_count, exits=$exit_count)"
+    echo "$vscope_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 52"
+echo "# Test count: 55"
 echo ""

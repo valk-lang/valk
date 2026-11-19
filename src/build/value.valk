@@ -121,6 +121,8 @@ class ValueMeta {
     literal_items: bool (false)
     // An element of a sequence's storage, for the IR's alias tags
     element_slot: bool (false)
+    // A bounds-checked borrow slot whose GEP is inbounds (without element TBAA)
+    inbounds_slot: bool (false)
 }
 
 class Value {
@@ -995,7 +997,7 @@ fn class_init_hook_chains(chain: Value, call: Value, rett: Type) bool {
 fn value_from_co_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
     let enclosing = ctx.get_func() !>
     enclosing.note_gc_allocation()
-    enclosing.note_suspend()
+    enclosing.note_explicit_suspend()
     let call_exp = exp.get(VALUE_EXP.left)
     if !isset(call_exp) : exp.bug("'co' is missing a call expression")
     if call_exp.type != EXP.value || call_exp.value_kind != VALUE_KIND.call {
@@ -2754,15 +2756,12 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
     let kind = type_native_sequence(on_type).kind
     // Through a view the array cannot grow, so the end is out of bounds
     let is_view = type_native_sequence(on_type).is_shared || type_native_sequence(on_type).is_locked
-    let invalid_op = kind == TYPE.array && !is_view ? VALUE_OP.gt : VALUE_OP.gte
-    let invalid = vgen_op(index, length, invalid_op, type_bool(ctx.build))
+    let out_of_range = vgen_op(index, length, VALUE_OP.gte, type_bool(ctx.build))
     let location_arg = func.args.get(3) ! at.bug("Sequence helper is missing its location")
     let panic_call = value_panic_call_at(inner_ctx, "Index out of bounds", vgen_decl(location_arg.decl), at) !>
-    body_scope.append_value(vgen_if(invalid, Array[Value]{ panic_call }, null, ctx.build, at))
-
     if kind == TYPE.array && !is_view {
         let class = on_type.get_non_nullable().get_class_or_null()
-        let append_func = isset(class) ? class.get_append_hook() : null
+        let append_func = isset(class) ? (class.get_func("append_at_end") ?? class.get_append_hook()) : null
         if !isset(append_func) : at.bug("Array type has no append function")
         if !append_func.parsed_types : parse_func_types(append_func) !>
         let at_end = vgen_op(index, length, VALUE_OP.eq, type_bool(ctx.build))
@@ -2772,7 +2771,10 @@ fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
         value_check_call_args(append_func, append_callee, append_args, body_scope, inner_ctx, at, false) !>
         let append_call = vgen_call(inner_ctx, append_callee, append_args, append_func.get_rett(), body_scope)
         append_call.exp = at
-        body_scope.append_value(vgen_if(at_end, Array[Value]{ append_call, vgen_return(null, ctx.build, at) }, null, ctx.build, at))
+        let append_branch = vgen_if(at_end, Array[Value]{ append_call, vgen_return(null, ctx.build, at) }, panic_call, ctx.build, at)
+        body_scope.append_value(vgen_if(out_of_range, Array[Value]{ append_branch }, null, ctx.build, at))
+    } else {
+        body_scope.append_value(vgen_if(out_of_range, Array[Value]{ panic_call }, null, ctx.build, at))
     }
 
     let data = value_native_sequence_data(sequence, on_type, inner_ctx, at) !>
@@ -3858,7 +3860,20 @@ fn value_from_class_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             fvals.set(prop, fv)
         }
 
+        let unzeroed_slice = false
+        if init_class.kind == CLASS_KIND.slice {
+            let elem = init_class.slice_type
+            let data_prop = init_class.get_prop_by_name("data") !? null
+            if isset(elem) && !elem.has_gc_refs() && isset(data_prop) {
+                let dv = fvals.get(data_prop) !? null
+                if isset(dv) && dv.type == VAL.undefined {
+                    fvals.remove(data_prop)
+                    unzeroed_slice = true
+                }
+            }
+        }
         let built = class_init_construct(init_class, rett, fvals, scope, ctx, exp) !>
+        if unzeroed_slice : built.bool_val = true
         if literal_view == 0 : return built
         return value_shared_view(built, rett.view_type(literal_view == 2))
     }
@@ -3917,11 +3932,12 @@ fn value_retype_bare_slice(value: Value, rett: Type, at: Exp) Value {
 }
 
 // Zero-filled storage of `count` elements, owned by the result.
-fn bare_slice_alloc(class: Class, rett: Type, count: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+fn bare_slice_alloc(class: Class, rett: Type, count: Value, scope: Scope, ctx: Context, at: Exp, unzeroed: bool (false)) Value !Error {
     let fields = HashMap[Prop, Value]{}
     let length_prop = class.get_prop_by_name("length") ! at.bug("Bare slice class has no 'length'")
     fields.set(length_prop, count)
     let init = class_init_construct(class, class.get_type() !>, fields, scope, ctx, at) !>
+    if unzeroed : init.bool_val = true
     return value_retype_bare_slice(init, rett, at)
 }
 
@@ -3998,7 +4014,11 @@ fn value_from_slice_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         let elem_exp = elems.get(0) ! exp.bug("slice count without a value")
         let vexp = elem_exp.get(VALUE_EXP.left) ?! elem_exp.bug("element is missing its value")
         let fill: ?Value = null
-        if vexp.type == EXP.value && vexp.value_kind == VALUE_KIND.null && !element.is_nullable_type() {
+        let unzeroed = false
+        if vexp.type == EXP.value && vexp.value_kind == VALUE_KIND.undefined && !element.has_gc_refs() {
+            require_unsafe(exp, scope, "Uninitialized slice storage") !>
+            unzeroed = true
+        } else if vexp.type == EXP.value && vexp.value_kind == VALUE_KIND.null && !element.is_nullable_type() {
             // Zeroed storage: valid only when a zero slot is a valid element
             if !type_zero_is_valid(element) {
                 require_unsafe(exp, scope, "Zeroed storage of '" + element.compat_display_name() + "' elements") !>
@@ -4008,10 +4028,10 @@ fn value_from_slice_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
             ev = value_try_convert(ev, scope, ctx, element) !>
             element.compat_check(ev.rett, vexp) !>
             // Fresh storage is already zero
-            let is_zero = (ev.type == VAL.int && ev.int_val == 0) || (ev.type == VAL.float && ev.float_val == 0.0) || ev.type == VAL.null
+            let is_zero = (ev.type == VAL.int && ev.int_val == 0) || (ev.type == VAL.float && ev.float_val == 0.0) || (ev.type == VAL.bool && !ev.bool_val) || ev.type == VAL.null
             if !is_zero : fill = ev
         }
-        if !isset(fill) : return bare_slice_alloc(class, rett, count, scope, ctx, exp) !>
+        if !isset(fill) : return bare_slice_alloc(class, rett, count, scope, ctx, exp, unzeroed) !>
         let fill_f = class.get_func("fill") ?! exp.bug("Bare slice class has no 'fill'")
         if !fill_f.parsed_types : parse_func_types(fill_f) !>
         let callee = vgen_func(fill_f)
@@ -4022,7 +4042,7 @@ fn value_from_slice_init_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error 
         return value_retype_bare_slice(call, rett, exp)
     }
 
-    let storage = bare_slice_alloc(class, rett, vgen_int(elems.length.to(int), uint_t), scope, ctx, exp) !>
+    let storage = bare_slice_alloc(class, rett, vgen_int(elems.length.to(int), uint_t), scope, ctx, exp, elems.length > 0 && !element.has_gc_refs()) !>
     if elems.length == 0 : return storage
     let write_f = class.get_func("write_init") ?! exp.bug("Bare slice class has no 'write_init'")
     if !write_f.parsed_types : parse_func_types(write_f) !>

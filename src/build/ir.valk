@@ -295,7 +295,10 @@ fn ir_write_func_signature(out: ByteBuffer, func: Func, declare: bool) !Error {
         if func.args.length > 0 : out.append_text(", ")
         out.append_text("...")
     }
-    out.append_text(")\n")
+    out.append_text(")")
+    if !func.is_extern : out.append_text(" nounwind")
+    if func.must_exit : out.append_text(" cold noreturn")
+    out.append_text("\n")
 }
 
 fn ir_target_triple(target: Target) String {
@@ -318,6 +321,8 @@ struct IRLoop {
     after: String
     // `active_locks` when the loop started: leaving it releases the locks entered since
     locks: uint
+    // Region loop id for per-loop region init/exit in suspending functions
+    region_loop: uint (0)
 }
 
 class IRFunc {
@@ -335,6 +340,7 @@ class IRFunc {
     // Release calls of the lock blocks the emitter is currently inside
     active_locks: Array[Value] (.{})
     vscope_lock_depth: uint (0)
+    vscope_loop_depth: uint (0)
     current_block: String ("")
     vscope_after: ?String (null)
     vscope_results: ?Array[String] (null)
@@ -369,6 +375,8 @@ class IRFunc {
     tbaa: HashMap[String, String] (.{})
     // Set when the function has places that a region may take over (regions.valk)
     regions: ?RegionFacts (null)
+    // Bounds-check `VAL.if` nodes proven redundant inside a versioned fast loop
+    skip_checks: ?Array[Value] (null)
 
     fn line(text: String) {
         this.code.append_text("  ")
@@ -601,7 +609,8 @@ fn generate_func_ir(func: Func) !Error {
             ir.code.append_text("...")
         }
     }
-    ir.code.append_text(")")
+    ir.code.append_text(") nounwind")
+    if func.must_exit : ir.code.append_text(" cold noreturn")
     if func.is_inline : ir.code.append_text(" alwaysinline")
     if func.is_noinline : ir.code.append_text(" noinline")
     if func.is_hot : ir.code.append_text(" hot")
@@ -652,6 +661,8 @@ fn generate_func_ir(func: Func) !Error {
         ir_use_func(ir, runtime.exit)
         let in_frame = runtime.stack_object
         if isset(in_frame) : ir_use_func(ir, in_frame)
+        let in_frame_zeroed = runtime.stack_object_zeroed
+        if isset(in_frame_zeroed) : ir_use_func(ir, in_frame_zeroed)
         region_put(ir.code, 'E', 0)
     }
 
@@ -861,6 +872,14 @@ fn ir_emit_func_cleanup(ir: IRFunc, exiting: bool (false)) !Error {
     if ir.cleanup_active : return
     ir.cleanup_active = true
     ir_emit_lock_cleanup(ir, 0) !>
+    if isset(ir.regions) && !exiting && !ir.terminated {
+        let li = ir.loops.length
+        while li > 0 {
+            li--
+            let rl = ir.loops[li].region_loop
+            if rl > 0 : region_put(ir.code, 'O', rl)
+        }
+    }
     let scope = ir.func.defer_scope
     if isset(scope) {
         each scope.values as value {
@@ -999,18 +1018,7 @@ fn ir_emit_string_data(ir: IRFunc, text: String) String {
     // A literal lives in static storage: nothing owns it, so the owner word
     // is null and the collector never looks at it.
     let index = ir_use_string(ir, text)
-    let storage = "null"
-    let data = ir.var()
-    ir.line_start()
-    ir.write(data)
-    ir.write(" = getelementptr i8, ptr @\"valk.str.")
-    ir.write_uint(index)
-    ir.write("\", i64 16")
-    ir.line_end()
-    let type = "{ ptr, ptr, i64 }"
-    let out = ir_emit_insert(ir, type, "undef", "ptr", storage, 0)
-    out = ir_emit_insert(ir, type, out, "ptr", data, 1)
-    return ir_emit_insert(ir, type, out, "i64", text.bytes.to_string(), 2)
+    return "{ ptr null, ptr getelementptr inbounds (i8, ptr @\"valk.str." + index + "\", i64 16), i64 " + text.bytes + " }"
 }
 
 fn ir_use_string(ir: IRFunc, value: String) uint {
@@ -1351,6 +1359,14 @@ fn ir_emit_stmt_code(ir: IRFunc, value: Value) !Error {
             results.append(rendered)
             ir_emit_values(ir, value.values) !>
             ir_emit_lock_cleanup(ir, ir.vscope_lock_depth) !>
+            if isset(ir.regions) && !ir.terminated {
+                let li = ir.loops.length
+                while li > ir.vscope_loop_depth {
+                    li--
+                    let rl = ir.loops[li].region_loop
+                    if rl > 0 : region_put(ir.code, 'O', rl)
+                }
+            }
             blocks.append(ir.current_block)
             ir.jump(vscope_after)
             return
@@ -1417,6 +1433,15 @@ fn ir_emit_stmt_code(ir: IRFunc, value: Value) !Error {
         let loop = ir.loops.get(ir.loops.length - depth) ! value.bug("'break' or 'continue' reached IR without its loop")
         ir_emit_values(ir, value.values) !>
         ir_emit_lock_cleanup(ir, loop.locks) !>
+        if isset(ir.regions) && !ir.terminated {
+            let li = ir.loops.length
+            let target_idx = ir.loops.length - depth
+            while li > target_idx + 1 {
+                li--
+                let rl = ir.loops[li].region_loop
+                if rl > 0 : region_put(ir.code, 'O', rl)
+            }
+        }
         ir.jump(t == VAL.break ? loop.after : loop.cond)
         return
     }
@@ -1507,6 +1532,12 @@ fn ir_emit_user_defers(ir: IRFunc, value: Value) !Error {
 }
 
 fn ir_emit_if(ir: IRFunc, value: Value) !Error {
+    let skip_checks = ir.skip_checks
+    if isset(skip_checks) {
+        each skip_checks as skip {
+            if skip == value : return
+        }
+    }
     let condv = value.value1
     if !isset(condv) : value.bug("IR if is missing its condition")
     let cond = ir_emit_value(ir, condv) !>
@@ -1532,31 +1563,6 @@ fn ir_emit_if(ir: IRFunc, value: Value) !Error {
         ir.line("unreachable")
         ir.terminated = true
     }
-}
-
-fn ir_emit_while(ir: IRFunc, value: Value) !Error {
-    let cond_block = ir.block("while.cond")
-    let body_block = ir.block("while.body")
-    let after_block = ir.block("while.after")
-    ir.jump(cond_block)
-
-    ir.label(cond_block)
-    // A round starts: the regions of this loop hold nothing that is still used
-    let loop_facts = ir.regions
-    if isset(loop_facts) && loop_facts.number_of(value) > 0 : region_put(ir.code, 'L', loop_facts.number_of(value))
-    let condv = value.value1
-    if !isset(condv) : value.bug("IR while is missing its condition")
-    ir.loops.append(IRLoop { cond: cond_block, after: after_block, locks: ir.active_locks.length })
-    let cond = ir_emit_value(ir, condv) !>
-    if !ir.terminated {
-        ir.cond_jump(cond, body_block, after_block)
-        ir.label(body_block)
-        ir_emit_values(ir, value.values) !>
-        ir.jump(cond_block)
-    }
-    ir.loops.pop_last() ! value.bug("IR loop stack is empty")
-
-    ir.label(after_block)
 }
 
 ////////////////////////////
@@ -2004,20 +2010,20 @@ fn ir_splice_entry_allocas(ir: IRFunc) {
     ir.code = code
 }
 
-fn ir_open_element_address(ir: IRFunc, name: String, type: String, base: String) {
+fn ir_open_element_address(ir: IRFunc, name: String, type: String, base: String, inbounds: bool (false)) {
     ir.line_start()
     ir.write(name)
-    ir.write(" = getelementptr ")
+    ir.write(inbounds ? " = getelementptr inbounds " : " = getelementptr ")
     ir.write(type)
     ir.write(", ptr ")
     ir.write(base)
     ir.write(", ")
 }
 
-// %x = getelementptr <type>, ptr base, <index_type> <index>
-fn ir_element_address(ir: IRFunc, type: String, base: String, index_type: String, index: String) String {
+// %x = getelementptr [inbounds] <type>, ptr base, <index_type> <index>
+fn ir_element_address(ir: IRFunc, type: String, base: String, index_type: String, index: String, inbounds: bool (false)) String {
     let out = ir.var()
-    ir_open_element_address(ir, out, type, base)
+    ir_open_element_address(ir, out, type, base, inbounds)
     ir.write(index_type)
     ir.write(" ")
     ir.write(index)
@@ -2037,7 +2043,7 @@ fn ir_index_address(ir: IRFunc, type: String, base: String, index: uint) String 
 
 fn ir_field_address(ir: IRFunc, type: String, base: String, field: uint, element: bool (false)) String {
     let out = ir.var()
-    ir_open_element_address(ir, out, type, base)
+    ir_open_element_address(ir, out, type, base, true)
     ir.write("i32 0, i32 ")
     ir.write_uint(field)
     if element : ir.write(", i32 0")
@@ -2045,9 +2051,9 @@ fn ir_field_address(ir: IRFunc, type: String, base: String, field: uint, element
     return out
 }
 
-fn ir_offset_address(ir: IRFunc, base: String, offset: uint) String {
+fn ir_offset_address(ir: IRFunc, base: String, offset: uint, inbounds: bool (false)) String {
     let address = ir.var()
-    ir_open_element_address(ir, address, "i8", base)
+    ir_open_element_address(ir, address, "i8", base, inbounds)
     ir.write("i64 ")
     ir.write_uint(offset)
     ir.line_end()
@@ -2064,7 +2070,7 @@ fn ir_dynamic_offset_address(ir: IRFunc, base: String, offset: String) String {
 }
 
 fn ir_prop_address(ir: IRFunc, on: String, prop: Prop) String {
-    let address = ir_offset_address(ir, on, prop.offset.to(uint))
+    let address = ir_offset_address(ir, on, prop.offset.to(uint), true)
     if prop.class.kind == CLASS_KIND.array : ir.tbaa.set(address, IR_TBAA_HEADER)
     return address
 }
@@ -2138,7 +2144,9 @@ fn ir_emit_address(ir: IRFunc, value: Value) String !Error {
         if ir.terminated : return "undef"
         let off_type, off = ir_emit_gep_index(ir, index) !>
         if ir.terminated : return "undef"
-        let address = ir_element_address(ir, ir_type(value.rett) !>, base, off_type, off)
+        let meta = value.meta
+        let is_slot = isset(meta) && (meta.element_slot || meta.inbounds_slot)
+        let address = ir_element_address(ir, ir_type(value.rett) !>, base, off_type, off, is_slot)
         if ir_is_element_access(value) : ir.tbaa.set(address, IR_TBAA_ELEMENT)
         return address
     }
@@ -2254,6 +2262,7 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
         if value.rett.kind == TYPE.fnptr && inner.type == VAL.func {
             let func = inner.func
             if isset(func) && value_is_capture_free_func(inner) {
+                func.note_taken_sig(region_callable_sig(value.rett))
                 ir_note_unknown_code(ir)
                 if func.is_literal {
                     return "@\"" + (ir_emit_fnptr_adapter(ir, value, func) !>) + "\""
@@ -2293,11 +2302,11 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
         return ir_emit_interface_object(ir, value) !>
     }
     if t == VAL.decl || t == VAL.global || t == VAL.ptrv {
-        if value_is_shared_storage(value) && value.rett.is_integer_type() {
+        if value_shared_load_needs_atomic(value) && value.rett.is_integer_type() {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
         // A reference other threads may replace: acquire, so its object is seen whole
-        if t != VAL.decl && value_is_shared_storage(value) && value.rett.is_shared_ref_word() {
+        if t != VAL.decl && value_shared_load_needs_atomic(value) && value.rett.is_shared_ref_word() {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
         let address = ir_emit_address(ir, value) !>
@@ -2323,11 +2332,11 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
     if t == VAL.prop {
         let prop = value.prop
         if !isset(prop) : value.bug("IR property value is missing its property")
-        if value_is_shared_storage(value) && value.rett.is_integer_type() {
+        if value_shared_load_needs_atomic(value) && value.rett.is_integer_type() {
             return ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
         }
         // A reference other threads may replace: acquire, so its object is seen whole
-        if value_is_shared_storage(value) && value.rett.is_shared_ref_word() {
+        if value_shared_load_needs_atomic(value) && value.rett.is_shared_ref_word() {
             let loaded = ir_emit_atomic_load(ir, vgen_atomic_load(value, value.exp)) !>
             return ir_clean_property_value(ir, prop.type, loaded)
         }
@@ -2432,6 +2441,17 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
         if !isset(inner) : value.bug("IR cast is missing its operand")
         let inner_kind = inner.rett.get_non_nullable().kind
         let target_kind = value.rett.get_non_nullable().kind
+        if inner_kind == TYPE.closure || inner_kind == TYPE.fnptr {
+            if target_kind == TYPE.closure || target_kind == TYPE.fnptr {
+                let from_sig = region_callable_sig(inner.rett)
+                let to_sig = region_callable_sig(value.rett)
+                if from_sig != to_sig : region_note_sig_coercion(ir.func.ns.build, from_sig, to_sig)
+            } else {
+                region_note_sig_coercion(ir.func.ns.build, region_callable_sig(inner.rett), "*")
+            }
+        } else if target_kind == TYPE.closure || target_kind == TYPE.fnptr {
+            region_note_sig_coercion(ir.func.ns.build, "*", region_callable_sig(value.rett))
+        }
         if inner_kind == TYPE.closure && (target_kind == TYPE.fnptr || target_kind == TYPE.voidptr) {
             return ir_emit_raw_function(ir, inner) !>
         }
@@ -2548,6 +2568,8 @@ fn ir_emit_value_code(ir: IRFunc, value: Value) String !Error {
         if func.is_generic_base || func.has_generic_args {
             value.error(value_generic_base_message(func))
         }
+        let vt = value.rett.get_non_nullable()
+        func.note_taken_sig(vt.kind == TYPE.closure || vt.kind == TYPE.fnptr ? region_callable_sig(vt) : "*")
         ir_note_unknown_code(ir)
         ir_use_func(ir, func)
         if value.rett.kind == TYPE.closure {
@@ -2956,12 +2978,14 @@ fn ir_emit_vscope(ir: IRFunc, value: Value) String !Error {
     let old_results = ir.vscope_results
     let old_blocks = ir.vscope_blocks
     let old_lock_depth = ir.vscope_lock_depth
+    let old_loop_depth = ir.vscope_loop_depth
     let results = Array[String]{}
     let blocks = Array[String]{}
     ir.vscope_after = after
     ir.vscope_results = results
     ir.vscope_blocks = blocks
     ir.vscope_lock_depth = ir.active_locks.length
+    ir.vscope_loop_depth = ir.loops.length
 
     ir_emit_values(ir, value.values) !>
     let falls_through = !ir.terminated
@@ -2972,6 +2996,7 @@ fn ir_emit_vscope(ir: IRFunc, value: Value) String !Error {
     ir.vscope_results = old_results
     ir.vscope_blocks = old_blocks
     ir.vscope_lock_depth = old_lock_depth
+    ir.vscope_loop_depth = old_loop_depth
 
     if results.length == 0 {
         if !falls_through {
@@ -3344,11 +3369,13 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let element = class.slice_type
     if !isset(element) : value.bug("Slice initializer has no element type")
     let length = ""
+    let const_len: ?uint = null
     if isset(fields) {
         each fields as field, i {
             let prop = field.get_init_prop()
             if !isset(prop) || prop.name != "length" : continue
             length = ir.field_values.get(field_mark + i) !? ""
+            if field.type == VAL.int && field.int_val >= 0 : const_len = field.int_val.to(uint)
             break
         }
     }
@@ -3374,9 +3401,11 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     }
     let total = ir_emit_binary_index(ir, "add", "i64", bytes, header)
 
-    let idf = valk_idf(ir.func.ns.build, "gc", "alloc_typed_zeroed") !>
+    let unzeroed = value.bool_val && !element.has_gc_refs()
+    let alloc_name = unzeroed ? "alloc_typed" : "alloc_typed_zeroed"
+    let idf = valk_idf(ir.func.ns.build, "gc", alloc_name) !>
     let alloc = idf.func
-    if !isset(alloc) : value.bug("gc.alloc_typed_zeroed is not a function")
+    if !isset(alloc) : value.bug("gc." + alloc_name + " is not a function")
     if !alloc.parsed_types : parse_func_types(alloc) !>
     ir_use_func(ir, alloc)
     ir_note_gc_allocates(ir)
@@ -3390,16 +3419,20 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let item = ""
     let after = ""
     if isset(regions) && isset(site) && site.dual {
-        let runtime = ir.func.ns.build.region_runtime ?! value.bug("Region runtime is missing")
         let id = regions.number_of(value)
         site.emitted = true
+        if isset(const_len) {
+            if element_size == 0 || const_len <= (uint.$max - header) / element_size.to(uint) {
+                site.bytes = header + const_len * element_size.to(uint)
+            }
+        }
         in_region = ir.block("rg.storage")
         let on_heap = ir.block("rg.heap")
         after = ir.block("rg.after")
         ir.cond_jump(region_token('U', id), in_region, on_heap)
         ir.label(in_region)
         item = ir.var()
-        ir.line(item + " = call ptr " + ir_func_address(runtime.alloc_zeroed) + "(ptr " + region_token('P', id) + ", i64 " + total + ")")
+        ir.line(item + " = call ptr " + region_token(unzeroed ? 'A' : 'Z', id) + "(ptr " + region_token('P', id) + ", i64 " + total + ")")
         ir.jump(after)
         ir.label(on_heap)
     }
@@ -3525,7 +3558,27 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
         slot = ir.var()
         ir_name_alloca(ir, slot, lowered)
     }
-    if size > 0 && class.kind != CLASS_KIND.slice {
+    let need_zero = size > 0 && class.kind != CLASS_KIND.slice
+    if need_zero && lowered == "ptr" && isset(fields) {
+        let all_set = true
+        each class.props as prop {
+            if prop.is_slice_data : continue
+            let found = false
+            each fields as field {
+                if field.get_init_prop() == prop {
+                    if field.type == VAL.array_init && ir_field_inits_in_place(field) : all_set = false
+                    found = true
+                    break
+                }
+            }
+            if !found || !all_set {
+                all_set = false
+                break
+            }
+        }
+        if all_set : need_zero = false
+    }
+    if need_zero {
         ir_emit_zero(ir, slot, size.to(uint))
     }
 
@@ -3536,14 +3589,21 @@ fn ir_emit_class_init(ir: IRFunc, value: Value) String !Error {
             let start = starts.get(i) !? field_mark + i
             let address = ir_prop_address(ir, slot, prop)
             if field.type == VAL.array_init && ir_field_inits_in_place(field) {
-                ir_emit_array_store(ir, field, ir.field_values, start, address, size > 0) !>
+                ir_emit_array_store(ir, field, ir.field_values, start, address, need_zero) !>
                 continue
             }
             let field_value = ir.field_values.get(start) !? "undef"
             if field_value == "" : ir_emit_aggregate_into(ir, field, address) !>
             else : ir_emit_store(ir, ir_type(prop.type) !>, field_value, address)
-            // An object of a region pins what its fields refer to, when that can be the collector's
-            if isset(region_site) : ir_emit_region_pins(ir, value, region_token('F', region_site_id), address, prop.type) !>
+        }
+        if isset(region_site) {
+            each fields as field {
+                let prop = field.get_init_prop()
+                if !isset(prop) : continue
+                if field.type == VAL.array_init && ir_field_inits_in_place(field) : continue
+                let address = ir_prop_address(ir, slot, prop)
+                ir_emit_region_pins(ir, value, region_token('F', region_site_id), address, prop.type) !>
+            }
         }
     }
     ir.release_field_values(field_mark)
@@ -4393,6 +4453,8 @@ fn ir_call_arg_needs_raw_function(actual: Type, expected: Type) bool {
 fn ir_emit_raw_function(ir: IRFunc, value: Value) String !Error {
     let direct = value_resolve_func_ref(value)
     if isset(direct) && !direct.is_literal {
+        let vk = value.rett.get_non_nullable().kind
+        direct.note_taken_sig(vk == TYPE.closure || vk == TYPE.fnptr ? region_callable_sig(value.rett) : "*")
         ir_use_func(ir, direct)
         return ir_func_address(direct)
     }

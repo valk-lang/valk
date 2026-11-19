@@ -1118,7 +1118,9 @@ why; `--no-regions` turns regions off.
 
 - Layout is target-specific and computed from the target pointer size and
   alignment rules.
-- Struct and class fields appear in declaration order.
+- Struct fields appear in declaration order; class fields are reordered (GC
+  references first, then descending alignment) to group traced pointers at
+  offset 0 and eliminate internal padding.
 - Natural padding is inserted before fields and at the end of aggregates.
 - `packed` suppresses normal inter-field padding for a struct.
 - Classes, arrays, and coroutines are reference-sized values.

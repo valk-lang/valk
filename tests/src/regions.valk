@@ -1349,3 +1349,188 @@ test "Regions: what a callee links both ways, or hands from one object to anothe
 test "Regions: an object that refers to one with a finalizer stays with the collector" {
     assert(rg_final_held() == 2)
 }
+
+class RgPinBox {
+    label: String
+}
+
+fn rg_pin_many_alternating(texts: Array[String]) int $region {
+    let items = Array[RgPinBox]{}
+    let i: int = 0
+    while i < 64 {
+        let label = texts.get((i % texts.length.to(int)).to(uint)) !!
+        items.append(RgPinBox { label: label })
+        i++
+    }
+    texts.clear()
+    gc.collect()
+    gc.collect()
+    let total: int = 0
+    each items as item : total += item.label.length.to(int)
+    return total
+}
+
+test "Regions: pinning more than four distinct heap owners survives collections" {
+    let texts = Array[String]{}
+    let i: int = 0
+    while i < 10 {
+        texts.append("pin-owner-" + i)
+        i++
+    }
+    let res = rg_pin_many_alternating(texts)
+    assert(res == 64 * 11)
+}
+
+fn rg_suspend_noop() $suspend {}
+
+fn rg_suspend_inner_loop(early_return: bool) int {
+    rg_suspend_noop()
+    let total: int = 0
+    let outer: int = 0
+    while outer < 4 {
+        let inner: int = 0
+        while inner < 6 {
+            let list = Array[RgPinBox]{}
+            list.append(RgPinBox { label: "a" })
+            list.append(RgPinBox { label: "bc" })
+            total += list.length.to(int)
+            if early_return && outer == 1 && inner == 2 : return total
+            if inner == 4 : break
+            inner++
+        }
+        outer++
+    }
+    rg_suspend_noop()
+    return total
+}
+
+fn rg_frame_slice_refs(a: RgPinBox, b: RgPinBox) int {
+    let s = [RgPinBox]{ a, b }
+    gc.collect()
+    gc.collect()
+    return s[0].label.length.to(int) + s[1].label.length.to(int)
+}
+
+test "Regions: non-suspending inner loops in suspending functions and frame slices" {
+    assert(rg_suspend_inner_loop(false) == 4 * 5 * 2)
+    assert(rg_suspend_inner_loop(true) == (5 + 3) * 2)
+
+    let a = RgPinBox { label: "hello" }
+    let b = RgPinBox { label: "world!" }
+    assert(rg_frame_slice_refs(a, b) == 11)
+}
+
+struct RgHeapPair {
+    score: i32
+    id: i32
+}
+
+fn rg_heap_pair_before(a: RgHeapPair, b: RgHeapPair) bool {
+    if a.score != b.score : return a.score < b.score
+    return a.id < b.id
+}
+
+fn rg_heap_with_large_slices(n: uint) i64 {
+    let scores = [i32]{ 999999 x n }
+    let heap = Heap[RgHeapPair].new(rg_heap_pair_before)
+    let i: uint = 0
+    while i < 64 {
+        let s = (64 - i).to(i32)
+        scores[i] = s
+        heap.push(RgHeapPair { score: s, id: i.to(i32) })
+        i++
+    }
+    let total: i64 = 0
+    while true {
+        let top = heap.pop() ! break
+        total += scores[top.id.to(uint)].to(i64)
+    }
+    return total
+}
+
+struct RgSuspTag {
+    v: i32
+}
+
+fn rg_susp_callback(x: RgSuspTag) i32 $suspend {
+    return x.v + 1
+}
+
+fn rg_calls_susp_cb(cb: fn(RgSuspTag)(i32)) i32 {
+    let list = Array[RgPinBox]{}
+    each 0 .. 4 as i : list.append(RgPinBox { label: "s" + i })
+    let r = cb(RgSuspTag { v: list.length.to(i32) })
+    return r + list[0].label.length.to(i32)
+}
+
+test "Regions: non-suspending Heap comparator, large chunk reuse, and suspending callback soundness" {
+    let expected: i64 = 64 * 65 / 2
+    // 100k i32 = 400 KiB (> 256 KiB REGION_CHUNK_MAX), exercises large chunk spare cache
+    each 0 .. 5 {
+        assert(rg_heap_with_large_slices(100000) == expected)
+    }
+    gc.release_memory()
+    assert(rg_heap_with_large_slices(100000) == expected)
+    assert(rg_calls_susp_cb(rg_susp_callback) == 7)
+}
+
+fn rg_vscope_early_return(limit: uint) uint {
+    let res = <{
+        let i: uint = 0
+        while i < limit {
+            let t = RgNode.tree(4)
+            if t.total() > 2 && i > 3 : return i
+            i++
+        }
+        return 0
+    }
+    rg_suspend_noop()
+    return res
+}
+
+test "Regions: early return from a value scope inside a loop exits its loop region" {
+    let top_before = gc.region_top_for_test()
+    each 0 .. 200 {
+        assert(rg_vscope_early_return(10) == 4)
+    }
+    assert(gc.region_top_for_test() == top_before)
+}
+
+fn rg_over_slab_cap_helper(chunks: uint) uint $region {
+    let sum: uint = 0
+    let i: uint = 0
+    while i < chunks {
+        let arr = Array[uint].new(24_000)
+        arr.append(i + 1)
+        sum += arr[0]
+        i++
+    }
+    return sum
+}
+
+fn rg_over_slab_cap_live() bool $region {
+    // Hold > 64 slabs (512 * 256 KiB = 128 MiB) in 256 KiB region chunks
+    let kept = Array[Array[uint]].new(520)
+    let i: uint = 0
+    while i < 520 {
+        let arr = Array[uint].new(24_000)
+        arr.append(0x1000 + i)
+        kept.append(arr)
+        i++
+    }
+    // Allocate and free over-cap 256 KiB chunks, then ask GC to release idle slabs
+    let extra = rg_over_slab_cap_helper(12)
+    gc.release_memory()
+    if extra != 12 * 13 / 2 : return false
+    // Every live slab-backed chunk must still hold its data intact
+    let ok = true
+    each kept as arr, idx {
+        if arr[0] != 0x1000 + idx : ok = false
+    }
+    return ok
+}
+
+test "Regions: over-cap 256 KiB chunks do not corrupt slab pool accounting" {
+    assert(rg_over_slab_cap_live())
+    gc.release_memory()
+}

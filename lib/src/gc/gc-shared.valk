@@ -2,6 +2,7 @@
 @ignore_access
 
 use core
+use ext
 use time
 
 // Core
@@ -18,9 +19,18 @@ global in_collect_shared: bool (false)
 fn mem_shared_now() uint {
     return mem_shared + gc.shared_pending
 }
-// 1 while a shared collection holds shared_lock: a running thread lets go of
-// its gc at its next allocator block switch (see shared_safepoint)
-shared shared_stop: uint (0)
+// Own cache line so frequent `mem_shared` updates never bounce `shared_stop` across cores
+struct SharedStopLine {
+    pad_before: [u8 x 64] ({ 0... })
+    stop: uint (0)
+    pad_after: [u8 x 56] ({ 0... })
+}
+// Non-zero (current round generation) while a shared collection holds shared_lock: a running
+// thread lets go of its gc at its next allocator block switch (see shared_safepoint)
+@shared shared_stop_line: SharedStopLine (.{})
+@shared shared_stop_seq: uint (0)
+shared pcollect_active: uint (0)
+shared pcollect_remaining: uint (0)
 
 fn collect_shared_native(sp: ptr) {
     if gc.state != GcState.idle : return
@@ -45,7 +55,8 @@ fn collect_shared_native(sp: ptr) {
     let mygc = gc
     mygc.live_sp = sp
     let gcs = gc_list
-    atomic_store(shared_stop, 1)
+    let stop_gen = ++shared_stop_seq
+    atomic_store(shared_stop_line.stop, stop_gen)
 
     each gcs as gcx {
         gcx.lock()
@@ -82,21 +93,61 @@ fn collect_shared_native(sp: ptr) {
     mark_count++
     shmark_now = shmark_now == flag_shmark ? flag_leak : flag_shmark
 
-    // Stack words of every thread resolve against every thread's blocks
+    // Stack words of every thread resolve against every thread's blocks (read-only while live)
     build_shared_ranges(gcs)
+    let helper_count: uint = 0
     each gcs as gcx {
+        if gcx != mygc && gcx.safepoint_gen == stop_gen && gcx.collect_allowed(CollectKind.shared) {
+            gcx.pcollect_ready = 1
+            helper_count++
+        } else {
+            gcx.pcollect_ready = 0
+        }
+    }
+    if helper_count > 0 {
+        atomic_store(pcollect_remaining, helper_count)
+        atomic_store(pcollect_active, 1)
+    }
+    each gcs as gcx {
+        if gcx.pcollect_ready != 0 : continue
         gc = gcx
         if gcx.collect_allowed(CollectKind.shared) : gcx.collect_run(CollectKind.shared)
     }
+    gc = mygc
+    if helper_count > 0 {
+        let wait_spins: uint = 0
+        while atomic_load(pcollect_remaining) > 0 {
+            if wait_spins < 64 {
+                $pause()
+                wait_spins++
+            } else {
+                pmark_yield()
+            }
+        }
+        atomic_store(pcollect_active, 0)
+    }
     end_shared_ranges()
+    each gcs as gcx {
+        gc = gcx
+        gcx.finish_deferred_blanks()
+        prune_marked_pools(gcx.alc_list_ptr[0])
+    }
+    gc = mygc
 
     // Mark, together with the threads waiting at their safepoint (see shared_safepoint)
-    let live = pmark_run(gcs)
+    let live = pmark_run(gcs, stop_gen)
     each gcs as gcx {
         gc = gcx
         gcx.clear_stack_items()
+        compact_shared_roots(gcx.shared_roots)
+        let next = gcx.shared_roots.index * 2
+        gcx.shared_roots_limit = next > 65536 ? next : 65536
     }
+    compact_shared_roots(shared_dump_roots)
     gc = mygc
+    #if GC_DEBUG
+    verify_shared_roots(gcs)
+    #end
 
     // Each thread frees its own unmarked items once it runs again (sweep_shared)
     each gcs as gcx {
@@ -114,7 +165,7 @@ fn collect_shared_native(sp: ptr) {
     each gcs as gcx {
         gcx.unlock()
     }
-    atomic_store(shared_stop, 0)
+    atomic_store(shared_stop_line.stop, 0)
 
     shared_pause_last_us = time.mono_us() - pause_start
     if shared_pause_last_us > shared_pause_max_us : shared_pause_max_us = shared_pause_last_us
@@ -139,14 +190,40 @@ fn collect_shared_native(sp: ptr) {
 // thread's stack and registers are saved as for any blocking call, it helps
 // mark, and it goes on once the collection lets the gcs go. Its own sweep
 // runs at its next collection
+fn shared_safepoint_collect(sp: ptr, gcp: ptr) {
+    let g: *Gc = gcp
+    g.live_sp = sp
+    g.collect_run(CollectKind.shared)
+}
+
 fn shared_safepoint() {
     let g = gc
     if g.state != GcState.idle || in_collect_shared : return
+    let stop_gen = atomic_load(shared_stop_line.stop)
+    if stop_gen == 0 : return
     g.at_safepoint = true
+    g.safepoint_gen = stop_gen
     g.unlock()
-    while shared_stop == 1 {
-        if pmark_active == 1 : pmark_help()
-        else : pmark_yield()
+    let spins: uint = 0
+    while atomic_load(shared_stop_line.stop) == stop_gen {
+        if atomic_load(pcollect_active) == 1 && g.pcollect_ready == 1 {
+            g.pcollect_ready = 2
+            ext.valk_gc_scan_stack(shared_safepoint_collect.@cast(ptr), g.@cast(ptr))
+            atomic(pcollect_remaining - 1)
+            spins = 0
+            continue
+        }
+        if atomic_load(pmark_active) == 1 {
+            pmark_help()
+            spins = 0
+            continue
+        }
+        if spins < 64 {
+            $pause()
+            spins++
+        } else {
+            pmark_yield()
+        }
     }
     g.lock()
     g.at_safepoint = false
