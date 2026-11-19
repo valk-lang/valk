@@ -266,6 +266,70 @@ if [ ! -d "$cache_root/old-dir" ]; then
     exit 1
 fi
 
+echo "> Shared object cache reuses objects across output paths and trims old entries"
+shared_home="$workdir/shared-cache-home"
+mkdir -p "$shared_home"
+shared_root="$shared_home/.valk/cache"
+shared_out_a="$workdir/shared-a"
+shared_out_b="$workdir/shared-b"
+shared_src="$workdir/shared-prog.valk"
+cat > "$shared_src" << 'EOF'
+class Box[T] {
+    v: T
+    fn get() T { return this.v }
+}
+fn main() {
+    let a = Box[int]{ v: 1 }
+    let b = Box[i32]{ v: 2 }
+    let c = Box[i16]{ v: 3 }
+    let d = Box[i8]{ v: 4 }
+    let e = Box[u64]{ v: 5 }
+    let f = Box[u32]{ v: 6 }
+    let g = Box[u16]{ v: 7 }
+    let h = Box[u8]{ v: 8 }
+    let s = Box[String]{ v: "ok" }
+    println(a.get() + b.get().to(int) + c.get().to(int) + d.get().to(int) + e.get().to(int) + f.get().to(int) + g.get().to(int) + h.get().to(int))
+    println(s.get())
+}
+EOF
+shared_first=$(HOME="$shared_home" USERPROFILE="$shared_home" "$VALK" build "$shared_src" --no-warn -vvv -o "$shared_out_a" 2>&1) || { echo "$shared_first"; exit 1; }
+shared_cache_a=$(cache_dir "$shared_first")
+if ! ls "$shared_root/objects"/*.o > /dev/null 2>&1; then
+    echo "# First build did not populate the shared object cache"
+    exit 1
+fi
+if ! ls "$shared_cache_a"/*_g[1-9]*.o > /dev/null 2>&1; then
+    echo "# Generic instantiations were not sharded into separate units"
+    ls -la "$shared_cache_a"
+    exit 1
+fi
+shared_second=$(HOME="$shared_home" USERPROFILE="$shared_home" "$VALK" build "$shared_src" --no-warn -vvv -o "$shared_out_b" 2>&1) || { echo "$shared_second"; exit 1; }
+if ! printf '%s\n' "$shared_second" | grep -q "Shared object cache hit:"; then
+    echo "# Fresh build at a new output path did not reuse the shared object cache"
+    echo "$shared_second"
+    exit 1
+fi
+shared_clean=$(HOME="$shared_home" USERPROFILE="$shared_home" "$VALK" build "$shared_src" --no-warn -c -vvv -o "$shared_out_b" 2>&1) || { echo "$shared_clean"; exit 1; }
+if printf '%s\n' "$shared_clean" | grep -q "Shared object cache hit:"; then
+    echo "# Clean build reused the shared object cache"
+    exit 1
+fi
+shared_runs=$("$shared_out_b")
+if [ "$shared_runs" != "$(printf '36\nok')" ]; then
+    echo "# Binary linked from shared object cache printed unexpected output: $shared_runs"
+    exit 1
+fi
+printf 'x' > "$shared_root/objects/stale-test.o"
+printf 'x' > "$shared_root/objects/fresh-test.o"
+touch -t 200001010000 "$shared_root/objects/stale-test.o"
+rm -f "$shared_root/last-trim"
+shared_trim=$(HOME="$shared_home" USERPROFILE="$shared_home" "$VALK" build "$shared_src" --no-warn -o "$shared_out_b" 2>&1) || { echo "$shared_trim"; exit 1; }
+if [ -e "$shared_root/objects/stale-test.o" ] || [ ! -f "$shared_root/objects/fresh-test.o" ] || [ ! -d "$shared_root/objects" ]; then
+    echo "# Shared object cache trim removed the wrong files"
+    ls -la "$shared_root/objects"
+    exit 1
+fi
+
 no_opt_out=$(build --no-opt)
 status=$?
 if [ "$status" -eq 0 ] || [[ "$no_opt_out" != *"Unknown build argument: --no-opt"* ]]; then
@@ -1512,4 +1576,4 @@ if [[ "$(uname -s)" == "Linux" ]]; then
 fi
 
 echo "# CLI tests passed"
-echo "# Test count: 85"
+echo "# Test count: 86"
