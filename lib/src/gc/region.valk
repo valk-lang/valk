@@ -66,6 +66,7 @@ global region_pool_count: [uint x 7]
 global region_slabs: [ptr x 64]
 global region_slab_count: uint (@undefined)
 global region_pool_used: bool (@undefined)
+global region_pin_spare: ?*Bump (@undefined)
 
 struct Region {
     cursor: ptr
@@ -75,9 +76,8 @@ struct Region {
     chunk: ?ptr
     // Starting chunk size for the next round
     hint: uint
-    // The owners pinned last, by their address, and the ones they pushed out
+    // The owners pinned last, by their address, and an unmanaged overflow *Bump
     pin: [?ptr x 4]
-    // An Array[GcPtr], as an address: the stack scan finds it here
     pins: ?ptr
 }
 
@@ -155,6 +155,11 @@ fn region_spares_age() {
 fn region_segments_free() {
     @unsafe
     region_spares_free()
+    let spare = region_pin_spare
+    if isset(spare) {
+        region_pin_spare = null
+        spare.free()
+    }
     let first = region_first ?! return
     if region_top != first.@cast(uint) + REGION_RECORD : return
     region_first = null
@@ -202,7 +207,8 @@ fn region_unpin(r: *Region) $inline {
     r.pin[1] = null
     r.pin[2] = null
     r.pin[3] = null
-    r.pins = null
+    let pins = r.pins
+    if isset(pins) : pins.@cast(*Bump).reset()
 }
 
 // `owner` is referred to by an object of the region from now on: it is kept until the region
@@ -212,11 +218,10 @@ fn region_pin(region: ?ptr, owner: ?ptr) $inline {
     @unsafe
     if !isset(region) || !isset(owner) : return
     let r = region.@cast(*Region)
-    let slot = (owner.@cast(uint) >> 4) & (REGION_PINS - 1)
-    if r.pin[slot] == owner : return
+    if r.pin[0] == owner || r.pin[1] == owner || r.pin[2] == owner || r.pin[3] == owner : return
     // Storage in a region lives as long as the region does, and static data for ever
     if gcdata(owner).offset == 0 : return
-    region_pin_new(r, owner, slot)
+    region_pin_new(r, owner)
 }
 
 // The write barrier for an object that may be in a region, when `pins` is set: what it now
@@ -233,14 +238,53 @@ fn region_property_update(pins: ?ptr, on_object: ptr, property_ref: ptr, new_val
     if isset(pins) && isset(new_value) : region_pin(region_of(on_object), new_value)
 }
 
-fn region_pin_new(r: *Region, owner: ptr, slot: uint) $noinline {
-    let last = r.pin[slot]
-    r.pin[slot] = owner
-    if !isset(last) : return
-    let known = r.pins
-    let pins = isset(known) ? known.@cast(Array[GcPtr]) : Array[GcPtr].new(8)
-    r.pins = pins.@cast(ptr)
-    pins.append(last.@cast(GcPtr))
+fn region_pin_new(r: *Region, owner: ptr) $noinline {
+    @unsafe
+    if !isset(r.pins) {
+        let i: uint = 0
+        while i < REGION_PINS {
+            if !isset(r.pin[i]) {
+                r.pin[i] = owner
+                return
+            }
+            i++
+        }
+        let pins = region_pin_spare
+        if isset(pins) {
+            region_pin_spare = null
+            pins.reset()
+        } else {
+            pins = Bump.new(64)
+        }
+        r.pins = pins.@cast(ptr)
+        let j: uint = 0
+        while j < REGION_PINS {
+            let existing = r.pin[j]
+            if isset(existing) : pins.add_ptr(existing)
+            j++
+        }
+        pins.add_ptr(owner)
+    } else {
+        let pins = r.pins.@cast(*Bump)
+        // Deduplicate against recent/small overflow lists so alternating owners don't grow unboundedly
+        let count = pins.index / size_of(ptr)
+        let start = count > 64 ? count - 64 : 0
+        let found = false
+        let i = start
+        while i < count {
+            if @ptrv(pins.data, ptr, i) == owner {
+                found = true
+                break
+            }
+            i++
+        }
+        if !found : pins.add_ptr(owner)
+    }
+    // Rotate into the 4-entry MRU filter cache
+    r.pin[3] = r.pin[2]
+    r.pin[2] = r.pin[1]
+    r.pin[1] = r.pin[0]
+    r.pin[0] = owner
 }
 
 fn region_alloc(r: *Region, size: uint) ptr $inline {
@@ -292,7 +336,7 @@ fn region_chunk(size: uint) (ptr, uint) {
                 @ptrv(region_pool_count, uint, REGION_BIG_IDX) = REGION_SLAB_CHUNKS - 1
                 return (slab, REGION_CHUNK_MAX)
             }
-            return (mem.alloc(REGION_SLAB_SIZE), REGION_SLAB_SIZE)
+            return (mem.alloc(size), size)
         }
     }
     return (mem.alloc(size), size)
@@ -363,7 +407,7 @@ fn region_reset_chunks(r: *Region) $noinline {
 
 fn region_exit(r: *Region) $inline {
     let start: ptr = r.@cast(ptr) + REGION_HEAD
-    if r.cursor != start {
+    if r.cursor != start || isset(r.pins) {
         // Debug builds always go there, to overwrite what the region gives up
         #if GC_DEBUG
         region_leave(r)
@@ -388,8 +432,14 @@ fn region_leave(r: *Region) $noinline {
     r.hint = 0
     let pins = r.pins
     if isset(pins) {
-        pins.@cast(Array[GcPtr]).clear()
+        let b = pins.@cast(*Bump)
         r.pins = null
+        if !isset(region_pin_spare) && b.size <= 4096 {
+            b.reset()
+            region_pin_spare = b
+        } else {
+            b.free()
+        }
     }
 }
 
