@@ -1501,6 +1501,59 @@ for mode in oob-direct oob-counter oob-preinc oob-max; do
     fi
 done
 
+echo "> Exit loop regions on early return from a value scope in a suspending function"
+vscope_src="$workdir/vscope-region-exit.valk"
+vscope_ir="$workdir/vscope-region-exit.ll"
+cat > "$vscope_src" << 'EOF'
+class VsNode {
+    v: int (1)
+    l: ?VsNode (null)
+    r: ?VsNode (null)
+    static fn tree(d: int) VsNode {
+        if d == 0 : return VsNode {}
+        return VsNode { l: VsNode.tree(d - 1), r: VsNode.tree(d - 1) }
+    }
+    fn sum() int {
+        let s = this.v
+        let l = this.l
+        if isset(l) : s += l.sum()
+        let r = this.r
+        if isset(r) : s += r.sum()
+        return s
+    }
+}
+fn susp_noop() $suspend {}
+fn find_in_vscope(limit: uint) uint {
+    let res = <{
+        let i: uint = 0
+        while i < limit {
+            let t = VsNode.tree(3)
+            if t.sum() > 2 && i > 2 : return i
+            i++
+        }
+        return 0
+    }
+    susp_noop()
+    return res
+}
+fn main() {
+    let _ = find_in_vscope(10)
+}
+EOF
+if ! out=$("$VALK" build "$vscope_src" --release --ir --no-warn -o "$vscope_ir" 2>&1); then
+    echo "# Failed to emit IR for vscope region exit fixture"
+    echo "$out"
+    exit 1
+fi
+vscope_body=$(sed -n '/^define .*__find_in_vscope__/,/^}/p' "$vscope_ir")
+init_count=$(grep -c '__region_init__' <<< "$vscope_body" || true)
+exit_count=$(grep -c '__region_exit__' <<< "$vscope_body" || true)
+if [ "$init_count" -lt 1 ] || [ "$exit_count" -lt 2 ]; then
+    echo "# Expected region_exit on both normal loop exit and value-scope early return (inits=$init_count, exits=$exit_count)"
+    echo "$vscope_body"
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 54"
+echo "# Test count: 55"
 echo ""
