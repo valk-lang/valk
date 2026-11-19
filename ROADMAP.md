@@ -4,6 +4,8 @@
 `+` = Done | `~` = Works but needs to be improved | `-` = Todo
 
 ```
+- Release 0.8.10
+
 + Release 0.8.9
 + Language: compile-time value generic parameters (`const NAME: Type` for `bool`, integers, and `String`) across functions, methods, classes, structs, traits, and `extend`
 + Language: zero-copy element borrowing in `each` loops (`each arr as &item`, `each arr as mut &item`, with optional index) for arrays, slices, and fixed arrays
