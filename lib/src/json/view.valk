@@ -1,6 +1,7 @@
 @ignore_access
 
 use core
+use mem
 
 value DOC_NULL (0)
 value DOC_TRUE (1)
@@ -47,13 +48,13 @@ class Doc {
         return View { doc: this, index: 1 }
     }
 
-    - fn add(tag: u8, a: u32, b: u32) u32 {
+    - fn add(tag: u8, a: u32, b: u32) u32 $inline {
         let index = this.nodes.length.to(u32)
         this.nodes.append(DocNode { tag: tag, a: a, b: b })
         return index
     }
 
-    - fn add_number(tag: u8, bits: u64) u32 {
+    - fn add_number(tag: u8, bits: u64) u32 $inline {
         return this.add(tag, bits.to(u32), (bits >> 32).to(u32))
     }
 
@@ -70,11 +71,10 @@ class Doc {
         let stack = doc_stack
         let links = this.links
         let count = stack.length - mark
-        let map_index: u32 = 0
         if count > DOC_MAP_MEMBERS && this.nodes[node.to(uint)].tag == DOC_OBJECT {
             let maps = this.maps ?? Array[Map[uint]]{}
             this.maps = maps
-            map_index = maps.length.to(u32)
+            let map_index = maps.length.to(u32)
             let map = Map[uint]{}
             each mark .. count as i {
                 let key = stack[i]
@@ -84,8 +84,14 @@ class Doc {
             links.append(map_index)
         }
         let first = links.length.to(u32)
-        each mark .. count as i : links.append(stack[i])
-        while stack.length > mark : stack.pop_last() ! break
+        if count > 0 {
+            @unsafe
+            let end_idx = first.to(uint) + count
+            links.fit_index(end_idx - 1)
+            mem.copy_bytes(stack.items().@cast(ptr) + mark * size_of(u32), links.items().@cast(ptr) + first.to(uint) * size_of(u32), count * size_of(u32))
+            links.length = end_idx
+            stack.length = mark
+        }
         let item = &this.nodes[node.to(uint)]
         item.a = first
         item.b = count.to(u32)
@@ -104,22 +110,34 @@ class Doc {
 
     // The node of a member's value, 0 when absent; the last of duplicate names wins
     - fn find(object: DocNode, name: String) u32 {
-        if object.b.to(uint) > DOC_MAP_MEMBERS {
+        let count = object.b.to(uint)
+        if count > DOC_MAP_MEMBERS {
             let maps = this.maps ?! panic("JSON document has no maps")
             let map = maps[this.links[object.a.to(uint) - 1].to(uint)]
             return (map.get(name) !? 0).to(u32)
         }
+        let name_len = name.bytes
         let first = object.a.to(uint)
-        let i = first + object.b.to(uint)
+        let i = first + count
+        @unsafe
+        let src_data: *[u8] = this.source.data
+        let name_data: *[u8] = name.data
+        let links_data = this.links.items()
+        let nodes_data = this.nodes.items()
         while i > first {
             i--
-            let key = this.links[i]
-            let node = this.nodes[key.to(uint)]
-            if node.b.to(uint) != name.bytes : continue
-            let same = node.tag == DOC_STRING
-                ? this.source.view(node.a.to(uint), node.b.to(uint)).equals(name)
-                : this.decoded_text(node.a) == name
-            if same : return key + 1
+            let key = links_data[i]
+            let node = &nodes_data[key.to(uint)]
+            if node.b.to(uint) != name_len : continue
+            if node.tag == DOC_STRING {
+                if name_len == 1 {
+                    if src_data[node.a.to(uint)] == name_data[0] : return key + 1
+                } else if mem.equals_bytes(src_data.@offset(node.a.to(uint)), name_data, name_len) {
+                    return key + 1
+                }
+            } else if this.decoded_text(node.a) == name {
+                return key + 1
+            }
         }
         return 0
     }
@@ -298,7 +316,7 @@ class Doc {
     /// Returns the object member named `key` or the array item at index `key`.
     ///
     /// Returns a `null` node when it is absent or the key form does not match the kind.
-    + fn get(key: uint | String) View $offset {
+    + fn get(key: uint | String) View $offset $inline {
         return View { doc: this.doc, index: this.lookup(key) }
     }
 
@@ -503,7 +521,13 @@ class Doc {
         max_depth: clamp_depth(max_depth)
         max_entries: max_entries
     }
-    let doc = Doc { source: json }
+    let est = length / 8
+    if est < 16 : est = 16
+    let doc = Doc {
+        source: json
+        nodes: Array[DocNode].new(est)
+        links: Array[u32].new(est)
+    }
     doc.add(DOC_NULL, 0, 0)
     // An error leaves members behind
     doc_stack.clear()
@@ -614,33 +638,52 @@ extend Parser[S] {
     // After the opening quote. A plain string stays a range of the source; read_string
     // decodes the others, with its checks of escapes and UTF-8
     fn doc_string(doc: Doc) u32 !ParseError {
+        @unsafe
+        let bytes: *[u8] = this.source.data
+        let limit = this.data_length
         let start = this.index
-        this.skip_plain_bytes()
-        // The fast scan stops within 16 bytes of the end, so the rest goes byte by byte
-        while true {
-            let ch = this.get(this.index)
+        let i = start
+        while i < limit {
+            let ch = bytes[i]
             if ch == '"' {
-                let length = this.index - start
-                this.index++
-                return doc.add(DOC_STRING, start.to(u32), length.to(u32))
+                this.index = i + 1
+                return doc.add(DOC_STRING, start.to(u32), (i - start).to(u32))
             }
             if ch < 32 || ch >= 0x80 || ch == '\\' : break
-            this.index++
+            i++
+            if i - start == 16 {
+                this.index = i
+                this.skip_plain_bytes()
+                i = this.index
+            }
         }
         this.index = start
         return doc.add_decoded(this.read_string() !>)
     }
 
     fn doc_number(doc: Doc) u32 !ParseError {
-        let value = this.parse_number() !>
-        match value {
-            int as number => {
-                return doc.add_number(DOC_INT, number.to(u64))
+        let parsed = this.scan_number() !>
+        if parsed.is_float {
+            let n = this.parsed_float(parsed) ?! throw .invalid {
+                message: "JSON float is outside the supported range"
+                at_index: this.index
+                character: 0
             }
-            float as number => {
-                return doc.add_number(DOC_FLOAT, core.f64_to_bits(number.to(f64)))
-            }
-            default => panic("A JSON number is an int or a float")
+            return doc.add_number(DOC_FLOAT, core.f64_to_bits(n.to(f64)))
         }
+        if parsed.exact {
+            if !parsed.negative && parsed.digits <= 9223372036854775807 {
+                return doc.add_number(DOC_INT, parsed.digits)
+            }
+            if parsed.negative && parsed.digits <= 9223372036854775808 {
+                return doc.add_number(DOC_INT, 0.to(u64) - parsed.digits)
+            }
+        }
+        let n = this.parsed_float(parsed) ?! throw .invalid {
+            message: "JSON integer is outside the supported range"
+            at_index: this.index
+            character: 0
+        }
+        return doc.add_number(DOC_FLOAT, core.f64_to_bits(n.to(f64)))
     }
 }
