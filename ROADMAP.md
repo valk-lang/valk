@@ -11,6 +11,7 @@
 + GC: parallel STW pre-mark with work stealing, single-worker shared mark fast path, local-to-shared root tracking, inline 63-bit layout bitmaps, contiguous GC-ref field reordering, single-branch `Pool.get`, leaf-object fast path, batched shared memory accounting, and capped 120 KiB pool blocks
 + Regions: expanded frame/region coverage, stateless closure regions, non-heap write-barrier elision, large-chunk reuse, and typed structured IR patches (replacing textual control tokens)
 + Compiler: counted slice loop versioning with pre-loop bounds guards, copy-on-publish elision for dead unaliased locals, atomic elision on locked stores and read-only atomic fields, `nounwind`/`cold noreturn`/`inbounds` IR attributes, and refactored compiler modules with shared AST traversal helpers
++ Compile time: direct `%sret.out`/arg-slot init for large aggregate literals, deterministic 16-way generic unit sharding, largest-first object scheduling scaled to CPU threads, and a shared content-addressed `.o` cache across projects
 + Standard library & HTTP: faster `json` parsing/encoding, `ByteBuffer` decimal formatting, `Heap` flat backing storage, AVX2 base64 encode, non-blocking TLS read fast paths, and smaller per-worker HTTP/2 buffer and coroutine stack cache footprint
 + Fix (regions & GC): fat-borrow region aliasing on in-loop mutations (`&arr[i]` and `each arr as mut &item`), value-scope loop region exits, region pin overflow handling, and parallel GC stack-scan race
 
