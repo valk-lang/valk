@@ -472,7 +472,22 @@ fn value_publish_copy(value: Value, ctx: Context, scope: Scope, target: Type) Va
     }
     if value_is_fresh_unaliased_call(value, ctx) : return value
     // `$clone` hooks run as on shared data, so they cannot hand back the original's parts
-    return value_clone(value, ctx, scope, at, false, false, true, true) !>
+    let cloned = value_clone(value, ctx, scope, at, false, false, true, true) !>
+    if value.type == VAL.decl && value.rett.is_gc_type() && cloned.type == VAL.call
+        && !isset(value.get_pre_value()) && !isset(cloned.get_pre_value())
+        && func.info_used && !func.is_local_check && ctx.build.silent == 0 && ctx.build.options.needs_ir() {
+            let decl = value.decl
+            if isset(decl) && decl.owner == func && !decl.is_arg && !decl.is_captured && !decl.is_bind && !decl.is_buffer
+                && !type_has_user_clone_hook(value.rett, Array[Class]{}) {
+                    let list = func.publish_copies ?? <{
+                        let created = Array[PublishCopyCandidate]{}
+                        func.publish_copies = created
+                        return created
+                    }
+                    list.append(PublishCopyCandidate { clone_node: cloned, decl_val: value })
+                }
+        }
+    return cloned
 }
 
 // A class literal whose values are its fields, not the calls a collection literal makes
@@ -548,7 +563,7 @@ fn type_has_user_clone_hook(type: Type, seen: Array[Class]) bool {
         seen.append(class)
         if isset(class.get_clone_hook()) {
             let base_name = (class.generic_from ?? class).name
-            if class.ns.pkg.name == "valk" && class.ns.name == "core" && (base_name == "Array" || base_name == "HashMap" || base_name == "ByteBuffer" || base_name == "String") {
+            if class.ns.pkg.name == "valk" && class.ns.name == "core" && (base_name == "Array" || base_name == "HashMap" || base_name == "HashSet" || base_name == "Deque" || base_name == "FlatMap" || base_name == "Map" || base_name == "ByteBuffer" || base_name == "String") {
                 let args = class.generic_types ?! return false
                 each args as arg {
                     if type_has_user_clone_hook(arg, seen) : return true
@@ -592,7 +607,7 @@ fn func_is_known_isolated_stdlib(func: Func) bool {
     if ns == "core" {
         let class = func.class ?! return false
         let base_name = (class.generic_from ?? class).name
-        return base_name == "Array" || base_name == "HashMap" || base_name == "ByteBuffer" || base_name == "String" || class.kind == CLASS_KIND.slice || class.kind == CLASS_KIND.integer || class.kind == CLASS_KIND.float || class.kind == CLASS_KIND.boolean
+        return base_name == "Array" || base_name == "HashMap" || base_name == "HashSet" || base_name == "Deque" || base_name == "FlatMap" || base_name == "Map" || base_name == "ByteBuffer" || base_name == "String" || class.kind == CLASS_KIND.slice || class.kind == CLASS_KIND.integer || class.kind == CLASS_KIND.float || class.kind == CLASS_KIND.boolean
     }
     return false
 }
@@ -699,6 +714,221 @@ fn func_body_is_isolated(func: Func, seen: Array[Func]) bool {
     seen.pop_last() _
     if seen.length == 0 : func.isolated_state = 3
     return true
+}
+
+class PublishCopyCandidate {
+    clone_node: Value
+    decl_val: Value
+}
+
+// Elides copy-on-publish clones of local variables that are freshly constructed, never aliased
+// outside isolated stdlib mutations, and never used again after the publish site.
+fn func_elide_publish_copies(func: Func) {
+    let list = func.publish_copies ?! return
+    func.publish_copies = null
+    if list.length == 0 : return
+    let body = func.body_scope ?! return
+    each list as cand {
+        let decl = cand.decl_val.decl ?! continue
+        if decl.is_captured || decl.is_bind || decl.is_arg || decl.is_buffer : continue
+        let defer_scope = func.defer_scope
+        if isset(defer_scope) && publish_scope_uses_decl(defer_scope.values, decl) : continue
+        let w = PublishElideWalk {
+            func: func
+            decl: decl
+            clone_node: cand.clone_node
+        }
+        w.walk_list(body.values)
+        if !w.bad && w.init_count == 1 && w.init_fresh && w.clone_seen && w.clone_loop == w.init_loop {
+            let cn = cand.clone_node
+            cn.type = VAL.wrap
+            cn.value1 = cand.decl_val
+            cn.value2 = null
+            cn.values = null
+            cn.decl = null
+        }
+    }
+}
+
+fn publish_scope_uses_decl(values: Array[Value], decl: Decl) bool {
+    each values as v {
+        if publish_val_uses_decl(v, decl) : return true
+    }
+    return false
+}
+
+fn publish_val_uses_decl(value: Value, decl: Decl) bool {
+    if value.type == VAL.decl && value.decl == decl : return true
+    let pre = value.get_pre_value()
+    if isset(pre) && publish_val_uses_decl(pre, decl) : return true
+    let v1 = value.value1
+    if isset(v1) && publish_val_uses_decl(v1, decl) : return true
+    let v2 = value.value2
+    if isset(v2) && publish_val_uses_decl(v2, decl) : return true
+    let list = value.values
+    if isset(list) {
+        each list as item {
+            if publish_val_uses_decl(item, decl) : return true
+        }
+    }
+    return false
+}
+
+fn publish_arg_is_isolated(value: Value, func: Func, decl: Decl) bool {
+    if publish_val_uses_decl(value, decl) : return false
+    if value_publish_needs_no_copy(value) : return true
+    let t = value.type
+    if t == VAL.wrap || t == VAL.cast || t == VAL.shared_view {
+        let inner = value.value1 ?! return false
+        return publish_arg_is_isolated(inner, func, decl)
+    }
+    if t == VAL.class_init && value_init_sets_fields(value) {
+        let fields = value.values ?? Array[Value]{}
+        each fields as part {
+            if !publish_arg_is_isolated(part, func, decl) : return false
+        }
+        return true
+    }
+    if t == VAL.call {
+        return value_is_fresh_unaliased_call(value, Context.for_func(func))
+    }
+    return false
+}
+
+fn publish_rhs_is_fresh(value: Value, func: Func, decl: Decl) bool {
+    let t = value.type
+    if t == VAL.wrap || t == VAL.cast {
+        let inner = value.value1 ?! return false
+        return publish_rhs_is_fresh(inner, func, decl)
+    }
+    if t == VAL.class_init && value_init_sets_fields(value) {
+        let fields = value.values ?? Array[Value]{}
+        each fields as part {
+            if !publish_arg_is_isolated(part, func, decl) : return false
+        }
+        return true
+    }
+    if t == VAL.call {
+        return value_is_fresh_unaliased_call(value, Context.for_func(func))
+    }
+    return false
+}
+
+class PublishElideWalk {
+    func: Func
+    decl: Decl
+    clone_node: Value
+    loop_depth: uint (0)
+    init_count: uint (0)
+    init_loop: uint (0)
+    init_fresh: bool (false)
+    clone_seen: bool (false)
+    clone_loop: uint (0)
+    bad: bool (false)
+
+    fn walk_list(values: ?Array[Value]) {
+        if this.bad || !isset(values) : return
+        each values as v {
+            this.walk(v)
+            if this.bad : return
+        }
+    }
+
+    fn walk(v: ?Value) {
+        if this.bad || !isset(v) : return
+        if v == this.clone_node {
+            if this.clone_seen {
+                this.bad = true
+                return
+            }
+            this.clone_seen = true
+            this.clone_loop = this.loop_depth
+            return
+        }
+        let pre = v.get_pre_value()
+        if isset(pre) {
+            this.walk(pre)
+            if this.bad : return
+        }
+        let t = v.type
+        if t == VAL.while {
+            this.loop_depth++
+            this.walk(v.value1)
+            this.walk_list(v.values)
+            this.loop_depth--
+            return
+        }
+        if t == VAL.if {
+            this.walk(v.value1)
+            this.walk_list(v.values)
+            this.walk(v.value2)
+            return
+        }
+        if t == VAL.assign {
+            let lhs = v.value1
+            let rhs = v.value2
+            if isset(lhs) && lhs.type == VAL.decl && lhs.decl == this.decl {
+                this.walk(rhs)
+                if this.bad || this.clone_seen || this.init_count > 0 || v.op != ASSIGN_OP.set.to(u8) || !isset(rhs) {
+                    this.bad = true
+                    return
+                }
+                this.init_count = 1
+                this.init_loop = this.loop_depth
+                this.init_fresh = publish_rhs_is_fresh(rhs, this.func, this.decl)
+                return
+            }
+            // Writing a non-GC scalar field on `decl` before publish cannot create aliases
+            if isset(lhs) && lhs.type == VAL.prop && !lhs.rett.has_gc_refs() {
+                let recv = lhs.value1
+                if isset(recv) && recv.type == VAL.decl && recv.decl == this.decl && !this.clone_seen {
+                    this.walk(rhs)
+                    return
+                }
+            }
+            this.walk(lhs)
+            this.walk(rhs)
+            return
+        }
+        if t == VAL.call && v.call_kind == CALL_KIND.direct {
+            let callee = v.value1
+            if isset(callee) && callee.type == VAL.func {
+                let recv = callee.value1
+                let fn_ref = callee.func
+                if isset(recv) && recv.type == VAL.decl && recv.decl == this.decl && isset(fn_ref)
+                    && !this.clone_seen && (!v.rett.has_gc_refs() || v.rett.is_void_type())
+                    && func_is_known_isolated_stdlib(fn_ref) {
+                        let args = v.values
+                        let args_ok = true
+                        if isset(args) {
+                            each args as arg {
+                                this.walk(arg)
+                                if this.bad || this.clone_seen || !publish_arg_is_isolated(arg, this.func, this.decl) {
+                                    args_ok = false
+                                    break
+                                }
+                            }
+                        }
+                        if args_ok : return
+                        this.bad = true
+                        return
+                    }
+            }
+        }
+        if t == VAL.prop && !v.rett.has_gc_refs() {
+            let recv = v.value1
+            if isset(recv) && recv.type == VAL.decl && recv.decl == this.decl && !this.clone_seen {
+                return
+            }
+        }
+        if t == VAL.decl && v.decl == this.decl {
+            this.bad = true
+            return
+        }
+        this.walk(v.value1)
+        this.walk(v.value2)
+        this.walk_list(v.values)
+    }
 }
 
 fn value_is_capture_free_func(value: Value) bool {

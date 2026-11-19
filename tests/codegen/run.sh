@@ -347,6 +347,18 @@ if [[ -z "$locked_body" || "$locked_body" == *"atomicrmw"* || "$locked_body" == 
     echo "$locked_body"
     exit 1
 fi
+elide_body=$(sed -n '/^define .*__publish_elide_dead__/,/^}/p' "$atomic_ir")
+if [[ -z "$elide_body" || "$elide_body" == *"__clone__"* ]]; then
+    echo "# Publishing a dead fresh local should elide the clone call"
+    echo "$elide_body"
+    exit 1
+fi
+keep_body=$(sed -n '/^define .*__publish_keep_live__/,/^}/p' "$atomic_ir")
+if [[ -z "$keep_body" || "$keep_body" != *"__clone__"* ]]; then
+    echo "# Publishing a local used afterwards must still clone it"
+    echo "$keep_body"
+    exit 1
+fi
 
 echo "> Vector types lower to LLVM vectors with element alignment"
 
