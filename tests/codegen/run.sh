@@ -583,6 +583,18 @@ if [[ "$fills_body" != *"llvm.memcpy.p0.p0.i64(ptr %"*", i64 4096"* ]] || [[ "$f
     echo "$fills_body"
     exit 1
 fi
+fills_body=$(sed -n "/^define .*__return_fill__/,/^}/p" "$fills_ir")
+if [[ "$fills_body" != *"ptr %sret.out"* ]] || [[ "$fills_body" == *"load [4096 x i8]"* ]] || [[ "$fills_body" == *"store [4096 x i8]"* ]]; then
+    echo "# return_fill loaded or stored a 4096-byte fixed array by value"
+    echo "$fills_body"
+    exit 1
+fi
+fills_body=$(sed -n "/^define .*__pass_fill__/,/^}/p" "$fills_ir")
+if [[ "$fills_body" == *"load [4096 x i8]"* ]] || [[ "$fills_body" == *"store [4096 x i8]"* ]]; then
+    echo "# pass_fill loaded or stored a 4096-byte argument by value"
+    echo "$fills_body"
+    exit 1
+fi
 
 bounds_ir="$workdir/fixed-array-bounds.ll"
 out=$(ir_result "$bounds_ir")
