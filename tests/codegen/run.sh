@@ -1387,6 +1387,120 @@ if ! grep -q '^define .*__panic__.* nounwind cold noreturn' "$region_ir" \
     exit 1
 fi
 
+echo "> Version counted slice loops with pre-loop bounds guards while preserving out-of-bounds panics"
+loop_src="$workdir/loop-bounds.valk"
+loop_ir="$workdir/loop-bounds.ll"
+loop_bin="$workdir/loop-bounds"
+cat > "$loop_src" << 'EOF'
+fn merge_step(dst: local mut &[i32], src: local &[i32], left: uint, mid: uint, right: uint) {
+    let i = left
+    let j = mid + 1
+    let k = left
+    while i <= mid && j <= right {
+        if src[i] <= src[j] {
+            dst[k] = src[i]
+            i++
+        } else {
+            dst[k] = src[j]
+            j++
+        }
+        k++
+    }
+    while i <= mid {
+        dst[k] = src[i]
+        i++
+        k++
+    }
+}
+
+fn fill_stride(buf: local mut &[u8], limit: uint, step: uint) {
+    let m: uint = 0
+    while m <= limit {
+        buf[m] = 7
+        m += step
+    }
+}
+
+fn pre_inc_read(buf: local &[u8], limit: uint) uint {
+    let i: uint = 0
+    let sum: uint = 0
+    while i <= limit {
+        i++
+        sum += buf[i].to(uint)
+    }
+    return sum
+}
+
+fn main(args: Array[String]) i32 {
+    let mode = args.length > 1 ? args[1] : "ok"
+    if mode == "ok" {
+        let src = [i32]{ 1, 5, 2, 4 }
+        let dst = [i32]{ 0 x 4 }
+        merge_step(dst, src, 0, 1, 3)
+        let buf = [u8]{ 0 x 6 }
+        fill_stride(buf, 5, 2)
+        if dst[0] != 1 || dst[1] != 2 || dst[2] != 4 || dst[3] != 5 : return 1
+        if buf[0] != 7 || buf[2] != 7 || buf[4] != 7 : return 2
+        if pre_inc_read(buf, 3) != 14 : return 3
+        return 0
+    }
+    if mode == "oob-direct" {
+        let buf = [u8]{ 0 x 4 }
+        fill_stride(buf, 4, 2)
+        return 0
+    }
+    if mode == "oob-counter" {
+        let src = [i32]{ 1, 5, 2, 4 }
+        let dst = [i32]{ 0 x 2 }
+        merge_step(dst, src, 0, 1, 3)
+        return 0
+    }
+    if mode == "oob-preinc" {
+        let buf = [u8]{ 1 x 4 }
+        let _ = pre_inc_read(buf, 3)
+        return 0
+    }
+    if mode == "oob-max" {
+        let buf = [u8]{ 0 x 4 }
+        fill_stride(buf, uint.$max, 1)
+        return 0
+    }
+    return 9
+}
+EOF
+if ! out=$("$VALK" build "$loop_src" --opt --ir --no-warn -o "$loop_ir" 2>&1); then
+    echo "# Failed to emit IR for loop bounds fixture"
+    echo "$out"
+    exit 1
+fi
+merge_body=$(sed -n '/^define .*__merge_step__/,/^}/p' "$loop_ir")
+stride_body=$(sed -n '/^define .*__fill_stride__/,/^}/p' "$loop_ir")
+if [[ "$merge_body" != *'while.fast'* || "$merge_body" != *'while.slow'* || "$merge_body" != *'getelementptr inbounds'* ]] \
+    || [[ "$stride_body" != *'while.fast'* || "$stride_body" != *'while.slow'* ]]; then
+    echo "# Counted slice loops did not emit versioned fast/slow loops with inbounds GEP"
+    echo "$merge_body"
+    exit 1
+fi
+if ! out=$("$VALK" build "$loop_src" --opt --no-warn -o "$loop_bin" 2>&1); then
+    echo "# Failed to compile loop bounds fixture"
+    echo "$out"
+    exit 1
+fi
+if ! "$loop_bin" ok; then
+    echo "# Loop bounds fixture failed valid case"
+    exit 1
+fi
+for mode in oob-direct oob-counter oob-preinc oob-max; do
+    if out=$("$loop_bin" "$mode" 2>&1); then
+        echo "# Loop bounds fixture did NOT panic on $mode"
+        exit 1
+    fi
+    if [[ "$out" != *'Index out of bounds'* ]]; then
+        echo "# Unexpected failure output on $mode: $out"
+        exit 1
+    fi
+done
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 53"
+echo "# Test count: 54"
 echo ""
