@@ -1554,6 +1554,38 @@ if [ "$init_count" -lt 1 ] || [ "$exit_count" -lt 2 ]; then
     exit 1
 fi
 
+echo "> Emit explicit LLVM align N for \$align(N) structs and globals"
+align_src="$workdir/explicit-align.valk"
+align_ir="$workdir/explicit-align.ll"
+cat > "$align_src" << 'EOF'
+struct CacheLine $align(64) {
+    counter: uint (0)
+}
+shared g_aligned: uint (0) $align(64)
+fn use_aligned() uint {
+    let local_line = CacheLine { counter: 5 }
+    return local_line.counter + g_aligned
+}
+fn main() {
+    let _ = use_aligned()
+}
+EOF
+if ! out=$("$VALK" build "$align_src" --release --ir --no-warn -o "$align_ir" 2>&1); then
+    echo "# Failed to emit IR for explicit align fixture"
+    echo "$out"
+    exit 1
+fi
+if ! grep -Eq 'g_aligned.*global i64 zeroinitializer, align 64' "$align_ir"; then
+    echo "# Expected align 64 on g_aligned global"
+    grep 'g_aligned' "$align_ir" || true
+    exit 1
+fi
+if ! grep -Eq 'alloca \[8 x i64\], align 64' "$align_ir"; then
+    echo "# Expected align 64 on CacheLine stack alloca"
+    sed -n '/^define .*__use_aligned__/,/^}/p' "$align_ir" || true
+    exit 1
+fi
+
 echo "# All generated-code optimization tests passed"
-echo "# Test count: 55"
+echo "# Test count: 56"
 echo ""
