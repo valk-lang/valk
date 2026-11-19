@@ -1,0 +1,2236 @@
+use helper
+
+////////////////////////////
+// Value scopes and raw memory
+////////////////////////////
+
+// `<{ ... }` — body re-parsed as statements; returns form the value (phi).
+fn value_from_vscope_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.left)
+    if !isset(body) : exp.bug("vscope is missing body")
+    if body.type != EXP.body : exp.bug("vscope body must be EXP.body")
+
+    let returns = Array[Value]{}
+    let sub = scope.sub_scope()
+    sub.vscope_returns = returns
+    // Seed result type from the suggested type (assign / !? alt / let type / …)
+    let suggested_type = ctx.suggested_type
+    if isset(suggested_type) : sub.vscope_rett = suggested_type
+
+    let state = ParseState.new()
+    let stmts = Array[Value]{}
+    let p = body_parser(body) !>
+    let members = read_func_stmts(p) !>
+    each members as mem {
+        let v = body_value_from_exp(ctx, sub, state, mem) !>
+        if isset(v) : stmts.append(v)
+    }
+    if state.has_open_if() || state.is_skipping() {
+        exp.error("Missing compile macro '#end' in value scope")
+    }
+    // The body always falls through into its returned value
+    let removed = sub.not_null_removed
+    if isset(removed) : each removed as decl : scope.clear_not_null(decl)
+
+    let rett = sub.vscope_rett
+    if returns.length == 0 && sub.did_return {
+        // The body always exits (throw/panic/return/...): no value is needed
+        scope.did_return = true
+        let phi = vgen_phi(Array[Value]{}, rett ?? type_void(ctx.build), exp)
+        return vgen_vscope(stmts, phi, exp)
+    }
+    if !isset(rett) || returns.length == 0 || !sub.did_return {
+        exp.error("Value scope did not return a value")
+    }
+    let retvs = Array[Value]{}
+    let all_exit = true
+    each returns as ret {
+        let rv = ret.value1
+        if !isset(rv) : exp.bug("Value scope return has no value")
+        if !rv.never_returns : all_exit = false
+        retvs.append(rv)
+    }
+    if all_exit : scope.did_return = true
+    let phi = vgen_phi(retvs, rett, exp)
+    return vgen_vscope(stmts, phi, exp)
+}
+
+// @ptrv(on, Type, offset?) — body re-parsed as value, type, optional value.
+fn value_from_ptrv_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("@ptrv is missing body")
+    if body.type != EXP.body : exp.bug("@ptrv body must be EXP.body")
+
+    let b = ctx.build
+    let p = body_parser(body) !>
+
+    let on_exp = read_value_exp(p, true, true) !>
+    p.expect(",", true, true) !>
+    let type_exp = read_type_exp(p, true, true) !>
+
+    let offset_exp: ?Exp = null
+    let t = p.tok(true, true, false) !>
+    if t == TOK.sign && p.word_is(",") {
+        p.tok(true, true) !>
+        let next = p.tok(true, true, false) !>
+        if next == TOK.sign && p.word_is(")") {
+            p.error("Trailing comma in @ptrv arguments")
+        } else {
+            if next == TOK.sign && p.word_is(",") {
+                p.error("Empty item in @ptrv arguments")
+            }
+            offset_exp = read_value_exp(p, true, true) !>
+            if read_comma_list_next(p, ")", "@ptrv arguments") !> {
+                p.error("@ptrv expects at most three arguments")
+            }
+        }
+    } else {
+        p.expect(")", true, true) !>
+    }
+
+    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    on = value_through_borrow(on, ctx)
+    if !on.rett.is_pointer() {
+        if !on.rett.is_inline_type() {
+            on_exp.error("Expected a pointer value, not: '" + on.rett.compat_display_name() + "'")
+        }
+        let pointer_t = on.rett.adr_ref()
+        on = value_try_convert(on, scope, ctx, pointer_t, true, true) !>
+        pointer_t.compat_check(on.rett, on_exp) !>
+    }
+
+    let elem = type_from_exp(type_exp, scope) !>
+    // Reading through a pointer that came out of shared storage keeps the view,
+    // the same as indexing a shared sequence does.
+    elem = on.rett.storage_view_of(elem)
+
+    let offset = vgen_int(0, type_int(b))
+    if isset(offset_exp) {
+        offset = value_from_exp(offset_exp, scope, ctx.with_suggested_type(type_int(b))) !>
+        if !offset.rett.is_integer_type() {
+            offset_exp.error("Expected a number value, not: " + offset.rett.compat_display_name())
+        }
+    }
+
+    return vgen_ptrv(on, offset, elem, exp)
+}
+
+// `$clone(value)` — deep-copy intrinsic.
+fn value_from_clone_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    if exp.bool1 : warn_deprecated_spelling(exp, "'$clone(x)' is deprecated: write 'clone x'")
+    let arg_exp = exp.get(VALUE_EXP.left)
+    if !isset(arg_exp) : exp.bug("clone is missing its value")
+    let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    let at = ctx.clone_at ?? exp
+    return value_clone(arg, ctx, scope, at, isset(ctx.clone_at) ? ctx.clone_check_access : true, false, clone_wants_plain(ctx)) !>
+}
+
+fn value_from_copy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = exp.get(VALUE_EXP.left)
+    if !isset(arg_exp) : exp.bug("copy is missing its value")
+    let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    return value_copy(arg, ctx, scope, exp) !>
+}
+
+// A property marked `-` or `~` can hold an invariant of its class, so only the class's own
+// hook may duplicate it
+fn class_guarded_prop(class: Class) ?Prop {
+    each class.props as prop {
+        if prop.act != ACT.public && prop.act != ACT.undefined : return prop
+    }
+    return null
+}
+
+// `what`: "copy" or "clone", the method that would make the copy instead
+fn class_check_generated_copy(class: Class, what: String, at: Exp) !Error {
+    // `@ignore_access` is the unsafe way past it
+    if at.src.ignore_access : return
+    let guarded = class_guarded_prop(class) ?! return
+    at.error("Cannot " + what + " '" + class.pretty_name() + "': property '" + (guarded.name ?? "?")
+        + "' is marked '-' or '~', so only a '" + what + "' method of the class can copy it")
+}
+
+// `copy value`: a new value holding the same parts. A class copies through its `$copy`
+// function, or field by field when all of its fields are public
+fn value_copy(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let type = value.rett
+    let nn = type.get_non_nullable()
+    let view = nn.is_shared || nn.is_locked
+    let class = value_member_class(nn)
+    if isset(class) {
+        if !isset(class.get_copy_hook()) : type_settle_hooks(nn, Array[String]{ "$copy" }) !>
+        let hook = class.get_copy_hook()
+        if isset(hook) : return value_copy_method(value, hook, ctx, scope, at) !>
+    }
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) {
+        let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
+        let slice_class = bare_slice_class(ctx.build, element, at) !>
+        let hook = slice_class.get_copy_hook() ?! at.bug("Bare slice class has no '$copy' hook")
+        let slice_type = slice_class.get_type() !>
+        let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
+        as_slice.exp = value.exp
+        let copied = value_copy_method(as_slice, hook, ctx, scope, at) !>
+        // The copy has storage of its own, also when the original was only lent
+        return value_retype_bare_slice(copied, type.plain_type().owned_type().get_non_nullable().mut_type(), at)
+    }
+    let string_class = type_string(ctx.build).get_class_or_null()
+    if nn.kind == TYPE.closure || (isset(class) && class == string_class) : return value
+    if view && type.has_gc_refs() {
+        at.error("Cannot copy '" + nn.compat_display_name() + "': the copy would still refer to its " + (nn.is_shared ? "atomic" : "locked")
+            + " parts as ordinary data; use 'clone' for an independent copy")
+    }
+    if !nn.is_gc_type() || nn.is_inline {
+        if nn.kind == TYPE.interface || nn.is_raw_pointer() : at.error("Cannot copy a value of type '" + nn.compat_display_name() + "'")
+        // An inline value is copied by assigning it
+        return view ? vgen_cast(value, type.plain_type()) : value
+    }
+    if !isset(class) || !nn.is_structural_type() : at.error("Cannot copy a value of type '" + nn.compat_display_name() + "'")
+    class_check_generated_copy(class, "copy", at) !>
+    if isset(class.get_func("gc_free")) {
+        at.error("Cannot copy '" + class.pretty_name() + "': both copies would release the resource its 'gc_free' releases")
+    }
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let copy_source = type.is_nullable_type() ? value_force_remove_nullable(source) : source
+    let copy_func = value_copy_func(nn, class, ctx, at) !>
+    let copied = vgen_call(ctx, vgen_func(copy_func), Array[Value]{ copy_source }, copy_func.get_rett(), scope)
+    copied.exp = at
+    let result = copied
+    if type.is_nullable_type() {
+        let nullable = copy_func.get_rett().nullable()
+        result = vgen_this_or_that(vgen_isset_val(source, type_bool(ctx.build)), value_make_nullable(copied), vgen_null(nullable), nullable)
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_copy_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    act_check(at, method.act, method.exp, false, "function '" + method.name + "'") !>
+    if !method.parsed_types : parse_func_types(method) !>
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let receiver = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    receiver = value_read_borrowed_receiver(receiver, scope, ctx, at) !>
+    let target = func_for_receiver(method, receiver, at, ctx.func) !>
+    let callee = vgen_func(target, receiver)
+    let args = Array[Value]{}
+    value_check_call_args(target, callee, args, scope, ctx, at) !>
+    let copied = vgen_call(ctx, callee, args, target.get_rett(), scope)
+    copied.exp = at
+    let result = copied
+    if value.rett.is_nullable_type() {
+        let nullable = copied.rett.nullable()
+        result = vgen_this_or_that(vgen_isset_val(source, type_bool(ctx.build)), value_make_nullable(copied), vgen_null(nullable), nullable)
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+// `fn(value: T) T`: a new object holding the same field values
+fn value_copy_func(type: Type, class: Class, ctx: Context, at: Exp) Func !Error {
+    let key = "copy:" + type_identity_key(type)
+    ctx.build.cache.clone_funcs.get(key) -> cached : return cached
+    let owner = ctx.get_func() !>
+    let arg_scope = Scope.new(owner.ns.scope)
+    let plain = type.plain_type()
+    let copy_func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<copy." + class.name + "." + helper.ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: plain
+    }
+    ctx.build.cache.clone_funcs.set(key, copy_func)
+    arg_scope.func = copy_func
+    append_func_arg(copy_func, "value", type)
+    bind_func_arg_decls(copy_func) !>
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = copy_func
+    copy_func.body_scope = body_scope
+    copy_func.alloca_scope = body_scope.sub_scope()
+    copy_func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(copy_func)
+    let value_arg = copy_func.args.get(0) ! at.bug("Copy helper is missing its value")
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        fields.set(prop, vgen_cast(field, prop.type))
+    }
+    let b = ctx.build
+    body_scope.append_value(vgen_return(vgen_class_init(inner_ctx, class, fields, plain, at) !>, b, at))
+    body_scope.did_return = true
+    owner.unit.functions.append(copy_func)
+    func_finish_ast(copy_func) !>
+    if !isset(b.options.lsp) : generate_func_ir(copy_func) !>
+    return copy_func
+}
+
+// A `$clone` of shared data copies it unless a shared result is expected, like an element of
+// `Array[shared T]`
+fn clone_wants_plain(ctx: Context) bool {
+    let wanted = ctx.suggested_type ?! return true
+    return !wanted.get_non_nullable().is_shared
+}
+
+fn value_from_hash_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let arg_exp = exp.get(VALUE_EXP.left)
+    if !isset(arg_exp) : exp.bug("$hash is missing its argument")
+    let arg = value_from_exp(arg_exp, scope, ctx.without_suggested_type()) !>
+    return value_hash(arg, ctx, scope, exp) !>
+}
+
+fn value_hash(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    if value.rett.is_nullable_type() {
+        at.error("Cannot hash a nullable type")
+    }
+    let nn = value.rett.get_non_nullable()
+    let class = value_member_class(nn)
+    if isset(class) && !isset(class.get_hash_hook()) : type_settle_hooks(nn, Array[String]{ "$hash" }) !>
+    let method = isset(class) ? class.get_hash_hook() : null
+    if !isset(method) {
+        // A struct or tuple hashes its parts
+        if type_auto_hashable(nn, true) : return value_structural_hash(value, ctx, scope, at) !>
+        at.error("Type '" + nn.compat_display_name() + "' has no 'hash' method")
+    }
+    return value_hash_method(value, method, ctx, scope, at) !>
+}
+
+// Whether values of `t` get a hash from their parts, consistent with how `==` compares
+// them: an inline struct, tuple or fixed array of hashable parts (`top`), or a part that is
+// an integer, bool, enum, pointer, or has `$hash`
+fn type_auto_hashable(t: Type, top: bool) bool {
+    let nn = t.get_non_nullable()
+    let class = nn.get_direct_class_or_null()
+    let own_hash = isset(class) && isset(class.get_hash_hook())
+    if !top {
+        if own_hash : return true
+        if nn.is_float_type() : return false
+        if nn.is_integer_type() || nn.is_bool_type() || isset(nn.get_enum()) : return !nn.is_float_type()
+        // An object without `$eq` is equal only to itself
+        if nn.is_pointer() && !nn.is_inline : return !nn.has_eq()
+    }
+    if own_hash || t.is_nullable_type() && top : return false
+    if nn.has_eq() : return false
+    if nn.is_fixed_array_type() {
+        let member = nn.get_sub_type() ?! return false
+        return type_auto_hashable(member, false)
+    }
+    if nn.is_tuple_type() {
+        let members = nn.get_members() ?! return false
+        each members as member {
+            if !type_auto_hashable(member, false) : return false
+        }
+        return members.length > 0
+    }
+    if !nn.is_inline || !isset(class) || class.representation_class().kind != CLASS_KIND.struct : return false
+    each class.props as prop {
+        if !type_auto_hashable(prop.type, false) : return false
+    }
+    return class.props.length > 0
+}
+
+// The hash of an inline struct, tuple or fixed array from the hashes of its parts
+fn value_structural_hash(value: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let b = ctx.build
+    let uint_t = type_from_core(b, "uint") !>
+    let type = value.rett.get_non_nullable()
+    let func = ctx.get_func() !>
+    let slot = vgen_scratch_value(func, type, at)
+    let address = vgen_cast(slot, type_ptr(b))
+    let result = vgen_int(0x2545F4914F6CDD1D, uint_t)
+    if type.is_fixed_array_type() && type.length > FIXED_EQUAL_UNROLL {
+        // Longer fixed arrays hash in a loop
+        let member = type.get_sub_type() ?! at.bug("Fixed array hash has no element type")
+        let i64_t = type_i64(b)
+        let index = vgen_scratch_storage(func, i64_t)
+        let acc = vgen_scratch_storage(func, uint_t)
+        let offset = vgen_op(vgen_decl(index), vgen_int((member.byte_size() !>).to(int), i64_t), VALUE_OP.mul, i64_t)
+        let part = value_hash_part_at(address, offset, member, ctx, scope, at) !>
+        let loop = vgen_while(vgen_op(vgen_decl(index), vgen_int(type.length.to(int), i64_t), VALUE_OP.lt, type_bool(b)), Array[Value]{
+            vgen_assign(vgen_decl(acc), value_hash_combine(vgen_decl(acc), part, uint_t), ASSIGN_OP.set, b, at)
+            vgen_assign(vgen_decl(index), vgen_int(1, i64_t), ASSIGN_OP.add, b, at)
+        }, b, at)
+        let body = Array[Value]{
+            vgen_assign(slot, value, ASSIGN_OP.set, b, at)
+            vgen_assign(vgen_decl(index), vgen_int(0, i64_t), ASSIGN_OP.set, b, at)
+            vgen_assign(vgen_decl(acc), result, ASSIGN_OP.set, b, at)
+            loop
+        }
+        return vgen_scoped_value(body, vgen_decl(acc), at)
+    }
+    if type.is_fixed_array_type() {
+        let member = type.get_sub_type() ?! at.bug("Fixed array hash has no element type")
+        let stride = member.byte_size() !>
+        let i: u32 = 0
+        while i < type.length {
+            result = value_hash_combine(result, value_hash_part(address, stride * i, member, ctx, scope, at) !>, uint_t)
+            i++
+        }
+    } else if type.is_tuple_type() {
+        let members = type.get_members() ?! at.bug("Tuple hash has no member types")
+        let offset: u32 = 0
+        each members as member {
+            offset = member.ir_align_offset(offset) !>
+            result = value_hash_combine(result, value_hash_part(address, offset, member, ctx, scope, at) !>, uint_t)
+            offset += member.byte_size() !>
+        }
+    } else {
+        let class = type.class ?! at.bug("Struct hash has no class")
+        each class.props as prop {
+            result = value_hash_combine(result, value_hash_part(address, prop.offset, prop.type, ctx, scope, at) !>, uint_t)
+        }
+    }
+    let body = Array[Value]{ vgen_assign(slot, value, ASSIGN_OP.set, b, at) }
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_hash_combine(acc: Value, part: Value, uint_t: Type) Value {
+    let mixed = vgen_op(acc, part, VALUE_OP.bit_xor, uint_t)
+    return vgen_op(mixed, vgen_int(0x100000001b3, uint_t), VALUE_OP.mul, uint_t)
+}
+
+// The hash of the part of type `type` at `offset` bytes into `address`
+fn value_hash_part(address: Value, offset: u32, type: Type, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    return value_hash_part_at(address, vgen_int(offset.to(int), type_i64(ctx.build)), type, ctx, scope, at) !>
+}
+
+fn value_hash_part_at(address: Value, byte_offset: Value, type: Type, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let b = ctx.build
+    let uint_t = type_from_core(b, "uint") !>
+    let part = vgen_load(vgen_ptr_offset(address, byte_offset, at), type, at)
+    if type.is_nullable_type() {
+        let bool_t = type_bool(b)
+        let present = value_hash_value(value_force_remove_nullable(part), ctx, scope, at) !>
+        return vgen_this_or_that(vgen_isset_val(part, bool_t), present, vgen_int(0, uint_t), uint_t)
+    }
+    return value_hash_value(part, ctx, scope, at) !>
+}
+
+fn value_hash_value(part: Value, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    let b = ctx.build
+    let uint_t = type_from_core(b, "uint") !>
+    let nn = part.rett.get_non_nullable()
+    let class = nn.get_direct_class_or_null()
+    let method = isset(class) ? class.get_hash_hook() : null
+    if isset(method) : return value_hash_method(part, method, ctx, scope, at) !>
+    if isset(nn.get_enum()) : part = value_enum_representation(part) !>
+    if part.rett.is_integer_type() || part.rett.is_bool_type() : return vgen_cast(part, uint_t)
+    if part.rett.is_pointer() && !part.rett.is_inline : return value_pointer_as_uint(part, type_ptr_uint(b))
+    return value_structural_hash(part, ctx, scope, at) !>
+}
+
+fn value_hash_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp) Value !Error {
+    act_check(at, method.act, method.exp, false, "function '" + method.name + "'") !>
+    if !method.parsed_types : parse_func_types(method) !>
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    value = value_read_borrowed_receiver(value, scope, ctx, at) !>
+    if value.rett.is_nullable_type() : at.error("Cannot hash a nullable type")
+    method = func_for_receiver(method, value, at, ctx.func) !>
+    let callee = vgen_func(method, value)
+    let args = Array[Value]{}
+    value_check_call_args(method, callee, args, scope, ctx, at) !>
+    let hashed = vgen_call(ctx, callee, args, uint_t, scope)
+    hashed.exp = at
+    return hashed
+}
+
+// `copy_shared`: a shared value is copied into a plain one, for a `$clone` whose result is not
+// shared; otherwise shared data is returned as it is, since nobody can change it
+fn value_clone(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool (true), allow_pointer_alias: bool (false), copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
+    let type = value.rett
+    let nn = type.get_non_nullable()
+    if nn.is_shared && !copy_shared : return value
+    if nn.kind == TYPE.closure {
+        // An ordinary closure read through a view: its copy is ordinary again
+        if (nn.is_shared || nn.is_locked) && copy_shared {
+            let plain = vgen_cast(value, type.plain_type())
+            plain.exp = value.exp
+            return value_fn_clone(plain, ctx, scope, at) !>
+        }
+        return value_fn_clone(value, ctx, scope, at) !>
+    }
+    if allow_pointer_alias && !isset(nn.class)
+        && (nn.is_bare_borrow() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of) : return value
+    let class = value_member_class(nn)
+    if isset(class) {
+        if !isset(class.get_clone_hook()) : type_settle_hooks(nn, Array[String]{ "$clone" }) !>
+        let method = class.get_clone_hook()
+        if isset(method) && (!check_access || act_allows(at, method.act, method.exp, false)) {
+            return value_clone_method(value, method, ctx, scope, at, check_access, view_hooks) !>
+        }
+    }
+    // A slice borrow is copied into storage of its own by the `&[T]` clone hook
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !allow_pointer_alias {
+        let element = nn.get_sub_type() ?! at.bug("Slice borrow has no element type")
+        let slice_class = bare_slice_class(ctx.build, element, at) !>
+        let method = slice_class.get_clone_hook() ?! at.bug("Bare slice class has no 'clone' method")
+        let slice_type = slice_class.get_type() !>
+        let as_slice = vgen_cast(value, type.is_nullable_type() ? slice_type.nullable() : slice_type)
+        as_slice.exp = value.exp
+        let cloned = value_clone_method(as_slice, method, ctx, scope, at, false, view_hooks) !>
+        let plain = type.plain_type().owned_type()
+        return value_retype_bare_slice(cloned, plain.get_non_nullable().mut_type(), at)
+    }
+    if (nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow()) && !allow_pointer_alias {
+        at.error("Cannot clone type '" + nn.compat_display_name() + "' because it aliases memory and has no accessible 'clone' method")
+    }
+    if nn.is_fixed_array_type() {
+        // Plain data copies as a whole instead of element by element
+        if type_clones_by_copy(nn) : return value
+        return value_clone_array(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+    }
+    if nn.kind == TYPE.struct && nn.is_inline && !isset(nn.class) && nn.has_gc_refs() {
+        return value_clone_tuple(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+    }
+    if nn.kind == TYPE.union : return value_clone_union(value, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+    if isset(class) && nn.is_structural_type() {
+        return value_clone_object(value, class, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+    }
+    if nn.kind == TYPE.interface {
+        // The implementation behind an interface is not known here; an object converted on
+        // the spot still is
+        let wrapped = value.type == VAL.interface_wrap ? value.value1 : null
+        let adapter = value.get_class_ref()
+        if isset(wrapped) && isset(adapter) {
+            let cloned = value_clone(wrapped, ctx, scope, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+            return vgen_interface_wrap(cloned, type, adapter, ctx)
+        }
+        at.error("Cannot clone an interface value of type '" + nn.compat_display_name() + "': the implementation is not known here. Clone it through its concrete type with 'match'")
+    }
+    return value
+}
+
+// Data without references or `$clone` hooks, which a copy clones
+fn type_clones_by_copy(type: Type) bool {
+    let nn = type.get_non_nullable()
+    if nn.has_gc_refs() || nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow() : return false
+    let class = value_member_class(nn)
+    if isset(class) && isset(class.get_clone_hook()) : return false
+    if nn.is_fixed_array_type() {
+        let sub = nn.get_sub_type() ?! return true
+        return type_clones_by_copy(sub)
+    }
+    let members = nn.get_members()
+    if isset(members) {
+        each members as member : if !type_clones_by_copy(member) : return false
+    }
+    if isset(class) && nn.is_structural_type() {
+        each class.props as prop : if !type_clones_by_copy(prop.type) : return false
+    }
+    return true
+}
+
+// Whether `value_clone` can copy this type, decided without generating anything. A class with
+// a `$clone` hook and type arguments (Array, HashMap, ...) copies its items, so those must be
+// clonable too.
+fn type_can_clone(type: Type, allow_pointer_alias: bool, seen: Array[Class]) bool {
+    let nn = type.get_non_nullable()
+    if nn.is_shared || nn.kind == TYPE.closure : return true
+    if nn.kind == TYPE.interface : return false
+    if allow_pointer_alias && !isset(nn.class)
+        && (nn.is_bare_borrow() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of) : return true
+    let class = value_member_class(nn)
+    if isset(class) {
+        if seen.contains(class) : return true
+        if isset(class.get_clone_hook()) {
+            seen.append(class)
+            let args = class.generic_types ?! return true
+            each args as arg {
+                if !type_can_clone(arg, allow_pointer_alias, seen) : return false
+            }
+            return true
+        }
+    }
+    if nn.kind == TYPE.ref_slice && !isset(nn.class) && !nn.is_local {
+        let element = nn.get_sub_type() ?! return true
+        return type_can_clone(element, allow_pointer_alias, seen)
+    }
+    if nn.is_raw_pointer() || nn.kind == TYPE.ptr_of || nn.kind == TYPE.adr_of || nn.is_bare_borrow() : return false
+    if nn.is_fixed_array_type() {
+        let sub = nn.get_sub_type() ?! return true
+        return type_can_clone(sub, allow_pointer_alias, seen)
+    }
+    if nn.kind == TYPE.union || (nn.kind == TYPE.struct && nn.is_inline && !isset(nn.class)) {
+        let members = nn.get_members() ?! return true
+        each members as member {
+            if member.is_null_alt() : continue
+            if !type_can_clone(member, allow_pointer_alias, seen) : return false
+        }
+        return true
+    }
+    if isset(class) && nn.is_structural_type() {
+        // A copy would share the resource its finalizer releases
+        if isset(class.get_func("gc_free")) || isset(class_guarded_prop(class)) : return false
+        seen.append(class)
+        each class.props as prop {
+            if !type_can_clone(prop.type, allow_pointer_alias, seen) : return false
+        }
+    }
+    return true
+}
+
+// Copying shared data into a plain copy reaches only what the view made shared: a part declared
+// shared stays the same shared data in the copy
+fn clone_copies_shared(copy_shared: bool, declared: Type) bool {
+    return copy_shared && !declared.get_non_nullable().is_shared
+}
+
+fn value_clone_method(value: Value, method: Func, ctx: Context, scope: Scope, at: Exp, check_access: bool, view_hooks: bool (false)) Value !Error {
+    if !method.parsed_types : parse_func_types(method) !>
+
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let receiver = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    receiver = value_read_borrowed_receiver(receiver, scope, ctx, at) !>
+    // A copy made for publishing runs the hook as on shared data: it cannot hand back the original
+    let receiver_nn = receiver.rett.get_non_nullable()
+    if view_hooks && !receiver_nn.is_shared && !receiver_nn.is_locked {
+        receiver = vgen_cast(receiver, receiver.rett.shared_type())
+    }
+    let result = receiver
+    if receiver.rett.is_nullable_type() {
+        result = value_clone_method(receiver, method, ctx, scope, at, check_access, view_hooks) !>
+    } else {
+        method = get_func_clone_variant(method, at, check_access) !>
+        method = func_for_receiver(method, receiver, at, ctx.func) !>
+        let callee = vgen_func(method, receiver)
+        let args = Array[Value]{}
+        value_fill_trailing_defaults(method, call_receiver_skip(callee, method), args, scope, ctx, at) !>
+        value_check_call_args(method, callee, args, scope, ctx, at) !>
+        let cloned = vgen_call(ctx, callee, args, method.get_rett(), scope)
+        cloned.exp = at
+        result = cloned
+        if method.can_error {
+            cloned.can_error = true
+            cloned.set_error_type(method.error_type)
+            result = value_apply_error_pass(cloned, scope, ctx, at) !>
+        }
+    }
+    if value.rett.is_nullable_type() {
+        let actual = result.rett
+        result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(result),
+            vgen_null(actual.nullable()),
+            actual.nullable()
+        )
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_clone_object(value: Value, class: Class, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
+    class_check_generated_copy(class, "clone", at) !>
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let clone_source = value.rett.is_nullable_type() ? value_force_remove_nullable(source) : source
+    let clone_func = value_clone_func(value.rett.get_non_nullable(), class, ctx, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+    let cloned = vgen_call(ctx, vgen_func(clone_func), Array[Value]{ clone_source }, clone_func.get_rett(), scope)
+    cloned.exp = at
+    let result = cloned
+    if value.rett.is_nullable_type() {
+        let nullable = clone_func.get_rett().nullable()
+        result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(cloned),
+            vgen_null(nullable),
+            nullable
+        )
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_clone_func(type: Type, class: Class, ctx: Context, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Func !Error {
+    let source = access_root_source(at.src)
+    let owner = ctx.get_func() !>
+    // Inside a fill, objects are only made and queued; elsewhere a clone fills its whole graph
+    let defers = owner.clone_defers
+    let key = type_identity_key(type) + ":" + source.id + ":" + at.src.ignore_access + ":" + check_access + ":" + allow_pointer_alias + ":" + copy_shared + ":" + view_hooks
+    let plain = type.plain_type()
+    if plain.is_gc_type() {
+        let make = value_clone_make_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+        if defers : return make
+        let direct: ?Func = null
+        if type_clone_is_unique_tree(type, copy_shared, Array[Class]{}, true, Array[Class]{}) && isset(valk_idf(ctx.build, "core", "clone_is_outer") !? null) {
+            direct = value_clone_direct_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+        }
+        return value_clone_top_func(key, type, make, direct, owner, at) !>
+    }
+
+    // A struct is copied by value: it has no identity to keep
+    let struct_key = key + ":" + defers
+    ctx.build.cache.clone_funcs.get(struct_key) -> cached : return cached
+    let clone_func = value_clone_helper(owner, "<clone." + class.name + "." + helper.ctxhash(struct_key) + ">", plain, at)
+    clone_func.clone_defers = defers
+    ctx.build.cache.clone_funcs.set(struct_key, clone_func)
+    append_func_arg(clone_func, "value", type)
+    bind_func_arg_decls(clone_func) !>
+    let body_scope = clone_func.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(clone_func)
+    let value_arg = clone_func.args.get(0) ! at.bug("Clone helper is missing its value")
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        field.rett = type.storage_view_of(prop.type)
+        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+        prop.type.compat_check(cloned.rett, at) !>
+        fields.set(prop, cloned)
+    }
+    let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
+    body_scope.append_value(vgen_return(result, ctx.build, at))
+    value_clone_helper_finish(owner, clone_func) !>
+    return clone_func
+}
+
+fn value_clone_helper(owner: Func, name: String, rett: Type, at: Exp) Func {
+    let arg_scope = Scope.new(owner.ns.scope)
+    let func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: name
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: rett
+    }
+    arg_scope.func = func
+    let body_scope = arg_scope.sub_scope()
+    body_scope.func = func
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    return func
+}
+
+fn value_clone_helper_finish(owner: Func, func: Func) !Error {
+    let body_scope = func.body_scope
+    if isset(body_scope) : body_scope.did_return = true
+    owner.unit.functions.append(func)
+    func_finish_ast(func) !>
+    if !isset(owner.ns.build.options.lsp) : generate_func_ir(func) !>
+}
+
+fn value_clone_core_func(b: Build, name: String, at: Exp) Func !Error {
+    let func = value_get_valk_func(b, "core", name, at) !>
+    if !func.parsed_types : parse_func_types(func) !>
+    return func
+}
+
+// Makes the copy of one object: the copy made before in this clone, or a shallow copy whose
+// fields a fill clones later. An object copied before keeps cycles and shared parts in shape
+fn value_clone_make_func(key: String, type: Type, class: Class, owner: Func, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool, view_hooks: bool) Func !Error {
+    let b = owner.ns.build
+    let make_key = key + ":make"
+    b.cache.clone_funcs.get(make_key) -> cached : return cached
+    let plain = type.plain_type()
+    let make = value_clone_helper(owner, "<clone." + class.name + "." + helper.ctxhash(make_key) + ">", plain, at)
+    b.cache.clone_funcs.set(make_key, make)
+    append_func_arg(make, "value", type)
+    bind_func_arg_decls(make) !>
+    let fill = value_clone_fill_func(key, type, class, owner, at, check_access, allow_pointer_alias, copy_shared, view_hooks) !>
+
+    let body_scope = make.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(make)
+    let value_arg = make.args.get(0) ! at.bug("Clone helper is missing its value")
+    let ptr_t = type_ptr(b)
+    let find_f = value_clone_core_func(b, "clone_find", at) !>
+    let note_f = value_clone_core_func(b, "clone_note", at) !>
+    let defer_f = value_clone_core_func(b, "clone_defer", at) !>
+
+    let found = Decl.new(make, find_f.get_rett(), false, "found")
+    found.exp = at
+    body_scope.add_decl(found)
+    let find = vgen_call(inner_ctx, vgen_func(find_f), Array[Value]{ vgen_cast(vgen_decl(value_arg.decl), ptr_t) }, find_f.get_rett(), body_scope)
+    body_scope.append_value(vgen_assign(vgen_decl(found), find, ASSIGN_OP.set, b, at))
+    let again = Array[Value]{ vgen_return(vgen_cast(value_force_remove_nullable(vgen_decl(found)), plain), b, at) }
+    body_scope.append_value(vgen_if(vgen_isset_val(vgen_decl(found), type_bool(b)), again, null, b, at))
+
+    let shallow = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        shallow.set(prop, vgen_cast(field, prop.type))
+    }
+    let result = Decl.new(make, plain, false, "result")
+    result.is_mut = true
+    result.exp = at
+    body_scope.add_decl(result)
+    body_scope.append_value(vgen_assign(vgen_decl(result), vgen_class_init(inner_ctx, class, shallow, plain, at) !>, ASSIGN_OP.set, b, at))
+    let source_ptr = vgen_cast(vgen_decl(value_arg.decl), ptr_t)
+    let copy_ptr = vgen_cast(vgen_decl(result), ptr_t)
+    body_scope.append_value(vgen_call(inner_ctx, vgen_func(note_f), Array[Value]{ source_ptr, copy_ptr }, note_f.get_rett(), body_scope))
+    let fill_ref = value_retype_function(vgen_func(fill), TYPE.fnptr)
+    body_scope.append_value(vgen_call(inner_ctx, vgen_func(defer_f), Array[Value]{ source_ptr, copy_ptr, fill_ref }, defer_f.get_rett(), body_scope))
+    body_scope.append_value(vgen_return(vgen_decl(result), b, at))
+    value_clone_helper_finish(owner, make) !>
+    return make
+}
+
+// Clones the fields of a copy the make function queued
+fn value_clone_fill_func(key: String, type: Type, class: Class, owner: Func, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool, view_hooks: bool) Func !Error {
+    let b = owner.ns.build
+    let ptr_t = type_ptr(b)
+    let fill = value_clone_helper(owner, "<clone_fill." + class.name + "." + helper.ctxhash(key) + ">", type_void(b), at)
+    fill.clone_defers = true
+    append_func_arg(fill, "source", ptr_t)
+    append_func_arg(fill, "copy", ptr_t)
+    bind_func_arg_decls(fill) !>
+    let body_scope = fill.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(fill)
+    let source_arg = fill.args.get(0) ! at.bug("Clone helper is missing its source")
+    let copy_arg = fill.args.get(1) ! at.bug("Clone helper is missing its copy")
+    let plain = type.plain_type()
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_cast(vgen_decl(source_arg.decl), type), inner_ctx)
+        field.rett = type.storage_view_of(prop.type)
+        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+        if cloned == field : continue
+        prop.type.compat_check(cloned.rett, at) !>
+        let slot = vgen_prop(prop, vgen_cast(vgen_decl(copy_arg.decl), plain), inner_ctx)
+        body_scope.append_value(vgen_store(slot, cloned, ASSIGN_OP.set, inner_ctx, body_scope, at) !>)
+    }
+    body_scope.append_value(vgen_return(null, b, at))
+    value_clone_helper_finish(owner, fill) !>
+    return fill
+}
+
+// Whether an outer clone of `type` can never visit any structural GC object twice:
+// no structural GC class appears more than once or inside a multi-element container
+fn type_clone_is_unique_tree(type: Type, copy_shared: bool, seen: Array[Class], allow_structural: bool, path: Array[Class]) bool {
+    let t = type.get_non_nullable()
+    if t.is_shared && !copy_shared : return true
+    if !t.has_gc_refs() && t.kind != TYPE.closure : return true
+    if t.kind == TYPE.closure || t.kind == TYPE.interface : return false
+    let string_class = type_string(t.build).get_class_or_null()
+    let class = value_member_class(t)
+    if isset(string_class) && class == string_class : return true
+    if isset(class) && class.atomic && !copy_shared : return true
+    if isset(class) && isset(class.get_clone_hook()) {
+        let base_name = (class.generic_from ?? class).name
+        if class.ns.pkg.name == "valk" && class.ns.name == "core" && (base_name == "Array" || base_name == "HashMap" || base_name == "ByteBuffer") {
+            let args = class.generic_types ?! return true
+            each args as arg {
+                if !type_clone_is_unique_tree(arg, copy_shared, seen, false, path) : return false
+            }
+            return true
+        }
+        return false
+    }
+    if t.kind == TYPE.ref_slice && !isset(t.class) {
+        let sub = t.get_sub_type() ?! return true
+        return type_clone_is_unique_tree(sub, copy_shared, seen, false, path)
+    }
+    if t.is_fixed_array_type() {
+        if t.length == 0 : return true
+        let sub = t.get_sub_type() ?! return true
+        return type_clone_is_unique_tree(sub, copy_shared, seen, t.length == 1 && allow_structural, path)
+    }
+    if t.kind == TYPE.union || (t.kind == TYPE.struct && t.is_inline && !isset(t.class)) {
+        let members = t.get_members() ?! return true
+        each members as member {
+            if member.is_null_alt() : continue
+            if !type_clone_is_unique_tree(member, copy_shared, seen, allow_structural, path) : return false
+        }
+        return true
+    }
+    if isset(class) && t.is_structural_type() {
+        if t.is_gc_type() {
+            if !allow_structural || seen.contains(class) : return false
+            seen.append(class)
+        } else {
+            // A struct that holds itself, through an Array for example
+            if path.contains(class) : return false
+            path.append(class)
+        }
+        each class.props as prop {
+            if !type_clone_is_unique_tree(prop.type, clone_copies_shared(copy_shared, prop.type), seen, allow_structural, path) : return false
+        }
+        if !t.is_gc_type() : path.pop_last() !? null
+        return true
+    }
+    return false
+}
+
+// Single-pass clone for an acyclic unique-class tree when no outer clone is active
+fn value_clone_direct_func(key: String, type: Type, class: Class, owner: Func, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool, view_hooks: bool) Func !Error {
+    let b = owner.ns.build
+    let direct_key = key + ":direct"
+    b.cache.clone_funcs.get(direct_key) -> cached : return cached
+    let plain = type.plain_type()
+    let direct = value_clone_helper(owner, "<clone_direct." + class.name + "." + helper.ctxhash(direct_key) + ">", plain, at)
+    b.cache.clone_funcs.set(direct_key, direct)
+    append_func_arg(direct, "value", type)
+    bind_func_arg_decls(direct) !>
+    let body_scope = direct.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(direct)
+    let value_arg = direct.args.get(0) ! at.bug("Clone helper is missing its value")
+    let fields = HashMap[Prop, Value]{}
+    each class.props as prop {
+        let field = vgen_prop(prop, vgen_decl(value_arg.decl), inner_ctx)
+        field.rett = type.storage_view_of(prop.type)
+        let cloned = value_clone(field, inner_ctx, body_scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, prop.type), view_hooks) !>
+        prop.type.compat_check(cloned.rett, at) !>
+        fields.set(prop, cloned)
+    }
+    let result = vgen_class_init(inner_ctx, class, fields, plain, at) !>
+    body_scope.append_value(vgen_return(result, b, at))
+    value_clone_helper_finish(owner, direct) !>
+    return direct
+}
+
+// A clone outside a fill: makes the copy, then fills everything it queued
+fn value_clone_top_func(key: String, type: Type, make: Func, direct: ?Func, owner: Func, at: Exp) Func !Error {
+    let b = owner.ns.build
+    let top_key = key + ":top"
+    b.cache.clone_funcs.get(top_key) -> cached : return cached
+    let plain = type.plain_type()
+    let top = value_clone_helper(owner, "<clone_top." + helper.ctxhash(top_key) + ">", plain, at)
+    b.cache.clone_funcs.set(top_key, top)
+    append_func_arg(top, "value", type)
+    bind_func_arg_decls(top) !>
+    let body_scope = top.body_scope ?! at.bug("Clone helper has no body")
+    let inner_ctx = Context.for_func(top)
+    let value_arg = top.args.get(0) ! at.bug("Clone helper is missing its value")
+    if isset(direct) {
+        let is_outer_f = value_clone_core_func(b, "clone_is_outer", at) !>
+        let cond = vgen_call(inner_ctx, vgen_func(is_outer_f), Array[Value]{}, is_outer_f.get_rett(), body_scope)
+        let fast_call = vgen_call(inner_ctx, vgen_func(direct), Array[Value]{ vgen_decl(value_arg.decl) }, plain, body_scope)
+        let fast_body = Array[Value]{ vgen_return(fast_call, b, at) }
+        body_scope.append_value(vgen_if(cond, fast_body, null, b, at))
+    }
+    let begin_f = value_clone_core_func(b, "clone_begin", at) !>
+    let end_f = value_clone_core_func(b, "clone_end", at) !>
+
+    let mark = Decl.new(top, begin_f.get_rett(), false, "mark")
+    mark.exp = at
+    body_scope.add_decl(mark)
+    body_scope.append_value(vgen_assign(vgen_decl(mark), vgen_call(inner_ctx, vgen_func(begin_f), Array[Value]{}, begin_f.get_rett(), body_scope), ASSIGN_OP.set, b, at))
+    let result = Decl.new(top, plain, false, "result")
+    result.exp = at
+    body_scope.add_decl(result)
+    let made = vgen_call(inner_ctx, vgen_func(make), Array[Value]{ vgen_decl(value_arg.decl) }, plain, body_scope)
+    body_scope.append_value(vgen_assign(vgen_decl(result), made, ASSIGN_OP.set, b, at))
+    body_scope.append_value(vgen_call(inner_ctx, vgen_func(end_f), Array[Value]{ vgen_decl(mark) }, end_f.get_rett(), body_scope))
+    body_scope.append_value(vgen_return(vgen_decl(result), b, at))
+    value_clone_helper_finish(owner, top) !>
+    return top
+}
+
+fn value_bind_once(value: Value, ctx: Context, at: Exp, body: Array[Value], snapshot: bool (false)) Value {
+    if !snapshot && value.type == VAL.decl && !isset(value.get_pre_value()) : return value
+    let func = ctx.func ?! return value
+    if value.rett.has_gc_refs() {
+        let buffered = buffer_value(ctx, func, value)
+        let pre = buffered.get_pre_value()
+        if isset(pre) : body.append(pre)
+        buffered.set_pre_value(null)
+        buffered.set_graph_source(value)
+        return buffered
+    }
+    let slot = vgen_scratch_value(func, value.rett, at)
+    body.append(vgen_assign(slot, value, ASSIGN_OP.set, ctx.build, at))
+    slot.set_graph_source(value)
+    return slot
+}
+
+fn value_clone_array(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
+    let type = value.rett.plain_type()
+    let array = type.get_non_nullable()
+    let sub = array.get_sub_type() ?! at.bug("Fixed-array clone has no element type")
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let clone_source = source
+    if type.is_nullable_type() : clone_source = value_force_remove_nullable(source)
+    let elements = Array[Value]{}
+    let i: uint = 0
+    while i < array.length {
+        let element = vgen_multi_part(clone_source, i, value.rett.storage_view_of(sub), at)
+        let cloned = value_clone(element, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, sub), view_hooks) !>
+        sub.compat_check(cloned.rett, at) !>
+        elements.append(cloned)
+        i++
+    }
+    let cloned = vgen_array_init(ctx, elements, array, at)
+    let result = cloned
+    if type.is_nullable_type() {
+        result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(cloned),
+            vgen_null(type),
+            type
+        )
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+// A tuple is copied part by part, like a fixed array
+fn value_clone_tuple(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
+    let type = value.rett.plain_type()
+    let tuple = type.get_non_nullable()
+    let members = tuple.get_members() ?! at.bug("Tuple clone has no member types")
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let clone_source = source
+    if type.is_nullable_type() : clone_source = value_force_remove_nullable(source)
+    let parts = Array[Value]{}
+    let part_types = Array[Type]{}
+    let retyped = false
+    each members as member, i {
+        let part = vgen_multi_part(clone_source, i, value.rett.storage_view_of(member), at)
+        let member_nn = member.get_non_nullable()
+        // A borrow owns nothing: the copy shares it, keeping how it was viewed
+        if member_nn.kind == TYPE.ref_of || member_nn.kind == TYPE.ref_slice {
+            parts.append(part)
+            part_types.append(part.rett)
+            if part.rett != member : retyped = true
+            continue
+        }
+        let cloned = value_clone(part, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member), view_hooks) !>
+        // A copy of locked data is not locked
+        let expected = member.plain_type()
+        expected.compat_check(cloned.rett, at) !>
+        parts.append(cloned)
+        part_types.append(expected)
+        if expected != member : retyped = true
+    }
+    let result_tuple = retyped ? type_multi(ctx.build, part_types, true) : tuple
+    let result_type = type.is_nullable_type() ? result_tuple.nullable() : result_tuple
+    let cloned = vgen_multi(parts, result_tuple, at)
+    let result = cloned
+    if type.is_nullable_type() {
+        result = vgen_this_or_that(
+            vgen_isset_val(source, type_bool(ctx.build)),
+            value_make_nullable(cloned),
+            vgen_null(result_type),
+            result_type
+        )
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_clone_union(value: Value, ctx: Context, scope: Scope, at: Exp, check_access: bool, allow_pointer_alias: bool, copy_shared: bool (false), view_hooks: bool (false)) Value !Error {
+    let type = value.rett.plain_type()
+    let union = type.get_non_nullable()
+    let members = union.get_members() ?! at.bug("Tagged-union clone has no alternatives")
+    let body = Array[Value]{}
+    let source = value_bind_once(value, ctx, at, body)
+    let result: Value = vgen_null(type)
+    let i = members.length
+    while i-- > 0 {
+        let member = members.get(i) ! at.bug("Tagged-union clone alternative is missing")
+        if member.is_null_alt() {
+            let wrapped = vgen_union_wrap(source, type, i, ctx) ?! at.bug("Failed to rebuild cloned tagged union")
+            result = vgen_this_or_that(vgen_union_is(source, i, at), wrapped, result, type)
+            continue
+        }
+        let extracted = vgen_union_extract(source, member, ctx, at) !>
+        extracted.rett = value.rett.storage_view_of(member)
+        let cloned = value_clone(extracted, ctx, scope, at, check_access, allow_pointer_alias, clone_copies_shared(copy_shared, member), view_hooks) !>
+        member.compat_check(cloned.rett, at) !>
+        let wrapped = vgen_union_wrap(cloned, type, i, ctx) ?! at.bug("Failed to rebuild cloned tagged union")
+        result = vgen_this_or_that(vgen_union_is(source, i, at), wrapped, result, type)
+    }
+    if body.length == 0 : return result
+    return vgen_scoped_value(body, result, at)
+}
+
+fn value_from_memcpy_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("@memcpy is missing its argument body")
+    let arg_exps = parse_body_as_value_list(body) !>
+    if arg_exps.length != 3 {
+        exp.error("@memcpy expects 3 arguments, got " + arg_exps.length)
+    }
+
+    let ptr_t = type_ptr(ctx.build)
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let values = Array[Value]{}
+    each arg_exps as arg_exp, i {
+        let target = i < 2 ? ptr_t : uint_t
+        let value = value_from_exp(arg_exp, scope, ctx.with_suggested_type(target)) !>
+        if i < 2 && value.rett.is_inline_type() : target = value.rett.adr_ref()
+        value = value_try_convert(value, scope, ctx, target, true, i < 2) !>
+        target.compat_check(value.rett, arg_exp) !>
+        values.append(value)
+    }
+    return vgen_memcpy(values, ctx.build, exp)
+}
+
+// `$leading_zeros(x)`, `$trailing_zeros(x)` and `$count_ones(x)` count bits of an integer
+// and give a value of its type; `$mul_wide(a, b)` multiplies two u64 into the 128-bit
+// product, returned as (high, low)
+fn value_from_intrinsic_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let name = exp.str1
+    if is_vector_intrinsic(name) : return value_from_vector_intrinsic(exp, scope, ctx) !>
+    let body = exp.get(VALUE_EXP.right) ?! exp.bug("$" + name + " is missing its argument body")
+    let arg_exps = parse_body_as_value_list(body) !>
+    if name == "pause" : return value_from_pause_exp(exp, arg_exps, ctx) !>
+    if name == "prefetch" : return value_from_prefetch_exp(exp, arg_exps, scope, ctx) !>
+    if name == "cpuid" || name == "xgetbv" : return value_from_cpuid_exp(exp, name, arg_exps, scope, ctx) !>
+    let wide = name == "mul_wide"
+    let expected: uint = wide ? 2 : 1
+    if arg_exps.length != expected {
+        exp.error("$" + name + " expects " + expected + (wide ? " arguments" : " argument") + ", got " + arg_exps.length)
+    }
+    let u64_type = type_from_core(ctx.build, "u64") !>
+    let values = Array[Value]{}
+    each arg_exps as arg_exp {
+        let value = value_from_exp(arg_exp, scope, wide ? ctx.with_suggested_type(u64_type) : ctx.without_suggested_type()) !>
+        if wide {
+            value = value_try_convert(value, scope, ctx, u64_type) !>
+            u64_type.compat_check(value.rett, arg_exp) !>
+        } else {
+            value = value_try_remove_nullable(value, scope, ctx) !>
+            let t = value.rett
+            if !t.is_integer_type() || t.is_nullable_type() || isset(t.get_enum()) {
+                arg_exp.error("$" + name + " expects an integer, not: " + t.compat_display_name())
+            }
+        }
+        values.append(value)
+    }
+    let first = values.get(0) ! exp.bug("$" + name + " lost its argument")
+    let rett = wide ? type_multi(ctx.build, Array[Type]{ u64_type, u64_type }) : first.rett
+    let result = Value {
+        type: VAL.intrinsic
+        values: values
+        rett: rett
+        exp: exp
+    }
+    result.set_string(name)
+    return result
+}
+
+// `$cpuid(leaf, subleaf)` gives the four registers of the x86 CPUID instruction as
+// (eax, ebx, ecx, edx); `$xgetbv(index)` reads an extended control register. x86-64 only:
+// guard the call with `#if ARCH == "x64"`
+fn value_from_cpuid_exp(exp: Exp, name: String, arg_exps: Array[Exp], scope: Scope, ctx: Context) Value !Error {
+    let b = ctx.build
+    if b.options.target.arch != "x64" : exp.error("$" + name + " is only available on x86-64 targets; guard it with '#if ARCH == \"x64\"'")
+    let expected: uint = name == "cpuid" ? 2 : 1
+    if arg_exps.length != expected : exp.error("$" + name + " expects " + expected + (expected == 1 ? " argument" : " arguments") + ", got " + arg_exps.length)
+    let u32_type = type_from_core(b, "u32") !>
+    let values = Array[Value]{}
+    each arg_exps as arg_exp {
+        let value = value_from_exp(arg_exp, scope, ctx.with_suggested_type(u32_type)) !>
+        value = value_try_convert(value, scope, ctx, u32_type) !>
+        u32_type.compat_check(value.rett, arg_exp) !>
+        values.append(value)
+    }
+    let rett = name == "cpuid" ? type_multi(b, Array[Type]{ u32_type, u32_type, u32_type, u32_type }) : (type_from_core(b, "u64") !>)
+    let result = Value {
+        type: VAL.intrinsic
+        values: values
+        rett: rett
+        exp: exp
+    }
+    result.set_string(name)
+    return result
+}
+
+// `$pause()` hints the CPU during a spin-wait loop; it has no effect on program results
+fn value_from_pause_exp(exp: Exp, arg_exps: Array[Exp], ctx: Context) Value !Error {
+    if arg_exps.length != 0 : exp.error("$pause expects 0 arguments, got " + arg_exps.length)
+    let result = Value {
+        type: VAL.intrinsic
+        values: Array[Value]{}
+        rett: type_void(ctx.build)
+        exp: exp
+    }
+    result.set_string("pause")
+    return result
+}
+
+// `$prefetch(address)` asks the CPU to start loading the cache line at a raw pointer; it
+// has no effect on the program's results
+fn value_from_prefetch_exp(exp: Exp, arg_exps: Array[Exp], scope: Scope, ctx: Context) Value !Error {
+    if arg_exps.length != 1 : exp.error("$prefetch expects 1 argument, got " + arg_exps.length)
+    let arg_exp = arg_exps.get(0) ! exp.bug("$prefetch lost its argument")
+    let ptr_type = type_ptr(ctx.build)
+    let value = value_from_exp(arg_exp, scope, ctx.with_suggested_type(ptr_type)) !>
+    value = value_try_convert(value, scope, ctx, ptr_type) !>
+    if !value.rett.is_raw_pointer() : arg_exp.error("$prefetch expects a raw pointer, not: " + value.rett.compat_display_name())
+    let result = Value {
+        type: VAL.intrinsic
+        values: Array[Value]{ value }
+        rett: type_void(ctx.build)
+        exp: exp
+    }
+    result.set_string("prefetch")
+    return result
+}
+
+// @ref(assignable) — body is a single lvalue; result is raw ptr.
+// `&fixed[a .. n]`: a fixed array, or a borrow of one, is taken as a `&[T]`, then
+// the range is taken from that
+fn value_fixed_array_range_base(on: Value, offset_exp: Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let bounded = on.rett.kind == TYPE.ref_of && on.rett.length > 1
+    if !bounded && (!on.rett.is_fixed_array_type() || !on.assignable()) : return on
+    let body = offset_exp.get(VALUE_EXP.right) ?! return on
+    if body.type != EXP.body : return on
+    let access = parse_offset_access(body) !>
+    if access.value_kind != VALUE_KIND.bracket_range : return on
+    let whole = bounded ? on : (value_borrow_of(on, scope, ctx, at, true) !>)
+    let t = whole.rett
+    let element = t.get_sub_type() ?! at.bug("Fixed array has no element type")
+    let slice = t.is_local ? element.local_ref_slice() : element.ref_slice()
+    if t.is_mut : slice = slice.mut_type()
+    return value_try_convert(whole, scope, ctx, slice) !>
+}
+
+fn value_from_ref_of_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("@ref is missing body")
+    if body.type != EXP.body : exp.bug("@ref body must be EXP.body")
+
+    let on_exp = parse_body_as_value_exp(body) !>
+    let on = value_from_exp(on_exp, scope, ctx.without_suggested_type()) !>
+    if !on.assignable() {
+        exp.error("Cannot use '@ref' on this value. It can only be used on assignable values, like variable names or object properties.")
+    }
+    act_check_assign(on, exp, scope) !>
+    value_check_shared_address(on, exp) !>
+
+    let storage = value_prepare_borrow_storage(on, ctx)
+    if !isset(storage) : storage = on
+    value_clear_borrowed_local_facts(on, scope)
+
+    // `*T` for storage of type `T`, from the declared type: `*?T` even after `isset`.
+    // Inline struct storage is the struct object type, like `*Struct` in a signature.
+    let rett = on.rett.pointer()
+    let on_nn = on.rett.get_non_nullable()
+    let class = on_nn.get_direct_class_or_null()
+    if on_nn.is_inline && isset(class) && class.representation_class().kind == CLASS_KIND.struct && !on.rett.is_nullable_type() {
+        rett = on_nn.non_inline()
+    }
+    return vgen_ptr_of(storage, rett, exp)
+}
+
+// The address a borrow points at, typed `*T`; null when `value` is not a borrow
+fn value_borrow_target_address(value: Value) ?Value {
+    if value.rett.is_nullable_type() : return null
+    let t = value.rett.get_non_nullable()
+    if t.kind != TYPE.ref_of : return null
+    let sub = t.get_sub_type() ?! return null
+    let rett = t.length > 1 ? sub.pointer(t.length, false) : sub.pointer()
+    if t.length <= 1 && sub.is_inline && sub.kind == TYPE.struct : rett = sub.non_inline()
+    return vgen_cast(value_owned_borrow_address(value), rett)
+}
+
+////////////////////////////
+// Offset access
+////////////////////////////
+
+fn parse_offset_access(body: Exp) Exp !Error {
+    let p = body_parser(body) !>
+    let start = read_value_exp(p, true, true) !>
+    let t = p.tok(true, true, false) !>
+
+    if t == TOK.sign && p.word_is("]") {
+        p.tok(true, true) !>
+        return start
+    }
+
+    if t == TOK.sign && p.word_is("..") {
+        p.tok(true, true) !>
+        let length = read_value_exp(p, true, true) !>
+        p.expect("]", true, true) !>
+        let range = p.create_exp(EXP.value)
+        range.i = start.i
+        range.kind = VALUE_KIND.bracket_range
+        range.set(VALUE_EXP.left, start)
+        range.set(VALUE_EXP.right, length)
+        range.set_end(p.token_end)
+        return range
+    }
+
+    p.error("Expected '..' or ']' in offset, found: '" + p.word() + "'")
+}
+
+// Call a `$range` / `$view` hook with already converted `uint` bounds.
+fn value_call_range_hook(on: Value, hook: Func, start_index: Value, length: Value, scope: Scope, ctx: Context, exp: Exp) Value !Error {
+    act_check_hook(exp, hook) !>
+    let func = func_for_receiver(hook, on, exp, ctx.func) !>
+    let args = Array[Value]{ start_index, length }
+    let callee = vgen_func(func, on)
+    value_check_call_args(func, callee, args, scope, ctx, exp) !>
+    let call = vgen_call(ctx, callee, args, func.get_rett(), scope)
+    call.exp = exp
+    if func.can_error {
+        call.can_error = true
+        call.set_error_type(func.error_type)
+    }
+    return call
+}
+
+// The two bounds of `value[start .. length]`, converted to `uint`.
+fn value_range_bounds(access: Exp, scope: Scope, ctx: Context) (Value, Value) !Error {
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let start_exp = access.get(VALUE_EXP.left)
+    let length_exp = access.get(VALUE_EXP.right)
+    if !isset(start_exp) || !isset(length_exp) : access.bug("Bracket range is missing an argument")
+    let start = value_from_exp(start_exp, scope, ctx.with_suggested_type(uint_t)) !>
+    let length = value_from_exp(length_exp, scope, ctx.with_suggested_type(uint_t)) !>
+    start = value_try_convert(start, scope, ctx, uint_t) !>
+    length = value_try_convert(length, scope, ctx, uint_t) !>
+    uint_t.compat_check(start.rett, start_exp) !>
+    uint_t.compat_check(length.rett, length_exp) !>
+    return (start, length)
+}
+
+fn type_native_sequence(type: Type) Type {
+    let t = type.get_non_nullable()
+    if t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of {
+        let class = t.get_direct_class_or_null()
+        if t.is_bounded_pointer() || (t.kind == TYPE.ptr_of && isset(class) && class.kind == CLASS_KIND.unbound) : return t
+        let sub = t.get_sub_type()
+        if isset(sub) && sub.kind == TYPE.array {
+            return sub
+        }
+    }
+    return t
+}
+
+fn type_has_native_sequence_length(type: Type) bool {
+    let t = type_native_sequence(type)
+    return t.is_fixed_array_type() || t.kind == TYPE.array
+        || t.is_bounded_pointer() || t.kind == TYPE.ref_slice
+}
+
+fn type_native_sequence_element(type: Type) ?Type {
+    let t = type_native_sequence(type)
+    let element = t.get_sub_type()
+    if isset(element) : return element
+    let class = t.get_class_or_null()
+    return isset(class) ? class.slice_type : null
+}
+
+fn value_native_sequence_length(on: Value, type: Type, ctx: Context, at: Exp) ?Value !Error {
+    let t = type_native_sequence(type)
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    if t.is_fixed_array_type() || t.is_bounded_pointer() {
+        return vgen_int(t.length.to(int), uint_t)
+    }
+    if t.kind == TYPE.ref_slice : return value_owned_borrow_length(on, ctx) !>
+    if t.kind != TYPE.array : return null
+    let class = t.get_class_or_null()
+    if isset(class) {
+        let prop = class.get_prop_by_name("length") !? null
+        if !isset(prop) : at.bug("Sequence type has no length property")
+        let value = vgen_prop(prop, on, ctx)
+        value.exp = at
+        return value
+    }
+    return vgen_ptrv(on, vgen_int(0, uint_t), uint_t, at)
+}
+
+// The owner word for element stores: the storage block behind an array.
+fn value_native_sequence_owner(on: Value, type: Type, ctx: Context, at: Exp) Value !Error {
+    let t = type_native_sequence(type)
+    let class = t.get_class_or_null() ?! at.bug("Sequence type has no storage owner")
+    let prop = class.get_prop_by_name("data") ! at.bug("Sequence type has no data property")
+    let value = vgen_prop(prop, on, ctx)
+    value.exp = at
+    return value
+}
+
+fn value_native_sequence_data(on: Value, type: Type, ctx: Context, at: Exp) Value !Error {
+    let t = type_native_sequence(type)
+    if t.is_fixed_array_type() || t.kind == TYPE.ptr_of || t.kind == TYPE.adr_of : return on
+    if t.kind == TYPE.ref_slice : return vgen_cast(value_owned_borrow_address(on), type_ptr(ctx.build))
+    let class = t.get_class_or_null()
+    if isset(class) {
+        let prop = class.get_prop_by_name("data") !? null
+        if !isset(prop) : at.bug("Sequence type has no data property")
+        let value = vgen_prop(prop, on, ctx)
+        value.exp = at
+        // A mode of an array keeps the array's storage
+        let base = class.representation_class()
+        if base.kind == CLASS_KIND.array {
+            // `data` is the storage block; the elements follow its header.
+            let block = vgen_cast(value, type_ptr(ctx.build))
+            let offset = vgen_int((base.slice_data_offset() !>).to(int), type_from_core(ctx.build, "uint") !>)
+            let elements = vgen_ptr_offset(block, offset, at)
+            elements.exp = at
+            return elements
+        }
+        return value
+    }
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    return vgen_ptrv(on, vgen_int(1, uint_t), type_ptr(ctx.build), at)
+}
+
+fn value_native_sequence_item(on: Value, index: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let t = type_native_sequence(on.rett)
+    let element = type_native_sequence_element(t)
+    if !isset(element) : at.bug("Sequence type has no element type")
+    // An element read out of shared storage keeps the shared view
+    element = t.storage_view_of(element)
+    let data = value_native_sequence_data(on, t, ctx, at) !>
+    return value_sequence_element_read(vgen_element_slot(data, index, element, at), scope, ctx, at) !>
+}
+
+// A `@ptrv` at an element of a sequence's storage
+fn vgen_element_slot(data: Value, index: Value, element: Type, at: Exp) Value {
+    let slot = vgen_ptrv(data, index, element, at)
+    slot.ensure_meta().element_slot = true
+    return slot
+}
+
+fn native_sequence_helper_base(owner: Func, name: String, key: String, on_type: Type, rett: Type, at: Exp) Func !Error {
+    let arg_scope = Scope.new(owner.ns.scope)
+    let func = Func {
+        unit: owner.unit
+        ns: owner.ns
+        name: "<sequence." + name + "." + helper.ctxhash(key) + ">"
+        act: ACT.private
+        exp: at
+        arg_scope: arg_scope
+        parsed_types: true
+        parsed_ast: true
+        rett: rett
+        is_inline: true
+    }
+    arg_scope.func = func
+    append_func_arg(func, "sequence", on_type)
+    append_func_arg(func, "index", type_from_core(owner.ns.build, "uint") !>)
+    return func
+}
+
+fn native_sequence_helper_finish(func: Func) !Error {
+    let owner_unit = func.unit
+    owner_unit.functions.append(func)
+    func_finish_ast(func) !>
+    if !isset(func.ns.build.options.lsp) : generate_func_ir(func) !>
+}
+
+fn native_sequence_get_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
+    let key = type_identity_key(on_type)
+    ctx.build.cache.sequence_get_funcs.get(key) -> cached : return cached
+
+    let owner = ctx.get_func() !>
+    let element = type_native_sequence_element(on_type)
+    if !isset(element) : at.bug("Sequence type has no element type")
+    let rett = on_type.storage_view_of(element)
+    let func = native_sequence_helper_base(owner, "get", key, on_type, rett, at) !>
+    append_func_arg(func, "location", type_string(ctx.build))
+    ctx.build.cache.sequence_get_funcs.set(key, func)
+    bind_func_arg_decls(func) !>
+
+    let body_scope = func.arg_scope.sub_scope()
+    body_scope.func = func
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(func)
+    let sequence_arg = func.args.get(0) ! at.bug("Sequence helper is missing its receiver")
+    let index_arg = func.args.get(1) ! at.bug("Sequence helper is missing its index")
+    let sequence = vgen_decl(sequence_arg.decl)
+    let index = vgen_decl(index_arg.decl)
+    let length = value_native_sequence_length(sequence, on_type, inner_ctx, at) !>
+    if !isset(length) : at.bug("Sequence type has no length")
+    let past_end = vgen_op(index, length, VALUE_OP.gte, type_bool(ctx.build))
+    let location_arg = func.args.get(2) ! at.bug("Sequence helper is missing its location")
+    let panic_call = value_panic_call_at(inner_ctx, "Index out of bounds", vgen_decl(location_arg.decl), at) !>
+    body_scope.append_value(vgen_if(past_end, Array[Value]{ panic_call }, null, ctx.build, at))
+    let result = value_native_sequence_item(sequence, index, body_scope, inner_ctx, at) !>
+    result.rett = rett
+    body_scope.append_value(vgen_return(result, ctx.build, at))
+    body_scope.did_return = true
+
+    native_sequence_helper_finish(func) !>
+    return func
+}
+
+fn native_sequence_set_func(on_type: Type, ctx: Context, at: Exp) Func !Error {
+    let key = type_identity_key(on_type)
+    ctx.build.cache.sequence_set_funcs.get(key) -> cached : return cached
+
+    let owner = ctx.get_func() !>
+    let element = type_native_sequence_element(on_type)
+    if !isset(element) : at.bug("Sequence type has no element type")
+    let func = native_sequence_helper_base(owner, "set", key, on_type, type_void(ctx.build), at) !>
+    func.mutates_receiver = true
+    append_func_arg(func, "value", element)
+    append_func_arg(func, "location", type_string(ctx.build))
+    ctx.build.cache.sequence_set_funcs.set(key, func)
+    bind_func_arg_decls(func) !>
+
+    let body_scope = func.arg_scope.sub_scope()
+    body_scope.func = func
+    func.body_scope = body_scope
+    func.alloca_scope = body_scope.sub_scope()
+    func.defer_scope = body_scope.sub_scope()
+    let inner_ctx = Context.for_func(func)
+    let sequence_arg = func.args.get(0) ! at.bug("Sequence helper is missing its receiver")
+    let index_arg = func.args.get(1) ! at.bug("Sequence helper is missing its index")
+    let value_arg = func.args.get(2) ! at.bug("Sequence helper is missing its value")
+    let sequence = vgen_decl(sequence_arg.decl)
+    let index = vgen_decl(index_arg.decl)
+    let value = vgen_decl(value_arg.decl)
+    let length = value_native_sequence_length(sequence, on_type, inner_ctx, at) !>
+    if !isset(length) : at.bug("Sequence type has no length")
+    let kind = type_native_sequence(on_type).kind
+    // Through a view the array cannot grow, so the end is out of bounds
+    let is_view = type_native_sequence(on_type).is_shared || type_native_sequence(on_type).is_locked
+    let out_of_range = vgen_op(index, length, VALUE_OP.gte, type_bool(ctx.build))
+    let location_arg = func.args.get(3) ! at.bug("Sequence helper is missing its location")
+    let panic_call = value_panic_call_at(inner_ctx, "Index out of bounds", vgen_decl(location_arg.decl), at) !>
+    if kind == TYPE.array && !is_view {
+        let class = on_type.get_non_nullable().get_class_or_null()
+        let append_func = isset(class) ? (class.get_func("append_at_end") ?? class.get_append_hook()) : null
+        if !isset(append_func) : at.bug("Array type has no append function")
+        if !append_func.parsed_types : parse_func_types(append_func) !>
+        let at_end = vgen_op(index, length, VALUE_OP.eq, type_bool(ctx.build))
+        let append_callee = vgen_func(append_func, sequence)
+        let append_args = Array[Value]{ value }
+        value_fill_trailing_defaults(append_func, call_receiver_skip(append_callee, append_func), append_args, body_scope, inner_ctx, at) !>
+        value_check_call_args(append_func, append_callee, append_args, body_scope, inner_ctx, at, false) !>
+        let append_call = vgen_call(inner_ctx, append_callee, append_args, append_func.get_rett(), body_scope)
+        append_call.exp = at
+        let append_branch = vgen_if(at_end, Array[Value]{ append_call, vgen_return(null, ctx.build, at) }, panic_call, ctx.build, at)
+        body_scope.append_value(vgen_if(out_of_range, Array[Value]{ append_branch }, null, ctx.build, at))
+    } else {
+        body_scope.append_value(vgen_if(out_of_range, Array[Value]{ panic_call }, null, ctx.build, at))
+    }
+
+    let data = value_native_sequence_data(sequence, on_type, inner_ctx, at) !>
+    let prop = vgen_element_slot(data, index, element, at)
+    // The element slot lives in the storage block, which is its owner.
+    let block_owner = value_native_sequence_owner(sequence, on_type, inner_ctx, at) !>
+    if type_native_sequence(on_type).is_shared {
+        body_scope.append_value(vgen_atomic_store(prop, value, at))
+    } else {
+        body_scope.append_value(value_owner_store(block_owner, prop, value, body_scope, inner_ctx, at) !>)
+    }
+    body_scope.append_value(vgen_return(null, ctx.build, at))
+    body_scope.did_return = true
+
+    native_sequence_helper_finish(func) !>
+    return func
+}
+
+fn value_from_offset_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let v = value_from_offset_raw_exp(exp, scope, ctx) !>
+    if v.can_error : return value_apply_offset_default(v, scope, ctx, exp) !>
+    return v
+}
+
+fn value_apply_offset_default(call: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let default_v = vgen_default_value(call.rett)
+    // An enum's default is its first member, which need not be zero
+    let enu = call.rett.is_nullable_type() ? null[?Enum] : call.rett.get_enum()
+    if isset(enu) && !(enu.allows_zero(ctx, at) !>) {
+        let first = enu.items.get(0) ! at.error("Cannot generate a default value for an empty enum")
+        default_v = value_from_enum_item(enu, first.name, at, scope, ctx) !>
+    }
+    return value_error_result(call, default_v, default_v.rett, ERRH_KIND.value, at)
+}
+
+// Mode-fallthrough lookup for the `$offset` get hook.
+fn resolve_offset_get_func(class: Class) ?Func {
+    let f = class.offset
+    if isset(f) : return f
+    let for_class = class.mode_for_class
+    if isset(for_class) : return resolve_offset_get_func(for_class)
+    return null
+}
+
+// Mode-fallthrough lookup for the `$offset_assign` set hook.
+fn resolve_offset_assign_func(class: Class) ?Func {
+    let f = class.offset_assign
+    if isset(f) : return f
+    let for_class = class.mode_for_class
+    if isset(for_class) : return resolve_offset_assign_func(for_class)
+    return null
+}
+
+fn func_for_receiver(func: Func, on: Value, at: Exp, from: ?Func (null)) Func !Error {
+    parse_func_types(func) !>
+    // Generic arguments must be concrete before checking the receiver view;
+    // the specialization comes back here
+    if func.has_generic_args || func.is_generic_base : return func
+    if !func.is_static && value_is_enum_storage(on) {
+        let receiver = func.args.get(0) !? null
+        if isset(receiver) && receiver.type.is_stack_borrow() {
+            // Enum storage is constant: a method may neither change it nor lend it out
+            let msg = "Cannot call a method that modifies or exposes enum storage; copy its underlying value first"
+            if func.get_rett().is_stack_borrow() : at.error(msg)
+            func_check_readonly_receiver(func, msg, at, from) !>
+        }
+    }
+    if func.is_static || func.threadsafe : return func
+    // A `$atomic` class's methods are checked with an atomic `this` already
+    let func_class = func.class
+    if isset(func_class) && func_class.atomic : return func
+    // A struct of plain words reads out of a view as an ordinary struct;
+    // its method still stores into the view's storage
+    let view = on.rett.storage_view_type_of()
+    let view_class = view.get_direct_class_or_null()
+    let in_storage = view == on.rett.get_non_nullable() && view.is_inline
+        && isset(view_class) && view_class.representation_class().kind == CLASS_KIND.struct
+    let locked = view.is_locked || (in_storage && value_is_locked_storage(on))
+    let shared = view.is_shared || (in_storage && !locked && value_is_shared_storage(on))
+    if func.is_clone_hook && !isset(func.clone_at) && (shared || locked) {
+        // Inside another clone the copy is checked from where that clone was asked for
+        let outer_at = isset(from) ? from.clone_at : null
+        let check_access = isset(from) && isset(outer_at) ? from.clone_check_access : true
+        func = get_func_clone_variant(func, outer_at ?? at, check_access) !>
+    }
+    if locked {
+        if func.is_interface {
+            at.error("Cannot call interface method '" + func.name + "' on locked data of type '"
+                + on.rett.compat_display_name()
+                + "'. The implementation is not known here, so it cannot be checked against the lock rules. Call it through its concrete type instead")
+        }
+        return get_func_locked_receiver(func, at, from) !>
+    }
+    if !shared : return func
+    if func.mutates_receiver {
+        at.error("Cannot call mutating method '" + func.name + "' on atomic data of type '" + on.rett.compat_display_name() + "'")
+    }
+    // A concrete method gets one shared-receiver variant, built on demand and
+    // cached on the base (see get_func_shared_receiver). An interface call has
+    // no single body to build it from and its implementations are open, so
+    // there is nothing here to prove the call safe.
+    if func.is_interface {
+        at.error("Cannot call interface method '" + func.name + "' on atomic data of type '"
+            + on.rett.compat_display_name()
+            + "'. The implementation is not known here, so it cannot be checked against the atomic rules. Call it through its concrete type instead")
+    }
+    let target = func_on_shared_elements(func, at) !>
+    return get_func_shared_receiver(target, at, from) !>
+}
+
+// A call on storage the method may not change: its body is checked again with `this`
+// read-only, and a store in it, or in a method it calls on `this`, reports `headline` here
+fn func_check_readonly_receiver(func: Func, headline: String, at: Exp, from: ?Func) !Error {
+    if func.is_static || func.threadsafe || func.is_readonly_receiver : return
+    if func.mutates_receiver : at.error(headline)
+    // An `$immutable` class never changes its values outside itself
+    let owner = func.class ?! return
+    if owner.representation_class().immutable || !isset(func.body) : return
+    let variants = func.readonly_variants ?? <{
+        let created = Map[Func]{}
+        func.readonly_variants = created
+        return created
+    }
+    if variants.has(headline) : return
+    let variant = get_func_view_variant(func, 3, 0, at, from) !>
+    variant.view_headline = headline
+    variant.check_required = true
+    variants.set(headline, variant)
+}
+
+fn value_from_offset_raw_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let left_exp = exp.get(VALUE_EXP.left)
+    if !isset(left_exp) : exp.bug("offset is missing base")
+    let on = value_from_exp(left_exp, scope, ctx.without_suggested_type()) !>
+    return value_from_offset_on(on, exp, scope, ctx) !>
+}
+
+// `on[...]` with the base already evaluated.
+fn value_from_offset_on(on: Value, exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("offset is missing body")
+    if body.type != EXP.body : exp.bug("offset body must be EXP.body")
+    let b = ctx.build
+
+    // Generic class specialize: `HashMap[String, uint]` / `X[String]`
+    let gen_class = offset_generic_class(on)
+    if isset(gen_class) {
+        let type_exps = parse_body_as_type_list(body) !>
+        if type_exps.length == 0 {
+            exp.error("Generic type '" + gen_class.name + "' requires type arguments")
+        }
+        let gtypes = Array[Type]{}
+        each type_exps as te {
+            gtypes.append(type_from_exp(te, scope) !>)
+        }
+        let c = gen_class.specialize(gtypes, exp) !>
+        let v = vgen_type(c.get_type() !>, b)
+        v.exp = exp
+        return v
+    }
+
+    // Generic free function: `foo[T]`
+    let gen_func = offset_generic_func(on)
+    if isset(gen_func) {
+        let type_exps = parse_body_as_type_list(body) !>
+        if type_exps.length == 0 {
+            exp.error("Generic function '" + gen_func.name + "' requires type arguments")
+        }
+        let gtypes = Array[Type]{}
+        each type_exps as te {
+            gtypes.append(type_from_exp(te, scope) !>)
+        }
+        let f = gen_func.specialize(gtypes, exp) !>
+        let receiver = on.value1
+        if isset(receiver) : f = func_for_receiver(f, receiver, exp, ctx.func) !>
+        return value_bind_method(f, receiver, ctx, exp)
+    }
+
+    let access = parse_offset_access(body) !>
+    if on.rett.get_non_nullable().kind != TYPE.union : on = value_try_remove_nullable(on, scope, ctx) !>
+    if on.rett.get_non_nullable().is_tuple_type() && access.value_kind != VALUE_KIND.bracket_range {
+        return value_tuple_member(on, access, scope, ctx, exp) !>
+    }
+    // `&[T]` and the named slices: a `$offset` / `$range` hook on the class
+    // comes first, the native bounds-checked access is the fallback.
+    let slice_t = on.rett.get_non_nullable()
+    if slice_t.kind == TYPE.ref_slice {
+        let slice_class = slice_t.class
+        let hook: ?Func = null
+        if isset(slice_class) {
+            hook = access.value_kind == VALUE_KIND.bracket_range ? slice_class.get_range_hook() : resolve_offset_get_func(slice_class)
+        } else if access.value_kind == VALUE_KIND.bracket_range {
+            // `view[a..b]` copies like every other `value[a..b]`, after the
+            // native bounds check; `&view[a..b]` is the view itself
+            let element = slice_t.get_sub_type() ?! exp.bug("Slice borrow has no element type")
+            let bare = bare_slice_class(b, element, exp) !>
+            let part = bare.get_range_hook() ?! exp.bug("core '&[T]' has no '$range' method")
+            let checked = value_from_ref_slice_offset(on, access, scope, ctx, exp) !>
+            let setup = Array[Value]{}
+            let rooted = value_bind_once(checked, ctx, exp, setup, true)
+            let uint_t = type_from_core(b, "uint") !>
+            let receiver = vgen_cast(rooted, bare.get_type() !>)
+            receiver.exp = on.exp
+            let length = value_owned_borrow_length(rooted, ctx) !>
+            let copy = value_call_range_hook(receiver, part, vgen_int(0, uint_t), length, scope, ctx, exp) !>
+            // Copied out of a view, the elements keep it
+            return vgen_scoped_value(setup, value_retype_bare_slice(copy, slice_t.storage_view_of(element.ref_slice().mut_type()), exp), exp)
+        }
+        if !isset(hook) : return value_from_ref_slice_offset(on, access, scope, ctx, exp) !>
+    }
+    on = value_through_borrow(on, ctx)
+    let on_t = on.rett.get_non_nullable()
+    if on_t.is_fixed_array_type() || on_t.kind == TYPE.ptr_of || on_t.kind == TYPE.adr_of {
+        if on.rett.is_nullable_type() : exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    }
+    if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
+        require_unsafe(exp, scope, "Offset access on an unbounded pointer") !>
+    }
+    if access.value_kind == VALUE_KIND.bracket_range {
+        let start_exp = access.get(VALUE_EXP.left)
+        let length_exp = access.get(VALUE_EXP.right)
+        if !isset(start_exp) || !isset(length_exp) : access.bug("Bracket range is missing an argument")
+        let uint_t = type_from_core(b, "uint") !>
+        let start_index = value_from_exp(start_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        let length = value_from_exp(length_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        start_index = value_try_convert(start_index, scope, ctx, uint_t) !>
+        length = value_try_convert(length, scope, ctx, uint_t) !>
+        uint_t.compat_check(start_index.rett, start_exp) !>
+        uint_t.compat_check(length.rett, length_exp) !>
+        let inline_length_is_const = length.type == VAL.int
+        let inline_length: uint = inline_length_is_const && length.int_val > 0 ? length.int_val.to(uint) : 0
+        let on_class = on_t.get_class_or_null()
+        let range_func = isset(on_class) ? on_class.get_range_hook() : null
+        if (on_t.is_fixed_array_type() && on_t.length > 0) || on_t.is_bounded_pointer() {
+            let checked_start, checked_length = value_check_known_length_range(start_index, length, on_t, on_t.length, ctx, exp) !>
+            start_index = checked_start
+            length = checked_length
+        }
+        if !isset(range_func) && (on_t.is_fixed_array_type() || on_t.is_bounded_pointer()) {
+            if !inline_length_is_const {
+                length_exp.error("Inline range length must be a compile-time integer")
+            }
+            if inline_length == 0 {
+                length_exp.error("Inline range length must be greater than zero")
+            }
+            let element = on_t.get_sub_type()
+            if !isset(element) : exp.bug("Sequence type has no element type")
+            let setup = Array[Value]{}
+            let data = on_t.is_fixed_array_type() ? vgen_ptr_of(on, type_ptr(b), exp) : on
+            data = value_bind_once(data, ctx, exp, setup, true)
+            let start = value_bind_once(start_index, ctx, exp, setup, true)
+            let viewed_element = on_t.storage_view_of(element)
+            let values = Array[Value]{}
+            let i: uint = 0
+            while i < inline_length {
+                let index = i == 0 ? start : vgen_op(start, vgen_int(i.to(int), uint_t), VALUE_OP.add, uint_t)
+                let slot = vgen_element_slot(data, index, viewed_element, exp)
+                values.append(value_sequence_element_read(slot, scope, ctx, exp) !>)
+                i++
+            }
+            return vgen_scoped_value(setup, vgen_array_init(ctx, values, viewed_element.fixed_array(inline_length), exp), exp)
+        }
+        if !isset(range_func) {
+            exp.error("Type: '" + on.rett.compat_display_name() + "' has no '$range' function")
+        }
+        if on.rett.is_nullable_type() {
+            exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+        }
+        return value_call_range_hook(on, range_func, start_index, length, scope, ctx, exp) !>
+    }
+
+    // Index / offset — body is a single value expression.
+    let index_exp = access
+    let index = value_from_exp(index_exp, scope, ctx.without_suggested_type()) !>
+
+    // Inline fixed sequence `[T x N]`
+    if on_t.is_fixed_array_type() {
+        let sub = on_t.get_sub_type()
+        if !isset(sub) : exp.bug("Array type is missing sub_type")
+        if !index.rett.is_integer_type() {
+            index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
+        }
+        // An element read out of shared storage keeps the shared view
+        sub = on_t.storage_view_of(sub)
+        let size = on_t.length
+        index = value_check_known_length_index(index, on_t, size, ctx, exp) !>
+        return value_sequence_element_read(vgen_element_slot(on, index, sub, exp), scope, ctx, exp) !>
+    }
+
+    // *T / &T / *[T x N] with known element type
+    let direct_class = on_t.get_direct_class_or_null()
+    let unbound_class = isset(direct_class) && direct_class.kind == CLASS_KIND.unbound ? direct_class : null
+    let unbound_hook = isset(unbound_class) ? resolve_offset_get_func(unbound_class) : null
+    if (on_t.kind == TYPE.ptr_of && !isset(unbound_hook)) || on_t.kind == TYPE.adr_of {
+        let sub = on_t.get_sub_type()
+        if isset(sub) {
+            let element = sub
+            if !index.rett.is_integer_type() {
+                index_exp.error("Invalid offset, expected an integer value instead of: " + index.rett.compat_display_name())
+            }
+            if on_t.is_bounded_pointer() {
+                index = value_check_known_length_index(index, on_t, on_t.length, ctx, exp) !>
+            }
+            return value_sequence_element_read(vgen_element_slot(on, index, element, exp), scope, ctx, exp) !>
+        }
+    }
+
+    // A named Array may define its own indexing contract. Use the native
+    // bounds-checked operation only when it has no `$offset` hook.
+    let sequence_class = on_t.get_class_or_null()
+    let sequence_offset = isset(sequence_class) ? resolve_offset_get_func(sequence_class) : null
+    if on_t.kind == TYPE.array && !isset(sequence_offset) {
+        if on.rett.is_nullable_type() {
+            exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+        }
+        let uint_t = type_from_core(b, "uint") !>
+        index = value_try_convert(index, scope, ctx, uint_t) !>
+        uint_t.compat_check(index.rett, index_exp) !>
+        let get_func = native_sequence_get_func(on.rett, ctx, exp) !>
+        let callee = vgen_func(get_func)
+        let args = Array[Value]{ on, index, value_panic_location(ctx, exp) }
+        value_check_call_args(get_func, callee, args, scope, ctx, exp, false) !>
+        let call = vgen_call(ctx, callee, args, get_func.get_rett(), scope)
+        call.exp = exp
+        if call.rett.is_inline_type() : call.ensure_meta().copied_element = true
+        return call
+    }
+
+    // User-defined class `$offset` hook.
+    let on_class = on_t.get_class_or_null()
+    if isset(on_class) {
+        let get_func = resolve_offset_get_func(on_class)
+        if isset(get_func) {
+            act_check_hook(exp, get_func) !>
+            if on.rett.is_nullable_type() {
+                let nullable_class = on.rett.get_non_nullable().class
+                if !isset(nullable_class) {
+                    exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+                } else if nullable_class.kind != CLASS_KIND.union {
+                    exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+                }
+            }
+            get_func = func_for_receiver(get_func, on, exp, ctx.func) !>
+            let arg_skip: uint = 0
+            if isset(get_func.class) && !get_func.is_static : arg_skip = 1
+            let index_arg = get_func.args.get(arg_skip) ! exp.bug("'$offset' function is missing its index parameter")
+            index = value_try_convert(index, scope, ctx, index_arg.type) !>
+            index_arg.type.compat_check(index.rett, index_exp) !>
+            if on_t.is_bounded_pointer() {
+                index = value_check_known_length_index(index, on_t, on_t.length, ctx, exp) !>
+            }
+
+            let callee = vgen_func(get_func, on)
+            let args = Array[Value]{ index }
+            value_check_call_args(get_func, callee, args, scope, ctx, exp) !>
+            let call = vgen_call(ctx, callee, args, get_func.get_rett(), scope)
+            call.exp = exp
+            if get_func.can_error {
+                call.can_error = true
+                call.set_error_type(get_func.error_type)
+            }
+            return call
+        }
+    }
+
+    exp.error("Type: '" + on.rett.compat_display_name() + "' has no '[]' get offset function")
+}
+
+// Read an element out of sequence storage. A managed slot carries collector
+// tag bits, so the read goes through the property read path to strip them,
+// and a non-nullable reference type is checked:
+// storage can hold an empty slot (zero-filled, or cleared by a removal), and
+// handing that out as a valid reference would be unsound.
+fn value_sequence_element_read(slot: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let read = slot
+    if slot.rett.has_gc_refs() : read = value_property_get(slot, scope, ctx, at) !>
+    read = value_check_present_element(read, ctx, at) !>
+    if read == slot : return slot
+    // Reads validate and clean the value; borrows still name the original slot.
+    let result = Value {
+        type: slot.type
+        rett: slot.rett
+        value1: slot.value1
+        value2: slot.value2
+        exp: at
+    }
+    result.set_pre_value(slot.get_pre_value())
+    result.set_checked_read(read)
+    return result
+}
+
+fn value_check_known_length_index(
+    index: Value,
+    on_type: Type,
+    size: uint,
+    ctx: Context,
+    at: Exp
+) Value !Error {
+    if index.type == VAL.int {
+        if index.int_val < 0 || index.int_val.@cast(uint) >= size {
+            at.error("Out of bounds. You are asking for index '" + index.int_val + "' on type: " + on_type.compat_display_name() + ". The last index is: " + (size - 1))
+        }
+        return index
+    }
+
+    let checked_index = vgen_scratch_value(ctx.get_func() !>, index.rett, at)
+    let index_decl = checked_index.decl
+    if !isset(index_decl) : at.bug("Bounds-check index has no scratch declaration")
+    let check_index = vgen_decl(index_decl)
+    let result_index = vgen_decl(index_decl)
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let unsigned_index = vgen_cast(check_index, uint_t)
+    let past_end = vgen_op(
+        unsigned_index,
+        vgen_int(size.to(int), uint_t),
+        VALUE_OP.gte,
+        type_bool(ctx.build)
+    )
+    past_end.exp = at
+
+    let panic_call = value_panic_call(ctx, "Index out of bounds", at) !>
+    result_index.set_pre_value(vgen_block(Array[Value]{
+        vgen_assign(checked_index, index, ASSIGN_OP.set, ctx.build, at)
+        vgen_if(past_end, Array[Value]{ panic_call }, null, ctx.build, at)
+    }, ctx.build, at))
+    return result_index
+}
+
+fn value_check_known_length_range(
+    start: Value,
+    length: Value,
+    on_type: Type,
+    size: uint,
+    ctx: Context,
+    at: Exp
+) (Value, Value) !Error {
+    if start.type == VAL.int && length.type == VAL.int {
+        if start.int_val < 0 || length.int_val < 0
+            || start.int_val.@cast(uint) > size
+            || length.int_val.@cast(uint) > size - start.int_val.@cast(uint)
+        {
+            at.error("Out of bounds range on type: " + on_type.compat_display_name())
+        }
+        return (start, length)
+    }
+
+    let func = ctx.get_func() !>
+    let start_slot = vgen_scratch_value(func, start.rett, at)
+    let length_slot = vgen_scratch_value(func, length.rett, at)
+    let start_decl = start_slot.decl
+    let length_decl = length_slot.decl
+    if !isset(start_decl) || !isset(length_decl) : at.bug("Range bounds have no scratch declarations")
+    let uint_t = type_from_core(ctx.build, "uint") !>
+    let checked_start = vgen_cast(vgen_decl(start_decl), uint_t)
+    let checked_length = vgen_cast(vgen_decl(length_decl), uint_t)
+    let limit = vgen_int(size.to(int), uint_t)
+    let start_past = vgen_op(checked_start, limit, VALUE_OP.gt, type_bool(ctx.build))
+    let remaining = vgen_op(limit, checked_start, VALUE_OP.sub, uint_t)
+    let length_past = vgen_op(checked_length, remaining, VALUE_OP.gt, type_bool(ctx.build))
+    let invalid = vgen_op(start_past, length_past, VALUE_OP.or, type_bool(ctx.build))
+
+    let panic_call = value_panic_call(ctx, "Range out of bounds", at) !>
+    let result_start = vgen_decl(start_decl)
+    result_start.set_pre_value(vgen_block(Array[Value]{
+        vgen_assign(start_slot, start, ASSIGN_OP.set, ctx.build, at)
+        vgen_assign(length_slot, length, ASSIGN_OP.set, ctx.build, at)
+        vgen_if(invalid, Array[Value]{ panic_call }, null, ctx.build, at)
+    }, ctx.build, at))
+    return (result_start, vgen_decl(length_decl))
+}
+
+// `given`: the value, already evaluated (tuple assignment)
+fn value_from_offset_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right_exp: Exp, at: Exp, given: ?Value (null)) ?Value !Error {
+    let base_exp = left_exp.get(VALUE_EXP.left)
+    if !isset(base_exp) : left_exp.bug("offset is missing base")
+    let body = left_exp.get(VALUE_EXP.right)
+    if !isset(body) : left_exp.bug("offset is missing body")
+    if body.type != EXP.body : left_exp.bug("offset body must be EXP.body")
+
+    let access = parse_offset_access(body) !>
+    if access.value_kind == VALUE_KIND.bracket_range {
+        left_exp.error("Cannot assign to a bracket range")
+    }
+
+    let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
+    if on.rett.get_non_nullable().kind != TYPE.union : on = value_try_remove_nullable(on, scope, ctx) !>
+    if on.rett.get_non_nullable().is_tuple_type() {
+        left_exp.error("A tuple member cannot be assigned; build a new tuple instead")
+    }
+    let slice_t = on.rett.get_non_nullable()
+    if slice_t.kind == TYPE.ref_slice {
+        let slice_class = slice_t.class
+        let hook = isset(slice_class) ? resolve_offset_assign_func(slice_class) : null
+        if !isset(hook) : return value_from_ref_slice_offset_assign(on, access, right_exp, scope, ctx, left_exp, at, given) !>
+    }
+    on = value_through_borrow(on, ctx)
+    let on_t = on.rett.get_non_nullable()
+    if on_t.is_fixed_array_type() || on_t.kind == TYPE.ptr_of || on_t.kind == TYPE.adr_of {
+        if on.rett.is_nullable_type() : left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    }
+    if value_is_readonly_storage(on, ctx) : left_exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(on, ctx))
+    if on_t.is_fixed_array_type() : value_check_captured_write(on, left_exp) !>
+    if on_t.has_locked_refs() {
+        let root = value_inline_storage_decl(on)
+        if isset(root) && root.lock_scope != scope_find_lock(scope) {
+            at.error("A locked view cannot be stored in a variable declared outside its lock block")
+        }
+    }
+    if on_t.kind == TYPE.ptr_of && !on_t.is_bounded_pointer() {
+        require_unsafe(left_exp, scope, "Offset access on an unbounded pointer") !>
+    }
+    let sequence_class = on_t.get_class_or_null()
+    let sequence_offset_assign = isset(sequence_class) ? resolve_offset_assign_func(sequence_class) : null
+    if on_t.kind == TYPE.array && !isset(sequence_offset_assign) {
+        if on.rett.is_nullable_type() {
+            left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+        }
+        let element = type_native_sequence_element(on_t)
+        if !isset(element) : left_exp.bug("Sequence type has no element type")
+        // A plain element is one word: stored atomically, it is race safe.
+        // Managed references follow the property rules instead.
+        let plain_element = element.is_shared_plain_word()
+        if type_native_sequence(on.rett).is_shared && !plain_element {
+            left_exp.error("Cannot call mutating method 'set' on atomic data of type '" + on.rett.compat_display_name() + "'")
+        }
+        if type_native_sequence(on.rett).is_locked && !plain_element {
+            left_exp.error("Cannot assign elements holding managed references through a locked view; use '.set(index, value)'")
+        }
+        let index_exp = access
+        let uint_t = type_from_core(ctx.build, "uint") !>
+        let index = value_from_exp(index_exp, scope, ctx.with_suggested_type(uint_t)) !>
+        index = value_try_convert(index, scope, ctx, uint_t) !>
+        uint_t.compat_check(index.rett, index_exp) !>
+        let right = given ?? (value_from_exp(right_exp, scope, ctx.with_suggested_type(element)) !>)
+        right = value_try_convert(right, scope, ctx, element) !>
+        element.compat_check(right.rett, right_exp) !>
+        let set_func = native_sequence_set_func(on.rett, ctx, left_exp) !>
+        let callee = vgen_func(set_func)
+        let args = Array[Value]{ on, index, right, value_panic_location(ctx, left_exp) }
+        value_check_call_args(set_func, callee, args, scope, ctx, at, false) !>
+        let call = vgen_call(ctx, callee, args, set_func.get_rett(), scope)
+        call.exp = at
+        return call
+    }
+    if on_t.is_fixed_array_type() || on_t.kind == TYPE.adr_of {
+        return value_from_managed_element_assign(on, on_t, access, right_exp, scope, ctx, left_exp, at, given) !>
+    }
+    let on_class = on_t.kind == TYPE.ptr_of ? on_t.get_direct_class_or_null() : on_t.get_class_or_null()
+    if !isset(on_class) : return null
+    if on_t.kind == TYPE.ptr_of && on_class.kind != CLASS_KIND.unbound : return null
+    let set_func = resolve_offset_assign_func(on_class)
+    if !isset(set_func) : return null
+    act_check_hook(at, set_func, true) !>
+
+    if on.rett.is_nullable_type() {
+        left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    }
+    set_func = func_for_receiver(set_func, on, left_exp, ctx.func) !>
+
+    let index_exp = access
+    let index = value_from_exp(index_exp, scope, ctx.without_suggested_type()) !>
+
+    let arg_skip: uint = 0
+    if isset(set_func.class) && !set_func.is_static : arg_skip = 1
+    let index_arg = set_func.args.get(arg_skip) ! at.bug("'$offset_assign' function is missing its index parameter")
+    index = value_try_convert(index, scope, ctx, index_arg.type) !>
+    index_arg.type.compat_check(index.rett, index_exp) !>
+    if on_t.is_bounded_pointer() {
+        index = value_check_known_length_index(index, on_t, on_t.length, ctx, left_exp) !>
+    }
+
+    let value_arg = set_func.args.get(arg_skip + 1) ! at.bug("'$offset_assign' function is missing its value parameter")
+    // `x[i] = v ! handler`: when the hook throws and `v` itself cannot, the
+    // handler belongs to the assignment
+    let handler_exp: ?Exp = null
+    let right = given
+    if !isset(right) && set_func.can_error && right_exp.type == EXP.value && right_exp.value_kind == VALUE_KIND.error_handler {
+        let inner_exp = right_exp.get(VALUE_EXP.left) ?! right_exp.bug("error_handler missing call")
+        let inner = value_from_call_raw(inner_exp, scope, ctx.with_suggested_type(value_arg.type)) !>
+        if inner.can_error {
+            right = value_apply_error_handler(inner, right_exp, scope, ctx) !>
+        } else {
+            right = inner
+            handler_exp = right_exp
+        }
+    }
+    if !isset(right) : right = value_from_exp(right_exp, scope, ctx.with_suggested_type(value_arg.type)) !>
+    right = value_try_convert(right, scope, ctx, value_arg.type) !>
+    value_arg.type.compat_check(right.rett, right_exp) !>
+
+    let callee = vgen_func(set_func, on)
+    let args = Array[Value]{ index, right }
+    value_check_call_args(set_func, callee, args, scope, ctx, at) !>
+    let call = vgen_call(ctx, callee, args, set_func.get_rett(), scope)
+    call.exp = at
+    if set_func.can_error {
+        call.can_error = true
+        call.set_error_type(set_func.error_type)
+        if isset(handler_exp) : return value_apply_error_handler(call, handler_exp, scope, ctx) !>
+        return value_apply_error_pass(call, scope, ctx, at) !>
+    }
+    return call
+}
+
+// `x[i] op= v` through the `$offset` / `$offset_assign` hooks, or the native Array get
+// and set: `x` and `i` are evaluated once, `x[i]` is read into a temporary that takes
+// `op= v` as a variable does, and the result is stored back. Like `x[i] = v`, a read or
+// store that throws passes its error on, or goes to a `! handler` after `v`.
+fn value_from_offset_compound_assign_exp(ctx: Context, scope: Scope, left_exp: Exp, right_exp: Exp, op: ASSIGN_OP, at: Exp) ?Value !Error {
+    let b = ctx.build
+    let base_exp = left_exp.get(VALUE_EXP.left) ?! left_exp.bug("offset is missing base")
+    let body = left_exp.get(VALUE_EXP.right) ?! left_exp.bug("offset is missing body")
+    if body.type != EXP.body : return null
+    let access = parse_offset_access(body) !>
+    if access.value_kind == VALUE_KIND.bracket_range : return null
+
+    let on = value_from_exp(base_exp, scope, ctx.without_suggested_type()) !>
+    if on.rett.get_non_nullable().kind != TYPE.union : on = value_try_remove_nullable(on, scope, ctx) !>
+    on = value_through_borrow(on, ctx)
+    let on_t = on.rett.get_non_nullable()
+    let class = on_t.get_class_or_null() ?! return null
+    if on_t.kind == TYPE.ptr_of || on_t.is_fixed_array_type() : return null
+    let get_func = resolve_offset_get_func(class)
+    let set_func = resolve_offset_assign_func(class)
+    let native = on_t.kind == TYPE.array && !isset(get_func) && !isset(set_func)
+    if !native && (!isset(get_func) || !isset(set_func)) : return null
+    if native && (type_native_sequence(on.rett).is_shared || type_native_sequence(on.rett).is_locked) : return null
+    if on.rett.is_nullable_type() : left_exp.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    if value_is_readonly_storage(on, ctx) : left_exp.error("Cannot assign through a read-only borrow; " + value_readonly_hint(on, ctx))
+
+    let setup = Array[Value]{}
+    let receiver = value_bind_once(on, ctx, at, setup)
+    let uint_t = type_from_core(b, "uint") !>
+    let index_type = uint_t
+    let get: ?Func = null
+    let set: ?Func = null
+    if native {
+        get = native_sequence_get_func(on.rett, ctx, left_exp) !>
+        set = native_sequence_set_func(on.rett, ctx, left_exp) !>
+    } else if isset(get_func) && isset(set_func) {
+        act_check_hook(left_exp, get_func) !>
+        act_check_hook(at, set_func, true) !>
+        get = func_for_receiver(get_func, on, left_exp, ctx.func) !>
+        set = func_for_receiver(set_func, on, left_exp, ctx.func) !>
+    }
+    let getter = get ?! left_exp.bug("compound offset assign has no get function")
+    let setter = set ?! left_exp.bug("compound offset assign has no set function")
+    let skip: uint = native || (isset(getter.class) && !getter.is_static) ? 1 : 0
+    let index_arg = getter.args.get(skip) ! left_exp.bug("'$offset' function is missing its index parameter")
+    index_type = index_arg.type
+    let index = value_from_exp(access, scope, ctx.with_suggested_type(index_type)) !>
+    index = value_try_convert(index, scope, ctx, index_type) !>
+    index_type.compat_check(index.rett, access) !>
+    index = value_bind_once(index, ctx, at, setup)
+
+    // `x[i] += v ! handler`: the handler takes a read or store that throws, unless `v` throws
+    let handler_exp: ?Exp = null
+    let given: ?Value = null
+    let value_exp = right_exp
+    if (getter.can_error || setter.can_error) && right_exp.type == EXP.value && right_exp.value_kind == VALUE_KIND.error_handler {
+        let inner_exp = right_exp.get(VALUE_EXP.left) ?! right_exp.bug("error_handler missing call")
+        let inner = value_from_call_raw(inner_exp, scope, ctx.with_suggested_type(getter.get_rett())) !>
+        if inner.can_error {
+            given = value_apply_error_handler(inner, right_exp, scope, ctx) !>
+        } else {
+            given = inner
+            handler_exp = right_exp
+            value_exp = inner_exp
+        }
+    }
+
+    let read_args = native ? Array[Value]{ receiver, index, value_panic_location(ctx, left_exp) } : Array[Value]{ index }
+    let read_callee = native ? vgen_func(getter) : vgen_func(getter, receiver)
+    value_check_call_args(getter, read_callee, read_args, scope, ctx, left_exp, !native) !>
+    let read = vgen_call(ctx, read_callee, read_args, getter.get_rett(), scope)
+    read.exp = left_exp
+    read = value_offset_hook_errors(read, getter, handler_exp, scope, ctx, at) !>
+    let current = value_bind_once(read, ctx, at, setup, true)
+    setup.append(value_assign_to(ctx, scope, at, current, value_exp, given, op) !>)
+
+    let set_skip: uint = native || (isset(setter.class) && !setter.is_static) ? 1 : 0
+    let set_index_arg = setter.args.get(set_skip) ! at.bug("'$offset_assign' function is missing its index parameter")
+    let set_index = value_try_convert(index, scope, ctx, set_index_arg.type) !>
+    let write_args = native ? Array[Value]{ receiver, set_index, current, value_panic_location(ctx, left_exp) } : Array[Value]{ set_index, current }
+    let write_callee = native ? vgen_func(setter) : vgen_func(setter, receiver)
+    value_check_call_args(setter, write_callee, write_args, scope, ctx, at, !native) !>
+    let write = vgen_call(ctx, write_callee, write_args, setter.get_rett(), scope)
+    write.exp = at
+    setup.append(value_offset_hook_errors(write, setter, handler_exp, scope, ctx, at) !>)
+    return vgen_block(setup, b, at)
+}
+
+// A hook call that can throw passes its error on, or goes to `handler_exp`
+fn value_offset_hook_errors(call: Value, func: Func, handler_exp: ?Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    if !func.can_error : return call
+    call.can_error = true
+    call.set_error_type(func.error_type)
+    if isset(handler_exp) : return value_apply_error_handler(call, handler_exp, scope, ctx) !>
+    return value_apply_error_pass(call, scope, ctx, at) !>
+}
+
+// `pair[0]`: a tuple member, picked by a constant since each member has its own type
+fn value_tuple_member(on: Value, index_exp: Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    if on.rett.is_nullable_type() : at.error("Cannot use '[]' on a nullable value: " + on.rett.compat_display_name())
+    let members = on.rett.get_members() ?! at.bug("Tuple type has no members")
+    let index = value_from_exp(index_exp, scope, ctx.with_suggested_type(type_from_core(ctx.build, "uint") !>)) !>
+    if index.type != VAL.int : index_exp.error("A tuple member is picked by a constant number, such as 'pair[0]'")
+    if index.int_val < 0 || index.int_val >= members.length.to(int) {
+        index_exp.error("Tuple index out of range: '" + on.rett.compat_display_name() + "' has " + members.length + " members")
+    }
+    let member = members.get(index.int_val.to(uint)) ! at.bug("Tuple member is missing")
+    return vgen_multi_part(on, index.int_val.to(uint), member, at)
+}
+
+// Generic class base from a value left of `[T, …]`.
+fn offset_generic_class(on: Value) ?Class {
+    if on.type == VAL.type {
+        let base = on.get_class_ref()
+        if isset(base) && base.is_generic_base : return base
+        let t = on.get_of_type()
+        if !isset(t) : return null
+        let c = t.class
+        if isset(c) && c.is_generic_base : return c
+    }
+    return null
+}
+
+// Generic free-function base from a value left of `[T, …]`.
+fn offset_generic_func(on: Value) ?Func {
+    if on.type != VAL.func : return null
+    let f = on.func
+    if isset(f) && f.is_generic_base : return f
+    return null
+}
+

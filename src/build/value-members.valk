@@ -1,0 +1,2540 @@
+use valk.fs
+
+////////////////////////////
+// Literals and identifiers
+////////////////////////////
+
+fn value_from_int_literal(exp: Exp, b: Build) Value !Error {
+    let text = exp.str1.replace("_", "")
+    let n: int = 0
+    if exp.value_kind == VALUE_KIND.hex {
+        let un = text.hex_to_uint() ! exp.error("Invalid hex integer: " + exp.str1)
+        n = un.to(int)
+    } else if exp.value_kind == VALUE_KIND.octal {
+        // Source form is 0c… — strip leading 0c/0C if present for octal_to_int
+        let body = text
+        if body.starts_with("0c") || body.starts_with("0C") {
+            body = body.range(2, body.length - 2)
+        }
+        let un = body.octal_to_uint() ! exp.error("Invalid octal integer: " + exp.str1)
+        n = un.to(int)
+    } else if text.starts_with("0b") {
+        if text.bytes == 2 || text.bytes > 66 : exp.error("Invalid binary integer: " + exp.str1)
+        let un: uint = 0
+        each text.range(2, text.bytes - 2) as ch {
+            if ch != '0' && ch != '1' : exp.error("Invalid binary integer: " + exp.str1)
+            un = (un << 1) | (ch == '1' ? 1 : 0)
+        }
+        n = un.to(int)
+    } else {
+        let un = text.to_uint() ! exp.error("Invalid integer: " + exp.str1)
+        n = un.to(int)
+    }
+    // A literal past the signed range is unsigned, whatever its radix
+    if n < 0 : return vgen_int(n, type_from_core(b, "uint") !>)
+    return vgen_int(n, type_int(b))
+}
+
+fn value_from_float_literal(exp: Exp, b: Build) Value !Error {
+    let text = exp.str1.replace("_", "")
+    let n = text.to_float() ! exp.error("Invalid float: " + exp.str1)
+    return vgen_float(n, type_float(b) !>)
+}
+
+fn value_from_id_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let id = exp.get(VALUE_EXP.left)
+    if !isset(id) : exp.bug("Missing id sub-expression")
+    let name = id.str1
+    let ns_name = id.str2
+    let b = ctx.build
+    // Optional `Id[T, U]` type arguments (VALUE_EXP.right multi TYPE)
+    let gens = exp.get(VALUE_EXP.right)
+
+    if !isset(ns_name) && (name == "__PATH__" || name == "__FILE__" || name == "__DIR__" || name == "__LINE__") {
+        if isset(gens) : exp.error("Unexpected type arguments on: " + name)
+        if name == "__LINE__" {
+            let at = message_resolve(exp.src, exp.i)
+            let line = at.src.line_of(at.i).to(uint)
+            let v = vgen_int(line.to(int), type_from_core(b, "uint") !>)
+            v.exp = exp
+            return v
+        }
+        let path = exp.src.path
+        if !isset(path) {
+            exp.error("Cannot resolve " + name + " for source without a file path")
+        }
+        let value = path
+        if name == "__DIR__" {
+            value = fs.dir_of(path)
+        } else if name == "__FILE__" {
+            value = fs.basename(path)
+            let ns = exp.src.ns
+            if isset(ns) {
+                let srcdir = ns.pkg.srcdir
+                if isset(srcdir) {
+                    let prefix = srcdir + fs.PATH_DIV
+                    if path.starts_with(prefix) {
+                        value = path.range(prefix.length, path.length - prefix.length)
+                    }
+                }
+            }
+        }
+        let v = vgen_string(value, type_string(b))
+        v.exp = exp
+        return v
+    }
+
+    let idf: ?Idf = null
+    if isset(ns_name) {
+        let ns_idf = scope.get_scope_idf(ns_name)
+        if !isset(ns_idf) : exp.error("Unknown namespace: " + ns_name)
+        let ns_scope = ns_idf.scope
+        if !isset(ns_scope) : exp.bug("Scope idf is missing scope")
+        lsp_complete_scope(exp, ns_scope) !>
+        idf = ns_scope.get_idf(name)
+        if !isset(idf) : exp.error("Unknown identifier: " + ns_name + "." + name)
+    } else {
+        lsp_complete_scope(exp, scope) !>
+        idf = scope.get_idf(name)
+        // Unresolved ids are allowed here (e.g. other value aliases); later stages resolve
+    }
+
+    // LSP: jump to whatever the compiler just decided this name refers to
+    if isset(idf) {
+        lsp_goto_idf(exp, idf, name) !>
+        alias_check_idf(exp, idf) !>
+    }
+
+    // Locals / arguments → VAL.decl with known type
+    if isset(idf) && idf.type == IDF.decl {
+        if isset(gens) : exp.error("Unexpected type arguments on variable: " + name)
+        let d = idf.decl
+        if !isset(d) : exp.bug("Decl idf is missing decl")
+        d.is_used = true
+        if !ctx.is_store_target : d.is_read = true
+        let current = ctx.func
+        if !isset(current) {
+            exp.error("A declaration cannot be evaluated outside a function")
+        }
+        let resolved = func_capture_decl(current, d, name, exp) !>
+        resolved.is_used = true
+        if !ctx.is_store_target : resolved.is_read = true
+        let v = vgen_decl(resolved)
+        v.exp = exp
+        return v
+    }
+
+    // Globals / shared → VAL.global (assignable, typed)
+    if isset(idf) && idf.type == IDF.global {
+        if isset(gens) : exp.error("Unexpected type arguments on global: " + name)
+        let g = idf.global
+        if !isset(g) : exp.bug("Global idf is missing global")
+        // Stores are checked at the assignment site, where is_assign is known
+        act_check(exp, g.act, g.exp, false, "global") !>
+        // Known before IR generation: global defaults are ordered by these reads
+        let reader = ctx.func
+        if isset(reader) : reader.globals_used.append(g, true)
+        let v = vgen_global(g) !>
+        v.exp = exp
+        return v
+    }
+
+    // Compile-time class-property metadata from `#loop properties`.
+    if isset(idf) && idf.type == IDF.property {
+        if isset(gens) : exp.error("Unexpected type arguments on property metadata: " + name)
+        let prop = idf.prop
+        if !isset(prop) : exp.bug("Property idf is missing Prop")
+        let runtime_value = idf.value
+        let v = Value {
+            type: VAL.property_meta
+            rett: isset(runtime_value) ? prop.type : type_string(b)
+            prop: prop
+            value1: runtime_value
+            exp: exp
+        }
+        v.set_string(prop.name ?? "")
+        return v
+    }
+
+    // Compile-time constants (macro defs on Build.scope) fold to their Value
+    if isset(idf) && idf.type == IDF.value {
+        if isset(gens) : exp.error("Unexpected type arguments on value: " + name)
+        let bound = idf.value
+        if !isset(bound) : exp.bug("Value idf is missing value")
+        let bound_type = bound.type == VAL.string
+            ? type_string(b)
+            : (bound.type == VAL.int ? type_int(b) : bound.rett)
+        // Return a shallow copy so we can attach this use's source span
+        let v = Value {
+            type: bound.type
+            rett: bound_type
+            exp: exp
+            int_val: bound.int_val
+            float_val: bound.float_val
+            bool_val: bound.bool_val
+            decl: bound.decl
+        }
+        v.set_string(bound.get_string())
+        v.set_name(bound.get_name())
+        v.set_of_type(bound.get_of_type())
+        return v
+    }
+
+    // `value Name (expr)` — evaluate the stored expression in this scope
+    if isset(idf) && idf.type == IDF.value_expr {
+        if isset(gens) : exp.error("Unexpected type arguments on value: " + name)
+        let value_exp = idf.value_exp
+        if !isset(value_exp) : exp.bug("Value-expr idf is missing value_exp")
+        let value_scope = idf.scope ?? scope
+        if idf.resolving : exp.error("Circular value definition: " + name)
+        idf.resolving = true
+        defer idf_resolved(idf)
+        // A constant written as a number is typed like that number where it is used
+        if exp_is_untyped_number(value_exp) : exp.bool1 = true
+        // Keep the suggested type type so e.g. a null alias can inherit the use-site expectation
+        let v = value_from_exp(value_exp, value_scope, ctx) !>
+        let suggested_type = ctx.suggested_type
+        // A number constant that does not fit the expected type stays that number, as the
+        // literal would: the operator or the destination then decides, at the use
+        let unfit = exp.bool1 && v.type == VAL.int && isset(suggested_type) && suggested_type.is_integer_type()
+            && !type_fits_int_literal(suggested_type, v.int_val, !v.rett.is_signed_type())
+        if isset(suggested_type) && !unfit {
+            v = value_try_convert(v, scope, ctx, suggested_type) !>
+        }
+        v.exp = exp
+        return v
+    }
+
+    if isset(idf) && idf.type == IDF.type {
+        let of_type = idf.of_type
+        if !isset(of_type) : exp.bug("Type idf is missing of_type")
+        // If the bound type is a generic class, allow `T[U]` only when of_type is a class base
+        let c = of_type.class
+        if isset(gens) {
+            if isset(c) && c.is_generic_base {
+                let gtypes = value_resolve_type_args(gens, scope) !>
+                c = c.specialize(gtypes, exp) !>
+                of_type = c.get_type() !>
+            } else {
+                exp.error("Type is not generic: " + name)
+            }
+        }
+        let v = vgen_type(of_type, b)
+        v.exp = exp
+        return v
+    }
+    if isset(idf) && idf.type == IDF.class {
+        let c = idf.class
+        if isset(c) {
+            act_check(exp, c.act, c.exp, false, "class") !>
+            if c.is_generic_base {
+                if isset(gens) {
+                    // Legacy: type args still attached on id (if any)
+                    let gtypes = value_resolve_type_args(gens, scope) !>
+                    c = c.specialize(gtypes, exp) !>
+                } else {
+                    let v = Value {
+                        type: VAL.type
+                        rett: type_string(b)
+                    }
+                    v.set_class_ref(c)
+                    v.set_name(name)
+                    v.exp = exp
+                    return v
+                }
+            } else if isset(gens) {
+                exp.error("Type is not generic: " + c.name)
+            }
+            let of_type = c.get_type() !>
+            let v = vgen_type(of_type, b)
+            v.exp = exp
+            return v
+        }
+    }
+
+    // Enum type as value: `Enum1` / `Enum2` — `.item` resolves via of_type.enum
+    if isset(idf) && idf.type == IDF.enum {
+        if isset(gens) : exp.error("Unexpected type arguments on enum: " + name)
+        let enu = idf.enum
+        if !isset(enu) : exp.bug("Enum idf is missing enum")
+        act_check(exp, enu.act, enu.exp, false, "enum") !>
+        let of_type = enu.get_type() !>
+        let v = vgen_type(of_type, b)
+        v.exp = exp
+        return v
+    }
+
+    // Error type as value: `TestError` — `.code` resolves via of_type.error_type
+    if isset(idf) && idf.type == IDF.error_type {
+        if isset(gens) : exp.error("Unexpected type arguments on error type: " + name)
+        let et = idf.error_type
+        if !isset(et) : exp.bug("Error-type idf is missing error_type")
+        act_check(exp, et.act, et.exp, false, "error type") !>
+        parse_error_type(et) !>
+        let v = vgen_type(type_error_code(et), b)
+        v.exp = exp
+        return v
+    }
+
+    // Generic free function: `foo[T]` → specialized Func id
+    if isset(idf) && idf.type == IDF.func {
+        let f = idf.func
+        if isset(f) && f.is_generic_base {
+            if !isset(gens) {
+                // Leave base for call-site specialization when possible
+            } else {
+                let gtypes = value_resolve_type_args(gens, scope) !>
+                f = f.specialize(gtypes, exp) !>
+                idf = Idf.for_func(f)
+            }
+        } else if isset(gens) {
+            exp.error("Function is not generic: " + name)
+        }
+    } else if isset(gens) {
+        exp.error("Unexpected type arguments on: " + name)
+    }
+
+    if isset(idf) && idf.type == IDF.func {
+        let f = idf.func
+        if !isset(f) : exp.bug("Function idf is missing func")
+        // Specializations carry the base's act and Exp, so this covers `foo[T]` too
+        act_check(exp, f.act, f.exp, false, "function") !>
+        require_unsafe_func(f, scope, exp) !>
+        let v = vgen_func(f)
+        v.exp = exp
+        return v
+    }
+    // Declared by a statement that failed; that error was reported
+    if scope.has_broken_name(name) : throw .error
+    let close = closest_visible_name(scope, name, exp)
+    if isset(close) : exp.error("Unknown identifier: " + name + ". Did you mean '" + close + "'?")
+    exp.error("Unknown identifier: " + name)
+}
+
+// The visible name nearest to `name` by edit distance, for a "did you mean"; null when
+// nothing is within 1 edit (2 for names longer than 3)
+fn closest_visible_name(scope: Scope, name: String, at: Exp) ?String {
+    let limit: uint = name.bytes > 3 ? 2 : 1
+    let best: ?String = null
+    let best_distance = limit + 1
+    let s = scope
+    while true {
+        let idfs = s.identifiers
+        if isset(idfs) {
+            each idfs as idf, candidate {
+                // Compiler-made names such as '&' are not suggested
+                let first = candidate.get(0)
+                if !((first >= 'a' && first <= 'z') || (first >= 'A' && first <= 'Z') || first == '_') : continue
+                let diff = candidate.bytes > name.bytes ? candidate.bytes - name.bytes : name.bytes - candidate.bytes
+                if diff > limit || candidate == name : continue
+                let distance = edit_distance(name, candidate)
+                if distance > limit || distance > best_distance : continue
+                // On a tie a longer shared start wins, then the longer name: a left-out
+                // letter is the likelier typo (`printn` is `println`, not `print`)
+                if distance == best_distance {
+                    let current = best ?? ""
+                    let a = common_prefix_length(name, candidate)
+                    let b = common_prefix_length(name, current)
+                    if a < b || (a == b && candidate.bytes <= current.bytes) : continue
+                }
+                if !lsp_idf_allowed(at, idf) : continue
+                best = candidate
+                best_distance = distance
+            }
+        }
+        let parent = s.parent
+        if !isset(parent) : break
+        s = parent
+    }
+    return best
+}
+
+fn common_prefix_length(a: String, b: String) uint {
+    let i: uint = 0
+    while i < a.bytes && i < b.bytes && a.get(i) == b.get(i) : i++
+    return i
+}
+
+fn edit_distance(a: String, b: String) uint {
+    let prev = Array[uint]{}
+    let j: uint = 0
+    while j <= b.bytes : prev.append(j++)
+    let i: uint = 0
+    while i < a.bytes {
+        let row = Array[uint]{ i + 1 }
+        j = 0
+        while j < b.bytes {
+            let cost: uint = a.get(i) == b.get(j) ? 0 : 1
+            let best = (prev.get(j) !? 0) + cost
+            let up = (prev.get(j + 1) !? 0) + 1
+            let left = (row.get(j) !? 0) + 1
+            if up < best : best = up
+            if left < best : best = left
+            row.append(best)
+            j++
+        }
+        prev = row
+        i++
+    }
+    return prev.get(b.bytes) !? 0
+}
+
+// Resolve multi TYPE_KIND type-argument list from a value id's `[T, U]`.
+fn value_resolve_type_args(gens: Exp, scope: Scope) Array[Type] !Error {
+    let gtypes = Array[Type]{}
+    let i: uint = 0
+    while true {
+        let g = gens.get(i)
+        if !isset(g) : break
+        gtypes.append(type_from_exp(g, scope) !>)
+        i++
+    }
+    return gtypes
+}
+
+// VAL.type for a value's result type (`typeof(v)` / `v.$type`).
+fn value_as_rett_type(on: Value, at: Exp, b: Build) Value !Error {
+    return vgen_type(on.rett, b)
+}
+
+////////////////////////////
+// Member access
+////////////////////////////
+
+// `left.name` — namespace lookup, type meta, static members, instance methods/getters, or object props.
+fn value_from_dot_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let b = ctx.build
+    let on_exp = exp.get(VALUE_EXP.left)
+    if !isset(on_exp) : exp.bug("Missing dot left value")
+
+    // A scope imported with `use` uses the same dot syntax as member access.
+    // Resolve that case before evaluating the left side as a runtime value.
+    if on_exp.type == EXP.value && on_exp.value_kind == VALUE_KIND.id {
+        let base_id = on_exp.get(VALUE_EXP.left)
+        let base_idf = isset(base_id) && !isset(base_id.str2) ? scope.get_idf(base_id.str1) : null
+        let namespace_idf = isset(base_id) && !isset(base_id.str2) ? scope.find_scope_idf(base_id.str1) : null
+        let namespace_scope = isset(namespace_idf) ? namespace_idf.scope : null
+        let namespace_has_name = isset(namespace_scope) && isset(namespace_scope.get_idf(exp.str1))
+        if isset(base_id) && ((isset(base_idf) && base_idf.type == IDF.scope) || namespace_has_name) {
+            let id = Exp {
+                type: EXP.id
+                str1: exp.str1
+                str2: base_id.str1
+                src: exp.src
+                i: exp.i
+                len: exp.len
+            }
+            let qualified = Exp {
+                type: EXP.value
+                kind: VALUE_KIND.id
+                src: exp.src
+                i: exp.i
+                len: exp.len
+            }
+            qualified.set(VALUE_EXP.left, id)
+            let v = value_from_id_exp(qualified, scope, ctx) !>
+            // `ns.NAME` of a `value NAME (literal)` stays untyped in operators, like `NAME`
+            exp.bool1 = qualified.bool1
+            return v
+        }
+    }
+
+    let on = value_from_exp(on_exp, scope, ctx.for_group_receiver()) !>
+    let name = exp.str1
+
+    if on.type == VAL.property_meta {
+        let prop = on.prop
+        if !isset(prop) : exp.bug("Property metadata value is missing Prop")
+        if name == "$type" {
+            let v = vgen_type(prop.type, b)
+            v.exp = exp
+            return v
+        }
+        if name == "name" {
+            let v = vgen_string(prop.name ?? "", type_string(b))
+            v.exp = exp
+            return v
+        }
+        if name == "$default_value" {
+            let body = prop.default
+            if isset(body) {
+                let default_exp = parse_body_as_value_exp(body) !>
+                let default_scope = prop.class.scope.sub_scope()
+                default_scope.func = scope.func
+                let v = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(prop.type).for_direct_init()) !>
+                v = value_try_convert(v, scope, ctx, prop.type) !>
+                prop.type.compat_check(v.rett, default_exp) !>
+                v.exp = exp
+                return v
+            }
+            if prop.zero_default {
+                let v = vgen_null(prop.type)
+                v.exp = exp
+                return v
+            }
+            return value_generate_default(prop.type, scope, ctx, exp) !>
+        }
+        if name == "$has_default_value" {
+            let has_default = isset(prop.default) || prop.zero_default || type_has_generated_default(prop.type, b)
+            let v = vgen_bool(has_default, type_bool(b))
+            v.exp = exp
+            return v
+        }
+        if name == "$has_explicit_default_value" {
+            let v = vgen_bool(isset(prop.default), type_bool(b))
+            v.exp = exp
+            return v
+        }
+        if name == "$index" {
+            let index: uint = 0
+            each prop.class.props as item, i {
+                if item == prop {
+                    index = i
+                    break
+                }
+            }
+            let v = vgen_int(index.to(int), type_int(b))
+            v.exp = exp
+            return v
+        }
+        if name == "name" || name == "type" || name == "default" {
+            exp.error("Property loop values use '$type', '$default_value', '$has_default_value', and '$has_explicit_default_value'; plain '." + name + "' is not supported")
+        }
+    }
+
+    let selected_group = on.get_group()
+    if isset(selected_group) {
+        lsp_complete_group(exp, selected_group) !>
+        let f = selected_group.funcs.get(name) !? null
+        if isset(f) {
+            act_check(exp, f.act, f.exp, false, "function") !>
+            lsp_goto(exp, f.exp, name) !>
+            lsp_sem_record_func(exp, f, name)
+            let receiver: ?Value = null
+            if !f.is_static {
+                receiver = on.value1
+                if !isset(receiver) : exp.bug("Instance group member is missing its receiver")
+                f = func_for_receiver(f, receiver, exp, ctx.func) !>
+            }
+            if f.is_getter {
+                let callee = vgen_func(f, receiver)
+                callee.exp = exp
+                let args = Array[Value]{}
+                value_check_call_args(f, callee, args, scope, ctx, exp) !>
+                let call = vgen_call(ctx, callee, args, f.get_rett(), scope)
+                call.exp = exp
+                if f.can_error {
+                    call.can_error = true
+                    call.set_error_type(f.error_type)
+                }
+                return call
+            }
+            require_unsafe_func(f, scope, exp) !>
+            return value_bind_method(f, receiver, ctx, exp)
+        }
+    }
+
+    // Any value: .$type → VAL.type of its result type (same as typeof)
+    if name == "$type" {
+        let v = value_as_rett_type(on, exp, b) !>
+        v.exp = exp
+        return v
+    }
+
+    if name == "$default_value" {
+        return value_from_default_value(on, scope, ctx, exp) !>
+    }
+
+    // Trusted library code can allocate a zeroed aggregate and finish its
+    // initialization before publishing it. This is intentionally restricted
+    // to files that already opt into unchecked access.
+    if name == "$zero_value" {
+        if !exp.src.ignore_access {
+            exp.error("'$zero_value' is only available in an @ignore_access source")
+        }
+        let zero_type = value_default_target_type(on, exp) !>
+        let zero_class = zero_type.get_non_nullable().get_class_or_null()
+        if !isset(zero_class) || !zero_type.get_non_nullable().is_structural_type() {
+            exp.error("'$zero_value' requires a structural type")
+        }
+        return vgen_class_init(ctx, zero_class, HashMap[Prop, Value]{}, zero_type, exp) !>
+    }
+
+    if name == "$is_shared_global" {
+        if on.type != VAL.global {
+            exp.error("The '$is_shared_global' token can only be used on global values")
+        }
+        let global = on.global
+        if !isset(global) : exp.bug("VAL.global is missing its Global")
+        let v = vgen_bool(global.shared, type_bool(b))
+        v.exp = exp
+        return v
+    }
+
+    if name == "$has_default_value" {
+        let default_type = value_default_target_type(on, exp) !>
+        let has_default = type_has_generated_default(default_type, b)
+        if on.type == VAL.global {
+            let global = on.global
+            if !isset(global) : exp.bug("VAL.global is missing its Global")
+            if isset(global.default_exp) : has_default = true
+        }
+        let v = vgen_bool(has_default, type_bool(b))
+        v.exp = exp
+        return v
+    }
+
+    if name == "$has_explicit_default_value" {
+        let explicit = false
+        if on.type == VAL.global {
+            let global = on.global
+            if !isset(global) : exp.bug("VAL.global is missing its Global")
+            explicit = isset(global.default_exp)
+        }
+        let v = vgen_bool(explicit, type_bool(b))
+        v.exp = exp
+        return v
+    }
+
+    // Compile-time type meta-properties + static members / enum items
+    if on.type == VAL.type {
+        let folded = value_type_prop(on, name, exp, b) !>
+        if isset(folded) {
+            folded.exp = exp
+            return folded
+        }
+        if name.starts_with("$") {
+            let v = vgen_dot(on, name, type_bool(b))
+            v.exp = exp
+            return v
+        }
+        let t = on.get_of_type()
+        if isset(t) {
+            // Enum member: `Enum1.a`, or a static function such as `Enum1.items()`
+            let enu = t.get_enum()
+            if isset(enu) {
+                lsp_complete_enum(exp, enu) !>
+                let methods = enu.methods
+                if isset(methods) && !enum_has_item(enu, name) {
+                    // Falls through to the item type's static functions, as `$has_method` does
+                    let f = methods.get_func(name)
+                    if isset(f) && f.is_static {
+                        act_check(exp, f.act, f.exp, false, "function") !>
+                        lsp_goto(exp, f.exp, name) !>
+                        lsp_sem_record_func(exp, f, name)
+                        let v = vgen_func(f)
+                        v.exp = exp
+                        return v
+                    }
+                }
+                return value_from_enum_item(enu, name, exp, scope, ctx) !>
+            }
+            // Error code constant: `TestError.err2`
+            let et = t.get_error_type()
+            if isset(et) {
+                lsp_complete_error_codes(exp, et) !>
+                return value_from_error_code_item(et, name, exp) !>
+            }
+            // Static method / member on a class type (modes fall through to wrapped type)
+            let c = t.get_class_or_null()
+            if isset(c) {
+                lsp_complete_class(exp, c) !>
+                let f = c.get_func(name)
+                if isset(f) {
+                    if c.kind == CLASS_KIND.interface && !f.is_static {
+                        exp.error("Interface methods require an interface value")
+                    }
+                    act_check(exp, f.act, f.exp, false, "function") !>
+                    lsp_goto(exp, f.exp, name) !>
+                    lsp_sem_record_func(exp, f, name)
+                    let v = vgen_func(f)
+                    v.exp = exp
+                    return v
+                }
+                let g = c.get_group(name)
+                if isset(g) {
+                    let v = vgen_dot(on, name, on.rett)
+                    v.set_group(g)
+                    v.exp = exp
+                    return v
+                }
+                if !isset(ctx.build.options.lsp) {
+                    exp.error("Type '" + c.pretty_name() + "' has no static function named: '" + name + "'")
+                }
+            }
+        }
+        let v = vgen_dot(on, name, type_void(b))
+        v.exp = exp
+        return v
+    }
+
+    // Soft: unresolved left — keep as open dot
+    if on.rett.is_void_type() {
+        let v = vgen_dot(on, name, type_void(b))
+        v.exp = exp
+        return v
+    }
+
+    let on_nn = on
+    if !value_is_nullable_union_receiver(on) : on_nn = value_try_remove_nullable(on, scope, ctx) !>
+    if on_nn.rett.is_nullable_type() && !value_is_nullable_union_receiver(on_nn) {
+        exp.error("You cannot access properties/functions on a nullable type: " + on_nn.rett.compat_display_name())
+    }
+    on_nn = value_read_borrowed_receiver(on_nn, scope, ctx, exp) !>
+    if on_nn.rett.is_nullable_type() && !value_is_nullable_union_receiver(on_nn) {
+        exp.error("You cannot access properties/functions on a nullable type: " + on_nn.rett.compat_display_name())
+    }
+    if on_nn.rett.kind == TYPE.ref_slice && !isset(on_nn.rett.class) {
+        if name == "length" {
+            let length = value_owned_borrow_length(value_root_owned_borrow(on_nn, ctx), ctx) !>
+            length.exp = exp
+            return length
+        }
+        // Everything else is declared by core's `slice &[T]` over the same
+        // three words; a read-only borrow keeps the methods that write out of reach
+        let element = on_nn.rett.get_sub_type() ?! exp.bug("Slice borrow has no element type")
+        let slice_class = bare_slice_class(b, element, exp) !>
+        let as_slice = vgen_cast(on_nn, slice_class.get_type() !>)
+        as_slice.exp = on_nn.exp
+        on_nn = as_slice
+    }
+    // Members of a borrow are the members of T. Properties are read through
+    // the address; a method keeps the whole borrow as its receiver so a store
+    // through `this` still knows the owner.
+    let on_adr = value_through_borrow(on_nn, ctx)
+
+    if name == "$is_shared" {
+        return value_from_is_shared(on_nn, exp, b) !>
+    }
+
+    let on_et_t = on_nn.rett
+    if on_et_t.kind == TYPE.error_code && on_et_t.error_is_instance {
+        let et = on_et_t.get_error_type()
+        if !isset(et) : exp.bug("Error-instance type is missing error_type")
+        // LSP: `E.` offers the payload fields and code constants
+        lsp_complete_error_codes(exp, et) !>
+        if name == "code" {
+            if on_nn.type != VAL.decl : exp.bug("Caught error code is not backed by a declaration")
+            let decl = on_nn.decl
+            if !isset(decl) : exp.bug("Caught error code declaration is missing")
+            let v = vgen_decl(decl)
+            v.rett = type_error_code(et)
+            v.exp = exp
+            return v
+        }
+        let ptype = et.payload.get(name) !? null
+        if isset(ptype) {
+            let caught_decl = on_nn.decl
+            if isset(caught_decl) {
+                let payloads = caught_decl.error_payloads
+                if isset(payloads) {
+                    let payload_decl = payloads.get(name) !? null
+                    if isset(payload_decl) {
+                        let v = vgen_decl(payload_decl)
+                        v.rett = ptype
+                        v.exp = exp
+                        return v
+                    }
+                }
+            }
+            let global = et.payload_globals.get(name) !? null
+            if !isset(global) : exp.bug("Error payload global is missing: " + et.name + "." + name)
+            let v = vgen_global(global) !>
+            v.rett = ptype
+            v.exp = exp
+            return v
+        }
+        if et.codes.contains(name) {
+            return value_from_error_code_item(et, name, exp) !>
+        }
+        exp.error("Error type '" + et.name + "' has no payload field or code named: '" + name + "'")
+    }
+    if on_et_t.kind == TYPE.error_code : lsp_complete_error_code_value(exp) !>
+
+    let on_class = value_member_class(on_nn.rett)
+    if isset(on_class) {
+        // LSP: members of the value on the left of the dot
+        lsp_complete_class(exp, on_class) !>
+
+        let current_func = ctx.func
+        let current_group: ?Group = isset(current_func) ? current_func.group : null
+        if isset(current_func) && isset(current_group) && on_nn.type == VAL.decl {
+            let receiver_arg = current_func.args.get(0) !? null
+            if isset(receiver_arg) && on_nn.decl == receiver_arg.decl {
+                let group_func = current_group.funcs.get(name) !? null
+                if isset(group_func) {
+                    group_func = func_for_receiver(group_func, on_nn, exp, ctx.func) !>
+                    if group_func.is_getter {
+                        let callee = vgen_func(group_func, on_nn)
+                        callee.exp = exp
+                        let args = Array[Value]{}
+                        value_check_call_args(group_func, callee, args, scope, ctx, exp) !>
+                        let call = vgen_call(ctx, callee, args, group_func.get_rett(), scope)
+                        call.exp = exp
+                        if group_func.can_error {
+                            call.can_error = true
+                            call.set_error_type(group_func.error_type)
+                        }
+                        return call
+                    }
+                    require_unsafe_func(group_func, scope, exp) !>
+                    return value_bind_method(group_func, on_nn, ctx, exp)
+                }
+            }
+        }
+
+        // Methods / getters (modes fall through to `mode_for_class`)
+        let f = on_class.get_func(name)
+        if isset(f) {
+            f = func_for_receiver(f, on_nn, exp, ctx.func) !>
+            act_check(exp, f.act, f.exp, false, "function") !>
+            lsp_goto(exp, f.exp, name) !>
+            lsp_sem_record_func(exp, f, name)
+            if f.is_getter {
+                // Getter call with implicit this (no arg list in source)
+                let callee = vgen_func(f, on_nn)
+                callee.exp = exp
+                let args = Array[Value]{}
+                value_check_call_args(f, callee, args, scope, ctx, exp) !>
+                let call = vgen_call(ctx, callee, args, f.get_rett(), scope)
+                call.exp = exp
+                if f.can_error {
+                    call.can_error = true
+                    call.set_error_type(f.error_type)
+                }
+                return call
+            }
+            require_unsafe_func(f, scope, exp) !>
+            return value_bind_method(f, on_nn, ctx, exp)
+        }
+
+        // Properties — assignable VAL.prop (modes fall through to wrapped props)
+        let prop = on_class.get_prop_by_name(name) !? null
+        if isset(prop) {
+            // Read only: a store through this prop is checked at the assignment site
+            act_check(exp, prop.act, prop.exp, false, "property") !>
+            lsp_goto(exp, prop.exp, name) !>
+            lsp_sem_record(exp, name, 8, 0, true)
+            let v = vgen_prop(prop, on_adr, ctx)
+            v.rett = on_adr.rett.storage_view_of(prop.type)
+            v.exp = exp
+            return value_check_borrowed_property(v, ctx, exp) !>
+        }
+
+        // Groups: leave as open dot for now (group method calls later)
+        let g = on_class.get_group(name)
+        if isset(g) {
+            act_check_explicit(exp, g.act, g.exp, "group") !>
+            let v = vgen_dot(on_nn, name, on_nn.rett)
+            v.set_group(g)
+            v.exp = exp
+            return v
+        }
+    }
+
+    if name == "length" && type_has_native_sequence_length(on_adr.rett) {
+        let length = value_native_sequence_length(on_adr, on_adr.rett, ctx, exp) !>
+        if isset(length) {
+            length.exp = exp
+            return length
+        }
+    }
+
+    if name == "to" || name == "$to" {
+        let v = vgen_dot(on_nn, name, type_void(b))
+        v.exp = exp
+        return v
+    }
+
+    if name == "clone" && on_nn.rett.get_non_nullable().kind == TYPE.closure {
+        let v = vgen_dot(on_nn, name, on_nn.rett)
+        v.exp = exp
+        return v
+    }
+
+    // `E.code.name()`, completed by the call
+    if name == "name" && on_nn.rett.get_non_nullable().kind == TYPE.error_code {
+        let v = vgen_dot(on_nn, name, type_void(b))
+        v.exp = exp
+        return v
+    }
+
+    if !isset(on_class) {
+        exp.error("Cannot access properties/functions on this type: " + on_nn.rett.compat_display_name())
+    }
+    exp.error("Type '" + on_class.pretty_name() + "' has no property or method named: '" + name + "'")
+}
+
+// Whether this storage lives in an element that was copied out of an Array
+fn value_is_copied_element(value: Value) bool {
+    let meta = value.meta
+    if isset(meta) && meta.copied_element : return true
+    let kind = value.type
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : return false
+    let inner = value.value1 ?! return false
+    if kind == VAL.prop && !inner.rett.is_inline_type() : return false
+    return value_is_copied_element(inner)
+}
+
+value CALL_RESULT_COPY_ERROR ("Cannot change a value returned by a call: it is a temporary copy, so the change would be lost; store it in a variable first")
+
+// Storage inside an inline value a call returned: a write into it is lost with the copy
+fn value_is_call_result_copy(value: Value) bool {
+    let meta = value.meta
+    if isset(meta) && meta.call_result_copy : return true
+    let kind = value.type
+    if kind == VAL.call {
+        let t = value.rett.get_non_nullable()
+        return value.rett.is_inline_type() && !t.is_fat_borrow() && !t.is_pointer()
+    }
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : return false
+    let inner = value.value1 ?! return false
+    if kind == VAL.prop && !inner.rett.is_inline_type() : return false
+    return value_is_call_result_copy(inner)
+}
+
+// The `each` variable this storage was copied into, if any
+fn value_copied_element_decl(value: Value) ?Decl {
+    let kind = value.type
+    if kind == VAL.decl {
+        let decl = value.decl ?! return null
+        return decl.copied_element ? decl : null
+    }
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast : return null
+    let inner = value.value1 ?! return null
+    return value_copied_element_decl(inner)
+}
+
+// The captured variable whose private copy this storage is, if any: the
+// variable itself or inline storage (struct, fixed array) inside it. An
+// object read out of a captured reference is not the capture.
+fn value_captured_decl(value: Value) ?Decl {
+    let kind = value.type
+    if kind == VAL.decl {
+        let decl = value.decl ?! return null
+        return decl.is_bind ? decl : null
+    }
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast && kind != VAL.ptr_of : return null
+    let inner = value.value1 ?! return null
+    if !inner.rett.is_inline_type() || inner.rett.is_fat_borrow() : return null
+    return value_captured_decl(inner)
+}
+
+fn value_check_captured_write(value: Value, at: Exp, what: String ("assign to")) !Error {
+    let captured = value_captured_decl(value) ?! return
+    if captured.owner.is_defer {
+        at.error("Cannot " + what + " '" + (captured.name ?? "?") + "' in a deferred block: it holds the value from the 'defer' line; change an object instead")
+    }
+    at.error("Cannot " + what + " captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead")
+}
+
+// A writable borrow of a capture's inline storage would write the private copy
+fn value_check_captured_borrow(value: Value, at: Exp) !Error {
+    if value.rett.is_fat_borrow() : return
+    value_check_captured_write(value, at, "take a writable borrow of") !>
+}
+
+// A type whose storage may not be written from here: a read-only borrow, or
+// an `$immutable` slice outside the class that declares it
+fn type_is_readonly_here(type: Type, ctx: Context) bool {
+    let nn = type.get_non_nullable()
+    if !nn.is_readonly_view() : return false
+    let c = nn.class ?! return true
+    let func = ctx.func ?? (ctx.get_func() !? null)
+    if !isset(func) : return true
+    // Only the declaring class itself may write; a mode or an extension from
+    // another package is not the class
+    let fc = func.class ?! return true
+    let rep = c.representation_class()
+    if fc.representation_class() != rep : return true
+    let src_ns = func.exp.src.ns ?! return true
+    return src_ns.pkg != rep.ns.pkg
+}
+
+// A property holding inline storage that is read-only from where it is used.
+// An object or raw pointer read out of the property is not the property.
+fn value_is_readonly_property(value: Value) bool {
+    if value.type != VAL.prop : return false
+    let prop = value.prop ?! return false
+    let at = value.exp ?! return false
+    let stored = prop.type.get_non_nullable()
+    if stored.is_gc_type() || stored.kind == TYPE.interface || stored.kind == TYPE.closure
+        || stored.is_raw_pointer() || stored.kind == TYPE.ptr_of || stored.is_struct_object() : return false
+    return act_level(at, prop.act, prop.exp) == ACT.readonly
+}
+
+// Whether this storage sits behind a read-only borrow: an element read out
+// of one, or something reached through one
+fn value_in_readonly_view(value: Value, ctx: Context) bool {
+    let meta = value.meta
+    if isset(meta) && meta.readonly_element : return true
+    // A raw pointer read out of anything is unsafe territory, not a borrow
+    let own_nn = value.rett.get_non_nullable()
+    if own_nn.is_raw_pointer() || own_nn.kind == TYPE.ptr_of : return false
+    let kind = value.type
+    if kind == VAL.multi {
+        // A borrow split into its words keeps its source in value1
+        let source = value.value1
+        if isset(source) && value_is_readonly_storage(source, ctx) : return true
+        let parts = value.values ?! return false
+        each parts as part {
+            if value_in_readonly_view(part, ctx) : return true
+        }
+        return false
+    }
+    if kind != VAL.prop && kind != VAL.ptrv && kind != VAL.wrap && kind != VAL.cast && kind != VAL.ptr_of : return false
+    let inner = value.value1 ?! return false
+    // Through a raw pointer the unsafe rules apply instead
+    let inner_nn = inner.rett.get_non_nullable()
+    if inner_nn.is_raw_pointer() || inner_nn.kind == TYPE.ptr_of : return false
+    if kind == VAL.prop {
+        // A class object reached through a borrow is an ordinary object;
+        // only inline storage (structs, fixed arrays) lives inside the borrow
+        let owner_t = inner.rett.get_non_nullable()
+        let stored = (owner_t.kind == TYPE.ref_of || owner_t.kind == TYPE.ref_slice)
+            ? (owner_t.get_sub_type() ?? owner_t) : owner_t
+        if stored.is_gc_type() || stored.kind == TYPE.interface || stored.kind == TYPE.closure : return false
+    }
+    return value_is_readonly_storage(inner, ctx)
+}
+
+// What to tell the writer: a read-only view blocks writes, an immutable type never changes
+fn value_readonly_hint(value: Value, ctx: Context) String {
+    let current: ?Value = value
+    while isset(current) {
+        let nn = current.rett.get_non_nullable()
+        let c = nn.class
+        if isset(c) && c.immutable && nn.is_readonly_view() : return "'" + c.pretty_name() + "' is an immutable slice type"
+        if value_is_readonly_property(current) {
+            let prop = current.prop
+            return "property '" + (isset(prop) ? (prop.name ?? "?") : "?") + "' is read-only here"
+        }
+        let kind = current.type
+        if kind == VAL.multi : current = current.value1
+        else if kind == VAL.prop || kind == VAL.ptrv || kind == VAL.wrap || kind == VAL.cast || kind == VAL.ptr_of : current = current.value1
+        else : break
+    }
+    return "the storage is read-only here"
+}
+
+// Whether the value itself is a read-only borrow or lives behind one
+fn value_is_readonly_storage(value: Value, ctx: Context) bool {
+    if type_is_readonly_here(value.rett, ctx) : return true
+    if value_is_readonly_property(value) : return true
+    return value_in_readonly_view(value, ctx)
+}
+
+fn value_bind_method(func: Func, receiver: ?Value, ctx: Context, at: Exp) Value {
+    let receiver_arg = func.args.get(0) !? null
+    let frame_bound = false
+    if !func.is_static && isset(receiver) && isset(receiver_arg) && receiver_arg.type.is_stack_borrow() {
+        let copied = value_is_copied_element(receiver)
+        let call_copy = value_is_call_result_copy(receiver)
+        let readonly = value_is_readonly_storage(receiver, ctx)
+        let captured = receiver.rett.is_fat_borrow() ? null[?Decl] : value_captured_decl(receiver)
+        // Bound to a struct inside an object, the method keeps that object alive
+        let origin = value_borrow_origin(receiver)
+        frame_bound = origin.kind == BORROW_ORIGIN.stack || origin.kind == BORROW_ORIGIN.borrowed
+        // A generic body's receiver is converted once its inferred args are concrete
+        if !func.is_generic_base && !func.has_generic_args {
+            receiver = value_struct_receiver(receiver, receiver_arg.type, ctx)
+        }
+        if copied : receiver.ensure_meta().copied_element = true
+        if call_copy : receiver.ensure_meta().call_result_copy = true
+        if readonly : receiver.ensure_meta().readonly_element = true
+        if isset(captured) : receiver.ensure_meta().captured_receiver = captured
+    }
+    let value = vgen_func(func, receiver)
+    value.exp = at
+    if frame_bound : value.mark_implicit_borrow()
+    return value
+}
+
+fn value_member_class(type: Type) ?Class {
+    let t = type.get_non_nullable()
+    // An enum value's methods, which fall through to those of its item type
+    let enu = t.get_enum()
+    if isset(enu) {
+        let methods = enu.methods
+        if isset(methods) : return methods
+    }
+    let direct = t.get_direct_class_or_null()
+    if isset(direct) : return direct
+    if t.kind == TYPE.ref_of {
+        if t.length != 1 : return null
+        let held = t.get_sub_type() ?! return null
+        return value_member_class(held)
+    }
+    if t.kind != TYPE.ptr_of && t.kind != TYPE.adr_of : return t.get_class_or_null()
+    let sub = t.get_sub_type()
+    // `&T` is a typed borrow, so member lookup remains that of T. Raw `*T`
+    // keeps pointer member semantics unless it points at inline storage.
+    if t.kind == TYPE.adr_of && isset(sub) : return sub.get_class_or_null()
+    if isset(sub) && sub.is_inline : return sub.get_class_or_null()
+    return type_ptr(t.build).class
+}
+
+////////////////////////////
+// Default values
+////////////////////////////
+
+fn value_from_default_value(on: Value, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let target = value_default_target_type(on, at) !>
+
+    if on.type == VAL.global {
+        let global = on.global
+        if !isset(global) : at.bug("VAL.global is missing its Global")
+        let init = global.init_func
+        if isset(init) {
+            if !init.parsed_types : parse_func_types(init) !>
+            let call = vgen_call(ctx, vgen_func(init), Array[Value]{}, init.get_rett(), scope)
+            call.exp = at
+            return call
+        }
+        let default_body = global.default_exp
+        if isset(default_body) {
+            let default_exp = parse_body_as_value_exp(default_body) !>
+            let default_scope = global.scope.sub_scope()
+            default_scope.func = scope.func
+            let value = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(target).for_direct_init()) !>
+            if value.type != VAL.undefined {
+                value = value_try_convert(value, scope, ctx, target, true, false, global.allow_unsafe) !>
+                target.compat_check(value.rett, default_exp) !>
+            }
+            value.exp = at
+            return value
+        }
+    }
+
+    return value_generate_default(target, scope, ctx, at) !>
+}
+
+fn value_default_target_type(on: Value, at: Exp) Type !Error {
+    if on.type != VAL.type : return on.rett
+    let target = on.get_of_type()
+    if isset(target) : return target
+    let base = on.get_class_ref()
+    if isset(base) && base.is_generic_base {
+        at.error("Generic type '" + base.pretty_name() + "' requires type arguments before '$default_value'")
+    }
+    at.bug("Type value is missing its represented type")
+}
+
+fn value_generate_default(target: Type, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let value: ?Value = null
+    let enu = target.get_enum()
+    let target_class = target.get_class_or_null()
+    let target_hook = isset(target_class) ? target_class.default_hook : null
+    if isset(target_hook) : act_check(at, target_hook.act, target_hook.exp, false, "function '" + target_hook.name + "'") !>
+    if isset(enu) {
+        let first = enu.items.get(0) ! at.error("Cannot generate a default value for an empty enum")
+        value = value_from_enum_item(enu, first.name, at, scope, ctx) !>
+    } else if target.is_nullable_type() {
+        value = vgen_null(target)
+    } else if target.is_float_type() {
+        value = vgen_float(0, target)
+    } else if target.is_integer_type() {
+        value = vgen_int(0, target)
+    } else if target.is_bool_type() {
+        value = vgen_bool(false, target)
+    } else if target.is_fixed_array_type() {
+        let sub = target.get_sub_type()
+        if !isset(sub) : at.bug("Array type is missing sub_type")
+        let values = Array[Value]{ value_generate_default(sub, scope, ctx, at) !> }
+        value = vgen_array_init(ctx, values, target, at, target.length > 1)
+    } else if isset(target_hook) {
+        let hook = target_hook
+        if !hook.parsed_types : parse_func_types(hook) !>
+        let callee = vgen_func(hook)
+        let args = value_from_call_args(callee, hook, null, scope, ctx, at) !>
+        value_check_call_args(hook, callee, args, scope, ctx, at) !>
+        value = vgen_call(ctx, callee, args, hook.get_rett(), scope)
+    } else if target.is_tuple_type() {
+        let members = target.get_members() ?! at.bug("Tuple type has no members")
+        let parts = Array[Value]{}
+        each members as member : parts.append(value_generate_default(member, scope, ctx, at) !>)
+        value = vgen_multi(parts, target, at)
+    } else if target.is_inline {
+        let class = class_from_inline_init_type(target)
+        if !isset(class) : at.bug("Inline default type has no class")
+        value = class_init_construct(class, target, HashMap[Prop, Value]{}, scope, ctx, at) !>
+    } else {
+        let string_class = type_string(ctx.build).get_class_or_null()
+        if isset(string_class) && target_class == string_class {
+            value = vgen_string("", target)
+        }
+    }
+
+    if !isset(value) {
+        at.error("Cannot generate a default value for type: " + target.compat_display_name())
+    }
+    value.exp = at
+    return value
+}
+
+fn type_has_generated_default(target: Type, b: Build) bool {
+    return type_has_generated_default_inner(target, b, Array[Class]{})
+}
+
+fn type_has_generated_default_inner(target: Type, b: Build, seen: Array[Class]) bool {
+    let enu = target.get_enum()
+    if isset(enu) : return enu.items.length > 0
+    if target.is_nullable_type() : return true
+    if target.is_float_type() : return true
+    if target.is_integer_type() : return true
+    if target.is_bool_type() : return true
+    if target.is_fixed_array_type() {
+        let sub = target.get_sub_type()
+        return isset(sub) && type_has_generated_default_inner(sub, b, seen)
+    }
+    if target.is_inline {
+        let class = class_from_inline_init_type(target)
+        if !isset(class) || seen.contains(class) : return false
+        let path = seen.copy()
+        path.append(class)
+        each class.props as prop {
+            if prop.is_slice_data || prop.zero_default || isset(prop.default) : continue
+            if !type_has_generated_default_inner(prop.type, b, path) : return false
+        }
+        return true
+    }
+    let string_class = type_string(b).get_class_or_null()
+    let target_class = target.get_class_or_null()
+    if isset(string_class) && target_class == string_class : return true
+    return isset(target_class) && isset(target_class.default_hook)
+}
+
+////////////////////////////
+// Errors and enums
+////////////////////////////
+
+fn value_from_is_shared(on: Value, at: Exp, b: Build) Value !Error {
+    if !on.rett.is_gc_type() {
+        at.error("The '$is_shared' token can only be used on 'class' types. Not on: " + on.rett.compat_display_name())
+    }
+    if on.rett.is_nullable_type() {
+        at.error("The '$is_shared' token cannot be used on null-able types. Your type: " + on.rett.compat_display_name())
+    }
+
+    let type_u8 = type_from_core(b, "u8") !>
+    let offset = vgen_int(-4, type_int(b))
+    let flags = vgen_ptrv(on, offset, type_u8, at)
+    let shared_bit = vgen_int(4, type_u8)
+    let mask = vgen_op(flags, shared_bit, VALUE_OP.bit_and, type_u8)
+    mask.exp = at
+    let cmp = vgen_op(mask, vgen_int(4, type_u8), VALUE_OP.eq, type_bool(b))
+    cmp.exp = at
+    return cmp
+}
+
+// `code.name()`: the name of an error code, or "" for a code its type does not list. The
+// code is read once; LLVM turns the comparisons into a switch.
+fn value_error_code_name(code: Value, ctx: Context) Value !Error {
+    let b = ctx.build
+    let et = code.rett.get_non_nullable().get_error_type() ?! code.bug("Error code has no error type")
+    if !et.parsed : parse_error_type(et) !>
+    let string_type = type_string(b)
+    let stores = Array[Value]{}
+    let read = value_compare_operand_once(code, stores, ctx)
+    let result = vgen_string("", string_type)
+    let i = et.codes.length
+    while i > 0 {
+        i--
+        let name = et.codes.get(i) ! code.bug("Error code name is missing")
+        let constant = Value { type: VAL.error_value, rett: type_error_code(et) }
+        constant.set_string(name)
+        let cond = vgen_op(read, constant, VALUE_OP.eq, type_bool(b))
+        result = vgen_this_or_that(cond, vgen_string(name, string_type), result, string_type)
+    }
+    if stores.length > 0 {
+        result = vgen_wrap(result, string_type)
+        result.set_pre_value(vgen_block(stores, b, code.exp))
+    }
+    result.exp = code.exp
+    return result
+}
+
+// `.code` / `TypeName.code` / `E.name` — a named, payload-less error code constant.
+fn value_from_error_code_item(et: ErrorType, name: String, at: Exp) Value !Error {
+    if !et.codes.contains(name) {
+        at.error("Error type '" + et.name + "' does not have an error code named: '" + name + "'")
+    }
+    let result = Value {
+        type: VAL.error_value
+        rett: type_error_code(et)
+        exp: at
+    }
+    result.set_string(name)
+    return result
+}
+
+fn value_from_error_payload_init_exp(exp: Exp, scope: Scope, ctx: Context, left_exp: Exp) Value !Error {
+    let func = ctx.get_func() !>
+    let et = func.error_type
+    if !isset(et) : left_exp.error(func_user_name(func) + " throws an error but has no error type: add one to its signature, like '!MyError'")
+    let name = left_exp.str1
+    if !et.codes.contains(name) {
+        left_exp.error("Error type '" + et.name + "' does not have an error code named: '" + name + "'")
+    }
+
+    let values = value_parse_error_payload_fields(exp, et, scope, ctx) !>
+    let result = Value {
+        type: VAL.error_value
+        values: values
+        rett: type_error_code(et)
+        exp: exp
+    }
+    result.set_string(name)
+    value_complete_error_payload(result, scope, ctx, exp) !>
+    return result
+}
+
+fn value_from_error_rethrow_payload_exp(exp: Exp, scope: Scope, ctx: Context, caught: Value) Value !Error {
+    let func = ctx.get_func() !>
+    let et = func.error_type
+    if !isset(et) : exp.error(func_user_name(func) + " throws an error but has no error type: add one to its signature, like '!MyError'")
+    let caught_et = caught.rett.get_non_nullable().get_error_type()
+    if !isset(caught_et) : exp.bug("Caught error value is missing its ErrorType")
+    if !et.is_compat(caught_et) {
+        exp.error("Error types are not compatible: " + et.name + " <> " + caught_et.name)
+    }
+
+    let values = value_parse_error_payload_fields(exp, et, scope, ctx) !>
+    // value1 carries the runtime code; empty string_val marks a dynamic error value.
+    let result = Value {
+        type: VAL.error_value
+        value1: caught
+        values: values
+        rett: type_error_code(et)
+        exp: exp
+    }
+    value_complete_error_payload(result, scope, ctx, exp) !>
+    return result
+}
+
+// Parse `{ field: value, ... }` against an error type's payload map.
+fn value_parse_error_payload_fields(exp: Exp, et: ErrorType, scope: Scope, ctx: Context) Array[Value] !Error {
+    let body = exp.get(VALUE_EXP.right)
+    if !isset(body) : exp.bug("Error payload init is missing body")
+    if body.type != EXP.body : exp.bug("Error payload init body must be EXP.body")
+
+    let items_exp = parse_body_as_class_init_fields(body) !>
+    let values = Array[Value]{}
+    let i: uint = 0
+    while true {
+        let item = items_exp.get(i)
+        if !isset(item) : break
+        let ik = item.number.@cast(CLASS_INIT_ITEM)
+        if ik != CLASS_INIT_ITEM.field {
+            item.error("Error payload fields must be named (e.g. 'field: value')")
+        }
+        let fname = item.str1
+        let ftype = et.payload.get(fname) !? null
+        if !isset(ftype) {
+            item.error("Error type '" + et.name + "' has no payload field named: '" + fname + "'")
+        }
+        let vexp = item.get(VALUE_EXP.left)
+        if !isset(vexp) : item.bug("Payload field is missing a value")
+        let fv = value_from_exp(vexp, scope, ctx.with_suggested_type(ftype)) !>
+        if fv.type != VAL.undefined {
+            fv = value_try_convert(fv, scope, ctx, ftype) !>
+            ftype.compat_check(fv.rett, item) !>
+        }
+        fv.set_name(fname)
+        values.append(fv)
+        i++
+    }
+    return values
+}
+
+fn value_complete_error_payload(value: Value, scope: Scope, ctx: Context, at: Exp) !Error {
+    let et = value.rett.get_non_nullable().get_error_type()
+    if !isset(et) : at.error("This is not an error value")
+    if et.payload.length == 0 : return
+
+    let values = value.values ?? Array[Value]{}
+    value.values = values
+    let provided = Map[bool]{}
+    // A payload travels with the error, beyond anything this body can see
+    each values as field {
+        provided.set(field.get_name(), true)
+    }
+
+    let caught_type: ?ErrorType = null
+    let caught_decl: ?Decl = null
+    let eidf = scope.get_idf("E")
+    if isset(eidf) {
+        let decl = eidf.decl
+        if isset(decl) {
+            caught_decl = decl
+            caught_type = decl.type.get_non_nullable().get_error_type()
+        }
+    }
+
+    each et.payload as ptype, name {
+        if provided.has(name) : continue
+        if isset(caught_type) {
+            let to_global = et.payload_globals.get(name) !? null
+            let from_global = caught_type.payload_globals.get(name) !? null
+            if isset(to_global) && isset(from_global) && to_global == from_global {
+                let payloads: ?Map[Decl] = null
+                if isset(caught_decl) : payloads = caught_decl.error_payloads
+                if isset(payloads) {
+                    let payload_decl = payloads.get(name) !? null
+                    if isset(payload_decl) {
+                        let inherited = vgen_decl(payload_decl)
+                        inherited.rett = ptype
+                        inherited.set_name(name)
+                        values.append(inherited)
+                        continue
+                    }
+                }
+                // Global is shared but we have no local snapshot — leave the live global.
+                continue
+            }
+        }
+        let default_body = et.payload_defaults.get(name) !? null
+        if isset(default_body) {
+            let fallback = value_from_error_payload_default(et, name, ptype, default_body, scope, ctx, at) !>
+            values.append(fallback)
+            continue
+        }
+        at.error("Missing error payload field '" + name + "' for " + et.name + ". Provide it in the throw, or declare a default on the error type: " + name + ": Type (value)")
+    }
+}
+
+fn value_from_error_payload_default(et: ErrorType, name: String, ptype: Type, default_body: Exp, scope: Scope, ctx: Context, at: Exp) Value !Error {
+    let default_exp = parse_body_as_value_exp(default_body) !>
+    let default_scope = et.scope.sub_scope()
+    default_scope.func = scope.func
+    let fallback = value_from_exp(default_exp, default_scope, ctx.with_suggested_type(ptype)) !>
+    if fallback.type != VAL.undefined {
+        fallback = value_try_convert(fallback, scope, ctx, ptype) !>
+        ptype.compat_check(fallback.rett, default_exp) !>
+    }
+    fallback.set_name(name)
+    fallback.exp = at
+    return fallback
+}
+
+// `EnumName.item` — resolve the variant to a typed constant value.
+// A `.name` that nothing could be resolved against. It reads as an enum member, a static
+// function or an error code depending on the type that is expected, so the message says which
+// type was expected rather than talking about errors alone.
+fn typehint_member_has_no_type(at: Exp, suggested_type: ?Type) !Error $throw {
+    let name = "'." + at.str1 + "'"
+    if isset(suggested_type) {
+        at.error(name + " is not a member of '" + suggested_type.compat_display_name() + "': a '.name' is an enum value, a static function or an error code of the type that is expected here")
+    }
+    at.error(name + " has no type to resolve against: a '.name' takes the type it is assigned or passed to, and there is none here")
+}
+
+fn enum_has_item(enu: Enum, name: String) bool {
+    each enu.items as it {
+        if it.name == name : return true
+    }
+    return false
+}
+
+fn value_from_enum_item(enu: Enum, name: String, at: Exp, scope: Scope, ctx: Context) Value !Error {
+    let item: ?EnumItem = null
+    each enu.items as it {
+        if it.name == name {
+            item = it
+            break
+        }
+    }
+    if !isset(item) {
+        at.error("Enum " + enu.name + " does not have a value named: '" + name + "'")
+    }
+
+    if item.resolving : at.error("Circular enum member initializer: " + enu.name + "." + name)
+    item.resolving = true
+    defer enum_item_resolved(item)
+    return value_resolve_enum_item(enu, item, at, scope, ctx) !>
+}
+
+fn idf_resolved(idf: Idf) {
+    idf.resolving = false
+}
+
+fn enum_item_resolved(item: EnumItem) {
+    item.resolving = false
+}
+
+fn value_resolve_enum_item(enu: Enum, item: EnumItem, at: Exp, scope: Scope, ctx: Context) Value !Error {
+    let name = item.name
+
+    let etype = enu.get_type() !>
+    let item_type = enu.get_item_type() !>
+    let value_body = item.value
+    if !isset(value_body) && !item_type.is_integer_type() {
+        at.error("Non-integer enum item requires an explicit value: " + enu.name + "." + name)
+    }
+    if isset(value_body) {
+        // Explicit `(value)` — parse as a value expression with enum type suggestion
+        let pos = value_body.pos
+        if !isset(pos) : value_body.bug("Enum item value is missing a Pos")
+        let p = pos.copy().init_parser()
+        let vexp = read_value_exp(p, true, true) !>
+        let v = value_from_exp(vexp, enu.scope, ctx.with_suggested_type(item_type).for_direct_init()) !>
+        v = value_try_convert(v, enu.scope, ctx, item_type) !>
+        if !item_type.compat(v.rett) {
+            at.error("Enum item value for '" + enu.name + "." + name + "' must be of type '" + item_type.compat_display_name() + "', got '" + v.rett.compat_display_name() + "'")
+        }
+        // Tag result type as this enum
+        v.rett = etype
+        v.exp = at
+        return v
+    }
+
+    // Implicit integer ordinal: first free ints skipping explicit values (old parse_enum_type)
+    let used = Map[bool]{}
+    each enu.items as it {
+        let vb = it.value
+        if !isset(vb) : continue
+        // Only pre-scan integer literals for occupancy; full eval is deferred
+        let pos = vb.pos
+        if !isset(pos) : continue
+        let p = pos.copy().init_parser()
+        let t = p.tok(true, true, false) !>
+        if t == TOK.int || t == TOK.hex || t == TOK.octal {
+            let vexp = read_value_exp(p, true, true) !>
+            let lit = value_from_exp(vexp, enu.scope, ctx.with_suggested_type(type_int(ctx.build))) !>
+            if lit.type == VAL.int {
+                used.set("" + lit.int_val, true)
+            }
+        }
+    }
+    let i: int = 0
+    each enu.items as it {
+        if it.name == name {
+            while used.has("" + i) {
+                i++
+            }
+            let v = vgen_int(i, etype)
+            v.exp = at
+            return v
+        }
+        if !isset(it.value) {
+            while used.has("" + i) {
+                i++
+            }
+            used.set("" + i, true)
+            i++
+        }
+    }
+    at.bug("Enum item not found after scan: " + name)
+}
+
+////////////////////////////
+// Compile-time type members
+////////////////////////////
+
+// A generic base used as a type value has no resolved type to inspect.
+fn value_require_type_of(on: Value, name: String, at: Exp) Type !Error {
+    let t = on.get_of_type()
+    if isset(t) : return t
+    let c = on.get_class_ref()
+    if isset(c) && c.is_generic_base {
+        at.error("Generic type '" + c.name + "' requires type arguments before '" + name + "'")
+    }
+    at.bug("VAL.type is missing of_type")
+}
+
+fn value_type_prop(on: Value, name: String, at: Exp, b: Build) ?Value !Error {
+    let t = value_require_type_of(on, name, at) !>
+
+    // Type-returning
+    if name == "$nonnull" {
+        return vgen_type(t.get_non_nullable(), b)
+    }
+
+    // Integer: same as size_of(T)
+    if name == "$size" {
+        let bytes = t.byte_size() !>
+        return vgen_int(bytes.to(int), type_int(b))
+    }
+
+    // Integer range: `u8.$max`, `i64.$min`. The literal is typed as the integer itself.
+    if name == "$max" || name == "$min" {
+        if !t.is_integer_type() {
+            at.error("'" + name + "' is only defined for integer types, not: " + t.compat_display_name())
+        }
+        return vgen_int(integer_bound(t.byte_size() !> * 8, t.is_signed_type(), name == "$max"), t)
+    }
+
+    // Bool queries
+    if name == "$is_inline" {
+        let slice = t.get_non_nullable().kind == TYPE.ref_slice
+        let inline = t.is_inline_type() && !t.is_number_type() && !slice
+        return vgen_bool(inline, type_bool(b))
+    }
+    if name == "$is_nullable" : return vgen_bool(t.is_nullable_type(), type_bool(b))
+    if name == "$is_void" : return vgen_bool(t.is_void_type(), type_bool(b))
+    if name == "$is_integer" : return vgen_bool(t.is_integer_type(), type_bool(b))
+    if name == "$is_float" : return vgen_bool(t.is_float_type(), type_bool(b))
+    if name == "$is_enum" : return vgen_bool(isset(t.get_non_nullable().get_enum()), type_bool(b))
+    if name == "$is_bool" : return vgen_bool(t.is_bool_type(), type_bool(b))
+    if name == "$is_signed" : return vgen_bool(t.is_signed_type(), type_bool(b))
+    if name == "$is_structural" : return vgen_bool(t.is_structural_type(), type_bool(b))
+    if name == "$is_gc" : return vgen_bool(t.is_gc_type(), type_bool(b))
+    if name == "$has_gc_refs" : return vgen_bool(t.has_gc_refs(), type_bool(b))
+    if name == "$is_shared" : return vgen_bool(t.get_non_nullable().is_shared, type_bool(b))
+    if name == "$has_borrows" : return vgen_bool(type_value_holds_borrow(t), type_bool(b))
+    if name == "$is_pointer" : return vgen_bool(t.is_pointer(), type_bool(b))
+    if name == "$is_raw_pointer" : return vgen_bool(t.is_raw_pointer(), type_bool(b))
+    if name == "$is_typed_pointer" {
+        let pointer = t.get_non_nullable()
+        return vgen_bool(pointer.kind == TYPE.ptr_of || pointer.is_struct_object(), type_bool(b))
+    }
+    if name == "$is_borrow" : return vgen_bool(t.is_bare_borrow() || t.get_non_nullable().kind == TYPE.adr_of, type_bool(b))
+    if name == "$has_raw_pointer_props" : return vgen_bool(t.has_raw_pointer_props(), type_bool(b))
+    // Byte offset of the element area inside sequence storage: a slice's
+    // block, or an array's `data` block
+    if name == "$slice_data_offset" {
+        let class = t.get_non_nullable().get_class_or_null()
+        if !isset(class) || (class.kind != CLASS_KIND.slice && class.kind != CLASS_KIND.array) {
+            at.error("'$slice_data_offset' is only defined for slice and array types")
+        }
+        return vgen_int((class.slice_data_offset() !>).to(int), type_int(b))
+    }
+    if name == "$has_hash" || name == "$has_eq" : type_settle_hooks(t, Array[String]{ "$hash", "$eq" }) !>
+    if name == "$has_vtable" : return vgen_bool(t.has_vtable(), type_bool(b))
+    if name == "$has_hash" : return vgen_bool(t.has_hash() || type_auto_hashable(t, true), type_bool(b))
+    if name == "$has_eq" : return vgen_bool(t.has_eq(), type_bool(b))
+    if name == "$can_order" {
+        // Documentation shows a type parameter's methods for the usual, orderable case
+        let placeholder = b.options.mode == BUILDTYPE.doc && t.kind == TYPE.any && !t.custom_name.is_empty()
+        return vgen_bool(placeholder || (type_can_order(t) !>), type_bool(b))
+    }
+    if name == "$property_count" {
+        let class = t.get_non_nullable().get_class_or_null()
+        if isset(class) : parse_class_properties(class) !>
+        return vgen_int(isset(class) ? class.props.length.to(int) : 0, type_int(b))
+    }
+
+    // Method-style meta: keep as `.name` so `.(args)` folds via value_type_method
+    if name == "$can_convert_to" : return null
+    if name == "$is_type_of" : return null
+    if name == "$has_method" : return null
+    if name == "$is_compatible_with" : return null
+
+    // Unknown `$…` meta on a type
+    if name.starts_with("$") {
+        at.error("Unknown type property: '" + name + "'")
+    }
+    // Normal name (e.g. static method `Node.tree`) — not a type meta-prop
+    return null
+}
+
+// Largest or smallest value of an integer width, as the 64-bit pattern int_val holds.
+// A 64-bit unsigned maximum is all ones, which is -1 in that pattern.
+fn integer_bound(bits: u32, signed: bool, max: bool) int {
+    let one: uint = 1
+    if signed {
+        let half = one << (bits - 1)
+        if max : return (half - 1).to(int)
+        if bits == 64 : return half.to(int)
+        return 0 - half.to(int)
+    }
+    if !max : return 0
+    if bits == 64 : return (0 - one).to(int)
+    return ((one << bits) - 1).to(int)
+}
+
+// Type meta-method calls: T.$can_convert_to(U) / T.$is_type_of(U) / T.$has_method(name) / …
+fn value_type_method(on: Value, name: String, args: Array[Value], at: Exp, b: Build) Value !Error {
+    let t = value_require_type_of(on, name, at) !>
+
+    if name == "$can_convert_to" {
+        if args.length != 1 {
+            at.error("'.$can_convert_to' expects 1 type argument, got " + args.length)
+        }
+        // Other type optional: unresolved → false (conversion hooks not ready)
+        let other = (args.get(0) ! at.bug("Missing $can_convert_to arg")).as_type()
+        if !isset(other) : return vgen_bool(false, type_bool(b))
+        // `$to` hooks are registered while parsing method types
+        type_settle_hooks(t, Array[String]{ "$to", "$auto" }) !>
+        return vgen_bool(t.can_convert_to(other), type_bool(b))
+    }
+
+    if name == "$is_type_of" {
+        if args.length != 1 {
+            at.error("'.$is_type_of' expects 1 type argument, got " + args.length)
+        }
+        let other = (args.get(0) ! at.bug("Missing $is_type_of arg")).as_type()
+        if !isset(other) : return vgen_bool(false, type_bool(b))
+        return vgen_bool(t.is_same_type(other), type_bool(b))
+    }
+
+    if name == "$is_compatible_with" {
+        if args.length != 1 {
+            at.error("'.$is_compatible_with' expects 1 type argument, got " + args.length)
+        }
+        let other = (args.get(0) ! at.bug("Missing $is_compatible_with arg")).as_type()
+        if !isset(other) : return vgen_bool(false, type_bool(b))
+        return vgen_bool(t.compat(other), type_bool(b))
+    }
+
+    if name == "$has_method" {
+        if args.length != 1 {
+            at.error("'.$has_method' expects 1 name argument, got " + args.length)
+        }
+        let mname = (args.get(0) ! at.bug("Missing $has_method arg")).as_name()
+        if !isset(mname) : return vgen_bool(false, type_bool(b))
+        type_settle_hooks(t, Array[String]{}) !>
+        return vgen_bool(t.has_method(mname), type_bool(b))
+    }
+
+    at.error("Unknown type method: '" + name + "'")
+}
+
+////////////////////////////
+// Constant folding and call checks
+////////////////////////////
+
+// Fold a binary op when both sides are compile-time constants. Returns null if not foldable.
+fn value_try_fold_op(left: Value, right: Value, op: VALUE_OP, b: Build) ?Value {
+    if op == VALUE_OP.and {
+        if left.type == VAL.bool && right.type == VAL.bool {
+            return vgen_bool(left.bool_val && right.bool_val, type_bool(b))
+        }
+        return null
+    }
+    if op == VALUE_OP.or {
+        if left.type == VAL.bool && right.type == VAL.bool {
+            return vgen_bool(left.bool_val || right.bool_val, type_bool(b))
+        }
+        return null
+    }
+
+    if op == VALUE_OP.eq || op == VALUE_OP.ne {
+        // A literal number next to a string literal is compared as its text,
+        // a character literal as the character
+        if (left.type == VAL.string) != (right.type == VAL.string) {
+            let number = left.type == VAL.string ? right : left
+            let text = left.type == VAL.string ? left : right
+            if number.type == VAL.int && number.rett == type_char(b) {
+                let buf = ByteBuffer.new()
+                buf.write_byte(number.int_val.to(u8))
+                let eq = text.get_string() == buf.to_string()
+                return vgen_bool(op == VALUE_OP.eq ? eq : !eq, type_bool(b))
+            }
+        }
+        // String-ish compare (macro defs, bare words like `win` in `OS == win`)
+        let ls = left.fold_string()
+        let rs = right.fold_string()
+        if isset(ls) && isset(rs) {
+            let eq = ls == rs
+            return vgen_bool(op == VALUE_OP.eq ? eq : !eq, type_bool(b))
+        }
+        // Integer compare
+        if left.type == VAL.int && right.type == VAL.int {
+            let eq = left.int_val == right.int_val
+            return vgen_bool(op == VALUE_OP.eq ? eq : !eq, type_bool(b))
+        }
+        // Bool compare
+        if left.type == VAL.bool && right.type == VAL.bool {
+            let eq = left.bool_val == right.bool_val
+            return vgen_bool(op == VALUE_OP.eq ? eq : !eq, type_bool(b))
+        }
+        return null
+    }
+
+    if op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte {
+        if left.type == VAL.string && right.type == VAL.string {
+            let l = left.get_string()
+            let r = right.get_string()
+            let ok = false
+            if op == VALUE_OP.lt : ok = l < r
+            else if op == VALUE_OP.gt : ok = l > r
+            else if op == VALUE_OP.lte : ok = l <= r
+            else : ok = l >= r
+            return vgen_bool(ok, type_bool(b))
+        }
+        if left.type == VAL.int && right.type == VAL.int {
+            if !fold_integer_types_match(left, right) : return null
+            if !left.rett.is_signed_type() {
+                let l = left.int_val.to(u64)
+                let r = right.int_val.to(u64)
+                let ok = false
+                if op == VALUE_OP.lt : ok = l < r
+                else if op == VALUE_OP.gt : ok = l > r
+                else if op == VALUE_OP.lte : ok = l <= r
+                else : ok = l >= r
+                return vgen_bool(ok, type_bool(b))
+            }
+            let ok = false
+            if op == VALUE_OP.lt : ok = left.int_val < right.int_val
+            else if op == VALUE_OP.gt : ok = left.int_val > right.int_val
+            else if op == VALUE_OP.lte : ok = left.int_val <= right.int_val
+            else : ok = left.int_val >= right.int_val
+            return vgen_bool(ok, type_bool(b))
+        }
+        return null
+    }
+
+    if left.type == VAL.int && right.type == VAL.int {
+        if !fold_integer_types_match(left, right) : return null
+        let l = left.int_val
+        let r = right.int_val
+        let result: int = 0
+        if op == VALUE_OP.add : result = l + r
+        else if op == VALUE_OP.sub : result = l - r
+        else if op == VALUE_OP.mul : result = l * r
+        else if op == VALUE_OP.div && r != 0 {
+            result = left.rett.is_signed_type() ? l / r : (l.to(u64) / r.to(u64)).to(int)
+        } else if op == VALUE_OP.mod && r != 0 {
+            result = left.rett.is_signed_type() ? l % r : (l.to(u64) % r.to(u64)).to(int)
+        } else if op == VALUE_OP.bit_and : result = l & r
+        else if op == VALUE_OP.bit_or : result = l | r
+        else if op == VALUE_OP.bit_xor : result = l ^ r
+        else if op == VALUE_OP.shl : result = l << r
+        else if op == VALUE_OP.shr {
+            result = left.rett.is_signed_type() ? l >> r : (l.to(u64) >> r.to(u64)).to(int)
+        } else : return null
+        return vgen_int(fold_integer_to_width(result, left.rett), left.rett)
+    }
+
+    return null
+}
+
+fn fold_integer_types_match(left: Value, right: Value) bool {
+    return left.rett.is_integer_type() && right.rett.is_integer_type()
+        && left.rett.is_signed_type() == right.rett.is_signed_type()
+        && left.rett.number_byte_size() == right.rett.number_byte_size()
+}
+
+// Does `l op r` leave the range of `type`? Used to reject untyped literal
+// arithmetic that would wrap in its destination type.
+fn fold_integer_overflows(l: int, r: int, op: VALUE_OP, type: Type) bool {
+    if op != VALUE_OP.add && op != VALUE_OP.sub && op != VALUE_OP.mul && op != VALUE_OP.shl : return false
+    let bits = type.number_byte_size() * 8
+    let signed = type.is_signed_type()
+    if bits < 64 {
+        let result: int = 0
+        if op == VALUE_OP.add : result = l + r
+        else if op == VALUE_OP.sub : result = l - r
+        else if op == VALUE_OP.mul : result = l * r
+        else : result = l << r
+        return fold_integer_to_width(result, type) != result
+    }
+    if signed {
+        if op == VALUE_OP.add : return ((l ^ (l + r)) & (r ^ (l + r))) < 0
+        if op == VALUE_OP.sub : return ((l ^ r) & (l ^ (l - r))) < 0
+        if op == VALUE_OP.mul {
+            // `INT_MIN * -1` traps if it reaches the wrapping division below
+            if l == -1 && r == (-9223372036854775807 - 1) : return true
+            return l != 0 && (l * r) / l != r
+        }
+        return ((l << r) >> r) != l
+    }
+    let ul = l.to(u64)
+    let ur = r.to(u64)
+    if op == VALUE_OP.add : return ul + ur < ul
+    if op == VALUE_OP.sub : return ul < ur
+    if op == VALUE_OP.mul : return ul != 0 && (ul * ur) / ul != ur
+    return ((ul << ur) >> ur) != ul
+}
+
+fn fold_integer_to_width(value: int, type: Type) int {
+    let bits = type.number_byte_size() * 8
+    if bits == 0 || bits >= 64 : return value
+    let modulus = 1 << bits.to(int)
+    let narrowed = value & (modulus - 1)
+    if type.is_signed_type() {
+        let sign = 1 << (bits - 1).to(int)
+        if (narrowed & sign) != 0 : return narrowed - modulus
+    }
+    return narrowed
+}
+
+// The integer a compile-time constant holds, looking through `@cast` / `.to`
+// so `0.to(int)` is seen as 0 rather than as an opaque cast
+fn value_constant_int(value: Value) ?int {
+    if value.type == VAL.int : return value.int_val
+    if value.type != VAL.cast : return null
+    let inner = value.value1 ?! return null
+    let constant = value_constant_int(inner) ?! return null
+    let t = value.rett
+    return t.is_integer_type() ? fold_integer_to_width(constant, t) : null
+}
+
+// ---- Operator / call type checks ----
+
+fn value_check_op_compat(left: Value, right: Value, op: VALUE_OP, at: Exp) !Error {
+    let lt = left.rett
+    let rt = right.rett
+    if lt.is_void_type() || rt.is_void_type() : return
+
+    if op == VALUE_OP.and || op == VALUE_OP.or {
+        if !lt.is_bool_type() {
+            at.error("Left operand of logical operator must be bool")
+        }
+        if !rt.is_bool_type() {
+            at.error("Right operand of logical operator must be bool")
+        }
+        return
+    }
+
+    if !lt.compat(rt) {
+        if op == VALUE_OP.eq || op == VALUE_OP.ne || op == VALUE_OP.lt || op == VALUE_OP.gt || op == VALUE_OP.lte || op == VALUE_OP.gte {
+            if rt.compat(lt) : return
+            // Shared and plain strings are the same immutable value
+            let string_class = type_string(lt.build).get_class_or_null()
+            if isset(string_class) && lt.get_non_nullable().get_class_or_null() == string_class
+                && rt.get_non_nullable().get_class_or_null() == string_class : return
+        }
+        lt.compat_check(rt, at) !>
+    }
+}
+
+fn value_check_call_args(func: Func, callee: Value, args: Array[Value], scope: Scope, ctx: Context, at: Exp, check_pointer_args: bool (true), is_coroutine: bool (false)) !Error {
+    // Ensure signature types are resolved
+    if !func.parsed_types {
+        parse_func_types(func) !>
+    }
+    let params = func.args
+    // Instance methods have `this` as first arg; call args are the remaining ones
+    let skip: uint = 0
+    if isset(func.class) && !func.is_static {
+        let on = callee.value1
+        if isset(on) && on.type != VAL.type {
+            skip = 1
+        }
+    }
+
+    let receiver: ?Value = null
+    if skip == 1 {
+        receiver = callee.value1
+        if isset(receiver) {
+            let receiver_param = params.get(0) !? null
+            let borrowed = isset(receiver_param) && receiver_param.type.is_stack_borrow()
+            // A struct receiver lives inside the borrow and a slice method
+            // writes the slice's storage; a class or interface method works
+            // on the object the slot refers to
+            let func_class = func.class
+            let storage_receiver = borrowed || (isset(func_class) && func_class.kind == CLASS_KIND.slice)
+            let receiver_meta = receiver.meta
+            let captured = isset(receiver_meta) ? receiver_meta.captured_receiver : null
+            let readonly: ?String = null
+            if borrowed && value_is_copied_element(receiver) {
+                readonly = "Cannot call a method that changes its receiver on an element copied out of an Array; borrow it with '&arr[i]' or store the element back with '.set'"
+            } else if borrowed && value_is_call_result_copy(receiver) && func.get_rett().is_void_type() {
+                // A method that returns nothing would only change the copy
+                readonly = CALL_RESULT_COPY_ERROR
+            } else if storage_receiver && value_is_readonly_storage(receiver, ctx) {
+                readonly = "Cannot call a method that changes its receiver through a read-only borrow; " + value_readonly_hint(receiver, ctx)
+            } else if isset(captured) && storage_receiver {
+                readonly = "Cannot call a method that changes captured variable '" + (captured.name ?? "?") + "': closures capture values, not variables; mutate through an object instead"
+            }
+            if isset(readonly) : func_check_readonly_receiver(func, readonly, at, ctx.func) !>
+            let receiver_arg = params.get(0) !? null
+            // Frame storage as a receiver goes only to a `local` receiver. The receiver was
+            // retyped to the method's class on the way here; the storage is behind the wrappers
+            let receiver_origin = receiver
+            while receiver_origin.type == VAL.cast || receiver_origin.type == VAL.wrap || receiver_origin.type == VAL.interface_wrap {
+                receiver_origin = receiver_origin.value1 ?! break
+            }
+            if isset(receiver_arg) && !is_coroutine && receiver_arg.type.get_non_nullable().is_owned_borrow()
+                && !receiver_arg.type.get_non_nullable().is_local && value_is_stack_borrow_source(receiver_origin) {
+                at.error("Cannot call '" + func.name + "' on frame storage: its receiver is not a 'local' borrow, so the method may keep it")
+            }
+        }
+    }
+
+    let max_params = params.length > skip ? params.length - skip : 0
+
+    let required: uint = 0
+    let pi: uint = skip
+    while pi < params.length {
+        let p = params.get(pi) ! break
+        if !isset(p.default) : required = (pi - skip) + 1
+        pi++
+    }
+
+    if args.length < required {
+        at.error("Not enough arguments for '" + func.name + "' (expected at least " + required + ", got " + args.length + ")")
+    }
+    if !func.infinite_args && args.length > max_params {
+        at.error("Too many arguments for '" + func.name + "' (expected at most " + max_params + ", got " + args.length + ")")
+    }
+
+    // The lock of the call's locked inputs, from the receiver or the first locked argument
+    let call_lock_root: ?Decl = null
+    let call_lock_known = false
+    if isset(receiver) && receiver.rett.has_locked_refs() && isset(ctx.func) {
+        call_lock_root = value_lock_root(receiver, ctx.get_func() !>)
+        call_lock_known = true
+    }
+    let i: uint = 0
+    while i < args.length {
+        let param_i = skip + i
+        let param: ?Arg = null
+        if param_i < params.length : param = params.get(param_i) !? null
+
+        let av = args.get(i) ! break
+        av.require_result() !>
+        if !isset(param) {
+            if !func.infinite_args : break
+            args.set(i, value_variadic_extern_arg(av, ctx, at) !>) _
+            i++
+            continue
+        }
+        if !param.is_generic {
+            if func.is_extern {
+                let target = param.type.get_non_nullable()
+                let source = av.rett.get_non_nullable()
+                let pointer_boundary = target.is_raw_pointer() || target.kind == TYPE.ptr_of || target.is_struct_object()
+                let explicit_raw = source.is_raw_pointer() || source.kind == TYPE.ptr_of || source.is_struct_object()
+                if pointer_boundary && !explicit_raw {
+                    // `&value`, or a borrow such as `this`: C gets the address it points at
+                    let address = value_borrow_target_address(av)
+                    if !isset(address) : at.error("Extern pointer arguments take an address: pass '&value'")
+                    address.exp = av.exp
+                    av = address
+                }
+            }
+            // Convert first (literal int → i32, nullable strip, $to hooks, …)
+            // An owned borrow may live anywhere, so an inline property converts to it
+            let accepts_borrow = param.type.has_borrowed_refs() || param.type.get_non_nullable().is_owned_borrow()
+            // Frame storage lent to an owned-borrow parameter: the ownership walk checks that
+            // nothing the callee keeps or returns lets it leave this frame. A coroutine keeps
+            // its arguments, so never there
+            let lends_frame = !is_coroutine && param.type.get_non_nullable().is_owned_borrow() && !param.type.get_non_nullable().is_local
+                && value_is_stack_borrow_source(av)
+            // A conversion call, such as an `$auto` to_string, passes its result instead
+            if lends_frame && value_converts_by_call(av, param.type) : lends_frame = false
+            if lends_frame {
+                let m = at.message("Frame storage can only be passed to a 'local' borrow parameter; parameter '" + param.name + "' of " + func_user_name(func) + " may keep it")
+                let type_exp = param.type_exp
+                if isset(type_exp) && func_param_could_be_local(func, param) {
+                    m.label(type_exp, "'" + param.name + "' is never kept: write '" + param.type.local_type().compat_display_name() + "'")
+                }
+                m.error()
+            }
+            // Locked plain data lent for the call: a `local` borrow cannot outlive it, and
+            // elements without references have nothing to take out of the lock
+            let param_nn = param.type.get_non_nullable()
+            let param_element = param_nn.is_fat_borrow() ? param_nn.get_sub_type() : null
+            let lends_plain = !is_coroutine && param_nn.is_local && !param_nn.is_locked && isset(param_element) && !param_element.has_gc_refs()
+                && !av.rett.is_nullable_type()
+            let lent_locked = lends_plain && (av.rett.get_non_nullable().is_locked || value_is_locked_storage(av))
+            if lends_plain && av.rett.get_non_nullable().is_locked : av = vgen_cast(av, av.rett.plain_type())
+            let lent_local = param.type.is_stack_borrow() && !value_is_owned_storage(av)
+            let was_locked = av.rett.has_locked_refs()
+            av = value_try_convert(av, scope, ctx, param.type, true, accepts_borrow) !>
+            if lent_local : av.ensure_meta().lent_local = true
+            if lent_locked : av.ensure_meta().lent_locked = true
+            // One call gets its locked data from one lock: data from another is copied
+            if was_locked && param.type.has_locked_refs() {
+                let root = value_lock_root(av, ctx.get_func() !>)
+                if !isset(call_lock_root) && !call_lock_known {
+                    call_lock_root = root
+                    call_lock_known = true
+                } else if !isset(root) || root != call_lock_root {
+                    let copied = value_publish_copy(av, ctx, scope, param.type) !>
+                    if copied != av : av = value_shared_view(copied, param.type)
+                }
+            }
+            let source_kind = av.rett.get_non_nullable().kind
+            let target_kind = param.type.get_non_nullable().kind
+            let accepts_reference_pointer = (source_kind == TYPE.ptr_of || source_kind == TYPE.adr_of || value_is_borrow_address(av))
+                && (target_kind == TYPE.ptr_of || param.type.is_raw_pointer())
+            // The callee may keep the address: what it does with it is unsafe code's concern
+            if av.is_implicit_borrow() && accepts_reference_pointer && !accepts_borrow {
+                require_unsafe(at, scope, "Passing an implicit pointer borrow to pointer storage") !>
+            }
+            // A closure bound to frame storage would carry its address along
+            let frame_closure = av.is_implicit_borrow() && source_kind == TYPE.closure && target_kind == TYPE.closure
+            if frame_closure {
+                at.error("A method bound to frame storage cannot be passed as a callback; the storage dies with this frame")
+            }
+            if av.is_implicit_borrow() && !accepts_borrow && !accepts_reference_pointer && !frame_closure {
+                at.error("An implicit pointer borrow cannot be passed to raw pointer storage: the address would outlive the value")
+            }
+            args.set(i, av) ! at.bug("value_check_call_args: args.set out of range")
+            let avt = av.rett
+            if !avt.is_void_type() {
+                if !param.type.is_nullable_type() && avt.is_nullable_type() {
+                    let proven = false
+                    if av.type == VAL.decl {
+                        let d = av.decl
+                        if isset(d) : proven = scope.not_null_check_relied(d)
+                    }
+                    if !proven : at.error("Incompatible types. Expected '" + param.type.compat_display_name() + "', got '" + avt.compat_display_name() + "'")
+                }
+                value_compat_check(param.type, av, at) !>
+            }
+        }
+        i++
+    }
+    // Native indexing helpers implement storage access, not a source-level call.
+    require_unsafe_func(func, scope, at) !>
+    if check_pointer_args : require_void_pointer_call(func, callee, args, scope, at) !>
+}
+
+// A `...` argument keeps its own type; C default promotions apply.
+fn value_variadic_extern_arg(av: Value, ctx: Context, at: Exp) Value !Error {
+    let t = av.rett.get_non_nullable()
+    if t.kind == TYPE.ptr_of || t.is_raw_pointer() : return av
+    if t.is_float_type() {
+        if t.number_byte_size() < 8 : return vgen_cast(av, type_from_core(ctx.build, "f64") !>)
+        return av
+    }
+    if t.is_integer_type() || t.is_bool_type() {
+        if t.number_byte_size() < 4 : return vgen_cast(av, type_from_core(ctx.build, "i32") !>)
+        return av
+    }
+    at.error("Variadic extern arguments must be integers, floats or raw pointers; got '" + av.rett.compat_display_name() + "'")
+}
+
+////////////////////////////
+// String literals
+////////////////////////////
+
+// Strip surrounding quotes from a string/char token (keeps escapes as written).
+fn strip_quotes(s: String) String {
+    if s.length >= 2 {
+        let first = s.get(0)
+        let last = s.get(s.length - 1)
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return s.range(1, s.length - 2)
+        }
+    }
+    return s
+}
+
+fn value_from_string_exp(exp: Exp, scope: Scope, ctx: Context) Value !Error {
+    let string_type = type_string(ctx.build)
+    let inner = strip_quotes(exp.str1)
+    if exp.bool1 || !inner.contains("%") {
+        let text = exp.bool1 ? inner : string_literal_unescape(inner, exp) !>
+        let v = vgen_string(text, string_type)
+        v.exp = exp
+        return v
+    }
+
+    let result = vgen_string("", string_type)
+    result.exp = exp
+    let literal_start: uint = 0
+    let i: uint = 0
+    while i < inner.length {
+        if inner.get(i) == '\\' && i + 1 < inner.length {
+            i += 2
+            continue
+        }
+        if inner.get(i) != '%' {
+            i++
+            continue
+        }
+
+        let marker = i
+        let expr_start = i + 1
+        let expr_end = expr_start
+        if expr_start >= inner.length {
+            i++
+            continue
+        }
+
+        if inner.get(expr_start) == '{' {
+            expr_start++
+            expr_end = expr_start
+            expr_end = interpolation_end(inner, expr_start)
+            if expr_end >= inner.length : exp.error("Missing '}' in string interpolation")
+        } else {
+            let ch = inner.get(expr_end)
+            if !ch.is_alpha() && ch != '_' {
+                i++
+                continue
+            }
+            expr_end++
+            while expr_end < inner.length {
+                let next = inner.get(expr_end)
+                if !next.is_alpha() && !next.is_number() && next != '_' : break
+                expr_end++
+            }
+        }
+
+        if marker > literal_start {
+            let literal = string_literal_unescape(inner.range(literal_start, marker - literal_start), exp) !>
+            let added = value_try_add_hook(result, vgen_string(literal, string_type), scope, ctx, exp) !>
+            if !isset(added) : exp.bug("String does not have a compatible '$add' hook")
+            result = added
+        }
+
+        let expression = inner.range(expr_start, expr_end - expr_start)
+        let quote_len: u32 = exp.str1.length > inner.length ? 1 : 0
+        let source = Source {
+            build: ctx.build
+            content: expression
+            path: exp.src.path
+            parent: exp.src
+            parent_offset: exp.i + quote_len + expr_start.to(u32)
+            ns: exp.src.ns
+            id: exp.src.id
+            ignore_access: exp.src.ignore_access
+        }
+        let parser = source.start().init_parser()
+        let value_exp = read_value_exp(parser, true, true) !>
+        let part = value_from_exp(value_exp, scope, ctx.without_suggested_type()) !>
+        part = value_try_convert(part, scope, ctx, string_type) !>
+        if !string_type.compat(part.rett) && !part.rett.is_nullable_type() {
+            // A `$to` hook only converts implicitly when it is also `$auto`
+            let part_class = part.rett.get_class_or_null()
+            let to_hook = isset(part_class) ? class_get_to_hook(part_class, string_type, false) : null
+            if isset(to_hook) {
+                value_exp.error("'" + part.rett.compat_display_name() + "' turns into a String with '" + to_hook.name + "', which is not marked '$auto': write '\%{" + expression + "." + to_hook.name + "()}' or mark it '$auto'")
+            }
+        }
+        string_type.compat_check(part.rett, exp) !>
+        let added = value_try_add_hook(result, part, scope, ctx, exp) !>
+        if !isset(added) : exp.bug("String does not have a compatible '$add' hook")
+        result = added
+
+        if inner.get(expr_start - 1) == '{' {
+            i = expr_end + 1
+        } else {
+            i = expr_end
+        }
+        literal_start = i
+    }
+
+    if literal_start < inner.length {
+        let literal = string_literal_unescape(inner.range(literal_start, inner.length - literal_start), exp) !>
+        let added = value_try_add_hook(result, vgen_string(literal, string_type), scope, ctx, exp) !>
+        if !isset(added) : exp.bug("String does not have a compatible '$add' hook")
+        result = added
+    }
+    result.exp = exp
+    return result
+}
+
+// Index of the '}' closing the `%{` whose body starts at `i`, or the length
+// when it is missing. Braces inside nested strings and chars do not count.
+fn interpolation_end(inner: String, i: uint) uint {
+    let len = inner.length
+    let depth: uint = 1
+    while i < len {
+        let ch = inner.get(i)
+        if ch == '"' {
+            i++
+            while i < len {
+                let c = inner.get(i++)
+                if c == '\\' : i++
+                else if c == '"' : break
+            }
+            continue
+        }
+        if ch == '\'' {
+            i += (i + 1 < len && inner.get(i + 1) == '\\') ? 4 : 3
+            continue
+        }
+        if ch == '{' : depth++
+        else if ch == '}' {
+            if --depth == 0 : return i
+        }
+        i++
+    }
+    return len
+}
+
+// Decodes the escapes of a string literal; the tokenizer only skipped them.
+fn string_literal_unescape(text: String, exp: Exp) String !Error {
+    if !text.contains("\\") : return text
+    let buf = ByteBuffer.new()
+    let i: uint = 0
+    while i < text.length {
+        let ch = text.get(i++)
+        if ch != '\\' {
+            buf.write_byte(ch)
+            continue
+        }
+        if i >= text.length : exp.error("Missing escape character after '\\' in string")
+        let e = text.get(i++)
+        if e == 'n' : buf.write_byte('\n')
+        else if e == 'r' : buf.write_byte('\r')
+        else if e == 't' : buf.write_byte('\t')
+        else if e == 'f' : buf.write_byte('\f')
+        else if e == 'b' : buf.write_byte('\b')
+        else if e == 'v' : buf.write_byte('\v')
+        else if e == 'a' : buf.write_byte('\a')
+        else if e == 'e' : buf.write_byte(27)
+        else if e == '0' : buf.write_byte(0)
+        else if e == '\\' || e == '"' || e == '\'' || e == '%' : buf.write_byte(e)
+        else if e == 'x' {
+            let hex = text.range(i, 2)
+            if hex.length != 2 || !hex.get(0).is_hex() || !hex.get(1).is_hex() : exp.error("Escape '\\x' needs two hex digits, like '\\x1f'")
+            buf.write_byte((hex.hex_to_uint() ! exp.bug("Invalid hex escape")).to(u8))
+            i += 2
+        } else if e == 'u' {
+            if i >= text.length || text.get(i) != '{' : exp.error("Escape '\\u' needs a code point in braces, like '\\u{1F600}'")
+            let end = i + 1
+            while end < text.length && text.get(end) != '}' : end++
+            if end >= text.length : exp.error("Missing '}' after '\\u{' in string")
+            let hex = text.range(i + 1, end - i - 1)
+            if hex.length == 0 || hex.length > 6 : exp.error("Escape '\\u{...}' needs 1 to 6 hex digits")
+            let d = 0.to(uint)
+            while d < hex.length {
+                if !hex.get(d).is_hex() : exp.error("Invalid hex digits in '\\u{" + hex + "}'")
+                d++
+            }
+            let code = hex.hex_to_uint() ! exp.bug("Invalid hex escape")
+            if code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) : exp.error("Code point '\\u{" + hex + "}' is not a valid unicode scalar value")
+            write_utf8_bytes(buf, code.to(u32))
+            i = end + 1
+        } else {
+            exp.error("Unknown escape sequence '\\" + e.to_ascii_string() + "' in string")
+        }
+    }
+    return buf.to_string()
+}
+
+fn write_utf8_bytes(buf: ByteBuffer, code: u32) {
+    if code < 0x80 {
+        buf.write_byte(code.to(u8))
+    } else if code < 0x800 {
+        buf.write_byte((0xC0 | (code >> 6)).to(u8))
+        buf.write_byte((0x80 | (code & 0x3F)).to(u8))
+    } else if code < 0x10000 {
+        buf.write_byte((0xE0 | (code >> 12)).to(u8))
+        buf.write_byte((0x80 | ((code >> 6) & 0x3F)).to(u8))
+        buf.write_byte((0x80 | (code & 0x3F)).to(u8))
+    } else {
+        buf.write_byte((0xF0 | (code >> 18)).to(u8))
+        buf.write_byte((0x80 | ((code >> 12) & 0x3F)).to(u8))
+        buf.write_byte((0x80 | ((code >> 6) & 0x3F)).to(u8))
+        buf.write_byte((0x80 | (code & 0x3F)).to(u8))
+    }
+}
+
+// Best-effort single-byte value from a char token like 'a' or '\n'.
+fn char_literal_byte(s: String) int {
+    let inner = strip_quotes(s)
+    if inner.length == 0 : return 0
+    if inner.get(0) == '\\' && inner.length >= 2 {
+        let e = inner.get(1)
+        if e == 'n' : return '\n'
+        if e == 't' : return '\t'
+        if e == 'r' : return '\r'
+        if e == 'b' : return 8
+        if e == 'f' : return 12
+        if e == 'a' : return 7
+        if e == 'v' : return 11
+        if e == '0' : return 0
+        if e == '\\' : return '\\'
+        if e == '\'' : return '\''
+        if e == '"' : return '"'
+        return e
+    }
+    return inner.get(0)
+}
+
+// A `local &` borrow, or inline frame storage (and storage reached through a
+// local borrow) that an owned-borrow parameter would otherwise refuse
+// Whether every reference a value of this type carries is shared, so copying it to another
+// thread leaves no mutable alias: an atomic view, or an inline value made of them
+fn type_refs_all_shared(type: Type) bool {
+    let t = type.get_non_nullable()
+    if t.is_shared : return true
+    if !t.has_gc_refs() && t.kind != TYPE.closure : return true
+    let class = t.get_class_or_null()
+    if isset(class) && class == type_string(t.build).get_class_or_null() : return true
+    if !t.is_inline : return false
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type() ?! return false
+        return type_refs_all_shared(sub)
+    }
+    let members = t.get_members()
+    if isset(members) && !isset(class) {
+        each members as member {
+            if !type_refs_all_shared(member) : return false
+        }
+        return true
+    }
+    if !isset(class) || class.kind != CLASS_KIND.struct : return false
+    each class.props as prop {
+        if !type_refs_all_shared(prop.type) : return false
+    }
+    return true
+}
+
+// A borrow that names its owner, or data that lives on its own: never frame storage
+fn value_is_owned_storage(av: Value) bool {
+    let nn = av.rett.get_non_nullable()
+    if nn.is_fat_borrow() || nn.kind == TYPE.ref_of : return !nn.is_local
+    return !av.rett.is_inline_type()
+}
+
+// Whether a call's `local` result may point into frame storage: some argument it was
+// lent from may be. Otherwise the result has the owners of its arguments
+fn value_call_lends_locked(args: Array[Value]) bool {
+    each args as arg {
+        let meta = arg.meta ?! continue
+        if meta.lent_locked : return true
+    }
+    return false
+}
+
+fn value_call_lends_local(callee: Value, args: Array[Value]) bool {
+    if callee.type == VAL.func {
+        let receiver = callee.value1
+        if isset(receiver) {
+            let origin = receiver
+            while origin.type == VAL.cast || origin.type == VAL.wrap || origin.type == VAL.interface_wrap {
+                origin = origin.value1 ?! break
+            }
+            if !value_is_owned_storage(origin) : return true
+        }
+    }
+    each args as arg {
+        let meta = arg.meta ?! continue
+        if meta.lent_local : return true
+    }
+    return false
+}
+
+// A `local` result must come from what the caller lent: a parameter, or a call that was only
+// lent such storage. Storage of the function's own frame dies with it
+fn value_lent_from_args(v: Value, lent: ?Array[Decl] (null)) bool {
+    let nn = v.rett.get_non_nullable()
+    let borrow = nn.is_fat_borrow() || nn.kind == TYPE.ref_of
+    if !v.is_implicit_borrow() && (!borrow || !nn.is_local) : return true
+    let t = v.type
+    if t == VAL.decl : return value_decl_is_lent(v, lent)
+    // A borrow made with '&': where its storage lives
+    if t == VAL.multi {
+        // A part of a borrow, like its data pointer: lent when the borrow is
+        let whole = v.value1
+        if isset(whole) && !isset(v.values) : return whole.type == VAL.decl ? value_decl_is_lent(whole, lent) : value_lent_from_args(whole, lent)
+        let address = (v.values ?? Array[Value]{}).get(1) ! return false
+        if address.type != VAL.ptr_of : return false
+        let storage = address.value1 ?! return false
+        while true {
+            let narrowed = value_narrowed_owned_borrow_source(storage)
+            if isset(narrowed) {
+                storage = narrowed
+                continue
+            }
+            if storage.type != VAL.prop && storage.type != VAL.ptrv && storage.type != VAL.cast && storage.type != VAL.wrap : break
+            storage = storage.value1 ?! return false
+        }
+        if storage.type == VAL.decl : return value_decl_is_lent(storage, lent)
+        return value_lent_from_args(storage, lent)
+    }
+    if t == VAL.call {
+        let callee = v.value1 ?! return false
+        if callee.type == VAL.func {
+            let receiver = callee.value1
+            if isset(receiver) && !value_lent_from_args(receiver, lent) : return false
+        }
+        let args = v.values ?! return true
+        each args as arg {
+            if !value_lent_from_args(arg, lent) : return false
+        }
+        return true
+    }
+    if t == VAL.cast || t == VAL.wrap || t == VAL.shared_view || t == VAL.prop || t == VAL.ptrv {
+        let inner = v.value1 ?! return false
+        return value_lent_from_args(inner, lent)
+    }
+    // A value computed after some setup, like a bounds check
+    if t == VAL.block {
+        let result = v.value1 ?! return false
+        // Temporaries the setup fills from lent values are lent too
+        let inner_lent = Array[Decl]{}
+        if isset(lent) : inner_lent.append_many(lent)
+        each (v.values ?? Array[Value]{}) as step {
+            if step.type != VAL.assign : continue
+            let target = step.value1 ?! continue
+            let source = step.value2 ?! continue
+            let decl = target.decl ?! continue
+            if target.type == VAL.decl && value_lent_from_args(source, inner_lent) : inner_lent.append(decl)
+        }
+        return value_lent_from_args(result, inner_lent)
+    }
+    if t == VAL.this_or_that {
+        let yes = v.value2 ?! return false
+        let no = (v.values ?? Array[Value]{}).get(0) ! return false
+        return value_lent_from_args(yes, lent) && value_lent_from_args(no, lent)
+    }
+    return false
+}
+
+// A parameter that is itself a borrow: what it points at belongs to the caller
+fn value_decl_is_lent(v: Value, lent: ?Array[Decl] (null)) bool {
+    let decl = v.decl ?! return false
+    if isset(lent) && lent.contains(decl) : return true
+    let nn = decl.type.get_non_nullable()
+    return decl.is_arg && (nn.is_fat_borrow() || nn.kind == TYPE.ref_of)
+}
+
+// Whether `av` reaches `target` through an `$auto` hook that returns a string: the string
+// is a value of its own, so the frame storage behind `av` is not lent
+fn value_converts_by_call(av: Value, target: Type) bool {
+    let source_class = av.rett.get_non_nullable().get_class_or_null()
+    let target_class = target.get_non_nullable().get_class_or_null()
+    let string_class = type_string(target.build).get_class_or_null()
+    if !isset(source_class) || source_class == target_class || target_class != string_class : return false
+    let hook = class_get_to_hook(source_class, target, true)
+    return isset(hook)
+}
+
+fn value_is_stack_borrow_source(av: Value) bool {
+    let nn = av.rett.get_non_nullable()
+    // A variable holding a borrow is not storage to lend; only a local borrow is
+    if nn.is_fat_borrow() : return nn.is_local
+    if !av.rett.is_inline_type() || av.rett.is_number_type() || nn.kind == TYPE.closure : return false
+    if !av.assignable() : return false
+    let origin = value_borrow_origin(av)
+    return origin.kind == BORROW_ORIGIN.stack || origin.kind == BORROW_ORIGIN.borrowed
+}
+
+// A generic declaration has no runtime value: it needs type arguments.
+// Whether `t` still holds a generic placeholder, such as the `R` of a base not specialized yet
+fn type_has_placeholder(t: Type) bool {
+    let nn = t.get_non_nullable()
+    if nn.kind == TYPE.any : return true
+    let members = nn.get_members()
+    if isset(members) {
+        each members as member {
+            if type_has_placeholder(member) : return true
+        }
+    }
+    return false
+}
+
+fn value_generic_base_message(f: Func) String {
+    if !f.is_generic_base {
+        return "'" + f.name + "' takes its types from the arguments of a call ('$T' parameters), so it cannot be used as a value; call it from a function literal instead"
+    }
+    let names = (f.generic_names ?? Array[String]{}).join(", ")
+    return "Missing generic arguments for '" + f.name + "': call it as " + f.name + "[" + names + "](...). They follow from the arguments only when an argument's type uses them, such as a function literal that returns a value"
+}
+
+// A borrow in the value itself, nested in tuples, unions, fixed arrays and structs, not behind an
+// object. A String owns its bytes even though it is laid out like a borrow
+fn type_value_holds_borrow(type: Type) bool {
+    let t = type.get_non_nullable()
+    let class = t.get_class_or_null()
+    if isset(class) && class.immutable : return false
+    if t.is_fat_borrow() || t.kind == TYPE.adr_of : return true
+    if t.is_fixed_array_type() {
+        let sub = t.get_sub_type()
+        return isset(sub) && type_value_holds_borrow(sub)
+    }
+    if t.kind == TYPE.union || t.is_tuple_type() {
+        let members = t.get_members() ?! return false
+        each members as member {
+            if type_value_holds_borrow(member) : return true
+        }
+        return false
+    }
+    if !t.is_inline : return false
+    let direct = t.get_direct_class_or_null() ?! return false
+    each direct.props as prop {
+        if type_value_holds_borrow(prop.type) : return true
+    }
+    return false
+}
