@@ -87,6 +87,10 @@ struct Gc {
     sweep_pending: bool (false)
     // Waiting in shared_safepoint: it sweeps for itself once it runs again
     at_safepoint: bool (false)
+    // Shared collection generation this thread entered shared_safepoint for
+    safepoint_gen: uint (0)
+    // 1 while assigned to run its own STW pre-mark local collection
+    pcollect_ready: u8 (0)
     // Unmarked items in other threads' blocks: freed by the next shared collection, while
     // those threads are stopped
     foreign_dead: *Bump (Bump.new())
@@ -128,6 +132,7 @@ struct Gc {
     region_first: ptr (@ref(region_first))
 
     coros_ptr: *Array[?coro.Coro] (@ref(coro.g_coros))
+    coro_count_ptr: ptr (@ref(coro.g_coro_count))
     alc_list_ptr: **Bump (@ref(alc_list))
     //
     mark_shared: bool (false)
@@ -743,15 +748,18 @@ struct Gc {
         }
         #end
         let data = gcdata(item)
-        // Another thread may be sweeping it
-        if data.is_shared() && !this.scanning_shared : return
+        if data.is_shared() {
+            // Another thread may be sweeping it during a local collection
+            if !this.scanning_shared : return
+            let old = atomic(data.flags | flag_on_stack)
+            if (old & flag_on_stack) != 0 : return
+            atomic(data.co_count + 1)
+            this.stack_items.add_ptr(item)
+            return
+        }
         if data.is_on_stack() : return
         data.set_on_stack()
-        if data.is_shared() {
-            atomic(data.co_count + 1)
-        } else {
-            data.co_count = data.co_count + 1
-        }
+        data.co_count = data.co_count + 1
         this.stack_items.add_ptr(item)
     }
     fn collect_stack_items() {
@@ -812,20 +820,22 @@ struct Gc {
             } else {
                 this.scan_words(sp, this.stack_top)
             }
-            let coros = this.coros_ptr[0]
-            each coros as coro_item {
-                if !isset(coro_item) : continue
-                if coro_item.started && !coro_item.active && !coro_item.done {
-                    if this.scanning_shared : this.scan_words(coro_item.saved_sp(), coro_item.stack_top)
-                    else if coro_item.gc_roots_kept : this.add_kept_roots(coro_item)
-                    else : this.scan_coro_words(coro_item)
+            if @ptrv(this.coro_count_ptr, uint) > 0 {
+                let coros = this.coros_ptr[0]
+                let need_kept: u8 = this.scanning_shared ? 2 : 1
+                each coros as coro_item {
+                    if !isset(coro_item) : continue
+                    if coro_item.started && !coro_item.active && !coro_item.done {
+                        if coro_item.gc_roots_kept >= need_kept : this.add_kept_roots(coro_item)
+                        else : this.scan_coro_words(coro_item)
+                    }
                 }
             }
             this.scan_regions()
         }
     }
 
-    // A suspended stack's words, keeping the roots found for the next local collection: until
+    // A suspended stack's words, keeping the roots found for subsequent collections: until
     // the coroutine runs, nothing writes to its stack
     fn scan_coro_words(c: coro.Coro) {
         let min = this.scan_min
@@ -851,7 +861,7 @@ struct Gc {
             count++
         }
         c.gc_root_count = count
-        c.gc_roots_kept = kept
+        c.gc_roots_kept = kept ? (this.scanning_shared ? 2 : 1) : 0
     }
 
     fn add_kept_roots(c: coro.Coro) {
