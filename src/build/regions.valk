@@ -284,6 +284,10 @@ class RegionFacts {
     loop_opaque_suspend: Array[bool] (.{ false })
     loop_call_callees: Array[Func] (.{})
     loop_call_loops: Array[uint] (.{})
+    loop_indirect_sigs: Array[String] (.{})
+    loop_indirect_sig_loops: Array[uint] (.{})
+    loop_indirect_ifaces: Array[Func] (.{})
+    loop_indirect_iface_loops: Array[uint] (.{})
     loop_suspends: Array[bool] (.{})
     loop: uint (0)
     node_loop: Array[uint] (.{})
@@ -2052,6 +2056,18 @@ class RegionFacts {
                 this.mark_loop_suspends(this.loop_call_loops[i])
             }
         }
+        let build = this.func.ns.build
+        let any_susp = build.region_suspending_sigs.has("*")
+        each this.loop_indirect_sigs as sig, i {
+            if any_susp || build.region_suspending_sigs.has(sig) {
+                this.mark_loop_suspends(this.loop_indirect_sig_loops[i])
+            }
+        }
+        each this.loop_indirect_ifaces as iface_func, i {
+            if build.region_suspending_ifaces.has(region_iface_key(iface_func)) {
+                this.mark_loop_suspends(this.loop_indirect_iface_loops[i])
+            }
+        }
     }
 
     fn loop_may_suspend(loop: uint) bool {
@@ -2594,10 +2610,29 @@ fn region_walk_call(f: RegionFacts, value: Value) uint {
 
     let result = holds ? f.add_node() : REGION_NONE
     if !isset(target) || target.is_extern {
-        if !isset(target) && f.loop > 0 : f.loop_opaque_suspend[f.loop] = true
+        if !isset(target) && f.loop > 0 {
+            if value.call_kind == CALL_KIND.interface_dispatch && isset(callee) && callee.type == VAL.func {
+                let ifunc = callee.func
+                if isset(ifunc) {
+                    f.loop_indirect_ifaces.append(ifunc)
+                    f.loop_indirect_iface_loops.append(f.loop)
+                } else {
+                    f.loop_opaque_suspend[f.loop] = true
+                }
+            } else if isset(callee) && (callee.rett.get_non_nullable().kind == TYPE.closure || callee.rett.get_non_nullable().kind == TYPE.fnptr) {
+                f.loop_indirect_sigs.append(region_callable_sig(callee.rett))
+                f.loop_indirect_sig_loops.append(f.loop)
+            } else {
+                f.loop_opaque_suspend[f.loop] = true
+            }
+        }
         let kind = !isset(target) ? (value.call_kind == CALL_KIND.interface_dispatch ? "passed to an interface call" : "passed to a call through a function value") : "passed to a C function"
         let why = f.here(kind)
-        each first .. count as a : f.mark(args[a], why)
+        // Closure envs with captures are already marked heap at creation; stateless functions have env == null
+        let skip_callee = !isset(target) && value.call_kind != CALL_KIND.interface_dispatch && isset(callee) && callee.type != VAL.func
+        let mark_first = skip_callee ? first + 1 : first
+        let mark_count = skip_callee && count > 0 ? count - 1 : count
+        each mark_first .. mark_count as a : f.mark(args[a], why)
         f.mark(result, why)
         region_cut_args(f, first)
         return result
@@ -3365,25 +3400,148 @@ fn region_collect_facts(func: Func) {
     }
 }
 
+fn region_type_sig_part(t: Type) String {
+    let nn = t.get_non_nullable()
+    let cls = nn.get_class_or_null()
+    if isset(cls) : return nn.kind.to(int).to_string() + ":" + cls.pretty_name()
+    return nn.kind.to(int).to_string()
+}
+
+fn region_callable_sig(type: Type) String {
+    let nn = type.get_non_nullable()
+    let info = nn.get_function_info() ?! return "*"
+    let out = ByteBuffer.new(32)
+    out.write_uint_ascii(info.args.length)
+    out.write(":")
+    each info.args as a, i {
+        if i > 0 : out.write(",")
+        out.write(region_type_sig_part(a))
+    }
+    out.write("->")
+    each info.returns as r, i {
+        if i > 0 : out.write(",")
+        out.write(region_type_sig_part(r))
+    }
+    if isset(info.error_type) : out.write("!")
+    return out.into_string()
+}
+
+fn region_note_sig_coercion(build: Build, from_sig: String, to_sig: String) {
+    build.region_sig_from.append(from_sig)
+    build.region_sig_to.append(to_sig)
+}
+
+fn region_iface_key(func: Func) String {
+    let cls = func.class
+    if isset(cls) : return cls.ns.pkg.identity() + ":" + cls.ns.name + ":" + cls.pretty_name() + "." + func.name
+    return func.name
+}
+
 // Which functions can give up the thread while a region of theirs is alive. `may_suspend` also
 // counts what a collection may run, which reaches nearly everything through the write barrier.
 // A collection does not switch coroutines and a finalizer may not block, so the collector
 // does not count
 fn region_find_suspending(build: Build) {
-    let changed = true
+    let susp_sigs = build.region_suspending_sigs
+    let susp_ifaces = build.region_suspending_ifaces
+    susp_sigs.clear()
+    susp_ifaces.clear()
+
+    let watched_ifaces = Array[Func]{}
+    let watched_iface_seen = Map[bool]{}
     each build.lists.units as unit {
-        each unit.functions as func : func.region_suspends = func.suspends_directly
+        each unit.functions as func {
+            func.region_suspends = func.suspends_explicitly
+            let ifaces = func.indirect_iface_calls
+            if isset(ifaces) {
+                each ifaces as ifunc {
+                    let key = region_iface_key(ifunc)
+                    if !watched_iface_seen.has(key) {
+                        watched_iface_seen.set(key, true)
+                        watched_ifaces.append(ifunc)
+                    }
+                }
+            }
+        }
     }
+
+    let changed = true
     while changed {
         changed = false
         each build.lists.units as unit {
             each unit.functions as func {
-                if func.region_suspends : continue
-                each func.effect_callees as callee {
-                    if !callee.region_suspends || callee.ns.name == "gc" : continue
-                    func.region_suspends = true
+                if !func.region_suspends : continue
+                if func.is_export && !susp_sigs.has("*") {
+                    susp_sigs.set("*", true)
+                    changed = true
+                }
+                let taken = func.taken_sigs
+                if isset(taken) {
+                    each taken as sig {
+                        if !susp_sigs.has(sig) {
+                            susp_sigs.set(sig, true)
+                            changed = true
+                        }
+                    }
+                }
+            }
+        }
+        each build.region_sig_from as from_sig, i {
+            let to_sig = build.region_sig_to[i]
+            if susp_sigs.has(from_sig) && !susp_sigs.has(to_sig) {
+                susp_sigs.set(to_sig, true)
+                changed = true
+            }
+        }
+        each watched_ifaces as ifunc {
+            let key = region_iface_key(ifunc)
+            if susp_ifaces.has(key) : continue
+            let iface = ifunc.class ?! continue
+            each iface.interface_adapters as adapter {
+                let concrete = adapter.interface_concrete ?! continue
+                let impl = concrete.get_func(ifunc.name) ?? ifunc
+                if impl.region_suspends {
+                    susp_ifaces.set(key, true)
                     changed = true
                     break
+                }
+            }
+        }
+        let any_susp = susp_sigs.has("*")
+        each build.lists.units as unit {
+            each unit.functions as func {
+                if func.region_suspends : continue
+                let found = false
+                each func.effect_callees as callee {
+                    if !callee.region_suspends || callee.ns.name == "gc" : continue
+                    found = true
+                    break
+                }
+                if !found {
+                    let sigs = func.indirect_call_sigs
+                    if isset(sigs) {
+                        each sigs as sig {
+                            if any_susp || susp_sigs.has(sig) {
+                                found = true
+                                break
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    let ifaces = func.indirect_iface_calls
+                    if isset(ifaces) {
+                        each ifaces as ifunc {
+                            if susp_ifaces.has(region_iface_key(ifunc)) {
+                                found = true
+                                break
+                            }
+                        }
+                    }
+                }
+                if found {
+                    func.region_suspends = true
+                    changed = true
                 }
             }
         }
