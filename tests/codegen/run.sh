@@ -335,6 +335,18 @@ if [[ "$atomic_body" != *"load atomic i8"*"align 1"* ]] \
     echo "$atomic_body"
     exit 1
 fi
+readonly_body=$(sed -n '/^define .*__atomic_readonly_load__/,/^}/p' "$atomic_ir")
+if [[ -z "$readonly_body" || "$readonly_body" == *"load atomic"* ]]; then
+    echo "# Read-only field on non-threadsafe atomic view should use plain load"
+    echo "$readonly_body"
+    exit 1
+fi
+locked_body=$(sed -n '/^define .*__locked_plain_store__/,/^}/p' "$atomic_ir")
+if [[ -z "$locked_body" || "$locked_body" == *"atomicrmw"* || "$locked_body" == *"store atomic"* ]]; then
+    echo "# Locked view integer stores should not emit atomic operations"
+    echo "$locked_body"
+    exit 1
+fi
 
 echo "> Vector types lower to LLVM vectors with element alignment"
 
