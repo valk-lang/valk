@@ -26,19 +26,19 @@ fn mark_used_direct(item: ?GcItem) $hot {
         #end
 
         data.set_owned()
-        if data.offset > 0 && is_new {
+        if data.offset > 0 {
             let block = data.block()
-            block.slots_used++
-            gc.mem_marked += block.isize
+            if is_new {
+                block.slots_used++
+                gc.mem_marked += block.isize
+            }
+            if isset(block.layout) : ml.add(item)
         }
-        ml.add(item)
     }
 
     while ml.index > 0 {
         let item = ml.pop_unchecked()
         let data = gcdata(item)
-        if data.offset == 0 : continue
-
         let block = data.block()
         let layout = block.layout
         if isset(layout) {
@@ -63,12 +63,14 @@ fn mark_used_props_direct(ref: ptr, list: *Lifo) $hot $inline {
             @ptrv(ref, ptr) = sub | prop_owned
             let is_new = sub_data.is_new()
             sub_data.set_owned()
-            if is_new && sub_data.offset > 0 {
+            if sub_data.offset > 0 {
                 let sub_block = sub_data.block()
-                sub_block.slots_used++
-                gc.mem_marked += sub_block.isize
+                if is_new {
+                    sub_block.slots_used++
+                    gc.mem_marked += sub_block.isize
+                }
+                if isset(sub_block.layout) : list.add_unchecked(sub)
             }
-            list.add_unchecked(sub)
         } else if adopt_root(sub_data) {
             @ptrv(ref, ptr) = sub | prop_owned
         } else {
@@ -288,11 +290,14 @@ fn flush_dead_block(block: ?*BlockMini, count: uint) $inline {
 
 fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
     @unsafe
-    let ml = gc.mark_list
+    let g = gc
+    let ml = g.mark_list
     let disowned: uint = 0
     let unmarked_bytes: uint = 0
     let dead_block: ?*BlockMini = null
     let dead_count: uint = 0
+    g.leaf_dis_owned = 0
+    g.leaf_unmarked = 0
 
     while true {
         let data = gcdata(item)
@@ -303,7 +308,7 @@ fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
         } else {
             disowned++
             data.set_new()
-            if data.co_count > 0 : gc.re_own_list.add_ptr(item)
+            if data.co_count > 0 : g.re_own_list.add_ptr(item)
 
             if block != dead_block {
                 flush_dead_block(dead_block, dead_count)
@@ -314,7 +319,7 @@ fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
             unmarked_bytes += block.isize
 
             let onfree = block.onfree
-            if isset(onfree) : gc.blanks.add_ptr(item)
+            if isset(onfree) : g.blanks.add_ptr(item)
         }
 
         let layout = block.layout
@@ -327,6 +332,10 @@ fn dis_own_loop_direct(item: ptr, children_only: bool) (uint, uint) {
         item = ml.pop_unchecked()
     }
     flush_dead_block(dead_block, dead_count)
+    disowned += g.leaf_dis_owned
+    unmarked_bytes += g.leaf_unmarked
+    g.leaf_dis_owned = 0
+    g.leaf_unmarked = 0
     return (disowned, unmarked_bytes)
 }
 
@@ -512,7 +521,20 @@ fn dis_own_props_direct(ref: ptr, list: *Lifo) $hot $inline {
         let sub_data = gcdata(sub_item)
         sub_data.set_no_owner()
         if sub_data.is_shared() : return
-        queue_dis_owned(sub_item, list)
+        if !should_dis_own(sub_item) : return
+        let sub_block = sub_data.block()
+        if !isset(sub_block.layout) {
+            sub_data.set_new()
+            let g = gc
+            if sub_data.co_count > 0 : g.re_own_list.add_ptr(sub_item)
+            sub_block.slots_used--
+            touch_block(sub_block.@cast(ptr) - (POOL_DATA_OFFSET - POOL_PUBLIC_OFFSET))
+            g.leaf_dis_owned++
+            g.leaf_unmarked += sub_block.isize
+            if isset(sub_block.onfree) : g.blanks.add_ptr(sub_item)
+            return
+        }
+        list.add_unchecked(sub_item)
     } else if sub & prop_co_owned == prop_co_owned {
         let sub_item = sub - prop_co_owned
         #if GC_DEBUG
@@ -579,17 +601,46 @@ fn share_ref(ref: ptr, list: *Lifo) $hot $inline {
     }
 
     if sub_data.is_shared() : return
+    if sub_data.offset == 0 {
+        sub_data.set_shared()
+        if sub_data.is_new() : sub_data.set_no_owner()
+        else if sub_data.is_still_co_owned() {
+            sub_data.remove_still_co_owned()
+            sub_data.set_no_owner()
+        }
+        return
+    }
+    let sub_block = sub_data.block()
+    if !isset(sub_block.layout) {
+        sub_data.set_shared()
+        let is_new = sub_data.is_new()
+        if is_new : sub_data.set_no_owner()
+        else if sub_data.is_still_co_owned() {
+            sub_data.remove_still_co_owned()
+            sub_data.set_no_owner()
+        }
+        let g = gc
+        g.shared_items.add_ptr(sub_item)
+        let size = sub_block.isize
+        if is_new : sub_block.slots_used++
+        else : g.mem_marked -= size
+        g.share_leaf_added += size
+        return
+    }
     list.add(sub_item)
 }
 
 fn share(item: GcItem) {
     @unsafe
-    let ds = gc.dont_stop
-    gc.dont_stop = true
+    let g = gc
+    let ds = g.dont_stop
+    g.dont_stop = true
 
-    let ml = gc.mark_list
+    let ml = g.mark_list
     let start = ml.index
     let added : uint = 0
+    let prev_leaf = g.share_leaf_added
+    g.share_leaf_added = 0
     ml.add(item)
 
     while ml.index > start {
@@ -607,14 +658,14 @@ fn share(item: GcItem) {
         }
 
         if data.offset == 0 : continue
-        gc.shared_items.add_ptr(item)
+        g.shared_items.add_ptr(item)
 
         let block = data.block()
         let size = block.isize
         if is_new {
             block.slots_used++
         } else {
-            gc.mem_marked -= size
+            g.mem_marked -= size
         }
         added += size
 
@@ -624,17 +675,20 @@ fn share(item: GcItem) {
         }
     }
 
+    added += g.share_leaf_added
+    g.share_leaf_added = prev_leaf
+
     // Batched per thread: threads publishing at once contend on the global counter.
     // A shared collection and the thread shutdown add what is left
     if added > 0 {
-        let pending = gc.shared_pending + added
+        let pending = g.shared_pending + added
         if pending >= 65536 {
             atomic(mem_shared + pending)
             pending = 0
         }
-        gc.shared_pending = pending
+        g.shared_pending = pending
     }
-    gc.dont_stop = ds
+    g.dont_stop = ds
 }
 
 fn mark_leak_rec(item: GcItem, on: bool) {
