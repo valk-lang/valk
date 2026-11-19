@@ -119,6 +119,8 @@ class RegionPin {
     emitted: bool (false)
     // The region that pins: as for a call
     pass: uint (REGION_NONE)
+    // Proven non-heap (region or frame): 0 in both forms, REGION_PASSED + n in copy when !may_null[n]
+    plain: uint (REGION_NONE)
 }
 
 class RegionCall {
@@ -154,6 +156,7 @@ class RegionCall {
 // The runtime functions the analysis knows by what they do, and the ones the IR calls
 class RegionRuntime {
     stack_object: ?Func (null)
+    stack_object_zeroed: ?Func (null)
     // Every summary is final: the regions are being chosen
     settled: bool (false)
     property_get: Func
@@ -278,6 +281,10 @@ class RegionFacts {
     // The loop every loop of the body is in; loop 0 is the body itself. A loop has a higher
     // number than the one it is in
     loops: Array[uint] (.{ 0 })
+    loop_opaque_suspend: Array[bool] (.{ false })
+    loop_call_callees: Array[Func] (.{})
+    loop_call_loops: Array[uint] (.{})
+    loop_suspends: Array[bool] (.{})
     loop: uint (0)
     node_loop: Array[uint] (.{})
     // What the body does: a step and its two nodes, three numbers each
@@ -1511,20 +1518,30 @@ class RegionFacts {
             if changed : return true
         }
         // A frame is there while its function waits, and the collector reads it: objects in
-        // it are fine where a region is not
-        if func.region_suspends || func.is_literal {
-            let why = this.runtime.reason_id(func.is_literal ? REGION_WHY_CLOSURE : REGION_WHY_SUSPENDS)
+        // it are fine where a region is not. A non-suspending inner loop in a suspending
+        // function can also own its own region (initialized at loop entry, exited at loop exit)
+        if func.is_literal {
+            let why = this.runtime.reason_id(REGION_WHY_CLOSURE)
+            each 0 .. this.parent.length as i {
+                if this.parent[i] != i || !this.is_local(i) : continue
+                if this.give_reason(i, why) : changed = true
+            }
+            return changed
+        }
+        if func.region_suspends {
+            let why = this.runtime.reason_id(REGION_WHY_SUSPENDS)
             // Only once the summaries are final: what a group refers to must not come to
             // depend on it
-            let frames = this.runtime.settled && !func.is_literal
+            let frames = this.runtime.settled
             if frames : this.find_framed()
             let framed = this.runtime.framed
             each 0 .. this.parent.length as i {
                 if this.parent[i] != i || !this.is_local(i) : continue
+                if !this.loop_may_suspend(this.scope[i]) : continue
                 if frames && framed[i] && !this.links_out(i) : continue
                 if this.give_reason(i, why) : changed = true
             }
-            return changed
+            if changed : return true
         }
         // A loop inside the scope would fill the region with whatever its rounds leave
         // behind, unless every object a round makes is kept by something that lives as long
@@ -1979,8 +1996,17 @@ class RegionFacts {
         }
         each this.pins as pin {
             let root = this.find(pin.node)
-            if framed[root] : continue
-            if pin.dual && pin.emitted && this.refers_out(root) : pin.pass = this.region_or_callers(root, passed)
+            if pin.dual && pin.emitted {
+                if framed[root] {
+                    pin.plain = 0
+                } else if this.is_local(root) {
+                    let reg = this.region_of(root, passed)
+                    if reg != REGION_NONE && reg < REGION_PASSED : pin.plain = 0
+                } else if passed[root] != REGION_NONE {
+                    pin.plain = REGION_PASSED + passed[root]
+                }
+                if !framed[root] && this.refers_out(root) : pin.pass = this.region_or_callers(root, passed)
+            }
         }
         each this.calls as call {
             let callee = call.callee.region_facts ?! continue
@@ -2003,14 +2029,44 @@ class RegionFacts {
         }
     }
 
+    fn mark_loop_suspends(loop: uint) {
+        let l = loop
+        while l > 0 && !this.loop_suspends[l] {
+            this.loop_suspends[l] = true
+            l = this.loops[l]
+        }
+        this.loop_suspends[0] = true
+    }
+
+    fn compute_loop_suspends() {
+        this.loop_suspends.clear()
+        let all_suspend = this.func.has_suspend_attr
+        each 0 .. this.loops.length : this.loop_suspends.append(all_suspend)
+        if !this.func.region_suspends || all_suspend : return
+        this.loop_suspends[0] = true
+        each this.loop_opaque_suspend as flag, l {
+            if flag : this.mark_loop_suspends(l)
+        }
+        each this.loop_call_callees as callee, i {
+            if callee.region_suspends && callee.ns.name != "gc" {
+                this.mark_loop_suspends(this.loop_call_loops[i])
+            }
+        }
+    }
+
+    fn loop_may_suspend(loop: uint) bool {
+        if !this.func.region_suspends : return false
+        return loop == 0 || loop >= this.loop_suspends.length || this.loop_suspends[loop]
+    }
+
     // The region a group is in: one of this function by its number, REGION_PASSED + n for
     // one a copy got, or none
     fn region_of(root: uint, passed: Array[uint]) uint {
         if passed[root] != REGION_NONE : return REGION_PASSED + passed[root]
         if !this.is_local(root) : return REGION_NONE
-        // Never a region where the function may give up its thread
-        if this.func.region_suspends : return REGION_NONE
+        // Never a region where its scope may give up its thread
         let loop = this.scope[root]
+        if this.loop_may_suspend(loop) : return REGION_NONE
         each this.regions as known, n {
             if known == loop : return n
         }
@@ -2127,6 +2183,12 @@ fn region_runtime(build: Build) ?RegionRuntime {
     if isset(stack_object) {
         if !stack_object.parsed_types : parse_func_types(stack_object) ! { stack_object = null }
         made.stack_object = stack_object
+    }
+    let in_frame_zeroed = isset(gc_ns) ? gc_ns.scope.get_idf("region_stack_object_zeroed") : null
+    let stack_object_zeroed = isset(in_frame_zeroed) ? in_frame_zeroed.func : null
+    if isset(stack_object_zeroed) {
+        if !stack_object_zeroed.parsed_types : parse_func_types(stack_object_zeroed) ! { stack_object_zeroed = null }
+        made.stack_object_zeroed = stack_object_zeroed
     }
     // Newer than the rest: a standard library without it has no such calls
     let named = isset(mem_ns) ? mem_ns.scope.get_idf("identity") : null
@@ -2532,12 +2594,17 @@ fn region_walk_call(f: RegionFacts, value: Value) uint {
 
     let result = holds ? f.add_node() : REGION_NONE
     if !isset(target) || target.is_extern {
+        if !isset(target) && f.loop > 0 : f.loop_opaque_suspend[f.loop] = true
         let kind = !isset(target) ? (value.call_kind == CALL_KIND.interface_dispatch ? "passed to an interface call" : "passed to a call through a function value") : "passed to a C function"
         let why = f.here(kind)
         each first .. count as a : f.mark(args[a], why)
         f.mark(result, why)
         region_cut_args(f, first)
         return result
+    }
+    if f.loop > 0 {
+        f.loop_call_callees.append(target)
+        f.loop_call_loops.append(f.loop)
     }
     // A call that passes and gives no references links nothing
     let any = result != REGION_NONE
@@ -3099,6 +3166,7 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         return REGION_NONE
     }
     if t == VAL.co {
+        if f.loop > 0 : f.loop_opaque_suspend[f.loop] = true
         let first = f.calls.length
         let inner = value.value1
         let node = isset(inner) ? region_walk(f, inner) : REGION_NONE
@@ -3110,6 +3178,7 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
         return region_unknown(f, value, node, "handed to a coroutine")
     }
     if t == VAL.await {
+        if f.loop > 0 : f.loop_opaque_suspend[f.loop] = true
         let inner = value.value1
         let node = isset(inner) ? region_walk(f, inner) : REGION_NONE
         f.mark(node, "comes from a coroutine")
@@ -3145,6 +3214,7 @@ fn region_walk_value(f: RegionFacts, value: Value) uint {
     if t == VAL.while {
         let outer = f.loop
         f.loops.append(outer)
+        f.loop_opaque_suspend.append(false)
         f.loop = f.loops.length - 1
         value.region_id = f.number(f.loop)
         // The test runs once more than the rounds do
@@ -3327,7 +3397,10 @@ fn region_solve(build: Build) {
     let all = Array[RegionFacts]{}
     each build.region_funcs as func {
         let f = func.region_facts
-        if isset(f) : all.append(f)
+        if isset(f) {
+            f.compute_loop_suspends()
+            all.append(f)
+        }
     }
     each all as f {
         // A caller is listed once: its calls are read together
@@ -3489,6 +3562,10 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
             let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
             let in_frame = runtime.stack_object
             out.append_text(ir_func_address(decided && site.stack && isset(in_frame) ? in_frame : runtime.alloc))
+        } else if kind == 'Z' {
+            let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
+            let in_frame = runtime.stack_object_zeroed
+            out.append_text(ir_func_address(decided && site.stack && isset(in_frame) ? in_frame : runtime.alloc_zeroed))
         } else if kind == 'U' || kind == 'P' {
             let site = f.sites.get(id - 1) ! f.func.exp.bug("Region token of an unknown object")
             let name = ""
@@ -3512,11 +3589,15 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
             else if site.region != REGION_NONE : out.append_text(region_local_name(site.region))
             else : out.append_text("null")
         } else if kind == 'Q' {
-            // Whether the store pins: the region comes from the object that is stored into
+            // Bit 0: pin what is stored. Bit 1: object is proven non-heap (skip GC barrier)
             let pin = f.pins.get(id - 1) ! f.func.exp.bug("Region token of an unknown store")
             let pass = pin.pass
-            if !decided || pass == REGION_NONE || (pass >= REGION_PASSED && !copy) : out.append_text("null")
-            else : out.append_text("inttoptr (i64 1 to ptr)")
+            let does_pin = decided && pass != REGION_NONE && (pass < REGION_PASSED || copy)
+            let plain = pin.plain
+            let is_plain = decided && plain != REGION_NONE && (plain < REGION_PASSED || (copy && !f.may_null[plain - REGION_PASSED]))
+            let mode: uint = (does_pin ? 1 : 0) | (is_plain ? 2 : 0)
+            if mode == 0 : out.append_text("null")
+            else : out.append_text("inttoptr (i64 " + mode + " to ptr)")
         } else if kind == 'C' {
             let call = f.calls.get(id - 1) ! f.func.exp.bug("Region token of an unknown call")
             if !decided || !f.call_uses_copy(call, copy) {
@@ -3545,9 +3626,12 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
                 }
             }
             if decided {
-                // A record of the thread's region stack each, given back in reverse
-                each f.regions as loop, i {
-                    out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
+                // Non-suspending functions own their regions for the whole call; suspending
+                // functions initialize non-suspending loop regions on loop entry ('I')
+                if !f.func.region_suspends {
+                    each f.regions as loop, i {
+                        out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
+                    }
                 }
                 // The objects of the frame, each with its header
                 each f.sites as site, i {
@@ -3555,10 +3639,23 @@ fn region_patch(f: RegionFacts, code: String, copy: bool, unit: Unit, out: ByteB
                 }
             }
         } else if kind == 'X' {
-            if decided {
+            if decided && !f.func.region_suspends {
                 let i = f.regions.length
                 while i-- > 0 {
                     out.append_text("  call void " + ir_func_address(runtime.exit) + "(ptr " + region_local_name(i) + ")\n")
+                }
+            }
+        } else if kind == 'I' {
+            if decided && f.func.region_suspends {
+                each f.regions as loop, i {
+                    if loop == id : out.append_text("  " + region_local_name(i) + " = call ptr " + ir_func_address(runtime.init) + "()\n")
+                }
+            }
+        } else if kind == 'O' {
+            if decided && f.func.region_suspends {
+                let i = f.regions.length
+                while i-- > 0 {
+                    if f.regions[i] == id : out.append_text("  call void " + ir_func_address(runtime.exit) + "(ptr " + region_local_name(i) + ")\n")
                 }
             }
         } else if kind == 'L' {

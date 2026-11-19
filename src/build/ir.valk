@@ -318,6 +318,8 @@ struct IRLoop {
     after: String
     // `active_locks` when the loop started: leaving it releases the locks entered since
     locks: uint
+    // Region loop id for per-loop region init/exit in suspending functions
+    region_loop: uint (0)
 }
 
 class IRFunc {
@@ -652,6 +654,8 @@ fn generate_func_ir(func: Func) !Error {
         ir_use_func(ir, runtime.exit)
         let in_frame = runtime.stack_object
         if isset(in_frame) : ir_use_func(ir, in_frame)
+        let in_frame_zeroed = runtime.stack_object_zeroed
+        if isset(in_frame_zeroed) : ir_use_func(ir, in_frame_zeroed)
         region_put(ir.code, 'E', 0)
     }
 
@@ -861,6 +865,14 @@ fn ir_emit_func_cleanup(ir: IRFunc, exiting: bool (false)) !Error {
     if ir.cleanup_active : return
     ir.cleanup_active = true
     ir_emit_lock_cleanup(ir, 0) !>
+    if isset(ir.regions) && !exiting && !ir.terminated {
+        let li = ir.loops.length
+        while li > 0 {
+            li--
+            let rl = ir.loops[li].region_loop
+            if rl > 0 : region_put(ir.code, 'O', rl)
+        }
+    }
     let scope = ir.func.defer_scope
     if isset(scope) {
         each scope.values as value {
@@ -1417,6 +1429,15 @@ fn ir_emit_stmt_code(ir: IRFunc, value: Value) !Error {
         let loop = ir.loops.get(ir.loops.length - depth) ! value.bug("'break' or 'continue' reached IR without its loop")
         ir_emit_values(ir, value.values) !>
         ir_emit_lock_cleanup(ir, loop.locks) !>
+        if isset(ir.regions) && !ir.terminated {
+            let li = ir.loops.length
+            let target_idx = ir.loops.length - depth
+            while li > target_idx + 1 {
+                li--
+                let rl = ir.loops[li].region_loop
+                if rl > 0 : region_put(ir.code, 'O', rl)
+            }
+        }
         ir.jump(t == VAL.break ? loop.after : loop.cond)
         return
     }
@@ -1538,17 +1559,20 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     let cond_block = ir.block("while.cond")
     let body_block = ir.block("while.body")
     let after_block = ir.block("while.after")
+    let loop_facts = ir.regions
+    let region_loop = isset(loop_facts) ? loop_facts.number_of(value) : 0
+    if isset(loop_facts) && region_loop > 0 : region_put(ir.code, 'I', region_loop)
     ir.jump(cond_block)
 
     ir.label(cond_block)
     // A round starts: the regions of this loop hold nothing that is still used
-    let loop_facts = ir.regions
-    if isset(loop_facts) && loop_facts.number_of(value) > 0 : region_put(ir.code, 'L', loop_facts.number_of(value))
+    if isset(loop_facts) && region_loop > 0 : region_put(ir.code, 'L', region_loop)
     let condv = value.value1
     if !isset(condv) : value.bug("IR while is missing its condition")
-    ir.loops.append(IRLoop { cond: cond_block, after: after_block, locks: ir.active_locks.length })
+    ir.loops.append(IRLoop { cond: cond_block, after: after_block, locks: ir.active_locks.length, region_loop: region_loop })
     let cond = ir_emit_value(ir, condv) !>
-    if !ir.terminated {
+    let cond_terminated = ir.terminated
+    if !cond_terminated {
         ir.cond_jump(cond, body_block, after_block)
         ir.label(body_block)
         ir_emit_values(ir, value.values) !>
@@ -1557,6 +1581,7 @@ fn ir_emit_while(ir: IRFunc, value: Value) !Error {
     ir.loops.pop_last() ! value.bug("IR loop stack is empty")
 
     ir.label(after_block)
+    if isset(loop_facts) && region_loop > 0 && !cond_terminated : region_put(ir.code, 'O', region_loop)
 }
 
 ////////////////////////////
@@ -3344,11 +3369,13 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let element = class.slice_type
     if !isset(element) : value.bug("Slice initializer has no element type")
     let length = ""
+    let const_len: ?uint = null
     if isset(fields) {
         each fields as field, i {
             let prop = field.get_init_prop()
             if !isset(prop) || prop.name != "length" : continue
             length = ir.field_values.get(field_mark + i) !? ""
+            if field.type == VAL.int && field.int_val >= 0 : const_len = field.int_val.to(uint)
             break
         }
     }
@@ -3392,17 +3419,20 @@ fn ir_emit_slice_alloc(ir: IRFunc, value: Value, class: Class, fields: ?Array[Va
     let item = ""
     let after = ""
     if isset(regions) && isset(site) && site.dual {
-        let runtime = ir.func.ns.build.region_runtime ?! value.bug("Region runtime is missing")
         let id = regions.number_of(value)
         site.emitted = true
+        if isset(const_len) {
+            if element_size == 0 || const_len <= (uint.$max - header) / element_size.to(uint) {
+                site.bytes = header + const_len * element_size.to(uint)
+            }
+        }
         in_region = ir.block("rg.storage")
         let on_heap = ir.block("rg.heap")
         after = ir.block("rg.after")
         ir.cond_jump(region_token('U', id), in_region, on_heap)
         ir.label(in_region)
         item = ir.var()
-        let rg_alloc = unzeroed ? runtime.alloc : runtime.alloc_zeroed
-        ir.line(item + " = call ptr " + ir_func_address(rg_alloc) + "(ptr " + region_token('P', id) + ", i64 " + total + ")")
+        ir.line(item + " = call ptr " + region_token(unzeroed ? 'A' : 'Z', id) + "(ptr " + region_token('P', id) + ", i64 " + total + ")")
         ir.jump(after)
         ir.label(on_heap)
     }
